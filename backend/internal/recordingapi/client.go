@@ -478,6 +478,12 @@ func (c *Client) FinishCaptureSet(ctx context.Context, jobID int64, leaseToken, 
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/finish", jobID, url.PathEscape(setID)), map[string]any{}, leaseTokenHeaders(leaseToken), nil)
 }
 
+func (c *Client) FinishEmptyCaptureSetRecovery(ctx context.Context, jobID int64, leaseToken, setID, reportID string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/empty-recovery", jobID, url.PathEscape(setID)), map[string]any{
+		"report_id": reportID,
+	}, leaseTokenHeaders(leaseToken), nil)
+}
+
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
 type IngestClipRequest struct {
 	IntentID                string
@@ -634,6 +640,53 @@ func (c *Client) CaptureProducerStatus(ctx context.Context, jobID int64, produce
 // ContentLength and Content-Type (matching the captureapi upload shape).
 func (c *Client) UploadFile(ctx context.Context, uploadURL, path, mimeType string) error {
 	return c.uploads.PutFile(ctx, uploadURL, path, mimeType)
+}
+
+// UploadFileExact binds the PUT body to the inode acknowledged by the capture
+// stop barrier. The pathname is opened once with no-follow semantics and the
+// held descriptor is streamed, so replacement cannot change uploaded bytes.
+func (c *Client) UploadFileExact(ctx context.Context, uploadURL, path, mimeType string, expectedDevice, expectedInode uint64, expectedSize int64) error {
+	directory, leaf := filepath.Split(filepath.Clean(path))
+	if directory == "" || leaf == "" || expectedDevice == 0 || expectedInode == 0 || expectedSize <= 0 {
+		return fmt.Errorf("invalid exact upload identity")
+	}
+	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	fileFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fileFD), leaf)
+	if file == nil {
+		_ = unix.Close(fileFD)
+		return fmt.Errorf("open exact upload")
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err = unix.Fstat(fileFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size != expectedSize || uint64(stat.Dev) != expectedDevice || uint64(stat.Ino) != expectedInode {
+		return fmt.Errorf("exact upload identity changed")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, file)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = stat.Size
+	request.Header.Set("Content-Type", mimeType)
+	uploadHTTP := *c.httpc
+	uploadHTTP.Timeout = UploadTimeout
+	response, err := uploadHTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("upload status=%d body=%s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // IngestClip records the uploaded clip and returns the new clip id.

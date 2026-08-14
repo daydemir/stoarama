@@ -132,6 +132,7 @@ const relayLeaseSQL = `
 	    AND n.status = 'active'
 	    AND n.last_heartbeat_at >= now() - interval '120 seconds'
 	  WHERE j.status = 'pending'
+	    AND recording_surrender_relay_candidate_eligible(j.id,$1)
 	    AND (NOT $5 OR EXISTS (
 	          SELECT 1 FROM recording_worker_claim_heads claim
 	          JOIN node_tokens claim_token ON claim_token.id=claim.claim_token_id
@@ -146,16 +147,6 @@ const relayLeaseSQL = `
 	    AND rec.start_at <= now()
 	    AND (rec.end_at IS NULL OR now() < rec.end_at)
 	    AND rec.capture_via = 'relay'
-	    -- YouTube resolution is egress-sensitive. Only nodes whose fresh heartbeat
-	    -- positively proves readiness may lease an authoritatively classified
-	    -- YouTube stream. Other source families retain the existing availability
-	    -- behavior; a missing/malformed readiness value fails closed for YouTube.
-	    AND (NOT EXISTS (
-	           SELECT 1 FROM streams source_stream
-	           WHERE source_stream.id=rec.stream_id
-	             AND source_stream.execution_class='youtube_direct')
-	         OR (jsonb_typeof(n.capabilities_jsonb->'youtube_ready') = 'boolean'
-	             AND (n.capabilities_jsonb->>'youtube_ready')::boolean))
 	    AND (j.handoff_owner IS NULL
 	         OR j.handoff_owner <> 'node:' || $1::text
 	         OR j.handoff_until <= now()
@@ -164,138 +155,6 @@ const relayLeaseSQL = `
 	          SELECT 1 FROM account_billing b
 	          WHERE b.account_id = rec.account_id
 	            AND b.has_payment_method))
-	    -- The surrounding node/group row locks make these capacity bounds authoritative.
-	    AND (SELECT COUNT(*) FROM recording_jobs aj
-	         WHERE aj.status = 'leased'
-	           AND aj.lease_owner = 'node:' || $1::text
-	           AND aj.lease_expires_at > now()) < n.relay_max_streams
-	    -- A recording may softly prefer one internet group. The preferred group gets
-	    -- the same bounded 12-second first opportunity as ordinary fairness, but an
-	    -- unavailable/full/non-polling preferred group can never strand capture.
-	    AND (rec.preferred_relay_group_id IS NULL
-	         OR n.relay_group_id=rec.preferred_relay_group_id
-	         OR j.relay_fairness_started_at<=now()-interval '12 seconds'
-	         OR NOT EXISTS (
-	              SELECT 1
-	              FROM relay_groups preferred_group
-	              WHERE preferred_group.id=rec.preferred_relay_group_id
-	                AND preferred_group.account_id=rec.account_id
-	                AND (SELECT COUNT(*)
-	                     FROM recording_jobs preferred_jobs
-	                     JOIN nodes preferred_nodes
-	                       ON preferred_jobs.lease_owner='node:'||preferred_nodes.id::text
-	                     WHERE preferred_nodes.account_id=rec.account_id
-	                       AND preferred_nodes.relay_group_id=preferred_group.id
-	                       AND preferred_jobs.status='leased'
-	                       AND preferred_jobs.lease_expires_at>now()) < preferred_group.max_streams
-	                AND EXISTS (
-	                     SELECT 1 FROM nodes preferred_node
-	                     WHERE preferred_node.account_id=rec.account_id
-	                       AND preferred_node.relay_group_id=preferred_group.id
-	                       AND preferred_node.node_type='relay'
-	                       AND preferred_node.status='active'
-	                       AND preferred_node.last_heartbeat_at>=now()-interval '120 seconds'
-	                       AND (SELECT COUNT(*) FROM recording_jobs preferred_node_jobs
-	                            WHERE preferred_node_jobs.status='leased'
-	                              AND preferred_node_jobs.lease_owner='node:'||preferred_node.id::text
-	                              AND preferred_node_jobs.lease_expires_at>now()) < preferred_node.relay_max_streams)))
-	    -- Prefer the lowest projected native-bandwidth utilization across healthy
-	    -- internet groups before balancing machines inside one. Successful clip
-	    -- ingests learn each recording's source-copy bitrate; unknown streams reserve
-	    -- a conservative 4 Mbps. A configured group bandwidth budget lets a stronger
-	    -- uplink intentionally carry more native media without changing its quality.
-	    -- A group participates only while it has an online node with spare node and
-	    -- group capacity. The fallback is measured from this job's first
-	    -- actual lease opportunity, not its scheduled time, so an old recovery batch
-	    -- still balances while a heartbeat-only peer can delay one job by at most 12s.
-	    -- Twelve seconds covers two polls from legacy 5s relay builds, so an older
-	    -- healthy node on an independent uplink is not starved by newer 1s pollers.
-	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds'
-	         OR n.relay_group_id IS NULL
-	         OR n.relay_group_id=rec.preferred_relay_group_id
-	         OR NOT EXISTS (
-	         SELECT 1
-	         FROM relay_groups peer_group
-	         CROSS JOIN LATERAL (
-	              SELECT COUNT(*) AS lease_count,
-	                     COALESCE(SUM(GREATEST(COALESCE(peer_group_bandwidth.observed_bandwidth_bps, 0), 4000000)), 0) AS bandwidth_load
-	              FROM recording_jobs peer_group_jobs
-	              JOIN nodes peer_group_nodes
-	                ON peer_group_jobs.lease_owner='node:'||peer_group_nodes.id::text
-	              JOIN recordings peer_group_recordings ON peer_group_recordings.id=peer_group_jobs.recording_id
-	              LEFT JOIN recording_bandwidth_observations peer_group_bandwidth ON peer_group_bandwidth.recording_id=peer_group_recordings.id
-	              WHERE peer_group_nodes.account_id=n.account_id
-	                AND peer_group_nodes.relay_group_id=peer_group.id
-	                AND peer_group_jobs.status='leased'
-	                AND peer_group_jobs.lease_expires_at>now()
-	         ) peer_group_load
-	         WHERE peer_group.account_id=n.account_id
-	           AND peer_group.id<>n.relay_group_id
-	           AND peer_group_load.lease_count < peer_group.max_streams
-	           AND EXISTS (
-	                SELECT 1 FROM nodes peer_group_node
-	                WHERE peer_group_node.account_id=n.account_id
-	                  AND peer_group_node.relay_group_id=peer_group.id
-	                  AND peer_group_node.node_type='relay'
-	                  AND peer_group_node.status='active'
-	                  AND peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'
-	                  AND (SELECT COUNT(*) FROM recording_jobs peer_node_jobs
-	                       WHERE peer_node_jobs.status='leased'
-	                         AND peer_node_jobs.lease_owner='node:'||peer_group_node.id::text
-	                         AND peer_node_jobs.lease_expires_at>now()) < peer_group_node.relay_max_streams)
-	           AND (peer_group_load.bandwidth_load + GREATEST(COALESCE((SELECT observed_bandwidth_bps FROM recording_bandwidth_observations WHERE recording_id=rec.id), 0), 4000000))::numeric
-	                 / COALESCE(peer_group.bandwidth_capacity_bps, peer_group.max_streams::bigint * 4000000)
-	               <
-	               ((SELECT COALESCE(SUM(GREATEST(COALESCE(current_group_bandwidth.observed_bandwidth_bps, 0), 4000000)), 0)
-	                FROM recording_jobs current_group_jobs
-	                JOIN nodes current_group_nodes
-	                  ON current_group_jobs.lease_owner='node:'||current_group_nodes.id::text
-	                JOIN recordings current_group_recordings ON current_group_recordings.id=current_group_jobs.recording_id
-	                LEFT JOIN recording_bandwidth_observations current_group_bandwidth ON current_group_bandwidth.recording_id=current_group_recordings.id
-	                WHERE current_group_nodes.account_id=n.account_id
-	                  AND current_group_nodes.relay_group_id=n.relay_group_id
-	                  AND current_group_jobs.status='leased'
-	                  AND current_group_jobs.lease_expires_at>now()) + GREATEST(COALESCE((SELECT observed_bandwidth_bps FROM recording_bandwidth_observations WHERE recording_id=rec.id), 0), 4000000))::numeric
-	                 / COALESCE((SELECT current_group.bandwidth_capacity_bps
-	                             FROM relay_groups current_group
-	                             WHERE current_group.id=n.relay_group_id AND current_group.account_id=n.account_id),
-	                            (SELECT current_group.max_streams::bigint * 4000000
-	                             FROM relay_groups current_group
-	                             WHERE current_group.id=n.relay_group_id AND current_group.account_id=n.account_id))))
-	    -- Within a group, only a least-loaded healthy node may take the next job.
-	    -- The surrounding group row lock makes this comparison authoritative, so
-	    -- simultaneous pollers converge on an even distribution instead of the
-	    -- fastest poller monopolizing long continuous-window leases.
-	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
-	         SELECT 1 FROM nodes peer
-	         WHERE peer.account_id=n.account_id
-	           AND peer.relay_group_id=n.relay_group_id
-	           AND peer.node_type='relay'
-	           AND peer.status='active'
-	           AND peer.last_heartbeat_at >= now()-interval '120 seconds'
-	           AND (SELECT COUNT(*) FROM recording_jobs pj
-	                WHERE pj.status='leased'
-	                  AND pj.lease_owner='node:'||peer.id::text
-	                  AND pj.lease_expires_at>now()) < peer.relay_max_streams
-	           AND (SELECT COUNT(*) FROM recording_jobs pj
-	                WHERE pj.status='leased'
-	                  AND pj.lease_owner='node:'||peer.id::text
-	                  AND pj.lease_expires_at>now()) <
-	               (SELECT COUNT(*) FROM recording_jobs nj
-	                WHERE nj.status='leased'
-	                  AND nj.lease_owner='node:'||n.id::text
-	                  AND nj.lease_expires_at>now())))
-	    AND (n.relay_group_id IS NULL OR (
-	         SELECT COUNT(*)
-	         FROM recording_jobs gj
-	         JOIN nodes gn ON gj.lease_owner='node:'||gn.id::text
-	         WHERE gn.account_id=n.account_id
-	           AND gn.relay_group_id=n.relay_group_id
-	           AND gj.status='leased'
-	           AND gj.lease_expires_at > now()) < (
-	         SELECT g.max_streams
-	         FROM relay_groups g
-	         WHERE g.id=n.relay_group_id AND g.account_id=n.account_id))
 	  ORDER BY j.scheduled_for ASC, j.id ASC
 	  LIMIT 1
 	  FOR UPDATE SKIP LOCKED
@@ -1135,7 +994,7 @@ func (s *Server) handleRecordingCaptureSetArtifactSeal(w http.ResponseWriter, r 
 	var namingMetadata, secretEnc []byte
 	var accessKeyID string
 	var expectedSequence int64
-	var tokenValid, leaseCurrent, destinationCurrent bool
+	var tokenValid, leaseCurrent bool
 	err = tx.QueryRow(r.Context(), `
 		SELECT plan.recording_id,(plan.destination_naming_snapshot->>'destination_id')::bigint,
 		       plan.destination_naming_snapshot->>'endpoint',plan.destination_naming_snapshot->>'region',
@@ -1144,8 +1003,7 @@ func (s *Server) handleRecordingCaptureSetArtifactSeal(w http.ResponseWriter, r 
 		       plan.destination_naming_snapshot->>'folder_name',plan.destination_naming_snapshot->'naming_metadata',
 		       plan.source_snapshot_sha256,plan.destination_naming_sha256,
 		       plan.first_capture_sequence+$3-1,
-		       (NOT $10 AND token.id=job.lease_node_token_id AND token.recording_claim_generation=job.lease_claim_generation
-		         AND token.recording_claim_purpose IN('claim_current','existing_fence_only') AND token.revoked_at IS NULL)
+		       (NOT $10 AND recording_surrender_token_can_access_lease($5,$6,job.lease_node_token_id,job.lease_claim_generation))
 		       OR ($10 AND EXISTS(SELECT 1 FROM recording_capture_set_grants grant
 		          WHERE grant.id=$11 AND grant.set_id=artifact.set_id AND grant.upload_grace_until>transaction_timestamp()
 		            AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
@@ -1153,25 +1011,20 @@ func (s *Server) handleRecordingCaptureSetArtifactSeal(w http.ResponseWriter, r 
 		       (NOT $10 AND job.status='leased' AND job.lease_owner=$7 AND job.lease_token=$4
 		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact')
 		       OR ($10 AND plan.recording_job_id=$9 AND plan.lease_token=$4),
-		       destination.endpoint=plan.destination_naming_snapshot->>'endpoint'
-		         AND destination.region=plan.destination_naming_snapshot->>'region'
-		         AND destination.bucket=plan.destination_naming_snapshot->>'bucket'
-		         AND destination.key_prefix=plan.destination_naming_snapshot->>'key_prefix',
 		       destination.access_key_id,destination.secret_access_key_enc
 		FROM recording_capture_materialized_artifacts artifact
 		JOIN recording_capture_reservation_sets reservation ON reservation.id=artifact.set_id
 		JOIN recording_capture_set_plans plan ON plan.id=reservation.plan_id
 		JOIN recording_jobs job ON job.id=plan.recording_job_id
-		LEFT JOIN node_tokens token ON token.id=$5 AND token.node_id=$6
 		JOIN storage_destinations destination ON destination.id=(plan.destination_naming_snapshot->>'destination_id')::bigint
 		WHERE artifact.set_id=$1 AND artifact.ordinal=$3 AND artifact.artifact_id=$2
 		  AND artifact.capture_sequence=$8 AND plan.recording_job_id=$9 AND plan.lease_token=$4
-		FOR UPDATE OF artifact,reservation,plan,job,token,destination
+		FOR UPDATE OF artifact,reservation,plan,job,destination
 	`, setID, artifactID, req.Ordinal, leaseToken, principal.NodeTokenID, principal.NodeID, recorderWorkerID(principal), req.CaptureSequence, req.JobID, recovering, recovery.GrantID).Scan(
 		&recordingID, &destinationID, &endpoint, &region, &bucket, &keyPrefix, &cronTimezone, &namingProfile,
 		&folderName, &namingMetadata, &sourceSHA, &namingSHA, &expectedSequence, &tokenValid, &leaseCurrent,
-		&destinationCurrent, &accessKeyID, &secretEnc)
-	if err != nil || !tokenValid || !leaseCurrent || !destinationCurrent || expectedSequence != req.CaptureSequence {
+		&accessKeyID, &secretEnc)
+	if err != nil || !tokenValid || !leaseCurrent || expectedSequence != req.CaptureSequence {
 		util.WriteError(w, http.StatusConflict, "capture set artifact authority is stale")
 		return
 	}
@@ -2053,11 +1906,8 @@ const recordingJobHeartbeatSQL = `
 	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4 AND j.lease_expires_at > now()
 	  AND (j.lease_credential_state='legacy_unknown'
-	       OR (j.lease_credential_state='exact' AND j.lease_node_token_id=$6
-	           AND EXISTS(SELECT 1 FROM node_tokens token WHERE token.id=$6 AND token.node_id=$7
-	             AND token.recording_claim_generation=j.lease_claim_generation
-	             AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
-	             AND token.revoked_at IS NULL)))
+	       OR (j.lease_credential_state='exact'
+	           AND recording_surrender_token_can_access_lease($6,$7,j.lease_node_token_id,j.lease_claim_generation)))
 	  AND (j.kind<>'continuous_window'
 	       OR (j.window_end_at IS NOT NULL
 	           AND j.window_end_at + make_interval(secs => $5) > now()))
@@ -2222,20 +2072,29 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	var (
-		recordingID int64
-		kind        string
-		clipCount   int64
-		jobError    string
-	)
-	err = s.pool.QueryRow(r.Context(), `
-		SELECT j.recording_id, j.kind, COUNT(c.id), COALESCE(j.error_text, '')
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin complete recording job")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock complete recording claim authority")
+		return
+	}
+	if err = revalidateRecordingLeaseCredential(r.Context(), tx, principal, id, leaseToken); err != nil {
+		util.WriteError(w, http.StatusConflict, "job lease credential is stale")
+		return
+	}
+	var recordingID int64
+	var kind, jobError string
+	err = tx.QueryRow(r.Context(), `
+		SELECT j.recording_id,j.kind,COALESCE(j.error_text,'')
 		FROM recording_jobs j
-		LEFT JOIN recording_clips c ON c.recording_job_id=j.id
 		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 		  AND j.lease_token IS NOT DISTINCT FROM $3
-		GROUP BY j.id
-	`, id, workerID, leaseToken).Scan(&recordingID, &kind, &clipCount, &jobError)
+		FOR UPDATE OF j
+	`, id, workerID, leaseToken).Scan(&recordingID, &kind, &jobError)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
 		return
@@ -2244,14 +2103,13 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording job: %v", err))
 		return
 	}
+	var clipCount int64
+	if err = tx.QueryRow(r.Context(), `SELECT count(*) FROM recording_clips WHERE recording_job_id=$1`, id).Scan(&clipCount); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "count recording job clips")
+		return
+	}
 	if kind == "continuous_window" && clipCount == 0 {
 		errText := sanitizeRecordingSurrenderError(jobError, "continuous recording produced no clips")
-		tx, err := s.pool.Begin(r.Context())
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin complete tx: %v", err))
-			return
-		}
-		defer func() { _ = tx.Rollback(r.Context()) }()
 		if _, err := tx.Exec(r.Context(), `
 			UPDATE recording_jobs
 			SET status='error', completed_at=now(), lease_expires_at=NULL, error_text=$3, updated_at=now()
@@ -2276,7 +2134,7 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusConflict, errText)
 		return
 	}
-	ct, err := s.pool.Exec(r.Context(), `
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE recording_jobs
 		SET status='done', completed_at=now(), lease_expires_at=NULL, updated_at=now()
 		WHERE id=$1 AND status='leased' AND lease_owner=$2
@@ -2288,6 +2146,10 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit complete recording job")
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -2570,6 +2432,14 @@ func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock fail recording claim authority")
+		return
+	}
+	if err = revalidateRecordingLeaseCredential(r.Context(), tx, principal, id, leaseToken); err != nil {
+		util.WriteError(w, http.StatusConflict, "job lease credential is stale")
+		return
+	}
 
 	var recordingID int64
 	err = tx.QueryRow(r.Context(), recordingJobFailSQL, id, workerID, errText, leaseToken).Scan(&recordingID)

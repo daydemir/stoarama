@@ -69,6 +69,16 @@ func (f *fakeRecordingRecoveryObjectStore) Copy(ctx context.Context, sourceKey, 
 	return "promoted-etag", nil
 }
 
+func (f *fakeRecordingRecoveryObjectStore) Head(_ context.Context, key string) (r2.ObjectHead, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.objects[key]
+	if !ok {
+		return r2.ObjectHead{}, errors.New("object is absent")
+	}
+	return r2.ObjectHead{SizeBytes: int64(len(data)), ETag: "fake-etag"}, nil
+}
+
 func (f *fakeRecordingRecoveryObjectStore) DeleteObjects(_ context.Context, keys []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -700,8 +710,51 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 		proofValues[index] = hex.EncodeToString(proof.Siblings[index][:])
 	}
 	secretSHA := hex.EncodeToString(artifact.RecoverySecretHash[:])
+	secondArtifact, err := surrenderplan.DeriveArtifact(seed, identity, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProof, err := tree.Proof(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondProofValues := make([]string, len(secondProof.Siblings))
+	for index := range secondProof.Siblings {
+		secondProofValues[index] = hex.EncodeToString(secondProof.Siblings[index][:])
+	}
+	thirdArtifact, err := surrenderplan.DeriveArtifact(seed, identity, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdProof, err := tree.Proof(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdProofValues := make([]string, len(thirdProof.Siblings))
+	thirdProofHash := sha256.New()
+	_, _ = thirdProofHash.Write([]byte("stoarama.recording.capture-artifact-proof.v1\x00"))
+	for index := range thirdProof.Siblings {
+		thirdProofValues[index] = hex.EncodeToString(thirdProof.Siblings[index][:])
+		_, _ = thirdProofHash.Write(thirdProof.Siblings[index][:])
+	}
 	if _, err = pool.Exec(ctx, `UPDATE streams SET source_url=source_url||'?r10-stop=1' WHERE id=$1`, fixture.streamID); err != nil {
 		t.Fatal(err)
+	}
+	thirdProofJSON, _ := json.Marshal(thirdProofValues)
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO recording_capture_materialized_artifacts
+			(set_id,ordinal,artifact_id,recovery_secret_sha256,capture_sequence,proof,proof_sha256)
+		VALUES($1,3,$2,$3,3,$4,$5)
+	`, setID, thirdArtifact.ID, hex.EncodeToString(thirdArtifact.RecoverySecretHash[:]), thirdProofJSON, hex.EncodeToString(thirdProofHash.Sum(nil))); err == nil {
+		t.Fatal("post-stop artifact outside an ACK inventory materialized")
+	}
+	emptyCoverage := map[string]any{"artifact_count": plan.ArtifactCount, "materialized_ordinals": []int{}, "unused_ranges": [][2]int{{1, plan.ArtifactCount}}}
+	emptyCoverageJSON, _ := json.Marshal(emptyCoverage)
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO recording_capture_set_results(set_id,result,coverage_ranges,coverage_sha256)
+		VALUES($1,'abandoned',$2,encode(sha256(convert_to($2::jsonb::text,'UTF8')),'hex'))
+	`, setID, emptyCoverageJSON); err == nil {
+		t.Fatal("stopped capture set sealed without its exact stop ACK")
 	}
 	ack := recordingapi.CaptureStopAck{
 		AckID: uuid.NewString(), RetainedDirectoryDevice: 41, RetainedDirectoryInode: 42,
@@ -709,6 +762,10 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 			Ordinal: 1, ArtifactID: artifact.ID.String(), CaptureSequence: 1,
 			RecoverySecretSHA256: secretSHA, Proof: proofValues,
 			Device: 41, Inode: 43, RelativeName: "seg-20260814-070000.mp4",
+		}, {
+			Ordinal: 2, ArtifactID: secondArtifact.ID.String(), CaptureSequence: 2,
+			RecoverySecretSHA256: hex.EncodeToString(secondArtifact.RecoverySecretHash[:]), Proof: secondProofValues,
+			Device: 41, Inode: 44, RelativeName: "seg-20260814-070001.mp4",
 		}},
 	}
 	ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
@@ -735,12 +792,47 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if _, err = pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-peer',repeat('7',64))`, peerNodeID); err != nil {
 		t.Fatal(err)
 	}
+	// Keep unrelated exact predecessor fences live before recovery blocks new
+	// claims. They prove the successor can heartbeat, complete, and fail old
+	// fences immediately while taking new work, without revoking the predecessor
+	// prematurely.
+	unrelated := seedPresentationV2Task(t, pool, 92002, fixture.accountID)
+	unrelatedLease := uuid.New()
+	if _, err = pool.Exec(ctx, `
+		UPDATE recordings SET capture_via='relay' WHERE id=$1;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$2;
+		UPDATE recording_jobs SET status='leased',lease_owner=$3,lease_token=$4,
+		 lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,
+		 lease_node_token_id=$5,lease_claim_generation=1,lease_credential_state='exact'
+		 WHERE id=$2
+	`, unrelated.recordingID, unrelated.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10), unrelatedLease, oldTokenID); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedFail := seedPresentationV2Task(t, pool, 92005, fixture.accountID)
+	unrelatedFailLease := uuid.New()
+	if _, err = pool.Exec(ctx, `
+		UPDATE recordings SET capture_via='relay' WHERE id=$1;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$2;
+		UPDATE recording_jobs SET status='leased',lease_owner=$3,lease_token=$4,
+		 lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,
+		 lease_node_token_id=$5,lease_claim_generation=1,lease_credential_state='exact'
+		 WHERE id=$2
+	`, unrelatedFail.recordingID, unrelatedFail.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10), unrelatedFailLease, oldTokenID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE id=$1`, fixture.jobID); err != nil {
 		t.Fatal(err)
 	}
 	var reclaimed int64
 	if err = pool.QueryRow(ctx, `SELECT recording_surrender_reclaim_expired()`).Scan(&reclaimed); err != nil || reclaimed < 1 {
 		t.Fatalf("reclaimed=%d err=%v", reclaimed, err)
+	}
+	if _, err = pool.Exec(ctx, `
+		UPDATE recording_jobs SET status='leased',lease_owner=$2,lease_token=gen_random_uuid(),
+		 lease_expires_at=transaction_timestamp()+interval '2 minutes'
+		WHERE id=$1
+	`, fixture.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10)); err == nil {
+		t.Fatal("rollback/v0 claim bypassed the recovery-blocked claim head")
 	}
 	var alternate bool
 	if err = pool.QueryRow(ctx, `SELECT alternate_available FROM recording_job_lease_expiry_events WHERE recording_job_id=$1 AND lease_token=$2`, fixture.jobID, lease.LeaseToken).Scan(&alternate); err != nil || !alternate {
@@ -757,6 +849,9 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if proposalResponse.Code != http.StatusTooEarly {
 		t.Fatalf("successor before terminal recovery=%d body=%s", proposalResponse.Code, proposalResponse.Body.String())
 	}
+	if _, err = pool.Exec(ctx, `UPDATE storage_destinations SET endpoint='https://changed-after-capture.invalid' WHERE id=$1`, fixture.destinationID); err != nil {
+		t.Fatal(err)
+	}
 	secretHex := hex.EncodeToString(artifact.RecoverySecret[:])
 	authRequest := httptest.NewRequest(http.MethodPost, "/", nil)
 	authRequest.Header.Set(recordingRecoveryIntentHeader, artifact.ID.String())
@@ -765,6 +860,7 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if err != nil || recovery.Authority != "capture_set" || recovery.SetID != setID {
 		t.Fatalf("recovery=%+v err=%v", recovery, err)
 	}
+	recoveryNode := nodePrincipal{NodeID: recovery.NodeID, AccountID: recovery.AccountID, NodeType: recovery.NodeType, DisplayName: recovery.WorkerID}
 	payload := []byte("verified recovery payload")
 	payloadSHA := sha256.Sum256(payload)
 	segmentStart := time.Date(2026, time.August, 14, 7, 0, 0, 500_000, time.UTC)
@@ -774,7 +870,7 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 		SizeBytes: int64(len(payload)), SHA256: hex.EncodeToString(payloadSHA[:]),
 	})
 	sealRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(sealBody))
-	sealRequest = sealRequest.WithContext(context.WithValue(sealRequest.Context(), nodePrincipalContextKey, principal))
+	sealRequest = sealRequest.WithContext(context.WithValue(sealRequest.Context(), nodePrincipalContextKey, recoveryNode))
 	sealRequest = sealRequest.WithContext(context.WithValue(sealRequest.Context(), recordingRecoveryContextKey{}, recovery))
 	sealRoute := chi.NewRouteContext()
 	sealRoute.URLParams.Add("intentId", artifact.ID.String())
@@ -783,6 +879,14 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	server.handleRecordingCaptureArtifactSeal(sealResponse, sealRequest)
 	if sealResponse.Code != http.StatusOK || strings.Contains(sealResponse.Body.String(), "upload_url") {
 		t.Fatalf("recovery seal=%d body=%s", sealResponse.Code, sealResponse.Body.String())
+	}
+	var frozenIntentEndpoint, currentDestinationEndpoint string
+	if err = pool.QueryRow(ctx, `
+		SELECT intent.endpoint,destination.endpoint
+		FROM recording_upload_intents intent JOIN storage_destinations destination ON destination.id=intent.storage_destination_id
+		WHERE intent.id=$1
+	`, artifact.ID).Scan(&frozenIntentEndpoint, &currentDestinationEndpoint); err != nil || frozenIntentEndpoint == currentDestinationEndpoint {
+		t.Fatalf("recovery did not preserve frozen destination: intent=%q current=%q err=%v", frozenIntentEndpoint, currentDestinationEndpoint, err)
 	}
 	reportID := uuid.New()
 	size := int64(len(payload))
@@ -801,33 +905,67 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 		t.Fatalf("sealed local bytes terminalized the set before verified promotion: %v", err)
 	}
 
-	// Promotion holds the shared claim fence through the exact final copy. A
-	// security revocation takes the exclusive fence, so it cannot race a stale
-	// handler into copying after revocation. If the upload wins, the immutable
-	// security event commits immediately afterward and all later capabilities fail.
-	newUploadRequest := func(sessionID string) *http.Request {
+	newUploadRequest := func(sessionID string, artifactID uuid.UUID, recoveryPrincipal recordingRecoveryPrincipal) *http.Request {
 		request := httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload))
 		request.Header.Set(recordingRecoverySessionHeader, sessionID)
-		request = request.WithContext(context.WithValue(request.Context(), recordingRecoveryContextKey{}, recovery))
+		request = request.WithContext(context.WithValue(request.Context(), recordingRecoveryContextKey{}, recoveryPrincipal))
 		route := chi.NewRouteContext()
-		route.URLParams.Add("intentId", artifact.ID.String())
+		route.URLParams.Add("intentId", artifactID.String())
 		return request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
 	}
 	responseLossSession := uuid.NewString()
-	responseLossRequest := newUploadRequest(responseLossSession)
+	responseLossRequest := newUploadRequest(responseLossSession, artifact.ID, recovery)
 	responseLossResponse := httptest.NewRecorder()
 	server.handleRecordingRecoveryProxyUpload(responseLossResponse, responseLossRequest)
 	if responseLossResponse.Code != http.StatusNoContent {
 		t.Fatalf("initial recovery proxy=%d body=%s", responseLossResponse.Code, responseLossResponse.Body.String())
 	}
 	responseLossReplay := httptest.NewRecorder()
-	server.handleRecordingRecoveryProxyUpload(responseLossReplay, newUploadRequest(responseLossSession))
+	server.handleRecordingRecoveryProxyUpload(responseLossReplay, newUploadRequest(responseLossSession, artifact.ID, recovery))
 	if responseLossReplay.Code != http.StatusNoContent {
 		t.Fatalf("recovery proxy response-loss replay=%d body=%s", responseLossReplay.Code, responseLossReplay.Body.String())
 	}
 
+	// A second retained artifact proves revocation can commit while provider copy
+	// is blocked. Final promotion revalidation must reject the stale handler.
+	secondAuthRequest := httptest.NewRequest(http.MethodPost, "/", nil)
+	secondAuthRequest.Header.Set(recordingRecoveryIntentHeader, secondArtifact.ID.String())
+	secondAuthRequest.Header.Set(recordingRecoverySecretHeader, hex.EncodeToString(secondArtifact.RecoverySecret[:]))
+	secondRecovery, err := server.authenticateRecordingRecovery(secondAuthRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStart := segmentStart.Add(time.Second)
+	secondSealBody, _ := json.Marshal(recordingCaptureArtifactSealRequest{
+		JobID: fixture.jobID, ProducerID: producerID.String(), CaptureSequence: 2,
+		SetID: setID.String(), Ordinal: 2, SegmentStartUS: secondStart.UnixMicro(),
+		SizeBytes: int64(len(payload)), SHA256: hex.EncodeToString(payloadSHA[:]),
+	})
+	secondSealRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(secondSealBody))
+	secondSealRequest = secondSealRequest.WithContext(context.WithValue(secondSealRequest.Context(), nodePrincipalContextKey, recoveryNode))
+	secondSealRequest = secondSealRequest.WithContext(context.WithValue(secondSealRequest.Context(), recordingRecoveryContextKey{}, secondRecovery))
+	secondSealRoute := chi.NewRouteContext()
+	secondSealRoute.URLParams.Add("intentId", secondArtifact.ID.String())
+	secondSealRequest = secondSealRequest.WithContext(context.WithValue(secondSealRequest.Context(), chi.RouteCtxKey, secondSealRoute))
+	secondSealResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureArtifactSeal(secondSealResponse, secondSealRequest)
+	if secondSealResponse.Code != http.StatusOK {
+		t.Fatalf("second recovery seal=%d body=%s", secondSealResponse.Code, secondSealResponse.Body.String())
+	}
+	secondReportBody, _ := json.Marshal(recordingCaptureRecoveryReportRequest{ReportID: uuid.NewString(), ReportType: "sealed_bytes", SizeBytes: &size, SHA256: hex.EncodeToString(payloadSHA[:]), LocalObservedAt: time.Now().UTC()})
+	secondReportRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(secondReportBody))
+	secondReportRequest = secondReportRequest.WithContext(context.WithValue(secondReportRequest.Context(), recordingRecoveryContextKey{}, secondRecovery))
+	secondReportRoute := chi.NewRouteContext()
+	secondReportRoute.URLParams.Add("intentId", secondArtifact.ID.String())
+	secondReportRequest = secondReportRequest.WithContext(context.WithValue(secondReportRequest.Context(), chi.RouteCtxKey, secondReportRoute))
+	secondReportResponse := httptest.NewRecorder()
+	server.handleRecordingRecoveryReport(secondReportResponse, secondReportRequest)
+	if secondReportResponse.Code != http.StatusNoContent {
+		t.Fatalf("second recovery report=%d body=%s", secondReportResponse.Code, secondReportResponse.Body.String())
+	}
+
 	fakeStore.copyStarted, fakeStore.copyGate = make(chan struct{}, 1), make(chan struct{})
-	uploadRequest := newUploadRequest(uuid.NewString())
+	uploadRequest := newUploadRequest(uuid.NewString(), secondArtifact.ID, secondRecovery)
 	uploadDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		out := httptest.NewRecorder()
@@ -862,15 +1000,15 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	}()
 	select {
 	case out := <-revokeDone:
-		t.Fatalf("security revoke crossed an in-flight promotion: %d %s", out.Code, out.Body.String())
+		if out.Code != http.StatusOK {
+			t.Fatalf("security revoke during in-flight promotion=%d body=%s", out.Code, out.Body.String())
+		}
 	case <-time.After(100 * time.Millisecond):
+		t.Fatal("security revoke waited behind provider copy")
 	}
 	close(fakeStore.copyGate)
-	if out := <-uploadDone; out.Code != http.StatusNoContent {
-		t.Fatalf("recovery proxy=%d body=%s", out.Code, out.Body.String())
-	}
-	if out := <-revokeDone; out.Code != http.StatusOK {
-		t.Fatalf("security revoke=%d body=%s", out.Code, out.Body.String())
+	if out := <-uploadDone; out.Code != http.StatusConflict {
+		t.Fatalf("revoked in-flight recovery proxy=%d body=%s", out.Code, out.Body.String())
 	}
 	if _, authErr := server.authenticateRecordingRecovery(authRequest); authErr == nil {
 		t.Fatal("security-revoked recovery capability remained usable")
@@ -904,17 +1042,6 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	// A successor may acknowledge with its own bearer while the predecessor
 	// continues heartbeating an unrelated exact fence. The predecessor retires
 	// only after that fence is terminal; rotation never churns a healthy capture.
-	unrelated := seedPresentationV2Task(t, pool, 92002, fixture.accountID)
-	unrelatedLease := uuid.New()
-	if _, err = pool.Exec(ctx, `
-		UPDATE recordings SET capture_via='relay' WHERE id=$1;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$2;
-		UPDATE recording_jobs SET status='leased',lease_owner=$3,lease_token=$4,
-		 lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1
-		 WHERE id=$2
-	`, unrelated.recordingID, unrelated.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10), unrelatedLease); err != nil {
-		t.Fatal(err)
-	}
 	ackPrincipal := principal
 	ackPrincipal.NodeTokenID = successor.SuccessorTokenID
 	ackSuccessor := func() *httptest.ResponseRecorder {
@@ -930,11 +1057,63 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if response := ackSuccessor(); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"predecessor_retired":false`) {
 		t.Fatalf("successor ack with live predecessor fence=%d body=%s", response.Code, response.Body.String())
 	}
-	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE id=$1`, unrelated.jobID); err != nil {
+	heartbeatRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader([]byte(`{}`)))
+	heartbeatRequest.Header.Set(recordingLeaseTokenHeader, unrelatedLease.String())
+	heartbeatRequest = heartbeatRequest.WithContext(context.WithValue(heartbeatRequest.Context(), nodePrincipalContextKey, ackPrincipal))
+	heartbeatRoute := chi.NewRouteContext()
+	heartbeatRoute.URLParams.Add("id", strconv.FormatInt(unrelated.jobID, 10))
+	heartbeatRequest = heartbeatRequest.WithContext(context.WithValue(heartbeatRequest.Context(), chi.RouteCtxKey, heartbeatRoute))
+	heartbeatResponse := httptest.NewRecorder()
+	server.handleRecordingJobHeartbeat(heartbeatResponse, heartbeatRequest)
+	if heartbeatResponse.Code != http.StatusOK {
+		t.Fatalf("successor could not heartbeat predecessor fence=%d body=%s", heartbeatResponse.Code, heartbeatResponse.Body.String())
+	}
+	completeJob := func(jobID int64, leaseToken uuid.UUID, presented nodePrincipal) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader([]byte(`{}`)))
+		request.Header.Set(recordingLeaseTokenHeader, leaseToken.String())
+		request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, presented))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("id", strconv.FormatInt(jobID, 10))
+		request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
+		response := httptest.NewRecorder()
+		server.handleRecordingJobComplete(response, request)
+		return response
+	}
+	failJob := func(jobID int64, leaseToken uuid.UUID, presented nodePrincipal) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(recordingJobFailRequest{ErrorText: "r10 fenced failure"})
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		request.Header.Set(recordingLeaseTokenHeader, leaseToken.String())
+		request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, presented))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("id", strconv.FormatInt(jobID, 10))
+		request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
+		response := httptest.NewRecorder()
+		server.handleRecordingJobFail(response, request)
+		return response
+	}
+	if response := completeJob(unrelated.jobID, unrelatedLease, ackPrincipal); response.Code != http.StatusOK {
+		t.Fatalf("successor could not complete predecessor fence=%d body=%s", response.Code, response.Body.String())
+	}
+	if response := failJob(unrelatedFail.jobID, unrelatedFailLease, ackPrincipal); response.Code != http.StatusOK {
+		t.Fatalf("successor could not fail predecessor fence=%d body=%s", response.Code, response.Body.String())
+	}
+	successorClaim := seedPresentationV2Task(t, pool, 92004, fixture.accountID)
+	if _, err = pool.Exec(ctx, `
+		UPDATE recordings SET capture_via='relay' WHERE id=$1;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$2
+	`, successorClaim.recordingID, successorClaim.jobID); err != nil {
 		t.Fatal(err)
 	}
-	if err = pool.QueryRow(ctx, `SELECT recording_surrender_reclaim_expired()`).Scan(&reclaimed); err != nil {
-		t.Fatal(err)
+	newClaim, claimErr := server.leaseRelayRecordingJob(ctx, ackPrincipal, true, 150, true)
+	if claimErr != nil || newClaim.JobID != successorClaim.jobID || newClaim.LeaseToken == nil {
+		t.Fatalf("successor did not claim new work while serving predecessor fence: lease=%+v err=%v", newClaim, claimErr)
+	}
+	if response := completeJob(successorClaim.jobID, *newClaim.LeaseToken, principal); response.Code != http.StatusConflict {
+		t.Fatalf("predecessor credential completed successor fence=%d body=%s", response.Code, response.Body.String())
+	}
+	if response := completeJob(successorClaim.jobID, *newClaim.LeaseToken, ackPrincipal); response.Code != http.StatusOK {
+		t.Fatalf("successor credential could not complete successor fence=%d body=%s", response.Code, response.Body.String())
 	}
 	if response := ackSuccessor(); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"predecessor_retired":true`) {
 		t.Fatalf("successor ack after predecessor fences drained=%d body=%s", response.Code, response.Body.String())

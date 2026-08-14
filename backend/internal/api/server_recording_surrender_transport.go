@@ -159,9 +159,22 @@ type minimumRateReader struct {
 	read      int64
 }
 
+const (
+	recoveryProxyGlobalConcurrency  = 16
+	recoveryProxyAccountConcurrency = 4
+	recoveryProxyNodeConcurrency    = 2
+	recoveryProxyGlobalBytes        = int64(512 << 20)
+	recoveryProxyAccountBytes       = int64(256 << 20)
+	recoveryProxyNodeBytes          = int64(64 << 20)
+	recoveryProxyMinimumRate        = int64(64 << 10)
+	recoveryProxyRateGrace          = 10 * time.Second
+	recoveryProxySessionLimit       = 5 * time.Minute
+)
+
 type recordingRecoveryObjectStore interface {
 	PutReader(context.Context, string, string, io.Reader) (string, error)
 	Copy(context.Context, string, string, string) (string, error)
+	Head(context.Context, string) (r2.ObjectHead, error)
 	DeleteObjects(context.Context, []string) error
 }
 
@@ -176,7 +189,7 @@ func (r *minimumRateReader) Read(buffer []byte) (int, error) {
 	n, err := r.reader.Read(buffer)
 	r.read += int64(n)
 	elapsed := time.Since(r.startedAt)
-	if elapsed >= 15*time.Second && r.read*int64(time.Second) < int64(32<<10)*int64(elapsed) {
+	if elapsed >= recoveryProxyRateGrace && r.read*int64(time.Second) < recoveryProxyMinimumRate*int64(elapsed) {
 		return n, fmt.Errorf("recovery upload fell below minimum rate")
 	}
 	return n, err
@@ -211,6 +224,15 @@ func appendRecoveryUploadSessionResult(ctx context.Context, pool interface {
 		return fmt.Errorf("recovery upload session result replay differs")
 	}
 	return nil
+}
+
+func appendRecoveryUploadSessionResultDetached(pool interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, sessionID uuid.UUID, phase, result string, size int64, sha string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return appendRecoveryUploadSessionResult(ctx, pool, sessionID, phase, result, size, sha)
 }
 
 func recoveryUploadFailureResult(err error, observedBytes, expectedBytes int64, observedSHA, expectedSHA string) string {
@@ -260,14 +282,16 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 	var expectedSize int64
 	var expectedSHA string
 	var revision int
-	var staleQuarantineKeys []string
+	var grantDeadline, sessionDeadline time.Time
 	err = tx.QueryRow(r.Context(), `
-		SELECT destination.endpoint,destination.region,intent.bucket,intent.object_key,intent.mime_type,
-		       destination.access_key_id,destination.secret_access_key_enc,seal.size_bytes,seal.sha256,
+		SELECT intent.endpoint,plan.destination_naming_snapshot->>'region',intent.bucket,intent.object_key,intent.mime_type,
+		       destination.access_key_id,destination.secret_access_key_enc,seal.size_bytes,seal.sha256,grant.upload_grace_until,
 		       COALESCE((SELECT max(session.revision) FROM recording_recovery_upload_sessions session
 		                 WHERE session.set_id=artifact.set_id AND session.ordinal=artifact.ordinal),0)+1
 		FROM recording_capture_materialized_artifacts artifact
 		JOIN recording_capture_set_grants grant ON grant.set_id=artifact.set_id
+		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=artifact.set_id
+		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		JOIN recording_capture_materialized_artifact_seals seal
 		  ON seal.set_id=artifact.set_id AND seal.ordinal=artifact.ordinal AND seal.artifact_id=artifact.artifact_id
 		JOIN recording_upload_intents intent ON intent.id=artifact.artifact_id AND intent.status='pending'
@@ -281,20 +305,68 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 		FOR UPDATE OF artifact,grant,seal,intent,destination
 	`, intentID, recovery.SetID, recovery.Ordinal, recovery.GrantID).Scan(
 		&endpoint, &region, &bucket, &objectKey, &mimeType, &accessKeyID, &secretEnc,
-		&expectedSize, &expectedSHA, &revision)
+		&expectedSize, &expectedSHA, &grantDeadline, &revision)
 	if err != nil || expectedSize != r.ContentLength {
 		util.WriteError(w, http.StatusConflict, "recovery upload authority is stale")
 		return
 	}
-	if err = tx.QueryRow(r.Context(), `
-		SELECT COALESCE(array_agg(session.quarantine_key ORDER BY session.revision),'{}'::text[])
-		FROM recording_recovery_upload_sessions session
-		WHERE session.set_id=$1 AND session.ordinal=$2 AND session.revision<$3
-		  AND NOT EXISTS(SELECT 1 FROM recording_recovery_upload_session_results result
-		                 WHERE result.session_id=session.id AND result.phase='promotion' AND result.result='promoted')
-	`, recovery.SetID, recovery.Ordinal, revision).Scan(&staleQuarantineKeys); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "load stale recovery quarantine authority")
+	// Exact same-session replay can resume a quarantined upload. A different
+	// session may start only after the latest revision is terminal. A previously
+	// promoted artifact is reconciled by object HEAD below without reading or
+	// overwriting the request body.
+	var replayExisting, resumePromotion, priorPromoted bool
+	var replayQuarantine string
+	var replayRevision int
+	var replayExact bool
+	var replayUploadResult, replayPromotionResult string
+	replayErr := tx.QueryRow(r.Context(), `
+		SELECT session.set_id=$2 AND session.ordinal=$3 AND session.node_id=$4
+		       AND session.account_id=$5 AND session.declared_bytes=$6,
+		       session.revision,session.quarantine_key,
+		       COALESCE((SELECT result.result FROM recording_recovery_upload_session_results result
+		                 WHERE result.session_id=session.id AND result.phase='upload'),''),
+		       COALESCE((SELECT result.result FROM recording_recovery_upload_session_results result
+		                 WHERE result.session_id=session.id AND result.phase='promotion'),'')
+		FROM recording_recovery_upload_sessions session WHERE session.id=$1 FOR UPDATE
+	`, sessionID, recovery.SetID, recovery.Ordinal, recovery.NodeID, recovery.AccountID, expectedSize).Scan(
+		&replayExact, &replayRevision, &replayQuarantine, &replayUploadResult, &replayPromotionResult)
+	if replayErr == nil {
+		if !replayExact {
+			util.WriteError(w, http.StatusConflict, "recovery upload session replay differs")
+			return
+		}
+		replayExisting = true
+		resumePromotion = replayUploadResult == "quarantined" && replayPromotionResult == ""
+		priorPromoted = replayPromotionResult == "promoted"
+		revision = replayRevision
+		if !resumePromotion && !priorPromoted {
+			util.WriteError(w, http.StatusConflict, "terminal recovery upload session requires a new revision")
+			return
+		}
+	} else if !errors.Is(replayErr, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusInternalServerError, "load recovery upload session replay")
 		return
+	} else {
+		var latestUpload, latestPromotion string
+		latestErr := tx.QueryRow(r.Context(), `
+			SELECT COALESCE((SELECT result.result FROM recording_recovery_upload_session_results result
+			                 WHERE result.session_id=session.id AND result.phase='upload'),''),
+			       COALESCE((SELECT result.result FROM recording_recovery_upload_session_results result
+			                 WHERE result.session_id=session.id AND result.phase='promotion'),'')
+			FROM recording_recovery_upload_sessions session
+			WHERE session.set_id=$1 AND session.ordinal=$2 ORDER BY session.revision DESC LIMIT 1 FOR UPDATE
+		`, recovery.SetID, recovery.Ordinal).Scan(&latestUpload, &latestPromotion)
+		if latestErr == nil {
+			priorPromoted = latestPromotion == "promoted"
+			terminal := latestPromotion != "" || (latestUpload != "" && latestUpload != "quarantined")
+			if !terminal && !priorPromoted {
+				util.WriteError(w, http.StatusConflict, "recovery upload session is already in progress")
+				return
+			}
+		} else if !errors.Is(latestErr, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusInternalServerError, "load latest recovery upload session")
+			return
+		}
 	}
 	var activeGlobal, activeNode, activeAccount int
 	var activeGlobalBytes, activeNodeBytes, activeAccountBytes int64
@@ -305,40 +377,34 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 		FROM recording_recovery_upload_sessions session
 		WHERE session.deadline_at>transaction_timestamp()
 		  AND NOT EXISTS(SELECT 1 FROM recording_recovery_upload_session_results result
-		                 WHERE result.session_id=session.id AND result.phase='promotion')
-	`, recovery.NodeID, recovery.AccountID).Scan(&activeGlobal, &activeNode, &activeAccount, &activeGlobalBytes, &activeNodeBytes, &activeAccountBytes); err != nil || activeGlobal >= 32 || activeNode >= 2 || activeAccount >= 8 || activeGlobalBytes+expectedSize > 1<<30 || activeNodeBytes+expectedSize > 64<<20 || activeAccountBytes+expectedSize > 256<<20 {
-		util.WriteError(w, http.StatusTooManyRequests, "recovery upload quota is full")
+		                 WHERE result.session_id=session.id
+		                   AND (result.phase='promotion' OR (result.phase='upload' AND result.result<>'quarantined')))
+	`, recovery.NodeID, recovery.AccountID).Scan(&activeGlobal, &activeNode, &activeAccount, &activeGlobalBytes, &activeNodeBytes, &activeAccountBytes); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load recovery upload quota")
 		return
 	}
-	quarantineKey := fmt.Sprintf(".stoarama-recovery/v1/%s/%d/%s", recovery.SetID, recovery.Ordinal, sessionID)
-	tag, err := tx.Exec(r.Context(), `
-		INSERT INTO recording_recovery_upload_sessions(id,set_id,ordinal,revision,node_id,account_id,declared_bytes,quarantine_key,deadline_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,transaction_timestamp()+interval '5 minutes')
-		ON CONFLICT(id) DO NOTHING
-	`, sessionID, recovery.SetID, recovery.Ordinal, revision, recovery.NodeID, recovery.AccountID, expectedSize, quarantineKey)
-	if err != nil {
-		util.WriteError(w, http.StatusConflict, "create recovery upload session")
-		return
-	}
-	if tag.RowsAffected() == 0 {
-		var exact, promoted bool
-		if err = tx.QueryRow(r.Context(), `
-			SELECT session.set_id=$2 AND session.ordinal=$3 AND session.node_id=$4 AND session.account_id=$5
-			       AND session.declared_bytes=$6 AND session.quarantine_key=$7,
-			       EXISTS(SELECT 1 FROM recording_recovery_upload_session_results result
-			              WHERE result.session_id=session.id AND result.phase='promotion' AND result.result='promoted')
-			FROM recording_recovery_upload_sessions session WHERE session.id=$1
-		`, sessionID, recovery.SetID, recovery.Ordinal, recovery.NodeID, recovery.AccountID, expectedSize, quarantineKey).Scan(&exact, &promoted); err != nil || !exact {
-			util.WriteError(w, http.StatusConflict, "recovery upload session replay differs")
+	if !replayExisting && !priorPromoted {
+		if activeGlobal >= recoveryProxyGlobalConcurrency || activeNode >= recoveryProxyNodeConcurrency || activeAccount >= recoveryProxyAccountConcurrency || activeGlobalBytes+expectedSize > recoveryProxyGlobalBytes || activeNodeBytes+expectedSize > recoveryProxyNodeBytes || activeAccountBytes+expectedSize > recoveryProxyAccountBytes {
+			util.WriteError(w, http.StatusTooManyRequests, "recovery upload quota is full")
 			return
 		}
-		if promoted {
-			_ = tx.Commit(r.Context())
-			w.WriteHeader(http.StatusNoContent)
+		sessionDeadline = time.Now().UTC().Add(recoveryProxySessionLimit)
+		if grantDeadline.Before(sessionDeadline) {
+			sessionDeadline = grantDeadline
+		}
+		replayQuarantine = fmt.Sprintf(".stoarama-recovery/v1/%s/%d/%s", recovery.SetID, recovery.Ordinal, sessionID)
+		if _, err = tx.Exec(r.Context(), `
+			INSERT INTO recording_recovery_upload_sessions(id,set_id,ordinal,revision,node_id,account_id,declared_bytes,quarantine_key,deadline_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, sessionID, recovery.SetID, recovery.Ordinal, revision, recovery.NodeID, recovery.AccountID, expectedSize, replayQuarantine, sessionDeadline); err != nil {
+			util.WriteError(w, http.StatusConflict, "create recovery upload session")
 			return
 		}
-		util.WriteError(w, http.StatusConflict, "recovery upload session is already in progress")
-		return
+	} else if replayExisting {
+		if err = tx.QueryRow(r.Context(), `SELECT deadline_at FROM recording_recovery_upload_sessions WHERE id=$1`, sessionID).Scan(&sessionDeadline); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load recovery upload session deadline")
+			return
+		}
 	}
 	if err = tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit recovery upload session")
@@ -355,32 +421,51 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusInternalServerError, "build recovery destination")
 		return
 	}
-	if len(staleQuarantineKeys) > 0 {
-		if err = client.DeleteObjects(r.Context(), staleQuarantineKeys); err != nil {
-			_ = appendRecoveryUploadSessionResult(context.Background(), s.pool, sessionID, "upload", "storage_5xx", -1, "")
-			util.WriteError(w, http.StatusBadGateway, "clean stale recovery quarantine")
+	if priorPromoted {
+		head, headErr := client.Head(r.Context(), objectKey)
+		if headErr != nil || head.SizeBytes != expectedSize {
+			util.WriteError(w, http.StatusConflict, "promoted recovery object cannot be reconciled")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	observedSHA := expectedSHA
+	observedBytes := expectedSize
+	if !resumePromotion {
+		uploadCtx, cancelUpload := context.WithDeadline(r.Context(), sessionDeadline)
+		hash := sha256.New()
+		counting := &countingReader{reader: io.TeeReader(io.LimitReader(r.Body, expectedSize+1), hash)}
+		rateReader := &minimumRateReader{reader: counting, startedAt: time.Now()}
+		_, uploadErr := client.PutReader(uploadCtx, replayQuarantine, mimeType, rateReader)
+		cancelUpload()
+		observedBytes = counting.read
+		observedSHA = hex.EncodeToString(hash.Sum(nil))
+		if uploadErr != nil || counting.read != expectedSize || observedSHA != expectedSHA {
+			result := recoveryUploadFailureResult(uploadErr, counting.read, expectedSize, observedSHA, expectedSHA)
+			if uploadErr == nil {
+				result = "hash_mismatch"
+			}
+			_ = appendRecoveryUploadSessionResultDetached(s.pool, sessionID, "upload", result, counting.read, observedSHA)
+			_ = client.DeleteObjects(context.Background(), []string{replayQuarantine})
+			util.WriteError(w, http.StatusConflict, "recovery upload verification failed")
+			return
+		}
+		if err = appendRecoveryUploadSessionResultDetached(s.pool, sessionID, "upload", "quarantined", counting.read, observedSHA); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "seal recovery quarantine result")
 			return
 		}
 	}
-	uploadCtx, cancelUpload := context.WithTimeout(r.Context(), 5*time.Minute)
-	hash := sha256.New()
-	counting := &countingReader{reader: io.TeeReader(io.LimitReader(r.Body, expectedSize+1), hash)}
-	rateReader := &minimumRateReader{reader: counting, startedAt: time.Now()}
-	_, uploadErr := client.PutReader(uploadCtx, quarantineKey, mimeType, rateReader)
-	cancelUpload()
-	observedSHA := hex.EncodeToString(hash.Sum(nil))
-	if uploadErr != nil || counting.read != expectedSize || observedSHA != expectedSHA {
-		result := recoveryUploadFailureResult(uploadErr, counting.read, expectedSize, observedSHA, expectedSHA)
-		if uploadErr == nil {
-			result = "hash_mismatch"
-		}
-		_ = appendRecoveryUploadSessionResult(r.Context(), s.pool, sessionID, "upload", result, counting.read, observedSHA)
-		_ = client.DeleteObjects(context.Background(), []string{quarantineKey})
-		util.WriteError(w, http.StatusConflict, "recovery upload verification failed")
-		return
-	}
-	if err = appendRecoveryUploadSessionResult(r.Context(), s.pool, sessionID, "upload", "quarantined", counting.read, observedSHA); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "seal recovery quarantine result")
+
+	// Copy is intentionally outside every DB transaction and claim fence. A
+	// security revocation can commit while storage is copying; finalization below
+	// then rejects and quarantines/deletes the unaccepted object.
+	promotionCtx, cancelPromotion := context.WithDeadline(r.Context(), sessionDeadline)
+	_, err = client.Copy(promotionCtx, replayQuarantine, objectKey, mimeType)
+	cancelPromotion()
+	if err != nil {
+		_ = appendRecoveryUploadSessionResultDetached(s.pool, sessionID, "promotion", "storage_5xx", observedBytes, observedSHA)
+		util.WriteError(w, http.StatusBadGateway, "promote recovery upload")
 		return
 	}
 	promotionTx, err := s.pool.Begin(r.Context())
@@ -405,28 +490,28 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 		WHERE grant.id=$4 FOR SHARE OF grant,session
 	`, sessionID, recovery.SetID, recovery.Ordinal, recovery.GrantID).Scan(&stillAuthorized)
 	if err != nil || !stillAuthorized {
-		_ = client.DeleteObjects(context.Background(), []string{quarantineKey})
-		_ = appendRecoveryUploadSessionResult(context.Background(), s.pool, sessionID, "promotion", "aborted", counting.read, observedSHA)
+		result := "aborted"
+		var revoked bool
+		_ = promotionTx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_capture_security_events event WHERE event.set_id=$1 AND (event.ordinal IS NULL OR event.ordinal=$2))`, recovery.SetID, recovery.Ordinal).Scan(&revoked)
+		if revoked {
+			result = "security_revoked"
+		}
+		if appendErr := appendRecoveryUploadSessionResult(r.Context(), promotionTx, sessionID, "promotion", result, observedBytes, observedSHA); appendErr == nil {
+			_ = promotionTx.Commit(r.Context())
+		}
+		_ = client.DeleteObjects(context.Background(), []string{objectKey, replayQuarantine})
 		util.WriteError(w, http.StatusConflict, "recovery upload was revoked")
 		return
 	}
-	if _, err = client.Copy(r.Context(), quarantineKey, objectKey, mimeType); err != nil {
-		_ = promotionTx.Rollback(r.Context())
-		_ = appendRecoveryUploadSessionResult(r.Context(), s.pool, sessionID, "promotion", "storage_5xx", counting.read, observedSHA)
-		util.WriteError(w, http.StatusBadGateway, "promote recovery upload")
-		return
-	}
-	if err = appendRecoveryUploadSessionResult(r.Context(), promotionTx, sessionID, "promotion", "promoted", counting.read, observedSHA); err != nil {
-		_ = client.DeleteObjects(context.Background(), []string{objectKey, quarantineKey})
+	if err = appendRecoveryUploadSessionResult(r.Context(), promotionTx, sessionID, "promotion", "promoted", observedBytes, observedSHA); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "seal recovery promotion result")
 		return
 	}
 	if err = promotionTx.Commit(r.Context()); err != nil {
-		_ = client.DeleteObjects(context.Background(), []string{objectKey, quarantineKey})
 		util.WriteError(w, http.StatusInternalServerError, "commit recovery promotion")
 		return
 	}
-	_ = client.DeleteObjects(context.Background(), []string{quarantineKey})
+	_ = client.DeleteObjects(context.Background(), []string{replayQuarantine})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1150,6 +1235,24 @@ func revalidateRecordingNodeCredential(ctx context.Context, tx pgx.Tx, principal
 	return nil
 }
 
+func revalidateRecordingLeaseCredential(ctx context.Context, tx pgx.Tx, principal nodePrincipal, jobID int64, leaseToken *uuid.UUID) error {
+	var valid bool
+	err := tx.QueryRow(ctx, `
+		SELECT CASE
+		  WHEN job.lease_credential_state='exact' THEN
+		    recording_surrender_token_can_access_lease($1,$2,job.lease_node_token_id,job.lease_claim_generation)
+		  WHEN job.lease_credential_state='legacy_unknown' THEN job.lease_owner=$5 AND EXISTS(
+		    SELECT 1 FROM node_tokens token WHERE token.id=$1 AND token.node_id=$2 AND token.revoked_at IS NULL)
+		  ELSE false END
+		FROM recording_jobs job
+		WHERE job.id=$3 AND job.lease_token IS NOT DISTINCT FROM $4
+	`, principal.NodeTokenID, principal.NodeID, jobID, leaseToken, recorderWorkerID(principal)).Scan(&valid)
+	if err != nil || !valid {
+		return fmt.Errorf("recording lease credential is stale")
+	}
+	return nil
+}
+
 func validLowerSHA256(v string) bool {
 	if len(v) != 64 || strings.ToLower(v) != v {
 		return false
@@ -1379,9 +1482,8 @@ func (s *Server) handleRecordingCaptureSetCommit(w http.ResponseWriter, r *http.
 		SELECT plan.set_id,plan.artifact_count,
 		 job.id=$2 AND job.status='leased' AND job.lease_token=$3 AND job.lease_owner=$4
 		 AND job.lease_expires_at>transaction_timestamp() AND plan.expires_at>transaction_timestamp()
-		 AND job.lease_node_token_id=$5 AND job.lease_claim_generation=token.recording_claim_generation
-		 AND job.lease_credential_state='exact' AND token.node_id=$6 AND token.revoked_at IS NULL
-		 AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
+		 AND job.lease_credential_state='exact'
+		 AND recording_surrender_token_can_access_lease($5,$6,job.lease_node_token_id,job.lease_claim_generation)
 		 AND plan.source_snapshot=recording_surrender_source_snapshot(recording.id)
 		 AND plan.destination_naming_snapshot=recording_surrender_destination_snapshot(recording.id),
 		 COALESCE(result.result,'')
@@ -1482,16 +1584,16 @@ func (s *Server) handleRecordingCaptureArtifactMaterialize(w http.ResponseWriter
 		       COALESCE(plan.origin_claim_generation,0),plan.producer_id,plan.source_snapshot_sha256,
 		       plan.destination_naming_sha256,reservation.artifact_count,reservation.merkle_root_sha256,
 		       plan.first_capture_sequence,
-		       token.recording_claim_purpose IN('claim_current','existing_fence_only') AND token.revoked_at IS NULL
-		         AND ((token.id=job.lease_node_token_id AND token.recording_claim_generation=job.lease_claim_generation)
+		       (recording_surrender_token_can_access_lease($6,$7,job.lease_node_token_id,job.lease_claim_generation)
 		           OR (token.recording_claim_generation=plan.origin_claim_generation
 		             AND EXISTS(SELECT 1 FROM recording_capture_set_grants grant
 		                        WHERE grant.set_id=reservation.id AND grant.upload_grace_until>transaction_timestamp())
 		             AND EXISTS(SELECT 1 FROM recording_job_lease_generations generation
 		                        WHERE generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
-		                          AND generation.node_id=$7))),
+		                          AND generation.node_id=$7)))),
 		       (job.status='leased' AND job.lease_owner=$5 AND job.lease_token=$4
-		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact')
+		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact'
+		         AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events stop WHERE stop.set_id=reservation.id))
 		       OR EXISTS(SELECT 1 FROM recording_capture_set_grants grant
 		                 WHERE grant.set_id=reservation.id AND grant.upload_grace_until>transaction_timestamp())
 		FROM recording_capture_reservation_sets reservation
@@ -1589,9 +1691,8 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 		JOIN node_tokens token ON token.id=$5
 		WHERE capture_set.id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
 		  AND job.status='leased' AND job.lease_owner=$4 AND job.lease_token=$3
-		  AND job.lease_node_token_id=$5 AND job.lease_claim_generation=token.recording_claim_generation
-		  AND job.lease_credential_state='exact' AND token.node_id=$6 AND token.revoked_at IS NULL
-		  AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
+		  AND job.lease_credential_state='exact'
+		  AND recording_surrender_token_can_access_lease($5,$6,job.lease_node_token_id,job.lease_claim_generation)
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=stop.id)
 		ORDER BY stop.required_at,stop.id LIMIT 1
 		FOR UPDATE OF stop,capture_set,plan,job,token
@@ -1731,9 +1832,8 @@ func (s *Server) handleRecordingCaptureSetFinish(w http.ResponseWriter, r *http.
 	err = tx.QueryRow(r.Context(), `
 		SELECT capture_set.artifact_count,
 		       job.id=$2 AND job.lease_token=$3 AND job.lease_owner=$4
-		         AND job.lease_node_token_id=$5 AND job.lease_claim_generation=token.recording_claim_generation
-		         AND job.lease_credential_state='exact' AND token.node_id=$6 AND token.revoked_at IS NULL
-		         AND token.recording_claim_purpose IN('claim_current','existing_fence_only')
+		         AND job.lease_credential_state='exact'
+		         AND recording_surrender_token_can_access_lease($5,$6,job.lease_node_token_id,job.lease_claim_generation)
 		FROM recording_capture_reservation_sets capture_set
 		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		JOIN recording_jobs job ON job.id=plan.recording_job_id
@@ -1807,6 +1907,112 @@ func (s *Server) handleRecordingCaptureSetFinish(w http.ResponseWriter, r *http.
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleRecordingCaptureSetEmptyRecovery(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	jobID, jobOK := parseInt64Path(w, r, "id")
+	setID, setErr := uuid.Parse(strings.TrimSpace(chiURLParam(r, "setId")))
+	leaseToken, leaseErr := recordingLeaseToken(r)
+	var req struct {
+		ReportID string `json:"report_id"`
+	}
+	if !ok || principal.NodeTokenID <= 0 || !jobOK || setErr != nil || leaseErr != nil || leaseToken == nil || util.DecodeJSON(r, &req) != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid empty capture set recovery")
+		return
+	}
+	reportID, reportErr := uuid.Parse(strings.TrimSpace(req.ReportID))
+	if reportErr != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid empty capture set report")
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin empty capture set recovery")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock empty capture set recovery")
+		return
+	}
+	var grantID uuid.UUID
+	var artifactCount int
+	var authorized bool
+	err = tx.QueryRow(r.Context(), `
+		SELECT grant.id,capture_set.artifact_count,
+		       generation.node_id=$4 AND (
+		         EXISTS(SELECT 1 FROM node_tokens token
+		                WHERE token.id=$5 AND token.node_id=generation.node_id AND token.revoked_at IS NULL
+		                  AND token.recording_claim_generation=plan.origin_claim_generation
+		                  AND token.recording_claim_purpose='existing_fence_only')
+		         OR EXISTS(SELECT 1 FROM recording_worker_claim_heads head
+		                   JOIN node_tokens token ON token.id=head.claim_token_id
+		                   WHERE head.node_id=generation.node_id AND head.claim_token_id=$5
+		                     AND head.state='enabled' AND head.generation>=grant.recovery_block_generation
+		                     AND token.revoked_at IS NULL AND token.recording_claim_purpose='claim_current'))
+		FROM recording_capture_set_grants grant
+		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+		JOIN recording_job_lease_generations generation
+		  ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
+		WHERE grant.set_id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+		  AND grant.upload_grace_until>transaction_timestamp()
+		  AND NOT EXISTS(SELECT 1 FROM recording_capture_materialized_artifacts artifact WHERE artifact.set_id=capture_set.id)
+		FOR UPDATE OF grant,capture_set,plan
+	`, setID, jobID, leaseToken, principal.NodeID, principal.NodeTokenID).Scan(&grantID, &artifactCount, &authorized)
+	if err != nil || !authorized {
+		util.WriteError(w, http.StatusConflict, "empty capture set recovery authority is unavailable")
+		return
+	}
+	tag, err := tx.Exec(r.Context(), `
+		INSERT INTO recording_capture_empty_set_reports(set_id,grant_id,node_id,report_id,result)
+		VALUES($1,$2,$3,$4,'no_bytes') ON CONFLICT(set_id) DO NOTHING
+	`, setID, grantID, principal.NodeID, reportID)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "record empty capture set recovery")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var exact bool
+		if err = tx.QueryRow(r.Context(), `
+			SELECT grant_id=$2 AND node_id=$3 AND report_id=$4 AND result='no_bytes'
+			FROM recording_capture_empty_set_reports WHERE set_id=$1
+		`, setID, grantID, principal.NodeID, reportID).Scan(&exact); err != nil || !exact {
+			util.WriteError(w, http.StatusConflict, "empty capture set recovery replay differs")
+			return
+		}
+	}
+	coverage := struct {
+		ArtifactCount int      `json:"artifact_count"`
+		Materialized  []int    `json:"materialized_ordinals"`
+		Unused        [][2]int `json:"unused_ranges"`
+	}{artifactCount, []int{}, [][2]int{{1, artifactCount}}}
+	coverageJSON, _ := json.Marshal(coverage)
+	tag, err = tx.Exec(r.Context(), `
+		INSERT INTO recording_capture_set_results(set_id,result,coverage_ranges,coverage_sha256)
+		VALUES($1,'abandoned',$2,encode(sha256(convert_to($2::jsonb::text,'UTF8')),'hex'))
+		ON CONFLICT(set_id) DO NOTHING
+	`, setID, coverageJSON)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "seal empty capture set recovery")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		var exact bool
+		if err = tx.QueryRow(r.Context(), `
+			SELECT result='abandoned' AND coverage_ranges=$2::jsonb
+			FROM recording_capture_set_results WHERE set_id=$1
+		`, setID, coverageJSON).Scan(&exact); err != nil || !exact {
+			util.WriteError(w, http.StatusConflict, "empty capture set result replay differs")
+			return
+		}
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit empty capture set recovery")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func surrenderRequestSHA(req recordingJobSurrenderRequest) string {
 	values := []string{
 		strconv.Itoa(req.TransportVersion), req.AttemptID, string(req.Reason), strings.TrimSpace(req.ErrorText),
@@ -1860,6 +2066,19 @@ func (s *Server) handleRecordingJobSurrenderV1(w http.ResponseWriter, r *http.Re
 	req.ErrorText = errorText
 	requestSHA := surrenderRequestSHA(req)
 	workerID := recorderWorkerID(principal)
+	// Discover the capacity domain without locks, then reselect the exact job
+	// after taking the global fence and capacity rows.  Relay claim uses
+	// capacity->job order; surrender must never invert that as job->capacity.
+	var discoveredCaptureVia string
+	var discoveredAccountID int64
+	if err = s.pool.QueryRow(r.Context(), `
+		SELECT recording.capture_via,recording.account_id
+		FROM recording_jobs job JOIN recordings recording ON recording.id=job.recording_id
+		WHERE job.id=$1
+	`, jobID).Scan(&discoveredCaptureVia, &discoveredAccountID); err != nil || (discoveredCaptureVia != "cloud" && discoveredCaptureVia != "relay") {
+		util.WriteError(w, http.StatusConflict, "surrender capacity domain is unavailable")
+		return
+	}
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "begin surrender decision")
@@ -1873,6 +2092,16 @@ func (s *Server) handleRecordingJobSurrenderV1(w http.ResponseWriter, r *http.Re
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lock surrender capacity")
 		return
+	}
+	if _, err = tx.Exec(r.Context(), `SELECT id FROM accounts WHERE id=$1 FOR SHARE`, discoveredAccountID); err != nil {
+		util.WriteError(w, http.StatusConflict, "lock surrender account")
+		return
+	}
+	if discoveredCaptureVia == "relay" {
+		if err = lockRelayCapacityDomain(r.Context(), tx, discoveredAccountID); err != nil {
+			util.WriteError(w, http.StatusConflict, "lock surrender relay capacity")
+			return
+		}
 	}
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, recordingSurrenderJobLockKey(jobID)); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lock surrender job")
@@ -1922,10 +2151,8 @@ func (s *Server) handleRecordingJobSurrenderV1(w http.ResponseWriter, r *http.Re
 		JOIN recordings recording ON recording.id=j.recording_id
 		JOIN recording_job_unique_heads h ON h.recording_job_id=g.recording_job_id AND h.lease_token=g.lease_token
 			WHERE g.recording_job_id=$1 AND g.lease_token=$2
-			  AND j.lease_node_token_id=$3 AND j.lease_claim_generation IS NOT NULL AND j.lease_credential_state='exact'
-			  AND EXISTS(SELECT 1 FROM node_tokens token WHERE token.id=$3 AND token.node_id=$4
-			             AND token.recording_claim_generation=j.lease_claim_generation
-			             AND token.recording_claim_purpose IN('claim_current','existing_fence_only') AND token.revoked_at IS NULL)
+			  AND j.lease_claim_generation IS NOT NULL AND j.lease_credential_state='exact'
+			  AND recording_surrender_token_can_access_lease($3,$4,j.lease_node_token_id,j.lease_claim_generation)
 			  AND j.kind='continuous_window' AND j.window_end_at IS NOT NULL AND recording.capture_via IN('cloud','relay')
 			FOR UPDATE OF j,h
 		`, jobID, leaseToken, principal.NodeTokenID, principal.NodeID).Scan(&generationOwner, &generationNode, &currentStatus, &currentOwner, &currentToken, &windowOpen, &attemptCount, &captureVia, &recordingAccountID, &currentHead, &currentIntent, &currentClip)
@@ -1935,6 +2162,10 @@ func (s *Server) handleRecordingJobSurrenderV1(w http.ResponseWriter, r *http.Re
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load surrender generation")
+		return
+	}
+	if captureVia != discoveredCaptureVia || recordingAccountID != discoveredAccountID {
+		util.WriteError(w, http.StatusConflict, "surrender capacity domain changed")
 		return
 	}
 	resultName := ""
@@ -2009,12 +2240,7 @@ func (s *Server) handleRecordingJobSurrenderV1(w http.ResponseWriter, r *http.Re
 		  AND (SELECT count(*) FROM recording_jobs live WHERE live.status='leased' AND live.lease_owner=d.name AND live.lease_expires_at>transaction_timestamp()) < d.capacity
 	)`, workerID).Scan(&alternate)
 	} else {
-		if _, err = tx.Exec(r.Context(), `SELECT id FROM nodes WHERE account_id=$1 AND node_type='relay' ORDER BY id FOR UPDATE`, recordingAccountID); err == nil {
-			_, err = tx.Exec(r.Context(), `SELECT id FROM relay_groups WHERE account_id=$1 ORDER BY id FOR UPDATE`, recordingAccountID)
-		}
-		if err == nil {
-			err = tx.QueryRow(r.Context(), `SELECT recording_surrender_relay_alternate($1,$2)`, jobID, workerID).Scan(&alternate)
-		}
+		err = tx.QueryRow(r.Context(), `SELECT recording_surrender_relay_alternate($1,$2)`, jobID, workerID).Scan(&alternate)
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "compute surrender alternate capacity")

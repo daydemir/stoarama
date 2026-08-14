@@ -515,6 +515,7 @@ func (s *Server) router() http.Handler {
 			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/artifacts/{ordinal}/materialize", s.handleRecordingCaptureArtifactMaterialize)
 			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/stop-ack", s.handleRecordingCaptureSetStopAck)
 			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/finish", s.handleRecordingCaptureSetFinish)
+			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/empty-recovery", s.handleRecordingCaptureSetEmptyRecovery)
 			rec.Post("/recording/claim-successor/propose", s.handleRecordingClaimSuccessorPropose)
 			rec.Post("/recording/claim-successor/{proposalId}/ack", s.handleRecordingClaimSuccessorAck)
 			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/status", s.handleRecordingCaptureProducerStatus)

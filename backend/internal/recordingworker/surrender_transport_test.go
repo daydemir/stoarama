@@ -107,6 +107,54 @@ func TestCaptureTimestampUsesExactTruncatedMicroseconds(t *testing.T) {
 	}
 }
 
+func TestCommittedCaptureSetPreflightStopsBeforeProcessLaunch(t *testing.T) {
+	var heartbeat, ack, finish atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			heartbeat.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"lease_expires_at": time.Now().Add(time.Minute), "stop_required": true})
+		case strings.HasSuffix(r.URL.Path, "/stop-ack"):
+			var body recordingapi.CaptureStopAck
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Members) != 0 || body.InventorySHA256 == "" {
+				http.Error(w, "invalid empty stop ACK", http.StatusBadRequest)
+				return
+			}
+			ack.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case strings.HasSuffix(r.URL.Path, "/finish"):
+			finish.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	worker, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputDir, err := os.MkdirTemp(root, "capture-continuous-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := recordingapi.RecordingJob{JobID: 99, LeaseToken: uuid.NewString()}
+	producer := &captureProducerJournal{
+		JobID: job.JobID, LeaseToken: job.LeaseToken, ProducerID: uuid.NewString(), OutputDir: outputDir,
+		CaptureSet: &captureSetJournal{SetID: uuid.NewString(), Plan: &recordingapi.CaptureSetPlan{ArtifactCount: 1}},
+	}
+	worker.surrenderState(job.JobID).producer = producer
+	launch, err := worker.preflightCommittedCaptureSet(context.Background(), job, producer, outputDir)
+	if err != nil || launch || heartbeat.Load() != 1 || ack.Load() != 1 || finish.Load() != 1 {
+		t.Fatalf("launch=%v heartbeat=%d ack=%d finish=%d err=%v", launch, heartbeat.Load(), ack.Load(), finish.Load(), err)
+	}
+}
+
 func durableSurrenderTestRoot(t *testing.T) string {
 	t.Helper()
 	root, err := os.MkdirTemp(".", ".surrender-transport-test-")
@@ -1175,11 +1223,11 @@ func TestEnabledClaimSuccessorReplaysAcknowledgmentWithSuccessorBearer(t *testin
 	if err = client.TouchDroplet(context.Background(), "build"); err != nil {
 		t.Fatal(err)
 	}
-	if touchAuthorization != "Bearer retiring-predecessor" {
-		t.Fatalf("unrelated predecessor fences lost their ordinary bearer: %q", touchAuthorization)
+	if touchAuthorization != "Bearer "+raw {
+		t.Fatalf("enabled successor did not become the ordinary bearer: %q", touchAuthorization)
 	}
 	if _, err = os.Stat(claimSuccessorStatePath(worker.surrenderJournalRoot())); err != nil {
-		t.Fatalf("pending predecessor retirement lost successor state: %v", err)
+		t.Fatalf("enabled successor current state was not persisted: %v", err)
 	}
 }
 

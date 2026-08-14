@@ -168,6 +168,17 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'recording claim credential migration requires exactly one live token per enrolled node';
   END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM nodes node
+    WHERE ((node.node_type='relay' AND node.status='active')
+       OR (node.node_type='local_recorder' AND EXISTS(
+         SELECT 1 FROM recorder_droplets droplet
+         WHERE droplet.node_id=node.id AND droplet.state IN('provisioning','active'))))
+      AND NOT EXISTS(SELECT 1 FROM node_tokens token WHERE token.node_id=node.id AND token.revoked_at IS NULL)
+  ) THEN
+    RAISE EXCEPTION 'recording claim credential migration found a claim-capable node without a live token';
+  END IF;
 END $$;
 
 UPDATE node_tokens
@@ -309,9 +320,75 @@ BEGIN
   RETURN NEW;
 END $$;
 
+-- Every post-migration claim, including one issued by a rollback/v0 binary,
+-- must pass the same enabled claim head.  Legacy clients may keep an unknown
+-- lease credential shape so their existing request contract remains readable,
+-- but a recovery-blocked host can never obtain a new fence.
+CREATE FUNCTION recording_surrender_validate_lease_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE claim_node_id BIGINT; head RECORD;
+BEGIN
+  IF OLD.status IS DISTINCT FROM 'leased' AND NEW.status='leased' THEN
+    IF NEW.lease_owner LIKE 'node:%' THEN
+      BEGIN claim_node_id:=substring(NEW.lease_owner FROM '^node:([0-9]+)$')::bigint;
+      EXCEPTION WHEN invalid_text_representation THEN claim_node_id:=NULL; END;
+    ELSE
+      SELECT droplet.node_id INTO claim_node_id
+      FROM recorder_droplets droplet WHERE droplet.name=NEW.lease_owner
+      ORDER BY droplet.id LIMIT 1;
+    END IF;
+    SELECT claim.*,token.revoked_at,token.recording_claim_generation,token.recording_claim_purpose
+      INTO head
+    FROM recording_worker_claim_heads claim
+    JOIN node_tokens token ON token.id=claim.claim_token_id
+    WHERE claim.node_id=claim_node_id FOR SHARE OF claim,token;
+    IF claim_node_id IS NULL OR head.node_id IS NULL OR head.state<>'enabled'
+       OR head.revoked_at IS NOT NULL OR head.recording_claim_generation<>head.generation
+       OR head.recording_claim_purpose<>'claim_current' THEN
+      RAISE EXCEPTION 'recording lease admission is blocked by claim authority';
+    END IF;
+    IF NEW.lease_credential_state='exact' AND
+       (NEW.lease_node_token_id IS DISTINCT FROM head.claim_token_id
+        OR NEW.lease_claim_generation IS DISTINCT FROM head.generation) THEN
+      RAISE EXCEPTION 'recording lease admission differs from enabled claim head';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER recording_surrender_admission_veto_trg
+BEFORE UPDATE OF status,lease_owner,lease_node_token_id,lease_claim_generation,lease_credential_state ON recording_jobs
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_lease_admission();
+
 CREATE TRIGGER recording_surrender_normalize_lease_credential_trg
 BEFORE UPDATE OF lease_token,lease_node_token_id,lease_claim_generation,lease_credential_state ON recording_jobs
 FOR EACH ROW EXECUTE FUNCTION recording_surrender_normalize_lease_credential();
+
+-- A current successor bearer may service exact older fences on the same node
+-- while also claiming new work.  The predecessor remains heartbeat/upload-only
+-- until every old fence drains.  No other token or node crosses this relation.
+CREATE FUNCTION recording_surrender_token_can_access_lease(
+  p_presented_token_id BIGINT,p_node_id BIGINT,p_bound_token_id BIGINT,p_bound_generation BIGINT
+) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+  SELECT EXISTS(
+    SELECT 1
+    FROM node_tokens presented
+    JOIN node_tokens bound ON bound.id=p_bound_token_id AND bound.node_id=p_node_id
+    WHERE presented.id=p_presented_token_id AND presented.node_id=p_node_id
+      AND presented.revoked_at IS NULL AND bound.recording_claim_generation=p_bound_generation
+      AND (
+        (presented.id=bound.id AND presented.recording_claim_generation=p_bound_generation
+          AND presented.recording_claim_purpose IN('claim_current','existing_fence_only'))
+        OR EXISTS(
+          SELECT 1 FROM recording_worker_claim_heads head
+          WHERE head.node_id=p_node_id AND head.state='enabled'
+            AND head.claim_token_id=presented.id
+            AND head.generation=presented.recording_claim_generation
+            AND presented.recording_claim_purpose='claim_current'
+            AND head.generation>p_bound_generation
+        )
+      )
+  )
+$$;
 
 -- One server-authored plan has one append-only outcome. The split-list digest
 -- and integer-microsecond facts are independent of session TimeZone/DateStyle.
@@ -388,7 +465,7 @@ CREATE TABLE recording_capture_reservation_sets (
 
 CREATE TABLE recording_capture_producer_stop_events (
   id UUID PRIMARY KEY,
-  set_id UUID NOT NULL REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  set_id UUID NOT NULL UNIQUE REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
   old_snapshot_generation BIGINT NOT NULL CHECK(old_snapshot_generation>0),
   new_snapshot_generation BIGINT NOT NULL CHECK(new_snapshot_generation>old_snapshot_generation),
   required_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
@@ -422,8 +499,7 @@ BEGIN
   JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
   WHERE (plan.source_snapshot->>'stream_id')::bigint=NEW.id
     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
-    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id
-                   AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=prior.id));
+    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id);
   RETURN NEW;
 END $$;
 
@@ -447,8 +523,7 @@ BEGIN
   JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
   WHERE plan.recording_id=NEW.id
     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
-    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id
-                   AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=prior.id));
+    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id);
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_surrender_append_recording_stop_events_trg
@@ -468,8 +543,7 @@ BEGIN
   JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
   WHERE (plan.destination_naming_snapshot->>'destination_id')::bigint=NEW.id
     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
-    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id
-                   AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=prior.id));
+    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior WHERE prior.set_id=capture_set.id);
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_surrender_append_destination_stop_events_trg
@@ -543,6 +617,44 @@ CREATE TABLE recording_capture_recovery_reports (
   CHECK((report_type='no_bytes' AND size_bytes IS NULL AND sha256 IS NULL)
      OR (report_type<>'no_bytes' AND size_bytes>0 AND sha256~'^[0-9a-f]{64}$'))
 );
+
+-- A crash after set commitment but before the first file still owns durable
+-- recovery authority.  The originating blocked node must explicitly attest
+-- that the committed set has no local bytes before the journal/seed is removed.
+CREATE TABLE recording_capture_empty_set_reports (
+  set_id UUID PRIMARY KEY REFERENCES recording_capture_reservation_sets(id) ON DELETE RESTRICT,
+  grant_id UUID NOT NULL UNIQUE REFERENCES recording_capture_set_grants(id) ON DELETE RESTRICT,
+  node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+  report_id UUID NOT NULL UNIQUE,
+  result TEXT NOT NULL CHECK(result='no_bytes'),
+  reported_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp()
+);
+
+CREATE FUNCTION recording_surrender_validate_empty_set_report() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.reported_at:=transaction_timestamp();
+  IF EXISTS(SELECT 1 FROM recording_capture_materialized_artifacts artifact WHERE artifact.set_id=NEW.set_id)
+     OR EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=NEW.set_id)
+     OR NOT EXISTS(
+       SELECT 1
+       FROM recording_capture_set_grants grant
+       JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+       JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+       JOIN recording_job_lease_generations lease
+         ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
+       JOIN recording_worker_claim_heads head ON head.node_id=lease.node_id
+       WHERE grant.id=NEW.grant_id AND grant.set_id=NEW.set_id AND lease.node_id=NEW.node_id
+         AND grant.upload_grace_until>transaction_timestamp()
+         AND head.state IN('recovery_blocked','successor_pending','enabled')
+         AND head.generation>=grant.recovery_block_generation
+     ) THEN
+    RAISE EXCEPTION 'empty capture set report lacks exact live recovery authority';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_capture_empty_set_reports_validate
+BEFORE INSERT ON recording_capture_empty_set_reports FOR EACH ROW
+EXECUTE FUNCTION recording_surrender_validate_empty_set_report();
 
 CREATE TABLE recording_capture_artifact_grant_results (
   set_id UUID NOT NULL,
@@ -886,7 +998,7 @@ CREATE TABLE recording_recovery_upload_sessions (
   deadline_at TIMESTAMPTZ NOT NULL,
   UNIQUE(set_id,ordinal,revision),
   FOREIGN KEY(set_id,ordinal) REFERENCES recording_capture_materialized_artifacts(set_id,ordinal) ON DELETE RESTRICT,
-  CHECK(deadline_at<=started_at+interval '5 minutes')
+  CHECK(deadline_at>started_at AND deadline_at<=started_at+interval '5 minutes')
 );
 
 CREATE TABLE recording_recovery_upload_session_results (
@@ -911,7 +1023,8 @@ BEGIN
     WHEN 'recording_capture_materialized_artifact_seals' THEN NEW.sealed_at:=transaction_timestamp();
     WHEN 'recording_capture_security_events' THEN NEW.created_at:=transaction_timestamp();
     WHEN 'recording_recovery_upload_sessions' THEN
-      NEW.started_at:=transaction_timestamp(); NEW.deadline_at:=transaction_timestamp()+interval '5 minutes';
+      NEW.started_at:=transaction_timestamp();
+      NEW.deadline_at:=LEAST(NEW.deadline_at,transaction_timestamp()+interval '5 minutes');
     WHEN 'recording_recovery_upload_session_results' THEN NEW.result_at:=transaction_timestamp();
     WHEN 'recording_capture_recovery_alert_events' THEN NEW.event_at:=transaction_timestamp();
     WHEN 'recording_worker_claim_successor_proposals' THEN NEW.proposed_at:=transaction_timestamp();
@@ -958,6 +1071,34 @@ BEGIN
 END $$;
 CREATE TRIGGER recording_recovery_upload_session_results_validate
 BEFORE INSERT ON recording_recovery_upload_session_results FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_recovery_upload_session_result();
+
+-- There is at most one retryable transport session per artifact.  A successor
+-- revision is legal only after the exact previous session has an upload failure
+-- or a terminal promotion result; it can never race or delete a live PUT.
+CREATE FUNCTION recording_surrender_validate_recovery_upload_session() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE prior RECORD; prior_terminal BOOLEAN;
+BEGIN
+  SELECT session.* INTO prior
+  FROM recording_recovery_upload_sessions session
+  WHERE session.set_id=NEW.set_id AND session.ordinal=NEW.ordinal
+  ORDER BY session.revision DESC LIMIT 1 FOR UPDATE;
+  IF FOUND THEN
+    SELECT EXISTS(
+      SELECT 1 FROM recording_recovery_upload_session_results result
+      WHERE result.session_id=prior.id
+        AND ((result.phase='upload' AND result.result<>'quarantined') OR result.phase='promotion')
+    ) INTO prior_terminal;
+    IF NOT prior_terminal OR NEW.revision<>prior.revision+1 THEN
+      RAISE EXCEPTION 'recovery upload session predecessor is still active or revision is noncanonical';
+    END IF;
+  ELSIF NEW.revision<>1 THEN
+    RAISE EXCEPTION 'first recovery upload session revision must be one';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_recovery_upload_sessions_validate
+BEFORE INSERT ON recording_recovery_upload_sessions FOR EACH ROW
+EXECUTE FUNCTION recording_surrender_validate_recovery_upload_session();
 CREATE TRIGGER recording_worker_claim_successor_proposals_db_time BEFORE INSERT ON recording_worker_claim_successor_proposals FOR EACH ROW EXECUTE FUNCTION recording_surrender_author_db_times();
 CREATE TRIGGER recording_worker_claim_successor_results_db_time BEFORE INSERT ON recording_worker_claim_successor_results FOR EACH ROW EXECUTE FUNCTION recording_surrender_author_db_times();
 
@@ -1231,6 +1372,48 @@ END $$;
 CREATE TRIGGER recording_capture_materialized_artifacts_validate
 BEFORE INSERT ON recording_capture_materialized_artifacts FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_materialized_artifact();
 
+-- A stop event closes ordinary materialization immediately.  The stop-ACK
+-- transaction may insert the exact inventoried artifact before its member row,
+-- so the inverse is deferred and sealed at COMMIT rather than weakened with a
+-- transaction-local bypass.
+CREATE FUNCTION recording_surrender_validate_stopped_artifact_membership() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS(SELECT 1 FROM recording_capture_producer_stop_events stop WHERE stop.set_id=NEW.set_id)
+     AND NOT EXISTS(
+       SELECT 1
+       FROM recording_capture_producer_stop_events stop
+       JOIN recording_capture_producer_stop_acks ack ON ack.stop_event_id=stop.id AND ack.set_id=stop.set_id
+       JOIN recording_capture_stop_ack_members member
+         ON member.stop_ack_id=ack.id AND member.ordinal=NEW.ordinal AND member.artifact_id=NEW.artifact_id
+       WHERE stop.set_id=NEW.set_id
+     ) THEN
+    RAISE EXCEPTION 'stopped capture artifact is not present in the exact stop inventory';
+  END IF;
+  RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER recording_capture_materialized_artifacts_stop_seal
+AFTER INSERT ON recording_capture_materialized_artifacts DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_stopped_artifact_membership();
+
+CREATE FUNCTION recording_surrender_validate_stopped_artifact_seal() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS(SELECT 1 FROM recording_capture_producer_stop_events stop WHERE stop.set_id=NEW.set_id)
+     AND NOT EXISTS(
+       SELECT 1
+       FROM recording_capture_producer_stop_events stop
+       JOIN recording_capture_producer_stop_acks ack ON ack.stop_event_id=stop.id AND ack.set_id=stop.set_id
+       JOIN recording_capture_stop_ack_members member
+         ON member.stop_ack_id=ack.id AND member.ordinal=NEW.ordinal AND member.artifact_id=NEW.artifact_id
+       WHERE stop.set_id=NEW.set_id
+     ) THEN
+    RAISE EXCEPTION 'post-stop artifact seal is outside the acknowledged inventory';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_capture_materialized_artifact_seals_stop_guard
+BEFORE INSERT ON recording_capture_materialized_artifact_seals
+FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_stopped_artifact_seal();
+
 CREATE FUNCTION recording_surrender_validate_stop_event() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE plan RECORD; prior_count BIGINT;
 BEGIN
@@ -1415,6 +1598,23 @@ BEGIN
   WHERE artifact.set_id=NEW.set_id AND result.set_id IS NULL;
   expected_materialized:=to_jsonb(materialized);
   expected_unused:=recording_surrender_unused_capture_ranges(expected_count,materialized);
+  IF EXISTS(SELECT 1 FROM recording_capture_producer_stop_events stop WHERE stop.set_id=NEW.set_id)
+     AND (NOT EXISTS(
+       SELECT 1 FROM recording_capture_producer_stop_events stop
+       JOIN recording_capture_producer_stop_acks ack ON ack.stop_event_id=stop.id
+       WHERE stop.set_id=NEW.set_id
+     ) OR EXISTS(
+       SELECT 1 FROM recording_capture_materialized_artifacts artifact
+       WHERE artifact.set_id=NEW.set_id AND NOT EXISTS(
+         SELECT 1 FROM recording_capture_producer_stop_events stop
+         JOIN recording_capture_producer_stop_acks ack ON ack.stop_event_id=stop.id
+         JOIN recording_capture_stop_ack_members member
+           ON member.stop_ack_id=ack.id AND member.ordinal=artifact.ordinal AND member.artifact_id=artifact.artifact_id
+         WHERE stop.set_id=NEW.set_id
+       )
+     )) THEN
+    RAISE EXCEPTION 'terminal stopped capture set does not consume its exact stop boundary';
+  END IF;
   IF nonterminal<>0 OR NEW.coverage_ranges->'artifact_count'<>to_jsonb(expected_count)
      OR NEW.coverage_ranges->'materialized_ordinals'<>expected_materialized
      OR NEW.coverage_ranges->'unused_ranges'<>expected_unused
@@ -1433,6 +1633,7 @@ BEGIN
                   WHERE result.set_id=NEW.set_id AND result.result IN('abandoned_no_bytes','unrecoverable_partial'))
        AND NOT (cardinality(materialized)=0 AND (
          EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.set_id=NEW.set_id)
+         OR EXISTS(SELECT 1 FROM recording_capture_empty_set_reports empty_report WHERE empty_report.set_id=NEW.set_id)
          OR EXISTS(
            SELECT 1 FROM recording_capture_reservation_sets capture_set
            JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
@@ -1737,7 +1938,7 @@ BEGIN
     'recording_capture_producer_stop_events','recording_capture_producer_stop_acks',
     'recording_capture_stop_ack_members','recording_capture_set_grants',
     'recording_capture_materialized_artifacts','recording_capture_materialized_artifact_seals',
-    'recording_capture_recovery_reports','recording_capture_artifact_grant_results',
+    'recording_capture_recovery_reports','recording_capture_empty_set_reports','recording_capture_artifact_grant_results',
     'recording_capture_set_results','recording_capture_security_events',
     'recording_recovery_upload_sessions',
     'recording_recovery_upload_session_results'
@@ -2626,8 +2827,7 @@ BEGIN
     AND plan.source_snapshot IS DISTINCT FROM recording_surrender_source_snapshot(recording.id)
     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
     AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events prior
-                   WHERE prior.set_id=capture_set.id
-                     AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=prior.id));
+                   WHERE prior.set_id=capture_set.id);
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_surrender_source_revision_stop_events
@@ -2723,32 +2923,30 @@ BEGIN
   RETURN changed;
 END $$;
 
-CREATE FUNCTION recording_surrender_relay_alternate(p_job_id BIGINT,p_excluded_owner TEXT) RETURNS BOOLEAN
+CREATE FUNCTION recording_surrender_relay_candidate_eligible(p_job_id BIGINT,p_node_id BIGINT) RETURNS BOOLEAN
 LANGUAGE sql STABLE AS $$
   SELECT EXISTS(
     SELECT 1
-	    FROM recording_jobs job
-	    JOIN recordings recording ON recording.id=job.recording_id
-	    LEFT JOIN streams stream ON stream.id=recording.stream_id
-	    JOIN nodes candidate ON candidate.account_id=recording.account_id
+    FROM recording_jobs job
+    JOIN recordings recording ON recording.id=job.recording_id
+    LEFT JOIN streams stream ON stream.id=recording.stream_id
+    JOIN nodes candidate ON candidate.id=p_node_id AND candidate.account_id=recording.account_id
       AND candidate.node_type='relay' AND candidate.status='active'
       AND candidate.last_heartbeat_at>=transaction_timestamp()-interval '120 seconds'
-      AND 'node:'||candidate.id::text<>p_excluded_owner
     LEFT JOIN relay_groups candidate_group ON candidate_group.id=candidate.relay_group_id
       AND candidate_group.account_id=candidate.account_id
     WHERE job.id=p_job_id
-	      AND (SELECT count(*) FROM recording_jobs live
+      AND EXISTS(SELECT 1 FROM recording_worker_claim_heads claim
+                 JOIN node_tokens token ON token.id=claim.claim_token_id
+                 WHERE claim.node_id=candidate.id AND claim.state='enabled'
+                   AND token.revoked_at IS NULL AND token.recording_claim_generation=claim.generation
+                   AND token.recording_claim_purpose='claim_current')
+      AND (stream.id IS NULL OR stream.execution_class<>'youtube_direct'
+           OR (jsonb_typeof(candidate.capabilities_jsonb->'youtube_ready')='boolean'
+               AND (candidate.capabilities_jsonb->>'youtube_ready')::boolean))
+      AND (SELECT count(*) FROM recording_jobs live
            WHERE live.status='leased' AND live.lease_owner='node:'||candidate.id::text
-	             AND live.lease_expires_at>transaction_timestamp())<candidate.relay_max_streams
-	      AND EXISTS(SELECT 1 FROM recording_worker_claim_heads claim
-	                 JOIN node_tokens claim_token ON claim_token.id=claim.claim_token_id
-	                 WHERE claim.node_id=candidate.id AND claim.state='enabled'
-	                   AND claim_token.revoked_at IS NULL
-	                   AND claim_token.recording_claim_generation=claim.generation
-	                   AND claim_token.recording_claim_purpose='claim_current')
-	      AND (stream.id IS NULL OR stream.execution_class<>'youtube_direct'
-	           OR (jsonb_typeof(candidate.capabilities_jsonb->'youtube_ready')='boolean'
-	               AND (candidate.capabilities_jsonb->>'youtube_ready')::boolean))
+             AND live.lease_expires_at>transaction_timestamp())<candidate.relay_max_streams
       AND (candidate_group.id IS NULL OR
            (SELECT count(*) FROM recording_jobs group_live
             JOIN nodes group_node ON group_live.lease_owner='node:'||group_node.id::text
@@ -2758,14 +2956,78 @@ LANGUAGE sql STABLE AS $$
            OR candidate.relay_group_id=recording.preferred_relay_group_id
            OR job.relay_fairness_started_at<=transaction_timestamp()-interval '12 seconds'
            OR NOT EXISTS(
-             SELECT 1 FROM nodes preferred
-             WHERE preferred.account_id=recording.account_id
-               AND preferred.relay_group_id=recording.preferred_relay_group_id
-               AND preferred.node_type='relay' AND preferred.status='active'
-               AND preferred.last_heartbeat_at>=transaction_timestamp()-interval '120 seconds'
-               AND (SELECT count(*) FROM recording_jobs preferred_live
-                    WHERE preferred_live.status='leased' AND preferred_live.lease_owner='node:'||preferred.id::text
-                      AND preferred_live.lease_expires_at>transaction_timestamp())<preferred.relay_max_streams))
+             SELECT 1 FROM relay_groups preferred_group
+             WHERE preferred_group.id=recording.preferred_relay_group_id
+               AND preferred_group.account_id=recording.account_id
+               AND (SELECT count(*) FROM recording_jobs preferred_jobs
+                    JOIN nodes preferred_nodes ON preferred_jobs.lease_owner='node:'||preferred_nodes.id::text
+                    WHERE preferred_nodes.account_id=recording.account_id
+                      AND preferred_nodes.relay_group_id=preferred_group.id
+                      AND preferred_jobs.status='leased' AND preferred_jobs.lease_expires_at>transaction_timestamp())<preferred_group.max_streams
+               AND EXISTS(SELECT 1 FROM nodes preferred_node
+                          WHERE preferred_node.account_id=recording.account_id
+                            AND preferred_node.relay_group_id=preferred_group.id
+                            AND preferred_node.node_type='relay' AND preferred_node.status='active'
+                            AND preferred_node.last_heartbeat_at>=transaction_timestamp()-interval '120 seconds'
+                            AND (SELECT count(*) FROM recording_jobs preferred_node_jobs
+                                 WHERE preferred_node_jobs.status='leased'
+                                   AND preferred_node_jobs.lease_owner='node:'||preferred_node.id::text
+                                   AND preferred_node_jobs.lease_expires_at>transaction_timestamp())<preferred_node.relay_max_streams))
+      AND (job.relay_fairness_started_at<=transaction_timestamp()-interval '12 seconds'
+           OR candidate.relay_group_id IS NULL OR candidate.relay_group_id=recording.preferred_relay_group_id
+           OR NOT EXISTS(
+             SELECT 1 FROM relay_groups peer_group
+             CROSS JOIN LATERAL (
+               SELECT count(*) AS lease_count,
+                      COALESCE(sum(GREATEST(COALESCE(peer_bw.observed_bandwidth_bps,0),4000000)),0) AS bandwidth_load
+               FROM recording_jobs peer_jobs
+               JOIN nodes peer_nodes ON peer_jobs.lease_owner='node:'||peer_nodes.id::text
+               JOIN recordings peer_recordings ON peer_recordings.id=peer_jobs.recording_id
+               LEFT JOIN recording_bandwidth_observations peer_bw ON peer_bw.recording_id=peer_recordings.id
+               WHERE peer_nodes.account_id=candidate.account_id AND peer_nodes.relay_group_id=peer_group.id
+                 AND peer_jobs.status='leased' AND peer_jobs.lease_expires_at>transaction_timestamp()
+             ) peer_load
+             WHERE peer_group.account_id=candidate.account_id AND peer_group.id<>candidate.relay_group_id
+               AND peer_load.lease_count<peer_group.max_streams
+               AND EXISTS(SELECT 1 FROM nodes peer_node
+                          WHERE peer_node.account_id=candidate.account_id AND peer_node.relay_group_id=peer_group.id
+                            AND peer_node.node_type='relay' AND peer_node.status='active'
+                            AND peer_node.last_heartbeat_at>=transaction_timestamp()-interval '120 seconds'
+                            AND (SELECT count(*) FROM recording_jobs peer_node_jobs
+                                 WHERE peer_node_jobs.status='leased' AND peer_node_jobs.lease_owner='node:'||peer_node.id::text
+                                   AND peer_node_jobs.lease_expires_at>transaction_timestamp())<peer_node.relay_max_streams)
+               AND (peer_load.bandwidth_load+GREATEST(COALESCE((SELECT observed_bandwidth_bps FROM recording_bandwidth_observations WHERE recording_id=recording.id),0),4000000))::numeric
+                     /COALESCE(peer_group.bandwidth_capacity_bps,peer_group.max_streams::bigint*4000000)
+                   < ((SELECT COALESCE(sum(GREATEST(COALESCE(current_bw.observed_bandwidth_bps,0),4000000)),0)
+                       FROM recording_jobs current_jobs
+                       JOIN nodes current_nodes ON current_jobs.lease_owner='node:'||current_nodes.id::text
+                       JOIN recordings current_recordings ON current_recordings.id=current_jobs.recording_id
+                       LEFT JOIN recording_bandwidth_observations current_bw ON current_bw.recording_id=current_recordings.id
+                       WHERE current_nodes.account_id=candidate.account_id AND current_nodes.relay_group_id=candidate.relay_group_id
+                         AND current_jobs.status='leased' AND current_jobs.lease_expires_at>transaction_timestamp())
+                      +GREATEST(COALESCE((SELECT observed_bandwidth_bps FROM recording_bandwidth_observations WHERE recording_id=recording.id),0),4000000))::numeric
+                     /COALESCE(candidate_group.bandwidth_capacity_bps,candidate_group.max_streams::bigint*4000000)))
+      AND (job.relay_fairness_started_at<=transaction_timestamp()-interval '12 seconds'
+           OR candidate.relay_group_id IS NULL OR NOT EXISTS(
+             SELECT 1 FROM nodes peer
+             WHERE peer.account_id=candidate.account_id AND peer.relay_group_id=candidate.relay_group_id
+               AND peer.node_type='relay' AND peer.status='active'
+               AND peer.last_heartbeat_at>=transaction_timestamp()-interval '120 seconds'
+               AND (SELECT count(*) FROM recording_jobs peer_jobs WHERE peer_jobs.status='leased'
+                    AND peer_jobs.lease_owner='node:'||peer.id::text AND peer_jobs.lease_expires_at>transaction_timestamp())<peer.relay_max_streams
+               AND (SELECT count(*) FROM recording_jobs peer_jobs WHERE peer_jobs.status='leased'
+                    AND peer_jobs.lease_owner='node:'||peer.id::text AND peer_jobs.lease_expires_at>transaction_timestamp())
+                   < (SELECT count(*) FROM recording_jobs current_jobs WHERE current_jobs.status='leased'
+                      AND current_jobs.lease_owner='node:'||candidate.id::text AND current_jobs.lease_expires_at>transaction_timestamp())))
+  )
+$$;
+
+CREATE FUNCTION recording_surrender_relay_alternate(p_job_id BIGINT,p_excluded_owner TEXT) RETURNS BOOLEAN
+LANGUAGE sql STABLE AS $$
+  SELECT EXISTS(
+    SELECT 1 FROM nodes candidate
+    WHERE 'node:'||candidate.id::text<>p_excluded_owner
+      AND recording_surrender_relay_candidate_eligible(p_job_id,candidate.id)
   )
 $$;
 
@@ -2977,18 +3239,22 @@ BEGIN
 	'recording_surrender_expire_set_plans()',
 	'recording_surrender_validate_set_commit()',
 	'recording_surrender_validate_materialized_artifact()',
+	'recording_surrender_validate_stopped_artifact_membership()',
+	'recording_surrender_validate_stopped_artifact_seal()',
 	'recording_surrender_validate_stop_event()',
 	'recording_surrender_validate_stop_ack()',
 	'recording_surrender_validate_stop_ack_member()',
 	'recording_surrender_stop_inventory_sha(uuid)',
 	'recording_surrender_validate_stop_inventory_seal()',
 	'recording_surrender_validate_recovery_report()',
+	'recording_surrender_validate_empty_set_report()',
 	'recording_surrender_validate_artifact_grant_result()',
 	'recording_surrender_unused_capture_ranges(integer,integer[])',
 	'recording_surrender_validate_set_result()',
 	'recording_surrender_validate_security_event()',
 	'recording_surrender_author_db_times()',
 	'recording_surrender_validate_recovery_upload_session_result()',
+	'recording_surrender_validate_recovery_upload_session()',
 	'recording_surrender_validate_set_grant()',
 	'recording_surrender_validate_set_grant_expiry_seal()',
 	'recording_surrender_validate_claim_head_projection()',
@@ -2997,6 +3263,8 @@ BEGIN
 	'recording_surrender_validate_claim_successor_result()',
 	'recording_surrender_validate_claim_token_update()',
 	'recording_surrender_normalize_lease_credential()',
+	'recording_surrender_validate_lease_admission()',
+	'recording_surrender_token_can_access_lease(bigint,bigint,bigint,bigint)',
 	'recording_surrender_append_stream_stop_events()',
 	'recording_surrender_append_recording_stop_events()',
 	'recording_surrender_append_destination_stop_events()',
@@ -3031,6 +3299,7 @@ BEGIN
 	'recording_surrender_preserve_referenced_source_revision()',
 	'recording_surrender_expire_set_grants()',
 	'recording_surrender_relay_alternate(bigint,text)',
+	'recording_surrender_relay_candidate_eligible(bigint,bigint)',
     'recording_surrender_reclaim_expired()'
   ] LOOP
     EXECUTE format('ALTER FUNCTION %I.%s SET search_path = %I, pg_catalog, pg_temp',install_schema,signature,install_schema);
@@ -3051,18 +3320,22 @@ REVOKE ALL ON FUNCTION recording_surrender_validate_plan_result() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_expire_set_plans() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_set_commit() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_materialized_artifact() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_validate_stopped_artifact_membership() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_validate_stopped_artifact_seal() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_stop_event() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_stop_ack() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_stop_ack_member() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_stop_inventory_sha(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_stop_inventory_seal() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_recovery_report() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_validate_empty_set_report() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_artifact_grant_result() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_unused_capture_ranges(INTEGER,INTEGER[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_set_result() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_security_event() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_author_db_times() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_recovery_upload_session_result() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_validate_recovery_upload_session() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_set_grant() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_set_grant_expiry_seal() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_claim_head_projection() FROM PUBLIC;
@@ -3075,6 +3348,8 @@ REVOKE ALL ON FUNCTION recording_surrender_initialize_claim_token() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_claim_generation_event() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_claim_token_retirement_seal() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_normalize_lease_credential() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_validate_lease_admission() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_token_can_access_lease(BIGINT,BIGINT,BIGINT,BIGINT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_append_stream_stop_events() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_append_recording_stop_events() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_append_destination_stop_events() FROM PUBLIC;
@@ -3109,3 +3384,4 @@ REVOKE ALL ON FUNCTION recording_surrender_append_source_revision_stop_events() 
 REVOKE ALL ON FUNCTION recording_surrender_preserve_referenced_source_revision() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_expire_set_grants() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_relay_alternate(BIGINT,TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_relay_candidate_eligible(BIGINT,BIGINT) FROM PUBLIC;

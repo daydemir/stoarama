@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
+	"golang.org/x/sys/unix"
 )
 
 func TestIngestClipTimestampProvenancePayloadModes(t *testing.T) {
@@ -238,6 +239,40 @@ func TestUploadUsesLongerTimeoutThanAPIRequests(t *testing.T) {
 	}
 	if _, err := client.LeaseRecordingJob(context.Background()); err == nil {
 		t.Fatal("expected API request to retain its shorter timeout")
+	}
+}
+
+func TestUploadFileExactRejectsPathReplacementBeforePUT(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	path := filepath.Join(directory, "seg-20260814-120000.mp4")
+	if err = os.WriteFile(path, []byte("acknowledged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err = unix.Stat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(path, path+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte(strings.Repeat("x", len("acknowledged"))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.UploadFileExact(context.Background(), server.URL, path, "video/mp4", uint64(stat.Dev), uint64(stat.Ino), int64(len("acknowledged"))); err == nil {
+		t.Fatal("replacement inode was uploaded")
+	}
+	if calls != 0 {
+		t.Fatalf("upload calls=%d", calls)
 	}
 }
 

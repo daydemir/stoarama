@@ -552,6 +552,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		alreadyIngested := false
 		var artifact *captureArtifactJournal
 		var artifactErr error
+		var artifactDevice, artifactInode uint64
 		if producer != nil && producer.CaptureSet != nil {
 			artifact, artifactErr = w.materializeCaptureSetArtifact(segmentCtx, job, producer, seg.CaptureSequence)
 		} else {
@@ -570,8 +571,9 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				var reserved recordingapi.ClipUploadIntent
 				var err error
 				if producer != nil {
-					if journalErr := w.recordProducerArtifact(job.JobID, producer, seg, artifact.IntentID); journalErr != nil {
-						return recordingapi.ClipUploadIntent{}, journalErr
+					artifactDevice, artifactInode, err = w.recordProducerArtifact(job.JobID, producer, seg, artifact.IntentID)
+					if err != nil {
+						return recordingapi.ClipUploadIntent{}, err
 					}
 					if producer.CaptureSet != nil {
 						reserved, err = w.cfg.Client.SealCaptureSetArtifact(segmentCtx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, artifact.Ordinal, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, captureUnixMicro(seg.StartAt), seg.SizeBytes, seg.SHA256)
@@ -591,7 +593,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "put", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
 				uploadCtx, uploadCancel := context.WithTimeout(segmentCtx, recordingapi.UploadTimeout)
-				err := w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+				var err error
+				if producer != nil {
+					err = w.cfg.Client.UploadFileExact(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType, artifactDevice, artifactInode, seg.SizeBytes)
+				} else {
+					err = w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+				}
 				uploadCancel()
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
@@ -643,7 +650,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// A different lease generation may have ingested this exact byte run.
 			// Acknowledge and remove only this local replay, but do not move the
 			// no-progress clock or claim a new unique ingest.
-			if removeErr := os.Remove(seg.Path); removeErr != nil && !os.IsNotExist(removeErr) {
+			var removeErr error
+			if producer != nil {
+				removeErr = removeRetainedArtifact(seg.Path, artifactDevice, artifactInode)
+			} else {
+				removeErr = os.Remove(seg.Path)
+			}
+			if removeErr != nil && !os.IsNotExist(removeErr) {
 				return removeErr
 			}
 			if journalErr := w.acknowledgeProducerArtifact(job.JobID, producer, seg.Path); journalErr != nil {
@@ -658,7 +671,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return err
 		}
 		progress.mark(time.Now())
-		if removeErr := os.Remove(seg.Path); removeErr != nil && !os.IsNotExist(removeErr) {
+		var removeErr error
+		if producer != nil {
+			removeErr = removeRetainedArtifact(seg.Path, artifactDevice, artifactInode)
+		} else {
+			removeErr = os.Remove(seg.Path)
+		}
+		if removeErr != nil && !os.IsNotExist(removeErr) {
 			return removeErr
 		}
 		if journalErr := w.acknowledgeProducerArtifact(job.JobID, producer, seg.Path); journalErr != nil {
@@ -786,6 +805,18 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if producer != nil && producer.CaptureOrdinal > captureOrdinal {
 			captureOrdinal = producer.CaptureOrdinal
 		}
+		if producer != nil && producer.CaptureSet != nil {
+			launch, preExecErr := w.preflightCommittedCaptureSet(jobCtx, job, producer, outDir)
+			if preExecErr != nil {
+				producerErr = preExecErr
+				w.cfg.RelayDiagnostics.Error(job.JobID, "capture_set_preexec_failed", producerErr)
+				cancel()
+				return
+			}
+			if !launch {
+				continue
+			}
+		}
 		// One delivery pool per attempt. attemptCtx lets the first delivery failure
 		// stop ffmpeg as promptly as the old inline upload did; it is a child of
 		// windowCtx, so aborting an attempt never looks like a window close (the
@@ -876,7 +907,17 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			segmentDeliveryPending = delivery.pending > 0 || durableProducerSpool
 		}
 		if shouldCleanupCaptureProducerAttempt(producer != nil, durableProducerSpool, segmentDeliveryPending, captureErr, mediaLagged.Load()) {
-			if removeErr := os.RemoveAll(outDir); removeErr != nil {
+			var removeErr error
+			if producer != nil {
+				if producer.OutputDir != outDir {
+					removeErr = removeCaptureNamespaceSentinel(outDir)
+				} else {
+					removeErr = removeEmptyRetainedDirectory(outDir)
+				}
+			} else {
+				removeErr = os.RemoveAll(outDir)
+			}
+			if removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
 			}
 		}
@@ -896,11 +937,17 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				return
 			}
 			if producer.OutputDir != outDir {
-				if removeErr := os.RemoveAll(producer.OutputDir); removeErr != nil {
+				if removeErr := removeEmptyRetainedDirectory(producer.OutputDir); removeErr != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "retained_temp_cleanup_failed", removeErr)
 				}
 			}
-			if removeErr := os.RemoveAll(outDir); removeErr != nil {
+			var removeErr error
+			if producer.OutputDir != outDir {
+				removeErr = removeCaptureNamespaceSentinel(outDir)
+			} else {
+				removeErr = removeEmptyRetainedDirectory(outDir)
+			}
+			if removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
 			}
 		}
