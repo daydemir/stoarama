@@ -6,18 +6,26 @@ package recordingapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/survey"
+	"golang.org/x/sys/unix"
 )
 
 // UploadTimeout bounds the complete upload of one finalized recording segment.
@@ -59,10 +67,34 @@ type ClientConfig struct {
 
 type Client struct {
 	baseURL   string
+	tokenMu   sync.RWMutex
 	nodeToken string
 	httpc     *http.Client
 	api       *apihttp.Client
 	uploads   *apihttp.Client
+}
+
+func (c *Client) SetNodeToken(token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return fmt.Errorf("missing NodeToken")
+	}
+	if err := c.api.SetToken(token); err != nil {
+		return err
+	}
+	if err := c.uploads.SetToken(token); err != nil {
+		return err
+	}
+	c.tokenMu.Lock()
+	c.nodeToken = token
+	c.tokenMu.Unlock()
+	return nil
+}
+
+func (c *Client) nodeBearer() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.nodeToken
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -278,6 +310,30 @@ type CaptureSetPlan struct {
 	ExpiresAt               time.Time `json:"expires_at"`
 }
 
+type ClaimSuccessor struct {
+	ProposalID            string `json:"proposal_id"`
+	NodeID                int64  `json:"node_id"`
+	PredecessorGeneration int64  `json:"predecessor_generation"`
+	SuccessorGeneration   int64  `json:"successor_generation"`
+	SuccessorTokenID      int64  `json:"successor_token_id"`
+}
+
+func (c *Client) ProposeClaimSuccessor(ctx context.Context, proposalID, keyPrefix, secretSHA256 string) (ClaimSuccessor, error) {
+	var out ClaimSuccessor
+	err := c.postJSONWithHeaders(ctx, "/api/v1/recording/claim-successor/propose", map[string]any{
+		"proposal_id": proposalID, "key_prefix": keyPrefix, "secret_sha256": secretSHA256,
+	}, nil, &out)
+	return out, err
+}
+
+func (c *Client) AckClaimSuccessor(ctx context.Context, proposalID, successorToken string) (bool, error) {
+	var out struct {
+		PredecessorRetired bool `json:"predecessor_retired"`
+	}
+	err := c.postJSONWithHeaders(ctx, "/api/v1/recording/claim-successor/"+url.PathEscape(proposalID)+"/ack", map[string]any{}, map[string]string{"Authorization": "Bearer " + strings.TrimSpace(successorToken)}, &out)
+	return out.PredecessorRetired, err
+}
+
 func (c *Client) PlanCaptureSet(ctx context.Context, jobID int64, leaseToken, planID, setID, producerID string, captureOrdinal, firstCaptureSequence int64) (CaptureSetPlan, error) {
 	var out CaptureSetPlan
 	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-set-plans", jobID), map[string]any{
@@ -300,8 +356,122 @@ type CaptureArtifactMaterialization struct {
 	Proof                []string `json:"proof"`
 }
 
+type CaptureStopAckMember struct {
+	Ordinal              int      `json:"ordinal"`
+	ArtifactID           string   `json:"artifact_id"`
+	CaptureSequence      int64    `json:"capture_sequence"`
+	RecoverySecretSHA256 string   `json:"recovery_secret_sha256"`
+	Proof                []string `json:"proof"`
+	Device               uint64   `json:"device"`
+	Inode                uint64   `json:"inode"`
+	RelativeName         string   `json:"relative_name"`
+}
+
+type CaptureStopAck struct {
+	AckID                   string                 `json:"ack_id"`
+	InventorySHA256         string                 `json:"inventory_sha256"`
+	RetainedDirectoryDevice uint64                 `json:"retained_directory_device"`
+	RetainedDirectoryInode  uint64                 `json:"retained_directory_inode"`
+	Members                 []CaptureStopAckMember `json:"members"`
+}
+
+func CaptureStopInventorySHA(ack CaptureStopAck) (string, error) {
+	h := sha256.New()
+	_, _ = h.Write([]byte("recording-capture-stop-inventory-v2\n"))
+	write := func(value string) { _, _ = fmt.Fprintf(h, "%d:%s\n", len([]byte(value)), value) }
+	write(strconv.FormatUint(ack.RetainedDirectoryDevice, 10))
+	write(strconv.FormatUint(ack.RetainedDirectoryInode, 10))
+	for _, member := range ack.Members {
+		write(strconv.Itoa(member.Ordinal))
+		write(strings.ToLower(strings.TrimSpace(member.ArtifactID)))
+		write(strconv.FormatInt(member.CaptureSequence, 10))
+		write(strings.ToLower(strings.TrimSpace(member.RecoverySecretSHA256)))
+		proofHash := sha256.New()
+		_, _ = proofHash.Write([]byte("stoarama.recording.capture-artifact-proof.v1\x00"))
+		for _, item := range member.Proof {
+			decoded, err := hex.DecodeString(item)
+			if err != nil || len(decoded) != sha256.Size {
+				return "", fmt.Errorf("invalid capture stop proof")
+			}
+			_, _ = proofHash.Write(decoded)
+		}
+		write(hex.EncodeToString(proofHash.Sum(nil)))
+		write(strconv.FormatUint(member.Device, 10))
+		write(strconv.FormatUint(member.Inode, 10))
+		write(member.RelativeName)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func (c *Client) MaterializeCaptureArtifact(ctx context.Context, jobID int64, leaseToken, setID string, ordinal int, artifact CaptureArtifactMaterialization) error {
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/artifacts/%d/materialize", jobID, url.PathEscape(setID), ordinal), artifact, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) AckCaptureSetStop(ctx context.Context, jobID int64, leaseToken, setID string, ack CaptureStopAck) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/stop-ack", jobID, url.PathEscape(setID)), ack, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) UploadRecoveryArtifact(ctx context.Context, intentID, recoverySecret, sessionID, path string, expectedDevice, expectedInode uint64) error {
+	directory, leaf := filepath.Split(path)
+	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	fileFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fileFD), leaf)
+	if file == nil {
+		_ = unix.Close(fileFD)
+		return fmt.Errorf("open recovery artifact")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	var stat unix.Stat_t
+	statErr := unix.Fstat(fileFD, &stat)
+	if err != nil || statErr != nil || !info.Mode().IsRegular() || stat.Nlink != 1 || info.Size() <= 0 || info.Size() > 32<<20 || expectedDevice == 0 || expectedInode == 0 || uint64(stat.Dev) != expectedDevice || uint64(stat.Ino) != expectedInode {
+		return fmt.Errorf("invalid recovery artifact")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/api/v1/recording/recovery/artifacts/"+url.PathEscape(intentID)+"/upload", file)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = info.Size()
+	request.Header.Set("Content-Type", "video/mp4")
+	request.Header.Set("Authorization", "Bearer "+c.nodeBearer())
+	request.Header.Set("X-Stoarama-Recording-Recovery-Intent", intentID)
+	request.Header.Set("X-Stoarama-Recording-Recovery-Secret", recoverySecret)
+	request.Header.Set("X-Stoarama-Recording-Recovery-Session", sessionID)
+	uploadHTTP := *c.httpc
+	uploadHTTP.Timeout = UploadTimeout
+	response, err := uploadHTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("recovery upload status=%d body=%s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+type CaptureRecoveryReport struct {
+	ReportID        string    `json:"report_id"`
+	ReportType      string    `json:"report_type"`
+	SizeBytes       *int64    `json:"size_bytes,omitempty"`
+	SHA256          string    `json:"sha256,omitempty"`
+	LocalObservedAt time.Time `json:"local_observed_at"`
+}
+
+func (c *Client) ReportRecoveryArtifact(ctx context.Context, intentID, recoverySecret string, report CaptureRecoveryReport) error {
+	headers := map[string]string{
+		"X-Stoarama-Recording-Recovery-Intent": intentID,
+		"X-Stoarama-Recording-Recovery-Secret": recoverySecret,
+	}
+	return c.postJSONWithHeaders(ctx, "/api/v1/recording/recovery/artifacts/"+url.PathEscape(intentID)+"/report", report, headers, nil)
 }
 
 func (c *Client) FinishCaptureSet(ctx context.Context, jobID int64, leaseToken, setID string) error {
@@ -413,6 +583,20 @@ func (c *Client) SealCaptureSetArtifact(ctx context.Context, jobID int64, leaseT
 		"capture_sequence": captureSequence, "segment_start_microseconds": segmentStartMicroseconds,
 		"size_bytes": sizeBytes, "sha256": sha,
 	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) SealCaptureSetArtifactRecovery(ctx context.Context, jobID int64, setID string, ordinal int, artifactID, recoverySecret, producerID string, captureSequence, segmentStartMicroseconds, sizeBytes int64, sha string) (ClipUploadIntent, error) {
+	var out ClipUploadIntent
+	headers := map[string]string{
+		"X-Stoarama-Recording-Recovery-Intent": artifactID,
+		"X-Stoarama-Recording-Recovery-Secret": recoverySecret,
+	}
+	err := c.postJSONWithHeaders(ctx, "/api/v1/recording/upload-intents/"+url.PathEscape(artifactID)+"/seal", map[string]any{
+		"job_id": jobID, "producer_id": producerID, "capture_sequence": captureSequence,
+		"segment_start_microseconds": segmentStartMicroseconds, "size_bytes": sizeBytes, "sha256": strings.ToLower(strings.TrimSpace(sha)),
+		"set_id": setID, "ordinal": ordinal,
+	}, headers, &out)
 	return out, err
 }
 

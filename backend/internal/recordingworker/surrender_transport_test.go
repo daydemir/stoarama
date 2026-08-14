@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,6 +80,107 @@ func TestCaptureProducerReservationResponseLossReplaysSameDurableIdentity(t *tes
 	defer mu.Unlock()
 	if calls != 2 || len(producerIDs) != 2 || producerIDs[0] == "" || producerIDs[0] != producerIDs[1] || got.ProducerID != producerIDs[0] {
 		t.Fatalf("calls=%d ids=%v got=%+v", calls, producerIDs, got)
+	}
+}
+
+func TestSurrenderTransportRequiresExplicitNonTemporaryDurableRoot(t *testing.T) {
+	for _, root := range []string{"", os.TempDir(), filepath.Join(os.TempDir(), "stoarama-manual-worker")} {
+		worker := &Worker{cfg: Config{CaptureTempDir: root}}
+		if worker.surrenderTransportEnabled() {
+			t.Fatalf("temporary capture root advertised v1: %q", root)
+		}
+	}
+	worker := &Worker{cfg: Config{CaptureTempDir: filepath.Join(string(os.PathSeparator), "var", "lib", "stoarama-capture")}}
+	if !worker.surrenderTransportEnabled() {
+		t.Fatal("explicit private non-system-temp root did not advertise v1")
+	}
+}
+
+func TestCaptureTimestampUsesExactTruncatedMicroseconds(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0).UTC()
+	for _, nanos := range []int{499_000, 500_000, 999_000} {
+		got := captureUnixMicro(base.Add(time.Duration(nanos)))
+		want := base.Unix()*int64(time.Second/time.Microsecond) + int64(time.Duration(nanos)/time.Microsecond)
+		if got != want {
+			t.Fatalf("nanoseconds=%d microseconds=%d want=%d", nanos, got, want)
+		}
+	}
+}
+
+func durableSurrenderTestRoot(t *testing.T) string {
+	t.Helper()
+	root, err := os.MkdirTemp(".", ".surrender-transport-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
+}
+
+func TestRetainedArtifactCleanupRejectsPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "seg-20260814-120000.mp4")
+	if err := os.WriteFile(path, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := infoSyscallStat(info)
+	if !ok {
+		t.Fatal("missing retained artifact identity")
+	}
+	original := path + ".original"
+	if err = os.Rename(path, original); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = removeRetainedArtifact(path, uint64(stat.Dev), uint64(stat.Ino)); err == nil {
+		t.Fatal("path replacement was deleted")
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "replacement" {
+		t.Fatalf("replacement changed: body=%q err=%v", body, readErr)
+	}
+}
+
+func TestRetainedArtifactOpenRejectsSymlinkAndAdditionalHardlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "seg-20260814-120000.mp4.target")
+	if err := os.WriteFile(target, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := infoSyscallStat(info)
+	if !ok {
+		t.Fatal("missing retained artifact identity")
+	}
+	symlink := filepath.Join(root, "seg-20260814-120000.mp4")
+	if err = os.Symlink(target, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if file, _, openErr := openRetainedArtifact(symlink, uint64(stat.Dev), uint64(stat.Ino)); openErr == nil {
+		_ = file.Close()
+		t.Fatal("symlink artifact opened")
+	}
+	if err = os.Remove(symlink); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Link(target, symlink); err != nil {
+		t.Fatal(err)
+	}
+	if file, _, openErr := openRetainedArtifact(symlink, uint64(stat.Dev), uint64(stat.Ino)); openErr == nil {
+		_ = file.Close()
+		t.Fatal("multiply-linked artifact opened")
 	}
 }
 
@@ -631,7 +733,7 @@ func TestSurrenderTransportObservationJournalIsBoundedAndFlushesExactly(t *testi
 }
 
 func TestRunRegistersRecoveryJournalBeforeFirstLeasePoll(t *testing.T) {
-	root := t.TempDir()
+	root := durableSurrenderTestRoot(t)
 	journalRoot := filepath.Join(root, ".stoarama-surrender-v1")
 	secret := strings.Repeat("1a", 32)
 	secretBytes, err := hex.DecodeString(secret)
@@ -702,7 +804,7 @@ func TestRunRegistersRecoveryJournalBeforeFirstLeasePoll(t *testing.T) {
 }
 
 func TestRunFailsClosedBeforeLeasePollOnMixedCorruptRecoveryInventory(t *testing.T) {
-	root := t.TempDir()
+	root := durableSurrenderTestRoot(t)
 	journalRoot := filepath.Join(root, ".stoarama-surrender-v1")
 	secretBytes := bytes.Repeat([]byte{0x2a}, 32)
 	secretHash := sha256.Sum256(secretBytes)
@@ -734,6 +836,39 @@ func TestRunFailsClosedBeforeLeasePollOnMixedCorruptRecoveryInventory(t *testing
 		t.Fatal(err)
 	}
 	if err = worker.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "validate surrender recovery inventory") {
+		t.Fatalf("Run error=%v", err)
+	}
+	if leaseCalls.Load() != 0 {
+		t.Fatalf("lease calls=%d", leaseCalls.Load())
+	}
+}
+
+func TestRunFailsClosedBeforeLeasePollOnCorruptObservationJournal(t *testing.T) {
+	root := durableSurrenderTestRoot(t)
+	journalRoot := filepath.Join(root, ".stoarama-surrender-v1")
+	if err := ensurePrivateSurrenderJournalRoot(journalRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(surrenderTransportObservationPath(journalRoot), []byte("{\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var leaseCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/recording/jobs/lease" {
+			leaseCalls.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root, SkipDropletHeartbeat: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "validate surrender observation journal") {
 		t.Fatalf("Run error=%v", err)
 	}
 	if leaseCalls.Load() != 0 {
@@ -883,6 +1018,238 @@ func TestSurrenderTransportKeepsLeaseHeartbeatUntilCommit(t *testing.T) {
 	defer mu.Unlock()
 	if surrenders != 2 || heartbeats < 3 || jobCtx.Err() == nil {
 		t.Fatalf("surrenders=%d heartbeats=%d context=%v", surrenders, heartbeats, jobCtx.Err())
+	}
+}
+
+func TestSurrenderTransportFourJobBurstRetainsEveryLeaseUntilCommit(t *testing.T) {
+	var mu sync.Mutex
+	surrenders := map[int64]int{}
+	heartbeats := map[int64]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 2 {
+			http.NotFound(w, r)
+			return
+		}
+		jobID, _ := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+		switch parts[len(parts)-1] {
+		case "heartbeat":
+			mu.Lock()
+			heartbeats[jobID]++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"cancel": false, "lease_expires_at": time.Now().Add(time.Minute)})
+		case "surrender":
+			mu.Lock()
+			surrenders[jobID]++
+			attempt := surrenders[jobID]
+			mu.Unlock()
+			if attempt == 1 {
+				http.Error(w, "temporary transport failure", http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": "committed", "current_head_version": 0, "handoff_until": time.Now(), "next_retry_at": time.Now(), "had_clips": false, "alternate_available": true})
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "relay", CaptureTempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.heartbeatInt = 20 * time.Millisecond
+	done := make(chan error, 4)
+	for index := range 4 {
+		job := recordingapi.RecordingJob{JobID: int64(100 + index), LeaseToken: uuid.NewString(), SurrenderTransportVersion: 1, LeaseExpiresAt: time.Now().Add(time.Minute)}
+		go func() {
+			jobCtx, cancel := context.WithCancel(context.Background())
+			_ = worker.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+			if !worker.surrenderContinuousJobForReason(jobCtx, cancel, job, recordingapi.SurrenderNoProgress, errors.New("no progress")) {
+				done <- errors.New("surrender did not commit")
+				return
+			}
+			if jobCtx.Err() == nil {
+				done <- errors.New("committed surrender retained job context")
+				return
+			}
+			done <- nil
+		}()
+	}
+	for range 4 {
+		if err = <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for index := range 4 {
+		jobID := int64(100 + index)
+		if surrenders[jobID] != 2 || heartbeats[jobID] < 2 {
+			t.Fatalf("job=%d surrender_calls=%d heartbeats=%d", jobID, surrenders[jobID], heartbeats[jobID])
+		}
+	}
+}
+
+func TestClaimSuccessorStateRestoresBearerBeforeAnyWorkerRequest(t *testing.T) {
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "stale-bootstrap-token", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	worker, err := NewWorker(Config{Client: client, WorkerID: "relay", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := "sin_" + strings.Repeat("x", 48)
+	digest := sha256.Sum256([]byte(raw))
+	state := claimSuccessorState{
+		CurrentRawToken: raw, CurrentKeyPrefix: raw[:16],
+		CurrentSecretSHA: hex.EncodeToString(digest[:]),
+	}
+	if err = persistClaimSuccessorState(worker.surrenderJournalRoot(), state); err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.restoreClaimCredential(); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.TouchDroplet(context.Background(), "build"); err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "Bearer "+raw {
+		t.Fatalf("authorization=%q", authorization)
+	}
+	if err = os.Chmod(claimSuccessorStatePath(worker.surrenderJournalRoot()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = loadClaimSuccessorState(worker.surrenderJournalRoot()); err == nil {
+		t.Fatal("world-readable successor credential was accepted")
+	}
+}
+
+func TestEnabledClaimSuccessorReplaysAcknowledgmentWithSuccessorBearer(t *testing.T) {
+	var authorization, path, touchAuthorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/claim-successor/") {
+			authorization = r.Header.Get("Authorization")
+			path = r.URL.Path
+			_ = json.NewEncoder(w).Encode(map[string]any{"predecessor_retired": false})
+			return
+		}
+		touchAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "retiring-predecessor", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "relay", CaptureTempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := "sin_" + strings.Repeat("y", 48)
+	digest := sha256.Sum256([]byte(raw))
+	state := claimSuccessorState{
+		ProposalID: uuid.NewString(), RawToken: raw, KeyPrefix: raw[:16],
+		SecretSHA: hex.EncodeToString(digest[:]), Enabled: true,
+	}
+	if err = persistClaimSuccessorState(worker.surrenderJournalRoot(), state); err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.maybeRotateClaimCredential(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "Bearer "+raw || !strings.HasSuffix(path, "/recording/claim-successor/"+state.ProposalID+"/ack") {
+		t.Fatalf("authorization=%q path=%q", authorization, path)
+	}
+	if err = client.TouchDroplet(context.Background(), "build"); err != nil {
+		t.Fatal(err)
+	}
+	if touchAuthorization != "Bearer retiring-predecessor" {
+		t.Fatalf("unrelated predecessor fences lost their ordinary bearer: %q", touchAuthorization)
+	}
+	if _, err = os.Stat(claimSuccessorStatePath(worker.surrenderJournalRoot())); err != nil {
+		t.Fatalf("pending predecessor retirement lost successor state: %v", err)
+	}
+}
+
+func TestEnabledClaimSuccessorRetirementPersistsCurrentForNextGeneration(t *testing.T) {
+	var authorization, path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		path = r.URL.Path
+		_ = json.NewEncoder(w).Encode(map[string]any{"predecessor_retired": true})
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "retiring-predecessor", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "relay", CaptureTempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := "sin_" + strings.Repeat("z", 48)
+	digest := sha256.Sum256([]byte(raw))
+	state := claimSuccessorState{
+		ProposalID: uuid.NewString(), RawToken: raw, KeyPrefix: raw[:16],
+		SecretSHA: hex.EncodeToString(digest[:]), Enabled: true,
+	}
+	if err = persistClaimSuccessorState(worker.surrenderJournalRoot(), state); err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.maybeRotateClaimCredential(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "Bearer "+raw || !strings.HasSuffix(path, "/recording/claim-successor/"+state.ProposalID+"/ack") {
+		t.Fatalf("authorization=%q path=%q", authorization, path)
+	}
+	persisted, err := loadClaimSuccessorState(worker.surrenderJournalRoot())
+	if err != nil || persisted == nil || persisted.CurrentRawToken != raw || persisted.ProposalID != "" || persisted.Enabled {
+		t.Fatalf("retired predecessor did not become durable current credential: state=%+v err=%v", persisted, err)
+	}
+}
+
+func TestUnacknowledgedClaimSuccessorNeverReplacesBootstrapBearer(t *testing.T) {
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "bootstrap-predecessor", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "relay", CaptureTempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := newClaimSuccessorState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = persistClaimSuccessorState(worker.surrenderJournalRoot(), pending); err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.restoreClaimCredential(); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.TouchDroplet(context.Background(), "build"); err != nil {
+		t.Fatal(err)
+	}
+	if authorization != "Bearer bootstrap-predecessor" {
+		t.Fatalf("unacknowledged successor replaced bootstrap bearer: %q", authorization)
 	}
 }
 

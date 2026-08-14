@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -167,6 +168,29 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
 	return cleanETag(aws.ToString(out.ETag)), nil
+}
+
+// Copy promotes an already-verified quarantine object to its immutable final
+// key without routing bytes back through the API process.
+func (c *Client) Copy(ctx context.Context, sourceKey, destinationKey, contentType string) (string, error) {
+	source := url.PathEscape(c.bucket + "/" + strings.TrimPrefix(sourceKey, "/"))
+	in := &s3.CopyObjectInput{
+		Bucket:     aws.String(c.bucket),
+		Key:        aws.String(destinationKey),
+		CopySource: aws.String(source),
+	}
+	if contentType != "" {
+		in.ContentType = aws.String(contentType)
+		in.MetadataDirective = types.MetadataDirectiveReplace
+	}
+	out, err := c.s3.CopyObject(ctx, in)
+	if err != nil {
+		return "", fmt.Errorf("copy object %s to %s: %w", sourceKey, destinationKey, err)
+	}
+	if out.CopyObjectResult == nil {
+		return "", fmt.Errorf("copy object %s to %s returned no result", sourceKey, destinationKey)
+	}
+	return cleanETag(aws.ToString(out.CopyObjectResult.ETag)), nil
 }
 
 // PutMultipart uploads body to key using S3 multipart upload with a bounded

@@ -45,14 +45,23 @@ const dropletHasCaptureAuthoritySQL = `
 	  SELECT 1
 	  FROM recording_job_recovery_grants grant_row
 	  JOIN recording_capture_producers producer ON producer.id=grant_row.producer_id
-	  WHERE producer.worker_id=$1 AND grant_row.revoked_at IS NULL
+	  WHERE producer.worker_id=$1
 	    AND grant_row.upload_grace_until>transaction_timestamp()
+	    AND NOT EXISTS(SELECT 1 FROM recording_job_recovery_grant_results grant_result WHERE grant_result.grant_id=grant_row.id)
 	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
 	  UNION ALL
 	  SELECT 1
 	  FROM recording_capture_producers producer
 	  WHERE producer.worker_id=$1
 	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+	  UNION ALL
+	  SELECT 1
+	  FROM recording_capture_reservation_sets capture_set
+	  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+	  JOIN recording_job_lease_generations generation
+	    ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
+	  WHERE generation.lease_owner=$1
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
 	)
 `
 
@@ -175,15 +184,74 @@ func (s *Store) MintNodeToken(ctx context.Context, operatorAccountID int64, name
 // decommissioned droplet's credential can never be reused (S-6). Both ids may be
 // nil for a droplet that failed before its token was minted.
 func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Credential teardown is an exclusive claim-authority transition. Existing
+	// leases and recovery uploads hold the shared fence, so a provider-loss or
+	// ordinary scale-down cannot revoke the credential underneath either path.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return fmt.Errorf("lock recorder token retirement: %w", err)
+	}
 	if nodeTokenID != nil {
-		if _, err := s.pool.Exec(ctx, `UPDATE node_tokens SET revoked_at=COALESCE(revoked_at, now()), updated_at=now() WHERE id=$1`, *nodeTokenID); err != nil {
-			return fmt.Errorf("revoke node token: %w", err)
+		var tokenNode, generation int64
+		var revoked bool
+		if err = tx.QueryRow(ctx, `
+			SELECT node_id,COALESCE(recording_claim_generation,0),revoked_at IS NOT NULL
+			FROM node_tokens WHERE id=$1 FOR UPDATE
+		`, *nodeTokenID).Scan(&tokenNode, &generation, &revoked); err != nil {
+			return fmt.Errorf("load recorder token retirement: %w", err)
+		}
+		if nodeID == nil || tokenNode != *nodeID {
+			return fmt.Errorf("recorder token/node retirement identity differs")
+		}
+		if !revoked {
+			var busy bool
+			if err = tx.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM recording_jobs job
+				WHERE job.lease_node_token_id=$1 AND job.status='leased'
+				UNION ALL
+				SELECT 1 FROM recording_capture_producers producer
+				WHERE producer.node_id=$2
+				  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+				UNION ALL
+				SELECT 1 FROM recording_capture_set_grants grant
+				JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+				JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+				JOIN recording_job_lease_generations lease
+				  ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
+				WHERE lease.node_id=$2 AND plan.origin_claim_generation=$3
+				  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
+			)`, *nodeTokenID, tokenNode, generation).Scan(&busy); err != nil {
+				return fmt.Errorf("prove recorder token drained: %w", err)
+			}
+			if busy {
+				return fmt.Errorf("recorder token still owns capture authority")
+			}
+			if _, err = tx.Exec(ctx, `
+				UPDATE node_tokens SET revoked_at=transaction_timestamp(),updated_at=transaction_timestamp() WHERE id=$1;
+				INSERT INTO recording_worker_claim_generation_events
+				  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+				VALUES($2,$3,CASE WHEN $3=1 THEN NULL ELSE $3-1 END,$1,'host_lost',
+				  encode(sha256(convert_to('recording-worker-host-lost-v1'||chr(0)||$2::text||chr(0)||$3::text||chr(0)||$1::text,'UTF8')),'hex'));
+				INSERT INTO recording_worker_claim_generation_events
+				  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+				VALUES($2,$3,CASE WHEN $3=1 THEN NULL ELSE $3-1 END,$1,'retired',
+				  encode(sha256(convert_to('recording-worker-claim-retired-v1'||chr(0)||$2::text||chr(0)||$3::text||chr(0)||$1::text,'UTF8')),'hex'))
+			`, *nodeTokenID, tokenNode, generation); err != nil {
+				return fmt.Errorf("seal recorder token retirement: %w", err)
+			}
 		}
 	}
 	if nodeID != nil {
-		if _, err := s.pool.Exec(ctx, `UPDATE nodes SET status='disabled', updated_at=now() WHERE id=$1`, *nodeID); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE nodes SET status='disabled', updated_at=transaction_timestamp() WHERE id=$1`, *nodeID); err != nil {
 			return fmt.Errorf("disable recorder node: %w", err)
 		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit recorder token retirement: %w", err)
 	}
 	return nil
 }
@@ -337,17 +405,7 @@ func (s *Store) BeginForcedDestroyAfterDrainTimeout(ctx context.Context, id int6
 		return false, nil
 	}
 	var recoveryBusy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(
-		SELECT 1 FROM recording_job_recovery_grants grant_row
-		JOIN recording_capture_producers producer ON producer.id=grant_row.producer_id
-		WHERE producer.worker_id=$1 AND grant_row.revoked_at IS NULL
-		  AND grant_row.upload_grace_until>transaction_timestamp()
-		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
-		UNION ALL
-		SELECT 1 FROM recording_capture_producers producer
-		WHERE producer.worker_id=$1
-		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
-	)`, name).Scan(&recoveryBusy); err != nil {
+	if err := tx.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&recoveryBusy); err != nil {
 		return false, err
 	}
 	if recoveryBusy {

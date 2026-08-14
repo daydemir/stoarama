@@ -113,8 +113,9 @@ jobs:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: |
           set -o pipefail
-          go test ./internal/api -run '^TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery$' -count=1 -json | tee /tmp/surrender-transport-pg.json
+          go test ./internal/api -run '^TestRecordingSurrenderTransport(PostgresLifecycleAndExpiryRecovery|R10PostgresAuthorityAndRaces)$' -count=1 -json | tee /tmp/surrender-transport-pg.json
           grep -F '"Action":"pass"' /tmp/surrender-transport-pg.json | grep -F '"Test":"TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery"'
+          grep -F '"Action":"pass"' /tmp/surrender-transport-pg.json | grep -F '"Test":"TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces"'
       - name: Test provisioning teardown lease safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

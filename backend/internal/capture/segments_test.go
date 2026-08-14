@@ -817,6 +817,85 @@ func TestCaptureContinuousStopsAliveStalledChild(t *testing.T) {
 	}
 }
 
+func TestFiniteCaptureStopBarrierSealsNamespaceBeforeContinue(t *testing.T) {
+	temp := t.TempDir()
+	installTimestampProbeFixture(t, temp)
+	ffmpeg := filepath.Join(temp, "ffmpeg")
+	script := `#!/bin/sh
+for last do :; done
+out=${last%/*}
+printf current > "$out/seg-20260814-120000.mp4"
+trap 'printf late > "$out/seg-20260814-120005.mp4" 2>/dev/null; exit 0' INT TERM
+while :; do sleep 0.05; done
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", ffmpeg)
+	output := filepath.Join(temp, "output")
+	if err := os.Mkdir(output, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := surrenderplan.Build(time.Now().UTC(), time.Now().UTC().Add(10*time.Second), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	barrierEntered := make(chan struct{})
+	retained := output + ".retained"
+	barrier := func(_ context.Context, path string) (string, error) {
+		close(barrierEntered)
+		if err := os.Rename(path, retained); err != nil {
+			return "", err
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0)
+		if err != nil {
+			return "", err
+		}
+		if err = file.Close(); err != nil {
+			return "", err
+		}
+		return retained, nil
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- CaptureContinuousWithFinitePlanAndStop(
+			context.Background(), "https://example.com/live.m3u8", 5*time.Second, "", nil, output,
+			func(Segment) error { return nil }, "", false, plan, stop, barrier,
+		)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(output, "seg-20260814-120000.mp4")); err == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("fake ffmpeg did not create initial leaf")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stop)
+	select {
+	case <-barrierEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop barrier was not entered")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrContinuousStopRequired) {
+			t.Fatalf("capture error=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopped capture did not reap")
+	}
+	if info, err := os.Lstat(output); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("old output namespace is not a sentinel: info=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(retained, "seg-20260814-120005.mp4")); !os.IsNotExist(err) {
+		t.Fatalf("continued child created a post-ACK leaf: %v", err)
+	}
+}
+
 func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
 	temp := t.TempDir()
 	installTimestampProbeFixture(t, temp)

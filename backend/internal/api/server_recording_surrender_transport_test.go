@@ -6,18 +6,120 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type fakeRecordingRecoveryObjectStore struct {
+	mu          sync.Mutex
+	objects     map[string][]byte
+	copyStarted chan struct{}
+	copyGate    chan struct{}
+}
+
+func (f *fakeRecordingRecoveryObjectStore) PutReader(_ context.Context, key, _ string, body io.Reader) (string, error) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.objects[key] = data
+	return "quarantine-etag", nil
+}
+
+func (f *fakeRecordingRecoveryObjectStore) Copy(ctx context.Context, sourceKey, destinationKey, _ string) (string, error) {
+	if f.copyStarted != nil {
+		select {
+		case f.copyStarted <- struct{}{}:
+		default:
+		}
+	}
+	if f.copyGate != nil {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-f.copyGate:
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	data, ok := f.objects[sourceKey]
+	if !ok {
+		return "", errors.New("quarantine object is absent")
+	}
+	f.objects[destinationKey] = append([]byte(nil), data...)
+	return "promoted-etag", nil
+}
+
+func (f *fakeRecordingRecoveryObjectStore) DeleteObjects(_ context.Context, keys []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, key := range keys {
+		delete(f.objects, key)
+	}
+	return nil
+}
+
+func TestRecoveryUploadFailureClassificationPreservesRetryTruth(t *testing.T) {
+	expectedSHA := strings.Repeat("a", 64)
+	for _, test := range []struct {
+		name     string
+		err      error
+		observed int64
+		sha      string
+		want     string
+	}{
+		{name: "deadline", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "disconnect", err: io.ErrUnexpectedEOF, observed: 2, want: "disconnect"},
+		{name: "slow", err: errors.New("recovery upload fell below minimum rate"), observed: 2, want: "slow"},
+		{name: "ambiguous after all bytes", err: errors.New("connection reset after response"), observed: 8, sha: expectedSHA, want: "response_ambiguous"},
+		{name: "storage rejection", err: errors.New("503"), observed: 2, want: "storage_5xx"},
+		{name: "verified transport but wrong bytes", observed: 8, sha: strings.Repeat("b", 64), want: "hash_mismatch"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := recoveryUploadFailureResult(test.err, test.observed, 8, test.sha, expectedSHA); got != test.want {
+				t.Fatalf("result=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRecordingRecoveryProxyRejectsUnboundedBodiesBeforeStorage(t *testing.T) {
+	intentID := uuid.New()
+	recovery := recordingRecoveryPrincipal{Authority: "capture_set", IntentID: intentID}
+	for _, contentLength := range []int64{-1, 0, surrenderplan.RecoveryArtifactMaxBytes + 1} {
+		request := httptest.NewRequest(http.MethodPut, "/", bytes.NewReader([]byte("x")))
+		request.ContentLength = contentLength
+		request.Header.Set(recordingRecoverySessionHeader, uuid.NewString())
+		request = request.WithContext(context.WithValue(request.Context(), recordingRecoveryContextKey{}, recovery))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("intentId", intentID.String())
+		request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
+		response := httptest.NewRecorder()
+		(&Server{}).handleRecordingRecoveryProxyUpload(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("content_length=%d status=%d body=%s", contentLength, response.Code, response.Body.String())
+		}
+	}
+}
 
 func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testing.T) {
 	pool, cleanup := testPresentationV2Pool(t)
@@ -28,6 +130,7 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	cloudLease := uuid.New()
 	if _, err := pool.Exec(ctx, `
 		UPDATE nodes SET node_type='local_recorder',display_name='cloud-recovery' WHERE id=$1;
+		INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'cloud-recovery-r10',repeat('5',64));
 		INSERT INTO recorder_droplets(name,node_id,state,capacity,last_seen_at)
 		VALUES('cloud-recovery',$1,'active',1,transaction_timestamp());
 		UPDATE recordings SET capture_via='cloud' WHERE id=$2;
@@ -78,6 +181,30 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	if len(sourceSnapshot) != 64 || len(configSnapshot) != 64 {
 		t.Fatalf("source=%q config=%q", sourceSnapshot, configSnapshot)
 	}
+	canonicalHashes := func(timezone, dateStyle string) (string, string) {
+		t.Helper()
+		conn, acquireErr := pool.Acquire(ctx)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		defer conn.Release()
+		if _, setErr := conn.Exec(ctx, `SELECT set_config('TimeZone',$1,false),set_config('DateStyle',$2,false)`, timezone, dateStyle); setErr != nil {
+			t.Fatal(setErr)
+		}
+		var sourceHash, configHash string
+		if queryErr := conn.QueryRow(ctx, `
+			SELECT encode(sha256(convert_to(recording_surrender_source_snapshot($1)::text,'UTF8')),'hex'),
+			       encode(sha256(convert_to(recording_surrender_capture_config_snapshot($1,$2,$3)::text,'UTF8')),'hex')
+		`, cloud.recordingID, cloud.jobID, cloudLease).Scan(&sourceHash, &configHash); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		return sourceHash, configHash
+	}
+	utcSource, utcConfig := canonicalHashes("UTC", "ISO, MDY")
+	localSource, localConfig := canonicalHashes("Pacific/Auckland", "SQL, DMY")
+	if utcSource != sourceSnapshot || utcConfig != configSnapshot || localSource != utcSource || localConfig != utcConfig {
+		t.Fatalf("canonical snapshot digests changed with session settings: stored=(%s,%s) utc=(%s,%s) local=(%s,%s)", sourceSnapshot, configSnapshot, utcSource, utcConfig, localSource, localConfig)
+	}
 
 	intentIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	secrets := []string{strings.Repeat("1a", 32), strings.Repeat("2b", 32), strings.Repeat("3c", 32), strings.Repeat("4d", 32)}
@@ -113,6 +240,15 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	}
 	acceptV1Artifact(t, pool, cloud, cloudLease, producerID, intentIDs[0], 5, strings.Repeat("b", 64))
 	acceptV1Artifact(t, pool, cloud, cloudLease, producerID, intentIDs[1], 6, strings.Repeat("b", 64))
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET surrender_transport_version=0 WHERE capture_lease_token=$1 AND capture_sequence=5`, cloudLease); err == nil {
+		t.Fatal("v1 clip transport provenance was mutable")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET sha256=repeat('c',64) WHERE capture_lease_token=$1 AND capture_sequence=5`, cloudLease); err == nil {
+		t.Fatal("v1 clip artifact identity was mutable")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=transaction_timestamp()+interval '1 hour' WHERE capture_lease_token=$1 AND capture_sequence=5`, cloudLease); err == nil {
+		t.Fatal("v1 clip purge time was caller-authored")
+	}
 	if response := callTransportObservation(t, server, cloud, "cloud-recovery", cloudLease, observationID, observationAttempt, observationSHA, observationAt); response.Code != http.StatusNoContent {
 		t.Fatalf("transport observation replay=%d body=%s", response.Code, response.Body.String())
 	}
@@ -263,7 +399,6 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	// every callable authority/helper while leaving trigger execution intact.
 	for _, signature := range []string{
 		"recording_surrender_reclaim_expired()",
-		"recording_surrender_revoke_recovery_grant(uuid,text)",
 		"recording_surrender_request_sha(uuid,text,text,bigint,uuid,bigint,integer,bigint,integer)",
 	} {
 		var publicCanExecute bool
@@ -302,7 +437,11 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	if _, err = pool.Exec(ctx, `UPDATE nodes SET node_type='relay',display_name='relay-recovery' WHERE id=$1; UPDATE recordings SET capture_via='relay' WHERE id=$2; UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3`, relay.nodeID, relay.recordingID, relay.jobID); err != nil {
 		t.Fatal(err)
 	}
-	relayLease, err := server.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: relay.nodeID, AccountID: relay.accountID, NodeType: nodeTypeRelay}, true, 150, true)
+	var relayTokenID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'relay-r10',repeat('3',64)) RETURNING id`, relay.nodeID).Scan(&relayTokenID); err != nil {
+		t.Fatal(err)
+	}
+	relayLease, err := server.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: relay.nodeID, AccountID: relay.accountID, NodeType: nodeTypeRelay, NodeTokenID: relayTokenID}, true, 150, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +462,11 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	if _, err = pool.Exec(ctx, `UPDATE nodes SET node_type='relay',display_name='relay-expiry' WHERE id=$1; UPDATE recordings SET capture_via='relay' WHERE id=$2; UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3`, relayExpiry.nodeID, relayExpiry.recordingID, relayExpiry.jobID); err != nil {
 		t.Fatal(err)
 	}
-	relayExpiredLease, err := server.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: relayExpiry.nodeID, AccountID: relayExpiry.accountID, NodeType: nodeTypeRelay}, true, 150, true)
+	var relayExpiryTokenID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'relay-expiry-r10',repeat('4',64)) RETURNING id`, relayExpiry.nodeID).Scan(&relayExpiryTokenID); err != nil {
+		t.Fatal(err)
+	}
+	relayExpiredLease, err := server.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: relayExpiry.nodeID, AccountID: relayExpiry.accountID, NodeType: nodeTypeRelay, NodeTokenID: relayExpiryTokenID}, true, 150, true)
 	if err != nil || relayExpiredLease.LeaseToken == nil {
 		t.Fatalf("relay expiry lease=%+v err=%v", relayExpiredLease, err)
 	}
@@ -341,7 +484,7 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	if relayAlternate || !relayHandoff.Equal(relayReclaimed) {
 		t.Fatalf("relay alternate=%v handoff=%s reclaimed=%s", relayAlternate, relayHandoff, relayReclaimed)
 	}
-	relayReclaimedLease, err := server.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: relayExpiry.nodeID, AccountID: relayExpiry.accountID, NodeType: nodeTypeRelay}, true, 150, true)
+	relayReclaimedLease, err := server.leaseRelayRecordingJob(ctx, nodePrincipal{NodeID: relayExpiry.nodeID, AccountID: relayExpiry.accountID, NodeType: nodeTypeRelay, NodeTokenID: relayExpiryTokenID}, true, 150, true)
 	if err != nil || relayReclaimedLease.JobID != relayExpiry.jobID || relayReclaimedLease.LeaseToken == nil || *relayReclaimedLease.LeaseToken == *relayExpiredLease.LeaseToken {
 		t.Fatalf("relay same-owner recovery lease=%+v err=%v", relayReclaimedLease, err)
 	}
@@ -367,6 +510,484 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 
 	if _, err = pool.Exec(ctx, `TRUNCATE recording_capture_artifact_intents`); err == nil {
 		t.Fatal("artifact intent authority was truncatable")
+	}
+}
+
+func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
+	pool, cleanup := testPresentationV2Pool(t)
+	defer cleanup()
+	ctx := context.Background()
+	fixture := seedPresentationV2Task(t, pool, 92001, 992001)
+	if _, err := pool.Exec(ctx, `
+		UPDATE nodes SET node_type='relay',display_name='r10-relay' WHERE id=$1;
+		UPDATE recordings SET capture_via='relay' WHERE id=$2;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,
+		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3
+	`, fixture.nodeID, fixture.recordingID, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+	var frozenSourceRevisionID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO stream_source_revisions(stream_id,actor,reason,previous_source_url,new_source_url)
+		SELECT id,'test','r10_frozen_baseline',source_url,source_url FROM streams WHERE id=$1
+		RETURNING id
+	`, fixture.streamID).Scan(&frozenSourceRevisionID); err != nil {
+		t.Fatal(err)
+	}
+	var oldTokenID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-old',repeat('6',64)) RETURNING id`, fixture.nodeID).Scan(&oldTokenID); err != nil {
+		t.Fatal(err)
+	}
+	secretsCipher, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealedDestinationSecret, err := secretsCipher.Encrypt([]byte("r10-test-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE storage_destinations SET access_key_id='r10-test-access',secret_access_key_enc=$2 WHERE id=$1`, fixture.destinationID, sealedDestinationSecret); err != nil {
+		t.Fatal(err)
+	}
+	fakeStore := &fakeRecordingRecoveryObjectStore{objects: make(map[string][]byte)}
+	server := &Server{pool: pool, secrets: secretsCipher, recoveryStorageFactory: func(context.Context, r2.Config) (recordingRecoveryObjectStore, error) {
+		return fakeStore, nil
+	}}
+	// Compact planning takes the same source/claim fence as mutations. A writer
+	// that wins first yields one new canonical plan; a mutation after the plan
+	// makes commitment fail rather than launching with a mixed snapshot.
+	planRace := seedPresentationV2Task(t, pool, 92003, 992003)
+	if _, err = pool.Exec(ctx, `
+		UPDATE nodes SET node_type='relay',display_name='r10-plan-race' WHERE id=$1;
+		UPDATE recordings SET capture_via='relay' WHERE id=$2;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
+		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3
+	`, planRace.nodeID, planRace.recordingID, planRace.jobID); err != nil {
+		t.Fatal(err)
+	}
+	var planRaceTokenID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-plan-race',repeat('4',64)) RETURNING id`, planRace.nodeID).Scan(&planRaceTokenID); err != nil {
+		t.Fatal(err)
+	}
+	planRacePrincipal := nodePrincipal{NodeID: planRace.nodeID, AccountID: planRace.accountID, NodeType: nodeTypeRelay, DisplayName: "r10-plan-race", NodeTokenID: planRaceTokenID}
+	planRaceLease, err := server.leaseRelayRecordingJob(ctx, planRacePrincipal, true, 150, true)
+	if err != nil || planRaceLease.LeaseToken == nil {
+		t.Fatalf("plan race lease=%+v err=%v", planRaceLease, err)
+	}
+	callPlan := func(planID, setID, producerID uuid.UUID) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{"plan_id": planID, "set_id": setID, "producer_id": producerID, "capture_ordinal": 1, "first_capture_sequence": 1})
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		request.Header.Set(recordingLeaseTokenHeader, planRaceLease.LeaseToken.String())
+		request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, planRacePrincipal))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("id", strconv.FormatInt(planRace.jobID, 10))
+		request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
+		response := httptest.NewRecorder()
+		server.handleRecordingCaptureSetPlan(response, request)
+		return response
+	}
+	sourceTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = sourceTx.Exec(ctx, `UPDATE streams SET source_url=source_url||'?writer-first=1' WHERE id=$1`, planRace.streamID); err != nil {
+		t.Fatal(err)
+	}
+	racePlanID, raceSetID, raceProducerID := uuid.New(), uuid.New(), uuid.New()
+	planDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { planDone <- callPlan(racePlanID, raceSetID, raceProducerID) }()
+	select {
+	case response := <-planDone:
+		t.Fatalf("compact plan crossed an uncommitted source mutation: %d %s", response.Code, response.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err = sourceTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	planRaceResponse := <-planDone
+	if planRaceResponse.Code != http.StatusOK {
+		t.Fatalf("compact plan after source commit=%d body=%s", planRaceResponse.Code, planRaceResponse.Body.String())
+	}
+	if _, err = pool.Exec(ctx, `UPDATE streams SET source_url=source_url||'&after-plan=1' WHERE id=$1`, planRace.streamID); err != nil {
+		t.Fatal(err)
+	}
+	commitRaceBody, _ := json.Marshal(map[string]any{"merkle_root_sha256": strings.Repeat("a", 64)})
+	commitRaceRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(commitRaceBody))
+	commitRaceRequest.Header.Set(recordingLeaseTokenHeader, planRaceLease.LeaseToken.String())
+	commitRaceRequest = commitRaceRequest.WithContext(context.WithValue(commitRaceRequest.Context(), nodePrincipalContextKey, planRacePrincipal))
+	commitRaceRoute := chi.NewRouteContext()
+	commitRaceRoute.URLParams.Add("id", strconv.FormatInt(planRace.jobID, 10))
+	commitRaceRoute.URLParams.Add("planId", racePlanID.String())
+	commitRaceRequest = commitRaceRequest.WithContext(context.WithValue(commitRaceRequest.Context(), chi.RouteCtxKey, commitRaceRoute))
+	commitRaceResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetCommit(commitRaceResponse, commitRaceRequest)
+	if commitRaceResponse.Code != http.StatusConflict {
+		t.Fatalf("compact commitment accepted a stale source plan: %d %s", commitRaceResponse.Code, commitRaceResponse.Body.String())
+	}
+	principal := nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeRelay, DisplayName: "r10-relay", NodeTokenID: oldTokenID}
+	lease, err := server.leaseRelayRecordingJob(ctx, principal, true, 150, true)
+	if err != nil || lease.LeaseToken == nil || lease.SurrenderTransportVersion != 1 {
+		t.Fatalf("lease=%+v err=%v", lease, err)
+	}
+	planID, setID, producerID := uuid.New(), uuid.New(), uuid.New()
+	planBody, _ := json.Marshal(map[string]any{
+		"plan_id": planID, "set_id": setID, "producer_id": producerID,
+		"capture_ordinal": 1, "first_capture_sequence": 1,
+	})
+	planRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(planBody))
+	planRequest.Header.Set(recordingLeaseTokenHeader, lease.LeaseToken.String())
+	planRequest = planRequest.WithContext(context.WithValue(planRequest.Context(), nodePrincipalContextKey, principal))
+	planRoute := chi.NewRouteContext()
+	planRoute.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
+	planRequest = planRequest.WithContext(context.WithValue(planRequest.Context(), chi.RouteCtxKey, planRoute))
+	planResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetPlan(planResponse, planRequest)
+	if planResponse.Code != http.StatusOK {
+		t.Fatalf("plan=%d body=%s", planResponse.Code, planResponse.Body.String())
+	}
+	var plan recordingapi.CaptureSetPlan
+	if err = json.Unmarshal(planResponse.Body.Bytes(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	identity := surrenderplan.SetIdentity{
+		SetID: setID, AccountID: plan.AccountID, RecordingID: plan.RecordingID, JobID: plan.JobID,
+		LeaseToken: *lease.LeaseToken, OriginClaimGeneration: plan.OriginClaimGeneration,
+		ProducerID: producerID, SnapshotSHA256: plan.SourceSnapshotSHA256,
+		DestinationNamingSHA256: plan.DestinationNamingSHA256, ArtifactCount: plan.ArtifactCount,
+		MIME: "video/mp4", MaxBytes: surrenderplan.RecoveryArtifactMaxBytes,
+	}
+	var seed [32]byte
+	for index := range seed {
+		seed[index] = byte(index + 1)
+	}
+	tree, err := surrenderplan.BuildTree(seed, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := tree.Root()
+	commitBody, _ := json.Marshal(map[string]any{"merkle_root_sha256": hex.EncodeToString(root[:])})
+	commitRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(commitBody))
+	commitRequest.Header.Set(recordingLeaseTokenHeader, lease.LeaseToken.String())
+	commitRequest = commitRequest.WithContext(context.WithValue(commitRequest.Context(), nodePrincipalContextKey, principal))
+	commitRoute := chi.NewRouteContext()
+	commitRoute.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
+	commitRoute.URLParams.Add("planId", planID.String())
+	commitRequest = commitRequest.WithContext(context.WithValue(commitRequest.Context(), chi.RouteCtxKey, commitRoute))
+	commitResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetCommit(commitResponse, commitRequest)
+	if commitResponse.Code != http.StatusNoContent {
+		t.Fatalf("commit=%d body=%s", commitResponse.Code, commitResponse.Body.String())
+	}
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO recording_capture_producer_stop_events(id,set_id,old_snapshot_generation,new_snapshot_generation)
+		SELECT gen_random_uuid(),capture_set.id,plan.snapshot_generation,plan.snapshot_generation+1
+		FROM recording_capture_reservation_sets capture_set
+		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+		WHERE capture_set.id=$1
+	`, setID); err == nil {
+		t.Fatal("caller forged a producer stop without a changed source snapshot")
+	}
+	artifact, err := surrenderplan.DeriveArtifact(seed, identity, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := tree.Proof(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofValues := make([]string, len(proof.Siblings))
+	for index := range proof.Siblings {
+		proofValues[index] = hex.EncodeToString(proof.Siblings[index][:])
+	}
+	secretSHA := hex.EncodeToString(artifact.RecoverySecretHash[:])
+	if _, err = pool.Exec(ctx, `UPDATE streams SET source_url=source_url||'?r10-stop=1' WHERE id=$1`, fixture.streamID); err != nil {
+		t.Fatal(err)
+	}
+	ack := recordingapi.CaptureStopAck{
+		AckID: uuid.NewString(), RetainedDirectoryDevice: 41, RetainedDirectoryInode: 42,
+		Members: []recordingapi.CaptureStopAckMember{{
+			Ordinal: 1, ArtifactID: artifact.ID.String(), CaptureSequence: 1,
+			RecoverySecretSHA256: secretSHA, Proof: proofValues,
+			Device: 41, Inode: 43, RelativeName: "seg-20260814-070000.mp4",
+		}},
+	}
+	ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackBody, _ := json.Marshal(ack)
+	ackRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(ackBody))
+	ackRequest.Header.Set(recordingLeaseTokenHeader, lease.LeaseToken.String())
+	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), nodePrincipalContextKey, principal))
+	ackRoute := chi.NewRouteContext()
+	ackRoute.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
+	ackRoute.URLParams.Add("setId", setID.String())
+	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), chi.RouteCtxKey, ackRoute))
+	ackResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetStopAck(ackResponse, ackRequest)
+	if ackResponse.Code != http.StatusNoContent {
+		t.Fatalf("stop ack=%d body=%s", ackResponse.Code, ackResponse.Body.String())
+	}
+	peerNodeID := fixture.nodeID + 500000
+	if _, err = pool.Exec(ctx, `INSERT INTO nodes(id,account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,$2,'r10-relay-peer','relay','active',transaction_timestamp(),4)`, peerNodeID, fixture.accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-peer',repeat('7',64))`, peerNodeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE id=$1`, fixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+	var reclaimed int64
+	if err = pool.QueryRow(ctx, `SELECT recording_surrender_reclaim_expired()`).Scan(&reclaimed); err != nil || reclaimed < 1 {
+		t.Fatalf("reclaimed=%d err=%v", reclaimed, err)
+	}
+	var alternate bool
+	if err = pool.QueryRow(ctx, `SELECT alternate_available FROM recording_job_lease_expiry_events WHERE recording_job_id=$1 AND lease_token=$2`, fixture.jobID, lease.LeaseToken).Scan(&alternate); err != nil || !alternate {
+		t.Fatalf("relay alternate=%v err=%v", alternate, err)
+	}
+	newRaw := "sin_" + strings.Repeat("n", 48)
+	newHash := sha256.Sum256([]byte(newRaw))
+	proposalID := uuid.New()
+	proposalBody, _ := json.Marshal(recordingClaimSuccessorProposalRequest{ProposalID: proposalID.String(), KeyPrefix: newRaw[:16], SecretSHA256: hex.EncodeToString(newHash[:])})
+	proposalRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(proposalBody))
+	proposalRequest = proposalRequest.WithContext(context.WithValue(proposalRequest.Context(), nodePrincipalContextKey, principal))
+	proposalResponse := httptest.NewRecorder()
+	server.handleRecordingClaimSuccessorPropose(proposalResponse, proposalRequest)
+	if proposalResponse.Code != http.StatusTooEarly {
+		t.Fatalf("successor before terminal recovery=%d body=%s", proposalResponse.Code, proposalResponse.Body.String())
+	}
+	secretHex := hex.EncodeToString(artifact.RecoverySecret[:])
+	authRequest := httptest.NewRequest(http.MethodPost, "/", nil)
+	authRequest.Header.Set(recordingRecoveryIntentHeader, artifact.ID.String())
+	authRequest.Header.Set(recordingRecoverySecretHeader, secretHex)
+	recovery, err := server.authenticateRecordingRecovery(authRequest)
+	if err != nil || recovery.Authority != "capture_set" || recovery.SetID != setID {
+		t.Fatalf("recovery=%+v err=%v", recovery, err)
+	}
+	payload := []byte("verified recovery payload")
+	payloadSHA := sha256.Sum256(payload)
+	segmentStart := time.Date(2026, time.August, 14, 7, 0, 0, 500_000, time.UTC)
+	sealBody, _ := json.Marshal(recordingCaptureArtifactSealRequest{
+		JobID: fixture.jobID, ProducerID: producerID.String(), CaptureSequence: 1,
+		SetID: setID.String(), Ordinal: 1, SegmentStartUS: segmentStart.UnixMicro(),
+		SizeBytes: int64(len(payload)), SHA256: hex.EncodeToString(payloadSHA[:]),
+	})
+	sealRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(sealBody))
+	sealRequest = sealRequest.WithContext(context.WithValue(sealRequest.Context(), nodePrincipalContextKey, principal))
+	sealRequest = sealRequest.WithContext(context.WithValue(sealRequest.Context(), recordingRecoveryContextKey{}, recovery))
+	sealRoute := chi.NewRouteContext()
+	sealRoute.URLParams.Add("intentId", artifact.ID.String())
+	sealRequest = sealRequest.WithContext(context.WithValue(sealRequest.Context(), chi.RouteCtxKey, sealRoute))
+	sealResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureArtifactSeal(sealResponse, sealRequest)
+	if sealResponse.Code != http.StatusOK || strings.Contains(sealResponse.Body.String(), "upload_url") {
+		t.Fatalf("recovery seal=%d body=%s", sealResponse.Code, sealResponse.Body.String())
+	}
+	reportID := uuid.New()
+	size := int64(len(payload))
+	reportBody, _ := json.Marshal(recordingCaptureRecoveryReportRequest{ReportID: reportID.String(), ReportType: "sealed_bytes", SizeBytes: &size, SHA256: hex.EncodeToString(payloadSHA[:]), LocalObservedAt: time.Now().UTC()})
+	reportRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(reportBody))
+	reportRequest = reportRequest.WithContext(context.WithValue(reportRequest.Context(), recordingRecoveryContextKey{}, recovery))
+	reportRoute := chi.NewRouteContext()
+	reportRoute.URLParams.Add("intentId", artifact.ID.String())
+	reportRequest = reportRequest.WithContext(context.WithValue(reportRequest.Context(), chi.RouteCtxKey, reportRoute))
+	reportResponse := httptest.NewRecorder()
+	server.handleRecordingRecoveryReport(reportResponse, reportRequest)
+	if reportResponse.Code != http.StatusNoContent {
+		t.Fatalf("report=%d body=%s", reportResponse.Code, reportResponse.Body.String())
+	}
+	if err = pool.QueryRow(ctx, `SELECT result FROM recording_capture_set_results WHERE set_id=$1`, setID).Scan(new(string)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("sealed local bytes terminalized the set before verified promotion: %v", err)
+	}
+
+	// Promotion holds the shared claim fence through the exact final copy. A
+	// security revocation takes the exclusive fence, so it cannot race a stale
+	// handler into copying after revocation. If the upload wins, the immutable
+	// security event commits immediately afterward and all later capabilities fail.
+	newUploadRequest := func(sessionID string) *http.Request {
+		request := httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload))
+		request.Header.Set(recordingRecoverySessionHeader, sessionID)
+		request = request.WithContext(context.WithValue(request.Context(), recordingRecoveryContextKey{}, recovery))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("intentId", artifact.ID.String())
+		return request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
+	}
+	responseLossSession := uuid.NewString()
+	responseLossRequest := newUploadRequest(responseLossSession)
+	responseLossResponse := httptest.NewRecorder()
+	server.handleRecordingRecoveryProxyUpload(responseLossResponse, responseLossRequest)
+	if responseLossResponse.Code != http.StatusNoContent {
+		t.Fatalf("initial recovery proxy=%d body=%s", responseLossResponse.Code, responseLossResponse.Body.String())
+	}
+	responseLossReplay := httptest.NewRecorder()
+	server.handleRecordingRecoveryProxyUpload(responseLossReplay, newUploadRequest(responseLossSession))
+	if responseLossReplay.Code != http.StatusNoContent {
+		t.Fatalf("recovery proxy response-loss replay=%d body=%s", responseLossReplay.Code, responseLossReplay.Body.String())
+	}
+
+	fakeStore.copyStarted, fakeStore.copyGate = make(chan struct{}, 1), make(chan struct{})
+	uploadRequest := newUploadRequest(uuid.NewString())
+	uploadDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		out := httptest.NewRecorder()
+		server.handleRecordingRecoveryProxyUpload(out, uploadRequest)
+		uploadDone <- out
+	}()
+	select {
+	case <-fakeStore.copyStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery proxy did not enter fenced promotion")
+	}
+	var operatorID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO users(email,name,is_operator) VALUES($1,'r10 recovery operator',true) RETURNING id`, fmt.Sprintf("r10-recovery-%d@example.test", time.Now().UnixNano())).Scan(&operatorID); err != nil {
+		t.Fatal(err)
+	}
+	var forgedActorID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO users(email,name,is_operator) VALUES($1,'forged recovery actor',false) RETURNING id`, fmt.Sprintf("r10-forged-%d@example.test", time.Now().UnixNano())).Scan(&forgedActorID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_capture_security_events(id,set_id,actor_user_id,reason,idempotency_key) VALUES(gen_random_uuid(),$1,$2,'suspected_seed_compromise',gen_random_uuid())`, setID, forgedActorID); err == nil {
+		t.Fatal("unauthorized direct SQL actor forged recovery security authority")
+	}
+	revokeBody, _ := json.Marshal(recordingRecoverySecurityRevokeRequest{SetID: setID.String(), IdempotencyKey: uuid.NewString(), Reason: "suspected_seed_compromise"})
+	revokeRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(revokeBody))
+	revokeRequest = revokeRequest.WithContext(context.WithValue(revokeRequest.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: fixture.accountID, UserID: operatorID}))
+	revokeRequest = revokeRequest.WithContext(context.WithValue(revokeRequest.Context(), adminOverrideKey, true))
+	revokeDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		out := httptest.NewRecorder()
+		server.handleAdminRecordingRecoverySecurityRevoke(out, revokeRequest)
+		revokeDone <- out
+	}()
+	select {
+	case out := <-revokeDone:
+		t.Fatalf("security revoke crossed an in-flight promotion: %d %s", out.Code, out.Body.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(fakeStore.copyGate)
+	if out := <-uploadDone; out.Code != http.StatusNoContent {
+		t.Fatalf("recovery proxy=%d body=%s", out.Code, out.Body.String())
+	}
+	if out := <-revokeDone; out.Code != http.StatusOK {
+		t.Fatalf("security revoke=%d body=%s", out.Code, out.Body.String())
+	}
+	if _, authErr := server.authenticateRecordingRecovery(authRequest); authErr == nil {
+		t.Fatal("security-revoked recovery capability remained usable")
+	}
+	staleUpload := httptest.NewRequest(http.MethodPut, "/", bytes.NewReader(payload))
+	staleUpload.Header.Set(recordingRecoverySessionHeader, uuid.NewString())
+	staleUpload = staleUpload.WithContext(context.WithValue(staleUpload.Context(), recordingRecoveryContextKey{}, recovery))
+	staleRoute := chi.NewRouteContext()
+	staleRoute.URLParams.Add("intentId", artifact.ID.String())
+	staleUpload = staleUpload.WithContext(context.WithValue(staleUpload.Context(), chi.RouteCtxKey, staleRoute))
+	staleResponse := httptest.NewRecorder()
+	server.handleRecordingRecoveryProxyUpload(staleResponse, staleUpload)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf("revoked stale-context recovery upload=%d body=%s", staleResponse.Code, staleResponse.Body.String())
+	}
+	var setResult string
+	if err = pool.QueryRow(ctx, `SELECT result FROM recording_capture_set_results WHERE set_id=$1`, setID).Scan(&setResult); err != nil || setResult != "security_revoked" {
+		t.Fatalf("set result=%q err=%v", setResult, err)
+	}
+	proposalRequest = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(proposalBody))
+	proposalRequest = proposalRequest.WithContext(context.WithValue(proposalRequest.Context(), nodePrincipalContextKey, principal))
+	proposalResponse = httptest.NewRecorder()
+	server.handleRecordingClaimSuccessorPropose(proposalResponse, proposalRequest)
+	if proposalResponse.Code != http.StatusOK {
+		t.Fatalf("successor proposal=%d body=%s", proposalResponse.Code, proposalResponse.Body.String())
+	}
+	var successor recordingapi.ClaimSuccessor
+	if err = json.Unmarshal(proposalResponse.Body.Bytes(), &successor); err != nil {
+		t.Fatal(err)
+	}
+	// A successor may acknowledge with its own bearer while the predecessor
+	// continues heartbeating an unrelated exact fence. The predecessor retires
+	// only after that fence is terminal; rotation never churns a healthy capture.
+	unrelated := seedPresentationV2Task(t, pool, 92002, fixture.accountID)
+	unrelatedLease := uuid.New()
+	if _, err = pool.Exec(ctx, `
+		UPDATE recordings SET capture_via='relay' WHERE id=$1;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$2;
+		UPDATE recording_jobs SET status='leased',lease_owner=$3,lease_token=$4,
+		 lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1
+		 WHERE id=$2
+	`, unrelated.recordingID, unrelated.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10), unrelatedLease); err != nil {
+		t.Fatal(err)
+	}
+	ackPrincipal := principal
+	ackPrincipal.NodeTokenID = successor.SuccessorTokenID
+	ackSuccessor := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader([]byte(`{}`)))
+		request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, ackPrincipal))
+		route := chi.NewRouteContext()
+		route.URLParams.Add("proposalId", proposalID.String())
+		request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
+		response := httptest.NewRecorder()
+		server.handleRecordingClaimSuccessorAck(response, request)
+		return response
+	}
+	if response := ackSuccessor(); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"predecessor_retired":false`) {
+		t.Fatalf("successor ack with live predecessor fence=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE id=$1`, unrelated.jobID); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT recording_surrender_reclaim_expired()`).Scan(&reclaimed); err != nil {
+		t.Fatal(err)
+	}
+	if response := ackSuccessor(); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"predecessor_retired":true`) {
+		t.Fatalf("successor ack after predecessor fences drained=%d body=%s", response.Code, response.Body.String())
+	}
+	var headGeneration int64
+	var headTokenID int64
+	var headState string
+	if err = pool.QueryRow(ctx, `SELECT generation,claim_token_id,state FROM recording_worker_claim_heads WHERE node_id=$1`, fixture.nodeID).Scan(&headGeneration, &headTokenID, &headState); err != nil || headGeneration != 2 || headTokenID != successor.SuccessorTokenID || headState != "enabled" {
+		t.Fatalf("head generation=%d token=%d state=%q err=%v", headGeneration, headTokenID, headState, err)
+	}
+	var retirementEvents int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM recording_worker_claim_generation_events WHERE node_id=$1 AND generation=1 AND claim_token_id=$2 AND event_type='retired'`, fixture.nodeID, oldTokenID).Scan(&retirementEvents); err != nil || retirementEvents != 1 {
+		t.Fatalf("retirement events=%d err=%v", retirementEvents, err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE nodes SET status='disabled' WHERE id=$1`, peerNodeID); err != nil {
+		t.Fatal(err)
+	}
+	recoveredLease, err := server.leaseRelayRecordingJob(ctx, ackPrincipal, true, 150, true)
+	if err != nil || recoveredLease.JobID != fixture.jobID || recoveredLease.LeaseToken == nil || *recoveredLease.LeaseToken == *lease.LeaseToken {
+		t.Fatalf("dynamic relay alternate waiver lease=%+v err=%v", recoveredLease, err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_capture_set_grants SET upload_grace_until=transaction_timestamp()+interval '1 hour' WHERE set_id=$1`, setID); err == nil {
+		t.Fatal("immutable set grant was mutable")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_worker_claim_heads SET generation=generation+1 WHERE node_id=$1`, fixture.nodeID); err == nil {
+		t.Fatal("claim head advanced without a typed successor event")
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash,recording_claim_generation,recording_claim_purpose) VALUES($1,'forged-current',repeat('8',64),3,'claim_current')`, fixture.nodeID); err == nil {
+		t.Fatal("caller forged an explicit current claim generation")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_worker_claim_successor_proposals SET successor_key_prefix='substituted' WHERE id=$1`, proposalID); err == nil {
+		t.Fatal("claim successor proposal was mutable")
+	}
+	if _, err = pool.Exec(ctx, `DELETE FROM recording_capture_set_grants WHERE set_id=$1`, setID); err == nil {
+		t.Fatal("capture set recovery grant was deletable")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_capture_set_results SET result_at=result_at+interval '1 second' WHERE set_id=$1`, setID); err == nil {
+		t.Fatal("capture set terminal result was mutable")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_worker_claim_heads SET state='recovery_blocked',blocked_at=transaction_timestamp(),block_reason='durable_recovery' WHERE node_id=$1`, peerNodeID); err == nil {
+		t.Fatal("claim head recovery block committed without its immutable event")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE node_tokens SET revoked_at=transaction_timestamp() WHERE node_id=$1 AND revoked_at IS NULL`, peerNodeID); err == nil {
+		t.Fatal("recording claim credential retired without terminal events")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE stream_source_revisions SET reason='substituted' WHERE id=$1`, frozenSourceRevisionID); err == nil {
+		t.Fatal("referenced source revision was mutable")
+	}
+	if _, err = pool.Exec(ctx, `DELETE FROM stream_source_revisions WHERE id=$1`, frozenSourceRevisionID); err == nil {
+		t.Fatal("referenced source revision was deletable")
+	}
+	if _, err = pool.Exec(ctx, `TRUNCATE stream_source_revisions`); err == nil {
+		t.Fatal("referenced source revision lineage was truncatable")
 	}
 }
 
@@ -445,7 +1066,7 @@ func callProducerReserve(t *testing.T, server *Server, fixture presentationV2Fix
 	route := chi.NewRouteContext()
 	route.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
 	request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
-	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker}))
+	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker, NodeTokenID: surrenderTransportTestTokenID(t, server, fixture.nodeID)}))
 	response := httptest.NewRecorder()
 	server.handleRecordingCaptureProducerReserve(response, request)
 	return response
@@ -460,7 +1081,7 @@ func callProducerFinish(t *testing.T, server *Server, fixture presentationV2Fixt
 	request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set(recordingLeaseTokenHeader, lease.String())
-	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker}))
+	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker, NodeTokenID: surrenderTransportTestTokenID(t, server, fixture.nodeID)}))
 	route := chi.NewRouteContext()
 	route.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
 	route.URLParams.Add("producerId", producer.String())
@@ -491,7 +1112,7 @@ func callArtifactReserve(t *testing.T, server *Server, fixture presentationV2Fix
 	route.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
 	route.URLParams.Add("producerId", producer.String())
 	request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
-	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker}))
+	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker, NodeTokenID: surrenderTransportTestTokenID(t, server, fixture.nodeID)}))
 	response := httptest.NewRecorder()
 	server.handleRecordingCaptureArtifactsReserve(response, request)
 	return response
@@ -499,6 +1120,10 @@ func callArtifactReserve(t *testing.T, server *Server, fixture presentationV2Fix
 
 func callSurrender(t *testing.T, server *Server, fixture presentationV2Fixture, lease uuid.UUID, worker, nodeType string, attempt uuid.UUID) *httptest.ResponseRecorder {
 	t.Helper()
+	var nodeTokenID int64
+	if err := server.pool.QueryRow(context.Background(), `SELECT lease_node_token_id FROM recording_jobs WHERE id=$1`, fixture.jobID).Scan(&nodeTokenID); err != nil {
+		t.Fatal(err)
+	}
 	body, err := json.Marshal(recordingJobSurrenderRequest{TransportVersion: 1, AttemptID: attempt.String(), Reason: recordingJobSurrenderNoProgress})
 	if err != nil {
 		t.Fatal(err)
@@ -508,7 +1133,7 @@ func callSurrender(t *testing.T, server *Server, fixture presentationV2Fixture, 
 	route := chi.NewRouteContext()
 	route.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
 	request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
-	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeType, DisplayName: worker}))
+	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeType, DisplayName: worker, NodeTokenID: nodeTokenID}))
 	response := httptest.NewRecorder()
 	server.handleRecordingJobSurrender(response, request)
 	return response
@@ -528,8 +1153,23 @@ func callTransportObservation(t *testing.T, server *Server, fixture presentation
 	route := chi.NewRouteContext()
 	route.URLParams.Add("id", strconv.FormatInt(fixture.jobID, 10))
 	request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
-	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker}))
+	tokenID := surrenderTransportTestTokenID(t, server, fixture.nodeID)
+	request = request.WithContext(context.WithValue(request.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: fixture.nodeID, AccountID: fixture.accountID, NodeType: nodeTypeLocalRecorder, DisplayName: worker, NodeTokenID: tokenID}))
 	response := httptest.NewRecorder()
 	server.handleRecordingSurrenderTransportObservations(response, request)
 	return response
+}
+
+func surrenderTransportTestTokenID(t *testing.T, server *Server, nodeID int64) int64 {
+	t.Helper()
+	var tokenID int64
+	err := server.pool.QueryRow(context.Background(), `SELECT id FROM node_tokens WHERE node_id=$1 AND revoked_at IS NULL ORDER BY id DESC LIMIT 1`, nodeID).Scan(&tokenID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		prefix := fmt.Sprintf("surrender-test-%d", nodeID)
+		err = server.pool.QueryRow(context.Background(), `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,$2,repeat('d',64)) RETURNING id`, nodeID, prefix).Scan(&tokenID)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tokenID
 }

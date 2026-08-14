@@ -192,6 +192,12 @@ func (w *Worker) Run(ctx context.Context) error {
 	// second capture generation over bytes from the first one.
 	transportEnabled := w.surrenderTransportEnabled()
 	if transportEnabled {
+		if _, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(w.surrenderJournalRoot())); err != nil {
+			return fmt.Errorf("validate surrender observation journal: %w", err)
+		}
+		if err := w.restoreClaimCredential(); err != nil {
+			return fmt.Errorf("restore recording claim credential: %w", err)
+		}
 		if err := w.recoverProducerJournals(ctx); err != nil {
 			return err
 		}
@@ -483,7 +489,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+	canceled, stopRequired := w.startHeartbeatWithSourceStop(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 
@@ -838,7 +844,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 		var captureErr error
 		if producer != nil && producer.CaptureSet != nil {
-			captureErr = capture.CaptureContinuousWithFinitePlan(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders, job.TimestampContractSupported, finitePlan)
+			captureErr = capture.CaptureContinuousWithFinitePlanAndStop(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders, job.TimestampContractSupported, finitePlan, stopRequired, w.captureSetStopBarrier(job, producer, pool, &captureSequence))
 		} else {
 			captureErr = captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
 		}
@@ -847,7 +853,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()
-		remainingProducerFiles, spoolErr := filepath.Glob(filepath.Join(outDir, "seg-*.mp4"))
+		spoolDir := outDir
+		if producer != nil && strings.TrimSpace(producer.OutputDir) != "" {
+			spoolDir = producer.OutputDir
+		}
+		remainingProducerFiles, spoolErr := filepath.Glob(filepath.Join(spoolDir, "seg-*.mp4"))
 		durableProducerSpool := producer != nil && (delivery.pending > 0 || spoolErr != nil || len(remainingProducerFiles) > 0)
 		var producerFinishErr error
 		if durableProducerSpool {
@@ -884,6 +894,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				cancel()
 				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", finishErr)
 				return
+			}
+			if producer.OutputDir != outDir {
+				if removeErr := os.RemoveAll(producer.OutputDir); removeErr != nil {
+					w.cfg.RelayDiagnostics.Error(job.JobID, "retained_temp_cleanup_failed", removeErr)
+				}
 			}
 			if removeErr := os.RemoveAll(outDir); removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
@@ -1512,8 +1527,25 @@ func isUploadIntentStateConflict(err error) bool {
 // job context (aborting ffmpeg). The returned func reports whether a cancel was
 // observed, so the caller skips ingest for a canceled job.
 func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) func() bool {
+	canceled, stopRequired := w.startHeartbeatWithSourceStop(ctx, cancel, jobID, leaseToken, leaseExpiresAt)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stopRequired:
+			cancel()
+		}
+	}()
+	return canceled
+}
+
+// startHeartbeatWithSourceStop keeps a source/config mutation distinct from a
+// lease cancellation. The finite capture process must enter its SIGSTOP +
+// namespace inventory protocol before the job context is canceled.
+func (w *Worker) startHeartbeatWithSourceStop(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) (func() bool, <-chan struct{}) {
 	var mu sync.Mutex
 	wasCanceled := false
+	stopRequired := make(chan struct{})
+	var stopOnce sync.Once
 	markCanceled := func() {
 		mu.Lock()
 		wasCanceled = true
@@ -1543,9 +1575,14 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 					}
 					continue
 				}
-				if heartbeat.Cancel || heartbeat.StopRequired {
+				if heartbeat.Cancel {
 					log.Printf("recording worker job=%d received cancel signal", jobID)
 					markCanceled()
+					return
+				}
+				if heartbeat.StopRequired {
+					log.Printf("recording worker job=%d received source stop signal", jobID)
+					stopOnce.Do(func() { close(stopRequired) })
 					return
 				}
 				leaseExpiresAt = heartbeat.LeaseExpiresAt
@@ -1563,7 +1600,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 		mu.Lock()
 		defer mu.Unlock()
 		return wasCanceled
-	}
+	}, stopRequired
 }
 
 func (w *Worker) fail(ctx context.Context, jobID int64, leaseToken string, runErr error) {

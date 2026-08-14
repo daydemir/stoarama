@@ -45,6 +45,7 @@ type Server struct {
 	pool                    *pgxpool.Pool
 	r2                      *r2.Client
 	secrets                 *secretbox.Cipher
+	recoveryStorageFactory  func(context.Context, r2.Config) (recordingRecoveryObjectStore, error)
 	mailer                  email.Sender
 	streamsHTML             []byte
 	recordingsHTML          []byte
@@ -373,6 +374,7 @@ func (s *Server) router() http.Handler {
 			admin.Delete("/storage-destinations/{id}", s.handleAdminStorageDestinationDelete)
 			admin.Post("/storage-destinations/{id}/grants", s.handleAdminStorageDestinationGrantCreate)
 			admin.Delete("/storage-destinations/{id}/grants/{accountId}", s.handleAdminStorageDestinationGrantDelete)
+			admin.Post("/recording/recovery/security-revoke", s.handleAdminRecordingRecoverySecurityRevoke)
 		})
 
 		api.Group(func(public chi.Router) {
@@ -511,7 +513,10 @@ func (s *Server) router() http.Handler {
 			rec.Post("/recording/jobs/{id}/capture-set-plans", s.handleRecordingCaptureSetPlan)
 			rec.Post("/recording/jobs/{id}/capture-set-plans/{planId}/commit", s.handleRecordingCaptureSetCommit)
 			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/artifacts/{ordinal}/materialize", s.handleRecordingCaptureArtifactMaterialize)
+			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/stop-ack", s.handleRecordingCaptureSetStopAck)
 			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/finish", s.handleRecordingCaptureSetFinish)
+			rec.Post("/recording/claim-successor/propose", s.handleRecordingClaimSuccessorPropose)
+			rec.Post("/recording/claim-successor/{proposalId}/ack", s.handleRecordingClaimSuccessorAck)
 			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/status", s.handleRecordingCaptureProducerStatus)
 			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/artifacts/reserve", s.handleRecordingCaptureArtifactsReserve)
 			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/finish", s.handleRecordingCaptureProducerFinish)
@@ -532,6 +537,8 @@ func (s *Server) router() http.Handler {
 			upload.Post("/recording/clips/ingest", s.handleRecordingClipIngest)
 			upload.Post("/recording/recovery/intents/{intentId}/status", s.handleRecordingRecoveryStatus)
 			upload.Post("/recording/recovery/intents/{intentId}/finish", s.handleRecordingRecoveryFinish)
+			upload.Put("/recording/recovery/artifacts/{intentId}/upload", s.handleRecordingRecoveryProxyUpload)
+			upload.Post("/recording/recovery/artifacts/{intentId}/report", s.handleRecordingRecoveryReport)
 		})
 
 		api.Group(func(worker chi.Router) {

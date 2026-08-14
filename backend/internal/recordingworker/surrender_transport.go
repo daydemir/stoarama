@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,10 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 )
 
 const surrenderTransportRetryBudget = time.Minute
@@ -30,11 +35,96 @@ const surrenderTransportRetryBudget = time.Minute
 const maxCaptureProducerJournalBytes = 1 << 20
 
 var surrenderAttemptNamespace = uuid.MustParse("3cc7341c-d96b-4f38-b7de-cc47229837f9")
+var captureRecoveryReportNamespace = uuid.MustParse("3b3dd24e-199c-4b28-a9d4-3ad1fbd01da9")
+var captureRecoverySessionNamespace = uuid.MustParse("ddeca08a-f772-4073-bc70-ec739f412681")
 var captureSegmentLeafRE = regexp.MustCompile(`^seg-[0-9]{8}-[0-9]{6}\.mp4$`)
+
+const claimSuccessorStateFile = ".claim-successor.json"
+
+type claimSuccessorState struct {
+	CurrentRawToken  string `json:"current_raw_token,omitempty"`
+	CurrentKeyPrefix string `json:"current_key_prefix,omitempty"`
+	CurrentSecretSHA string `json:"current_secret_sha256,omitempty"`
+	ProposalID       string `json:"proposal_id,omitempty"`
+	RawToken         string `json:"raw_token,omitempty"`
+	KeyPrefix        string `json:"key_prefix,omitempty"`
+	SecretSHA        string `json:"secret_sha256,omitempty"`
+	Enabled          bool   `json:"enabled"`
+}
 
 func captureUnixMicro(value time.Time) int64 {
 	value = value.UTC()
 	return value.Unix()*int64(time.Second/time.Microsecond) + int64(value.Nanosecond())/int64(time.Microsecond)
+}
+
+func hashRetainedArtifact(path string) (int64, string, error) {
+	file, stat, err := openRetainedArtifact(path, 0, 0)
+	if err != nil {
+		return 0, "", fmt.Errorf("retained capture artifact identity is unsafe")
+	}
+	defer file.Close()
+	h := sha256.New()
+	written, err := io.Copy(h, io.LimitReader(file, surrenderplan.RecoveryArtifactMaxBytes+1))
+	if err != nil || written != stat.Size {
+		return 0, "", fmt.Errorf("hash retained capture artifact: %w", err)
+	}
+	return written, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func openRetainedArtifact(path string, expectedDevice, expectedInode uint64) (*os.File, unix.Stat_t, error) {
+	directory, leaf := filepath.Split(filepath.Clean(path))
+	if directory == "" || !captureSegmentLeafRE.MatchString(leaf) {
+		return nil, unix.Stat_t{}, fmt.Errorf("invalid retained artifact path")
+	}
+	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, unix.Stat_t{}, err
+	}
+	defer unix.Close(directoryFD)
+	fileFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, unix.Stat_t{}, err
+	}
+	var stat unix.Stat_t
+	if err = unix.Fstat(fileFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > surrenderplan.RecoveryArtifactMaxBytes || (expectedDevice != 0 && uint64(stat.Dev) != expectedDevice) || (expectedInode != 0 && uint64(stat.Ino) != expectedInode) {
+		_ = unix.Close(fileFD)
+		return nil, unix.Stat_t{}, fmt.Errorf("retained artifact identity changed")
+	}
+	file := os.NewFile(uintptr(fileFD), leaf)
+	if file == nil {
+		_ = unix.Close(fileFD)
+		return nil, unix.Stat_t{}, fmt.Errorf("open retained artifact")
+	}
+	return file, stat, nil
+}
+
+func removeRetainedArtifact(path string, expectedDevice, expectedInode uint64) error {
+	file, _, err := openRetainedArtifact(path, expectedDevice, expectedInode)
+	if err != nil {
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	directory, leaf := filepath.Split(filepath.Clean(path))
+	directoryFD, err := unix.Open(filepath.Clean(directory), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	// Re-open and compare immediately before unlink so a pathname substitution
+	// can never make recovery delete bytes other than the inventoried artifact.
+	checkFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	var stat unix.Stat_t
+	statErr := unix.Fstat(checkFD, &stat)
+	_ = unix.Close(checkFD)
+	if statErr != nil || uint64(stat.Dev) != expectedDevice || uint64(stat.Ino) != expectedInode || stat.Nlink != 1 {
+		return fmt.Errorf("retained artifact changed before cleanup")
+	}
+	return unix.Unlinkat(directoryFD, leaf, 0)
 }
 
 type acceptedUniqueHead struct {
@@ -57,7 +147,7 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 	}
 	journals := make([]*captureProducerJournal, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Name() == filepath.Base(surrenderTransportObservationPath(root)) {
+		if entry.Name() == filepath.Base(surrenderTransportObservationPath(root)) || entry.Name() == claimSuccessorStateFile {
 			continue
 		}
 		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || !entry.Type().IsRegular() {
@@ -101,8 +191,23 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 			secret, secretErr := hex.DecodeString(artifact.RecoverySecret)
 			hash := sha256.Sum256(secret)
 			seg := artifact.Segment
+			localPath := strings.TrimSpace(artifact.LocalPath)
+			if seg != nil && localPath == "" {
+				localPath = seg.Path
+			}
 			if intentErr != nil || intentID.String() != strings.ToLower(strings.TrimSpace(artifact.IntentID)) || artifact.CaptureSequence <= 0 || len(secret) != 32 || secretErr != nil || hex.EncodeToString(hash[:]) != artifact.RecoverySecretSHA256 {
 				return nil, fmt.Errorf("invalid capture producer artifact journal")
+			}
+			if localPath != "" {
+				absolutePath, pathErr := filepath.Abs(localPath)
+				if pathErr != nil || filepath.Dir(absolutePath) != outputDir || !captureSegmentLeafRE.MatchString(filepath.Base(absolutePath)) || artifact.Device == 0 || artifact.Inode == 0 {
+					return nil, fmt.Errorf("invalid capture artifact local path")
+				}
+				info, identityErr := os.Lstat(absolutePath)
+				stat, statOK := infoSyscallStat(info)
+				if identityErr != nil || !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 || uint64(stat.Dev) != artifact.Device || uint64(stat.Ino) != artifact.Inode {
+					return nil, fmt.Errorf("capture artifact local identity changed")
+				}
 			}
 			if seg != nil {
 				segmentPath, segmentErr := filepath.Abs(seg.Path)
@@ -131,6 +236,21 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 			if err := validateCaptureSetJournal(&journal); err != nil {
 				return nil, err
 			}
+			if journal.CaptureSet.StopAck != nil {
+				members := make(map[int]recordingapi.CaptureStopAckMember, len(journal.CaptureSet.StopAck.Members))
+				for _, member := range journal.CaptureSet.StopAck.Members {
+					members[member.Ordinal] = member
+				}
+				for _, artifact := range journal.Artifacts {
+					if artifact.LocalPath == "" {
+						continue
+					}
+					member, exists := members[artifact.Ordinal]
+					if !exists || member.Device != artifact.Device || member.Inode != artifact.Inode || member.RelativeName != filepath.Base(artifact.LocalPath) {
+						return nil, fmt.Errorf("capture stop inventory differs from local artifact")
+					}
+				}
+			}
 		}
 		journal.ProducerID = producerID.String()
 		journal.LeaseToken = leaseToken.String()
@@ -138,6 +258,204 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 		journals = append(journals, &journal)
 	}
 	return journals, nil
+}
+
+func claimSuccessorStatePath(root string) string { return filepath.Join(root, claimSuccessorStateFile) }
+
+func validClaimCredential(raw, prefix, digest string) bool {
+	secretHash := sha256.Sum256([]byte(strings.TrimSpace(raw)))
+	return strings.HasPrefix(raw, "sin_") && len(prefix) >= 8 && len(prefix) <= 32 && strings.HasPrefix(raw, prefix) && hex.EncodeToString(secretHash[:]) == digest
+}
+
+func persistClaimSuccessorState(root string, state claimSuccessorState) error {
+	if err := ensurePrivateSurrenderJournalRoot(root); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	tmp, err := os.CreateTemp(root, ".claim-successor-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(raw)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tmpPath, claimSuccessorStatePath(root)); err != nil {
+		return err
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	closeErr = dir.Close()
+	if err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func loadClaimSuccessorState(root string) (*claimSuccessorState, error) {
+	path := claimSuccessorStatePath(root)
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 4096 {
+		return nil, fmt.Errorf("claim successor state is not a private regular file")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var state claimSuccessorState
+	if err = json.Unmarshal(raw, &state); err != nil {
+		return nil, err
+	}
+	hasCurrent := state.CurrentRawToken != "" || state.CurrentKeyPrefix != "" || state.CurrentSecretSHA != ""
+	hasPending := state.ProposalID != "" || state.RawToken != "" || state.KeyPrefix != "" || state.SecretSHA != ""
+	_, proposalErr := uuid.Parse(state.ProposalID)
+	if (!hasCurrent && !hasPending) || (hasCurrent && !validClaimCredential(state.CurrentRawToken, state.CurrentKeyPrefix, state.CurrentSecretSHA)) || (hasPending && (!validClaimCredential(state.RawToken, state.KeyPrefix, state.SecretSHA) || proposalErr != nil)) || (state.Enabled && !hasPending) {
+		return nil, fmt.Errorf("claim successor state identity is invalid")
+	}
+	return &state, nil
+}
+
+func newClaimSuccessorState() (claimSuccessorState, error) {
+	random := make([]byte, 36)
+	if _, err := rand.Read(random); err != nil {
+		return claimSuccessorState{}, err
+	}
+	raw := "sin_" + base64.RawURLEncoding.EncodeToString(random)
+	prefix := raw
+	if len(prefix) > 16 {
+		prefix = prefix[:16]
+	}
+	digest := sha256.Sum256([]byte(raw))
+	return claimSuccessorState{ProposalID: uuid.New().String(), RawToken: raw, KeyPrefix: prefix, SecretSHA: hex.EncodeToString(digest[:])}, nil
+}
+
+func (w *Worker) restoreClaimCredential() error {
+	state, err := loadClaimSuccessorState(w.surrenderJournalRoot())
+	if err != nil || state == nil {
+		return err
+	}
+	raw := state.CurrentRawToken
+	if raw == "" {
+		// A locally prepared but server-unacknowledged successor never replaces
+		// the bootstrap/predecessor bearer on restart.
+		return nil
+	}
+	return w.cfg.Client.SetNodeToken(raw)
+}
+
+func promoteClaimSuccessorState(root string, state *claimSuccessorState) error {
+	state.CurrentRawToken = state.RawToken
+	state.CurrentKeyPrefix = state.KeyPrefix
+	state.CurrentSecretSHA = state.SecretSHA
+	state.ProposalID, state.RawToken, state.KeyPrefix, state.SecretSHA = "", "", "", ""
+	state.Enabled = false
+	return persistClaimSuccessorState(root, *state)
+}
+
+func (w *Worker) maybeRotateClaimCredential(ctx context.Context) error {
+	root := w.surrenderJournalRoot()
+	state, err := loadClaimSuccessorState(root)
+	if err != nil {
+		return err
+	}
+	if state != nil {
+		raw := state.CurrentRawToken
+		if raw != "" {
+			err = w.cfg.Client.SetNodeToken(raw)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	created := state == nil || state.ProposalID == ""
+	if created {
+		pending, createErr := newClaimSuccessorState()
+		if createErr != nil {
+			return createErr
+		}
+		if state == nil {
+			state = &claimSuccessorState{}
+		}
+		state.ProposalID, state.RawToken, state.KeyPrefix, state.SecretSHA = pending.ProposalID, pending.RawToken, pending.KeyPrefix, pending.SecretSHA
+		state.Enabled = false
+		if err = persistClaimSuccessorState(root, *state); err != nil {
+			return err
+		}
+	}
+	if state.Enabled {
+		// Replay the ACK until the predecessor token can be retired. The
+		// successor may become claim-current while unrelated old fences are
+		// still live; the server retires the predecessor only after those drain.
+		retired, ackErr := w.cfg.Client.AckClaimSuccessor(ctx, state.ProposalID, state.RawToken)
+		if ackErr != nil {
+			return ackErr
+		}
+		if retired {
+			if err = w.cfg.Client.SetNodeToken(state.RawToken); err != nil {
+				return err
+			}
+			return promoteClaimSuccessorState(root, state)
+		}
+		return nil
+	}
+	_, err = w.cfg.Client.ProposeClaimSuccessor(ctx, state.ProposalID, state.KeyPrefix, state.SecretSHA)
+	if err != nil {
+		var statusErr *apihttp.StatusError
+		if errors.As(err, &statusErr) && statusErr.Code == http.StatusTooEarly {
+			return nil
+		}
+		if created && errors.As(err, &statusErr) && statusErr.Code == http.StatusConflict {
+			if state.CurrentRawToken == "" {
+				_ = os.Remove(claimSuccessorStatePath(root))
+			} else {
+				state.ProposalID, state.RawToken, state.KeyPrefix, state.SecretSHA = "", "", "", ""
+				state.Enabled = false
+				_ = persistClaimSuccessorState(root, *state)
+			}
+			return nil
+		}
+		return err
+	}
+	// Persist the successor-issued phase before its ACK. The ACK uses the new
+	// bearer explicitly, while the worker keeps the predecessor as its ordinary
+	// bearer until every unrelated old fence drains. A crash can therefore replay
+	// the ACK without either losing the successor or starving old heartbeats.
+	state.Enabled = true
+	if err = persistClaimSuccessorState(root, *state); err != nil {
+		return err
+	}
+	retired, err := w.cfg.Client.AckClaimSuccessor(ctx, state.ProposalID, state.RawToken)
+	if err != nil {
+		return err
+	}
+	if retired {
+		if err = w.cfg.Client.SetNodeToken(state.RawToken); err != nil {
+			return err
+		}
+		return promoteClaimSuccessorState(root, state)
+	}
+	return nil
 }
 
 func infoSyscallStat(info os.FileInfo) (*syscall.Stat_t, bool) {
@@ -207,6 +525,23 @@ func validateCaptureSetJournal(journal *captureProducerJournal) error {
 	if setJournal.Committed && setJournal.MerkleRootSHA256 == "" {
 		return fmt.Errorf("committed capture set has no root")
 	}
+	if setJournal.StopAck != nil {
+		ackID, ackErr := uuid.Parse(strings.TrimSpace(setJournal.StopAck.AckID))
+		inventorySHA, inventoryErr := recordingapi.CaptureStopInventorySHA(*setJournal.StopAck)
+		if ackErr != nil || ackID.String() != setJournal.StopAck.AckID || inventoryErr != nil || inventorySHA != setJournal.StopAck.InventorySHA256 || setJournal.StopAck.RetainedDirectoryInode == 0 || len(setJournal.StopAck.Members) > plan.ArtifactCount {
+			return fmt.Errorf("capture stop acknowledgment journal is invalid")
+		}
+		seen := make(map[int]struct{}, len(setJournal.StopAck.Members))
+		for _, member := range setJournal.StopAck.Members {
+			if member.Ordinal < 1 || member.Ordinal > plan.ArtifactCount || member.CaptureSequence != plan.FirstCaptureSequence+int64(member.Ordinal-1) || member.Inode == 0 || !captureSegmentLeafRE.MatchString(member.RelativeName) {
+				return fmt.Errorf("capture stop acknowledgment member is invalid")
+			}
+			if _, duplicate := seen[member.Ordinal]; duplicate {
+				return fmt.Errorf("capture stop acknowledgment member is duplicated")
+			}
+			seen[member.Ordinal] = struct{}{}
+		}
+	}
 	setJournal.tree = tree
 	return nil
 }
@@ -237,6 +572,13 @@ func surrenderTransportObservationPath(root string) string {
 }
 
 func loadSurrenderTransportObservations(path string) ([]queuedSurrenderTransportObservation, error) {
+	info, statErr := os.Lstat(path)
+	if statErr == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0) {
+		return nil, fmt.Errorf("surrender transport observation journal is not a private regular file")
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, statErr
+	}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -364,14 +706,25 @@ func (w *Worker) recoverProducerJournals(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("validate surrender recovery inventory: %w", err)
 	}
+	rotateAfterRecovery := false
 	for _, journal := range journals {
 		done, err := w.recoverProducerJournalV2(ctx, journal)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("recording worker job=%d capture recovery pending: %v", journal.JobID, err)
 		}
 		if done {
+			rotateAfterRecovery = rotateAfterRecovery || journal.RecoveryGrantSeen
 			_ = os.Remove(journal.path)
 			_ = os.RemoveAll(journal.OutputDir)
+		}
+	}
+	claimState, stateErr := loadClaimSuccessorState(w.surrenderJournalRoot())
+	if stateErr != nil {
+		return stateErr
+	}
+	if rotateAfterRecovery || claimState != nil && claimState.ProposalID != "" {
+		if err := w.maybeRotateClaimCredential(ctx); err != nil {
+			return fmt.Errorf("rotate recovered claim credential: %w", err)
 		}
 	}
 	return nil
@@ -416,6 +769,11 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 		return false, err
 	}
 	sort.Strings(paths)
+	if journal.CaptureSet != nil {
+		setDone, setErr := w.recoverCaptureSetJournal(ctx, journal, paths)
+		done = setDone
+		return setDone, setErr
+	}
 	if producerStatus, statusErr := w.cfg.Client.CaptureProducerStatus(ctx, journal.JobID, journal.ProducerID); statusErr == nil {
 		if producerStatus.ProducerID != journal.ProducerID {
 			return false, fmt.Errorf("capture producer status identity mismatch")
@@ -564,6 +922,226 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 	return true, nil
 }
 
+func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureProducerJournal, paths []string) (bool, error) {
+	if err := validateCaptureSetJournal(journal); err != nil {
+		return false, err
+	}
+	bound := make(map[string]struct{}, len(journal.Artifacts))
+	nextSequence := journal.CaptureSet.FirstCaptureSequence
+	if journal.LastAcceptedSequence >= nextSequence {
+		nextSequence = journal.LastAcceptedSequence + 1
+	}
+	for _, artifact := range journal.Artifacts {
+		if artifact.CaptureSequence >= nextSequence {
+			nextSequence = artifact.CaptureSequence + 1
+		}
+		if artifact.Segment != nil {
+			bound[artifact.Segment.Path] = struct{}{}
+		} else if artifact.LocalPath != "" {
+			bound[artifact.LocalPath] = struct{}{}
+		}
+	}
+	for _, path := range paths {
+		if _, exists := bound[path]; exists {
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		segment, probeErr := w.recoverContinuousSegment(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
+		cancel()
+		artifact, _, deriveErr := deriveCaptureSetArtifact(journal, nextSequence)
+		if deriveErr != nil {
+			return false, deriveErr
+		}
+		artifact.LocalPath = path
+		info, identityErr := os.Lstat(path)
+		stat, statOK := infoSyscallStat(info)
+		if identityErr != nil || !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 {
+			return false, fmt.Errorf("recovered capture artifact identity is unsafe")
+		}
+		artifact.Device, artifact.Inode = uint64(stat.Dev), uint64(stat.Ino)
+		if probeErr == nil {
+			segment.CaptureSequence = nextSequence
+			artifact.Segment = &segment
+		}
+		journal.Artifacts = append(journal.Artifacts, artifact)
+		nextSequence++
+	}
+	for index := range journal.Artifacts {
+		artifact := &journal.Artifacts[index]
+		if artifact.Segment != nil || artifact.LocalPath == "" {
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		segment, probeErr := w.recoverContinuousSegment(probeCtx, artifact.LocalPath, time.Duration(journal.ClipDurationSec)*time.Second)
+		cancel()
+		if probeErr == nil {
+			segment.CaptureSequence = artifact.CaptureSequence
+			artifact.Segment = &segment
+		}
+	}
+	sort.Slice(journal.Artifacts, func(i, j int) bool {
+		return journal.Artifacts[i].CaptureSequence < journal.Artifacts[j].CaptureSequence
+	})
+	if err := persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+		return false, err
+	}
+
+	heartbeatCtx, cancelHeartbeat := context.WithTimeout(ctx, 10*time.Second)
+	heartbeat, heartbeatErr := w.cfg.Client.HeartbeatRecordingJobState(heartbeatCtx, journal.JobID, journal.LeaseToken)
+	cancelHeartbeat()
+	currentLease := heartbeatErr == nil && !heartbeat.Cancel
+	for index := range journal.Artifacts {
+		artifact := &journal.Artifacts[index]
+		if artifact.Done {
+			continue
+		}
+		_, proof, err := deriveCaptureSetArtifact(journal, artifact.CaptureSequence)
+		if err != nil {
+			return false, err
+		}
+		materialization := recordingapi.CaptureArtifactMaterialization{
+			ArtifactID: artifact.IntentID, CaptureSequence: artifact.CaptureSequence,
+			RecoverySecretSHA256: artifact.RecoverySecretSHA256, Proof: proof,
+		}
+		if err = w.cfg.Client.MaterializeCaptureArtifact(ctx, journal.JobID, journal.LeaseToken, journal.CaptureSet.SetID, artifact.Ordinal, materialization); err != nil {
+			return false, err
+		}
+		if currentLease {
+			if artifact.Segment == nil {
+				continue
+			}
+			segment := *artifact.Segment
+			intent, sealErr := w.cfg.Client.SealCaptureSetArtifact(ctx, journal.JobID, journal.LeaseToken, journal.CaptureSet.SetID, artifact.Ordinal, artifact.IntentID, journal.ProducerID, artifact.CaptureSequence, captureUnixMicro(segment.StartAt), segment.SizeBytes, segment.SHA256)
+			if sealErr != nil {
+				return false, sealErr
+			}
+			if !intent.AlreadyIngested {
+				if err = w.cfg.Client.UploadFile(ctx, intent.UploadURL, segment.Path, segment.MIMEType); err != nil {
+					return false, err
+				}
+				if _, err = w.cfg.Client.IngestClipWithResult(ctx, recoveryIngestRequest(journal, segment, artifact.IntentID, artifact.CaptureSequence)); err != nil {
+					return false, err
+				}
+			}
+			if err = removeRetainedArtifact(segment.Path, artifact.Device, artifact.Inode); err != nil {
+				return false, err
+			}
+			artifact.Done, artifact.Segment = true, nil
+			journal.HadAcceptedArtifact = true
+			journal.LastAcceptedSequence = max(journal.LastAcceptedSequence, artifact.CaptureSequence)
+			if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+				return false, err
+			}
+			continue
+		}
+
+		status, statusErr := w.cfg.Client.RecordingRecoveryStatus(ctx, artifact.IntentID, artifact.RecoverySecret)
+		if statusErr != nil {
+			return false, statusErr
+		}
+		if status.Authority != "capture_set_grant" || status.IntentID != artifact.IntentID || status.ProducerID != journal.ProducerID || status.JobID != journal.JobID || status.LeaseToken != journal.LeaseToken || len(status.Artifacts) != 1 || status.Artifacts[0].CaptureSequence != artifact.CaptureSequence {
+			return false, fmt.Errorf("capture set recovery status identity mismatch")
+		}
+		if !journal.RecoveryGrantSeen {
+			journal.RecoveryGrantSeen = true
+			if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+				return false, err
+			}
+		}
+		if terminal := status.Artifacts[0].Result; terminal != "" {
+			if terminal == "unrecoverable_partial" {
+				return false, fmt.Errorf("partial capture bytes retained for operator recovery")
+			}
+			if artifact.Segment != nil {
+				if err = removeRetainedArtifact(artifact.Segment.Path, artifact.Device, artifact.Inode); err != nil {
+					return false, err
+				}
+			}
+			artifact.Done, artifact.Segment = true, nil
+			if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+				return false, err
+			}
+			continue
+		}
+		reportID := uuid.NewSHA1(captureRecoveryReportNamespace, []byte(artifact.IntentID)).String()
+		if artifact.Segment == nil && artifact.LocalPath == "" {
+			report := recordingapi.CaptureRecoveryReport{ReportID: reportID, ReportType: "no_bytes", LocalObservedAt: time.Now().UTC()}
+			if err = w.cfg.Client.ReportRecoveryArtifact(ctx, artifact.IntentID, artifact.RecoverySecret, report); err != nil {
+				return false, err
+			}
+			artifact.Done = true
+			if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+				return false, err
+			}
+			continue
+		}
+		if artifact.Segment == nil {
+			size, partialSHA, hashErr := hashRetainedArtifact(artifact.LocalPath)
+			if hashErr != nil {
+				return false, hashErr
+			}
+			report := recordingapi.CaptureRecoveryReport{ReportID: reportID, ReportType: "partial_bytes", SizeBytes: &size, SHA256: partialSHA, LocalObservedAt: time.Now().UTC()}
+			if err = w.cfg.Client.ReportRecoveryArtifact(ctx, artifact.IntentID, artifact.RecoverySecret, report); err != nil {
+				return false, err
+			}
+			return false, fmt.Errorf("partial capture bytes retained for operator recovery")
+		}
+		segment := *artifact.Segment
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		probed, probeErr := w.recoverContinuousSegment(probeCtx, segment.Path, time.Duration(journal.ClipDurationSec)*time.Second)
+		cancel()
+		if probeErr != nil || probed.SizeBytes != segment.SizeBytes || probed.SHA256 != segment.SHA256 {
+			size := segment.SizeBytes
+			report := recordingapi.CaptureRecoveryReport{ReportID: reportID, ReportType: "partial_bytes", SizeBytes: &size, SHA256: segment.SHA256, LocalObservedAt: time.Now().UTC()}
+			if err = w.cfg.Client.ReportRecoveryArtifact(ctx, artifact.IntentID, artifact.RecoverySecret, report); err != nil {
+				return false, errors.Join(probeErr, err)
+			}
+			return false, fmt.Errorf("partial capture bytes retained for operator recovery")
+		}
+		if _, err = w.cfg.Client.SealCaptureSetArtifactRecovery(ctx, journal.JobID, journal.CaptureSet.SetID, artifact.Ordinal, artifact.IntentID, artifact.RecoverySecret, journal.ProducerID, artifact.CaptureSequence, captureUnixMicro(segment.StartAt), segment.SizeBytes, segment.SHA256); err != nil {
+			return false, err
+		}
+		size := segment.SizeBytes
+		report := recordingapi.CaptureRecoveryReport{ReportID: reportID, ReportType: "sealed_bytes", SizeBytes: &size, SHA256: segment.SHA256, LocalObservedAt: time.Now().UTC()}
+		if err = w.cfg.Client.ReportRecoveryArtifact(ctx, artifact.IntentID, artifact.RecoverySecret, report); err != nil {
+			return false, err
+		}
+		if artifact.RecoveryRevision < 1 {
+			artifact.RecoveryRevision = 1
+		}
+		sessionID := uuid.NewSHA1(captureRecoverySessionNamespace, []byte(fmt.Sprintf("%s:%d", artifact.IntentID, artifact.RecoveryRevision))).String()
+		if err = w.cfg.Client.UploadRecoveryArtifact(ctx, artifact.IntentID, artifact.RecoverySecret, sessionID, segment.Path, artifact.Device, artifact.Inode); err != nil {
+			artifact.RecoveryRevision++
+			if persistErr := persistProducerJournal(w.surrenderJournalRoot(), journal); persistErr != nil {
+				return false, errors.Join(err, persistErr)
+			}
+			return false, err
+		}
+		if _, err = w.cfg.Client.IngestClipRecovery(ctx, recoveryIngestRequest(journal, segment, artifact.IntentID, artifact.CaptureSequence), artifact.IntentID, artifact.RecoverySecret); err != nil {
+			return false, err
+		}
+		if err = removeRetainedArtifact(segment.Path, artifact.Device, artifact.Inode); err != nil {
+			return false, err
+		}
+		artifact.Done, artifact.Segment = true, nil
+		journal.HadAcceptedArtifact = true
+		journal.LastAcceptedSequence = max(journal.LastAcceptedSequence, artifact.CaptureSequence)
+		if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+			return false, err
+		}
+	}
+	remaining, err := filepath.Glob(filepath.Join(journal.OutputDir, "seg-*.mp4"))
+	if err != nil || len(remaining) != 0 {
+		return false, fmt.Errorf("capture set recovery retains local bytes")
+	}
+	if currentLease {
+		if err = w.cfg.Client.FinishCaptureSet(ctx, journal.JobID, journal.LeaseToken, journal.CaptureSet.SetID); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *captureProducerJournal, paths []string) error {
 	boundPaths := make(map[string]struct{}, len(journal.Artifacts))
 	for _, artifact := range journal.Artifacts {
@@ -665,16 +1243,18 @@ func recoveryIngestRequest(journal *captureProducerJournal, seg capture.Segment,
 }
 
 type captureProducerJournal struct {
-	JobID               int64                    `json:"job_id"`
-	LeaseToken          string                   `json:"lease_token"`
-	ProducerID          string                   `json:"producer_id"`
-	CaptureOrdinal      int64                    `json:"capture_ordinal"`
-	OutputDir           string                   `json:"output_dir"`
-	ClipDurationSec     int                      `json:"clip_duration_sec"`
-	Artifacts           []captureArtifactJournal `json:"artifacts,omitempty"`
-	CaptureSet          *captureSetJournal       `json:"capture_set,omitempty"`
-	HadAcceptedArtifact bool                     `json:"had_accepted_artifact,omitempty"`
-	path                string
+	JobID                int64                    `json:"job_id"`
+	LeaseToken           string                   `json:"lease_token"`
+	ProducerID           string                   `json:"producer_id"`
+	CaptureOrdinal       int64                    `json:"capture_ordinal"`
+	OutputDir            string                   `json:"output_dir"`
+	ClipDurationSec      int                      `json:"clip_duration_sec"`
+	Artifacts            []captureArtifactJournal `json:"artifacts,omitempty"`
+	CaptureSet           *captureSetJournal       `json:"capture_set,omitempty"`
+	HadAcceptedArtifact  bool                     `json:"had_accepted_artifact,omitempty"`
+	LastAcceptedSequence int64                    `json:"last_accepted_sequence,omitempty"`
+	RecoveryGrantSeen    bool                     `json:"recovery_grant_seen,omitempty"`
+	path                 string
 }
 
 type captureSetJournal struct {
@@ -685,6 +1265,7 @@ type captureSetJournal struct {
 	Plan                 *recordingapi.CaptureSetPlan `json:"plan,omitempty"`
 	MerkleRootSHA256     string                       `json:"merkle_root_sha256,omitempty"`
 	Committed            bool                         `json:"committed,omitempty"`
+	StopAck              *recordingapi.CaptureStopAck `json:"stop_ack,omitempty"`
 	tree                 *surrenderplan.Tree
 }
 
@@ -695,22 +1276,25 @@ type captureArtifactJournal struct {
 	RecoverySecretSHA256 string           `json:"recovery_secret_sha256"`
 	CaptureSequence      int64            `json:"capture_sequence"`
 	Segment              *capture.Segment `json:"segment,omitempty"`
+	LocalPath            string           `json:"local_path,omitempty"`
+	Device               uint64           `json:"device,omitempty"`
+	Inode                uint64           `json:"inode,omitempty"`
 	Done                 bool             `json:"done,omitempty"`
+	RecoveryRevision     int              `json:"recovery_revision,omitempty"`
 }
 
-func (w *Worker) materializeCaptureSetArtifact(ctx context.Context, job recordingapi.RecordingJob, producer *captureProducerJournal, sequence int64) (*captureArtifactJournal, error) {
+func deriveCaptureSetArtifact(producer *captureProducerJournal, sequence int64) (captureArtifactJournal, []string, error) {
 	if producer == nil || producer.CaptureSet == nil || !producer.CaptureSet.Committed || producer.CaptureSet.Plan == nil {
-		return nil, fmt.Errorf("capture set is not committed")
+		return captureArtifactJournal{}, nil, fmt.Errorf("capture set is not committed")
 	}
 	setJournal := producer.CaptureSet
 	ordinal64 := sequence - setJournal.FirstCaptureSequence + 1
 	if ordinal64 < 1 || ordinal64 > int64(setJournal.Plan.ArtifactCount) {
-		return nil, fmt.Errorf("capture sequence is outside committed set")
+		return captureArtifactJournal{}, nil, fmt.Errorf("capture sequence is outside committed set")
 	}
-	ordinal := int(ordinal64)
 	if setJournal.tree == nil {
 		if err := validateCaptureSetJournal(producer); err != nil {
-			return nil, err
+			return captureArtifactJournal{}, nil, err
 		}
 	}
 	seedBytes, _ := hex.DecodeString(setJournal.Seed)
@@ -718,23 +1302,34 @@ func (w *Worker) materializeCaptureSetArtifact(ctx context.Context, job recordin
 	copy(seed[:], seedBytes)
 	set, err := captureSetIdentity(*setJournal.Plan)
 	if err != nil {
-		return nil, err
+		return captureArtifactJournal{}, nil, err
 	}
+	ordinal := int(ordinal64)
 	derived, err := surrenderplan.DeriveArtifact(seed, set, ordinal)
 	if err != nil {
-		return nil, err
+		return captureArtifactJournal{}, nil, err
 	}
 	proof, err := setJournal.tree.Proof(ordinal)
 	if err != nil {
-		return nil, err
+		return captureArtifactJournal{}, nil, err
 	}
 	proofHex := make([]string, len(proof.Siblings))
 	for index := range proof.Siblings {
 		proofHex[index] = hex.EncodeToString(proof.Siblings[index][:])
 	}
-	secretHex := hex.EncodeToString(derived.RecoverySecret[:])
-	secretHashHex := hex.EncodeToString(derived.RecoverySecretHash[:])
-	artifact := captureArtifactJournal{Ordinal: ordinal, IntentID: derived.ID.String(), RecoverySecret: secretHex, RecoverySecretSHA256: secretHashHex, CaptureSequence: sequence}
+	return captureArtifactJournal{
+		Ordinal: ordinal, IntentID: derived.ID.String(), RecoverySecret: hex.EncodeToString(derived.RecoverySecret[:]),
+		RecoverySecretSHA256: hex.EncodeToString(derived.RecoverySecretHash[:]), CaptureSequence: sequence,
+	}, proofHex, nil
+}
+
+func (w *Worker) materializeCaptureSetArtifact(ctx context.Context, job recordingapi.RecordingJob, producer *captureProducerJournal, sequence int64) (*captureArtifactJournal, error) {
+	artifact, proofHex, err := deriveCaptureSetArtifact(producer, sequence)
+	if err != nil {
+		return nil, err
+	}
+	setJournal := producer.CaptureSet
+	ordinal := artifact.Ordinal
 	state := w.surrenderState(job.JobID)
 	state.mu.Lock()
 	found := false
@@ -761,11 +1356,130 @@ func (w *Worker) materializeCaptureSetArtifact(ctx context.Context, job recordin
 	state.mu.Unlock()
 
 	if err := w.cfg.Client.MaterializeCaptureArtifact(ctx, job.JobID, job.LeaseToken, setJournal.SetID, ordinal, recordingapi.CaptureArtifactMaterialization{
-		ArtifactID: artifact.IntentID, CaptureSequence: sequence, RecoverySecretSHA256: secretHashHex, Proof: proofHex,
+		ArtifactID: artifact.IntentID, CaptureSequence: sequence, RecoverySecretSHA256: artifact.RecoverySecretSHA256, Proof: proofHex,
 	}); err != nil {
 		return nil, err
 	}
 	return &artifact, nil
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	closeErr := dir.Close()
+	if err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *captureProducerJournal, pool *segmentDeliveryPool, captureSequence *int64) capture.ContinuousStopBarrier {
+	return func(ctx context.Context, outputDir string) (string, error) {
+		if producer == nil || producer.CaptureSet == nil || producer.CaptureSet.Plan == nil || pool == nil || captureSequence == nil {
+			return "", fmt.Errorf("capture stop authority is incomplete")
+		}
+		if err := pool.waitIdle(ctx); err != nil {
+			return "", fmt.Errorf("drain pre-stop deliveries: %w", err)
+		}
+		retainedDir := outputDir + ".retained-" + uuid.NewString()
+		if err := os.Rename(outputDir, retainedDir); err != nil {
+			return "", fmt.Errorf("isolate capture output namespace: %w", err)
+		}
+		sentinel, err := os.OpenFile(outputDir, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0)
+		if err != nil {
+			return "", fmt.Errorf("install capture namespace sentinel: %w", err)
+		}
+		if err = sentinel.Sync(); err == nil {
+			err = sentinel.Close()
+		} else {
+			_ = sentinel.Close()
+		}
+		if err != nil {
+			return "", fmt.Errorf("sync capture namespace sentinel: %w", err)
+		}
+		if err = syncDirectory(filepath.Dir(outputDir)); err != nil {
+			return "", fmt.Errorf("sync capture namespace parent: %w", err)
+		}
+		dirInfo, err := os.Lstat(retainedDir)
+		dirStat, dirStatOK := infoSyscallStat(dirInfo)
+		if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 || !dirStatOK || dirStat.Ino == 0 {
+			return "", fmt.Errorf("retained capture directory identity is unsafe")
+		}
+		entries, err := os.ReadDir(retainedDir)
+		if err != nil {
+			return "", err
+		}
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if !captureSegmentLeafRE.MatchString(entry.Name()) || entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("retained capture namespace contains an unauthorized leaf")
+			}
+			names = append(names, entry.Name())
+		}
+		sort.Strings(names)
+		members := make([]recordingapi.CaptureStopAckMember, 0, len(names))
+		artifacts := make([]captureArtifactJournal, 0, len(names))
+		for index, name := range names {
+			path := filepath.Join(retainedDir, name)
+			info, statErr := os.Lstat(path)
+			stat, statOK := infoSyscallStat(info)
+			if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !statOK || stat.Nlink != 1 || stat.Ino == 0 {
+				return "", fmt.Errorf("retained capture leaf identity is unsafe")
+			}
+			sequence := *captureSequence + int64(index+1)
+			artifact, proof, deriveErr := deriveCaptureSetArtifact(producer, sequence)
+			if deriveErr != nil {
+				return "", deriveErr
+			}
+			artifact.LocalPath = path
+			artifact.Device, artifact.Inode = uint64(stat.Dev), uint64(stat.Ino)
+			artifacts = append(artifacts, artifact)
+			members = append(members, recordingapi.CaptureStopAckMember{
+				Ordinal: artifact.Ordinal, ArtifactID: artifact.IntentID, CaptureSequence: artifact.CaptureSequence,
+				RecoverySecretSHA256: artifact.RecoverySecretSHA256, Proof: proof,
+				Device: uint64(stat.Dev), Inode: uint64(stat.Ino), RelativeName: name,
+			})
+		}
+		ack := recordingapi.CaptureStopAck{
+			AckID: uuid.NewString(), RetainedDirectoryDevice: uint64(dirStat.Dev), RetainedDirectoryInode: uint64(dirStat.Ino), Members: members,
+		}
+		ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
+		if err != nil {
+			return "", err
+		}
+		state := w.surrenderState(job.JobID)
+		state.mu.Lock()
+		producer.OutputDir = retainedDir
+		producer.CaptureSet.StopAck = &ack
+		for _, artifact := range artifacts {
+			found := false
+			for _, existing := range producer.Artifacts {
+				if existing.CaptureSequence == artifact.CaptureSequence {
+					if existing.IntentID != artifact.IntentID || existing.RecoverySecretSHA256 != artifact.RecoverySecretSHA256 {
+						state.mu.Unlock()
+						return "", fmt.Errorf("stop inventory artifact differs from journal")
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				producer.Artifacts = append(producer.Artifacts, artifact)
+			}
+		}
+		err = persistProducerJournal(w.surrenderJournalRoot(), producer)
+		state.mu.Unlock()
+		if err != nil {
+			return "", fmt.Errorf("persist stopped capture inventory: %w", err)
+		}
+		if err = w.cfg.Client.AckCaptureSetStop(ctx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, ack); err != nil {
+			return "", err
+		}
+		return retainedDir, nil
+	}
 }
 
 type surrenderJobState struct {
@@ -833,6 +1547,11 @@ func (w *Worker) recordProducerArtifact(jobID int64, producer *captureProducerJo
 	if state.producer == nil || state.producer.ProducerID != producer.ProducerID {
 		return fmt.Errorf("capture producer journal is not current")
 	}
+	info, statErr := os.Lstat(seg.Path)
+	stat, statOK := infoSyscallStat(info)
+	if statErr != nil || !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 || stat.Ino == 0 {
+		return fmt.Errorf("capture artifact identity is unsafe")
+	}
 	for _, artifact := range producer.Artifacts {
 		if artifact.CaptureSequence == seg.CaptureSequence {
 			if artifact.IntentID != intentID {
@@ -844,6 +1563,9 @@ func (w *Worker) recordProducerArtifact(jobID int64, producer *captureProducerJo
 			for index := range producer.Artifacts {
 				if producer.Artifacts[index].CaptureSequence == seg.CaptureSequence {
 					producer.Artifacts[index].Segment = &seg
+					producer.Artifacts[index].LocalPath = seg.Path
+					producer.Artifacts[index].Device = uint64(stat.Dev)
+					producer.Artifacts[index].Inode = uint64(stat.Ino)
 					return persistProducerJournal(w.surrenderJournalRoot(), producer)
 				}
 			}
@@ -865,6 +1587,9 @@ func (w *Worker) acknowledgeProducerArtifact(jobID int64, producer *captureProdu
 		}
 		if producer.CaptureSet != nil {
 			producer.HadAcceptedArtifact = true
+			if producer.Artifacts[index].CaptureSequence > producer.LastAcceptedSequence {
+				producer.LastAcceptedSequence = producer.Artifacts[index].CaptureSequence
+			}
 			producer.Artifacts = append(producer.Artifacts[:index], producer.Artifacts[index+1:]...)
 		} else {
 			producer.Artifacts[index].Done = true
@@ -893,7 +1618,14 @@ func (w *Worker) surrenderTransportEnabled() bool {
 		return false
 	}
 	temp, err := filepath.Abs(os.TempDir())
-	return err == nil && abs != temp
+	if err != nil || abs == temp {
+		return false
+	}
+	rel, err := filepath.Rel(temp, abs)
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
 }
 
 func ensurePrivateSurrenderJournalRoot(root string) error {

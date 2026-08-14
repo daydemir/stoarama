@@ -97,6 +97,8 @@ func main() {
 		runRecordingPreopen(ctx, cfg, os.Args[2:])
 	case "recording-stitch":
 		runRecordingStitch(ctx, cfg, os.Args[2:])
+	case "recording-recovery":
+		runRecordingRecovery(ctx, cfg, os.Args[2:])
 	case "relay-connectivity":
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
 	case "relay-routing":
@@ -187,6 +189,7 @@ func usage() {
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recording-health summary
 	  stoaramactl recording-preopen run [--dry-run --concurrency 4 --probe-sec 20 --frame-fresh-min 30]
+	  stoaramactl recording-recovery security-revoke --set-id UUID [--ordinal N] --reason suspected_capability_compromise|suspected_seed_compromise --idempotency-key UUID [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
 	  stoaramactl recordings naming allocate|get|set|preview

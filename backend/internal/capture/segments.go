@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
@@ -34,6 +36,19 @@ var ErrContinuousSegmentDuplicate = errors.New("continuous segment is a duplicat
 // ErrContinuousNoOutput identifies watchdog exits eligible for the separately
 // fenced frozen-live-edge observer. It says nothing about the playlist itself.
 var ErrContinuousNoOutput = errors.New("continuous ffmpeg made no output progress")
+
+// ErrContinuousStopRequired means the server froze the source/config snapshot
+// used by this finite producer and required it to stop opening new artifacts.
+// It is deliberately distinct from context cancellation: callers must retain
+// and account for the namespace returned by the stop barrier.
+var ErrContinuousStopRequired = errors.New("continuous producer stop required")
+
+// ContinuousStopBarrier runs only after the entire FFmpeg process group has
+// been confirmed stopped. It must atomically move the output namespace out of
+// FFmpeg's reach, install a non-directory sentinel at the old pathname, and
+// durably acknowledge the exact retained inventory before returning its new
+// directory. No callback runs after FFmpeg has been continued.
+type ContinuousStopBarrier func(context.Context, string) (string, error)
 
 type continuousNoOutputError struct{ message string }
 
@@ -316,10 +331,20 @@ func CaptureContinuousWithTimestampContract(ctx context.Context, sourceURL strin
 // split plan accepted by the server. The plan bounds file cardinality before
 // exec; it never changes codec selection.
 func CaptureContinuousWithFinitePlan(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, timestampContract bool, plan surrenderplan.Plan) error {
+	return CaptureContinuousWithFinitePlanAndStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, timestampContract, plan, nil, nil)
+}
+
+// CaptureContinuousWithFinitePlanAndStop is the finite-plan capture path with
+// the append-only source/config stop protocol. stopRequired is separate from
+// ctx so a source mutation cannot be mistaken for an ordinary window close.
+func CaptureContinuousWithFinitePlanAndStop(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, timestampContract bool, plan surrenderplan.Plan, stopRequired <-chan struct{}, stopBarrier ContinuousStopBarrier) error {
 	if targetFPS != nil && timestampContract {
 		return fmt.Errorf("timestamp contract requires native source-copy capture")
 	}
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), timestampContract, &plan)
+	if stopRequired != nil && stopBarrier == nil {
+		return fmt.Errorf("finite capture stop signal requires a stop barrier")
+	}
+	return captureContinuousWithHeadersModeAndStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), timestampContract, &plan, stopRequired, stopBarrier)
 }
 
 func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
@@ -335,6 +360,10 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 }
 
 func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool, finitePlan *surrenderplan.Plan) error {
+	return captureContinuousWithHeadersModeAndStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, timestampContract, finitePlan, nil, nil)
+}
+
+func captureContinuousWithHeadersModeAndStop(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool, finitePlan *surrenderplan.Plan, stopRequired <-chan struct{}, stopBarrier ContinuousStopBarrier) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
@@ -355,7 +384,7 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 			return fmt.Errorf("finite capture plan differs from capture parameters")
 		}
 	}
-	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract, finitePlan)
+	err := captureContinuousAttemptWithStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract, finitePlan, stopRequired, stopBarrier)
 	if !isMalformedAudioMuxError(err) {
 		return err
 	}
@@ -378,10 +407,14 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	// write that track and exits before producing any video. Retry once without
 	// audio; video remains a lossless stream copy and healthy audio is preserved
 	// on every source that did not hit this exact muxer failure.
-	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract, finitePlan)
+	return captureContinuousAttemptWithStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract, finitePlan, stopRequired, stopBarrier)
 }
 
 func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool, finitePlan *surrenderplan.Plan) error {
+	return captureContinuousAttemptWithStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, includeAudio, timestampContract, finitePlan, nil, nil)
+}
+
+func captureContinuousAttemptWithStop(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool, finitePlan *surrenderplan.Plan, stopRequired <-chan struct{}, stopBarrier ContinuousStopBarrier) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -400,6 +433,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		}
 	}
 	cmd := exec.Command(ffmpegBin(), args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
@@ -429,18 +463,57 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 
 	// stopFFmpeg sends SIGINT for a clean trailer, then waits a bounded grace for
 	// the process to exit (falling back to Kill so we never hang on a wedged child).
+	var stopOnce sync.Once
 	stopFFmpeg := func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(os.Interrupt)
-		}
-		select {
-		case <-waitErr:
-		case <-time.After(continuousShutdownGrace):
+		stopOnce.Do(func() {
 			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
+				_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
 			}
-			<-waitErr
+			select {
+			case <-waitErr:
+			case <-time.After(continuousShutdownGrace):
+				if cmd.Process != nil {
+					_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+				}
+				<-waitErr
+			}
+		})
+	}
+
+	retainedOutputDir := outDir
+	stopAtBarrier := func() error {
+		if cmd.Process == nil || stopBarrier == nil {
+			return fmt.Errorf("continuous stop barrier is unavailable")
 		}
+		if err := signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGSTOP); err != nil {
+			return fmt.Errorf("stop continuous process group: %w", err)
+		}
+		if err := waitContinuousProcessStopped(cmd.Process.Pid, 5*time.Second); err != nil {
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+			return err
+		}
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 30*time.Second)
+		movedDir, err := stopBarrier(barrierCtx, outDir)
+		cancelBarrier()
+		if err != nil {
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+			stopFFmpeg()
+			return fmt.Errorf("acknowledge continuous stop inventory: %w", err)
+		}
+		if strings.TrimSpace(movedDir) == "" || movedDir == outDir {
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+			stopFFmpeg()
+			return fmt.Errorf("continuous stop barrier did not isolate output namespace")
+		}
+		retainedOutputDir = movedDir
+		// SIGINT is queued while every process in the group remains stopped. Only
+		// after the namespace ACK is durable may the group continue and reap.
+		_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+		_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+		stopFFmpeg()
+		return nil
 	}
 
 	// sweepFinal scans outDir and hands every newly-finalized segment to onSegment.
@@ -448,7 +521,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 	// exists (steady state); finalizeAll=true treats every unprocessed segment as
 	// final (post-SIGINT sweep, when ffmpeg has closed the last trailer).
 	sweepFinal := func(probeCtx context.Context, finalizeAll bool) error {
-		segs, err := sortedSegments(outDir)
+		segs, err := sortedSegments(retainedOutputDir)
 		if err != nil {
 			return err
 		}
@@ -475,6 +548,17 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 
 	for {
 		select {
+		case <-stopRequired:
+			if err := stopAtBarrier(); err != nil {
+				stopFFmpeg()
+				return err
+			}
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancelFinalize()
+			if err := sweepFinal(finalizeCtx, true); err != nil {
+				return errors.Join(ErrContinuousStopRequired, err)
+			}
+			return ErrContinuousStopRequired
 		case <-ctx.Done():
 			stopFFmpeg()
 			// Final sweep: the last open segment now has a clean trailer.
@@ -545,6 +629,63 @@ var readExecArgumentLimit = func() (int, error) {
 		return 0, fmt.Errorf("invalid ARG_MAX")
 	}
 	return value, nil
+}
+
+var signalContinuousProcessGroup = func(pid int, signal syscall.Signal) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid continuous process id")
+	}
+	return syscall.Kill(-pid, signal)
+}
+
+var readContinuousProcessGroupStates = func(pid int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/bin/ps", "-axo", "pgid=,state=").Output()
+	if err != nil {
+		return nil, err
+	}
+	var states []byte
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		pgid, parseErr := strconv.Atoi(fields[0])
+		if parseErr == nil && pgid == pid && fields[1] != "" {
+			states = append(states, fields[1][0])
+		}
+	}
+	if len(states) == 0 {
+		return nil, fmt.Errorf("continuous process group is empty")
+	}
+	return states, nil
+}
+
+func waitContinuousProcessStopped(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		states, err := readContinuousProcessGroupStates(pid)
+		if err == nil {
+			allStopped := true
+			for _, state := range states {
+				if state != 'T' && state != 't' {
+					allStopped = false
+					break
+				}
+			}
+			if allStopped {
+				return nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return fmt.Errorf("confirm continuous process group stopped: %w", err)
+			}
+			return fmt.Errorf("continuous process group did not stop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func platformExecArgumentLimit() (int, error) {

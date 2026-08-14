@@ -187,6 +187,12 @@ func (s *Scheduler) autoStopExpiredRecordings(ctx context.Context, tx pgx.Tx) er
 		    WHERE producer.recording_job_id=recording_jobs.id
 		      AND producer.lease_token=recording_jobs.lease_token
 		      AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+		  ) AND NOT EXISTS(
+		    SELECT 1 FROM recording_capture_reservation_sets capture_set
+		    JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+		    WHERE plan.recording_job_id=recording_jobs.id
+		      AND plan.lease_token=recording_jobs.lease_token
+		      AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
 		  )))
 	`); err != nil {
 		return fmt.Errorf("cancel jobs for completed recordings: %w", err)

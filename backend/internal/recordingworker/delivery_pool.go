@@ -230,6 +230,30 @@ func (p *segmentDeliveryPool) acknowledge(uniqueIngest bool) {
 	}
 }
 
+// waitIdle pauses a source-mutation stop barrier until every descriptor that
+// was accepted before SIGSTOP has reached a terminal delivery outcome. It does
+// not close the pool: the final, namespace-isolated FFmpeg leaf is submitted
+// only after the stopped process has been interrupted, continued, and reaped.
+func (p *segmentDeliveryPool) waitIdle(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		for p.inFlight > 0 && p.err == nil && !p.closed {
+			p.ready.Wait()
+		}
+		p.mu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.err
+	}
+}
+
 // close stops accepting segments, waits for every outstanding upload to finish,
 // and reports the attempt's delivery outcome. The continuous job MUST call it
 // after CaptureContinuous returns and BEFORE it decides the attempt's fate
