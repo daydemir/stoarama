@@ -1780,6 +1780,7 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 	var rootHex string
 	var firstSequence int64
 	var artifactCount int
+	currentFenceAuthority := true
 	scanAuthority := func(row pgx.Row) error {
 		return row.Scan(&stopEventID, &set.AccountID, &set.RecordingID, &set.JobID, &set.LeaseToken,
 			&set.OriginClaimGeneration, &set.ProducerID, &set.SnapshotSHA256,
@@ -1797,6 +1798,7 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 		JOIN node_tokens token ON token.id=$5
 		WHERE capture_set.id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
 		  AND job.status='leased' AND job.lease_owner=$4 AND job.lease_token=$3
+		  AND job.lease_expires_at>transaction_timestamp()
 		  AND job.lease_credential_state='exact'
 		  AND recording_surrender_token_can_access_lease($5,$6,job.lease_node_token_id,job.lease_claim_generation)
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.stop_event_id=stop.id)
@@ -1804,6 +1806,7 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 		FOR UPDATE OF stop,capture_set,plan,job,token
 	`, setID, jobID, leaseToken, recorderWorkerID(principal), principal.NodeTokenID, principal.NodeID))
 	if errors.Is(err, pgx.ErrNoRows) {
+		currentFenceAuthority = false
 		// A stop ACK is fsynced locally before its request. If that response is
 		// lost and the lease expires, the exact set recovery grant and immutable
 		// origin generation remain authority to replay the inventory. The current
@@ -1846,8 +1849,30 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 			SELECT ack.set_id=$2 AND ack.inventory_sha256=$3
 			FROM recording_capture_producer_stop_acks ack WHERE ack.id=$1
 		`, ackID, setID, req.InventorySHA256).Scan(&exact); replayErr == nil && exact {
+			rows, queryErr := tx.Query(r.Context(), `
+				SELECT ordinal FROM recording_capture_artifact_grant_results
+				WHERE stop_ack_id=$1 AND result='acknowledged_no_bytes' ORDER BY ordinal
+			`, ackID)
+			if queryErr != nil {
+				util.WriteError(w, http.StatusInternalServerError, "load capture stop replay result")
+				return
+			}
+			var noBytes []int
+			for rows.Next() {
+				var ordinal int
+				if queryErr = rows.Scan(&ordinal); queryErr != nil {
+					break
+				}
+				noBytes = append(noBytes, ordinal)
+			}
+			queryErr = errors.Join(queryErr, rows.Err())
+			rows.Close()
+			if queryErr != nil {
+				util.WriteError(w, http.StatusInternalServerError, "scan capture stop replay result")
+				return
+			}
 			_ = tx.Commit(r.Context())
-			w.WriteHeader(http.StatusNoContent)
+			util.WriteJSON(w, http.StatusOK, recordingapi.CaptureStopAckResult{NoBytesOrdinals: noBytes})
 			return
 		}
 		util.WriteError(w, http.StatusConflict, "capture stop authority is stale")
@@ -1867,7 +1892,7 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 		artifactID, artifactErr := uuid.Parse(strings.TrimSpace(member.ArtifactID))
 		secretBytes, secretErr := hex.DecodeString(strings.TrimSpace(member.RecoverySecretSHA256))
 		proof, proofSHA, proofErr := parseCaptureMerkleProof(member.Proof, member.Ordinal)
-		if artifactErr != nil || secretErr != nil || len(secretBytes) != sha256.Size || proofErr != nil || member.Ordinal < 1 || member.Ordinal > artifactCount || member.CaptureSequence != firstSequence+int64(member.Ordinal-1) || member.Device > uint64(^uint64(0)>>1) || member.Inode == 0 || member.Inode > uint64(^uint64(0)>>1) || !recordingCaptureSegmentLeafRE.MatchString(member.RelativeName) {
+		if artifactErr != nil || secretErr != nil || len(secretBytes) != sha256.Size || proofErr != nil || member.Ordinal < 1 || member.Ordinal > artifactCount || member.CaptureSequence != firstSequence+int64(member.Ordinal-1) || member.Device > uint64(^uint64(0)>>1) || member.Inode == 0 || member.Inode > uint64(^uint64(0)>>1) || member.SizeBytes < 0 || member.SizeBytes > surrenderplan.RecoveryArtifactMaxBytes || !recordingCaptureSegmentLeafRE.MatchString(member.RelativeName) {
 			util.WriteError(w, http.StatusBadRequest, "invalid capture stop member")
 			return
 		}
@@ -1911,18 +1936,35 @@ func (s *Server) handleRecordingCaptureSetStopAck(w http.ResponseWriter, r *http
 	}
 	for _, member := range req.Members {
 		if _, err = tx.Exec(r.Context(), `
-			INSERT INTO recording_capture_stop_ack_members(stop_ack_id,ordinal,artifact_id,device,inode,relative_name)
-			VALUES($1,$2,$3,$4,$5,$6)
-		`, ackID, member.Ordinal, member.ArtifactID, int64(member.Device), int64(member.Inode), member.RelativeName); err != nil {
+			INSERT INTO recording_capture_stop_ack_members(stop_ack_id,ordinal,artifact_id,device,inode,size_bytes,relative_name)
+			VALUES($1,$2,$3,$4,$5,$6,$7)
+		`, ackID, member.Ordinal, member.ArtifactID, int64(member.Device), int64(member.Inode), member.SizeBytes, member.RelativeName); err != nil {
 			util.WriteError(w, http.StatusConflict, "seal capture stop inventory member")
 			return
+		}
+		if currentFenceAuthority && member.SizeBytes == 0 {
+			if _, err = tx.Exec(r.Context(), `
+				INSERT INTO recording_capture_artifact_grant_results(set_id,ordinal,result,stop_ack_id)
+				VALUES($1,$2,'acknowledged_no_bytes',$3)
+			`, setID, member.Ordinal, ackID); err != nil {
+				util.WriteError(w, http.StatusConflict, "terminalize zero-byte stopped capture artifact")
+				return
+			}
 		}
 	}
 	if err = tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit capture stop acknowledgment")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	var noBytes []int
+	if currentFenceAuthority {
+		for _, member := range req.Members {
+			if member.SizeBytes == 0 {
+				noBytes = append(noBytes, member.Ordinal)
+			}
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, recordingapi.CaptureStopAckResult{NoBytesOrdinals: noBytes})
 }
 
 func captureSetUnusedRanges(count int, materialized []int) [][2]int {
@@ -1997,6 +2039,7 @@ func (s *Server) handleRecordingCaptureSetFinish(w http.ResponseWriter, r *http.
 		return
 	}
 	var materialized []int
+	hasNoBytes := false
 	for rows.Next() {
 		var ordinal int
 		var result *string
@@ -2005,11 +2048,12 @@ func (s *Server) handleRecordingCaptureSetFinish(w http.ResponseWriter, r *http.
 			util.WriteError(w, http.StatusInternalServerError, "scan capture set coverage")
 			return
 		}
-		if result == nil || (*result != "accepted_unique" && *result != "exact_replay") {
+		if result == nil || (*result != "accepted_unique" && *result != "exact_replay" && *result != "acknowledged_no_bytes") {
 			rows.Close()
 			util.WriteError(w, http.StatusConflict, "capture set has a nonterminal materialized artifact")
 			return
 		}
+		hasNoBytes = hasNoBytes || *result == "acknowledged_no_bytes"
 		materialized = append(materialized, ordinal)
 	}
 	rows.Close()
@@ -2020,7 +2064,7 @@ func (s *Server) handleRecordingCaptureSetFinish(w http.ResponseWriter, r *http.
 	}{artifactCount, materialized, captureSetUnusedRanges(artifactCount, materialized)}
 	coverageJSON, _ := json.Marshal(coverage)
 	setResult := "completed"
-	if len(materialized) == 0 {
+	if len(materialized) == 0 || hasNoBytes {
 		setResult = "abandoned"
 	}
 	var coverageSHA string

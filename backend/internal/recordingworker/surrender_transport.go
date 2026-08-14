@@ -1209,8 +1209,13 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 	// The local ACK is fsynced before its network call. Replay it before any
 	// materialize/seal/finish request so a restart cannot bypass the server's
 	// immutable stop-inventory boundary.
-	if err := w.replayCaptureSetStopAck(ctx, journal); err != nil {
+	stopResult, err := w.replayCaptureSetStopAck(ctx, journal)
+	if err != nil {
 		return false, err
+	}
+	currentNoBytes := make(map[int]struct{}, len(stopResult.NoBytesOrdinals))
+	for _, ordinal := range stopResult.NoBytesOrdinals {
+		currentNoBytes[ordinal] = struct{}{}
 	}
 	bound := make(map[string]struct{}, len(journal.Artifacts))
 	nextSequence := journal.CaptureSet.FirstCaptureSequence
@@ -1303,6 +1308,25 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 			return false, err
 		}
 		if currentLease {
+			_, acknowledgedNoBytes := currentNoBytes[artifact.Ordinal]
+			if _, zero := stoppedZeroByteMember(journal.CaptureSet.StopAck, *artifact); acknowledgedNoBytes && zero {
+				file, stat, openErr := openRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode)
+				if openErr != nil || stat.Size != 0 {
+					if file != nil {
+						_ = file.Close()
+					}
+					return false, fmt.Errorf("acknowledged zero-byte capture artifact identity changed")
+				}
+				_ = file.Close()
+				if err = removeRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode); err != nil {
+					return false, err
+				}
+				artifact.Done, artifact.LocalPath = true, ""
+				if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
+					return false, err
+				}
+				continue
+			}
 			if artifact.Segment == nil {
 				continue
 			}
@@ -1460,14 +1484,15 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 	return true, nil
 }
 
-func (w *Worker) replayCaptureSetStopAck(ctx context.Context, journal *captureProducerJournal) error {
+func (w *Worker) replayCaptureSetStopAck(ctx context.Context, journal *captureProducerJournal) (recordingapi.CaptureStopAckResult, error) {
 	if journal == nil || journal.CaptureSet == nil || journal.CaptureSet.StopAck == nil {
-		return nil
+		return recordingapi.CaptureStopAckResult{}, nil
 	}
-	if err := w.cfg.Client.AckCaptureSetStop(ctx, journal.JobID, journal.LeaseToken, journal.CaptureSet.SetID, *journal.CaptureSet.StopAck); err != nil {
-		return fmt.Errorf("replay capture stop acknowledgment: %w", err)
+	result, err := w.cfg.Client.AckCaptureSetStop(ctx, journal.JobID, journal.LeaseToken, journal.CaptureSet.SetID, *journal.CaptureSet.StopAck)
+	if err != nil {
+		return recordingapi.CaptureStopAckResult{}, fmt.Errorf("replay capture stop acknowledgment: %w", err)
 	}
-	return nil
+	return result, nil
 }
 
 func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *captureProducerJournal, paths []captureArtifactPath) error {
@@ -1725,6 +1750,32 @@ func (n *retainedCaptureNamespace) artifactIdentity(name string) (uint64, uint64
 	return uint64(stat.Dev), uint64(stat.Ino), stat.Size, nil
 }
 
+func (n *retainedCaptureNamespace) removeArtifact(name string, device, inode uint64, size int64) error {
+	actualDevice, actualInode, actualSize, err := n.artifactIdentity(name)
+	if err != nil || actualDevice != device || actualInode != inode || actualSize != size {
+		return fmt.Errorf("retained capture leaf identity changed")
+	}
+	if err = unix.Unlinkat(n.fd, name, 0); err != nil {
+		return err
+	}
+	return unix.Fsync(n.fd)
+}
+
+func stoppedZeroByteMember(ack *recordingapi.CaptureStopAck, artifact captureArtifactJournal) (recordingapi.CaptureStopAckMember, bool) {
+	if ack == nil || artifact.LocalSize != 0 || artifact.LocalPath == "" {
+		return recordingapi.CaptureStopAckMember{}, false
+	}
+	for _, member := range ack.Members {
+		if member.Ordinal == artifact.Ordinal && member.ArtifactID == artifact.IntentID &&
+			member.CaptureSequence == artifact.CaptureSequence && member.SizeBytes == 0 &&
+			member.Device == artifact.Device && member.Inode == artifact.Inode &&
+			member.RelativeName == filepath.Base(artifact.LocalPath) {
+			return member, true
+		}
+	}
+	return recordingapi.CaptureStopAckMember{}, false
+}
+
 // isolateCaptureNamespace keeps the original directory inode open while it is
 // renamed and inventoried. All namespace operations are relative to held
 // no-follow descriptors, so a root process cannot be tricked by path replacement
@@ -1835,7 +1886,7 @@ func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *
 			members = append(members, recordingapi.CaptureStopAckMember{
 				Ordinal: artifact.Ordinal, ArtifactID: artifact.IntentID, CaptureSequence: artifact.CaptureSequence,
 				RecoverySecretSHA256: artifact.RecoverySecretSHA256, Proof: proof,
-				Device: device, Inode: inode, RelativeName: name,
+				Device: device, Inode: inode, SizeBytes: size, RelativeName: name,
 			})
 		}
 		ack := recordingapi.CaptureStopAck{
@@ -1851,12 +1902,18 @@ func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *
 		producer.CaptureSet.StopAck = &ack
 		for _, artifact := range artifacts {
 			found := false
-			for _, existing := range producer.Artifacts {
+			for existingIndex := range producer.Artifacts {
+				existing := &producer.Artifacts[existingIndex]
 				if existing.CaptureSequence == artifact.CaptureSequence {
 					if existing.IntentID != artifact.IntentID || existing.RecoverySecretSHA256 != artifact.RecoverySecretSHA256 {
 						state.mu.Unlock()
 						return "", fmt.Errorf("stop inventory artifact differs from journal")
 					}
+					if (existing.Device != 0 && existing.Device != artifact.Device) || (existing.Inode != 0 && existing.Inode != artifact.Inode) || (existing.LocalPath != "" && existing.LocalPath != artifact.LocalPath) {
+						state.mu.Unlock()
+						return "", fmt.Errorf("stop inventory artifact identity differs from journal")
+					}
+					existing.LocalPath, existing.Device, existing.Inode, existing.LocalSize = artifact.LocalPath, artifact.Device, artifact.Inode, artifact.LocalSize
 					found = true
 					break
 				}
@@ -1870,8 +1927,31 @@ func (w *Worker) captureSetStopBarrier(job recordingapi.RecordingJob, producer *
 		if err != nil {
 			return "", fmt.Errorf("persist stopped capture inventory: %w", err)
 		}
-		if err = w.cfg.Client.AckCaptureSetStop(ctx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, ack); err != nil {
-			return "", err
+		stopResult, stopErr := w.cfg.Client.AckCaptureSetStop(ctx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, ack)
+		if stopErr != nil {
+			return "", stopErr
+		}
+		currentNoBytes := make(map[int]struct{}, len(stopResult.NoBytesOrdinals))
+		for _, ordinal := range stopResult.NoBytesOrdinals {
+			currentNoBytes[ordinal] = struct{}{}
+		}
+		state.mu.Lock()
+		for index := range producer.Artifacts {
+			artifact := &producer.Artifacts[index]
+			member, zero := stoppedZeroByteMember(&ack, *artifact)
+			if _, acknowledged := currentNoBytes[artifact.Ordinal]; !zero || !acknowledged {
+				continue
+			}
+			if err = retained.removeArtifact(member.RelativeName, member.Device, member.Inode, member.SizeBytes); err != nil {
+				state.mu.Unlock()
+				return "", fmt.Errorf("remove acknowledged zero-byte capture artifact: %w", err)
+			}
+			artifact.Done, artifact.LocalPath = true, ""
+		}
+		err = persistProducerJournal(w.surrenderJournalRoot(), producer)
+		state.mu.Unlock()
+		if err != nil {
+			return "", fmt.Errorf("persist acknowledged zero-byte capture result: %w", err)
 		}
 		return retained.path, nil
 	}
@@ -1906,7 +1986,7 @@ func (w *Worker) finishStoppedCaptureSetBeforeExec(ctx context.Context, job reco
 	if err != nil {
 		return err
 	}
-	if err = w.cfg.Client.AckCaptureSetStop(ctx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, ack); err != nil {
+	if _, err = w.cfg.Client.AckCaptureSetStop(ctx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, ack); err != nil {
 		return err
 	}
 	if err = w.cfg.Client.FinishCaptureSet(ctx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID); err != nil {

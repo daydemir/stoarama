@@ -559,6 +559,7 @@ CREATE TABLE recording_capture_stop_ack_members (
   artifact_id UUID NOT NULL,
   device BIGINT NOT NULL CHECK(device>=0),
   inode BIGINT NOT NULL CHECK(inode>0),
+  size_bytes BIGINT NOT NULL CHECK(size_bytes BETWEEN 0 AND 33554432),
   relative_name TEXT NOT NULL CHECK(relative_name~'^seg-[0-9]{8}-[0-9]{6}\.mp4$'),
   PRIMARY KEY(stop_ack_id,ordinal),
   UNIQUE(stop_ack_id,artifact_id),
@@ -662,14 +663,16 @@ EXECUTE FUNCTION recording_surrender_validate_empty_set_report();
 CREATE TABLE recording_capture_artifact_grant_results (
   set_id UUID NOT NULL,
   ordinal INTEGER NOT NULL,
-  result TEXT NOT NULL CHECK(result IN('accepted_unique','exact_replay','abandoned_no_bytes','unrecoverable_partial','host_unreachable','security_revoked')),
+  result TEXT NOT NULL CHECK(result IN('accepted_unique','exact_replay','acknowledged_no_bytes','abandoned_no_bytes','unrecoverable_partial','host_unreachable','security_revoked')),
   report_id UUID REFERENCES recording_capture_recovery_reports(id) ON DELETE RESTRICT,
   clip_id BIGINT REFERENCES recording_clips(id) ON DELETE RESTRICT,
+  stop_ack_id UUID,
   security_event_id UUID,
   result_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
   PRIMARY KEY(set_id,ordinal),
 	FOREIGN KEY(set_id,ordinal) REFERENCES recording_capture_materialized_artifacts(set_id,ordinal) ON DELETE RESTRICT,
-	FOREIGN KEY(report_id,set_id,ordinal) REFERENCES recording_capture_recovery_reports(id,set_id,ordinal) ON DELETE RESTRICT
+	FOREIGN KEY(report_id,set_id,ordinal) REFERENCES recording_capture_recovery_reports(id,set_id,ordinal) ON DELETE RESTRICT,
+	FOREIGN KEY(stop_ack_id,ordinal) REFERENCES recording_capture_stop_ack_members(stop_ack_id,ordinal) ON DELETE RESTRICT
 );
 
 CREATE TABLE recording_capture_set_results (
@@ -1508,7 +1511,7 @@ BEFORE INSERT ON recording_capture_stop_ack_members FOR EACH ROW EXECUTE FUNCTIO
 
 CREATE FUNCTION recording_surrender_stop_inventory_sha(p_ack_id UUID) RETURNS TEXT LANGUAGE sql STABLE AS $$
   SELECT encode(sha256(convert_to(
-    'recording-capture-stop-inventory-v2'||chr(10)
+    'recording-capture-stop-inventory-v3'||chr(10)
     ||octet_length(ack.retained_directory_device::text)::text||':'||ack.retained_directory_device::text||chr(10)
     ||octet_length(ack.retained_directory_inode::text)::text||':'||ack.retained_directory_inode::text||chr(10)
     ||COALESCE((SELECT string_agg(
@@ -1519,6 +1522,7 @@ CREATE FUNCTION recording_surrender_stop_inventory_sha(p_ack_id UUID) RETURNS TE
         ||octet_length(artifact.proof_sha256)::text||':'||artifact.proof_sha256||chr(10)
         ||octet_length(member.device::text)::text||':'||member.device::text||chr(10)
         ||octet_length(member.inode::text)::text||':'||member.inode::text||chr(10)
+        ||octet_length(member.size_bytes::text)::text||':'||member.size_bytes::text||chr(10)
         ||octet_length(member.relative_name)::text||':'||member.relative_name||chr(10),'' ORDER BY member.ordinal)
       FROM recording_capture_stop_ack_members member
       JOIN recording_capture_materialized_artifacts artifact
@@ -1571,7 +1575,7 @@ CREATE TRIGGER recording_capture_recovery_reports_validate
 BEFORE INSERT ON recording_capture_recovery_reports FOR EACH ROW EXECUTE FUNCTION recording_surrender_validate_recovery_report();
 
 CREATE FUNCTION recording_surrender_validate_artifact_grant_result() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE report_type TEXT; event_set UUID; event_ordinal INTEGER; grace_until TIMESTAMPTZ;
+DECLARE report_type TEXT; event_set UUID; event_ordinal INTEGER; grace_until TIMESTAMPTZ; ack_matches BOOLEAN;
 BEGIN
   NEW.result_at:=transaction_timestamp();
   SELECT grant.upload_grace_until INTO grace_until FROM recording_capture_set_grants grant
@@ -1580,12 +1584,33 @@ BEGIN
     SELECT report.report_type INTO report_type FROM recording_capture_recovery_reports report
     WHERE report.id=NEW.report_id AND report.set_id=NEW.set_id AND report.ordinal=NEW.ordinal;
   END IF;
+  IF (NEW.result='acknowledged_no_bytes') IS DISTINCT FROM (NEW.stop_ack_id IS NOT NULL) THEN
+	RAISE EXCEPTION 'artifact result has invalid stop acknowledgment shape';
+  END IF;
   IF NEW.result IN('accepted_unique','exact_replay') THEN
 	IF grace_until IS NOT NULL AND report_type IS DISTINCT FROM 'sealed_bytes' THEN
 	  RAISE EXCEPTION 'recovered accepted artifact lacks exact sealed local report';
 	END IF;
     IF NEW.clip_id IS NULL OR (grace_until IS NULL AND NEW.report_id IS NOT NULL) OR NEW.security_event_id IS NOT NULL THEN
       RAISE EXCEPTION 'accepted artifact result has invalid evidence shape'; END IF;
+  ELSIF NEW.result='acknowledged_no_bytes' THEN
+	SELECT EXISTS(
+	  SELECT 1
+	  FROM recording_capture_producer_stop_acks ack
+	  JOIN recording_capture_stop_ack_members member
+	    ON member.stop_ack_id=ack.id AND member.ordinal=NEW.ordinal
+	  JOIN recording_capture_materialized_artifacts artifact
+	    ON artifact.set_id=ack.set_id AND artifact.ordinal=member.ordinal AND artifact.artifact_id=member.artifact_id
+	  JOIN recording_capture_reservation_sets capture_set ON capture_set.id=ack.set_id
+	  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+	  JOIN recording_jobs job ON job.id=plan.recording_job_id
+	  WHERE ack.id=NEW.stop_ack_id AND ack.set_id=NEW.set_id AND member.size_bytes=0
+	    AND job.status='leased' AND job.lease_token=plan.lease_token
+	    AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact'
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_grants grant WHERE grant.set_id=NEW.set_id)
+	) INTO ack_matches;
+	IF NOT ack_matches OR NEW.report_id IS NOT NULL OR NEW.clip_id IS NOT NULL OR NEW.security_event_id IS NOT NULL THEN
+	  RAISE EXCEPTION 'acknowledged no-bytes result lacks exact immutable zero-byte inventory'; END IF;
   ELSIF NEW.result='abandoned_no_bytes' THEN
 	IF grace_until IS NULL THEN RAISE EXCEPTION 'no-bytes result lacks set recovery grant'; END IF;
     IF report_type IS DISTINCT FROM 'no_bytes' OR NEW.clip_id IS NOT NULL OR NEW.security_event_id IS NOT NULL THEN
@@ -1670,7 +1695,7 @@ BEGIN
      ) THEN RAISE EXCEPTION 'completed capture set must contain only accepted artifacts'; END IF;
   IF NEW.result='abandoned' AND (
        NOT EXISTS(SELECT 1 FROM recording_capture_artifact_grant_results result
-                  WHERE result.set_id=NEW.set_id AND result.result IN('abandoned_no_bytes','unrecoverable_partial'))
+                  WHERE result.set_id=NEW.set_id AND result.result IN('acknowledged_no_bytes','abandoned_no_bytes','unrecoverable_partial'))
        AND NOT (cardinality(materialized)=0 AND (
          EXISTS(SELECT 1 FROM recording_capture_producer_stop_acks ack WHERE ack.set_id=NEW.set_id)
          OR EXISTS(SELECT 1 FROM recording_capture_empty_set_reports empty_report WHERE empty_report.set_id=NEW.set_id)

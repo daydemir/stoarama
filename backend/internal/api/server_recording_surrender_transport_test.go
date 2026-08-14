@@ -602,6 +602,148 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	server := &Server{pool: pool, secrets: secretsCipher, recoveryStorageFactory: func(context.Context, r2.Config) (recordingRecoveryObjectStore, error) {
 		return fakeStore, nil
 	}}
+	// A source stop can catch FFmpeg after it opens a leaf but before the first
+	// byte. The exact live-fence ACK is sufficient DB authority to terminalize
+	// that immutable zero-size inode; it must not wait for lease expiry or create
+	// recovery grants, admission blocks, successor rotation, or a requeue.
+	zeroFixture := seedPresentationV2Task(t, pool, 92006, 992006)
+	if _, err = pool.Exec(ctx, `
+		UPDATE nodes SET node_type='relay',display_name='r10-zero-current' WHERE id=$1;
+		UPDATE recordings SET capture_via='relay' WHERE id=$2;
+		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,
+		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3
+	`, zeroFixture.nodeID, zeroFixture.recordingID, zeroFixture.jobID); err != nil {
+		t.Fatal(err)
+	}
+	var zeroTokenID int64
+	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-zero',repeat('3',64)) RETURNING id`, zeroFixture.nodeID).Scan(&zeroTokenID); err != nil {
+		t.Fatal(err)
+	}
+	zeroPrincipal := nodePrincipal{NodeID: zeroFixture.nodeID, AccountID: zeroFixture.accountID, NodeType: nodeTypeRelay, DisplayName: "r10-zero-current", NodeTokenID: zeroTokenID}
+	zeroLease, err := server.leaseRelayRecordingJob(ctx, zeroPrincipal, true, 150, true)
+	if err != nil || zeroLease.LeaseToken == nil || zeroLease.SurrenderTransportVersion != 1 {
+		t.Fatalf("zero current lease=%+v err=%v", zeroLease, err)
+	}
+	zeroPlanID, zeroSetID, zeroProducerID := uuid.New(), uuid.New(), uuid.New()
+	zeroPlanBody, _ := json.Marshal(map[string]any{
+		"plan_id": zeroPlanID, "set_id": zeroSetID, "producer_id": zeroProducerID,
+		"capture_ordinal": 1, "first_capture_sequence": 1,
+	})
+	zeroPlanRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(zeroPlanBody))
+	zeroPlanRequest.Header.Set(recordingLeaseTokenHeader, zeroLease.LeaseToken.String())
+	zeroPlanRequest = zeroPlanRequest.WithContext(context.WithValue(zeroPlanRequest.Context(), nodePrincipalContextKey, zeroPrincipal))
+	zeroPlanRoute := chi.NewRouteContext()
+	zeroPlanRoute.URLParams.Add("id", strconv.FormatInt(zeroFixture.jobID, 10))
+	zeroPlanRequest = zeroPlanRequest.WithContext(context.WithValue(zeroPlanRequest.Context(), chi.RouteCtxKey, zeroPlanRoute))
+	zeroPlanResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetPlan(zeroPlanResponse, zeroPlanRequest)
+	if zeroPlanResponse.Code != http.StatusOK {
+		t.Fatalf("zero current plan=%d body=%s", zeroPlanResponse.Code, zeroPlanResponse.Body.String())
+	}
+	var zeroPlan recordingapi.CaptureSetPlan
+	if err = json.Unmarshal(zeroPlanResponse.Body.Bytes(), &zeroPlan); err != nil {
+		t.Fatal(err)
+	}
+	zeroIdentity := surrenderplan.SetIdentity{
+		SetID: zeroSetID, AccountID: zeroPlan.AccountID, RecordingID: zeroPlan.RecordingID, JobID: zeroPlan.JobID,
+		LeaseToken: *zeroLease.LeaseToken, OriginClaimGeneration: zeroPlan.OriginClaimGeneration,
+		ProducerID: zeroProducerID, SnapshotSHA256: zeroPlan.SourceSnapshotSHA256,
+		DestinationNamingSHA256: zeroPlan.DestinationNamingSHA256, ArtifactCount: zeroPlan.ArtifactCount,
+		MIME: "video/mp4", MaxBytes: surrenderplan.RecoveryArtifactMaxBytes,
+	}
+	zeroSeed := sha256.Sum256([]byte("r10-current-fence-zero-byte"))
+	zeroTree, err := surrenderplan.BuildTree(zeroSeed, zeroIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroRoot := zeroTree.Root()
+	zeroCommitBody, _ := json.Marshal(map[string]any{"merkle_root_sha256": hex.EncodeToString(zeroRoot[:])})
+	zeroCommitRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(zeroCommitBody))
+	zeroCommitRequest.Header.Set(recordingLeaseTokenHeader, zeroLease.LeaseToken.String())
+	zeroCommitRequest = zeroCommitRequest.WithContext(context.WithValue(zeroCommitRequest.Context(), nodePrincipalContextKey, zeroPrincipal))
+	zeroCommitRoute := chi.NewRouteContext()
+	zeroCommitRoute.URLParams.Add("id", strconv.FormatInt(zeroFixture.jobID, 10))
+	zeroCommitRoute.URLParams.Add("planId", zeroPlanID.String())
+	zeroCommitRequest = zeroCommitRequest.WithContext(context.WithValue(zeroCommitRequest.Context(), chi.RouteCtxKey, zeroCommitRoute))
+	zeroCommitResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetCommit(zeroCommitResponse, zeroCommitRequest)
+	if zeroCommitResponse.Code != http.StatusNoContent {
+		t.Fatalf("zero current commit=%d body=%s", zeroCommitResponse.Code, zeroCommitResponse.Body.String())
+	}
+	if _, err = pool.Exec(ctx, `UPDATE streams SET source_url=source_url||'?r10-zero-stop=1' WHERE id=$1`, zeroFixture.streamID); err != nil {
+		t.Fatal(err)
+	}
+	zeroArtifact, err := surrenderplan.DeriveArtifact(zeroSeed, zeroIdentity, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroProof, err := zeroTree.Proof(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroProofValues := make([]string, len(zeroProof.Siblings))
+	for index := range zeroProof.Siblings {
+		zeroProofValues[index] = hex.EncodeToString(zeroProof.Siblings[index][:])
+	}
+	zeroACK := recordingapi.CaptureStopAck{
+		AckID: uuid.NewString(), RetainedDirectoryDevice: 51, RetainedDirectoryInode: 52,
+		Members: []recordingapi.CaptureStopAckMember{{
+			Ordinal: 1, ArtifactID: zeroArtifact.ID.String(), CaptureSequence: 1,
+			RecoverySecretSHA256: hex.EncodeToString(zeroArtifact.RecoverySecretHash[:]), Proof: zeroProofValues,
+			Device: 51, Inode: 53, SizeBytes: 0, RelativeName: "seg-20260814-070000.mp4",
+		}},
+	}
+	zeroACK.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(zeroACK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroACKBody, _ := json.Marshal(zeroACK)
+	zeroACKRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(zeroACKBody))
+	zeroACKRequest.Header.Set(recordingLeaseTokenHeader, zeroLease.LeaseToken.String())
+	zeroACKRequest = zeroACKRequest.WithContext(context.WithValue(zeroACKRequest.Context(), nodePrincipalContextKey, zeroPrincipal))
+	zeroACKRoute := chi.NewRouteContext()
+	zeroACKRoute.URLParams.Add("id", strconv.FormatInt(zeroFixture.jobID, 10))
+	zeroACKRoute.URLParams.Add("setId", zeroSetID.String())
+	zeroACKRequest = zeroACKRequest.WithContext(context.WithValue(zeroACKRequest.Context(), chi.RouteCtxKey, zeroACKRoute))
+	zeroACKResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetStopAck(zeroACKResponse, zeroACKRequest)
+	if zeroACKResponse.Code != http.StatusOK {
+		t.Fatalf("zero current stop ack=%d body=%s", zeroACKResponse.Code, zeroACKResponse.Body.String())
+	}
+	var zeroACKResult recordingapi.CaptureStopAckResult
+	if err = json.Unmarshal(zeroACKResponse.Body.Bytes(), &zeroACKResult); err != nil || len(zeroACKResult.NoBytesOrdinals) != 1 || zeroACKResult.NoBytesOrdinals[0] != 1 {
+		t.Fatalf("zero current stop result=%+v err=%v", zeroACKResult, err)
+	}
+	zeroFinishRequest := httptest.NewRequest(http.MethodPost, "/", nil)
+	zeroFinishRequest.Header.Set(recordingLeaseTokenHeader, zeroLease.LeaseToken.String())
+	zeroFinishRequest = zeroFinishRequest.WithContext(context.WithValue(zeroFinishRequest.Context(), nodePrincipalContextKey, zeroPrincipal))
+	zeroFinishRoute := chi.NewRouteContext()
+	zeroFinishRoute.URLParams.Add("id", strconv.FormatInt(zeroFixture.jobID, 10))
+	zeroFinishRoute.URLParams.Add("setId", zeroSetID.String())
+	zeroFinishRequest = zeroFinishRequest.WithContext(context.WithValue(zeroFinishRequest.Context(), chi.RouteCtxKey, zeroFinishRoute))
+	zeroFinishResponse := httptest.NewRecorder()
+	server.handleRecordingCaptureSetFinish(zeroFinishResponse, zeroFinishRequest)
+	if zeroFinishResponse.Code != http.StatusNoContent {
+		t.Fatalf("zero current finish=%d body=%s", zeroFinishResponse.Code, zeroFinishResponse.Body.String())
+	}
+	var zeroResult, zeroJobStatus, zeroHeadState string
+	var zeroGrants, zeroExpiries, zeroSuccessors int
+	var zeroCurrentLease bool
+	if err = pool.QueryRow(ctx, `
+		SELECT result.result,job.status,job.lease_token=$3 AND job.lease_expires_at>transaction_timestamp(),head.state,
+		       (SELECT count(*) FROM recording_capture_set_grants grant WHERE grant.set_id=$1),
+		       (SELECT count(*) FROM recording_job_lease_expiry_events expiry WHERE expiry.recording_job_id=$2 AND expiry.lease_token=$3),
+		       (SELECT count(*) FROM recording_worker_claim_successor_proposals successor WHERE successor.node_id=$4)
+		FROM recording_capture_artifact_grant_results result
+		JOIN recording_jobs job ON job.id=$2
+		JOIN recording_worker_claim_heads head ON head.node_id=$4
+		WHERE result.set_id=$1 AND result.ordinal=1
+	`, zeroSetID, zeroFixture.jobID, zeroLease.LeaseToken, zeroFixture.nodeID).Scan(&zeroResult, &zeroJobStatus, &zeroCurrentLease, &zeroHeadState, &zeroGrants, &zeroExpiries, &zeroSuccessors); err != nil {
+		t.Fatal(err)
+	}
+	if zeroResult != "acknowledged_no_bytes" || zeroJobStatus != "leased" || !zeroCurrentLease || zeroHeadState != "enabled" || zeroGrants != 0 || zeroExpiries != 0 || zeroSuccessors != 0 {
+		t.Fatalf("zero current result=%q job=%q current=%v head=%q grants=%d expiries=%d successors=%d", zeroResult, zeroJobStatus, zeroCurrentLease, zeroHeadState, zeroGrants, zeroExpiries, zeroSuccessors)
+	}
 	// Compact planning takes the same source/claim fence as mutations. A writer
 	// that wins first yields one new canonical plan; a mutation after the plan
 	// makes commitment fail rather than launching with a mixed snapshot.
@@ -812,11 +954,11 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 		Members: []recordingapi.CaptureStopAckMember{{
 			Ordinal: 1, ArtifactID: artifact.ID.String(), CaptureSequence: 1,
 			RecoverySecretSHA256: secretSHA, Proof: proofValues,
-			Device: 41, Inode: 43, RelativeName: "seg-20260814-070000.mp4",
+			Device: 41, Inode: 43, SizeBytes: 100, RelativeName: "seg-20260814-070000.mp4",
 		}, {
 			Ordinal: 2, ArtifactID: secondArtifact.ID.String(), CaptureSequence: 2,
 			RecoverySecretSHA256: hex.EncodeToString(secondArtifact.RecoverySecretHash[:]), Proof: secondProofValues,
-			Device: 41, Inode: 44, RelativeName: "seg-20260814-070001.mp4",
+			Device: 41, Inode: 44, SizeBytes: 100, RelativeName: "seg-20260814-070001.mp4",
 		}},
 	}
 	ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
@@ -905,7 +1047,7 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	ackRequest = ackRequest.WithContext(context.WithValue(ackRequest.Context(), chi.RouteCtxKey, ackRoute))
 	ackResponse := httptest.NewRecorder()
 	server.handleRecordingCaptureSetStopAck(ackResponse, ackRequest)
-	if ackResponse.Code != http.StatusNoContent {
+	if ackResponse.Code != http.StatusOK {
 		t.Fatalf("post-expiry stop ack=%d body=%s", ackResponse.Code, ackResponse.Body.String())
 	}
 	newRaw := "sin_" + strings.Repeat("n", 48)

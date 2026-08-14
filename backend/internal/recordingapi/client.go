@@ -365,6 +365,7 @@ type CaptureStopAckMember struct {
 	Proof                []string `json:"proof"`
 	Device               uint64   `json:"device"`
 	Inode                uint64   `json:"inode"`
+	SizeBytes            int64    `json:"size_bytes"`
 	RelativeName         string   `json:"relative_name"`
 }
 
@@ -376,9 +377,13 @@ type CaptureStopAck struct {
 	Members                 []CaptureStopAckMember `json:"members"`
 }
 
+type CaptureStopAckResult struct {
+	NoBytesOrdinals []int `json:"no_bytes_ordinals"`
+}
+
 func CaptureStopInventorySHA(ack CaptureStopAck) (string, error) {
 	h := sha256.New()
-	_, _ = h.Write([]byte("recording-capture-stop-inventory-v2\n"))
+	_, _ = h.Write([]byte("recording-capture-stop-inventory-v3\n"))
 	write := func(value string) { _, _ = fmt.Fprintf(h, "%d:%s\n", len([]byte(value)), value) }
 	write(strconv.FormatUint(ack.RetainedDirectoryDevice, 10))
 	write(strconv.FormatUint(ack.RetainedDirectoryInode, 10))
@@ -399,6 +404,7 @@ func CaptureStopInventorySHA(ack CaptureStopAck) (string, error) {
 		write(hex.EncodeToString(proofHash.Sum(nil)))
 		write(strconv.FormatUint(member.Device, 10))
 		write(strconv.FormatUint(member.Inode, 10))
+		write(strconv.FormatInt(member.SizeBytes, 10))
 		write(member.RelativeName)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -408,8 +414,10 @@ func (c *Client) MaterializeCaptureArtifact(ctx context.Context, jobID int64, le
 	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/artifacts/%d/materialize", jobID, url.PathEscape(setID), ordinal), artifact, leaseTokenHeaders(leaseToken), nil)
 }
 
-func (c *Client) AckCaptureSetStop(ctx context.Context, jobID int64, leaseToken, setID string, ack CaptureStopAck) error {
-	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/stop-ack", jobID, url.PathEscape(setID)), ack, leaseTokenHeaders(leaseToken), nil)
+func (c *Client) AckCaptureSetStop(ctx context.Context, jobID int64, leaseToken, setID string, ack CaptureStopAck) (CaptureStopAckResult, error) {
+	var result CaptureStopAckResult
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/stop-ack", jobID, url.PathEscape(setID)), ack, leaseTokenHeaders(leaseToken), &result)
+	return result, err
 }
 
 func openDirectoryNoFollow(path string) (int, error) {
