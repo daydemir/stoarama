@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
@@ -16,32 +15,71 @@ import (
 
 func runRecordability(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recordability <run-once> ...")
+		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|review-targeted> ...")
 	}
 	switch args[0] {
 	case "run-once":
 		runRecordabilityRunOnce(ctx, cfg, args[1:])
 	case "run-targeted":
 		runRecordabilityTargeted(ctx, cfg, args[1:])
+	case "review-targeted":
+		runRecordabilityTargetedReview(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown recordability subcommand: %s", args[0])
 	}
+}
+
+func runRecordabilityTargetedReview(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordability review-targeted", flag.ExitOnError)
+	approvalRaw := fs.String("approval-id", "", "exact immutable campaign approval UUID")
+	evidenceRaw := fs.String("probe-evidence-ids", "", "exact comma-separated server-derived probe evidence UUIDs reviewed against the approved scene")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
+	asJSON := fs.Bool("json", false, "print JSON")
+	_ = fs.Parse(args)
+	_ = cfg
+	approvalID, err := uuid.Parse(strings.TrimSpace(*approvalRaw))
+	if err != nil {
+		log.Fatalf("--approval-id must be a UUID: %v", err)
+	}
+	rawIDs := strings.Split(strings.TrimSpace(*evidenceRaw), ",")
+	if len(rawIDs) == 0 || strings.TrimSpace(*evidenceRaw) == "" {
+		log.Fatal("--probe-evidence-ids is required")
+	}
+	evidenceIDs := make([]uuid.UUID, 0, len(rawIDs))
+	seen := map[uuid.UUID]bool{}
+	for _, raw := range rawIDs {
+		id, parseErr := uuid.Parse(strings.TrimSpace(raw))
+		if parseErr != nil || seen[id] {
+			log.Fatalf("--probe-evidence-ids must contain unique UUIDs: %v", parseErr)
+		}
+		seen[id] = true
+		evidenceIDs = append(evidenceIDs, id)
+	}
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	results := make([]map[string]any, 0, len(evidenceIDs))
+	for _, evidenceID := range evidenceIDs {
+		results = append(results, postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/scene-reviews", map[string]any{"approval_id": approvalID, "probe_evidence_id": evidenceID, "request_id": uuid.New()}))
+	}
+	if *asJSON {
+		printJSON(map[string]any{"approval_id": approvalID, "scene_reviews": results})
+		return
+	}
+	fmt.Printf("approval_id=%s reviewed=%d\n", approvalID, len(results))
 }
 
 func runRecordabilityTargeted(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recordability run-targeted", flag.ExitOnError)
 	approvalRaw := fs.String("approval-id", "", "exact immutable campaign approval UUID")
 	streamIDsRaw := fs.String("stream-ids", "", "exact comma-separated approved stream IDs")
-	windowSec := fs.Int("window-sec", 600, "real recording window seconds")
-	segmentSec := fs.Int("segment-sec", 60, "continuous segment seconds")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
-	nodeToken := fs.String("node-token", strings.TrimSpace(os.Getenv("RECORDER_NODE_TOKEN")), "managed recorder node token")
-	attempts := fs.Int("attempts", 2, "separate full probes per stream (admission requires 2)")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
-	if !cfg.StreamRecordabilityProbeEnabled {
-		log.Fatal("recordability run-targeted: refusing to probe, STREAM_RECORDABILITY_PROBE_ENABLED is off")
-	}
+	_ = cfg
 	approvalID, err := uuid.Parse(strings.TrimSpace(*approvalRaw))
 	if err != nil {
 		log.Fatalf("--approval-id must be a UUID: %v", err)
@@ -50,48 +88,23 @@ func runRecordabilityTargeted(ctx context.Context, cfg config.Config, args []str
 	if err != nil || len(ids) == 0 {
 		log.Fatalf("--stream-ids must contain unique positive integers: %v", err)
 	}
-	if *windowSec < 120 || *segmentSec <= 0 || *segmentSec > *windowSec/2 {
-		log.Fatal("--window-sec must be >=120 and permit at least two --segment-sec segments")
+	if strings.TrimSpace(*backendAPIURL) == "" {
+		log.Fatal("--backend-api-url is required")
 	}
-	if strings.TrimSpace(*backendAPIURL) == "" || strings.TrimSpace(*nodeToken) == "" || *attempts != 2 {
-		log.Fatal("--backend-api-url and --node-token are required; --attempts must be exactly 2")
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
 	}
-	results := make([]map[string]any, 0, len(ids)*2)
-	failed := false
+	results := make([]map[string]any, 0, len(ids))
 	for _, streamID := range ids {
-		for attempt := 1; attempt <= *attempts; attempt++ {
-			requestID := uuid.New()
-			var targetResponse struct {
-				Targets []recordability.Target `json:"targets"`
-			}
-			if err := postJSONWithToken(ctx, *backendAPIURL, *nodeToken, "/api/v1/recording/campaign-admission/targets", map[string]any{"approval_id": approvalID, "stream_ids": []int64{streamID}, "request_id": requestID}, &targetResponse); err != nil {
-				log.Fatalf("load exact approved target attempt: %v", err)
-			}
-			if len(targetResponse.Targets) != 1 || targetResponse.Targets[0].ID != streamID || targetResponse.Targets[0].AttemptID == "" || targetResponse.Targets[0].Challenge == "" {
-				log.Fatal("server did not return the exact challenged approved target")
-			}
-			target := targetResponse.Targets[0]
-			evidence := recordability.ProbeStreamTargeted(ctx, target, time.Duration(*windowSec)*time.Second, time.Duration(*segmentSec)*time.Second)
-			var saved map[string]any
-			if err := postJSONWithToken(ctx, *backendAPIURL, *nodeToken, "/api/v1/recording/campaign-admission/evidence", map[string]any{"approval_id": approvalID, "stream_id": target.ID, "attempt_id": target.AttemptID, "request_id": requestID, "evidence": evidence}, &saved); err != nil {
-				log.Printf("recordability run-targeted: stream %d attempt %d: %v", target.ID, attempt, err)
-				failed = true
-				break
-			}
-			results = append(results, map[string]any{"stream_id": target.ID, "attempt": attempt, "result": evidence.Result, "valid_ratio": evidence.ValidRatio, "duration_ms": evidence.DurationMs, "segment_count": evidence.SegmentCount})
-			if evidence.Result != recordability.ResultOK {
-				failed = true
-				break
-			}
-		}
+		requestID := uuid.New()
+		result := postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/probe-orders", map[string]any{"approval_id": approvalID, "stream_id": streamID, "request_id": requestID})
+		results = append(results, result)
 	}
 	if *asJSON {
-		printJSON(map[string]any{"approval_id": approvalID, "results": results, "all_ok": !failed})
+		printJSON(map[string]any{"approval_id": approvalID, "orders": results})
 	} else {
-		fmt.Printf("approval_id=%s total=%d all_ok=%t\n", approvalID, len(results), !failed)
-	}
-	if failed {
-		log.Fatal("one or more targeted probes failed or were not persisted")
+		fmt.Printf("approval_id=%s queued=%d desired_attempts_per_stream=2\n", approvalID, len(results))
 	}
 }
 

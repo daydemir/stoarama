@@ -30,6 +30,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/email"
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/queue"
@@ -63,6 +64,7 @@ type Server struct {
 	dayZipSlot              chan struct{}
 	authLinkLimiter         *authLinkLimiter
 	sharedRecordingsLimiter *sharedRecordingsLimiter
+	campaignDOAttest        func(context.Context, int64, string) (dropletpool.ProviderAttestation, error)
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -173,6 +175,9 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		authLinkLimiter:         newAuthLinkLimiter(),
 		sharedRecordingsLimiter: newSharedRecordingsLimiter(),
 	}
+	s.campaignDOAttest = func(ctx context.Context, dropletID int64, expectedName string) (dropletpool.ProviderAttestation, error) {
+		return dropletpool.AttestManagedDroplet(ctx, cfg.DOAPIToken, cfg.DropletPoolProjectID, cfg.DropletPoolFirewallID, dropletID, expectedName)
+	}
 	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
 		cipher, err := secretbox.NewFromBase64Key(key)
 		if err != nil {
@@ -271,6 +276,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/streak-priority", s.handleAccountRecordingStreakPriority)
 			account.Get("/recordings/campaign-tracks", s.handleAccountRecordingCampaignTracks)
 			account.Post("/recordings/campaign-admission/approvals", s.handleAccountCampaignAdmissionApprovalCreate)
+			account.Post("/recordings/campaign-admission/probe-orders", s.handleAccountCampaignAdmissionProbeOrderCreate)
+			account.Post("/recordings/campaign-admission/scene-reviews", s.handleAccountCampaignAdmissionSceneReviewCreate)
 			account.Post("/recordings/qualification/scene-attest", s.handleAccountRecordingSceneAttest)
 			account.Post("/recordings/qualification/build", s.handleAccountRecordingQualificationBuild)
 			account.Get("/recordings.csv", s.handleAccountRecordingsCSV)
@@ -509,7 +516,7 @@ func (s *Server) router() http.Handler {
 			rec.Post("/recording/presentation-probes/{taskId}/unavailable", s.handleRecordingPresentationV2Unavailable)
 			rec.Post("/recording/presentation-probes/{taskId}/release-ack", s.handleRecordingPresentationV2ReleaseAck)
 			rec.Post("/recording/droplets/heartbeat", s.handleRecordingDropletHeartbeat)
-			rec.Post("/recording/campaign-admission/targets", s.handleRecordingCampaignAdmissionTargets)
+			rec.Post("/recording/campaign-admission/lease", s.handleRecordingCampaignAdmissionProbeLease)
 			rec.Post("/recording/campaign-admission/evidence", s.handleRecordingCampaignAdmissionEvidence)
 			rec.Post("/recording/jobs/{id}/heartbeat", s.handleRecordingJobHeartbeat)
 			rec.Post("/recording/jobs/{id}/capture-producers", s.handleRecordingCaptureProducerReserve)

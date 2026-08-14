@@ -3,8 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,6 +54,37 @@ func TestTargetedEvidenceReplayComparisonExact(t *testing.T) {
 	mutated.FrameSHA256 = strings.Repeat("e", 64)
 	if targetedEvidenceEqual(base, mutated) {
 		t.Fatal("different evidence replay was accepted")
+	}
+}
+
+func TestCanonicalizeTargetedFrameEvidenceUsesDecodedBytes(t *testing.T) {
+	var jpegBytes bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	if err := jpeg.Encode(&jpegBytes, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	evidence := recordability.TargetedEvidence{
+		Result:      recordability.ResultOK,
+		FrameBase64: base64.StdEncoding.EncodeToString(jpegBytes.Bytes()),
+	}
+	if err := canonicalizeTargetedFrameEvidence(&evidence); err != nil {
+		t.Fatal(err)
+	}
+	if len(evidence.FrameSHA256) != 64 || evidence.FrameBase64 != "" {
+		t.Fatalf("frame evidence was not server-canonicalized: %#v", evidence)
+	}
+
+	mismatch := recordability.TargetedEvidence{Result: recordability.ResultOK, FrameBase64: base64.StdEncoding.EncodeToString(jpegBytes.Bytes()), FrameSHA256: strings.Repeat("f", 64)}
+	if err := canonicalizeTargetedFrameEvidence(&mismatch); err == nil {
+		t.Fatal("caller-authored mismatched frame hash was accepted")
+	}
+	if err := canonicalizeTargetedFrameEvidence(&recordability.TargetedEvidence{Result: recordability.ResultOK}); err == nil {
+		t.Fatal("successful evidence without decoded frame bytes was accepted")
+	}
+	failed := recordability.TargetedEvidence{Result: recordability.ResultInconclusive, FrameSHA256: strings.Repeat("a", 64)}
+	if err := canonicalizeTargetedFrameEvidence(&failed); err != nil || failed.FrameSHA256 != "" {
+		t.Fatalf("terminal failure did not clear unobserved frame hash: evidence=%#v err=%v", failed, err)
 	}
 }
 

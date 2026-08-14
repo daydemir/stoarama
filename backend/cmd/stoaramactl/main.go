@@ -184,7 +184,8 @@ func usage() {
 	  stoaramactl survey coverage [--json]
 	  stoaramactl survey delete-stream-captures --id N --apply
 	  stoaramactl recordability run-once [--batch 1 --window-sec 600 --segment-sec 60 --probe-host LABEL --json] (gated by STREAM_RECORDABILITY_PROBE_ENABLED)
-	  stoaramactl recordability run-targeted --approval-id UUID --stream-ids IDS --node-token TOKEN [--window-sec 600 --segment-sec 60 --json]
+	  stoaramactl recordability run-targeted --approval-id UUID --stream-ids IDS --session-cookie-file FILE [--json]
+	  stoaramactl recordability review-targeted --approval-id UUID --probe-evidence-ids UUIDS --session-cookie-file FILE [--json]
 	  stoaramactl recorder-control run
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]

@@ -47,7 +47,7 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		CREATE TABLE node_tokens(id BIGINT PRIMARY KEY,node_id BIGINT NOT NULL REFERENCES nodes(id),revoked_at TIMESTAMPTZ);
 		CREATE TABLE recorder_droplets(id BIGINT PRIMARY KEY,name TEXT NOT NULL,node_id BIGINT REFERENCES nodes(id),do_droplet_id BIGINT,region TEXT NOT NULL,build_sha TEXT NOT NULL,state TEXT NOT NULL,last_seen_at TIMESTAMPTZ);
 		CREATE TABLE storage_destinations(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL);
-		CREATE TABLE recording_scene_frame_evidence(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,stream_id BIGINT NOT NULL,scene_identity_sha256 TEXT NOT NULL,verified_at TIMESTAMPTZ NOT NULL,UNIQUE(id,account_id,stream_id,scene_identity_sha256));
+		CREATE TABLE recording_scene_frame_evidence(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,stream_id BIGINT NOT NULL,scene_identity_sha256 TEXT NOT NULL,captured_at TIMESTAMPTZ NOT NULL,verified_at TIMESTAMPTZ NOT NULL,UNIQUE(id,account_id,stream_id,scene_identity_sha256));
 		CREATE TABLE recordings(
 		 id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,stream_id BIGINT REFERENCES streams(id),status TEXT NOT NULL,paused_at TIMESTAMPTZ,end_at TIMESTAMPTZ,
 		 capture_via TEXT NOT NULL,target_fps INTEGER,mode TEXT NOT NULL,cron_expr TEXT,cron_timezone TEXT NOT NULL,clip_duration_sec INTEGER NOT NULL,
@@ -83,7 +83,7 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		INSERT INTO node_tokens VALUES(92,91,NULL);
 		INSERT INTO recorder_droplets VALUES(231,'worker-231',91,592454108,'nyc1',$1,'active',transaction_timestamp());
 		INSERT INTO storage_destinations VALUES(12,47);
-		INSERT INTO recording_scene_frame_evidence VALUES(501,47,17235,$4,transaction_timestamp());
+		INSERT INTO recording_scene_frame_evidence VALUES(501,47,17235,$4,transaction_timestamp(),transaction_timestamp());
 		INSERT INTO recordings(id,account_id,stream_id,status,capture_via,target_fps,mode,cron_timezone,clip_duration_sec,daily_window_start,daily_window_end,active_weekdays,start_at,end_at,storage_destination_id,delivery,naming_profile,name,stream_url,source_kind,folder_name,naming_metadata_jsonb,storage_retention_tier)
 		VALUES(381,47,17235,'completed','cloud',NULL,'continuous','Europe/Berlin',60,'06:00','18:00',ARRAY[1,2,3,4,5,6,7],$2,$3,12,'nas_pull','stoarama_v1','FD scene [17235]','https://source.example/live.m3u8','hls_live','recordings','{}','monthly')
 	`, strings.Repeat("a", 40), start, end, strings.Repeat("b", 64))
@@ -147,7 +147,7 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		if _, err := c.Exec(ctx, `INSERT INTO stream_source_revisions(id,stream_id) VALUES($1,$2)`, revisionID, streamID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Exec(ctx, `INSERT INTO recording_scene_frame_evidence(id,account_id,stream_id,scene_identity_sha256,verified_at) VALUES($1,47,$2,$3,transaction_timestamp())`, sceneID, streamID, sha(fmt.Sprintf("scene-%d", streamID))); err != nil {
+		if _, err := c.Exec(ctx, `INSERT INTO recording_scene_frame_evidence(id,account_id,stream_id,scene_identity_sha256,captured_at,verified_at) VALUES($1,47,$2,$3,transaction_timestamp(),transaction_timestamp())`, sceneID, streamID, sha(fmt.Sprintf("scene-%d", streamID))); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := c.Exec(ctx, `INSERT INTO recordings(id,account_id,stream_id,status,capture_via,target_fps,mode,cron_timezone,clip_duration_sec,daily_window_start,daily_window_end,active_weekdays,start_at,end_at,storage_destination_id,delivery,naming_profile,name,stream_url,source_kind,folder_name,naming_metadata_jsonb,storage_retention_tier) VALUES($1,47,$2,$3,'cloud',NULL,'continuous','Europe/Berlin',60,'06:00','18:00',ARRAY[1,2,3,4,5,6,7],$4,$5,12,'nas_pull','stoarama_v1',$6,$7,'hls_live','recordings','{}','monthly')`, recordingID, streamID, status, start, end, fmt.Sprintf("%s [%d]", name, streamID), fmt.Sprintf("https://source.example/%d/live.m3u8", streamID)); err != nil {

@@ -20,6 +20,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
+	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
@@ -292,6 +293,26 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			<-sem
 			return
 		}
+		if !w.cfg.SkipDropletHeartbeat {
+			probe, probeErr := w.cfg.Client.LeaseTargetedProbe(ctx)
+			if probeErr != nil && !errors.Is(probeErr, context.Canceled) {
+				// Provider attestation or an empty queue must never prevent ordinary
+				// recording work from being leased.
+				log.Printf("recording worker targeted probe lease error: %v", probeErr)
+			}
+			if probe != nil {
+				if w.cfg.LeaseGate != nil {
+					w.cfg.LeaseGate.RUnlock()
+				}
+				wg.Add(1)
+				go func(lease recordingapi.TargetedProbeLease) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					w.processTargetedProbe(ctx, lease)
+				}(*probe)
+				continue
+			}
+		}
 		job, err := w.cfg.Client.LeaseRecordingJobWithSurrenderTransport(ctx, w.surrenderTransportEnabled())
 		if err != nil {
 			if w.cfg.LeaseGate != nil {
@@ -329,6 +350,56 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			}
 			w.processJob(ctx, j)
 		}(*job)
+	}
+}
+
+func (w *Worker) processTargetedProbe(ctx context.Context, lease recordingapi.TargetedProbeLease) {
+	if lease.Target == nil {
+		return
+	}
+	evidence := recordability.ProbeStreamTargeted(ctx, *lease.Target, recordability.DefaultWindow, recordability.DefaultSegment)
+	if evidence.CleanupDir != "" {
+		defer func() { _ = os.RemoveAll(evidence.CleanupDir) }()
+	}
+	if evidence.Result == recordability.ResultOK {
+		mediaInfo, mediaErr := os.Stat(evidence.MediaPath)
+		frameInfo, frameErr := os.Stat(evidence.FramePath)
+		if mediaErr != nil || frameErr != nil || mediaInfo.Size() <= 0 || frameInfo.Size() <= 0 ||
+			(lease.Target.MediaMaxSizeBytes > 0 && mediaInfo.Size() > lease.Target.MediaMaxSizeBytes) ||
+			(lease.Target.FrameMaxSizeBytes > 0 && frameInfo.Size() > lease.Target.FrameMaxSizeBytes) ||
+			strings.TrimSpace(lease.Target.MediaUploadURL) == "" || strings.TrimSpace(lease.Target.FrameUploadURL) == "" {
+			log.Printf("recording worker targeted probe quarantine payload invalid stream_id=%d attempt_id=%s", lease.Target.ID, lease.Target.AttemptID)
+			return
+		}
+		if err := w.cfg.Client.UploadFile(ctx, lease.Target.MediaUploadURL, evidence.MediaPath, "application/zip"); err != nil {
+			log.Printf("recording worker targeted probe media upload failed stream_id=%d attempt_id=%s: %v", lease.Target.ID, lease.Target.AttemptID, err)
+			return
+		}
+		if err := w.cfg.Client.UploadFile(ctx, lease.Target.FrameUploadURL, evidence.FramePath, "image/jpeg"); err != nil {
+			log.Printf("recording worker targeted probe frame upload failed stream_id=%d attempt_id=%s: %v", lease.Target.ID, lease.Target.AttemptID, err)
+			return
+		}
+		// Quarantine objects are now the evidence transport. Never duplicate raw
+		// frame bytes into the JSON completion request.
+		evidence.FrameBase64 = ""
+	}
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		err := w.cfg.Client.SubmitTargetedProbeEvidence(ctx, lease, evidence)
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			log.Printf("recording worker targeted probe evidence submit failed stream_id=%d attempt_id=%s: %v", lease.Target.ID, lease.Target.AttemptID, err)
+			return
+		}
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 

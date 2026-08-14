@@ -1414,6 +1414,36 @@ type ffprobeMeta struct {
 	VideoHeight  int
 }
 
+// SegmentFileMetadata is the server-verifiable native media contract read from
+// finalized bytes. It deliberately excludes paths and source identifiers.
+type SegmentFileMetadata struct {
+	DurationMs   int64
+	ActualFPS    *float64
+	VideoCodec   string
+	AudioCodec   string
+	AudioPresent bool
+	VideoWidth   int
+	VideoHeight  int
+}
+
+// InspectSegmentFile validates and returns typed native facts from exact local
+// bytes. Admission code uses this after an exact object-generation download;
+// worker-authored ffprobe facts are not authority.
+func InspectSegmentFile(ctx context.Context, path string) (SegmentFileMetadata, error) {
+	meta, err := probeSegment(ctx, path)
+	if err != nil {
+		return SegmentFileMetadata{}, fmt.Errorf("ffprobe: %w", err)
+	}
+	if meta.DurationMs <= 0 || strings.TrimSpace(meta.VideoCodec) == "" {
+		return SegmentFileMetadata{}, fmt.Errorf("ffprobe returned incomplete media facts")
+	}
+	return SegmentFileMetadata{
+		DurationMs: meta.DurationMs, ActualFPS: meta.ActualFPS,
+		VideoCodec: meta.VideoCodec, AudioCodec: meta.AudioCodec,
+		AudioPresent: meta.AudioPresent, VideoWidth: meta.VideoWidth, VideoHeight: meta.VideoHeight,
+	}, nil
+}
+
 // ValidateSegmentFile proves that a stored clip is a decodable media container
 // with a positive duration and a video stream. It intentionally performs no
 // transcoding and therefore cannot change recording quality; the health sweeper
