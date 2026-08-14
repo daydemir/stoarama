@@ -44,13 +44,20 @@ func TestMigrateUpAppliesLowerReservedMigrationAfterHigherHistory(t *testing.T) 
 	}
 	defer pool.Close()
 	dir := t.TempDir()
-	higher := "0137_reserved_higher_test.sql"
-	lower := "0136_reserved_lower_test.sql"
+	higher := "0138_reserved_quarantine_test.sql"
+	middle := "0137_reserved_rollout_test.sql"
+	lower := "0136_reserved_roster_test.sql"
 	if err = os.WriteFile(filepath.Join(dir, higher), []byte("CREATE TABLE reserved_higher(id integer PRIMARY KEY);\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err = MigrateUp(ctx, pool, dir); err != nil {
 		t.Fatalf("apply higher reserved migration: %v", err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, middle), []byte("CREATE TABLE reserved_middle(id integer PRIMARY KEY);\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = MigrateUp(ctx, pool, dir); err != nil {
+		t.Fatalf("apply later middle reserved migration: %v", err)
 	}
 	if err = os.WriteFile(filepath.Join(dir, lower), []byte("CREATE TABLE reserved_lower(id integer PRIMARY KEY);\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -77,10 +84,10 @@ func TestMigrateUpAppliesLowerReservedMigrationAfterHigherHistory(t *testing.T) 
 	if err = rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(versions, ","); got != lower+","+higher {
+	if got := strings.Join(versions, ","); got != lower+","+middle+","+higher {
 		t.Fatalf("migration ledger=%q", got)
 	}
-	for _, table := range []string{"reserved_lower", "reserved_higher"} {
+	for _, table := range []string{"reserved_lower", "reserved_middle", "reserved_higher"} {
 		var present *string
 		if err = pool.QueryRow(ctx, `SELECT to_regclass($1)::text`, table).Scan(&present); err != nil || present == nil {
 			t.Fatalf("table %s missing: present=%v err=%v", table, present, err)
