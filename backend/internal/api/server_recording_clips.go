@@ -386,6 +386,9 @@ func (s *Server) leaseRelayRecordingJob(ctx context.Context, principal nodePrinc
 			resp.TimestampContractSupported = true
 		}
 	}
+	if err == nil && tokenSupported && resp.LeaseToken != nil && resp.Kind == "continuous_window" {
+		resp.SurrenderTransportVersion = 1
+	}
 	if commitErr := tx.Commit(ctx); commitErr != nil {
 		return resp, commitErr
 	}
@@ -562,12 +565,9 @@ func (s *Server) touchDropletLiveness(ctx context.Context, workerID string, node
 }
 
 type recordingUploadIntentRequest struct {
-	JobID           int64  `json:"job_id"`
-	MimeType        string `json:"mime_type"`
-	SHA256          string `json:"sha256"`
-	ProducerID      string `json:"producer_id"`
-	CaptureSequence int64  `json:"capture_sequence"`
-	SizeBytes       int64  `json:"size_bytes"`
+	JobID    int64  `json:"job_id"`
+	MimeType string `json:"mime_type"`
+	SHA256   string `json:"sha256"`
 	// SegmentStartMs, when > 0, is the UTC start instant (Unix millis) of a
 	// continuous-capture segment. The per-segment object key is derived from it so
 	// each back-to-back segment of one window job gets a unique, ordered,
@@ -576,7 +576,23 @@ type recordingUploadIntentRequest struct {
 	SegmentStartMs int64 `json:"segment_start_ms"`
 }
 
+type recordingCaptureArtifactSealRequest struct {
+	JobID           int64  `json:"job_id"`
+	ProducerID      string `json:"producer_id"`
+	CaptureSequence int64  `json:"capture_sequence"`
+	SegmentStartMs  int64  `json:"segment_start_ms"`
+	SizeBytes       int64  `json:"size_bytes"`
+	SHA256          string `json:"sha256"`
+}
+
 type recordingUploadIntentStatus string
+
+func surrenderTransportVersion(enabled bool) int {
+	if enabled {
+		return 1
+	}
+	return 0
+}
 
 const (
 	recordingUploadIntentPending  recordingUploadIntentStatus = "pending"
@@ -612,14 +628,6 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusBadRequest, "job_id is required")
 		return
 	}
-	recovery, recovering := recordingRecoveryFromContext(r.Context())
-	if recovering {
-		leaseToken = &recovery.LeaseToken
-		if req.JobID != recovery.JobID || strings.TrimSpace(req.ProducerID) != recovery.ProducerID.String() {
-			util.WriteError(w, http.StatusForbidden, "recovery capability does not authorize this artifact")
-			return
-		}
-	}
 	mimeType := strings.TrimSpace(req.MimeType)
 	if mimeType == "" {
 		mimeType = "video/mp4"
@@ -653,17 +661,10 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		FROM recording_jobs j
 		JOIN recordings rec ON rec.id = j.recording_id
 		JOIN storage_destinations sd ON sd.id = rec.storage_destination_id
-		WHERE j.id=$1 AND (
-		  (NOT $4 AND j.status='leased' AND j.lease_owner=$2
-		    AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > transaction_timestamp()
-		    AND rec.status='active')
-		  OR ($4 AND EXISTS(
-		    SELECT 1 FROM recording_job_recovery_grants grant_row
-		    WHERE grant_row.id=$5 AND grant_row.recording_job_id=j.id AND grant_row.lease_token=$3
-		      AND grant_row.producer_id=$6 AND grant_row.revoked_at IS NULL
-		      AND grant_row.upload_grace_until>transaction_timestamp()))
-		)
-	`, req.JobID, workerID, leaseToken, recovering, recovery.GrantID, recovery.ProducerID).Scan(
+		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+		  AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > transaction_timestamp()
+		  AND rec.status='active'
+	`, req.JobID, workerID, leaseToken).Scan(
 		&recordingID, &clipDurationSec, &fireAt, &jobKind,
 		&destID, &endpoint, &region, &bucket, &keyPrefix,
 		&cronTimezone, &namingProfile, &folderName, &namingMetadata,
@@ -686,7 +687,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	// Skip it before presigning/uploading when its content hash is already part of
 	// this window job. This removes only byte-identical media; a unique tail or a
 	// visually similar but different clip is always retained.
-	if sha256 := strings.TrimSpace(req.SHA256); sha256 != "" && strings.TrimSpace(req.ProducerID) == "" {
+	if sha256 := strings.TrimSpace(req.SHA256); sha256 != "" {
 		var alreadyIngested bool
 		if err := s.pool.QueryRow(r.Context(), `
 			SELECT EXISTS(
@@ -765,36 +766,6 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	if strings.TrimSpace(req.ProducerID) != "" {
-		if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, recordingSurrenderJobLockKey(req.JobID)); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, "lock capture artifact seal")
-			return
-		}
-		// The descriptive destination query above deliberately happens before the
-		// transaction so decrypt/presign preparation does not hold authority locks.
-		// Recheck the exact mutation authority after acquiring the job fence: a
-		// concurrent surrender may have committed between that query and this lock.
-		// Without this second check an old generation could create durable bytes
-		// after surrender had proved its spool empty.
-		var authorityCurrent bool
-		if err := tx.QueryRow(r.Context(), `SELECT CASE WHEN $4 THEN EXISTS(
-			SELECT 1 FROM recording_job_recovery_grants grant_row
-			WHERE grant_row.id=$5 AND grant_row.recording_job_id=$1 AND grant_row.lease_token=$3
-			  AND grant_row.producer_id=$6 AND grant_row.revoked_at IS NULL
-			  AND grant_row.upload_grace_until>transaction_timestamp()
-		) ELSE EXISTS(
-			SELECT 1 FROM recording_jobs job
-			WHERE job.id=$1 AND job.status='leased' AND job.lease_owner=$2
-			  AND job.lease_token=$3 AND job.lease_expires_at>transaction_timestamp()
-		) END`, req.JobID, workerID, leaseToken, recovering, recovery.GrantID, recovery.ProducerID).Scan(&authorityCurrent); err != nil {
-			util.WriteError(w, http.StatusInternalServerError, "recheck capture artifact authority")
-			return
-		}
-		if !authorityCurrent {
-			util.WriteError(w, http.StatusConflict, "capture artifact authority changed before reservation")
-			return
-		}
-	}
 	lockKey := fmt.Sprintf("%d:%d:%s:%s:%s", req.JobID, destID, endpoint, bucket, objectKey)
 	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, lockKey); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("lock upload intent reservation: %v", err))
@@ -829,45 +800,6 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	} else {
 		if status == recordingUploadIntentConsumed {
-			if strings.TrimSpace(req.ProducerID) != "" {
-				requestedProducer, parseErr := uuid.Parse(strings.TrimSpace(req.ProducerID))
-				if parseErr != nil {
-					util.WriteError(w, http.StatusBadRequest, "invalid capture producer")
-					return
-				}
-				var sealedProducer uuid.UUID
-				sealErr := tx.QueryRow(r.Context(), `SELECT producer_id FROM recording_capture_artifact_seals WHERE upload_intent_id=$1`, intentID).Scan(&sealedProducer)
-				if sealErr == nil && sealedProducer != requestedProducer {
-					// Upload intents are single-producer identities. A later lease may
-					// encounter the same already-consumed object/bytes, but it gets its
-					// own consumed intent and exact_replay result rather than stealing
-					// the predecessor's immutable seal.
-					intentID = uuid.New()
-					if _, err := tx.Exec(r.Context(), `
-						INSERT INTO recording_upload_intents
-						  (id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at)
-						VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'consumed',$11)
-					`, intentID, recordingID, req.JobID, destID, endpoint, bucket, objectKey, displayPath, mimeType, maxSize, expiresAt); err != nil {
-						util.WriteError(w, http.StatusInternalServerError, "record replay capture intent")
-						return
-					}
-				} else if sealErr != nil && !errors.Is(sealErr, pgx.ErrNoRows) {
-					util.WriteError(w, http.StatusInternalServerError, "load replay capture seal")
-					return
-				}
-			}
-			if err := sealRecordingCaptureArtifact(r.Context(), tx, req, intentID, leaseToken, workerID); err != nil {
-				util.WriteError(w, http.StatusConflict, fmt.Sprintf("seal replayed capture artifact: %v", err))
-				return
-			}
-			if err := sealRecordingCaptureReplay(r.Context(), tx, req, intentID); err != nil {
-				util.WriteError(w, http.StatusConflict, fmt.Sprintf("bind replayed capture artifact: %v", err))
-				return
-			}
-			if err := linkRecordingRecoveryIntent(r.Context(), tx, recovering, recovery, intentID); err != nil {
-				util.WriteError(w, http.StatusConflict, "bind replayed recovery artifact")
-				return
-			}
 			if err := tx.Commit(r.Context()); err != nil {
 				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit replayed upload intent: %v", err))
 				return
@@ -893,14 +825,6 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		}
 		responseStatus = http.StatusOK
 	}
-	if err := sealRecordingCaptureArtifact(r.Context(), tx, req, intentID, leaseToken, workerID); err != nil {
-		util.WriteError(w, http.StatusConflict, fmt.Sprintf("seal capture artifact: %v", err))
-		return
-	}
-	if err := linkRecordingRecoveryIntent(r.Context(), tx, recovering, recovery, intentID); err != nil {
-		util.WriteError(w, http.StatusConflict, "bind recovery artifact")
-		return
-	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit upload intent reservation: %v", err))
 		return
@@ -913,43 +837,119 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	}
 
 	util.WriteJSON(w, responseStatus, map[string]any{
-		"intent_id":      intentID.String(),
-		"upload_url":     uploadURL,
-		"object_key":     objectKey,
-		"bucket":         bucket,
-		"endpoint":       endpoint,
-		"content_type":   mimeType,
-		"max_size_bytes": maxSize,
-		"expires_at":     expiresAt,
+		"intent_id": intentID.String(), "upload_url": uploadURL, "object_key": objectKey,
+		"bucket": bucket, "endpoint": endpoint, "content_type": mimeType,
+		"max_size_bytes": maxSize, "expires_at": expiresAt,
 	})
 }
 
-func linkRecordingRecoveryIntent(ctx context.Context, tx pgx.Tx, recovering bool, recovery recordingRecoveryPrincipal, intentID uuid.UUID) error {
-	if !recovering {
-		return nil
+func (s *Server) handleRecordingCaptureArtifactSeal(w http.ResponseWriter, r *http.Request) {
+	principal, ok := nodePrincipalFromContext(r.Context())
+	if !ok || s.secrets == nil {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
 	}
-	command, err := tx.Exec(ctx, `
-		INSERT INTO recording_job_recovery_grant_intents(grant_id,upload_intent_id)
-		SELECT $1,$2
-		FROM recording_capture_artifact_seals seal
-		WHERE seal.upload_intent_id=$2 AND seal.producer_id=$3
-		ON CONFLICT(grant_id,upload_intent_id) DO NOTHING
-	`, recovery.GrantID, intentID, recovery.ProducerID)
+	intentID, err := uuid.Parse(strings.TrimSpace(chiURLParam(r, "intentId")))
 	if err != nil {
-		return err
+		util.WriteError(w, http.StatusBadRequest, "invalid capture artifact intent")
+		return
 	}
-	if command.RowsAffected() == 1 {
-		return nil
+	var req recordingCaptureArtifactSealRequest
+	if err = util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	var exact bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_job_recovery_grant_intents WHERE grant_id=$1 AND upload_intent_id=$2)`, recovery.GrantID, intentID).Scan(&exact)
-	if err != nil || !exact {
-		return fmt.Errorf("recovery artifact does not match grant")
+	recovery, recovering := recordingRecoveryFromContext(r.Context())
+	leaseToken, tokenErr := recordingLeaseToken(r)
+	if recovering {
+		leaseToken = &recovery.LeaseToken
+		if recovery.IntentID != intentID || recovery.JobID != req.JobID || recovery.ProducerID.String() != strings.TrimSpace(req.ProducerID) {
+			util.WriteError(w, http.StatusForbidden, "recovery capability does not authorize this exact intent")
+			return
+		}
+	} else if tokenErr != nil || leaseToken == nil {
+		util.WriteError(w, http.StatusBadRequest, "generation-fenced lease token is required")
+		return
 	}
-	return nil
+	workerID := recorderWorkerID(principal)
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin capture artifact seal")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, recordingSurrenderJobLockKey(req.JobID)); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock capture artifact seal")
+		return
+	}
+	var endpoint, region, bucket, objectKey, mimeType, accessKeyID string
+	var secretEnc []byte
+	var maxSize int64
+	var status recordingUploadIntentStatus
+	err = tx.QueryRow(r.Context(), `
+		SELECT upload.endpoint,destination.region,upload.bucket,upload.object_key,upload.mime_type,upload.max_size_bytes,
+		       upload.status,destination.access_key_id,destination.secret_access_key_enc
+		FROM recording_upload_intents upload
+		JOIN storage_destinations destination ON destination.id=upload.storage_destination_id
+		JOIN recording_capture_artifact_intents artifact ON artifact.upload_intent_id=upload.id
+		JOIN recording_capture_producers producer ON producer.id=artifact.producer_id
+		JOIN recording_jobs job ON job.id=producer.recording_job_id
+		WHERE upload.id=$1 AND producer.id=$2 AND producer.recording_job_id=$3 AND producer.lease_token=$4
+		  AND (($5 AND EXISTS(SELECT 1 FROM recording_job_recovery_grants grant_row
+		         WHERE grant_row.id=$6 AND grant_row.upload_intent_id=upload.id AND grant_row.producer_id=producer.id
+		           AND grant_row.revoked_at IS NULL AND grant_row.upload_grace_until>transaction_timestamp()))
+		       OR (NOT $5 AND job.status='leased' AND job.lease_token=producer.lease_token
+		           AND job.lease_owner=producer.worker_id AND producer.node_id=$7 AND job.lease_expires_at>transaction_timestamp()))
+		FOR UPDATE OF upload,job
+	`, intentID, strings.TrimSpace(req.ProducerID), req.JobID, leaseToken, recovering, recovery.GrantID, principal.NodeID).Scan(&endpoint, &region, &bucket, &objectKey, &mimeType, &maxSize, &status, &accessKeyID, &secretEnc)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "capture artifact intent authority is stale")
+		return
+	}
+	if status == recordingUploadIntentConsumed {
+		if err = sealRecordingCaptureReplay(r.Context(), tx, req, intentID); err != nil {
+			util.WriteError(w, http.StatusConflict, "bind capture replay")
+			return
+		}
+	} else if status != recordingUploadIntentPending && status != recordingUploadIntentExpired {
+		util.WriteError(w, http.StatusConflict, "capture artifact intent is unavailable")
+		return
+	}
+	if err = sealRecordingCaptureArtifact(r.Context(), tx, req, intentID, leaseToken, workerID); err != nil {
+		util.WriteError(w, http.StatusConflict, fmt.Sprintf("seal capture artifact: %v", err))
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `UPDATE recording_upload_intents SET status='pending',expires_at=transaction_timestamp()+interval '15 minutes' WHERE id=$1 AND status<>'consumed'`, intentID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "refresh exact capture intent")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit capture artifact seal")
+		return
+	}
+	if status == recordingUploadIntentConsumed {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"intent_id": intentID.String(), "already_ingested": true})
+		return
+	}
+	secret, err := s.secrets.Decrypt(secretEnc)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "decrypt destination secret")
+		return
+	}
+	client, err := r2.New(r.Context(), r2.Config{AccessKey: accessKeyID, SecretKey: string(secret), Region: region, Bucket: bucket, Endpoint: endpoint})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "build destination client")
+		return
+	}
+	uploadURL, err := client.PresignPut(r.Context(), objectKey, mimeType, s.cfg.R2SignPutTTL)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "presign exact capture artifact")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"intent_id": intentID.String(), "upload_url": uploadURL, "object_key": objectKey, "bucket": bucket, "endpoint": endpoint, "content_type": mimeType, "max_size_bytes": maxSize, "expires_at": time.Now().UTC().Add(s.cfg.R2SignPutTTL)})
 }
 
-func sealRecordingCaptureArtifact(ctx context.Context, tx pgx.Tx, req recordingUploadIntentRequest, intentID uuid.UUID, leaseToken *uuid.UUID, workerID string) error {
+func sealRecordingCaptureArtifact(ctx context.Context, tx pgx.Tx, req recordingCaptureArtifactSealRequest, intentID uuid.UUID, leaseToken *uuid.UUID, workerID string) error {
 	producerRaw := strings.TrimSpace(req.ProducerID)
 	if producerRaw == "" {
 		if req.CaptureSequence != 0 || req.SizeBytes != 0 {
@@ -991,7 +991,7 @@ func sealRecordingCaptureArtifact(ctx context.Context, tx pgx.Tx, req recordingU
 	return nil
 }
 
-func sealRecordingCaptureReplay(ctx context.Context, tx pgx.Tx, req recordingUploadIntentRequest, intentID uuid.UUID) error {
+func sealRecordingCaptureReplay(ctx context.Context, tx pgx.Tx, req recordingCaptureArtifactSealRequest, intentID uuid.UUID) error {
 	if strings.TrimSpace(req.ProducerID) == "" {
 		return nil
 	}
@@ -1250,11 +1250,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		WHERE ui.id=$1 AND ui.status='pending' AND (
 		  (NOT $4 AND j.status='leased' AND j.lease_owner=$2
 		    AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > transaction_timestamp())
-		  OR ($4 AND EXISTS(
-		    SELECT 1 FROM recording_job_recovery_grant_intents grant_intent
-		    JOIN recording_job_recovery_grants grant_row ON grant_row.id=grant_intent.grant_id
-		    WHERE grant_intent.upload_intent_id=ui.id AND grant_row.id=$6
-		      AND grant_row.producer_id=$7 AND grant_row.recording_job_id=j.id AND grant_row.lease_token=$3
+			  OR ($4 AND EXISTS(
+			    SELECT 1 FROM recording_job_recovery_grants grant_row
+			    WHERE grant_row.upload_intent_id=ui.id AND grant_row.id=$6
+			      AND grant_row.producer_id=$7 AND grant_row.recording_job_id=j.id AND grant_row.lease_token=$3
 		      AND grant_row.revoked_at IS NULL AND grant_row.upload_grace_until>transaction_timestamp()))
 		)
 		-- Serialize ingest with generation-fenced surrender. If ingest wins, the
@@ -1405,14 +1404,15 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 			(recording_id, recording_job_id, storage_destination_id, endpoint, bucket, object_key, display_path,
 			 mime_type, container, size_bytes, etag, sha256, duration_ms, video_codec, audio_codec,
 			 audio_present, actual_fps, video_width, video_height, resolved_url, fire_at, clip_start_at, clip_end_at,
-			 capture_lease_token, capture_sequence, capture_attempt_id, timestamp_contract_version, timestamp_contract, timestamp_contract_status, timestamp_contract_reason)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+			 capture_lease_token, capture_sequence, capture_attempt_id, timestamp_contract_version, timestamp_contract, timestamp_contract_status, timestamp_contract_reason,
+			 surrender_transport_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
 		ON CONFLICT (bucket, object_key) DO NOTHING
 		RETURNING id
 	`, recordingID, jobID, destID, endpoint, bucket, objectKey,
 		displayPath, mimeType, container, head.SizeBytes, etag, strings.TrimSpace(req.SHA256), durationMs,
 		strings.TrimSpace(req.VideoCodec), strings.TrimSpace(req.AudioCodec), req.AudioPresent, req.ActualFPS,
-		nullablePositiveInt(req.VideoWidth), nullablePositiveInt(req.VideoHeight), strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence, captureAttemptID, nullableTimestampVersion(captureAttemptID, req.TimestampContractStatus), req.TimestampContract, nullableTimestampStatus(captureAttemptID, req.TimestampContractStatus), nullableTimestampReason(captureAttemptID, req.TimestampContractReason)).Scan(&clipID)
+		nullablePositiveInt(req.VideoWidth), nullablePositiveInt(req.VideoHeight), strings.TrimSpace(req.ResolvedURL), fireAt, clipStartAt, clipEndAt, captureLeaseToken, captureSequence, captureAttemptID, nullableTimestampVersion(captureAttemptID, req.TimestampContractStatus), req.TimestampContract, nullableTimestampStatus(captureAttemptID, req.TimestampContractStatus), nullableTimestampReason(captureAttemptID, req.TimestampContractReason), surrenderTransportVersion(v1Head)).Scan(&clipID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 0-row insert means a clip already exists for this (bucket,object_key).
 		// Treat as an error so the job is NOT marked done and the dropped clip
@@ -1425,7 +1425,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" &&
-		pgErr.ConstraintName == "uq_recording_clips_capture_sequence" {
+		(pgErr.ConstraintName == "uq_recording_clips_capture_sequence" || pgErr.ConstraintName == "uq_recording_clips_capture_sha256") {
 		// A parallel retry can pass the preflight before the first ingest commits.
 		// The generation-scoped sequence index is the concurrency backstop; expose
 		// the same idempotent result as the ordinary already-ingested path.
@@ -1512,6 +1512,29 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		}
 		if _, err := tx.Exec(r.Context(), `INSERT INTO recording_capture_artifact_results(upload_intent_id,result,clip_id,head_version) VALUES($1,'accepted_unique',$2,$3)`, intentID, clipID, headVersion); err != nil {
 			util.WriteError(w, http.StatusConflict, "seal accepted capture artifact result")
+			return
+		}
+		if recovering {
+			if _, err := tx.Exec(r.Context(), `UPDATE recording_job_recovery_grants SET revoked_at=transaction_timestamp(),revoke_reason='recovery_completed' WHERE id=$1 AND upload_intent_id=$2 AND revoked_at IS NULL`, recovery.GrantID, intentID); err != nil {
+				util.WriteError(w, http.StatusConflict, "close exact recovery capability")
+				return
+			}
+			if err := terminalizeRecoveredProducer(r.Context(), tx, recovery.ProducerID); err != nil {
+				util.WriteError(w, http.StatusConflict, "finish recovered producer after ingest")
+				return
+			}
+		}
+		if _, err := tx.Exec(r.Context(), `
+			WITH resolved AS (
+			  UPDATE recording_surrender_transport_episodes
+			  SET state='resolved',resolved_at=transaction_timestamp(),last_observed_at=transaction_timestamp()
+			  WHERE recording_job_id=$1 AND state='open'
+			  RETURNING episode_key,lease_token
+			)
+			INSERT INTO recording_surrender_transport_episode_events(event_key,episode_key,recording_job_id,lease_token,event_type,reason)
+			SELECT gen_random_uuid(),episode_key,$1,lease_token,'resolved','accepted_unique' FROM resolved
+		`, jobID); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "resolve surrender transport episode")
 			return
 		}
 	}

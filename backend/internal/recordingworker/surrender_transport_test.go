@@ -1,12 +1,14 @@
 package recordingworker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -69,7 +71,7 @@ func TestCaptureProducerReservationResponseLossReplaysSameDurableIdentity(t *tes
 		t.Fatal(err)
 	}
 	job := recordingapi.RecordingJob{JobID: 41, LeaseToken: "20ea197f-3b7d-4d18-a74e-cb63215a4527", SurrenderTransportVersion: 1}
-	got, err := w.reserveCaptureProducer(context.Background(), job, 1, "/capture/one", "https://media.example/live.m3u8")
+	got, err := w.reserveCaptureProducer(context.Background(), job, 1, "/capture/one")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +79,74 @@ func TestCaptureProducerReservationResponseLossReplaysSameDurableIdentity(t *tes
 	defer mu.Unlock()
 	if calls != 2 || len(producerIDs) != 2 || producerIDs[0] == "" || producerIDs[0] != producerIDs[1] || got.ProducerID != producerIDs[0] {
 		t.Fatalf("calls=%d ids=%v got=%+v", calls, producerIDs, got)
+	}
+}
+
+func TestCaptureArtifactReservationResponseLossReplaysExactPreByteIntents(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
+	var producer *captureProducerJournal
+	var durableBeforeServer bool
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/recording/jobs/51/capture-producers/3cc7341c-d96b-4f38-b7de-cc47229837f9/artifacts/reserve" {
+			http.NotFound(w, r)
+			return
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		bodies = append(bodies, raw)
+		call := len(bodies)
+		mu.Unlock()
+		journalRaw, readErr := os.ReadFile(producer.path)
+		if readErr != nil {
+			t.Fatalf("server observed reservation before durable journal: %v", readErr)
+		}
+		durableBeforeServer = len(producer.Artifacts) == 2
+		for _, artifact := range producer.Artifacts {
+			durableBeforeServer = durableBeforeServer && bytes.Contains(journalRaw, []byte(artifact.RecoverySecret))
+		}
+		if call == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), ".surrender")
+	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer = &captureProducerJournal{JobID: 51, LeaseToken: uuid.NewString(), ProducerID: surrenderAttemptNamespace.String(), CaptureOrdinal: 1, OutputDir: filepath.Join(root, "capture"), ClipDurationSec: 60}
+	state := w.surrenderState(51)
+	state.producer = producer
+	job := recordingapi.RecordingJob{JobID: 51, LeaseToken: producer.LeaseToken, SurrenderTransportVersion: 1}
+	if err = w.reserveCaptureArtifactSlots(context.Background(), job, producer, 7, 2); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) || len(producer.Artifacts) != 2 || !durableBeforeServer {
+		t.Fatalf("calls=%d artifacts=%d", len(bodies), len(producer.Artifacts))
+	}
+	raw, err := os.ReadFile(producer.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("resolved_url")) || bytes.Contains(raw, []byte("source_url")) || bytes.Contains(raw, []byte("headers")) {
+		t.Fatalf("producer journal persisted source authority: %s", raw)
 	}
 }
 
@@ -100,7 +170,7 @@ func TestRecoveryCannotRaceActiveOrCrossLeaseGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	journal := &captureProducerJournal{JobID: current.JobID, LeaseToken: current.LeaseToken, ProducerID: uuid.NewString(), RecoverySecret: strings.Repeat("1a", 32), CaptureOrdinal: 1}
+	journal := &captureProducerJournal{JobID: current.JobID, LeaseToken: current.LeaseToken, ProducerID: uuid.NewString(), CaptureOrdinal: 1}
 	done, err := w.recoverProducerJournal(context.Background(), journal)
 	if err != nil || done || statusCalls != 0 {
 		t.Fatalf("active recovery done=%v calls=%d err=%v", done, statusCalls, err)
@@ -115,57 +185,135 @@ func TestRecoveryCannotRaceActiveOrCrossLeaseGeneration(t *testing.T) {
 	}
 }
 
-func TestRecoveryCapabilityDrainsFinalizedBytesWithoutMainLease(t *testing.T) {
-	producerID := "5a7adfda-b8e8-48c8-a755-690e8a84c32a"
-	leaseToken := "20ea197f-3b7d-4d18-a74e-cb63215a4527"
-	secret := strings.Repeat("1a", 32)
-	var mu sync.Mutex
-	var reserveCalls, uploadCalls, ingestCalls, finishCalls int
-	sequences := make([]int64, 0, 2)
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/v1/recording/recovery/") || r.URL.Path == "/api/v1/recording/upload-intents" || r.URL.Path == "/api/v1/recording/clips/ingest" {
-			if r.Header.Get("X-Stoarama-Recording-Recovery-Producer") != producerID || r.Header.Get("X-Stoarama-Recording-Recovery-Secret") != secret {
-				http.Error(w, "missing recovery capability", http.StatusUnauthorized)
+func TestCurrentLeaseCrashAbandonsEveryPreReservedUnsealedIntent(t *testing.T) {
+	producerID, leaseToken := uuid.NewString(), uuid.NewString()
+	var finished atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"producer_id": producerID, "found": true, "current_lease": true, "intent_count": 2})
+		case strings.HasSuffix(r.URL.Path, "/finish"):
+			if r.Header.Get("X-Stoarama-Recording-Lease-Token") != leaseToken {
+				http.Error(w, "missing lease", http.StatusUnauthorized)
 				return
 			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["result"] != "abandoned_empty" {
+				http.Error(w, "wrong result", http.StatusBadRequest)
+				return
+			}
+			finished.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	outDir := filepath.Join(root, "capture-empty")
+	if err = os.Mkdir(outDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := &captureProducerJournal{JobID: 52, LeaseToken: leaseToken, ProducerID: producerID, CaptureOrdinal: 1, OutputDir: outDir, ClipDurationSec: 60,
+		Artifacts: []captureArtifactJournal{{IntentID: uuid.NewString(), CaptureSequence: 1}, {IntentID: uuid.NewString(), CaptureSequence: 2}}}
+	done, err := w.recoverProducerJournal(context.Background(), journal)
+	if err != nil || !done || !finished.Load() {
+		t.Fatalf("done=%v finished=%v err=%v", done, finished.Load(), err)
+	}
+}
+
+func TestCrashBeforeProducerReservationLeavesNoServerOrByteAuthority(t *testing.T) {
+	producerID := uuid.NewString()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"producer_id": producerID, "found": false, "intent_count": 0})
+			return
+		}
+		http.Error(w, "unexpected mutation", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	outDir := filepath.Join(root, "capture-never-opened")
+	if err = os.Mkdir(outDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := w.recoverProducerJournal(context.Background(), &captureProducerJournal{JobID: 53, LeaseToken: uuid.NewString(), ProducerID: producerID, CaptureOrdinal: 1, OutputDir: outDir, ClipDurationSec: 60})
+	if err != nil || !done {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+}
+
+func TestRecoveryCapabilityDrainsFinalizedBytesWithoutMainLease(t *testing.T) {
+	producerID, leaseToken := uuid.NewString(), uuid.NewString()
+	intentIDs := []string{uuid.NewString(), uuid.NewString()}
+	secrets := []string{strings.Repeat("1a", 32), strings.Repeat("2b", 32)}
+	var mu sync.Mutex
+	ingested := map[string]bool{}
+	var sealCalls, uploadCalls, ingestCalls int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		intentIndex := -1
+		for i, intentID := range intentIDs {
+			if strings.Contains(r.URL.Path, intentID) || r.Header.Get("X-Stoarama-Recording-Recovery-Intent") == intentID {
+				intentIndex = i
+				break
+			}
+		}
+		if !strings.HasPrefix(r.URL.Path, "/put/") && (intentIndex < 0 || r.Header.Get("X-Stoarama-Recording-Recovery-Secret") != secrets[intentIndex]) {
+			http.Error(w, "missing exact-intent recovery capability", http.StatusUnauthorized)
+			return
 		}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			mu.Lock()
-			done := ingestCalls
+			done := ingested[intentIDs[intentIndex]]
 			mu.Unlock()
-			artifacts := []map[string]any{{"intent_id": "5d351c0c-7f6e-47ff-913e-3d555c190a78", "capture_sequence": 1, "segment_start_ms": time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC).UnixMilli(), "size_bytes": 7, "sha256": strings.Repeat("a", 64)}}
-			if done == 2 {
-				artifacts[0]["result"] = "accepted_unique"
-				artifacts = append(artifacts, map[string]any{"intent_id": "6e462d1d-8a7f-48ff-a24f-4e666d201b89", "capture_sequence": 2, "segment_start_ms": time.Date(2026, 8, 14, 12, 1, 0, 0, time.UTC).UnixMilli(), "size_bytes": 7, "sha256": strings.Repeat("a", 64), "result": "accepted_unique"})
+			artifact := map[string]any{"intent_id": intentIDs[intentIndex], "capture_sequence": intentIndex + 1}
+			if done {
+				artifact["result"] = "accepted_unique"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"producer_id": producerID, "job_id": 41, "lease_token": leaseToken, "expires_at": time.Now().Add(time.Minute), "next_capture_sequence": 2, "artifacts": artifacts})
-		case r.URL.Path == "/api/v1/recording/upload-intents":
-			var body struct {
-				CaptureSequence int64 `json:"capture_sequence"`
+			_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": intentIDs[intentIndex], "producer_id": producerID, "job_id": 41, "lease_token": leaseToken, "expires_at": time.Now().Add(time.Minute), "artifacts": []any{artifact}})
+		case strings.HasSuffix(r.URL.Path, "/seal"):
+			sealCalls++
+			if intentIndex == 0 && sealCalls == 1 {
+				// The server may have committed this exact seal even though the
+				// response vanished. Recovery must retain the file/journal and retry
+				// the same intent+bytes, never reserve a replacement intent.
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = conn.Close()
+				return
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			mu.Lock()
-			reserveCalls++
-			sequences = append(sequences, body.CaptureSequence)
-			mu.Unlock()
-			intentID := "5d351c0c-7f6e-47ff-913e-3d555c190a78"
-			if body.CaptureSequence == 2 {
-				intentID = "6e462d1d-8a7f-48ff-a24f-4e666d201b89"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": intentID, "upload_url": server.URL + "/put", "content_type": "video/mp4", "max_size_bytes": 1024, "expires_at": time.Now().Add(time.Minute)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": intentIDs[intentIndex], "upload_url": server.URL + "/put/" + intentIDs[intentIndex], "content_type": "video/mp4", "max_size_bytes": 1024, "expires_at": time.Now().Add(time.Minute)})
 		case r.URL.Path == "/put":
+			t.Fatal("non-exact upload path")
+		case strings.HasPrefix(r.URL.Path, "/put/"):
 			uploadCalls++
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/api/v1/recording/clips/ingest":
 			mu.Lock()
 			ingestCalls++
+			ingested[intentIDs[intentIndex]] = true
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"clip_id": 71, "head_version": 1, "head_upload_intent_id": "5d351c0c-7f6e-47ff-913e-3d555c190a78"})
-		case strings.HasSuffix(r.URL.Path, "/finish"):
-			finishCalls++
-			w.WriteHeader(http.StatusNoContent)
+			_ = json.NewEncoder(w).Encode(map[string]any{"clip_id": 71 + intentIndex, "head_version": intentIndex + 1, "head_upload_intent_id": intentIDs[intentIndex]})
 		default:
 			http.NotFound(w, r)
 		}
@@ -199,12 +347,29 @@ func TestRecoveryCapabilityDrainsFinalizedBytesWithoutMainLease(t *testing.T) {
 		}
 		return capture.Segment{Path: path, MIMEType: "video/mp4", SizeBytes: 7, SHA256: strings.Repeat("a", 64), StartAt: start, EndAt: start.Add(time.Minute), DurationMs: 60_000, Container: "mp4", VideoCodec: "h264"}, nil
 	}
-	done, err := w.recoverProducerJournal(context.Background(), &captureProducerJournal{JobID: 41, LeaseToken: leaseToken, ProducerID: producerID, RecoverySecret: secret, RecoverySecretSHA256: strings.Repeat("b", 64), CaptureOrdinal: 1, OutputDir: outDir, ResolvedURL: "https://media.example/live.m3u8", ClipDurationSec: 60})
+	artifacts := make([]captureArtifactJournal, 2)
+	for i := range artifacts {
+		secretBytes, decodeErr := hex.DecodeString(secrets[i])
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		hash := sha256.Sum256(secretBytes)
+		artifacts[i] = captureArtifactJournal{IntentID: intentIDs[i], RecoverySecret: secrets[i], RecoverySecretSHA256: hex.EncodeToString(hash[:]), CaptureSequence: int64(i + 1)}
+	}
+	journal := &captureProducerJournal{JobID: 41, LeaseToken: leaseToken, ProducerID: producerID, CaptureOrdinal: 1, OutputDir: outDir, ClipDurationSec: 60, Artifacts: artifacts}
+	done, err := w.recoverProducerJournal(context.Background(), journal)
+	if err == nil || done {
+		t.Fatalf("lost seal response did not preserve recovery: done=%v err=%v", done, err)
+	}
+	if _, statErr := os.Stat(segmentPath); statErr != nil {
+		t.Fatalf("seal response loss removed exact bytes: %v", statErr)
+	}
+	done, err = w.recoverProducerJournal(context.Background(), journal)
 	if err != nil || !done {
 		t.Fatalf("done=%v err=%v", done, err)
 	}
-	if reserveCalls != 2 || uploadCalls != 2 || ingestCalls != 2 || finishCalls != 1 || len(sequences) != 2 || sequences[0] != 1 || sequences[1] != 2 {
-		t.Fatalf("reserve=%d upload=%d ingest=%d finish=%d", reserveCalls, uploadCalls, ingestCalls, finishCalls)
+	if sealCalls != 3 || uploadCalls != 2 || ingestCalls != 2 {
+		t.Fatalf("seal=%d upload=%d ingest=%d", sealCalls, uploadCalls, ingestCalls)
 	}
 	if _, err = os.Stat(segmentPath); !os.IsNotExist(err) {
 		t.Fatalf("recovered segment still present: %v", err)
@@ -215,18 +380,28 @@ func TestRecoveryCapabilityDrainsFinalizedBytesWithoutMainLease(t *testing.T) {
 }
 
 func TestRecoveryCapabilityRetainsUnfinalizedProducerBytes(t *testing.T) {
-	producerID, leaseToken := uuid.NewString(), uuid.NewString()
+	producerID, leaseToken, intentID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	secret := strings.Repeat("1a", 32)
+	var finished string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/status") {
-			http.Error(w, "partial bytes must not reach upload or finish", http.StatusInternalServerError)
+		if r.Header.Get("X-Stoarama-Recording-Recovery-Intent") != intentID || r.Header.Get("X-Stoarama-Recording-Recovery-Secret") != secret {
+			http.Error(w, "wrong exact intent", http.StatusUnauthorized)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"producer_id": producerID, "job_id": 42, "lease_token": leaseToken,
-			"authority": "recovery_grant", "expires_at": time.Now().Add(time.Minute),
-			"next_capture_sequence": 1, "artifacts": []any{},
-		})
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": intentID, "producer_id": producerID, "job_id": 42, "lease_token": leaseToken, "expires_at": time.Now().Add(time.Minute), "artifacts": []any{map[string]any{"intent_id": intentID, "capture_sequence": 1}}})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/finish") {
+			var body struct {
+				Result string `json:"result"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			finished = body.Result
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, "partial bytes must not upload", http.StatusInternalServerError)
 	}))
 	defer server.Close()
 	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "revoked-main-token"})
@@ -249,11 +424,10 @@ func TestRecoveryCapabilityRetainsUnfinalizedProducerBytes(t *testing.T) {
 	w.recoverContinuousSegment = func(context.Context, string, time.Duration) (capture.Segment, error) {
 		return capture.Segment{}, errors.New("missing terminal media metadata")
 	}
-	done, recoverErr := w.recoverProducerJournal(context.Background(), &captureProducerJournal{
-		JobID: 42, LeaseToken: leaseToken, ProducerID: producerID, RecoverySecret: secret,
-		CaptureOrdinal: 1, OutputDir: outDir, ResolvedURL: "https://media.example/live.m3u8", ClipDurationSec: 60,
-	})
-	if done || recoverErr == nil || !strings.Contains(recoverErr.Error(), "not finalized") {
+	secretBytes, _ := hex.DecodeString(secret)
+	hash := sha256.Sum256(secretBytes)
+	done, recoverErr := w.recoverProducerJournal(context.Background(), &captureProducerJournal{JobID: 42, LeaseToken: leaseToken, ProducerID: producerID, CaptureOrdinal: 1, OutputDir: outDir, ClipDurationSec: 60, Artifacts: []captureArtifactJournal{{IntentID: intentID, RecoverySecret: secret, RecoverySecretSHA256: hex.EncodeToString(hash[:]), CaptureSequence: 1}}})
+	if done || recoverErr == nil || !strings.Contains(recoverErr.Error(), "retained") || finished != "unrecoverable_partial" {
 		t.Fatalf("done=%v err=%v", done, recoverErr)
 	}
 	if _, err = os.Stat(partialPath); err != nil {
@@ -261,50 +435,25 @@ func TestRecoveryCapabilityRetainsUnfinalizedProducerBytes(t *testing.T) {
 	}
 }
 
-func TestCurrentLeaseRestartFinishesThroughGenerationFencedProducerRoute(t *testing.T) {
-	producerID := uuid.NewString()
-	leaseToken := uuid.NewString()
-	secret := strings.Repeat("1a", 32)
-	var ordinaryFinishes, recoveryFinishes int
+func TestRecoveryCapabilityCannotCrossIntent(t *testing.T) {
+	intentID, secret := uuid.NewString(), strings.Repeat("1a", 32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/status"):
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"producer_id": producerID, "job_id": 71, "lease_token": leaseToken,
-				"authority": "current_lease", "expires_at": time.Now().Add(time.Minute),
-				"next_capture_sequence": 1, "artifacts": []any{},
-			})
-		case r.URL.Path == "/api/v1/recording/jobs/71/capture-producers/"+producerID+"/finish":
-			ordinaryFinishes++
-			w.WriteHeader(http.StatusNoContent)
-		case strings.HasSuffix(r.URL.Path, "/finish"):
-			recoveryFinishes++
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.NotFound(w, r)
+		if !strings.Contains(r.URL.Path, intentID) || r.Header.Get("X-Stoarama-Recording-Recovery-Intent") != intentID || r.Header.Get("X-Stoarama-Recording-Recovery-Secret") != secret {
+			http.Error(w, "cross-intent authority", http.StatusForbidden)
+			return
 		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"intent_id": intentID})
 	}))
 	defer server.Close()
-	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "current-node"})
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
-	outDir, err := os.MkdirTemp(root, "capture-continuous-")
-	if err != nil {
+	if _, err = client.RecordingRecoveryStatus(context.Background(), intentID, secret); err != nil {
 		t.Fatal(err)
 	}
-	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	done, err := w.recoverProducerJournal(context.Background(), &captureProducerJournal{
-		JobID: 71, LeaseToken: leaseToken, ProducerID: producerID, RecoverySecret: secret,
-		RecoverySecretSHA256: strings.Repeat("b", 64), CaptureOrdinal: 1,
-		OutputDir: outDir, ResolvedURL: "https://media.example/live.m3u8", ClipDurationSec: 60,
-	})
-	if err != nil || !done || ordinaryFinishes != 1 || recoveryFinishes != 0 {
-		t.Fatalf("done=%v ordinary=%d recovery=%d err=%v", done, ordinaryFinishes, recoveryFinishes, err)
+	if _, err = client.RecordingRecoveryStatus(context.Background(), uuid.NewString(), secret); err == nil {
+		t.Fatal("cross-intent recovery succeeded")
 	}
 }
 
@@ -325,6 +474,100 @@ func TestPersistProducerJournalIgnoresAbandonedTemporarySibling(t *testing.T) {
 	}
 }
 
+func TestProducerJournalCarriesMaximumPreByteIntentSetWithinHardBounds(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".surrender")
+	journal := &captureProducerJournal{
+		JobID: 82, LeaseToken: uuid.NewString(), ProducerID: uuid.NewString(), CaptureOrdinal: 1,
+		OutputDir: filepath.Join(root, "capture"), ClipDurationSec: 60,
+		Artifacts: make([]captureArtifactJournal, 2048),
+	}
+	for index := range journal.Artifacts {
+		secret := sha256.Sum256([]byte(fmt.Sprintf("intent-secret-%d", index)))
+		secretHash := sha256.Sum256(secret[:])
+		journal.Artifacts[index] = captureArtifactJournal{
+			IntentID: uuid.NewString(), RecoverySecret: hex.EncodeToString(secret[:]),
+			RecoverySecretSHA256: hex.EncodeToString(secretHash[:]), CaptureSequence: int64(index + 1),
+		}
+	}
+	if err := persistProducerJournal(root, journal); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadCaptureProducerJournals(root)
+	if err != nil || len(loaded) != 1 || len(loaded[0].Artifacts) != 2048 {
+		t.Fatalf("loaded=%d artifacts=%d err=%v", len(loaded), func() int {
+			if len(loaded) == 0 {
+				return 0
+			}
+			return len(loaded[0].Artifacts)
+		}(), err)
+	}
+	journal.Artifacts = append(journal.Artifacts, captureArtifactJournal{})
+	if err = persistProducerJournal(root, journal); err == nil {
+		t.Fatal("producer journal exceeded the pre-byte artifact bound")
+	}
+}
+
+func TestSurrenderTransportObservationJournalIsBoundedAndFlushesExactly(t *testing.T) {
+	var available atomic.Bool
+	var received atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/surrender/observations") {
+			http.NotFound(w, r)
+			return
+		}
+		if !available.Load() {
+			http.Error(w, "offline", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Observations []recordingapi.SurrenderTransportObservation `json:"observations"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		received.Add(int64(len(body.Observations)))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := queuedSurrenderTransportObservation{JobID: 73, SurrenderTransportObservation: recordingapi.SurrenderTransportObservation{
+		ID: uuid.NewString(), LeaseToken: uuid.NewString(), AttemptID: uuid.NewString(), Type: "request_started", ObservedAt: time.Now().UTC(), RequestSHA256: strings.Repeat("a", 64),
+	}}
+	if err = w.appendSurrenderTransportObservation(observation); err != nil {
+		t.Fatal(err)
+	}
+	w.flushSurrenderTransportObservations(context.Background())
+	if queued, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(w.surrenderJournalRoot())); err != nil || len(queued) != 1 {
+		t.Fatalf("offline queue=%d err=%v", len(queued), err)
+	}
+	available.Store(true)
+	w.flushSurrenderTransportObservations(context.Background())
+	if received.Load() != 1 {
+		t.Fatalf("received=%d", received.Load())
+	}
+	if queued, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(w.surrenderJournalRoot())); err != nil || len(queued) != 0 {
+		t.Fatalf("flushed queue=%d err=%v", len(queued), err)
+	}
+	full := make([]queuedSurrenderTransportObservation, 256)
+	for index := range full {
+		full[index] = observation
+		full[index].ID = uuid.NewString()
+	}
+	if err = persistSurrenderTransportObservations(w.surrenderJournalRoot(), full); err != nil {
+		t.Fatal(err)
+	}
+	if err = w.appendSurrenderTransportObservation(observation); err == nil {
+		t.Fatal("observation journal exceeded its hard bound")
+	}
+}
+
 func TestRunRegistersRecoveryJournalBeforeFirstLeasePoll(t *testing.T) {
 	root := t.TempDir()
 	journalRoot := filepath.Join(root, ".stoarama-surrender-v1")
@@ -336,8 +579,8 @@ func TestRunRegistersRecoveryJournalBeforeFirstLeasePoll(t *testing.T) {
 	secretHash := sha256.Sum256(secretBytes)
 	journal := &captureProducerJournal{
 		JobID: 91, LeaseToken: uuid.NewString(), ProducerID: uuid.NewString(),
-		CaptureOrdinal: 1, RecoverySecret: secret, RecoverySecretSHA256: hex.EncodeToString(secretHash[:]),
-		OutputDir: filepath.Join(root, "capture-continuous-pending"), ResolvedURL: "https://media.example/live.m3u8", ClipDurationSec: 60,
+		CaptureOrdinal: 1, OutputDir: filepath.Join(root, "capture-continuous-pending"), ClipDurationSec: 60,
+		Artifacts: []captureArtifactJournal{{IntentID: uuid.NewString(), RecoverySecret: secret, RecoverySecretSHA256: hex.EncodeToString(secretHash[:]), CaptureSequence: 1}},
 	}
 	if err = persistProducerJournal(journalRoot, journal); err != nil {
 		t.Fatal(err)
@@ -410,11 +653,15 @@ func TestCaptureProducerNeverDeletesPendingSpoolAcrossSafetyExits(t *testing.T) 
 	}
 }
 
-func TestSurrenderTransportFourJobBurstRetriesStableAttempts(t *testing.T) {
+func TestRelaySurrenderTransportFourJobBurstRetriesStableAttempts(t *testing.T) {
 	var mu sync.Mutex
 	counts := map[string]int{}
 	jobs := map[string]int64{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/observations") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		var body struct {
 			AttemptID string `json:"attempt_id"`
 		}
@@ -447,7 +694,7 @@ func TestSurrenderTransportFourJobBurstRetriesStableAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: t.TempDir()})
+	w, err := NewWorker(Config{Client: client, WorkerID: "relay", CaptureTempDir: t.TempDir(), SkipDropletHeartbeat: true})
 	if err != nil {
 		t.Fatal(err)
 	}

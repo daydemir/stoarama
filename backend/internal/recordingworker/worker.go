@@ -107,6 +107,7 @@ type Worker struct {
 	continuousCapture        continuousCaptureFunc
 	recoverContinuousSegment func(context.Context, string, time.Duration) (capture.Segment, error)
 	surrenderJobs            sync.Map // job id -> *surrenderJobState
+	surrenderObservationMu   sync.Mutex
 }
 
 var (
@@ -536,6 +537,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		segmentCtx, segmentCancel := continuousSegmentDeliveryContext(jobCtx, job.WindowEndAt, time.Now())
 		defer segmentCancel()
 		alreadyIngested := false
+		artifact, artifactErr := captureArtifactForSequence(producer, seg.CaptureSequence)
+		if artifactErr != nil {
+			return artifactErr
+		}
 		err := deliverSegmentWithRetry(segmentCtx, segmentDeliveryRetryDelay, func() bool {
 			return w.diskHasSpace(w.cfg.MinActiveFreeBytes)
 		}, segmentDeliveryOps{
@@ -543,17 +548,18 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				started := time.Now()
 				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "reserve", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
-				producerID := ""
+				var reserved recordingapi.ClipUploadIntent
+				var err error
 				if producer != nil {
-					producerID = producer.ProducerID
+					if journalErr := w.recordProducerArtifact(job.JobID, producer, seg, artifact.IntentID); journalErr != nil {
+						return recordingapi.ClipUploadIntent{}, journalErr
+					}
+					reserved, err = w.cfg.Client.SealCaptureArtifact(segmentCtx, job.JobID, job.LeaseToken, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, segStartMs, seg.SizeBytes, seg.SHA256)
+				} else {
+					reserved, err = w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs)
 				}
-				reserved, err := w.cfg.Client.ReserveClipUploadV1(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs, producerID, seg.CaptureSequence, seg.SizeBytes)
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
-				} else if producer != nil && !reserved.AlreadyIngested {
-					if err = w.recordProducerArtifact(job.JobID, producer, seg, reserved.IntentID); err != nil {
-						w.cfg.RelayDiagnostics.Error(job.JobID, "segment_journal_failed", err)
-					}
 				}
 				return reserved, err
 			},
@@ -737,18 +743,38 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			continue
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_capturing")
-		producer, producerErr := w.reserveCaptureProducer(jobCtx, job, captureOrdinal+1, outDir, resolved)
-		if producerErr != nil {
-			if removeErr := os.RemoveAll(outDir); removeErr != nil {
-				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
-			}
-			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_producer_reserve_failed", producerErr)
-			failures++
-			delay := w.nextReconnectDelay(job.JobID, failures)
-			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
-			continue
+		producerOrdinal := captureOrdinal + 1
+		jobState.mu.Lock()
+		if jobState.producer != nil {
+			producerOrdinal = jobState.producer.CaptureOrdinal
 		}
-		captureOrdinal++
+		jobState.mu.Unlock()
+		producer, producerErr := w.reserveCaptureProducer(jobCtx, job, producerOrdinal, outDir)
+		if producerErr != nil {
+			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_producer_reserve_failed", producerErr)
+			// Reservation response loss is ambiguous: the server may already have
+			// frozen this producer's source/config identity. Do not re-resolve and
+			// reparent that identity to a later ffmpeg attempt. The recovery loop
+			// proves absent/current/expired authority before cleanup or capture.
+			cancel()
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", producerErr)
+			return
+		}
+		if producer != nil && len(producer.Artifacts) == 0 {
+			reservationCount, countErr := captureArtifactReservationCount(job, time.Now())
+			if countErr == nil {
+				countErr = w.reserveCaptureArtifactSlots(jobCtx, job, producer, captureSequence+1, reservationCount)
+			}
+			if countErr != nil {
+				w.cfg.RelayDiagnostics.Error(job.JobID, "capture_artifact_prereserve_failed", countErr)
+				cancel()
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", countErr)
+				return
+			}
+		}
+		if producer != nil && producer.CaptureOrdinal > captureOrdinal {
+			captureOrdinal = producer.CaptureOrdinal
+		}
 		// One delivery pool per attempt. attemptCtx lets the first delivery failure
 		// stop ffmpeg as promptly as the old inline upload did; it is a child of
 		// windowCtx, so aborting an attempt never looks like a window close (the
@@ -813,10 +839,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		delivery := pool.close()
 		remainingProducerFiles, spoolErr := filepath.Glob(filepath.Join(outDir, "seg-*.mp4"))
 		durableProducerSpool := producer != nil && (delivery.pending > 0 || spoolErr != nil || len(remainingProducerFiles) > 0)
-		producerResult := "completed"
-		if delivery.submitted == 0 {
-			producerResult = "abandoned_empty"
-		}
 		var producerFinishErr error
 		if durableProducerSpool {
 			producerFinishErr = fmt.Errorf("capture producer retains durable local spool")
@@ -824,11 +846,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				producerFinishErr = errors.Join(producerFinishErr, spoolErr)
 			}
 			captureErr = errors.Join(captureErr, producerFinishErr)
-		} else {
-			if finishErr := w.finishCaptureProducer(jobCtx, job, producer, producerResult, ""); finishErr != nil {
-				producerFinishErr = finishErr
-				captureErr = errors.Join(captureErr, fmt.Errorf("finish capture producer: %w", finishErr))
-			}
 		}
 		abortAttempt()
 		captureErr = joinSegmentDeliveryError(captureErr, delivery.err)
@@ -851,6 +868,16 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			cancel()
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", producerFinishErr)
 			return
+		}
+		if producer != nil {
+			if finishErr := w.finishCaptureProducer(jobCtx, job, producer, captureProducerTerminalResult(producer), ""); finishErr != nil {
+				cancel()
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", finishErr)
+				return
+			}
+			if removeErr := os.RemoveAll(outDir); removeErr != nil {
+				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
+			}
 		}
 
 		if errors.Is(captureErr, errDiskPressure) {
@@ -876,6 +903,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			continue
 		}
 		if continuousDeliveryFailureShouldFail(captureErr, windowClosed) {
+			if finishErr := w.finishActiveCaptureProducer(jobCtx, job); finishErr != nil {
+				cancel()
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", finishErr)
+				return
+			}
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
 			w.fail(ctx, job.JobID, job.LeaseToken, captureErr)
 			return
@@ -960,6 +992,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	if canceled() {
 		log.Printf("recording worker job=%d continuous canceled", job.JobID)
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "canceled", nil)
+		return
+	}
+	if err := w.finishActiveCaptureProducer(ctx, job); err != nil {
+		cancel()
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", err)
 		return
 	}
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "completing")
@@ -1184,7 +1221,7 @@ func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.Canc
 
 func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, reason recordingapi.SurrenderReason, cause error) bool {
 	errorText := SanitizeDiagnosticError(cause)
-	if !w.cfg.SkipDropletHeartbeat && strings.TrimSpace(job.LeaseToken) != "" && job.SurrenderTransportVersion == 1 {
+	if strings.TrimSpace(job.LeaseToken) != "" && job.SurrenderTransportVersion == 1 {
 		result, surrenderErr := w.surrenderRecordingJobV1(ctx, job, reason, errorText)
 		if surrenderErr != nil {
 			// The bounded v1 transport budget elapsed without an authoritative
