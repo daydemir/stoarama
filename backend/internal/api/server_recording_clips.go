@@ -359,13 +359,13 @@ const cloudRecordingJobsLeaseSQL = `
 	  FROM recording_jobs j
 	  JOIN recordings rec ON rec.id = j.recording_id
 		  WHERE j.id=$9 AND rec.account_id=$10
-		    AND (
+		    AND ((
 	          SELECT count(*)
 	          FROM recording_jobs live
 	          WHERE live.status = 'leased'
 	            AND live.lease_owner = $1
 	            AND live.lease_expires_at > now()
-	        ) < $5
+	        ) + recording_worker_targeted_probe_occupancy($8)) < $5
 	    AND (NOT $6 OR EXISTS (
 	          SELECT 1 FROM recording_worker_claim_heads claim
 	          JOIN node_tokens claim_token ON claim_token.id=claim.claim_token_id

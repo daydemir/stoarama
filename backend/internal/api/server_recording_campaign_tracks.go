@@ -44,7 +44,8 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 		return
 	}
 	rows, err := s.pool.Query(r.Context(), `
-		SELECT t.campaign_key,t.label,t.deadline_at,t.target_count,t.grade_floor,t.required_consecutive_windows,t.state,
+		SELECT t.campaign_key,t.label,t.deadline_at,t.target_count,t.grade_floor,t.required_consecutive_windows,
+		 COALESCE(t.reporting_grade_floor,''),COALESCE(t.reporting_required_consecutive_windows,0),t.state,
 		 e.recording_id,e.stream_id,e.scene_identity_sha256,e.role,e.rank,e.status,e.reason_codes,e.decision_at,e.evidence_observed_at,e.evidence_sha256,
 		 r.name,r.status,
 		 j.fire_at,j.window_end_at,j.status,
@@ -73,10 +74,10 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var key, label, floor, trackState, scene, role, rosterState, recName, recState string
+		var key, label, floor, reportingFloor, trackState, scene, role, rosterState, recName, recState string
 		var deadline, decision, evidenceAt time.Time
 		var evidenceSHA string
-		var target, required, rank int
+		var target, required, reportingRequired, rank int
 		var recordingID, streamID int64
 		var reasons []string
 		var fire, end *time.Time
@@ -89,12 +90,12 @@ func (s *Server) handleAccountRecordingCampaignTracks(w http.ResponseWriter, r *
 		var goodWindows, totalWindows int
 		var latestCoverage *float64
 		var latestMedia, latestIngest *time.Time
-		if err := rows.Scan(&key, &label, &deadline, &target, &floor, &required, &trackState, &recordingID, &streamID, &scene, &role, &rank, &rosterState, &reasons, &decision, &evidenceAt, &evidenceSHA, &recName, &recState, &fire, &end, &jobState, &clips, &firstMedia, &firstIngest, &jobMedia, &jobIngest, &earlyResult, &earlyAt, &confirmResult, &confirmAt, &goodWindows, &totalWindows, &latestCoverage, &latestMedia, &latestIngest); err != nil {
+		if err := rows.Scan(&key, &label, &deadline, &target, &floor, &required, &reportingFloor, &reportingRequired, &trackState, &recordingID, &streamID, &scene, &role, &rank, &rosterState, &reasons, &decision, &evidenceAt, &evidenceSHA, &recName, &recState, &fire, &end, &jobState, &clips, &firstMedia, &firstIngest, &jobMedia, &jobIngest, &earlyResult, &earlyAt, &confirmResult, &confirmAt, &goodWindows, &totalWindows, &latestCoverage, &latestMedia, &latestIngest); err != nil {
 			util.WriteError(w, 500, "scan campaign tracks")
 			return
 		}
 		checkpoint := campaignCheckpoint(time.Now(), fire, jobState, clips, firstMedia, firstIngest, jobMedia, jobIngest, earlyResult, confirmResult)
-		items = append(items, map[string]any{"campaign_key": key, "label": label, "deadline_at": deadline, "target_count": target, "grade_floor": floor, "required_consecutive_windows": required, "track_state": trackState, "recording_id": recordingID, "stream_id": streamID, "scene_identity_sha256": scene, "role": role, "rank": rank, "roster_status": rosterState, "reason_codes": reasons, "decision_at": decision, "evidence_observed_at": evidenceAt, "evidence_sha256": evidenceSHA, "recording_name": recName, "recording_status": recState, "next_window_start_at": fire, "next_window_end_at": end, "job_status": jobState, "current_job_first3_clip_count": clips, "current_job_first3_latest_media_at": firstMedia, "current_job_first3_latest_ingest_at": firstIngest, "preopen_early_result": earlyResult, "preopen_early_checked_at": earlyAt, "preopen_confirm_result": confirmResult, "preopen_confirm_checked_at": confirmAt, "checkpoint": checkpoint, "health_metric_good_candidate_windows": goodWindows, "health_metric_windows": totalWindows, "latest_coverage_pct": latestCoverage, "latest_media_at": latestMedia, "latest_ingest_at": latestIngest})
+		items = append(items, map[string]any{"campaign_key": key, "label": label, "deadline_at": deadline, "target_count": target, "grade_floor": floor, "required_consecutive_windows": required, "reporting_grade_floor": reportingFloor, "reporting_required_consecutive_windows": reportingRequired, "track_state": trackState, "recording_id": recordingID, "stream_id": streamID, "scene_identity_sha256": scene, "role": role, "rank": rank, "roster_status": rosterState, "reason_codes": reasons, "decision_at": decision, "evidence_observed_at": evidenceAt, "evidence_sha256": evidenceSHA, "recording_name": recName, "recording_status": recState, "next_window_start_at": fire, "next_window_end_at": end, "job_status": jobState, "current_job_first3_clip_count": clips, "current_job_first3_latest_media_at": firstMedia, "current_job_first3_latest_ingest_at": firstIngest, "preopen_early_result": earlyResult, "preopen_early_checked_at": earlyAt, "preopen_confirm_result": confirmResult, "preopen_confirm_checked_at": confirmAt, "checkpoint": checkpoint, "health_metric_good_candidate_windows": goodWindows, "health_metric_windows": totalWindows, "latest_coverage_pct": latestCoverage, "latest_media_at": latestMedia, "latest_ingest_at": latestIngest})
 	}
 	if err := rows.Err(); err != nil {
 		util.WriteError(w, 500, "read campaign tracks")

@@ -15,6 +15,7 @@ const campaignProductTableManifestSHA256 = "67d9c41a1dd19dcf1939cd69a12eae47a148
 var campaignAuthorityTables = []string{
 	"recording_campaign_authority_decisions", "recording_campaign_admission_approvals",
 	"recording_campaign_admission_reservations", "recording_campaign_admission_source_fence_events",
+	"recording_campaign_admission_reservation_terminal_events",
 	"recording_targeted_probe_orders", "recording_targeted_provider_attestations",
 	"recording_targeted_probe_attempts", "recording_targeted_probe_evidence",
 	"recording_targeted_probe_attempt_terminal_events",
@@ -34,12 +35,13 @@ var campaignRuntimeFunctions = []string{
 	"recording_campaign_create_provider_attestation(bigint,bigint,bigint,text,text,text,text,text,text)",
 	"recording_campaign_create_probe_attempt(uuid,uuid,uuid,uuid,bigint,bigint,bigint,bigint,uuid,bigint,text,text,bigint,text,text,timestamp with time zone,text,text,text,text,bigint,bigint)",
 	"recording_campaign_lease_probe(bigint,bigint,bigint,text,bigint,bigint,text,text,text,text,text,text,uuid,uuid,text,text,text,text,bigint,bigint)",
-	"recording_campaign_create_probe_evidence(uuid,uuid,bigint,bigint,text,double precision,bigint,integer,text,text,text,text,text,text,boolean,integer,integer,double precision,text,bigint,text,text,bigint,text,text,text,text,text,text,text,text,text,text,text,text)",
+	"recording_campaign_create_probe_evidence(uuid,uuid,bigint,bigint,text,double precision,bigint,integer,text,text,text,text,text,text,boolean,integer,integer,double precision,text,bigint,text,text,bigint,text,text,text,text,text,text,text,text,text,text,text,text,text)",
 	"recording_campaign_submit_probe_evidence(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint,bigint,jsonb)",
 	"recording_campaign_read_probe_attempt(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint)",
 	"recording_campaign_create_scene_presentation(uuid,bigint,uuid,uuid,bigint)",
 	"recording_campaign_create_scene_review(uuid,bigint,uuid,uuid,uuid,bigint)",
 	"recording_campaign_approve(uuid,bigint,bigint,bigint,text,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
+	"recording_campaign_expire_approval(uuid,uuid,bigint,bigint,bigint,text)",
 	"recording_campaign_queue_probe(uuid,uuid,bigint,bigint,bigint,text,bigint)",
 	"recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid)",
 	"recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid)",
@@ -71,10 +73,12 @@ var campaignRuntimeProductFunctions = []string{
 	"recording_surrender_request_sha(uuid,text,text,bigint,uuid,bigint,integer,bigint,integer)",
 	"recording_surrender_relay_candidate_eligible(bigint,bigint)",
 	"recording_surrender_relay_alternate(bigint,text)",
+	"recording_worker_targeted_probe_occupancy(bigint)",
 }
 
 var campaignExecutorFunctions = []string{
 	"recording_campaign_approve(uuid,bigint,bigint,bigint,text,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
+	"recording_campaign_expire_approval(uuid,uuid,bigint,bigint,bigint,text)",
 	"recording_campaign_queue_probe(uuid,uuid,bigint,bigint,bigint,text,bigint)",
 	"recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid)",
 	"recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid)",
@@ -115,6 +119,7 @@ func BootstrapCampaignRoles(ctx context.Context, pool *pgxpool.Pool, runtimeRole
 		return fmt.Errorf("bootstrap campaign authority owner: %w", err)
 	}
 	var authorityOK, runtimeMember, executorMember bool
+	var authorityMemberCount int
 	if err := pool.QueryRow(ctx, `SELECT NOT rolcanlogin AND NOT rolinherit FROM pg_roles WHERE rolname=$1`, authorityRole).Scan(&authorityOK); err != nil || !authorityOK {
 		return fmt.Errorf("campaign authority role is not exact NOLOGIN/NOINHERIT")
 	}
@@ -123,6 +128,12 @@ func BootstrapCampaignRoles(ctx context.Context, pool *pgxpool.Pool, runtimeRole
 	}
 	if err := pool.QueryRow(ctx, `SELECT pg_has_role($1,$2,'MEMBER')`, executorRole, authorityRole).Scan(&executorMember); err != nil || executorMember {
 		return fmt.Errorf("admission executor role must not be a member of campaign authority")
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_auth_members membership JOIN pg_roles role ON role.oid=membership.roleid JOIN pg_roles member ON member.oid=membership.member WHERE role.rolname=$1 AND member.rolname=$2`, authorityRole, migrator).Scan(&authorityMemberCount); err != nil || authorityMemberCount != 1 {
+		return fmt.Errorf("campaign authority must have the exact migrator as its sole member")
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_auth_members membership JOIN pg_roles role ON role.oid=membership.roleid WHERE role.rolname=$1`, authorityRole).Scan(&authorityMemberCount); err != nil || authorityMemberCount != 1 {
+		return fmt.Errorf("campaign authority has an unreviewed additional member")
 	}
 	return nil
 }
@@ -142,7 +153,7 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 	}
 	var sessionUser, currentUser string
 	var super, member, ownsObjects, schemaCreate, migrationApplied bool
-	var invalidTables, invalidProductTables, authoritySequences, executableFunctions, missingProductFunctions int
+	var invalidTables, invalidProductTables, authoritySequences, executableFunctions, missingProductFunctions, authorityMembers int
 	var productManifestSHA256 string
 	err := pool.QueryRow(ctx, `
 		SELECT session_user,current_user,r.rolsuper,
@@ -171,12 +182,13 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		       (SELECT count(*) FROM unnest($5::text[]) signature
 		          LEFT JOIN pg_proc p ON p.oid=to_regprocedure(format('%I.%s',current_schema(),signature))
 		         WHERE p.oid IS NULL OR NOT has_function_privilege(current_user,p.oid,'EXECUTE')),
+		       (SELECT count(*) FROM pg_auth_members membership JOIN pg_roles role ON role.oid=membership.roleid WHERE role.rolname=$2),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &authoritySequences, &executableFunctions, &missingProductFunctions, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &authoritySequences, &executableFunctions, &missingProductFunctions, &authorityMembers, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign runtime privileges: %w", err)
 	}
-	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || authoritySequences != 0 || executableFunctions != 0 || missingProductFunctions != 0 || !migrationApplied {
+	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || authoritySequences != 0 || executableFunctions != 0 || missingProductFunctions != 0 || authorityMembers != 1 || !migrationApplied {
 		return fmt.Errorf("campaign runtime database privilege boundary is not exact")
 	}
 	return nil

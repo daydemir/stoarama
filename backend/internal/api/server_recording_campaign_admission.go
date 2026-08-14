@@ -122,6 +122,36 @@ func lowerSHA256(v string) bool {
 	return true
 }
 
+type campaignAdmissionExpireRequest struct {
+	ApprovalID string `json:"approval_id"`
+	RequestID  string `json:"request_id"`
+}
+
+func (s *Server) handleAccountCampaignAdmissionExpire(w http.ResponseWriter, r *http.Request) {
+	p, ok := accountPrincipalFromContext(r.Context())
+	if !ok || p.UserID == 0 || p.SessionID == nil || p.Role != accountRoleAdmin || !strings.EqualFold(strings.TrimSpace(p.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) {
+		util.WriteError(w, http.StatusForbidden, "campaign admission expiration requires Deniz's exact operator browser session")
+		return
+	}
+	var req campaignAdmissionExpireRequest
+	if s.admissionPool == nil || util.DecodeJSON(r, &req) != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid campaign expiration request")
+		return
+	}
+	approvalID, approvalErr := uuid.Parse(strings.TrimSpace(req.ApprovalID))
+	requestID, requestErr := uuid.Parse(strings.TrimSpace(req.RequestID))
+	if approvalErr != nil || requestErr != nil {
+		util.WriteError(w, http.StatusBadRequest, "approval_id and request_id must be UUIDs")
+		return
+	}
+	var eventSHA string
+	if err := s.admissionPool.QueryRow(r.Context(), `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, requestID, approvalID, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256).Scan(&eventSHA); err != nil {
+		util.WriteError(w, http.StatusConflict, "campaign approval is not expired and unadmitted")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"approval_id": approvalID, "request_id": requestID, "result": "expired_unadmitted", "event_sha256": eventSHA})
+}
+
 func (s *Server) handleAccountCampaignAdmissionApprovalCreate(w http.ResponseWriter, r *http.Request) {
 	p, ok := accountPrincipalFromContext(r.Context())
 	if !ok || p.UserID == 0 || p.SessionID == nil || p.Role != accountRoleAdmin || !strings.EqualFold(strings.TrimSpace(p.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) {
@@ -657,29 +687,39 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 		util.WriteError(w, http.StatusBadRequest, "invalid approval, stream, or evidence shape")
 		return
 	}
-	if p.NodeTokenID <= 0 || p.NodeClaimGeneration <= 0 || p.NodeClaimPurpose != "claim_current" {
+	if p.NodeTokenID <= 0 || p.NodeClaimGeneration <= 0 {
 		util.WriteError(w, http.StatusUnauthorized, "targeted evidence requires an authenticated node token identity")
 		return
 	}
+	submissionBytes, err := json.Marshal(req.Evidence)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid evidence request")
+		return
+	}
+	submissionRequestSHA := hashSecret(string(submissionBytes))
 	// Terminal replay is deliberately resolved before mutable worker, attempt,
 	// approval, or source freshness. A committed response must remain replayable
 	// after any of those live prerequisites expire.
-	var replayID, replaySHA, replayResult, replayDetail *string
+	var replayID, replaySHA, replayRequestSHA, replayResult, replayDetail *string
 	var terminal bool
 	var targetAccountID int64
 	var challenge, mediaKey, frameKey string
 	var mediaMax, frameMax int64
-	stateErr := s.admissionPool.QueryRow(r.Context(), `SELECT account_id,challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes,terminal,evidence_id::text,evidence_sha256,result,detail FROM recording_campaign_read_probe_attempt($1,$2,$3,$4,$5,$6,$7,$8)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, attemptID, requestID, approvalID, req.StreamID).Scan(&targetAccountID, &challenge, &mediaKey, &frameKey, &mediaMax, &frameMax, &terminal, &replayID, &replaySHA, &replayResult, &replayDetail)
+	stateErr := s.admissionPool.QueryRow(r.Context(), `SELECT account_id,challenge,media_object_key,frame_object_key,media_max_size_bytes,frame_max_size_bytes,terminal,evidence_id::text,evidence_sha256,submission_request_sha256,result,detail FROM recording_campaign_read_probe_attempt($1,$2,$3,$4,$5,$6,$7,$8)`, p.NodeID, p.NodeTokenID, p.NodeClaimGeneration, p.credentialSHA256, attemptID, requestID, approvalID, req.StreamID).Scan(&targetAccountID, &challenge, &mediaKey, &frameKey, &mediaMax, &frameMax, &terminal, &replayID, &replaySHA, &replayRequestSHA, &replayResult, &replayDetail)
 	if stateErr != nil {
 		util.WriteError(w, http.StatusConflict, "targeted attempt identity or current node authority does not match")
 		return
 	}
 	if terminal {
-		if replayID == nil || replaySHA == nil || replayResult == nil || *replayResult != req.Evidence.Result || (*replayResult != recordability.ResultOK && (replayDetail == nil || *replayDetail != req.Evidence.Detail)) {
+		if replayID == nil || replaySHA == nil || replayRequestSHA == nil || *replayRequestSHA != submissionRequestSHA {
 			util.WriteError(w, http.StatusConflict, "targeted evidence request idempotency conflict")
 			return
 		}
 		util.WriteJSON(w, http.StatusCreated, map[string]any{"evidence_id": *replayID, "attempt_id": attemptID, "evidence_sha256": *replaySHA})
+		return
+	}
+	if p.NodeClaimPurpose != "claim_current" {
+		util.WriteError(w, http.StatusUnauthorized, "new targeted evidence requires a current claim token")
 		return
 	}
 	var observation targetedQuarantineObservation
@@ -723,7 +763,8 @@ func (s *Server) handleRecordingCampaignAdmissionEvidence(w http.ResponseWriter,
 		"media_archive_etag": observation.MediaArchiveETag, "media_archive_version_id": observation.MediaArchiveVersion,
 		"frame_archive_object_key": observation.FrameArchiveKey, "frame_archive_sha256": observation.FrameArchiveSHA256,
 		"frame_archive_etag": observation.FrameArchiveETag, "frame_archive_version_id": observation.FrameArchiveVersion,
-		"evidence_sha256": strings.Repeat("0", 64),
+		"submission_request_sha256": submissionRequestSHA,
+		"evidence_sha256":           strings.Repeat("0", 64),
 	})
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "encode targeted evidence observation")
