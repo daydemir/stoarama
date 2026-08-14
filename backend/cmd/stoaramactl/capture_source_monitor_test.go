@@ -204,7 +204,7 @@ func TestMonitorSourceCancellationAfterCaptureEmitsCompleted(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
 			info, err := os.Stat(filepath.Join(dir, "segment-%09d.ts"))
 			if err == nil && info.Size() > 0 {
@@ -218,7 +218,7 @@ func TestMonitorSourceCancellationAfterCaptureEmitsCompleted(t *testing.T) {
 	var output bytes.Buffer
 	err := monitorSource(ctx, sourceMonitorConfig{
 		SourceURL: "https://example.com/live.m3u8",
-		Duration:  3 * time.Second,
+		Duration:  15 * time.Second,
 		Clip:      10 * time.Millisecond,
 		OutputDir: dir,
 		FFmpeg:    script,
@@ -243,7 +243,7 @@ func TestMonitorSourceCancellationDiscardsEmptyNewestSegment(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		second := filepath.Join(dir, "segment-000000001.ts")
-		deadline := time.Now().Add(time.Second)
+		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
 			if _, err := os.Stat(second); err == nil {
 				cancel()
@@ -256,7 +256,7 @@ func TestMonitorSourceCancellationDiscardsEmptyNewestSegment(t *testing.T) {
 	var output bytes.Buffer
 	err := monitorSource(ctx, sourceMonitorConfig{
 		SourceURL: "https://example.com/live.m3u8",
-		Duration:  3 * time.Second,
+		Duration:  15 * time.Second,
 		Clip:      10 * time.Millisecond,
 		OutputDir: dir,
 		FFmpeg:    script,

@@ -825,6 +825,63 @@ func RecoverContinuousSegment(ctx context.Context, path string, fallbackSpan tim
 	return finalizeSegmentWithTimestampContract(ctx, path, fallbackSpan, true)
 }
 
+// RecoverContinuousSegmentFile derives recovery metadata from one already-open
+// no-follow file identity.  The descriptor is passed to ffprobe as fd 3, so no
+// pathname lookup can substitute bytes between inventory, hashing, and probes.
+func RecoverContinuousSegmentFile(ctx context.Context, file *os.File, leaf string, fallbackSpan time.Duration) (Segment, error) {
+	if file == nil || filepath.Base(leaf) != leaf {
+		return Segment{}, fmt.Errorf("invalid recovery segment file")
+	}
+	startAt, err := parseSegmentStart(leaf)
+	if err != nil {
+		return Segment{}, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
+		return Segment{}, fmt.Errorf("stat recovery segment: %w", err)
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return Segment{}, err
+	}
+	readStarted := time.Now()
+	h := sha256.New()
+	written, err := io.Copy(h, io.LimitReader(file, info.Size()+1))
+	if err != nil || written != info.Size() {
+		return Segment{}, fmt.Errorf("read recovery segment: %w", err)
+	}
+	readDuration := time.Since(readStarted)
+	hashStarted := time.Now()
+	sha := hex.EncodeToString(h.Sum(nil))
+	hashDuration := time.Since(hashStarted)
+	probeStarted := time.Now()
+	meta, metaErr := probeSegmentFile(ctx, file)
+	contract, contractErr := probeTimestampContractFile(ctx, file)
+	probeDuration := time.Since(probeStarted)
+	status, reason := TimestampProbeComplete, ""
+	if contractErr != nil {
+		contract, status, reason = nil, TimestampProbeUnknown, timestampContractErrorCode(contractErr)
+	}
+	durationMs := meta.DurationMs
+	if durationMs <= 0 {
+		durationMs = fallbackSpan.Milliseconds()
+	}
+	videoCodec, audioCodec, audioPresent := meta.VideoCodec, meta.AudioCodec, meta.AudioPresent
+	if videoCodec == "" {
+		videoCodec = "h264"
+	}
+	if metaErr != nil {
+		meta = ffprobeMeta{VideoCodec: videoCodec, AudioCodec: audioCodec}
+	}
+	if status == TimestampProbeComplete {
+		audioPresent = timestampContractHasAudio(contract)
+	}
+	return Segment{Path: file.Name(), SourceKind: "live", StartAt: startAt, EndAt: startAt.Add(time.Duration(durationMs) * time.Millisecond), DurationMs: durationMs,
+		SizeBytes: info.Size(), SHA256: sha, MIMEType: "video/mp4", Container: "mp4", VideoCodec: videoCodec,
+		AudioCodec: audioCodec, AudioPresent: audioPresent, ActualFPS: meta.ActualFPS, VideoWidth: meta.VideoWidth,
+		VideoHeight: meta.VideoHeight, FinalizeReadDuration: readDuration, FinalizeHashDuration: hashDuration, FinalizeProbeDuration: probeDuration,
+		TimestampContract: contract, TimestampContractStatus: status, TimestampContractReason: reason}, nil
+}
+
 func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fallbackSpan time.Duration, timestampContractEnabled bool) (Segment, error) {
 	startAt, err := parseSegmentStart(filepath.Base(path))
 	if err != nil {
@@ -1484,6 +1541,17 @@ func runFFmpegHealthCommand(cmd *exec.Cmd) error {
 }
 
 func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
+	return probeSegmentCommand(ctx, path, nil)
+}
+
+func probeSegmentFile(ctx context.Context, file *os.File) (ffprobeMeta, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return ffprobeMeta{}, err
+	}
+	return probeSegmentCommand(ctx, "/dev/fd/3", file)
+}
+
+func probeSegmentCommand(ctx context.Context, path string, file *os.File) (ffprobeMeta, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx,
@@ -1493,6 +1561,9 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 		"-of", "json",
 		path,
 	)
+	if file != nil {
+		cmd.ExtraFiles = []*os.File{file}
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return ffprobeMeta{}, err
@@ -1558,6 +1629,17 @@ func (w *timestampProbeOutput) Write(p []byte) (int, error) {
 // order (packet PTS order is not presentation order with B-frames); audio keeps
 // its own sample-domain end evidence.
 func probeTimestampContract(ctx context.Context, path string) (*TimestampContract, error) {
+	return probeTimestampContractCommand(ctx, path, nil)
+}
+
+func probeTimestampContractFile(ctx context.Context, file *os.File) (*TimestampContract, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return probeTimestampContractCommand(ctx, "/dev/fd/3", file)
+}
+
+func probeTimestampContractCommand(ctx context.Context, path string, file *os.File) (*TimestampContract, error) {
 	// A clean window shutdown cancels capture before the final muxer trailer is
 	// swept. The finalized immutable bytes still require bounded provenance.
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1565,6 +1647,9 @@ func probeTimestampContract(ctx context.Context, path string) (*TimestampContrac
 	cmd := exec.CommandContext(probeCtx, ffprobeBin(), "-v", "error", "-show_frames", "-show_streams", "-show_data",
 		"-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,duration,pkt_duration,nb_samples",
 		"-of", "json", path)
+	if file != nil {
+		cmd.ExtraFiles = []*os.File{file}
+	}
 	var out timestampProbeOutput
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard

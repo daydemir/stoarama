@@ -50,6 +50,7 @@ type claimSuccessorState struct {
 	KeyPrefix        string `json:"key_prefix,omitempty"`
 	SecretSHA        string `json:"secret_sha256,omitempty"`
 	Enabled          bool   `json:"enabled"`
+	RotationRequired bool   `json:"rotation_required,omitempty"`
 }
 
 func captureUnixMicro(value time.Time) int64 {
@@ -57,8 +58,8 @@ func captureUnixMicro(value time.Time) int64 {
 	return value.Unix()*int64(time.Second/time.Microsecond) + int64(value.Nanosecond())/int64(time.Microsecond)
 }
 
-func hashRetainedArtifact(path string) (int64, string, error) {
-	file, stat, err := openRetainedArtifact(path, 0, 0)
+func hashRetainedArtifact(path string, expectedDevice, expectedInode uint64) (int64, string, error) {
+	file, stat, err := openRetainedArtifact(path, expectedDevice, expectedInode)
 	if err != nil {
 		return 0, "", fmt.Errorf("retained capture artifact identity is unsafe")
 	}
@@ -96,6 +97,73 @@ func openRetainedArtifact(path string, expectedDevice, expectedInode uint64) (*o
 		return nil, unix.Stat_t{}, fmt.Errorf("open retained artifact")
 	}
 	return file, stat, nil
+}
+
+type captureArtifactPath struct {
+	Path   string
+	Device uint64
+	Inode  uint64
+}
+
+func listCaptureArtifactPaths(path string) ([]captureArtifactPath, error) {
+	fd, err := unix.Open(filepath.Clean(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(fd)
+	dupFD, err := unix.Dup(fd)
+	if err != nil {
+		return nil, err
+	}
+	directory := os.NewFile(uintptr(dupFD), filepath.Base(path))
+	if directory == nil {
+		_ = unix.Close(dupFD)
+		return nil, fmt.Errorf("open capture namespace")
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	result := make([]captureArtifactPath, 0, len(entries))
+	for _, entry := range entries {
+		if !captureSegmentLeafRE.MatchString(entry.Name()) {
+			return nil, fmt.Errorf("capture namespace contains an unauthorized leaf")
+		}
+		artifactFD, openErr := unix.Openat(fd, entry.Name(), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return nil, openErr
+		}
+		var stat unix.Stat_t
+		statErr := unix.Fstat(artifactFD, &stat)
+		_ = unix.Close(artifactFD)
+		if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size <= 0 || stat.Size > surrenderplan.RecoveryArtifactMaxBytes {
+			return nil, fmt.Errorf("capture artifact identity is unsafe")
+		}
+		result = append(result, captureArtifactPath{Path: filepath.Join(path, entry.Name()), Device: uint64(stat.Dev), Inode: uint64(stat.Ino)})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result, nil
+}
+
+func (w *Worker) recoverContinuousSegmentExact(ctx context.Context, artifact captureArtifactPath, fallback time.Duration) (capture.Segment, error) {
+	file, _, err := openRetainedArtifact(artifact.Path, artifact.Device, artifact.Inode)
+	if err != nil {
+		return capture.Segment{}, err
+	}
+	defer file.Close()
+	if w.recoverContinuousSegmentFile == nil {
+		return capture.Segment{}, fmt.Errorf("fd-bound recovery probe is unavailable")
+	}
+	segment, err := w.recoverContinuousSegmentFile(ctx, file, filepath.Base(artifact.Path), fallback)
+	segment.Path = artifact.Path
+	return segment, err
 }
 
 func removeRetainedArtifact(path string, expectedDevice, expectedInode uint64) error {
@@ -238,6 +306,64 @@ func readPrivateRegularAt(directoryFD int, name string, maxBytes int64) ([]byte,
 	return raw, nil
 }
 
+func writePrivateRegularAt(directoryFD int, name string, raw []byte) error {
+	if name == "" || filepath.Base(name) != name || len(raw) == 0 {
+		return fmt.Errorf("invalid private state write")
+	}
+	tempName := ".pending-" + uuid.NewString()
+	fd, err := unix.Openat(directoryFD, tempName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), tempName)
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("open private state temporary leaf")
+	}
+	_, writeErr := file.Write(raw)
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr == nil {
+		writeErr = unix.Renameat(directoryFD, tempName, directoryFD, name)
+	}
+	if writeErr != nil {
+		_ = unix.Unlinkat(directoryFD, tempName, 0)
+		return writeErr
+	}
+	return unix.Fsync(directoryFD)
+}
+
+func unlinkPrivateLeaf(root, path string) error {
+	if filepath.Dir(path) != root || filepath.Base(path) == "." {
+		return fmt.Errorf("private state deletion escaped root")
+	}
+	rootFD, err := openPrivateDirectory(root)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(rootFD)
+	if err = unix.Unlinkat(rootFD, filepath.Base(path), 0); errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return unix.Fsync(rootFD)
+}
+
+func infoSyscallStat(info os.FileInfo) (*syscall.Stat_t, bool) {
+	if info == nil {
+		return nil, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return stat, ok
+}
+
 func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error) {
 	rootFD, statErr := openPrivateDirectory(root)
 	if errors.Is(statErr, unix.ENOENT) {
@@ -289,12 +415,11 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 		if pathErr != nil || rootErr != nil || relErr != nil || rel == "." || strings.Contains(rel, string(filepath.Separator)) || !strings.HasPrefix(rel, "capture-continuous-") {
 			return nil, fmt.Errorf("capture producer output path is outside its private root")
 		}
-		if info, pathErr := os.Lstat(outputDir); pathErr == nil {
-			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-				return nil, fmt.Errorf("capture producer output path is not a real directory")
-			}
-		} else if !os.IsNotExist(pathErr) {
-			return nil, pathErr
+		outputFD, outputErr := unix.Open(outputDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if outputErr == nil {
+			_ = unix.Close(outputFD)
+		} else if !errors.Is(outputErr, unix.ENOENT) && !errors.Is(outputErr, unix.ENOTDIR) {
+			return nil, outputErr
 		}
 		seenIntents := make(map[string]struct{}, len(journal.Artifacts))
 		seenSequences := make(map[int64]struct{}, len(journal.Artifacts))
@@ -315,10 +440,12 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 				if pathErr != nil || filepath.Dir(absolutePath) != outputDir || !captureSegmentLeafRE.MatchString(filepath.Base(absolutePath)) || artifact.Device == 0 || artifact.Inode == 0 {
 					return nil, fmt.Errorf("invalid capture artifact local path")
 				}
-				info, identityErr := os.Lstat(absolutePath)
-				stat, statOK := infoSyscallStat(info)
-				if identityErr != nil || !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 || uint64(stat.Dev) != artifact.Device || uint64(stat.Ino) != artifact.Inode {
+				file, _, identityErr := openRetainedArtifact(absolutePath, artifact.Device, artifact.Inode)
+				if identityErr != nil {
 					return nil, fmt.Errorf("capture artifact local identity changed")
+				}
+				if err := file.Close(); err != nil {
+					return nil, err
 				}
 			}
 			if seg != nil {
@@ -326,10 +453,12 @@ func loadCaptureProducerJournals(root string) ([]*captureProducerJournal, error)
 				if segmentErr != nil || filepath.Dir(segmentPath) != outputDir || !captureSegmentLeafRE.MatchString(filepath.Base(segmentPath)) || seg.CaptureSequence != artifact.CaptureSequence || seg.SizeBytes <= 0 || seg.StartAt.IsZero() || len(seg.SHA256) != 64 || strings.ToLower(seg.SHA256) != seg.SHA256 {
 					return nil, fmt.Errorf("invalid sealed capture producer artifact journal")
 				}
-				info, statErr := os.Lstat(segmentPath)
-				stat, statOK := infoSyscallStat(info)
-				if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !statOK || stat.Nlink != 1 {
+				file, _, statErr := openRetainedArtifact(segmentPath, artifact.Device, artifact.Inode)
+				if statErr != nil {
 					return nil, fmt.Errorf("capture artifact path identity is unsafe")
+				}
+				if err := file.Close(); err != nil {
+					return nil, err
 				}
 				if _, err := hex.DecodeString(seg.SHA256); err != nil {
 					return nil, fmt.Errorf("invalid capture producer artifact digest")
@@ -388,38 +517,12 @@ func persistClaimSuccessorState(root string, state claimSuccessorState) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	tmp, err := os.CreateTemp(root, ".claim-successor-*.tmp")
+	rootFD, err := openPrivateDirectory(root)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err = tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(raw)
-	}
-	if err == nil {
-		err = tmp.Sync()
-	}
-	closeErr := tmp.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(tmpPath, claimSuccessorStatePath(root)); err != nil {
-		return err
-	}
-	dir, err := os.Open(root)
-	if err != nil {
-		return err
-	}
-	err = dir.Sync()
-	closeErr = dir.Close()
-	if err == nil {
-		err = closeErr
-	}
-	return err
+	defer unix.Close(rootFD)
+	return writePrivateRegularAt(rootFD, claimSuccessorStateFile, raw)
 }
 
 func loadClaimSuccessorState(root string) (*claimSuccessorState, error) {
@@ -445,7 +548,7 @@ func loadClaimSuccessorState(root string) (*claimSuccessorState, error) {
 	hasCurrent := state.CurrentRawToken != "" || state.CurrentKeyPrefix != "" || state.CurrentSecretSHA != ""
 	hasPending := state.ProposalID != "" || state.RawToken != "" || state.KeyPrefix != "" || state.SecretSHA != ""
 	_, proposalErr := uuid.Parse(state.ProposalID)
-	if (!hasCurrent && !hasPending) || (hasCurrent && !validClaimCredential(state.CurrentRawToken, state.CurrentKeyPrefix, state.CurrentSecretSHA)) || (hasPending && (!validClaimCredential(state.RawToken, state.KeyPrefix, state.SecretSHA) || proposalErr != nil)) || (state.Enabled && !hasPending) {
+	if (!hasCurrent && !hasPending && !state.RotationRequired) || (hasCurrent && !validClaimCredential(state.CurrentRawToken, state.CurrentKeyPrefix, state.CurrentSecretSHA)) || (hasPending && (!validClaimCredential(state.RawToken, state.KeyPrefix, state.SecretSHA) || proposalErr != nil)) || (state.Enabled && !hasPending) {
 		return nil, fmt.Errorf("claim successor state identity is invalid")
 	}
 	return &state, nil
@@ -485,6 +588,7 @@ func promoteClaimSuccessorState(root string, state *claimSuccessorState) error {
 	state.CurrentSecretSHA = state.SecretSHA
 	state.ProposalID, state.RawToken, state.KeyPrefix, state.SecretSHA = "", "", "", ""
 	state.Enabled = false
+	state.RotationRequired = false
 	return persistClaimSuccessorState(root, *state)
 }
 
@@ -514,6 +618,7 @@ func (w *Worker) maybeRotateClaimCredential(ctx context.Context) error {
 		}
 		state.ProposalID, state.RawToken, state.KeyPrefix, state.SecretSHA = pending.ProposalID, pending.RawToken, pending.KeyPrefix, pending.SecretSHA
 		state.Enabled = false
+		state.RotationRequired = true
 		if err = persistClaimSuccessorState(root, *state); err != nil {
 			return err
 		}
@@ -538,8 +643,8 @@ func (w *Worker) maybeRotateClaimCredential(ctx context.Context) error {
 			return nil
 		}
 		if created && errors.As(err, &statusErr) && statusErr.Code == http.StatusConflict {
-			if state.CurrentRawToken == "" {
-				_ = os.Remove(claimSuccessorStatePath(root))
+			if state.CurrentRawToken == "" && !state.RotationRequired {
+				_ = unlinkPrivateLeaf(root, claimSuccessorStatePath(root))
 			} else {
 				state.ProposalID, state.RawToken, state.KeyPrefix, state.SecretSHA = "", "", "", ""
 				state.Enabled = false
@@ -565,14 +670,6 @@ func (w *Worker) maybeRotateClaimCredential(ctx context.Context) error {
 		return err
 	}
 	return promoteClaimSuccessorState(root, state)
-}
-
-func infoSyscallStat(info os.FileInfo) (*syscall.Stat_t, bool) {
-	if info == nil {
-		return nil, false
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	return stat, ok
 }
 
 func captureSetIdentity(plan recordingapi.CaptureSetPlan) (surrenderplan.SetIdentity, error) {
@@ -680,19 +777,20 @@ func surrenderTransportObservationPath(root string) string {
 	return filepath.Join(root, "transport-observations-v1.queue")
 }
 
-func loadSurrenderTransportObservations(path string) ([]queuedSurrenderTransportObservation, error) {
-	info, statErr := os.Lstat(path)
-	if statErr == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0) {
-		return nil, fmt.Errorf("surrender transport observation journal is not a private regular file")
-	}
-	if statErr != nil && !os.IsNotExist(statErr) {
-		return nil, statErr
-	}
-	raw, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
+func loadSurrenderTransportObservations(root string) ([]queuedSurrenderTransportObservation, error) {
+	rootFD, err := openPrivateDirectory(root)
+	if errors.Is(err, unix.ENOENT) {
 		return nil, nil
 	}
-	if err != nil || len(raw) == 0 || len(raw) > 256<<10 {
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(rootFD)
+	raw, err := readPrivateRegularAt(rootFD, filepath.Base(surrenderTransportObservationPath(root)), 256<<10)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, nil
+	}
+	if err != nil || len(raw) == 0 {
 		return nil, fmt.Errorf("invalid surrender transport observation journal")
 	}
 	var observations []queuedSurrenderTransportObservation
@@ -708,50 +806,37 @@ func persistSurrenderTransportObservations(root string, observations []queuedSur
 	}
 	path := surrenderTransportObservationPath(root)
 	if len(observations) == 0 {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		rootFD, openErr := openPrivateDirectory(root)
+		if errors.Is(openErr, unix.ENOENT) {
+			return nil
+		}
+		if openErr != nil {
+			return openErr
+		}
+		defer unix.Close(rootFD)
+		if err := unix.Unlinkat(rootFD, filepath.Base(path), 0); err != nil && !errors.Is(err, unix.ENOENT) {
 			return err
 		}
-		return nil
+		return unix.Fsync(rootFD)
 	}
-	tmp, err := os.CreateTemp(root, ".transport-observations-*.tmp")
+	raw, err := json.Marshal(observations)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	if err = tmp.Chmod(0o600); err == nil {
-		err = json.NewEncoder(tmp).Encode(observations)
-	}
-	if err == nil {
-		err = tmp.Sync()
-	}
-	closeErr := tmp.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(tmpPath, path)
-	}
-	if err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	dir, err := os.Open(root)
+	raw = append(raw, '\n')
+	rootFD, err := openPrivateDirectory(root)
 	if err != nil {
 		return err
 	}
-	err = dir.Sync()
-	closeErr = dir.Close()
-	if err == nil {
-		err = closeErr
-	}
-	return err
+	defer unix.Close(rootFD)
+	return writePrivateRegularAt(rootFD, filepath.Base(path), raw)
 }
 
 func (w *Worker) appendSurrenderTransportObservation(observation queuedSurrenderTransportObservation) error {
 	w.surrenderObservationMu.Lock()
 	defer w.surrenderObservationMu.Unlock()
 	root := w.surrenderJournalRoot()
-	observations, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(root))
+	observations, err := loadSurrenderTransportObservations(root)
 	if err != nil {
 		return err
 	}
@@ -766,7 +851,7 @@ func (w *Worker) flushSurrenderTransportObservations(ctx context.Context) {
 	w.surrenderObservationMu.Lock()
 	defer w.surrenderObservationMu.Unlock()
 	root := w.surrenderJournalRoot()
-	observations, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(root))
+	observations, err := loadSurrenderTransportObservations(root)
 	if err != nil || len(observations) == 0 {
 		return
 	}
@@ -822,19 +907,43 @@ func (w *Worker) recoverProducerJournals(ctx context.Context) error {
 			log.Printf("recording worker job=%d capture recovery pending: %v", journal.JobID, err)
 		}
 		if done {
-			rotateAfterRecovery = rotateAfterRecovery || journal.RecoveryGrantSeen
-			_ = os.Remove(journal.path)
-			_ = removeEmptyRetainedDirectory(journal.OutputDir)
+			if journal.RecoveryGrantSeen {
+				rotateAfterRecovery = true
+				if stateErr := persistRecoveryRotationRequirement(w.surrenderJournalRoot()); stateErr != nil {
+					return stateErr
+				}
+			}
+			if err := unlinkPrivateLeaf(w.surrenderJournalRoot(), journal.path); err != nil {
+				return fmt.Errorf("retire recovered capture journal: %w", err)
+			}
+			if err := removeEmptyRetainedDirectory(journal.OutputDir); err != nil && !errors.Is(err, unix.ENOENT) {
+				return fmt.Errorf("retire recovered capture directory: %w", err)
+			}
 		}
 	}
 	claimState, stateErr := loadClaimSuccessorState(w.surrenderJournalRoot())
 	if stateErr != nil {
 		return stateErr
 	}
-	if rotateAfterRecovery || claimState != nil && claimState.ProposalID != "" {
+	if rotateAfterRecovery || claimState != nil && (claimState.RotationRequired || claimState.ProposalID != "") {
 		if err := w.maybeRotateClaimCredential(ctx); err != nil {
 			return fmt.Errorf("rotate recovered claim credential: %w", err)
 		}
+	}
+	return nil
+}
+
+func persistRecoveryRotationRequirement(root string) error {
+	state, err := loadClaimSuccessorState(root)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		state = &claimSuccessorState{}
+	}
+	state.RotationRequired = true
+	if err = persistClaimSuccessorState(root, *state); err != nil {
+		return fmt.Errorf("persist recovery rotation requirement: %w", err)
 	}
 	return nil
 }
@@ -873,11 +982,27 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false, fmt.Errorf("recovery output directory escaped capture root")
 	}
-	paths, err := filepath.Glob(filepath.Join(outDir, "seg-*.mp4"))
+	paths, err := listCaptureArtifactPaths(outDir)
 	if err != nil {
 		return false, err
 	}
-	sort.Strings(paths)
+	pathIdentity := make(map[string]captureArtifactPath, len(paths))
+	for _, path := range paths {
+		pathIdentity[path.Path] = path
+	}
+	for index := range journal.Artifacts {
+		artifact := &journal.Artifacts[index]
+		localPath := artifact.LocalPath
+		if artifact.Segment != nil {
+			localPath = artifact.Segment.Path
+		}
+		if identity, exists := pathIdentity[localPath]; exists {
+			if (artifact.Device != 0 && artifact.Device != identity.Device) || (artifact.Inode != 0 && artifact.Inode != identity.Inode) {
+				return false, fmt.Errorf("capture artifact identity changed before recovery")
+			}
+			artifact.LocalPath, artifact.Device, artifact.Inode = identity.Path, identity.Device, identity.Inode
+		}
+	}
 	if journal.CaptureSet != nil {
 		setDone, setErr := w.recoverCaptureSetJournal(ctx, journal, paths)
 		done = setDone
@@ -928,9 +1053,9 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 			boundPaths[artifact.Segment.Path] = struct{}{}
 		}
 	}
-	unboundPaths := make([]string, 0, len(paths))
+	unboundPaths := make([]captureArtifactPath, 0, len(paths))
 	for _, path := range paths {
-		if _, bound := boundPaths[path]; !bound {
+		if _, bound := boundPaths[path.Path]; !bound {
 			unboundPaths = append(unboundPaths, path)
 		}
 	}
@@ -956,7 +1081,9 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 				return false, err
 			}
 			if artifact.Segment != nil {
-				capture.RemoveSegmentFile(*artifact.Segment)
+				if err := removeRetainedArtifact(artifact.Segment.Path, artifact.Device, artifact.Inode); err != nil {
+					return false, err
+				}
 			}
 			artifact.Done = true
 			artifact.Segment = nil
@@ -965,15 +1092,15 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 			}
 			continue
 		}
-		path := ""
+		path := captureArtifactPath{}
 		if artifact.Segment != nil {
-			path = artifact.Segment.Path
+			path = captureArtifactPath{Path: artifact.Segment.Path, Device: artifact.Device, Inode: artifact.Inode}
 		}
-		if path == "" && pathIndex < len(unboundPaths) {
+		if path.Path == "" && pathIndex < len(unboundPaths) {
 			path = unboundPaths[pathIndex]
 			pathIndex++
 		}
-		if path == "" {
+		if path.Path == "" {
 			if err := w.cfg.Client.FinishRecordingRecovery(ctx, artifact.IntentID, artifact.RecoverySecret, "abandoned_unsealed"); err != nil {
 				return false, err
 			}
@@ -984,7 +1111,7 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		seg, probeErr := w.recoverContinuousSegment(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
+		seg, probeErr := w.recoverContinuousSegmentExact(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		if probeErr != nil {
 			if err := w.cfg.Client.FinishRecordingRecovery(ctx, artifact.IntentID, artifact.RecoverySecret, "unrecoverable_partial"); err != nil {
@@ -1000,6 +1127,7 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 		} else {
 			seg.CaptureSequence = artifact.CaptureSequence
 			artifact.Segment = &seg
+			artifact.LocalPath, artifact.Device, artifact.Inode = path.Path, path.Device, path.Inode
 			if err := persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
 				return false, err
 			}
@@ -1009,21 +1137,23 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 			return false, err
 		}
 		if !intent.AlreadyIngested {
-			if err = w.cfg.Client.UploadFile(ctx, intent.UploadURL, seg.Path, seg.MIMEType); err != nil {
+			if err = w.cfg.Client.UploadFileExact(ctx, intent.UploadURL, seg.Path, seg.MIMEType, artifact.Device, artifact.Inode, seg.SizeBytes); err != nil {
 				return false, err
 			}
 			if _, err = w.cfg.Client.IngestClipRecovery(ctx, recoveryIngestRequest(journal, seg, artifact.IntentID, artifact.CaptureSequence), artifact.IntentID, artifact.RecoverySecret); err != nil {
 				return false, err
 			}
 		}
-		capture.RemoveSegmentFile(seg)
+		if err = removeRetainedArtifact(seg.Path, artifact.Device, artifact.Inode); err != nil {
+			return false, err
+		}
 		artifact.Done = true
 		artifact.Segment = nil
 		if err = persistProducerJournal(w.surrenderJournalRoot(), journal); err != nil {
 			return false, err
 		}
 	}
-	remaining, err := filepath.Glob(filepath.Join(outDir, "seg-*.mp4"))
+	remaining, err := listCaptureArtifactPaths(outDir)
 	if err != nil || len(remaining) != 0 {
 		return false, err
 	}
@@ -1031,8 +1161,14 @@ func (w *Worker) recoverProducerJournalV2(ctx context.Context, journal *captureP
 	return true, nil
 }
 
-func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureProducerJournal, paths []string) (bool, error) {
+func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureProducerJournal, paths []captureArtifactPath) (bool, error) {
 	if err := validateCaptureSetJournal(journal); err != nil {
+		return false, err
+	}
+	// The local ACK is fsynced before its network call. Replay it before any
+	// materialize/seal/finish request so a restart cannot bypass the server's
+	// immutable stop-inventory boundary.
+	if err := w.replayCaptureSetStopAck(ctx, journal); err != nil {
 		return false, err
 	}
 	bound := make(map[string]struct{}, len(journal.Artifacts))
@@ -1051,23 +1187,18 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 		}
 	}
 	for _, path := range paths {
-		if _, exists := bound[path]; exists {
+		if _, exists := bound[path.Path]; exists {
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		segment, probeErr := w.recoverContinuousSegment(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
+		segment, probeErr := w.recoverContinuousSegmentExact(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		artifact, _, deriveErr := deriveCaptureSetArtifact(journal, nextSequence)
 		if deriveErr != nil {
 			return false, deriveErr
 		}
-		artifact.LocalPath = path
-		info, identityErr := os.Lstat(path)
-		stat, statOK := infoSyscallStat(info)
-		if identityErr != nil || !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 {
-			return false, fmt.Errorf("recovered capture artifact identity is unsafe")
-		}
-		artifact.Device, artifact.Inode = uint64(stat.Dev), uint64(stat.Ino)
+		artifact.LocalPath = path.Path
+		artifact.Device, artifact.Inode = path.Device, path.Inode
 		if probeErr == nil {
 			segment.CaptureSequence = nextSequence
 			artifact.Segment = &segment
@@ -1081,7 +1212,7 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		segment, probeErr := w.recoverContinuousSegment(probeCtx, artifact.LocalPath, time.Duration(journal.ClipDurationSec)*time.Second)
+		segment, probeErr := w.recoverContinuousSegmentExact(probeCtx, captureArtifactPath{Path: artifact.LocalPath, Device: artifact.Device, Inode: artifact.Inode}, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		if probeErr == nil {
 			segment.CaptureSequence = artifact.CaptureSequence
@@ -1136,7 +1267,7 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 				return false, sealErr
 			}
 			if !intent.AlreadyIngested {
-				if err = w.cfg.Client.UploadFile(ctx, intent.UploadURL, segment.Path, segment.MIMEType); err != nil {
+				if err = w.cfg.Client.UploadFileExact(ctx, intent.UploadURL, segment.Path, segment.MIMEType, artifact.Device, artifact.Inode, segment.SizeBytes); err != nil {
 					return false, err
 				}
 				if _, err = w.cfg.Client.IngestClipWithResult(ctx, recoveryIngestRequest(journal, segment, artifact.IntentID, artifact.CaptureSequence)); err != nil {
@@ -1196,7 +1327,7 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 			continue
 		}
 		if artifact.Segment == nil {
-			size, partialSHA, hashErr := hashRetainedArtifact(artifact.LocalPath)
+			size, partialSHA, hashErr := hashRetainedArtifact(artifact.LocalPath, artifact.Device, artifact.Inode)
 			if hashErr != nil {
 				return false, hashErr
 			}
@@ -1208,7 +1339,7 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 		}
 		segment := *artifact.Segment
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		probed, probeErr := w.recoverContinuousSegment(probeCtx, segment.Path, time.Duration(journal.ClipDurationSec)*time.Second)
+		probed, probeErr := w.recoverContinuousSegmentExact(probeCtx, captureArtifactPath{Path: segment.Path, Device: artifact.Device, Inode: artifact.Inode}, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		if probeErr != nil || probed.SizeBytes != segment.SizeBytes || probed.SHA256 != segment.SHA256 {
 			size := segment.SizeBytes
@@ -1250,7 +1381,7 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 			return false, err
 		}
 	}
-	remaining, err := filepath.Glob(filepath.Join(journal.OutputDir, "seg-*.mp4"))
+	remaining, err := listCaptureArtifactPaths(journal.OutputDir)
 	if err != nil || len(remaining) != 0 {
 		return false, fmt.Errorf("capture set recovery retains local bytes")
 	}
@@ -1262,16 +1393,26 @@ func (w *Worker) recoverCaptureSetJournal(ctx context.Context, journal *captureP
 	return true, nil
 }
 
-func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *captureProducerJournal, paths []string) error {
+func (w *Worker) replayCaptureSetStopAck(ctx context.Context, journal *captureProducerJournal) error {
+	if journal == nil || journal.CaptureSet == nil || journal.CaptureSet.StopAck == nil {
+		return nil
+	}
+	if err := w.cfg.Client.AckCaptureSetStop(ctx, journal.JobID, journal.LeaseToken, journal.CaptureSet.SetID, *journal.CaptureSet.StopAck); err != nil {
+		return fmt.Errorf("replay capture stop acknowledgment: %w", err)
+	}
+	return nil
+}
+
+func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *captureProducerJournal, paths []captureArtifactPath) error {
 	boundPaths := make(map[string]struct{}, len(journal.Artifacts))
 	for _, artifact := range journal.Artifacts {
 		if artifact.Segment != nil {
 			boundPaths[artifact.Segment.Path] = struct{}{}
 		}
 	}
-	unboundPaths := make([]string, 0, len(paths))
+	unboundPaths := make([]captureArtifactPath, 0, len(paths))
 	for _, path := range paths {
-		if _, bound := boundPaths[path]; !bound {
+		if _, bound := boundPaths[path.Path]; !bound {
 			unboundPaths = append(unboundPaths, path)
 		}
 	}
@@ -1283,19 +1424,19 @@ func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *
 			accepted = true
 			continue
 		}
-		path := ""
+		path := captureArtifactPath{}
 		if artifact.Segment != nil {
-			path = artifact.Segment.Path
+			path = captureArtifactPath{Path: artifact.Segment.Path, Device: artifact.Device, Inode: artifact.Inode}
 		}
-		if path == "" && pathIndex < len(unboundPaths) {
+		if path.Path == "" && pathIndex < len(unboundPaths) {
 			path = unboundPaths[pathIndex]
 			pathIndex++
 		}
-		if path == "" {
+		if path.Path == "" {
 			continue
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		seg, err := w.recoverContinuousSegment(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
+		seg, err := w.recoverContinuousSegmentExact(probeCtx, path, time.Duration(journal.ClipDurationSec)*time.Second)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("capture artifact remains partial under current lease: %w", err)
@@ -1317,14 +1458,16 @@ func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *
 			return err
 		}
 		if !intent.AlreadyIngested {
-			if err = w.cfg.Client.UploadFile(ctx, intent.UploadURL, seg.Path, seg.MIMEType); err != nil {
+			if err = w.cfg.Client.UploadFileExact(ctx, intent.UploadURL, seg.Path, seg.MIMEType, artifact.Device, artifact.Inode, seg.SizeBytes); err != nil {
 				return err
 			}
 			if _, err = w.cfg.Client.IngestClipWithResult(ctx, recoveryIngestRequest(journal, seg, artifact.IntentID, artifact.CaptureSequence)); err != nil {
 				return err
 			}
 		}
-		capture.RemoveSegmentFile(seg)
+		if err = removeRetainedArtifact(seg.Path, artifact.Device, artifact.Inode); err != nil {
+			return err
+		}
 		artifact.Done = true
 		artifact.Segment = nil
 		accepted = true
@@ -1332,7 +1475,7 @@ func (w *Worker) recoverProducerUnderCurrentLease(ctx context.Context, journal *
 			return err
 		}
 	}
-	remaining, err := filepath.Glob(filepath.Join(journal.OutputDir, "seg-*.mp4"))
+	remaining, err := listCaptureArtifactPaths(journal.OutputDir)
 	if err != nil || len(remaining) != 0 {
 		return fmt.Errorf("capture producer retains unbound bytes")
 	}
@@ -1481,19 +1624,6 @@ func (w *Worker) materializeCaptureSetArtifact(ctx context.Context, job recordin
 		return nil, err
 	}
 	return &artifact, nil
-}
-
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	err = dir.Sync()
-	closeErr := dir.Close()
-	if err == nil {
-		err = closeErr
-	}
-	return err
 }
 
 type retainedCaptureNamespace struct {
@@ -1720,7 +1850,7 @@ func (w *Worker) finishStoppedCaptureSetBeforeExec(ctx context.Context, job reco
 	}
 	state.mu.Unlock()
 	if producer.path != "" {
-		_ = os.Remove(producer.path)
+		_ = unlinkPrivateLeaf(w.surrenderJournalRoot(), producer.path)
 	}
 	_ = removeEmptyRetainedDirectory(retained.path)
 	_ = removeCaptureNamespaceSentinel(outputDir)
@@ -1811,10 +1941,12 @@ func (w *Worker) recordProducerArtifact(jobID int64, producer *captureProducerJo
 	if state.producer == nil || state.producer.ProducerID != producer.ProducerID {
 		return 0, 0, fmt.Errorf("capture producer journal is not current")
 	}
-	info, statErr := os.Lstat(seg.Path)
-	stat, statOK := infoSyscallStat(info)
-	if statErr != nil || !statOK || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || stat.Nlink != 1 || stat.Ino == 0 {
+	file, stat, statErr := openRetainedArtifact(seg.Path, 0, 0)
+	if statErr != nil || stat.Ino == 0 {
 		return 0, 0, fmt.Errorf("capture artifact identity is unsafe")
+	}
+	if err := file.Close(); err != nil {
+		return 0, 0, err
 	}
 	for _, artifact := range producer.Artifacts {
 		if artifact.CaptureSequence == seg.CaptureSequence {
@@ -1900,10 +2032,11 @@ func ensurePrivateSurrenderJournalRoot(root string) error {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return err
 	}
-	rootInfo, err := os.Lstat(root)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm()&0o077 != 0 {
+	rootFD, err := openPrivateDirectory(root)
+	if err != nil {
 		return fmt.Errorf("surrender transport journal root is not private")
 	}
+	_ = unix.Close(rootFD)
 	return nil
 }
 
@@ -1923,44 +2056,16 @@ func persistProducerJournal(root string, journal *captureProducerJournal) error 
 	}
 	raw = append(raw, '\n')
 	path := filepath.Join(root, fmt.Sprintf("job-%d-%s.json", journal.JobID, strings.ToLower(journal.ProducerID)))
-	tmp, err := os.CreateTemp(root, ".capture-producer-*.tmp")
+	rootFD, err := openPrivateDirectory(root)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
-	if err = tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
+	defer unix.Close(rootFD)
+	if err = writePrivateRegularAt(rootFD, filepath.Base(path), raw); err != nil {
 		return err
-	}
-	_, encErr := tmp.Write(raw)
-	if encErr == nil {
-		encErr = tmp.Sync()
-	}
-	closeErr := tmp.Close()
-	if encErr != nil {
-		_ = os.Remove(tmpPath)
-		return encErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmpPath)
-		return closeErr
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	dir, err := os.Open(root)
-	if err != nil {
-		return err
-	}
-	err = dir.Sync()
-	closeErr = dir.Close()
-	if err == nil {
-		err = closeErr
 	}
 	journal.path = path
-	return err
+	return nil
 }
 
 func (w *Worker) reserveCaptureProducer(ctx context.Context, job recordingapi.RecordingJob, ordinal int64, outputDir string) (*captureProducerJournal, error) {
@@ -1977,7 +2082,7 @@ func (w *Worker) reserveCaptureProducer(ctx context.Context, job recordingapi.Re
 			return nil, fmt.Errorf("capture producer %d remains nonterminal", producer.CaptureOrdinal)
 		}
 		if producer.OutputDir != outputDir {
-			paths, globErr := filepath.Glob(filepath.Join(producer.OutputDir, "seg-*.mp4"))
+			paths, globErr := listCaptureArtifactPaths(producer.OutputDir)
 			if globErr != nil || len(paths) != 0 {
 				state.mu.Unlock()
 				return nil, fmt.Errorf("capture producer %d retains durable bytes", producer.CaptureOrdinal)
@@ -2262,7 +2367,7 @@ func (w *Worker) finishActiveCaptureProducer(ctx context.Context, job recordinga
 	if producer == nil {
 		return nil
 	}
-	paths, err := filepath.Glob(filepath.Join(producer.OutputDir, "seg-*.mp4"))
+	paths, err := listCaptureArtifactPaths(producer.OutputDir)
 	if err != nil {
 		return err
 	}
@@ -2301,7 +2406,7 @@ func (w *Worker) finishCaptureProducer(ctx context.Context, job recordingapi.Rec
 			}
 			state.mu.Unlock()
 			if producer.path != "" {
-				_ = os.Remove(producer.path)
+				_ = unlinkPrivateLeaf(w.surrenderJournalRoot(), producer.path)
 			}
 			return nil
 		}

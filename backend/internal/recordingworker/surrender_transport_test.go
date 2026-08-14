@@ -155,6 +155,67 @@ func TestCommittedCaptureSetPreflightStopsBeforeProcessLaunch(t *testing.T) {
 	}
 }
 
+func TestRecoveryReplaysDurableStopAckBeforeAnyFurtherAuthority(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		if strings.HasSuffix(r.URL.Path, "/stop-ack") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, "unexpected authority before stop ACK", http.StatusConflict)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, WorkerID: "worker", CaptureTempDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := recordingapi.CaptureStopAck{AckID: uuid.NewString(), RetainedDirectoryDevice: 1, RetainedDirectoryInode: 2, Members: []recordingapi.CaptureStopAckMember{}}
+	ack.InventorySHA256, err = recordingapi.CaptureStopInventorySHA(ack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := &captureProducerJournal{JobID: 77, LeaseToken: uuid.NewString(), CaptureSet: &captureSetJournal{SetID: uuid.NewString(), StopAck: &ack}}
+	if err = worker.replayCaptureSetStopAck(context.Background(), journal); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || !strings.HasSuffix(calls[0], "/stop-ack") {
+		t.Fatalf("calls=%v", calls)
+	}
+}
+
+func TestRecoveryRotationRequirementSurvivesCrashesBeforeAndAfterJournalRetirement(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".stoarama-surrender-v1")
+	if err := ensurePrivateSurrenderJournalRoot(root); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(root, "job-1-"+uuid.NewString()+".json")
+	if err := os.WriteFile(journal, []byte("retired"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistRecoveryRotationRequirement(root); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadClaimSuccessorState(root)
+	if err != nil || state == nil || !state.RotationRequired || state.ProposalID != "" {
+		t.Fatalf("state=%+v err=%v", state, err)
+	}
+	if _, err = os.Stat(journal); err != nil {
+		t.Fatalf("journal was retired before rotation authority became durable: %v", err)
+	}
+	if err = unlinkPrivateLeaf(root, journal); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadClaimSuccessorState(root)
+	if err != nil || state == nil || !state.RotationRequired {
+		t.Fatalf("rotation authority was lost after journal deletion: state=%+v err=%v", state, err)
+	}
+}
+
 func durableSurrenderTestRoot(t *testing.T) string {
 	t.Helper()
 	root, err := os.MkdirTemp(".", ".surrender-transport-test-")
@@ -195,6 +256,36 @@ func TestRetainedArtifactCleanupRejectsPathReplacement(t *testing.T) {
 	}
 	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "replacement" {
 		t.Fatalf("replacement changed: body=%q err=%v", body, readErr)
+	}
+}
+
+func TestRetainedArtifactRecoveryRejectsPathReplacementBeforeProbe(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "seg-20260814-120000.mp4")
+	if err := os.WriteFile(path, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := infoSyscallStat(info)
+	if !ok {
+		t.Fatal("missing retained artifact identity")
+	}
+	if err = os.Rename(path, path+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{recoverContinuousSegmentFile: func(context.Context, *os.File, string, time.Duration) (capture.Segment, error) {
+		t.Fatal("replacement reached recovery probe")
+		return capture.Segment{}, nil
+	}}
+	_, err = worker.recoverContinuousSegmentExact(context.Background(), captureArtifactPath{Path: path, Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}, time.Minute)
+	if err == nil {
+		t.Fatal("path replacement entered recovery probe")
 	}
 }
 
@@ -497,6 +588,10 @@ func TestRecoveryCapabilityDrainsFinalizedBytesWithoutMainLease(t *testing.T) {
 		}
 		return capture.Segment{Path: path, MIMEType: "video/mp4", SizeBytes: 7, SHA256: strings.Repeat("a", 64), StartAt: start, EndAt: start.Add(time.Minute), DurationMs: 60_000, Container: "mp4", VideoCodec: "h264"}, nil
 	}
+	w.recoverContinuousSegmentFile = func(_ context.Context, _ *os.File, leaf string, _ time.Duration) (capture.Segment, error) {
+		path := filepath.Join(outDir, leaf)
+		return w.recoverContinuousSegment(context.Background(), path, time.Minute)
+	}
 	artifacts := make([]captureArtifactJournal, 2)
 	for i := range artifacts {
 		secretBytes, decodeErr := hex.DecodeString(secrets[i])
@@ -572,6 +667,9 @@ func TestRecoveryCapabilityRetainsUnfinalizedProducerBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.recoverContinuousSegment = func(context.Context, string, time.Duration) (capture.Segment, error) {
+		return capture.Segment{}, errors.New("missing terminal media metadata")
+	}
+	w.recoverContinuousSegmentFile = func(context.Context, *os.File, string, time.Duration) (capture.Segment, error) {
 		return capture.Segment{}, errors.New("missing terminal media metadata")
 	}
 	secretBytes, _ := hex.DecodeString(secret)
@@ -756,7 +854,7 @@ func TestSurrenderTransportObservationJournalIsBoundedAndFlushesExactly(t *testi
 		t.Fatal(err)
 	}
 	w.flushSurrenderTransportObservations(context.Background())
-	if queued, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(w.surrenderJournalRoot())); err != nil || len(queued) != 1 {
+	if queued, err := loadSurrenderTransportObservations(w.surrenderJournalRoot()); err != nil || len(queued) != 1 {
 		t.Fatalf("offline queue=%d err=%v", len(queued), err)
 	}
 	available.Store(true)
@@ -764,7 +862,7 @@ func TestSurrenderTransportObservationJournalIsBoundedAndFlushesExactly(t *testi
 	if received.Load() != 1 {
 		t.Fatalf("received=%d", received.Load())
 	}
-	if queued, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(w.surrenderJournalRoot())); err != nil || len(queued) != 0 {
+	if queued, err := loadSurrenderTransportObservations(w.surrenderJournalRoot()); err != nil || len(queued) != 0 {
 		t.Fatalf("flushed queue=%d err=%v", len(queued), err)
 	}
 	full := make([]queuedSurrenderTransportObservation, 256)
@@ -888,6 +986,64 @@ func TestRunFailsClosedBeforeLeasePollOnMixedCorruptRecoveryInventory(t *testing
 	}
 	if leaseCalls.Load() != 0 {
 		t.Fatalf("lease calls=%d", leaseCalls.Load())
+	}
+}
+
+func TestRecoveryInventoryRejectsSymlinkAndNonPrivateStateLeaves(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		make func(*testing.T, string)
+	}{
+		{name: "symlink producer journal", make: func(t *testing.T, root string) {
+			target := filepath.Join(t.TempDir(), "target.json")
+			if err := os.WriteFile(target, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(root, "job-1-"+uuid.NewString()+".json")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "nonprivate producer journal", make: func(t *testing.T, root string) {
+			if err := os.WriteFile(filepath.Join(root, "job-1-"+uuid.NewString()+".json"), []byte("{}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), ".stoarama-surrender-v1")
+			if err := ensurePrivateSurrenderJournalRoot(root); err != nil {
+				t.Fatal(err)
+			}
+			test.make(t, root)
+			if _, err := loadCaptureProducerJournals(root); err == nil {
+				t.Fatal("unsafe recovery inventory was accepted")
+			}
+		})
+	}
+}
+
+func TestObservationAndSuccessorStateRejectSymlinkLeaves(t *testing.T) {
+	for _, leaf := range []string{filepath.Base(surrenderTransportObservationPath("root")), claimSuccessorStateFile} {
+		t.Run(leaf, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), ".stoarama-surrender-v1")
+			if err := ensurePrivateSurrenderJournalRoot(root); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(t.TempDir(), "target")
+			if err := os.WriteFile(target, []byte("[]\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(root, leaf)); err != nil {
+				t.Fatal(err)
+			}
+			if leaf == claimSuccessorStateFile {
+				if _, err := loadClaimSuccessorState(root); err == nil {
+					t.Fatal("symlink successor state was accepted")
+				}
+			} else if _, err := loadSurrenderTransportObservations(root); err == nil {
+				t.Fatal("symlink observation state was accepted")
+			}
+		})
 	}
 }
 

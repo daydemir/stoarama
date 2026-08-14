@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -30,6 +31,8 @@ import (
 type fakeRecordingRecoveryObjectStore struct {
 	mu          sync.Mutex
 	objects     map[string][]byte
+	metadata    map[string]map[string]string
+	versions    map[string]string
 	copyStarted chan struct{}
 	copyGate    chan struct{}
 }
@@ -45,7 +48,7 @@ func (f *fakeRecordingRecoveryObjectStore) PutReader(_ context.Context, key, _ s
 	return "quarantine-etag", nil
 }
 
-func (f *fakeRecordingRecoveryObjectStore) Copy(ctx context.Context, sourceKey, destinationKey, _ string) (string, error) {
+func (f *fakeRecordingRecoveryObjectStore) Copy(ctx context.Context, sourceKey, destinationKey, contentType string, metadata map[string]string) (r2.ObjectHead, error) {
 	if f.copyStarted != nil {
 		select {
 		case f.copyStarted <- struct{}{}:
@@ -55,7 +58,7 @@ func (f *fakeRecordingRecoveryObjectStore) Copy(ctx context.Context, sourceKey, 
 	if f.copyGate != nil {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return r2.ObjectHead{}, ctx.Err()
 		case <-f.copyGate:
 		}
 	}
@@ -63,10 +66,18 @@ func (f *fakeRecordingRecoveryObjectStore) Copy(ctx context.Context, sourceKey, 
 	defer f.mu.Unlock()
 	data, ok := f.objects[sourceKey]
 	if !ok {
-		return "", errors.New("quarantine object is absent")
+		return r2.ObjectHead{}, errors.New("quarantine object is absent")
 	}
 	f.objects[destinationKey] = append([]byte(nil), data...)
-	return "promoted-etag", nil
+	if f.metadata == nil {
+		f.metadata = make(map[string]map[string]string)
+	}
+	if f.versions == nil {
+		f.versions = make(map[string]string)
+	}
+	f.metadata[destinationKey] = maps.Clone(metadata)
+	f.versions[destinationKey] = "fake-version-1"
+	return r2.ObjectHead{ETag: "promoted-etag", VersionID: "fake-version-1", Metadata: maps.Clone(metadata), ContentType: contentType}, nil
 }
 
 func (f *fakeRecordingRecoveryObjectStore) Head(_ context.Context, key string) (r2.ObjectHead, error) {
@@ -76,7 +87,11 @@ func (f *fakeRecordingRecoveryObjectStore) Head(_ context.Context, key string) (
 	if !ok {
 		return r2.ObjectHead{}, errors.New("object is absent")
 	}
-	return r2.ObjectHead{SizeBytes: int64(len(data)), ETag: "fake-etag"}, nil
+	etag := "fake-etag"
+	if _, promoted := f.versions[key]; promoted {
+		etag = "promoted-etag"
+	}
+	return r2.ObjectHead{SizeBytes: int64(len(data)), ETag: etag, VersionID: f.versions[key], Metadata: maps.Clone(f.metadata[key]), ContentType: "video/mp4"}, nil
 }
 
 func (f *fakeRecordingRecoveryObjectStore) DeleteObjects(_ context.Context, keys []string) error {
@@ -109,6 +124,30 @@ func TestRecoveryUploadFailureClassificationPreservesRetryTruth(t *testing.T) {
 				t.Fatalf("result=%q want=%q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestRecoveryPromotionHeadRequiresExactProviderIdentity(t *testing.T) {
+	metadata := recoveryPromotionMetadata(uuid.MustParse("3f3620b7-2ed9-4ad7-b515-8b0649aa6e70"), 2, uuid.MustParse("43c3ca88-ad46-4949-a32d-e8954b3707ca"), 17, strings.Repeat("a", 64))
+	copied := r2.ObjectHead{ETag: "etag-1", VersionID: "version-1", ContentType: "video/mp4"}
+	exact := r2.ObjectHead{ETag: "etag-1", VersionID: "version-1", ContentType: "video/mp4", SizeBytes: 17, Metadata: maps.Clone(metadata)}
+	if !recoveryPromotionHeadExact(exact, copied, 17, "video/mp4", metadata) {
+		t.Fatal("exact promoted provider identity was rejected")
+	}
+	mutations := []r2.ObjectHead{
+		{ETag: "etag-1", VersionID: "version-1", ContentType: "video/mp4", SizeBytes: 16, Metadata: maps.Clone(metadata)},
+		{ETag: "etag-2", VersionID: "version-1", ContentType: "video/mp4", SizeBytes: 17, Metadata: maps.Clone(metadata)},
+		{ETag: "etag-1", VersionID: "version-2", ContentType: "video/mp4", SizeBytes: 17, Metadata: maps.Clone(metadata)},
+		{ETag: "etag-1", VersionID: "version-1", ContentType: "application/octet-stream", SizeBytes: 17, Metadata: maps.Clone(metadata)},
+		{ETag: "etag-1", VersionID: "version-1", ContentType: "video/mp4", SizeBytes: 17, Metadata: map[string]string{}},
+	}
+	extra := maps.Clone(metadata)
+	extra["unbound"] = "metadata"
+	mutations = append(mutations, r2.ObjectHead{ETag: "etag-1", VersionID: "version-1", ContentType: "video/mp4", SizeBytes: 17, Metadata: extra})
+	for index, head := range mutations {
+		if recoveryPromotionHeadExact(head, copied, 17, "video/mp4", metadata) {
+			t.Fatalf("provider identity mutation %d was accepted", index)
+		}
 	}
 }
 
@@ -659,6 +698,18 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if err = json.Unmarshal(planResponse.Body.Bytes(), &plan); err != nil {
 		t.Fatal(err)
 	}
+	var destinationLifetimeRestricted bool
+	if err = pool.QueryRow(ctx, `
+		SELECT EXISTS(
+		 SELECT 1 FROM pg_constraint
+		 WHERE conrelid='recording_capture_set_plans'::regclass
+		   AND confrelid='storage_destinations'::regclass AND confdeltype='r'
+		   AND conkey=ARRAY[(SELECT attnum FROM pg_attribute
+		                       WHERE attrelid='recording_capture_set_plans'::regclass
+		                         AND attname='storage_destination_id')]::smallint[])
+	`).Scan(&destinationLifetimeRestricted); err != nil || !destinationLifetimeRestricted {
+		t.Fatalf("frozen capture destination lacks a restrictive lifetime FK: %v", err)
+	}
 	identity := surrenderplan.SetIdentity{
 		SetID: setID, AccountID: plan.AccountID, RecordingID: plan.RecordingID, JobID: plan.JobID,
 		LeaseToken: *lease.LeaseToken, OriginClaimGeneration: plan.OriginClaimGeneration,
@@ -913,6 +964,44 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 		route.URLParams.Add("intentId", artifactID.String())
 		return request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, route))
 	}
+	crashedSessionID := uuid.New()
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO recording_recovery_upload_sessions(
+		 id,set_id,ordinal,revision,node_id,account_id,declared_bytes,quarantine_key,deadline_at)
+		VALUES($1,$2,1,1,$3,$4,$5,$6,transaction_timestamp()+interval '1 millisecond')
+	`, crashedSessionID, setID, recovery.NodeID, recovery.AccountID, len(payload), ".stoarama-recovery/v1/crashed/"+crashedSessionID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `SELECT pg_sleep(0.01)`); err != nil {
+		t.Fatal(err)
+	}
+	var reconciled int64
+	if err = pool.QueryRow(ctx, `SELECT recording_surrender_reconcile_expired_upload_sessions()`).Scan(&reconciled); err != nil || reconciled != 1 {
+		t.Fatalf("expired empty session reconciled=%d err=%v", reconciled, err)
+	}
+	var crashResult string
+	if err = pool.QueryRow(ctx, `SELECT result FROM recording_recovery_upload_session_results WHERE session_id=$1 AND phase='upload'`, crashedSessionID).Scan(&crashResult); err != nil || crashResult != "timeout" {
+		t.Fatalf("crashed session result=%q err=%v", crashResult, err)
+	}
+	stalledPromotionID := uuid.New()
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO recording_recovery_upload_sessions(
+		 id,set_id,ordinal,revision,node_id,account_id,declared_bytes,quarantine_key,deadline_at)
+		VALUES($1,$2,1,2,$3,$4,$5,$6,transaction_timestamp()+interval '1 millisecond');
+		INSERT INTO recording_recovery_upload_session_results(id,session_id,phase,result,observed_size,observed_sha256)
+		VALUES(gen_random_uuid(),$1,'upload','quarantined',$5,$7)
+	`, stalledPromotionID, setID, recovery.NodeID, recovery.AccountID, len(payload), ".stoarama-recovery/v1/stalled/"+stalledPromotionID.String(), hex.EncodeToString(payloadSHA[:])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `SELECT pg_sleep(0.01)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT recording_surrender_reconcile_expired_upload_sessions()`).Scan(&reconciled); err != nil || reconciled != 1 {
+		t.Fatalf("expired promotion reconciled=%d err=%v", reconciled, err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT result FROM recording_recovery_upload_session_results WHERE session_id=$1 AND phase='promotion'`, stalledPromotionID).Scan(&crashResult); err != nil || crashResult != "aborted" {
+		t.Fatalf("stalled promotion result=%q err=%v", crashResult, err)
+	}
 	responseLossSession := uuid.NewString()
 	responseLossRequest := newUploadRequest(responseLossSession, artifact.ID, recovery)
 	responseLossResponse := httptest.NewRecorder()
@@ -920,10 +1009,32 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if responseLossResponse.Code != http.StatusNoContent {
 		t.Fatalf("initial recovery proxy=%d body=%s", responseLossResponse.Code, responseLossResponse.Body.String())
 	}
+	var promotedObjectKey string
+	if err = pool.QueryRow(ctx, `SELECT object_key FROM recording_upload_intents WHERE id=$1`, artifact.ID).Scan(&promotedObjectKey); err != nil {
+		t.Fatal(err)
+	}
+	fakeStore.mu.Lock()
+	originalMetadata := maps.Clone(fakeStore.metadata[promotedObjectKey])
+	fakeStore.metadata[promotedObjectKey]["stoarama-sha256"] = strings.Repeat("0", 64)
+	fakeStore.mu.Unlock()
+	corruptReplay := httptest.NewRecorder()
+	server.handleRecordingRecoveryProxyUpload(corruptReplay, newUploadRequest(responseLossSession, artifact.ID, recovery))
+	if corruptReplay.Code != http.StatusConflict {
+		t.Fatalf("size-only promoted replay bypassed immutable metadata=%d body=%s", corruptReplay.Code, corruptReplay.Body.String())
+	}
+	fakeStore.mu.Lock()
+	fakeStore.metadata[promotedObjectKey] = originalMetadata
+	fakeStore.mu.Unlock()
 	responseLossReplay := httptest.NewRecorder()
 	server.handleRecordingRecoveryProxyUpload(responseLossReplay, newUploadRequest(responseLossSession, artifact.ID, recovery))
 	if responseLossReplay.Code != http.StatusNoContent {
 		t.Fatalf("recovery proxy response-loss replay=%d body=%s", responseLossReplay.Code, responseLossReplay.Body.String())
+	}
+	if _, err = pool.Exec(ctx, `
+		UPDATE recording_recovery_upload_session_results SET provider_etag='forged'
+		WHERE session_id=$1 AND phase='promotion'
+	`, responseLossSession); err == nil {
+		t.Fatal("promoted provider identity was mutable")
 	}
 
 	// A second retained artifact proves revocation can commit while provider copy

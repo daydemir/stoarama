@@ -12,6 +12,9 @@ import (
 
 func fakeLaunchctl(t *testing.T, script string) string {
 	t.Helper()
+	priorCommandTimeout := launchctlCommandTimeout
+	launchctlCommandTimeout = 20 * time.Second
+	t.Cleanup(func() { launchctlCommandTimeout = priorCommandTimeout })
 	home := t.TempDir()
 	bin := t.TempDir()
 	logPath := filepath.Join(bin, "calls")

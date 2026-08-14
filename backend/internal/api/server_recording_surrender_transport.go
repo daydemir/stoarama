@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -173,9 +174,77 @@ const (
 
 type recordingRecoveryObjectStore interface {
 	PutReader(context.Context, string, string, io.Reader) (string, error)
-	Copy(context.Context, string, string, string) (string, error)
+	Copy(context.Context, string, string, string, map[string]string) (r2.ObjectHead, error)
 	Head(context.Context, string) (r2.ObjectHead, error)
 	DeleteObjects(context.Context, []string) error
+}
+
+func recoveryPromotionMetadata(setID uuid.UUID, ordinal int, sessionID uuid.UUID, size int64, sha string) map[string]string {
+	return map[string]string{
+		"stoarama-schema":     "recording-recovery-promotion-v1",
+		"stoarama-set-id":     setID.String(),
+		"stoarama-ordinal":    strconv.Itoa(ordinal),
+		"stoarama-session-id": sessionID.String(),
+		"stoarama-size":       strconv.FormatInt(size, 10),
+		"stoarama-sha256":     sha,
+	}
+}
+
+func recoveryPromotionMetadataSHA(metadata map[string]string) string {
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	_, _ = h.Write([]byte("stoarama.recording.recovery-provider-metadata.v1\x00"))
+	for _, key := range keys {
+		_, _ = fmt.Fprintf(h, "%d:%s%d:%s\n", len(key), key, len(metadata[key]), metadata[key])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func recoveryPromotionHeadExact(head, copied r2.ObjectHead, expectedSize int64, expectedContentType string, expectedMetadata map[string]string) bool {
+	if head.SizeBytes != expectedSize || strings.TrimSpace(head.ETag) == "" || head.ETag != copied.ETag || strings.TrimSpace(head.VersionID) != strings.TrimSpace(copied.VersionID) || strings.TrimSpace(head.ContentType) != strings.TrimSpace(expectedContentType) || len(head.Metadata) != len(expectedMetadata) {
+		return false
+	}
+	for key, value := range expectedMetadata {
+		if head.Metadata[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func appendRecoveryPromotionResult(ctx context.Context, tx pgx.Tx, sessionID uuid.UUID, result string, size int64, sha string, provider r2.ObjectHead, metadataSHA string) error {
+	var sizeValue any
+	if size >= 0 {
+		sizeValue = size
+	}
+	var shaValue any
+	if sha != "" {
+		shaValue = sha
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO recording_recovery_upload_session_results(
+		 id,session_id,phase,result,observed_size,observed_sha256,provider_etag,provider_version_id,provider_metadata_sha256)
+		VALUES($1,$2,'promotion',$3,$4,$5,$6,$7,$8)
+		ON CONFLICT(session_id,phase) DO NOTHING
+	`, uuid.New(), sessionID, result, sizeValue, shaValue, strings.TrimSpace(provider.ETag), strings.TrimSpace(provider.VersionID), metadataSHA)
+	if err != nil || tag.RowsAffected() == 1 {
+		return err
+	}
+	var exact bool
+	err = tx.QueryRow(ctx, `
+		SELECT result=$2 AND observed_size IS NOT DISTINCT FROM $3::bigint
+		 AND observed_sha256 IS NOT DISTINCT FROM $4::text AND provider_etag IS NOT DISTINCT FROM $5::text
+		 AND provider_version_id IS NOT DISTINCT FROM $6::text AND provider_metadata_sha256 IS NOT DISTINCT FROM $7::text
+		FROM recording_recovery_upload_session_results WHERE session_id=$1 AND phase='promotion'
+	`, sessionID, result, sizeValue, shaValue, strings.TrimSpace(provider.ETag), strings.TrimSpace(provider.VersionID), metadataSHA).Scan(&exact)
+	if err != nil || !exact {
+		return fmt.Errorf("recovery promotion result replay differs")
+	}
+	return nil
 }
 
 func (s *Server) newRecordingRecoveryObjectStore(ctx context.Context, cfg r2.Config) (recordingRecoveryObjectStore, error) {
@@ -275,6 +344,10 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 	}
 	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-recovery-proxy-quota-v1',0))`); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lock recovery upload quota")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `SELECT recording_surrender_reconcile_expired_upload_sessions()`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "reconcile expired recovery upload sessions")
 		return
 	}
 	var endpoint, region, bucket, objectKey, mimeType, accessKeyID string
@@ -422,8 +495,23 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 		return
 	}
 	if priorPromoted {
+		var promotedSessionID uuid.UUID
+		var promotedETag, promotedVersion, promotedMetadataSHA string
+		err = s.pool.QueryRow(r.Context(), `
+			SELECT session.id,result.provider_etag,result.provider_version_id,result.provider_metadata_sha256
+			FROM recording_recovery_upload_sessions session
+			JOIN recording_recovery_upload_session_results result ON result.session_id=session.id
+			WHERE session.set_id=$1 AND session.ordinal=$2 AND result.phase='promotion' AND result.result='promoted'
+			ORDER BY session.revision DESC LIMIT 1
+		`, recovery.SetID, recovery.Ordinal).Scan(&promotedSessionID, &promotedETag, &promotedVersion, &promotedMetadataSHA)
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, "promoted recovery identity is unavailable")
+			return
+		}
+		expectedMetadata := recoveryPromotionMetadata(recovery.SetID, recovery.Ordinal, promotedSessionID, expectedSize, expectedSHA)
 		head, headErr := client.Head(r.Context(), objectKey)
-		if headErr != nil || head.SizeBytes != expectedSize {
+		persistedIdentity := r2.ObjectHead{ETag: promotedETag, VersionID: promotedVersion, ContentType: mimeType}
+		if headErr != nil || promotedMetadataSHA != recoveryPromotionMetadataSHA(expectedMetadata) || !recoveryPromotionHeadExact(head, persistedIdentity, expectedSize, mimeType, expectedMetadata) {
 			util.WriteError(w, http.StatusConflict, "promoted recovery object cannot be reconciled")
 			return
 		}
@@ -460,8 +548,17 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 	// Copy is intentionally outside every DB transaction and claim fence. A
 	// security revocation can commit while storage is copying; finalization below
 	// then rejects and quarantines/deletes the unaccepted object.
+	promotionMetadata := recoveryPromotionMetadata(recovery.SetID, recovery.Ordinal, sessionID, expectedSize, expectedSHA)
+	promotionMetadataSHA := recoveryPromotionMetadataSHA(promotionMetadata)
 	promotionCtx, cancelPromotion := context.WithDeadline(r.Context(), sessionDeadline)
-	_, err = client.Copy(promotionCtx, replayQuarantine, objectKey, mimeType)
+	promotionCopy, err := client.Copy(promotionCtx, replayQuarantine, objectKey, mimeType, promotionMetadata)
+	var promotionIdentity r2.ObjectHead
+	if err == nil {
+		promotionIdentity, err = client.Head(promotionCtx, objectKey)
+		if err == nil && !recoveryPromotionHeadExact(promotionIdentity, promotionCopy, expectedSize, mimeType, promotionMetadata) {
+			err = fmt.Errorf("promoted recovery object identity differs")
+		}
+	}
 	cancelPromotion()
 	if err != nil {
 		_ = appendRecoveryUploadSessionResultDetached(s.pool, sessionID, "promotion", "storage_5xx", observedBytes, observedSHA)
@@ -499,11 +596,15 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 		if appendErr := appendRecoveryUploadSessionResult(r.Context(), promotionTx, sessionID, "promotion", result, observedBytes, observedSHA); appendErr == nil {
 			_ = promotionTx.Commit(r.Context())
 		}
-		_ = client.DeleteObjects(context.Background(), []string{objectKey, replayQuarantine})
+		// The provider copy may have completed after this session's DB deadline.
+		// Never issue an unversioned delete against the ordinary key: a newer exact
+		// retry may already own it. The unaccepted object is unreachable from clip
+		// authority and a later exact retry overwrites only this same artifact key.
+		_ = client.DeleteObjects(context.Background(), []string{replayQuarantine})
 		util.WriteError(w, http.StatusConflict, "recovery upload was revoked")
 		return
 	}
-	if err = appendRecoveryUploadSessionResult(r.Context(), promotionTx, sessionID, "promotion", "promoted", observedBytes, observedSHA); err != nil {
+	if err = appendRecoveryPromotionResult(r.Context(), promotionTx, sessionID, "promoted", observedBytes, observedSHA, promotionIdentity, promotionMetadataSHA); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "seal recovery promotion result")
 		return
 	}
@@ -1428,12 +1529,12 @@ func (s *Server) handleRecordingCaptureSetPlan(w http.ResponseWriter, r *http.Re
 	}
 	segmentHash := sha256.Sum256([]byte(plan.SplitTimesArgument))
 	_, err = tx.Exec(r.Context(), `
-		INSERT INTO recording_capture_set_plans(id,set_id,account_id,recording_id,recording_job_id,lease_token,
+		INSERT INTO recording_capture_set_plans(id,set_id,account_id,recording_id,storage_destination_id,recording_job_id,lease_token,
 		 origin_claim_generation,producer_id,capture_ordinal,first_capture_sequence,snapshot_generation,source_snapshot,source_snapshot_sha256,
 		 destination_naming_snapshot,destination_naming_sha256,plan_at,window_end_at,duration_microseconds,
 		 clip_duration_seconds,artifact_count,segment_times_argument,segment_times_sha256,max_artifact_bytes,expires_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$16+interval '30 seconds')
-	`, planID, setID, accountID, recordingID, jobID, leaseToken, originGeneration, producerID, req.CaptureOrdinal,
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$17+interval '30 seconds')
+	`, planID, setID, accountID, recordingID, destinationID, jobID, leaseToken, originGeneration, producerID, req.CaptureOrdinal,
 		req.FirstCaptureSequence, snapshotGeneration, sourceSnapshot, hex.EncodeToString(sourceHash[:]), destinationSnapshot, hex.EncodeToString(destinationHash[:]),
 		dbNow, windowEnd, plan.DurationMicro, clipDuration, plan.ArtifactCount, plan.SplitTimesArgument,
 		hex.EncodeToString(segmentHash[:]), surrenderplan.RecoveryArtifactMaxBytes)

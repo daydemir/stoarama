@@ -397,6 +397,7 @@ CREATE TABLE recording_capture_set_plans (
   set_id UUID NOT NULL UNIQUE,
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   recording_id BIGINT NOT NULL REFERENCES recordings(id) ON DELETE RESTRICT,
+  storage_destination_id BIGINT NOT NULL REFERENCES storage_destinations(id) ON DELETE RESTRICT,
   recording_job_id BIGINT NOT NULL REFERENCES recording_jobs(id) ON DELETE RESTRICT,
   lease_token UUID NOT NULL,
   origin_claim_generation BIGINT,
@@ -423,18 +424,20 @@ CREATE TABLE recording_capture_set_plans (
 );
 
 CREATE FUNCTION recording_surrender_validate_set_plan() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected_source JSONB; expected_destination JSONB; expected_generation BIGINT;
+DECLARE expected_source JSONB; expected_destination JSONB; expected_generation BIGINT; expected_destination_id BIGINT;
 BEGIN
   NEW.plan_at:=transaction_timestamp();
   NEW.expires_at:=NEW.plan_at+interval '30 seconds';
   SELECT recording_surrender_source_snapshot(NEW.recording_id),
          recording_surrender_destination_snapshot(NEW.recording_id),
-         COALESCE((SELECT max(revision.id) FROM stream_source_revisions revision WHERE revision.stream_id=stream.id),0)+1
-    INTO expected_source,expected_destination,expected_generation
+         COALESCE((SELECT max(revision.id) FROM stream_source_revisions revision WHERE revision.stream_id=stream.id),0)+1,
+         recording.storage_destination_id
+    INTO expected_source,expected_destination,expected_generation,expected_destination_id
   FROM recordings recording JOIN streams stream ON stream.id=recording.stream_id
   WHERE recording.id=NEW.recording_id
   FOR SHARE OF recording,stream;
-  IF expected_source IS NULL OR NEW.source_snapshot IS DISTINCT FROM expected_source
+  IF expected_source IS NULL OR NEW.storage_destination_id IS DISTINCT FROM expected_destination_id
+     OR NEW.source_snapshot IS DISTINCT FROM expected_source
      OR NEW.destination_naming_snapshot IS DISTINCT FROM expected_destination
      OR NEW.snapshot_generation<>expected_generation
      OR NEW.source_snapshot_sha256<>encode(sha256(convert_to(expected_source::text,'UTF8')),'hex')
@@ -1006,10 +1009,14 @@ CREATE TABLE recording_recovery_upload_session_results (
 	  session_id UUID NOT NULL REFERENCES recording_recovery_upload_sessions(id) ON DELETE RESTRICT,
 	  phase TEXT NOT NULL CHECK(phase IN('upload','promotion')),
 	  result TEXT NOT NULL CHECK(result IN('quarantined','promoted','disconnect','slow','timeout','hash_mismatch','storage_5xx','response_ambiguous','aborted','security_revoked')),
-  observed_size BIGINT,
-  observed_sha256 TEXT,
+	  observed_size BIGINT,
+	  observed_sha256 TEXT,
+	  provider_etag TEXT,
+	  provider_version_id TEXT,
+	  provider_metadata_sha256 TEXT,
   result_at TIMESTAMPTZ NOT NULL DEFAULT transaction_timestamp(),
 	  CHECK(observed_sha256 IS NULL OR observed_sha256~'^[0-9a-f]{64}$'),
+	  CHECK(provider_metadata_sha256 IS NULL OR provider_metadata_sha256~'^[0-9a-f]{64}$'),
 	  UNIQUE(session_id,phase)
 );
 
@@ -1063,7 +1070,9 @@ BEGIN
        OR NEW.result NOT IN('promoted','storage_5xx','security_revoked','aborted') THEN
       RAISE EXCEPTION 'recovery promotion result is stale or lacks quarantine authority';
     END IF;
-    IF NEW.result='promoted' AND (NEW.observed_size IS DISTINCT FROM session_row.declared_bytes OR NEW.observed_sha256 IS NULL) THEN
+    IF NEW.result='promoted' AND (NEW.observed_size IS DISTINCT FROM session_row.declared_bytes OR NEW.observed_sha256 IS NULL
+       OR NULLIF(NEW.provider_etag,'') IS NULL OR NEW.provider_version_id IS NULL
+       OR NEW.provider_metadata_sha256 IS NULL) THEN
       RAISE EXCEPTION 'promoted recovery upload lacks exact bytes';
     END IF;
   END IF;
@@ -1099,6 +1108,37 @@ END $$;
 CREATE TRIGGER recording_recovery_upload_sessions_validate
 BEFORE INSERT ON recording_recovery_upload_sessions FOR EACH ROW
 EXECUTE FUNCTION recording_surrender_validate_recovery_upload_session();
+
+-- A process or database outage after session creation but before its first
+-- immutable result must not wedge the artifact forever.  DB time alone closes
+-- only sessions whose hard deadline passed; a later exact/new replay can then
+-- advance to the next canonical revision.
+CREATE FUNCTION recording_surrender_reconcile_expired_upload_sessions() RETURNS BIGINT LANGUAGE plpgsql AS $$
+DECLARE changed BIGINT:=0; inserted BIGINT;
+BEGIN
+  INSERT INTO recording_recovery_upload_session_results(id,session_id,phase,result)
+  SELECT gen_random_uuid(),session.id,'upload','timeout'
+  FROM recording_recovery_upload_sessions session
+  WHERE session.deadline_at<=transaction_timestamp()
+    AND NOT EXISTS(SELECT 1 FROM recording_recovery_upload_session_results result WHERE result.session_id=session.id)
+  ORDER BY session.set_id,session.ordinal,session.revision
+  ON CONFLICT(session_id,phase) DO NOTHING;
+  GET DIAGNOSTICS inserted=ROW_COUNT;
+  changed:=changed+inserted;
+  INSERT INTO recording_recovery_upload_session_results(id,session_id,phase,result)
+  SELECT gen_random_uuid(),session.id,'promotion','aborted'
+  FROM recording_recovery_upload_sessions session
+  JOIN recording_recovery_upload_session_results upload
+    ON upload.session_id=session.id AND upload.phase='upload' AND upload.result='quarantined'
+  WHERE session.deadline_at<=transaction_timestamp()
+    AND NOT EXISTS(SELECT 1 FROM recording_recovery_upload_session_results result
+                   WHERE result.session_id=session.id AND result.phase='promotion')
+  ORDER BY session.set_id,session.ordinal,session.revision
+  ON CONFLICT(session_id,phase) DO NOTHING;
+  GET DIAGNOSTICS inserted=ROW_COUNT;
+  changed:=changed+inserted;
+  RETURN changed;
+END $$;
 CREATE TRIGGER recording_worker_claim_successor_proposals_db_time BEFORE INSERT ON recording_worker_claim_successor_proposals FOR EACH ROW EXECUTE FUNCTION recording_surrender_author_db_times();
 CREATE TRIGGER recording_worker_claim_successor_results_db_time BEFORE INSERT ON recording_worker_claim_successor_results FOR EACH ROW EXECUTE FUNCTION recording_surrender_author_db_times();
 
@@ -2874,6 +2914,7 @@ CREATE FUNCTION recording_surrender_expire_set_grants() RETURNS BIGINT LANGUAGE 
 DECLARE target RECORD; materialized INTEGER[]; coverage JSONB; changed BIGINT:=0; fresh_at TIMESTAMPTZ;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0));
+  PERFORM recording_surrender_reconcile_expired_upload_sessions();
   FOR target IN
     SELECT grant.id,grant.set_id,grant.upload_grace_until,plan.recording_job_id,plan.lease_token,
            generation.node_id,capture_set.artifact_count
@@ -3255,6 +3296,7 @@ BEGIN
 	'recording_surrender_author_db_times()',
 	'recording_surrender_validate_recovery_upload_session_result()',
 	'recording_surrender_validate_recovery_upload_session()',
+	'recording_surrender_reconcile_expired_upload_sessions()',
 	'recording_surrender_validate_set_grant()',
 	'recording_surrender_validate_set_grant_expiry_seal()',
 	'recording_surrender_validate_claim_head_projection()',
@@ -3336,6 +3378,7 @@ REVOKE ALL ON FUNCTION recording_surrender_validate_security_event() FROM PUBLIC
 REVOKE ALL ON FUNCTION recording_surrender_author_db_times() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_recovery_upload_session_result() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_recovery_upload_session() FROM PUBLIC;
+REVOKE ALL ON FUNCTION recording_surrender_reconcile_expired_upload_sessions() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_set_grant() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_set_grant_expiry_seal() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_surrender_validate_claim_head_projection() FROM PUBLIC;

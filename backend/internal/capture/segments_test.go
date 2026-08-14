@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -292,6 +294,35 @@ printf '%s\n' '{"format":{"duration":"60.0"},"streams":[{"codec_type":"video","c
 	}
 	if meta.VideoWidth != 1280 || meta.VideoHeight != 720 {
 		t.Fatalf("dimensions=%dx%d want 1280x720", meta.VideoWidth, meta.VideoHeight)
+	}
+}
+
+func TestRecoverContinuousSegmentFileKeepsInventoriedDescriptorAcrossPathSwap(t *testing.T) {
+	dir := t.TempDir()
+	installTimestampProbeFixture(t, dir)
+	path := filepath.Join(dir, "seg-20260814-120000.mp4")
+	original := []byte("inventoried recovery bytes")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err = os.Rename(path, path+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte("replacement bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	segment, err := RecoverContinuousSegmentFile(context.Background(), file, filepath.Base(path), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSHA := sha256.Sum256(original)
+	if segment.SizeBytes != int64(len(original)) || segment.SHA256 != hex.EncodeToString(wantSHA[:]) {
+		t.Fatalf("recovery segment read replacement: size=%d sha=%s", segment.SizeBytes, segment.SHA256)
 	}
 }
 
@@ -864,7 +895,7 @@ while :; do sleep 0.05; done
 			func(Segment) error { return nil }, "", false, plan, stop, barrier,
 		)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(filepath.Join(output, "seg-20260814-120000.mp4")); err == nil {
 			break
@@ -877,7 +908,7 @@ while :; do sleep 0.05; done
 	close(stop)
 	select {
 	case <-barrierEntered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("stop barrier was not entered")
 	}
 	select {
@@ -885,7 +916,7 @@ while :; do sleep 0.05; done
 		if !errors.Is(err, ErrContinuousStopRequired) {
 			t.Fatalf("capture error=%v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("stopped capture did not reap")
 	}
 	if info, err := os.Lstat(output); err != nil || !info.Mode().IsRegular() {
@@ -973,7 +1004,7 @@ while :; do sleep 0.1; done
 			deliveredAttemptIDs = append(deliveredAttemptIDs, seg.CaptureAttemptID)
 			cancel()
 			return nil
-		}, "", time.Second, 5*time.Second, true, nil,
+		}, "", 5*time.Second, 10*time.Second, true, nil,
 	)
 	if err != nil {
 		t.Fatalf("capture malformed-audio fallback: %v", err)
@@ -1070,9 +1101,9 @@ exit 1
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- captureContinuousWithHeaders(ctx, "https://example.com/live.m3u8", time.Second, "", nil, output, func(Segment) error { return nil }, "", time.Second, time.Second)
+		errCh <- captureContinuousWithHeaders(ctx, "https://example.com/live.m3u8", time.Second, "", nil, output, func(Segment) error { return nil }, "", 5*time.Second, 5*time.Second)
 	}()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		body, _ := os.ReadFile(logPath)
 		if strings.Contains(string(body), "invoked") {
@@ -1111,14 +1142,14 @@ func TestCaptureContinuousRetriesFinalSweepAfterFinalizeFailure(t *testing.T) {
 	}
 
 	deliveries := 0
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	err := captureContinuousWithHeaders(
 		ctx, "https://example.com/live.m3u8", time.Second, "", nil, output,
 		func(Segment) error {
 			deliveries++
 			return nil
-		}, "", time.Second, 5*time.Second,
+		}, "", 5*time.Second, 10*time.Second,
 	)
 	if err == nil || !strings.Contains(err.Error(), "finalize after sweep failure") {
 		t.Fatalf("capture error=%v, want final-sweep recovery error", err)

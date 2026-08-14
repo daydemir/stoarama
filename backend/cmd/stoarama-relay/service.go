@@ -29,9 +29,8 @@ const (
 var (
 	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
 	launchdRemovalTimeout   = 10 * time.Second
+	launchctlCommandTimeout = 5 * time.Second
 )
-
-const launchctlCommandTimeout = 5 * time.Second
 
 // installLaunchd writes the launchd USER agent (so the login user's Keychain is
 // reachable for Chrome cookie decryption, which a system LaunchDaemon could not do)

@@ -90,24 +90,25 @@ type Config struct {
 }
 
 type Worker struct {
-	cfg                      Config
-	heartbeatInt             time.Duration
-	leaseSafetyMargin        time.Duration
-	reconnectDelay           func(int64, int) time.Duration
-	lastDiskPauseLog         time.Time
-	lastDiskErrorLog         atomic.Int64
-	frozenHLSAllowlist       frozenHLSAllowlist
-	frozenHLSObserve         frozenHLSObserveFunc
-	frozenHLSObserveCurrent  frozenHLSObserveCurrentFunc
-	frozenHLSPollMax         time.Duration
-	frozenHLSForceCapture    time.Duration
-	frozenHLSSafetyInterval  time.Duration
-	frozenHLSWait            func(context.Context, time.Duration) error
-	frozenHLSProofSpan       func(time.Duration) time.Duration
-	continuousCapture        continuousCaptureFunc
-	recoverContinuousSegment func(context.Context, string, time.Duration) (capture.Segment, error)
-	surrenderJobs            sync.Map // job id -> *surrenderJobState
-	surrenderObservationMu   sync.Mutex
+	cfg                          Config
+	heartbeatInt                 time.Duration
+	leaseSafetyMargin            time.Duration
+	reconnectDelay               func(int64, int) time.Duration
+	lastDiskPauseLog             time.Time
+	lastDiskErrorLog             atomic.Int64
+	frozenHLSAllowlist           frozenHLSAllowlist
+	frozenHLSObserve             frozenHLSObserveFunc
+	frozenHLSObserveCurrent      frozenHLSObserveCurrentFunc
+	frozenHLSPollMax             time.Duration
+	frozenHLSForceCapture        time.Duration
+	frozenHLSSafetyInterval      time.Duration
+	frozenHLSWait                func(context.Context, time.Duration) error
+	frozenHLSProofSpan           func(time.Duration) time.Duration
+	continuousCapture            continuousCaptureFunc
+	recoverContinuousSegment     func(context.Context, string, time.Duration) (capture.Segment, error)
+	recoverContinuousSegmentFile func(context.Context, *os.File, string, time.Duration) (capture.Segment, error)
+	surrenderJobs                sync.Map // job id -> *surrenderJobState
+	surrenderObservationMu       sync.Mutex
 }
 
 var (
@@ -165,16 +166,17 @@ func NewWorker(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	return &Worker{
-		cfg:                      cfg,
-		heartbeatInt:             time.Duration(cfg.HeartbeatSec) * time.Second,
-		leaseSafetyMargin:        5 * time.Second,
-		reconnectDelay:           reconnectBackoff,
-		frozenHLSAllowlist:       frozenHLSAllowlist,
-		frozenHLSObserve:         observeFrozenHLS,
-		frozenHLSPollMax:         30 * time.Second,
-		frozenHLSForceCapture:    frozenHLSForcedCaptureMax,
-		frozenHLSSafetyInterval:  time.Second,
-		recoverContinuousSegment: capture.RecoverContinuousSegment,
+		cfg:                          cfg,
+		heartbeatInt:                 time.Duration(cfg.HeartbeatSec) * time.Second,
+		leaseSafetyMargin:            5 * time.Second,
+		reconnectDelay:               reconnectBackoff,
+		frozenHLSAllowlist:           frozenHLSAllowlist,
+		frozenHLSObserve:             observeFrozenHLS,
+		frozenHLSPollMax:             30 * time.Second,
+		frozenHLSForceCapture:        frozenHLSForcedCaptureMax,
+		frozenHLSSafetyInterval:      time.Second,
+		recoverContinuousSegment:     capture.RecoverContinuousSegment,
+		recoverContinuousSegmentFile: capture.RecoverContinuousSegmentFile,
 	}, nil
 }
 
