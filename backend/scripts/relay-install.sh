@@ -19,6 +19,7 @@ set -euo pipefail
 # and starts the launchd user agent (macOS) or systemd user unit (Linux).
 #
 #   curl -fsSL https://stoarama.com/relay/install.sh | bash -s -- --token sie_xxxx
+#   curl -fsSL https://stoarama.com/relay/install.sh | bash -s -- --token sie_xxxx --user-domain
 #   curl -fsSL https://stoarama.com/relay/download/install-VERSION.sh \
 #     | bash -s -- --token sie_xxxx --manifest latest-VERSION.json
 
@@ -26,6 +27,7 @@ API_URL="https://stoarama.com"
 TOKEN=""
 NAME=""
 MANIFEST_NAME="latest.json"
+USER_DOMAIN=0
 
 PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
 
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --api-url)     API_URL="${2:-}"; shift 2 ;;
     --name)        NAME="${2:-}"; shift 2 ;;
     --manifest)    MANIFEST_NAME="${2:-}"; shift 2 ;;
+    --user-domain) USER_DOMAIN=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -351,7 +354,9 @@ echo ""
 # Load/start the background service. install-launchd/install-systemd replace any prior
 # instance and kickstart it, so a re-run also restarts an already-loaded service.
 if [[ "${OS}" == "darwin" ]]; then
-  "${BIN_DIR}/stoarama-relay" install-launchd && INSTALL_COMMITTED=1
+  LAUNCHD_ARGS=(install-launchd)
+  [[ "${USER_DOMAIN}" -eq 1 ]] && LAUNCHD_ARGS+=(--user-domain)
+  "${BIN_DIR}/stoarama-relay" "${LAUNCHD_ARGS[@]}" && INSTALL_COMMITTED=1
 else
   "${BIN_DIR}/stoarama-relay" install-systemd && INSTALL_COMMITTED=1
 fi
