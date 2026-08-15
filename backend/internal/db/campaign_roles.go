@@ -71,7 +71,7 @@ var campaignRuntimeReadOnlyProductTables = []string{
 // procedures. The executor must not receive direct table access, but startup
 // must prove the definer owner can resolve the exact protected frame bytes.
 var campaignAuthorityReadOnlyProductTables = []string{
-	"frames", "media_objects",
+	"frames", "media_objects", "protected_campaign_recordings",
 }
 
 // Admission serializes against ordinary product writers by locking these
@@ -261,7 +261,7 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 		               has_function_privilege(current_user,p.oid,'EXECUTE') IS DISTINCT FROM (signature=ANY($4::text[])) OR
 		               EXISTS(SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE')),
 		       (SELECT count(*) FROM unnest($5::text[]) name
-		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),name)) AND c.relkind IN('r','p')
+		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),name)) AND c.relkind IN('r','p','v','m')
 		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
 		               has_table_privilege($2,c.oid,'INSERT') OR has_table_privilege($2,c.oid,'UPDATE') OR
 		               has_table_privilege($2,c.oid,'DELETE') OR has_table_privilege($2,c.oid,'TRUNCATE')),

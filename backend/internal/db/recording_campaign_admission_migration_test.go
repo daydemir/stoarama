@@ -99,6 +99,9 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := executorPool.Exec(ctx, `SELECT id FROM media_objects LIMIT 1`); err == nil {
 		t.Fatal("executor read protected media-object rows directly")
 	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_id FROM protected_campaign_recordings LIMIT 1`); err == nil {
+		t.Fatal("executor read protected campaign view directly")
+	}
 	if _, err := migrator.Exec(ctx, `REVOKE SELECT ON frames FROM stoarama_test_admission_authority`); err != nil {
 		t.Fatalf("revoke protected frame dependency fixture: %v", err)
 	}
@@ -107,6 +110,15 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	if _, err := migrator.Exec(ctx, `GRANT SELECT ON frames TO stoarama_test_admission_authority`); err != nil {
 		t.Fatalf("restore protected frame dependency fixture: %v", err)
+	}
+	if _, err := migrator.Exec(ctx, `REVOKE SELECT ON protected_campaign_recordings FROM stoarama_test_admission_authority`); err != nil {
+		t.Fatalf("revoke protected campaign view dependency fixture: %v", err)
+	}
+	if err := ValidateCampaignExecutorPrivileges(ctx, executorPool, "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err == nil {
+		t.Fatal("executor startup accepted a missing authority campaign-view dependency")
+	}
+	if _, err := migrator.Exec(ctx, `GRANT SELECT ON protected_campaign_recordings TO stoarama_test_admission_authority`); err != nil {
+		t.Fatalf("restore protected campaign view dependency fixture: %v", err)
 	}
 	if _, err := migrator.Exec(ctx, `REVOKE UPDATE(id) ON accounts FROM stoarama_test_admission_authority`); err != nil {
 		t.Fatalf("revoke authority account-lock privilege fixture: %v", err)
