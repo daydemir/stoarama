@@ -668,7 +668,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		var sealedResponse []byte
 		err = s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_admit($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb)`, admissionApprovalID, accountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, admissionScheduleSpec, nextFireJSON, capacityJSON, storageJSON).Scan(&sealedResponse)
 		if err != nil {
-			util.WriteError(w, http.StatusConflict, "campaign admission atomic executor rejected the transition")
+			util.WriteError(w, http.StatusConflict, fmt.Sprintf("campaign admission atomic executor rejected the transition: %v", err))
 			return
 		}
 		var response batchScheduleResponse
