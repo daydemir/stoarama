@@ -21,13 +21,15 @@ import (
 
 func runRecordability(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|present-targeted|review-targeted|expire-targeted> ...")
+		log.Fatalf("usage: stoaramactl recordability <run-once|run-targeted|status-targeted|present-targeted|review-targeted|expire-targeted> ...")
 	}
 	switch args[0] {
 	case "run-once":
 		runRecordabilityRunOnce(ctx, cfg, args[1:])
 	case "run-targeted":
 		runRecordabilityTargeted(ctx, cfg, args[1:])
+	case "status-targeted":
+		runRecordabilityTargetedStatus(ctx, cfg, args[1:])
 	case "present-targeted":
 		runRecordabilityTargetedPresent(ctx, cfg, args[1:])
 	case "review-targeted":
@@ -37,6 +39,33 @@ func runRecordability(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordability subcommand: %s", args[0])
 	}
+}
+
+func runRecordabilityTargetedStatus(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordability status-targeted", flag.ExitOnError)
+	orderRaw := fs.String("probe-order-ids", "", "exact comma-separated probe order UUIDs")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
+	_ = fs.Parse(args)
+	_ = cfg
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	seen := map[uuid.UUID]bool{}
+	statuses := make([]map[string]any, 0)
+	for _, raw := range strings.Split(strings.TrimSpace(*orderRaw), ",") {
+		id, parseErr := uuid.Parse(strings.TrimSpace(raw))
+		if parseErr != nil || seen[id] {
+			log.Fatalf("--probe-order-ids must contain unique UUIDs: %v", parseErr)
+		}
+		seen[id] = true
+		statuses = append(statuses, getRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/probe-orders/"+id.String()))
+	}
+	if len(statuses) == 0 {
+		log.Fatal("--probe-order-ids is required")
+	}
+	printJSON(map[string]any{"probe_orders": statuses})
 }
 
 func runRecordabilityTargetedExpire(ctx context.Context, cfg config.Config, args []string) {

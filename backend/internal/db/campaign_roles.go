@@ -38,6 +38,9 @@ var campaignRuntimeFunctions = []string{
 	"recording_campaign_create_probe_evidence(uuid,uuid,bigint,bigint,text,double precision,bigint,integer,text,text,text,text,text,text,boolean,integer,integer,double precision,text,bigint,text,text,bigint,text,text,text,text,text,text,text,text,text,text,text,text,text)",
 	"recording_campaign_submit_probe_evidence(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint,bigint,jsonb)",
 	"recording_campaign_read_probe_attempt(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint)",
+	"recording_campaign_prepare_authoritative_frame(bigint,text,bigint)",
+	"recording_campaign_authorize_authoritative_frame(bigint,text,bigint,bigint,text)",
+	"recording_campaign_read_probe_order_status(bigint,bigint,bigint,text,uuid)",
 	"recording_campaign_create_scene_presentation(uuid,bigint,uuid,uuid,bigint)",
 	"recording_campaign_create_scene_review(uuid,bigint,uuid,uuid,uuid,bigint)",
 	"recording_campaign_approve(uuid,bigint,bigint,bigint,text,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
@@ -103,6 +106,9 @@ var campaignRuntimeProductFunctions = []string{
 }
 
 var campaignExecutorFunctions = []string{
+	"recording_campaign_prepare_authoritative_frame(bigint,text,bigint)",
+	"recording_campaign_authorize_authoritative_frame(bigint,text,bigint,bigint,text)",
+	"recording_campaign_read_probe_order_status(bigint,bigint,bigint,text,uuid)",
 	"recording_campaign_approve(uuid,bigint,bigint,bigint,text,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
 	"recording_campaign_expire_approval(uuid,uuid,bigint,bigint,bigint,text)",
 	"recording_campaign_queue_probe(uuid,uuid,bigint,bigint,bigint,text,bigint)",

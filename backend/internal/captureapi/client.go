@@ -39,6 +39,22 @@ type IngestSuccessRequest struct {
 	FrameSHA256            string
 	RecordingHeartbeat     bool
 	AuthoritativeFrameOnly bool
+	AuthorityCode          string
+	SourceRevisionID       int64
+	SourceSnapshotSHA256   string
+}
+
+type AuthoritativeFrameResult struct {
+	FrameID     int64  `json:"frame_id"`
+	FrameSHA256 string `json:"frame_sha256"`
+}
+
+type AuthoritativeFrameTarget struct {
+	StreamID             int64  `json:"stream_id"`
+	SourceURL            string `json:"source_url"`
+	SourcePageURL        string `json:"source_page_url"`
+	SourceRevisionID     int64  `json:"source_revision_id"`
+	SourceSnapshotSHA256 string `json:"source_snapshot_sha256"`
 }
 
 type SegmentUploadIntentRequest struct {
@@ -122,14 +138,41 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 }
 
 func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) error {
+	_, err := c.ingestSuccess(ctx, req)
+	return err
+}
+
+func (c *Client) IngestAuthoritativeFrame(ctx context.Context, req IngestSuccessRequest) (AuthoritativeFrameResult, error) {
+	if !req.AuthoritativeFrameOnly {
+		return AuthoritativeFrameResult{}, fmt.Errorf("authoritative_frame_only is required")
+	}
+	result, err := c.ingestSuccess(ctx, req)
+	if err == nil && (result.FrameID <= 0 || len(strings.TrimSpace(result.FrameSHA256)) != 64) {
+		return AuthoritativeFrameResult{}, fmt.Errorf("authoritative frame response omitted exact identity")
+	}
+	return result, err
+}
+
+func (c *Client) PrepareAuthoritativeFrame(ctx context.Context, accountID, streamID int64, authorityCode string) (AuthoritativeFrameTarget, error) {
+	if accountID <= 0 || streamID <= 0 || strings.TrimSpace(authorityCode) == "" {
+		return AuthoritativeFrameTarget{}, fmt.Errorf("account_id, stream_id, and authority_code are required")
+	}
+	var out AuthoritativeFrameTarget
+	err := c.api.PostJSON(ctx, "/api/v1/capture/authoritative-frame-target", map[string]any{
+		"account_id": accountID, "stream_id": streamID, "authority_code": strings.TrimSpace(authorityCode),
+	}, &out)
+	return out, err
+}
+
+func (c *Client) ingestSuccess(ctx context.Context, req IngestSuccessRequest) (AuthoritativeFrameResult, error) {
 	if req.StreamID <= 0 {
-		return fmt.Errorf("stream_id must be > 0")
+		return AuthoritativeFrameResult{}, fmt.Errorf("stream_id must be > 0")
 	}
 	if len(req.FrameBytes) == 0 {
-		return fmt.Errorf("frame bytes are empty")
+		return AuthoritativeFrameResult{}, fmt.Errorf("frame bytes are empty")
 	}
 	if req.AuthoritativeFrameOnly && req.AccountID <= 0 {
-		return fmt.Errorf("account_id must be > 0 for authoritative frame ingest")
+		return AuthoritativeFrameResult{}, fmt.Errorf("account_id must be > 0 for authoritative frame ingest")
 	}
 	if req.CapturedAt.IsZero() {
 		req.CapturedAt = time.Now().UTC()
@@ -156,6 +199,9 @@ func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) er
 		"frame_sha256":             strings.ToLower(strings.TrimSpace(req.FrameSHA256)),
 		"recording_heartbeat":      req.RecordingHeartbeat,
 		"authoritative_frame_only": req.AuthoritativeFrameOnly,
+		"authority_code":           strings.TrimSpace(req.AuthorityCode),
+		"source_revision_id":       req.SourceRevisionID,
+		"source_snapshot_sha256":   strings.ToLower(strings.TrimSpace(req.SourceSnapshotSHA256)),
 	}
 	if req.AuthoritativeFrameOnly {
 		// This endpoint never needs the resolved live URL or execution class.
@@ -163,11 +209,14 @@ func (c *Client) IngestSuccess(ctx context.Context, req IngestSuccessRequest) er
 		delete(payload, "resolved_url")
 		delete(payload, "execution_class")
 	}
-	var out ingestResponse
-	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {
-		return err
+	var out struct {
+		ingestResponse
+		AuthoritativeFrameResult
 	}
-	return nil
+	if err := c.postJSONWithRetry(ctx, "/api/v1/capture/ingest", payload, &out, ingestMaxAttempts()); err != nil {
+		return AuthoritativeFrameResult{}, err
+	}
+	return out.AuthoritativeFrameResult, nil
 }
 
 func (c *Client) ReserveSegmentUpload(ctx context.Context, req SegmentUploadIntentRequest) (SegmentUploadIntent, error) {

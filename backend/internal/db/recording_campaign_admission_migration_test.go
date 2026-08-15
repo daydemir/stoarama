@@ -240,6 +240,27 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if err := migrator.QueryRow(ctx, `INSERT INTO stream_source_revisions(stream_id,actor,reason,new_source_url,new_source_page_url) VALUES($1,'test','bind','https://source.example/live.m3u8','https://source.example/page') RETURNING id`, streamID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
+	var preparedStreamID, preparedRevisionID int64
+	var preparedSource, preparedPage, preparedSnapshot string
+	if err := executorPool.QueryRow(ctx, `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,'deniz_fd_restore_20260814',$2)`, accountID, streamID).Scan(&preparedStreamID, &preparedSource, &preparedPage, &preparedRevisionID, &preparedSnapshot); err != nil {
+		t.Fatalf("prepare decision-authorized inactive frame target: %v", err)
+	}
+	if preparedStreamID != streamID || preparedRevisionID != revisionID || preparedSource != "https://source.example/live.m3u8" || preparedPage != "https://source.example/page" || len(preparedSnapshot) != 64 {
+		t.Fatalf("prepared target stream=%d revision=%d source=%q page=%q snapshot=%q", preparedStreamID, preparedRevisionID, preparedSource, preparedPage, preparedSnapshot)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/replaced.m3u8' WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_authorize_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4)`, accountID, streamID, preparedRevisionID, preparedSnapshot); err == nil || !strings.Contains(err.Error(), "source snapshot changed") {
+		t.Fatalf("stale prepared source was authorized: %v", err)
+	}
+	var framesBefore int
+	if err := migrator.QueryRow(ctx, `SELECT count(*) FROM frames WHERE stream_id=$1`, streamID).Scan(&framesBefore); err != nil || framesBefore != 0 {
+		t.Fatalf("rejected source snapshot created a frame: frames=%d err=%v", framesBefore, err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
 	frameSHA := strings.Repeat("1", 64)
 	sceneSHA := strings.Repeat("2", 64)
 	if err := migrator.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256) VALUES('r2','campaign','scene.jpg','image/jpeg',1,$1) RETURNING id`, frameSHA).Scan(&mediaID); err != nil {
@@ -360,6 +381,16 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	var probeRaceOrderID uuid.UUID
 	if err := executorPool.QueryRow(ctx, `SELECT order_id FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), probeRaceApprovalID, accountID, userID, sessionID, credentialSHA, probeRaceStreamID).Scan(&probeRaceOrderID); err != nil {
 		t.Fatalf("queue probe/expiration race order: %v", err)
+	}
+	var probeStatus []byte
+	if err := executorPool.QueryRow(ctx, `SELECT recording_campaign_read_probe_order_status($1,$2,$3,$4,$5)`, accountID, userID, sessionID, credentialSHA, probeRaceOrderID).Scan(&probeStatus); err != nil {
+		t.Fatalf("read exact probe order before lease: %v", err)
+	}
+	if strings.Contains(string(probeStatus), "source_url") || strings.Contains(string(probeStatus), "object_key") || strings.Contains(string(probeStatus), "challenge") || !strings.Contains(string(probeStatus), `"attempts": []`) {
+		t.Fatalf("probe status leaked authority or omitted empty state: %s", probeStatus)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_read_probe_order_status($1,$2,$3,$4,$5)`, accountID+1, userID, sessionID, credentialSHA, probeRaceOrderID); err == nil {
+		t.Fatal("foreign account read an exact probe order")
 	}
 	var probeNodeID, probeTokenID, probeGeneration, probeDropletID int64
 	probeCredentialSHA := hashText("probe-race-token")
@@ -699,6 +730,9 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	if err := probeExpireTx.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_read_probe_order_status($1,$2,$3,$4,$5)`, accountID, userID, expireSessionID, expireCredentialSHA, probeRaceOrderID); err == nil {
+		t.Fatal("terminal approval remained visible through probe-order status")
 	}
 	select {
 	case after := <-leaseAfterTerminal:

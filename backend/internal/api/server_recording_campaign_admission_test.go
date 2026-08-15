@@ -514,6 +514,19 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if order.Code != http.StatusCreated {
 		t.Fatalf("probe order status=%d body=%s", order.Code, order.Body.String())
 	}
+	var orderResponse struct {
+		OrderID string `json:"order_id"`
+	}
+	if err := json.Unmarshal(order.Body.Bytes(), &orderResponse); err != nil {
+		t.Fatal(err)
+	}
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/campaign-admission/probe-orders/"+orderResponse.OrderID, nil)
+	statusReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	statusRec := httptest.NewRecorder()
+	router.ServeHTTP(statusRec, statusReq)
+	if statusRec.Code != http.StatusOK || strings.Contains(statusRec.Body.String(), "source_url") || strings.Contains(statusRec.Body.String(), "object_key") || strings.Contains(statusRec.Body.String(), "challenge") {
+		t.Fatalf("probe order status leaked or failed: status=%d body=%s", statusRec.Code, statusRec.Body.String())
+	}
 	orderReplay := postOperator("/api/v1/account/recordings/campaign-admission/probe-orders", probeOrderBody)
 	if orderReplay.Code != http.StatusCreated || orderReplay.Body.String() != order.Body.String() {
 		t.Fatalf("probe-order replay changed: first=%s second=%s", order.Body.String(), orderReplay.Body.String())

@@ -108,7 +108,9 @@ func TestLoadCaptureBackfillMissingTargetsUsesOnlyExplicitIDs(t *testing.T) {
 
 func TestExplicitFrameRefreshIngestsAuthoritativeFrameWithoutHeartbeatOrLeak(t *testing.T) {
 	var ingested map[string]any
+	var prepares int
 	mux := http.NewServeMux()
+	var server *httptest.Server
 	mux.HandleFunc("/frame.jpg", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/jpeg")
 		img := image.NewRGBA(image.Rect(0, 0, 2, 2))
@@ -117,13 +119,17 @@ func TestExplicitFrameRefreshIngestsAuthoritativeFrameWithoutHeartbeatOrLeak(t *
 			t.Fatal(err)
 		}
 	})
+	mux.HandleFunc("/api/v1/capture/authoritative-frame-target", func(w http.ResponseWriter, _ *http.Request) {
+		prepares++
+		_ = json.NewEncoder(w).Encode(map[string]any{"stream_id": 339, "source_url": server.URL + "/frame.jpg?token=prepared-secret", "source_page_url": "https://publisher.example/camera", "source_revision_id": 12, "source_snapshot_sha256": strings.Repeat("b", 64)})
+	})
 	mux.HandleFunc("/api/v1/capture/ingest", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&ingested); err != nil {
 			t.Fatal(err)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "frame_id": 88, "frame_sha256": ingested["frame_sha256"]})
 	})
-	server := httptest.NewServer(mux)
+	server = httptest.NewServer(mux)
 	defer server.Close()
 	client, err := captureapi.NewClient(captureapi.ClientConfig{BaseURL: server.URL, APIToken: "operator", HTTPClient: server.Client()})
 	if err != nil {
@@ -134,9 +140,13 @@ func TestExplicitFrameRefreshIngestsAuthoritativeFrameWithoutHeartbeatOrLeak(t *
 		t.Fatal(err)
 	}
 	target := captureBackfillMissingCandidate{Stream: model.Stream{ID: 339, Slug: "secret-token-should-not-appear", Provider: "direct", SourceURL: server.URL + "/frame.jpg?token=secret", CaptureType: "snapshot_url", ExecutionClass: "image_poll"}, BackfillReason: "explicit_refresh"}
-	result := processCaptureBackfillMissingTarget(context.Background(), registry, client, target, 5*time.Second, false, 47)
+	// The prepared server target, not this stale dashboard URL, must drive capture.
+	result := processCaptureBackfillMissingTarget(context.Background(), registry, client, target, 5*time.Second, false, 47, "deniz_fd_restore_20260814")
 	if result.Status != "success" {
 		t.Fatalf("result=%+v", result)
+	}
+	if prepares != 1 || result.FrameID != 88 || result.FrameSHA256 == "" {
+		t.Fatalf("prepares=%d result=%+v", prepares, result)
 	}
 	if ingested["account_id"] != float64(47) || ingested["stream_id"] != float64(339) || ingested["recording_heartbeat"] != false || ingested["source_kind"] != "backfill_missing_frame" || ingested["authoritative_frame_only"] != true {
 		t.Fatalf("ingest=%v", ingested)
@@ -161,25 +171,27 @@ func TestExplicitFrameRefreshDryRunDoesNotIngestAndFailureIsIsolated(t *testing.
 		img := image.NewRGBA(image.Rect(0, 0, 1, 1))
 		_ = jpeg.Encode(w, img, nil)
 	})
-	mux.HandleFunc("/api/v1/capture/ingest", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/v1/capture/ingest", func(w http.ResponseWriter, r *http.Request) {
 		ingests++
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "frame_id": 1, "frame_sha256": payload["frame_sha256"]})
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	client, _ := captureapi.NewClient(captureapi.ClientConfig{BaseURL: server.URL, APIToken: "operator", HTTPClient: server.Client()})
 	registry, _ := capture.NewDefaultRegistry()
 	bad := captureBackfillMissingCandidate{Stream: model.Stream{ID: 1, Provider: "direct", SourceURL: "http://127.0.0.1:1/private?token=secret", CaptureType: "snapshot_url", ExecutionClass: "image_poll"}}
-	badResult := processCaptureBackfillMissingTarget(context.Background(), registry, client, bad, 100*time.Millisecond, false, 47)
+	badResult := processCaptureBackfillMissingTarget(context.Background(), registry, client, bad, 100*time.Millisecond, false, 47, "")
 	if badResult.Status != "error" || strings.Contains(badResult.Reason, "secret") {
 		t.Fatalf("bad=%+v", badResult)
 	}
 	good := captureBackfillMissingCandidate{Stream: model.Stream{ID: 2, Provider: "direct", SourceURL: server.URL + "/good.jpg", CaptureType: "snapshot_url", ExecutionClass: "image_poll"}}
-	dry := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, true, 47)
+	dry := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, true, 47, "")
 	if dry.Status != "dry_run" || ingests != 0 {
 		t.Fatalf("dry=%+v ingests=%d", dry, ingests)
 	}
-	success := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, false, 47)
+	success := processCaptureBackfillMissingTarget(context.Background(), registry, client, good, time.Second, false, 47, "")
 	if success.Status != "success" || ingests != 1 {
 		t.Fatalf("success=%+v ingests=%d", success, ingests)
 	}

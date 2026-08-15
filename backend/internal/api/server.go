@@ -309,6 +309,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/recordings/campaign-admission/approvals", s.handleAccountCampaignAdmissionApprovalCreate)
 			account.Post("/recordings/campaign-admission/expire", s.handleAccountCampaignAdmissionExpire)
 			account.Post("/recordings/campaign-admission/probe-orders", s.handleAccountCampaignAdmissionProbeOrderCreate)
+			account.Get("/recordings/campaign-admission/probe-orders/{orderId}", s.handleAccountCampaignAdmissionProbeOrderGet)
 			account.Get("/recordings/campaign-admission/scene-presentations/{evidenceId}", s.handleAccountCampaignAdmissionScenePresentationGet)
 			account.Post("/recordings/campaign-admission/scene-reviews", s.handleAccountCampaignAdmissionSceneReviewCreate)
 			account.Post("/recordings/qualification/scene-attest", s.handleAccountRecordingSceneAttest)
@@ -596,6 +597,7 @@ func (s *Server) router() http.Handler {
 
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
+			service.Post("/capture/authoritative-frame-target", s.handleAuthoritativeFrameTarget)
 			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)
@@ -2951,6 +2953,34 @@ type captureIngestRequest struct {
 	ErrorText              string     `json:"error_text"`
 	RecordingHeartbeat     bool       `json:"recording_heartbeat"`
 	AuthoritativeFrameOnly bool       `json:"authoritative_frame_only"`
+	AuthorityCode          string     `json:"authority_code"`
+	SourceRevisionID       int64      `json:"source_revision_id"`
+	SourceSnapshotSHA256   string     `json:"source_snapshot_sha256"`
+}
+
+type authoritativeFrameTargetRequest struct {
+	AccountID     int64  `json:"account_id"`
+	StreamID      int64  `json:"stream_id"`
+	AuthorityCode string `json:"authority_code"`
+}
+
+func (s *Server) handleAuthoritativeFrameTarget(w http.ResponseWriter, r *http.Request) {
+	var req authoritativeFrameTargetRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.AccountID <= 0 || req.AccountID != s.cfg.SharedRecordingsAccountID || req.StreamID <= 0 || strings.TrimSpace(req.AuthorityCode) == "" {
+		util.WriteError(w, http.StatusForbidden, "authoritative frame target is not decision-authorized")
+		return
+	}
+	var sourceURL, sourcePageURL, snapshotSHA string
+	var streamID, revisionID int64
+	if err := s.admissionPool.QueryRow(r.Context(), `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,$2,$3)`, req.AccountID, strings.TrimSpace(req.AuthorityCode), req.StreamID).Scan(&streamID, &sourceURL, &sourcePageURL, &revisionID, &snapshotSHA); err != nil {
+		util.WriteError(w, http.StatusForbidden, "authoritative frame target is not decision-authorized")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"stream_id": streamID, "source_url": sourceURL, "source_page_url": sourcePageURL, "source_revision_id": revisionID, "source_snapshot_sha256": snapshotSHA})
 }
 
 const authoritativeFrameMaxBytes = 8 << 20
@@ -3166,7 +3196,14 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, "account_id and stream_id are required")
 		return
 	}
-	if !s.hasServiceBearerToken(r) {
+	authorityCode := strings.TrimSpace(req.AuthorityCode)
+	snapshotSHA := strings.ToLower(strings.TrimSpace(req.SourceSnapshotSHA256))
+	decisionGated := authorityCode != "" || req.SourceRevisionID != 0 || snapshotSHA != ""
+	if decisionGated && (authorityCode == "" || len(snapshotSHA) != 64 || !lowerSHA256(snapshotSHA) || req.AccountID != s.cfg.SharedRecordingsAccountID || !s.hasServiceBearerToken(r)) {
+		util.WriteError(w, http.StatusForbidden, "authoritative frame decision fence is incomplete")
+		return
+	}
+	if !decisionGated && !s.hasServiceBearerToken(r) {
 		principal, ok := nodePrincipalFromContext(r.Context())
 		if !ok || principal.AccountID != req.AccountID || strings.TrimSpace(principal.NodeType) != nodeTypeLocalRecorder {
 			util.WriteError(w, http.StatusForbidden, "authoritative frame account mismatch")
@@ -3206,7 +3243,27 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, "authoritative frame SHA-256 mismatch")
 		return
 	}
-	if err := s.persistAuthoritativeFrameSuccess(r.Context(), req.AccountID, req.StreamID, req.CapturedAt.UTC(), frame); err != nil {
+	var authorityTx pgx.Tx
+	if decisionGated {
+		authorityTx, err = s.admissionPool.Begin(r.Context())
+		if err == nil {
+			var authorized bool
+			err = authorityTx.QueryRow(r.Context(), `SELECT recording_campaign_authorize_authoritative_frame($1,$2,$3,$4,$5)`, req.AccountID, authorityCode, req.StreamID, req.SourceRevisionID, snapshotSHA).Scan(&authorized)
+			if err == nil && !authorized {
+				err = fmt.Errorf("authoritative frame decision rejected")
+			}
+		}
+		if err != nil {
+			if authorityTx != nil {
+				_ = authorityTx.Rollback(r.Context())
+			}
+			util.WriteError(w, http.StatusConflict, "authoritative frame source snapshot changed")
+			return
+		}
+		defer func() { _ = authorityTx.Rollback(r.Context()) }()
+	}
+	result, err := s.persistAuthoritativeFrameAuthorized(r.Context(), req.AccountID, req.StreamID, req.CapturedAt.UTC(), frame, decisionGated)
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "active account recording stream not found")
 			return
@@ -3215,63 +3272,87 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusInternalServerError, "persist authoritative frame")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "stored", "recording_heartbeat": false})
+	if authorityTx != nil {
+		if err = authorityTx.Commit(r.Context()); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "commit authoritative frame decision fence")
+			return
+		}
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "stored", "recording_heartbeat": false, "frame_id": result.FrameID, "frame_sha256": result.FrameSHA256})
+}
+
+type authoritativeFrameResult struct {
+	FrameID     int64
+	FrameSHA256 string
 }
 
 func (s *Server) persistAuthoritativeFrameSuccess(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame) error {
 	return s.persistAuthoritativeFrameSuccessWithStorage(ctx, accountID, streamID, capturedAt, frame, s.r2.Bucket(), s.r2.PutBytes)
 }
 
+func (s *Server) persistAuthoritativeFrameAuthorized(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, decisionAuthorized bool) (authoritativeFrameResult, error) {
+	return s.persistAuthoritativeFrameAuthorizedWithStorage(ctx, accountID, streamID, capturedAt, frame, decisionAuthorized, s.r2.Bucket(), s.r2.PutBytes)
+}
+
 func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error)) error {
+	_, err := s.persistAuthoritativeFrameAuthorizedWithStorage(ctx, accountID, streamID, capturedAt, frame, false, bucket, put)
+	return err
+}
+
+func (s *Server) persistAuthoritativeFrameAuthorizedWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, decisionAuthorized bool, bucket string, put func(context.Context, string, string, []byte) (string, error)) (authoritativeFrameResult, error) {
 	objectKey := fmt.Sprintf("raw/stream/%d/%04d/%02d/%02d/authoritative-%d-%s.jpg", streamID, capturedAt.Year(), int(capturedAt.Month()), capturedAt.Day(), capturedAt.UnixNano(), frame.SHA256)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin authoritative frame tx: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("begin authoritative frame tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	identity := fmt.Sprintf("authoritative-frame:%d:%s", streamID, capturedAt.UTC().Format(time.RFC3339Nano))
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, identity); err != nil {
-		return fmt.Errorf("lock authoritative frame identity: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("lock authoritative frame identity: %w", err)
 	}
-	var recordingID int64
-	if err = tx.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active' ORDER BY id LIMIT 1 FOR SHARE`, accountID, streamID).Scan(&recordingID); err != nil {
-		return err
+	if !decisionAuthorized {
+		var recordingID int64
+		if err = tx.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active' ORDER BY id LIMIT 1 FOR SHARE`, accountID, streamID).Scan(&recordingID); err != nil {
+			return authoritativeFrameResult{}, err
+		}
 	}
+	var existingID int64
 	var existingSHA string
-	err = tx.QueryRow(ctx, `SELECT lower(m.sha256) FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.stream_id=$1 AND f.captured_at=$2 AND f.source_kind='authoritative_frame_refresh'`, streamID, capturedAt).Scan(&existingSHA)
+	err = tx.QueryRow(ctx, `SELECT f.id,lower(m.sha256) FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id WHERE f.stream_id=$1 AND f.captured_at=$2 AND f.source_kind='authoritative_frame_refresh'`, streamID, capturedAt).Scan(&existingID, &existingSHA)
 	if err == nil {
 		if existingSHA != frame.SHA256 {
-			return fmt.Errorf("authoritative frame identity hash conflict")
+			return authoritativeFrameResult{}, fmt.Errorf("authoritative frame identity hash conflict")
 		}
-		return tx.Commit(ctx)
+		return authoritativeFrameResult{FrameID: existingID, FrameSHA256: existingSHA}, tx.Commit(ctx)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("read authoritative frame identity: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("read authoritative frame identity: %w", err)
 	}
 	etag, err := put(ctx, objectKey, frame.MIMEType, frame.Bytes)
 	if err != nil {
 		// Put failures can be ambiguous: R2 may have accepted the deterministic
 		// object before the client observed an error. Never delete this key. A
 		// retry carries the same verified bytes and safely overwrites/reuses it.
-		return fmt.Errorf("upload authoritative frame: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("upload authoritative frame: %w", err)
 	}
 	mediaID, err := storage.UpsertMediaObject(ctx, tx, storage.MediaObjectInput{StorageProvider: "r2", Bucket: bucket, ObjectKey: objectKey, MIMEType: frame.MIMEType, SizeBytes: frame.SizeBytes, ETag: etag, SHA256: frame.SHA256, Width: frame.Width, Height: frame.Height})
 	if err != nil {
-		return fmt.Errorf("upsert authoritative media: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("upsert authoritative media: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO frames(stream_id,capture_job_id,captured_at,raw_media_object_id,capture_status,capture_error,source_kind) VALUES($1,NULL,$2,$3,'success',NULL,'authoritative_frame_refresh')`, streamID, capturedAt, mediaID); err != nil {
-		return fmt.Errorf("insert authoritative frame: %w", err)
+	var frameID int64
+	if err = tx.QueryRow(ctx, `INSERT INTO frames(stream_id,capture_job_id,captured_at,raw_media_object_id,capture_status,capture_error,source_kind) VALUES($1,NULL,$2,$3,'success',NULL,'authoritative_frame_refresh') RETURNING id`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
+		return authoritativeFrameResult{}, fmt.Errorf("insert authoritative frame: %w", err)
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO stream_health(stream_id,captures_total,captures_success,captures_error,last_capture_at,last_error_at,last_error_text) VALUES($1,1,1,0,$2,NULL,NULL) ON CONFLICT(stream_id) DO UPDATE SET captures_total=stream_health.captures_total+1,captures_success=stream_health.captures_success+1,last_capture_at=EXCLUDED.last_capture_at,updated_at=now()`, streamID, capturedAt); err != nil {
-		return fmt.Errorf("update authoritative stream health: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("update authoritative stream health: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
 		// The commit result can be ambiguous. Preserve the deterministic R2
 		// object: if rows committed, the next retry observes the exact identity;
 		// otherwise it reuses the same key and verified content.
-		return fmt.Errorf("commit authoritative frame: %w", err)
+		return authoritativeFrameResult{}, fmt.Errorf("commit authoritative frame: %w", err)
 	}
-	return nil
+	return authoritativeFrameResult{FrameID: frameID, FrameSHA256: frame.SHA256}, nil
 }
 
 type captureMarkUnsupportedRequest struct {

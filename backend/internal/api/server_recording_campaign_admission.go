@@ -631,6 +631,27 @@ func (s *Server) handleAccountCampaignAdmissionProbeOrderCreate(w http.ResponseW
 	util.WriteJSON(w, http.StatusCreated, map[string]any{"order_id": orderID, "approval_id": approvalID, "stream_id": req.StreamID, "desired_attempts": 2})
 }
 
+func (s *Server) handleAccountCampaignAdmissionProbeOrderGet(w http.ResponseWriter, r *http.Request) {
+	p, ok := accountPrincipalFromContext(r.Context())
+	if !ok || p.UserID == 0 || p.SessionID == nil || p.Role != accountRoleAdmin || !strings.EqualFold(strings.TrimSpace(p.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) {
+		util.WriteError(w, http.StatusForbidden, "targeted probe order status requires the exact operator browser session")
+		return
+	}
+	orderID, err := uuid.Parse(strings.TrimSpace(chi.URLParam(r, "orderId")))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, "orderId must be a UUID")
+		return
+	}
+	var status json.RawMessage
+	if err := s.admissionPool.QueryRow(r.Context(), `SELECT recording_campaign_read_probe_order_status($1,$2,$3,$4,$5)`, p.AccountID, p.UserID, *p.SessionID, p.credentialSHA256, orderID).Scan(&status); err != nil {
+		util.WriteError(w, http.StatusNotFound, "targeted probe order is not current")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(status)
+}
+
 func (s *Server) handleRecordingCampaignAdmissionProbeLease(w http.ResponseWriter, r *http.Request) {
 	p, ok := nodePrincipalFromContext(r.Context())
 	store := s.campaignProbeObjects()
