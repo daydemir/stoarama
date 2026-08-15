@@ -19,7 +19,13 @@ const (
 	cloudRecorderMinLeaseFreeBytes  = 2 << 30
 	cloudRecorderMinActiveFreeBytes = 512 << 20
 	cloudRecorderNoProgressTimeout  = 5 * time.Minute
+	cloudRecorderMaxMediaLag        = 15 * time.Minute
 )
+
+func applyCloudRecorderContinuousSafety(cfg *recordingworker.Config) {
+	cfg.ContinuousNoProgressTimeout = cloudRecorderNoProgressTimeout
+	cfg.ContinuousMaxMediaLag = cloudRecorderMaxMediaLag
+}
 
 // runRecordingWorker runs the recorder droplet's clip-capture loop. It
 // authenticates with a per-droplet local_recorder node token (RECORDER_NODE_TOKEN)
@@ -66,7 +72,7 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatalf("init recording api client: %v", err)
 	}
-	worker, err := recordingworker.NewWorker(recordingworker.Config{
+	workerConfig := recordingworker.Config{
 		Client:                       client,
 		WorkerID:                     strings.TrimSpace(*workerID),
 		Concurrency:                  *concurrency,
@@ -74,7 +80,6 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		PollInterval:                 time.Duration(*pollSec) * time.Second,
 		BuildSHA:                     strings.ToLower(strings.TrimSpace(*buildSHA)),
 		UploadWorkers:                cfg.RelayUploadWorkers,
-		ContinuousNoProgressTimeout:  cloudRecorderNoProgressTimeout,
 		FrozenHLSQuiescenceAllowlist: cfg.RecordingFrozenHLSQuiescenceAllowlist,
 		DiskFreeBytes: func() (uint64, error) {
 			var stat unix.Statfs_t
@@ -85,7 +90,9 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		},
 		MinLeaseFreeBytes:  cloudRecorderMinLeaseFreeBytes,
 		MinActiveFreeBytes: cloudRecorderMinActiveFreeBytes,
-	})
+	}
+	applyCloudRecorderContinuousSafety(&workerConfig)
+	worker, err := recordingworker.NewWorker(workerConfig)
 	if err != nil {
 		log.Fatalf("init recording worker: %v", err)
 	}
