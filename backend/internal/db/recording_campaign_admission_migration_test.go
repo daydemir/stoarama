@@ -305,10 +305,10 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := migrator.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,$4,'primary',1,'probation',ARRAY['fixture'],recording_campaign_now(),recording_campaign_now(),recording_campaign_now(),$5,$6)`, draftTrackID, recordingID, streamID, sceneSHA, frameSHA, userID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtimePool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_runtime'],$2,recording_campaign_now())`, draftTrackID, userID); err == nil {
+	if _, err := runtimePool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_runtime'],$2,now())`, draftTrackID, userID); err == nil {
 		t.Fatal("runtime invoked the authority-owned campaign transition")
 	}
-	if _, err := executorPool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_executor'],$2,recording_campaign_now())`, draftTrackID, userID); err == nil {
+	if _, err := executorPool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_executor'],$2,now())`, draftTrackID, userID); err == nil {
 		t.Fatal("admission executor invoked the internal campaign transition")
 	}
 	var unwitnessedTrackID int64
