@@ -477,15 +477,15 @@ RETURNS INTEGER LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
   ), days AS (
     SELECT c.id,c.cron_timezone,c.daily_window_start,c.daily_window_end,c.active_weekdays,c.start_at,c.end_at,
       generate_series((recording_campaign_now() AT TIME ZONE c.cron_timezone)::date-1,
-        (recording_campaign_now() AT TIME ZONE c.cron_timezone)::date+60,interval '1 day') day
+        (recording_campaign_now() AT TIME ZONE c.cron_timezone)::date+60,interval '1 day') AS schedule_day
     FROM configs c WHERE c.mode='continuous' AND c.daily_window_start IS NOT NULL AND c.daily_window_end IS NOT NULL
   ), windows AS (
-    SELECT ((day::date+daily_window_start)::timestamp AT TIME ZONE cron_timezone) start_at,
-      ((day::date+daily_window_end+CASE WHEN daily_window_end<=daily_window_start THEN interval '1 day' ELSE interval '0' END)::timestamp AT TIME ZONE cron_timezone) end_at
+    SELECT ((schedule_day::date+daily_window_start)::timestamp AT TIME ZONE cron_timezone) start_at,
+      ((schedule_day::date+daily_window_end+CASE WHEN daily_window_end<=daily_window_start THEN interval '1 day' ELSE interval '0' END)::timestamp AT TIME ZONE cron_timezone) end_at
     FROM days
-    WHERE (active_weekdays & (1 << (extract(isodow from day)::int-1)))<>0
-      AND ((day::date+daily_window_start)::timestamp AT TIME ZONE cron_timezone)<COALESCE(end_at,'infinity'::timestamptz)
-      AND ((day::date+daily_window_end+CASE WHEN daily_window_end<=daily_window_start THEN interval '1 day' ELSE interval '0' END)::timestamp AT TIME ZONE cron_timezone)>start_at
+    WHERE (active_weekdays & (1 << (extract(isodow from schedule_day)::int-1)))<>0
+      AND ((schedule_day::date+daily_window_start)::timestamp AT TIME ZONE cron_timezone)<COALESCE(end_at,'infinity'::timestamptz)
+      AND ((schedule_day::date+daily_window_end+CASE WHEN daily_window_end<=daily_window_start THEN interval '1 day' ELSE interval '0' END)::timestamp AT TIME ZONE cron_timezone)>start_at
   ), events AS (
     SELECT start_at moment,1 delta FROM windows WHERE end_at>recording_campaign_now()
     UNION ALL SELECT end_at,-1 FROM windows WHERE end_at>recording_campaign_now()
@@ -1556,11 +1556,11 @@ BEGIN
     v_timezone:=(SELECT value->>'timezone' FROM jsonb_array_elements(approval.schedule_spec->'stream_timezones') value
       WHERE (value->>'stream_id')::bigint=reservation.stream_id);
     SELECT min(candidate) INTO v_expected_next FROM (
-      SELECT ((day::date+(approval.schedule_spec->>'daily_window_start')::time)::timestamp AT TIME ZONE v_timezone) candidate
+	      SELECT ((schedule_day::date+(approval.schedule_spec->>'daily_window_start')::time)::timestamp AT TIME ZONE v_timezone) candidate
       FROM generate_series(
         (greatest(recording_campaign_now(),(approval.schedule_spec->>'start_at')::timestamptz) AT TIME ZONE v_timezone)::date-1,
         (greatest(recording_campaign_now(),(approval.schedule_spec->>'start_at')::timestamptz) AT TIME ZONE v_timezone)::date+372,
-        interval '1 day') day
+	        interval '1 day') AS generated_days(schedule_day)
     ) candidates WHERE candidate>recording_campaign_now()
       AND candidate>=(approval.schedule_spec->>'start_at')::timestamptz
       AND candidate<(approval.schedule_spec->>'end_at')::timestamptz
@@ -2524,9 +2524,9 @@ BEGIN
     INTO bound USING rid;
   IF TG_OP='UPDATE' AND NEW.next_fire_at IS DISTINCT FROM OLD.next_fire_at AND OLD.status='active' THEN
     SELECT min(candidate) INTO expected_next FROM (
-      SELECT ((day::date+NEW.daily_window_start)::timestamp AT TIME ZONE NEW.cron_timezone) candidate
+	      SELECT ((schedule_day::date+NEW.daily_window_start)::timestamp AT TIME ZONE NEW.cron_timezone) candidate
       FROM generate_series((OLD.next_fire_at AT TIME ZONE NEW.cron_timezone)::date,
-        (OLD.next_fire_at AT TIME ZONE NEW.cron_timezone)::date+372,interval '1 day') day
+	        (OLD.next_fire_at AT TIME ZONE NEW.cron_timezone)::date+372,interval '1 day') AS generated_days(schedule_day)
     ) q WHERE candidate>OLD.next_fire_at AND candidate<NEW.end_at
       AND (NEW.active_weekdays & (1 << (extract(isodow from candidate AT TIME ZONE NEW.cron_timezone)::int-1)))<>0;
     IF NEW.next_fire_at IS DISTINCT FROM expected_next THEN

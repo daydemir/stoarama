@@ -806,6 +806,9 @@ func TestRecordingCampaignAdmissionMigrationUsesBootstrapSearchPathOnlyBeforePin
 	if !strings.Contains(sql, "ALTER FUNCTION %I.%s SET search_path = %I, pg_catalog, pg_temp") {
 		t.Fatal("admission function bootstrap paths are not replaced by the exact final install-schema pin")
 	}
+	if strings.Contains(sql, ") day") {
+		t.Fatal("admission SQL uses the datetime keyword day as a bare generate_series alias")
+	}
 }
 
 func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testing.T) {
