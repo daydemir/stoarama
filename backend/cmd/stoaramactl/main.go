@@ -201,7 +201,8 @@ func usage() {
 	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --session-cookie-file FILE --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-postflight (--recording-ids IDS | --batch-response FILE | --spec FILE) --session-cookie-file FILE [--max-nas-pending-clips N --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings capture-health --id ID [--from YYYY-MM-DD --to YYYY-MM-DD --backend-api-url URL --api-token TOKEN]
-	  stoaramactl recordings scene-attest --recording-id ID --frame-id ID --scene-identity TEXT --session-cookie-file FILE
+	  stoaramactl recordings scene-present --stream-id ID --frame-id ID --authority-code CODE --request-id UUID --output-file PRIVATE.jpg --session-cookie-file FILE
+	  stoaramactl recordings scene-attest (--recording-id ID | --stream-id ID --authority-code CODE --presentation-id UUID) --frame-id ID --scene-identity TEXT --session-cookie-file FILE
 	  stoaramactl recordings qualification build --recording-ids IDS --sequence-start RFC3339 --session-cookie-file FILE
 	  stoaramactl recordings qualification freeze --recording-ids IDS --sequence-start RFC3339 --expected-plan-sha256 HASH --session-cookie-file FILE
 	  stoaramactl recordings qualification report [--backend-api-url URL --api-token TOKEN]
