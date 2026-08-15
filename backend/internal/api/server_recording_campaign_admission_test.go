@@ -380,7 +380,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	capturedAt := time.Now().UTC().Add(-time.Minute)
-	if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','live') RETURNING id`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','authoritative_frame_refresh') RETURNING id`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'worker-test','local_recorder','active',now(),1) RETURNING id`, infrastructureAccountID).Scan(&nodeID); err != nil {
@@ -442,6 +442,14 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	var revisionID int64
 	if err := pool.QueryRow(ctx, `SELECT max(id) FROM stream_source_revisions WHERE stream_id=$1`, streamID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
+	}
+	var preparedStreamID, preparedRevisionID int64
+	var preparedSource, preparedPage, preparedSnapshot, frameWitnessSHA string
+	if err := s.admissionPool.QueryRow(ctx, `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,'deniz_fd_restore_20260814',$2)`, accountID, streamID).Scan(&preparedStreamID, &preparedSource, &preparedPage, &preparedRevisionID, &preparedSnapshot); err != nil {
+		t.Fatalf("prepare baseline frame witness: %v", err)
+	}
+	if err := s.admissionPool.QueryRow(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, streamID, frameID, preparedRevisionID, preparedSnapshot, frameSHA).Scan(&frameWitnessSHA); err != nil || len(frameWitnessSHA) != 64 {
+		t.Fatalf("seal baseline frame witness: sha=%q err=%v", frameWitnessSHA, err)
 	}
 	start := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	end := start.Add(24 * time.Hour)
@@ -835,8 +843,14 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,etag,sha256) VALUES('r2','admission','scene-second.jpg','image/jpeg',$1,$2,$3) RETURNING id`, len(secondBaseline), secondBaselineETag, secondBaselineSHA).Scan(&secondMediaID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,now()-interval '1 minute',$2,'success','live') RETURNING id`, secondStreamID, secondMediaID).Scan(&secondFrameID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,now()-interval '1 minute',$2,'success','authoritative_frame_refresh') RETURNING id`, secondStreamID, secondMediaID).Scan(&secondFrameID); err != nil {
 		t.Fatal(err)
+	}
+	if err := s.admissionPool.QueryRow(ctx, `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,'deniz_fd_restore_20260814',$2)`, accountID, secondStreamID).Scan(&preparedStreamID, &preparedSource, &preparedPage, &preparedRevisionID, &preparedSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.admissionPool.QueryRow(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, secondStreamID, secondFrameID, preparedRevisionID, preparedSnapshot, secondBaselineSHA).Scan(&frameWitnessSHA); err != nil || len(frameWitnessSHA) != 64 {
+		t.Fatalf("seal second baseline frame witness: sha=%q err=%v", frameWitnessSHA, err)
 	}
 	secondBaselineRequest := uuid.NewString()
 	secondPresentReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/account/recordings/qualification/scene-presentations/%d?stream_id=%d&authority_code=deniz_fd_restore_20260814&request_id=%s", secondFrameID, secondStreamID, secondBaselineRequest), nil)

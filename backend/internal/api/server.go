@@ -3273,6 +3273,11 @@ func (s *Server) handleAuthoritativeFrameIngest(w http.ResponseWriter, r *http.R
 		return
 	}
 	if authorityTx != nil {
+		var witnessSHA string
+		if err = authorityTx.QueryRow(r.Context(), `SELECT recording_campaign_seal_authoritative_frame($1,$2,$3,$4,$5,$6,$7)`, req.AccountID, authorityCode, req.StreamID, result.FrameID, req.SourceRevisionID, snapshotSHA, result.FrameSHA256).Scan(&witnessSHA); err != nil || !lowerSHA256(witnessSHA) {
+			util.WriteError(w, http.StatusConflict, "seal authoritative frame decision witness")
+			return
+		}
 		if err = authorityTx.Commit(r.Context()); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, "commit authoritative frame decision fence")
 			return

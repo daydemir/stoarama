@@ -13,6 +13,7 @@ var postgresRoleName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 const campaignProductTableManifestSHA256 = "769af37338fc1a6775f1e7be93a55255fe21d8eebea9201e27f1ae4ddd6eabfb"
 
 var campaignAuthorityTables = []string{
+	"recording_campaign_authoritative_frame_witnesses",
 	"recording_campaign_authority_decisions", "recording_campaign_admission_approvals",
 	"recording_campaign_admission_reservations", "recording_campaign_admission_source_fence_events",
 	"recording_campaign_admission_reservation_terminal_events",
@@ -41,6 +42,9 @@ var campaignRuntimeFunctions = []string{
 	"recording_campaign_prepare_authoritative_frame(bigint,text,bigint)",
 	"recording_campaign_authorize_authoritative_frame(bigint,text,bigint,bigint,text)",
 	"recording_campaign_read_probe_order_status(bigint,bigint,bigint,text,uuid)",
+	"recording_campaign_seal_authoritative_frame(bigint,text,bigint,bigint,bigint,text,text)",
+	"recording_campaign_assert_baseline_frame_authority(bigint,text,bigint,bigint)",
+	"validate_recording_campaign_authoritative_frame_witness()",
 	"recording_campaign_create_scene_presentation(uuid,bigint,uuid,uuid,bigint)",
 	"recording_campaign_create_scene_review(uuid,bigint,uuid,uuid,uuid,bigint)",
 	"recording_campaign_approve(uuid,bigint,bigint,bigint,text,text,text,text,timestamp with time zone,jsonb,jsonb,text)",
@@ -106,6 +110,8 @@ var campaignRuntimeProductFunctions = []string{
 }
 
 var campaignExecutorFunctions = []string{
+	"recording_campaign_seal_authoritative_frame(bigint,text,bigint,bigint,bigint,text,text)",
+	"recording_campaign_assert_baseline_frame_authority(bigint,text,bigint,bigint)",
 	"recording_campaign_prepare_authoritative_frame(bigint,text,bigint)",
 	"recording_campaign_authorize_authoritative_frame(bigint,text,bigint,bigint,text)",
 	"recording_campaign_read_probe_order_status(bigint,bigint,bigint,text,uuid)",

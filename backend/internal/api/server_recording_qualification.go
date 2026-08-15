@@ -163,7 +163,17 @@ func (s *Server) handleAccountRecordingBaselineScenePresentation(w http.Response
 	var readReceiptID, presentationID uuid.UUID
 	var frameSHA, key, etag string
 	var size int64
-	err = s.admissionPool.QueryRow(r.Context(), `SELECT read_receipt_id,frame_sha256,media_object_key,media_etag,media_size_bytes FROM recording_campaign_read_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8)`, requestID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, authorityCode, streamID, frameID).Scan(&readReceiptID, &frameSHA, &key, &etag, &size)
+	tx, err := s.admissionPool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin baseline frame authority")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	var authorized bool
+	err = tx.QueryRow(r.Context(), `SELECT recording_campaign_assert_baseline_frame_authority($1,$2,$3,$4)`, principal.AccountID, authorityCode, streamID, frameID).Scan(&authorized)
+	if err == nil && authorized {
+		err = tx.QueryRow(r.Context(), `SELECT read_receipt_id,frame_sha256,media_object_key,media_etag,media_size_bytes FROM recording_campaign_read_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8)`, requestID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, authorityCode, streamID, frameID).Scan(&readReceiptID, &frameSHA, &key, &etag, &size)
+	}
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "baseline frame is not current and decision-authorized")
 		return
@@ -174,9 +184,13 @@ func (s *Server) handleAccountRecordingBaselineScenePresentation(w http.Response
 		return
 	}
 	var sealedSHA, sealedKey, sealedETag string
-	err = s.admissionPool.QueryRow(r.Context(), `SELECT presentation_id,frame_sha256,media_object_key,media_etag FROM recording_campaign_present_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8,$9)`, requestID, readReceiptID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, authorityCode, streamID, frameID).Scan(&presentationID, &sealedSHA, &sealedKey, &sealedETag)
+	err = tx.QueryRow(r.Context(), `SELECT presentation_id,frame_sha256,media_object_key,media_etag FROM recording_campaign_present_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8,$9)`, requestID, readReceiptID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, authorityCode, streamID, frameID).Scan(&presentationID, &sealedSHA, &sealedKey, &sealedETag)
 	if err != nil || sealedSHA != frameSHA || sealedKey != key || sealedETag != etag {
 		util.WriteError(w, http.StatusConflict, "baseline frame/source changed before presentation receipt")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit baseline frame presentation")
 		return
 	}
 	w.Header().Set("Content-Type", "image/jpeg")

@@ -163,6 +163,9 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := executorPool.Exec(ctx, `SELECT count(*) FROM recording_campaign_admission_approvals`); err == nil {
 		t.Fatal("executor read an authority table directly")
 	}
+	if _, err := executorPool.Exec(ctx, `SELECT count(*) FROM recording_campaign_authoritative_frame_witnesses`); err == nil {
+		t.Fatal("executor read authoritative frame witnesses directly")
+	}
 	if _, err := runtimePool.Exec(ctx, `INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,account_id) VALUES(txid_current(),'approve',1)`); err == nil {
 		t.Fatal("runtime forged an admission authorization directly")
 	}
@@ -269,9 +272,56 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if err := migrator.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256) VALUES('r2','campaign','scene.jpg','image/jpeg',1,$1) RETURNING id`, frameSHA).Scan(&mediaID); err != nil {
 		t.Fatal(err)
 	}
-	capturedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
-	if err := migrator.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','live') RETURNING id`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
+	var activeCompatibilityFrameID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,recording_campaign_now(),$2,'success','live') RETURNING id`, relayStreamID, mediaID).Scan(&activeCompatibilityFrameID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, relayStreamID, activeCompatibilityFrameID); err != nil {
+		t.Fatalf("existing active-recording baseline path changed: %v", err)
+	}
+	capturedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	var oldFrameID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','authoritative_frame_refresh') RETURNING id`, streamID, capturedAt, mediaID).Scan(&oldFrameID); err != nil {
+		t.Fatal(err)
+	}
+	if err := executorPool.QueryRow(ctx, `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,'deniz_fd_restore_20260814',$2)`, accountID, streamID).Scan(&preparedStreamID, &preparedSource, &preparedPage, &preparedRevisionID, &preparedSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	var witnessSHA string
+	if err := executorPool.QueryRow(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, streamID, oldFrameID, preparedRevisionID, preparedSnapshot, frameSHA).Scan(&witnessSHA); err != nil || len(witnessSHA) != 64 {
+		t.Fatalf("seal exact inactive candidate frame: sha=%q err=%v", witnessSHA, err)
+	}
+	var witnessReplaySHA string
+	if err := executorPool.QueryRow(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, streamID, oldFrameID, preparedRevisionID, preparedSnapshot, frameSHA).Scan(&witnessReplaySHA); err != nil || witnessReplaySHA != witnessSHA {
+		t.Fatalf("exact orphan/retry witness did not replay: first=%q replay=%q err=%v", witnessSHA, witnessReplaySHA, err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, streamID, oldFrameID, preparedRevisionID, preparedSnapshot, strings.Repeat("f", 64)); err == nil {
+		t.Fatal("witness retry accepted different frame facts")
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, streamID, oldFrameID); err != nil {
+		t.Fatalf("sealed inactive candidate frame was not usable: %v", err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/after-frame.m3u8' WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, streamID, oldFrameID); err == nil {
+		t.Fatal("old candidate frame survived A-to-B source mutation")
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, streamID, oldFrameID); err == nil {
+		t.Fatal("old candidate frame survived A-to-B-to-A source mutation")
+	}
+	if err := executorPool.QueryRow(ctx, `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,'deniz_fd_restore_20260814',$2)`, accountID, streamID).Scan(&preparedStreamID, &preparedSource, &preparedPage, &preparedRevisionID, &preparedSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	capturedAt = capturedAt.Add(time.Second)
+	if err := migrator.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','authoritative_frame_refresh') RETURNING id`, streamID, capturedAt, mediaID).Scan(&frameID); err != nil {
+		t.Fatal(err)
+	}
+	if err := executorPool.QueryRow(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, streamID, frameID, preparedRevisionID, preparedSnapshot, frameSHA).Scan(&witnessSHA); err != nil || len(witnessSHA) != 64 {
+		t.Fatalf("seal replacement current candidate frame: sha=%q err=%v", witnessSHA, err)
 	}
 	if err := migrator.QueryRow(ctx, `INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id,evidence_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,'operator_visual',$8,$9) RETURNING id`, accountID, streamID, frameID, mediaID, capturedAt, frameSHA, sceneSHA, userID, strings.Repeat("0", 64)).Scan(&sceneID); err != nil {
 		t.Fatal(err)

@@ -1,6 +1,19 @@
 -- Two day-zero operator gaps only: authorize a current candidate frame refresh
 -- before approval, and recover the immutable state of one known probe order.
 
+CREATE TABLE recording_campaign_authoritative_frame_witnesses (
+  frame_id BIGINT PRIMARY KEY REFERENCES frames(id) ON DELETE RESTRICT,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  stream_id BIGINT NOT NULL REFERENCES streams(id) ON DELETE RESTRICT,
+  authority_code TEXT NOT NULL REFERENCES recording_campaign_authority_decisions(code) ON DELETE RESTRICT,
+  source_revision_id BIGINT REFERENCES stream_source_revisions(id) ON DELETE RESTRICT,
+  source_snapshot_sha256 TEXT NOT NULL CHECK(source_snapshot_sha256~'^[0-9a-f]{64}$'),
+  frame_sha256 TEXT NOT NULL CHECK(frame_sha256~'^[0-9a-f]{64}$'),
+  witnessed_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
+  witness_sha256 TEXT NOT NULL CHECK(witness_sha256~'^[0-9a-f]{64}$'),
+  UNIQUE(account_id,stream_id,frame_id)
+);
+
 CREATE FUNCTION recording_campaign_prepare_authoritative_frame(
   p_account_id BIGINT,p_authority_code TEXT,p_stream_id BIGINT
 ) RETURNS TABLE(stream_id BIGINT,source_url TEXT,source_page_url TEXT,source_revision_id BIGINT,source_snapshot_sha256 TEXT)
@@ -30,6 +43,82 @@ BEGIN
     'source_fence_event_id',source_row.source_fence_event_id
   )::text,'UTF8')),'hex');
   RETURN QUERY SELECT p_stream_id,source_row.source_url,source_row.source_page_url,revision,digest;
+END $$;
+
+CREATE FUNCTION validate_recording_campaign_authoritative_frame_witness()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
+DECLARE prepared RECORD; stored_sha TEXT; expected TEXT;
+BEGIN
+  SELECT * INTO prepared FROM recording_campaign_prepare_authoritative_frame(NEW.account_id,NEW.authority_code,NEW.stream_id);
+  SELECT lower(media.sha256) INTO stored_sha FROM frames frame JOIN media_objects media ON media.id=frame.raw_media_object_id
+    WHERE frame.id=NEW.frame_id AND frame.stream_id=NEW.stream_id AND frame.capture_status='success'
+      AND frame.source_kind='authoritative_frame_refresh'
+      AND frame.captured_at BETWEEN recording_campaign_now()-interval '10 minutes' AND recording_campaign_now()
+    FOR SHARE OF frame,media;
+  expected:=encode(sha256(convert_to(jsonb_build_object('account_id',NEW.account_id,'authority_code',NEW.authority_code,
+    'stream_id',NEW.stream_id,'frame_id',NEW.frame_id,'source_revision_id',NULLIF(NEW.source_revision_id,0),
+    'source_snapshot_sha256',NEW.source_snapshot_sha256,'frame_sha256',NEW.frame_sha256,
+    'witnessed_at_epoch_us',floor(extract(epoch from recording_campaign_now())*1000000)::bigint)::text,'UTF8')),'hex');
+  IF prepared.stream_id IS NULL OR prepared.source_revision_id IS DISTINCT FROM NULLIF(NEW.source_revision_id,0) OR
+     prepared.source_snapshot_sha256<>NEW.source_snapshot_sha256 OR stored_sha IS NULL OR stored_sha<>NEW.frame_sha256 OR
+     NEW.witnessed_at IS DISTINCT FROM recording_campaign_now() OR NEW.witness_sha256<>expected THEN
+    RAISE EXCEPTION 'authoritative frame witness is not exact and current';
+  END IF;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER recording_campaign_authoritative_frame_witness_validate
+BEFORE INSERT ON recording_campaign_authoritative_frame_witnesses
+FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_authoritative_frame_witness();
+CREATE TRIGGER recording_campaign_authoritative_frame_witness_immutable
+BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_authoritative_frame_witnesses
+FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
+
+CREATE FUNCTION recording_campaign_seal_authoritative_frame(
+  p_account_id BIGINT,p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT,
+  p_source_revision_id BIGINT,p_source_snapshot_sha256 TEXT,p_frame_sha256 TEXT
+) RETURNS TEXT LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
+DECLARE prepared RECORD; digest TEXT; sealed RECORD;
+BEGIN
+  SELECT * INTO prepared FROM recording_campaign_prepare_authoritative_frame(p_account_id,p_authority_code,p_stream_id);
+  IF prepared.source_revision_id IS DISTINCT FROM NULLIF(p_source_revision_id,0) OR
+     prepared.source_snapshot_sha256<>p_source_snapshot_sha256 OR p_frame_sha256!~'^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'authoritative frame witness source changed';
+  END IF;
+  digest:=encode(sha256(convert_to(jsonb_build_object('account_id',p_account_id,'authority_code',p_authority_code,
+    'stream_id',p_stream_id,'frame_id',p_frame_id,'source_revision_id',NULLIF(p_source_revision_id,0),
+    'source_snapshot_sha256',p_source_snapshot_sha256,'frame_sha256',p_frame_sha256,
+    'witnessed_at_epoch_us',floor(extract(epoch from recording_campaign_now())*1000000)::bigint)::text,'UTF8')),'hex');
+  INSERT INTO recording_campaign_authoritative_frame_witnesses(frame_id,account_id,stream_id,authority_code,
+    source_revision_id,source_snapshot_sha256,frame_sha256,witness_sha256)
+  VALUES(p_frame_id,p_account_id,p_stream_id,p_authority_code,NULLIF(p_source_revision_id,0),p_source_snapshot_sha256,p_frame_sha256,digest)
+  ON CONFLICT(frame_id) DO NOTHING;
+  SELECT * INTO sealed FROM recording_campaign_authoritative_frame_witnesses WHERE frame_id=p_frame_id;
+  IF sealed.frame_id IS NULL OR (sealed.account_id,sealed.stream_id,sealed.authority_code,sealed.source_revision_id,
+     sealed.source_snapshot_sha256,sealed.frame_sha256) IS DISTINCT FROM
+     (p_account_id,p_stream_id,p_authority_code,NULLIF(p_source_revision_id,0),p_source_snapshot_sha256,p_frame_sha256) THEN
+    RAISE EXCEPTION 'authoritative frame witness conflicts with immutable frame';
+  END IF;
+  RETURN sealed.witness_sha256;
+END $$;
+
+CREATE FUNCTION recording_campaign_assert_baseline_frame_authority(
+  p_account_id BIGINT,p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT
+) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
+DECLARE prepared RECORD; witness RECORD;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  IF EXISTS(SELECT 1 FROM recordings WHERE account_id=p_account_id AND stream_id=p_stream_id AND status='active' FOR SHARE) THEN
+    RETURN true;
+  END IF;
+  SELECT * INTO prepared FROM recording_campaign_prepare_authoritative_frame(p_account_id,p_authority_code,p_stream_id);
+  SELECT * INTO witness FROM recording_campaign_authoritative_frame_witnesses
+    WHERE frame_id=p_frame_id AND account_id=p_account_id AND stream_id=p_stream_id AND authority_code=p_authority_code FOR SHARE;
+  IF witness.frame_id IS NULL OR witness.source_revision_id IS DISTINCT FROM prepared.source_revision_id OR
+     witness.source_snapshot_sha256<>prepared.source_snapshot_sha256 THEN
+    RAISE EXCEPTION 'nonactive baseline frame lacks a current decision witness';
+  END IF;
+  RETURN true;
 END $$;
 
 CREATE FUNCTION recording_campaign_authorize_authoritative_frame(
@@ -91,23 +180,30 @@ BEGIN
 END $$;
 
 DO $day0_admission_role_split$
-DECLARE install_schema TEXT:=current_schema(); executor_role TEXT:=current_setting('stoarama.campaign_executor_role',true);
+DECLARE install_schema TEXT:=current_schema(); runtime_role TEXT:=current_setting('stoarama.campaign_runtime_role',true);
+  executor_role TEXT:=current_setting('stoarama.campaign_executor_role',true);
   authority_role TEXT:=current_setting('stoarama.campaign_authority_role',true); signature TEXT;
 BEGIN
-  IF install_schema IS NULL OR install_schema LIKE 'pg_temp%' OR executor_role IS NULL OR authority_role IS NULL OR
-     executor_role!~'^[a-z][a-z0-9_]{0,62}$' OR authority_role!~'^[a-z][a-z0-9_]{0,62}$' THEN
+  IF install_schema IS NULL OR install_schema LIKE 'pg_temp%' OR runtime_role IS NULL OR executor_role IS NULL OR authority_role IS NULL OR
+     runtime_role!~'^[a-z][a-z0-9_]{0,62}$' OR executor_role!~'^[a-z][a-z0-9_]{0,62}$' OR authority_role!~'^[a-z][a-z0-9_]{0,62}$' THEN
     RAISE EXCEPTION '0141 requires the exact 0140 role split';
   END IF;
   FOREACH signature IN ARRAY ARRAY[
     'recording_campaign_prepare_authoritative_frame(bigint,text,bigint)',
     'recording_campaign_authorize_authoritative_frame(bigint,text,bigint,bigint,text)',
-    'recording_campaign_read_probe_order_status(bigint,bigint,bigint,text,uuid)'
+    'recording_campaign_read_probe_order_status(bigint,bigint,bigint,text,uuid)',
+    'recording_campaign_seal_authoritative_frame(bigint,text,bigint,bigint,bigint,text,text)',
+    'recording_campaign_assert_baseline_frame_authority(bigint,text,bigint,bigint)',
+    'validate_recording_campaign_authoritative_frame_witness()'
   ] LOOP
     EXECUTE format('ALTER FUNCTION %I.%s OWNER TO %I',install_schema,signature,authority_role);
     EXECUTE format('ALTER FUNCTION %I.%s SECURITY DEFINER',install_schema,signature);
     EXECUTE format('ALTER FUNCTION %I.%s SET search_path=%I,pg_catalog,pg_temp',install_schema,signature,install_schema);
-    EXECUTE format('REVOKE ALL ON FUNCTION %I.%s FROM PUBLIC',install_schema,signature);
+    EXECUTE format('REVOKE ALL ON FUNCTION %I.%s FROM PUBLIC,%I,%I',install_schema,signature,runtime_role,executor_role);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %I.%s TO %I',install_schema,signature,executor_role);
   END LOOP;
+  EXECUTE format('REVOKE ALL ON FUNCTION %I.validate_recording_campaign_authoritative_frame_witness() FROM %I',install_schema,executor_role);
+  EXECUTE format('ALTER TABLE %I.recording_campaign_authoritative_frame_witnesses OWNER TO %I',install_schema,authority_role);
+  EXECUTE format('REVOKE ALL ON TABLE %I.recording_campaign_authoritative_frame_witnesses FROM PUBLIC,%I,%I',install_schema,runtime_role,executor_role);
 END
 $day0_admission_role_split$;
