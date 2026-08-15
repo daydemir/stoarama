@@ -45,18 +45,25 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 		VALUES('direct','streak','streak','streak','https://example.test/live.m3u8','hls','video_manifest','video_live','continuous_video',30) RETURNING id`).Scan(&streamID); err != nil {
 		t.Fatal(err)
 	}
+	var otherStreamID, envelopeStreamID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES('direct','streak-other','streak other','streak-other','https://example.test/other.m3u8','hls','video_manifest','video_live','continuous_video',30) RETURNING id`).Scan(&otherStreamID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES('direct','streak-envelope','streak envelope','streak-envelope','https://example.test/envelope.m3u8','hls','video_manifest','video_live','continuous_video',30) RETURNING id`).Scan(&envelopeStreamID); err != nil {
+		t.Fatal(err)
+	}
 	open := fixedNow.Truncate(24 * time.Hour).Add(-24*time.Hour + 8*time.Hour)
 	var recID, otherRecID int64
 	insertRec := `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays)
-		VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'active',$3,$4,'continuous','08:00','20:00',127) RETURNING id`
-	if err := pool.QueryRow(ctx, insertRec, accountID, "mine", open.Add(-48*time.Hour), streamID).Scan(&recID); err != nil {
+		VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),$2,$5,'hls_live','0 8 * * *','UTC',60,'active',$3,$4,'continuous','08:00','20:00',127) RETURNING id`
+	if err := pool.QueryRow(ctx, insertRec, accountID, "mine", open.Add(-48*time.Hour), streamID, "https://example.test/live.m3u8").Scan(&recID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, insertRec, otherAccount, "other", open.Add(-48*time.Hour), streamID).Scan(&otherRecID); err != nil {
+	if err := pool.QueryRow(ctx, insertRec, otherAccount, "other", open.Add(-48*time.Hour), otherStreamID, "https://example.test/other.m3u8").Scan(&otherRecID); err != nil {
 		t.Fatal(err)
 	}
 	var envelopeRec int64
-	if err := pool.QueryRow(ctx, insertRec, accountID, "envelope-excluded", open.Add(-48*time.Hour), streamID).Scan(&envelopeRec); err != nil {
+	if err := pool.QueryRow(ctx, insertRec, accountID, "envelope-excluded", open.Add(-48*time.Hour), envelopeStreamID, "https://example.test/envelope.m3u8").Scan(&envelopeRec); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET end_at=$2 WHERE id=$1`, envelopeRec, open.Add(11*time.Hour)); err != nil {
@@ -192,8 +199,12 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	}
 	// Real non-UTC handler path: Sunday-only fall-back window is generated at
 	// local 08:00-20:00 and appears UNKNOWN because its health is absent.
+	var nyStreamID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,capture_type,source_family,execution_class,capture_family,expected_fps) VALUES('direct','streak-ny','streak ny','streak-ny','https://example.test/ny.m3u8','hls','video_manifest','video_live','continuous_video',30) RETURNING id`).Scan(&nyStreamID); err != nil {
+		t.Fatal(err)
+	}
 	var nyRec int64
-	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays) VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),'ny-dst','https://example.test/live.m3u8','hls_live','0 8 * * *','America/New_York',60,'active','2026-10-31',$2,'continuous','08:00','20:00',64) RETURNING id`, accountID, streamID).Scan(&nyRec); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays) VALUES($1,(SELECT id FROM storage_destinations WHERE account_id=$1 LIMIT 1),'ny-dst','https://example.test/ny.m3u8','hls_live','0 8 * * *','America/New_York',60,'active','2026-10-31',$2,'continuous','08:00','20:00',64) RETURNING id`, accountID, nyStreamID).Scan(&nyRec); err != nil {
 		t.Fatal(err)
 	}
 	nyOpen := time.Date(2026, 11, 1, 13, 0, 0, 0, time.UTC)
