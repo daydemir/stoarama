@@ -2475,7 +2475,7 @@ BEGIN
       EXECUTE format('SELECT COALESCE(sum(d.capacity),0)::int,COALESCE(max(d.capacity),0)::int FROM %I.recorder_droplets d JOIN %I.nodes n ON n.id=d.node_id JOIN %I.recording_worker_claim_heads head ON head.node_id=n.id JOIN %I.node_tokens tok ON tok.id=head.claim_token_id WHERE d.state=''active'' AND n.status=''active'' AND n.node_type=''local_recorder'' AND d.last_seen_at BETWEEN recording_campaign_now()-interval ''120 seconds'' AND recording_campaign_now()+interval ''30 seconds'' AND d.build_sha=$1 AND d.size=$2 AND d.do_droplet_id IS NOT NULL AND d.capacity>0 AND encode(sha256(convert_to(d.size||chr(10)||d.build_sha||chr(10)||d.capacity::text||chr(10)||$3||chr(10)||$4,''UTF8'')),''hex'')=$5 AND head.state=''enabled'' AND tok.revoked_at IS NULL AND tok.recording_claim_purpose=''claim_current'' AND tok.recording_claim_generation=head.generation',s,s,s,s)
         INTO current_total,current_largest USING expected_build,expected_size,expected_project,expected_firewall,expected_pool;
       usable_slots:=current_total-current_largest;
-      IF active_cloud+CASE WHEN NEW.capture_via='cloud' THEN 1 ELSE 0 END>usable_slots THEN
+      IF active_cloud + (CASE WHEN NEW.capture_via='cloud' THEN 1 ELSE 0 END) > usable_slots THEN
         RAISE EXCEPTION 'campaign one-worker-loss capacity head is permanently enforced';
       END IF;
       EXECUTE format('SELECT active_demand,failure_domains,usable_after_largest_loss FROM %I.recording_campaign_relay_failure_capacity($1)',s)

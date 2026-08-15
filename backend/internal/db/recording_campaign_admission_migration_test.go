@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -808,6 +809,9 @@ func TestRecordingCampaignAdmissionMigrationUsesBootstrapSearchPathOnlyBeforePin
 	}
 	if strings.Contains(sql, ") day") {
 		t.Fatal("admission SQL uses the datetime keyword day as a bare generate_series alias")
+	}
+	if regexp.MustCompile(`(?m)\bIF[^\n]*[+*/-]\s*CASE\b[^\n]*\bEND[^\n]*\bTHEN\b`).MatchString(sql) {
+		t.Fatal("admission SQL uses an unparenthesized arithmetic CASE in a PL/pgSQL IF condition")
 	}
 }
 
