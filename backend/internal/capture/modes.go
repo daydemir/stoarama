@@ -63,7 +63,7 @@ type Registry struct {
 	adapters map[Mode]Adapter
 }
 
-func NewRegistry(adapters ...Adapter) (*Registry, error) {
+func newRegistry(adapters ...Adapter) (*Registry, error) {
 	m := make(map[Mode]Adapter, len(adapters))
 	for _, a := range adapters {
 		if a == nil {
@@ -82,7 +82,7 @@ func NewRegistry(adapters ...Adapter) (*Registry, error) {
 }
 
 func NewDefaultRegistry() (*Registry, error) {
-	return NewRegistry(
+	return newRegistry(
 		&youtubeLiveAdapter{},
 		&hlsLiveAdapter{},
 		&imagePollAdapter{},

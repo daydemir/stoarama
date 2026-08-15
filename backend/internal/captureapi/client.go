@@ -214,7 +214,7 @@ func (c *Client) reserveSegmentUpload(ctx context.Context, kind string, idempote
 	headers := map[string]string{
 		"Idempotency-Key": buildIdempotencyKey(idempotencyPrefix, req.StreamID),
 	}
-	if err := c.postJSONWithHeaders(ctx, "/api/v1/media/upload-intents", payload, headers, &out); err != nil {
+	if err := c.api.PostJSONWithHeaders(ctx, "/api/v1/media/upload-intents", payload, headers, &out); err != nil {
 		return SegmentUploadIntent{}, err
 	}
 	return SegmentUploadIntent{
@@ -333,15 +333,7 @@ func (c *Client) MarkUnsupported(ctx context.Context, streamID int64, effective 
 		"resolved_url":    strings.TrimSpace(resolvedURL),
 		"reason":          reason,
 	}
-	return c.postJSON(ctx, "/api/v1/capture/mark-unsupported", payload, nil)
-}
-
-func (c *Client) postJSON(ctx context.Context, path string, payload any, out any) error {
-	return c.api.PostJSON(ctx, path, payload, out)
-}
-
-func (c *Client) postJSONWithHeaders(ctx context.Context, path string, payload any, headers map[string]string, out any) error {
-	return c.api.PostJSONWithHeaders(ctx, path, payload, headers, out)
+	return c.api.PostJSON(ctx, "/api/v1/capture/mark-unsupported", payload, nil)
 }
 
 func buildIdempotencyKey(prefix string, streamID int64) string {
@@ -353,7 +345,7 @@ func buildIdempotencyKey(prefix string, streamID int64) string {
 
 func (c *Client) postJSONWithRetry(ctx context.Context, path string, payload any, out any, attempts int) error {
 	if attempts <= 1 {
-		return c.postJSON(ctx, path, payload, out)
+		return c.api.PostJSON(ctx, path, payload, out)
 	}
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -366,7 +358,7 @@ func (c *Client) postJSONWithRetry(ctx context.Context, path string, payload any
 			}
 		}
 
-		err := c.postJSON(ctx, path, payload, out)
+		err := c.api.PostJSON(ctx, path, payload, out)
 		if err == nil {
 			return nil
 		}
