@@ -236,6 +236,17 @@ func TestInstallLaunchdUserDomainRequiresExistingDomain(t *testing.T) {
 	}
 }
 
+func TestLaunchdMissingDomainExitIsNotLoaded(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd probe is macOS-only")
+	}
+	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 125; fi; exit 0`)
+	loaded, err := launchdJobLoadedBounded("gui/503/" + launchdLabel)
+	if err != nil || loaded {
+		t.Fatalf("loaded=%v error=%v", loaded, err)
+	}
+}
+
 func TestInstallLaunchdUserDomainRejectsCookieMode(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd install is macOS-only")

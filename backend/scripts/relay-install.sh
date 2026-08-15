@@ -356,9 +356,11 @@ echo ""
 if [[ "${OS}" == "darwin" ]]; then
   LAUNCHD_ARGS=(install-launchd)
   [[ "${USER_DOMAIN}" -eq 1 ]] && LAUNCHD_ARGS+=(--user-domain)
-  "${BIN_DIR}/stoarama-relay" "${LAUNCHD_ARGS[@]}" && INSTALL_COMMITTED=1
+  "${BIN_DIR}/stoarama-relay" "${LAUNCHD_ARGS[@]}"
+  INSTALL_COMMITTED=1
 else
-  "${BIN_DIR}/stoarama-relay" install-systemd && INSTALL_COMMITTED=1
+  "${BIN_DIR}/stoarama-relay" install-systemd
+  INSTALL_COMMITTED=1
 fi
 
 echo ""
