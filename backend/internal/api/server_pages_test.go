@@ -378,6 +378,9 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`Whole period`,
 		`native layout changed`,
 		`continuous timeline · native layout compatible`,
+		`dailyGradesHTML(timeline.daily_grades, timezone)`,
+		`A–C good · D degraded · E poor · F no usable media · ? not yet measurable`,
+		`daily-grade ${grade.toLowerCase()}`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings list health-column layout missing %q", marker)

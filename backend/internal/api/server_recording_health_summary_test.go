@@ -26,3 +26,35 @@ func TestClassifyRecordingTimelineHealth(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyRecordingDailyGrade(t *testing.T) {
+	metric := func(coverage, gap float64, over30, over5, overlaps, version int) qualificationWindowMetrics {
+		expected := int64(43200)
+		return qualificationWindowMetrics{
+			CoveragePct: &coverage, LargestGap: &gap, GapsOver30s: &over30, GapsOver5m: &over5,
+			OverlapCount: &overlaps, MetricVersion: &version, ExpectedSeconds: expected,
+			MeasuredExpected: &expected, JobCount: 1, HealthCount: 1,
+		}
+	}
+	tests := []struct {
+		name  string
+		m     qualificationWindowMetrics
+		clips int
+		want  string
+	}{
+		{"great", metric(99, 120, 1, 0, 0, 2), 10, "A"},
+		{"good", metric(95, 900, 6, 1, 0, 2), 10, "B"},
+		{"acceptable", metric(90, 1800, 9, 2, 0, 2), 10, "C"},
+		{"degraded", metric(80, 2000, 9, 3, 0, 2), 10, "D"},
+		{"poor", metric(79.99, 2000, 9, 3, 0, 2), 10, "E"},
+		{"blackout", metric(0, 43200, 1, 1, 0, 2), 0, "F"},
+		{"unknown metric", metric(100, 0, 0, 0, 0, 1), 10, "UNKNOWN"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, _ := classifyRecordingDailyGrade(tc.m, tc.clips); got != tc.want {
+				t.Fatalf("grade=%s want=%s", got, tc.want)
+			}
+		})
+	}
+}
