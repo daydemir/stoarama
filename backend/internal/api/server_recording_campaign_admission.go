@@ -433,7 +433,7 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 	if s.campaignDOAttest == nil || strings.TrimSpace(s.cfg.DropletPoolBuildSHA) == "" {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("managed cloud capacity attestation is unavailable")
 	}
-	observationStartedAt := time.Now().UTC()
+	observationStartedAt := time.Now().UTC().Truncate(time.Microsecond)
 	type worker struct {
 		ID, NodeID, DOID, ClaimTokenID, ClaimGeneration int64
 		Name, Region, Size, Build                       string
@@ -507,7 +507,7 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 	}
 	factsDigest := sha256.Sum256([]byte(strings.Join(factLines, "\n") + "\n"))
 	observation.FactsSHA256 = hex.EncodeToString(factsDigest[:])
-	observation.ObservedAt = time.Now().UTC()
+	observation.ObservedAt = time.Now().UTC().Truncate(time.Microsecond)
 	if observation.ObservedAt.Before(observation.ObservationStartedAt) || observation.ObservedAt.Sub(observation.ObservationStartedAt) > 120*time.Second {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity observation interval is invalid")
 	}
