@@ -73,13 +73,13 @@ BEGIN
 		           WHERE producer.node_id=NEW.node_id
 		             AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id))
 		 OR EXISTS(
-		   SELECT 1 FROM recording_capture_set_grants grant
-		   JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+		   SELECT 1 FROM recording_capture_set_grants set_grant
+		   JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
 		   JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		   JOIN recording_job_lease_generations lease
 		     ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
 		   WHERE lease.node_id=NEW.node_id AND plan.origin_claim_generation=NEW.generation
-		     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
+		     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
 		 ) THEN
 		  RAISE EXCEPTION 'claim terminal event lacks exact drained credential';
     END IF;
@@ -204,13 +204,13 @@ BEGIN
       SELECT * INTO head FROM recording_worker_claim_heads WHERE node_id=NEW.node_id FOR UPDATE;
       IF head.node_id IS NULL OR head.state<>'recovery_blocked' OR head.block_reason<>'durable_recovery'
          OR NEW.recording_claim_generation<>head.generation+1
-         OR EXISTS(SELECT 1 FROM recording_capture_set_grants grant
-                   JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+         OR EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant
+                   JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
                    JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
                    JOIN recording_job_lease_generations generation
                      ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
                    WHERE generation.node_id=NEW.node_id AND plan.origin_claim_generation=head.generation
-                     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)) THEN
+                     AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)) THEN
         RAISE EXCEPTION 'explicit recording claim successor lacks terminal blocked authority';
       END IF;
       RETURN NEW;
@@ -641,16 +641,16 @@ BEGIN
      OR EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=NEW.set_id)
      OR NOT EXISTS(
        SELECT 1
-       FROM recording_capture_set_grants grant
-       JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+       FROM recording_capture_set_grants set_grant
+       JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
        JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
        JOIN recording_job_lease_generations lease
          ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
        JOIN recording_worker_claim_heads head ON head.node_id=lease.node_id
-       WHERE grant.id=NEW.grant_id AND grant.set_id=NEW.set_id AND lease.node_id=NEW.node_id
-         AND grant.upload_grace_until>transaction_timestamp()
+       WHERE set_grant.id=NEW.grant_id AND set_grant.set_id=NEW.set_id AND lease.node_id=NEW.node_id
+         AND set_grant.upload_grace_until>transaction_timestamp()
          AND head.state IN('recovery_blocked','successor_pending','enabled')
-         AND head.generation>=grant.recovery_block_generation
+         AND head.generation>=set_grant.recovery_block_generation
      ) THEN
     RAISE EXCEPTION 'empty capture set report lacks exact live recovery authority';
   END IF;
@@ -1312,13 +1312,13 @@ BEGIN
      OR token.recording_claim_purpose<>'existing_fence_only'
      OR token.key_prefix<>NEW.successor_key_prefix
      OR token.secret_hash<>NEW.successor_secret_sha256
-     OR EXISTS(SELECT 1 FROM recording_capture_set_grants grant
-               JOIN recording_capture_set_plans plan ON plan.id=(SELECT capture_set.plan_id FROM recording_capture_reservation_sets capture_set WHERE capture_set.id=grant.set_id)
+     OR EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant
+               JOIN recording_capture_set_plans plan ON plan.id=(SELECT capture_set.plan_id FROM recording_capture_reservation_sets capture_set WHERE capture_set.id=set_grant.set_id)
                WHERE plan.origin_claim_generation=NEW.predecessor_generation
                  AND EXISTS(SELECT 1 FROM recording_job_lease_generations generation
                             WHERE generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
                               AND generation.node_id=NEW.node_id)
-                 AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)) THEN
+                 AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)) THEN
     RAISE EXCEPTION 'claim successor proposal lacks terminal recovery authority';
   END IF;
   RETURN NEW;
@@ -1556,8 +1556,8 @@ CREATE FUNCTION recording_surrender_validate_recovery_report() RETURNS trigger L
 DECLARE grace_until TIMESTAMPTZ;
 BEGIN
   NEW.received_at:=transaction_timestamp();
-  SELECT grant.upload_grace_until INTO grace_until
-  FROM recording_capture_set_grants grant WHERE grant.set_id=NEW.set_id FOR SHARE;
+  SELECT set_grant.upload_grace_until INTO grace_until
+  FROM recording_capture_set_grants set_grant WHERE set_grant.set_id=NEW.set_id FOR SHARE;
   IF NOT FOUND OR NEW.received_at>grace_until OR NEW.local_observed_at>NEW.received_at+interval '1 minute'
      OR NEW.local_observed_at<NEW.received_at-interval '30 minutes' THEN
     RAISE EXCEPTION 'recovery report is outside its exact grant window';
@@ -1578,8 +1578,8 @@ CREATE FUNCTION recording_surrender_validate_artifact_grant_result() RETURNS tri
 DECLARE report_type TEXT; event_set UUID; event_ordinal INTEGER; grace_until TIMESTAMPTZ; ack_matches BOOLEAN;
 BEGIN
   NEW.result_at:=transaction_timestamp();
-  SELECT grant.upload_grace_until INTO grace_until FROM recording_capture_set_grants grant
-  WHERE grant.set_id=NEW.set_id FOR SHARE;
+  SELECT set_grant.upload_grace_until INTO grace_until FROM recording_capture_set_grants set_grant
+  WHERE set_grant.set_id=NEW.set_id FOR SHARE;
   IF NEW.report_id IS NOT NULL THEN
     SELECT report.report_type INTO report_type FROM recording_capture_recovery_reports report
     WHERE report.id=NEW.report_id AND report.set_id=NEW.set_id AND report.ordinal=NEW.ordinal;
@@ -1607,7 +1607,7 @@ BEGIN
 	  WHERE ack.id=NEW.stop_ack_id AND ack.set_id=NEW.set_id AND member.size_bytes=0
 	    AND job.status='leased' AND job.lease_token=plan.lease_token
 	    AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact'
-	    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_grants grant WHERE grant.set_id=NEW.set_id)
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant WHERE set_grant.set_id=NEW.set_id)
 	) INTO ack_matches;
 	IF NOT ack_matches OR NEW.report_id IS NOT NULL OR NEW.clip_id IS NOT NULL OR NEW.security_event_id IS NOT NULL THEN
 	  RAISE EXCEPTION 'acknowledged no-bytes result lacks exact immutable zero-byte inventory'; END IF;
@@ -1715,8 +1715,8 @@ BEGIN
        (EXISTS(SELECT 1 FROM recording_capture_materialized_artifacts artifact WHERE artifact.set_id=NEW.set_id)
         AND NOT EXISTS(SELECT 1 FROM recording_capture_artifact_grant_results result
                        WHERE result.set_id=NEW.set_id AND result.result='host_unreachable'))
-       OR NOT EXISTS(SELECT 1 FROM recording_capture_set_grants grant
-                     WHERE grant.set_id=NEW.set_id AND grant.upload_grace_until<=transaction_timestamp())
+       OR NOT EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant
+                     WHERE set_grant.set_id=NEW.set_id AND set_grant.upload_grace_until<=transaction_timestamp())
        OR EXISTS(SELECT 1 FROM recording_capture_artifact_grant_results result
                  WHERE result.set_id=NEW.set_id AND result.result='security_revoked')
      ) THEN RAISE EXCEPTION 'host-unreachable capture set has invalid terminal outcomes'; END IF;
@@ -2831,10 +2831,10 @@ BEGIN
 		  SELECT count(*) INTO set_granted
 		  FROM recording_capture_reservation_sets capture_set
 		  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
-		  JOIN recording_capture_set_grants grant ON grant.set_id=capture_set.id
+		  JOIN recording_capture_set_grants set_grant ON set_grant.set_id=capture_set.id
 		  WHERE plan.recording_job_id=OLD.id AND plan.lease_token=OLD.lease_token
 		    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
-		    AND grant.upload_grace_until>transaction_timestamp();
+		    AND set_grant.upload_grace_until>transaction_timestamp();
 		  IF granted<>nonterminal OR set_granted<>set_nonterminal OR NOT EXISTS(
         SELECT 1 FROM recording_job_lease_expiry_events event
         WHERE event.recording_job_id=OLD.id AND event.lease_token=OLD.lease_token
@@ -2941,19 +2941,19 @@ BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0));
   PERFORM recording_surrender_reconcile_expired_upload_sessions();
   FOR target IN
-    SELECT grant.id,grant.set_id,grant.upload_grace_until,plan.recording_job_id,plan.lease_token,
+    SELECT set_grant.id,set_grant.set_id,set_grant.upload_grace_until,plan.recording_job_id,plan.lease_token,
            generation.node_id,capture_set.artifact_count
-    FROM recording_capture_set_grants grant
-    JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+    FROM recording_capture_set_grants set_grant
+    JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
     JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
     JOIN recording_job_lease_generations generation
       ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
-    WHERE grant.upload_grace_until<=transaction_timestamp()
-      AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
-    ORDER BY generation.node_id,grant.set_id
+    WHERE set_grant.upload_grace_until<=transaction_timestamp()
+      AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
+    ORDER BY generation.node_id,set_grant.set_id
   LOOP
     PERFORM 1 FROM nodes WHERE id=target.node_id FOR UPDATE;
-    PERFORM 1 FROM recording_capture_set_grants grant WHERE grant.id=target.id FOR UPDATE;
+    PERFORM 1 FROM recording_capture_set_grants set_grant WHERE set_grant.id=target.id FOR UPDATE;
     IF EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=target.set_id) THEN CONTINUE; END IF;
     SELECT greatest(
       COALESCE((SELECT node.last_heartbeat_at FROM nodes node WHERE node.id=target.node_id),'-infinity'::timestamptz),

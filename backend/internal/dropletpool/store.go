@@ -223,13 +223,13 @@ func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64)
 				WHERE producer.node_id=$2
 				  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
 				UNION ALL
-				SELECT 1 FROM recording_capture_set_grants grant
-				JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+				SELECT 1 FROM recording_capture_set_grants set_grant
+				JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
 				JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 				JOIN recording_job_lease_generations lease
 				  ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
 				WHERE lease.node_id=$2 AND plan.origin_claim_generation=$3
-				  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
+				  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
 				UNION ALL
 				SELECT 1
 				WHERE recording_worker_targeted_probe_occupancy($2)>0

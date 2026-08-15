@@ -114,18 +114,18 @@ func (s *Server) authenticateRecordingRecovery(r *http.Request) (recordingRecove
 	secretHash := sha256.Sum256(secretBytes)
 	var out recordingRecoveryPrincipal
 	err = s.pool.QueryRow(r.Context(), `
-		SELECT grant.id,artifact.artifact_id,plan.producer_id,artifact.set_id,artifact.ordinal,
+		SELECT set_grant.id,artifact.artifact_id,plan.producer_id,artifact.set_id,artifact.ordinal,
 		       plan.recording_job_id,plan.lease_token,generation.lease_owner,generation.node_id,node.account_id,
-		       node.node_type,grant.upload_grace_until
+		       node.node_type,set_grant.upload_grace_until
 		FROM recording_capture_materialized_artifacts artifact
-		JOIN recording_capture_set_grants grant ON grant.set_id=artifact.set_id
+		JOIN recording_capture_set_grants set_grant ON set_grant.set_id=artifact.set_id
 		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=artifact.set_id
 		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		JOIN recording_job_lease_generations generation
 		  ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
 		JOIN nodes node ON node.id=generation.node_id
 		WHERE artifact.artifact_id=$1 AND artifact.recovery_secret_sha256=$2
-		  AND grant.upload_grace_until>transaction_timestamp()
+		  AND set_grant.upload_grace_until>transaction_timestamp()
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
 		                 WHERE event.set_id=artifact.set_id AND (event.ordinal IS NULL OR event.ordinal=artifact.ordinal))
 	`, intentID, hex.EncodeToString(secretHash[:])).Scan(
@@ -358,24 +358,24 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 	var grantDeadline, sessionDeadline time.Time
 	err = tx.QueryRow(r.Context(), `
 		SELECT intent.endpoint,plan.destination_naming_snapshot->>'region',intent.bucket,intent.object_key,intent.mime_type,
-		       destination.access_key_id,destination.secret_access_key_enc,seal.size_bytes,seal.sha256,grant.upload_grace_until,
+		       destination.access_key_id,destination.secret_access_key_enc,seal.size_bytes,seal.sha256,set_grant.upload_grace_until,
 		       COALESCE((SELECT max(session.revision) FROM recording_recovery_upload_sessions session
 		                 WHERE session.set_id=artifact.set_id AND session.ordinal=artifact.ordinal),0)+1
 		FROM recording_capture_materialized_artifacts artifact
-		JOIN recording_capture_set_grants grant ON grant.set_id=artifact.set_id
+		JOIN recording_capture_set_grants set_grant ON set_grant.set_id=artifact.set_id
 		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=artifact.set_id
 		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		JOIN recording_capture_materialized_artifact_seals seal
 		  ON seal.set_id=artifact.set_id AND seal.ordinal=artifact.ordinal AND seal.artifact_id=artifact.artifact_id
 		JOIN recording_upload_intents intent ON intent.id=artifact.artifact_id AND intent.status='pending'
 		JOIN storage_destinations destination ON destination.id=intent.storage_destination_id
-		WHERE artifact.artifact_id=$1 AND artifact.set_id=$2 AND artifact.ordinal=$3 AND grant.id=$4
-		  AND grant.upload_grace_until>transaction_timestamp()
+		WHERE artifact.artifact_id=$1 AND artifact.set_id=$2 AND artifact.ordinal=$3 AND set_grant.id=$4
+		  AND set_grant.upload_grace_until>transaction_timestamp()
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
 		                 WHERE event.set_id=artifact.set_id AND (event.ordinal IS NULL OR event.ordinal=artifact.ordinal))
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_artifact_grant_results result
 		                 WHERE result.set_id=artifact.set_id AND result.ordinal=artifact.ordinal)
-		FOR UPDATE OF artifact,grant,seal,intent,destination
+		FOR UPDATE OF artifact,set_grant,seal,intent,destination
 	`, intentID, recovery.SetID, recovery.Ordinal, recovery.GrantID).Scan(
 		&endpoint, &region, &bucket, &objectKey, &mimeType, &accessKeyID, &secretEnc,
 		&expectedSize, &expectedSHA, &grantDeadline, &revision)
@@ -577,14 +577,14 @@ func (s *Server) handleRecordingRecoveryProxyUpload(w http.ResponseWriter, r *ht
 	}
 	var stillAuthorized bool
 	err = promotionTx.QueryRow(r.Context(), `
-		SELECT grant.upload_grace_until>transaction_timestamp()
+		SELECT set_grant.upload_grace_until>transaction_timestamp()
 		 AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
 		                WHERE event.set_id=$2 AND (event.ordinal IS NULL OR event.ordinal=$3))
 		 AND session.revision=(SELECT max(latest.revision) FROM recording_recovery_upload_sessions latest
 		                       WHERE latest.set_id=$2 AND latest.ordinal=$3)
-		FROM recording_capture_set_grants grant
-		JOIN recording_recovery_upload_sessions session ON session.id=$1 AND session.set_id=grant.set_id
-		WHERE grant.id=$4 FOR SHARE OF grant,session
+		FROM recording_capture_set_grants set_grant
+		JOIN recording_recovery_upload_sessions session ON session.id=$1 AND session.set_id=set_grant.set_id
+		WHERE set_grant.id=$4 FOR SHARE OF set_grant,session
 	`, sessionID, recovery.SetID, recovery.Ordinal, recovery.GrantID).Scan(&stillAuthorized)
 	if err != nil || !stillAuthorized {
 		result := "aborted"
@@ -663,13 +663,13 @@ func (s *Server) handleRecordingRecoveryReport(w http.ResponseWriter, r *http.Re
 	}
 	var current bool
 	if err = tx.QueryRow(r.Context(), `
-		SELECT grant.id=$4 AND grant.upload_grace_until>transaction_timestamp()
+		SELECT set_grant.id=$4 AND set_grant.upload_grace_until>transaction_timestamp()
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
 		                 WHERE event.set_id=artifact.set_id AND (event.ordinal IS NULL OR event.ordinal=artifact.ordinal))
 		FROM recording_capture_materialized_artifacts artifact
-		JOIN recording_capture_set_grants grant ON grant.set_id=artifact.set_id
+		JOIN recording_capture_set_grants set_grant ON set_grant.set_id=artifact.set_id
 		WHERE artifact.artifact_id=$1 AND artifact.set_id=$2 AND artifact.ordinal=$3
-		FOR UPDATE OF artifact,grant
+		FOR UPDATE OF artifact,set_grant
 	`, intentID, recovery.SetID, recovery.Ordinal, recovery.GrantID).Scan(&current); err != nil || !current {
 		util.WriteError(w, http.StatusConflict, "recovery artifact report authority is stale")
 		return
@@ -957,13 +957,13 @@ func (s *Server) handleRecordingClaimSuccessorPropose(w http.ResponseWriter, r *
 	var recoveryPending bool
 	if err = tx.QueryRow(r.Context(), `
 		SELECT EXISTS(
-		  SELECT 1 FROM recording_capture_set_grants grant
-		  JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+		  SELECT 1 FROM recording_capture_set_grants set_grant
+		  JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
 		  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		  JOIN recording_job_lease_generations generation
 		    ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
 		  WHERE generation.node_id=$1 AND plan.origin_claim_generation=$2
-		    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
+		    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
 		)
 	`, principal.NodeID, predecessor).Scan(&recoveryPending); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load claim recovery state")
@@ -1125,12 +1125,12 @@ func (s *Server) handleRecordingRecoveryStatus(w http.ResponseWriter, r *http.Re
 			  ON seal.set_id=artifact.set_id AND seal.ordinal=artifact.ordinal
 			LEFT JOIN recording_capture_artifact_grant_results result
 			  ON result.set_id=artifact.set_id AND result.ordinal=artifact.ordinal
-			JOIN recording_capture_set_grants grant ON grant.set_id=artifact.set_id
+			JOIN recording_capture_set_grants set_grant ON set_grant.set_id=artifact.set_id
 			WHERE artifact.artifact_id=$1 AND artifact.set_id=$2 AND artifact.ordinal=$3
-			  AND grant.id=$4 AND grant.upload_grace_until>transaction_timestamp()
+			  AND set_grant.id=$4 AND set_grant.upload_grace_until>transaction_timestamp()
 			  AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
 			                 WHERE event.set_id=artifact.set_id AND (event.ordinal IS NULL OR event.ordinal=artifact.ordinal))
-			FOR SHARE OF artifact,grant
+			FOR SHARE OF artifact,set_grant
 		`, intentID, recovery.SetID, recovery.Ordinal, recovery.GrantID).Scan(&captureSequence, &segmentStartMicro, &size, &sha, &result)
 		if err != nil {
 			util.WriteError(w, http.StatusConflict, "recovery artifact is unavailable")
@@ -1687,16 +1687,16 @@ func (s *Server) handleRecordingCaptureArtifactMaterialize(w http.ResponseWriter
 		       plan.first_capture_sequence,
 		       (recording_surrender_token_can_access_lease($6,$7,job.lease_node_token_id,job.lease_claim_generation)
 		           OR (token.recording_claim_generation=plan.origin_claim_generation
-		             AND EXISTS(SELECT 1 FROM recording_capture_set_grants grant
-		                        WHERE grant.set_id=reservation.id AND grant.upload_grace_until>transaction_timestamp())
+		             AND EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant
+		                        WHERE set_grant.set_id=reservation.id AND set_grant.upload_grace_until>transaction_timestamp())
 		             AND EXISTS(SELECT 1 FROM recording_job_lease_generations generation
 		                        WHERE generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
 		                          AND generation.node_id=$7)))),
 		       (job.status='leased' AND job.lease_owner=$5 AND job.lease_token=$4
 		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact'
 		         AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events stop WHERE stop.set_id=reservation.id))
-		       OR EXISTS(SELECT 1 FROM recording_capture_set_grants grant
-		                 WHERE grant.set_id=reservation.id AND grant.upload_grace_until>transaction_timestamp())
+		       OR EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant
+		                 WHERE set_grant.set_id=reservation.id AND set_grant.upload_grace_until>transaction_timestamp())
 		FROM recording_capture_reservation_sets reservation
 		JOIN recording_capture_set_plans plan ON plan.id=reservation.plan_id
 		JOIN recording_jobs job ON job.id=plan.recording_job_id
@@ -2122,7 +2122,7 @@ func (s *Server) handleRecordingCaptureSetEmptyRecovery(w http.ResponseWriter, r
 	var artifactCount int
 	var authorized bool
 	err = tx.QueryRow(r.Context(), `
-		SELECT grant.id,capture_set.artifact_count,
+		SELECT set_grant.id,capture_set.artifact_count,
 		       generation.node_id=$4 AND (
 		         EXISTS(SELECT 1 FROM node_tokens token
 		                WHERE token.id=$5 AND token.node_id=generation.node_id AND token.revoked_at IS NULL
@@ -2131,17 +2131,17 @@ func (s *Server) handleRecordingCaptureSetEmptyRecovery(w http.ResponseWriter, r
 		         OR EXISTS(SELECT 1 FROM recording_worker_claim_heads head
 		                   JOIN node_tokens token ON token.id=head.claim_token_id
 		                   WHERE head.node_id=generation.node_id AND head.claim_token_id=$5
-		                     AND head.state='enabled' AND head.generation>=grant.recovery_block_generation
+		                     AND head.state='enabled' AND head.generation>=set_grant.recovery_block_generation
 		                     AND token.revoked_at IS NULL AND token.recording_claim_purpose='claim_current'))
-		FROM recording_capture_set_grants grant
-		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+		FROM recording_capture_set_grants set_grant
+		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
 		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		JOIN recording_job_lease_generations generation
 		  ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
-		WHERE grant.set_id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
-		  AND grant.upload_grace_until>transaction_timestamp()
+		WHERE set_grant.set_id=$1 AND plan.recording_job_id=$2 AND plan.lease_token=$3
+		  AND set_grant.upload_grace_until>transaction_timestamp()
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_materialized_artifacts artifact WHERE artifact.set_id=capture_set.id)
-		FOR UPDATE OF grant,capture_set,plan
+		FOR UPDATE OF set_grant,capture_set,plan
 	`, setID, jobID, leaseToken, principal.NodeID, principal.NodeTokenID).Scan(&grantID, &artifactCount, &authorized)
 	if err != nil || !authorized {
 		util.WriteError(w, http.StatusConflict, "empty capture set recovery authority is unavailable")

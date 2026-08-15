@@ -1004,8 +1004,8 @@ func (s *Server) handleRecordingCaptureSetArtifactSeal(w http.ResponseWriter, r 
 		       plan.source_snapshot_sha256,plan.destination_naming_sha256,
 		       plan.first_capture_sequence+$3-1,
 		       (NOT $10 AND recording_surrender_token_can_access_lease($5,$6,job.lease_node_token_id,job.lease_claim_generation))
-		       OR ($10 AND EXISTS(SELECT 1 FROM recording_capture_set_grants grant
-		          WHERE grant.id=$11 AND grant.set_id=artifact.set_id AND grant.upload_grace_until>transaction_timestamp()
+		       OR ($10 AND EXISTS(SELECT 1 FROM recording_capture_set_grants set_grant
+		          WHERE set_grant.id=$11 AND set_grant.set_id=artifact.set_id AND set_grant.upload_grace_until>transaction_timestamp()
 		            AND NOT EXISTS(SELECT 1 FROM recording_capture_security_events event
 		                           WHERE event.set_id=artifact.set_id AND (event.ordinal IS NULL OR event.ordinal=artifact.ordinal)))),
 		       (NOT $10 AND job.status='leased' AND job.lease_owner=$7 AND job.lease_token=$4

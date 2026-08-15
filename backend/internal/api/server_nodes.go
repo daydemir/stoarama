@@ -577,13 +577,13 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 		WHERE producer.node_id=$1
 		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
 		UNION ALL
-		SELECT 1 FROM recording_capture_set_grants grant
-		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=grant.set_id
+		SELECT 1 FROM recording_capture_set_grants set_grant
+		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
 		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
 		JOIN recording_job_lease_generations lease
 		  ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
 		WHERE lease.node_id=$1
-		  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=grant.set_id)
+		  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
 	)`, id).Scan(&recoveryBusy); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "load node recovery authority")
 		return

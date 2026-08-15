@@ -8,10 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -566,6 +570,7 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	pool, cleanup := testPresentationV2Pool(t)
 	defer cleanup()
 	ctx := context.Background()
+	prepareRecordingCaptureSetGrantQueries(t, ctx, pool)
 	fixture := seedPresentationV2Task(t, pool, 92001, 992001)
 	if _, err := pool.Exec(ctx, `
 		UPDATE nodes SET node_type='relay',display_name='r10-relay' WHERE id=$1;
@@ -731,7 +736,7 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	var zeroCurrentLease bool
 	if err = pool.QueryRow(ctx, `
 		SELECT result.result,job.status,job.lease_token=$3 AND job.lease_expires_at>transaction_timestamp(),head.state,
-		       (SELECT count(*) FROM recording_capture_set_grants grant WHERE grant.set_id=$1),
+		       (SELECT count(*) FROM recording_capture_set_grants set_grant WHERE set_grant.set_id=$1),
 		       (SELECT count(*) FROM recording_job_lease_expiry_events expiry WHERE expiry.recording_job_id=$2 AND expiry.lease_token=$3),
 		       (SELECT count(*) FROM recording_worker_claim_successor_proposals successor WHERE successor.node_id=$4)
 		FROM recording_capture_artifact_grant_results result
@@ -1439,6 +1444,50 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	}
 	if _, err = pool.Exec(ctx, `TRUNCATE stream_source_revisions`); err == nil {
 		t.Fatal("referenced source revision lineage was truncatable")
+	}
+}
+
+func prepareRecordingCaptureSetGrantQueries(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	files := []string{
+		"server_recording_surrender_transport.go",
+		"server_recording_clips.go",
+		"server_nodes.go",
+		filepath.Join("..", "dropletpool", "store.go"),
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire PostgreSQL parser connection: %v", err)
+	}
+	defer conn.Release()
+	prepared := 0
+	for _, path := range files {
+		syntax, parseErr := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse runtime SQL owner %s: %v", path, parseErr)
+		}
+		ast.Inspect(syntax, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			query, unquoteErr := strconv.Unquote(literal.Value)
+			if unquoteErr != nil || !strings.Contains(query, "recording_capture_set_grants set_grant") {
+				return true
+			}
+			prepared++
+			name := pgx.Identifier{fmt.Sprintf("surrender_set_grant_%02d", prepared)}.Sanitize()
+			if _, prepareErr := conn.Exec(ctx, "PREPARE "+name+" AS "+query); prepareErr != nil {
+				t.Fatalf("prepare runtime set-grant query %s #%d: %v", path, prepared, prepareErr)
+			}
+			if _, deallocateErr := conn.Exec(ctx, "DEALLOCATE "+name); deallocateErr != nil {
+				t.Fatalf("deallocate runtime set-grant query %s #%d: %v", path, prepared, deallocateErr)
+			}
+			return true
+		})
+	}
+	if prepared != 13 {
+		t.Fatalf("prepared %d runtime set-grant queries, want exact reviewed 13", prepared)
 	}
 }
 
