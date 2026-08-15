@@ -3296,7 +3296,8 @@ func (s *Server) persistAuthoritativeFrameSuccess(ctx context.Context, accountID
 }
 
 func (s *Server) persistAuthoritativeFrameAuthorized(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, decisionAuthorized bool) (authoritativeFrameResult, error) {
-	return s.persistAuthoritativeFrameAuthorizedWithStorage(ctx, accountID, streamID, capturedAt, frame, decisionAuthorized, s.r2.Bucket(), s.r2.PutBytes)
+	objects := s.campaignProbeObjects()
+	return s.persistAuthoritativeFrameAuthorizedWithStorage(ctx, accountID, streamID, capturedAt, frame, decisionAuthorized, objects.Bucket(), objects.PutBytes)
 }
 
 func (s *Server) persistAuthoritativeFrameSuccessWithStorage(ctx context.Context, accountID, streamID int64, capturedAt time.Time, frame capture.Frame, bucket string, put func(context.Context, string, string, []byte) (string, error)) error {

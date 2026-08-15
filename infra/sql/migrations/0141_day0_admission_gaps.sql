@@ -11,8 +11,7 @@ CREATE TABLE recording_campaign_authoritative_frame_witnesses (
   media_object_id BIGINT NOT NULL REFERENCES media_objects(id) ON DELETE RESTRICT,
   frame_sha256 TEXT NOT NULL CHECK(frame_sha256~'^[0-9a-f]{64}$'),
   witnessed_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
-  witness_sha256 TEXT NOT NULL CHECK(witness_sha256~'^[0-9a-f]{64}$'),
-  UNIQUE(account_id,stream_id,frame_id)
+  witness_sha256 TEXT NOT NULL CHECK(witness_sha256~'^[0-9a-f]{64}$')
 );
 
 CREATE FUNCTION recording_campaign_prepare_authoritative_frame(

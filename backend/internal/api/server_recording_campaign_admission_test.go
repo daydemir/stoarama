@@ -336,6 +336,8 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		return dropletpool.ProviderAttestation{DropletID: dropletID, Name: name, Region: region, SizeSlug: "s-2vcpu-4gb", Status: "active"}, nil
 	}
 	userID, accountID := seedUserOrg(t, pool, "deniz@example.test", true)
+	s.cfg.SharedRecordingsAccountID = accountID
+	s.cfg.ServiceToken = "campaign-admission-service-token"
 	_, infrastructureAccountID := seedUserOrg(t, pool, "cloud-infrastructure@example.test", false)
 	const rawSession = "campaign-admission-session"
 	insertSession(t, pool, accountID, userID, rawSession)
@@ -443,14 +445,56 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT max(id) FROM stream_source_revisions WHERE stream_id=$1`, streamID).Scan(&revisionID); err != nil {
 		t.Fatal(err)
 	}
+	targetBody, _ := json.Marshal(authoritativeFrameTargetRequest{AccountID: accountID, StreamID: streamID, AuthorityCode: "deniz_fd_restore_20260814"})
+	targetReq := httptest.NewRequest(http.MethodPost, "/api/v1/capture/authoritative-frame-target", bytes.NewReader(targetBody))
+	targetReq.Header.Set("Authorization", "Bearer "+s.cfg.ServiceToken)
+	targetRec := httptest.NewRecorder()
+	s.handleAuthoritativeFrameTarget(targetRec, targetReq)
+	if targetRec.Code != http.StatusOK {
+		t.Fatalf("prepare authoritative frame target status=%d body=%s", targetRec.Code, targetRec.Body.String())
+	}
+	var target struct {
+		StreamID             int64  `json:"stream_id"`
+		SourceRevisionID     int64  `json:"source_revision_id"`
+		SourceSnapshotSHA256 string `json:"source_snapshot_sha256"`
+	}
+	if err := json.Unmarshal(targetRec.Body.Bytes(), &target); err != nil || target.StreamID != streamID || target.SourceRevisionID != revisionID || len(target.SourceSnapshotSHA256) != 64 {
+		t.Fatalf("invalid authoritative frame target: %+v err=%v", target, err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	img.Set(0, 0, color.White)
+	var baselineJPEG bytes.Buffer
+	if err := jpeg.Encode(&baselineJPEG, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	baselineFrame = baselineJPEG.Bytes()
+	frameSHA = sha256Hex(baselineFrame)
+	capturedAt = time.Now().UTC().Add(-time.Second)
+	ingestBody, _ := json.Marshal(map[string]any{
+		"account_id": accountID, "stream_id": streamID, "status": "success", "captured_at": capturedAt,
+		"mime_type": "image/jpeg", "frame_base64": base64.StdEncoding.EncodeToString(baselineFrame), "frame_sha256": frameSHA,
+		"authoritative_frame_only": true, "authority_code": "deniz_fd_restore_20260814",
+		"source_revision_id": target.SourceRevisionID, "source_snapshot_sha256": target.SourceSnapshotSHA256,
+	})
+	ingestReq := httptest.NewRequest(http.MethodPost, "/api/v1/capture/ingest", bytes.NewReader(ingestBody))
+	ingestReq.Header.Set("Authorization", "Bearer "+s.cfg.ServiceToken)
+	ingestRec := httptest.NewRecorder()
+	s.handleCaptureIngest(ingestRec, ingestReq)
+	var stored struct {
+		FrameID     int64  `json:"frame_id"`
+		FrameSHA256 string `json:"frame_sha256"`
+	}
+	if err := json.Unmarshal(ingestRec.Body.Bytes(), &stored); err != nil || ingestRec.Code != http.StatusOK || stored.FrameID <= 0 || stored.FrameSHA256 != frameSHA {
+		t.Fatalf("decision frame ingest status=%d stored=%+v body=%s err=%v", ingestRec.Code, stored, ingestRec.Body.String(), err)
+	}
+	frameID = stored.FrameID
+	var witnessedMediaID int64
+	var witnessedFrameSHA string
+	if err := fixtureAdmin.QueryRow(ctx, `SELECT witness.media_object_id,witness.frame_sha256,frame.raw_media_object_id FROM recording_campaign_authoritative_frame_witnesses witness JOIN frames frame ON frame.id=witness.frame_id WHERE witness.frame_id=$1 AND witness.account_id=$2 AND witness.stream_id=$3 AND witness.authority_code='deniz_fd_restore_20260814'`, frameID, accountID, streamID).Scan(&witnessedMediaID, &witnessedFrameSHA, &mediaID); err != nil || witnessedMediaID != mediaID || witnessedFrameSHA != frameSHA {
+		t.Fatalf("immutable decision frame witness media=%d frame_media=%d sha=%q err=%v", witnessedMediaID, mediaID, witnessedFrameSHA, err)
+	}
 	var preparedStreamID, preparedRevisionID int64
 	var preparedSource, preparedPage, preparedSnapshot, frameWitnessSHA string
-	if err := s.admissionPool.QueryRow(ctx, `SELECT stream_id,source_url,source_page_url,COALESCE(source_revision_id,0),source_snapshot_sha256 FROM recording_campaign_prepare_authoritative_frame($1,'deniz_fd_restore_20260814',$2)`, accountID, streamID).Scan(&preparedStreamID, &preparedSource, &preparedPage, &preparedRevisionID, &preparedSnapshot); err != nil {
-		t.Fatalf("prepare baseline frame witness: %v", err)
-	}
-	if err := s.admissionPool.QueryRow(ctx, `SELECT recording_campaign_seal_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4,$5,$6)`, accountID, streamID, frameID, preparedRevisionID, preparedSnapshot, frameSHA).Scan(&frameWitnessSHA); err != nil || len(frameWitnessSHA) != 64 {
-		t.Fatalf("seal baseline frame witness: sha=%q err=%v", frameWitnessSHA, err)
-	}
 	start := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	end := start.Add(24 * time.Hour)
 	router := s.router()
