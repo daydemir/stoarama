@@ -638,8 +638,11 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		t.Fatalf("commit isolated terminal fixture reset: %v", err)
 	}
 	setAttemptWindow("-14 minutes -58 seconds", "+2 seconds")
-	if _, err := migrator.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=recording_campaign_now() WHERE id=$1; UPDATE nodes SET last_heartbeat_at=recording_campaign_now() WHERE id=$2`, probeDropletID, probeNodeID); err != nil {
+	if _, err := migrator.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=recording_campaign_now() WHERE id=$1`, probeDropletID); err != nil {
 		t.Fatalf("refresh isolated probe principal: %v", err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=recording_campaign_now() WHERE id=$1`, probeNodeID); err != nil {
+		t.Fatalf("refresh isolated probe node: %v", err)
 	}
 
 	// Evidence-first: the supported executor statement owns the same global and
@@ -678,11 +681,26 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		t.Fatalf("evidence-first race did not leave exactly one truth: terminal=%d evidence=%d id=%s err=%v", terminalCount, evidenceCount, evidenceFirstID, err)
 	}
 	var draftTrackID int64
-	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id,reporting_grade_floor,reporting_required_consecutive_windows) VALUES($1,$2,'reservation collision fixture',recording_campaign_now()+interval '3 days',1,'GOOD',14,$3,'ACCEPTABLE',14) RETURNING id`, accountID, "draft-collision-"+uuid.NewString(), userID).Scan(&draftTrackID); err != nil {
+	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id) VALUES($1,$2,'reservation collision fixture',recording_campaign_now()+interval '3 days',1,'GOOD',14,$3) RETURNING id`, accountID, "draft-collision-"+uuid.NewString(), userID).Scan(&draftTrackID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := migrator.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,$4,'primary',1,'probation',ARRAY['fixture'],recording_campaign_now(),recording_campaign_now(),recording_campaign_now(),$5,$6)`, draftTrackID, recordingID, streamID, sceneSHA, frameSHA, userID); err != nil {
+	fixtureTx, err := migrator.Begin(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err = fixtureTx.Exec(ctx, `ALTER TABLE recording_campaign_roster_entries DISABLE TRIGGER recording_campaign_admission_roster_guard`); err == nil {
+		_, err = fixtureTx.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,$4,'primary',1,'probation',ARRAY['fixture'],recording_campaign_now(),recording_campaign_now(),recording_campaign_now(),$5,$6)`, draftTrackID, recordingID, streamID, sceneSHA, frameSHA, userID)
+	}
+	if err == nil {
+		err = fixtureTx.Commit(ctx)
+	} else {
+		_ = fixtureTx.Rollback(ctx)
+	}
+	if _, enableErr := migrator.Exec(ctx, `ALTER TABLE recording_campaign_roster_entries ENABLE TRIGGER recording_campaign_admission_roster_guard`); err == nil {
+		err = enableErr
+	}
+	if err != nil {
+		t.Fatalf("seed hostile preexisting roster fixture: %v", err)
 	}
 	if _, err := runtimePool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_runtime'],$2,now())`, draftTrackID, userID); err == nil {
 		t.Fatal("runtime invoked the authority-owned campaign transition")
@@ -691,7 +709,7 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		t.Fatal("admission executor invoked the internal campaign transition")
 	}
 	var unwitnessedTrackID int64
-	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id,reporting_grade_floor,reporting_required_consecutive_windows) VALUES($1,$2,'unwitnessed transition fixture',recording_campaign_now()+interval '3 days',0,'GOOD',14,$3,'ACCEPTABLE',14) RETURNING id`, accountID, "unwitnessed-"+uuid.NewString(), userID).Scan(&unwitnessedTrackID); err != nil {
+	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id) VALUES($1,$2,'unwitnessed transition fixture',recording_campaign_now()+interval '3 days',1,'GOOD',14,$3) RETURNING id`, accountID, "unwitnessed-"+uuid.NewString(), userID).Scan(&unwitnessedTrackID); err != nil {
 		t.Fatal(err)
 	}
 	unwitnessedTx, err := runtimePool.Begin(ctx)
@@ -819,7 +837,7 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	// reservation while expiration waits. Then expiration owns the fence with
 	// its terminal row still uncommitted: a second activation waits and succeeds
 	// only after the terminal event commits.
-	activationFirst, err := runtimePool.Begin(ctx)
+	activationFirst, err := migrator.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -925,7 +943,10 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := executorPool.Exec(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, uuid.New(), approvalID, accountID, userID, expireSessionID, expireCredentialSHA); err == nil {
 		t.Fatal("expired approval accepted a second terminal event")
 	}
-	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/changed.m3u8' WHERE id=$1; UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
+	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/changed.m3u8' WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
 		t.Fatal(err)
 	}
 	var fenceEvents int

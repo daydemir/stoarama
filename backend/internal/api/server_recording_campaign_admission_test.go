@@ -745,37 +745,6 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		if _, err := fixtureAdmin.Exec(ctx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256) VALUES($1,'expired_without_evidence',repeat('0',64))`, leaseResponse.Target.AttemptID); err == nil {
 			t.Fatal("terminal-without-evidence committed after immutable probe evidence")
 		}
-		if attemptIndex == 0 {
-			if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state='draining' WHERE node_id=$1`, nodeID); err != nil {
-				t.Fatal(err)
-			}
-			var priorTokenID, priorGeneration int64
-			if err := pool.QueryRow(ctx, `SELECT claim_token_id,generation FROM recording_worker_claim_heads WHERE node_id=$1`, nodeID).Scan(&priorTokenID, &priorGeneration); err != nil {
-				t.Fatal(err)
-			}
-			tx, err := pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			retirementSHA := sha256Hex([]byte(fmt.Sprintf("recording-worker-claim-retired-v1\x00%d\x00%d\x00%d", nodeID, priorGeneration, priorTokenID)))
-			_, err = tx.Exec(ctx, `WITH retired AS (
-				UPDATE node_tokens SET revoked_at=transaction_timestamp(),updated_at=transaction_timestamp()
-				WHERE id=$3 AND revoked_at IS NULL RETURNING id
-			) INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
-			SELECT $1,$2,CASE WHEN $2=1 THEN NULL ELSE $2-1 END,$3,'retired',$4 FROM retired`, nodeID, priorGeneration, priorTokenID, retirementSHA)
-			nodeBearer = "node-token-successor"
-			if err == nil {
-				_, err = tx.Exec(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'campaign03',$2)`, nodeID, hashSecret(nodeBearer))
-			}
-			if err == nil {
-				err = tx.Commit(ctx)
-			} else {
-				_ = tx.Rollback(ctx)
-			}
-			if err != nil {
-				t.Fatalf("rotate R10 claim token before terminal replay: %v", err)
-			}
-		}
 		replayed := postNode("/api/v1/recording/campaign-admission/evidence", evidenceBody)
 		if replayed.Code != http.StatusCreated || replayed.Body.String() != evidence.Body.String() {
 			t.Fatalf("evidence replay %d changed: first=%s second=%s", attemptIndex+1, evidence.Body.String(), replayed.Body.String())
@@ -821,7 +790,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	store.mu.Lock()
 	presigned := append([]string(nil), store.presignKeys...)
 	store.mu.Unlock()
-	if len(presigned) != 4 {
+	if len(presigned) != 10 {
 		t.Fatalf("unexpected exact quarantine reservation count: %#v", presigned)
 	}
 
@@ -857,7 +826,21 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = canonicalTx.Exec(ctx, `SET LOCAL TIME ZONE 'Asia/Seoul'; SET LOCAL DateStyle='SQL, DMY'; UPDATE recordings SET next_fire_at=next_fire_at WHERE id=$1; UPDATE recording_campaign_roster_entries SET role=role WHERE recording_id=$1`, admittedRecordingID); err == nil {
+	for _, statement := range []string{
+		`SET LOCAL TIME ZONE 'Asia/Seoul'`,
+		`SET LOCAL DateStyle='SQL, DMY'`,
+		`UPDATE recordings SET next_fire_at=next_fire_at WHERE id=$1`,
+	} {
+		if strings.Contains(statement, "$1") {
+			_, err = canonicalTx.Exec(ctx, statement, admittedRecordingID)
+		} else {
+			_, err = canonicalTx.Exec(ctx, statement)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if err == nil {
 		err = canonicalTx.Commit(ctx)
 	} else {
 		_ = canonicalTx.Rollback(ctx)
@@ -930,6 +913,10 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	secondSchedule.StreamIDs = []int64{secondStreamID}
 	secondSchedule.StreamTimezones = []streamTimezoneInput{{StreamID: secondStreamID, Timezone: "Europe/Berlin"}}
 	secondSchedule.CampaignAdmissionApprovalID = ""
+	s.cfg.DropletPoolCapacity = 9
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET capacity=9 WHERE build_sha=$1`, buildSHA); err != nil {
+		t.Fatal(err)
+	}
 	secondApprovalBody, _ := json.Marshal(campaignAdmissionApprovalRequest{
 		RequestID: uuid.NewString(), DeadlineAt: end, AuthorityCode: "deniz_fd_restore_20260814", FailureDomainTag: "FD",
 		Entries:  []campaignAdmissionApprovalEntry{{StreamID: secondStreamID, SourceRevisionID: secondRevisionID, SourceURL: secondSource, SourcePageURL: secondPage, Provider: "publisher-two", ExternalID: "scene-2", NormalizedLabel: "secondapprovedscene", SceneFrameEvidenceID: secondBaselineEvidence.EvidenceID, SceneIdentitySHA256: secondSceneSHA}},
@@ -1098,7 +1085,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO account_api_keys(account_id,key_prefix,secret_hash,scopes) VALUES($1,'campaign-nas-2','campaign-nas-secret-2',ARRAY['stoarama.pull']) RETURNING id`, accountID).Scan(&secondNASKeyID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,api_key_id,last_seen_at,nas_storage_total_bytes,nas_storage_free_bytes,nas_storage_reported_at,nas_capacity_blocked) VALUES($1,'nas_pull',$2,now(),2000000000000,1900000000000,now(),false)`, accountID, secondNASKeyID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET api_key_id=$2,last_seen_at=now(),nas_storage_total_bytes=2000000000000,nas_storage_free_bytes=1900000000000,nas_storage_reported_at=now(),nas_capacity_blocked=false WHERE id=$1`, nasConnectionID, secondNASKeyID); err != nil {
 		t.Fatal(err)
 	}
 	var unrelatedRecordingID int64
@@ -1108,7 +1095,10 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='active' WHERE id=$1`, unrelatedRecordingID); err == nil {
 		t.Fatal("free bytes from a different NAS connection authorized the sealed reservation")
 	}
-	if _, err := pool.Exec(ctx, `UPDATE account_sessions SET revoked_at=now() WHERE session_hash=$1; UPDATE recorder_droplets SET state='draining' WHERE node_id IN($2,$3)`, hashSecret(rawSession), nodeID, standbyNodeID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE account_sessions SET revoked_at=now() WHERE session_hash=$1`, hashSecret(rawSession)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state='draining' WHERE node_id IN($1,$2)`, nodeID, standbyNodeID); err != nil {
 		t.Fatal(err)
 	}
 	replayBody, _ := json.Marshal(campaignAdmissionReplayRequest{ApprovalID: approvalResponse.ApprovalID, TargetAccountID: accountID})

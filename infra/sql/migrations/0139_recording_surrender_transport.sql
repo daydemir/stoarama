@@ -1176,10 +1176,10 @@ CREATE TRIGGER recording_worker_claim_successor_results_db_time BEFORE INSERT ON
 CREATE FUNCTION recording_surrender_validate_set_grant() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE plan RECORD; generation RECORD;
 BEGIN
-  SELECT plan.origin_claim_generation,plan.recording_job_id,plan.lease_token INTO plan
+  SELECT capture_plan.origin_claim_generation,capture_plan.recording_job_id,capture_plan.lease_token INTO plan
   FROM recording_capture_reservation_sets capture_set
-  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
-  WHERE capture_set.id=NEW.set_id FOR SHARE OF capture_set,plan;
+  JOIN recording_capture_set_plans capture_plan ON capture_plan.id=capture_set.plan_id
+  WHERE capture_set.id=NEW.set_id FOR SHARE OF capture_set,capture_plan;
   SELECT lease_generation.node_id INTO generation
   FROM recording_job_lease_generations lease_generation
   WHERE lease_generation.recording_job_id=plan.recording_job_id AND lease_generation.lease_token=plan.lease_token;
@@ -1317,7 +1317,6 @@ BEGIN
   END IF;
   IF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL AND (
        NEW.revoked_at<>transaction_timestamp()
-       OR EXISTS(SELECT 1 FROM recording_worker_claim_heads head WHERE head.claim_token_id=OLD.id)
        OR EXISTS(SELECT 1 FROM recording_jobs job WHERE job.lease_node_token_id=OLD.id AND job.status='leased')
      ) THEN RAISE EXCEPTION 'recording claim credential cannot retire while authoritative'; END IF;
   RETURN NEW;
@@ -1489,11 +1488,11 @@ CREATE FUNCTION recording_surrender_validate_stop_event() RETURNS trigger LANGUA
 DECLARE plan RECORD; prior_count BIGINT;
 BEGIN
   NEW.required_at:=transaction_timestamp();
-  SELECT plan.recording_id,plan.snapshot_generation,plan.source_snapshot,plan.destination_naming_snapshot
+  SELECT capture_plan.recording_id,capture_plan.snapshot_generation,capture_plan.source_snapshot,capture_plan.destination_naming_snapshot
     INTO plan
   FROM recording_capture_reservation_sets capture_set
-  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
-  WHERE capture_set.id=NEW.set_id FOR SHARE OF capture_set,plan;
+  JOIN recording_capture_set_plans capture_plan ON capture_plan.id=capture_set.plan_id
+  WHERE capture_set.id=NEW.set_id FOR SHARE OF capture_set,capture_plan;
   SELECT count(*) INTO prior_count FROM recording_capture_producer_stop_events prior WHERE prior.set_id=NEW.set_id;
   IF plan.recording_id IS NULL OR NEW.old_snapshot_generation<>plan.snapshot_generation
      OR NEW.new_snapshot_generation<>plan.snapshot_generation+prior_count+1
@@ -1563,7 +1562,11 @@ $$;
 CREATE FUNCTION recording_surrender_validate_stop_inventory_seal() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE ack_id UUID; expected TEXT;
 BEGIN
-  ack_id:=CASE WHEN TG_TABLE_NAME='recording_capture_producer_stop_acks' THEN NEW.id ELSE NEW.stop_ack_id END;
+  IF TG_TABLE_NAME='recording_capture_producer_stop_acks' THEN
+    ack_id:=NEW.id;
+  ELSE
+    ack_id:=NEW.stop_ack_id;
+  END IF;
   SELECT recording_surrender_stop_inventory_sha(ack_id) INTO expected;
   IF expected IS NULL OR NOT EXISTS(
        SELECT 1 FROM recording_capture_producer_stop_acks ack

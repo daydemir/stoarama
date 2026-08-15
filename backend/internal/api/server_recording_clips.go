@@ -1049,7 +1049,7 @@ func (s *Server) handleRecordingCaptureSetArtifactSeal(w http.ResponseWriter, r 
 	}
 	objectKey := storageObjectKey(keyPrefix, displayPath)
 	semanticSHA := captureArtifactSemanticSHA(setID, req.Ordinal, sourceSHA, namingSHA, req.SegmentStartUS, req.SizeBytes, sha)
-	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-object-key-v1:'||$1::text||':'||$2||':'||$3,0))`, destinationID, bucket, objectKey); err != nil {
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-object-key-v1:'||$1::bigint::text||':'||$2::text||':'||$3::text,0))`, destinationID, bucket, objectKey); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "lock capture destination key")
 		return
 	}
@@ -1685,7 +1685,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	if durationMs > 0 && head.SizeBytes > 0 {
 		if _, err := tx.Exec(r.Context(), `
 			INSERT INTO recording_bandwidth_observations (recording_id, observed_bandwidth_bps, observed_at)
-			VALUES ($1, ($3::bigint * 8000 / $2)::bigint, now())
+			VALUES ($1, GREATEST(1, ($3::bigint * 8000 / $2)::bigint), now())
 			ON CONFLICT (recording_id) DO UPDATE SET
 			  observed_bandwidth_bps=GREATEST(
 			    EXCLUDED.observed_bandwidth_bps,

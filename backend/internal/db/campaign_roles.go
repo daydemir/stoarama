@@ -199,8 +199,8 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		       EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user)),
 		       has_schema_privilege(current_user,current_schema(),'CREATE'),
 		       (SELECT count(*) FROM unnest($3::text[]) name
-		          LEFT JOIN pg_class c ON c.relname=name
-		          LEFT JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname=current_schema()
+		          LEFT JOIN pg_namespace n ON n.nspname=current_schema()
+		          LEFT JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=name
 		         WHERE c.oid IS NULL OR pg_get_userbyid(c.relowner)<>$2 OR has_table_privilege(current_user,c.oid,'SELECT') OR
 		               has_table_privilege(current_user,c.oid,'INSERT') OR has_table_privilege(current_user,c.oid,'UPDATE') OR
 		               has_table_privilege(current_user,c.oid,'DELETE') OR has_table_privilege(current_user,c.oid,'TRUNCATE')),
@@ -224,8 +224,8 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		         WHERE n.nspname=current_schema() AND c.relkind='S' AND pg_get_userbyid(c.relowner)=$2 AND
 		           (has_sequence_privilege(current_user,c.oid,'USAGE') OR has_sequence_privilege(current_user,c.oid,'SELECT') OR has_sequence_privilege(current_user,c.oid,'UPDATE'))),
 		       (SELECT count(*) FROM unnest($7::text[]) name
-		          LEFT JOIN pg_class c ON c.relname=name AND c.relkind='S'
-		          LEFT JOIN pg_namespace n ON n.oid=c.relnamespace AND n.nspname=current_schema()
+		          LEFT JOIN pg_namespace n ON n.nspname=current_schema()
+		          LEFT JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=name AND c.relkind='S'
 		         WHERE n.oid IS NULL OR has_sequence_privilege(current_user,c.oid,'USAGE') OR
 		               has_sequence_privilege(current_user,c.oid,'SELECT') OR has_sequence_privilege(current_user,c.oid,'UPDATE')),
 		       (SELECT count(*) FROM unnest($4::text[]) signature
@@ -236,12 +236,14 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		         WHERE p.oid IS NULL OR NOT has_function_privilege(current_user,p.oid,'EXECUTE')),
 		       (SELECT count(*) FROM pg_auth_members membership JOIN pg_roles role ON role.oid=membership.roleid WHERE role.rolname=$2),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions, campaignRuntimeReadOnlyProductTables, campaignRuntimeDeniedProductSequences).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &migratorLedgerDenied, &authoritySequences, &invalidProductSequences, &executableFunctions, &missingProductFunctions, &authorityMembers, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user AND current_user=$1`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions, campaignRuntimeReadOnlyProductTables, campaignRuntimeDeniedProductSequences).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &migratorLedgerDenied, &authoritySequences, &invalidProductSequences, &executableFunctions, &missingProductFunctions, &authorityMembers, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign runtime privileges: %w", err)
 	}
 	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || !migratorLedgerDenied || authoritySequences != 0 || invalidProductSequences != 0 || executableFunctions != 0 || missingProductFunctions != 0 || authorityMembers != 1 || !migrationApplied {
-		return fmt.Errorf("campaign runtime database privilege boundary is not exact")
+		var invalidAuthorityNames []string
+		_ = pool.QueryRow(ctx, `SELECT COALESCE(array_agg(name ORDER BY name),'{}'::text[]) FROM unnest($1::text[]) name LEFT JOIN pg_namespace n ON n.nspname=current_schema() LEFT JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=name WHERE c.oid IS NULL OR pg_get_userbyid(c.relowner)<>$2 OR has_table_privilege(current_user,c.oid,'SELECT') OR has_table_privilege(current_user,c.oid,'INSERT') OR has_table_privilege(current_user,c.oid,'UPDATE') OR has_table_privilege(current_user,c.oid,'DELETE') OR has_table_privilege(current_user,c.oid,'TRUNCATE')`, campaignAuthorityTables, authorityRole).Scan(&invalidAuthorityNames)
+		return fmt.Errorf("campaign runtime database privilege boundary is not exact: session=%t current=%t super=%t member=%t owner=%t schema_create=%t authority_tables=%v product_manifest=%t product_tables=%d ledger_denied=%t authority_sequences=%d product_sequences=%d authority_exec=%d product_exec_missing=%d authority_members=%d migration=%t", sessionUser == runtimeRole, currentUser == runtimeRole, super, member, ownsObjects, schemaCreate, invalidAuthorityNames, productManifestSHA256 == campaignProductTableManifestSHA256, invalidProductTables, migratorLedgerDenied, authoritySequences, invalidProductSequences, executableFunctions, missingProductFunctions, authorityMembers, migrationApplied)
 	}
 	return nil
 }
@@ -286,7 +288,7 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 		                 NOT attribute.attisdropped AND attribute.attname<>split_part(spec,':',2) AND
 		                 has_column_privilege($2,c.oid,attribute.attnum,'UPDATE'))),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables, campaignAuthorityLockProductColumns).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &invalidAuthorityLockDependencies, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user AND current_user=$1`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables, campaignAuthorityLockProductColumns).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &invalidAuthorityLockDependencies, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign executor privileges: %w", err)
 	}

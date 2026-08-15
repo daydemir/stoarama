@@ -486,7 +486,7 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		excluded := make([]int64, 0, len(streams))
 		for _, st := range streams {
 			captureVia := batchCaptureVia(st.sourceURL, st.provider, st.captureVia)
-			if st.recordingID > 0 {
+			if st.recordingID > 0 && !admissionRequested {
 				excluded = append(excluded, st.recordingID)
 			}
 			if captureVia == "relay" {
@@ -494,7 +494,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			}
 			candidates = append(candidates, dropletpool.ForecastCandidate{Mode: string(mode), CronExpr: cronExpr, CronTimezone: st.timezone, ClipDurationSec: clipDuration, DailyWindowStart: dailyStartRaw, DailyWindowEnd: dailyEndRaw, EnvStart: startAt, EnvEnd: timeOrZero(endAt), ActiveWeekdays: weekdays})
 		}
-		peak, ferr := dropletpool.ForecastPeakWithCandidatesExcluding(r.Context(), s.pool, s.billing != nil, candidates, excluded, time.Now().UTC(), 8*24*time.Hour)
+		forecastHorizon := 8 * 24 * time.Hour
+		if admissionRequested {
+			forecastHorizon = 62 * 24 * time.Hour
+		}
+		peak, ferr := dropletpool.ForecastPeakWithCandidatesExcluding(r.Context(), s.pool, s.billing != nil, candidates, excluded, time.Now().UTC(), forecastHorizon)
 		if ferr != nil {
 			util.WriteError(w, http.StatusInternalServerError, "forecast batch capacity")
 			return

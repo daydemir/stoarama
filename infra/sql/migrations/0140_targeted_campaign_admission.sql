@@ -766,7 +766,9 @@ BEGIN
     WHERE account.id IN(selected.account_id,(SELECT node.account_id FROM nodes node WHERE node.id=p_node_id))
     ORDER BY account.id FOR SHARE;
   PERFORM 1 FROM nodes WHERE id=p_node_id FOR SHARE;
-  PERFORM 1 FROM recorder_droplets WHERE id=p_recorder_droplet_id AND node_id=p_node_id FOR UPDATE;
+  PERFORM 1 FROM recorder_droplets WHERE id=p_recorder_droplet_id AND node_id=p_node_id
+    AND state='active' AND last_seen_at BETWEEN recording_campaign_now()-interval '120 seconds' AND recording_campaign_now()+interval '30 seconds' FOR UPDATE;
+  IF NOT FOUND THEN RETURN; END IF;
   IF (SELECT count(*) FROM recording_jobs job JOIN recorder_droplets droplet ON droplet.name=job.lease_owner
         WHERE droplet.node_id=p_node_id AND job.status='leased' AND job.lease_expires_at>recording_campaign_now())+
      (SELECT count(*) FROM recording_targeted_probe_attempts attempt
@@ -1113,7 +1115,7 @@ BEGIN
     a.frame_max_size_bytes,e.id evidence_id,e.evidence_sha256,e.submission_request_sha256,e.result,e.detail INTO attempt
   FROM recording_targeted_probe_attempts a LEFT JOIN recording_targeted_probe_evidence e ON e.attempt_id=a.id
   WHERE a.id=p_attempt_id AND a.request_id=p_request_id AND a.approval_id=p_approval_id
-    AND a.stream_id=p_stream_id AND a.node_id=p_node_id FOR SHARE;
+    AND a.stream_id=p_stream_id AND a.node_id=p_node_id FOR SHARE OF a;
   IF attempt.account_id IS NULL THEN RAISE EXCEPTION 'targeted attempt identity does not match'; END IF;
   IF attempt.evidence_id IS NULL THEN
     PERFORM recording_campaign_authorize_node('evidence',p_approval_id,attempt.account_id,p_node_id,
@@ -1726,8 +1728,7 @@ BEGIN
     v_relay_effective_capacity,v_relay_usable_after_largest_loss,
     v_project_sha,v_firewall_sha,v_capacity_facts_sha,v_provider_observation_sha);
   v_forecast_peak_slots:=recording_campaign_forecast_peak_slots(p_account_id);
-  IF v_forecast_peak_slots<=0 OR v_forecast_peak_slots>v_usable_after_worker_loss OR
-     (p_capacity->>'forecast_peak_slots')::int<>v_forecast_peak_slots THEN
+  IF v_forecast_peak_slots<=0 OR v_forecast_peak_slots>v_usable_after_worker_loss THEN
     RAISE EXCEPTION 'campaign DB-derived forecast exceeds one-worker-loss authority';
   END IF;
   PERFORM recording_campaign_create_capacity_reservation(p_approval_id,p_account_id,v_capacity_id,
@@ -1820,6 +1821,13 @@ BEGIN
     FOR SHARE OF rs,u,m,a
   ) INTO valid;
   IF valid IS DISTINCT FROM true THEN RAISE EXCEPTION 'campaign account credential is not current'; END IF;
+  IF EXISTS(SELECT 1 FROM recording_campaign_admission_tx_authorizations auth_row
+      WHERE auth_row.transaction_id=txid_current() AND auth_row.action=requested_action
+        AND auth_row.account_id=requested_account
+        AND (auth_row.approval_id,auth_row.actor_user_id,auth_row.account_session_id)
+          IS NOT DISTINCT FROM (requested_approval,requested_user,requested_session)) THEN
+    RETURN;
+  END IF;
   INSERT INTO recording_campaign_admission_tx_authorizations(transaction_id,action,approval_id,account_id,actor_user_id,account_session_id)
   VALUES(txid_current(),requested_action,requested_approval,requested_account,requested_user,requested_session);
 END $$;
@@ -2865,6 +2873,7 @@ BEGIN
     'enforce_reserved_activation_has_result()',
     'enforce_admitted_recording_inverse_seal()',
     'guard_recording_campaign_track_state()',
+    'enforce_active_campaign_target()',
     'transition_recording_campaign_track(bigint,text,text[],bigint,timestamp with time zone)',
     'guard_reserved_campaign_roster_occupancy()',
     'enforce_admitted_roster_inverse_seal()',
@@ -2956,6 +2965,7 @@ DECLARE
     'recording_campaign_assert_track_activation_occupancy(bigint,bigint)','guard_recording_campaign_track_activation_occupancy()',
     'guard_reserved_completed_recording_activation()','enforce_reserved_activation_has_result()',
     'enforce_admitted_recording_inverse_seal()','guard_recording_campaign_track_state()',
+    'enforce_active_campaign_target()',
     'transition_recording_campaign_track(bigint,text,text[],bigint,timestamp with time zone)',
     'guard_reserved_campaign_roster_occupancy()',
     'enforce_admitted_roster_inverse_seal()','enforce_admitted_track_inverse_seal()',
@@ -3025,6 +3035,7 @@ BEGIN
   -- by the state guard. Only the typed authority-owned transition function may
   -- append one; the general product runtime keeps read-only access.
   EXECUTE format('REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON TABLE %I.recording_campaign_track_events FROM %I',install_schema,runtime_role);
+  EXECUTE format('GRANT SELECT ON TABLE %I.recording_campaign_track_events TO %I',install_schema,runtime_role);
   FOREACH signature IN ARRAY authority_functions LOOP
     EXECUTE format('ALTER FUNCTION %I.%s OWNER TO %I',install_schema,signature,authority_role);
     EXECUTE format('ALTER FUNCTION %I.%s SECURITY DEFINER',install_schema,signature);
@@ -3061,6 +3072,7 @@ BEGIN
   -- functions. Grant their exact append-only side effects to the authority;
   -- without these the split-role admission path cannot commit.
   EXECUTE format('GRANT INSERT ON TABLE %I.recording_campaign_tracks,%I.recording_campaign_roster_entries,%I.recording_campaign_roster_events,%I.recording_campaign_track_events TO %I',install_schema,install_schema,install_schema,install_schema,authority_role);
+  EXECUTE format('GRANT SELECT ON TABLE %I.recording_campaign_track_events TO %I',install_schema,authority_role);
   EXECUTE format('GRANT UPDATE ON TABLE %I.recording_campaign_tracks TO %I',install_schema,authority_role);
   FOR object_name IN
     SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace

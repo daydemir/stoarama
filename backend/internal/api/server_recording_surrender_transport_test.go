@@ -182,16 +182,20 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 
 	cloud := seedPresentationV2Task(t, pool, 91001, 991001)
 	cloudLease := uuid.New()
-	if _, err := pool.Exec(ctx, `
-		UPDATE nodes SET node_type='local_recorder',display_name='cloud-recovery' WHERE id=$1;
-		INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'cloud-recovery-r10',repeat('5',64));
-		INSERT INTO recorder_droplets(name,node_id,state,capacity,last_seen_at)
-		VALUES('cloud-recovery',$1,'active',1,transaction_timestamp());
-		UPDATE recordings SET capture_via='cloud' WHERE id=$2;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL WHERE id=$3;
-		UPDATE recording_jobs SET status='leased',lease_owner='cloud-recovery',lease_expires_at=transaction_timestamp()+interval '3 minutes',lease_token=$4,attempt_count=attempt_count+1 WHERE id=$3;
-	`, cloud.nodeID, cloud.recordingID, cloud.jobID, cloudLease); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='local_recorder',display_name='cloud-recovery' WHERE id=$1`, []any{cloud.nodeID}},
+		{`INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'cloud-recovery-r10',repeat('5',64))`, []any{cloud.nodeID}},
+		{`INSERT INTO recorder_droplets(name,node_id,region,size,state,capacity,last_seen_at) VALUES('cloud-recovery',$1,'test','test','active',1,transaction_timestamp())`, []any{cloud.nodeID}},
+		{`UPDATE recordings SET capture_via='cloud' WHERE id=$1`, []any{cloud.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL WHERE id=$1`, []any{cloud.jobID}},
+		{`UPDATE recording_jobs SET status='leased',lease_owner='cloud-recovery',lease_expires_at=transaction_timestamp()+interval '3 minutes',lease_token=$2,attempt_count=attempt_count+1,lease_node_token_id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$3),lease_claim_generation=(SELECT generation FROM recording_worker_claim_heads WHERE node_id=$3),lease_credential_state='exact' WHERE id=$1`, []any{cloud.jobID, cloudLease, cloud.nodeID}},
+	} {
+		if _, err := pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// The legacy equal-SHA unique index remains a DB concurrency backstop. V1
@@ -300,9 +304,16 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET sha256=repeat('c',64) WHERE capture_lease_token=$1 AND capture_sequence=5`, cloudLease); err == nil {
 		t.Fatal("v1 clip artifact identity was mutable")
 	}
-	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=transaction_timestamp()+interval '1 hour' WHERE capture_lease_token=$1 AND capture_sequence=5`, cloudLease); err == nil {
-		t.Fatal("v1 clip purge time was caller-authored")
+	purgeTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
+	var canonicalPurge, databaseNow time.Time
+	if err = purgeTx.QueryRow(ctx, `UPDATE recording_clips SET purged_at=transaction_timestamp()+interval '1 hour' WHERE capture_lease_token=$1 AND capture_sequence=5 RETURNING purged_at,transaction_timestamp()`, cloudLease).Scan(&canonicalPurge, &databaseNow); err != nil || !canonicalPurge.Equal(databaseNow) {
+		_ = purgeTx.Rollback(ctx)
+		t.Fatalf("v1 clip purge time was not server-canonicalized: purge=%s now=%s err=%v", canonicalPurge, databaseNow, err)
+	}
+	_ = purgeTx.Rollback(ctx)
 	if response := callTransportObservation(t, server, cloud, "cloud-recovery", cloudLease, observationID, observationAttempt, observationSHA, observationAt); response.Code != http.StatusNoContent {
 		t.Fatalf("transport observation replay=%d body=%s", response.Code, response.Body.String())
 	}
@@ -322,14 +333,20 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	// reservation waits on the shared stream fence and never mixes old/new fields.
 	sourceRace := seedPresentationV2Task(t, pool, 91002, 991002)
 	sourceLease := uuid.New()
-	if _, err = pool.Exec(ctx, `
-		UPDATE nodes SET node_type='local_recorder',display_name='cloud-source-race' WHERE id=$1;
-		INSERT INTO recorder_droplets(name,node_id,state,capacity,last_seen_at) VALUES('cloud-source-race',$1,'active',1,transaction_timestamp());
-		UPDATE recordings SET capture_via='cloud' WHERE id=$2;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL WHERE id=$3;
-		UPDATE recording_jobs SET status='leased',lease_owner='cloud-source-race',lease_expires_at=transaction_timestamp()+interval '3 minutes',lease_token=$4,attempt_count=attempt_count+1 WHERE id=$3;
-	`, sourceRace.nodeID, sourceRace.recordingID, sourceRace.jobID, sourceLease); err != nil {
-		t.Fatal(err)
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE nodes SET node_type='local_recorder',display_name='cloud-source-race' WHERE id=$1`, []any{sourceRace.nodeID}},
+		{`INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'cloud-source-race',repeat('7',64))`, []any{sourceRace.nodeID}},
+		{`INSERT INTO recorder_droplets(name,node_id,region,size,state,capacity,last_seen_at) VALUES('cloud-source-race',$1,'test','test','active',1,transaction_timestamp())`, []any{sourceRace.nodeID}},
+		{`UPDATE recordings SET capture_via='cloud' WHERE id=$1`, []any{sourceRace.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL WHERE id=$1`, []any{sourceRace.jobID}},
+		{`UPDATE recording_jobs SET status='leased',lease_owner='cloud-source-race',lease_expires_at=transaction_timestamp()+interval '3 minutes',lease_token=$2,attempt_count=attempt_count+1,lease_node_token_id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$3),lease_claim_generation=(SELECT generation FROM recording_worker_claim_heads WHERE node_id=$3),lease_credential_state='exact' WHERE id=$1`, []any{sourceRace.jobID, sourceLease, sourceRace.nodeID}},
+	} {
+		if _, err = pool.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	sourceTx, err := pool.Begin(ctx)
 	if err != nil {
@@ -363,14 +380,20 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	}
 	producerFirst := seedPresentationV2Task(t, pool, 91005, 991005)
 	producerFirstLease := uuid.New()
-	if _, err = pool.Exec(ctx, `
-		UPDATE nodes SET node_type='local_recorder',display_name='cloud-producer-first' WHERE id=$1;
-		INSERT INTO recorder_droplets(name,node_id,state,capacity,last_seen_at) VALUES('cloud-producer-first',$1,'active',1,transaction_timestamp());
-		UPDATE recordings SET capture_via='cloud' WHERE id=$2;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL WHERE id=$3;
-		UPDATE recording_jobs SET status='leased',lease_owner='cloud-producer-first',lease_expires_at=transaction_timestamp()+interval '3 minutes',lease_token=$4,attempt_count=attempt_count+1 WHERE id=$3;
-	`, producerFirst.nodeID, producerFirst.recordingID, producerFirst.jobID, producerFirstLease); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='local_recorder',display_name='cloud-producer-first' WHERE id=$1`, []any{producerFirst.nodeID}},
+		{`INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'producer-first',repeat('8',64))`, []any{producerFirst.nodeID}},
+		{`INSERT INTO recorder_droplets(name,node_id,region,size,state,capacity,last_seen_at) VALUES('cloud-producer-first',$1,'test','test','active',1,transaction_timestamp())`, []any{producerFirst.nodeID}},
+		{`UPDATE recordings SET capture_via='cloud' WHERE id=$1`, []any{producerFirst.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL WHERE id=$1`, []any{producerFirst.jobID}},
+		{`UPDATE recording_jobs SET status='leased',lease_owner='cloud-producer-first',lease_expires_at=transaction_timestamp()+interval '3 minutes',lease_token=$2,attempt_count=attempt_count+1,lease_node_token_id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$3),lease_claim_generation=(SELECT generation FROM recording_worker_claim_heads WHERE node_id=$3),lease_credential_state='exact' WHERE id=$1`, []any{producerFirst.jobID, producerFirstLease, producerFirst.nodeID}},
+	} {
+		if _, err = pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	producerFirstID := uuid.New()
 	if response := callProducerReserve(t, server, producerFirst, producerFirstLease, "cloud-producer-first", producerFirstID, 1); response.Code != http.StatusOK {
@@ -488,8 +511,17 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	// Relay is a first-class v1 generation. It has no cloud-droplet heartbeat
 	// dependency and no fabricated alternate-capacity exclusion.
 	relay := seedPresentationV2Task(t, pool, 91003, 991003)
-	if _, err = pool.Exec(ctx, `UPDATE nodes SET node_type='relay',display_name='relay-recovery' WHERE id=$1; UPDATE recordings SET capture_via='relay' WHERE id=$2; UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3`, relay.nodeID, relay.recordingID, relay.jobID); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='relay',display_name='relay-recovery' WHERE id=$1`, []any{relay.nodeID}},
+		{`UPDATE recordings SET capture_via='relay' WHERE id=$1`, []any{relay.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$1`, []any{relay.jobID}},
+	} {
+		if _, err = pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var relayTokenID int64
 	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'relay-r10',repeat('3',64)) RETURNING id`, relay.nodeID).Scan(&relayTokenID); err != nil {
@@ -513,8 +545,17 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 		t.Fatal(err)
 	}
 	relayExpiry := seedPresentationV2Task(t, pool, 91006, 991006)
-	if _, err = pool.Exec(ctx, `UPDATE nodes SET node_type='relay',display_name='relay-expiry' WHERE id=$1; UPDATE recordings SET capture_via='relay' WHERE id=$2; UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3`, relayExpiry.nodeID, relayExpiry.recordingID, relayExpiry.jobID); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='relay',display_name='relay-expiry' WHERE id=$1`, []any{relayExpiry.nodeID}},
+		{`UPDATE recordings SET capture_via='relay' WHERE id=$1`, []any{relayExpiry.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$1`, []any{relayExpiry.jobID}},
+	} {
+		if _, err = pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var relayExpiryTokenID int64
 	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'relay-expiry-r10',repeat('4',64)) RETURNING id`, relayExpiry.nodeID).Scan(&relayExpiryTokenID); err != nil {
@@ -546,7 +587,22 @@ func TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery(t *testin
 	// Deferred attempt/result sealing is symmetric: neither half can commit alone.
 	sealFixture := seedPresentationV2Task(t, pool, 91004, 991004)
 	sealLease := uuid.New()
-	if _, err = pool.Exec(ctx, `UPDATE nodes SET node_type='relay' WHERE id=$1; UPDATE recordings SET capture_via='relay' WHERE id=$2; UPDATE recording_jobs SET status='leased',lease_owner='node:'||$1::text,lease_token=$4,lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1 WHERE id=$3`, sealFixture.nodeID, sealFixture.recordingID, sealFixture.jobID, sealLease); err != nil {
+	var sealTokenID int64
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='relay' WHERE id=$1`, []any{sealFixture.nodeID}},
+		{`UPDATE recordings SET capture_via='relay' WHERE id=$1`, []any{sealFixture.recordingID}},
+	} {
+		if _, err = pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'seal-fixture',repeat('9',64)) RETURNING id`, sealFixture.nodeID).Scan(&sealTokenID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET status='leased',lease_owner='node:'||$1::bigint::text,lease_token=$3,lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,lease_node_token_id=$4,lease_claim_generation=1,lease_credential_state='exact' WHERE id=$2`, sealFixture.nodeID, sealFixture.jobID, sealLease, sealTokenID); err != nil {
 		t.Fatal(err)
 	}
 	attemptID := uuid.New()
@@ -574,13 +630,17 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	prepareRecordingCaptureSetGrantQueries(t, ctx, pool)
 	assertRecordingSurrenderNULDigestGoldens(t, ctx, pool)
 	fixture := seedPresentationV2Task(t, pool, 92001, 992001)
-	if _, err := pool.Exec(ctx, `
-		UPDATE nodes SET node_type='relay',display_name='r10-relay' WHERE id=$1;
-		UPDATE recordings SET capture_via='relay' WHERE id=$2;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,
-		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3
-	`, fixture.nodeID, fixture.recordingID, fixture.jobID); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='relay',display_name='r10-relay' WHERE id=$1`, []any{fixture.nodeID}},
+		{`UPDATE recordings SET capture_via='relay' WHERE id=$1`, []any{fixture.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$1`, []any{fixture.jobID}},
+	} {
+		if _, err := pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var frozenSourceRevisionID int64
 	if err := pool.QueryRow(ctx, `
@@ -614,13 +674,17 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	// that immutable zero-size inode; it must not wait for lease expiry or create
 	// recovery grants, admission blocks, successor rotation, or a requeue.
 	zeroFixture := seedPresentationV2Task(t, pool, 92006, 992006)
-	if _, err = pool.Exec(ctx, `
-		UPDATE nodes SET node_type='relay',display_name='r10-zero-current' WHERE id=$1;
-		UPDATE recordings SET capture_via='relay' WHERE id=$2;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,
-		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3
-	`, zeroFixture.nodeID, zeroFixture.recordingID, zeroFixture.jobID); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='relay',display_name='r10-zero-current' WHERE id=$1`, []any{zeroFixture.nodeID}},
+		{`UPDATE recordings SET capture_via='relay' WHERE id=$1`, []any{zeroFixture.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$1`, []any{zeroFixture.jobID}},
+	} {
+		if _, err = pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var zeroTokenID int64
 	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-zero',repeat('3',64)) RETURNING id`, zeroFixture.nodeID).Scan(&zeroTokenID); err != nil {
@@ -755,13 +819,17 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	// that wins first yields one new canonical plan; a mutation after the plan
 	// makes commitment fail rather than launching with a mixed snapshot.
 	planRace := seedPresentationV2Task(t, pool, 92003, 992003)
-	if _, err = pool.Exec(ctx, `
-		UPDATE nodes SET node_type='relay',display_name='r10-plan-race' WHERE id=$1;
-		UPDATE recordings SET capture_via='relay' WHERE id=$2;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
-		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$3
-	`, planRace.nodeID, planRace.recordingID, planRace.jobID); err != nil {
-		t.Fatal(err)
+	for _, operation := range []struct {
+		statement string
+		args      []any
+	}{
+		{`UPDATE nodes SET node_type='relay',display_name='r10-plan-race' WHERE id=$1`, []any{planRace.nodeID}},
+		{`UPDATE recordings SET capture_via='relay' WHERE id=$1`, []any{planRace.recordingID}},
+		{`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$1`, []any{planRace.jobID}},
+	} {
+		if _, err = pool.Exec(ctx, operation.statement, operation.args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var planRaceTokenID int64
 	if err = pool.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'r10-plan-race',repeat('4',64)) RETURNING id`, planRace.nodeID).Scan(&planRaceTokenID); err != nil {
@@ -986,27 +1054,39 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	// prematurely.
 	unrelated := seedPresentationV2Task(t, pool, 92002, fixture.accountID)
 	unrelatedLease := uuid.New()
-	if _, err = pool.Exec(ctx, `
-		UPDATE recordings SET capture_via='relay' WHERE id=$1;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$2;
-		UPDATE recording_jobs SET status='leased',lease_owner=$3,lease_token=$4,
-		 lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,
-		 lease_node_token_id=$5,lease_claim_generation=1,lease_credential_state='exact'
-		 WHERE id=$2
-	`, unrelated.recordingID, unrelated.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10), unrelatedLease, oldTokenID); err != nil {
-		t.Fatal(err)
+	for _, statement := range []string{
+		`UPDATE recordings SET capture_via='relay' WHERE id=$1`,
+		`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$1`,
+		`UPDATE recording_jobs SET status='leased',lease_owner=$2,lease_token=$3,lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,lease_node_token_id=$4,lease_claim_generation=1,lease_credential_state='exact' WHERE id=$1`,
+	} {
+		args := []any{unrelated.recordingID}
+		if strings.Contains(statement, "recording_jobs") {
+			args = []any{unrelated.jobID}
+		}
+		if strings.Contains(statement, "$4") {
+			args = []any{unrelated.jobID, "node:" + strconv.FormatInt(fixture.nodeID, 10), unrelatedLease, oldTokenID}
+		}
+		if _, err = pool.Exec(ctx, statement, args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	unrelatedFail := seedPresentationV2Task(t, pool, 92005, fixture.accountID)
 	unrelatedFailLease := uuid.New()
-	if _, err = pool.Exec(ctx, `
-		UPDATE recordings SET capture_via='relay' WHERE id=$1;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$2;
-		UPDATE recording_jobs SET status='leased',lease_owner=$3,lease_token=$4,
-		 lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,
-		 lease_node_token_id=$5,lease_claim_generation=1,lease_credential_state='exact'
-		 WHERE id=$2
-	`, unrelatedFail.recordingID, unrelatedFail.jobID, "node:"+strconv.FormatInt(fixture.nodeID, 10), unrelatedFailLease, oldTokenID); err != nil {
-		t.Fatal(err)
+	for _, statement := range []string{
+		`UPDATE recordings SET capture_via='relay' WHERE id=$1`,
+		`UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$1`,
+		`UPDATE recording_jobs SET status='leased',lease_owner=$2,lease_token=$3,lease_expires_at=transaction_timestamp()+interval '2 minutes',attempt_count=attempt_count+1,lease_node_token_id=$4,lease_claim_generation=1,lease_credential_state='exact' WHERE id=$1`,
+	} {
+		args := []any{unrelatedFail.recordingID}
+		if strings.Contains(statement, "recording_jobs") {
+			args = []any{unrelatedFail.jobID}
+		}
+		if strings.Contains(statement, "$4") {
+			args = []any{unrelatedFail.jobID, "node:" + strconv.FormatInt(fixture.nodeID, 10), unrelatedFailLease, oldTokenID}
+		}
+		if _, err = pool.Exec(ctx, statement, args...); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET lease_expires_at=transaction_timestamp()-interval '1 second' WHERE id=$1`, fixture.jobID); err != nil {
 		t.Fatal(err)
@@ -1155,10 +1235,14 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	if _, err = pool.Exec(ctx, `
 		INSERT INTO recording_recovery_upload_sessions(
 		 id,set_id,ordinal,revision,node_id,account_id,declared_bytes,quarantine_key,deadline_at)
-		VALUES($1,$2,1,2,$3,$4,$5,$6,transaction_timestamp()+interval '1 millisecond');
+		VALUES($1,$2,1,2,$3,$4,$5,$6,transaction_timestamp()+interval '1 millisecond')
+	`, stalledPromotionID, setID, recovery.NodeID, recovery.AccountID, len(payload), ".stoarama-recovery/v1/stalled/"+stalledPromotionID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `
 		INSERT INTO recording_recovery_upload_session_results(id,session_id,phase,result,observed_size,observed_sha256)
-		VALUES(gen_random_uuid(),$1,'upload','quarantined',$5,$7)
-	`, stalledPromotionID, setID, recovery.NodeID, recovery.AccountID, len(payload), ".stoarama-recovery/v1/stalled/"+stalledPromotionID.String(), hex.EncodeToString(payloadSHA[:])); err != nil {
+		VALUES(gen_random_uuid(),$1,'upload','quarantined',$2,$3)
+	`, stalledPromotionID, len(payload), hex.EncodeToString(payloadSHA[:])); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = pool.Exec(ctx, `SELECT pg_sleep(0.01)`); err != nil {
@@ -1377,11 +1461,10 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 		t.Fatalf("successor could not fail predecessor fence=%d body=%s", response.Code, response.Body.String())
 	}
 	successorClaim := seedPresentationV2Task(t, pool, 92004, fixture.accountID)
-	if _, err = pool.Exec(ctx, `
-		UPDATE recordings SET capture_via='relay' WHERE id=$1;
-		UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,
-		 scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$2
-	`, successorClaim.recordingID, successorClaim.jobID); err != nil {
+	if _, err = pool.Exec(ctx, `UPDATE recordings SET capture_via='relay' WHERE id=$1`, successorClaim.recordingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,scheduled_for=transaction_timestamp()-interval '1 minute' WHERE id=$1`, successorClaim.jobID); err != nil {
 		t.Fatal(err)
 	}
 	newClaim, claimErr := server.leaseRelayRecordingJob(ctx, ackPrincipal, true, 150, true)
@@ -1581,7 +1664,7 @@ func acceptV1Artifact(t *testing.T, pool *pgxpool.Pool, fixture presentationV2Fi
 			 clip_start_at,clip_end_at,capture_lease_token,capture_sequence,surrender_transport_version)
 		SELECT $2,$3,upload.storage_destination_id,upload.endpoint,upload.bucket,upload.object_key,upload.display_path,
 		       upload.mime_type,'mp4',1024,'etag',$4,60000,'h264',false,transaction_timestamp(),
-		       $5,$5+interval '1 minute',$6,$7,1
+		       $5::timestamptz,$5::timestamptz+interval '1 minute',$6,$7,1
 		FROM recording_upload_intents upload WHERE upload.id=$1
 		RETURNING id
 	`, intent, fixture.recordingID, fixture.jobID, sha, segmentStart, lease, sequence).Scan(&clipID); err != nil {
@@ -1596,11 +1679,22 @@ func acceptV1Artifact(t *testing.T, pool *pgxpool.Pool, fixture presentationV2Fi
 	`, fixture.jobID, lease, intent, clipID, sequence).Scan(&headVersion); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = tx.Exec(ctx, `UPDATE recording_upload_intents SET status='consumed' WHERE id=$1`, intent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO recording_capture_artifact_results(upload_intent_id,result,clip_id,head_version) VALUES($1,'accepted_unique',$2,$3)`, intent, clipID, headVersion); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = tx.Exec(ctx, `
-		UPDATE recording_upload_intents SET status='consumed' WHERE id=$1;
-		INSERT INTO recording_capture_artifact_results(upload_intent_id,result,clip_id,head_version)
-		VALUES($1,'accepted_unique',$2,$3)
-	`, intent, clipID, headVersion); err != nil {
+		WITH resolved AS (
+			UPDATE recording_surrender_transport_episodes
+			SET state='resolved',resolved_at=transaction_timestamp(),last_observed_at=transaction_timestamp()
+			WHERE recording_job_id=$1 AND state='open'
+			RETURNING episode_key,lease_token
+		)
+		INSERT INTO recording_surrender_transport_episode_events(event_key,episode_key,recording_job_id,lease_token,event_type,reason)
+		SELECT gen_random_uuid(),episode_key,$1,lease_token,'resolved','accepted_unique' FROM resolved
+	`, fixture.jobID); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(ctx); err != nil {

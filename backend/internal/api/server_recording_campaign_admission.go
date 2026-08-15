@@ -505,7 +505,8 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 			fmt.Sprint(item.Capacity), item.BuildSHA, fmt.Sprint(item.ClaimGeneration), fmt.Sprint(item.ClaimTokenID),
 		}, "\x1f"))
 	}
-	observation.FactsSHA256 = hashSecret(strings.Join(factLines, "\n") + "\n")
+	factsDigest := sha256.Sum256([]byte(strings.Join(factLines, "\n") + "\n"))
+	observation.FactsSHA256 = hex.EncodeToString(factsDigest[:])
 	observation.ObservedAt = time.Now().UTC()
 	if observation.ObservedAt.Before(observation.ObservationStartedAt) || observation.ObservedAt.Sub(observation.ObservationStartedAt) > 120*time.Second {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity observation interval is invalid")

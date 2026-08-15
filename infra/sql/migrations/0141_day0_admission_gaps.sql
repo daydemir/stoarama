@@ -26,7 +26,7 @@ BEGIN
   SELECT EXISTS(SELECT 1 FROM recording_campaign_authority_decisions
     WHERE code=p_authority_code AND campaign_key=('delivery30'||'-2026q3')
       AND expires_at>recording_campaign_now() AND p_stream_id=ANY(permitted_stream_ids)) INTO decision_ok;
-  PERFORM 1 FROM stream_source_revisions WHERE stream_id=p_stream_id ORDER BY id FOR SHARE;
+  PERFORM 1 FROM stream_source_revisions revision_row WHERE revision_row.stream_id=p_stream_id ORDER BY revision_row.id FOR SHARE;
   SELECT s.source_url,COALESCE(s.source_page_url,'') source_page_url,s.updated_at,
     (SELECT max(r.id) FROM stream_source_revisions r WHERE r.stream_id=s.id) source_revision_id,
     (SELECT max(f.id) FROM recording_campaign_admission_source_fence_events f WHERE f.stream_id=s.id) source_fence_event_id

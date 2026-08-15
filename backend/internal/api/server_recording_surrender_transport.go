@@ -719,6 +719,10 @@ func sealCaptureSetTerminalTx(ctx context.Context, tx pgx.Tx, setID uuid.UUID) (
 	if err := tx.QueryRow(ctx, `SELECT artifact_count FROM recording_capture_reservation_sets WHERE id=$1 FOR UPDATE`, setID).Scan(&artifactCount); err != nil {
 		return false, err
 	}
+	var setSecurity bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_capture_security_events event WHERE event.set_id=$1 AND event.ordinal IS NULL)`, setID).Scan(&setSecurity); err != nil {
+		return false, err
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT artifact.ordinal,result.result
 		FROM recording_capture_materialized_artifacts artifact
@@ -732,10 +736,6 @@ func sealCaptureSetTerminalTx(ctx context.Context, tx pgx.Tx, setID uuid.UUID) (
 	defer rows.Close()
 	var materialized []int
 	setResult := "completed"
-	var setSecurity bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_capture_security_events event WHERE event.set_id=$1 AND event.ordinal IS NULL)`, setID).Scan(&setSecurity); err != nil {
-		return false, err
-	}
 	if setSecurity {
 		setResult = "security_revoked"
 	}
@@ -765,6 +765,7 @@ func sealCaptureSetTerminalTx(ctx context.Context, tx pgx.Tx, setID uuid.UUID) (
 	if err = rows.Err(); err != nil {
 		return false, err
 	}
+	rows.Close()
 	coverage := struct {
 		ArtifactCount int      `json:"artifact_count"`
 		Materialized  []int    `json:"materialized_ordinals"`
@@ -885,13 +886,16 @@ func (s *Server) handleAdminRecordingRecoverySecurityRevoke(w http.ResponseWrite
 	}
 	if _, err = tx.Exec(r.Context(), `
 		INSERT INTO recording_capture_recovery_alert_events(id,set_id,event_type,dedupe_key)
-		VALUES(gen_random_uuid(),$1,'security_revoked','capture-set:'||$1::text)
+		VALUES(gen_random_uuid(),$1::uuid,'security_revoked','capture-set:'||$1::uuid::text)
 		ON CONFLICT(dedupe_key,event_type) DO NOTHING
 	`, setID); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "record recovery security alert")
 		return
 	}
-	_, _ = sealCaptureSetTerminalTx(r.Context(), tx, setID)
+	if sealed, sealErr := sealCaptureSetTerminalTx(r.Context(), tx, setID); sealErr != nil || !sealed {
+		util.WriteError(w, http.StatusInternalServerError, "seal recovery security terminal")
+		return
+	}
 	if err = tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit recovery security revocation")
 		return
@@ -992,12 +996,19 @@ func (s *Server) handleRecordingClaimSuccessorPropose(w http.ResponseWriter, r *
 	factsSHA := claimSuccessorFactsSHA(principal.NodeID, predecessor, successor, proposalID, successorTokenID, req.SecretSHA256)
 	if _, err = tx.Exec(r.Context(), `
 		INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
-		VALUES($1,$2,$3,$4,'successor_proposed',$5);
-		UPDATE node_tokens SET recording_claim_purpose='existing_fence_only' WHERE id=$6;
-		UPDATE recording_worker_claim_heads
-		SET generation=$2,claim_token_id=$4,state='successor_pending'
-		WHERE node_id=$1 AND generation=$3 AND claim_token_id=$6 AND state='recovery_blocked'
-	`, principal.NodeID, successor, predecessor, successorTokenID, factsSHA, predecessorTokenID); err != nil {
+		VALUES($1,$2,$3,$4,'successor_proposed',$5)
+	`, principal.NodeID, successor, predecessor, successorTokenID, factsSHA); err != nil {
+		util.WriteError(w, http.StatusConflict, "advance claim successor proposal")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `UPDATE node_tokens SET recording_claim_purpose='existing_fence_only' WHERE id=$1`, predecessorTokenID); err != nil {
+		util.WriteError(w, http.StatusConflict, "advance claim successor proposal")
+		return
+	}
+	if _, err = tx.Exec(r.Context(), `
+		UPDATE recording_worker_claim_heads SET generation=$2,claim_token_id=$3,state='successor_pending'
+		WHERE node_id=$1 AND generation=$4 AND claim_token_id=$5 AND state='recovery_blocked'
+	`, principal.NodeID, successor, successorTokenID, predecessor, predecessorTokenID); err != nil {
 		util.WriteError(w, http.StatusConflict, "advance claim successor proposal")
 		return
 	}
@@ -1046,14 +1057,15 @@ func (s *Server) handleRecordingClaimSuccessorAck(w http.ResponseWriter, r *http
 			return
 		}
 		factsSHA := claimSuccessorFactsSHA(nodeID, predecessor, successor, proposalID, successorTokenID, secretSHA)
-		if _, err = tx.Exec(r.Context(), `
-			UPDATE node_tokens SET recording_claim_purpose='claim_current' WHERE id=$1;
-			UPDATE recording_worker_claim_heads
-			SET state='enabled',blocked_at=NULL,block_reason=NULL
-			WHERE node_id=$2 AND generation=$3 AND claim_token_id=$1 AND state='successor_pending';
-			INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
-			VALUES($2,$3,$4,$1,'enabled',$5)
-		`, successorTokenID, nodeID, successor, predecessor, factsSHA); err != nil {
+		if _, err = tx.Exec(r.Context(), `UPDATE node_tokens SET recording_claim_purpose='claim_current' WHERE id=$1`, successorTokenID); err != nil {
+			util.WriteError(w, http.StatusConflict, "enable claim successor")
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `UPDATE recording_worker_claim_heads SET state='enabled',blocked_at=NULL,block_reason=NULL WHERE node_id=$1 AND generation=$2 AND claim_token_id=$3 AND state='successor_pending'`, nodeID, successor, successorTokenID); err != nil {
+			util.WriteError(w, http.StatusConflict, "enable claim successor")
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256) VALUES($1,$2,$3,$4,'enabled',$5)`, nodeID, successor, predecessor, successorTokenID, factsSHA); err != nil {
 			util.WriteError(w, http.StatusConflict, "enable claim successor")
 			return
 		}
@@ -1069,11 +1081,11 @@ func (s *Server) handleRecordingClaimSuccessorAck(w http.ResponseWriter, r *http
 		)
 		INSERT INTO recording_worker_claim_generation_events
 		  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
-		SELECT $2,$3,CASE WHEN $3=1 THEN NULL ELSE $3-1 END,$1,'retired',
+		SELECT $2::bigint,$3::bigint,CASE WHEN $3::bigint=1 THEN NULL ELSE $3::bigint-1 END,$1::bigint,'retired',
 		       encode(sha256(convert_to('recording-worker-claim-retired-v1','UTF8')
-		         ||decode('00','hex')||convert_to($2::text,'UTF8')
+		         ||decode('00','hex')||convert_to($2::bigint::text,'UTF8')
 		         ||decode('00','hex')||convert_to($3::text,'UTF8')
-		         ||decode('00','hex')||convert_to($1::text,'UTF8')),'hex')
+		         ||decode('00','hex')||convert_to($1::bigint::text,'UTF8')),'hex')
 		FROM retired ON CONFLICT DO NOTHING
 	`, predecessorTokenID, nodeID, predecessor); err != nil {
 		util.WriteError(w, http.StatusConflict, "retire drained predecessor credential")
@@ -1536,7 +1548,12 @@ func (s *Server) handleRecordingCaptureSetPlan(w http.ResponseWriter, r *http.Re
 		 origin_claim_generation,producer_id,capture_ordinal,first_capture_sequence,snapshot_generation,source_snapshot,source_snapshot_sha256,
 		 destination_naming_snapshot,destination_naming_sha256,plan_at,window_end_at,duration_microseconds,
 		 clip_duration_seconds,artifact_count,segment_times_argument,segment_times_sha256,max_artifact_bytes,expires_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$17+interval '30 seconds')
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+		  CASE WHEN $13::bytea IS NOT NULL THEN recording_surrender_source_snapshot($4) END,
+		  CASE WHEN $14::text IS NOT NULL THEN encode(sha256(convert_to(recording_surrender_source_snapshot($4)::text,'UTF8')),'hex') END,
+		  CASE WHEN $15::bytea IS NOT NULL THEN recording_surrender_destination_snapshot($4) END,
+		  CASE WHEN $16::text IS NOT NULL THEN encode(sha256(convert_to(recording_surrender_destination_snapshot($4)::text,'UTF8')),'hex') END,
+		  $17::timestamptz,$18,$19,$20,$21,$22,$23,$24,$17::timestamptz+interval '30 seconds')
 	`, planID, setID, accountID, recordingID, destinationID, jobID, leaseToken, originGeneration, producerID, req.CaptureOrdinal,
 		req.FirstCaptureSequence, snapshotGeneration, sourceSnapshot, hex.EncodeToString(sourceHash[:]), destinationSnapshot, hex.EncodeToString(destinationHash[:]),
 		dbNow, windowEnd, plan.DurationMicro, clipDuration, plan.ArtifactCount, plan.SplitTimesArgument,
@@ -1694,7 +1711,7 @@ func (s *Server) handleRecordingCaptureArtifactMaterialize(w http.ResponseWriter
 		                        WHERE set_grant.set_id=reservation.id AND set_grant.upload_grace_until>transaction_timestamp())
 		             AND EXISTS(SELECT 1 FROM recording_job_lease_generations generation
 		                        WHERE generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
-		                          AND generation.node_id=$7)))),
+			                          AND generation.node_id=$7))),
 		       (job.status='leased' AND job.lease_owner=$5 AND job.lease_token=$4
 		         AND job.lease_expires_at>transaction_timestamp() AND job.lease_credential_state='exact'
 		         AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_stop_events stop WHERE stop.set_id=reservation.id))
