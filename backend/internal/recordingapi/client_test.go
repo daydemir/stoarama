@@ -63,6 +63,43 @@ func TestIngestClipTimestampProvenancePayloadModes(t *testing.T) {
 	}
 }
 
+func TestNodeHeartbeatDecodesOnlyTypedRelayUpdateIntent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"relay_update_intent":{"request_id":"00000000-0000-4000-8000-000000000142","node_id":66,"target_version":"new123","manifest_name":"latest-new123.json","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"pending"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "old123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent == nil || intent.NodeID != 66 || intent.TargetVersion != "new123" || intent.ManifestName != "latest-new123.json" {
+		t.Fatalf("intent=%+v", intent)
+	}
+}
+
+func TestNodeHeartbeatCannotBootstrapWithoutServerIntent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent != nil {
+		t.Fatalf("unexpected bootstrap instruction=%+v", intent)
+	}
+}
+
 func TestReserveClipUploadKeepsRollbackCompatibleIdempotencyKey(t *testing.T) {
 	type receivedRequest struct {
 		idempotencyKey string

@@ -118,7 +118,7 @@ func runSurveyRelayWorker(ctx context.Context, cfg config.Config, args []string)
 }
 
 func startSurveyRelayHeartbeat(ctx context.Context, client *recordingapi.Client, caps map[string]any, every time.Duration) error {
-	if err := client.NodeHeartbeat(ctx, caps); err != nil {
+	if _, err := client.NodeHeartbeat(ctx, caps); err != nil {
 		return err
 	}
 	go func() {
@@ -129,7 +129,7 @@ func startSurveyRelayHeartbeat(ctx context.Context, client *recordingapi.Client,
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := client.NodeHeartbeat(ctx, caps); err != nil {
+				if _, err := client.NodeHeartbeat(ctx, caps); err != nil {
 					log.Printf("survey relay heartbeat failed: %v", err)
 				}
 			}

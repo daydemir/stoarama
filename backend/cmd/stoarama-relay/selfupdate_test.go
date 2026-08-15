@@ -20,7 +20,49 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
+
+func TestValidateRelayUpdateIntentIsNodeAndManifestSpecific(t *testing.T) {
+	valid := recordingapi.RelayUpdateIntent{
+		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 66,
+		TargetVersion: "new123", ManifestName: "latest-new123.json",
+		ManifestSHA256: strings.Repeat("a", 64), Status: "pending",
+	}
+	if err := validateRelayUpdateIntent(66, valid); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*recordingapi.RelayUpdateIntent){
+		"node":     func(i *recordingapi.RelayUpdateIntent) { i.NodeID++ },
+		"manifest": func(i *recordingapi.RelayUpdateIntent) { i.ManifestName = "latest-other.json" },
+		"digest":   func(i *recordingapi.RelayUpdateIntent) { i.ManifestSHA256 = strings.Repeat("A", 64) },
+		"status":   func(i *recordingapi.RelayUpdateIntent) { i.Status = "completed" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := valid
+			mutate(&bad)
+			if err := validateRelayUpdateIntent(66, bad); err == nil {
+				t.Fatal("invalid typed intent accepted")
+			}
+		})
+	}
+}
+
+func TestRelayUpdateIntentRequiresImmediateSuccessor(t *testing.T) {
+	if !relayIntentUpgradeAllowed("old123", latestJSON{Version: "new123", PreviousVersion: "old123"}) {
+		t.Fatal("immediate signed successor rejected")
+	}
+	for _, target := range []latestJSON{
+		{Version: "old123", PreviousVersion: "older"},
+		{Version: "candidate", PreviousVersion: "newer"},
+		{Version: "new123", PreviousVersion: "unknown"},
+	} {
+		if relayIntentUpgradeAllowed("old123", target) {
+			t.Fatalf("downgrade or unproven ancestry accepted: %+v", target)
+		}
+	}
+}
 
 func TestRelaySelfUpdateDefersForActiveCapture(t *testing.T) {
 	if deferUpdate, count := relaySelfUpdateDeferred(nil); deferUpdate || count != 0 {
@@ -534,6 +576,37 @@ func TestFetchLatestRequiresValidManifestSignature(t *testing.T) {
 				t.Fatalf("version=%q", got.Version)
 			}
 		})
+	}
+}
+
+func TestFetchLatestExpectedBindsIntentSnapshot(t *testing.T) {
+	manifest := []byte(`{"version":"signed1","relay":{},"ytdlp":{},"deno":{}}`)
+	seed := sha256.Sum256([]byte("stoarama relay intent signing key"))
+	privateKey := ed25519.NewKeyFromSeed(seed[:])
+	oldPublicKey := releasePublicKeyBase64
+	releasePublicKeyBase64 = base64.StdEncoding.EncodeToString(privateKey.Public().(ed25519.PublicKey))
+	t.Cleanup(func() { releasePublicKeyBase64 = oldPublicKey })
+	signature := ed25519.Sign(privateKey, manifest)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/relay/download/latest-signed1.json":
+			_, _ = w.Write(manifest)
+		case "/relay/download/latest-signed1.json.sig":
+			_, _ = w.Write([]byte(base64.StdEncoding.EncodeToString(signature)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	sum := sha256.Sum256(manifest)
+	if _, err := fetchLatestExpected(server.URL, "latest-signed1.json", "signed1", hex.EncodeToString(sum[:])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fetchLatestExpected(server.URL, "latest-signed1.json", "signed1", strings.Repeat("0", 64)); err == nil {
+		t.Fatal("manifest substitution accepted")
+	}
+	if _, err := fetchLatestExpected(server.URL, "latest-signed1.json", "other", hex.EncodeToString(sum[:])); err == nil {
+		t.Fatal("version substitution accepted")
 	}
 }
 

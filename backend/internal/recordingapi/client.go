@@ -203,6 +203,18 @@ type SurveyLease struct {
 	Day     string          `json:"day"`
 }
 
+// RelayUpdateIntent is the only control-plane instruction accepted by a relay.
+// It names an immutable promoted manifest; the relay's existing signed updater
+// still verifies that manifest and every artifact before installation.
+type RelayUpdateIntent struct {
+	RequestID      string `json:"request_id"`
+	NodeID         int64  `json:"node_id"`
+	TargetVersion  string `json:"target_version"`
+	ManifestName   string `json:"manifest_name"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+	Status         string `json:"status"`
+}
+
 // LeaseRecordingJob leases one due job, or returns (nil, nil) when none is due.
 func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
 	var out struct {
@@ -358,15 +370,21 @@ func (c *Client) TouchDroplet(ctx context.Context, buildSHA string) error {
 // capability keys into nodes.capabilities_jsonb via POST /api/v1/node/heartbeat.
 // The relay binary calls this on its own 30s ticker; cloud droplet workers use
 // TouchDroplet instead and never call this.
-func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) error {
+func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) (*RelayUpdateIntent, error) {
 	status, body, err := c.postRaw(ctx, "/api/v1/node/heartbeat", map[string]any{"capabilities_json": capabilities})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if status < 200 || status >= 300 {
-		return &apihttp.StatusError{Label: "node heartbeat", Code: status, Body: strings.TrimSpace(string(body))}
+		return nil, &apihttp.StatusError{Label: "node heartbeat", Code: status, Body: strings.TrimSpace(string(body))}
 	}
-	return nil
+	var out struct {
+		Intent *RelayUpdateIntent `json:"relay_update_intent"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode node heartbeat: %w", err)
+	}
+	return out.Intent, nil
 }
 
 // StartRecordingCanary creates a short metadata-only reservation honored by

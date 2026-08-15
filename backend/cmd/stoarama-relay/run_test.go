@@ -107,7 +107,7 @@ func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	firstSent := make(chan struct{})
-	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, nil, time.Now().UTC(), "", server.URL, firstSent)
+	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, nil, time.Now().UTC(), "", server.URL, nil, firstSent)
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 
@@ -717,7 +717,7 @@ func TestSendNodeHeartbeatRetriesTransientFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sendNodeHeartbeat(context.Background(), client, map[string]any{}); err != nil {
+	if _, err := sendNodeHeartbeat(context.Background(), client, map[string]any{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := attempts.Load(); got != 3 {
@@ -736,7 +736,7 @@ func TestSendNodeHeartbeatDoesNotRetryAuthenticationFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sendNodeHeartbeat(context.Background(), client, map[string]any{}); err == nil {
+	if _, err := sendNodeHeartbeat(context.Background(), client, map[string]any{}); err == nil {
 		t.Fatal("authentication failure accepted")
 	}
 	if got := attempts.Load(); got != 1 {

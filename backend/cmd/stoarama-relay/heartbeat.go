@@ -833,7 +833,7 @@ func loadFFmpegTelemetry(binDir string) *ffmpegTelemetry {
 // 30s. External probes run independently so a slow resolver cannot block liveness.
 // POST /api/v1/node/heartbeat sets last_heartbeat_at and merges the reported keys into
 // nodes.capabilities_jsonb.
-func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, diag relayDiagnostics, startedAt time.Time, tempDir, apiURL string, firstSent chan<- struct{}) {
+func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *probe, active *atomic.Int64, diag relayDiagnostics, startedAt time.Time, tempDir, apiURL string, updates chan<- recordingapi.RelayUpdateIntent, firstSent chan<- struct{}) {
 	diagnosticsPath := ""
 	relayDataDir := ""
 	if home, err := stoaramaHome(); err == nil {
@@ -888,6 +888,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			"relay_started_at":         startedAt,
 			"health":                   health,
 			"continuous_source_pts_v1": true,
+			"relay_update_intents_v1":  true,
 		}
 		if recoveryPending {
 			caps["recovery"] = map[string]any{"recovered_at": time.Now().UTC(), "previous_exit": reportedPreviousExit, "boot_id": previousRecovery.BootID, "started_at": previousRecovery.StartedAt, "last_heartbeat_at": previousRecovery.LastHeartbeatAt, "last_capture_at": previousRecovery.LastCaptureAt, "last_upload_at": previousRecovery.LastUploadAt, "last_updater_at": previousRecovery.LastUpdaterAt, "error_tail": previousRecovery.ErrorTail, "log_tail": relayLogTail(relayLogPath(relayDataDir))}
@@ -931,7 +932,7 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		if hasOffline {
 			caps["offline_diagnostics"] = offline
 		}
-		err := sendNodeHeartbeat(ctx, client, caps)
+		intent, err := sendNodeHeartbeat(ctx, client, caps)
 		if err != nil && ctx.Err() == nil {
 			sanitized := recordingworker.SanitizeDiagnosticError(err)
 			recovery.LastError = sanitized
@@ -944,6 +945,12 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 			}
 			log.Printf("relay heartbeat error: %s", sanitized)
 		} else if err == nil {
+			if intent != nil && updates != nil {
+				select {
+				case updates <- *intent:
+				default:
+				}
+			}
 			recovery.LastHeartbeatAt = time.Now().UTC()
 			recovery.HeartbeatSuccessCount++
 			recovery.LastError = ""
@@ -1092,27 +1099,28 @@ func relayLogCategory(line string) string {
 	return ""
 }
 
-func sendNodeHeartbeat(ctx context.Context, client *recordingapi.Client, caps map[string]any) error {
+func sendNodeHeartbeat(ctx context.Context, client *recordingapi.Client, caps map[string]any) (*recordingapi.RelayUpdateIntent, error) {
 	const attempts = 3
 	var lastErr error
+	var intent *recordingapi.RelayUpdateIntent
 	for attempt := 1; attempt <= attempts; attempt++ {
 		hctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-		lastErr = client.NodeHeartbeat(hctx, caps)
+		intent, lastErr = client.NodeHeartbeat(hctx, caps)
 		cancel()
 		if lastErr == nil || ctx.Err() != nil || !retryableNodeHeartbeatError(lastErr) {
-			return lastErr
+			return intent, lastErr
 		}
 		if attempt < attempts {
 			timer := time.NewTimer(time.Second)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-timer.C:
 			}
 		}
 	}
-	return lastErr
+	return nil, lastErr
 }
 
 func retryableNodeHeartbeatError(err error) bool {

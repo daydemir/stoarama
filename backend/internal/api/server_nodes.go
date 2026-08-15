@@ -1005,7 +1005,13 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// relay heartbeat that reports only its relay keys (youtube_mode, youtube_ready,
 	// youtube_error, active_jobs, relay_version, ...) preserves any pre-existing keys.
 	// A null capabilities payload leaves the column untouched (concat with '{}').
-	ct, err := s.pool.Exec(r.Context(), `
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin node heartbeat")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE nodes
 		SET
 			last_heartbeat_at=now(),
@@ -1023,12 +1029,26 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusNotFound, "node not found")
 		return
 	}
+	reportedVersion, _ := req.CapabilitiesJSON["relay_version"].(string)
+	intent, err := resolveRelayUpdateHeartbeat(r.Context(), tx, principal, strings.TrimSpace(reportedVersion))
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "resolve relay update intent")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit node heartbeat")
+		return
+	}
 	node, err := s.fetchNodeByID(r.Context(), principal.NodeID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "node": node})
+	response := map[string]any{"ok": true, "node": node}
+	if intent != nil {
+		response["relay_update_intent"] = intent
+	}
+	util.WriteJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) fetchNodeByID(ctx context.Context, id int64) (map[string]any, error) {

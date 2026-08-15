@@ -62,6 +62,7 @@ type Server struct {
 	dayZipSlot              chan struct{}
 	authLinkLimiter         *authLinkLimiter
 	sharedRecordingsLimiter *sharedRecordingsLimiter
+	relayUpdateSnapshot     func(context.Context, string, string) (relayManifestSnapshot, error)
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -314,6 +315,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/billing/portal", s.handleAccountBillingPortal)
 			account.Get("/nodes", s.handleAccountNodesList)
 			account.Patch("/nodes/{id}", s.handleAccountNodePatch)
+			account.Post("/nodes/{id}/relay-update-intents", s.handleAccountRelayUpdateIntentCreate)
 			account.Delete("/nodes/{id}", s.handleAccountNodeDelete)
 			account.Put("/nodes/{id}/relay-group/{group_id}", s.handleAccountNodeRelayGroupPut)
 			account.Delete("/nodes/{id}/relay-group", s.handleAccountNodeRelayGroupDelete)
