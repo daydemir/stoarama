@@ -76,7 +76,7 @@ func installLaunchdInDomain(userDomain bool) error {
 	}
 	plistPath := filepath.Join(agentsDir, launchdLabel+".plist")
 	instanceID := newServiceInstanceID()
-	rendered, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), logPath, instanceID))
+	rendered, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), logPath, instanceID, userDomain))
 	if err != nil {
 		return err
 	}
@@ -354,9 +354,14 @@ func newServiceInstanceID() string {
 	return rand.Text()
 }
 
-func launchdTemplateData(label, exePath, logPath, instanceID string) map[string]string {
+type launchdPlistData struct {
+	Label, ExePath, LogPath, InstanceID string
+	UserDomain                          bool
+}
+
+func launchdTemplateData(label, exePath, logPath, instanceID string, userDomain bool) launchdPlistData {
 	escape := html.EscapeString
-	return map[string]string{"Label": escape(label), "ExePath": escape(exePath), "LogPath": escape(logPath), "InstanceID": escape(instanceID)}
+	return launchdPlistData{escape(label), escape(exePath), escape(logPath), escape(instanceID), userDomain}
 }
 
 func readPriorFile(path string) ([]byte, os.FileMode, bool, error) {
@@ -641,7 +646,7 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 	}
 	instanceID := newServiceInstanceID()
 	logPath := filepath.Join(home, ".stoarama", "logs", "relay.log")
-	updated, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, exe, logPath, instanceID))
+	updated, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, exe, logPath, instanceID, false))
 	if err != nil {
 		return err
 	}
