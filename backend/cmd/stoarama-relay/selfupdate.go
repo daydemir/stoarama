@@ -30,7 +30,6 @@ import (
 var lastUpdaterUnix atomic.Int64
 var releasePublicKeyBase64 string
 var restartRelayAfterSelfUpdate = restartAfterSelfUpdate
-var selfUpdateDrainPollInterval = time.Second
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -194,24 +193,44 @@ func runSelfUpdate(args []string) error {
 // after start (not immediately) so a fresh install does not restart itself on boot.
 // When the relay binary itself changes it kickstarts the service so the new binary is
 // exec'd; a yt-dlp-only refresh is picked up by the next capture without a restart.
-func selfUpdateLoop(ctx context.Context, cfg relayConfig, intents <-chan recordingapi.RelayUpdateIntent, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
+func selfUpdateLoop(ctx context.Context, cfg relayConfig, updates <-chan recordingapi.RelayHeartbeatUpdate, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
 	ticker := time.NewTicker(selfUpdateInterval)
 	defer ticker.Stop()
 	manifest := cfg.updateManifest()
+	pendingIntent := cfg.PendingUpdateIntent
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case intent := <-intents:
+		case update := <-updates:
+			if update.AckRequestID != "" {
+				if err := clearPendingRelayUpdate(update.AckRequestID); err != nil {
+					log.Printf("relay update intent ack persistence failed: %v", err)
+					continue
+				}
+				if drainForUpdate != nil {
+					drainForUpdate.Store(false)
+				}
+				pendingIntent = nil
+			}
+			if update.Intent == nil {
+				continue
+			}
+			intent := *update.Intent
 			if err := validateRelayUpdateIntent(cfg.NodeID, intent); err != nil {
 				log.Printf("relay update intent rejected: %v", err)
 				continue
 			}
-			if checkAndApplyUpdateExpected(cfg.APIURL, releaseManifest(intent.ManifestName), intent.TargetVersion, intent.ManifestSHA256, activeJobs, leaseGate, drainForUpdate) {
-				waitForSelfUpdateDrain(ctx, activeJobs, leaseGate, drainForUpdate)
+			pinned := releaseManifest(intent.ManifestName)
+			if err := setPendingRelayUpdateIntent(intent); err != nil {
+				log.Printf("relay update intent pin failed: %v", err)
+				continue
 			}
+			manifest = pinned
+			pendingIntent = &intent
+			checkAndApplyUpdateExpected(cfg.APIURL, manifest, &intent, activeJobs, leaseGate, drainForUpdate)
 		case <-ticker.C:
-			if manifest != liveReleaseManifest {
+			if manifest != liveReleaseManifest && pendingIntent == nil {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
 				if err != nil {
 					log.Printf("relay self-update: check live promotion: %v", err)
@@ -226,9 +245,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, intents <-chan recordi
 					}
 				}
 			}
-			if checkAndApplyUpdate(cfg.APIURL, manifest, activeJobs, leaseGate, drainForUpdate) {
-				waitForSelfUpdateDrain(ctx, activeJobs, leaseGate, drainForUpdate)
-			}
+			checkAndApplyUpdateExpected(cfg.APIURL, manifest, pendingIntent, activeJobs, leaseGate, drainForUpdate)
 		}
 	}
 }
@@ -238,11 +255,31 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, intents <-chan recordi
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
 func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
-	return checkAndApplyUpdateExpected(base, manifest, "", "", activeJobs, leaseGate, drainForUpdate)
+	return checkAndApplyUpdateExpected(base, manifest, nil, activeJobs, leaseGate, drainForUpdate)
 }
 
-func checkAndApplyUpdateExpected(base string, manifest releaseManifest, expectedVersion, expectedSHA string, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
+func checkAndApplyUpdateExpected(base string, manifest releaseManifest, intent *recordingapi.RelayUpdateIntent, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
 	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
+	if drainForUpdate != nil {
+		drainForUpdate.Store(true)
+	}
+	unlock, deferred, count := lockRelayRestartGate(leaseGate, activeJobs)
+	if deferred {
+		unlock()
+		log.Printf("relay self-update: draining %d recording job(s) before any update mutation", count)
+		return true
+	}
+	defer unlock()
+	holdDrain := intent != nil
+	defer func() {
+		if !holdDrain && drainForUpdate != nil {
+			drainForUpdate.Store(false)
+		}
+	}()
+	expectedVersion, expectedSHA := "", ""
+	if intent != nil {
+		expectedVersion, expectedSHA = intent.TargetVersion, intent.ManifestSHA256
+	}
 	lj, err := fetchLatestExpected(base, manifest, expectedVersion, expectedSHA)
 	if err != nil {
 		log.Printf("relay self-update: fetch latest.json: %v", err)
@@ -253,6 +290,13 @@ func checkAndApplyUpdateExpected(base string, manifest releaseManifest, expected
 		return false
 	}
 	target := runtime.GOOS + "-" + runtime.GOARCH
+	if intent != nil {
+		relayArtifact, ok := lj.Relay[target]
+		if !ok || strings.TrimSpace(relayArtifact.SHA256) != intent.RelayArtifactSHA256 {
+			log.Printf("relay update intent: signed relay artifact digest differs")
+			return false
+		}
+	}
 	ytdlpPresent, _, err := refreshExecutableDependency(base, lj.Ytdlp, target, "yt-dlp")
 	if err != nil {
 		log.Printf("relay self-update: yt-dlp refresh failed; relay activation held: %v", err)
@@ -288,21 +332,22 @@ func checkAndApplyUpdateExpected(base string, manifest releaseManifest, expected
 		log.Printf("relay self-update: relay up to date (%s)", version)
 	}
 
+	if intent != nil && (relayUpdated || lj.Version == version) {
+		installedSHA, err := installedRelaySHA256()
+		if err != nil {
+			log.Printf("relay update intent: hash installed relay: %v", err)
+			return false
+		}
+		result := recordingapi.RelayUpdateResult{RequestID: intent.RequestID, TargetVersion: intent.TargetVersion,
+			ManifestName: intent.ManifestName, ManifestSHA256: intent.ManifestSHA256,
+			RelayArtifactSHA256: intent.RelayArtifactSHA256, InstalledSHA256: installedSHA, AppliedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+		if err := setPendingRelayUpdateResult(result); err != nil {
+			log.Printf("relay update intent: persist applied proof: %v", err)
+			return false
+		}
+	}
 	if relayUpdated || runtimeActivationNeeded {
-		if drainForUpdate != nil {
-			drainForUpdate.Store(true)
-		}
-		// A recording can be leased while the update downloads. Exclude lease
-		// admission across the final idle check and restart initiation: workers hold
-		// the read side from before the lease request until ActiveJobs is incremented.
-		// If a capture is active, leave the old process running; the next idle tick
-		// restarts into the already-verified binary without losing an open segment.
-		unlock, deferUpdate, count := lockRelayRestartGate(leaseGate, activeJobs)
-		defer unlock()
-		if deferUpdate {
-			log.Printf("relay self-update: draining %d recording job(s) before restart", count)
-			return true
-		}
+		holdDrain = true
 		log.Printf("relay self-update: restarting service to load new binary")
 		if err := restartRelayAfterSelfUpdate(); err != nil {
 			log.Printf("relay self-update: restart failed: %v", err)
@@ -333,35 +378,10 @@ func validateRelayUpdateIntent(nodeID int64, intent recordingapi.RelayUpdateInte
 	if err != nil || len(digest) != sha256.Size || intent.ManifestSHA256 != strings.ToLower(intent.ManifestSHA256) {
 		return fmt.Errorf("manifest digest is invalid")
 	}
-	return nil
-}
-
-func waitForSelfUpdateDrain(ctx context.Context, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
-	ticker := time.NewTicker(selfUpdateDrainPollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			unlock, deferred, count := lockRelayRestartGate(leaseGate, activeJobs)
-			if deferred {
-				unlock()
-				log.Printf("relay self-update: waiting for %d recording job(s) to drain", count)
-				continue
-			}
-			log.Printf("relay self-update: drain complete; restarting service")
-			err := restartRelayAfterSelfUpdate()
-			unlock()
-			if err != nil {
-				log.Printf("relay self-update: restart after drain failed: %v", err)
-				if drainForUpdate != nil {
-					drainForUpdate.Store(false)
-				}
-			}
-			return
-		}
+	if !lowerHexSHA256(intent.RelayArtifactSHA256) {
+		return fmt.Errorf("relay artifact digest is invalid")
 	}
+	return nil
 }
 
 func refreshExecutableDependency(base string, artifacts map[string]latestArtifact, target, name string) (bool, bool, error) {
@@ -513,6 +533,8 @@ func updateManifestAfterPromotion(current releaseManifest, pinnedPreviousVersion
 }
 
 func setUpdateManifest(manifest releaseManifest) error {
+	relayConfigMu.Lock()
+	defer relayConfigMu.Unlock()
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -525,6 +547,55 @@ func setUpdateManifest(manifest releaseManifest) error {
 		return nil
 	}
 	cfg.UpdateManifest = desired
+	return saveConfig(cfg)
+}
+
+func setPendingRelayUpdateResult(result recordingapi.RelayUpdateResult) error {
+	relayConfigMu.Lock()
+	defer relayConfigMu.Unlock()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.PendingUpdateIntent == nil || cfg.PendingUpdateIntent.RequestID != result.RequestID {
+		return fmt.Errorf("relay update result has no matching pending intent")
+	}
+	if cfg.PendingUpdateResult != nil && *cfg.PendingUpdateResult == result {
+		return nil
+	}
+	cfg.PendingUpdateResult = &result
+	return saveConfig(cfg)
+}
+
+func setPendingRelayUpdateIntent(intent recordingapi.RelayUpdateIntent) error {
+	relayConfigMu.Lock()
+	defer relayConfigMu.Unlock()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.PendingUpdateIntent != nil && *cfg.PendingUpdateIntent != intent {
+		return fmt.Errorf("another relay update intent is already pending")
+	}
+	manifest := releaseManifest(intent.ManifestName)
+	cfg.UpdateManifest = manifest
+	cfg.PendingUpdateIntent = &intent
+	return saveConfig(cfg)
+}
+
+func clearPendingRelayUpdate(requestID string) error {
+	relayConfigMu.Lock()
+	defer relayConfigMu.Unlock()
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.PendingUpdateResult == nil || cfg.PendingUpdateResult.RequestID != requestID ||
+		cfg.PendingUpdateIntent == nil || cfg.PendingUpdateIntent.RequestID != requestID {
+		return nil
+	}
+	cfg.PendingUpdateResult = nil
+	cfg.PendingUpdateIntent = nil
 	return saveConfig(cfg)
 }
 
@@ -703,6 +774,19 @@ func fileMatchesSHA256(path, want string) (bool, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]) == want, nil
+}
+
+func installedRelaySHA256() (string, error) {
+	dir, err := binDir()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "stoarama-relay"))
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func downloadVerified(base string, art latestArtifact) ([]byte, error) {

@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/relaylimits"
 )
 
@@ -21,12 +23,16 @@ const relayWorkerCeiling = relaylimits.MaxStreams
 
 // relayConfig is the persisted enrollment state at ~/.stoarama/config.json (0600).
 type relayConfig struct {
-	NodeID         int64           `json:"node_id"`
-	NodeToken      string          `json:"node_token"`
-	APIURL         string          `json:"api_url"`
-	InstalledAt    time.Time       `json:"installed_at"`
-	UpdateManifest releaseManifest `json:"update_manifest,omitempty"`
+	NodeID              int64                           `json:"node_id"`
+	NodeToken           string                          `json:"node_token"`
+	APIURL              string                          `json:"api_url"`
+	InstalledAt         time.Time                       `json:"installed_at"`
+	UpdateManifest      releaseManifest                 `json:"update_manifest,omitempty"`
+	PendingUpdateIntent *recordingapi.RelayUpdateIntent `json:"pending_update_intent,omitempty"`
+	PendingUpdateResult *recordingapi.RelayUpdateResult `json:"pending_update_result,omitempty"`
 }
+
+var relayConfigMu sync.Mutex
 
 func stoaramaHome() (string, error) {
 	home, err := os.UserHomeDir()
@@ -107,7 +113,34 @@ func loadConfig() (relayConfig, error) {
 	if cfg.UpdateManifest != "" && !cfg.UpdateManifest.valid() {
 		return cfg, fmt.Errorf("relay config %s has invalid update_manifest", p)
 	}
+	if intent := cfg.PendingUpdateIntent; intent != nil {
+		if err := validateRelayUpdateIntent(cfg.NodeID, *intent); err != nil || cfg.UpdateManifest != releaseManifest(intent.ManifestName) {
+			return cfg, fmt.Errorf("relay config %s has invalid pending_update_intent", p)
+		}
+	}
+	if result := cfg.PendingUpdateResult; result != nil {
+		manifest, manifestErr := immutableReleaseManifest(result.TargetVersion)
+		if manifestErr != nil || string(manifest) != result.ManifestName || !lowerHexSHA256(result.ManifestSHA256) ||
+			!lowerHexSHA256(result.RelayArtifactSHA256) || !lowerHexSHA256(result.InstalledSHA256) || strings.TrimSpace(result.RequestID) == "" {
+			return cfg, fmt.Errorf("relay config %s has invalid pending_update_result", p)
+		}
+		if cfg.PendingUpdateIntent == nil || cfg.PendingUpdateIntent.RequestID != result.RequestID {
+			return cfg, fmt.Errorf("relay config %s has orphaned pending_update_result", p)
+		}
+	}
 	return cfg, nil
+}
+
+func lowerHexSHA256(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func saveConfig(cfg relayConfig) error {

@@ -28,7 +28,7 @@ func TestValidateRelayUpdateIntentIsNodeAndManifestSpecific(t *testing.T) {
 	valid := recordingapi.RelayUpdateIntent{
 		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 66,
 		TargetVersion: "new123", ManifestName: "latest-new123.json",
-		ManifestSHA256: strings.Repeat("a", 64), Status: "pending",
+		ManifestSHA256: strings.Repeat("a", 64), RelayArtifactSHA256: strings.Repeat("b", 64), Status: "pending",
 	}
 	if err := validateRelayUpdateIntent(66, valid); err != nil {
 		t.Fatal(err)
@@ -37,6 +37,7 @@ func TestValidateRelayUpdateIntentIsNodeAndManifestSpecific(t *testing.T) {
 		"node":     func(i *recordingapi.RelayUpdateIntent) { i.NodeID++ },
 		"manifest": func(i *recordingapi.RelayUpdateIntent) { i.ManifestName = "latest-other.json" },
 		"digest":   func(i *recordingapi.RelayUpdateIntent) { i.ManifestSHA256 = strings.Repeat("A", 64) },
+		"artifact": func(i *recordingapi.RelayUpdateIntent) { i.RelayArtifactSHA256 = strings.Repeat("A", 64) },
 		"status":   func(i *recordingapi.RelayUpdateIntent) { i.Status = "completed" },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -282,14 +283,118 @@ func TestCheckAndApplyUpdateDrainsActiveJobsBeforeRestart(t *testing.T) {
 		t.Fatalf("drain=%v restarts=%d want true,0", drain.Load(), *restarts)
 	}
 	active.Store(0)
-	oldPoll := selfUpdateDrainPollInterval
-	selfUpdateDrainPollInterval = time.Millisecond
-	t.Cleanup(func() { selfUpdateDrainPollInterval = oldPoll })
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	waitForSelfUpdateDrain(ctx, active, gate, drain)
+	checkAndApplyUpdate(server.URL, liveReleaseManifest, active, gate, drain)
 	if *restarts != 1 {
 		t.Fatalf("restarts=%d want 1", *restarts)
+	}
+}
+
+func TestTypedRelayUpdatePersistsPinBeforeAnyMutation(t *testing.T) {
+	setupSelfUpdateHome(t, "old123")
+	active := &atomic.Int64{}
+	active.Store(1)
+	updates := make(chan recordingapi.RelayHeartbeatUpdate, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		selfUpdateLoop(ctx, relayConfig{NodeID: 1, NodeToken: "test", APIURL: "http://127.0.0.1:1"}, updates, active, &sync.RWMutex{}, &atomic.Bool{})
+	}()
+	updates <- recordingapi.RelayHeartbeatUpdate{Intent: &recordingapi.RelayUpdateIntent{
+		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 1, TargetVersion: "new123",
+		ManifestName: "latest-new123.json", ManifestSHA256: strings.Repeat("a", 64),
+		RelayArtifactSHA256: strings.Repeat("b", 64), Status: "pending",
+	}}
+	deadline := time.Now().Add(time.Second)
+	for {
+		cfg, err := loadConfig()
+		if err == nil && cfg.UpdateManifest == releaseManifest("latest-new123.json") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("typed immutable pin was not persisted before drain: cfg=%+v err=%v", cfg, err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	cfg, err := loadConfig()
+	if err != nil || cfg.updateManifest() != releaseManifest("latest-new123.json") || cfg.PendingUpdateIntent == nil {
+		t.Fatalf("restart would reclaim old live pin: manifest=%q err=%v", cfg.updateManifest(), err)
+	}
+}
+
+func TestTypedRelayUpdateDoesNotFetchOrMutateWhileBusy(t *testing.T) {
+	setupSelfUpdateHome(t, "old123")
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer server.Close()
+	active := &atomic.Int64{}
+	active.Store(1)
+	drain := &atomic.Bool{}
+	intent := &recordingapi.RelayUpdateIntent{
+		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 1, TargetVersion: "new123",
+		ManifestName: "latest-new123.json", ManifestSHA256: strings.Repeat("a", 64),
+		RelayArtifactSHA256: strings.Repeat("b", 64), Status: "pending",
+	}
+	if !checkAndApplyUpdateExpected(server.URL, releaseManifest(intent.ManifestName), intent, active, &sync.RWMutex{}, drain) {
+		t.Fatal("busy typed update did not remain drained")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("busy update fetched or mutated dependencies before idle fence: requests=%d", requests.Load())
+	}
+}
+
+func TestTypedRelayUpdatePersistsExactAppliedWitness(t *testing.T) {
+	setupSelfUpdateHome(t, "old123")
+	newRelay := relayScript("new123")
+	relayTar := testRelayTarball(t, newRelay)
+	manifest := latestJSON{
+		Version: "new123", PreviousVersion: "old123",
+		Relay: map[string]latestArtifact{testRelayTarget(): testArtifact("relay.tar.gz", relayTar)},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := serveTestRelayRelease(t, manifest, map[string][]byte{"relay.tar.gz": relayTar})
+	captureSelfUpdateRestarts(t)
+	manifestSum := sha256.Sum256(manifestBytes)
+	intent := &recordingapi.RelayUpdateIntent{
+		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 1, TargetVersion: "new123",
+		ManifestName: "latest-new123.json", ManifestSHA256: hex.EncodeToString(manifestSum[:]),
+		RelayArtifactSHA256: manifest.Relay[testRelayTarget()].SHA256, Status: "pending",
+	}
+	if err := setPendingRelayUpdateIntent(*intent); err != nil {
+		t.Fatal(err)
+	}
+	checkAndApplyUpdateExpected(server.URL, releaseManifest(intent.ManifestName), intent, &atomic.Int64{}, &sync.RWMutex{}, &atomic.Bool{})
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpdateManifest != releaseManifest(intent.ManifestName) || cfg.PendingUpdateResult == nil {
+		t.Fatalf("config=%+v", cfg)
+	}
+	result := cfg.PendingUpdateResult
+	if result.RequestID != intent.RequestID || result.ManifestSHA256 != intent.ManifestSHA256 ||
+		result.RelayArtifactSHA256 != intent.RelayArtifactSHA256 || result.TargetVersion != intent.TargetVersion ||
+		!lowerHexSHA256(result.InstalledSHA256) || result.AppliedAt == "" {
+		t.Fatalf("applied witness=%+v", result)
+	}
+	if err := clearPendingRelayUpdate("00000000-0000-4000-8000-000000000999"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = loadConfig(); err != nil || cfg.PendingUpdateResult == nil || cfg.PendingUpdateIntent == nil {
+		t.Fatalf("mismatched ack cleared durable witness: cfg=%+v err=%v", cfg, err)
+	}
+	if err := clearPendingRelayUpdate(intent.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = loadConfig(); err != nil || cfg.PendingUpdateResult != nil || cfg.PendingUpdateIntent != nil || cfg.UpdateManifest != releaseManifest(intent.ManifestName) {
+		t.Fatalf("exact ack cleanup changed pin or retained receipt: cfg=%+v err=%v", cfg, err)
 	}
 }
 
@@ -338,9 +443,9 @@ func serveTestRelayRelease(t *testing.T, manifest latestJSON, artifacts map[stri
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/relay/download/")
 		switch name {
-		case "latest.json":
+		case "latest.json", "latest-" + manifest.Version + ".json":
 			_, _ = w.Write(manifestBytes)
-		case "latest.json.sig":
+		case "latest.json.sig", "latest-" + manifest.Version + ".json.sig":
 			_, _ = w.Write([]byte(signature))
 		default:
 			if artifact, ok := artifacts[name]; ok {

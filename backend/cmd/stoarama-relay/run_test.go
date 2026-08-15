@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,7 +108,7 @@ func TestHeartbeatDoesNotWaitForExternalProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	firstSent := make(chan struct{})
-	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, nil, time.Now().UTC(), "", server.URL, nil, firstSent)
+	go relayHeartbeatLoop(ctx, client, newProbe("missing-yt-dlp"), &atomic.Int64{}, nil, time.Now().UTC(), "", server.URL, false, nil, firstSent)
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 
@@ -722,6 +723,21 @@ func TestSendNodeHeartbeatRetriesTransientFailure(t *testing.T) {
 	}
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("attempts=%d want 3", got)
+	}
+}
+
+func TestRelayUpdateCapabilityIsAbsentWithoutSelfUpdater(t *testing.T) {
+	caps := map[string]any{"relay_version": "old123"}
+	addRelayUpdateCapabilities(caps, false)
+	if _, ok := caps["relay_update_intents_v1"]; ok {
+		t.Fatal("disabled updater advertised intent capability")
+	}
+	if _, ok := caps["relay_update_runtime_target"]; ok {
+		t.Fatal("disabled updater advertised runtime target")
+	}
+	addRelayUpdateCapabilities(caps, true)
+	if caps["relay_update_intents_v1"] != true || caps["relay_update_runtime_target"] != runtime.GOOS+"-"+runtime.GOARCH {
+		t.Fatalf("enabled updater capabilities=%v", caps)
 	}
 }
 

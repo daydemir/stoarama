@@ -1093,14 +1093,23 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusNotFound, "node not found")
 		return
 	}
-	reportedVersion, _ := req.CapabilitiesJSON["relay_version"].(string)
-	intent, err := resolveRelayUpdateHeartbeat(r.Context(), tx, principal, strings.TrimSpace(reportedVersion))
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "resolve relay update intent")
-		return
-	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit node heartbeat")
+		return
+	}
+	reportedVersion, _ := req.CapabilitiesJSON["relay_version"].(string)
+	supportsUpdateIntents, _ := req.CapabilitiesJSON["relay_update_intents_v1"].(bool)
+	var appliedResult *relayUpdateAppliedResult
+	if raw, ok := req.CapabilitiesJSON["relay_update_result"]; ok {
+		encoded, marshalErr := json.Marshal(raw)
+		if marshalErr != nil || json.Unmarshal(encoded, &appliedResult) != nil {
+			util.WriteError(w, http.StatusBadRequest, "relay_update_result is invalid")
+			return
+		}
+	}
+	updateResponse, err := s.resolveRelayUpdateHeartbeat(r.Context(), principal, strings.TrimSpace(reportedVersion), supportsUpdateIntents, appliedResult)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "resolve relay update intent")
 		return
 	}
 	node, err := s.fetchNodeByID(r.Context(), principal.NodeID)
@@ -1109,8 +1118,11 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := map[string]any{"ok": true, "node": node}
-	if intent != nil {
-		response["relay_update_intent"] = intent
+	if updateResponse.Intent != nil {
+		response["relay_update_intent"] = updateResponse.Intent
+	}
+	if updateResponse.AckRequestID != "" {
+		response["relay_update_ack_request_id"] = updateResponse.AckRequestID
 	}
 	util.WriteJSON(w, http.StatusOK, response)
 }

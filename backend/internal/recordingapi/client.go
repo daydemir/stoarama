@@ -588,12 +588,28 @@ type SurveyLease struct {
 // It names an immutable promoted manifest; the relay's existing signed updater
 // still verifies that manifest and every artifact before installation.
 type RelayUpdateIntent struct {
-	RequestID      string `json:"request_id"`
-	NodeID         int64  `json:"node_id"`
-	TargetVersion  string `json:"target_version"`
-	ManifestName   string `json:"manifest_name"`
-	ManifestSHA256 string `json:"manifest_sha256"`
-	Status         string `json:"status"`
+	RequestID           string `json:"request_id"`
+	NodeID              int64  `json:"node_id"`
+	TargetVersion       string `json:"target_version"`
+	ManifestName        string `json:"manifest_name"`
+	ManifestSHA256      string `json:"manifest_sha256"`
+	RelayArtifactSHA256 string `json:"relay_artifact_sha256"`
+	Status              string `json:"status"`
+}
+
+type RelayUpdateResult struct {
+	RequestID           string `json:"request_id"`
+	TargetVersion       string `json:"target_version"`
+	ManifestName        string `json:"manifest_name"`
+	ManifestSHA256      string `json:"manifest_sha256"`
+	RelayArtifactSHA256 string `json:"relay_artifact_sha256"`
+	InstalledSHA256     string `json:"installed_binary_sha256"`
+	AppliedAt           string `json:"applied_at"`
+}
+
+type RelayHeartbeatUpdate struct {
+	Intent       *RelayUpdateIntent
+	AckRequestID string
 }
 
 // LeaseRecordingJob leases one due job, or returns (nil, nil) when none is due.
@@ -932,21 +948,22 @@ func (c *Client) TouchDroplet(ctx context.Context, buildSHA string) error {
 // capability keys into nodes.capabilities_jsonb via POST /api/v1/node/heartbeat.
 // The relay binary calls this on its own 30s ticker; cloud droplet workers use
 // TouchDroplet instead and never call this.
-func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) (*RelayUpdateIntent, error) {
+func (c *Client) NodeHeartbeat(ctx context.Context, capabilities map[string]any) (RelayHeartbeatUpdate, error) {
 	status, body, err := c.postRaw(ctx, "/api/v1/node/heartbeat", map[string]any{"capabilities_json": capabilities})
 	if err != nil {
-		return nil, err
+		return RelayHeartbeatUpdate{}, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, &apihttp.StatusError{Label: "node heartbeat", Code: status, Body: strings.TrimSpace(string(body))}
+		return RelayHeartbeatUpdate{}, &apihttp.StatusError{Label: "node heartbeat", Code: status, Body: strings.TrimSpace(string(body))}
 	}
 	var out struct {
-		Intent *RelayUpdateIntent `json:"relay_update_intent"`
+		Intent       *RelayUpdateIntent `json:"relay_update_intent"`
+		AckRequestID string             `json:"relay_update_ack_request_id"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("decode node heartbeat: %w", err)
+		return RelayHeartbeatUpdate{}, fmt.Errorf("decode node heartbeat: %w", err)
 	}
-	return out.Intent, nil
+	return RelayHeartbeatUpdate{Intent: out.Intent, AckRequestID: out.AckRequestID}, nil
 }
 
 // StartRecordingCanary creates a short metadata-only reservation honored by

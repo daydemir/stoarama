@@ -67,7 +67,7 @@ type Server struct {
 	authLinkLimiter         *authLinkLimiter
 	sharedRecordingsLimiter *sharedRecordingsLimiter
 	campaignDOAttest        func(context.Context, int64, string) (dropletpool.ProviderAttestation, error)
-	relayUpdateSnapshot     func(context.Context, string, string) (relayManifestSnapshot, error)
+	relayUpdateSnapshot     func(context.Context, string, string, string) (relayManifestSnapshot, error)
 }
 
 type campaignProbeObjectStore interface {

@@ -153,12 +153,12 @@ func runRelay(ctx context.Context) error {
 		return fmt.Errorf("establish rollback baseline: %w", err)
 	}
 	firstHeartbeat := make(chan struct{})
-	updateIntents := make(chan recordingapi.RelayUpdateIntent, 1)
+	updateIntents := make(chan recordingapi.RelayHeartbeatUpdate, 1)
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, relayDiag, startedAt, tempRoot, cfg.APIURL, updateIntents, firstHeartbeat)
+		relayHeartbeatLoop(heartbeatCtx, client, pr, &activeJobs, relayDiag, startedAt, tempRoot, cfg.APIURL, selfUpdatesEnabled, updateIntents, firstHeartbeat)
 	}()
 	select {
 	case <-ctx.Done():

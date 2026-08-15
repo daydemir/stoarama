@@ -67,19 +67,38 @@ func TestIngestClipTimestampProvenancePayloadModes(t *testing.T) {
 func TestNodeHeartbeatDecodesOnlyTypedRelayUpdateIntent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"relay_update_intent":{"request_id":"00000000-0000-4000-8000-000000000142","node_id":66,"target_version":"new123","manifest_name":"latest-new123.json","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"pending"}}`))
+		_, _ = w.Write([]byte(`{"ok":true,"relay_update_intent":{"request_id":"00000000-0000-4000-8000-000000000142","node_id":66,"target_version":"new123","manifest_name":"latest-new123.json","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relay_artifact_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pending"}}`))
 	}))
 	defer server.Close()
 	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "old123"})
+	update, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "old123"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if intent == nil || intent.NodeID != 66 || intent.TargetVersion != "new123" || intent.ManifestName != "latest-new123.json" {
-		t.Fatalf("intent=%+v", intent)
+	if update.Intent == nil || update.Intent.NodeID != 66 || update.Intent.TargetVersion != "new123" || update.Intent.ManifestName != "latest-new123.json" || update.Intent.RelayArtifactSHA256 != strings.Repeat("b", 64) {
+		t.Fatalf("update=%+v", update)
+	}
+}
+
+func TestNodeHeartbeatDecodesExactRelayUpdateReceipt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"relay_update_ack_request_id":"00000000-0000-4000-8000-000000000142"}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "new123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if update.Intent != nil || update.AckRequestID != "00000000-0000-4000-8000-000000000142" {
+		t.Fatalf("receipt=%+v", update)
 	}
 }
 
@@ -92,12 +111,12 @@ func TestNodeHeartbeatCannotBootstrapWithoutServerIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "legacy"})
+	update, err := client.NodeHeartbeat(context.Background(), map[string]any{"relay_version": "legacy"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if intent != nil {
-		t.Fatalf("unexpected bootstrap instruction=%+v", intent)
+	if update.Intent != nil || update.AckRequestID != "" {
+		t.Fatalf("unexpected bootstrap instruction=%+v", update)
 	}
 }
 

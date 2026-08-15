@@ -13,6 +13,7 @@ var postgresRoleName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 const campaignProductTableManifestSHA256 = "769af37338fc1a6775f1e7be93a55255fe21d8eebea9201e27f1ae4ddd6eabfb"
 
 var campaignAuthorityTables = []string{
+	"relay_update_intents",
 	"recording_campaign_authoritative_frame_witnesses",
 	"recording_campaign_authority_decisions", "recording_campaign_admission_approvals",
 	"recording_campaign_admission_reservations", "recording_campaign_admission_source_fence_events",
@@ -28,6 +29,12 @@ var campaignAuthorityTables = []string{
 }
 
 var campaignRuntimeFunctions = []string{
+	"guard_relay_update_intent()",
+	"guard_relay_update_node_state()",
+	"relay_update_authorize_account(bigint,bigint,bigint,bigint,text)",
+	"relay_update_intent_replay(bigint,bigint,uuid,text,bigint,bigint,bigint,text)",
+	"relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text)",
+	"relay_update_intent_heartbeat(bigint,bigint,bigint,text,text,boolean,jsonb)",
 	"recording_campaign_now()",
 	"recording_campaign_authorize_account(text,uuid,bigint,bigint,bigint,text)",
 	"recording_campaign_authorize_node(text,uuid,bigint,bigint,bigint,bigint,text)",
@@ -85,8 +92,8 @@ var campaignAuthorityReadOnlyProductTables = []string{
 // product identities. PostgreSQL requires UPDATE privilege for FOR UPDATE and
 // FOR SHARE, but the authority receives it only on each immutable key column.
 var campaignAuthorityLockProductColumns = []string{
-	"accounts:id", "account_sessions:id", "connections:id", "frames:id", "media_objects:id",
-	"memberships:user_id", "node_tokens:id", "nodes:id", "recorder_droplets:id",
+	"accounts:id", "account_api_keys:id", "account_sessions:id", "connections:id", "frames:id", "media_objects:id",
+	"memberships:user_id", "node_tokens:id", "nodes:id,status", "recorder_droplets:id",
 	"recording_scene_frame_evidence:id", "recording_worker_claim_heads:node_id",
 	"stream_source_revisions:id", "streams:id", "users:id",
 }
@@ -110,6 +117,9 @@ var campaignRuntimeProductFunctions = []string{
 }
 
 var campaignExecutorFunctions = []string{
+	"relay_update_intent_replay(bigint,bigint,uuid,text,bigint,bigint,bigint,text)",
+	"relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text)",
+	"relay_update_intent_heartbeat(bigint,bigint,bigint,text,text,boolean,jsonb)",
 	"recording_campaign_seal_authoritative_frame(bigint,text,bigint,bigint,bigint,text,text)",
 	"recording_campaign_assert_baseline_frame_authority(bigint,text,bigint,bigint)",
 	"recording_campaign_prepare_authoritative_frame(bigint,text,bigint)",
@@ -280,10 +290,12 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 		       (SELECT count(*) FROM unnest($6::text[]) spec
 		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),split_part(spec,':',1))) AND c.relkind IN('r','p')
 		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
-		               split_part(spec,':',2)='' OR NOT has_column_privilege($2,c.oid,split_part(spec,':',2),'UPDATE') OR
+		               split_part(spec,':',2)='' OR EXISTS(
+		                 SELECT 1 FROM unnest(string_to_array(split_part(spec,':',2),',')) required_column
+		                 WHERE required_column='' OR NOT has_column_privilege($2,c.oid,required_column,'UPDATE')) OR
 		               has_table_privilege($2,c.oid,'UPDATE') OR
 		               EXISTS(SELECT 1 FROM pg_attribute attribute WHERE attribute.attrelid=c.oid AND attribute.attnum>0 AND
-		                 NOT attribute.attisdropped AND attribute.attname<>split_part(spec,':',2) AND
+		                 NOT attribute.attisdropped AND NOT(attribute.attname=ANY(string_to_array(split_part(spec,':',2),','))) AND
 		                 has_column_privilege($2,c.oid,attribute.attnum,'UPDATE'))),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
 		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables, campaignAuthorityLockProductColumns).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &invalidAuthorityLockDependencies, &migrationApplied)
