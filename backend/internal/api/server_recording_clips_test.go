@@ -1362,6 +1362,13 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		testRelayNodesTableDDL,
+		`CREATE TABLE node_tokens (
+			id BIGSERIAL PRIMARY KEY,
+			node_id BIGINT NOT NULL,
+			recording_claim_generation BIGINT,
+			recording_claim_purpose TEXT NOT NULL DEFAULT 'legacy_full',
+			revoked_at TIMESTAMPTZ
+		)`,
 		`CREATE TABLE streams (
 			id BIGSERIAL PRIMARY KEY,
 			provider TEXT NOT NULL DEFAULT '',
@@ -1398,6 +1405,9 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			lease_owner TEXT,
 			lease_expires_at TIMESTAMPTZ,
 			lease_token UUID,
+			lease_node_token_id BIGINT,
+			lease_claim_generation BIGINT,
+			lease_credential_state TEXT NOT NULL DEFAULT 'legacy_unknown',
 			attempt_count INTEGER NOT NULL DEFAULT 0,
 			max_attempts INTEGER NOT NULL DEFAULT 3,
 			idempotency_key TEXT NOT NULL UNIQUE,

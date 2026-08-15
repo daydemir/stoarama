@@ -141,11 +141,18 @@ func seedPresentationV2Task(t *testing.T, pool *pgxpool.Pool, suffix int64, acco
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_presentation_v2_attempts(id,admission_id,account_id,recording_id,stream_id,recording_job_id,lease_token,node_id,idempotency_key,ffmpeg_version,ffprobe_version,libavformat_version,libavcodec_version,libavutil_version,build_flags_sha256,demuxer_name,video_decoder_name,audio_decoder_name,parser_schema,request_sha256,response_sha256) VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,'8.1','8.1','62','62','60',repeat('b',64),'mov','h264','aac','presentation-probe-v2',repeat('c',64),encode(sha256(convert_to('attempt:'||$1::uuid::text,'UTF8')),'hex'))`, attempt, admission, accountID, recordingID, streamID, jobID, lease, nodeID, fmt.Sprintf("attempt-%d", suffix)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) VALUES($1,$2,$3,$4,'https://storage.example.test','v2',$5,$5,'video/mp4',4096,'consumed',now()+interval '1 hour')`, intent, recordingID, jobID, destinationID, fmt.Sprintf("clip-%d.mp4", suffix)); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) VALUES($1,$2,$3,$4,'https://storage.example.test','v2',$5,$5,'video/mp4',4096,'pending',now()+interval '1 hour')`, intent, recordingID, jobID, destinationID, fmt.Sprintf("clip-%d.mp4", suffix)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,audio_present,fire_at,clip_start_at,clip_end_at,capture_lease_token,capture_sequence) VALUES($1,$2,$3,$4,'https://storage.example.test','v2',$5,$5,'video/mp4','mp4',1024,'etag',repeat('e',64),60000,'h264',false,now(),now(),now()+interval '1 minute',$6,1)`, clipID, recordingID, jobID, destinationID, fmt.Sprintf("clip-%d.mp4", suffix), lease); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_upload_intents SET status='consumed' WHERE id=$1`, intent); err != nil {
+		t.Fatal(err)
+	}
+	var rootKind, rootIdentity string
+	if err := pool.QueryRow(ctx, `SELECT owner_kind,owner_identity FROM recording_object_key_roots WHERE storage_destination_id=$1 AND bucket='v2' AND object_key=$2`, destinationID, fmt.Sprintf("clip-%d.mp4", suffix)).Scan(&rootKind, &rootIdentity); err != nil || rootKind != "legacy_clip" || rootIdentity != fmt.Sprintf("intent:%s:clip:%d", intent, clipID) {
+		t.Fatalf("consumed key root kind=%q identity=%q err=%v", rootKind, rootIdentity, err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_presentation_v2_probe_tasks(id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,staging_identity_sha256,staging_method,staging_device_id,staging_inode_id,request_sha256,response_sha256,initial_disposition,state,retention_state,absolute_deadline_at) VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8::bigint,$9,$10,$11,1,1024,repeat('e',64),repeat('f',64),repeat('1',64),'hardlink','42',$12,repeat('2',64),encode(sha256(convert_to('task:'||$1::uuid::text||':'||$8::bigint::text||':awaiting_retention','UTF8')),'hex'),'retained','awaiting_retention','awaiting',now()+interval '8 minutes')`, task, admission, attempt, accountID, recordingID, streamID, jobID, clipID, intent, lease, nodeID, fmt.Sprint(100000+suffix)); err != nil {
 		t.Fatal(err)
@@ -163,11 +170,18 @@ func addPresentationV2Task(t *testing.T, pool *pgxpool.Pool, f presentationV2Fix
 	var clipID int64
 	name := fmt.Sprintf("extra-%s-%d.mp4", f.taskID.String()[:8], sequence)
 	clipSHA := fmt.Sprintf("%064x", sequence)
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) SELECT $1,$2,$3,id,endpoint,bucket,$4,$4,'video/mp4',4096,'consumed',now()+interval '1 hour' FROM storage_destinations WHERE id=$5`, intent, f.recordingID, f.jobID, name, f.destinationID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_upload_intents(id,recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,max_size_bytes,status,expires_at) SELECT $1,$2,$3,id,endpoint,bucket,$4,$4,'video/mp4',4096,'pending',now()+interval '1 hour' FROM storage_destinations WHERE id=$5`, intent, f.recordingID, f.jobID, name, f.destinationID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,audio_present,fire_at,clip_start_at,clip_end_at,capture_lease_token,capture_sequence) SELECT $1,$2,id,endpoint,bucket,$3,$3,'video/mp4','mp4',1024,'etag',$4,60000,'h264',false,now(),now(),now()+interval '1 minute',$5,$6 FROM storage_destinations WHERE id=$7 RETURNING id`, f.recordingID, f.jobID, name, clipSHA, f.leaseToken, sequence, f.destinationID).Scan(&clipID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_upload_intents SET status='consumed' WHERE id=$1`, intent); err != nil {
+		t.Fatal(err)
+	}
+	var rootKind, rootIdentity string
+	if err := pool.QueryRow(ctx, `SELECT owner_kind,owner_identity FROM recording_object_key_roots WHERE storage_destination_id=$1 AND object_key=$2`, f.destinationID, name).Scan(&rootKind, &rootIdentity); err != nil || rootKind != "legacy_clip" || rootIdentity != fmt.Sprintf("intent:%s:clip:%d", intent, clipID) {
+		t.Fatalf("consumed key root kind=%q identity=%q err=%v", rootKind, rootIdentity, err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_presentation_v2_probe_tasks(id,admission_id,attempt_id,account_id,recording_id,stream_id,recording_job_id,clip_id,upload_intent_id,lease_token,node_id,capture_sequence,clip_size_bytes,clip_sha256,local_upload_identity_sha256,staging_identity_sha256,staging_method,staging_device_id,staging_inode_id,request_sha256,response_sha256,initial_disposition,state,retention_state,absolute_deadline_at,created_at) VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8::bigint,$9,$10,$11,$12,1024,$13,repeat('f',64),repeat('1',64),'hardlink','42',$14,repeat('2',64),encode(sha256(convert_to('task:'||$1::uuid::text||':'||$8::bigint::text||':awaiting_retention','UTF8')),'hex'),'retained','awaiting_retention','awaiting',CASE WHEN $15 THEN now()-interval '1 minute' ELSE now()+interval '8 minutes' END,CASE WHEN $15 THEN now()-interval '2 minutes' ELSE now() END)`, task, f.admissionID, f.attemptID, f.accountID, f.recordingID, f.streamID, f.jobID, clipID, intent, f.leaseToken, f.nodeID, sequence, clipSHA, fmt.Sprint(200000+sequence), mode == "expired"); err != nil {
 		t.Fatal(err)
