@@ -1787,6 +1787,10 @@ CREATE OR REPLACE FUNCTION validate_recording_campaign_reservation_terminal_even
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; approval RECORD; expected TEXT; has_inflight BOOLEAN; has_commit BOOLEAN;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
+  EXECUTE format('SELECT 1 FROM %I.recording_targeted_probe_orders WHERE approval_id=$1 ORDER BY id FOR UPDATE',s)
+    USING NEW.approval_id;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''expire'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
     INTO authorized USING NEW.approval_id,NEW.account_id,NEW.actor_user_id;
   EXECUTE format('SELECT id,account_id,deadline_at FROM %I.recording_campaign_admission_approvals WHERE id=$1 FOR SHARE',s)
@@ -2158,6 +2162,9 @@ CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_attempt()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_deadline TIMESTAMPTZ; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_reserved TIMESTAMPTZ; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; d_node BIGINT; d_do BIGINT; d_region TEXT; d_size TEXT; d_build TEXT; d_state TEXT; d_seen TIMESTAMPTZ; order_valid BOOLEAN; provider_valid BOOLEAN; expected_attempt INTEGER; prior_completed TIMESTAMPTZ;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+  EXECUTE format('SELECT 1 FROM %I.accounts WHERE id=$1 FOR UPDATE',s) USING NEW.account_id;
+  EXECUTE format('SELECT 1 FROM %I.recording_targeted_probe_orders WHERE id=$1 FOR UPDATE',s) USING NEW.order_id;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''attempt'' AND approval_id=$1 AND account_id=$2 AND node_id=$3)',s) INTO authorized USING NEW.approval_id,NEW.account_id,NEW.node_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'targeted attempt requires typed node transaction authorization'; END IF;
   EXECUTE format('SELECT account_id,deadline_at FROM %I.recording_campaign_admission_approvals WHERE id=$1',s) INTO a_account,a_deadline USING NEW.approval_id;
