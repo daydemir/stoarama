@@ -420,6 +420,15 @@ type campaignCloudCapacityObservation struct {
 	FactsSHA256               string
 }
 
+func campaignProviderObservationSHA256(startedAt, observedAt time.Time, factsSHA256, buildSHA, sizeSlug, poolSHA256, projectSHA256, firewallSHA256 string) string {
+	return hashSecret(strings.Join([]string{
+		fmt.Sprint(startedAt.UTC().UnixMicro()), fmt.Sprint(observedAt.UTC().UnixMicro()),
+		strings.ToLower(strings.TrimSpace(factsSHA256)), strings.ToLower(strings.TrimSpace(buildSHA)),
+		strings.TrimSpace(sizeSlug), strings.ToLower(strings.TrimSpace(poolSHA256)),
+		strings.ToLower(strings.TrimSpace(projectSHA256)), strings.ToLower(strings.TrimSpace(firewallSHA256)),
+	}, "\n"))
+}
+
 func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignCloudCapacityObservation, error) {
 	if s.campaignDOAttest == nil || strings.TrimSpace(s.cfg.DropletPoolBuildSHA) == "" {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("managed cloud capacity attestation is unavailable")
@@ -501,10 +510,11 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 	if observation.ObservedAt.Before(observation.ObservationStartedAt) || observation.ObservedAt.Sub(observation.ObservationStartedAt) > 120*time.Second {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity observation interval is invalid")
 	}
-	observation.ProviderObservationSHA256 = hashSecret(strings.Join([]string{
-		fmt.Sprint(observation.ObservationStartedAt.UnixMicro()),
-		fmt.Sprint(observation.ObservedAt.UnixMicro()), observation.FactsSHA256,
-	}, "\n"))
+	observation.ProviderObservationSHA256 = campaignProviderObservationSHA256(
+		observation.ObservationStartedAt, observation.ObservedAt, observation.FactsSHA256,
+		s.cfg.DropletPoolBuildSHA, observation.SizeSlug, observation.PoolIdentitySHA256,
+		hashSecret(s.cfg.DropletPoolProjectID), hashSecret(s.cfg.DropletPoolFirewallID),
+	)
 	if observation.ReadyWorkers < 2 || observation.UsableAfterWorkerLoss <= 0 || !lowerSHA256(observation.FactsSHA256) {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity cannot survive one worker loss")
 	}

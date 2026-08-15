@@ -1195,7 +1195,11 @@ LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE existing RECORD; decision_ok BOOLEAN; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; frame RECORD; digest TEXT;
 BEGIN
   SELECT * INTO existing FROM recording_campaign_baseline_scene_read_receipts
-    WHERE account_id=p_account_id AND request_id=p_request_id AND expires_at>recording_campaign_now()
+    WHERE account_id=p_account_id AND request_id=p_request_id AND
+      (expires_at>recording_campaign_now() OR EXISTS(
+        SELECT 1 FROM recording_campaign_baseline_scene_presentations presented
+        WHERE presented.read_receipt_id=recording_campaign_baseline_scene_read_receipts.id
+          AND presented.account_id=p_account_id AND presented.request_id=p_request_id))
       AND EXISTS(SELECT 1 FROM account_sessions session WHERE session.id=p_session_id
         AND session.account_id=recording_campaign_baseline_scene_read_receipts.account_id
         AND session.user_id=recording_campaign_baseline_scene_read_receipts.read_by_user_id
@@ -1684,7 +1688,8 @@ BEGIN
   v_capacity_observed_at:=(p_capacity->>'observed_at')::timestamptz;
   v_provider_observation_sha:=encode(sha256(convert_to(
     floor(extract(epoch from v_capacity_started_at)*1000000)::bigint::text||chr(10)||
-    floor(extract(epoch from v_capacity_observed_at)*1000000)::bigint::text||chr(10)||v_capacity_facts_sha,'UTF8')),'hex');
+    floor(extract(epoch from v_capacity_observed_at)*1000000)::bigint::text||chr(10)||v_capacity_facts_sha||chr(10)||
+    v_build_sha||chr(10)||v_size_slug||chr(10)||v_pool_identity_sha||chr(10)||v_project_sha||chr(10)||v_firewall_sha,'UTF8')),'hex');
   SELECT active_demand,failure_domains,effective_capacity,usable_after_largest_loss
     INTO v_relay_active_demand,v_relay_failure_domains,v_relay_effective_capacity,v_relay_usable_after_largest_loss
   FROM recording_campaign_relay_failure_capacity(p_account_id);
@@ -1963,7 +1968,9 @@ BEGIN
     INTO authorized USING NEW.approval_id,NEW.account_id;
   expected_provider_digest:=encode(sha256(convert_to(
     floor(extract(epoch from NEW.observation_started_at)*1000000)::bigint::text||chr(10)||
-    floor(extract(epoch from NEW.observed_at)*1000000)::bigint::text||chr(10)||NEW.facts_sha256,'UTF8')),'hex');
+    floor(extract(epoch from NEW.observed_at)*1000000)::bigint::text||chr(10)||NEW.facts_sha256||chr(10)||
+    NEW.build_sha||chr(10)||NEW.size_slug||chr(10)||NEW.pool_identity_sha256||chr(10)||
+    NEW.provider_project_sha256||chr(10)||NEW.provider_firewall_sha256,'UTF8')),'hex');
   IF authorized IS DISTINCT FROM true OR NEW.observation_started_at>NEW.observed_at OR
      NEW.observed_at-NEW.observation_started_at>interval '120 seconds' OR
      NEW.observed_at<recording_campaign_now()-interval '30 seconds' OR NEW.observed_at>recording_campaign_now()+interval '5 seconds' OR

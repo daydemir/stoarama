@@ -216,6 +216,27 @@ func TestTargetedEvidenceReplayComparisonExact(t *testing.T) {
 	}
 }
 
+func TestCampaignProviderObservationDigestSealsCompleteDomain(t *testing.T) {
+	started := time.Unix(1_700_000_000, 123_000).UTC()
+	observed := started.Add(3 * time.Second)
+	fields := []string{strings.Repeat("1", 64), strings.Repeat("a", 40), "s-2vcpu-4gb", strings.Repeat("2", 64), strings.Repeat("3", 64), strings.Repeat("4", 64)}
+	want := campaignProviderObservationSHA256(started, observed, fields[0], fields[1], fields[2], fields[3], fields[4], fields[5])
+	for index := range fields {
+		mutated := append([]string(nil), fields...)
+		mutated[index] += "x"
+		got := campaignProviderObservationSHA256(started, observed, mutated[0], mutated[1], mutated[2], mutated[3], mutated[4], mutated[5])
+		if got == want {
+			t.Fatalf("provider observation digest ignored domain field %d", index)
+		}
+	}
+	if got := campaignProviderObservationSHA256(started.Add(time.Microsecond), observed, fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]); got == want {
+		t.Fatal("provider observation digest ignored bounded start time")
+	}
+	if got := campaignProviderObservationSHA256(started, observed.Add(time.Microsecond), fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]); got == want {
+		t.Fatal("provider observation digest ignored bounded completion time")
+	}
+}
+
 func TestCanonicalizeTargetedFrameEvidenceUsesDecodedBytes(t *testing.T) {
 	var jpegBytes bytes.Buffer
 	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
@@ -434,6 +455,15 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatalf("baseline presentation status=%d headers=%v body=%s", presentationRec.Code, presentationRec.Header(), presentationRec.Body.String())
 	}
 	presentationID := presentationRec.Header().Get("X-Stoarama-Presentation-ID")
+	advanceCampaignAdmissionClock(t, pool, 301)
+	presentationReplayReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/account/recordings/qualification/scene-presentations/%d?stream_id=%d&authority_code=deniz_fd_restore_20260814&request_id=%s", frameID, streamID, presentationRequestID), nil)
+	presentationReplayReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	presentationReplayRec := httptest.NewRecorder()
+	router.ServeHTTP(presentationReplayRec, presentationReplayReq)
+	if presentationReplayRec.Code != http.StatusOK || presentationReplayRec.Header().Get("X-Stoarama-Presentation-ID") != presentationID || !bytes.Equal(presentationReplayRec.Body.Bytes(), presentationRec.Body.Bytes()) {
+		t.Fatalf("sealed baseline presentation was not replayable after read-receipt expiry: first=%d/%s replay=%d/%s", presentationRec.Code, presentationID, presentationReplayRec.Code, presentationReplayRec.Header().Get("X-Stoarama-Presentation-ID"))
+	}
+	advanceCampaignAdmissionClock(t, pool, 0)
 	attestBody, _ := json.Marshal(sceneAttestRequest{StreamID: streamID, AuthorityCode: "deniz_fd_restore_20260814", FrameID: frameID, PresentationID: presentationID, SceneIdentity: "Approved Scene"})
 	attestReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewReader(attestBody))
 	attestReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
@@ -770,7 +800,8 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		  observed_at=observed_at-interval '181 seconds',expires_at=expires_at-interval '181 seconds',
 		  provider_observation_sha256=encode(sha256(convert_to(
 		    floor(extract(epoch from observation_started_at-interval '181 seconds')*1000000)::bigint::text||chr(10)||
-		    floor(extract(epoch from observed_at-interval '181 seconds')*1000000)::bigint::text||chr(10)||facts_sha256,'UTF8')),'hex');
+		    floor(extract(epoch from observed_at-interval '181 seconds')*1000000)::bigint::text||chr(10)||facts_sha256||chr(10)||
+		    build_sha||chr(10)||size_slug||chr(10)||pool_identity_sha256||chr(10)||provider_project_sha256||chr(10)||provider_firewall_sha256,'UTF8')),'hex');
 		ALTER TABLE recording_campaign_capacity_observations ENABLE TRIGGER recording_campaign_capacity_observations_immutable`); err != nil {
 		t.Fatalf("age prior immutable capacity fixture: %v", err)
 	}
