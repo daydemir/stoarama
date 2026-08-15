@@ -11,6 +11,7 @@ CREATE TABLE relay_update_intents (
   manifest_name TEXT NOT NULL CHECK(manifest_name='latest-'||target_version||'.json'),
   manifest_sha256 TEXT NOT NULL CHECK(manifest_sha256~'^[0-9a-f]{64}$'),
   relay_artifact_sha256 TEXT NOT NULL CHECK(relay_artifact_sha256~'^[0-9a-f]{64}$'),
+  expected_installed_binary_sha256 TEXT NOT NULL CHECK(expected_installed_binary_sha256~'^[0-9a-f]{64}$'),
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','completed')),
   requested_by_user_id BIGINT REFERENCES users(id) ON DELETE RESTRICT,
   requested_by_api_key_id BIGINT REFERENCES account_api_keys(id) ON DELETE RESTRICT,
@@ -58,9 +59,11 @@ BEGIN
   IF OLD.status<>'pending' OR NEW.status<>'completed' OR
      (NEW.id,NEW.account_id,NEW.node_id,NEW.request_id,NEW.node_version_at_request,NEW.runtime_target,
       NEW.target_version,NEW.manifest_name,NEW.manifest_sha256,NEW.relay_artifact_sha256,
+      NEW.expected_installed_binary_sha256,
       NEW.requested_by_user_id,NEW.requested_by_api_key_id,NEW.created_at) IS DISTINCT FROM
      (OLD.id,OLD.account_id,OLD.node_id,OLD.request_id,OLD.node_version_at_request,OLD.runtime_target,
       OLD.target_version,OLD.manifest_name,OLD.manifest_sha256,OLD.relay_artifact_sha256,
+      OLD.expected_installed_binary_sha256,
       OLD.requested_by_user_id,OLD.requested_by_api_key_id,OLD.created_at) OR
      NEW.completed_at IS DISTINCT FROM transaction_timestamp() THEN
     RAISE EXCEPTION 'relay update intent transition is not canonical';
@@ -83,7 +86,7 @@ BEGIN
   EXECUTE pg_catalog.format('SELECT EXISTS(SELECT 1 FROM %I.relay_update_intents WHERE node_id=$1 AND status=''pending'')',TG_TABLE_SCHEMA)
     INTO pending_exists USING OLD.id;
   SELECT pg_catalog.has_function_privilege(session_user,
-    pg_catalog.to_regprocedure(pg_catalog.format('%I.relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text)',TG_TABLE_SCHEMA)),
+    pg_catalog.to_regprocedure(pg_catalog.format('%I.relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,text,bigint,bigint,bigint,text)',TG_TABLE_SCHEMA)),
     'EXECUTE') INTO typed_executor;
   IF pending_exists AND typed_executor IS DISTINCT FROM true THEN
     RAISE EXCEPTION 'relay update drain state requires typed authority';
@@ -141,12 +144,14 @@ BEGIN
   END IF;
   RETURN jsonb_build_object('request_id',intent.request_id,'node_id',intent.node_id,'target_version',intent.target_version,
     'manifest_name',intent.manifest_name,'manifest_sha256',intent.manifest_sha256,
-    'relay_artifact_sha256',intent.relay_artifact_sha256,'status',intent.status);
+    'relay_artifact_sha256',intent.relay_artifact_sha256,
+    'installed_binary_sha256',intent.expected_installed_binary_sha256,'status',intent.status);
 END $$;
 
 CREATE FUNCTION relay_update_intent_create(
   p_request_id UUID,p_account_id BIGINT,p_node_id BIGINT,p_node_version TEXT,p_runtime_target TEXT,
   p_target_version TEXT,p_manifest_name TEXT,p_manifest_sha256 TEXT,p_relay_artifact_sha256 TEXT,
+  p_expected_installed_binary_sha256 TEXT,
   p_user_id BIGINT,p_session_id BIGINT,p_api_key_id BIGINT,p_credential_sha256 TEXT
 ) RETURNS JSONB LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing relay_update_intents%ROWTYPE; node_row RECORD; live_count BIGINT; inserted relay_update_intents%ROWTYPE;
@@ -159,13 +164,15 @@ BEGIN
   IF existing.id IS NOT NULL THEN
     IF (existing.node_id,existing.node_version_at_request,existing.runtime_target,existing.target_version,
         existing.manifest_name,existing.manifest_sha256,existing.relay_artifact_sha256) IS DISTINCT FROM
-       (p_node_id,p_node_version,p_runtime_target,p_target_version,p_manifest_name,p_manifest_sha256,p_relay_artifact_sha256) THEN
+       (p_node_id,p_node_version,p_runtime_target,p_target_version,p_manifest_name,p_manifest_sha256,p_relay_artifact_sha256) OR
+       existing.expected_installed_binary_sha256<>p_expected_installed_binary_sha256 THEN
       RAISE EXCEPTION 'relay update request replay differs';
     END IF;
     RETURN jsonb_build_object('created',false,'intent',jsonb_build_object(
       'request_id',existing.request_id,'node_id',existing.node_id,'target_version',existing.target_version,
       'manifest_name',existing.manifest_name,'manifest_sha256',existing.manifest_sha256,
-      'relay_artifact_sha256',existing.relay_artifact_sha256,'status',existing.status));
+      'relay_artifact_sha256',existing.relay_artifact_sha256,
+      'installed_binary_sha256',existing.expected_installed_binary_sha256,'status',existing.status));
   END IF;
   SELECT id,node_type,status,last_heartbeat_at,COALESCE(capabilities_jsonb->>'relay_version','') version,
     COALESCE(capabilities_jsonb->>'relay_update_runtime_target','') runtime_target,
@@ -184,13 +191,14 @@ BEGIN
   END IF;
   UPDATE nodes SET status='disabled' WHERE id=p_node_id;
   INSERT INTO relay_update_intents(account_id,node_id,request_id,node_version_at_request,runtime_target,target_version,
-    manifest_name,manifest_sha256,relay_artifact_sha256,requested_by_user_id,requested_by_api_key_id)
+    manifest_name,manifest_sha256,relay_artifact_sha256,expected_installed_binary_sha256,requested_by_user_id,requested_by_api_key_id)
   VALUES(p_account_id,p_node_id,p_request_id,p_node_version,p_runtime_target,p_target_version,p_manifest_name,
-    p_manifest_sha256,p_relay_artifact_sha256,p_user_id,p_api_key_id) RETURNING * INTO inserted;
+    p_manifest_sha256,p_relay_artifact_sha256,p_expected_installed_binary_sha256,p_user_id,p_api_key_id) RETURNING * INTO inserted;
   RETURN jsonb_build_object('created',true,'intent',jsonb_build_object(
     'request_id',inserted.request_id,'node_id',inserted.node_id,'target_version',inserted.target_version,
     'manifest_name',inserted.manifest_name,'manifest_sha256',inserted.manifest_sha256,
-    'relay_artifact_sha256',inserted.relay_artifact_sha256,'status',inserted.status));
+    'relay_artifact_sha256',inserted.relay_artifact_sha256,
+    'installed_binary_sha256',inserted.expected_installed_binary_sha256,'status',inserted.status));
 END $$;
 
 CREATE FUNCTION relay_update_intent_heartbeat(
@@ -226,7 +234,8 @@ BEGIN
     IF p_supports_intents IS DISTINCT FROM true OR p_reported_version<>intent.node_version_at_request THEN RETURN '{}'::jsonb; END IF;
     RETURN jsonb_build_object('intent',jsonb_build_object('request_id',intent.request_id,'node_id',intent.node_id,
       'target_version',intent.target_version,'manifest_name',intent.manifest_name,'manifest_sha256',intent.manifest_sha256,
-      'relay_artifact_sha256',intent.relay_artifact_sha256,'status',intent.status));
+      'relay_artifact_sha256',intent.relay_artifact_sha256,
+      'installed_binary_sha256',intent.expected_installed_binary_sha256,'status',intent.status));
   END IF;
   result_request:=NULLIF(p_result->>'request_id','')::uuid;
   installed_sha:=p_result->>'installed_binary_sha256';
@@ -235,6 +244,7 @@ BEGIN
      p_result->>'target_version'<>intent.target_version OR p_result->>'manifest_name'<>intent.manifest_name OR
      p_result->>'manifest_sha256'<>intent.manifest_sha256 OR
      p_result->>'relay_artifact_sha256'<>intent.relay_artifact_sha256 OR installed_sha!~'^[0-9a-f]{64}$' OR
+     installed_sha<>intent.expected_installed_binary_sha256 OR
      applied_time IS NULL OR applied_time<intent.created_at OR applied_time>transaction_timestamp()+interval '30 seconds' THEN
     RAISE EXCEPTION 'relay update applied proof differs';
   END IF;
@@ -254,7 +264,7 @@ DECLARE s TEXT:=current_schema(); runtime_role TEXT:=NULLIF(current_setting('sto
     'guard_relay_update_intent()','guard_relay_update_node_state()',
     'relay_update_authorize_account(bigint,bigint,bigint,bigint,text)',
     'relay_update_intent_replay(bigint,bigint,uuid,text,bigint,bigint,bigint,text)',
-    'relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text)',
+    'relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,text,bigint,bigint,bigint,text)',
     'relay_update_intent_heartbeat(bigint,bigint,bigint,text,text,boolean,jsonb)'];
 BEGIN
   IF runtime_role IS NULL OR executor_role IS NULL OR authority_role IS NULL THEN
@@ -271,7 +281,7 @@ BEGIN
     EXECUTE format('REVOKE ALL ON FUNCTION %I.%s FROM PUBLIC,%I,%I',s,signature,runtime_role,executor_role);
   END LOOP;
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.relay_update_intent_replay(bigint,bigint,uuid,text,bigint,bigint,bigint,text) TO %I',s,executor_role);
-  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text) TO %I',s,executor_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,text,bigint,bigint,bigint,text) TO %I',s,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.relay_update_intent_heartbeat(bigint,bigint,bigint,text,text,boolean,jsonb) TO %I',s,executor_role);
   EXECUTE format('GRANT SELECT ON TABLE %I.account_api_keys TO %I',s,authority_role);
   EXECUTE format('GRANT UPDATE(id) ON TABLE %I.account_api_keys TO %I',s,authority_role);

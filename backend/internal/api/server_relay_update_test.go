@@ -1,8 +1,12 @@
 package api
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,11 +19,15 @@ import (
 )
 
 func TestSnapshotPromotedRelayManifestBindsImmutableBytes(t *testing.T) {
-	live := []byte(`{"version":"new123","previous_version":"old123","relay":{"linux-arm64":{"artifact":"relay.tgz","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},"ytdlp":{},"deno":{}}`)
+	installed := []byte("exact installed relay")
+	archive := testRelayUpdateArchive(t, installed)
+	archiveSum := sha256.Sum256(archive)
+	live := []byte(fmt.Sprintf(`{"version":"new123","previous_version":"old123","relay":{"linux-arm64":{"artifact":"relay.tgz","sha256":"%s"}},"ytdlp":{},"deno":{}}`, hex.EncodeToString(archiveSum[:])))
 	objects := map[string][]byte{
 		relayReleasePrefix + "latest.json":            live,
 		relayReleasePrefix + "latest-new123.json":     live,
 		relayReleasePrefix + "latest-new123.json.sig": []byte("signed"),
+		relayReleasePrefix + "relay.tgz":              archive,
 	}
 	open := func(_ context.Context, key string) (io.ReadCloser, error) {
 		body, ok := objects[key]
@@ -32,7 +40,7 @@ func TestSnapshotPromotedRelayManifestBindsImmutableBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Version != "new123" || snapshot.PreviousVersion != "old123" || snapshot.Name != "latest-new123.json" || snapshot.ArtifactSHA256 != strings.Repeat("c", 64) || len(snapshot.SHA256) != 64 {
+	if snapshot.Version != "new123" || snapshot.PreviousVersion != "old123" || snapshot.Name != "latest-new123.json" || snapshot.ArtifactSHA256 != hex.EncodeToString(archiveSum[:]) || snapshot.InstalledSHA256 != testSHA256Bytes(installed) || len(snapshot.SHA256) != 64 {
 		t.Fatalf("snapshot=%+v", snapshot)
 	}
 	if _, err := snapshotPromotedRelayManifest(context.Background(), "new123", "candidate999", "linux-arm64", open); err == nil || !strings.Contains(err.Error(), "immediate successor") {
@@ -42,6 +50,31 @@ func TestSnapshotPromotedRelayManifestBindsImmutableBytes(t *testing.T) {
 	if _, err := snapshotPromotedRelayManifest(context.Background(), "new123", "old123", "linux-arm64", open); err == nil || !strings.Contains(err.Error(), "differs") {
 		t.Fatalf("immutable substitution accepted: %v", err)
 	}
+}
+
+func testRelayUpdateArchive(t *testing.T, binary []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	gz := gzip.NewWriter(&compressed)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "stoarama-relay", Mode: 0o755, Size: int64(len(binary)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(binary); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+func testSHA256Bytes(value []byte) string {
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
 }
 
 func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
@@ -74,7 +107,7 @@ func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
 		if expected != "new123" {
 			return relayManifestSnapshot{}, fmt.Errorf("not current")
 		}
-		return relayManifestSnapshot{Version: expected, Name: "latest-new123.json", SHA256: strings.Repeat("a", 64), PreviousVersion: fromVersion, RuntimeTarget: runtimeTarget, ArtifactSHA256: strings.Repeat("b", 64)}, nil
+		return relayManifestSnapshot{Version: expected, Name: "latest-new123.json", SHA256: strings.Repeat("a", 64), PreviousVersion: fromVersion, RuntimeTarget: runtimeTarget, ArtifactSHA256: strings.Repeat("b", 64), InstalledSHA256: strings.Repeat("d", 64)}, nil
 	}
 	requestID := "00000000-0000-4000-8000-000000000142"
 	callCreate := func(p accountPrincipal, id, expected string) *httptest.ResponseRecorder {
@@ -150,7 +183,12 @@ func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
 	result := &relayUpdateAppliedResult{
 		RequestID: requestID, TargetVersion: "new123", ManifestName: "latest-new123.json",
 		ManifestSHA256: strings.Repeat("a", 64), RelayArtifactSHA256: strings.Repeat("b", 64),
-		InstalledSHA256: strings.Repeat("b", 64), AppliedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		InstalledSHA256: strings.Repeat("d", 64), AppliedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	wrongInstalled := *result
+	wrongInstalled.InstalledSHA256 = strings.Repeat("e", 64)
+	if rec := heartbeat("new123", true, &wrongInstalled); rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), `"relay_update_ack_request_id"`) {
+		t.Fatalf("untrusted installed digest status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if rec := heartbeat("new123", true, result); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"relay_update_ack_request_id":"`+requestID+`"`) {
 		t.Fatalf("proof completion status=%d body=%s", rec.Code, rec.Body.String())
@@ -164,7 +202,7 @@ func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
 	if _, err := pool.Exec(context.Background(), `DELETE FROM relay_update_intents WHERE account_id=$1 AND request_id=$2`, accountID, requestID); err == nil {
 		t.Fatal("runtime deleted immutable intent")
 	}
-	if _, err := pool.Exec(context.Background(), `INSERT INTO relay_update_intents(account_id,node_id,request_id,node_version_at_request,runtime_target,target_version,manifest_name,manifest_sha256,relay_artifact_sha256,requested_by_user_id) VALUES($1,$2,gen_random_uuid(),'old123','linux-arm64','new123','latest-new123.json',repeat('a',64),repeat('b',64),$3)`, accountID, nodeID, userID); err == nil {
+	if _, err := pool.Exec(context.Background(), `INSERT INTO relay_update_intents(account_id,node_id,request_id,node_version_at_request,runtime_target,target_version,manifest_name,manifest_sha256,relay_artifact_sha256,expected_installed_binary_sha256,requested_by_user_id) VALUES($1,$2,gen_random_uuid(),'old123','linux-arm64','new123','latest-new123.json',repeat('a',64),repeat('b',64),repeat('d',64),$3)`, accountID, nodeID, userID); err == nil {
 		t.Fatal("runtime forged relay update intent")
 	}
 	if rec := callCreate(owner, requestID, "new123"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"status":"completed"`) {
@@ -172,9 +210,28 @@ func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
 	}
 
 	s.relayUpdateSnapshot = func(_ context.Context, expected, fromVersion, runtimeTarget string) (relayManifestSnapshot, error) {
-		return relayManifestSnapshot{Version: expected, Name: "latest-" + expected + ".json", SHA256: strings.Repeat("b", 64), PreviousVersion: fromVersion, RuntimeTarget: runtimeTarget, ArtifactSHA256: strings.Repeat("c", 64)}, nil
+		return relayManifestSnapshot{Version: expected, Name: "latest-" + expected + ".json", SHA256: strings.Repeat("b", 64), PreviousVersion: fromVersion, RuntimeTarget: runtimeTarget, ArtifactSHA256: strings.Repeat("c", 64), InstalledSHA256: strings.Repeat("d", 64)}, nil
 	}
-	const concurrentID = "00000000-0000-4000-8000-000000000144"
+	var destinationID, streamID, recordingID int64
+	if err := pool.QueryRow(context.Background(), `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status,managed) VALUES($1,'relay-update-destination','s3_compatible','https://storage.example.test','auto','relay-update','key',decode('00','hex'),'verified',true) RETURNING id`, accountID).Scan(&destinationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone) VALUES('relay-update','race-source','Relay Update Race','relay-update-race','https://source.example/live.m3u8','https://source.example/page','hls','video_manifest','video_live','continuous_video',30,'UTC') RETURNING id`).Scan(&streamID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,mode,cron_expr,cron_timezone,clip_duration_sec,status,start_at,capture_via,next_fire_at) VALUES($1,$2,'relay update race','https://source.example/live.m3u8',$3,'hls_live','sampled','* * * * *','UTC',60,'active',now()-interval '1 day','relay',now()) RETURNING id`, accountID, destinationID, streamID).Scan(&recordingID); err != nil {
+		t.Fatal(err)
+	}
+	seedDueJob := func(key string) int64 {
+		var jobID int64
+		if err := pool.QueryRow(context.Background(), `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key) VALUES($1,now(),now(),60,'pending',$2) RETURNING id`, recordingID, key).Scan(&jobID); err != nil {
+			t.Fatal(err)
+		}
+		return jobID
+	}
+	leasePrincipal := nodePrincipal{NodeID: nodeID, NodeTokenID: nodeTokenID, NodeClaimGeneration: claimGeneration, AccountID: accountID, NodeType: nodeTypeRelay}
+	firstJobID := seedDueJob("relay-update-race-claim-first")
+	const claimFirstID = "00000000-0000-4000-8000-000000000144"
 	claimTx, err := pool.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -184,23 +241,86 @@ func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := make(chan *httptest.ResponseRecorder, 1)
-	go func() { created <- callCreate(owner, concurrentID, "new456") }()
+	go func() { created <- callCreate(owner, claimFirstID, "new456") }()
 	select {
 	case rec := <-created:
 		_ = claimTx.Rollback(context.Background())
 		t.Fatalf("update intent crossed an in-flight lease claim fence: status=%d body=%s", rec.Code, rec.Body.String())
 	case <-time.After(75 * time.Millisecond):
 	}
+	lease, err := s.leaseRelayRecordingJob(context.Background(), leasePrincipal, true, 60, true)
+	if err != nil || lease.JobID != firstJobID {
+		_ = claimTx.Rollback(context.Background())
+		t.Fatalf("actual claim-first lease job=%d want=%d err=%v", lease.JobID, firstJobID, err)
+	}
 	if err := claimTx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case rec := <-created:
-		if rec.Code != http.StatusCreated {
+		if rec.Code != http.StatusConflict {
 			t.Fatalf("claim-first update status=%d body=%s", rec.Code, rec.Body.String())
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("update intent did not resume after claim fence")
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE recording_jobs SET status='done',completed_at=now() WHERE id=$1`, firstJobID); err != nil {
+		t.Fatal(err)
+	}
+	seedDueJob("relay-update-race-create-first")
+	accountBlocker, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accountBlocker.Exec(context.Background(), `SELECT 1 FROM accounts WHERE id=$1 FOR UPDATE`, accountID); err != nil {
+		_ = accountBlocker.Rollback(context.Background())
+		t.Fatal(err)
+	}
+	const createFirstID = "00000000-0000-4000-8000-000000000146"
+	createFirst := make(chan *httptest.ResponseRecorder, 1)
+	go func() { createFirst <- callCreate(owner, createFirstID, "new456") }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		probeTx, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var acquired bool
+		err = probeTx.QueryRow(context.Background(), `SELECT pg_try_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`).Scan(&acquired)
+		_ = probeTx.Rollback(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !acquired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("create-first operation never acquired the exclusive claim fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	leaseAfterCreate := make(chan recordingLeaseResponse, 1)
+	leaseAfterCreateErr := make(chan error, 1)
+	go func() {
+		leased, err := s.leaseRelayRecordingJob(context.Background(), leasePrincipal, true, 60, true)
+		leaseAfterCreate <- leased
+		leaseAfterCreateErr <- err
+	}()
+	select {
+	case leased := <-leaseAfterCreate:
+		_ = accountBlocker.Rollback(context.Background())
+		t.Fatalf("actual lease crossed create-first exclusive fence: job=%d", leased.JobID)
+	case <-time.After(75 * time.Millisecond):
+	}
+	if err := accountBlocker.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := <-createFirst; rec.Code != http.StatusCreated {
+		t.Fatalf("create-first status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	leased := <-leaseAfterCreate
+	if err := <-leaseAfterCreateErr; err != nil || leased.JobID != 0 {
+		t.Fatalf("create-first lease job=%d err=%v", leased.JobID, err)
 	}
 	var nodeStatus string
 	if err := pool.QueryRow(context.Background(), `SELECT status FROM nodes WHERE id=$1`, nodeID).Scan(&nodeStatus); err != nil || nodeStatus != "disabled" {
@@ -209,23 +329,13 @@ func TestRelayUpdateIntentCreateReplayAndHeartbeatCompletion(t *testing.T) {
 	if _, err := pool.Exec(context.Background(), `UPDATE nodes SET status='active' WHERE id=$1`, nodeID); err == nil {
 		t.Fatal("runtime bypassed typed update drain state")
 	}
-	lease, err := s.leaseRelayRecordingJob(context.Background(), nodePrincipal{
-		NodeID: nodeID, NodeTokenID: nodeTokenID, NodeClaimGeneration: claimGeneration,
-		AccountID: accountID, NodeType: nodeTypeRelay,
-	}, true, 60, true)
-	if err != nil {
-		t.Fatalf("lease after update reservation: %v", err)
-	}
-	if lease.JobID != 0 {
-		t.Fatalf("disabled update-reserved node leased recording job %d", lease.JobID)
-	}
-	if rec := callCreate(owner, concurrentID, "new456"); rec.Code != http.StatusOK {
+	if rec := callCreate(owner, createFirstID, "new456"); rec.Code != http.StatusOK {
 		t.Fatalf("exact replay status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if _, err := pool.Exec(context.Background(), `UPDATE account_sessions SET revoked_at=now() WHERE id=$1`, sessionID); err != nil {
 		t.Fatal(err)
 	}
-	if rec := callCreate(owner, concurrentID, "new456"); rec.Code != http.StatusUnauthorized {
+	if rec := callCreate(owner, createFirstID, "new456"); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked-session replay status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

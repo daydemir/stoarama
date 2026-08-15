@@ -67,7 +67,7 @@ func TestIngestClipTimestampProvenancePayloadModes(t *testing.T) {
 func TestNodeHeartbeatDecodesOnlyTypedRelayUpdateIntent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true,"relay_update_intent":{"request_id":"00000000-0000-4000-8000-000000000142","node_id":66,"target_version":"new123","manifest_name":"latest-new123.json","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relay_artifact_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"pending"}}`))
+		_, _ = w.Write([]byte(`{"ok":true,"relay_update_intent":{"request_id":"00000000-0000-4000-8000-000000000142","node_id":66,"target_version":"new123","manifest_name":"latest-new123.json","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relay_artifact_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","installed_binary_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","status":"pending"}}`))
 	}))
 	defer server.Close()
 	client, err := NewClient(ClientConfig{BaseURL: server.URL, NodeToken: "test-token"})
@@ -78,7 +78,7 @@ func TestNodeHeartbeatDecodesOnlyTypedRelayUpdateIntent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if update.Intent == nil || update.Intent.NodeID != 66 || update.Intent.TargetVersion != "new123" || update.Intent.ManifestName != "latest-new123.json" || update.Intent.RelayArtifactSHA256 != strings.Repeat("b", 64) {
+	if update.Intent == nil || update.Intent.NodeID != 66 || update.Intent.TargetVersion != "new123" || update.Intent.ManifestName != "latest-new123.json" || update.Intent.RelayArtifactSHA256 != strings.Repeat("b", 64) || update.Intent.InstalledSHA256 != strings.Repeat("c", 64) {
 		t.Fatalf("update=%+v", update)
 	}
 }

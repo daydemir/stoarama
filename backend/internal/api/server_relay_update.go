@@ -1,7 +1,9 @@
 package api
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,7 +22,10 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-const relayManifestMaxBytes = 1 << 20
+const (
+	relayManifestMaxBytes = 1 << 20
+	relayArchiveMaxBytes  = 256 << 20
+)
 
 type relayUpdateIntentRequest struct {
 	RequestID               string `json:"request_id"`
@@ -34,6 +39,7 @@ type relayUpdateIntent struct {
 	ManifestName        string `json:"manifest_name"`
 	ManifestSHA256      string `json:"manifest_sha256"`
 	RelayArtifactSHA256 string `json:"relay_artifact_sha256"`
+	InstalledSHA256     string `json:"installed_binary_sha256"`
 	Status              string `json:"status"`
 }
 
@@ -53,7 +59,8 @@ type relayUpdateHeartbeatResult struct {
 }
 
 type promotedRelayArtifact struct {
-	SHA256 string `json:"sha256"`
+	Artifact string `json:"artifact"`
+	SHA256   string `json:"sha256"`
 }
 
 type promotedRelayManifest struct {
@@ -69,6 +76,7 @@ type relayManifestSnapshot struct {
 	PreviousVersion string
 	RuntimeTarget   string
 	ArtifactSHA256  string
+	InstalledSHA256 string
 }
 
 var errRelayUpdateReplayConflict = errors.New("relay update request replay differs")
@@ -112,7 +120,9 @@ func snapshotPromotedRelayManifest(ctx context.Context, expected, fromVersion, r
 		return relayManifestSnapshot{}, fmt.Errorf("current promoted relay version is not the node's immediate successor")
 	}
 	artifact, ok := manifest.Relay[runtimeTarget]
-	if !ok || !lowerSHA256(strings.TrimSpace(artifact.SHA256)) {
+	artifact.Artifact = strings.TrimSpace(artifact.Artifact)
+	artifact.SHA256 = strings.TrimSpace(artifact.SHA256)
+	if !ok || !relayArtifactName.MatchString(artifact.Artifact) || strings.Contains(artifact.Artifact, "..") || !lowerSHA256(artifact.SHA256) {
 		return relayManifestSnapshot{}, fmt.Errorf("promoted manifest has no exact relay artifact for %s", runtimeTarget)
 	}
 	immutable, err := read(name, relayManifestMaxBytes)
@@ -129,8 +139,49 @@ func snapshotPromotedRelayManifest(ctx context.Context, expected, fromVersion, r
 	if err != nil || !bytes.Equal(live, liveAgain) {
 		return relayManifestSnapshot{}, fmt.Errorf("promoted relay manifest changed during snapshot")
 	}
+	archive, err := read(artifact.Artifact, relayArchiveMaxBytes)
+	if err != nil {
+		return relayManifestSnapshot{}, fmt.Errorf("read promoted relay artifact: %w", err)
+	}
+	archiveSum := sha256.Sum256(archive)
+	if hex.EncodeToString(archiveSum[:]) != artifact.SHA256 {
+		return relayManifestSnapshot{}, fmt.Errorf("promoted relay artifact digest differs")
+	}
+	installedSHA, err := relayInstalledBinarySHA256(archive)
+	if err != nil {
+		return relayManifestSnapshot{}, fmt.Errorf("inspect promoted relay artifact: %w", err)
+	}
 	sum := sha256.Sum256(immutable)
-	return relayManifestSnapshot{Version: expected, Name: name, SHA256: hex.EncodeToString(sum[:]), PreviousVersion: manifest.PreviousVersion, RuntimeTarget: runtimeTarget, ArtifactSHA256: strings.TrimSpace(artifact.SHA256)}, nil
+	return relayManifestSnapshot{Version: expected, Name: name, SHA256: hex.EncodeToString(sum[:]), PreviousVersion: manifest.PreviousVersion, RuntimeTarget: runtimeTarget, ArtifactSHA256: strings.TrimSpace(artifact.SHA256), InstalledSHA256: installedSHA}, nil
+}
+
+func relayInstalledBinarySHA256(archive []byte) (string, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		return "", err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			return "", fmt.Errorf("stoarama-relay entry is absent")
+		}
+		if err != nil {
+			return "", err
+		}
+		if header.Name != "stoarama-relay" {
+			continue
+		}
+		if header.Typeflag != tar.TypeReg || header.Size < 1 || header.Size > relayArchiveMaxBytes {
+			return "", fmt.Errorf("stoarama-relay entry is invalid")
+		}
+		hash := sha256.New()
+		if _, err := io.CopyN(hash, tr, header.Size); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(hash.Sum(nil)), nil
+	}
 }
 
 func relayUpdateActorArgs(principal accountPrincipal) (userID, sessionID, apiKeyID any) {
@@ -220,9 +271,9 @@ func (s *Server) handleAccountRelayUpdateIntentCreate(w http.ResponseWriter, r *
 		return
 	}
 	var createdJSON []byte
-	err = s.admissionPool.QueryRow(r.Context(), `SELECT relay_update_intent_create($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+	err = s.admissionPool.QueryRow(r.Context(), `SELECT relay_update_intent_create($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		requestID, principal.AccountID, nodeID, nodeVersion, runtimeTarget, snapshot.Version, snapshot.Name,
-		snapshot.SHA256, snapshot.ArtifactSHA256, userID, sessionID, apiKeyID, principal.credentialSHA256).Scan(&createdJSON)
+		snapshot.SHA256, snapshot.ArtifactSHA256, snapshot.InstalledSHA256, userID, sessionID, apiKeyID, principal.credentialSHA256).Scan(&createdJSON)
 	if err != nil {
 		writeRelayUpdateAuthorityError(w, err)
 		return

@@ -124,7 +124,10 @@ func loadConfig() (relayConfig, error) {
 			!lowerHexSHA256(result.RelayArtifactSHA256) || !lowerHexSHA256(result.InstalledSHA256) || strings.TrimSpace(result.RequestID) == "" {
 			return cfg, fmt.Errorf("relay config %s has invalid pending_update_result", p)
 		}
-		if cfg.PendingUpdateIntent == nil || cfg.PendingUpdateIntent.RequestID != result.RequestID {
+		if cfg.PendingUpdateIntent == nil || cfg.PendingUpdateIntent.RequestID != result.RequestID ||
+			cfg.PendingUpdateIntent.TargetVersion != result.TargetVersion || cfg.PendingUpdateIntent.ManifestName != result.ManifestName ||
+			cfg.PendingUpdateIntent.ManifestSHA256 != result.ManifestSHA256 || cfg.PendingUpdateIntent.RelayArtifactSHA256 != result.RelayArtifactSHA256 ||
+			cfg.PendingUpdateIntent.InstalledSHA256 != result.InstalledSHA256 {
 			return cfg, fmt.Errorf("relay config %s has orphaned pending_update_result", p)
 		}
 	}

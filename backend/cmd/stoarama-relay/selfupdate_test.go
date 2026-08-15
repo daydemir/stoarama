@@ -28,17 +28,18 @@ func TestValidateRelayUpdateIntentIsNodeAndManifestSpecific(t *testing.T) {
 	valid := recordingapi.RelayUpdateIntent{
 		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 66,
 		TargetVersion: "new123", ManifestName: "latest-new123.json",
-		ManifestSHA256: strings.Repeat("a", 64), RelayArtifactSHA256: strings.Repeat("b", 64), Status: "pending",
+		ManifestSHA256: strings.Repeat("a", 64), RelayArtifactSHA256: strings.Repeat("b", 64), InstalledSHA256: strings.Repeat("c", 64), Status: "pending",
 	}
 	if err := validateRelayUpdateIntent(66, valid); err != nil {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*recordingapi.RelayUpdateIntent){
-		"node":     func(i *recordingapi.RelayUpdateIntent) { i.NodeID++ },
-		"manifest": func(i *recordingapi.RelayUpdateIntent) { i.ManifestName = "latest-other.json" },
-		"digest":   func(i *recordingapi.RelayUpdateIntent) { i.ManifestSHA256 = strings.Repeat("A", 64) },
-		"artifact": func(i *recordingapi.RelayUpdateIntent) { i.RelayArtifactSHA256 = strings.Repeat("A", 64) },
-		"status":   func(i *recordingapi.RelayUpdateIntent) { i.Status = "completed" },
+		"node":      func(i *recordingapi.RelayUpdateIntent) { i.NodeID++ },
+		"manifest":  func(i *recordingapi.RelayUpdateIntent) { i.ManifestName = "latest-other.json" },
+		"digest":    func(i *recordingapi.RelayUpdateIntent) { i.ManifestSHA256 = strings.Repeat("A", 64) },
+		"artifact":  func(i *recordingapi.RelayUpdateIntent) { i.RelayArtifactSHA256 = strings.Repeat("A", 64) },
+		"installed": func(i *recordingapi.RelayUpdateIntent) { i.InstalledSHA256 = strings.Repeat("A", 64) },
+		"status":    func(i *recordingapi.RelayUpdateIntent) { i.Status = "completed" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			bad := valid
@@ -303,7 +304,7 @@ func TestTypedRelayUpdatePersistsPinBeforeAnyMutation(t *testing.T) {
 	updates <- recordingapi.RelayHeartbeatUpdate{Intent: &recordingapi.RelayUpdateIntent{
 		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 1, TargetVersion: "new123",
 		ManifestName: "latest-new123.json", ManifestSHA256: strings.Repeat("a", 64),
-		RelayArtifactSHA256: strings.Repeat("b", 64), Status: "pending",
+		RelayArtifactSHA256: strings.Repeat("b", 64), InstalledSHA256: strings.Repeat("c", 64), Status: "pending",
 	}}
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -337,7 +338,7 @@ func TestTypedRelayUpdateDoesNotFetchOrMutateWhileBusy(t *testing.T) {
 	intent := &recordingapi.RelayUpdateIntent{
 		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 1, TargetVersion: "new123",
 		ManifestName: "latest-new123.json", ManifestSHA256: strings.Repeat("a", 64),
-		RelayArtifactSHA256: strings.Repeat("b", 64), Status: "pending",
+		RelayArtifactSHA256: strings.Repeat("b", 64), InstalledSHA256: strings.Repeat("c", 64), Status: "pending",
 	}
 	if !checkAndApplyUpdateExpected(server.URL, releaseManifest(intent.ManifestName), intent, active, &sync.RWMutex{}, drain) {
 		t.Fatal("busy typed update did not remain drained")
@@ -365,7 +366,7 @@ func TestTypedRelayUpdatePersistsExactAppliedWitness(t *testing.T) {
 	intent := &recordingapi.RelayUpdateIntent{
 		RequestID: "00000000-0000-4000-8000-000000000142", NodeID: 1, TargetVersion: "new123",
 		ManifestName: "latest-new123.json", ManifestSHA256: hex.EncodeToString(manifestSum[:]),
-		RelayArtifactSHA256: manifest.Relay[testRelayTarget()].SHA256, Status: "pending",
+		RelayArtifactSHA256: manifest.Relay[testRelayTarget()].SHA256, InstalledSHA256: testSHA256(newRelay), Status: "pending",
 	}
 	if err := setPendingRelayUpdateIntent(*intent); err != nil {
 		t.Fatal(err)
@@ -396,6 +397,65 @@ func TestTypedRelayUpdatePersistsExactAppliedWitness(t *testing.T) {
 	if cfg, err = loadConfig(); err != nil || cfg.PendingUpdateResult != nil || cfg.PendingUpdateIntent != nil || cfg.UpdateManifest != releaseManifest(intent.ManifestName) {
 		t.Fatalf("exact ack cleanup changed pin or retained receipt: cfg=%+v err=%v", cfg, err)
 	}
+}
+
+func TestSelfUpdateLoopRetriesTypedIntentImmediatelyAfterDrain(t *testing.T) {
+	current := setupSelfUpdateHome(t, "old123")
+	newRelay := relayScript("new123")
+	relayTar := testRelayTarball(t, newRelay)
+	manifest := latestJSON{
+		Version: "new123", PreviousVersion: "old123",
+		Relay: map[string]latestArtifact{testRelayTarget(): testArtifact("relay.tar.gz", relayTar)},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestSum := sha256.Sum256(manifestBytes)
+	intent := recordingapi.RelayUpdateIntent{
+		RequestID: "00000000-0000-4000-8000-000000000143", NodeID: 1, TargetVersion: "new123",
+		ManifestName: "latest-new123.json", ManifestSHA256: hex.EncodeToString(manifestSum[:]),
+		RelayArtifactSHA256: manifest.Relay[testRelayTarget()].SHA256, InstalledSHA256: testSHA256(newRelay), Status: "pending",
+	}
+	server := serveTestRelayRelease(t, manifest, map[string][]byte{"relay.tar.gz": relayTar})
+	captureSelfUpdateRestarts(t)
+	oldPoll := selfUpdateIdlePollInterval
+	selfUpdateIdlePollInterval = time.Millisecond
+	t.Cleanup(func() { selfUpdateIdlePollInterval = oldPoll })
+	active := &atomic.Int64{}
+	active.Store(1)
+	drain := &atomic.Bool{}
+	updates := make(chan recordingapi.RelayHeartbeatUpdate, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		selfUpdateLoop(ctx, relayConfig{NodeID: 1, NodeToken: "test", APIURL: server.URL}, updates, active, &sync.RWMutex{}, drain)
+	}()
+	updates <- recordingapi.RelayHeartbeatUpdate{Intent: &intent}
+	waitFor := func(label string, predicate func() bool) {
+		deadline := time.Now().Add(3 * time.Second)
+		for !predicate() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", label)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitFor("durable drain and intent", func() bool {
+		cfg, err := loadConfig()
+		return err == nil && drain.Load() && cfg.PendingUpdateIntent != nil
+	})
+	if got, err := os.ReadFile(current); err != nil || !bytes.Equal(got, relayScript("old123")) {
+		t.Fatalf("relay mutated while active: err=%v", err)
+	}
+	active.Store(0)
+	waitFor("applied witness after drain", func() bool {
+		cfg, err := loadConfig()
+		return err == nil && cfg.PendingUpdateResult != nil && cfg.PendingUpdateResult.InstalledSHA256 == intent.InstalledSHA256
+	})
+	cancel()
+	<-done
 }
 
 func setupSelfUpdateHome(t *testing.T, runningVersion string) string {

@@ -30,6 +30,7 @@ import (
 var lastUpdaterUnix atomic.Int64
 var releasePublicKeyBase64 string
 var restartRelayAfterSelfUpdate = restartAfterSelfUpdate
+var selfUpdateIdlePollInterval = time.Second
 
 // selfUpdateInterval is how often the run loop checks latest.json for a newer relay
 // binary + yt-dlp. Ten minutes keeps remote relay fixes quick to iterate.
@@ -228,7 +229,7 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, updates <-chan recordi
 			}
 			manifest = pinned
 			pendingIntent = &intent
-			checkAndApplyUpdateExpected(cfg.APIURL, manifest, &intent, activeJobs, leaseGate, drainForUpdate)
+			applyRelayUpdateAfterDrain(ctx, cfg.APIURL, manifest, &intent, activeJobs, leaseGate, drainForUpdate)
 		case <-ticker.C:
 			if manifest != liveReleaseManifest && pendingIntent == nil {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
@@ -245,7 +246,25 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, updates <-chan recordi
 					}
 				}
 			}
-			checkAndApplyUpdateExpected(cfg.APIURL, manifest, pendingIntent, activeJobs, leaseGate, drainForUpdate)
+			applyRelayUpdateAfterDrain(ctx, cfg.APIURL, manifest, pendingIntent, activeJobs, leaseGate, drainForUpdate)
+		}
+	}
+}
+
+func applyRelayUpdateAfterDrain(ctx context.Context, base string, manifest releaseManifest, intent *recordingapi.RelayUpdateIntent, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
+	if !checkAndApplyUpdateExpected(base, manifest, intent, activeJobs, leaseGate, drainForUpdate) {
+		return
+	}
+	ticker := time.NewTicker(selfUpdateIdlePollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !checkAndApplyUpdateExpected(base, manifest, intent, activeJobs, leaseGate, drainForUpdate) {
+				return
+			}
 		}
 	}
 }
@@ -338,6 +357,10 @@ func checkAndApplyUpdateExpected(base string, manifest releaseManifest, intent *
 			log.Printf("relay update intent: hash installed relay: %v", err)
 			return false
 		}
+		if installedSHA != intent.InstalledSHA256 {
+			log.Printf("relay update intent: installed relay digest differs")
+			return false
+		}
 		result := recordingapi.RelayUpdateResult{RequestID: intent.RequestID, TargetVersion: intent.TargetVersion,
 			ManifestName: intent.ManifestName, ManifestSHA256: intent.ManifestSHA256,
 			RelayArtifactSHA256: intent.RelayArtifactSHA256, InstalledSHA256: installedSHA, AppliedAt: time.Now().UTC().Format(time.RFC3339Nano)}
@@ -380,6 +403,9 @@ func validateRelayUpdateIntent(nodeID int64, intent recordingapi.RelayUpdateInte
 	}
 	if !lowerHexSHA256(intent.RelayArtifactSHA256) {
 		return fmt.Errorf("relay artifact digest is invalid")
+	}
+	if !lowerHexSHA256(intent.InstalledSHA256) {
+		return fmt.Errorf("installed relay digest is invalid")
 	}
 	return nil
 }

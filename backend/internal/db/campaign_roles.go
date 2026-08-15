@@ -33,7 +33,7 @@ var campaignRuntimeFunctions = []string{
 	"guard_relay_update_node_state()",
 	"relay_update_authorize_account(bigint,bigint,bigint,bigint,text)",
 	"relay_update_intent_replay(bigint,bigint,uuid,text,bigint,bigint,bigint,text)",
-	"relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text)",
+	"relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,text,bigint,bigint,bigint,text)",
 	"relay_update_intent_heartbeat(bigint,bigint,bigint,text,text,boolean,jsonb)",
 	"recording_campaign_now()",
 	"recording_campaign_authorize_account(text,uuid,bigint,bigint,bigint,text)",
@@ -118,7 +118,7 @@ var campaignRuntimeProductFunctions = []string{
 
 var campaignExecutorFunctions = []string{
 	"relay_update_intent_replay(bigint,bigint,uuid,text,bigint,bigint,bigint,text)",
-	"relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,bigint,bigint,bigint,text)",
+	"relay_update_intent_create(uuid,bigint,bigint,text,text,text,text,text,text,text,bigint,bigint,bigint,text)",
 	"relay_update_intent_heartbeat(bigint,bigint,bigint,text,text,boolean,jsonb)",
 	"recording_campaign_seal_authoritative_frame(bigint,text,bigint,bigint,bigint,text,text)",
 	"recording_campaign_assert_baseline_frame_authority(bigint,text,bigint,bigint)",

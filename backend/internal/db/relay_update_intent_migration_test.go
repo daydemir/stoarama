@@ -24,6 +24,7 @@ func TestRelayUpdateIntentMigrationPinsAndNarrowsAuthority(t *testing.T) {
 		"GRANT EXECUTE ON FUNCTION %I.relay_update_intent_heartbeat",
 		"pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))",
 		"UPDATE nodes SET status='disabled'",
+		"installed_sha<>intent.expected_installed_binary_sha256",
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("0142 missing %q", required)

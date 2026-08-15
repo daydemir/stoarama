@@ -594,6 +594,7 @@ type RelayUpdateIntent struct {
 	ManifestName        string `json:"manifest_name"`
 	ManifestSHA256      string `json:"manifest_sha256"`
 	RelayArtifactSHA256 string `json:"relay_artifact_sha256"`
+	InstalledSHA256     string `json:"installed_binary_sha256"`
 	Status              string `json:"status"`
 }
 
