@@ -15,7 +15,8 @@ BEGIN
       AND expires_at>recording_campaign_now() AND p_stream_id=ANY(permitted_stream_ids)) INTO decision_ok;
   PERFORM 1 FROM stream_source_revisions WHERE stream_id=p_stream_id ORDER BY id FOR SHARE;
   SELECT s.source_url,COALESCE(s.source_page_url,'') source_page_url,s.updated_at,
-    (SELECT max(r.id) FROM stream_source_revisions r WHERE r.stream_id=s.id) source_revision_id
+    (SELECT max(r.id) FROM stream_source_revisions r WHERE r.stream_id=s.id) source_revision_id,
+    (SELECT max(f.id) FROM recording_campaign_admission_source_fence_events f WHERE f.stream_id=s.id) source_fence_event_id
     INTO source_row FROM streams s WHERE s.id=p_stream_id AND s.deleted_at IS NULL FOR SHARE;
   IF decision_ok IS DISTINCT FROM true OR source_row.source_url IS NULL THEN
     RAISE EXCEPTION 'authoritative frame target is not decision-authorized';
@@ -25,7 +26,8 @@ BEGIN
     'account_id',p_account_id,'authority_code',p_authority_code,'stream_id',p_stream_id,
     'source_revision_id',revision,'source_url_sha256',encode(sha256(convert_to(source_row.source_url,'UTF8')),'hex'),
     'source_page_url_sha256',encode(sha256(convert_to(source_row.source_page_url,'UTF8')),'hex'),
-    'source_updated_at_epoch_us',floor(extract(epoch from source_row.updated_at)*1000000)::bigint
+    'source_updated_at_epoch_us',floor(extract(epoch from source_row.updated_at)*1000000)::bigint,
+    'source_fence_event_id',source_row.source_fence_event_id
   )::text,'UTF8')),'hex');
   RETURN QUERY SELECT p_stream_id,source_row.source_url,source_row.source_page_url,revision,digest;
 END $$;

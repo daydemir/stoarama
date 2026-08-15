@@ -261,6 +261,9 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/live.m3u8' WHERE id=$1`, streamID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_authorize_authoritative_frame($1,'deniz_fd_restore_20260814',$2,$3,$4)`, accountID, streamID, preparedRevisionID, preparedSnapshot); err == nil || !strings.Contains(err.Error(), "source snapshot changed") {
+		t.Fatalf("A-B-A source mutation restored a stale prepared snapshot: %v", err)
+	}
 	frameSHA := strings.Repeat("1", 64)
 	sceneSHA := strings.Repeat("2", 64)
 	if err := migrator.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256) VALUES('r2','campaign','scene.jpg','image/jpeg',1,$1) RETURNING id`, frameSHA).Scan(&mediaID); err != nil {
