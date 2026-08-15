@@ -180,7 +180,7 @@ CREATE TABLE recording_targeted_provider_attestations (
 );
 
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_order()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; bound BOOLEAN;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''queue'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
@@ -195,7 +195,7 @@ END $$;
 CREATE TRIGGER recording_targeted_probe_order_validate BEFORE INSERT ON recording_targeted_probe_orders FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_order();
 
 CREATE OR REPLACE FUNCTION validate_recording_targeted_provider_attestation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE expected TEXT;
 BEGIN
   expected:=encode(sha256(convert_to(jsonb_build_object('node_id',NEW.node_id,'recorder_droplet_id',NEW.recorder_droplet_id,'do_droplet_id',NEW.do_droplet_id,'project_id_sha256',NEW.project_id_sha256,'firewall_id_sha256',NEW.firewall_id_sha256,'region',NEW.region,'size_slug',NEW.size_slug,'pool_identity_sha256',NEW.pool_identity_sha256,'build_sha',NEW.build_sha,'observed_at_epoch',extract(epoch from NEW.observed_at))::text,'UTF8')),'hex');
@@ -248,7 +248,7 @@ CREATE TABLE recording_targeted_probe_attempt_terminal_events (
 );
 
 CREATE FUNCTION validate_recording_targeted_probe_attempt_terminal_event()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; exact BOOLEAN; expected TEXT;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
@@ -318,7 +318,7 @@ CREATE TABLE recording_targeted_probe_evidence (
 -- Narrow product bridge used by the ordinary cloud claim query. It exposes
 -- only the current slot count, never attempt/object/evidence rows.
 CREATE FUNCTION recording_worker_targeted_probe_occupancy(p_node_id BIGINT)
-RETURNS INTEGER LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS $$
+RETURNS INTEGER LANGUAGE sql STABLE SECURITY DEFINER SET search_path FROM CURRENT AS $$
   SELECT count(*)::integer FROM recording_targeted_probe_attempts attempt
   LEFT JOIN recording_targeted_probe_evidence evidence ON evidence.attempt_id=attempt.id
   LEFT JOIN recording_targeted_probe_attempt_terminal_events terminal ON terminal.attempt_id=attempt.id
@@ -468,7 +468,7 @@ CREATE TABLE recording_campaign_capacity_reservations (
 -- This is recomputed after the candidate rows are active while the shared
 -- scheduler fence is held, so no executor forecast can increase authority.
 CREATE FUNCTION recording_campaign_forecast_peak_slots(p_account_id BIGINT)
-RETURNS INTEGER LANGUAGE sql STABLE SET search_path=pg_catalog AS $$
+RETURNS INTEGER LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
   WITH configs AS (
     SELECT r.* FROM recordings r
     WHERE r.account_id=p_account_id AND r.status='active' AND r.capture_via='cloud'
@@ -501,7 +501,7 @@ $$;
 -- that denominator from the same fresh-node/group cap used by relay alerts.
 CREATE FUNCTION recording_campaign_relay_failure_capacity(p_account_id BIGINT)
 RETURNS TABLE(active_demand INTEGER,failure_domains INTEGER,effective_capacity INTEGER,usable_after_largest_loss INTEGER)
-LANGUAGE sql STABLE SET search_path=pg_catalog AS $$
+LANGUAGE sql STABLE SET search_path FROM CURRENT AS $$
   WITH live_nodes AS (
     SELECT n.id,n.relay_group_id,n.relay_max_streams
     FROM nodes n
@@ -621,7 +621,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_approval(
   p_request_id UUID,p_account_id BIGINT,p_actor_user_id BIGINT,p_actor_email TEXT,
   p_authority_code TEXT,p_failure_domain_tag TEXT,p_deadline_at TIMESTAMPTZ,
   p_entries JSONB,p_schedule_spec JSONB,p_request_sha256 TEXT
-) RETURNS TABLE(id UUID,approval_sha256 TEXT) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID,approval_sha256 TEXT) LANGUAGE sql SET search_path FROM CURRENT AS $$
   WITH payload AS (
     SELECT p_account_id account_id,p_actor_user_id actor_user_id,p_actor_email actor_email,
       p_authority_code authority_code,NULLIF(p_failure_domain_tag,'') failure_domain_tag,
@@ -647,7 +647,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION recording_campaign_create_probe_order(
   p_request_id UUID,p_approval_id UUID,p_account_id BIGINT,p_stream_id BIGINT,p_user_id BIGINT
-) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_targeted_probe_orders(request_id,approval_id,account_id,stream_id,requested_by_user_id)
   VALUES(p_request_id,p_approval_id,p_account_id,p_stream_id,p_user_id)
   ON CONFLICT DO NOTHING
@@ -658,7 +658,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_provider_attestation(
   p_node_id BIGINT,p_recorder_droplet_id BIGINT,p_do_droplet_id BIGINT,
   p_project_sha256 TEXT,p_firewall_sha256 TEXT,p_region TEXT,p_size_slug TEXT,
   p_pool_identity_sha256 TEXT,p_build_sha TEXT
-) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path FROM CURRENT AS $$
   WITH facts AS (
     SELECT p_node_id node_id,p_recorder_droplet_id recorder_droplet_id,p_do_droplet_id do_droplet_id,
       p_project_sha256 project_hash,p_firewall_sha256 firewall_hash,p_region region,p_size_slug size_slug,
@@ -694,7 +694,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_probe_attempt(
   p_source_page_url_sha256 TEXT,p_source_updated_at TIMESTAMPTZ,p_challenge TEXT,
   p_object_bucket_sha256 TEXT,p_media_object_key TEXT,p_frame_object_key TEXT,
   p_media_max_size_bytes BIGINT,p_frame_max_size_bytes BIGINT
-) RETURNS TABLE(id UUID,challenge TEXT) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID,challenge TEXT) LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_targeted_probe_attempts(
     id,request_id,order_id,approval_id,account_id,stream_id,attempt_no,node_id,recorder_droplet_id,
     provider_attestation_id,do_droplet_id,region,probe_build_sha,source_revision_id,source_url_sha256,
@@ -717,7 +717,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_lease_probe(
   p_attempt_id UUID,p_request_id UUID,p_challenge TEXT,
   p_bucket_sha256 TEXT,p_media_key TEXT,p_frame_key TEXT,p_media_max BIGINT,p_frame_max BIGINT
 ) RETURNS TABLE(order_id UUID,approval_id UUID,account_id BIGINT,stream_id BIGINT,provider TEXT,
-  source_url TEXT,source_page_url TEXT,attempt_id UUID,challenge TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+  source_url TEXT,source_page_url TEXT,attempt_id UUID,challenge TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE selected RECORD; provider_id UUID; revision_id BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ;
 BEGIN
   PERFORM pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0));
@@ -811,7 +811,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_probe_evidence(
   p_media_archive_etag TEXT,p_media_archive_version_id TEXT,p_frame_archive_object_key TEXT,
   p_frame_archive_sha256 TEXT,p_frame_archive_etag TEXT,p_frame_archive_version_id TEXT,
   p_submission_request_sha256 TEXT,p_evidence_sha256 TEXT
-) RETURNS TABLE(id UUID,evidence_sha256 TEXT) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID,evidence_sha256 TEXT) LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_targeted_probe_evidence(
     attempt_id,approval_id,account_id,stream_id,result,valid_ratio,duration_ms,segment_count,
     frame_sha256,media_sha256,native_signature_sha256,challenge_proof_sha256,video_codec,audio_codec,
@@ -846,7 +846,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_submit_probe_evidence(
   p_node_id BIGINT,p_node_token_id BIGINT,p_claim_generation BIGINT,p_credential_sha256 TEXT,
   p_attempt_id UUID,p_request_id UUID,p_approval_id UUID,p_account_id BIGINT,p_stream_id BIGINT,
   p_observation JSONB
-) RETURNS TABLE(evidence_id UUID,evidence_sha256 TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(evidence_id UUID,evidence_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD; attempt RECORD;
 BEGIN
   IF jsonb_typeof(p_observation)<>'object' OR
@@ -925,7 +925,7 @@ END $$;
 
 CREATE OR REPLACE FUNCTION recording_campaign_create_scene_presentation(
   p_request_id UUID,p_presented_to BIGINT,p_probe_evidence_id UUID,p_approval_id UUID,p_account_id BIGINT
-) RETURNS TABLE(id UUID,presentation_sha256 TEXT) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID,presentation_sha256 TEXT) LANGUAGE sql SET search_path FROM CURRENT AS $$
   WITH facts AS (
     SELECT p_request_id request_id,e.approval_id,e.account_id,e.stream_id,e.id probe_evidence_id,
       e.frame_sha256,e.frame_archive_object_key,e.frame_archive_etag,e.frame_archive_version_id,
@@ -955,7 +955,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION recording_campaign_create_scene_review(
   p_request_id UUID,p_reviewer BIGINT,p_probe_evidence_id UUID,p_presentation_id UUID,p_approval_id UUID,p_account_id BIGINT
-) RETURNS TABLE(id UUID,review_sha256 TEXT) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID,review_sha256 TEXT) LANGUAGE sql SET search_path FROM CURRENT AS $$
   WITH facts AS (
     SELECT p_request_id request_id,e.approval_id,e.account_id,e.stream_id,e.id probe_evidence_id,
       e.frame_sha256,p_presentation_id presentation_id,r.scene_frame_evidence_id,r.scene_identity_sha256,p_reviewer reviewer,
@@ -985,7 +985,7 @@ $$;
 -- replay before mutable credential/deadline/source checks.
 CREATE FUNCTION recording_campaign_replay(
   p_approval_id UUID,p_account_id BIGINT,p_credential_sha256 TEXT
-) RETURNS JSONB LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS JSONB LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE response JSONB;
 BEGIN
   IF p_credential_sha256!~'^[0-9a-f]{64}$' THEN RAISE EXCEPTION 'invalid campaign replay credential'; END IF;
@@ -1003,7 +1003,7 @@ END $$;
 CREATE FUNCTION recording_campaign_replay_approval(
   p_account_id BIGINT,p_request_id UUID,p_request_sha256 TEXT,p_credential_sha256 TEXT
 ) RETURNS TABLE(approval_id UUID,approval_sha256 TEXT,entries JSONB)
-LANGUAGE sql SET search_path=pg_catalog AS $$
+LANGUAGE sql SET search_path FROM CURRENT AS $$
   SELECT a.id,a.approval_sha256,a.entries
   FROM recording_campaign_admission_approvals a
   WHERE a.account_id=p_account_id AND a.request_id=p_request_id AND a.request_sha256=p_request_sha256
@@ -1017,7 +1017,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_approve(
   p_request_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_actor_email TEXT,p_authority_code TEXT,p_failure_domain_tag TEXT,p_deadline_at TIMESTAMPTZ,
   p_entries JSONB,p_schedule_spec JSONB,p_request_sha256 TEXT
-) RETURNS TABLE(approval_id UUID,approval_sha256 TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(approval_id UUID,approval_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD;
 BEGIN
   SELECT a.id,a.approval_sha256,a.request_sha256,a.actor_user_id,a.actor_email_snapshot,
@@ -1046,7 +1046,7 @@ END $$;
 
 CREATE FUNCTION recording_campaign_expire_approval(
   p_request_id UUID,p_approval_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT
-) RETURNS TABLE(event_sha256 TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(event_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD; approval RECORD; digest TEXT;
 BEGIN
   SELECT terminal.event_sha256,terminal.actor_user_id INTO existing
@@ -1106,7 +1106,7 @@ CREATE FUNCTION recording_campaign_read_probe_attempt(
 ) RETURNS TABLE(account_id BIGINT,challenge TEXT,media_object_key TEXT,frame_object_key TEXT,
   media_max_size_bytes BIGINT,frame_max_size_bytes BIGINT,terminal BOOLEAN,
   evidence_id UUID,evidence_sha256 TEXT,submission_request_sha256 TEXT,result TEXT,detail TEXT)
-LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE attempt RECORD;
 BEGIN
   SELECT a.account_id,a.challenge,a.media_object_key,a.frame_object_key,a.media_max_size_bytes,
@@ -1127,7 +1127,7 @@ END $$;
 CREATE OR REPLACE FUNCTION recording_campaign_queue_probe(
   p_request_id UUID,p_approval_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,
   p_credential_sha256 TEXT,p_stream_id BIGINT
-) RETURNS TABLE(order_id UUID) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(order_id UUID) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD;
 BEGIN
   SELECT o.id,o.approval_id,o.stream_id,o.requested_by_user_id INTO existing
@@ -1153,7 +1153,7 @@ END $$;
 CREATE OR REPLACE FUNCTION recording_campaign_review_probe_scene(
   p_request_id UUID,p_approval_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,
   p_credential_sha256 TEXT,p_probe_evidence_id UUID,p_presentation_id UUID
-) RETURNS TABLE(review_id UUID,review_sha256 TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(review_id UUID,review_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD;
 BEGIN
   SELECT r.id,r.review_sha256,r.approval_id,r.probe_evidence_id,r.presentation_id,r.reviewed_by_user_id INTO existing
@@ -1174,7 +1174,7 @@ CREATE FUNCTION recording_campaign_read_probe_scene(
   p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,p_probe_evidence_id UUID
 ) RETURNS TABLE(approval_id UUID,frame_archive_object_key TEXT,frame_archive_etag TEXT,frame_archive_version_id TEXT,
   frame_archive_sha256 TEXT,frame_size_bytes BIGINT)
-LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE bound_approval UUID;
 BEGIN
   SELECT e.approval_id INTO bound_approval FROM recording_targeted_probe_evidence e
@@ -1197,7 +1197,7 @@ CREATE FUNCTION recording_campaign_read_baseline_scene(
   p_request_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT
 ) RETURNS TABLE(read_receipt_id UUID,frame_sha256 TEXT,media_object_key TEXT,media_etag TEXT,media_size_bytes BIGINT)
-LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD; decision_ok BOOLEAN; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; frame RECORD; digest TEXT;
 BEGIN
   SELECT * INTO existing FROM recording_campaign_baseline_scene_read_receipts
@@ -1260,7 +1260,7 @@ END $$;
 CREATE FUNCTION recording_campaign_present_baseline_scene(
   p_request_id UUID,p_read_receipt_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT
-) RETURNS TABLE(presentation_id UUID,frame_sha256 TEXT,media_object_key TEXT,media_etag TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(presentation_id UUID,frame_sha256 TEXT,media_object_key TEXT,media_etag TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD; receipt RECORD; decision RECORD; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; digest TEXT;
 BEGIN
   SELECT * INTO existing FROM recording_campaign_baseline_scene_presentations
@@ -1315,7 +1315,7 @@ END $$;
 CREATE FUNCTION recording_campaign_attest_baseline_scene(
   p_presentation_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_frame_id BIGINT,p_scene_identity_sha256 TEXT
-) RETURNS TABLE(evidence_id BIGINT,evidence_sha256 TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(evidence_id BIGINT,evidence_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE presented RECORD; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ;
 BEGIN
   PERFORM recording_campaign_authorize_account('baseline_attest',NULL,p_account_id,p_user_id,p_session_id,p_credential_sha256);
@@ -1352,7 +1352,7 @@ END $$;
 CREATE OR REPLACE FUNCTION recording_campaign_present_probe_scene(
   p_request_id UUID,p_approval_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,
   p_credential_sha256 TEXT,p_probe_evidence_id UUID
-) RETURNS TABLE(presentation_id UUID,presentation_sha256 TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(presentation_id UUID,presentation_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE existing RECORD;
 BEGIN
   SELECT p.id,p.presentation_sha256,p.approval_id,p.probe_evidence_id,p.presented_to_user_id INTO existing
@@ -1377,7 +1377,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_capacity_observation(
   p_relay_active_demand INTEGER,p_relay_failure_domains INTEGER,p_relay_effective_capacity INTEGER,
   p_relay_usable_after_largest_loss INTEGER,
   p_project_sha256 TEXT,p_firewall_sha256 TEXT,p_facts_sha256 TEXT,p_provider_observation_sha256 TEXT
-) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_campaign_capacity_observations(
     approval_id,account_id,observation_started_at,observed_at,expires_at,build_sha,size_slug,pool_identity_sha256,ready_workers,total_slots,
     largest_worker_slots,usable_after_worker_loss,largest_region,largest_region_slots,relay_active_demand,
@@ -1393,7 +1393,7 @@ $$;
 CREATE OR REPLACE FUNCTION recording_campaign_create_capacity_reservation(
   p_approval_id UUID,p_account_id BIGINT,p_observation_id UUID,p_forecast_peak_slots INTEGER,
   p_active_roster_after INTEGER
-) RETURNS void LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS void LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_campaign_capacity_reservations(
     approval_id,account_id,observation_id,forecast_peak_slots,active_roster_after,roster_cap
   ) VALUES(p_approval_id,p_account_id,p_observation_id,p_forecast_peak_slots,p_active_roster_after,60)
@@ -1405,7 +1405,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_storage_observation(
   p_active_roster_after INTEGER,p_projected_daily_bytes BIGINT,p_campaign_days_with_reserve INTEGER,
   p_required_free_bytes BIGINT,p_projected_free_after_bytes BIGINT,p_warning_threshold_bytes BIGINT,
   p_warning_after_reservation BOOLEAN
-) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path FROM CURRENT AS $$
   WITH facts AS (
     SELECT p_approval_id approval_id,p_account_id account_id,p_connection_id connection_id,
       recording_campaign_now() observed_at,p_nas_reported_at nas_reported_at,p_nas_total_bytes nas_total_bytes,
@@ -1441,7 +1441,7 @@ $$;
 CREATE OR REPLACE FUNCTION recording_campaign_create_storage_reservation(
   p_approval_id UUID,p_account_id BIGINT,p_observation_id UUID,p_reserved_bytes BIGINT,
   p_reserved_until TIMESTAMPTZ
-) RETURNS void LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS void LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_campaign_storage_reservations(
     approval_id,account_id,observation_id,reserved_bytes,reserved_until
   ) VALUES(p_approval_id,p_account_id,p_observation_id,p_reserved_bytes,p_reserved_until)
@@ -1451,7 +1451,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_create_admission_result(
   p_approval_id UUID,p_first_evidence_id UUID,p_second_evidence_id UUID,p_account_id BIGINT,
   p_track_id BIGINT,p_roster_entry_id BIGINT,p_stream_id BIGINT,p_recording_id BIGINT,
   p_actor_user_id BIGINT,p_action TEXT,p_schedule_sha256 TEXT,p_recording_config_sha256 TEXT
-) RETURNS void LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS void LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_campaign_admission_results(
     approval_id,first_probe_evidence_id,second_probe_evidence_id,account_id,track_id,roster_entry_id,
     stream_id,recording_id,actor_user_id,action,schedule_sha256,recording_config_sha256
@@ -1461,7 +1461,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION recording_campaign_create_admission_commit(
   p_approval_id UUID,p_account_id BIGINT,p_actor_user_id BIGINT,p_track_id BIGINT,p_response_json JSONB
-) RETURNS void LANGUAGE sql SET search_path=pg_catalog AS $$
+) RETURNS void LANGUAGE sql SET search_path FROM CURRENT AS $$
   INSERT INTO recording_campaign_admission_commits(
     approval_id,account_id,actor_user_id,track_id,schedule_sha256,response_json,response_sha256
   ) SELECT p_approval_id,p_account_id,p_actor_user_id,p_track_id,schedule_sha256,p_response_json,
@@ -1476,7 +1476,7 @@ $$;
 CREATE OR REPLACE FUNCTION recording_campaign_admit(
   p_approval_id UUID,p_account_id BIGINT,p_actor_user_id BIGINT,p_session_id BIGINT,
   p_credential_sha256 TEXT,p_schedule_spec JSONB,p_next_fires JSONB,p_capacity JSONB,p_storage JSONB
-) RETURNS JSONB LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+) RETURNS JSONB LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
   approval RECORD; reservation RECORD; stream_row RECORD; existing RECORD;
   v_first_evidence UUID; v_second_evidence UUID; v_roster_id BIGINT; v_recording_id BIGINT; v_track_id BIGINT;
@@ -1798,7 +1798,7 @@ END $$;
 CREATE OR REPLACE FUNCTION recording_campaign_authorize_account(
   requested_action TEXT, requested_approval UUID, requested_account BIGINT,
   requested_user BIGINT, requested_session BIGINT, credential_sha256 TEXT
-) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
 DECLARE valid BOOLEAN;
 BEGIN
   IF requested_action NOT IN('baseline_present','baseline_attest','approve','queue','present','review','admit','expire') OR
@@ -1826,7 +1826,7 @@ CREATE OR REPLACE FUNCTION recording_campaign_authorize_node(
   requested_action TEXT, requested_approval UUID, requested_account BIGINT,
   requested_node BIGINT, requested_token BIGINT, requested_generation BIGINT,
   credential_sha256 TEXT
-) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
 DECLARE valid BOOLEAN;
 BEGIN
   IF requested_action NOT IN('attempt','evidence') OR requested_approval IS NULL OR
@@ -1859,7 +1859,7 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_tx_authorization()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; valid BOOLEAN;
 BEGIN
   IF NEW.transaction_id<>txid_current() OR NEW.authorized_at IS DISTINCT FROM recording_campaign_now() THEN RAISE EXCEPTION 'campaign authorization must be bound to the current database transaction'; END IF;
@@ -1885,7 +1885,7 @@ CREATE CONSTRAINT TRIGGER recording_campaign_tx_authorization_commit_seal AFTER 
 -- commit so same-transaction approval/commit/attempt changes cannot release a
 -- reservation without the exact typed expiration operation.
 CREATE OR REPLACE FUNCTION validate_recording_campaign_reservation_terminal_event()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; approval RECORD; expected TEXT; has_inflight BOOLEAN; has_commit BOOLEAN;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
@@ -1916,7 +1916,7 @@ CREATE TRIGGER recording_campaign_reservation_terminal_validate BEFORE INSERT ON
 CREATE CONSTRAINT TRIGGER recording_campaign_reservation_terminal_commit_seal AFTER INSERT ON recording_campaign_admission_reservation_terminal_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_reservation_terminal_event();
 
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_scene_presentation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; e RECORD; expected TEXT;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''present'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
@@ -1942,7 +1942,7 @@ END $$;
 CREATE TRIGGER recording_targeted_probe_scene_presentation_validate BEFORE INSERT ON recording_targeted_probe_scene_presentations FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_scene_presentation();
 
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_scene_review()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; e RECORD; reservation RECORD; presentation RECORD; scene_fresh BOOLEAN; expected TEXT;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''review'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s)
@@ -1967,7 +1967,7 @@ END $$;
 CREATE TRIGGER recording_targeted_probe_scene_review_validate BEFORE INSERT ON recording_targeted_probe_scene_reviews FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_scene_review();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_capacity_observation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; expected_provider_digest TEXT;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s)
@@ -1988,7 +1988,7 @@ END $$;
 CREATE TRIGGER recording_campaign_capacity_observation_validate BEFORE INSERT ON recording_campaign_capacity_observations FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_capacity_observation();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_capacity_reservation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; observation RECORD; live_active INTEGER;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s)
@@ -2006,7 +2006,7 @@ END $$;
 CREATE TRIGGER recording_campaign_capacity_reservation_validate BEFORE INSERT ON recording_campaign_capacity_reservations FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_capacity_reservation();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_storage_observation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; connection_valid BOOLEAN; expected TEXT;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s)
@@ -2026,7 +2026,7 @@ END $$;
 CREATE TRIGGER recording_campaign_storage_observation_validate BEFORE INSERT ON recording_campaign_storage_observations FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_storage_observation();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_storage_reservation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; observation RECORD;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s)
@@ -2042,7 +2042,7 @@ END $$;
 CREATE TRIGGER recording_campaign_storage_reservation_validate BEFORE INSERT ON recording_campaign_storage_reservations FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_storage_reservation();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_commit()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; valid BOOLEAN; result_count INTEGER; entry_count INTEGER; canonical_response JSONB;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_approvals a JOIN %I.recording_campaign_tracks t ON t.id=$4 WHERE a.id=$1 AND a.account_id=$2 AND a.actor_user_id=$3 AND a.schedule_sha256=$5 AND t.account_id=$2 AND t.state=''active'')',s,s)
@@ -2082,7 +2082,7 @@ END $$;
 CREATE TRIGGER recording_campaign_admission_commit_validate BEFORE INSERT ON recording_campaign_admission_commits FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_admission_commit();
 
 CREATE OR REPLACE FUNCTION enforce_recording_campaign_result_has_commit()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; sealed BOOLEAN;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_commits c JOIN %I.recording_campaign_capacity_reservations cap ON cap.approval_id=c.approval_id AND cap.account_id=c.account_id JOIN %I.recording_campaign_storage_reservations storage ON storage.approval_id=c.approval_id AND storage.account_id=c.account_id WHERE c.approval_id=$1 AND c.account_id=$2 AND c.track_id=$3)',s,s,s) INTO sealed USING NEW.approval_id,NEW.account_id,NEW.track_id;
@@ -2092,7 +2092,7 @@ END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_result_commit AFTER INSERT ON recording_campaign_admission_results DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_recording_campaign_result_has_commit();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_approval()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; unidentified_active BOOLEAN; entry JSONB; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; stream_provider TEXT; stream_external TEXT; stream_label TEXT; stream_timezone TEXT; expected_timezone TEXT; tags TEXT[]; latest_revision BIGINT; scene_bound BOOLEAN; recording_account BIGINT; recording_stream BIGINT; recording_status TEXT; expected_schedule TEXT; expected_approval TEXT; prior_stream BIGINT:=0; decision RECORD; requested_ids BIGINT[];
 BEGIN
   EXECUTE format('SELECT u.is_operator AND lower(u.email)=lower($2) FROM %I.users u WHERE u.id=$1',s)
@@ -2196,7 +2196,7 @@ END $$;
 CREATE TRIGGER recording_campaign_admission_approval_validate BEFORE INSERT ON recording_campaign_admission_approvals FOR EACH ROW EXECUTE FUNCTION validate_recording_campaign_admission_approval();
 
 CREATE OR REPLACE FUNCTION reserve_recording_campaign_admission_entries()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; entry JSONB; collision BOOLEAN;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
@@ -2211,7 +2211,7 @@ BEGIN
   RETURN NEW;
 END $$;
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_reservation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; a_account BIGINT; entry JSONB;
 BEGIN
   EXECUTE format('SELECT account_id,(SELECT value FROM jsonb_array_elements(entries) value WHERE (value->>''stream_id'')::bigint=$2) FROM %I.recording_campaign_admission_approvals WHERE id=$1',s)
@@ -2229,7 +2229,7 @@ CREATE TRIGGER recording_campaign_admission_reservation_validate BEFORE INSERT O
 CREATE TRIGGER recording_campaign_admission_reserve AFTER INSERT ON recording_campaign_admission_approvals FOR EACH ROW EXECUTE FUNCTION reserve_recording_campaign_admission_entries();
 
 CREATE OR REPLACE FUNCTION audit_recording_campaign_reserved_source_mutation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; reserved BOOLEAN; collides BOOLEAN; prior_hash TEXT; next_hash TEXT;
 BEGIN
   IF (NEW.source_url,NEW.source_page_url,NEW.provider,NEW.external_id,NEW.name,NEW.local_timezone,NEW.tags,NEW.deleted_at,NEW.updated_at)
@@ -2252,7 +2252,7 @@ AFTER UPDATE OF source_url,source_page_url,provider,external_id,name,local_timez
 FOR EACH ROW EXECUTE FUNCTION audit_recording_campaign_reserved_source_mutation();
 
 CREATE OR REPLACE FUNCTION audit_recording_campaign_reserved_revision_mutation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; sid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.stream_id ELSE NEW.stream_id END; reserved BOOLEAN; prior_hash TEXT; next_hash TEXT;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservations r WHERE r.stream_id=$1 AND NOT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_reservation_terminal_events terminal WHERE terminal.approval_id=r.approval_id))',s,s) INTO reserved USING sid;
@@ -2268,7 +2268,7 @@ AFTER INSERT OR UPDATE OR DELETE ON stream_source_revisions
 FOR EACH ROW EXECUTE FUNCTION audit_recording_campaign_reserved_revision_mutation();
 
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_attempt()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_deadline TIMESTAMPTZ; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_reserved TIMESTAMPTZ; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; d_node BIGINT; d_do BIGINT; d_region TEXT; d_size TEXT; d_build TEXT; d_state TEXT; d_seen TIMESTAMPTZ; order_valid BOOLEAN; provider_valid BOOLEAN; expected_attempt INTEGER; prior_completed TIMESTAMPTZ;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
@@ -2299,7 +2299,7 @@ END $$;
 CREATE TRIGGER recording_targeted_probe_attempt_validate BEFORE INSERT ON recording_targeted_probe_attempts FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_attempt();
 
 CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_evidence()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a RECORD; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; native_text TEXT; native_hash TEXT; proof_hash TEXT; expected_evidence TEXT;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
@@ -2329,7 +2329,7 @@ CREATE CONSTRAINT TRIGGER recording_targeted_probe_evidence_commit_seal AFTER IN
 CREATE CONSTRAINT TRIGGER recording_targeted_probe_attempt_terminal_commit_seal AFTER INSERT ON recording_targeted_probe_attempt_terminal_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_attempt_terminal_event();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_result()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a_account BIGINT; a_actor BIGINT; a_schedule TEXT; a_deadline TIMESTAMPTZ; a_tag TEXT; r_stream BIGINT; r_recording BIGINT; r_revision BIGINT; r_source TEXT; r_page TEXT; r_updated TIMESTAMPTZ; r_scene BIGINT; r_scene_hash TEXT; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; current_tags TEXT[]; t_account BIGINT; e_recording BIGINT; e_stream BIGINT; e_actor BIGINT; e_scene TEXT; config_ok BOOLEAN; scene_fresh BOOLEAN; reviews_valid BOOLEAN; current_config_sha TEXT; current_roster_sha TEXT; newer_attempt BOOLEAN; p1 RECORD; p2 RECORD;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2 AND actor_user_id=$3)',s) INTO authorized USING NEW.approval_id,NEW.account_id,NEW.actor_user_id;
@@ -2382,7 +2382,7 @@ CREATE TRIGGER recording_campaign_admission_result_validate BEFORE INSERT ON rec
 -- recording row. Supported writers that pre-lock account/stream/job rows call
 -- the same advisory fence explicitly before those locks.
 CREATE OR REPLACE FUNCTION recording_campaign_admission_statement_fence()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   RETURN NULL;
@@ -2395,7 +2395,7 @@ CREATE TRIGGER recording_campaign_admission_demand_update_fence BEFORE UPDATE OF
 ON recordings FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_admission_statement_fence();
 
 CREATE OR REPLACE FUNCTION guard_reserved_completed_recording_activation()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE
   s TEXT:=TG_TABLE_SCHEMA; approval UUID; authorized BOOLEAN; active_count INTEGER; active_cloud INTEGER;
   has_campaign BOOLEAN; expected_build TEXT; expected_size TEXT; expected_pool TEXT; expected_project TEXT; expected_firewall TEXT; observed_expires TIMESTAMPTZ;
@@ -2497,7 +2497,7 @@ END $$;
 CREATE TRIGGER recording_campaign_admission_activation_guard BEFORE INSERT OR UPDATE ON recordings FOR EACH ROW EXECUTE FUNCTION guard_reserved_completed_recording_activation();
 
 CREATE OR REPLACE FUNCTION enforce_reserved_activation_has_result()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; approval UUID; sealed BOOLEAN;
 BEGIN
   IF NEW.status='active' AND (TG_OP='INSERT' OR OLD.status<>'active') THEN
@@ -2512,7 +2512,7 @@ END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_activation_seal AFTER INSERT OR UPDATE ON recordings DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_reserved_activation_has_result();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_recording_inverse_seal()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; rid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END; expected TEXT; actual TEXT; bound BOOLEAN; lifecycle_ok BOOLEAN; expected_next TIMESTAMPTZ;
 BEGIN
   EXECUTE format('SELECT recording_config_sha256 FROM %I.recording_campaign_admission_results WHERE recording_id=$1',s) INTO expected USING rid;
@@ -2543,7 +2543,7 @@ CREATE CONSTRAINT TRIGGER recording_campaign_admission_recording_inverse AFTER I
 -- therefore its final activation must compete atomically with reservations and
 -- already-active/protected identities.
 CREATE OR REPLACE FUNCTION recording_campaign_assert_track_activation_occupancy(p_track BIGINT,p_account BIGINT)
-RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
 DECLARE entry RECORD; collision BOOLEAN;
 BEGIN
   FOR entry IN
@@ -2579,7 +2579,7 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION guard_recording_campaign_track_activation_occupancy()
-RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
 BEGIN
   IF OLD.state='draft' AND NEW.state='active' THEN
     PERFORM recording_campaign_assert_track_activation_occupancy(NEW.id,NEW.account_id);
@@ -2590,7 +2590,7 @@ CREATE TRIGGER recording_campaign_track_state_fence BEFORE UPDATE OF state ON re
 CREATE TRIGGER recording_campaign_track_activation_occupancy BEFORE UPDATE OF state ON recording_campaign_tracks FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_track_activation_occupancy();
 
 CREATE OR REPLACE FUNCTION guard_recording_campaign_track_state()
-RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; witnessed BOOLEAN;
 BEGIN
   IF OLD.state<>'draft' AND (NEW.account_id,NEW.campaign_key,NEW.label,NEW.deadline_at,NEW.target_count,
@@ -2610,7 +2610,7 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION transition_recording_campaign_track(p_track BIGINT,p_to TEXT,p_reasons TEXT[],p_actor BIGINT,p_decided TIMESTAMPTZ)
-RETURNS VOID LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS VOID LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE old_state TEXT; expected_count INTEGER; actual_count INTEGER; track_account BIGINT; first_account BIGINT; authorized BOOLEAN;
 BEGIN
   SELECT account_id INTO first_account FROM recording_campaign_tracks WHERE id=p_track;
@@ -2636,7 +2636,7 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION guard_reserved_campaign_roster_occupancy()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; account BIGINT; approval UUID; authorized BOOLEAN;
 BEGIN
   IF NEW.status NOT IN('protect','probation') THEN RETURN NEW; END IF;
@@ -2653,7 +2653,7 @@ END $$;
 CREATE TRIGGER recording_campaign_admission_roster_guard BEFORE INSERT OR UPDATE ON recording_campaign_roster_entries FOR EACH ROW EXECUTE FUNCTION guard_reserved_campaign_roster_occupancy();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_roster_inverse_seal()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; eid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END; admitted BOOLEAN; bound BOOLEAN; expected TEXT; actual TEXT;
 BEGIN
   EXECUTE format('SELECT roster_entry_sha256 FROM %I.recording_campaign_admission_results WHERE roster_entry_id=$1',s) INTO expected USING eid;
@@ -2670,7 +2670,7 @@ END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_roster_inverse AFTER UPDATE OR DELETE ON recording_campaign_roster_entries DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_admitted_roster_inverse_seal();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_track_inverse_seal()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; tid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END; admitted BOOLEAN; active BOOLEAN;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE track_id=$1)',s) INTO admitted USING tid;
@@ -2685,14 +2685,14 @@ CREATE CONSTRAINT TRIGGER recording_campaign_admission_track_inverse AFTER UPDAT
 -- leasing. A live server-owned probe is capture authority: no controller,
 -- operator force-drain, direct SQL, or claim-head rotation may strand it.
 CREATE OR REPLACE FUNCTION recording_campaign_worker_lifecycle_statement_fence()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0));
   PERFORM pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0));
   RETURN NULL;
 END $$;
 CREATE OR REPLACE FUNCTION guard_recording_campaign_worker_probe_lifecycle()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF (NEW.state,NEW.node_id,NEW.do_droplet_id,NEW.region,NEW.size,NEW.build_sha,NEW.capacity) IS DISTINCT FROM
      (OLD.state,OLD.node_id,OLD.do_droplet_id,OLD.region,OLD.size,OLD.build_sha,OLD.capacity) AND OLD.node_id IS NOT NULL AND
@@ -2705,7 +2705,7 @@ CREATE TRIGGER recording_campaign_droplet_lifecycle_fence BEFORE UPDATE OF state
 CREATE TRIGGER recording_campaign_droplet_probe_guard BEFORE UPDATE OF state,node_id,do_droplet_id,region,size,build_sha,capacity ON recorder_droplets FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_worker_probe_lifecycle();
 
 CREATE OR REPLACE FUNCTION guard_recording_campaign_node_probe_lifecycle()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF (NEW.status,NEW.node_type,NEW.account_id) IS DISTINCT FROM (OLD.status,OLD.node_type,OLD.account_id) AND
      recording_worker_targeted_probe_occupancy(OLD.id)>0 THEN
@@ -2717,7 +2717,7 @@ CREATE TRIGGER recording_campaign_node_lifecycle_fence BEFORE UPDATE OF status,n
 CREATE TRIGGER recording_campaign_node_probe_guard BEFORE UPDATE OF status,node_type,account_id ON nodes FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_node_probe_lifecycle();
 
 CREATE OR REPLACE FUNCTION guard_recording_campaign_claim_head_probe_lifecycle()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF (NEW.generation,NEW.claim_token_id,NEW.state) IS DISTINCT FROM (OLD.generation,OLD.claim_token_id,OLD.state) AND
      recording_worker_targeted_probe_occupancy(OLD.node_id)>0 THEN
@@ -2729,7 +2729,7 @@ CREATE TRIGGER recording_campaign_claim_head_lifecycle_fence BEFORE UPDATE OF ge
 CREATE TRIGGER recording_campaign_claim_head_probe_guard BEFORE UPDATE OF generation,claim_token_id,state ON recording_worker_claim_heads FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_claim_head_probe_lifecycle();
 
 CREATE OR REPLACE FUNCTION guard_recording_campaign_node_token_probe_lifecycle()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 BEGIN
   IF (NEW.node_id,NEW.key_prefix,NEW.secret_hash,NEW.revoked_at,NEW.recording_claim_purpose,NEW.recording_claim_generation) IS DISTINCT FROM
      (OLD.node_id,OLD.key_prefix,OLD.secret_hash,OLD.revoked_at,OLD.recording_claim_purpose,OLD.recording_claim_generation) AND
@@ -2742,7 +2742,7 @@ CREATE TRIGGER recording_campaign_node_token_lifecycle_fence BEFORE UPDATE OF no
 CREATE TRIGGER recording_campaign_node_token_probe_guard BEFORE UPDATE OF node_id,key_prefix,secret_hash,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_node_token_probe_lifecycle();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_stream_inverse_seal()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; sid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.id ELSE NEW.id END; admitted BOOLEAN; bound BOOLEAN;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE stream_id=$1)',s) INTO admitted USING sid;
@@ -2756,7 +2756,7 @@ END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_stream_inverse AFTER UPDATE OR DELETE ON streams DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_admitted_stream_inverse_seal();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_revision_inverse_seal()
-RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
+RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; sid BIGINT:=CASE WHEN TG_OP='DELETE' THEN OLD.stream_id ELSE NEW.stream_id END; admitted BOOLEAN; bound BOOLEAN;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results WHERE stream_id=$1)',s) INTO admitted USING sid;
@@ -2768,7 +2768,7 @@ BEGIN
 END $$;
 CREATE CONSTRAINT TRIGGER recording_campaign_admission_revision_inverse AFTER INSERT OR UPDATE OR DELETE ON stream_source_revisions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_admitted_revision_inverse_seal();
 
-CREATE OR REPLACE FUNCTION reject_campaign_admission_evidence_mutation() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$ BEGIN RAISE EXCEPTION 'campaign admission evidence is append-only'; END $$;
+CREATE OR REPLACE FUNCTION reject_campaign_admission_evidence_mutation() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$ BEGIN RAISE EXCEPTION 'campaign admission evidence is append-only'; END $$;
 CREATE TRIGGER recording_campaign_admission_approvals_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_admission_approvals FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_admission_reservations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_admission_reservations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_admission_reservation_terminal_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_admission_reservation_terminal_events FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();

@@ -29,10 +29,11 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	defer admin.Close()
 	schema := fmt.Sprintf("campaign_admission_%d", time.Now().UnixNano())
-	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{schema}.Sanitize()); err != nil {
+	hostileSchema := fmt.Sprintf("campaign_admission_hostile_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{schema}.Sanitize()+`; CREATE SCHEMA `+pgx.Identifier{hostileSchema}.Sanitize()+`; CREATE TABLE `+pgx.Identifier{hostileSchema, "recording_targeted_probe_attempts"}.Sanitize()+`(id bigint)`); err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Exec(context.Background(), `DROP SCHEMA `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
+	defer admin.Exec(context.Background(), `DROP SCHEMA `+pgx.Identifier{schema}.Sanitize()+` CASCADE; DROP SCHEMA `+pgx.Identifier{hostileSchema}.Sanitize()+` CASCADE`)
 
 	baseConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -41,7 +42,12 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if baseConfig.ConnConfig.RuntimeParams == nil {
 		baseConfig.ConnConfig.RuntimeParams = map[string]string{}
 	}
-	baseConfig.ConnConfig.RuntimeParams["search_path"] = schema
+	baseConfig.ConnConfig.RuntimeParams["search_path"] = strings.Join([]string{
+		pgx.Identifier{schema}.Sanitize(),
+		pgx.Identifier{hostileSchema}.Sanitize(),
+		"pg_temp",
+		"public",
+	}, ",")
 	migrator, err := pgxpool.NewWithConfig(ctx, baseConfig)
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +55,16 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	defer migrator.Close()
 	if err := migrateUpForDBTest(ctx, migrator, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
 		t.Fatalf("migrate 0139 -> 0140 with split roles: %v", err)
+	}
+	var pinnedFunctions int
+	if err := migrator.QueryRow(ctx, `
+		SELECT count(*) FROM pg_catalog.pg_proc procedure
+		JOIN pg_catalog.pg_namespace namespace ON namespace.oid=procedure.pronamespace
+		WHERE namespace.nspname=current_schema()
+		  AND procedure.proname IN('recording_worker_targeted_probe_occupancy','recording_campaign_create_approval')
+		  AND COALESCE(procedure.proconfig,'{}'::text[]) @> ARRAY[format('search_path=%s, pg_catalog, pg_temp',current_schema())]
+	`).Scan(&pinnedFunctions); err != nil || pinnedFunctions != 2 {
+		t.Fatalf("final admission function search path pins=%d want=2 err=%v", pinnedFunctions, err)
 	}
 
 	connectRole := func(role string) *pgxpool.Pool {
@@ -772,6 +788,23 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	var fenceEvents int
 	if err := migrator.QueryRow(ctx, `SELECT count(*) FROM recording_campaign_admission_source_fence_events WHERE stream_id=$1`, streamID).Scan(&fenceEvents); err != nil || fenceEvents != 0 {
 		t.Fatalf("terminal reservation still fenced source lineage: count=%d err=%v", fenceEvents, err)
+	}
+}
+
+func TestRecordingCampaignAdmissionMigrationUsesBootstrapSearchPathOnlyBeforePin(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0140_targeted_campaign_admission.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(body)
+	if got := strings.Count(sql, "SET search_path=pg_catalog"); got != 1 {
+		t.Fatalf("initial pg_catalog-only function paths=%d, want only recording_campaign_now", got)
+	}
+	if !strings.Contains(sql, "SET search_path FROM CURRENT") {
+		t.Fatal("install-schema relation helpers do not capture the migration search path before final pinning")
+	}
+	if !strings.Contains(sql, "ALTER FUNCTION %I.%s SET search_path = %I, pg_catalog, pg_temp") {
+		t.Fatal("admission function bootstrap paths are not replaced by the exact final install-schema pin")
 	}
 }
 
