@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -812,6 +813,115 @@ func TestRecordingCampaignAdmissionMigrationUsesBootstrapSearchPathOnlyBeforePin
 	}
 	if regexp.MustCompile(`(?m)\bIF[^\n]*[+*/-]\s*CASE\b[^\n]*\bEND[^\n]*\bTHEN\b`).MatchString(sql) {
 		t.Fatal("admission SQL uses an unparenthesized arithmetic CASE in a PL/pgSQL IF condition")
+	}
+	if strings.Count(sql, "c.relname<>'schema_migrations'") != 2 ||
+		!strings.Contains(sql, "REVOKE ALL ON TABLE %I.schema_migrations FROM PUBLIC,%I,%I") {
+		t.Fatal("migrator-owned schema ledger is not excluded from both runtime product queries and explicitly denied")
+	}
+}
+
+func TestRecordingCampaignAdmissionProductManifestIsReviewed(t *testing.T) {
+	type tableOperation struct {
+		offset int
+		kind   string
+		from   string
+		to     string
+	}
+	createTable := regexp.MustCompile(`(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)`)
+	dropTable := regexp.MustCompile(`(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)`)
+	renameTable := regexp.MustCompile(`(?i)\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:[a-z_][a-z0-9_]*\.)?([a-z_][a-z0-9_]*)\s+RENAME\s+TO\s+([a-z_][a-z0-9_]*)`)
+	migrationsDir := filepath.Join("..", "..", "..", "infra", "sql", "migrations")
+	entries, err := os.ReadDir(migrationsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := map[string]bool{"schema_migrations": true}
+	var r10Tables []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(migrationsDir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var operations []tableOperation
+		for _, match := range createTable.FindAllSubmatchIndex(body, -1) {
+			name := strings.ToLower(string(body[match[2]:match[3]]))
+			operations = append(operations, tableOperation{offset: match[0], kind: "create", from: name})
+			if strings.HasPrefix(entry.Name(), "0139_") {
+				r10Tables = append(r10Tables, name)
+			}
+		}
+		for _, match := range dropTable.FindAllSubmatchIndex(body, -1) {
+			operations = append(operations, tableOperation{offset: match[0], kind: "drop", from: strings.ToLower(string(body[match[2]:match[3]]))})
+		}
+		for _, match := range renameTable.FindAllSubmatchIndex(body, -1) {
+			operations = append(operations, tableOperation{
+				offset: match[0], kind: "rename",
+				from: strings.ToLower(string(body[match[2]:match[3]])),
+				to:   strings.ToLower(string(body[match[4]:match[5]])),
+			})
+		}
+		sort.Slice(operations, func(i, j int) bool { return operations[i].offset < operations[j].offset })
+		for _, operation := range operations {
+			switch operation.kind {
+			case "create":
+				tables[operation.from] = true
+			case "drop":
+				delete(tables, operation.from)
+			case "rename":
+				delete(tables, operation.from)
+				tables[operation.to] = true
+			}
+		}
+	}
+	authority := make(map[string]bool, len(campaignAuthorityTables))
+	for _, name := range campaignAuthorityTables {
+		authority[name] = true
+	}
+	var productTables []string
+	for name := range tables {
+		if name != "schema_migrations" && !authority[name] {
+			productTables = append(productTables, name)
+		}
+	}
+	sort.Strings(productTables)
+	manifest := sha256.Sum256([]byte(strings.Join(productTables, "\n") + "\n"))
+	if len(productTables) != 167 || fmt.Sprintf("%x", manifest) != campaignProductTableManifestSHA256 {
+		t.Fatalf("reviewed product manifest changed: tables=%d sha256=%x", len(productTables), manifest)
+	}
+	if _, included := tables["schema_migrations"]; !included {
+		t.Fatal("migration parser did not include the migrator-owned schema ledger")
+	}
+	if authority["schema_migrations"] || sort.SearchStrings(productTables, "schema_migrations") < len(productTables) && productTables[sort.SearchStrings(productTables, "schema_migrations")] == "schema_migrations" {
+		t.Fatal("migrator-owned schema ledger entered an authority or runtime product manifest")
+	}
+
+	expectedR10Tables := []string{
+		"recording_capture_artifact_grant_results", "recording_capture_artifact_intents", "recording_capture_artifact_results",
+		"recording_capture_artifact_seals", "recording_capture_empty_set_reports", "recording_capture_materialized_artifact_seals",
+		"recording_capture_materialized_artifacts", "recording_capture_producer_results", "recording_capture_producer_stop_acks",
+		"recording_capture_producer_stop_events", "recording_capture_producers", "recording_capture_recovery_alert_events",
+		"recording_capture_recovery_reports", "recording_capture_reservation_sets", "recording_capture_security_events",
+		"recording_capture_set_grants", "recording_capture_set_plan_results", "recording_capture_set_plans",
+		"recording_capture_set_results", "recording_capture_stop_ack_members", "recording_job_lease_expiry_events",
+		"recording_job_lease_generations", "recording_job_recovery_grant_results", "recording_job_recovery_grants",
+		"recording_job_surrender_attempts", "recording_job_surrender_results", "recording_job_unique_heads",
+		"recording_object_key_roots", "recording_recovery_upload_session_results", "recording_recovery_upload_sessions",
+		"recording_surrender_transport_episode_events", "recording_surrender_transport_episodes", "recording_surrender_transport_observations",
+		"recording_worker_claim_generation_events", "recording_worker_claim_heads", "recording_worker_claim_successor_proposals",
+		"recording_worker_claim_successor_results",
+	}
+	sort.Strings(r10Tables)
+	if strings.Join(r10Tables, "\n") != strings.Join(expectedR10Tables, "\n") {
+		t.Fatalf("reviewed R10 product-table scope changed:\n%s", strings.Join(r10Tables, "\n"))
+	}
+	for _, name := range expectedR10Tables {
+		index := sort.SearchStrings(productTables, name)
+		if index == len(productTables) || productTables[index] != name {
+			t.Fatalf("R10 table %q is not in the reviewed runtime product scope", name)
+		}
 	}
 }
 

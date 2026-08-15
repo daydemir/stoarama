@@ -2992,6 +2992,10 @@ BEGIN
   EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I',install_schema,runtime_role);
   EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I',install_schema,executor_role);
   EXECUTE format('GRANT USAGE ON SCHEMA %I TO %I',install_schema,authority_role);
+  -- The migration ledger is owned and used only by the migrator. It is not a
+  -- product table and must never be included in the runtime's broad product
+  -- DML manifest.
+  EXECUTE format('REVOKE ALL ON TABLE %I.schema_migrations FROM PUBLIC,%I,%I',install_schema,runtime_role,executor_role);
   FOREACH object_name IN ARRAY authority_tables LOOP
     EXECUTE format('ALTER TABLE %I.%I OWNER TO %I',install_schema,object_name,authority_role);
     EXECUTE format('REVOKE ALL ON TABLE %I.%I FROM PUBLIC,%I,%I',install_schema,object_name,runtime_role,executor_role);
@@ -3004,13 +3008,13 @@ BEGIN
   SELECT encode(sha256(convert_to(string_agg(c.relname,E'\n' ORDER BY c.relname)||E'\n','UTF8')),'hex')
     INTO product_manifest_sha256
   FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-  WHERE n.nspname=install_schema AND c.relkind IN('r','p') AND NOT(c.relname=ANY(authority_tables));
-  IF product_manifest_sha256<>'67d9c41a1dd19dcf1939cd69a12eae47a148504da6610453094856eb383b8039' THEN
+  WHERE n.nspname=install_schema AND c.relkind IN('r','p') AND c.relname<>'schema_migrations' AND NOT(c.relname=ANY(authority_tables));
+  IF product_manifest_sha256<>'769af37338fc1a6775f1e7be93a55255fe21d8eebea9201e27f1ae4ddd6eabfb' THEN
     RAISE EXCEPTION '0140 reviewed product table manifest mismatch: %',product_manifest_sha256;
   END IF;
   FOR object_name IN
     SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-    WHERE n.nspname=install_schema AND c.relkind IN('r','p') AND NOT(c.relname=ANY(authority_tables))
+    WHERE n.nspname=install_schema AND c.relkind IN('r','p') AND c.relname<>'schema_migrations' AND NOT(c.relname=ANY(authority_tables))
     ORDER BY c.relname
   LOOP
     EXECUTE format('GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE %I.%I TO %I',install_schema,object_name,runtime_role);

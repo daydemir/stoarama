@@ -10,7 +10,7 @@ import (
 
 var postgresRoleName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 
-const campaignProductTableManifestSHA256 = "67d9c41a1dd19dcf1939cd69a12eae47a148504da6610453094856eb383b8039"
+const campaignProductTableManifestSHA256 = "769af37338fc1a6775f1e7be93a55255fe21d8eebea9201e27f1ae4ddd6eabfb"
 
 var campaignAuthorityTables = []string{
 	"recording_campaign_authority_decisions", "recording_campaign_admission_approvals",
@@ -168,7 +168,7 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		return fmt.Errorf("campaign runtime role configuration is invalid")
 	}
 	var sessionUser, currentUser string
-	var super, member, ownsObjects, schemaCreate, migrationApplied bool
+	var super, member, ownsObjects, schemaCreate, migratorLedgerDenied, migrationApplied bool
 	var invalidTables, invalidProductTables, authoritySequences, invalidProductSequences, executableFunctions, missingProductFunctions, authorityMembers int
 	var productManifestSHA256 string
 	err := pool.QueryRow(ctx, `
@@ -184,15 +184,20 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		               has_table_privilege(current_user,c.oid,'DELETE') OR has_table_privilege(current_user,c.oid,'TRUNCATE')),
 		       (SELECT encode(sha256(convert_to(string_agg(c.relname,E'\n' ORDER BY c.relname)||E'\n','UTF8')),'hex')
 		          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		         WHERE n.nspname=current_schema() AND c.relkind IN('r','p') AND NOT(c.relname=ANY($3::text[]))),
+		         WHERE n.nspname=current_schema() AND c.relkind IN('r','p') AND c.relname<>'schema_migrations' AND NOT(c.relname=ANY($3::text[]))),
 		       (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-		         WHERE n.nspname=current_schema() AND c.relkind IN('r','p') AND NOT(c.relname=ANY($3::text[])) AND
+		         WHERE n.nspname=current_schema() AND c.relkind IN('r','p') AND c.relname<>'schema_migrations' AND NOT(c.relname=ANY($3::text[])) AND
 		           NOT ((c.relname=ANY($6::text[]) AND has_table_privilege(current_user,c.oid,'SELECT') AND
 		                 NOT has_table_privilege(current_user,c.oid,'INSERT') AND NOT has_table_privilege(current_user,c.oid,'UPDATE') AND
 		                 NOT has_table_privilege(current_user,c.oid,'DELETE') AND NOT has_table_privilege(current_user,c.oid,'TRUNCATE')) OR
 		                (NOT(c.relname=ANY($6::text[])) AND has_table_privilege(current_user,c.oid,'SELECT') AND
 		                 has_table_privilege(current_user,c.oid,'INSERT') AND has_table_privilege(current_user,c.oid,'UPDATE') AND
 		                 has_table_privilege(current_user,c.oid,'DELETE')))),
+		       EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		         WHERE n.nspname=current_schema() AND c.relname='schema_migrations' AND c.relkind IN('r','p') AND
+		           NOT has_table_privilege(current_user,c.oid,'SELECT') AND NOT has_table_privilege(current_user,c.oid,'INSERT') AND
+		           NOT has_table_privilege(current_user,c.oid,'UPDATE') AND NOT has_table_privilege(current_user,c.oid,'DELETE') AND
+		           NOT has_table_privilege(current_user,c.oid,'TRUNCATE')),
 		       (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		         WHERE n.nspname=current_schema() AND c.relkind='S' AND pg_get_userbyid(c.relowner)=$2 AND
 		           (has_sequence_privilege(current_user,c.oid,'USAGE') OR has_sequence_privilege(current_user,c.oid,'SELECT') OR has_sequence_privilege(current_user,c.oid,'UPDATE'))),
@@ -209,11 +214,11 @@ func ValidateCampaignRuntimePrivileges(ctx context.Context, pool *pgxpool.Pool, 
 		         WHERE p.oid IS NULL OR NOT has_function_privilege(current_user,p.oid,'EXECUTE')),
 		       (SELECT count(*) FROM pg_auth_members membership JOIN pg_roles role ON role.oid=membership.roleid WHERE role.rolname=$2),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions, campaignRuntimeReadOnlyProductTables, campaignRuntimeDeniedProductSequences).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &authoritySequences, &invalidProductSequences, &executableFunctions, &missingProductFunctions, &authorityMembers, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user`, runtimeRole, authorityRole, campaignAuthorityTables, campaignRuntimeFunctions, campaignRuntimeProductFunctions, campaignRuntimeReadOnlyProductTables, campaignRuntimeDeniedProductSequences).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &invalidTables, &productManifestSHA256, &invalidProductTables, &migratorLedgerDenied, &authoritySequences, &invalidProductSequences, &executableFunctions, &missingProductFunctions, &authorityMembers, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign runtime privileges: %w", err)
 	}
-	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || authoritySequences != 0 || invalidProductSequences != 0 || executableFunctions != 0 || missingProductFunctions != 0 || authorityMembers != 1 || !migrationApplied {
+	if sessionUser != runtimeRole || currentUser != runtimeRole || super || member || ownsObjects || schemaCreate || invalidTables != 0 || productManifestSHA256 != campaignProductTableManifestSHA256 || invalidProductTables != 0 || !migratorLedgerDenied || authoritySequences != 0 || invalidProductSequences != 0 || executableFunctions != 0 || missingProductFunctions != 0 || authorityMembers != 1 || !migrationApplied {
 		return fmt.Errorf("campaign runtime database privilege boundary is not exact")
 	}
 	return nil
