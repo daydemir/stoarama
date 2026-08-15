@@ -421,6 +421,9 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	terminalFirstEvidence := make(chan error, 1)
 	go func() {
 		_, submitErr := terminalFirstEvidenceTx.Exec(ctx, `SELECT evidence_id FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeAttemptID, probeRequestID, probeRaceApprovalID, accountID, probeRaceStreamID, failedObservation)
+		if submitErr == nil {
+			submitErr = terminalFirstEvidenceTx.Commit(ctx)
+		}
 		terminalFirstEvidence <- submitErr
 	}()
 	select {
