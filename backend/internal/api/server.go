@@ -30,6 +30,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/email"
 	"github.com/daydemir/stoarama/backend/internal/model"
 	"github.com/daydemir/stoarama/backend/internal/queue"
@@ -43,8 +44,11 @@ import (
 type Server struct {
 	cfg                     config.Config
 	pool                    *pgxpool.Pool
+	admissionPool           *pgxpool.Pool
 	r2                      *r2.Client
+	campaignProbeStore      campaignProbeObjectStore
 	secrets                 *secretbox.Cipher
+	recoveryStorageFactory  func(context.Context, r2.Config) (recordingRecoveryObjectStore, error)
 	mailer                  email.Sender
 	streamsHTML             []byte
 	recordingsHTML          []byte
@@ -62,6 +66,26 @@ type Server struct {
 	dayZipSlot              chan struct{}
 	authLinkLimiter         *authLinkLimiter
 	sharedRecordingsLimiter *sharedRecordingsLimiter
+	campaignDOAttest        func(context.Context, int64, string) (dropletpool.ProviderAttestation, error)
+}
+
+type campaignProbeObjectStore interface {
+	Bucket() string
+	PresignPut(context.Context, string, string, time.Duration) (string, error)
+	Head(context.Context, string) (r2.ObjectHead, error)
+	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
+	PutReader(context.Context, string, string, io.Reader) (string, error)
+	PutBytes(context.Context, string, string, []byte) (string, error)
+}
+
+func (s *Server) campaignProbeObjects() campaignProbeObjectStore {
+	if s.campaignProbeStore != nil {
+		return s.campaignProbeStore
+	}
+	if s.r2 != nil {
+		return s.r2
+	}
+	return nil
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -121,6 +145,14 @@ type frameExportRow struct {
 }
 
 func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer email.Sender) (http.Handler, error) {
+	return NewRouterWithAdmissionPool(cfg, pool, pool, r2c, mailer)
+}
+
+// NewRouterWithAdmissionPool keeps the ordinary product role and the
+// API-exclusive admission executor credential structurally separate. Tests
+// may use NewRouter's single-pool compatibility surface only before the role
+// split migration is installed.
+func NewRouterWithAdmissionPool(cfg config.Config, pool, admissionPool *pgxpool.Pool, r2c *r2.Client, mailer email.Sender) (http.Handler, error) {
 	streamsHTML, err := loadStreamsHTML()
 	if err != nil {
 		return nil, err
@@ -156,6 +188,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 	s := &Server{
 		cfg:                     cfg,
 		pool:                    pool,
+		admissionPool:           admissionPool,
 		r2:                      r2c,
 		mailer:                  mailer,
 		streamsHTML:             injectShell(streamsHTML, "streams"),
@@ -171,6 +204,9 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		dayZipSlot:              make(chan struct{}, 1),
 		authLinkLimiter:         newAuthLinkLimiter(),
 		sharedRecordingsLimiter: newSharedRecordingsLimiter(),
+	}
+	s.campaignDOAttest = func(ctx context.Context, dropletID int64, expectedName string) (dropletpool.ProviderAttestation, error) {
+		return dropletpool.AttestManagedDroplet(ctx, cfg.DOAPIToken, cfg.DropletPoolProjectID, cfg.DropletPoolFirewallID, dropletID, expectedName)
 	}
 	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
 		cipher, err := secretbox.NewFromBase64Key(key)
@@ -246,6 +282,7 @@ func (s *Server) router() http.Handler {
 		})
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
+		api.Post("/recordings/campaign-admission/replay", s.handleRecordingCampaignAdmissionReplay)
 		api.Route("/account", func(account chi.Router) {
 			account.Use(s.requireAccountAuth)
 			// Confine a 'stoarama.pull'-scoped key to the 4 NAS pull endpoints; a
@@ -269,7 +306,13 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/qualification", s.handleAccountRecordingQualification)
 			account.Get("/recordings/streak-priority", s.handleAccountRecordingStreakPriority)
 			account.Get("/recordings/campaign-tracks", s.handleAccountRecordingCampaignTracks)
+			account.Post("/recordings/campaign-admission/approvals", s.handleAccountCampaignAdmissionApprovalCreate)
+			account.Post("/recordings/campaign-admission/expire", s.handleAccountCampaignAdmissionExpire)
+			account.Post("/recordings/campaign-admission/probe-orders", s.handleAccountCampaignAdmissionProbeOrderCreate)
+			account.Get("/recordings/campaign-admission/scene-presentations/{evidenceId}", s.handleAccountCampaignAdmissionScenePresentationGet)
+			account.Post("/recordings/campaign-admission/scene-reviews", s.handleAccountCampaignAdmissionSceneReviewCreate)
 			account.Post("/recordings/qualification/scene-attest", s.handleAccountRecordingSceneAttest)
+			account.Get("/recordings/qualification/scene-presentations/{frameId}", s.handleAccountRecordingBaselineScenePresentation)
 			account.Post("/recordings/qualification/build", s.handleAccountRecordingQualificationBuild)
 			account.Get("/recordings.csv", s.handleAccountRecordingsCSV)
 			account.Post("/recordings", s.handleAccountRecordingsCreate)
@@ -373,6 +416,7 @@ func (s *Server) router() http.Handler {
 			admin.Delete("/storage-destinations/{id}", s.handleAdminStorageDestinationDelete)
 			admin.Post("/storage-destinations/{id}/grants", s.handleAdminStorageDestinationGrantCreate)
 			admin.Delete("/storage-destinations/{id}/grants/{accountId}", s.handleAdminStorageDestinationGrantDelete)
+			admin.Post("/recording/recovery/security-revoke", s.handleAdminRecordingRecoverySecurityRevoke)
 		})
 
 		api.Group(func(public chi.Router) {
@@ -498,8 +542,6 @@ func (s *Server) router() http.Handler {
 
 			rec.Post("/recording/jobs/lease", s.handleRecordingJobsLease)
 			rec.Post("/recording/jobs/{id}/presentation-attempts", s.handleRecordingPresentationV2Attempt)
-			rec.Post("/recording/upload-intents", s.handleRecordingUploadIntent)
-			rec.Post("/recording/clips/ingest", s.handleRecordingClipIngest)
 			rec.Get("/recording/presentation-probes/{taskId}", s.handleRecordingPresentationV2Status)
 			rec.Post("/recording/presentation-probes/{taskId}/retention/activate", s.handleRecordingPresentationV2Activate)
 			rec.Post("/recording/presentation-probes/claim", s.handleRecordingPresentationV2Claim)
@@ -508,10 +550,40 @@ func (s *Server) router() http.Handler {
 			rec.Post("/recording/presentation-probes/{taskId}/unavailable", s.handleRecordingPresentationV2Unavailable)
 			rec.Post("/recording/presentation-probes/{taskId}/release-ack", s.handleRecordingPresentationV2ReleaseAck)
 			rec.Post("/recording/droplets/heartbeat", s.handleRecordingDropletHeartbeat)
+			rec.Post("/recording/campaign-admission/lease", s.handleRecordingCampaignAdmissionProbeLease)
+			rec.Post("/recording/campaign-admission/evidence", s.handleRecordingCampaignAdmissionEvidence)
 			rec.Post("/recording/jobs/{id}/heartbeat", s.handleRecordingJobHeartbeat)
+			rec.Post("/recording/jobs/{id}/capture-producers", s.handleRecordingCaptureProducerReserve)
+			rec.Post("/recording/jobs/{id}/capture-set-plans", s.handleRecordingCaptureSetPlan)
+			rec.Post("/recording/jobs/{id}/capture-set-plans/{planId}/commit", s.handleRecordingCaptureSetCommit)
+			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/artifacts/{ordinal}/materialize", s.handleRecordingCaptureArtifactMaterialize)
+			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/stop-ack", s.handleRecordingCaptureSetStopAck)
+			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/finish", s.handleRecordingCaptureSetFinish)
+			rec.Post("/recording/jobs/{id}/capture-sets/{setId}/empty-recovery", s.handleRecordingCaptureSetEmptyRecovery)
+			rec.Post("/recording/claim-successor/propose", s.handleRecordingClaimSuccessorPropose)
+			rec.Post("/recording/claim-successor/{proposalId}/ack", s.handleRecordingClaimSuccessorAck)
+			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/status", s.handleRecordingCaptureProducerStatus)
+			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/artifacts/reserve", s.handleRecordingCaptureArtifactsReserve)
+			rec.Post("/recording/jobs/{id}/capture-producers/{producerId}/finish", s.handleRecordingCaptureProducerFinish)
+			rec.Post("/recording/upload-intents", s.handleRecordingUploadIntent)
 			rec.Post("/recording/jobs/{id}/complete", s.handleRecordingJobComplete)
 			rec.Post("/recording/jobs/{id}/surrender", s.handleRecordingJobSurrender)
+			rec.Post("/recording/jobs/{id}/surrender/observations", s.handleRecordingSurrenderTransportObservations)
 			rec.Post("/recording/jobs/{id}/fail", s.handleRecordingJobFail)
+		})
+
+		// Upload-only crash recovery accepts either the ordinary recorder principal
+		// or one exact, expiring artifact capability. The capability middleware is
+		// mounted only on these four exact byte-preservation/recovery operations; it cannot reserve, lease,
+		// heartbeat, capture, complete, fail, or surrender a job.
+		api.Group(func(upload chi.Router) {
+			upload.Use(s.requireRecorderOrRecoveryAuth)
+			upload.Post("/recording/upload-intents/{intentId}/seal", s.handleRecordingCaptureArtifactSeal)
+			upload.Post("/recording/clips/ingest", s.handleRecordingClipIngest)
+			upload.Post("/recording/recovery/intents/{intentId}/status", s.handleRecordingRecoveryStatus)
+			upload.Post("/recording/recovery/intents/{intentId}/finish", s.handleRecordingRecoveryFinish)
+			upload.Put("/recording/recovery/artifacts/{intentId}/upload", s.handleRecordingRecoveryProxyUpload)
+			upload.Post("/recording/recovery/artifacts/{intentId}/report", s.handleRecordingRecoveryReport)
 		})
 
 		api.Group(func(worker chi.Router) {
@@ -757,6 +829,10 @@ func (s *Server) handleStreamsPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if err := lockCampaignAdmissionFence(r.Context(), tx); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock campaign admission capacity")
+		return
+	}
 	current, err := s.loadStreamForAssignmentTx(r.Context(), tx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1022,6 +1098,16 @@ func (s *Server) reconcileStreamRecordingAssignments(
 		return result, status, nil
 	}
 	return nil, 0, nil
+}
+
+// lockCampaignAdmissionFence is the common first lock for every supported
+// writer that may create, activate, or alter active recording demand/identity.
+// The database statement trigger is the direct-SQL backstop; callers that lock
+// account/stream/job rows before issuing their UPDATE must take this first to
+// preserve the admission global -> account -> stream -> recording order.
+func lockCampaignAdmissionFence(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0))`)
+	return err
 }
 
 // propagateStreamSourceToActiveRelayRecordingsTx updates the source snapshot used

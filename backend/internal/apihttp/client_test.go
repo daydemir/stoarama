@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -77,5 +78,44 @@ func TestPutFileReportsErrorBody(t *testing.T) {
 	err = c.PutFile(context.Background(), srv.URL, tmp.Name(), "text/plain")
 	if err == nil || !strings.Contains(err.Error(), "status=502") || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestSetTokenIsAtomicForFutureRequests(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	seen := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.Header.Get("Authorization")]++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c, err := New(srv.URL, "old", srv.Client(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = c.PostJSON(context.Background(), "/before", map[string]any{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.SetToken("successor"); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for index := 0; index < 20; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if requestErr := c.PostJSON(context.Background(), "/after", map[string]any{}, nil); requestErr != nil {
+				t.Errorf("request after rotation: %v", requestErr)
+			}
+		}()
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if seen["Bearer old"] != 1 || seen["Bearer successor"] != 20 {
+		t.Fatalf("seen=%v", seen)
 	}
 }

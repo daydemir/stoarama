@@ -71,7 +71,7 @@ func TestSegmentDeliveryPoolQueueObserverCannotPublishAfterLaterMutation(t *test
 	delivered := make(chan struct{})
 	var mu sync.Mutex
 	var depths []int
-	pool := startSegmentDeliveryPool(1, func() {}, func(capture.Segment) error { <-delivered; return nil }, func(depth int) {
+	pool := startSegmentDeliveryPool(2, func() {}, func(capture.Segment) error { <-delivered; return nil }, func(depth int) {
 		mu.Lock()
 		first := len(depths) == 0
 		mu.Unlock()
@@ -153,33 +153,36 @@ func TestSegmentDeliveryPoolCloseDrainsOutstandingUploads(t *testing.T) {
 	}
 }
 
-// TestSegmentDeliveryPoolSubmitDoesNotBlockDuringOutage proves a stalled object
-// store cannot pin the capture sweep past window cancellation. Only descriptors
-// are queued here; the independent disk monitor bounds their media files.
-func TestSegmentDeliveryPoolSubmitDoesNotBlockDuringOutage(t *testing.T) {
+// TestSegmentDeliveryPoolBoundsOutstandingSealedIntents proves the local
+// descriptor queue cannot outrun the producer's matching server-side seal bound.
+func TestSegmentDeliveryPoolBoundsOutstandingSealedIntents(t *testing.T) {
 	const workers = 2
-	const segments = 10_000
 	release := make(chan struct{})
-	var accepted atomic.Int64
 
 	pool := startSegmentDeliveryPool(workers, func() {}, func(capture.Segment) error {
 		<-release
 		return nil
 	})
 
-	for range segments {
+	for i := range workers {
 		if err := pool.Submit(capture.Segment{Path: "seg.mp4"}); err != nil {
-			t.Fatalf("submit during outage: %v", err)
+			t.Fatalf("submit %d: %v", i, err)
 		}
-		accepted.Add(1)
 	}
-	if got := accepted.Load(); got != segments {
-		t.Fatalf("accepted=%d want %d: storage outage blocked capture", got, segments)
+	blocked := make(chan error, 1)
+	go func() { blocked <- pool.Submit(capture.Segment{Path: "bounded.mp4"}) }()
+	select {
+	case err := <-blocked:
+		t.Fatalf("submit escaped hard outstanding bound: %v", err)
+	case <-time.After(25 * time.Millisecond):
 	}
 	close(release)
+	if err := <-blocked; err != nil {
+		t.Fatalf("bounded submit after acknowledgement: %v", err)
+	}
 	result := pool.close()
-	if result.err != nil || result.pending != 0 || result.submitted != segments {
-		t.Fatalf("result=%+v want all queued descriptors drained", result)
+	if result.err != nil || result.pending != 0 || result.submitted != workers+1 {
+		t.Fatalf("result=%+v want bounded descriptors drained", result)
 	}
 }
 
@@ -216,7 +219,6 @@ func TestSegmentDeliveryPoolSurfacesFailureAndAbortsAttempt(t *testing.T) {
 }
 
 func TestSegmentDeliveryPoolTerminalFailureDrainsQueuedDescriptors(t *testing.T) {
-	const segments = 10_000
 	ctx, abort := context.WithCancel(context.Background())
 	defer abort()
 	started := make(chan struct{})
@@ -235,13 +237,11 @@ func TestSegmentDeliveryPoolTerminalFailureDrainsQueuedDescriptors(t *testing.T)
 		t.Fatal(err)
 	}
 	<-started
-	for i := 1; i < segments; i++ {
-		if err := pool.Submit(capture.Segment{Path: fmt.Sprintf("seg-%d.mp4", i)}); err != nil {
-			t.Fatalf("submit %d: %v", i, err)
-		}
-	}
 	close(releaseFailure)
 	waitFor(t, "terminal failure abort", func() bool { return ctx.Err() != nil })
+	if err := pool.Submit(capture.Segment{Path: "seg-1.mp4"}); !errors.Is(err, errSegmentDeliveryExhausted) {
+		t.Fatalf("submit after terminal failure=%v", err)
+	}
 
 	result := pool.close()
 	if !errors.Is(result.err, errSegmentDeliveryExhausted) {
@@ -250,8 +250,8 @@ func TestSegmentDeliveryPoolTerminalFailureDrainsQueuedDescriptors(t *testing.T)
 	if got := deliveryCalls.Load(); got != 1 {
 		t.Fatalf("delivery calls=%d want 1: queued descriptors delivered after terminal failure", got)
 	}
-	if result.submitted != segments || result.pending != segments || result.ingested {
-		t.Fatalf("result=%+v want every unacknowledged descriptor preserved as pending", result)
+	if result.submitted != 1 || result.pending != 1 || result.ingested {
+		t.Fatalf("result=%+v want the accepted descriptor preserved as pending", result)
 	}
 }
 

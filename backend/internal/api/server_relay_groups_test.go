@@ -81,29 +81,9 @@ func TestRelayGroupChangeAllowed(t *testing.T) {
 }
 
 func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
-	for _, want := range []string{
-		"n.relay_group_id IS NULL",
-		"j.relay_fairness_started_at <= now()-interval '12 seconds'",
-		"peer_group.id<>n.relay_group_id",
-		"n.relay_group_id=rec.preferred_relay_group_id",
-		"preferred_group.id=rec.preferred_relay_group_id",
-		"peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'",
-		"peer_group_jobs.lease_expires_at>now()",
-		"peer.relay_group_id=n.relay_group_id",
-		"peer.last_heartbeat_at >= now()-interval '120 seconds'",
-		"pj.lease_owner='node:'||peer.id::text",
-		"gn.account_id=n.account_id",
-		"gn.relay_group_id=n.relay_group_id",
-		"g.account_id=n.account_id",
-		"peer_group.bandwidth_capacity_bps",
-		"recording_bandwidth_observations",
-		"source_stream.execution_class",
-		"n.capabilities_jsonb->'youtube_ready'",
-		"GREATEST(COALESCE(peer_group_bandwidth.observed_bandwidth_bps, 0), 4000000)",
-	} {
-		if !strings.Contains(relayLeaseSQL, want) {
-			t.Fatalf("relay lease SQL missing %q", want)
-		}
+	const authority = "recording_surrender_relay_candidate_eligible(j.id,$1)"
+	if strings.Count(relayLeaseSQL, authority) != 1 {
+		t.Fatalf("relay lease SQL must delegate capacity and fairness exactly once to %q", authority)
 	}
 }
 

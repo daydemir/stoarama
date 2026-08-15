@@ -6,18 +6,28 @@ package recordingapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
+	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/survey"
+	"golang.org/x/sys/unix"
 )
 
 // UploadTimeout bounds the complete upload of one finalized recording segment.
@@ -59,10 +69,34 @@ type ClientConfig struct {
 
 type Client struct {
 	baseURL   string
+	tokenMu   sync.RWMutex
 	nodeToken string
 	httpc     *http.Client
 	api       *apihttp.Client
 	uploads   *apihttp.Client
+}
+
+func (c *Client) SetNodeToken(token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return fmt.Errorf("missing NodeToken")
+	}
+	if err := c.api.SetToken(token); err != nil {
+		return err
+	}
+	if err := c.uploads.SetToken(token); err != nil {
+		return err
+	}
+	c.tokenMu.Lock()
+	c.nodeToken = token
+	c.tokenMu.Unlock()
+	return nil
+}
+
+func (c *Client) nodeBearer() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.nodeToken
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -119,6 +153,38 @@ type RecordingJob struct {
 	Kind                       string     `json:"kind"`
 	WindowEndAt                *time.Time `json:"window_end_at"`
 	TimestampContractSupported bool       `json:"timestamp_contract_supported"`
+	SurrenderTransportVersion  int        `json:"surrender_transport_version,omitempty"`
+}
+
+type TargetedProbeLease struct {
+	Target     *recordability.Target `json:"target"`
+	ApprovalID string                `json:"approval_id"`
+	RequestID  string                `json:"request_id"`
+	OrderID    string                `json:"order_id"`
+}
+
+func (c *Client) LeaseTargetedProbe(ctx context.Context) (*TargetedProbeLease, error) {
+	var out TargetedProbeLease
+	if err := c.postJSON(ctx, "/api/v1/recording/campaign-admission/lease", map[string]any{}, &out); err != nil {
+		return nil, err
+	}
+	if out.Target == nil {
+		return nil, nil
+	}
+	if out.Target.ID <= 0 || strings.TrimSpace(out.Target.AttemptID) == "" || strings.TrimSpace(out.Target.Challenge) == "" || strings.TrimSpace(out.ApprovalID) == "" || strings.TrimSpace(out.RequestID) == "" {
+		return nil, fmt.Errorf("targeted probe lease response is incomplete")
+	}
+	return &out, nil
+}
+
+func (c *Client) SubmitTargetedProbeEvidence(ctx context.Context, lease TargetedProbeLease, evidence recordability.TargetedEvidence) error {
+	return c.postJSON(ctx, "/api/v1/recording/campaign-admission/evidence", map[string]any{
+		"approval_id": lease.ApprovalID,
+		"stream_id":   lease.Target.ID,
+		"attempt_id":  lease.Target.AttemptID,
+		"request_id":  lease.RequestID,
+		"evidence":    evidence,
+	}, nil)
 }
 
 // RecordingCanarySpec is the canonical, account-scoped source returned to an
@@ -172,6 +238,321 @@ type ClipUploadIntent struct {
 	AlreadyIngested bool      `json:"already_ingested"`
 }
 
+// CaptureProducer is the server-sealed identity of one ffmpeg producer. It is
+// reserved before ffmpeg can create bytes; every artifact produced by that
+// invocation is subsequently sealed against ProducerID.
+type CaptureProducer struct {
+	ProducerID     string `json:"producer_id"`
+	CaptureOrdinal int64  `json:"capture_ordinal"`
+}
+
+type CaptureProducerStatus struct {
+	ProducerID   string `json:"producer_id"`
+	Found        bool   `json:"found"`
+	CurrentLease bool   `json:"current_lease"`
+	IntentCount  int    `json:"intent_count"`
+	Result       string `json:"result,omitempty"`
+}
+
+type ClipIngestResult struct {
+	ClipID         int64  `json:"clip_id"`
+	HeadVersion    int64  `json:"head_version,omitempty"`
+	UploadIntentID string `json:"head_upload_intent_id,omitempty"`
+}
+
+type SurrenderRequest struct {
+	AttemptID            string
+	Reason               SurrenderReason
+	ErrorText            string
+	ExpectedHeadVersion  int64
+	ExpectedUploadIntent string
+	ExpectedClipID       int64
+	SpoolCount           int
+	SpoolBytes           int64
+	InFlightCount        int
+}
+
+type SurrenderResult struct {
+	Result                string    `json:"result"`
+	HandoffUntil          time.Time `json:"handoff_until,omitempty"`
+	NextRetryAt           time.Time `json:"next_retry_at,omitempty"`
+	HadClips              bool      `json:"had_clips,omitempty"`
+	AlternateAvailable    bool      `json:"alternate_available,omitempty"`
+	CurrentHeadVersion    int64     `json:"current_head_version"`
+	CurrentUploadIntentID string    `json:"current_upload_intent_id,omitempty"`
+	CurrentClipID         int64     `json:"current_clip_id,omitempty"`
+}
+
+type SurrenderTransportObservation struct {
+	ID            string    `json:"id"`
+	LeaseToken    string    `json:"lease_token"`
+	AttemptID     string    `json:"attempt_id,omitempty"`
+	Type          string    `json:"type"`
+	ErrorClass    string    `json:"error_class,omitempty"`
+	ObservedAt    time.Time `json:"observed_at"`
+	RequestSHA256 string    `json:"request_sha256"`
+}
+
+type RecoveryArtifact struct {
+	IntentID        string `json:"intent_id"`
+	CaptureSequence int64  `json:"capture_sequence"`
+	SegmentStartMs  int64  `json:"segment_start_ms"`
+	SizeBytes       int64  `json:"size_bytes"`
+	SHA256          string `json:"sha256"`
+	Result          string `json:"result,omitempty"`
+}
+
+type RecoveryStatus struct {
+	IntentID       string             `json:"intent_id"`
+	ProducerID     string             `json:"producer_id"`
+	JobID          int64              `json:"job_id"`
+	LeaseToken     string             `json:"lease_token"`
+	ExpiresAt      time.Time          `json:"expires_at"`
+	Authority      string             `json:"authority"`
+	ProducerResult string             `json:"producer_result,omitempty"`
+	Artifacts      []RecoveryArtifact `json:"artifacts"`
+}
+
+type CaptureArtifactReservationInput struct {
+	IntentID             string `json:"intent_id"`
+	RecoverySecretSHA256 string `json:"recovery_secret_sha256"`
+	CaptureSequence      int64  `json:"capture_sequence"`
+}
+
+type CaptureSetPlan struct {
+	PlanID                  string    `json:"plan_id"`
+	SetID                   string    `json:"set_id"`
+	ProducerID              string    `json:"producer_id"`
+	CaptureOrdinal          int64     `json:"capture_ordinal"`
+	FirstCaptureSequence    int64     `json:"first_capture_sequence"`
+	AccountID               int64     `json:"account_id"`
+	RecordingID             int64     `json:"recording_id"`
+	JobID                   int64     `json:"job_id"`
+	LeaseToken              string    `json:"lease_token"`
+	OriginClaimGeneration   int64     `json:"origin_claim_generation"`
+	SnapshotGeneration      int64     `json:"snapshot_generation"`
+	SourceSnapshotSHA256    string    `json:"source_snapshot_sha256"`
+	DestinationNamingSHA256 string    `json:"destination_naming_sha256"`
+	PlanAt                  time.Time `json:"plan_at"`
+	WindowEndAt             time.Time `json:"window_end_at"`
+	DurationMicroseconds    int64     `json:"duration_microseconds"`
+	ClipDurationSeconds     int       `json:"clip_duration_seconds"`
+	ArtifactCount           int       `json:"artifact_count"`
+	SegmentTimesArgument    string    `json:"segment_times_argument"`
+	MaxArtifactBytes        int64     `json:"max_artifact_bytes"`
+	ExpiresAt               time.Time `json:"expires_at"`
+}
+
+type ClaimSuccessor struct {
+	ProposalID            string `json:"proposal_id"`
+	NodeID                int64  `json:"node_id"`
+	PredecessorGeneration int64  `json:"predecessor_generation"`
+	SuccessorGeneration   int64  `json:"successor_generation"`
+	SuccessorTokenID      int64  `json:"successor_token_id"`
+}
+
+func (c *Client) ProposeClaimSuccessor(ctx context.Context, proposalID, keyPrefix, secretSHA256 string) (ClaimSuccessor, error) {
+	var out ClaimSuccessor
+	err := c.postJSONWithHeaders(ctx, "/api/v1/recording/claim-successor/propose", map[string]any{
+		"proposal_id": proposalID, "key_prefix": keyPrefix, "secret_sha256": secretSHA256,
+	}, nil, &out)
+	return out, err
+}
+
+func (c *Client) AckClaimSuccessor(ctx context.Context, proposalID, successorToken string) (bool, error) {
+	var out struct {
+		PredecessorRetired bool `json:"predecessor_retired"`
+	}
+	err := c.postJSONWithHeaders(ctx, "/api/v1/recording/claim-successor/"+url.PathEscape(proposalID)+"/ack", map[string]any{}, map[string]string{"Authorization": "Bearer " + strings.TrimSpace(successorToken)}, &out)
+	return out.PredecessorRetired, err
+}
+
+func (c *Client) PlanCaptureSet(ctx context.Context, jobID int64, leaseToken, planID, setID, producerID string, captureOrdinal, firstCaptureSequence int64) (CaptureSetPlan, error) {
+	var out CaptureSetPlan
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-set-plans", jobID), map[string]any{
+		"plan_id": planID, "set_id": setID, "producer_id": producerID, "capture_ordinal": captureOrdinal,
+		"first_capture_sequence": firstCaptureSequence,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) CommitCaptureSet(ctx context.Context, jobID int64, leaseToken, planID, merkleRootSHA256 string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-set-plans/%s/commit", jobID, url.PathEscape(planID)), map[string]any{
+		"merkle_root_sha256": strings.TrimSpace(merkleRootSHA256),
+	}, leaseTokenHeaders(leaseToken), nil)
+}
+
+type CaptureArtifactMaterialization struct {
+	ArtifactID           string   `json:"artifact_id"`
+	CaptureSequence      int64    `json:"capture_sequence"`
+	RecoverySecretSHA256 string   `json:"recovery_secret_sha256"`
+	Proof                []string `json:"proof"`
+}
+
+type CaptureStopAckMember struct {
+	Ordinal              int      `json:"ordinal"`
+	ArtifactID           string   `json:"artifact_id"`
+	CaptureSequence      int64    `json:"capture_sequence"`
+	RecoverySecretSHA256 string   `json:"recovery_secret_sha256"`
+	Proof                []string `json:"proof"`
+	Device               uint64   `json:"device"`
+	Inode                uint64   `json:"inode"`
+	SizeBytes            int64    `json:"size_bytes"`
+	RelativeName         string   `json:"relative_name"`
+}
+
+type CaptureStopAck struct {
+	AckID                   string                 `json:"ack_id"`
+	InventorySHA256         string                 `json:"inventory_sha256"`
+	RetainedDirectoryDevice uint64                 `json:"retained_directory_device"`
+	RetainedDirectoryInode  uint64                 `json:"retained_directory_inode"`
+	Members                 []CaptureStopAckMember `json:"members"`
+}
+
+type CaptureStopAckResult struct {
+	NoBytesOrdinals []int `json:"no_bytes_ordinals"`
+}
+
+func CaptureStopInventorySHA(ack CaptureStopAck) (string, error) {
+	h := sha256.New()
+	_, _ = h.Write([]byte("recording-capture-stop-inventory-v3\n"))
+	write := func(value string) { _, _ = fmt.Fprintf(h, "%d:%s\n", len([]byte(value)), value) }
+	write(strconv.FormatUint(ack.RetainedDirectoryDevice, 10))
+	write(strconv.FormatUint(ack.RetainedDirectoryInode, 10))
+	for _, member := range ack.Members {
+		write(strconv.Itoa(member.Ordinal))
+		write(strings.ToLower(strings.TrimSpace(member.ArtifactID)))
+		write(strconv.FormatInt(member.CaptureSequence, 10))
+		write(strings.ToLower(strings.TrimSpace(member.RecoverySecretSHA256)))
+		proofHash := sha256.New()
+		_, _ = proofHash.Write([]byte("stoarama.recording.capture-artifact-proof.v1\x00"))
+		for _, item := range member.Proof {
+			decoded, err := hex.DecodeString(item)
+			if err != nil || len(decoded) != sha256.Size {
+				return "", fmt.Errorf("invalid capture stop proof")
+			}
+			_, _ = proofHash.Write(decoded)
+		}
+		write(hex.EncodeToString(proofHash.Sum(nil)))
+		write(strconv.FormatUint(member.Device, 10))
+		write(strconv.FormatUint(member.Inode, 10))
+		write(strconv.FormatInt(member.SizeBytes, 10))
+		write(member.RelativeName)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (c *Client) MaterializeCaptureArtifact(ctx context.Context, jobID int64, leaseToken, setID string, ordinal int, artifact CaptureArtifactMaterialization) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/artifacts/%d/materialize", jobID, url.PathEscape(setID), ordinal), artifact, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) AckCaptureSetStop(ctx context.Context, jobID int64, leaseToken, setID string, ack CaptureStopAck) (CaptureStopAckResult, error) {
+	var result CaptureStopAckResult
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/stop-ack", jobID, url.PathEscape(setID)), ack, leaseTokenHeaders(leaseToken), &result)
+	return result, err
+}
+
+func openDirectoryNoFollow(path string) (int, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil || filepath.Clean(absolute) != absolute {
+		return -1, fmt.Errorf("invalid absolute directory path")
+	}
+	if runtime.GOOS == "darwin" {
+		if absolute == "/var" || strings.HasPrefix(absolute, "/var/") || absolute == "/tmp" || strings.HasPrefix(absolute, "/tmp/") {
+			absolute = "/private" + absolute
+		}
+	}
+	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(absolute, string(filepath.Separator)), string(filepath.Separator)) {
+		if component == "" {
+			continue
+		}
+		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(fd)
+		if openErr != nil {
+			return -1, openErr
+		}
+		fd = next
+	}
+	return fd, nil
+}
+
+func (c *Client) UploadRecoveryArtifact(ctx context.Context, intentID, recoverySecret, sessionID, path string, expectedDevice, expectedInode uint64) error {
+	directory, leaf := filepath.Split(path)
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	fileFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fileFD), leaf)
+	if file == nil {
+		_ = unix.Close(fileFD)
+		return fmt.Errorf("open recovery artifact")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	var stat unix.Stat_t
+	statErr := unix.Fstat(fileFD, &stat)
+	if err != nil || statErr != nil || !info.Mode().IsRegular() || stat.Nlink != 1 || info.Size() <= 0 || info.Size() > 32<<20 || expectedDevice == 0 || expectedInode == 0 || uint64(stat.Dev) != expectedDevice || uint64(stat.Ino) != expectedInode {
+		return fmt.Errorf("invalid recovery artifact")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/api/v1/recording/recovery/artifacts/"+url.PathEscape(intentID)+"/upload", file)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = info.Size()
+	request.Header.Set("Content-Type", "video/mp4")
+	request.Header.Set("Authorization", "Bearer "+c.nodeBearer())
+	request.Header.Set("X-Stoarama-Recording-Recovery-Intent", intentID)
+	request.Header.Set("X-Stoarama-Recording-Recovery-Secret", recoverySecret)
+	request.Header.Set("X-Stoarama-Recording-Recovery-Session", sessionID)
+	uploadHTTP := *c.httpc
+	uploadHTTP.Timeout = UploadTimeout
+	response, err := uploadHTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("recovery upload status=%d body=%s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+type CaptureRecoveryReport struct {
+	ReportID        string    `json:"report_id"`
+	ReportType      string    `json:"report_type"`
+	SizeBytes       *int64    `json:"size_bytes,omitempty"`
+	SHA256          string    `json:"sha256,omitempty"`
+	LocalObservedAt time.Time `json:"local_observed_at"`
+}
+
+func (c *Client) ReportRecoveryArtifact(ctx context.Context, intentID, recoverySecret string, report CaptureRecoveryReport) error {
+	headers := map[string]string{
+		"X-Stoarama-Recording-Recovery-Intent": intentID,
+		"X-Stoarama-Recording-Recovery-Secret": recoverySecret,
+	}
+	return c.postJSONWithHeaders(ctx, "/api/v1/recording/recovery/artifacts/"+url.PathEscape(intentID)+"/report", report, headers, nil)
+}
+
+func (c *Client) FinishCaptureSet(ctx context.Context, jobID int64, leaseToken, setID string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/finish", jobID, url.PathEscape(setID)), map[string]any{}, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) FinishEmptyCaptureSetRecovery(ctx context.Context, jobID int64, leaseToken, setID, reportID string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-sets/%s/empty-recovery", jobID, url.PathEscape(setID)), map[string]any{
+		"report_id": reportID,
+	}, leaseTokenHeaders(leaseToken), nil)
+}
+
 // IngestClipRequest carries the captured clip's metadata to the ingest endpoint.
 type IngestClipRequest struct {
 	IntentID                string
@@ -205,12 +586,18 @@ type SurveyLease struct {
 
 // LeaseRecordingJob leases one due job, or returns (nil, nil) when none is due.
 func (c *Client) LeaseRecordingJob(ctx context.Context) (*RecordingJob, error) {
+	return c.LeaseRecordingJobWithSurrenderTransport(ctx, true)
+}
+
+func (c *Client) LeaseRecordingJobWithSurrenderTransport(ctx context.Context, enabled bool) (*RecordingJob, error) {
 	var out struct {
 		Job *RecordingJob `json:"job"`
 	}
-	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/jobs/lease", map[string]any{}, map[string]string{
-		leaseTokenSupportedHeader: "true",
-	}, &out); err != nil {
+	headers := map[string]string{}
+	if enabled {
+		headers[leaseTokenSupportedHeader] = "true"
+	}
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/jobs/lease", map[string]any{}, headers, &out); err != nil {
 		return nil, err
 	}
 	return out.Job, nil
@@ -244,14 +631,144 @@ func (c *Client) ReserveClipUpload(ctx context.Context, jobID int64, leaseToken,
 	return out, nil
 }
 
+func recoveryHeaders(intentID, secret string) map[string]string {
+	return map[string]string{
+		"X-Stoarama-Recording-Recovery-Intent": strings.TrimSpace(intentID),
+		"X-Stoarama-Recording-Recovery-Secret": strings.TrimSpace(secret),
+	}
+}
+
+func (c *Client) ReserveCaptureArtifacts(ctx context.Context, jobID int64, leaseToken, producerID string, artifacts []CaptureArtifactReservationInput) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-producers/%s/artifacts/reserve", jobID, url.PathEscape(producerID)), map[string]any{"artifacts": artifacts}, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) SealCaptureArtifact(ctx context.Context, jobID int64, leaseToken, intentID, producerID string, captureSequence, segmentStartMs, sizeBytes int64, sha string) (ClipUploadIntent, error) {
+	var out ClipUploadIntent
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/upload-intents/%s/seal", url.PathEscape(intentID)), map[string]any{
+		"job_id": jobID, "producer_id": producerID, "capture_sequence": captureSequence,
+		"segment_start_ms": segmentStartMs, "size_bytes": sizeBytes, "sha256": sha,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) SealCaptureSetArtifact(ctx context.Context, jobID int64, leaseToken, setID string, ordinal int, artifactID, producerID string, captureSequence, segmentStartMicroseconds, sizeBytes int64, sha string) (ClipUploadIntent, error) {
+	var out ClipUploadIntent
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/upload-intents/%s/seal", url.PathEscape(artifactID)), map[string]any{
+		"job_id": jobID, "producer_id": producerID, "set_id": setID, "ordinal": ordinal,
+		"capture_sequence": captureSequence, "segment_start_microseconds": segmentStartMicroseconds,
+		"size_bytes": sizeBytes, "sha256": sha,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) SealCaptureSetArtifactRecovery(ctx context.Context, jobID int64, setID string, ordinal int, artifactID, recoverySecret, producerID string, captureSequence, segmentStartMicroseconds, sizeBytes int64, sha string) (ClipUploadIntent, error) {
+	var out ClipUploadIntent
+	headers := map[string]string{
+		"X-Stoarama-Recording-Recovery-Intent": artifactID,
+		"X-Stoarama-Recording-Recovery-Secret": recoverySecret,
+	}
+	err := c.postJSONWithHeaders(ctx, "/api/v1/recording/upload-intents/"+url.PathEscape(artifactID)+"/seal", map[string]any{
+		"job_id": jobID, "producer_id": producerID, "capture_sequence": captureSequence,
+		"segment_start_microseconds": segmentStartMicroseconds, "size_bytes": sizeBytes, "sha256": strings.ToLower(strings.TrimSpace(sha)),
+		"set_id": setID, "ordinal": ordinal,
+	}, headers, &out)
+	return out, err
+}
+
+func (c *Client) SealCaptureArtifactRecovery(ctx context.Context, jobID int64, leaseToken, intentID, recoverySecret, producerID string, captureSequence, segmentStartMs, sizeBytes int64, sha string) (ClipUploadIntent, error) {
+	var out ClipUploadIntent
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/upload-intents/%s/seal", url.PathEscape(intentID)), map[string]any{
+		"job_id": jobID, "producer_id": producerID, "capture_sequence": captureSequence,
+		"segment_start_ms": segmentStartMs, "size_bytes": sizeBytes, "sha256": sha,
+	}, recoveryHeaders(intentID, recoverySecret), &out)
+	return out, err
+}
+
+func (c *Client) ReserveCaptureProducer(ctx context.Context, jobID int64, leaseToken, producerID string, captureOrdinal int64, sealedIntentLimit int) (CaptureProducer, error) {
+	var out CaptureProducer
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-producers", jobID), map[string]any{
+		"producer_id": producerID, "capture_ordinal": captureOrdinal,
+		"sealed_intent_limit": sealedIntentLimit,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) FinishCaptureProducer(ctx context.Context, jobID int64, leaseToken, producerID, result, detailClass string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-producers/%s/finish", jobID, url.PathEscape(producerID)), map[string]any{
+		"result": result, "detail_class": detailClass,
+	}, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) CaptureProducerStatus(ctx context.Context, jobID int64, producerID string) (CaptureProducerStatus, error) {
+	var out CaptureProducerStatus
+	err := c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/capture-producers/%s/status", jobID, url.PathEscape(producerID)), map[string]any{}, &out)
+	return out, err
+}
+
 // UploadFile streams a local file to a presigned PUT URL with an explicit
 // ContentLength and Content-Type (matching the captureapi upload shape).
 func (c *Client) UploadFile(ctx context.Context, uploadURL, path, mimeType string) error {
 	return c.uploads.PutFile(ctx, uploadURL, path, mimeType)
 }
 
+// UploadFileExact binds the PUT body to the inode acknowledged by the capture
+// stop barrier. The pathname is opened once with no-follow semantics and the
+// held descriptor is streamed, so replacement cannot change uploaded bytes.
+func (c *Client) UploadFileExact(ctx context.Context, uploadURL, path, mimeType string, expectedDevice, expectedInode uint64, expectedSize int64) error {
+	directory, leaf := filepath.Split(filepath.Clean(path))
+	if directory == "" || leaf == "" || expectedDevice == 0 || expectedInode == 0 || expectedSize <= 0 {
+		return fmt.Errorf("invalid exact upload identity")
+	}
+	directoryFD, err := openDirectoryNoFollow(filepath.Clean(directory))
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directoryFD)
+	fileFD, err := unix.Openat(directoryFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fileFD), leaf)
+	if file == nil {
+		_ = unix.Close(fileFD)
+		return fmt.Errorf("open exact upload")
+	}
+	defer file.Close()
+	var stat unix.Stat_t
+	if err = unix.Fstat(fileFD, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Size != expectedSize || uint64(stat.Dev) != expectedDevice || uint64(stat.Ino) != expectedInode {
+		return fmt.Errorf("exact upload identity changed")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, file)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = stat.Size
+	request.Header.Set("Content-Type", mimeType)
+	uploadHTTP := *c.httpc
+	uploadHTTP.Timeout = UploadTimeout
+	response, err := uploadHTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("upload status=%d body=%s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 // IngestClip records the uploaded clip and returns the new clip id.
 func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, error) {
+	result, err := c.IngestClipWithResult(ctx, req)
+	return result.ClipID, err
+}
+
+func (c *Client) IngestClipWithResult(ctx context.Context, req IngestClipRequest) (ClipIngestResult, error) {
+	return c.ingestClipWithHeaders(ctx, req, nil)
+}
+
+func (c *Client) ingestClipWithHeaders(ctx context.Context, req IngestClipRequest, extraHeaders map[string]string) (ClipIngestResult, error) {
 	payload := map[string]any{
 		"intent_id":     strings.TrimSpace(req.IntentID),
 		"job_id":        req.JobID,
@@ -282,39 +799,67 @@ func (c *Client) IngestClip(ctx context.Context, req IngestClipRequest) (int64, 
 			payload["timestamp_contract_reason"] = req.TimestampContractReason
 		}
 	}
-	var out struct {
-		ClipID int64 `json:"clip_id"`
+	var out ClipIngestResult
+	headers := leaseTokenHeaders(req.LeaseToken)
+	for key, value := range extraHeaders {
+		headers[key] = value
 	}
-	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/clips/ingest", payload, leaseTokenHeaders(req.LeaseToken), &out); err != nil {
-		return 0, err
+	if err := c.postJSONWithHeaders(ctx, "/api/v1/recording/clips/ingest", payload, headers, &out); err != nil {
+		return ClipIngestResult{}, err
 	}
-	return out.ClipID, nil
+	return out, nil
+}
+
+func (c *Client) IngestClipRecovery(ctx context.Context, req IngestClipRequest, intentID, recoverySecret string) (ClipIngestResult, error) {
+	return c.ingestClipWithHeaders(ctx, req, recoveryHeaders(intentID, recoverySecret))
+}
+
+func (c *Client) RecordingRecoveryStatus(ctx context.Context, intentID, recoverySecret string) (RecoveryStatus, error) {
+	var out RecoveryStatus
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/recovery/intents/%s/status", url.PathEscape(intentID)), map[string]any{}, recoveryHeaders(intentID, recoverySecret), &out)
+	return out, err
+}
+
+func (c *Client) FinishRecordingRecovery(ctx context.Context, intentID, recoverySecret, result string) error {
+	return c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/recovery/intents/%s/finish", url.PathEscape(intentID)), map[string]any{"result": result}, recoveryHeaders(intentID, recoverySecret), nil)
 }
 
 // HeartbeatRecordingJob extends the lease. It returns cancel=true when the
 // server signals (409) that the job was canceled or is no longer owned.
 func (c *Client) HeartbeatRecordingJob(ctx context.Context, jobID int64, leaseToken string) (cancel bool, leaseExpiresAt time.Time, err error) {
+	state, err := c.HeartbeatRecordingJobState(ctx, jobID, leaseToken)
+	return state.Cancel, state.LeaseExpiresAt, err
+}
+
+type RecordingHeartbeatState struct {
+	Cancel         bool
+	LeaseExpiresAt time.Time
+	StopRequired   bool
+}
+
+func (c *Client) HeartbeatRecordingJobState(ctx context.Context, jobID int64, leaseToken string) (RecordingHeartbeatState, error) {
 	path := fmt.Sprintf("/api/v1/recording/jobs/%d/heartbeat", jobID)
 	status, body, err := c.postRawWithHeaders(ctx, path, map[string]any{}, leaseTokenHeaders(leaseToken))
 	if err != nil {
-		return false, time.Time{}, err
+		return RecordingHeartbeatState{}, err
 	}
 	if status == http.StatusConflict {
-		return true, time.Time{}, nil
+		return RecordingHeartbeatState{Cancel: true}, nil
 	}
 	if status < 200 || status >= 300 {
-		return false, time.Time{}, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
+		return RecordingHeartbeatState{}, fmt.Errorf("heartbeat status=%d body=%s", status, strings.TrimSpace(string(body)))
 	}
 	var out struct {
 		LeaseExpiresAt time.Time `json:"lease_expires_at"`
+		StopRequired   bool      `json:"stop_required"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return false, time.Time{}, fmt.Errorf("decode heartbeat: %w", err)
+		return RecordingHeartbeatState{}, fmt.Errorf("decode heartbeat: %w", err)
 	}
 	if out.LeaseExpiresAt.IsZero() {
-		return false, time.Time{}, fmt.Errorf("heartbeat response missing lease_expires_at")
+		return RecordingHeartbeatState{}, fmt.Errorf("heartbeat response missing lease_expires_at")
 	}
-	return false, out.LeaseExpiresAt, nil
+	return RecordingHeartbeatState{LeaseExpiresAt: out.LeaseExpiresAt, StopRequired: out.StopRequired}, nil
 }
 
 // CompleteRecordingJob marks the job done (no reschedule).
@@ -332,6 +877,23 @@ func (c *Client) SurrenderRecordingJob(ctx context.Context, jobID int64, leaseTo
 		"reason":     reason,
 		"error_text": strings.TrimSpace(errorText),
 	}, leaseTokenHeaders(leaseToken), nil)
+}
+
+func (c *Client) SurrenderRecordingJobV1(ctx context.Context, jobID int64, leaseToken string, req SurrenderRequest) (SurrenderResult, error) {
+	var out SurrenderResult
+	err := c.postJSONWithHeaders(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender", jobID), map[string]any{
+		"transport_version": 1, "attempt_id": strings.TrimSpace(req.AttemptID),
+		"reason": req.Reason, "error_text": strings.TrimSpace(req.ErrorText),
+		"expected_head_version":     req.ExpectedHeadVersion,
+		"expected_upload_intent_id": strings.TrimSpace(req.ExpectedUploadIntent),
+		"expected_clip_id":          req.ExpectedClipID,
+		"spool_count":               req.SpoolCount, "spool_bytes": req.SpoolBytes, "in_flight_count": req.InFlightCount,
+	}, leaseTokenHeaders(leaseToken), &out)
+	return out, err
+}
+
+func (c *Client) RecordSurrenderTransportObservations(ctx context.Context, jobID int64, observations []SurrenderTransportObservation) error {
+	return c.postJSON(ctx, fmt.Sprintf("/api/v1/recording/jobs/%d/surrender/observations", jobID), map[string]any{"observations": observations}, nil)
 }
 
 func leaseTokenHeaders(token string) map[string]string {

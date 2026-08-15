@@ -237,7 +237,22 @@ func testDropletPoolDB(t *testing.T) (*pgxpool.Pool, func()) {
 		t.Fatalf("open test pool: %v", err)
 	}
 
-	if err := db.MigrateUp(ctx, pool, findDropletPoolMigrationsDir(t)); err != nil {
+	if _, err := pool.Exec(ctx, `DO $roles$ BEGIN
+		IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='stoarama_test_runtime') THEN CREATE ROLE stoarama_test_runtime LOGIN NOINHERIT; END IF;
+		IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='stoarama_test_admission_executor') THEN CREATE ROLE stoarama_test_admission_executor LOGIN NOINHERIT; END IF;
+	END $roles$`); err != nil {
+		pool.Close()
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
+		admin.Close()
+		t.Fatalf("create campaign test roles: %v", err)
+	}
+	if err := db.BootstrapCampaignRoles(ctx, pool, "stoarama_test_runtime", "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err != nil {
+		pool.Close()
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
+		admin.Close()
+		t.Fatalf("bootstrap campaign test roles: %v", err)
+	}
+	if err := db.MigrateUpWithCampaignRoles(ctx, pool, findDropletPoolMigrationsDir(t), "stoarama_test_runtime", "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err != nil {
 		pool.Close()
 		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
 		admin.Close()

@@ -84,13 +84,42 @@ Relay recordings (`capture_via != 'cloud'`) are excluded from the droplet foreca
 - optionally `R2_ENDPOINT`
 - optionally `SERVICE_TOKEN` for machine-to-machine runtime paths before node/service enrollment is expanded
 - optionally `APP_BASE_URL` if the Render hostname differs from the blueprint default
+- Runtime services receive only the unprivileged `DATABASE_URL`. The API alone
+  also receives `ADMISSION_DATABASE_URL`. The dedicated `stoarama-db-migrate`
+  cron alone receives `MIGRATION_DATABASE_URL`, `RUNTIME_DATABASE_URL`, and
+  `ADMISSION_DATABASE_URL`; never copy the migration URL to API, workers, or
+  other crons.
 - `DROPLET_POOL_MAX` and `DROPLET_POOL_CAPACITY` — must be set **identically on both** `stoarama-api` (`srv-d6usqn94tr6s73d94cd0`) and `stoarama-recorder-control` (`srv-d8vcdspo3t8c73far4e0`). recorder-control scales the pool; the API enforces the admission ceiling as `DROPLET_POOL_MAX * DROPLET_POOL_CAPACITY` (`backend/internal/api/server_recordings_batch.go:320`, `server_recordings.go:2559,2629`). If absent on either service, that service silently falls back to `config.go` defaults MAX=5 x CAPACITY=1 = 5, so the API rejects batch schedules against a phantom ceiling far below what the pool can really run. Read the live values from the REST API rather than trusting a number written here; a figure in docs is wrong as soon as an operator changes it.
   - The C-cap guard requiring `DROPLET_POOL_CAPACITY == RECORDING_WORKER_CONCURRENCY` (`config.go:364`) is gated behind `DROPLET_POOL_ENABLED`, which is unset on `stoarama-api` — so setting CAPACITY there does not require also setting `RECORDING_WORKER_CONCURRENCY` or enabling the pool on the API service.
   - Set via the REST API (see `AGENTS.md`, "Render Operator Access"); the Render CLI cannot do it.
 
+## Migration-first deployment
+
+Migration 0140 requires three distinct PostgreSQL logins and a NOLOGIN authority
+owner. Deploys must use [deploy-with-migration.sh](../infra/render/deploy-with-migration.sh)
+from a clean checkout whose `origin/main` exactly equals `COMMIT_SHA`. The
+operator supplies the migration cron id, API service id, and every other runtime
+service id. Automatic deploys are disabled for every service in `render.yaml`;
+the script verifies the exact seven-runtime name manifest and env **keys only**, deploys the exact commit to the
+migration cron, waits for a successful migration run, then deploys all
+unprivileged runtimes and the API last. It aborts before runtime deployment on
+any build, schema, role, or migration failure.
+
+`AUTO_MIGRATE` must be absent or false everywhere. A runtime startup requires
+`STOARAMA_DATABASE_ROLE_KIND=runtime` and fails before listen/claim if its login
+owns objects, can write admission authority tables, can execute admission
+functions, or if the reviewed product-table grant manifest drifts. The API also
+validates that its separate executor login owns no objects and has no table
+privileges, while possessing exactly the six reviewed atomic admission entry
+points.
+
+Application rollback never restores a privileged `DATABASE_URL`. The 0140
+objects remain dormant and auditable; revoking admission EXECUTE is a separate
+reviewed operation after in-flight operations are empty.
+
 ## Recommended initial values
 
-- `AUTO_MIGRATE=true` for first boot, then optional to turn off after schema is up
+- `AUTO_MIGRATE=false` (the API refuses to start if it is true)
 - `EMAIL_PROVIDER=log`
 - `BOX_WORKER_EMBEDDED=true`
 
