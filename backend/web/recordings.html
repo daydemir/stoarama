@@ -3222,7 +3222,8 @@
 
     function best14Sort(rec) {
       const rating = rec.timeline_health && rec.timeline_health.best_14_rating;
-      return [Number(rating && rating.sort_rank || 99), -Number(rating && rating.completed_days || 0)];
+      const rank = rating && Number.isFinite(Number(rating.sort_rank)) ? Number(rating.sort_rank) : 99;
+      return [rank, -Number(rating && rating.completed_days || 0)];
     }
 
     function dailyGradesCardHTML(rec) {

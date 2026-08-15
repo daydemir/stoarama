@@ -385,6 +385,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`best14RatingHTML(best14)`,
 		`Insufficient`,
 		`state.recordingSort === 'best14'`,
+		`Number.isFinite(Number(rating.sort_rank)) ? Number(rating.sort_rank) : 99`,
 		`captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec)`,
 		`data-health-tooltip="${escapeHTML(title)}" tabindex="0" aria-describedby="healthTooltip"`,
 	} {
