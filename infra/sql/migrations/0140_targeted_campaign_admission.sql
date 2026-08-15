@@ -1719,7 +1719,13 @@ BEGIN
      v_capacity_observed_at-v_capacity_started_at>interval '120 seconds' OR
      v_capacity_observed_at<recording_campaign_now()-interval '30 seconds' OR
      v_capacity_observed_at>recording_campaign_now()+interval '5 seconds'
-  THEN RAISE EXCEPTION 'campaign capacity witness differs from authority rows'; END IF;
+  THEN RAISE EXCEPTION 'campaign capacity witness differs from authority rows: supplied % authority %',
+    row(p_capacity->>'build_sha',(p_capacity->>'ready_workers')::int,(p_capacity->>'total_slots')::int,
+      (p_capacity->>'largest_worker_slots')::int,(p_capacity->>'usable_after_worker_loss')::int,
+      p_capacity->>'largest_region',(p_capacity->>'largest_region_slots')::int,p_capacity->>'facts_sha256',
+      p_capacity->>'provider_observation_sha256'),
+    row(v_build_sha,v_ready_workers,v_total_slots,v_largest_worker_slots,v_usable_after_worker_loss,
+      v_largest_region,v_largest_region_slots,v_capacity_facts_sha,v_provider_observation_sha); END IF;
   SELECT id INTO v_capacity_id FROM recording_campaign_create_capacity_observation(
     p_approval_id,p_account_id,v_capacity_started_at,v_capacity_observed_at,v_build_sha,
     v_size_slug,v_pool_identity_sha,
