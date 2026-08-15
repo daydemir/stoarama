@@ -217,6 +217,87 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if approvalID == uuid.Nil || len(approvalSHA) != 64 {
 		t.Fatalf("invalid approval result id=%s sha=%q", approvalID, approvalSHA)
 	}
+	// A second, independent approval exercises the probe-vs-expiration fence in
+	// both commit orders without consuming the activation-reservation fixture.
+	const probeRaceStreamID int64 = 17237
+	probeRaceSource := "https://source.example/probe-race.m3u8"
+	probeRacePage := "https://source.example/probe-race"
+	if _, err := migrator.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone,tags) VALUES($1,'publisher','fd-probe-race','FD probe race','fd-probe-race',$2,$3,'hls','video_manifest','video_live','continuous_video',30,'Europe/Berlin',ARRAY['FD'])`, probeRaceStreamID, probeRaceSource, probeRacePage); err != nil {
+		t.Fatal(err)
+	}
+	var probeRaceRevisionID, probeRaceMediaID, probeRaceFrameID, probeRaceSceneID, probeRaceRecordingID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO stream_source_revisions(stream_id,actor,reason,new_source_url,new_source_page_url) VALUES($1,'test','probe-race',$2,$3) RETURNING id`, probeRaceStreamID, probeRaceSource, probeRacePage).Scan(&probeRaceRevisionID); err != nil {
+		t.Fatal(err)
+	}
+	probeRaceFrameSHA := strings.Repeat("3", 64)
+	probeRaceSceneSHA := strings.Repeat("4", 64)
+	if err := migrator.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256) VALUES('r2','campaign','probe-race-scene.jpg','image/jpeg',1,$1) RETURNING id`, probeRaceFrameSHA).Scan(&probeRaceMediaID); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,$2,$3,'success','live') RETURNING id`, probeRaceStreamID, capturedAt, probeRaceMediaID).Scan(&probeRaceFrameID); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.QueryRow(ctx, `INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id,evidence_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,'operator_visual',$8,$9) RETURNING id`, accountID, probeRaceStreamID, probeRaceFrameID, probeRaceMediaID, capturedAt, probeRaceFrameSHA, probeRaceSceneSHA, userID, strings.Repeat("0", 64)).Scan(&probeRaceSceneID); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.QueryRow(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,stream_id,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,end_at,capture_via,target_fps,mode,daily_window_start,daily_window_end,active_weekdays,delivery,naming_profile,folder_name,naming_metadata_jsonb,storage_retention_tier) VALUES($1,$2,'FD probe race [17237]',$3,$4,'hls_live','','Europe/Berlin',60,'completed',$5,$6,'cloud',NULL,'continuous','06:00','18:00',127,'nas_pull','stoarama_v1','recordings','{}','monthly') RETURNING id`, accountID, destinationID, probeRaceSource, probeRaceStreamID, startAt, endAt).Scan(&probeRaceRecordingID); err != nil {
+		t.Fatal(err)
+	}
+	var probeRaceSourceUpdated time.Time
+	if err := migrator.QueryRow(ctx, `SELECT updated_at FROM streams WHERE id=$1`, probeRaceStreamID).Scan(&probeRaceSourceUpdated); err != nil {
+		t.Fatal(err)
+	}
+	probeRaceEntries := []map[string]any{{
+		"stream_id": probeRaceStreamID, "recording_id": probeRaceRecordingID, "source_revision_id": probeRaceRevisionID,
+		"source_url_sha256": hashText(probeRaceSource), "source_page_url_sha256": hashText(probeRacePage),
+		"source_updated_at_unix_micros": probeRaceSourceUpdated.UTC().UnixMicro(), "provider": "publisher", "external_id": "fd-probe-race",
+		"normalized_label": "fdproberace", "scene_frame_evidence_id": probeRaceSceneID, "scene_identity_sha256": probeRaceSceneSHA,
+	}}
+	probeRaceSchedule := map[string]any{}
+	for key, value := range schedule {
+		probeRaceSchedule[key] = value
+	}
+	probeRaceSchedule["stream_ids"] = []int64{probeRaceStreamID}
+	probeRaceSchedule["stream_timezones"] = []map[string]any{{"stream_id": probeRaceStreamID, "timezone": "Europe/Berlin"}}
+	probeRaceEntriesJSON, _ := json.Marshal(probeRaceEntries)
+	probeRaceScheduleJSON, _ := json.Marshal(probeRaceSchedule)
+	var probeRaceApprovalID uuid.UUID
+	if err := executorPool.QueryRow(ctx, `SELECT approval_id FROM recording_campaign_approve($1,$2,$3,$4,$5,$6,'deniz_fd_restore_20260814','FD',$7,$8::jsonb,$9::jsonb,$10)`, uuid.New(), accountID, userID, sessionID, credentialSHA, "deniz@example.test", endAt, probeRaceEntriesJSON, probeRaceScheduleJSON, strings.Repeat("c", 64)).Scan(&probeRaceApprovalID); err != nil {
+		t.Fatalf("create probe/expiration race approval: %v", err)
+	}
+	var probeRaceOrderID uuid.UUID
+	if err := executorPool.QueryRow(ctx, `SELECT order_id FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), probeRaceApprovalID, accountID, userID, sessionID, credentialSHA, probeRaceStreamID).Scan(&probeRaceOrderID); err != nil {
+		t.Fatalf("queue probe/expiration race order: %v", err)
+	}
+	var probeNodeID, probeTokenID, probeGeneration, probeDropletID int64
+	probeCredentialSHA := hashText("probe-race-token")
+	const probeBuildSHA = "5555555555555555555555555555555555555555"
+	if err := migrator.QueryRow(ctx, `INSERT INTO nodes(account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES($1,'probe-race-worker','local_recorder','active',recording_campaign_now(),1) RETURNING id`, accountID).Scan(&probeNodeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.QueryRow(ctx, `INSERT INTO node_tokens(node_id,key_prefix,secret_hash) VALUES($1,'probe-race',$2) RETURNING id,recording_claim_generation`, probeNodeID, probeCredentialSHA).Scan(&probeTokenID, &probeGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.QueryRow(ctx, `INSERT INTO recorder_droplets(name,node_id,do_droplet_id,region,size,capacity,state,last_seen_at,build_sha) VALUES('probe-race-worker',$1,170237,'nyc1','s-2vcpu-4gb',5,'active',recording_campaign_now(),$2) RETURNING id`, probeNodeID, probeBuildSHA).Scan(&probeDropletID); err != nil {
+		t.Fatal(err)
+	}
+	probeProjectSHA := strings.Repeat("6", 64)
+	probeFirewallSHA := strings.Repeat("7", 64)
+	probePoolSHA := hashText("s-2vcpu-4gb\n" + probeBuildSHA + "\n5\n" + probeProjectSHA + "\n" + probeFirewallSHA)
+	probeAttemptID := uuid.New()
+	probeRequestID := uuid.New()
+	probeLeaseTx, err := executorPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leasedOrderID uuid.UUID
+	if err := probeLeaseTx.QueryRow(ctx, `SELECT order_id FROM recording_campaign_lease_probe($1,$2,$3,$4,$5,170237,'nyc1',$6,$7,$8,'s-2vcpu-4gb',$9,$10,$11,$12,$13,$14,$15,134217728,8388608)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeDropletID, probeBuildSHA, probeProjectSHA, probeFirewallSHA, probePoolSHA, probeAttemptID, probeRequestID, strings.Repeat("8", 64), strings.Repeat("9", 64), "quarantine/campaign-probe/"+probeAttemptID.String()+"/media.zip", "quarantine/campaign-probe/"+probeAttemptID.String()+"/frame.jpg").Scan(&leasedOrderID); err != nil || leasedOrderID != probeRaceOrderID {
+		_ = probeLeaseTx.Rollback(ctx)
+		t.Fatalf("lease probe/expiration race order: got=%s want=%s err=%v", leasedOrderID, probeRaceOrderID, err)
+	}
+	if err := probeLeaseTx.Commit(ctx); err != nil {
+		t.Fatalf("commit probe-first side of expiration race: %v", err)
+	}
 	var draftTrackID int64
 	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id,reporting_grade_floor,reporting_required_consecutive_windows) VALUES($1,$2,'reservation collision fixture',recording_campaign_now()+interval '3 days',1,'GOOD',14,$3,'ACCEPTABLE',14) RETURNING id`, accountID, "draft-collision-"+uuid.NewString(), userID).Scan(&draftTrackID); err != nil {
 		t.Fatal(err)
@@ -224,6 +305,29 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := migrator.Exec(ctx, `INSERT INTO recording_campaign_roster_entries(track_id,recording_id,stream_id,scene_identity_sha256,role,rank,status,reason_codes,effective_at,decision_at,evidence_observed_at,evidence_sha256,updated_by_user_id) VALUES($1,$2,$3,$4,'primary',1,'probation',ARRAY['fixture'],recording_campaign_now(),recording_campaign_now(),recording_campaign_now(),$5,$6)`, draftTrackID, recordingID, streamID, sceneSHA, frameSHA, userID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := runtimePool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_runtime'],$2,recording_campaign_now())`, draftTrackID, userID); err == nil {
+		t.Fatal("runtime invoked the authority-owned campaign transition")
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT transition_recording_campaign_track($1,'active',ARRAY['forged_executor'],$2,recording_campaign_now())`, draftTrackID, userID); err == nil {
+		t.Fatal("admission executor invoked the internal campaign transition")
+	}
+	var unwitnessedTrackID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id,reporting_grade_floor,reporting_required_consecutive_windows) VALUES($1,$2,'unwitnessed transition fixture',recording_campaign_now()+interval '3 days',0,'GOOD',14,$3,'ACCEPTABLE',14) RETURNING id`, accountID, "unwitnessed-"+uuid.NewString(), userID).Scan(&unwitnessedTrackID); err != nil {
+		t.Fatal(err)
+	}
+	unwitnessedTx, err := runtimePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = unwitnessedTx.Exec(ctx, `SELECT set_config('stoarama.campaign_transition','1',true)`); err != nil {
+		_ = unwitnessedTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err = unwitnessedTx.Exec(ctx, `UPDATE recording_campaign_tracks SET state='active' WHERE id=$1`, unwitnessedTrackID); err == nil || !strings.Contains(err.Error(), "typed transition") {
+		_ = unwitnessedTx.Rollback(ctx)
+		t.Fatalf("runtime GUC forged an unwitnessed track transition: %v", err)
+	}
+	_ = unwitnessedTx.Rollback(ctx)
 	forgedTrackTx, err := migrator.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -270,6 +374,63 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	var terminalSHA string
 	if _, err := migrator.Exec(ctx, `INSERT INTO recording_campaign_admission_reservation_terminal_events(approval_id,account_id,request_id,result,actor_user_id,event_sha256) VALUES($1,$2,$3,'expired_unadmitted',$4,repeat('0',64))`, approvalID, accountID, uuid.New(), userID); err == nil {
 		t.Fatal("direct SQL forged a reservation terminal event")
+	}
+	// Probe-first: the committed server attempt is visible to expiration and is
+	// terminalized under the same approval fence. Expiry-first: while that
+	// terminal event is uncommitted, another lease blocks; after commit it
+	// observes the terminal approval and returns no target without authorizing
+	// the node or creating a second attempt.
+	probeExpireTx, err := executorPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probeTerminalSHA string
+	if err := probeExpireTx.QueryRow(ctx, `SELECT event_sha256 FROM recording_campaign_expire_approval($1,$2,$3,$4,$5,$6)`, uuid.New(), probeRaceApprovalID, accountID, userID, expireSessionID, expireCredentialSHA).Scan(&probeTerminalSHA); err != nil || len(probeTerminalSHA) != 64 {
+		_ = probeExpireTx.Rollback(ctx)
+		t.Fatalf("probe-first expiration did not terminalize exact approval: sha=%q err=%v", probeTerminalSHA, err)
+	}
+	leaseAfterTerminal := make(chan struct {
+		count int
+		err   error
+	}, 1)
+	go func() {
+		rows, queryErr := executorPool.Query(ctx, `SELECT order_id FROM recording_campaign_lease_probe($1,$2,$3,$4,$5,170237,'nyc1',$6,$7,$8,'s-2vcpu-4gb',$9,$10,$11,$12,$13,$14,$15,134217728,8388608)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeDropletID, probeBuildSHA, probeProjectSHA, probeFirewallSHA, probePoolSHA, uuid.New(), uuid.New(), strings.Repeat("a", 64), strings.Repeat("b", 64), "quarantine/campaign-probe/"+uuid.NewString()+"/media.zip", "quarantine/campaign-probe/"+uuid.NewString()+"/frame.jpg")
+		if queryErr != nil {
+			leaseAfterTerminal <- struct {
+				count int
+				err   error
+			}{err: queryErr}
+			return
+		}
+		defer rows.Close()
+		count := 0
+		for rows.Next() {
+			count++
+		}
+		leaseAfterTerminal <- struct {
+			count int
+			err   error
+		}{count: count, err: rows.Err()}
+	}()
+	select {
+	case early := <-leaseAfterTerminal:
+		_ = probeExpireTx.Rollback(ctx)
+		t.Fatalf("probe lease crossed uncommitted approval terminal: count=%d err=%v", early.count, early.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := probeExpireTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case after := <-leaseAfterTerminal:
+		if after.err != nil || after.count != 0 {
+			t.Fatalf("terminal approval leased another probe: count=%d err=%v", after.count, after.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe lease did not resume after approval terminal commit")
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT order_id FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), probeRaceApprovalID, accountID, userID, expireSessionID, expireCredentialSHA, probeRaceStreamID); err == nil {
+		t.Fatal("terminal approval accepted a new probe order")
 	}
 	// Genuine two-connection, both-order serialization. First the ordinary
 	// activation owns the global fence: it deterministically rejects the live
@@ -431,12 +592,19 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"recording_campaign_worker_lifecycle_statement_fence",
 		"recording_campaign_node_probe_guard",
 		"recording_campaign_claim_head_probe_guard",
+		"recording_campaign_node_token_probe_guard",
+		"UPDATE OF state,node_id,do_droplet_id,region,size,build_sha,capacity",
+		"UPDATE OF node_id,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens",
 		"campaign account additions require typed admission capacity and NAS recomputation",
+		"The typed admission function recomputes and seals a new capacity/NAS",
 		"active recording identity collides with active or protected campaign occupancy",
 		"campaign track activation collides with active/protected/reserved occupancy",
 		"recording_campaign_assert_track_activation_occupancy",
 		"recording_campaign_track_state_fence",
 		"recording_campaign_track_activation_occupancy",
+		"use typed transition_recording_campaign_track authority",
+		"REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON TABLE %I.recording_campaign_track_events",
+		"REVOKE USAGE,SELECT,UPDATE ON SEQUENCE %I.recording_campaign_track_events_id_seq",
 		"to_jsonb(e)::text",
 		"submission_request_sha256",
 		"authority_member_count<>1",

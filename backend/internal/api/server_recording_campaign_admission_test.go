@@ -560,6 +560,20 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		if _, err := pool.Exec(ctx, `UPDATE recording_worker_claim_heads SET state='recovery_blocked',blocked_at=now(),block_reason='durable_recovery' WHERE node_id=$1`, nodeID); err == nil {
 			t.Fatal("probe-first claim-head rotation crossed occupancy")
 		}
+		for label, statement := range map[string]string{
+			"provider id":      `UPDATE recorder_droplets SET do_droplet_id=do_droplet_id+1 WHERE node_id=$1`,
+			"region":           `UPDATE recorder_droplets SET region=region||'-changed' WHERE node_id=$1`,
+			"size":             `UPDATE recorder_droplets SET size=size||'-changed' WHERE node_id=$1`,
+			"build":            `UPDATE recorder_droplets SET build_sha=CASE WHEN build_sha=repeat('a',40) THEN repeat('b',40) ELSE repeat('a',40) END WHERE node_id=$1`,
+			"capacity":         `UPDATE recorder_droplets SET capacity=capacity+1 WHERE node_id=$1`,
+			"token revoke":     `UPDATE node_tokens SET revoked_at=transaction_timestamp() WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"token purpose":    `UPDATE node_tokens SET recording_claim_purpose='existing_fence_only' WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"token generation": `UPDATE node_tokens SET recording_claim_generation=recording_claim_generation+1 WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+		} {
+			if _, err := pool.Exec(ctx, statement, nodeID); err == nil {
+				t.Fatalf("probe-first %s mutation crossed occupancy", label)
+			}
+		}
 		mediaArchive, frame := buildCampaignProbeArchive(t, colorName)
 		mediaKey := fmt.Sprintf("quarantine/campaign-probe/%s/media.zip", leaseResponse.Target.AttemptID)
 		frameKey := fmt.Sprintf("quarantine/campaign-probe/%s/frame.jpg", leaseResponse.Target.AttemptID)
@@ -689,6 +703,27 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active'`, accountID, streamID).Scan(&admittedRecordingID); err != nil {
 		t.Fatal(err)
 	}
+	// A later typed admission must not be rejected merely because the prior
+	// commit's capacity observation is older than 120 seconds. The exact
+	// approval-bound transaction is allowed through the row guard so the admit
+	// procedure can create its replacement observations and deferred seals. We
+	// roll this focused transaction back before those seals because this test's
+	// full admission was already committed above.
+	advanceCampaignAdmissionClock(t, pool, 181)
+	stalePriorObservationTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stalePriorObservationTx.Exec(ctx, `SELECT recording_campaign_authorize_account('admit',$1,$2,$3,(SELECT id FROM account_sessions WHERE session_hash=$4),$4)`, approvalResponse.ApprovalID, accountID, userID, hashSecret(rawSession)); err != nil {
+		_ = stalePriorObservationTx.Rollback(ctx)
+		t.Fatalf("authorize delayed typed admission fixture: %v", err)
+	}
+	if _, err := stalePriorObservationTx.Exec(ctx, `UPDATE recordings SET clip_duration_sec=clip_duration_sec+1 WHERE id=$1`, admittedRecordingID); err != nil {
+		_ = stalePriorObservationTx.Rollback(ctx)
+		t.Fatalf("delayed typed admission was blocked by stale prior observation: %v", err)
+	}
+	_ = stalePriorObservationTx.Rollback(ctx)
+	advanceCampaignAdmissionClock(t, pool, 0)
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET next_fire_at=NULL WHERE id=$1`, admittedRecordingID); err == nil {
 		t.Fatal("runtime direct SQL cleared the sealed next-fire schedule")
 	}
