@@ -2752,7 +2752,7 @@ BEGIN
        OR job_row.scheduled_for IS DISTINCT FROM result_row.next_retry_at
        OR result_row.had_clips IS DISTINCT FROM (head_row.version>0)
        OR result_row.next_retry_at IS DISTINCT FROM expected_retry
-       OR result_row.handoff_until IS DISTINCT FROM result_row.result_at+CASE WHEN result_row.alternate_available THEN interval '5 minutes' ELSE interval '0' END THEN
+	       OR result_row.handoff_until IS DISTINCT FROM (result_row.result_at+CASE WHEN result_row.alternate_available THEN interval '5 minutes' ELSE interval '0' END) THEN
 	      RAISE EXCEPTION 'committed surrender result does not seal the job transition';
 	    END IF;
 	  ELSIF result_row.result='stale_fence' THEN
