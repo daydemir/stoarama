@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -219,6 +220,13 @@ exit 0
 	if err := installLaunchdInDomain(true); err != nil {
 		t.Fatal(err)
 	}
+	plist, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", launchdLabel+".plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(plist, []byte("<key>LimitLoadToSessionType</key><string>Background</string>")) {
+		t.Fatalf("user-domain plist lacks Background session contract:\n%s", plist)
+	}
 	calls, _ := os.ReadFile(logPath)
 	if !strings.Contains(string(calls), "bootstrap user/"+fmt.Sprint(uid)+" ") || strings.Contains(string(calls), "bootstrap gui/") {
 		t.Fatalf("user-domain install selected the wrong domain:\n%s", calls)
@@ -327,7 +335,7 @@ func writeTestLaunchdPlist(t *testing.T, instanceID string) (string, []byte) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	b, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), filepath.Join(home, ".stoarama", "logs", "relay.log"), instanceID))
+	b, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), filepath.Join(home, ".stoarama", "logs", "relay.log"), instanceID, false))
 	if err != nil {
 		t.Fatal(err)
 	}
