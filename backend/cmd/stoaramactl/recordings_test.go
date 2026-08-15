@@ -122,26 +122,26 @@ func TestCandidateScenePresentationRequestAndResponse(t *testing.T) {
 
 func TestRecordingSceneAttestPayloadModesAndRequest(t *testing.T) {
 	presentationID := uuid.NewString()
-	candidate, err := recordingSceneAttestPayload(0, 11, 22, "decision", presentationID, "  Exact Scene  ")
-	if err != nil || candidate["stream_id"] != int64(11) || candidate["presentation_id"] != presentationID || candidate["scene_identity"] != "Exact Scene" {
+	candidate, err := recordingSceneAttestPayload(0, 22, presentationID, "  Exact Scene  ")
+	if err != nil || candidate["presentation_id"] != presentationID || candidate["scene_identity"] != "Exact Scene" || candidate["stream_id"] != nil || candidate["authority_code"] != nil {
 		t.Fatalf("candidate payload=%v err=%v", candidate, err)
 	}
-	recording, err := recordingSceneAttestPayload(33, 0, 22, "", "", "Exact Scene")
+	recording, err := recordingSceneAttestPayload(33, 22, "", "Exact Scene")
 	if err != nil || recording["recording_id"] != int64(33) {
 		t.Fatalf("recording payload=%v err=%v", recording, err)
 	}
 	for _, args := range []struct {
-		recordingID, streamID int64
-		authority, receipt    string
-	}{{33, 11, "decision", presentationID}, {0, 11, "", presentationID}, {0, 11, "decision", "bad"}} {
-		if _, err := recordingSceneAttestPayload(args.recordingID, args.streamID, 22, args.authority, args.receipt, "Exact Scene"); err == nil {
+		recordingID int64
+		receipt     string
+	}{{33, presentationID}, {0, "bad"}} {
+		if _, err := recordingSceneAttestPayload(args.recordingID, 22, args.receipt, "Exact Scene"); err == nil {
 			t.Fatalf("accepted ambiguous payload %+v", args)
 		}
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		body, _ := io.ReadAll(r.Body)
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/account/recordings/qualification/scene-attest" || r.Header.Get("Cookie") != "stoarama_session=secret" || !strings.Contains(string(body), `"stream_id":11`) || !strings.Contains(string(body), `"presentation_id":"`+presentationID+`"`) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/account/recordings/qualification/scene-attest" || r.Header.Get("Cookie") != "stoarama_session=secret" || strings.Contains(string(body), `"stream_id"`) || strings.Contains(string(body), `"authority_code"`) || !strings.Contains(string(body), `"presentation_id":"`+presentationID+`"`) {
 			t.Fatalf("unexpected attest request: method=%s path=%s body=%s", r.Method, r.URL.Path, body)
 		}
 		w.Header().Set("Content-Type", "application/json")

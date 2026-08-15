@@ -173,9 +173,7 @@ func postRecordingSessionJSON(ctx context.Context, baseURL, cookie, path string,
 func runRecordingSceneAttest(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("recordings scene-attest", flag.ExitOnError)
 	recordingID := fs.Int64("recording-id", 0, "recording id")
-	streamID := fs.Int64("stream-id", 0, "decision-authorized candidate stream id")
 	frameID := fs.Int64("frame-id", 0, "authoritative successful frame id")
-	authorityCode := fs.String("authority-code", "", "immutable campaign decision code")
 	presentationID := fs.String("presentation-id", "", "exact candidate baseline presentation UUID")
 	identity := fs.String("scene-identity", "", "operator-confirmed canonical scene identity")
 	cookieFile := fs.String("session-cookie-file", "", "file containing member session cookie")
@@ -185,29 +183,28 @@ func runRecordingSceneAttest(ctx context.Context, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	payload, err := recordingSceneAttestPayload(*recordingID, *streamID, *frameID, *authorityCode, *presentationID, *identity)
+	payload, err := recordingSceneAttestPayload(*recordingID, *frameID, *presentationID, *identity)
 	if err != nil {
 		log.Fatal(err)
 	}
 	printJSON(postRecordingSessionJSON(ctx, *base, cookie, "/api/v1/account/recordings/qualification/scene-attest", payload))
 }
 
-func recordingSceneAttestPayload(recordingID, streamID, frameID int64, authorityCode, presentationID, identity string) (map[string]any, error) {
+func recordingSceneAttestPayload(recordingID, frameID int64, presentationID, identity string) (map[string]any, error) {
 	identity = strings.TrimSpace(identity)
-	authorityCode = strings.TrimSpace(authorityCode)
 	presentationID = strings.TrimSpace(presentationID)
 	if frameID <= 0 || identity == "" {
 		return nil, fmt.Errorf("--frame-id and --scene-identity are required")
 	}
-	if recordingID > 0 && streamID == 0 && authorityCode == "" && presentationID == "" {
+	if recordingID > 0 && presentationID == "" {
 		return map[string]any{"recording_id": recordingID, "frame_id": frameID, "scene_identity": identity}, nil
 	}
-	if recordingID == 0 && streamID > 0 && authorityCode != "" {
+	if recordingID == 0 {
 		if _, err := uuid.Parse(presentationID); err == nil {
-			return map[string]any{"stream_id": streamID, "authority_code": authorityCode, "frame_id": frameID, "presentation_id": presentationID, "scene_identity": identity}, nil
+			return map[string]any{"frame_id": frameID, "presentation_id": presentationID, "scene_identity": identity}, nil
 		}
 	}
-	return nil, fmt.Errorf("provide either --recording-id, or all of --stream-id, --authority-code, and UUID --presentation-id")
+	return nil, fmt.Errorf("provide either --recording-id or UUID --presentation-id")
 }
 
 type candidateScenePresentation struct {

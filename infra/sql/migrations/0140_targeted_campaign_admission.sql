@@ -1315,7 +1315,7 @@ END $$;
 CREATE FUNCTION recording_campaign_attest_baseline_scene(
   p_presentation_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_frame_id BIGINT,p_scene_identity_sha256 TEXT
-) RETURNS TABLE(evidence_id BIGINT,evidence_sha256 TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+) RETURNS TABLE(evidence_id BIGINT,evidence_sha256 TEXT,stream_id BIGINT,authority_code TEXT) LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
 DECLARE presented RECORD; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ;
 BEGIN
   PERFORM recording_campaign_authorize_account('baseline_attest',NULL,p_account_id,p_user_id,p_session_id,p_credential_sha256);
@@ -1346,6 +1346,8 @@ BEGIN
       AND scene_identity_sha256=p_scene_identity_sha256 AND verified_by_user_id=p_user_id;
   END IF;
   IF evidence_id IS NULL THEN RAISE EXCEPTION 'baseline scene attestation conflicts with immutable evidence'; END IF;
+  stream_id:=presented.stream_id;
+  authority_code:=presented.authority_code;
   RETURN NEXT;
 END $$;
 

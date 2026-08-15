@@ -35,8 +35,6 @@ func invalidQualification(format string, args ...any) error {
 
 type sceneAttestRequest struct {
 	RecordingID    int64  `json:"recording_id"`
-	StreamID       int64  `json:"stream_id"`
-	AuthorityCode  string `json:"authority_code"`
 	FrameID        int64  `json:"frame_id"`
 	PresentationID string `json:"presentation_id,omitempty"`
 	SceneIdentity  string `json:"scene_identity"`
@@ -80,13 +78,14 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 	if !decodeQualificationJSON(w, r, &req) {
 		return
 	}
+	req.PresentationID = strings.TrimSpace(req.PresentationID)
 	identity, err := normalizeSceneIdentity(req.SceneIdentity)
-	if err != nil || req.FrameID <= 0 || (req.RecordingID <= 0) == (req.StreamID <= 0) {
-		util.WriteError(w, http.StatusBadRequest, "exactly one of recording_id or stream_id, plus frame_id and valid scene_identity, is required")
+	candidate := req.PresentationID != ""
+	if err != nil || req.FrameID <= 0 || (candidate && req.RecordingID != 0) || (!candidate && req.RecordingID <= 0) {
+		util.WriteError(w, http.StatusBadRequest, "exactly one of recording_id or presentation_id, plus frame_id and valid scene_identity, is required")
 		return
 	}
-	if req.StreamID > 0 {
-		req.AuthorityCode = strings.TrimSpace(req.AuthorityCode)
+	if candidate {
 		if principal.SessionID == nil || principal.Role != accountRoleAdmin || !strings.EqualFold(strings.TrimSpace(principal.Email), strings.TrimSpace(s.cfg.DropletPoolOperatorEmail)) {
 			util.WriteError(w, http.StatusForbidden, "candidate scene attestation requires the exact operator browser session")
 			return
@@ -94,19 +93,20 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 	}
 	sceneHash := sha256Hex([]byte("stoarama-scene-identity-v1\n" + identity))
 	var evidenceID int64
-	var evidenceHash string
-	if req.StreamID > 0 {
-		presentationID, parseErr := uuid.Parse(strings.TrimSpace(req.PresentationID))
+	var evidenceHash, authorityCode string
+	var streamID int64
+	if candidate {
+		presentationID, parseErr := uuid.Parse(req.PresentationID)
 		if parseErr != nil || s.admissionPool == nil || principal.SessionID == nil {
 			util.WriteError(w, http.StatusBadRequest, "candidate scene attestation requires an exact baseline presentation_id")
 			return
 		}
-		err = s.admissionPool.QueryRow(r.Context(), `SELECT evidence_id,evidence_sha256 FROM recording_campaign_attest_baseline_scene($1,$2,$3,$4,$5,$6,$7)`, presentationID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, req.FrameID, sceneHash).Scan(&evidenceID, &evidenceHash)
+		err = s.admissionPool.QueryRow(r.Context(), `SELECT evidence_id,evidence_sha256,stream_id,authority_code FROM recording_campaign_attest_baseline_scene($1,$2,$3,$4,$5,$6,$7)`, presentationID, principal.AccountID, principal.UserID, *principal.SessionID, principal.credentialSHA256, req.FrameID, sceneHash).Scan(&evidenceID, &evidenceHash, &streamID, &authorityCode)
 		if err != nil {
 			util.WriteError(w, http.StatusConflict, "baseline presentation/source fence changed")
 			return
 		}
-		util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": int64(0), "stream_id": req.StreamID, "frame_id": req.FrameID, "presentation_id": presentationID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
+		util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": int64(0), "stream_id": streamID, "authority_code": authorityCode, "frame_id": req.FrameID, "presentation_id": presentationID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
 		return
 	}
 	err = s.pool.QueryRow(r.Context(), `
@@ -128,17 +128,17 @@ func (s *Server) handleAccountRecordingSceneAttest(w http.ResponseWriter, r *htt
 	SELECT e.id,e.evidence_sha256 FROM recording_scene_frame_evidence e
 	WHERE e.account_id=$1 AND e.frame_id=$3 AND e.scene_identity_sha256=$4 AND e.verified_by_user_id=$5
 	LIMIT 1
-	`, principal.AccountID, req.RecordingID, req.FrameID, sceneHash, principal.UserID, req.StreamID).Scan(&evidenceID, &evidenceHash)
+	`, principal.AccountID, req.RecordingID, req.FrameID, sceneHash, principal.UserID, int64(0)).Scan(&evidenceID, &evidenceHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "frame is not a current authoritative successful frame, or it was attested differently")
 		return
 	}
 	if err != nil {
-		log.Printf("scene attestation failed account_id=%d recording_id=%d stream_id=%d: %v", principal.AccountID, req.RecordingID, req.StreamID, err)
+		log.Printf("scene attestation failed account_id=%d recording_id=%d: %v", principal.AccountID, req.RecordingID, err)
 		util.WriteError(w, http.StatusInternalServerError, "store scene attestation")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": req.RecordingID, "stream_id": req.StreamID, "frame_id": req.FrameID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"evidence_id": evidenceID, "recording_id": req.RecordingID, "stream_id": int64(0), "frame_id": req.FrameID, "scene_identity_sha256": sceneHash, "evidence_sha256": evidenceHash})
 }
 
 func (s *Server) handleAccountRecordingBaselineScenePresentation(w http.ResponseWriter, r *http.Request) {

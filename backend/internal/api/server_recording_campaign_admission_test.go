@@ -516,7 +516,16 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatalf("sealed baseline presentation was not replayable after read-receipt expiry: first=%d/%s replay=%d/%s", presentationRec.Code, presentationID, presentationReplayRec.Code, presentationReplayRec.Header().Get("X-Stoarama-Presentation-ID"))
 	}
 	advanceCampaignAdmissionClock(t, pool, 0)
-	attestBody, _ := json.Marshal(sceneAttestRequest{StreamID: streamID, AuthorityCode: "deniz_fd_restore_20260814", FrameID: frameID, PresentationID: presentationID, SceneIdentity: "Approved Scene"})
+	forgedAttestBody, _ := json.Marshal(map[string]any{"stream_id": streamID + 1, "authority_code": "deniz_scene_approval_20260814", "frame_id": frameID, "presentation_id": presentationID, "scene_identity": "Approved Scene"})
+	forgedAttestReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewReader(forgedAttestBody))
+	forgedAttestReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	forgedAttestRec := httptest.NewRecorder()
+	router.ServeHTTP(forgedAttestRec, forgedAttestReq)
+	var forgedEvidence int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_scene_frame_evidence WHERE account_id=$1 AND frame_id=$2`, accountID, frameID).Scan(&forgedEvidence); forgedAttestRec.Code != http.StatusBadRequest || err != nil || forgedEvidence != 0 {
+		t.Fatalf("candidate caller labels changed evidence: status=%d evidence=%d err=%v", forgedAttestRec.Code, forgedEvidence, err)
+	}
+	attestBody, _ := json.Marshal(sceneAttestRequest{FrameID: frameID, PresentationID: presentationID, SceneIdentity: "Approved Scene"})
 	attestReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewReader(attestBody))
 	attestReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
 	attestRec := httptest.NewRecorder()
@@ -525,9 +534,11 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatalf("baseline attest status=%d body=%s", attestRec.Code, attestRec.Body.String())
 	}
 	var baselineEvidence struct {
-		EvidenceID int64 `json:"evidence_id"`
+		EvidenceID    int64  `json:"evidence_id"`
+		StreamID      int64  `json:"stream_id"`
+		AuthorityCode string `json:"authority_code"`
 	}
-	if err := json.Unmarshal(attestRec.Body.Bytes(), &baselineEvidence); err != nil || baselineEvidence.EvidenceID <= 0 {
+	if err := json.Unmarshal(attestRec.Body.Bytes(), &baselineEvidence); err != nil || baselineEvidence.EvidenceID <= 0 || baselineEvidence.StreamID != streamID || baselineEvidence.AuthorityCode != "deniz_fd_restore_20260814" {
 		t.Fatalf("decode baseline evidence: err=%v body=%s", err, attestRec.Body.String())
 	}
 	sceneEvidenceID = baselineEvidence.EvidenceID
@@ -904,7 +915,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if secondPresentRec.Code != http.StatusOK {
 		t.Fatalf("second baseline presentation status=%d body=%s", secondPresentRec.Code, secondPresentRec.Body.String())
 	}
-	secondAttestBody, _ := json.Marshal(sceneAttestRequest{StreamID: secondStreamID, AuthorityCode: "deniz_fd_restore_20260814", FrameID: secondFrameID, PresentationID: secondPresentRec.Header().Get("X-Stoarama-Presentation-ID"), SceneIdentity: "Second Approved Scene"})
+	secondAttestBody, _ := json.Marshal(sceneAttestRequest{FrameID: secondFrameID, PresentationID: secondPresentRec.Header().Get("X-Stoarama-Presentation-ID"), SceneIdentity: "Second Approved Scene"})
 	secondAttestReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewReader(secondAttestBody))
 	secondAttestReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
 	secondAttestRec := httptest.NewRecorder()
