@@ -75,6 +75,21 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if err := ValidateCampaignExecutorPrivileges(ctx, executorPool, "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err != nil {
 		t.Fatalf("executor privilege manifest: %v", err)
 	}
+	if _, err := executorPool.Exec(ctx, `SELECT id FROM frames LIMIT 1`); err == nil {
+		t.Fatal("executor read protected frame rows directly")
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT id FROM media_objects LIMIT 1`); err == nil {
+		t.Fatal("executor read protected media-object rows directly")
+	}
+	if _, err := migrator.Exec(ctx, `REVOKE SELECT ON frames FROM stoarama_test_admission_authority`); err != nil {
+		t.Fatalf("revoke protected frame dependency fixture: %v", err)
+	}
+	if err := ValidateCampaignExecutorPrivileges(ctx, executorPool, "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err == nil {
+		t.Fatal("executor startup accepted a missing authority frame dependency")
+	}
+	if _, err := migrator.Exec(ctx, `GRANT SELECT ON frames TO stoarama_test_admission_authority`); err != nil {
+		t.Fatalf("restore protected frame dependency fixture: %v", err)
+	}
 	unreviewedRole := fmt.Sprintf("campaign_unreviewed_%d", time.Now().UnixNano())
 	unreviewedIdentifier := pgx.Identifier{unreviewedRole}.Sanitize()
 	if _, err := admin.Exec(ctx, `CREATE ROLE `+unreviewedIdentifier+`; GRANT stoarama_test_admission_authority TO `+unreviewedIdentifier); err != nil {
@@ -217,6 +232,27 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if approvalID == uuid.Nil || len(approvalSHA) != 64 {
 		t.Fatalf("invalid approval result id=%s sha=%q", approvalID, approvalSHA)
 	}
+	// Exercise the actual executor -> authority definer chain over both product
+	// dependencies. The executor itself has no frame/media table rights.
+	baselineRequestID := uuid.New()
+	var baselineReceiptID, baselinePresentationID uuid.UUID
+	var baselineReadSHA, baselineObjectKey, baselineETag string
+	var baselineSize int64
+	if err := executorPool.QueryRow(ctx, `SELECT read_receipt_id,frame_sha256,media_object_key,media_etag,media_size_bytes FROM recording_campaign_read_baseline_scene($1,$2,$3,$4,$5,'deniz_fd_restore_20260814',$6,$7)`, baselineRequestID, accountID, userID, sessionID, credentialSHA, streamID, frameID).Scan(&baselineReceiptID, &baselineReadSHA, &baselineObjectKey, &baselineETag, &baselineSize); err != nil {
+		t.Fatalf("split-role baseline read: %v", err)
+	}
+	var presentedSHA, presentedObjectKey, presentedETag string
+	if err := executorPool.QueryRow(ctx, `SELECT presentation_id,frame_sha256,media_object_key,media_etag FROM recording_campaign_present_baseline_scene($1,$2,$3,$4,$5,$6,'deniz_fd_restore_20260814',$7,$8)`, baselineRequestID, baselineReceiptID, accountID, userID, sessionID, credentialSHA, streamID, frameID).Scan(&baselinePresentationID, &presentedSHA, &presentedObjectKey, &presentedETag); err != nil {
+		t.Fatalf("split-role baseline presentation: %v", err)
+	}
+	var attestedSceneID int64
+	var attestedSceneSHA string
+	if err := executorPool.QueryRow(ctx, `SELECT evidence_id,evidence_sha256 FROM recording_campaign_attest_baseline_scene($1,$2,$3,$4,$5,$6,$7)`, baselinePresentationID, accountID, userID, sessionID, credentialSHA, frameID, sceneSHA).Scan(&attestedSceneID, &attestedSceneSHA); err != nil {
+		t.Fatalf("split-role baseline attestation: %v", err)
+	}
+	if baselineReceiptID == uuid.Nil || baselinePresentationID == uuid.Nil || baselineReadSHA != frameSHA || presentedSHA != frameSHA || baselineObjectKey != "scene.jpg" || presentedObjectKey != baselineObjectKey || presentedETag != baselineETag || baselineSize != 1 || attestedSceneID != sceneID || len(attestedSceneSHA) != 64 {
+		t.Fatalf("split-role baseline chain mismatch receipt=%s presentation=%s frame=%q/%q object=%q/%q etag=%q/%q size=%d scene=%d/%d sha=%q", baselineReceiptID, baselinePresentationID, baselineReadSHA, presentedSHA, baselineObjectKey, presentedObjectKey, baselineETag, presentedETag, baselineSize, attestedSceneID, sceneID, attestedSceneSHA)
+	}
 	// A second, independent approval exercises the probe-vs-expiration fence in
 	// both commit orders without consuming the activation-reservation fixture.
 	const probeRaceStreamID int64 = 17237
@@ -297,6 +333,186 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	}
 	if err := probeLeaseTx.Commit(ctx); err != nil {
 		t.Fatalf("commit probe-first side of expiration race: %v", err)
+	}
+	failedObservation, _ := json.Marshal(map[string]any{
+		"result": "source_unstable", "valid_ratio": 0.0, "duration_ms": 0, "segment_count": 0,
+		"frame_sha256": "", "media_sha256": "", "native_signature_sha256": "", "challenge_proof_sha256": "",
+		"video_codec": "", "audio_codec": "", "audio_present": false, "video_width": 0, "video_height": 0,
+		"actual_fps": nil, "detail": "resolve_failed", "media_size_bytes": 0, "media_etag": "", "media_version_id": "",
+		"frame_size_bytes": 0, "frame_etag": "", "frame_version_id": "", "archive_bucket_sha256": "",
+		"media_archive_object_key": "", "media_archive_sha256": "", "media_archive_etag": "", "media_archive_version_id": "",
+		"frame_archive_object_key": "", "frame_archive_sha256": "", "frame_archive_etag": "", "frame_archive_version_id": "",
+		"submission_request_sha256": strings.Repeat("d", 64), "evidence_sha256": strings.Repeat("0", 64),
+	})
+	setAttemptWindow := func(startDelta, expiryDelta string) {
+		t.Helper()
+		windowTx, err := migrator.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := windowTx.Exec(ctx, `SET LOCAL ROLE stoarama_test_admission_authority`); err != nil {
+			_ = windowTx.Rollback(ctx)
+			t.Fatalf("enter attempt-window authority role: %v", err)
+		}
+		if _, err := windowTx.Exec(ctx, `ALTER TABLE recording_targeted_probe_attempts DISABLE TRIGGER USER`); err != nil {
+			_ = windowTx.Rollback(ctx)
+			t.Fatalf("disable isolated attempt fixture triggers: %v", err)
+		}
+		if _, err := windowTx.Exec(ctx, `UPDATE recording_targeted_probe_attempts SET started_at=recording_campaign_now()+$2::interval,expires_at=recording_campaign_now()+$3::interval WHERE id=$1`, probeAttemptID, startDelta, expiryDelta); err != nil {
+			_ = windowTx.Rollback(ctx)
+			t.Fatalf("set isolated attempt window: %v", err)
+		}
+		if _, err := windowTx.Exec(ctx, `ALTER TABLE recording_targeted_probe_attempts ENABLE TRIGGER USER`); err != nil {
+			_ = windowTx.Rollback(ctx)
+			t.Fatalf("restore isolated attempt fixture triggers: %v", err)
+		}
+		if err := windowTx.Commit(ctx); err != nil {
+			t.Fatalf("commit isolated attempt window: %v", err)
+		}
+	}
+	insertAttemptTerminal := func(execCtx context.Context) error {
+		terminalTx, err := migrator.Begin(execCtx)
+		if err != nil {
+			return err
+		}
+		defer terminalTx.Rollback(execCtx)
+		if _, err = terminalTx.Exec(execCtx, `SET LOCAL ROLE stoarama_test_admission_authority`); err != nil {
+			return err
+		}
+		if _, err = terminalTx.Exec(execCtx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256)
+			SELECT $1,'expired_without_evidence',encode(sha256(convert_to(
+			'expired_without_evidence'||chr(0)||$1::uuid::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')`, probeAttemptID); err != nil {
+			return err
+		}
+		return terminalTx.Commit(execCtx)
+	}
+
+	// Terminal-first: hold a correctly authored terminal event uncommitted.
+	// The supported executor submission must wait, then reject after the event
+	// commits. This proves the terminal projection, not a malformed-digest
+	// negative, wins this commit order.
+	setAttemptWindow("-14 minutes -58 seconds", "+2 seconds")
+	terminalFirstEvidenceTx, err := executorPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preExpiryNow time.Time
+	if err := terminalFirstEvidenceTx.QueryRow(ctx, `SELECT transaction_timestamp()`).Scan(&preExpiryNow); err != nil {
+		_ = terminalFirstEvidenceTx.Rollback(ctx)
+		t.Fatalf("start pre-expiry evidence transaction: %v", err)
+	}
+	time.Sleep(2250 * time.Millisecond)
+	terminalFirstTx, err := migrator.Begin(ctx)
+	if err != nil {
+		_ = terminalFirstEvidenceTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err := terminalFirstTx.Exec(ctx, `SET LOCAL ROLE stoarama_test_admission_authority`); err != nil {
+		_ = terminalFirstTx.Rollback(ctx)
+		_ = terminalFirstEvidenceTx.Rollback(ctx)
+		t.Fatalf("enter terminal-first authority role: %v", err)
+	}
+	if _, err := terminalFirstTx.Exec(ctx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256)
+		SELECT $1,'expired_without_evidence',encode(sha256(convert_to(
+		'expired_without_evidence'||chr(0)||$1::uuid::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')`, probeAttemptID); err != nil {
+		_ = terminalFirstTx.Rollback(ctx)
+		t.Fatalf("author valid terminal-first event: %v", err)
+	}
+	terminalFirstEvidence := make(chan error, 1)
+	go func() {
+		_, submitErr := terminalFirstEvidenceTx.Exec(ctx, `SELECT evidence_id FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeAttemptID, probeRequestID, probeRaceApprovalID, accountID, probeRaceStreamID, failedObservation)
+		terminalFirstEvidence <- submitErr
+	}()
+	select {
+	case early := <-terminalFirstEvidence:
+		_ = terminalFirstTx.Rollback(ctx)
+		_ = terminalFirstEvidenceTx.Rollback(ctx)
+		t.Fatalf("evidence crossed uncommitted valid terminal event: %v", early)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := terminalFirstTx.Commit(ctx); err != nil {
+		t.Fatalf("commit terminal-first event: %v", err)
+	}
+	select {
+	case submitErr := <-terminalFirstEvidence:
+		if submitErr == nil || (!strings.Contains(submitErr.Error(), "already terminal") && !strings.Contains(submitErr.Error(), "mutually exclusive")) {
+			_ = terminalFirstEvidenceTx.Rollback(ctx)
+			t.Fatalf("terminal-first race did not reject evidence: %v", submitErr)
+		}
+	case <-time.After(5 * time.Second):
+		_ = terminalFirstEvidenceTx.Rollback(ctx)
+		t.Fatal("terminal-first evidence did not resume")
+	}
+	_ = terminalFirstEvidenceTx.Rollback(ctx)
+	var terminalCount, evidenceCount int
+	if err := migrator.QueryRow(ctx, `SELECT (SELECT count(*) FROM recording_targeted_probe_attempt_terminal_events WHERE attempt_id=$1),(SELECT count(*) FROM recording_targeted_probe_evidence WHERE attempt_id=$1)`, probeAttemptID).Scan(&terminalCount, &evidenceCount); err != nil || terminalCount != 1 || evidenceCount != 0 {
+		t.Fatalf("terminal-first race did not leave exactly one truth: terminal=%d evidence=%d err=%v", terminalCount, evidenceCount, err)
+	}
+
+	// Reset only this isolated-schema race fixture so the inverse commit order
+	// can exercise the identical immutable attempt.
+	resetTerminalTx, err := migrator.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resetTerminalTx.Exec(ctx, `SET LOCAL ROLE stoarama_test_admission_authority`); err != nil {
+		_ = resetTerminalTx.Rollback(ctx)
+		t.Fatalf("enter isolated authority role: %v", err)
+	}
+	if _, err := resetTerminalTx.Exec(ctx, `ALTER TABLE recording_targeted_probe_attempt_terminal_events DISABLE TRIGGER USER`); err != nil {
+		_ = resetTerminalTx.Rollback(ctx)
+		t.Fatalf("disable isolated terminal fixture triggers: %v", err)
+	}
+	if _, err := resetTerminalTx.Exec(ctx, `DELETE FROM recording_targeted_probe_attempt_terminal_events WHERE attempt_id=$1`, probeAttemptID); err != nil {
+		_ = resetTerminalTx.Rollback(ctx)
+		t.Fatalf("delete isolated terminal fixture: %v", err)
+	}
+	if _, err := resetTerminalTx.Exec(ctx, `ALTER TABLE recording_targeted_probe_attempt_terminal_events ENABLE TRIGGER USER`); err != nil {
+		_ = resetTerminalTx.Rollback(ctx)
+		t.Fatalf("restore isolated terminal fixture triggers: %v", err)
+	}
+	if err := resetTerminalTx.Commit(ctx); err != nil {
+		t.Fatalf("commit isolated terminal fixture reset: %v", err)
+	}
+	setAttemptWindow("-14 minutes -58 seconds", "+2 seconds")
+	if _, err := migrator.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=recording_campaign_now() WHERE id=$1; UPDATE nodes SET last_heartbeat_at=recording_campaign_now() WHERE id=$2`, probeDropletID, probeNodeID); err != nil {
+		t.Fatalf("refresh isolated probe principal: %v", err)
+	}
+
+	// Evidence-first: the supported executor statement owns the same global and
+	// attempt fences. A correctly authored terminal insert starts after expiry,
+	// waits, then rejects once the evidence commit becomes visible.
+	evidenceFirstTx, err := executorPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidenceFirstID uuid.UUID
+	if err := evidenceFirstTx.QueryRow(ctx, `SELECT evidence_id FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeAttemptID, probeRequestID, probeRaceApprovalID, accountID, probeRaceStreamID, failedObservation).Scan(&evidenceFirstID); err != nil {
+		_ = evidenceFirstTx.Rollback(ctx)
+		t.Fatalf("author evidence-first result: %v", err)
+	}
+	time.Sleep(2250 * time.Millisecond)
+	evidenceFirstTerminal := make(chan error, 1)
+	go func() { evidenceFirstTerminal <- insertAttemptTerminal(ctx) }()
+	select {
+	case early := <-evidenceFirstTerminal:
+		_ = evidenceFirstTx.Rollback(ctx)
+		t.Fatalf("terminal crossed uncommitted evidence: %v", early)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := evidenceFirstTx.Commit(ctx); err != nil {
+		t.Fatalf("commit evidence-first result: %v", err)
+	}
+	select {
+	case terminalErr := <-evidenceFirstTerminal:
+		if terminalErr == nil || !strings.Contains(terminalErr.Error(), "database-authored") {
+			t.Fatalf("evidence-first race did not reject terminal event: %v", terminalErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("evidence-first terminal did not resume")
+	}
+	if err := migrator.QueryRow(ctx, `SELECT (SELECT count(*) FROM recording_targeted_probe_attempt_terminal_events WHERE attempt_id=$1),(SELECT count(*) FROM recording_targeted_probe_evidence WHERE attempt_id=$1)`, probeAttemptID).Scan(&terminalCount, &evidenceCount); err != nil || terminalCount != 0 || evidenceCount != 1 || evidenceFirstID == uuid.Nil {
+		t.Fatalf("evidence-first race did not leave exactly one truth: terminal=%d evidence=%d id=%s err=%v", terminalCount, evidenceCount, evidenceFirstID, err)
 	}
 	var draftTrackID int64
 	if err := migrator.QueryRow(ctx, `INSERT INTO recording_campaign_tracks(account_id,campaign_key,label,deadline_at,target_count,grade_floor,required_consecutive_windows,created_by_user_id,reporting_grade_floor,reporting_required_consecutive_windows) VALUES($1,$2,'reservation collision fixture',recording_campaign_now()+interval '3 days',1,'GOOD',14,$3,'ACCEPTABLE',14) RETURNING id`, accountID, "draft-collision-"+uuid.NewString(), userID).Scan(&draftTrackID); err != nil {
@@ -428,23 +644,6 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("probe lease did not resume after approval terminal commit")
-	}
-	terminalFirstObservation, _ := json.Marshal(map[string]any{
-		"result": "ok", "valid_ratio": 1.0, "duration_ms": 119960, "segment_count": 2,
-		"frame_sha256": strings.Repeat("1", 64), "media_sha256": strings.Repeat("2", 64),
-		"native_signature_sha256": strings.Repeat("3", 64), "challenge_proof_sha256": strings.Repeat("4", 64),
-		"video_codec": "h264", "audio_codec": "aac", "audio_present": true, "video_width": 1920,
-		"video_height": 1080, "actual_fps": 30.0, "detail": "valid_ratio=1.000 segments=2 native_signature_stable=true frame=true",
-		"media_size_bytes": 1, "media_etag": "media", "media_version_id": "", "frame_size_bytes": 1,
-		"frame_etag": "frame", "frame_version_id": "", "archive_bucket_sha256": strings.Repeat("5", 64),
-		"media_archive_object_key": "protected/campaign-probe/" + probeAttemptID.String() + "/media.zip",
-		"media_archive_sha256":     strings.Repeat("6", 64), "media_archive_etag": "archive-media", "media_archive_version_id": "",
-		"frame_archive_object_key": "protected/campaign-probe/" + probeAttemptID.String() + "/frame.jpg",
-		"frame_archive_sha256":     strings.Repeat("1", 64), "frame_archive_etag": "archive-frame", "frame_archive_version_id": "",
-		"submission_request_sha256": strings.Repeat("7", 64), "evidence_sha256": strings.Repeat("8", 64),
-	})
-	if _, err := executorPool.Exec(ctx, `SELECT evidence_id FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeAttemptID, probeRequestID, probeRaceApprovalID, accountID, probeRaceStreamID, terminalFirstObservation); err == nil || !strings.Contains(err.Error(), "already terminal") {
-		t.Fatalf("terminal-first attempt accepted evidence: %v", err)
 	}
 	if _, err := executorPool.Exec(ctx, `SELECT order_id FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), probeRaceApprovalID, accountID, userID, expireSessionID, expireCredentialSHA, probeRaceStreamID); err == nil {
 		t.Fatal("terminal approval accepted a new probe order")
@@ -594,6 +793,7 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"recording_campaign_read_probe_attempt",
 		"recording_campaign_read_probe_scene",
 		"recording_campaign_read_baseline_scene",
+		"%I.frames,%I.media_objects,%I.recording_scene_frame_evidence",
 		"campaign activation requires a fresh typed capacity observation",
 		"campaign one-worker-loss capacity head is permanently enforced",
 		"recording_campaign_relay_failure_capacity",

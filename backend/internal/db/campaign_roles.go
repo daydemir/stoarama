@@ -67,6 +67,13 @@ var campaignRuntimeReadOnlyProductTables = []string{
 	"recording_campaign_track_events",
 }
 
+// These product rows are read only by authority-owned SECURITY DEFINER
+// procedures. The executor must not receive direct table access, but startup
+// must prove the definer owner can resolve the exact protected frame bytes.
+var campaignAuthorityReadOnlyProductTables = []string{
+	"frames", "media_objects",
+}
+
 var campaignRuntimeDeniedProductSequences = []string{
 	"recording_campaign_track_events_id_seq",
 }
@@ -221,7 +228,7 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 	}
 	var sessionUser, currentUser string
 	var super, member, ownsObjects, schemaCreate, migrationApplied bool
-	var tablePrivileges, invalidFunctions int
+	var tablePrivileges, invalidFunctions, invalidAuthorityDependencies int
 	err := pool.QueryRow(ctx, `
 		SELECT session_user,current_user,r.rolsuper,
 		       pg_has_role(current_user,$2,'MEMBER'),
@@ -238,12 +245,17 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 		               NOT COALESCE(p.proconfig,'{}'::text[]) @> ARRAY[format('search_path=%s, pg_catalog, pg_temp',current_schema())] OR
 		               has_function_privilege(current_user,p.oid,'EXECUTE') IS DISTINCT FROM (signature=ANY($4::text[])) OR
 		               EXISTS(SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) acl WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE')),
+		       (SELECT count(*) FROM unnest($5::text[]) name
+		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),name)) AND c.relkind IN('r','p')
+		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
+		               has_table_privilege($2,c.oid,'INSERT') OR has_table_privilege($2,c.oid,'UPDATE') OR
+		               has_table_privilege($2,c.oid,'DELETE') OR has_table_privilege($2,c.oid,'TRUNCATE')),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign executor privileges: %w", err)
 	}
-	if sessionUser != executorRole || currentUser != executorRole || super || member || ownsObjects || schemaCreate || tablePrivileges != 0 || invalidFunctions != 0 || !migrationApplied {
+	if sessionUser != executorRole || currentUser != executorRole || super || member || ownsObjects || schemaCreate || tablePrivileges != 0 || invalidFunctions != 0 || invalidAuthorityDependencies != 0 || !migrationApplied {
 		return fmt.Errorf("campaign executor database privilege boundary is not exact")
 	}
 	var productFunctionExec int
