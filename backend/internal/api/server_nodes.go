@@ -614,14 +614,20 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 		    (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 		  SELECT node_id,recording_claim_generation,
 		         CASE WHEN recording_claim_generation=1 THEN NULL ELSE recording_claim_generation-1 END,
-		         id,'host_lost',encode(sha256(convert_to('recording-worker-host-lost-v1'||chr(0)||node_id::text||chr(0)||recording_claim_generation::text||chr(0)||id::text,'UTF8')),'hex')
+		         id,'host_lost',encode(sha256(convert_to('recording-worker-host-lost-v1','UTF8')
+		           ||decode('00','hex')||convert_to(node_id::text,'UTF8')
+		           ||decode('00','hex')||convert_to(recording_claim_generation::text,'UTF8')
+		           ||decode('00','hex')||convert_to(id::text,'UTF8')),'hex')
 		  FROM retired
 		)
 		INSERT INTO recording_worker_claim_generation_events
 		  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 		SELECT node_id,recording_claim_generation,
 		       CASE WHEN recording_claim_generation=1 THEN NULL ELSE recording_claim_generation-1 END,
-		       id,'retired',encode(sha256(convert_to('recording-worker-claim-retired-v1'||chr(0)||node_id::text||chr(0)||recording_claim_generation::text||chr(0)||id::text,'UTF8')),'hex')
+		       id,'retired',encode(sha256(convert_to('recording-worker-claim-retired-v1','UTF8')
+		         ||decode('00','hex')||convert_to(node_id::text,'UTF8')
+		         ||decode('00','hex')||convert_to(recording_claim_generation::text,'UTF8')
+		         ||decode('00','hex')||convert_to(id::text,'UTF8')),'hex')
 		FROM retired
 	`, id); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("revoke node tokens: %v", err))

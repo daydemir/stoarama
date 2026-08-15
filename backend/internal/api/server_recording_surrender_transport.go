@@ -1070,7 +1070,10 @@ func (s *Server) handleRecordingClaimSuccessorAck(w http.ResponseWriter, r *http
 		INSERT INTO recording_worker_claim_generation_events
 		  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 		SELECT $2,$3,CASE WHEN $3=1 THEN NULL ELSE $3-1 END,$1,'retired',
-		       encode(sha256(convert_to('recording-worker-claim-retired-v1'||chr(0)||$2::text||chr(0)||$3::text||chr(0)||$1::text,'UTF8')),'hex')
+		       encode(sha256(convert_to('recording-worker-claim-retired-v1','UTF8')
+		         ||decode('00','hex')||convert_to($2::text,'UTF8')
+		         ||decode('00','hex')||convert_to($3::text,'UTF8')
+		         ||decode('00','hex')||convert_to($1::text,'UTF8')),'hex')
 		FROM retired ON CONFLICT DO NOTHING
 	`, predecessorTokenID, nodeID, predecessor); err != nil {
 		util.WriteError(w, http.StatusConflict, "retire drained predecessor credential")

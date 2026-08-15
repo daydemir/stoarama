@@ -60,9 +60,11 @@ BEGIN
   NEW.event_at:=transaction_timestamp();
   IF NEW.event_type IN('retired','host_lost') THEN
     SELECT * INTO token FROM node_tokens WHERE id=NEW.claim_token_id FOR SHARE;
-		expected:=encode(sha256(convert_to(
-		  CASE WHEN NEW.event_type='retired' THEN 'recording-worker-claim-retired-v1' ELSE 'recording-worker-host-lost-v1' END
-		  ||chr(0)||NEW.node_id::text||chr(0)||NEW.generation::text||chr(0)||NEW.claim_token_id::text,'UTF8')),'hex');
+		expected:=encode(sha256(
+		  convert_to(CASE WHEN NEW.event_type='retired' THEN 'recording-worker-claim-retired-v1' ELSE 'recording-worker-host-lost-v1' END,'UTF8')
+		  ||decode('00','hex')||convert_to(NEW.node_id::text,'UTF8')
+		  ||decode('00','hex')||convert_to(NEW.generation::text,'UTF8')
+		  ||decode('00','hex')||convert_to(NEW.claim_token_id::text,'UTF8')),'hex');
     IF token.id IS NULL OR token.node_id<>NEW.node_id
        OR token.recording_claim_generation<>NEW.generation
        OR token.revoked_at IS DISTINCT FROM transaction_timestamp()
@@ -94,9 +96,12 @@ BEGIN
 		  WHERE lease.node_id=NEW.node_id AND plan.origin_claim_generation=NEW.generation
 		    AND job.status='leased' AND job.lease_expires_at<transaction_timestamp()
 		    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
-		    AND NEW.facts_sha256=encode(sha256(convert_to(
-		      'recording-worker-recovery-block-v1'||chr(0)||NEW.node_id::text||chr(0)||NEW.generation::text
-		      ||chr(0)||job.id::text||chr(0)||lease.lease_token::text,'UTF8')),'hex')
+		    AND NEW.facts_sha256=encode(sha256(
+		      convert_to('recording-worker-recovery-block-v1','UTF8')
+		      ||decode('00','hex')||convert_to(NEW.node_id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(NEW.generation::text,'UTF8')
+		      ||decode('00','hex')||convert_to(job.id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(lease.lease_token::text,'UTF8')),'hex')
 		) THEN RAISE EXCEPTION 'claim recovery block event lacks exact expired capture authority'; END IF;
 	ELSIF NEW.event_type='successor_proposed' THEN
 		IF NOT EXISTS(
@@ -104,10 +109,14 @@ BEGIN
 		  WHERE proposal.node_id=NEW.node_id AND proposal.successor_generation=NEW.generation
 		    AND proposal.predecessor_generation=NEW.predecessor_generation
 		    AND proposal.successor_token_id=NEW.claim_token_id
-		    AND NEW.facts_sha256=encode(sha256(convert_to(
-		      'recording-claim-successor-v1'||chr(0)||proposal.node_id::text||chr(0)||proposal.predecessor_generation::text
-		      ||chr(0)||proposal.successor_generation::text||chr(0)||proposal.id::text||chr(0)||proposal.successor_token_id::text
-		      ||chr(0)||proposal.successor_secret_sha256,'UTF8')),'hex')
+		    AND NEW.facts_sha256=encode(sha256(
+		      convert_to('recording-claim-successor-v1','UTF8')
+		      ||decode('00','hex')||convert_to(proposal.node_id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.predecessor_generation::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.successor_generation::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.successor_token_id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.successor_secret_sha256,'UTF8')),'hex')
 		) THEN RAISE EXCEPTION 'claim successor event lacks exact proposal'; END IF;
 	ELSIF NEW.event_type='enabled' THEN
 		IF NOT EXISTS(
@@ -116,10 +125,14 @@ BEGIN
 		  WHERE proposal.node_id=NEW.node_id AND proposal.successor_generation=NEW.generation
 		    AND proposal.predecessor_generation=NEW.predecessor_generation
 		    AND proposal.successor_token_id=NEW.claim_token_id
-		    AND NEW.facts_sha256=encode(sha256(convert_to(
-		      'recording-claim-successor-v1'||chr(0)||proposal.node_id::text||chr(0)||proposal.predecessor_generation::text
-		      ||chr(0)||proposal.successor_generation::text||chr(0)||proposal.id::text||chr(0)||proposal.successor_token_id::text
-		      ||chr(0)||proposal.successor_secret_sha256,'UTF8')),'hex')
+		    AND NEW.facts_sha256=encode(sha256(
+		      convert_to('recording-claim-successor-v1','UTF8')
+		      ||decode('00','hex')||convert_to(proposal.node_id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.predecessor_generation::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.successor_generation::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.successor_token_id::text,'UTF8')
+		      ||decode('00','hex')||convert_to(proposal.successor_secret_sha256,'UTF8')),'hex')
 		) THEN RAISE EXCEPTION 'claim enabled event lacks exact acknowledged proposal'; END IF;
   END IF;
   RETURN NEW;
@@ -190,7 +203,9 @@ SELECT node_id,1,id,'enabled' FROM node_tokens WHERE revoked_at IS NULL;
 
 INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 SELECT node_id,1,NULL,id,'baseline',
-       encode(sha256(convert_to('recording-worker-claim-baseline-v1'||chr(0)||node_id::text||chr(0)||id::text,'UTF8')),'hex')
+       encode(sha256(convert_to('recording-worker-claim-baseline-v1','UTF8')
+         ||decode('00','hex')||convert_to(node_id::text,'UTF8')
+         ||decode('00','hex')||convert_to(id::text,'UTF8')),'hex')
 FROM node_tokens WHERE revoked_at IS NULL;
 
 CREATE FUNCTION recording_surrender_initialize_claim_token() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -230,7 +245,10 @@ BEGIN
   END IF;
   IF NEW.recording_claim_purpose<>'claim_current' THEN RETURN NULL; END IF;
   SELECT * INTO head FROM recording_worker_claim_heads WHERE node_id=NEW.node_id FOR UPDATE;
-  facts:=encode(sha256(convert_to('recording-worker-enrollment-v1'||chr(0)||NEW.node_id::text||chr(0)||NEW.recording_claim_generation::text||chr(0)||NEW.id::text,'UTF8')),'hex');
+  facts:=encode(sha256(convert_to('recording-worker-enrollment-v1','UTF8')
+    ||decode('00','hex')||convert_to(NEW.node_id::text,'UTF8')
+    ||decode('00','hex')||convert_to(NEW.recording_claim_generation::text,'UTF8')
+    ||decode('00','hex')||convert_to(NEW.id::text,'UTF8')),'hex');
   IF head.node_id IS NULL THEN
     INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
     VALUES(NEW.node_id,NEW.recording_claim_generation,NULL,NEW.id,'baseline',facts);
@@ -836,7 +854,9 @@ WITH owners AS (
 )
 INSERT INTO recording_object_key_roots(id,storage_destination_id,bucket,object_key,owner_kind,owner_identity,semantic_identity_sha256)
 SELECT gen_random_uuid(),storage_destination_id,bucket,object_key,owner_kind,owner_identity,
-       encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||owner_kind||chr(0)||owner_identity,'UTF8')),'hex')
+       encode(sha256(convert_to('recording-object-key-owner-v1','UTF8')
+         ||decode('00','hex')||convert_to(owner_kind,'UTF8')
+         ||decode('00','hex')||convert_to(owner_identity,'UTF8')),'hex')
 FROM owners;
 
 CREATE FUNCTION recording_surrender_validate_key_root_transition() RETURNS trigger
@@ -861,7 +881,9 @@ BEGIN
       AND intent.bucket=OLD.bucket AND intent.object_key=OLD.object_key;
     expected_identity:='intent:'||intent_id::text||':clip:'||clip_id::text;
     IF NEW.owner_identity<>expected_identity
-       OR NEW.semantic_identity_sha256<>encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||'legacy_clip'||chr(0)||expected_identity,'UTF8')),'hex') THEN
+       OR NEW.semantic_identity_sha256<>encode(sha256(convert_to('recording-object-key-owner-v1','UTF8')
+         ||decode('00','hex')||convert_to('legacy_clip','UTF8')
+         ||decode('00','hex')||convert_to(expected_identity,'UTF8')),'hex') THEN
       RAISE EXCEPTION 'recording destination key consumption identity differs';
     END IF;
     RETURN NEW;
@@ -915,7 +937,9 @@ BEGIN
       consumed_identity:=expected_identity||':clip:'||clip_id::text;
       UPDATE recording_object_key_roots
       SET owner_kind='legacy_clip',owner_identity=consumed_identity,
-          semantic_identity_sha256=encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||'legacy_clip'||chr(0)||consumed_identity,'UTF8')),'hex')
+          semantic_identity_sha256=encode(sha256(convert_to('recording-object-key-owner-v1','UTF8')
+            ||decode('00','hex')||convert_to('legacy_clip','UTF8')
+            ||decode('00','hex')||convert_to(consumed_identity,'UTF8')),'hex')
       WHERE storage_destination_id=NEW.storage_destination_id AND bucket=NEW.bucket AND object_key=NEW.object_key
         AND owner_kind='legacy_intent' AND owner_identity=expected_identity;
       IF NOT FOUND THEN RAISE EXCEPTION 'recording intent consumption lacks exact destination owner'; END IF;
@@ -928,7 +952,9 @@ BEGIN
   IF NOT FOUND THEN
     INSERT INTO recording_object_key_roots(id,storage_destination_id,bucket,object_key,owner_kind,owner_identity,semantic_identity_sha256)
     VALUES(gen_random_uuid(),NEW.storage_destination_id,NEW.bucket,NEW.object_key,'legacy_intent',expected_identity,
-      encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||'legacy_intent'||chr(0)||expected_identity,'UTF8')),'hex'));
+      encode(sha256(convert_to('recording-object-key-owner-v1','UTF8')
+        ||decode('00','hex')||convert_to('legacy_intent','UTF8')
+        ||decode('00','hex')||convert_to(expected_identity,'UTF8')),'hex'));
   ELSIF NOT ((root.owner_kind='legacy_intent' AND root.owner_identity=expected_identity)
           OR (root.owner_kind='legacy_clip' AND root.owner_identity LIKE expected_identity||':clip:%')
           OR (root.owner_kind='capture_artifact' AND root.owner_identity LIKE '%:'||NEW.id::text)) THEN
@@ -967,7 +993,9 @@ BEGIN
 	END IF;
 	INSERT INTO recording_object_key_roots(id,storage_destination_id,bucket,object_key,owner_kind,owner_identity,semantic_identity_sha256)
 	VALUES(gen_random_uuid(),NEW.storage_destination_id,NEW.bucket,NEW.object_key,'legacy_clip','clip:'||NEW.id::text,
-	  encode(sha256(convert_to('recording-object-key-owner-v1'||chr(0)||'legacy_clip'||chr(0)||'clip:'||NEW.id::text,'UTF8')),'hex'));
+	  encode(sha256(convert_to('recording-object-key-owner-v1','UTF8')
+	    ||decode('00','hex')||convert_to('legacy_clip','UTF8')
+	    ||decode('00','hex')||convert_to('clip:'||NEW.id::text,'UTF8')),'hex'));
 	RETURN NEW;
   END IF;
   SELECT id INTO intent_id FROM recording_upload_intents
@@ -3217,7 +3245,11 @@ BEGIN
 	  INSERT INTO recording_worker_claim_generation_events(node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 	  SELECT head.node_id,head.generation,CASE WHEN head.generation=1 THEN NULL ELSE head.generation-1 END,
 	         head.claim_token_id,'recovery_blocked',
-	         encode(sha256(convert_to('recording-worker-recovery-block-v1'||chr(0)||head.node_id::text||chr(0)||head.generation::text||chr(0)||j.id::text||chr(0)||j.lease_token::text,'UTF8')),'hex')
+	         encode(sha256(convert_to('recording-worker-recovery-block-v1','UTF8')
+	           ||decode('00','hex')||convert_to(head.node_id::text,'UTF8')
+	           ||decode('00','hex')||convert_to(head.generation::text,'UTF8')
+	           ||decode('00','hex')||convert_to(j.id::text,'UTF8')
+	           ||decode('00','hex')||convert_to(j.lease_token::text,'UTF8')),'hex')
 	  FROM recording_worker_claim_heads head WHERE head.node_id=lease_generation.node_id
 	  ON CONFLICT DO NOTHING;
 	  FOR capture_set_row IN

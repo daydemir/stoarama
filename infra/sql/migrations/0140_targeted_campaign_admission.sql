@@ -254,7 +254,9 @@ BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_attempts a LEFT JOIN %I.recording_targeted_probe_evidence e ON e.attempt_id=a.id WHERE a.id=$1 AND a.expires_at<=recording_campaign_now() AND e.id IS NULL FOR SHARE OF a)',s,s)
     INTO exact USING NEW.attempt_id;
-  expected:=encode(sha256(convert_to('expired_without_evidence'||chr(0)||NEW.attempt_id::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex');
+  expected:=encode(sha256(convert_to('expired_without_evidence','UTF8')
+    ||decode('00','hex')||convert_to(NEW.attempt_id::text,'UTF8')
+    ||decode('00','hex')||convert_to(extract(epoch from recording_campaign_now())::text,'UTF8')),'hex');
   IF exact IS DISTINCT FROM true OR NEW.result<>'expired_without_evidence' OR
      NEW.observed_at IS DISTINCT FROM recording_campaign_now() OR NEW.event_sha256<>expected THEN
     RAISE EXCEPTION 'targeted attempt terminal must be exact, expired, and database-authored';
@@ -736,8 +738,10 @@ BEGIN
   END IF;
 
   INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256)
-  SELECT pa.id,'expired_without_evidence',encode(sha256(convert_to(
-    'expired_without_evidence'||chr(0)||pa.id::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')
+  SELECT pa.id,'expired_without_evidence',encode(sha256(
+	convert_to('expired_without_evidence','UTF8')
+	||decode('00','hex')||convert_to(pa.id::text,'UTF8')
+	||decode('00','hex')||convert_to(extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')
   FROM recording_targeted_probe_attempts pa
   LEFT JOIN recording_targeted_probe_evidence pe ON pe.attempt_id=pa.id
   LEFT JOIN recording_targeted_probe_attempt_terminal_events terminal ON terminal.attempt_id=pa.id
@@ -1071,8 +1075,10 @@ BEGIN
     RAISE EXCEPTION 'campaign approval is not expired and unadmitted';
   END IF;
   INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256)
-  SELECT attempt.id,'expired_without_evidence',encode(sha256(convert_to(
-    'expired_without_evidence'||chr(0)||attempt.id::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')
+  SELECT attempt.id,'expired_without_evidence',encode(sha256(
+	convert_to('expired_without_evidence','UTF8')
+	||decode('00','hex')||convert_to(attempt.id::text,'UTF8')
+	||decode('00','hex')||convert_to(extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')
   FROM recording_targeted_probe_attempts attempt
   LEFT JOIN recording_targeted_probe_evidence evidence ON evidence.attempt_id=attempt.id
   LEFT JOIN recording_targeted_probe_attempt_terminal_events terminal ON terminal.attempt_id=attempt.id

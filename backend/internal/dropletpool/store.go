@@ -244,11 +244,17 @@ func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64)
 				INSERT INTO recording_worker_claim_generation_events
 				  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 				VALUES($2,$3,CASE WHEN $3=1 THEN NULL ELSE $3-1 END,$1,'host_lost',
-				  encode(sha256(convert_to('recording-worker-host-lost-v1'||chr(0)||$2::text||chr(0)||$3::text||chr(0)||$1::text,'UTF8')),'hex'));
+				  encode(sha256(convert_to('recording-worker-host-lost-v1','UTF8')
+				    ||decode('00','hex')||convert_to($2::text,'UTF8')
+				    ||decode('00','hex')||convert_to($3::text,'UTF8')
+				    ||decode('00','hex')||convert_to($1::text,'UTF8')),'hex'));
 				INSERT INTO recording_worker_claim_generation_events
 				  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
 				VALUES($2,$3,CASE WHEN $3=1 THEN NULL ELSE $3-1 END,$1,'retired',
-				  encode(sha256(convert_to('recording-worker-claim-retired-v1'||chr(0)||$2::text||chr(0)||$3::text||chr(0)||$1::text,'UTF8')),'hex'))
+				  encode(sha256(convert_to('recording-worker-claim-retired-v1','UTF8')
+				    ||decode('00','hex')||convert_to($2::text,'UTF8')
+				    ||decode('00','hex')||convert_to($3::text,'UTF8')
+				    ||decode('00','hex')||convert_to($1::text,'UTF8')),'hex'))
 			`, *nodeTokenID, tokenNode, generation); err != nil {
 				return fmt.Errorf("seal recorder token retirement: %w", err)
 			}

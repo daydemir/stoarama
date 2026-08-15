@@ -380,8 +380,10 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 			return err
 		}
 		if _, err = terminalTx.Exec(execCtx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256)
-			SELECT $1,'expired_without_evidence',encode(sha256(convert_to(
-			'expired_without_evidence'||chr(0)||$1::uuid::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')`, probeAttemptID); err != nil {
+			SELECT $1,'expired_without_evidence',encode(sha256(
+			convert_to('expired_without_evidence','UTF8')
+			||decode('00','hex')||convert_to($1::uuid::text,'UTF8')
+			||decode('00','hex')||convert_to(extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')`, probeAttemptID); err != nil {
 			return err
 		}
 		return terminalTx.Commit(execCtx)
@@ -413,8 +415,10 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 		t.Fatalf("enter terminal-first authority role: %v", err)
 	}
 	if _, err := terminalFirstTx.Exec(ctx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256)
-		SELECT $1,'expired_without_evidence',encode(sha256(convert_to(
-		'expired_without_evidence'||chr(0)||$1::uuid::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')`, probeAttemptID); err != nil {
+		SELECT $1,'expired_without_evidence',encode(sha256(
+		convert_to('expired_without_evidence','UTF8')
+		||decode('00','hex')||convert_to($1::uuid::text,'UTF8')
+		||decode('00','hex')||convert_to(extract(epoch from recording_campaign_now())::text,'UTF8')),'hex')`, probeAttemptID); err != nil {
 		_ = terminalFirstTx.Rollback(ctx)
 		t.Fatalf("author valid terminal-first event: %v", err)
 	}

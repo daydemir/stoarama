@@ -15,6 +15,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -571,6 +572,7 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	prepareRecordingCaptureSetGrantQueries(t, ctx, pool)
+	assertRecordingSurrenderNULDigestGoldens(t, ctx, pool)
 	fixture := seedPresentationV2Task(t, pool, 92001, 992001)
 	if _, err := pool.Exec(ctx, `
 		UPDATE nodes SET node_type='relay',display_name='r10-relay' WHERE id=$1;
@@ -1444,6 +1446,57 @@ func TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces(t *testing.T) {
 	}
 	if _, err = pool.Exec(ctx, `TRUNCATE stream_source_revisions`); err == nil {
 		t.Fatal("referenced source revision lineage was truncatable")
+	}
+}
+
+func TestRecordingSurrenderSQLRejectsTextNULConstruction(t *testing.T) {
+	files := []string{
+		"server_recording_surrender_transport.go",
+		"server_nodes.go",
+		filepath.Join("..", "dropletpool", "store.go"),
+		filepath.Join("..", "db", "recording_campaign_admission_migration_test.go"),
+		filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0139_recording_surrender_transport.sql"),
+		filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0140_targeted_campaign_admission.sql"),
+	}
+	for _, path := range files {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read SQL owner %s: %v", path, err)
+		}
+		if bytes.Contains(body, []byte("chr"+"(0)")) {
+			t.Fatalf("%s constructs a PostgreSQL text NUL; canonical digests must concatenate bytea components", path)
+		}
+	}
+}
+
+func assertRecordingSurrenderNULDigestGoldens(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	vectors := [][]string{
+		{"recording-worker-claim-retired-v1", "92001", "1", "42"},
+		{"recording-claim-successor-v1", "92001", "1", "2", "225b5cf4-a8a5-4c6e-8511-d3ec4a0325b8", "43", strings.Repeat("a", 64)},
+		{"recording-worker-claim-baseline-v1", "92001", "42"},
+		{"recording-worker-recovery-block-v1", "92001", "2", "992001", "782dfe4c-b5ef-482c-b5fd-c07be7aa7da2"},
+		{"recording-object-key-owner-v1", "legacy_clip", "clip:992001"},
+		{"expired_without_evidence", "225b5cf4-a8a5-4c6e-8511-d3ec4a0325b8", "1786665600.000000"},
+	}
+	for _, parts := range vectors {
+		components := []string{"convert_to($1::text,'UTF8')"}
+		arguments := make([]any, len(parts))
+		for index, part := range parts {
+			arguments[index] = part
+			if index > 0 {
+				components = append(components, "decode('00','hex')", fmt.Sprintf("convert_to($%d::text,'UTF8')", index+1))
+			}
+		}
+		var actual string
+		query := "SELECT encode(sha256(" + strings.Join(components, "||") + "),'hex')"
+		if err := pool.QueryRow(ctx, query, arguments...).Scan(&actual); err != nil {
+			t.Fatalf("compute PostgreSQL NUL digest for %q: %v", parts[0], err)
+		}
+		expected := sha256Hex([]byte(strings.Join(parts, "\x00")))
+		if actual != expected {
+			t.Fatalf("PostgreSQL NUL digest %q=%s, want Go %s", parts[0], actual, expected)
+		}
 	}
 }
 
