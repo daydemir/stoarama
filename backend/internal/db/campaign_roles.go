@@ -75,10 +75,13 @@ var campaignAuthorityReadOnlyProductTables = []string{
 }
 
 // Admission serializes against ordinary product writers by locking these
-// product identities. PostgreSQL requires UPDATE privilege for SELECT FOR
-// UPDATE, but the authority receives it only on the immutable id column.
-var campaignAuthorityLockProductTables = []string{
-	"accounts", "recorder_droplets", "streams",
+// product identities. PostgreSQL requires UPDATE privilege for FOR UPDATE and
+// FOR SHARE, but the authority receives it only on each immutable key column.
+var campaignAuthorityLockProductColumns = []string{
+	"accounts:id", "account_sessions:id", "connections:id", "frames:id", "media_objects:id",
+	"memberships:user_id", "node_tokens:id", "nodes:id", "recorder_droplets:id",
+	"recording_scene_frame_evidence:id", "recording_worker_claim_heads:node_id",
+	"stream_source_revisions:id", "streams:id", "users:id",
 }
 
 var campaignRuntimeDeniedProductSequences = []string{
@@ -262,14 +265,16 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
 		               has_table_privilege($2,c.oid,'INSERT') OR has_table_privilege($2,c.oid,'UPDATE') OR
 		               has_table_privilege($2,c.oid,'DELETE') OR has_table_privilege($2,c.oid,'TRUNCATE')),
-		       (SELECT count(*) FROM unnest($6::text[]) name
-		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),name)) AND c.relkind IN('r','p')
+		       (SELECT count(*) FROM unnest($6::text[]) spec
+		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),split_part(spec,':',1))) AND c.relkind IN('r','p')
 		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
-		               NOT has_column_privilege($2,c.oid,'id','UPDATE') OR has_table_privilege($2,c.oid,'UPDATE') OR
+		               split_part(spec,':',2)='' OR NOT has_column_privilege($2,c.oid,split_part(spec,':',2),'UPDATE') OR
+		               has_table_privilege($2,c.oid,'UPDATE') OR
 		               EXISTS(SELECT 1 FROM pg_attribute attribute WHERE attribute.attrelid=c.oid AND attribute.attnum>0 AND
-		                 NOT attribute.attisdropped AND attribute.attname<>'id' AND has_column_privilege($2,c.oid,attribute.attnum,'UPDATE'))),
+		                 NOT attribute.attisdropped AND attribute.attname<>split_part(spec,':',2) AND
+		                 has_column_privilege($2,c.oid,attribute.attnum,'UPDATE'))),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables, campaignAuthorityLockProductTables).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &invalidAuthorityLockDependencies, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables, campaignAuthorityLockProductColumns).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &invalidAuthorityLockDependencies, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign executor privileges: %w", err)
 	}

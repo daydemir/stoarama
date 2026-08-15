@@ -3045,10 +3045,12 @@ BEGIN
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_submit_probe_evidence(bigint,bigint,bigint,text,uuid,uuid,uuid,bigint,bigint,jsonb) TO %I',install_schema,executor_role);
   EXECUTE format('GRANT SELECT ON TABLE %I.accounts,%I.users,%I.memberships,%I.account_sessions,%I.nodes,%I.node_tokens,%I.recorder_droplets,%I.recording_worker_claim_heads,%I.streams,%I.stream_source_revisions,%I.recordings,%I.recording_scene_frame_evidence,%I.recording_campaign_tracks,%I.recording_campaign_roster_entries,%I.connections,%I.storage_destinations,%I.recording_jobs,%I.recording_clips,%I.relay_groups TO %I',install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,runtime_role);
   EXECUTE format('GRANT SELECT ON TABLE %I.accounts,%I.users,%I.memberships,%I.account_sessions,%I.nodes,%I.node_tokens,%I.recorder_droplets,%I.recording_worker_claim_heads,%I.streams,%I.stream_source_revisions,%I.recordings,%I.frames,%I.media_objects,%I.recording_scene_frame_evidence,%I.recording_campaign_tracks,%I.recording_campaign_roster_entries,%I.connections,%I.storage_destinations,%I.recording_jobs,%I.recording_clips,%I.relay_groups TO %I',install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,authority_role);
-  -- PostgreSQL requires UPDATE privilege for a locking SELECT. Admission uses
-  -- these three product-row identities to preserve the reviewed account,
-  -- stream, and worker lock order, so grant only the immutable lock column.
-  EXECUTE format('GRANT UPDATE(id) ON TABLE %I.accounts,%I.recorder_droplets,%I.streams TO %I',install_schema,install_schema,install_schema,authority_role);
+  -- PostgreSQL requires UPDATE privilege for FOR UPDATE and FOR SHARE.
+  -- Admission locks these product identities to preserve the reviewed account,
+  -- source, storage, auth, and worker order, so grant only immutable key columns.
+  EXECUTE format('GRANT UPDATE(id) ON TABLE %I.accounts,%I.account_sessions,%I.connections,%I.frames,%I.media_objects,%I.node_tokens,%I.nodes,%I.recorder_droplets,%I.recording_scene_frame_evidence,%I.stream_source_revisions,%I.streams,%I.users TO %I',install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,install_schema,authority_role);
+  EXECUTE format('GRANT UPDATE(user_id) ON TABLE %I.memberships TO %I',install_schema,authority_role);
+  EXECUTE format('GRANT UPDATE(node_id) ON TABLE %I.recording_worker_claim_heads TO %I',install_schema,authority_role);
   EXECUTE format('GRANT INSERT,UPDATE ON TABLE %I.recordings TO %I',install_schema,authority_role);
   EXECUTE format('GRANT INSERT ON TABLE %I.recording_scene_frame_evidence TO %I',install_schema,authority_role);
   EXECUTE format('GRANT UPDATE ON TABLE %I.recording_jobs TO %I',install_schema,authority_role);

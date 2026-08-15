@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/model"
@@ -777,6 +779,12 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 			created++
 		}
 		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				log.Printf("batch schedule failed account_id=%d stream_id=%d sqlstate=%s table=%s constraint=%s routine=%s", accountID, st.id, pgErr.Code, pgErr.TableName, pgErr.ConstraintName, pgErr.Routine)
+			} else {
+				log.Printf("batch schedule failed account_id=%d stream_id=%d error=%v", accountID, st.id, err)
+			}
 			util.WriteError(w, http.StatusInternalServerError, "schedule recording")
 			return
 		}
