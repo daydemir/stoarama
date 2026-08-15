@@ -3113,7 +3113,7 @@ LANGUAGE sql STABLE AS $$
                     AND peer_jobs.lease_owner='node:'||peer.id::text AND peer_jobs.lease_expires_at>transaction_timestamp())
                    < (SELECT count(*) FROM recording_jobs current_jobs WHERE current_jobs.status='leased'
                       AND current_jobs.lease_owner='node:'||candidate.id::text AND current_jobs.lease_expires_at>transaction_timestamp())))
-  )
+  ))
 $$;
 
 CREATE FUNCTION recording_surrender_relay_alternate(p_job_id BIGINT,p_excluded_owner TEXT) RETURNS BOOLEAN
