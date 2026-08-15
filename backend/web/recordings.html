@@ -3189,7 +3189,7 @@
         const local = captureHealthLocalParts(item.window_start_at, timezone || 'UTC').date;
         const coverage = Number(item.coverage_pct);
         const title = `${local} · ${grade}${Number.isFinite(coverage) ? ` · ${coverage.toFixed(2)}% coverage` : ''} · ${String(item.reason || '')}`;
-        return `<span class="daily-grade ${grade.toLowerCase()}" title="${escapeHTML(title)}" aria-label="${escapeHTML(title)}">${escapeHTML(grade === 'UNKNOWN' ? '?' : grade)}</span>`;
+        return `<span class="daily-grade ${grade.toLowerCase()}" data-health-tooltip="${escapeHTML(title)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(title)}">${escapeHTML(grade === 'UNKNOWN' ? '?' : grade)}</span>`;
       }).join('')}</div>`;
     }
 

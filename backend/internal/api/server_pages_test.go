@@ -381,6 +381,8 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`dailyGradesHTML(timeline.daily_grades, timezone)`,
 		`A–C good · D degraded · E poor · F no usable media · ? not yet measurable`,
 		`daily-grade ${grade.toLowerCase()}`,
+		`captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec)`,
+		`data-health-tooltip="${escapeHTML(title)}" tabindex="0" aria-describedby="healthTooltip"`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings list health-column layout missing %q", marker)
