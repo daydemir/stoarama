@@ -27,6 +27,14 @@ type recordingTimelineHealth struct {
 	Stitchability             string                `json:"stitchability"`
 	Diagnosis                 string                `json:"diagnosis"`
 	DailyGrades               []recordingDailyGrade `json:"daily_grades"`
+	Best14Rating              recordingBest14Rating `json:"best_14_rating"`
+}
+
+type recordingBest14Rating struct {
+	Rating    string `json:"rating"`
+	Qualifier string `json:"qualifier,omitempty"`
+	Completed int    `json:"completed_days"`
+	SortRank  int    `json:"sort_rank"`
 }
 
 type recordingDailyGrade struct {
@@ -57,6 +65,95 @@ func classifyRecordingDailyGrade(m qualificationWindowMetrics, clipCount int) (s
 		return "E", reason
 	}
 	return "D", reason
+}
+
+func gradeRunRating(grades []recordingDailyGrade) string {
+	counts := map[string]int{}
+	known := 0
+	for _, day := range grades {
+		if day.Grade != "UNKNOWN" {
+			counts[day.Grade]++
+			known++
+		}
+	}
+	switch {
+	case known == 0:
+		return "UNKNOWN"
+	case counts["F"] > 1:
+		return "BAD"
+	case counts["F"] == 1:
+		return "QUESTIONABLE"
+	case counts["E"] > 2:
+		return "FINE"
+	case counts["E"] > 0:
+		return "GOOD"
+	case counts["D"] > 0:
+		return "VERY_GOOD"
+	default:
+		return "GREAT"
+	}
+}
+
+func gradeRunScore(grades []recordingDailyGrade) [5]int {
+	counts := map[string]int{}
+	for _, day := range grades {
+		counts[day.Grade]++
+	}
+	return [5]int{counts["F"], counts["E"], counts["D"], counts["C"], -counts["A"]}
+}
+
+func best14Grades(days []recordingDailyGrade) []recordingDailyGrade {
+	known := make([]recordingDailyGrade, 0, len(days))
+	for _, day := range days {
+		if day.Grade != "UNKNOWN" {
+			known = append(known, day)
+		}
+	}
+	if len(known) < 14 {
+		return known
+	}
+	best := known[:14]
+	for i := 1; i+14 <= len(known); i++ {
+		candidate := known[i : i+14]
+		if scoreLess(gradeRunScore(candidate), gradeRunScore(best)) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func scoreLess(left, right [5]int) bool {
+	for i := range left {
+		if left[i] != right[i] {
+			return left[i] < right[i]
+		}
+	}
+	return false
+}
+
+func ratingRank(rating string) int {
+	return map[string]int{"GREAT": 0, "VERY_GOOD": 1, "GOOD": 2, "FINE": 3, "QUESTIONABLE": 4, "BAD": 5, "UNKNOWN": 6}[rating]
+}
+
+func classifyBest14(days []recordingDailyGrade, status string, remainingWindows int) recordingBest14Rating {
+	best := best14Grades(days)
+	completed := len(best)
+	rating := gradeRunRating(best)
+	if completed >= 14 {
+		return recordingBest14Rating{Rating: rating, Completed: completed, SortRank: ratingRank(rating)}
+	}
+	out := recordingBest14Rating{Rating: "INSUFFICIENT", Completed: completed, SortRank: 60}
+	if status != "active" {
+		out.Qualifier = "ENDED"
+		out.SortRank = 80
+	} else if completed+remainingWindows < 14 {
+		out.Qualifier = "SHORT_RUNWAY"
+		out.SortRank = 70
+	} else {
+		out.Qualifier = rating + "_POTENTIAL"
+		out.SortRank = 10 + ratingRank(rating)
+	}
+	return out
 }
 
 func classifyRecordingTimelineHealth(h *recordingTimelineHealth) {
@@ -130,6 +227,40 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	remaining := map[int64]int{}
+	status := map[int64]string{}
+	metaRows, err := s.pool.Query(ctx, `
+		SELECT r.id,r.status,
+		CASE WHEN r.status <> 'active' THEN 0 WHEN r.end_at IS NULL THEN 14 ELSE (
+			SELECT count(*) FROM generate_series(
+				(now() AT TIME ZONE r.cron_timezone)::date - 1,
+				(r.end_at AT TIME ZONE r.cron_timezone)::date,
+				interval '1 day') d
+			WHERE (r.active_weekdays & (1 << (extract(isodow FROM d)::int-1))) <> 0
+			  AND ((d::date + r.daily_window_end) AT TIME ZONE r.cron_timezone) > now()
+			  AND ((d::date + r.daily_window_end) AT TIME ZONE r.cron_timezone) <= r.end_at
+		) END
+		FROM recordings r WHERE r.account_id=$1 AND r.id=ANY($2::bigint[])
+	`, accountID, recordingIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer metaRows.Close()
+	for metaRows.Next() {
+		var id int64
+		var state string
+		var runway int
+		if err := metaRows.Scan(&id, &state, &runway); err != nil {
+			return nil, err
+		}
+		status[id], remaining[id] = state, runway
+		if _, ok := out[id]; !ok {
+			out[id] = recordingTimelineHealth{}
+		}
+	}
+	if err := metaRows.Err(); err != nil {
+		return nil, err
+	}
 	gradeRows, err := s.pool.Query(ctx, `
 		SELECT h.recording_id,h.window_start_at,h.window_end_at,h.expected_seconds,h.coverage_pct,
 		       h.largest_gap_seconds,h.gap_over_30s_count,h.gap_over_5m_count,h.overlap_count,
@@ -165,5 +296,12 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 		})
 		out[id] = h
 	}
-	return out, gradeRows.Err()
+	if err := gradeRows.Err(); err != nil {
+		return nil, err
+	}
+	for id, h := range out {
+		h.Best14Rating = classifyBest14(h.DailyGrades, status[id], remaining[id])
+		out[id] = h
+	}
+	return out, nil
 }
