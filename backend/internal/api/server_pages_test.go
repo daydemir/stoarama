@@ -381,6 +381,10 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`dailyGradesHTML(timeline.daily_grades, timezone)`,
 		`A–C good · D degraded · E poor · F no usable media · ? not yet measurable`,
 		`daily-grade ${grade.toLowerCase()}`,
+		`<option value="best14">Best 14-day rating</option>`,
+		`best14RatingHTML(best14)`,
+		`Insufficient`,
+		`state.recordingSort === 'best14'`,
 		`captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec)`,
 		`data-health-tooltip="${escapeHTML(title)}" tabindex="0" aria-describedby="healthTooltip"`,
 	} {

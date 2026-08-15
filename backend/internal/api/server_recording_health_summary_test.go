@@ -1,6 +1,9 @@
 package api
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func float64Ptr(v float64) *float64 { return &v }
 
@@ -56,5 +59,70 @@ func TestClassifyRecordingDailyGrade(t *testing.T) {
 				t.Fatalf("grade=%s want=%s", got, tc.want)
 			}
 		})
+	}
+}
+
+func dailyGrades(s string) []recordingDailyGrade {
+	out := make([]recordingDailyGrade, 0, len(s))
+	for i, grade := range s {
+		value := string(grade)
+		if grade == '?' {
+			value = "UNKNOWN"
+		}
+		out = append(out, recordingDailyGrade{WindowStartAt: time.Date(2026, 1, i+1, 0, 0, 0, 0, time.UTC), Grade: value})
+	}
+	return out
+}
+
+func TestClassifyBest14(t *testing.T) {
+	tests := []struct {
+		name, grades, status, rating, qualifier string
+		runway                                  int
+		completed                               int
+	}{
+		{"great", "AAABBBCCCAAABB", "completed", "GREAT", "", 0, 14},
+		{"very good", "AAABBBCCCAAABD", "completed", "VERY_GOOD", "", 0, 14},
+		{"good two e", "AAABBBCCCAAEEB", "completed", "GOOD", "", 0, 14},
+		{"fine three e", "AAABBBCCCAEEEB", "completed", "FINE", "", 0, 14},
+		{"one f wins precedence", "AAABBBCCCEEEDF", "completed", "QUESTIONABLE", "", 0, 14},
+		{"multiple f", "AAABBBCCCAEEFF", "completed", "BAD", "", 0, 14},
+		{"exactly thirteen ended", "AAABBBCCCAAAB", "completed", "INSUFFICIENT", "ENDED", 0, 13},
+		{"live great potential", "ABCC", "active", "INSUFFICIENT", "GREAT_POTENTIAL", 10, 4},
+		{"live questionable potential", "ABCF", "active", "INSUFFICIENT", "QUESTIONABLE_POTENTIAL", 10, 4},
+		{"live bad potential", "ABCFF", "active", "INSUFFICIENT", "BAD_POTENTIAL", 9, 5},
+		{"short runway", "ABCC", "active", "INSUFFICIENT", "SHORT_RUNWAY", 9, 4},
+		{"paused is ended", "ABCC", "paused", "INSUFFICIENT", "ENDED", 20, 4},
+		{"unknown excluded", "ABC?D", "active", "INSUFFICIENT", "VERY_GOOD_POTENTIAL", 10, 4},
+		{"no completed days", "?", "active", "INSUFFICIENT", "UNKNOWN_POTENTIAL", 14, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyBest14(dailyGrades(tc.grades), tc.status, tc.runway)
+			if got.Rating != tc.rating || got.Qualifier != tc.qualifier || got.Completed != tc.completed {
+				t.Fatalf("got %+v want rating=%s qualifier=%s completed=%d", got, tc.rating, tc.qualifier, tc.completed)
+			}
+		})
+	}
+}
+
+func TestBest14ChoosesFewestFThenEThenDThenC(t *testing.T) {
+	got := best14Grades(dailyGrades("FEEEEEEEEEEEEEABBBBBBBBBBBBB"))
+	if score := gradeRunScore(got); score != [5]int{0, 0, 0, 0, -1} {
+		t.Fatalf("best score=%v grades=%v", score, got)
+	}
+}
+
+func TestBest14SortOrder(t *testing.T) {
+	want := []string{"GREAT", "VERY_GOOD", "GOOD", "FINE", "QUESTIONABLE", "BAD"}
+	for i, rating := range want {
+		if got := ratingRank(rating); got != i {
+			t.Fatalf("rank(%s)=%d want=%d", rating, got, i)
+		}
+	}
+	if greatPotential := classifyBest14(dailyGrades("ABC"), "active", 11); greatPotential.SortRank != 10 {
+		t.Fatalf("unexpected potential sort rank %+v", greatPotential)
+	}
+	if classifyBest14(dailyGrades("ABC"), "active", 1).SortRank >= classifyBest14(dailyGrades("ABC"), "completed", 0).SortRank {
+		t.Fatal("short runway must sort before ended")
 	}
 }

@@ -221,6 +221,11 @@
     .daily-grade.e { background: #f97316; }
     .daily-grade.f { background: #b91c1c; }
     .daily-grade.unknown { background: var(--muted); color: var(--bg); }
+    .best14-rating { display: inline-block; margin: 0 0 4px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; font: 600 10px/1.2 var(--mono); }
+    .best14-rating.great, .best14-rating.very_good { color: var(--ok); }
+    .best14-rating.good, .best14-rating.fine { color: var(--warn); }
+    .best14-rating.questionable, .best14-rating.bad { color: var(--err); }
+    .best14-rating.insufficient { color: var(--muted); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
     .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
     .health-strip-cell[data-health-tooltip] { cursor: help; }
@@ -592,6 +597,10 @@
         <button type="button" data-statusfilter="scheduled">Scheduled</button>
         <button type="button" data-statusfilter="paused">Paused</button>
         <button type="button" data-statusfilter="completed">Completed</button>
+      </div>
+      <div id="recordingSortWrap" class="field hidden" style="max-width:260px;margin-bottom:14px;">
+        <label for="recordingSort">Sort recordings</label>
+        <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Best 14-day rating</option></select>
       </div>
 
       <!-- Recording cards -->
@@ -997,6 +1006,8 @@
       clipPage: document.getElementById('clipPage'),
       cards: document.getElementById('cards'),
       statusFilter: document.getElementById('statusFilter'),
+      recordingSortWrap: document.getElementById('recordingSortWrap'),
+      recordingSort: document.getElementById('recordingSort'),
       newRecRow: document.getElementById('newRecRow'),
       newRecBtn: document.getElementById('newRecBtn'),
       recordingsCsvBtn: document.getElementById('recordingsCsvBtn'),
@@ -1152,6 +1163,7 @@
       // Client-side status filter over the loaded recordings list: 'all' (default),
       // 'active', 'scheduled', 'paused', or 'completed'.
       statusFilter: 'all',
+      recordingSort: 'newest',
       destinations: [],
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
@@ -3129,6 +3141,7 @@
 	  const capturePercent = expected > 0 ? Math.min(100, Math.round(captured / expected * 1000) / 10) : null;
 	  const healthBins = Array.isArray(rec.capture_health_bins) ? rec.capture_health_bins : [];
 	  const timeline = rec.timeline_health && typeof rec.timeline_health === 'object' ? rec.timeline_health : null;
+	  const best14 = timeline && timeline.best_14_rating && typeof timeline.best_14_rating === 'object' ? timeline.best_14_rating : null;
 	  const timelineGrade = timeline ? String(timeline.grade || 'unknown') : 'unknown';
 	  const recentCoverage = timeline && Number.isFinite(Number(timeline.recent_coverage_pct))
 	    ? Number(timeline.recent_coverage_pct) : null;
@@ -3136,7 +3149,7 @@
 	    ? Number(timeline.lifetime_coverage_pct) : null;
 	  const stitchLabels = { continuous: 'continuous timeline · native layout compatible', gapped: 'gapped timeline', overlap: 'overlapping timeline', layout_changed: 'native layout changed', unknown: 'not checked yet' };
 	  const timelineHealthHTML = timeline
-	    ? `<div class="capture-health ${escapeHTML(timelineGrade)}">${recentCoverage == null ? 'Awaiting a completed window' : `${recentCoverage.toFixed(2)}% recent coverage`}</div>
+	    ? `${best14RatingHTML(best14)}<div class="capture-health ${escapeHTML(timelineGrade)}">${recentCoverage == null ? 'Awaiting a completed window' : `${recentCoverage.toFixed(2)}% recent coverage`}</div>
 	       <div class="cell-sub">${escapeHTML(stitchLabels[String(timeline.stitchability || 'unknown')] || String(timeline.stitchability || 'unknown'))} · ${escapeHTML(String(timeline.diagnosis || ''))}</div>
 	       ${recentCoverage == null ? '' : `<div class="cell-sub">Largest gap ${escapeHTML(formatDuration(Number(timeline.recent_largest_gap_seconds || 0) * 1000))} · overlaps ${Number(timeline.recent_overlap_count || 0)} · layout changes ${Number(timeline.recent_layout_change_count || 0)}</div>`}
 	       ${lifetimeCoverage == null ? '' : `<div class="cell-sub">Whole period ${lifetimeCoverage.toFixed(2)}% · ${Number(timeline.lifetime_window_count || 0)} completed window(s)${timeline.lifetime_complete === true ? '' : ' · historical check in progress'}</div>`}
@@ -3191,6 +3204,25 @@
         const title = `${local} · ${grade}${Number.isFinite(coverage) ? ` · ${coverage.toFixed(2)}% coverage` : ''} · ${String(item.reason || '')}`;
         return `<span class="daily-grade ${grade.toLowerCase()}" data-health-tooltip="${escapeHTML(title)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(title)}">${escapeHTML(grade === 'UNKNOWN' ? '?' : grade)}</span>`;
       }).join('')}</div>`;
+    }
+
+    function best14RatingHTML(value) {
+      if (!value) return '';
+      const rating = String(value.rating || 'INSUFFICIENT').toUpperCase();
+      const qualifier = String(value.qualifier || '').toUpperCase();
+      const completed = Number(value.completed_days || 0);
+      const labels = { GREAT: 'Great', VERY_GOOD: 'Very good', GOOD: 'Good', FINE: 'Fine', QUESTIONABLE: 'Questionable', BAD: 'Bad', UNKNOWN: 'Unknown' };
+      let text = labels[rating] || 'Insufficient';
+      if (rating === 'INSUFFICIENT') {
+        if (qualifier.endsWith('_POTENTIAL')) text += ` — ${labels[qualifier.slice(0, -10)] || 'Unknown'} potential (${completed}/14)`;
+        else text += qualifier === 'SHORT_RUNWAY' ? ` — short runway (${completed}/14)` : ` — ended (${completed}/14)`;
+      }
+      return `<div class="best14-rating ${rating.toLowerCase()}" aria-label="Best 14-day rating: ${escapeHTML(text)}">${escapeHTML(text)}</div>`;
+    }
+
+    function best14Sort(rec) {
+      const rating = rec.timeline_health && rec.timeline_health.best_14_rating;
+      return [Number(rating && rating.sort_rank || 99), -Number(rating && rating.completed_days || 0)];
     }
 
     function dailyGradesCardHTML(rec) {
@@ -3256,6 +3288,7 @@
       els.newRecRow.classList.toggle('hidden', sharedReadOnly);
       els.cards.classList.toggle('hidden', empty);
       els.statusFilter.classList.toggle('hidden', empty);
+      els.recordingSortWrap.classList.toggle('hidden', empty);
       if (empty) {
         els.cards.innerHTML = '';
         return;
@@ -3263,6 +3296,10 @@
       renderStatusFilter();
       // Client-side status filter over the loaded list (pagination deferred).
       const items = all.filter(matchesStatusFilter);
+      if (state.recordingSort === 'best14') items.sort((a, b) => {
+        const left = best14Sort(a), right = best14Sort(b);
+        return left[0] - right[0] || left[1] - right[1] || Number(b.id) - Number(a.id);
+      });
       if (items.length === 0) {
         els.cards.innerHTML = `<div class="clip-summary">No recordings match this filter.</div>`;
         return;
@@ -5190,6 +5227,10 @@
       const key = btn.getAttribute('data-statusfilter');
       if (!key || state.statusFilter === key) return;
       state.statusFilter = key;
+      renderCards();
+    });
+    els.recordingSort.addEventListener('change', () => {
+      state.recordingSort = els.recordingSort.value;
       renderCards();
     });
     els.selectStreamsBtn.addEventListener('click', () => window.location.assign('/streams'));
