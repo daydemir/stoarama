@@ -8,6 +8,7 @@ CREATE TABLE recording_campaign_authoritative_frame_witnesses (
   authority_code TEXT NOT NULL REFERENCES recording_campaign_authority_decisions(code) ON DELETE RESTRICT,
   source_revision_id BIGINT REFERENCES stream_source_revisions(id) ON DELETE RESTRICT,
   source_snapshot_sha256 TEXT NOT NULL CHECK(source_snapshot_sha256~'^[0-9a-f]{64}$'),
+  media_object_id BIGINT NOT NULL REFERENCES media_objects(id) ON DELETE RESTRICT,
   frame_sha256 TEXT NOT NULL CHECK(frame_sha256~'^[0-9a-f]{64}$'),
   witnessed_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
   witness_sha256 TEXT NOT NULL CHECK(witness_sha256~'^[0-9a-f]{64}$'),
@@ -47,20 +48,21 @@ END $$;
 
 CREATE FUNCTION validate_recording_campaign_authoritative_frame_witness()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
-DECLARE prepared RECORD; stored_sha TEXT; expected TEXT;
+DECLARE prepared RECORD; stored_media_id BIGINT; stored_sha TEXT; expected TEXT;
 BEGIN
   SELECT * INTO prepared FROM recording_campaign_prepare_authoritative_frame(NEW.account_id,NEW.authority_code,NEW.stream_id);
-  SELECT lower(media.sha256) INTO stored_sha FROM frames frame JOIN media_objects media ON media.id=frame.raw_media_object_id
+  SELECT media.id,lower(media.sha256) INTO stored_media_id,stored_sha FROM frames frame JOIN media_objects media ON media.id=frame.raw_media_object_id
     WHERE frame.id=NEW.frame_id AND frame.stream_id=NEW.stream_id AND frame.capture_status='success'
       AND frame.source_kind='authoritative_frame_refresh'
       AND frame.captured_at BETWEEN recording_campaign_now()-interval '10 minutes' AND recording_campaign_now()
     FOR SHARE OF frame,media;
   expected:=encode(sha256(convert_to(jsonb_build_object('account_id',NEW.account_id,'authority_code',NEW.authority_code,
     'stream_id',NEW.stream_id,'frame_id',NEW.frame_id,'source_revision_id',NULLIF(NEW.source_revision_id,0),
-    'source_snapshot_sha256',NEW.source_snapshot_sha256,'frame_sha256',NEW.frame_sha256,
+    'source_snapshot_sha256',NEW.source_snapshot_sha256,'media_object_id',NEW.media_object_id,'frame_sha256',NEW.frame_sha256,
     'witnessed_at_epoch_us',floor(extract(epoch from recording_campaign_now())*1000000)::bigint)::text,'UTF8')),'hex');
   IF prepared.stream_id IS NULL OR prepared.source_revision_id IS DISTINCT FROM NULLIF(NEW.source_revision_id,0) OR
-     prepared.source_snapshot_sha256<>NEW.source_snapshot_sha256 OR stored_sha IS NULL OR stored_sha<>NEW.frame_sha256 OR
+     prepared.source_snapshot_sha256<>NEW.source_snapshot_sha256 OR stored_media_id IS DISTINCT FROM NEW.media_object_id OR
+     stored_sha IS NULL OR stored_sha<>NEW.frame_sha256 OR
      NEW.witnessed_at IS DISTINCT FROM recording_campaign_now() OR NEW.witness_sha256<>expected THEN
     RAISE EXCEPTION 'authoritative frame witness is not exact and current';
   END IF;
@@ -78,25 +80,29 @@ CREATE FUNCTION recording_campaign_seal_authoritative_frame(
   p_account_id BIGINT,p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT,
   p_source_revision_id BIGINT,p_source_snapshot_sha256 TEXT,p_frame_sha256 TEXT
 ) RETURNS TEXT LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
-DECLARE prepared RECORD; digest TEXT; sealed RECORD;
+DECLARE prepared RECORD; digest TEXT; sealed RECORD; media_id BIGINT;
 BEGIN
   SELECT * INTO prepared FROM recording_campaign_prepare_authoritative_frame(p_account_id,p_authority_code,p_stream_id);
   IF prepared.source_revision_id IS DISTINCT FROM NULLIF(p_source_revision_id,0) OR
      prepared.source_snapshot_sha256<>p_source_snapshot_sha256 OR p_frame_sha256!~'^[0-9a-f]{64}$' THEN
     RAISE EXCEPTION 'authoritative frame witness source changed';
   END IF;
+  SELECT frame.raw_media_object_id INTO media_id FROM frames frame JOIN media_objects media ON media.id=frame.raw_media_object_id
+    WHERE frame.id=p_frame_id AND frame.stream_id=p_stream_id AND lower(media.sha256)=p_frame_sha256
+    FOR SHARE OF frame,media;
+  IF media_id IS NULL THEN RAISE EXCEPTION 'authoritative frame media changed'; END IF;
   digest:=encode(sha256(convert_to(jsonb_build_object('account_id',p_account_id,'authority_code',p_authority_code,
     'stream_id',p_stream_id,'frame_id',p_frame_id,'source_revision_id',NULLIF(p_source_revision_id,0),
-    'source_snapshot_sha256',p_source_snapshot_sha256,'frame_sha256',p_frame_sha256,
+    'source_snapshot_sha256',p_source_snapshot_sha256,'media_object_id',media_id,'frame_sha256',p_frame_sha256,
     'witnessed_at_epoch_us',floor(extract(epoch from recording_campaign_now())*1000000)::bigint)::text,'UTF8')),'hex');
   INSERT INTO recording_campaign_authoritative_frame_witnesses(frame_id,account_id,stream_id,authority_code,
-    source_revision_id,source_snapshot_sha256,frame_sha256,witness_sha256)
-  VALUES(p_frame_id,p_account_id,p_stream_id,p_authority_code,NULLIF(p_source_revision_id,0),p_source_snapshot_sha256,p_frame_sha256,digest)
+    source_revision_id,source_snapshot_sha256,media_object_id,frame_sha256,witness_sha256)
+  VALUES(p_frame_id,p_account_id,p_stream_id,p_authority_code,NULLIF(p_source_revision_id,0),p_source_snapshot_sha256,media_id,p_frame_sha256,digest)
   ON CONFLICT(frame_id) DO NOTHING;
   SELECT * INTO sealed FROM recording_campaign_authoritative_frame_witnesses WHERE frame_id=p_frame_id;
   IF sealed.frame_id IS NULL OR (sealed.account_id,sealed.stream_id,sealed.authority_code,sealed.source_revision_id,
-     sealed.source_snapshot_sha256,sealed.frame_sha256) IS DISTINCT FROM
-     (p_account_id,p_stream_id,p_authority_code,NULLIF(p_source_revision_id,0),p_source_snapshot_sha256,p_frame_sha256) THEN
+     sealed.source_snapshot_sha256,sealed.media_object_id,sealed.frame_sha256) IS DISTINCT FROM
+     (p_account_id,p_stream_id,p_authority_code,NULLIF(p_source_revision_id,0),p_source_snapshot_sha256,media_id,p_frame_sha256) THEN
     RAISE EXCEPTION 'authoritative frame witness conflicts with immutable frame';
   END IF;
   RETURN sealed.witness_sha256;
@@ -105,7 +111,7 @@ END $$;
 CREATE FUNCTION recording_campaign_assert_baseline_frame_authority(
   p_account_id BIGINT,p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT
 ) RETURNS BOOLEAN LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $$
-DECLARE prepared RECORD; witness RECORD;
+DECLARE prepared RECORD; witness RECORD; current_media_id BIGINT; current_frame_sha TEXT;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   IF EXISTS(SELECT 1 FROM recordings WHERE account_id=p_account_id AND stream_id=p_stream_id AND status='active' FOR SHARE) THEN
@@ -114,8 +120,12 @@ BEGIN
   SELECT * INTO prepared FROM recording_campaign_prepare_authoritative_frame(p_account_id,p_authority_code,p_stream_id);
   SELECT * INTO witness FROM recording_campaign_authoritative_frame_witnesses
     WHERE frame_id=p_frame_id AND account_id=p_account_id AND stream_id=p_stream_id AND authority_code=p_authority_code FOR SHARE;
+  SELECT media.id,lower(media.sha256) INTO current_media_id,current_frame_sha
+    FROM frames frame JOIN media_objects media ON media.id=frame.raw_media_object_id
+    WHERE frame.id=p_frame_id AND frame.stream_id=p_stream_id FOR SHARE OF frame,media;
   IF witness.frame_id IS NULL OR witness.source_revision_id IS DISTINCT FROM prepared.source_revision_id OR
-     witness.source_snapshot_sha256<>prepared.source_snapshot_sha256 THEN
+     witness.source_snapshot_sha256<>prepared.source_snapshot_sha256 OR
+     witness.media_object_id IS DISTINCT FROM current_media_id OR witness.frame_sha256 IS DISTINCT FROM current_frame_sha THEN
     RAISE EXCEPTION 'nonactive baseline frame lacks a current decision witness';
   END IF;
   RETURN true;

@@ -301,6 +301,28 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, streamID, oldFrameID); err != nil {
 		t.Fatalf("sealed inactive candidate frame was not usable: %v", err)
 	}
+	var substitutedMediaID int64
+	if err := migrator.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256) VALUES('r2','campaign','substituted-scene.jpg','image/jpeg',1,$1) RETURNING id`, frameSHA).Scan(&substitutedMediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE frames SET raw_media_object_id=$1 WHERE id=$2`, substitutedMediaID, oldFrameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, streamID, oldFrameID); err == nil {
+		t.Fatal("candidate frame survived direct media-object substitution")
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE frames SET raw_media_object_id=$1 WHERE id=$2`, mediaID, oldFrameID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE media_objects SET sha256=$1 WHERE id=$2`, strings.Repeat("e", 64), mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executorPool.Exec(ctx, `SELECT recording_campaign_assert_baseline_frame_authority($1,'deniz_fd_restore_20260814',$2,$3)`, accountID, streamID, oldFrameID); err == nil {
+		t.Fatal("candidate frame survived direct media SHA substitution")
+	}
+	if _, err := migrator.Exec(ctx, `UPDATE media_objects SET sha256=$1 WHERE id=$2`, frameSHA, mediaID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := migrator.Exec(ctx, `UPDATE streams SET source_url='https://source.example/after-frame.m3u8' WHERE id=$1`, streamID); err != nil {
 		t.Fatal(err)
 	}
