@@ -1093,7 +1093,13 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusNotFound, "node not found")
 		return
 	}
-	if err = tx.Commit(r.Context()); err != nil {
+	reportedVersion, _ := req.CapabilitiesJSON["relay_version"].(string)
+	intent, err := resolveRelayUpdateHeartbeat(r.Context(), tx, principal, strings.TrimSpace(reportedVersion))
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "resolve relay update intent")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit node heartbeat")
 		return
 	}
@@ -1102,7 +1108,11 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load node: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "node": node})
+	response := map[string]any{"ok": true, "node": node}
+	if intent != nil {
+		response["relay_update_intent"] = intent
+	}
+	util.WriteJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) fetchNodeByID(ctx context.Context, id int64) (map[string]any, error) {

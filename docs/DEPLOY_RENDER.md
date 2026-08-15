@@ -70,6 +70,10 @@ buys before forcing either.
   liveness signal, not as "how much video do we have".
 - **Some relay binaries cannot self-update.** Builds predating the embedded signing key (e.g.
   `85c91b6e`) deliberately disable self-update and cannot pull signed releases on their own.
+- **A relay update intent is not a bootstrap path.** Only a relay already running the typed
+  heartbeat client can receive one. An offline or older relay such as node63 must first recover
+  through the existing globally promoted signed updater (or the supported installer); the API
+  never sends a URL, artifact, command, arguments, or environment to a node.
   Avoid shipping service-unit directives that older Pis cannot parse — that strands them.
 
 Relay recordings (`capture_via != 'cloud'`) are excluded from the droplet forecast (`backend/internal/dropletpool/forecast.go:71`), so the cloud ceiling never blocks relay-only streams. Do not report relay work as pool-blocked.

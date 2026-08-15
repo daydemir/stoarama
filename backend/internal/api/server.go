@@ -67,6 +67,7 @@ type Server struct {
 	authLinkLimiter         *authLinkLimiter
 	sharedRecordingsLimiter *sharedRecordingsLimiter
 	campaignDOAttest        func(context.Context, int64, string) (dropletpool.ProviderAttestation, error)
+	relayUpdateSnapshot     func(context.Context, string, string) (relayManifestSnapshot, error)
 }
 
 type campaignProbeObjectStore interface {
@@ -358,6 +359,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/billing/portal", s.handleAccountBillingPortal)
 			account.Get("/nodes", s.handleAccountNodesList)
 			account.Patch("/nodes/{id}", s.handleAccountNodePatch)
+			account.Post("/nodes/{id}/relay-update-intents", s.handleAccountRelayUpdateIntentCreate)
 			account.Delete("/nodes/{id}", s.handleAccountNodeDelete)
 			account.Put("/nodes/{id}/relay-group/{group_id}", s.handleAccountNodeRelayGroupPut)
 			account.Delete("/nodes/{id}/relay-group", s.handleAccountNodeRelayGroupDelete)

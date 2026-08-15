@@ -23,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
 var lastUpdaterUnix atomic.Int64
@@ -192,7 +194,7 @@ func runSelfUpdate(args []string) error {
 // after start (not immediately) so a fresh install does not restart itself on boot.
 // When the relay binary itself changes it kickstarts the service so the new binary is
 // exec'd; a yt-dlp-only refresh is picked up by the next capture without a restart.
-func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
+func selfUpdateLoop(ctx context.Context, cfg relayConfig, intents <-chan recordingapi.RelayUpdateIntent, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
 	ticker := time.NewTicker(selfUpdateInterval)
 	defer ticker.Stop()
 	manifest := cfg.updateManifest()
@@ -200,6 +202,14 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int
 		select {
 		case <-ctx.Done():
 			return
+		case intent := <-intents:
+			if err := validateRelayUpdateIntent(cfg.NodeID, intent); err != nil {
+				log.Printf("relay update intent rejected: %v", err)
+				continue
+			}
+			if checkAndApplyUpdateExpected(cfg.APIURL, releaseManifest(intent.ManifestName), intent.TargetVersion, intent.ManifestSHA256, activeJobs, leaseGate, drainForUpdate) {
+				waitForSelfUpdateDrain(ctx, activeJobs, leaseGate, drainForUpdate)
+			}
 		case <-ticker.C:
 			if manifest != liveReleaseManifest {
 				live, err := fetchLatest(cfg.APIURL, liveReleaseManifest)
@@ -228,10 +238,18 @@ func selfUpdateLoop(ctx context.Context, cfg relayConfig, activeJobs *atomic.Int
 // binary actually changed. Errors are logged and swallowed so a bad manifest or a
 // transient network failure never takes the relay down.
 func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
+	return checkAndApplyUpdateExpected(base, manifest, "", "", activeJobs, leaseGate, drainForUpdate)
+}
+
+func checkAndApplyUpdateExpected(base string, manifest releaseManifest, expectedVersion, expectedSHA string, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
 	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
-	lj, err := fetchLatest(base, manifest)
+	lj, err := fetchLatestExpected(base, manifest, expectedVersion, expectedSHA)
 	if err != nil {
 		log.Printf("relay self-update: fetch latest.json: %v", err)
+		return false
+	}
+	if expectedVersion != "" && !relayIntentUpgradeAllowed(version, lj) {
+		log.Printf("relay self-update: typed intent target %s is not an immediate successor of %s", lj.Version, version)
 		return false
 	}
 	target := runtime.GOOS + "-" + runtime.GOARCH
@@ -294,6 +312,28 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 		}
 	}
 	return false
+}
+
+func relayIntentUpgradeAllowed(current string, target latestJSON) bool {
+	return strings.TrimSpace(current) != "" && target.Version != current && target.PreviousVersion == current
+}
+
+func validateRelayUpdateIntent(nodeID int64, intent recordingapi.RelayUpdateIntent) error {
+	if intent.NodeID != nodeID || intent.NodeID <= 0 {
+		return fmt.Errorf("node identity differs")
+	}
+	if strings.TrimSpace(intent.RequestID) == "" || intent.Status != "pending" {
+		return fmt.Errorf("request identity or status is invalid")
+	}
+	manifest, err := immutableReleaseManifest(intent.TargetVersion)
+	if err != nil || string(manifest) != intent.ManifestName {
+		return fmt.Errorf("manifest identity is invalid")
+	}
+	digest, err := hex.DecodeString(intent.ManifestSHA256)
+	if err != nil || len(digest) != sha256.Size || intent.ManifestSHA256 != strings.ToLower(intent.ManifestSHA256) {
+		return fmt.Errorf("manifest digest is invalid")
+	}
+	return nil
 }
 
 func waitForSelfUpdateDrain(ctx context.Context, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) {
@@ -362,6 +402,10 @@ func relaySelfUpdateDeferred(activeJobs *atomic.Int64) (bool, int64) {
 }
 
 func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {
+	return fetchLatestExpected(base, manifest, "", "")
+}
+
+func fetchLatestExpected(base string, manifest releaseManifest, expectedVersion, expectedSHA string) (latestJSON, error) {
 	var lj latestJSON
 	if !manifest.valid() {
 		return lj, fmt.Errorf("invalid release manifest %q", manifest)
@@ -392,8 +436,17 @@ func fetchLatest(base string, manifest releaseManifest) (latestJSON, error) {
 	if !verified {
 		return lj, fmt.Errorf("verify %s signature", manifest)
 	}
+	if expectedSHA != "" {
+		sum := sha256.Sum256(manifestBytes)
+		if hex.EncodeToString(sum[:]) != expectedSHA {
+			return lj, fmt.Errorf("%s differs from update intent snapshot", manifest)
+		}
+	}
 	if err := json.Unmarshal(manifestBytes, &lj); err != nil {
 		return lj, fmt.Errorf("decode latest.json: %w", err)
+	}
+	if expectedVersion != "" && lj.Version != expectedVersion {
+		return latestJSON{}, fmt.Errorf("%s version differs from update intent", manifest)
 	}
 	return lj, nil
 }

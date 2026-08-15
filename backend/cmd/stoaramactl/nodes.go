@@ -15,11 +15,11 @@ import (
 
 func runNodes(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Print("stoaramactl nodes enrollment-token create ...\nstoaramactl nodes relay-groups list|create|update|assign|unassign|delete ...\n")
+		fmt.Print("stoaramactl nodes enrollment-token create ...\nstoaramactl nodes relay-groups list|create|update|assign|unassign|delete ...\nstoaramactl nodes relay-update request ...\n")
 		return
 	}
 	if len(args) < 1 {
-		fmt.Print("stoaramactl nodes enrollment-token create ...\nstoaramactl nodes relay-groups list|create|update|assign|unassign|delete ...\n")
+		fmt.Print("stoaramactl nodes enrollment-token create ...\nstoaramactl nodes relay-groups list|create|update|assign|unassign|delete ...\nstoaramactl nodes relay-update request ...\n")
 		return
 	}
 	switch args[0] {
@@ -27,9 +27,32 @@ func runNodes(ctx context.Context, cfg config.Config, args []string) {
 		runNodesEnrollmentToken(ctx, cfg, args[1:])
 	case "relay-groups":
 		runNodesRelayGroups(ctx, cfg, args[1:])
+	case "relay-update":
+		runNodesRelayUpdate(ctx, cfg, args[1:])
 	default:
 		log.Fatalf("unknown nodes subcommand: %s", args[0])
 	}
+}
+
+func runNodesRelayUpdate(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) < 1 || args[0] != "request" {
+		fmt.Print("stoaramactl nodes relay-update request --node-id ID --request-id UUID --expected-promoted-version VERSION [--backend-api-url URL --api-token TOKEN]\n")
+		return
+	}
+	fs := flag.NewFlagSet("nodes relay-update request", flag.ExitOnError)
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	nodeID := fs.Int64("node-id", 0, "relay node id")
+	requestID := fs.String("request-id", "", "stable UUID for exact replay")
+	expectedVersion := fs.String("expected-promoted-version", "", "exact currently promoted relay version")
+	_ = fs.Parse(args[1:])
+	if *nodeID <= 0 || strings.TrimSpace(*requestID) == "" || strings.TrimSpace(*expectedVersion) == "" {
+		log.Fatalf("--node-id, --request-id, and --expected-promoted-version are required")
+	}
+	printJSON(mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken),
+		"/api/v1/account/nodes/"+strconv.FormatInt(*nodeID, 10)+"/relay-update-intents", map[string]any{
+			"request_id": strings.TrimSpace(*requestID), "expected_promoted_version": strings.TrimSpace(*expectedVersion),
+		}))
 }
 
 func runNodesRelayGroups(ctx context.Context, cfg config.Config, args []string) {
