@@ -319,6 +319,23 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	const rawSession = "campaign-admission-session"
 	insertSession(t, pool, accountID, userID, rawSession)
 	ctx := context.Background()
+	var fixtureSearchPath string
+	if err := pool.QueryRow(ctx, `SHOW search_path`).Scan(&fixtureSearchPath); err != nil {
+		t.Fatal(err)
+	}
+	fixtureAdminConfig, err := pgxpool.ParseConfig(strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixtureAdminConfig.ConnConfig.RuntimeParams == nil {
+		fixtureAdminConfig.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	fixtureAdminConfig.ConnConfig.RuntimeParams["search_path"] = fixtureSearchPath
+	fixtureAdmin, err := pgxpool.NewWithConfig(ctx, fixtureAdminConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fixtureAdmin.Close()
 	var destinationID, sceneEvidenceID, nodeID, sessionID int64
 	if err := pool.QueryRow(ctx, `SELECT id FROM account_sessions WHERE account_id=$1 AND user_id=$2 AND session_hash=$3`, accountID, userID, hashSecret(rawSession)).Scan(&sessionID); err != nil {
 		t.Fatal(err)
@@ -619,7 +636,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 			t.Fatalf("decode evidence %d: err=%v body=%s", attemptIndex+1, err, evidence.Body.String())
 		}
 		evidenceIDs = append(evidenceIDs, evidenceResponse.EvidenceID)
-		if _, err := pool.Exec(ctx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256) VALUES($1,'expired_without_evidence',repeat('0',64))`, leaseResponse.Target.AttemptID); err == nil {
+		if _, err := fixtureAdmin.Exec(ctx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256) VALUES($1,'expired_without_evidence',repeat('0',64))`, leaseResponse.Target.AttemptID); err == nil {
 			t.Fatal("terminal-without-evidence committed after immutable probe evidence")
 		}
 		if attemptIndex == 0 {
@@ -747,7 +764,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	// a fixture-only time shift under the migration owner; product roles still
 	// cannot mutate immutable observations. The second commit must replace both
 	// capacity and NAS seals instead of relying on the stale predecessor.
-	if _, err := pool.Exec(ctx, `ALTER TABLE recording_campaign_capacity_observations DISABLE TRIGGER recording_campaign_capacity_observations_immutable;
+	if _, err := fixtureAdmin.Exec(ctx, `ALTER TABLE recording_campaign_capacity_observations DISABLE TRIGGER recording_campaign_capacity_observations_immutable;
 		UPDATE recording_campaign_capacity_observations SET
 		  observation_started_at=observation_started_at-interval '181 seconds',
 		  observed_at=observed_at-interval '181 seconds',expires_at=expires_at-interval '181 seconds',
@@ -927,7 +944,7 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatalf("complete second admission did not replace stale capacity/NAS seals: status=%d body=%s", secondScheduleRec.Code, secondScheduleRec.Body.String())
 	}
 	var capacitySealCount, storageSealCount int
-	if err := pool.QueryRow(ctx, `SELECT count(DISTINCT cap.approval_id),count(DISTINCT storage.approval_id) FROM recording_campaign_capacity_reservations cap FULL JOIN recording_campaign_storage_reservations storage ON storage.approval_id=cap.approval_id WHERE cap.account_id=$1 OR storage.account_id=$1`, accountID).Scan(&capacitySealCount, &storageSealCount); err != nil || capacitySealCount != 2 || storageSealCount != 2 {
+	if err := fixtureAdmin.QueryRow(ctx, `SELECT count(DISTINCT cap.approval_id),count(DISTINCT storage.approval_id) FROM recording_campaign_capacity_reservations cap FULL JOIN recording_campaign_storage_reservations storage ON storage.approval_id=cap.approval_id WHERE cap.account_id=$1 OR storage.account_id=$1`, accountID).Scan(&capacitySealCount, &storageSealCount); err != nil || capacitySealCount != 2 || storageSealCount != 2 {
 		t.Fatalf("second admission did not commit replacement capacity/NAS seals: capacity=%d storage=%d err=%v", capacitySealCount, storageSealCount, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET next_fire_at=NULL WHERE id=$1`, admittedRecordingID); err == nil {
