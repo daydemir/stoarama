@@ -43,6 +43,7 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 	heartbeatSec := fs.Int("heartbeat-sec", cfg.RecordingWorkerHeartbeatSec, "lease heartbeat interval seconds")
 	pollSec := fs.Int("poll-sec", cfg.RecordingWorkerPollSec, "job poll interval seconds")
 	buildSHA := fs.String("build-sha", strings.TrimSpace(os.Getenv("RECORDER_BUILD_SHA")), "source commit for this worker binary")
+	captureTempDir := fs.String("capture-temp-dir", strings.TrimSpace(os.Getenv("RECORDING_CAPTURE_TEMP_DIR")), "durable private recording spool directory")
 	duration := fs.Duration("duration", 0, "optional run duration (e.g. 30m, 8h)")
 	_ = fs.Parse(args[1:])
 
@@ -79,7 +80,9 @@ func runRecordingWorker(ctx context.Context, cfg config.Config, args []string) {
 		HeartbeatSec:                 *heartbeatSec,
 		PollInterval:                 time.Duration(*pollSec) * time.Second,
 		BuildSHA:                     strings.ToLower(strings.TrimSpace(*buildSHA)),
+		CaptureTempDir:               strings.TrimSpace(*captureTempDir),
 		UploadWorkers:                cfg.RelayUploadWorkers,
+		ContinuousNoProgressTimeout:  cloudRecorderNoProgressTimeout,
 		FrozenHLSQuiescenceAllowlist: cfg.RecordingFrozenHLSQuiescenceAllowlist,
 		DiskFreeBytes: func() (uint64, error) {
 			var stat unix.Statfs_t

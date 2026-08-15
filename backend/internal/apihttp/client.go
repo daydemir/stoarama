@@ -10,13 +10,34 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Client struct {
 	baseURL string
+	tokenMu sync.RWMutex
 	token   string
 	httpc   *http.Client
+}
+
+// SetToken atomically changes the bearer used by future requests. In-flight
+// requests keep the bearer they already copied into their request header.
+func (c *Client) SetToken(token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return fmt.Errorf("missing token")
+	}
+	c.tokenMu.Lock()
+	c.token = token
+	c.tokenMu.Unlock()
+	return nil
+}
+
+func (c *Client) bearerToken() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.token
 }
 
 type StatusError struct {
@@ -78,7 +99,7 @@ func (c *Client) PostRawWithHeaders(ctx context.Context, path string, payload an
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request %s: %w", path, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.bearerToken())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	for k, v := range headers {

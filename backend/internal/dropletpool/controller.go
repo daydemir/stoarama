@@ -700,8 +700,12 @@ func (c *Controller) beginDrains(ctx context.Context, now time.Time, idleEligibl
 		if drained >= n {
 			break
 		}
-		if err := c.store.MarkDraining(ctx, d.ID); err != nil {
+		marked, err := c.store.MarkDrainingIfIdle(ctx, d.ID)
+		if err != nil {
 			log.Printf("droplet pool: mark draining %s: %v", d.Name, err)
+			continue
+		}
+		if !marked {
 			continue
 		}
 		log.Printf("droplet pool: draining droplet id=%d name=%s", d.ID, d.Name)
@@ -745,6 +749,21 @@ func (c *Controller) progressDrains(ctx context.Context, now time.Time) {
 		if busy && forced {
 			log.Printf("droplet pool: drain timeout exceeded for id=%d name=%s; forcing destroy", d.ID, d.Name)
 		}
+		ready := false
+		if forced {
+			ready, err = c.store.BeginForcedDestroyAfterDrainTimeout(ctx, d.ID)
+		} else {
+			ready, err = c.store.BeginDestroyIfIdle(ctx, d.ID)
+		}
+		if err != nil {
+			log.Printf("droplet pool: cannot fence draining teardown id=%d name=%s: %v", d.ID, d.Name, err)
+			continue
+		}
+		if !ready {
+			// Most importantly, an upload-only recovery grant keeps the physical
+			// spool host alive even after the ordinary drain timeout.
+			continue
+		}
 		c.destroyDraining(ctx, d)
 	}
 }
@@ -752,10 +771,6 @@ func (c *Controller) progressDrains(ctx context.Context, now time.Time) {
 // destroyDraining deletes a draining droplet's DO instance, revokes its node
 // token, and marks the row destroyed.
 func (c *Controller) destroyDraining(ctx context.Context, d Droplet) {
-	if err := c.store.MarkDestroying(ctx, d.ID); err != nil {
-		log.Printf("droplet pool: mark destroying %s: %v", d.Name, err)
-		return
-	}
 	if d.DODropletID != nil {
 		if err := c.do.DeleteDroplet(ctx, *d.DODropletID); err != nil {
 			log.Printf("droplet pool: delete droplet %s: %v", d.Name, err)

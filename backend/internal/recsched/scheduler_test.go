@@ -727,6 +727,14 @@ func testSchedulerPool(t *testing.T) (*pgxpool.Pool, func()) {
 			clip_start_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			clip_end_at TIMESTAMPTZ NOT NULL
 		)`,
+		`CREATE FUNCTION recording_surrender_reclaim_expired() RETURNS BIGINT LANGUAGE plpgsql AS $$
+		DECLARE changed BIGINT;
+		BEGIN
+		  UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,lease_token=NULL,relay_fairness_started_at=NULL,updated_at=transaction_timestamp()
+		  WHERE status='leased' AND lease_expires_at<transaction_timestamp();
+		  GET DIAGNOSTICS changed=ROW_COUNT;
+		  RETURN changed;
+		END $$`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			pool.Close()

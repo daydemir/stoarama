@@ -29,23 +29,16 @@ const (
 var (
 	launchdReadinessTimeout = 2*heartbeatInterval + 15*time.Second
 	launchdRemovalTimeout   = 10 * time.Second
+	launchctlCommandTimeout = 5 * time.Second
 )
 
-const launchctlCommandTimeout = 5 * time.Second
-
-// installLaunchd writes the login-durable GUI-domain LaunchAgent. The explicit
-// user-domain mode supports cookieless relays on headless accounts that already
-// have a launchd user domain; it is intentionally never selected automatically.
+// installLaunchd writes the launchd USER agent (so the login user's Keychain is
+// reachable for Chrome cookie decryption, which a system LaunchDaemon could not do)
+// and bootstraps it into the per-user GUI domain. A non-admin LaunchAgent is
+// restarted after login, but macOS cannot run it before a user logs in.
 func installLaunchd() error {
-	return installLaunchdInDomain(false)
-}
-
-func installLaunchdInDomain(userDomain bool) error {
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("install-launchd is only supported on macOS")
-	}
-	if userDomain && experimentalCookieMode() {
-		return fmt.Errorf("--user-domain supports cookieless relay mode only")
 	}
 	installLock, err := acquireServiceOperationLock()
 	if err != nil {
@@ -76,7 +69,7 @@ func installLaunchdInDomain(userDomain bool) error {
 	}
 	plistPath := filepath.Join(agentsDir, launchdLabel+".plist")
 	instanceID := newServiceInstanceID()
-	rendered, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), logPath, instanceID, userDomain))
+	rendered, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, filepath.Join(bd, "stoarama-relay"), logPath, instanceID))
 	if err != nil {
 		return err
 	}
@@ -120,16 +113,7 @@ func installLaunchdInDomain(userDomain bool) error {
 	}
 	priorDomain := ""
 	domain := fmt.Sprintf("gui/%d", uid)
-	if userDomain {
-		domain = fmt.Sprintf("user/%d", uid)
-		if _, err := runLaunchctlBounded("print", domain); err != nil {
-			return fmt.Errorf("--user-domain requires an existing %s launchd domain: %w", domain, err)
-		}
-	}
 	if len(loaded) == 1 {
-		if loaded[0] != domain {
-			return fmt.Errorf("relay is already loaded in %s; refusing cross-domain replacement with %s", loaded[0], domain)
-		}
 		if !hadPrior || !ownedRelayPlist(prior, filepath.Join(bd, "stoarama-relay")) {
 			return fmt.Errorf("relay job is loaded in %s but its canonical plist is not owned by this installer; refusing replacement", loaded[0])
 		}
@@ -194,11 +178,7 @@ func bootstrapLaunchd(domain, plistPath, instanceID string, baselineSuccesses ui
 	startedAt := time.Now().UTC()
 	out, err := runLaunchctlBounded("bootstrap", domain, plistPath)
 	if err != nil {
-		hint := "the selected launchd domain is unavailable"
-		if strings.HasPrefix(domain, "gui/") {
-			hint = "this non-admin service requires an active GUI login session"
-		}
-		cause := fmt.Errorf("launchctl bootstrap %s: %w (%s); %s", domain, err, strings.TrimSpace(string(out)), hint)
+		cause := fmt.Errorf("launchctl bootstrap %s: %w (%s); this non-admin service requires an active GUI login session", domain, err, strings.TrimSpace(string(out)))
 		loaded, probeErr := launchdJobLoadedBounded(domain + "/" + launchdLabel)
 		if probeErr != nil {
 			return fmt.Errorf("%w; candidate state probe failed: %v", cause, probeErr)
@@ -354,14 +334,9 @@ func newServiceInstanceID() string {
 	return rand.Text()
 }
 
-type launchdPlistData struct {
-	Label, ExePath, LogPath, InstanceID string
-	UserDomain                          bool
-}
-
-func launchdTemplateData(label, exePath, logPath, instanceID string, userDomain bool) launchdPlistData {
+func launchdTemplateData(label, exePath, logPath, instanceID string) map[string]string {
 	escape := html.EscapeString
-	return launchdPlistData{escape(label), escape(exePath), escape(logPath), escape(instanceID), userDomain}
+	return map[string]string{"Label": escape(label), "ExePath": escape(exePath), "LogPath": escape(logPath), "InstanceID": escape(instanceID)}
 }
 
 func readPriorFile(path string) ([]byte, os.FileMode, bool, error) {
@@ -646,7 +621,7 @@ func scheduleLegacyLaunchdHandoff(domain, plistPath string, prior []byte) error 
 	}
 	instanceID := newServiceInstanceID()
 	logPath := filepath.Join(home, ".stoarama", "logs", "relay.log")
-	updated, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, exe, logPath, instanceID, false))
+	updated, err := executeTemplate("templates/launchd.plist.tmpl", launchdTemplateData(launchdLabel, exe, logPath, instanceID))
 	if err != nil {
 		return err
 	}
@@ -879,7 +854,7 @@ func launchdJobLoadedWithin(target string, timeout time.Duration) (bool, error) 
 		return true, nil
 	}
 	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && (exitErr.ExitCode() == 113 || exitErr.ExitCode() == 125) {
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 113 {
 		return false, nil
 	}
 	return false, err

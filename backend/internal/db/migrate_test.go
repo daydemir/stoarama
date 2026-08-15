@@ -11,6 +11,24 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func migrateUpForDBTest(ctx context.Context, pool *pgxpool.Pool, dir string) error {
+	const runtimeRole = "stoarama_test_runtime"
+	const executorRole = "stoarama_test_admission_executor"
+	const authorityRole = "stoarama_test_admission_authority"
+	if _, err := pool.Exec(ctx, `
+		DO $roles$ BEGIN
+		  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='stoarama_test_runtime') THEN CREATE ROLE stoarama_test_runtime LOGIN NOINHERIT; END IF;
+		  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='stoarama_test_admission_executor') THEN CREATE ROLE stoarama_test_admission_executor LOGIN NOINHERIT; END IF;
+		END $roles$;
+	`); err != nil {
+		return err
+	}
+	if err := BootstrapCampaignRoles(ctx, pool, runtimeRole, executorRole, authorityRole); err != nil {
+		return err
+	}
+	return MigrateUpWithCampaignRoles(ctx, pool, dir, runtimeRole, executorRole, authorityRole)
+}
+
 // A migration that cannot take its lock must abort quickly instead of queueing
 // behind a live transaction. Without SET LOCAL lock_timeout this blocks forever
 // and every query arriving after the ALTER stacks up behind it.

@@ -34,10 +34,16 @@ const (
 )
 
 type nodePrincipal struct {
-	NodeID      int64
-	AccountID   int64
-	NodeType    string
-	DisplayName string
+	NodeID              int64
+	NodeTokenID         int64
+	NodeClaimGeneration int64
+	NodeClaimPurpose    string
+	AccountID           int64
+	NodeType            string
+	DisplayName         string
+	// credentialSHA256 is a one-way request proof. Raw bearer credentials never
+	// cross into SQL arguments or loggable principal state.
+	credentialSHA256 string
 }
 
 type nodeContextKey string
@@ -138,7 +144,7 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 	var principal nodePrincipal
 	var tokenID int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT n.id, n.account_id, n.node_type, n.display_name, t.id
+		SELECT n.id, n.account_id, n.node_type, n.display_name, t.id, COALESCE(t.recording_claim_generation,0), t.recording_claim_purpose
 		FROM node_tokens t
 		JOIN nodes n ON n.id=t.node_id
 		JOIN accounts a ON a.id=n.account_id
@@ -146,10 +152,12 @@ func (s *Server) lookupNodeToken(ctx context.Context, raw string) (nodePrincipal
 		  AND t.revoked_at IS NULL
 		  AND n.status = ANY($2::text[])
 		  AND a.status='active'
-	`, hash, nodeTokenAllowedStatuses()).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID)
+	`, hash, nodeTokenAllowedStatuses()).Scan(&principal.NodeID, &principal.AccountID, &principal.NodeType, &principal.DisplayName, &tokenID, &principal.NodeClaimGeneration, &principal.NodeClaimPurpose)
 	if err != nil {
 		return nodePrincipal{}, err
 	}
+	principal.NodeTokenID = tokenID
+	principal.credentialSHA256 = hash
 	_, _ = s.pool.Exec(ctx, `UPDATE node_tokens SET last_used_at=now() WHERE id=$1`, tokenID)
 	return principal, nil
 }
@@ -546,6 +554,10 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock node removal claim authority")
+		return
+	}
 
 	relayGroupID, liveLeases, err := lockRelayNode(r.Context(), tx, id, principal.AccountID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -557,6 +569,27 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 	}
 	if !relayGroupChangeAllowed(relayGroupID, nil, liveLeases) {
 		util.WriteError(w, http.StatusConflict, "disable this computer before removing it")
+		return
+	}
+	var recoveryBusy bool
+	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(
+		SELECT 1 FROM recording_capture_producers producer
+		WHERE producer.node_id=$1
+		  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+		UNION ALL
+		SELECT 1 FROM recording_capture_set_grants set_grant
+		JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
+		JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+		JOIN recording_job_lease_generations lease
+		  ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
+		WHERE lease.node_id=$1
+		  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
+	)`, id).Scan(&recoveryBusy); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load node recovery authority")
+		return
+	}
+	if recoveryBusy {
+		util.WriteError(w, http.StatusConflict, "node retains fenced capture recovery authority")
 		return
 	}
 	ct, err := tx.Exec(r.Context(), `
@@ -572,8 +605,30 @@ func (s *Server) handleAccountNodeDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `
-		UPDATE node_tokens SET revoked_at=COALESCE(revoked_at, now())
-		WHERE node_id=$1 AND revoked_at IS NULL
+		WITH retired AS (
+		  UPDATE node_tokens SET revoked_at=transaction_timestamp(),updated_at=transaction_timestamp()
+		  WHERE node_id=$1 AND revoked_at IS NULL
+		  RETURNING id,node_id,recording_claim_generation
+		), host_events AS (
+		  INSERT INTO recording_worker_claim_generation_events
+		    (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+		  SELECT node_id,recording_claim_generation,
+		         CASE WHEN recording_claim_generation=1 THEN NULL ELSE recording_claim_generation-1 END,
+		         id,'host_lost',encode(sha256(convert_to('recording-worker-host-lost-v1','UTF8')
+		           ||decode('00','hex')||convert_to(node_id::text,'UTF8')
+		           ||decode('00','hex')||convert_to(recording_claim_generation::text,'UTF8')
+		           ||decode('00','hex')||convert_to(id::text,'UTF8')),'hex')
+		  FROM retired
+		)
+		INSERT INTO recording_worker_claim_generation_events
+		  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+		SELECT node_id,recording_claim_generation,
+		       CASE WHEN recording_claim_generation=1 THEN NULL ELSE recording_claim_generation-1 END,
+		       id,'retired',encode(sha256(convert_to('recording-worker-claim-retired-v1','UTF8')
+		         ||decode('00','hex')||convert_to(node_id::text,'UTF8')
+		         ||decode('00','hex')||convert_to(recording_claim_generation::text,'UTF8')
+		         ||decode('00','hex')||convert_to(id::text,'UTF8')),'hex')
+		FROM retired
 	`, id); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("revoke node tokens: %v", err))
 		return
@@ -1005,7 +1060,22 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// relay heartbeat that reports only its relay keys (youtube_mode, youtube_ready,
 	// youtube_error, active_jobs, relay_version, ...) preserves any pre-existing keys.
 	// A null capabilities payload leaves the column untouched (concat with '{}').
-	ct, err := s.pool.Exec(r.Context(), `
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin node heartbeat")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err = tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "lock node heartbeat claim authority")
+		return
+	}
+	var tokenCurrent bool
+	if err = tx.QueryRow(r.Context(), `SELECT node_id=$2 AND revoked_at IS NULL FROM node_tokens WHERE id=$1 FOR SHARE`, principal.NodeTokenID, principal.NodeID).Scan(&tokenCurrent); err != nil || !tokenCurrent {
+		util.WriteError(w, http.StatusUnauthorized, "node credential is stale")
+		return
+	}
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE nodes
 		SET
 			last_heartbeat_at=now(),
@@ -1021,6 +1091,10 @@ func (s *Server) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusNotFound, "node not found")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "commit node heartbeat")
 		return
 	}
 	node, err := s.fetchNodeByID(r.Context(), principal.NodeID)

@@ -13,6 +13,9 @@ import (
 type Config struct {
 	Port                             int
 	DatabaseURL                      string
+	AdmissionDatabaseURL             string
+	AdmissionExecutorRole            string
+	AdmissionAuthorityRole           string
 	APIToken                         string
 	ServiceToken                     string
 	BootstrapAdminEmail              string
@@ -162,6 +165,9 @@ func Load() (Config, error) {
 	cfg := Config{
 		Port:                             intEnv("PORT", 8080),
 		DatabaseURL:                      os.Getenv("DATABASE_URL"),
+		AdmissionDatabaseURL:             os.Getenv("ADMISSION_DATABASE_URL"),
+		AdmissionExecutorRole:            strings.TrimSpace(os.Getenv("STOARAMA_ADMISSION_EXECUTOR_ROLE")),
+		AdmissionAuthorityRole:           strings.TrimSpace(os.Getenv("STOARAMA_ADMISSION_AUTHORITY_ROLE")),
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
@@ -329,6 +335,12 @@ func validSharedRecordingsSlug(slug string) bool {
 }
 
 func (c Config) ValidateAPI() error {
+	if strings.TrimSpace(c.AdmissionDatabaseURL) == "" || strings.TrimSpace(c.AdmissionDatabaseURL) == strings.TrimSpace(c.DatabaseURL) {
+		return fmt.Errorf("ADMISSION_DATABASE_URL must be present and distinct from DATABASE_URL")
+	}
+	if c.AdmissionExecutorRole != "stoarama_admission_executor" || c.AdmissionAuthorityRole != "stoarama_admission_authority" {
+		return fmt.Errorf("campaign admission database roles must match the reviewed executor/authority manifest")
+	}
 	if err := c.ValidateR2(); err != nil {
 		return err
 	}

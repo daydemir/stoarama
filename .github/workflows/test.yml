@@ -74,6 +74,28 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db ./internal/api -run 'Test(RecordingPresentationV2MigrationRunsThroughMigrateUp|RecordingPresentationV2DisabledClaimAndFencedLifecyclePostgres|RecordingPresentationV2CampaignProtectionFencePostgres|RecordingPresentationV2IngestAmbiguousReplayAndUnavailablePostgres|RecordingPresentationV2ClaimSkipsStaleBacklogAndFencesConcurrentCallersPostgres|RecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent|RecordingClipTimestampContractMigration)' -count=1 -v
+      - name: Test targeted campaign admission authority, evidence, and activation fencing
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          set -o pipefail
+          go test -p=1 ./internal/db ./internal/api ./internal/recordability -run 'Test(RecordingCampaignAdmissionMigrationFencesAndSealsActivation|RecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses|CampaignAdmissionHandlersPersistReplayAndSealExactBatch|CampaignAdmissionApprovalRequiresExactOperatorSession|NormalizeCampaignAdmissionEntriesCanonicalAndExact|TargetedEvidenceReplayComparisonExact|VerifyTargetedQuarantineUsesExactMediaBytesAndRetainsVersions|NativeSegmentSignatureBindsAllStoredMediaFacts|TargetedChallengeProofCannotReplayAcrossAttempts)' -count=1 -json | tee /tmp/campaign-admission-pg.json
+          ! grep -F '"Action":"skip"' /tmp/campaign-admission-pg.json
+          ! grep -F 'testing: warning: no tests to run' /tmp/campaign-admission-pg.json
+          for test_name in \
+            TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation \
+            TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses \
+            TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch \
+            TestCampaignAdmissionApprovalRequiresExactOperatorSession \
+            TestNormalizeCampaignAdmissionEntriesCanonicalAndExact \
+            TestTargetedEvidenceReplayComparisonExact \
+            TestVerifyTargetedQuarantineUsesExactMediaBytesAndRetainsVersions \
+            TestNativeSegmentSignatureBindsAllStoredMediaFacts \
+            TestTargetedChallengeProofCannotReplayAcrossAttempts; do
+            grep -F '"Action":"pass"' /tmp/campaign-admission-pg.json | grep -F '"Test":"'"${test_name}"'"'
+          done
+      - name: Test exact migration-first Render orchestration
+        run: python3 ../infra/render/test_deploy_with_migration.py -q
       - name: Test dynamic streak priority PostgreSQL schedule and plan
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -108,6 +130,14 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run 'Test(RecordingJobsLease(RespectsDropletCapacityOne|RefusesDrainingDroplet)|RecordingJobCompleteRejectsZeroClipContinuous|RecordingHeartbeat(CapsContinuousWindowDrain|HandlerCancelsAfterContinuousDrainCap)|RelayGroupLeaseCapConcurrent|CloudSurrenderExcludesPriorOwnerAndPreservesClips|RelaySurrenderHandsJobToDifferentOwner|PropagateStreamSourceUpdatesOnlyActiveRelayRecordings)' -count=1 -v
+      - name: Test surrender transport fencing and crash recovery
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          set -o pipefail
+          go test ./internal/api -run '^TestRecordingSurrenderTransport(PostgresLifecycleAndExpiryRecovery|R10PostgresAuthorityAndRaces)$' -count=1 -json | tee /tmp/surrender-transport-pg.json
+          grep -F '"Action":"pass"' /tmp/surrender-transport-pg.json | grep -F '"Test":"TestRecordingSurrenderTransportPostgresLifecycleAndExpiryRecovery"'
+          grep -F '"Action":"pass"' /tmp/surrender-transport-pg.json | grep -F '"Test":"TestRecordingSurrenderTransportR10PostgresAuthorityAndRaces"'
       - name: Test provisioning teardown lease safety
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

@@ -43,6 +43,36 @@ func TestAuthoritativeFramePayloadCarriesAccountHashAndNoHeartbeat(t *testing.T)
 	}
 }
 
+func TestDecisionAuthoritativeFrameUsesPreparedFenceAndReturnsIdentity(t *testing.T) {
+	var ingest map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/capture/authoritative-frame-target":
+			_, _ = w.Write([]byte(`{"stream_id":123,"source_url":"https://publisher.example/live.m3u8","source_page_url":"https://publisher.example/camera","source_revision_id":9,"source_snapshot_sha256":"` + strings.Repeat("b", 64) + `"}`))
+		case "/api/v1/capture/ingest":
+			if err := json.NewDecoder(r.Body).Decode(&ingest); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"frame_id":77,"frame_sha256":"` + strings.Repeat("a", 64) + `"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, _ := NewClient(ClientConfig{BaseURL: server.URL, APIToken: "test", HTTPClient: server.Client()})
+	target, err := client.PrepareAuthoritativeFrame(context.Background(), 47, 123, "deniz_fd_restore_20260814")
+	if err != nil || target.SourceRevisionID != 9 || target.SourceSnapshotSHA256 != strings.Repeat("b", 64) {
+		t.Fatalf("target=%+v err=%v", target, err)
+	}
+	stored, err := client.IngestAuthoritativeFrame(context.Background(), IngestSuccessRequest{AccountID: 47, StreamID: 123, CapturedAt: time.Now(), MIMEType: "image/jpeg", FrameBytes: []byte{1}, FrameSHA256: strings.Repeat("a", 64), AuthoritativeFrameOnly: true, AuthorityCode: "deniz_fd_restore_20260814", SourceRevisionID: target.SourceRevisionID, SourceSnapshotSHA256: target.SourceSnapshotSHA256})
+	if err != nil || stored.FrameID != 77 || stored.FrameSHA256 != strings.Repeat("a", 64) {
+		t.Fatalf("stored=%+v err=%v", stored, err)
+	}
+	if ingest["authority_code"] != "deniz_fd_restore_20260814" || ingest["source_revision_id"] != float64(9) || ingest["source_snapshot_sha256"] != strings.Repeat("b", 64) {
+		t.Fatalf("ingest=%v", ingest)
+	}
+}
+
 func TestIngestSuccessRetriesOnTransientFailure(t *testing.T) {
 	t.Parallel()
 

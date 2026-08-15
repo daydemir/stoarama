@@ -216,15 +216,22 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 		log.Fatalf("begin drain tx: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		log.Fatalf("lock recorder claim authority: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		log.Fatalf("lock recorder capacity authority: %v", err)
+	}
 
 	var (
 		name      string
 		state     string
 		createdAt time.Time
+		nodeID    int64
 	)
 	if err := tx.QueryRow(ctx, `
-		SELECT name, state, created_at FROM recorder_droplets WHERE id=$1 FOR UPDATE
-	`, id).Scan(&name, &state, &createdAt); err != nil {
+		SELECT name, state, created_at, node_id FROM recorder_droplets WHERE id=$1 FOR UPDATE
+	`, id).Scan(&name, &state, &createdAt, &nodeID); err != nil {
 		log.Fatalf("load droplet %d: %v", id, err)
 	}
 	// Only an active droplet has a drain to begin. Re-draining one that is already
@@ -232,6 +239,13 @@ func runRecorderControlDrain(ctx context.Context, cfg config.Config, args []stri
 	// out, which is the opposite of what an operator forcing a roll wants.
 	if state != "active" {
 		log.Fatalf("droplet %d (%s) is %s, not active; only an active droplet can be drained", id, name, state)
+	}
+	var probeOccupancy int
+	if err := tx.QueryRow(ctx, `SELECT recording_worker_targeted_probe_occupancy($1)`, nodeID).Scan(&probeOccupancy); err != nil {
+		log.Fatalf("check targeted probe occupancy for %s: %v", name, err)
+	}
+	if probeOccupancy > 0 {
+		log.Fatalf("droplet %d (%s) has %d live targeted qualification probe(s); drain is forbidden even with -force", id, name, probeOccupancy)
 	}
 
 	// Report the cost before paying it. A draining droplet that still holds live

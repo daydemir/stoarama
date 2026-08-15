@@ -20,6 +20,31 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/email"
 )
 
+const (
+	testCampaignRuntimeRole   = "stoarama_test_runtime"
+	testCampaignExecutorRole  = "stoarama_test_admission_executor"
+	testCampaignAuthorityRole = "stoarama_test_admission_authority"
+)
+
+func migrateAPITestSchema(ctx context.Context, pool *pgxpool.Pool, migrationDir string) error {
+	if _, err := pool.Exec(ctx, `
+		DO $roles$ BEGIN
+		  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='stoarama_test_runtime') THEN
+		    CREATE ROLE stoarama_test_runtime LOGIN NOINHERIT;
+		  END IF;
+		  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='stoarama_test_admission_executor') THEN
+		    CREATE ROLE stoarama_test_admission_executor LOGIN NOINHERIT;
+		  END IF;
+		END $roles$;
+	`); err != nil {
+		return fmt.Errorf("create campaign test roles: %w", err)
+	}
+	if err := db.BootstrapCampaignRoles(ctx, pool, testCampaignRuntimeRole, testCampaignExecutorRole, testCampaignAuthorityRole); err != nil {
+		return err
+	}
+	return db.MigrateUpWithCampaignRoles(ctx, pool, migrationDir, testCampaignRuntimeRole, testCampaignExecutorRole, testCampaignAuthorityRole)
+}
+
 // captureMailer is a no-op email.Sender for tests that exercise the invite path.
 type captureMailer struct{ sent int }
 
@@ -85,7 +110,7 @@ func testIdentityServer(t *testing.T) (*Server, *pgxpool.Pool, func()) {
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
 
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	migrationPool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
 		admin.Close()
@@ -93,20 +118,56 @@ func testIdentityServer(t *testing.T) (*Server, *pgxpool.Pool, func()) {
 	}
 
 	migrationDir := findMigrationsDir(t)
-	if err := db.MigrateUp(ctx, pool, migrationDir); err != nil {
-		pool.Close()
+	if err := migrateAPITestSchema(ctx, migrationPool, migrationDir); err != nil {
+		migrationPool.Close()
 		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
 		admin.Close()
 		t.Fatalf("apply migrations: %v", err)
 	}
+	runtimeConfig := cfg.Copy()
+	runtimeConfig.ConnConfig.User = testCampaignRuntimeRole
+	runtimePool, err := pgxpool.NewWithConfig(ctx, runtimeConfig)
+	if err != nil {
+		migrationPool.Close()
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
+		admin.Close()
+		t.Fatalf("open campaign runtime test pool: %v", err)
+	}
+	if err := runtimePool.Ping(ctx); err != nil {
+		runtimePool.Close()
+		migrationPool.Close()
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
+		admin.Close()
+		t.Fatalf("ping campaign runtime test pool: %v", err)
+	}
+	executorConfig := cfg.Copy()
+	executorConfig.ConnConfig.User = testCampaignExecutorRole
+	executorPool, err := pgxpool.NewWithConfig(ctx, executorConfig)
+	if err != nil {
+		runtimePool.Close()
+		migrationPool.Close()
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
+		admin.Close()
+		t.Fatalf("open campaign executor test pool: %v", err)
+	}
+	if err := executorPool.Ping(ctx); err != nil {
+		executorPool.Close()
+		runtimePool.Close()
+		migrationPool.Close()
+		_, _ = admin.Exec(ctx, fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
+		admin.Close()
+		t.Fatalf("ping campaign executor test pool: %v", err)
+	}
+	migrationPool.Close()
 
-	s := &Server{pool: pool}
+	s := &Server{pool: runtimePool, admissionPool: executorPool}
 	cleanup := func() {
-		pool.Close()
+		executorPool.Close()
+		runtimePool.Close()
 		_, _ = admin.Exec(context.Background(), fmt.Sprintf(`DROP SCHEMA %s CASCADE`, schema))
 		admin.Close()
 	}
-	return s, pool, cleanup
+	return s, runtimePool, cleanup
 }
 
 func findMigrationsDir(t *testing.T) string {

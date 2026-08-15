@@ -39,6 +39,8 @@ type captureBackfillMissingResult struct {
 	SizeBytes       int64     `json:"size_bytes,omitempty"`
 	CapturesSuccess int64     `json:"captures_success"`
 	BackfillReason  string    `json:"backfill_reason,omitempty"`
+	FrameID         int64     `json:"frame_id,omitempty"`
+	FrameSHA256     string    `json:"frame_sha256,omitempty"`
 }
 
 type streamIDFlags []int64
@@ -114,6 +116,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 	timeoutSec := fs.Int("timeout-sec", 90, "per-stream resolution/capture timeout seconds")
 	dryRun := fs.Bool("dry-run", false, "print actions without ingesting frames")
 	accountID := fs.Int64("account-id", 0, "owning account for explicit authoritative frame refresh")
+	authorityCode := fs.String("authority-code", "", "immutable campaign decision code for nonactive candidate refresh")
 	asJSON := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
 
@@ -161,7 +164,7 @@ func runCaptureBackfillMissing(ctx context.Context, cfg config.Config, args []st
 		go func() {
 			defer wg.Done()
 			for target := range workCh {
-				resCh <- processCaptureBackfillMissingTarget(ctx, registry, client, target, time.Duration(*timeoutSec)*time.Second, *dryRun, *accountID)
+				resCh <- processCaptureBackfillMissingTarget(ctx, registry, client, target, time.Duration(*timeoutSec)*time.Second, *dryRun, *accountID, strings.TrimSpace(*authorityCode))
 			}
 		}()
 	}
@@ -219,6 +222,7 @@ func processCaptureBackfillMissingTarget(
 	timeout time.Duration,
 	dryRun bool,
 	accountID int64,
+	authorityCode string,
 ) captureBackfillMissingResult {
 	stream := target.Stream
 	result := captureBackfillMissingResult{
@@ -227,6 +231,17 @@ func processCaptureBackfillMissingTarget(
 		Provider:        strings.TrimSpace(stream.Provider),
 		CapturesSuccess: target.CapturesSuccess,
 		BackfillReason:  strings.TrimSpace(target.BackfillReason),
+	}
+	var sourceRevisionID int64
+	var sourceSnapshotSHA string
+	if authorityCode != "" && !dryRun {
+		prepared, err := client.PrepareAuthoritativeFrame(ctx, accountID, stream.ID, authorityCode)
+		if err != nil {
+			result.Status, result.Reason = "error", "prepare decision-authorized source failed"
+			return result
+		}
+		stream.SourceURL, stream.SourcePageURL = prepared.SourceURL, prepared.SourcePageURL
+		sourceRevisionID, sourceSnapshotSHA = prepared.SourceRevisionID, prepared.SourceSnapshotSHA256
 	}
 	if stream.ID <= 0 {
 		result.Status = "error"
@@ -289,7 +304,7 @@ func processCaptureBackfillMissingTarget(
 
 	ingestCtx, cancelIngest := context.WithTimeout(ctx, timeout)
 	defer cancelIngest()
-	if err := client.IngestSuccess(ingestCtx, captureapi.IngestSuccessRequest{
+	stored, err := client.IngestAuthoritativeFrame(ingestCtx, captureapi.IngestSuccessRequest{
 		AccountID:              accountID,
 		StreamID:               stream.ID,
 		CapturedAt:             result.CapturedAt,
@@ -301,11 +316,16 @@ func processCaptureBackfillMissingTarget(
 		FrameSHA256:            frame.SHA256,
 		RecordingHeartbeat:     false,
 		AuthoritativeFrameOnly: true,
-	}); err != nil {
+		AuthorityCode:          authorityCode,
+		SourceRevisionID:       sourceRevisionID,
+		SourceSnapshotSHA256:   sourceSnapshotSHA,
+	})
+	if err != nil {
 		result.Status = "error"
 		result.Reason = "ingest capture success failed"
 		return result
 	}
+	result.FrameID, result.FrameSHA256 = stored.FrameID, stored.FrameSHA256
 	result.Status = "success"
 	return result
 }

@@ -51,7 +51,7 @@ func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 			t.Fatalf("droplet lock SQL missing %q", want)
 		}
 	}
-	for _, want := range []string{"live.lease_owner = $1", "live.lease_expires_at > now()", ") < $5"} {
+	for _, want := range []string{"live.lease_owner = $1", "live.lease_expires_at > now()", "recording_worker_targeted_probe_occupancy($8)", ") < $5", "j.handoff_owner=$1 AND j.handoff_until>now()", "retry_alternate.name<>$1"} {
 		if !strings.Contains(cloudRecordingJobsLeaseSQL, want) {
 			t.Fatalf("lease SQL missing %q", want)
 		}
@@ -1155,7 +1155,7 @@ func TestAccountClipsFeedPreservesTimestampContractTriState(t *testing.T) {
 }
 
 func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testing.T) {
-	pool, cleanup := testRecordingLeasePool(t)
+	pool, cleanup := testPresentationV2Pool(t)
 	defer cleanup()
 	ctx := context.Background()
 	var headCount atomic.Int64
@@ -1169,22 +1169,6 @@ func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testi
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer objectServer.Close()
-	raw, err := os.ReadFile("../../../infra/sql/migrations/0132_recording_clip_timestamp_contract.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, string(raw)); err != nil {
-		t.Fatal(err)
-	}
-	for _, ddl := range []string{
-		`ALTER TABLE recordings ADD COLUMN delivery_storage_destination_id bigint, ADD COLUMN last_clip_at timestamptz, ADD COLUMN consecutive_failures integer NOT NULL DEFAULT 0, ADD COLUMN last_error_text text NOT NULL DEFAULT '', ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()`,
-		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN storage_destination_id bigint, ADD COLUMN endpoint text, ADD COLUMN bucket text, ADD COLUMN object_key text, ADD COLUMN display_path text, ADD COLUMN mime_type text, ADD COLUMN container text, ADD COLUMN size_bytes bigint, ADD COLUMN etag text, ADD COLUMN sha256 text, ADD COLUMN duration_ms bigint, ADD COLUMN video_codec text, ADD COLUMN audio_codec text, ADD COLUMN audio_present boolean, ADD COLUMN actual_fps double precision, ADD COLUMN video_width integer, ADD COLUMN video_height integer, ADD COLUMN resolved_url text, ADD COLUMN fire_at timestamptz, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz`,
-		`CREATE UNIQUE INDEX test_recording_clip_object ON recording_clips(bucket,object_key)`,
-	} {
-		if _, err := pool.Exec(ctx, ddl); err != nil {
-			t.Fatal(err)
-		}
-	}
 	secrets, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
 		t.Fatal(err)
@@ -1193,15 +1177,21 @@ func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc) VALUES(7,42,$2,'auto','bucket','prefix','access',$1)`, sealed, objectServer.URL); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO accounts(id,email,name,status,role) VALUES(42,'clip-ingest@example.test','clip ingest','active','admin')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO storage_destinations(id,account_id,name,provider,endpoint,region,bucket,key_prefix,access_key_id,secret_access_key_enc,status,verified_at) VALUES(7,42,'clip ingest','s3_compatible',$2,'auto','bucket','prefix','access',$1,'verified',now())`, sealed, objectServer.URL); err != nil {
 		t.Fatal(err)
 	}
 	lease := "123e4567-e89b-12d3-a456-426614174000"
 	intent := "123e4567-e89b-12d3-a456-426614174010"
-	if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams) VALUES(1,42,'relay','active',now(),4)`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,account_id,display_name,node_type,status,last_heartbeat_at,relay_max_streams) VALUES(1,42,'clip-ingest-node','relay','active',now(),4)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via) VALUES(1,42,7,'ingest','https://example/live','active',now()-interval '1 hour','relay')`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,recording_state) VALUES(1,'test','clip-ingest','clip ingest','clip-ingest','https://example.test/live.m3u8','https://example.test/clip-ingest','hls','video_manifest','video_live','continuous_video',30,'on')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,stream_id,source_kind,cron_timezone,clip_duration_sec,mode,daily_window_start,daily_window_end,active_weekdays,status,start_at,capture_via) VALUES(1,42,7,'ingest','https://example.test/live.m3u8',1,'hls_live','UTC',60,'continuous','08:00','20:00',127,'active',now()-interval '1 hour','relay')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,lease_owner,lease_expires_at,lease_token,idempotency_key,kind,window_end_at) VALUES(1,1,now(),now(),60,'leased','node:1',now()+interval '1 hour',$1,'ingest','continuous_window',now()+interval '1 hour')`, lease); err != nil {
