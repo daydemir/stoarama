@@ -7,25 +7,56 @@ import (
 )
 
 type recordingTimelineHealth struct {
-	RecentCoveragePct         *float64  `json:"recent_coverage_pct"`
-	RecentLargestGapSeconds   float64   `json:"recent_largest_gap_seconds"`
-	RecentGapCount            int64     `json:"recent_gap_count"`
-	RecentOverlapCount        int64     `json:"recent_overlap_count"`
-	RecentOverlapSeconds      float64   `json:"recent_overlap_seconds"`
-	RecentLayoutChangeCount   int64     `json:"recent_layout_change_count"`
-	RecentWindowCount         int       `json:"recent_window_count"`
-	LifetimeCoveragePct       *float64  `json:"lifetime_coverage_pct"`
-	LifetimeLargestGapSeconds float64   `json:"lifetime_largest_gap_seconds"`
-	LifetimeGapCount          int64     `json:"lifetime_gap_count"`
-	LifetimeOverlapCount      int64     `json:"lifetime_overlap_count"`
-	LifetimeOverlapSeconds    float64   `json:"lifetime_overlap_seconds"`
-	LifetimeLayoutChangeCount int64     `json:"lifetime_layout_change_count"`
-	LifetimeWindowCount       int       `json:"lifetime_window_count"`
-	LifetimeComplete          bool      `json:"lifetime_complete"`
-	CalculatedAt              time.Time `json:"calculated_at"`
-	Grade                     string    `json:"grade"`
-	Stitchability             string    `json:"stitchability"`
-	Diagnosis                 string    `json:"diagnosis"`
+	RecentCoveragePct         *float64              `json:"recent_coverage_pct"`
+	RecentLargestGapSeconds   float64               `json:"recent_largest_gap_seconds"`
+	RecentGapCount            int64                 `json:"recent_gap_count"`
+	RecentOverlapCount        int64                 `json:"recent_overlap_count"`
+	RecentOverlapSeconds      float64               `json:"recent_overlap_seconds"`
+	RecentLayoutChangeCount   int64                 `json:"recent_layout_change_count"`
+	RecentWindowCount         int                   `json:"recent_window_count"`
+	LifetimeCoveragePct       *float64              `json:"lifetime_coverage_pct"`
+	LifetimeLargestGapSeconds float64               `json:"lifetime_largest_gap_seconds"`
+	LifetimeGapCount          int64                 `json:"lifetime_gap_count"`
+	LifetimeOverlapCount      int64                 `json:"lifetime_overlap_count"`
+	LifetimeOverlapSeconds    float64               `json:"lifetime_overlap_seconds"`
+	LifetimeLayoutChangeCount int64                 `json:"lifetime_layout_change_count"`
+	LifetimeWindowCount       int                   `json:"lifetime_window_count"`
+	LifetimeComplete          bool                  `json:"lifetime_complete"`
+	CalculatedAt              time.Time             `json:"calculated_at"`
+	Grade                     string                `json:"grade"`
+	Stitchability             string                `json:"stitchability"`
+	Diagnosis                 string                `json:"diagnosis"`
+	DailyGrades               []recordingDailyGrade `json:"daily_grades"`
+}
+
+type recordingDailyGrade struct {
+	WindowStartAt     time.Time `json:"window_start_at"`
+	WindowEndAt       time.Time `json:"window_end_at"`
+	Grade             string    `json:"grade"`
+	CoveragePct       float64   `json:"coverage_pct"`
+	LargestGapSeconds float64   `json:"largest_gap_seconds"`
+	Reason            string    `json:"reason"`
+}
+
+func classifyRecordingDailyGrade(m qualificationWindowMetrics, clipCount int) (string, string) {
+	grade, reason := classifyQualificationTimeline(m)
+	switch grade {
+	case "GREAT_CANDIDATE":
+		return "A", reason
+	case "GOOD_CANDIDATE":
+		return "B", reason
+	case "ACCEPTABLE_CANDIDATE":
+		return "C", reason
+	case "UNKNOWN":
+		return "UNKNOWN", reason
+	}
+	if m.CoveragePct == nil || clipCount == 0 || *m.CoveragePct == 0 {
+		return "F", "no usable completed media"
+	}
+	if *m.CoveragePct < 80 {
+		return "E", reason
+	}
+	return "D", reason
 }
 
 func classifyRecordingTimelineHealth(h *recordingTimelineHealth) {
@@ -96,5 +127,43 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 		classifyRecordingTimelineHealth(&h)
 		out[id] = h
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	gradeRows, err := s.pool.Query(ctx, `
+		SELECT h.recording_id,h.window_start_at,h.window_end_at,h.expected_seconds,h.coverage_pct,
+		       h.largest_gap_seconds,h.gap_over_30s_count,h.gap_over_5m_count,h.overlap_count,
+		       h.metric_version,h.clip_count
+		FROM recording_window_health h
+		JOIN recordings r ON r.id=h.recording_id
+		WHERE r.account_id=$1 AND h.recording_id=ANY($2::bigint[])
+		ORDER BY h.recording_id,h.window_start_at
+	`, accountID, recordingIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer gradeRows.Close()
+	for gradeRows.Next() {
+		var id, expected int64
+		var start, end time.Time
+		var coverage, largest float64
+		var over30, over5, overlaps *int
+		var version *int
+		var clips int
+		if err := gradeRows.Scan(&id, &start, &end, &expected, &coverage, &largest, &over30, &over5, &overlaps, &version, &clips); err != nil {
+			return nil, err
+		}
+		grade, reason := classifyRecordingDailyGrade(qualificationWindowMetrics{
+			CoveragePct: &coverage, LargestGap: &largest, GapsOver30s: over30, GapsOver5m: over5,
+			OverlapCount: overlaps, MetricVersion: version, ExpectedSeconds: expected,
+			MeasuredExpected: &expected, JobCount: 1, HealthCount: 1,
+		}, clips)
+		h := out[id]
+		h.DailyGrades = append(h.DailyGrades, recordingDailyGrade{
+			WindowStartAt: start, WindowEndAt: end, Grade: grade, CoveragePct: coverage,
+			LargestGapSeconds: largest, Reason: reason,
+		})
+		out[id] = h
+	}
+	return out, gradeRows.Err()
 }

@@ -55,6 +55,7 @@ type sharedRecording struct {
 	HasRelayOnline    bool                        `json:"has_relay_online"`
 	HasRelayAssigned  bool                        `json:"has_relay_assigned"`
 	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins,omitempty"`
+	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health,omitempty"`
 }
 
 type sharedRecordingsLimiter struct {
@@ -424,8 +425,15 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	if err != nil {
 		return nil, err
 	}
+	timeline, err := s.recordingTimelineHealthForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
+	if err != nil {
+		return nil, err
+	}
 	for i := range items {
 		items[i].CaptureHealthBins = bins[items[i].ID]
+		if health, ok := timeline[items[i].ID]; ok {
+			items[i].TimelineHealth = &health
+		}
 	}
 	return items, nil
 }
