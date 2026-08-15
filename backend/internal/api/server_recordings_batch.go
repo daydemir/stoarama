@@ -629,8 +629,11 @@ func (s *Server) handleAccountRecordingsBatchSchedule(w http.ResponseWriter, r *
 		projectedFreeAfterBytes := nasFreeBytes - requiredFreeBytes
 		warningThresholdBytes := (nasTotalBytes + 9) / 10
 		capacityJSON, marshalErr := json.Marshal(map[string]any{
-			"observed_at": admissionCloudCapacity.ObservedAt.UTC(), "build_sha": strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)),
-			"ready_workers": admissionCloudCapacity.ReadyWorkers, "total_slots": admissionCloudCapacity.TotalSlots,
+			"observation_started_at":      admissionCloudCapacity.ObservationStartedAt.UTC(),
+			"observed_at":                 admissionCloudCapacity.ObservedAt.UTC(),
+			"provider_observation_sha256": admissionCloudCapacity.ProviderObservationSHA256,
+			"build_sha":                   strings.ToLower(strings.TrimSpace(s.cfg.DropletPoolBuildSHA)),
+			"ready_workers":               admissionCloudCapacity.ReadyWorkers, "total_slots": admissionCloudCapacity.TotalSlots,
 			"largest_worker_slots": admissionCloudCapacity.LargestWorkerSlots, "usable_after_worker_loss": admissionCloudCapacity.UsableAfterWorkerLoss,
 			"largest_region": admissionCloudCapacity.LargestRegion, "largest_region_slots": admissionCloudCapacity.LargestRegionSlots,
 			"provider_project_sha256": hashSecret(s.cfg.DropletPoolProjectID), "provider_firewall_sha256": hashSecret(s.cfg.DropletPoolFirewallID),

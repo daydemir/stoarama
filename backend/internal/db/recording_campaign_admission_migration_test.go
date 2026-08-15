@@ -429,6 +429,23 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	case <-time.After(5 * time.Second):
 		t.Fatal("probe lease did not resume after approval terminal commit")
 	}
+	terminalFirstObservation, _ := json.Marshal(map[string]any{
+		"result": "ok", "valid_ratio": 1.0, "duration_ms": 119960, "segment_count": 2,
+		"frame_sha256": strings.Repeat("1", 64), "media_sha256": strings.Repeat("2", 64),
+		"native_signature_sha256": strings.Repeat("3", 64), "challenge_proof_sha256": strings.Repeat("4", 64),
+		"video_codec": "h264", "audio_codec": "aac", "audio_present": true, "video_width": 1920,
+		"video_height": 1080, "actual_fps": 30.0, "detail": "valid_ratio=1.000 segments=2 native_signature_stable=true frame=true",
+		"media_size_bytes": 1, "media_etag": "media", "media_version_id": "", "frame_size_bytes": 1,
+		"frame_etag": "frame", "frame_version_id": "", "archive_bucket_sha256": strings.Repeat("5", 64),
+		"media_archive_object_key": "protected/campaign-probe/" + probeAttemptID.String() + "/media.zip",
+		"media_archive_sha256":     strings.Repeat("6", 64), "media_archive_etag": "archive-media", "media_archive_version_id": "",
+		"frame_archive_object_key": "protected/campaign-probe/" + probeAttemptID.String() + "/frame.jpg",
+		"frame_archive_sha256":     strings.Repeat("1", 64), "frame_archive_etag": "archive-frame", "frame_archive_version_id": "",
+		"submission_request_sha256": strings.Repeat("7", 64), "evidence_sha256": strings.Repeat("8", 64),
+	})
+	if _, err := executorPool.Exec(ctx, `SELECT evidence_id FROM recording_campaign_submit_probe_evidence($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, probeNodeID, probeTokenID, probeGeneration, probeCredentialSHA, probeAttemptID, probeRequestID, probeRaceApprovalID, accountID, probeRaceStreamID, terminalFirstObservation); err == nil || !strings.Contains(err.Error(), "already terminal") {
+		t.Fatalf("terminal-first attempt accepted evidence: %v", err)
+	}
 	if _, err := executorPool.Exec(ctx, `SELECT order_id FROM recording_campaign_queue_probe($1,$2,$3,$4,$5,$6,$7)`, uuid.New(), probeRaceApprovalID, accountID, userID, expireSessionID, expireCredentialSHA, probeRaceStreamID); err == nil {
 		t.Fatal("terminal approval accepted a new probe order")
 	}
@@ -594,7 +611,7 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"recording_campaign_claim_head_probe_guard",
 		"recording_campaign_node_token_probe_guard",
 		"UPDATE OF state,node_id,do_droplet_id,region,size,build_sha,capacity",
-		"UPDATE OF node_id,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens",
+		"UPDATE OF node_id,key_prefix,secret_hash,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens",
 		"campaign account additions require typed admission capacity and NAS recomputation",
 		"The typed admission function recomputes and seals a new capacity/NAS",
 		"active recording identity collides with active or protected campaign occupancy",
@@ -605,7 +622,10 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"use typed transition_recording_campaign_track authority",
 		"REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON TABLE %I.recording_campaign_track_events",
 		"REVOKE USAGE,SELECT,UPDATE ON SEQUENCE %I.recording_campaign_track_events_id_seq",
-		"to_jsonb(e)::text",
+		"effective_at_us",
+		"start_at_us",
+		"recording_campaign_baseline_scene_read_receipts",
+		"provider_observation_sha256",
 		"submission_request_sha256",
 		"authority_member_count<>1",
 		"reservation.observation_id",

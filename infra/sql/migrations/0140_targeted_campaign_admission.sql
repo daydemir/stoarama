@@ -251,6 +251,7 @@ CREATE FUNCTION validate_recording_targeted_probe_attempt_terminal_event()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; exact BOOLEAN; expected TEXT;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_attempts a LEFT JOIN %I.recording_targeted_probe_evidence e ON e.attempt_id=a.id WHERE a.id=$1 AND a.expires_at<=recording_campaign_now() AND e.id IS NULL FOR SHARE OF a)',s,s)
     INTO exact USING NEW.attempt_id;
   expected:=encode(sha256(convert_to('expired_without_evidence'||chr(0)||NEW.attempt_id::text||chr(0)||extract(epoch from recording_campaign_now())::text,'UTF8')),'hex');
@@ -303,7 +304,7 @@ CREATE TABLE recording_targeted_probe_evidence (
   detail TEXT NOT NULL CHECK(length(detail)<=1024 AND detail~'^(resolve_failed|image_source|ssrf_guard_rejected|temporary_storage_unavailable|parent_context_cancelled|valid_ratio=[0-9]+\.[0-9]{3} segments=[0-9]+ native_signature_stable=(true|false) frame=(true|false)( capture_exit=(network_cut|source_down|other))?)$'),
   observed_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
   evidence_sha256 TEXT NOT NULL CHECK(evidence_sha256~'^[0-9a-f]{64}$'),
-  CHECK(result<>'ok' OR (valid_ratio>=0.95 AND duration_ms>=120000 AND segment_count>=2 AND
+  CHECK(result<>'ok' OR (valid_ratio>=0.95 AND duration_ms BETWEEN 110000 AND 130000 AND segment_count=2 AND
     frame_sha256 IS NOT NULL AND media_sha256 IS NOT NULL AND native_signature_sha256 IS NOT NULL AND challenge_proof_sha256 IS NOT NULL AND
     lower(video_codec)='h264' AND video_width BETWEEN 1 AND 16384 AND video_height BETWEEN 1 AND 16384 AND actual_fps>0 AND actual_fps<=240 AND
     media_size_bytes IS NOT NULL AND media_etag IS NOT NULL AND frame_size_bytes IS NOT NULL AND frame_etag IS NOT NULL AND
@@ -366,6 +367,31 @@ CREATE TABLE recording_targeted_probe_scene_reviews (
 -- Candidate/completed streams need a supported visual baseline before an
 -- approval exists. This receipt binds the exact bytes presented to the exact
 -- immutable decision and source head; scene attestation consumes it.
+CREATE TABLE recording_campaign_baseline_scene_read_receipts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  request_id UUID NOT NULL,
+  authority_code TEXT NOT NULL REFERENCES recording_campaign_authority_decisions(code) ON DELETE RESTRICT,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  stream_id BIGINT NOT NULL REFERENCES streams(id) ON DELETE RESTRICT,
+  frame_id BIGINT NOT NULL REFERENCES frames(id) ON DELETE RESTRICT,
+  media_object_id BIGINT NOT NULL REFERENCES media_objects(id) ON DELETE RESTRICT,
+  frame_sha256 TEXT NOT NULL CHECK(frame_sha256~'^[0-9a-f]{64}$'),
+  media_object_key TEXT NOT NULL,
+  media_etag TEXT NOT NULL,
+  media_size_bytes BIGINT NOT NULL CHECK(media_size_bytes BETWEEN 1 AND 8388608),
+  source_revision_id BIGINT REFERENCES stream_source_revisions(id) ON DELETE RESTRICT,
+  source_url_sha256 TEXT NOT NULL CHECK(source_url_sha256~'^[0-9a-f]{64}$'),
+  source_page_url_sha256 TEXT NOT NULL CHECK(source_page_url_sha256~'^[0-9a-f]{64}$'),
+  source_updated_at TIMESTAMPTZ NOT NULL,
+  read_by_user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  read_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now()+interval '5 minutes',
+  receipt_sha256 TEXT NOT NULL CHECK(receipt_sha256~'^[0-9a-f]{64}$'),
+  UNIQUE(account_id,request_id),
+  UNIQUE(id,account_id,stream_id,frame_id,read_by_user_id),
+  CHECK(expires_at=read_at+interval '5 minutes')
+);
+
 CREATE TABLE recording_campaign_baseline_scene_presentations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   request_id UUID NOT NULL,
@@ -373,6 +399,7 @@ CREATE TABLE recording_campaign_baseline_scene_presentations (
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   stream_id BIGINT NOT NULL REFERENCES streams(id) ON DELETE RESTRICT,
   frame_id BIGINT NOT NULL REFERENCES frames(id) ON DELETE RESTRICT,
+  read_receipt_id UUID NOT NULL,
   media_object_id BIGINT NOT NULL REFERENCES media_objects(id) ON DELETE RESTRICT,
   frame_sha256 TEXT NOT NULL CHECK(frame_sha256~'^[0-9a-f]{64}$'),
   media_object_key TEXT NOT NULL,
@@ -385,13 +412,16 @@ CREATE TABLE recording_campaign_baseline_scene_presentations (
   presented_at TIMESTAMPTZ NOT NULL DEFAULT recording_campaign_now(),
   presentation_sha256 TEXT NOT NULL CHECK(presentation_sha256~'^[0-9a-f]{64}$'),
   UNIQUE(account_id,request_id),
-  UNIQUE(id,account_id,stream_id,frame_id,presented_to_user_id)
+  UNIQUE(id,account_id,stream_id,frame_id,presented_to_user_id),
+  FOREIGN KEY(read_receipt_id,account_id,stream_id,frame_id,presented_to_user_id)
+    REFERENCES recording_campaign_baseline_scene_read_receipts(id,account_id,stream_id,frame_id,read_by_user_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE recording_campaign_capacity_observations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   approval_id UUID NOT NULL REFERENCES recording_campaign_admission_approvals(id) ON DELETE RESTRICT,
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  observation_started_at TIMESTAMPTZ NOT NULL,
   observed_at TIMESTAMPTZ NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   build_sha TEXT NOT NULL CHECK(build_sha~'^[0-9a-f]{40}$'),
@@ -410,11 +440,13 @@ CREATE TABLE recording_campaign_capacity_observations (
   provider_project_sha256 TEXT NOT NULL CHECK(provider_project_sha256~'^[0-9a-f]{64}$'),
   provider_firewall_sha256 TEXT NOT NULL CHECK(provider_firewall_sha256~'^[0-9a-f]{64}$'),
   facts_sha256 TEXT NOT NULL CHECK(facts_sha256~'^[0-9a-f]{64}$'),
+  provider_observation_sha256 TEXT NOT NULL CHECK(provider_observation_sha256~'^[0-9a-f]{64}$'),
   UNIQUE(id,account_id,approval_id),
   CHECK(usable_after_worker_loss=total_slots-largest_worker_slots),
   CHECK(relay_usable_after_largest_loss<=relay_effective_capacity),
   CHECK(relay_active_demand=0 OR (relay_failure_domains>=2 AND relay_usable_after_largest_loss>=relay_active_demand)),
   CHECK(largest_region_slots<=total_slots),
+  CHECK(observation_started_at<=observed_at AND observed_at-observation_started_at<=interval '120 seconds'),
   CHECK(expires_at=observed_at+interval '120 seconds')
 );
 
@@ -842,11 +874,19 @@ BEGIN
     RETURN;
   END IF;
 
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended('recording-worker-claim-v1',0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
+
   SELECT * INTO attempt FROM recording_targeted_probe_attempts a
   WHERE a.id=p_attempt_id AND a.request_id=p_request_id AND a.approval_id=p_approval_id
     AND a.account_id=p_account_id AND a.stream_id=p_stream_id AND a.node_id=p_node_id
   FOR UPDATE;
   IF attempt.id IS NULL THEN RAISE EXCEPTION 'targeted evidence attempt identity mismatch'; END IF;
+  IF EXISTS(SELECT 1 FROM recording_targeted_probe_attempt_terminal_events terminal
+      WHERE terminal.attempt_id=p_attempt_id FOR SHARE) THEN
+    RAISE EXCEPTION 'targeted evidence attempt is already terminal without evidence';
+  END IF;
   IF recording_campaign_now()>attempt.expires_at OR NOT EXISTS(
     SELECT 1 FROM recorder_droplets d
     WHERE d.id=attempt.recorder_droplet_id AND d.node_id=p_node_id
@@ -1148,12 +1188,25 @@ END $$;
 -- these bytes before calling recording_campaign_present_baseline_scene, which
 -- rechecks the same source/frame fence and appends the immutable receipt.
 CREATE FUNCTION recording_campaign_read_baseline_scene(
-  p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
+  p_request_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT
-) RETURNS TABLE(frame_sha256 TEXT,media_object_key TEXT,media_etag TEXT,media_size_bytes BIGINT)
+) RETURNS TABLE(read_receipt_id UUID,frame_sha256 TEXT,media_object_key TEXT,media_etag TEXT,media_size_bytes BIGINT)
 LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE decision_ok BOOLEAN; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ;
+DECLARE existing RECORD; decision_ok BOOLEAN; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; frame RECORD; digest TEXT;
 BEGIN
+  SELECT * INTO existing FROM recording_campaign_baseline_scene_read_receipts
+    WHERE account_id=p_account_id AND request_id=p_request_id AND expires_at>recording_campaign_now()
+      AND EXISTS(SELECT 1 FROM account_sessions session WHERE session.id=p_session_id
+        AND session.account_id=recording_campaign_baseline_scene_read_receipts.account_id
+        AND session.user_id=recording_campaign_baseline_scene_read_receipts.read_by_user_id
+        AND session.session_hash=p_credential_sha256 AND session.revoked_at IS NULL
+        AND session.expires_at>recording_campaign_now());
+  IF existing.id IS NOT NULL THEN
+    IF (existing.authority_code,existing.stream_id,existing.frame_id,existing.read_by_user_id) IS DISTINCT FROM
+       (p_authority_code,p_stream_id,p_frame_id,p_user_id) THEN RAISE EXCEPTION 'baseline read receipt idempotency conflict'; END IF;
+    RETURN QUERY SELECT existing.id,existing.frame_sha256,existing.media_object_key,existing.media_etag,existing.media_size_bytes;
+    RETURN;
+  END IF;
   PERFORM recording_campaign_authorize_account('baseline_present',NULL,p_account_id,p_user_id,p_session_id,p_credential_sha256);
   SELECT EXISTS(SELECT 1 FROM recording_campaign_authority_decisions
     WHERE code=p_authority_code AND campaign_key='delivery30-2026q3'
@@ -1168,19 +1221,37 @@ BEGIN
   IF decision_ok IS DISTINCT FROM true OR source_hash IS NULL THEN
     RAISE EXCEPTION 'baseline frame is not current and decision-authorized';
   END IF;
-  RETURN QUERY SELECT lower(m.sha256),m.object_key,COALESCE(m.etag,''),m.size_bytes
+  SELECT f.raw_media_object_id,lower(m.sha256) sha,m.object_key,COALESCE(m.etag,'') etag,m.size_bytes
+    INTO frame
     FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id
     WHERE f.id=p_frame_id AND f.stream_id=p_stream_id AND f.capture_status='success'
       AND f.captured_at BETWEEN recording_campaign_now()-interval '6 hours' AND recording_campaign_now()
       AND m.size_bytes BETWEEN 1 AND 8388608 FOR SHARE OF f,m;
-  IF NOT FOUND THEN RAISE EXCEPTION 'baseline frame bytes are not current'; END IF;
+  IF frame.raw_media_object_id IS NULL THEN RAISE EXCEPTION 'baseline frame bytes are not current'; END IF;
+  digest:=encode(sha256(convert_to(jsonb_build_object('request_id',p_request_id,'authority_code',p_authority_code,
+    'account_id',p_account_id,'stream_id',p_stream_id,'frame_id',p_frame_id,'media_object_id',frame.raw_media_object_id,
+    'frame_sha256',frame.sha,'media_object_key',frame.object_key,'media_etag',frame.etag,'media_size_bytes',frame.size_bytes,
+    'source_revision_id',revision,'source_url_sha256',source_hash,'source_page_url_sha256',page_hash,
+    'source_updated_at_epoch_us',floor(extract(epoch from source_updated)*1000000)::bigint,
+    'read_by_user_id',p_user_id,'read_at_epoch_us',floor(extract(epoch from recording_campaign_now())*1000000)::bigint)::text,'UTF8')),'hex');
+  INSERT INTO recording_campaign_baseline_scene_read_receipts(request_id,authority_code,account_id,stream_id,frame_id,
+    media_object_id,frame_sha256,media_object_key,media_etag,media_size_bytes,source_revision_id,source_url_sha256,
+    source_page_url_sha256,source_updated_at,read_by_user_id,receipt_sha256)
+  VALUES(p_request_id,p_authority_code,p_account_id,p_stream_id,p_frame_id,frame.raw_media_object_id,frame.sha,
+    frame.object_key,frame.etag,frame.size_bytes,revision,source_hash,page_hash,source_updated,p_user_id,digest)
+  RETURNING id,recording_campaign_baseline_scene_read_receipts.frame_sha256,
+    recording_campaign_baseline_scene_read_receipts.media_object_key,
+    recording_campaign_baseline_scene_read_receipts.media_etag,
+    recording_campaign_baseline_scene_read_receipts.media_size_bytes
+  INTO read_receipt_id,frame_sha256,media_object_key,media_etag,media_size_bytes;
+  RETURN NEXT;
 END $$;
 
 CREATE FUNCTION recording_campaign_present_baseline_scene(
-  p_request_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
+  p_request_id UUID,p_read_receipt_id UUID,p_account_id BIGINT,p_user_id BIGINT,p_session_id BIGINT,p_credential_sha256 TEXT,
   p_authority_code TEXT,p_stream_id BIGINT,p_frame_id BIGINT
 ) RETURNS TABLE(presentation_id UUID,frame_sha256 TEXT,media_object_key TEXT,media_etag TEXT) LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE existing RECORD; decision RECORD; frame RECORD; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; digest TEXT;
+DECLARE existing RECORD; receipt RECORD; decision RECORD; revision BIGINT; source_hash TEXT; page_hash TEXT; source_updated TIMESTAMPTZ; digest TEXT;
 BEGIN
   SELECT * INTO existing FROM recording_campaign_baseline_scene_presentations
     WHERE account_id=p_account_id AND request_id=p_request_id
@@ -1188,8 +1259,8 @@ BEGIN
         AND session.user_id=recording_campaign_baseline_scene_presentations.presented_to_user_id
         AND session.session_hash=p_credential_sha256);
   IF existing.id IS NOT NULL THEN
-    IF (existing.authority_code,existing.stream_id,existing.frame_id,existing.presented_to_user_id) IS DISTINCT FROM
-       (p_authority_code,p_stream_id,p_frame_id,p_user_id) THEN RAISE EXCEPTION 'baseline presentation idempotency conflict'; END IF;
+    IF (existing.read_receipt_id,existing.authority_code,existing.stream_id,existing.frame_id,existing.presented_to_user_id) IS DISTINCT FROM
+       (p_read_receipt_id,p_authority_code,p_stream_id,p_frame_id,p_user_id) THEN RAISE EXCEPTION 'baseline presentation idempotency conflict'; END IF;
     presentation_id:=existing.id; frame_sha256:=existing.frame_sha256;
     media_object_key:=existing.media_object_key; media_etag:=existing.media_etag; RETURN NEXT; RETURN;
   END IF;
@@ -1197,30 +1268,33 @@ BEGIN
   SELECT * INTO decision FROM recording_campaign_authority_decisions
     WHERE code=p_authority_code AND campaign_key='delivery30-2026q3' AND expires_at>recording_campaign_now()
       AND p_stream_id=ANY(permitted_stream_ids) FOR SHARE;
-  SELECT f.raw_media_object_id,lower(m.sha256) sha,m.object_key,COALESCE(m.etag,''),f.captured_at
-    INTO frame FROM frames f JOIN media_objects m ON m.id=f.raw_media_object_id
-    WHERE f.id=p_frame_id AND f.stream_id=p_stream_id AND f.capture_status='success'
-      AND f.captured_at BETWEEN recording_campaign_now()-interval '6 hours' AND recording_campaign_now() FOR SHARE OF f,m;
+  SELECT * INTO receipt FROM recording_campaign_baseline_scene_read_receipts
+    WHERE id=p_read_receipt_id AND request_id=p_request_id AND account_id=p_account_id AND stream_id=p_stream_id
+      AND frame_id=p_frame_id AND authority_code=p_authority_code AND read_by_user_id=p_user_id
+      AND expires_at>recording_campaign_now() FOR SHARE;
   PERFORM 1 FROM stream_source_revisions WHERE stream_id=p_stream_id ORDER BY id FOR SHARE;
   SELECT (SELECT max(id) FROM stream_source_revisions WHERE stream_id=s.id),
     encode(sha256(convert_to(source_url,'UTF8')),'hex'),
     encode(sha256(convert_to(COALESCE(source_page_url,''),'UTF8')),'hex'),updated_at
     INTO revision,source_hash,page_hash,source_updated FROM streams s
     WHERE s.id=p_stream_id AND s.deleted_at IS NULL FOR SHARE;
-  IF decision.code IS NULL OR frame.raw_media_object_id IS NULL OR source_hash IS NULL THEN
+  IF decision.code IS NULL OR receipt.id IS NULL OR source_hash IS NULL OR
+     (receipt.source_revision_id,receipt.source_url_sha256,receipt.source_page_url_sha256,receipt.source_updated_at) IS DISTINCT FROM
+     (revision,source_hash,page_hash,source_updated) THEN
     RAISE EXCEPTION 'baseline frame is not current and decision-authorized';
   END IF;
   digest:=encode(sha256(convert_to(jsonb_build_object('request_id',p_request_id,'authority_code',p_authority_code,
-    'account_id',p_account_id,'stream_id',p_stream_id,'frame_id',p_frame_id,'media_object_id',frame.raw_media_object_id,
-    'frame_sha256',frame.sha,'media_object_key',frame.object_key,'media_etag',frame.etag,
+    'account_id',p_account_id,'stream_id',p_stream_id,'frame_id',p_frame_id,'read_receipt_id',p_read_receipt_id,
+    'media_object_id',receipt.media_object_id,'frame_sha256',receipt.frame_sha256,
+    'media_object_key',receipt.media_object_key,'media_etag',receipt.media_etag,
     'source_revision_id',revision,'source_url_sha256',source_hash,'source_page_url_sha256',page_hash,
     'source_updated_at_epoch',extract(epoch from source_updated),'presented_to_user_id',p_user_id,
     'presented_at_epoch',extract(epoch from recording_campaign_now()))::text,'UTF8')),'hex');
   INSERT INTO recording_campaign_baseline_scene_presentations(request_id,authority_code,account_id,stream_id,
-    frame_id,media_object_id,frame_sha256,media_object_key,media_etag,source_revision_id,source_url_sha256,
+    frame_id,read_receipt_id,media_object_id,frame_sha256,media_object_key,media_etag,source_revision_id,source_url_sha256,
     source_page_url_sha256,source_updated_at,presented_to_user_id,presentation_sha256)
-  VALUES(p_request_id,p_authority_code,p_account_id,p_stream_id,p_frame_id,frame.raw_media_object_id,frame.sha,
-    frame.object_key,frame.etag,revision,source_hash,page_hash,source_updated,p_user_id,digest)
+  VALUES(p_request_id,p_authority_code,p_account_id,p_stream_id,p_frame_id,p_read_receipt_id,receipt.media_object_id,receipt.frame_sha256,
+    receipt.media_object_key,receipt.media_etag,revision,source_hash,page_hash,source_updated,p_user_id,digest)
   RETURNING id,recording_campaign_baseline_scene_presentations.frame_sha256,
     recording_campaign_baseline_scene_presentations.media_object_key,
     recording_campaign_baseline_scene_presentations.media_etag
@@ -1286,23 +1360,23 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION recording_campaign_create_capacity_observation(
-  p_approval_id UUID,p_account_id BIGINT,p_observed_at TIMESTAMPTZ,p_build_sha TEXT,
+  p_approval_id UUID,p_account_id BIGINT,p_observation_started_at TIMESTAMPTZ,p_observed_at TIMESTAMPTZ,p_build_sha TEXT,
   p_size_slug TEXT,p_pool_identity_sha256 TEXT,
   p_ready_workers INTEGER,p_total_slots INTEGER,p_largest_worker_slots INTEGER,
   p_usable_after_worker_loss INTEGER,p_largest_region TEXT,p_largest_region_slots INTEGER,
   p_relay_active_demand INTEGER,p_relay_failure_domains INTEGER,p_relay_effective_capacity INTEGER,
   p_relay_usable_after_largest_loss INTEGER,
-  p_project_sha256 TEXT,p_firewall_sha256 TEXT,p_facts_sha256 TEXT
+  p_project_sha256 TEXT,p_firewall_sha256 TEXT,p_facts_sha256 TEXT,p_provider_observation_sha256 TEXT
 ) RETURNS TABLE(id UUID) LANGUAGE sql SET search_path=pg_catalog AS $$
   INSERT INTO recording_campaign_capacity_observations(
-    approval_id,account_id,observed_at,expires_at,build_sha,size_slug,pool_identity_sha256,ready_workers,total_slots,
+    approval_id,account_id,observation_started_at,observed_at,expires_at,build_sha,size_slug,pool_identity_sha256,ready_workers,total_slots,
     largest_worker_slots,usable_after_worker_loss,largest_region,largest_region_slots,relay_active_demand,
     relay_failure_domains,relay_effective_capacity,relay_usable_after_largest_loss,
-    provider_project_sha256,provider_firewall_sha256,facts_sha256
-  ) VALUES(p_approval_id,p_account_id,p_observed_at,p_observed_at+interval '120 seconds',p_build_sha,
+    provider_project_sha256,provider_firewall_sha256,facts_sha256,provider_observation_sha256
+  ) VALUES(p_approval_id,p_account_id,p_observation_started_at,p_observed_at,p_observed_at+interval '120 seconds',p_build_sha,
     p_size_slug,p_pool_identity_sha256,p_ready_workers,p_total_slots,p_largest_worker_slots,p_usable_after_worker_loss,p_largest_region,
     p_largest_region_slots,p_relay_active_demand,p_relay_failure_domains,p_relay_effective_capacity,
-    p_relay_usable_after_largest_loss,p_project_sha256,p_firewall_sha256,p_facts_sha256)
+    p_relay_usable_after_largest_loss,p_project_sha256,p_firewall_sha256,p_facts_sha256,p_provider_observation_sha256)
   RETURNING recording_campaign_capacity_observations.id
 $$;
 
@@ -1400,6 +1474,7 @@ DECLARE
   v_expected_next TIMESTAMPTZ; v_weekdays SMALLINT; v_response JSONB; v_created_count INTEGER:=0;
   v_updated_count INTEGER:=0; v_rank INTEGER:=0; v_active_after INTEGER; v_plan JSONB;
   v_build_sha TEXT; v_project_sha TEXT; v_firewall_sha TEXT; v_size_slug TEXT; v_pool_identity_sha TEXT; v_capacity_facts_sha TEXT;
+  v_capacity_started_at TIMESTAMPTZ; v_capacity_observed_at TIMESTAMPTZ; v_provider_observation_sha TEXT;
   v_ready_workers INTEGER; v_total_slots INTEGER; v_largest_worker_slots INTEGER;
   v_usable_after_worker_loss INTEGER; v_largest_region TEXT; v_largest_region_slots INTEGER; v_forecast_peak_slots INTEGER;
   v_relay_active_demand INTEGER; v_relay_failure_domains INTEGER; v_relay_effective_capacity INTEGER;
@@ -1429,7 +1504,13 @@ BEGIN
       AND a.schedule_sha256=encode(sha256(convert_to(p_schedule_spec::text,'UTF8')),'hex')
       AND a.deadline_at>recording_campaign_now() AND decision.campaign_key='delivery30-2026q3'
       AND decision.expires_at>recording_campaign_now() AND a.deadline_at<=decision.expires_at FOR UPDATE OF a;
-  IF approval.id IS NULL OR jsonb_typeof(p_next_fires)<>'array' OR
+  IF approval.id IS NULL OR jsonb_typeof(p_capacity)<>'object' OR
+     NOT (p_capacity ?& ARRAY['observation_started_at','observed_at','provider_observation_sha256','build_sha',
+       'ready_workers','total_slots','largest_worker_slots','usable_after_worker_loss','largest_region',
+       'largest_region_slots','provider_project_sha256','provider_firewall_sha256','size_slug',
+       'pool_identity_sha256','facts_sha256','forecast_peak_slots']) OR
+     (SELECT count(*) FROM jsonb_object_keys(p_capacity))<>16 OR
+     jsonb_typeof(p_next_fires)<>'array' OR
      jsonb_array_length(p_next_fires)<>jsonb_array_length(approval.entries) OR
      EXISTS(SELECT 1 FROM jsonb_array_elements(p_next_fires) i
        WHERE jsonb_typeof(i)<>'object' OR (SELECT count(*) FROM jsonb_object_keys(i))<>2 OR
@@ -1599,6 +1680,11 @@ BEGIN
     AND tok.recording_claim_generation=head.generation
   GROUP BY region ORDER BY sum(capacity) DESC,region LIMIT 1;
   v_usable_after_worker_loss:=v_total_slots-v_largest_worker_slots;
+  v_capacity_started_at:=(p_capacity->>'observation_started_at')::timestamptz;
+  v_capacity_observed_at:=(p_capacity->>'observed_at')::timestamptz;
+  v_provider_observation_sha:=encode(sha256(convert_to(
+    floor(extract(epoch from v_capacity_started_at)*1000000)::bigint::text||chr(10)||
+    floor(extract(epoch from v_capacity_observed_at)*1000000)::bigint::text||chr(10)||v_capacity_facts_sha,'UTF8')),'hex');
   SELECT active_demand,failure_domains,effective_capacity,usable_after_largest_loss
     INTO v_relay_active_demand,v_relay_failure_domains,v_relay_effective_capacity,v_relay_usable_after_largest_loss
   FROM recording_campaign_relay_failure_capacity(p_account_id);
@@ -1610,18 +1696,22 @@ BEGIN
        (p_capacity->>'usable_after_worker_loss')::int,p_capacity->>'largest_region',
        (p_capacity->>'largest_region_slots')::int,p_capacity->>'provider_project_sha256',
        p_capacity->>'provider_firewall_sha256',p_capacity->>'size_slug',p_capacity->>'pool_identity_sha256',
-       p_capacity->>'facts_sha256') IS DISTINCT FROM
+       p_capacity->>'facts_sha256',p_capacity->>'provider_observation_sha256') IS DISTINCT FROM
      (v_build_sha,v_ready_workers,v_total_slots,v_largest_worker_slots,
        v_usable_after_worker_loss,v_largest_region,v_largest_region_slots,v_project_sha,v_firewall_sha,v_size_slug,v_pool_identity_sha,
-       v_capacity_facts_sha)
+       v_capacity_facts_sha,v_provider_observation_sha) OR
+     v_capacity_started_at>v_capacity_observed_at OR
+     v_capacity_observed_at-v_capacity_started_at>interval '120 seconds' OR
+     v_capacity_observed_at<recording_campaign_now()-interval '30 seconds' OR
+     v_capacity_observed_at>recording_campaign_now()+interval '5 seconds'
   THEN RAISE EXCEPTION 'campaign capacity witness differs from authority rows'; END IF;
   SELECT id INTO v_capacity_id FROM recording_campaign_create_capacity_observation(
-    p_approval_id,p_account_id,recording_campaign_now(),v_build_sha,
+    p_approval_id,p_account_id,v_capacity_started_at,v_capacity_observed_at,v_build_sha,
     v_size_slug,v_pool_identity_sha,
     v_ready_workers,v_total_slots,v_largest_worker_slots,v_usable_after_worker_loss,
     v_largest_region,v_largest_region_slots,v_relay_active_demand,v_relay_failure_domains,
     v_relay_effective_capacity,v_relay_usable_after_largest_loss,
-    v_project_sha,v_firewall_sha,v_capacity_facts_sha);
+    v_project_sha,v_firewall_sha,v_capacity_facts_sha,v_provider_observation_sha);
   v_forecast_peak_slots:=recording_campaign_forecast_peak_slots(p_account_id);
   IF v_forecast_peak_slots<=0 OR v_forecast_peak_slots>v_usable_after_worker_loss OR
      (p_capacity->>'forecast_peak_slots')::int<>v_forecast_peak_slots THEN
@@ -1867,11 +1957,17 @@ CREATE TRIGGER recording_targeted_probe_scene_review_validate BEFORE INSERT ON r
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_capacity_observation()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
-DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN;
+DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; expected_provider_digest TEXT;
 BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''admit'' AND approval_id=$1 AND account_id=$2)',s)
     INTO authorized USING NEW.approval_id,NEW.account_id;
-  IF authorized IS DISTINCT FROM true OR NEW.observed_at<recording_campaign_now()-interval '30 seconds' OR NEW.observed_at>recording_campaign_now()+interval '5 seconds' THEN
+  expected_provider_digest:=encode(sha256(convert_to(
+    floor(extract(epoch from NEW.observation_started_at)*1000000)::bigint::text||chr(10)||
+    floor(extract(epoch from NEW.observed_at)*1000000)::bigint::text||chr(10)||NEW.facts_sha256,'UTF8')),'hex');
+  IF authorized IS DISTINCT FROM true OR NEW.observation_started_at>NEW.observed_at OR
+     NEW.observed_at-NEW.observation_started_at>interval '120 seconds' OR
+     NEW.observed_at<recording_campaign_now()-interval '30 seconds' OR NEW.observed_at>recording_campaign_now()+interval '5 seconds' OR
+     NEW.provider_observation_sha256<>expected_provider_digest THEN
     RAISE EXCEPTION 'campaign capacity observation is not fresh and transaction-authorized';
   END IF;
   RETURN NEW;
@@ -2193,7 +2289,12 @@ CREATE OR REPLACE FUNCTION validate_recording_targeted_probe_evidence()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 DECLARE s TEXT:=TG_TABLE_SCHEMA; authorized BOOLEAN; a RECORD; source_clean BOOLEAN; current_revision BIGINT; current_source TEXT; current_page TEXT; current_updated TIMESTAMPTZ; native_text TEXT; native_hash TEXT; proof_hash TEXT; expected_evidence TEXT;
 BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0));
   EXECUTE format('SELECT * FROM %I.recording_targeted_probe_attempts WHERE id=$1 FOR UPDATE',s) INTO a USING NEW.attempt_id;
+  IF EXISTS(SELECT 1 FROM recording_targeted_probe_attempt_terminal_events terminal
+      WHERE terminal.attempt_id=NEW.attempt_id FOR SHARE) THEN
+    RAISE EXCEPTION 'targeted evidence and terminal-without-evidence are mutually exclusive';
+  END IF;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_tx_authorizations WHERE transaction_id=txid_current() AND action=''evidence'' AND approval_id=$1 AND account_id=$2 AND node_id=$3)',s) INTO authorized USING NEW.approval_id,NEW.account_id,a.node_id;
   IF authorized IS DISTINCT FROM true THEN RAISE EXCEPTION 'targeted evidence requires typed node transaction authorization'; END IF;
   EXECUTE format('SELECT (SELECT max(id) FROM %I.stream_source_revisions WHERE stream_id=st.id),encode(sha256(convert_to(st.source_url,''UTF8'')),''hex''),encode(sha256(convert_to(COALESCE(st.source_page_url,''''),''UTF8'')),''hex''),st.updated_at FROM %I.streams st WHERE id=$1 AND deleted_at IS NULL FOR SHARE',s,s)
@@ -2211,6 +2312,8 @@ BEGIN
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_targeted_probe_evidence_validate BEFORE INSERT ON recording_targeted_probe_evidence FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_evidence();
+CREATE CONSTRAINT TRIGGER recording_targeted_probe_evidence_commit_seal AFTER INSERT ON recording_targeted_probe_evidence DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_evidence();
+CREATE CONSTRAINT TRIGGER recording_targeted_probe_attempt_terminal_commit_seal AFTER INSERT ON recording_targeted_probe_attempt_terminal_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION validate_recording_targeted_probe_attempt_terminal_event();
 
 CREATE OR REPLACE FUNCTION validate_recording_campaign_admission_result()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
@@ -2234,13 +2337,13 @@ BEGIN
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_targeted_probe_attempts WHERE approval_id=$1 AND stream_id=$2 AND attempt_no>$3)',s) INTO newer_attempt USING NEW.approval_id,NEW.stream_id,p2.attempt_no;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_approvals a JOIN %I.recordings r ON r.id=$2 JOIN %I.streams st ON st.id=r.stream_id WHERE a.id=$1 AND r.account_id=a.account_id AND r.stream_id=$3 AND r.name=st.name||'' [''||st.id::text||'']'' AND r.stream_url=st.source_url AND r.source_kind=CASE WHEN lower(st.source_url) LIKE ''%%.m3u8%%'' OR lower(st.source_url) LIKE ''%%!hls%%'' THEN ''hls_live'' ELSE ''ffmpeg_direct'' END AND r.status=''active'' AND r.paused_at IS NULL AND r.capture_via=''cloud'' AND r.target_fps IS NULL AND r.mode=a.schedule_spec->>''mode'' AND COALESCE(r.cron_expr,'''')=COALESCE(a.schedule_spec->>''cron_expr'','''') AND r.cron_timezone=(SELECT value->>''timezone'' FROM jsonb_array_elements(a.schedule_spec->''stream_timezones'') value WHERE (value->>''stream_id'')::bigint=$3) AND r.clip_duration_sec=(a.schedule_spec->>''clip_duration_sec'')::int AND COALESCE(to_char(r.daily_window_start,''HH24:MI''),'''')=COALESCE(a.schedule_spec->>''daily_window_start'','''') AND COALESCE(to_char(r.daily_window_end,''HH24:MI''),'''')=COALESCE(a.schedule_spec->>''daily_window_end'','''') AND r.active_weekdays=(SELECT sum(1 << ((d::text)::int-1))::smallint FROM jsonb_array_elements(a.schedule_spec->''active_weekdays'') d) AND r.next_fire_at IS NOT NULL AND r.start_at=(a.schedule_spec->>''start_at'')::timestamptz AND r.end_at=(a.schedule_spec->>''end_at'')::timestamptz AND r.storage_destination_id=(a.schedule_spec->>''storage_destination_id'')::bigint AND r.delivery_storage_destination_id IS NULL AND r.delivery=a.schedule_spec->>''delivery'' AND r.naming_profile=a.schedule_spec->>''naming_profile'' AND r.folder_name=''recordings'' AND r.naming_metadata_jsonb=''{}''::jsonb AND r.storage_retention_tier=''monthly'')',s,s,s)
     INTO config_ok USING NEW.approval_id,NEW.recording_id,NEW.stream_id;
-  EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''account_id'',r.account_id,''stream_id'',r.stream_id,''name'',r.name,''stream_url'',r.stream_url,''source_kind'',r.source_kind,''mode'',r.mode,''cron_expr'',r.cron_expr,''cron_timezone'',r.cron_timezone,''clip_duration_sec'',r.clip_duration_sec,''daily_window_start'',r.daily_window_start,''daily_window_end'',r.daily_window_end,''active_weekdays'',r.active_weekdays,''target_fps'',r.target_fps,''start_at'',r.start_at,''end_at'',r.end_at,''storage_destination_id'',r.storage_destination_id,''delivery_storage_destination_id'',r.delivery_storage_destination_id,''delivery'',r.delivery,''capture_via'',r.capture_via,''naming_profile'',r.naming_profile,''folder_name'',r.folder_name,''naming_metadata_jsonb'',r.naming_metadata_jsonb,''storage_retention_tier'',r.storage_retention_tier)::text,''UTF8'')),''hex'') FROM %I.recordings r WHERE id=$1',s)
+  EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''account_id'',r.account_id,''stream_id'',r.stream_id,''name'',r.name,''stream_url'',r.stream_url,''source_kind'',r.source_kind,''mode'',r.mode,''cron_expr'',r.cron_expr,''cron_timezone'',r.cron_timezone,''clip_duration_sec'',r.clip_duration_sec,''daily_window_start_us'',CASE WHEN r.daily_window_start IS NULL THEN NULL ELSE floor(extract(epoch from r.daily_window_start)*1000000)::bigint END,''daily_window_end_us'',CASE WHEN r.daily_window_end IS NULL THEN NULL ELSE floor(extract(epoch from r.daily_window_end)*1000000)::bigint END,''active_weekdays'',r.active_weekdays,''target_fps'',r.target_fps,''start_at_us'',CASE WHEN r.start_at IS NULL THEN NULL ELSE floor(extract(epoch from r.start_at)*1000000)::bigint END,''end_at_us'',CASE WHEN r.end_at IS NULL THEN NULL ELSE floor(extract(epoch from r.end_at)*1000000)::bigint END,''storage_destination_id'',r.storage_destination_id,''delivery_storage_destination_id'',r.delivery_storage_destination_id,''delivery'',r.delivery,''capture_via'',r.capture_via,''naming_profile'',r.naming_profile,''folder_name'',r.folder_name,''naming_metadata_jsonb'',r.naming_metadata_jsonb,''storage_retention_tier'',r.storage_retention_tier)::text,''UTF8'')),''hex'') FROM %I.recordings r WHERE id=$1',s)
     INTO current_config_sha USING NEW.recording_id;
   -- Seal the full 0129 roster row, including decision/evidence timestamps and
   -- every optional source-provenance field. A later typed lifecycle extension
   -- must create a new authority event; generic audited row edits cannot rewrite
   -- admitted provenance.
-  EXECUTE format('SELECT encode(sha256(convert_to(to_jsonb(e)::text,''UTF8'')),''hex'') FROM %I.recording_campaign_roster_entries e WHERE id=$1',s)
+  EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''id'',e.id,''track_id'',e.track_id,''recording_id'',e.recording_id,''stream_id'',e.stream_id,''scene_identity_sha256'',e.scene_identity_sha256,''role'',e.role,''rank'',e.rank,''status'',e.status,''reason_codes'',e.reason_codes,''effective_at_us'',floor(extract(epoch from e.effective_at)*1000000)::bigint,''decision_at_us'',floor(extract(epoch from e.decision_at)*1000000)::bigint,''evidence_observed_at_us'',floor(extract(epoch from e.evidence_observed_at)*1000000)::bigint,''evidence_sha256'',e.evidence_sha256,''source_window_end_at_us'',CASE WHEN e.source_window_end_at IS NULL THEN NULL ELSE floor(extract(epoch from e.source_window_end_at)*1000000)::bigint END,''source_job_id'',e.source_job_id,''source_health_recording_id'',e.source_health_recording_id,''source_health_job_id'',e.source_health_job_id,''updated_by_user_id'',e.updated_by_user_id,''updated_at_us'',floor(extract(epoch from e.updated_at)*1000000)::bigint)::text,''UTF8'')),''hex'') FROM %I.recording_campaign_roster_entries e WHERE id=$1',s)
     INTO current_roster_sha USING NEW.roster_entry_id;
   IF a_account<>NEW.account_id OR a_schedule<>NEW.schedule_sha256 OR recording_campaign_now()>=a_deadline OR t_account<>NEW.account_id OR
      a_actor<>NEW.actor_user_id OR config_ok IS DISTINCT FROM true OR scene_fresh IS DISTINCT FROM true OR reviews_valid IS DISTINCT FROM true OR source_clean IS DISTINCT FROM true OR
@@ -2402,7 +2505,7 @@ BEGIN
   EXECUTE format('SELECT recording_config_sha256 FROM %I.recording_campaign_admission_results WHERE recording_id=$1',s) INTO expected USING rid;
   IF expected IS NULL THEN RETURN NULL; END IF;
   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'admitted recording is immutable without a typed release'; END IF;
-  EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''account_id'',r.account_id,''stream_id'',r.stream_id,''name'',r.name,''stream_url'',r.stream_url,''source_kind'',r.source_kind,''mode'',r.mode,''cron_expr'',r.cron_expr,''cron_timezone'',r.cron_timezone,''clip_duration_sec'',r.clip_duration_sec,''daily_window_start'',r.daily_window_start,''daily_window_end'',r.daily_window_end,''active_weekdays'',r.active_weekdays,''target_fps'',r.target_fps,''start_at'',r.start_at,''end_at'',r.end_at,''storage_destination_id'',r.storage_destination_id,''delivery_storage_destination_id'',r.delivery_storage_destination_id,''delivery'',r.delivery,''capture_via'',r.capture_via,''naming_profile'',r.naming_profile,''folder_name'',r.folder_name,''naming_metadata_jsonb'',r.naming_metadata_jsonb,''storage_retention_tier'',r.storage_retention_tier)::text,''UTF8'')),''hex''),r.paused_at IS NULL AND ((r.status=''active'' AND r.next_fire_at IS NOT NULL) OR (r.status=''completed'' AND r.end_at<=recording_campaign_now() AND r.next_fire_at IS NULL)) FROM %I.recordings r WHERE id=$1',s)
+  EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''account_id'',r.account_id,''stream_id'',r.stream_id,''name'',r.name,''stream_url'',r.stream_url,''source_kind'',r.source_kind,''mode'',r.mode,''cron_expr'',r.cron_expr,''cron_timezone'',r.cron_timezone,''clip_duration_sec'',r.clip_duration_sec,''daily_window_start_us'',CASE WHEN r.daily_window_start IS NULL THEN NULL ELSE floor(extract(epoch from r.daily_window_start)*1000000)::bigint END,''daily_window_end_us'',CASE WHEN r.daily_window_end IS NULL THEN NULL ELSE floor(extract(epoch from r.daily_window_end)*1000000)::bigint END,''active_weekdays'',r.active_weekdays,''target_fps'',r.target_fps,''start_at_us'',CASE WHEN r.start_at IS NULL THEN NULL ELSE floor(extract(epoch from r.start_at)*1000000)::bigint END,''end_at_us'',CASE WHEN r.end_at IS NULL THEN NULL ELSE floor(extract(epoch from r.end_at)*1000000)::bigint END,''storage_destination_id'',r.storage_destination_id,''delivery_storage_destination_id'',r.delivery_storage_destination_id,''delivery'',r.delivery,''capture_via'',r.capture_via,''naming_profile'',r.naming_profile,''folder_name'',r.folder_name,''naming_metadata_jsonb'',r.naming_metadata_jsonb,''storage_retention_tier'',r.storage_retention_tier)::text,''UTF8'')),''hex''),r.paused_at IS NULL AND ((r.status=''active'' AND r.next_fire_at IS NOT NULL) OR (r.status=''completed'' AND r.end_at<=recording_campaign_now() AND r.next_fire_at IS NULL)) FROM %I.recordings r WHERE id=$1',s)
     INTO actual,lifecycle_ok USING rid;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_tracks t ON t.id=ar.track_id JOIN %I.recording_campaign_roster_entries e ON e.id=ar.roster_entry_id AND e.track_id=t.id WHERE ar.recording_id=$1 AND t.state=''active'' AND e.recording_id=$1 AND e.stream_id=ar.stream_id AND e.scene_identity_sha256=(SELECT scene_identity_sha256 FROM %I.recording_campaign_admission_reservations WHERE approval_id=ar.approval_id AND stream_id=ar.stream_id) AND e.status IN(''protect'',''probation''))',s,s,s,s)
     INTO bound USING rid;
@@ -2544,7 +2647,7 @@ BEGIN
   admitted:=expected IS NOT NULL;
   IF admitted IS DISTINCT FROM true THEN RETURN NULL; END IF;
   IF TG_OP='DELETE' THEN RAISE EXCEPTION 'admitted roster entry is immutable without a typed release'; END IF;
-  EXECUTE format('SELECT encode(sha256(convert_to(to_jsonb(e)::text,''UTF8'')),''hex'') FROM %I.recording_campaign_roster_entries e WHERE id=$1',s)
+  EXECUTE format('SELECT encode(sha256(convert_to(jsonb_build_object(''id'',e.id,''track_id'',e.track_id,''recording_id'',e.recording_id,''stream_id'',e.stream_id,''scene_identity_sha256'',e.scene_identity_sha256,''role'',e.role,''rank'',e.rank,''status'',e.status,''reason_codes'',e.reason_codes,''effective_at_us'',floor(extract(epoch from e.effective_at)*1000000)::bigint,''decision_at_us'',floor(extract(epoch from e.decision_at)*1000000)::bigint,''evidence_observed_at_us'',floor(extract(epoch from e.evidence_observed_at)*1000000)::bigint,''evidence_sha256'',e.evidence_sha256,''source_window_end_at_us'',CASE WHEN e.source_window_end_at IS NULL THEN NULL ELSE floor(extract(epoch from e.source_window_end_at)*1000000)::bigint END,''source_job_id'',e.source_job_id,''source_health_recording_id'',e.source_health_recording_id,''source_health_job_id'',e.source_health_job_id,''updated_by_user_id'',e.updated_by_user_id,''updated_at_us'',floor(extract(epoch from e.updated_at)*1000000)::bigint)::text,''UTF8'')),''hex'') FROM %I.recording_campaign_roster_entries e WHERE id=$1',s)
     INTO actual USING eid;
   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.recording_campaign_admission_results ar JOIN %I.recording_campaign_tracks t ON t.id=ar.track_id JOIN %I.recording_campaign_roster_entries e ON e.id=ar.roster_entry_id AND e.track_id=t.id JOIN %I.recording_campaign_admission_reservations r ON r.approval_id=ar.approval_id AND r.stream_id=ar.stream_id JOIN %I.recording_targeted_probe_evidence evidence ON evidence.id=ar.second_probe_evidence_id WHERE ar.roster_entry_id=$1 AND t.state=''active'' AND e.recording_id=ar.recording_id AND e.stream_id=ar.stream_id AND e.scene_identity_sha256=r.scene_identity_sha256 AND e.role=''primary'' AND e.rank=1+(SELECT count(*) FROM %I.recording_campaign_admission_results prior WHERE prior.approval_id=ar.approval_id AND prior.stream_id<ar.stream_id) AND e.status=''probation'' AND e.reason_codes=ARRAY[''deniz_approved'',''targeted_do_two_pass'',''source_fenced'']::text[] AND e.effective_at=e.decision_at AND e.evidence_observed_at=evidence.observed_at AND e.evidence_sha256=evidence.media_sha256 AND e.updated_by_user_id=ar.actor_user_id)',s,s,s,s,s,s)
     INTO bound USING eid;
@@ -2615,15 +2718,15 @@ CREATE TRIGGER recording_campaign_claim_head_probe_guard BEFORE UPDATE OF genera
 CREATE OR REPLACE FUNCTION guard_recording_campaign_node_token_probe_lifecycle()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
 BEGIN
-  IF (NEW.node_id,NEW.revoked_at,NEW.recording_claim_purpose,NEW.recording_claim_generation) IS DISTINCT FROM
-     (OLD.node_id,OLD.revoked_at,OLD.recording_claim_purpose,OLD.recording_claim_generation) AND
+  IF (NEW.node_id,NEW.key_prefix,NEW.secret_hash,NEW.revoked_at,NEW.recording_claim_purpose,NEW.recording_claim_generation) IS DISTINCT FROM
+     (OLD.node_id,OLD.key_prefix,OLD.secret_hash,OLD.revoked_at,OLD.recording_claim_purpose,OLD.recording_claim_generation) AND
      recording_worker_targeted_probe_occupancy(OLD.node_id)>0 THEN
     RAISE EXCEPTION 'node token authority cannot revoke, repurpose, or rotate while targeted probe is live';
   END IF;
   RETURN NEW;
 END $$;
-CREATE TRIGGER recording_campaign_node_token_lifecycle_fence BEFORE UPDATE OF node_id,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_worker_lifecycle_statement_fence();
-CREATE TRIGGER recording_campaign_node_token_probe_guard BEFORE UPDATE OF node_id,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_node_token_probe_lifecycle();
+CREATE TRIGGER recording_campaign_node_token_lifecycle_fence BEFORE UPDATE OF node_id,key_prefix,secret_hash,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens FOR EACH STATEMENT EXECUTE FUNCTION recording_campaign_worker_lifecycle_statement_fence();
+CREATE TRIGGER recording_campaign_node_token_probe_guard BEFORE UPDATE OF node_id,key_prefix,secret_hash,revoked_at,recording_claim_purpose,recording_claim_generation ON node_tokens FOR EACH ROW EXECUTE FUNCTION guard_recording_campaign_node_token_probe_lifecycle();
 
 CREATE OR REPLACE FUNCTION enforce_admitted_stream_inverse_seal()
 RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$
@@ -2669,6 +2772,7 @@ CREATE TRIGGER recording_targeted_provider_attestations_immutable BEFORE UPDATE 
 CREATE TRIGGER recording_targeted_probe_scene_reviews_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_targeted_probe_scene_reviews FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_targeted_probe_scene_presentations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_targeted_probe_scene_presentations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_baseline_scene_presentations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_baseline_scene_presentations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
+CREATE TRIGGER recording_campaign_baseline_scene_read_receipts_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_baseline_scene_read_receipts FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_capacity_observations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_capacity_observations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_capacity_reservations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_capacity_reservations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
 CREATE TRIGGER recording_campaign_storage_observations_immutable BEFORE UPDATE OR DELETE OR TRUNCATE ON recording_campaign_storage_observations FOR EACH STATEMENT EXECUTE FUNCTION reject_campaign_admission_evidence_mutation();
@@ -2704,10 +2808,10 @@ BEGIN
     'recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid)',
     'recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid)',
     'recording_campaign_read_probe_scene(bigint,bigint,bigint,text,uuid)',
-    'recording_campaign_read_baseline_scene(bigint,bigint,bigint,text,text,bigint,bigint)',
-    'recording_campaign_present_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint)',
+    'recording_campaign_read_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint)',
+    'recording_campaign_present_baseline_scene(uuid,uuid,bigint,bigint,bigint,text,text,bigint,bigint)',
     'recording_campaign_attest_baseline_scene(uuid,bigint,bigint,bigint,text,bigint,text)',
-    'recording_campaign_create_capacity_observation(uuid,bigint,timestamp with time zone,text,text,text,integer,integer,integer,integer,text,integer,integer,integer,integer,integer,text,text,text)',
+    'recording_campaign_create_capacity_observation(uuid,bigint,timestamp with time zone,timestamp with time zone,text,text,text,integer,integer,integer,integer,text,integer,integer,integer,integer,integer,text,text,text,text)',
     'recording_campaign_create_capacity_reservation(uuid,bigint,uuid,integer,integer)',
     'recording_campaign_forecast_peak_slots(bigint)',
     'recording_campaign_relay_failure_capacity(bigint)',
@@ -2764,7 +2868,7 @@ BEGIN
 END
 $pin_recording_campaign_admission_search_path$;
 
-REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON recording_campaign_authority_decisions,recording_campaign_admission_approvals,recording_campaign_admission_reservations,recording_campaign_admission_reservation_terminal_events,recording_targeted_probe_orders,recording_targeted_provider_attestations,recording_targeted_probe_attempts,recording_targeted_probe_attempt_terminal_events,recording_targeted_probe_evidence,recording_targeted_probe_scene_presentations,recording_targeted_probe_scene_reviews,recording_campaign_baseline_scene_presentations,recording_campaign_capacity_observations,recording_campaign_capacity_reservations,recording_campaign_storage_observations,recording_campaign_storage_reservations,recording_campaign_admission_results,recording_campaign_admission_commits,recording_campaign_admission_tx_authorizations,recording_campaign_admission_source_fence_events FROM PUBLIC;
+REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON recording_campaign_authority_decisions,recording_campaign_admission_approvals,recording_campaign_admission_reservations,recording_campaign_admission_reservation_terminal_events,recording_targeted_probe_orders,recording_targeted_provider_attestations,recording_targeted_probe_attempts,recording_targeted_probe_attempt_terminal_events,recording_targeted_probe_evidence,recording_targeted_probe_scene_presentations,recording_targeted_probe_scene_reviews,recording_campaign_baseline_scene_read_receipts,recording_campaign_baseline_scene_presentations,recording_campaign_capacity_observations,recording_campaign_capacity_reservations,recording_campaign_storage_observations,recording_campaign_storage_reservations,recording_campaign_admission_results,recording_campaign_admission_commits,recording_campaign_admission_tx_authorizations,recording_campaign_admission_source_fence_events FROM PUBLIC;
 REVOKE ALL ON FUNCTION validate_recording_targeted_probe_order(),validate_recording_targeted_probe_attempt_terminal_event(),validate_recording_targeted_provider_attestation(),validate_recording_campaign_tx_authorization(),validate_recording_campaign_reservation_terminal_event(),validate_recording_targeted_probe_scene_presentation(),validate_recording_targeted_probe_scene_review(),validate_recording_campaign_capacity_observation(),validate_recording_campaign_capacity_reservation(),validate_recording_campaign_storage_observation(),validate_recording_campaign_storage_reservation(),validate_recording_campaign_admission_commit(),enforce_recording_campaign_result_has_commit(),validate_recording_campaign_admission_approval(),reserve_recording_campaign_admission_entries(),validate_recording_campaign_admission_reservation(),audit_recording_campaign_reserved_source_mutation(),audit_recording_campaign_reserved_revision_mutation(),validate_recording_targeted_probe_attempt(),validate_recording_targeted_probe_evidence(),validate_recording_campaign_admission_result(),recording_campaign_admission_statement_fence(),recording_campaign_assert_track_activation_occupancy(BIGINT,BIGINT),guard_recording_campaign_track_activation_occupancy(),guard_reserved_completed_recording_activation(),enforce_reserved_activation_has_result(),enforce_admitted_recording_inverse_seal(),guard_recording_campaign_track_state(),transition_recording_campaign_track(BIGINT,TEXT,TEXT[],BIGINT,TIMESTAMPTZ),guard_reserved_campaign_roster_occupancy(),enforce_admitted_roster_inverse_seal(),enforce_admitted_track_inverse_seal(),recording_campaign_worker_lifecycle_statement_fence(),guard_recording_campaign_worker_probe_lifecycle(),guard_recording_campaign_node_probe_lifecycle(),guard_recording_campaign_claim_head_probe_lifecycle(),guard_recording_campaign_node_token_probe_lifecycle(),enforce_admitted_stream_inverse_seal(),enforce_admitted_revision_inverse_seal(),reject_campaign_admission_evidence_mutation() FROM PUBLIC;
 REVOKE ALL ON FUNCTION recording_campaign_authorize_account(TEXT,UUID,BIGINT,BIGINT,BIGINT,TEXT),recording_campaign_authorize_node(TEXT,UUID,BIGINT,BIGINT,BIGINT,BIGINT,TEXT) FROM PUBLIC;
 
@@ -2786,7 +2890,7 @@ DECLARE
     'recording_campaign_admission_source_fence_events','recording_targeted_probe_orders','recording_targeted_provider_attestations',
     'recording_targeted_probe_attempts','recording_targeted_probe_evidence','recording_targeted_probe_scene_presentations','recording_targeted_probe_scene_reviews',
     'recording_targeted_probe_attempt_terminal_events',
-    'recording_campaign_baseline_scene_presentations',
+    'recording_campaign_baseline_scene_read_receipts','recording_campaign_baseline_scene_presentations',
     'recording_campaign_capacity_observations','recording_campaign_capacity_reservations','recording_campaign_storage_observations',
     'recording_campaign_storage_reservations','recording_campaign_admission_results','recording_campaign_admission_commits',
     'recording_campaign_admission_tx_authorizations'
@@ -2811,10 +2915,10 @@ DECLARE
     'recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid)',
     'recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid)',
     'recording_campaign_read_probe_scene(bigint,bigint,bigint,text,uuid)',
-    'recording_campaign_read_baseline_scene(bigint,bigint,bigint,text,text,bigint,bigint)',
-    'recording_campaign_present_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint)',
+    'recording_campaign_read_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint)',
+    'recording_campaign_present_baseline_scene(uuid,uuid,bigint,bigint,bigint,text,text,bigint,bigint)',
     'recording_campaign_attest_baseline_scene(uuid,bigint,bigint,bigint,text,bigint,text)',
-    'recording_campaign_create_capacity_observation(uuid,bigint,timestamp with time zone,text,text,text,integer,integer,integer,integer,text,integer,integer,integer,integer,integer,text,text,text)',
+    'recording_campaign_create_capacity_observation(uuid,bigint,timestamp with time zone,timestamp with time zone,text,text,text,integer,integer,integer,integer,text,integer,integer,integer,integer,integer,text,text,text,text)',
     'recording_campaign_create_capacity_reservation(uuid,bigint,uuid,integer,integer)',
     'recording_campaign_forecast_peak_slots(bigint)',
     'recording_campaign_relay_failure_capacity(bigint)',
@@ -2913,8 +3017,8 @@ BEGIN
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_present_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid) TO %I',install_schema,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_review_probe_scene(uuid,uuid,bigint,bigint,bigint,text,uuid,uuid) TO %I',install_schema,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_read_probe_scene(bigint,bigint,bigint,text,uuid) TO %I',install_schema,executor_role);
-  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_read_baseline_scene(bigint,bigint,bigint,text,text,bigint,bigint) TO %I',install_schema,executor_role);
-  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_present_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint) TO %I',install_schema,executor_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_read_baseline_scene(uuid,bigint,bigint,bigint,text,text,bigint,bigint) TO %I',install_schema,executor_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_present_baseline_scene(uuid,uuid,bigint,bigint,bigint,text,text,bigint,bigint) TO %I',install_schema,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_attest_baseline_scene(uuid,bigint,bigint,bigint,text,bigint,text) TO %I',install_schema,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_admit(uuid,bigint,bigint,bigint,text,jsonb,jsonb,jsonb,jsonb) TO %I',install_schema,executor_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION %I.recording_campaign_replay(uuid,bigint,text) TO %I',install_schema,executor_role);

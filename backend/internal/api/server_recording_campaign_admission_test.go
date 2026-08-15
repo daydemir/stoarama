@@ -110,8 +110,8 @@ func buildCampaignProbeArchive(t *testing.T, colorName string) ([]byte, []byte) 
 	for i := range segments {
 		segments[i] = filepath.Join(dir, fmt.Sprintf("segment-%d.mp4", i+1))
 		cmd := exec.Command(ffmpeg,
-			"-v", "error", "-f", "lavfi", "-i", "color=c="+colorName+":s=64x64:r=1:d=60.1",
-			"-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "60.1",
+			"-v", "error", "-f", "lavfi", "-i", "color=c="+colorName+":s=64x64:r=1:d=59.98",
+			"-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "59.98",
 			"-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "ultrafast",
 			"-pix_fmt", "yuv420p", "-g", "1", "-c:a", "aac", "-shortest", "-y", segments[i],
 		)
@@ -260,7 +260,7 @@ func TestVerifyTargetedQuarantineUsesExactMediaBytesAndRetainsVersions(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.Evidence.Result != recordability.ResultOK || observation.Evidence.SegmentCount != 2 || observation.Evidence.DurationMs < 120000 || observation.Evidence.VideoCodec != "h264" || !observation.Evidence.AudioPresent || observation.Evidence.AudioCodec != "aac" {
+	if observation.Evidence.Result != recordability.ResultOK || observation.Evidence.SegmentCount != 2 || observation.Evidence.DurationMs < 110000 || observation.Evidence.DurationMs > 130000 || observation.Evidence.VideoCodec != "h264" || !observation.Evidence.AudioPresent || observation.Evidence.AudioCodec != "aac" {
 		t.Fatalf("server-derived native evidence is incomplete: %#v", observation.Evidence)
 	}
 	if !lowerSHA256(observation.Evidence.FrameSHA256) || !lowerSHA256(observation.Evidence.MediaSHA256) || !lowerSHA256(observation.Evidence.NativeSignatureSHA256) || !lowerSHA256(observation.Evidence.ChallengeProofSHA256) {
@@ -319,7 +319,10 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	const rawSession = "campaign-admission-session"
 	insertSession(t, pool, accountID, userID, rawSession)
 	ctx := context.Background()
-	var destinationID, sceneEvidenceID, nodeID int64
+	var destinationID, sceneEvidenceID, nodeID, sessionID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM account_sessions WHERE account_id=$1 AND user_id=$2 AND session_hash=$3`, accountID, userID, hashSecret(rawSession)).Scan(&sessionID); err != nil {
+		t.Fatal(err)
+	}
 	const streamID int64 = 17235 // Immutable Deniz FD-decision member in migration 0140.
 	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,access_key_id,secret_access_key_enc,status,managed) VALUES($1,'admission','s3_compatible','https://s3.example.test','auto','admission','key',decode('00','hex'),'verified',true) RETURNING id`, accountID).Scan(&destinationID); err != nil {
 		t.Fatal(err)
@@ -377,6 +380,25 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,'https://s3.example.test','admission','baseline.mp4',1000000,now()-interval '1 hour',now()-interval '1 hour',now()-interval '59 minutes',now()-interval '1 hour')`, baselineRecordingID, destinationID); err != nil {
+		t.Fatal(err)
+	}
+	// The byte read and the presentation receipt are one source-bound
+	// operation. A source mutation between them must invalidate the old read
+	// receipt, even if the same frame object still exists.
+	staleReadRequest := uuid.New()
+	var staleReceipt uuid.UUID
+	var staleFrameSHA, staleKey, staleETag string
+	var staleSize int64
+	if err := s.admissionPool.QueryRow(ctx, `SELECT read_receipt_id,frame_sha256,media_object_key,media_etag,media_size_bytes FROM recording_campaign_read_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8)`, staleReadRequest, accountID, userID, sessionID, hashSecret(rawSession), "deniz_fd_restore_20260814", streamID, frameID).Scan(&staleReceipt, &staleFrameSHA, &staleKey, &staleETag, &staleSize); err != nil {
+		t.Fatalf("create source-bound baseline read receipt: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET source_page_url='https://source.example/changed',updated_at=clock_timestamp() WHERE id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.admissionPool.Exec(ctx, `SELECT * FROM recording_campaign_present_baseline_scene($1,$2,$3,$4,$5,$6,$7,$8,$9)`, staleReadRequest, staleReceipt, accountID, userID, sessionID, hashSecret(rawSession), "deniz_fd_restore_20260814", streamID, frameID); err == nil {
+		t.Fatal("baseline presentation accepted a read receipt from a prior source head")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET source_page_url='https://source.example/page',updated_at=clock_timestamp() WHERE id=$1`, streamID); err != nil {
 		t.Fatal(err)
 	}
 	var revisionID int64
@@ -561,14 +583,16 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 			t.Fatal("probe-first claim-head rotation crossed occupancy")
 		}
 		for label, statement := range map[string]string{
-			"provider id":      `UPDATE recorder_droplets SET do_droplet_id=do_droplet_id+1 WHERE node_id=$1`,
-			"region":           `UPDATE recorder_droplets SET region=region||'-changed' WHERE node_id=$1`,
-			"size":             `UPDATE recorder_droplets SET size=size||'-changed' WHERE node_id=$1`,
-			"build":            `UPDATE recorder_droplets SET build_sha=CASE WHEN build_sha=repeat('a',40) THEN repeat('b',40) ELSE repeat('a',40) END WHERE node_id=$1`,
-			"capacity":         `UPDATE recorder_droplets SET capacity=capacity+1 WHERE node_id=$1`,
-			"token revoke":     `UPDATE node_tokens SET revoked_at=transaction_timestamp() WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
-			"token purpose":    `UPDATE node_tokens SET recording_claim_purpose='existing_fence_only' WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
-			"token generation": `UPDATE node_tokens SET recording_claim_generation=recording_claim_generation+1 WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"provider id":       `UPDATE recorder_droplets SET do_droplet_id=do_droplet_id+1 WHERE node_id=$1`,
+			"region":            `UPDATE recorder_droplets SET region=region||'-changed' WHERE node_id=$1`,
+			"size":              `UPDATE recorder_droplets SET size=size||'-changed' WHERE node_id=$1`,
+			"build":             `UPDATE recorder_droplets SET build_sha=CASE WHEN build_sha=repeat('a',40) THEN repeat('b',40) ELSE repeat('a',40) END WHERE node_id=$1`,
+			"capacity":          `UPDATE recorder_droplets SET capacity=capacity+1 WHERE node_id=$1`,
+			"token revoke":      `UPDATE node_tokens SET revoked_at=transaction_timestamp() WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"token purpose":     `UPDATE node_tokens SET recording_claim_purpose='existing_fence_only' WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"token generation":  `UPDATE node_tokens SET recording_claim_generation=recording_claim_generation+1 WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"token key prefix":  `UPDATE node_tokens SET key_prefix=key_prefix||'x' WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
+			"token secret hash": `UPDATE node_tokens SET secret_hash=repeat('f',64) WHERE id=(SELECT claim_token_id FROM recording_worker_claim_heads WHERE node_id=$1)`,
 		} {
 			if _, err := pool.Exec(ctx, statement, nodeID); err == nil {
 				t.Fatalf("probe-first %s mutation crossed occupancy", label)
@@ -595,6 +619,9 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 			t.Fatalf("decode evidence %d: err=%v body=%s", attemptIndex+1, err, evidence.Body.String())
 		}
 		evidenceIDs = append(evidenceIDs, evidenceResponse.EvidenceID)
+		if _, err := pool.Exec(ctx, `INSERT INTO recording_targeted_probe_attempt_terminal_events(attempt_id,result,event_sha256) VALUES($1,'expired_without_evidence',repeat('0',64))`, leaseResponse.Target.AttemptID); err == nil {
+			t.Fatal("terminal-without-evidence committed after immutable probe evidence")
+		}
 		if attemptIndex == 0 {
 			if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET state='draining' WHERE node_id=$1`, nodeID); err != nil {
 				t.Fatal(err)
@@ -703,27 +730,206 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT id FROM recordings WHERE account_id=$1 AND stream_id=$2 AND status='active'`, accountID, streamID).Scan(&admittedRecordingID); err != nil {
 		t.Fatal(err)
 	}
-	// A later typed admission must not be rejected merely because the prior
-	// commit's capacity observation is older than 120 seconds. The exact
-	// approval-bound transaction is allowed through the row guard so the admit
-	// procedure can create its replacement observations and deferred seals. We
-	// roll this focused transaction back before those seals because this test's
-	// full admission was already committed above.
-	advanceCampaignAdmissionClock(t, pool, 181)
-	stalePriorObservationTx, err := pool.Begin(ctx)
+	canonicalTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stalePriorObservationTx.Exec(ctx, `SELECT recording_campaign_authorize_account('admit',$1,$2,$3,(SELECT id FROM account_sessions WHERE session_hash=$4),$4)`, approvalResponse.ApprovalID, accountID, userID, hashSecret(rawSession)); err != nil {
-		_ = stalePriorObservationTx.Rollback(ctx)
-		t.Fatalf("authorize delayed typed admission fixture: %v", err)
+	if _, err = canonicalTx.Exec(ctx, `SET LOCAL TIME ZONE 'Asia/Seoul'; SET LOCAL DateStyle='SQL, DMY'; UPDATE recordings SET next_fire_at=next_fire_at WHERE id=$1; UPDATE recording_campaign_roster_entries SET role=role WHERE recording_id=$1`, admittedRecordingID); err == nil {
+		err = canonicalTx.Commit(ctx)
+	} else {
+		_ = canonicalTx.Rollback(ctx)
 	}
-	if _, err := stalePriorObservationTx.Exec(ctx, `UPDATE recordings SET clip_duration_sec=clip_duration_sec+1 WHERE id=$1`, admittedRecordingID); err != nil {
-		_ = stalePriorObservationTx.Rollback(ctx)
-		t.Fatalf("delayed typed admission was blocked by stale prior observation: %v", err)
+	if err != nil {
+		t.Fatalf("typed config/roster digest changed with TimeZone or DateStyle: %v", err)
 	}
-	_ = stalePriorObservationTx.Rollback(ctx)
+	// Make the prior committed capacity head older than its exact 120-second
+	// lease, then execute a complete second approval/evidence/admission. This is
+	// a fixture-only time shift under the migration owner; product roles still
+	// cannot mutate immutable observations. The second commit must replace both
+	// capacity and NAS seals instead of relying on the stale predecessor.
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_campaign_capacity_observations DISABLE TRIGGER recording_campaign_capacity_observations_immutable;
+		UPDATE recording_campaign_capacity_observations SET
+		  observation_started_at=observation_started_at-interval '181 seconds',
+		  observed_at=observed_at-interval '181 seconds',expires_at=expires_at-interval '181 seconds',
+		  provider_observation_sha256=encode(sha256(convert_to(
+		    floor(extract(epoch from observation_started_at-interval '181 seconds')*1000000)::bigint::text||chr(10)||
+		    floor(extract(epoch from observed_at-interval '181 seconds')*1000000)::bigint::text||chr(10)||facts_sha256,'UTF8')),'hex');
+		ALTER TABLE recording_campaign_capacity_observations ENABLE TRIGGER recording_campaign_capacity_observations_immutable`); err != nil {
+		t.Fatalf("age prior immutable capacity fixture: %v", err)
+	}
+	const secondStreamID int64 = 17237
+	const secondSource = "https://source.example/second.m3u8"
+	const secondPage = "https://source.example/second"
+	if _, err := pool.Exec(ctx, `INSERT INTO streams(id,provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps,local_timezone,tags) VALUES($1,'publisher-two','scene-2','Second Approved Scene','second-approved-scene',$2,$3,'hls','video_manifest','video_live','continuous_video',30,'Europe/Berlin',ARRAY['FD'])`, secondStreamID, secondSource, secondPage); err != nil {
+		t.Fatal(err)
+	}
+	var secondRevisionID, secondMediaID, secondFrameID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO stream_source_revisions(stream_id,actor,reason,new_source_url,new_source_page_url) VALUES($1,'test','second-bind',$2,$3) RETURNING id`, secondStreamID, secondSource, secondPage).Scan(&secondRevisionID); err != nil {
+		t.Fatal(err)
+	}
+	secondBaseline := []byte("second exact reviewed baseline frame bytes")
+	secondBaselineETag := store.put("scene-second.jpg", "image/jpeg", secondBaseline)
+	secondBaselineSHA := sha256Hex(secondBaseline)
+	secondSceneSHA := sha256Hex([]byte("stoarama-scene-identity-v1\nsecond approved scene"))
+	if err := pool.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,etag,sha256) VALUES('r2','admission','scene-second.jpg','image/jpeg',$1,$2,$3) RETURNING id`, len(secondBaseline), secondBaselineETag, secondBaselineSHA).Scan(&secondMediaID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind) VALUES($1,now()-interval '1 minute',$2,'success','live') RETURNING id`, secondStreamID, secondMediaID).Scan(&secondFrameID); err != nil {
+		t.Fatal(err)
+	}
+	secondBaselineRequest := uuid.NewString()
+	secondPresentReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/account/recordings/qualification/scene-presentations/%d?stream_id=%d&authority_code=deniz_fd_restore_20260814&request_id=%s", secondFrameID, secondStreamID, secondBaselineRequest), nil)
+	secondPresentReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	secondPresentRec := httptest.NewRecorder()
+	router.ServeHTTP(secondPresentRec, secondPresentReq)
+	if secondPresentRec.Code != http.StatusOK {
+		t.Fatalf("second baseline presentation status=%d body=%s", secondPresentRec.Code, secondPresentRec.Body.String())
+	}
+	secondAttestBody, _ := json.Marshal(sceneAttestRequest{StreamID: secondStreamID, AuthorityCode: "deniz_fd_restore_20260814", FrameID: secondFrameID, PresentationID: secondPresentRec.Header().Get("X-Stoarama-Presentation-ID"), SceneIdentity: "Second Approved Scene"})
+	secondAttestReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/qualification/scene-attest", bytes.NewReader(secondAttestBody))
+	secondAttestReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+	secondAttestRec := httptest.NewRecorder()
+	router.ServeHTTP(secondAttestRec, secondAttestReq)
+	var secondBaselineEvidence struct {
+		EvidenceID int64 `json:"evidence_id"`
+	}
+	if secondAttestRec.Code != http.StatusOK || json.Unmarshal(secondAttestRec.Body.Bytes(), &secondBaselineEvidence) != nil || secondBaselineEvidence.EvidenceID <= 0 {
+		t.Fatalf("second baseline attest status=%d body=%s", secondAttestRec.Code, secondAttestRec.Body.String())
+	}
+	secondSchedule := schedule
+	secondSchedule.StreamIDs = []int64{secondStreamID}
+	secondSchedule.StreamTimezones = []streamTimezoneInput{{StreamID: secondStreamID, Timezone: "Europe/Berlin"}}
+	secondSchedule.CampaignAdmissionApprovalID = ""
+	secondApprovalBody, _ := json.Marshal(campaignAdmissionApprovalRequest{
+		RequestID: uuid.NewString(), DeadlineAt: end, AuthorityCode: "deniz_fd_restore_20260814", FailureDomainTag: "FD",
+		Entries:  []campaignAdmissionApprovalEntry{{StreamID: secondStreamID, SourceRevisionID: secondRevisionID, SourceURL: secondSource, SourcePageURL: secondPage, Provider: "publisher-two", ExternalID: "scene-2", NormalizedLabel: "secondapprovedscene", SceneFrameEvidenceID: secondBaselineEvidence.EvidenceID, SceneIdentitySHA256: secondSceneSHA}},
+		Schedule: secondSchedule,
+	})
+	secondApprovalRec := postOperator("/api/v1/account/recordings/campaign-admission/approvals", secondApprovalBody)
+	var secondApproval struct {
+		ApprovalID string `json:"approval_id"`
+	}
+	if secondApprovalRec.Code != http.StatusCreated || json.Unmarshal(secondApprovalRec.Body.Bytes(), &secondApproval) != nil || secondApproval.ApprovalID == "" {
+		t.Fatalf("second approval status=%d body=%s", secondApprovalRec.Code, secondApprovalRec.Body.String())
+	}
+	secondOrderBody, _ := json.Marshal(campaignAdmissionProbeOrderRequest{ApprovalID: secondApproval.ApprovalID, StreamID: secondStreamID, RequestID: uuid.NewString()})
+	if rec := postOperator("/api/v1/account/recordings/campaign-admission/probe-orders", secondOrderBody); rec.Code != http.StatusCreated {
+		t.Fatalf("second probe order status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for attemptIndex, colorName := range []string{"yellow", "purple"} {
+		lease := postNode("/api/v1/recording/campaign-admission/lease", map[string]any{})
+		var leaseResponse struct {
+			Target     *recordability.Target `json:"target"`
+			ApprovalID string                `json:"approval_id"`
+			RequestID  string                `json:"request_id"`
+		}
+		if lease.Code != http.StatusOK || json.Unmarshal(lease.Body.Bytes(), &leaseResponse) != nil || leaseResponse.Target == nil || leaseResponse.Target.ID != secondStreamID {
+			t.Fatalf("second probe lease %d status=%d body=%s", attemptIndex+1, lease.Code, lease.Body.String())
+		}
+		mediaArchive, frame := buildCampaignProbeArchive(t, colorName)
+		store.put(fmt.Sprintf("quarantine/campaign-probe/%s/media.zip", leaseResponse.Target.AttemptID), "application/zip", mediaArchive)
+		store.put(fmt.Sprintf("quarantine/campaign-probe/%s/frame.jpg", leaseResponse.Target.AttemptID), "image/jpeg", frame)
+		evidenceBody := map[string]any{"approval_id": leaseResponse.ApprovalID, "stream_id": secondStreamID, "attempt_id": leaseResponse.Target.AttemptID, "request_id": leaseResponse.RequestID, "evidence": recordability.TargetedEvidence{Result: recordability.ResultOK, Detail: "caller fields are non-authoritative"}}
+		evidenceRec := postNode("/api/v1/recording/campaign-admission/evidence", evidenceBody)
+		var evidenceResponse struct {
+			EvidenceID string `json:"evidence_id"`
+		}
+		if evidenceRec.Code != http.StatusCreated || json.Unmarshal(evidenceRec.Body.Bytes(), &evidenceResponse) != nil || evidenceResponse.EvidenceID == "" {
+			t.Fatalf("second evidence %d status=%d body=%s", attemptIndex+1, evidenceRec.Code, evidenceRec.Body.String())
+		}
+		probePresentationReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/campaign-admission/scene-presentations/"+evidenceResponse.EvidenceID+"?request_id="+uuid.NewString(), nil)
+		probePresentationReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+		probePresentationRec := httptest.NewRecorder()
+		router.ServeHTTP(probePresentationRec, probePresentationReq)
+		var probePresentation struct {
+			PresentationID string `json:"presentation_id"`
+		}
+		if probePresentationRec.Code != http.StatusOK || json.Unmarshal(probePresentationRec.Body.Bytes(), &probePresentation) != nil || probePresentation.PresentationID == "" {
+			t.Fatalf("second scene presentation %d status=%d body=%s", attemptIndex+1, probePresentationRec.Code, probePresentationRec.Body.String())
+		}
+		reviewBody, _ := json.Marshal(campaignAdmissionSceneReviewRequest{ApprovalID: secondApproval.ApprovalID, ProbeEvidenceID: evidenceResponse.EvidenceID, PresentationID: probePresentation.PresentationID, RequestID: uuid.NewString()})
+		if review := postOperator("/api/v1/account/recordings/campaign-admission/scene-reviews", reviewBody); review.Code != http.StatusCreated {
+			t.Fatalf("second scene review %d status=%d body=%s", attemptIndex+1, review.Code, review.Body.String())
+		}
+		if attemptIndex == 0 {
+			advanceCampaignAdmissionClock(t, pool, 61)
+		}
+	}
 	advanceCampaignAdmissionClock(t, pool, 0)
+	secondSchedule.CampaignAdmissionApprovalID = secondApproval.ApprovalID
+	secondScheduleBody, _ := json.Marshal(secondSchedule)
+	postSecondSchedule := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/account/recordings/batch-schedule", bytes.NewReader(secondScheduleBody))
+		request.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	// Freeze admission immediately after its bounded provider reads. A provider
+	// identity mutation while the global DB fence is held must invalidate that
+	// observation; it cannot be freshness-laundered with DB-now after the wait.
+	providerReads := make(chan struct{}, 2)
+	s.campaignDOAttest = func(_ context.Context, dropletID int64, name string) (dropletpool.ProviderAttestation, error) {
+		region := "nyc1"
+		if dropletID == 1000 {
+			region = "sfo3"
+		}
+		providerReads <- struct{}{}
+		return dropletpool.ProviderAttestation{DropletID: dropletID, Name: name, Region: region, SizeSlug: "s-2vcpu-4gb", Status: "active"}, nil
+	}
+	capacityFenceTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := capacityFenceTx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('campaign-admission-capacity-v1',0))`); err != nil {
+		_ = capacityFenceTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	staleProviderResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() { staleProviderResult <- postSecondSchedule() }()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-providerReads:
+		case <-time.After(5 * time.Second):
+			_ = capacityFenceTx.Rollback(ctx)
+			t.Fatal("second admission did not complete its bounded provider observation")
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET do_droplet_id=do_droplet_id+10000 WHERE node_id=$1`, nodeID); err != nil {
+		_ = capacityFenceTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := capacityFenceTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case stale := <-staleProviderResult:
+		if stale.Code != http.StatusConflict {
+			t.Fatalf("provider identity changed behind bounded observation: status=%d body=%s", stale.Code, stale.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second admission did not resume after capacity fence")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET do_droplet_id=do_droplet_id-10000 WHERE node_id=$1`, nodeID); err != nil {
+		t.Fatal(err)
+	}
+	// Restore the ordinary deterministic provider callback for the successful
+	// retry. The failed transaction did not consume the approval or seals.
+	s.campaignDOAttest = func(_ context.Context, dropletID int64, name string) (dropletpool.ProviderAttestation, error) {
+		region := "nyc1"
+		if dropletID == 1000 {
+			region = "sfo3"
+		}
+		return dropletpool.ProviderAttestation{DropletID: dropletID, Name: name, Region: region, SizeSlug: "s-2vcpu-4gb", Status: "active"}, nil
+	}
+	secondScheduleRec := postSecondSchedule()
+	if secondScheduleRec.Code != http.StatusOK {
+		t.Fatalf("complete second admission did not replace stale capacity/NAS seals: status=%d body=%s", secondScheduleRec.Code, secondScheduleRec.Body.String())
+	}
+	var capacitySealCount, storageSealCount int
+	if err := pool.QueryRow(ctx, `SELECT count(DISTINCT cap.approval_id),count(DISTINCT storage.approval_id) FROM recording_campaign_capacity_reservations cap FULL JOIN recording_campaign_storage_reservations storage ON storage.approval_id=cap.approval_id WHERE cap.account_id=$1 OR storage.account_id=$1`, accountID).Scan(&capacitySealCount, &storageSealCount); err != nil || capacitySealCount != 2 || storageSealCount != 2 {
+		t.Fatalf("second admission did not commit replacement capacity/NAS seals: capacity=%d storage=%d err=%v", capacitySealCount, storageSealCount, err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET next_fire_at=NULL WHERE id=$1`, admittedRecordingID); err == nil {
 		t.Fatal("runtime direct SQL cleared the sealed next-fire schedule")
 	}
@@ -778,10 +984,10 @@ func TestCampaignAdmissionHandlersPersistReplayAndSealExactBatch(t *testing.T) {
 	replayBody, _ := json.Marshal(campaignAdmissionReplayRequest{ApprovalID: approvalResponse.ApprovalID, TargetAccountID: accountID})
 	replayReq := httptest.NewRequest(http.MethodPost, "/api/v1/recordings/campaign-admission/replay", bytes.NewReader(replayBody))
 	replayReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: rawSession})
-	secondSchedule := httptest.NewRecorder()
-	router.ServeHTTP(secondSchedule, replayReq)
-	if secondSchedule.Code != http.StatusOK || secondSchedule.Body.String() != firstSchedule.Body.String() {
-		t.Fatalf("sealed admission replay after session/provider revocation changed: first=%s second=%s", firstSchedule.Body.String(), secondSchedule.Body.String())
+	replayRec := httptest.NewRecorder()
+	router.ServeHTTP(replayRec, replayReq)
+	if replayRec.Code != http.StatusOK || replayRec.Body.String() != firstSchedule.Body.String() {
+		t.Fatalf("sealed admission replay after session/provider revocation changed: first=%s second=%s", firstSchedule.Body.String(), replayRec.Body.String())
 	}
 	var recordings int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recordings WHERE account_id=$1 AND stream_id=$2`, accountID, streamID).Scan(&recordings); err != nil || recordings != 1 {

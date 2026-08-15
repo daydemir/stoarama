@@ -406,22 +406,25 @@ type campaignAdmissionProbeOrderRequest struct {
 }
 
 type campaignCloudCapacityObservation struct {
-	ObservedAt            time.Time
-	ReadyWorkers          int
-	TotalSlots            int
-	LargestWorkerSlots    int
-	UsableAfterWorkerLoss int
-	LargestRegion         string
-	LargestRegionSlots    int
-	SizeSlug              string
-	PoolIdentitySHA256    string
-	FactsSHA256           string
+	ObservationStartedAt      time.Time
+	ObservedAt                time.Time
+	ProviderObservationSHA256 string
+	ReadyWorkers              int
+	TotalSlots                int
+	LargestWorkerSlots        int
+	UsableAfterWorkerLoss     int
+	LargestRegion             string
+	LargestRegionSlots        int
+	SizeSlug                  string
+	PoolIdentitySHA256        string
+	FactsSHA256               string
 }
 
 func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignCloudCapacityObservation, error) {
 	if s.campaignDOAttest == nil || strings.TrimSpace(s.cfg.DropletPoolBuildSHA) == "" {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("managed cloud capacity attestation is unavailable")
 	}
+	observationStartedAt := time.Now().UTC()
 	type worker struct {
 		ID, NodeID, DOID, ClaimTokenID, ClaimGeneration int64
 		Name, Region, Size, Build                       string
@@ -455,7 +458,7 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 		ClaimGeneration int64  `json:"claim_generation"`
 		ClaimTokenID    int64  `json:"claim_token_id"`
 	}
-	observation := campaignCloudCapacityObservation{ObservedAt: time.Now().UTC()}
+	observation := campaignCloudCapacityObservation{ObservationStartedAt: observationStartedAt}
 	regionSlots := map[string]int{}
 	facts := make([]fact, 0, len(workers))
 	for _, item := range workers {
@@ -494,6 +497,14 @@ func (s *Server) observeCampaignCloudCapacity(ctx context.Context) (campaignClou
 		}, "\x1f"))
 	}
 	observation.FactsSHA256 = hashSecret(strings.Join(factLines, "\n") + "\n")
+	observation.ObservedAt = time.Now().UTC()
+	if observation.ObservedAt.Before(observation.ObservationStartedAt) || observation.ObservedAt.Sub(observation.ObservationStartedAt) > 120*time.Second {
+		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity observation interval is invalid")
+	}
+	observation.ProviderObservationSHA256 = hashSecret(strings.Join([]string{
+		fmt.Sprint(observation.ObservationStartedAt.UnixMicro()),
+		fmt.Sprint(observation.ObservedAt.UnixMicro()), observation.FactsSHA256,
+	}, "\n"))
 	if observation.ReadyWorkers < 2 || observation.UsableAfterWorkerLoss <= 0 || !lowerSHA256(observation.FactsSHA256) {
 		return campaignCloudCapacityObservation{}, fmt.Errorf("cloud capacity cannot survive one worker loss")
 	}
@@ -911,6 +922,13 @@ func (s *Server) verifyTargetedQuarantine(ctx context.Context, attemptID, challe
 		if inspectErr != nil {
 			return targetedQuarantineObservation{}, inspectErr
 		}
+		// Archive capture is two consecutive nominal one-minute stream-copy
+		// segments. FFmpeg boundaries naturally land a little either side of
+		// 60 seconds, so validate each boundary instead of requiring an exact
+		// aggregate two minutes.
+		if meta.DurationMs < 55_000 || meta.DurationMs > 65_000 {
+			return targetedQuarantineObservation{}, fmt.Errorf("targeted media segment duration is outside the nominal one-minute cadence")
+		}
 		if err := capture.ValidateSegmentDecode(ctx, segmentPath); err != nil {
 			return targetedQuarantineObservation{}, err
 		}
@@ -928,6 +946,9 @@ func (s *Server) verifyTargetedQuarantine(ctx context.Context, attemptID, challe
 		}
 		evidence.DurationMs += meta.DurationMs
 		evidence.SegmentCount++
+	}
+	if evidence.DurationMs < 110_000 || evidence.DurationMs > 130_000 || evidence.SegmentCount != 2 {
+		return targetedQuarantineObservation{}, fmt.Errorf("targeted media archive cadence is outside the two-segment tolerance")
 	}
 	evidence.Result = recordability.ResultOK
 	evidence.ValidRatio = 1
