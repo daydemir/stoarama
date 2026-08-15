@@ -1388,6 +1388,9 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			lease_owner TEXT,
 			lease_expires_at TIMESTAMPTZ,
 			lease_token UUID,
+			lease_node_token_id BIGINT,
+			lease_claim_generation BIGINT,
+			lease_credential_state TEXT,
 			attempt_count INTEGER NOT NULL DEFAULT 0,
 			max_attempts INTEGER NOT NULL DEFAULT 3,
 			idempotency_key TEXT NOT NULL UNIQUE,
@@ -1400,6 +1403,26 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE FUNCTION recording_surrender_relay_candidate_eligible(BIGINT, BIGINT)
+		RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`,
+		`CREATE FUNCTION recording_surrender_relay_alternate(BIGINT, TEXT)
+		RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`,
+		`CREATE TABLE node_tokens (
+			id BIGINT PRIMARY KEY,
+			revoked_at TIMESTAMPTZ,
+			recording_claim_generation BIGINT,
+			recording_claim_purpose TEXT
+		)`,
+		`INSERT INTO node_tokens(id,recording_claim_generation,recording_claim_purpose)
+		VALUES(0,1,'claim_current')`,
+		`CREATE TABLE recording_worker_claim_heads (
+			node_id BIGINT PRIMARY KEY,
+			generation BIGINT NOT NULL,
+			claim_token_id BIGINT NOT NULL,
+			state TEXT NOT NULL
+		)`,
+		`INSERT INTO recording_worker_claim_heads(node_id,generation,claim_token_id,state)
+		VALUES(77,1,0,'enabled')`,
 		`CREATE TABLE recording_clips (
 			id BIGSERIAL PRIMARY KEY,
 			recording_job_id BIGINT NOT NULL,
