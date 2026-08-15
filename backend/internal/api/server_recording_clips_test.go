@@ -30,6 +30,7 @@ const testRelayNodesTableDDL = `CREATE TABLE nodes (
 	node_type TEXT NOT NULL,
 	status TEXT NOT NULL,
 	last_heartbeat_at TIMESTAMPTZ,
+	last_seen_at TIMESTAMPTZ,
 	relay_max_streams INTEGER NOT NULL,
 	relay_group_id BIGINT,
 	capabilities_jsonb JSONB NOT NULL DEFAULT '{}'::jsonb
@@ -407,6 +408,10 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 		INSERT INTO recorder_droplets (name, node_id, state, capacity)
 		VALUES ('cloud-a', 10, 'active', 1),
 		       ('cloud-b', 11, 'active', 1);
+		INSERT INTO node_tokens(id,node_id,recording_claim_generation,recording_claim_purpose)
+		VALUES(11,11,1,'claim_current');
+		INSERT INTO recording_worker_claim_heads(node_id,generation,claim_token_id,state)
+		VALUES(11,1,11,'enabled');
 		INSERT INTO recordings
 			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
 		VALUES (1, 42, 7, 'continuous', 'https://example.test/live.m3u8', 'active', now()-interval '1 hour', 'cloud');
@@ -469,7 +474,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var blocked recordingLeaseResponse
 	err := pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false, 0, 10, 1, 42).Scan(
 		&blocked.JobID, &blocked.RecordingID, &blocked.SourceURL, &blocked.StreamID, &blocked.StreamProvider, &blocked.SourcePageURL, &blocked.ClipDurationSec,
 		&blocked.StorageDestinationID, &blocked.FireAt, &blocked.AttemptCount, &blocked.LeaseExpiresAt, &blocked.TargetFPS, &blocked.Kind, &blocked.WindowEndAt, &blocked.LeaseToken,
 	)
@@ -482,7 +487,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var priorOwner recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false, 0, 10, 1, 42).Scan(
 		&priorOwner.JobID, &priorOwner.RecordingID, &priorOwner.SourceURL, &priorOwner.StreamID, &priorOwner.StreamProvider, &priorOwner.SourcePageURL, &priorOwner.ClipDurationSec,
 		&priorOwner.StorageDestinationID, &priorOwner.FireAt, &priorOwner.AttemptCount, &priorOwner.LeaseExpiresAt, &priorOwner.TargetFPS, &priorOwner.Kind, &priorOwner.WindowEndAt, &priorOwner.LeaseToken,
 	)
@@ -491,7 +496,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var job recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-b", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true).Scan(
+		"cloud-b", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true, 11, 11, 1, 42).Scan(
 		&job.JobID, &job.RecordingID, &job.SourceURL, &job.StreamID, &job.StreamProvider, &job.SourcePageURL, &job.ClipDurationSec,
 		&job.StorageDestinationID, &job.FireAt, &job.AttemptCount, &job.LeaseExpiresAt, &job.TargetFPS, &job.Kind, &job.WindowEndAt, &job.LeaseToken,
 	)
@@ -553,7 +558,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var expired recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-c", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		"cloud-c", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false, 0, 12, 1, 42).Scan(
 		&expired.JobID, &expired.RecordingID, &expired.SourceURL, &expired.StreamID, &expired.StreamProvider, &expired.SourcePageURL, &expired.ClipDurationSec,
 		&expired.StorageDestinationID, &expired.FireAt, &expired.AttemptCount, &expired.LeaseExpiresAt, &expired.TargetFPS, &expired.Kind, &expired.WindowEndAt, &expired.LeaseToken,
 	)
@@ -607,6 +612,8 @@ func TestRecordingHeartbeatCapsContinuousWindowDrain(t *testing.T) {
 		INSERT INTO accounts(id) VALUES(42);
 		INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams)
 		VALUES(1,42,'relay','active',now(),4),(2,42,'relay','active',now(),4);
+		INSERT INTO node_tokens(id,node_id,recording_claim_generation,recording_claim_purpose)
+		VALUES(1,1,1,'claim_current');
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via)
 		VALUES(1,42,1,'heartbeat','https://example.test/live.m3u8','active',now()-interval '1 hour','relay');
 		INSERT INTO recording_jobs
@@ -622,7 +629,7 @@ func TestRecordingHeartbeatCapsContinuousWindowDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{pool: pool}
-	principal := nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}
+	principal := nodePrincipal{NodeID: 1, NodeTokenID: 1, AccountID: 42, NodeType: nodeTypeRelay}
 	dbNow := func() time.Time {
 		var now time.Time
 		if err := pool.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
@@ -888,6 +895,7 @@ func TestRecordingJobsLeaseRespectsDropletCapacityOne(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id) VALUES (42);
 		INSERT INTO recorder_droplets (name, node_id, capacity, state)
 		VALUES ('recorder-a', 1001, 1, 'active')
 	`); err != nil {
@@ -981,6 +989,7 @@ func TestRecordingJobsLeaseRefusesDrainingDroplet(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id) VALUES (42);
 		INSERT INTO recorder_droplets (name, node_id, capacity, state)
 		VALUES ('recorder-a', 1001, 5, 'active')
 	`); err != nil {
@@ -1334,7 +1343,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			name TEXT NOT NULL,
 			node_id BIGINT,
 			capacity INTEGER NOT NULL,
-			state TEXT NOT NULL
+			state TEXT NOT NULL,
+			last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE account_billing (
 			account_id BIGINT NOT NULL,
@@ -1390,7 +1400,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			lease_token UUID,
 			lease_node_token_id BIGINT,
 			lease_claim_generation BIGINT,
-			lease_credential_state TEXT,
+			lease_credential_state TEXT NOT NULL DEFAULT 'legacy_unknown',
 			attempt_count INTEGER NOT NULL DEFAULT 0,
 			max_attempts INTEGER NOT NULL DEFAULT 3,
 			idempotency_key TEXT NOT NULL UNIQUE,
@@ -1407,14 +1417,19 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 		RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`,
 		`CREATE FUNCTION recording_surrender_relay_alternate(BIGINT, TEXT)
 		RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`,
+		`CREATE FUNCTION recording_surrender_token_can_access_lease(BIGINT, BIGINT, BIGINT, BIGINT)
+		RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`,
+		`CREATE FUNCTION recording_worker_targeted_probe_occupancy(BIGINT)
+		RETURNS BIGINT LANGUAGE sql AS 'SELECT 0::bigint'`,
 		`CREATE TABLE node_tokens (
 			id BIGINT PRIMARY KEY,
+			node_id BIGINT,
 			revoked_at TIMESTAMPTZ,
 			recording_claim_generation BIGINT,
 			recording_claim_purpose TEXT
 		)`,
-		`INSERT INTO node_tokens(id,recording_claim_generation,recording_claim_purpose)
-		VALUES(0,1,'claim_current')`,
+		`INSERT INTO node_tokens(id,node_id,recording_claim_generation,recording_claim_purpose)
+		VALUES(0,77,1,'claim_current')`,
 		`CREATE TABLE recording_worker_claim_heads (
 			node_id BIGINT PRIMARY KEY,
 			generation BIGINT NOT NULL,
@@ -1428,6 +1443,22 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			recording_job_id BIGINT NOT NULL,
 			capture_lease_token UUID,
 			capture_sequence BIGINT
+		)`,
+		`CREATE TABLE recording_capture_set_plans (
+			id UUID PRIMARY KEY,
+			recording_job_id BIGINT NOT NULL,
+			lease_token UUID NOT NULL
+		)`,
+		`CREATE TABLE recording_capture_reservation_sets (
+			id UUID PRIMARY KEY,
+			plan_id UUID NOT NULL
+		)`,
+		`CREATE TABLE recording_capture_producer_stop_events (
+			id UUID PRIMARY KEY,
+			set_id UUID NOT NULL
+		)`,
+		`CREATE TABLE recording_capture_producer_stop_acks (
+			stop_event_id UUID NOT NULL
 		)`,
 		testRecordingCanaryReservationsTableDDL,
 		`CREATE TABLE storage_destinations (

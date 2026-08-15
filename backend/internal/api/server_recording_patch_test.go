@@ -272,6 +272,9 @@ func TestRecordingJobCompleteRejectsZeroClipContinuous(t *testing.T) {
 
 	ctx := context.Background()
 	const accountID = int64(42)
+	if _, err := pool.Exec(ctx, `INSERT INTO node_tokens(id,node_id) VALUES(7,7)`); err != nil {
+		t.Fatal(err)
+	}
 	destID := insertPatchDestination(t, pool, accountID)
 	recID := insertPatchRecording(t, pool, accountID, destID, "managed")
 	var jobID int64
@@ -286,7 +289,7 @@ func TestRecordingJobCompleteRejectsZeroClipContinuous(t *testing.T) {
 
 	s := &Server{pool: pool}
 	rec := httptest.NewRecorder()
-	s.handleRecordingJobComplete(rec, recordingJobReq(jobID, nodePrincipal{NodeID: 7, AccountID: accountID, NodeType: nodeTypeRelay}))
+	s.handleRecordingJobComplete(rec, recordingJobReq(jobID, nodePrincipal{NodeID: 7, NodeTokenID: 7, AccountID: accountID, NodeType: nodeTypeRelay}))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("complete zero-clip continuous: status=%d body=%s, want 409", rec.Code, rec.Body.String())
 	}
@@ -509,6 +512,9 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			lease_owner TEXT,
 			lease_expires_at TIMESTAMPTZ,
 			lease_token UUID,
+			lease_node_token_id BIGINT,
+			lease_claim_generation BIGINT,
+			lease_credential_state TEXT NOT NULL DEFAULT 'legacy_unknown',
 			attempt_count INT NOT NULL DEFAULT 0,
 			error_text TEXT NOT NULL DEFAULT '',
 			idempotency_key TEXT NOT NULL UNIQUE,
@@ -517,6 +523,13 @@ func testRecordingPatchPool(t *testing.T) (*pgxpool.Pool, func()) {
 			completed_at TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`CREATE TABLE node_tokens (
+			id BIGINT PRIMARY KEY,
+			node_id BIGINT NOT NULL,
+			revoked_at TIMESTAMPTZ
+		)`,
+		`CREATE FUNCTION recording_surrender_token_can_access_lease(BIGINT, BIGINT, BIGINT, BIGINT)
+		RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true'`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			pool.Close()
