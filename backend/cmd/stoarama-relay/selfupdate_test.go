@@ -458,6 +458,21 @@ func TestSelfUpdateLoopRetriesTypedIntentImmediatelyAfterDrain(t *testing.T) {
 	<-done
 }
 
+func TestOrdinaryNoopUpdateTickDoesNotDrainActiveRelay(t *testing.T) {
+	setupSelfUpdateHome(t, "current123")
+	manifest := latestJSON{Version: "current123"}
+	server := serveTestRelayRelease(t, manifest, nil)
+	active := &atomic.Int64{}
+	active.Store(1)
+	drain := &atomic.Bool{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	applyRelayUpdateAfterDrain(ctx, server.URL, liveReleaseManifest, nil, active, &sync.RWMutex{}, drain)
+	if drain.Load() {
+		t.Fatal("ordinary no-op update tick interrupted claim admission")
+	}
+}
+
 func setupSelfUpdateHome(t *testing.T, runningVersion string) string {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())

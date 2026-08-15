@@ -279,6 +279,16 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 
 func checkAndApplyUpdateExpected(base string, manifest releaseManifest, intent *recordingapi.RelayUpdateIntent, activeJobs *atomic.Int64, leaseGate *sync.RWMutex, drainForUpdate *atomic.Bool) bool {
 	lastUpdaterUnix.Store(time.Now().UTC().UnixNano())
+	if intent == nil {
+		preflight, err := fetchLatestExpected(base, manifest, "", "")
+		if err != nil {
+			log.Printf("relay self-update: preflight latest.json: %v", err)
+			return false
+		}
+		if !relayUpdateMutationNeeded(preflight, runtime.GOOS+"-"+runtime.GOARCH) {
+			return false
+		}
+	}
 	if drainForUpdate != nil {
 		drainForUpdate.Store(true)
 	}
@@ -378,6 +388,30 @@ func checkAndApplyUpdateExpected(base string, manifest releaseManifest, intent *
 				drainForUpdate.Store(false)
 			}
 		}
+	}
+	return false
+}
+
+func relayUpdateMutationNeeded(manifest latestJSON, target string) bool {
+	if relay, ok := manifest.Relay[target]; ok && strings.TrimSpace(relay.SHA256) != "" && manifest.Version != version {
+		return true
+	}
+	dir, err := binDir()
+	if err != nil {
+		return len(manifest.Ytdlp[target].SHA256) != 0 || len(manifest.Deno[target].SHA256) != 0
+	}
+	for name, artifact := range map[string]latestArtifact{"yt-dlp": manifest.Ytdlp[target], "deno": manifest.Deno[target]} {
+		if strings.TrimSpace(artifact.SHA256) == "" {
+			continue
+		}
+		matches, err := fileMatchesSHA256(filepath.Join(dir, name), artifact.SHA256)
+		if err != nil || !matches {
+			return true
+		}
+	}
+	if strings.TrimSpace(manifest.Deno[target].SHA256) != "" && strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")) == "" &&
+		ytdlpJSRuntimeReady(dir, filepath.Join(dir, "yt-dlp")) {
+		return true
 	}
 	return false
 }
