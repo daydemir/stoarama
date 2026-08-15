@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -47,7 +48,12 @@ func main() {
 			fatal(err)
 		}
 	case "install-launchd":
-		if err := installLaunchd(); err != nil {
+		fs := flag.NewFlagSet("install-launchd", flag.ContinueOnError)
+		userDomain := fs.Bool("user-domain", false, "install in the existing headless per-user launchd domain")
+		if err := fs.Parse(args); err != nil {
+			fatal(err)
+		}
+		if err := installLaunchdInDomain(*userDomain); err != nil {
 			fatal(err)
 		}
 	case "launchd-handoff":
@@ -93,7 +99,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, strings.Join([]string{
 		"  enroll --token sie_... [--api-url URL] [--name NAME] [--update-manifest NAME]",
 		"  run                                                   run the relay worker + heartbeat (service entrypoint)",
-		"  install-launchd                                       write + load the macOS launchd user agent",
+		"  install-launchd [--user-domain]                       write + load the macOS launchd user agent",
 		"  install-systemd                                       write + enable the systemd user unit",
 		"  uninstall                                             stop the service and remove the unit",
 		"  link-youtube                                          [experimental] export Chrome cookies for private/members YouTube; needs STOARAMA_RELAY_YT_COOKIES=1 + a bundled JS runtime",

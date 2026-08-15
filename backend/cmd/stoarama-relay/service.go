@@ -33,13 +33,19 @@ var (
 
 const launchctlCommandTimeout = 5 * time.Second
 
-// installLaunchd writes the launchd USER agent (so the login user's Keychain is
-// reachable for Chrome cookie decryption, which a system LaunchDaemon could not do)
-// and bootstraps it into the per-user GUI domain. A non-admin LaunchAgent is
-// restarted after login, but macOS cannot run it before a user logs in.
+// installLaunchd writes the login-durable GUI-domain LaunchAgent. The explicit
+// user-domain mode supports cookieless relays on headless accounts that already
+// have a launchd user domain; it is intentionally never selected automatically.
 func installLaunchd() error {
+	return installLaunchdInDomain(false)
+}
+
+func installLaunchdInDomain(userDomain bool) error {
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("install-launchd is only supported on macOS")
+	}
+	if userDomain && experimentalCookieMode() {
+		return fmt.Errorf("--user-domain supports cookieless relay mode only")
 	}
 	installLock, err := acquireServiceOperationLock()
 	if err != nil {
@@ -114,7 +120,16 @@ func installLaunchd() error {
 	}
 	priorDomain := ""
 	domain := fmt.Sprintf("gui/%d", uid)
+	if userDomain {
+		domain = fmt.Sprintf("user/%d", uid)
+		if _, err := runLaunchctlBounded("print", domain); err != nil {
+			return fmt.Errorf("--user-domain requires an existing %s launchd domain: %w", domain, err)
+		}
+	}
 	if len(loaded) == 1 {
+		if loaded[0] != domain {
+			return fmt.Errorf("relay is already loaded in %s; refusing cross-domain replacement with %s", loaded[0], domain)
+		}
 		if !hadPrior || !ownedRelayPlist(prior, filepath.Join(bd, "stoarama-relay")) {
 			return fmt.Errorf("relay job is loaded in %s but its canonical plist is not owned by this installer; refusing replacement", loaded[0])
 		}
@@ -179,7 +194,11 @@ func bootstrapLaunchd(domain, plistPath, instanceID string, baselineSuccesses ui
 	startedAt := time.Now().UTC()
 	out, err := runLaunchctlBounded("bootstrap", domain, plistPath)
 	if err != nil {
-		cause := fmt.Errorf("launchctl bootstrap %s: %w (%s); this non-admin service requires an active GUI login session", domain, err, strings.TrimSpace(string(out)))
+		hint := "the selected launchd domain is unavailable"
+		if strings.HasPrefix(domain, "gui/") {
+			hint = "this non-admin service requires an active GUI login session"
+		}
+		cause := fmt.Errorf("launchctl bootstrap %s: %w (%s); %s", domain, err, strings.TrimSpace(string(out)), hint)
 		loaded, probeErr := launchdJobLoadedBounded(domain + "/" + launchdLabel)
 		if probeErr != nil {
 			return fmt.Errorf("%w; candidate state probe failed: %v", cause, probeErr)

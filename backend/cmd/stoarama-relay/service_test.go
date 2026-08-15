@@ -197,6 +197,75 @@ exit 0
 	}
 }
 
+func TestInstallLaunchdUserDomainIsExplicitAndVerified(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd install is macOS-only")
+	}
+	uid := os.Getuid()
+	logPath := fakeLaunchctl(t, `
+echo "$*" >> "$LAUNCHCTL_TEST_LOG"
+marker="$HOME/loaded"
+if [ "$1" = print ] && [ "$2" = "user/`+fmt.Sprint(uid)+`" ]; then exit 0; fi
+if [ "$1" = print ]; then [ -f "$marker" ] && echo 'state = running' && exit 0; exit 113; fi
+if [ "$1" = bootstrap ]; then touch "$marker"; exit 0; fi
+if [ "$1" = kickstart ]; then
+  id=$(sed -n 's/.*STOARAMA_SERVICE_INSTANCE_ID<\/key><string>\([^<]*\)<.*/\1/p' "$HOME/Library/LaunchAgents/com.stoarama.relay.plist")
+  mkdir -p "$HOME/.stoarama"
+  echo "{\"service_instance_id\":\"$id\",\"heartbeat_success_count\":2,\"started_at\":\"2099-01-01T00:00:00Z\"}" > "$HOME/.stoarama/relay-recovery.json"
+  exit 0
+fi
+exit 0
+`)
+	if err := installLaunchdInDomain(true); err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(calls), "bootstrap user/"+fmt.Sprint(uid)+" ") || strings.Contains(string(calls), "bootstrap gui/") {
+		t.Fatalf("user-domain install selected the wrong domain:\n%s", calls)
+	}
+}
+
+func TestInstallLaunchdUserDomainRequiresExistingDomain(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd install is macOS-only")
+	}
+	fakeLaunchctl(t, `if [ "$1" = print ]; then exit 113; fi; exit 0`)
+	err := installLaunchdInDomain(true)
+	if err == nil || !strings.Contains(err.Error(), "requires an existing user/") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestInstallLaunchdUserDomainRejectsCookieMode(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd install is macOS-only")
+	}
+	t.Setenv(experimentalCookieEnv, "1")
+	if err := installLaunchdInDomain(true); err == nil || !strings.Contains(err.Error(), "cookieless") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestInstallLaunchdUserDomainRefusesLoadedGUIService(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd install is macOS-only")
+	}
+	fakeLaunchctl(t, `
+if [ "$1" = print ]; then
+  case "$2" in
+    user/`+fmt.Sprint(os.Getuid())+`) exit 0 ;;
+    gui/*/com.stoarama.relay) echo 'state = running'; exit 0 ;;
+  esac
+  exit 113
+fi
+exit 0
+`)
+	err := installLaunchdInDomain(true)
+	if err == nil || !strings.Contains(err.Error(), "refusing cross-domain replacement") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestInstallLaunchdRestartsPriorServiceAfterCandidateFailure(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd install is macOS-only")
