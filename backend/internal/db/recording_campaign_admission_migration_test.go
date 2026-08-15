@@ -108,6 +108,32 @@ func TestRecordingCampaignAdmissionMigrationFencesAndSealsActivation(t *testing.
 	if _, err := migrator.Exec(ctx, `GRANT SELECT ON frames TO stoarama_test_admission_authority`); err != nil {
 		t.Fatalf("restore protected frame dependency fixture: %v", err)
 	}
+	if _, err := migrator.Exec(ctx, `REVOKE UPDATE(id) ON accounts FROM stoarama_test_admission_authority`); err != nil {
+		t.Fatalf("revoke authority account-lock privilege fixture: %v", err)
+	}
+	if err := ValidateCampaignExecutorPrivileges(ctx, executorPool, "stoarama_test_admission_executor", "stoarama_test_admission_authority"); err == nil {
+		t.Fatal("executor startup accepted a missing authority account-lock privilege")
+	}
+	if _, err := migrator.Exec(ctx, `GRANT UPDATE(id) ON accounts TO stoarama_test_admission_authority`); err != nil {
+		t.Fatalf("restore authority account-lock privilege fixture: %v", err)
+	}
+	lockTx, err := migrator.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `SET LOCAL ROLE stoarama_test_admission_authority`); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `SELECT 1 FROM accounts WHERE false FOR UPDATE`); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("authority could not take its reviewed account identity lock: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx, `UPDATE accounts SET name=name WHERE false`); err == nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal("authority updated a non-lock product column")
+	}
+	_ = lockTx.Rollback(ctx)
 	unreviewedRole := fmt.Sprintf("campaign_unreviewed_%d", time.Now().UnixNano())
 	unreviewedIdentifier := pgx.Identifier{unreviewedRole}.Sanitize()
 	if _, err := admin.Exec(ctx, `CREATE ROLE `+unreviewedIdentifier+`; GRANT stoarama_test_admission_authority TO `+unreviewedIdentifier); err != nil {
@@ -951,6 +977,7 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"recording_campaign_read_probe_scene",
 		"recording_campaign_read_baseline_scene",
 		"%I.frames,%I.media_objects,%I.recording_scene_frame_evidence",
+		"GRANT UPDATE(id) ON TABLE %I.accounts,%I.recorder_droplets,%I.streams TO %I",
 		"campaign activation requires a fresh typed capacity observation",
 		"campaign one-worker-loss capacity head is permanently enforced",
 		"recording_campaign_relay_failure_capacity",

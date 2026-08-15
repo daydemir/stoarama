@@ -74,6 +74,13 @@ var campaignAuthorityReadOnlyProductTables = []string{
 	"frames", "media_objects",
 }
 
+// Admission serializes against ordinary product writers by locking these
+// product identities. PostgreSQL requires UPDATE privilege for SELECT FOR
+// UPDATE, but the authority receives it only on the immutable id column.
+var campaignAuthorityLockProductTables = []string{
+	"accounts", "recorder_droplets", "streams",
+}
+
 var campaignRuntimeDeniedProductSequences = []string{
 	"recording_campaign_track_events_id_seq",
 }
@@ -233,7 +240,7 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 	}
 	var sessionUser, currentUser string
 	var super, member, ownsObjects, schemaCreate, migrationApplied bool
-	var tablePrivileges, invalidFunctions, invalidAuthorityDependencies int
+	var tablePrivileges, invalidFunctions, invalidAuthorityDependencies, invalidAuthorityLockDependencies int
 	err := pool.QueryRow(ctx, `
 		SELECT session_user,current_user,r.rolsuper,
 		       pg_has_role(current_user,$2,'MEMBER'),
@@ -255,12 +262,18 @@ func ValidateCampaignExecutorPrivileges(ctx context.Context, pool *pgxpool.Pool,
 		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
 		               has_table_privilege($2,c.oid,'INSERT') OR has_table_privilege($2,c.oid,'UPDATE') OR
 		               has_table_privilege($2,c.oid,'DELETE') OR has_table_privilege($2,c.oid,'TRUNCATE')),
+		       (SELECT count(*) FROM unnest($6::text[]) name
+		          LEFT JOIN pg_class c ON c.oid=to_regclass(format('%I.%I',current_schema(),name)) AND c.relkind IN('r','p')
+		         WHERE c.oid IS NULL OR NOT has_table_privilege($2,c.oid,'SELECT') OR
+		               NOT has_column_privilege($2,c.oid,'id','UPDATE') OR has_table_privilege($2,c.oid,'UPDATE') OR
+		               EXISTS(SELECT 1 FROM pg_attribute attribute WHERE attribute.attrelid=c.oid AND attribute.attnum>0 AND
+		                 NOT attribute.attisdropped AND attribute.attname<>'id' AND has_column_privilege($2,c.oid,attribute.attnum,'UPDATE'))),
 		       to_regprocedure(format('%I.recording_campaign_create_admission_commit(uuid,bigint,bigint,bigint,jsonb)',current_schema())) IS NOT NULL
-		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &migrationApplied)
+		FROM pg_roles r WHERE r.rolname=current_user`, executorRole, authorityRole, campaignRuntimeFunctions, campaignExecutorFunctions, campaignAuthorityReadOnlyProductTables, campaignAuthorityLockProductTables).Scan(&sessionUser, &currentUser, &super, &member, &ownsObjects, &schemaCreate, &tablePrivileges, &invalidFunctions, &invalidAuthorityDependencies, &invalidAuthorityLockDependencies, &migrationApplied)
 	if err != nil {
 		return fmt.Errorf("inspect campaign executor privileges: %w", err)
 	}
-	if sessionUser != executorRole || currentUser != executorRole || super || member || ownsObjects || schemaCreate || tablePrivileges != 0 || invalidFunctions != 0 || invalidAuthorityDependencies != 0 || !migrationApplied {
+	if sessionUser != executorRole || currentUser != executorRole || super || member || ownsObjects || schemaCreate || tablePrivileges != 0 || invalidFunctions != 0 || invalidAuthorityDependencies != 0 || invalidAuthorityLockDependencies != 0 || !migrationApplied {
 		return fmt.Errorf("campaign executor database privilege boundary is not exact")
 	}
 	var productFunctionExec int
