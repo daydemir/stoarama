@@ -1091,6 +1091,8 @@ func TestRecordingCampaignAdmissionMigrationClosesCrossBoundaryBypasses(t *testi
 		"recording_campaign_read_probe_attempt",
 		"recording_campaign_read_probe_scene",
 		"recording_campaign_read_baseline_scene",
+		"stream_source_revisions rev WHERE rev.stream_id=presented.stream_id",
+		"max(rev.id) FROM stream_source_revisions rev WHERE rev.stream_id=s.id",
 		"%I.frames,%I.media_objects,%I.recording_scene_frame_evidence",
 		"GRANT UPDATE(id) ON TABLE %I.accounts,%I.account_sessions,%I.connections,%I.frames,%I.media_objects,%I.node_tokens,%I.nodes,%I.recorder_droplets,%I.recording_scene_frame_evidence,%I.stream_source_revisions,%I.streams,%I.users TO %I",
 		"GRANT UPDATE(user_id) ON TABLE %I.memberships TO %I",

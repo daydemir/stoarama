@@ -1322,8 +1322,8 @@ BEGIN
   SELECT * INTO presented FROM recording_campaign_baseline_scene_presentations WHERE id=p_presentation_id
     AND account_id=p_account_id AND frame_id=p_frame_id AND presented_to_user_id=p_user_id
     AND presented_at>=recording_campaign_now()-interval '30 minutes' FOR SHARE;
-  PERFORM 1 FROM stream_source_revisions WHERE stream_id=presented.stream_id ORDER BY id FOR SHARE;
-  SELECT (SELECT max(id) FROM stream_source_revisions WHERE stream_id=s.id),
+  PERFORM 1 FROM stream_source_revisions rev WHERE rev.stream_id=presented.stream_id ORDER BY rev.id FOR SHARE;
+  SELECT (SELECT max(rev.id) FROM stream_source_revisions rev WHERE rev.stream_id=s.id),
     encode(sha256(convert_to(s.source_url,'UTF8')),'hex'),
     encode(sha256(convert_to(COALESCE(s.source_page_url,''),'UTF8')),'hex'),s.updated_at
     INTO current_revision,current_source,current_page,current_updated
