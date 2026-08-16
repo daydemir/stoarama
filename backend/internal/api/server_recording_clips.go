@@ -406,7 +406,7 @@ func lockRelayNodeAndGroup(ctx context.Context, tx pgx.Tx, principal nodePrincip
 }
 
 const cloudRecorderLockSQL = `
-	SELECT capacity
+	SELECT capacity, pool_role
 	FROM recorder_droplets
 	WHERE name = $1 AND node_id = $2 AND state IN ('provisioning', 'active')
 	FOR UPDATE
@@ -435,6 +435,17 @@ const cloudRecordingJobsLeaseSQL = `
 	    AND rec.start_at <= now()
 	    AND (rec.end_at IS NULL OR now() < rec.end_at)
 	    AND rec.capture_via = 'cloud'
+	    AND (
+	          ($7 = 'shared' AND NOT EXISTS (
+	            SELECT 1 FROM recording_dedicated_canary_reservations dc
+	            WHERE dc.recording_id=j.recording_id AND dc.state='active'
+	          ))
+	          OR ($7 = 'dedicated_canary' AND EXISTS (
+	            SELECT 1 FROM recording_dedicated_canary_reservations dc
+	            WHERE dc.recording_id=j.recording_id AND dc.worker_name=$1
+	              AND dc.state='active' AND dc.expires_at > now()
+	          ))
+	    )
 	    AND (j.handoff_owner IS NULL
 	         OR j.handoff_owner <> $1
 	         OR j.handoff_until <= now())
@@ -501,10 +512,11 @@ func (s *Server) handleRecordingJobsLease(w http.ResponseWriter, r *http.Request
 		} else {
 			defer func() { _ = tx.Rollback(r.Context()) }()
 			var capacity int
-			err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity)
+			var poolRole string
+			err = tx.QueryRow(r.Context(), cloudRecorderLockSQL, workerID, principal.NodeID).Scan(&capacity, &poolRole)
 			if err == nil {
 				err = tx.QueryRow(r.Context(), cloudRecordingJobsLeaseSQL,
-					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported).Scan(
+					workerID, billingDisabled, margin, recordingFreshnessGraceSec, capacity, tokenSupported, poolRole).Scan(
 					&resp.JobID, &resp.RecordingID, &resp.SourceURL, &resp.StreamID, &resp.StreamProvider, &resp.SourcePageURL, &resp.ClipDurationSec,
 					&resp.StorageDestinationID, &resp.FireAt, &resp.AttemptCount, &resp.LeaseExpiresAt,
 					&resp.TargetFPS, &resp.Kind, &resp.WindowEndAt, &resp.LeaseToken,
@@ -572,6 +584,10 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseFence := ""
+	if principal.NodeType == nodeTypeLocalRecorder {
+		leaseFence = dedicatedCanaryLeaseFenceSQL
+	}
 	leaseToken, err := recordingLeaseToken(r)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -622,7 +638,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 		  AND j.lease_token IS NOT DISTINCT FROM $3 AND j.lease_expires_at > now()
 		  AND rec.status='active'
-	`, req.JobID, workerID, leaseToken).Scan(
+	`+leaseFence, req.JobID, workerID, leaseToken).Scan(
 		&recordingID, &clipDurationSec, &fireAt, &jobKind,
 		&destID, &endpoint, &region, &bucket, &keyPrefix,
 		&cronTimezone, &namingProfile, &folderName, &namingMetadata,
@@ -896,6 +912,10 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	workerID := recorderWorkerID(principal)
+	leaseFence := ""
+	if principal.NodeType == nodeTypeLocalRecorder {
+		leaseFence = dedicatedCanaryLeaseFenceSQL
+	}
 	leaseToken, err := recordingLeaseToken(r)
 	if err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -1016,6 +1036,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		-- Serialize ingest with generation-fenced surrender. If ingest wins, the
 		-- clip commits before surrender computes had_clips; if surrender wins, this
 		-- rechecks the lease after waiting and rejects the old generation.
+	`+leaseFence+`
 		FOR UPDATE OF ui, j
 	`, intentID, workerID, leaseToken).Scan(
 		&recordingID, &jobID, &destID, &endpoint, &region,
@@ -1324,7 +1345,28 @@ func timestampContractAudioPresent(contract *capture.TimestampContract) bool {
 	return false
 }
 
-const recordingJobHeartbeatSQL = `
+// dedicatedCanaryLeaseFenceSQL is appended to every cloud-worker mutation. A
+// reservation expiry therefore cancels the exact lease instead of allowing a
+// stale canary process to upload after its owner fence is gone. Shared workers
+// satisfy the first branch; dedicated workers must still hold their exact,
+// unexpired reservation. Every host query must alias recording_jobs as j and
+// concatenate this fragment inside its WHERE clause before GROUP BY, FOR UPDATE,
+// or RETURNING clauses.
+const dedicatedCanaryLeaseFenceSQL = `
+	AND (
+		NOT EXISTS (
+			SELECT 1 FROM recorder_droplets d
+			WHERE d.name=j.lease_owner AND d.pool_role='dedicated_canary'
+		)
+		OR EXISTS (
+			SELECT 1 FROM recording_dedicated_canary_reservations dc
+			WHERE dc.recording_id=j.recording_id AND dc.worker_name=j.lease_owner
+			  AND dc.state='active' AND dc.expires_at > now()
+		)
+	)
+`
+
+const recordingJobHeartbeatSQLBase = `
 	UPDATE recording_jobs j
 	SET lease_expires_at = LEAST(
 	      now() + make_interval(secs => (j.clip_duration_sec + $3)),
@@ -1337,13 +1379,21 @@ const recordingJobHeartbeatSQL = `
 	  AND (j.kind<>'continuous_window'
 	       OR (j.window_end_at IS NOT NULL
 	           AND j.window_end_at + make_interval(secs => $5) > now()))
+
+`
+
+const recordingJobHeartbeatSQL = recordingJobHeartbeatSQLBase + `
+	RETURNING j.lease_expires_at
+`
+
+const recordingJobHeartbeatCloudSQL = recordingJobHeartbeatSQLBase + dedicatedCanaryLeaseFenceSQL + `
 	RETURNING j.lease_expires_at
 `
 
 func (s *Server) heartbeatRecordingJob(ctx context.Context, principal nodePrincipal, jobID int64, workerID string, leaseToken *uuid.UUID) (time.Time, error) {
 	var leaseExpiresAt time.Time
 	if principal.NodeType != nodeTypeRelay {
-		err := s.pool.QueryRow(ctx, recordingJobHeartbeatSQL,
+		err := s.pool.QueryRow(ctx, recordingJobHeartbeatCloudSQL,
 			jobID, workerID, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, leaseToken,
 			recordingContinuousPostWindowLeaseSec).Scan(&leaseExpiresAt)
 		return leaseExpiresAt, err
@@ -1387,7 +1437,6 @@ func (s *Server) handleRecordingJobHeartbeat(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	leaseExpiresAt, err := s.heartbeatRecordingJob(r.Context(), principal, id, workerID, leaseToken)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Not owned / not leased anymore (canceled, reclaimed, or completed).
@@ -1456,6 +1505,10 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	leaseFence := ""
+	if principal.NodeType == nodeTypeLocalRecorder {
+		leaseFence = dedicatedCanaryLeaseFenceSQL
+	}
 
 	var (
 		recordingID int64
@@ -1469,6 +1522,7 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		LEFT JOIN recording_clips c ON c.recording_job_id=j.id
 		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 		  AND j.lease_token IS NOT DISTINCT FROM $3
+	`+leaseFence+`
 		GROUP BY j.id
 	`, id, workerID, leaseToken).Scan(&recordingID, &kind, &clipCount, &jobError)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1488,11 +1542,11 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		}
 		defer func() { _ = tx.Rollback(r.Context()) }()
 		if _, err := tx.Exec(r.Context(), `
-			UPDATE recording_jobs
+			UPDATE recording_jobs j
 			SET status='error', completed_at=now(), lease_expires_at=NULL, error_text=$3, updated_at=now()
-			WHERE id=$1 AND status='leased' AND lease_owner=$2
-			  AND lease_token IS NOT DISTINCT FROM $4
-		`, id, workerID, errText, leaseToken); err != nil {
+			WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+			  AND j.lease_token IS NOT DISTINCT FROM $4
+		`+leaseFence, id, workerID, errText, leaseToken); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mark empty continuous job failed: %v", err))
 			return
 		}
@@ -1512,11 +1566,11 @@ func (s *Server) handleRecordingJobComplete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	ct, err := s.pool.Exec(r.Context(), `
-		UPDATE recording_jobs
+		UPDATE recording_jobs j
 		SET status='done', completed_at=now(), lease_expires_at=NULL, updated_at=now()
-		WHERE id=$1 AND status='leased' AND lease_owner=$2
-		  AND lease_token IS NOT DISTINCT FROM $3
-	`, id, workerID, leaseToken)
+		WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
+		  AND j.lease_token IS NOT DISTINCT FROM $3
+	`+leaseFence, id, workerID, leaseToken)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("complete recording job: %v", err))
 		return
@@ -1631,8 +1685,9 @@ const recordingJobCloudSurrenderSQL = `
 	    AND j.window_end_at > now()
 	    AND j.status='leased'
 	    AND j.lease_owner=$2
-	    AND j.lease_token IS NOT DISTINCT FROM $4
-	    AND j.lease_expires_at > now()
+		  AND j.lease_token IS NOT DISTINCT FROM $4
+		  AND j.lease_expires_at > now()
+	` + dedicatedCanaryLeaseFenceSQL + `
 	  FOR UPDATE OF j
 	)
 	UPDATE recording_jobs j
@@ -1729,7 +1784,7 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-const recordingJobFailSQL = `
+const recordingJobFailSQLBase = `
 	UPDATE recording_jobs j
 	SET status = CASE WHEN j.attempt_count < j.max_attempts THEN 'pending' ELSE 'error' END,
 	    scheduled_for = CASE WHEN j.attempt_count < j.max_attempts THEN now() + interval '60 seconds' ELSE j.scheduled_for END,
@@ -1741,6 +1796,14 @@ const recordingJobFailSQL = `
 	    updated_at = now()
 	WHERE j.id=$1 AND j.status='leased' AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4
+
+`
+
+const recordingJobFailSQL = recordingJobFailSQLBase + `
+	RETURNING j.recording_id
+`
+
+const recordingJobFailCloudSQL = recordingJobFailSQLBase + dedicatedCanaryLeaseFenceSQL + `
 	RETURNING j.recording_id
 `
 
@@ -1780,7 +1843,11 @@ func (s *Server) handleRecordingJobFail(w http.ResponseWriter, r *http.Request) 
 	defer func() { _ = tx.Rollback(r.Context()) }()
 
 	var recordingID int64
-	err = tx.QueryRow(r.Context(), recordingJobFailSQL, id, workerID, errText, leaseToken).Scan(&recordingID)
+	failSQL := recordingJobFailSQL
+	if principal.NodeType == nodeTypeLocalRecorder {
+		failSQL = recordingJobFailCloudSQL
+	}
+	err = tx.QueryRow(r.Context(), failSQL, id, workerID, errText, leaseToken).Scan(&recordingID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "job is not leased by this worker")
 		return

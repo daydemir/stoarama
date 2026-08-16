@@ -22,6 +22,7 @@ type Droplet struct {
 	Size           string
 	Capacity       int
 	State          string
+	PoolRole       string
 	IPAddress      string
 	BuildSHA       string
 	LastSeenAt     *time.Time
@@ -176,12 +177,23 @@ func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64)
 // is bound through node_id (its token id is recovered via NodeBinding on
 // destroy), so no node_token_id column is needed.
 func (s *Store) InsertProvisioning(ctx context.Context, name, region, size string, capacity int, nodeID int64, buildSHA string) (int64, error) {
+	return s.InsertProvisioningWithRole(ctx, name, region, size, capacity, nodeID, buildSHA, sharedPoolRole)
+}
+
+// InsertProvisioningWithRole writes a worker row before provider creation. The
+// role is typed in the database so a dedicated canary can never enter shared
+// autoscaler capacity by naming convention alone.
+func (s *Store) InsertProvisioningWithRole(ctx context.Context, name, region, size string, capacity int, nodeID int64, buildSHA, poolRole string) (int64, error) {
+	poolRole = strings.TrimSpace(poolRole)
+	if poolRole != sharedPoolRole && poolRole != dedicatedCanaryPoolRole {
+		return 0, fmt.Errorf("invalid recorder pool role %q", poolRole)
+	}
 	var id int64
 	if err := s.pool.QueryRow(ctx, `
-		INSERT INTO recorder_droplets (name, node_id, region, size, capacity, state, build_sha)
-		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6)
+		INSERT INTO recorder_droplets (name, node_id, region, size, capacity, state, build_sha, pool_role)
+		VALUES ($1, $2, $3, $4, $5, 'provisioning', $6, $7)
 		RETURNING id
-	`, name, nodeID, region, size, capacity, strings.ToLower(strings.TrimSpace(buildSHA))).Scan(&id); err != nil {
+	`, name, nodeID, region, size, capacity, strings.ToLower(strings.TrimSpace(buildSHA)), poolRole).Scan(&id); err != nil {
 		return 0, fmt.Errorf("insert provisioning droplet: %w", err)
 	}
 	return id, nil
@@ -343,28 +355,45 @@ func (s *Store) NodeBinding(ctx context.Context, id int64) (nodeID, nodeTokenID 
 	return nid, tid, nil
 }
 
-// CountLive returns the number of recorder_droplets rows in a billing-relevant
-// state (provisioning, active, draining, destroying). This is the spend-cap
-// denominator; a destroyed/failed droplet does not count.
+// CountLive returns shared recorder_droplets rows in a billing-relevant state
+// (provisioning, active, draining, destroying). Dedicated canary spend is
+// observable separately through CountLiveByRole; it does not consume shared
+// autoscaler capacity.
 func (s *Store) CountLive(ctx context.Context) (int, error) {
 	var n int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT count(*) FROM recorder_droplets
-		WHERE state IN ('provisioning','active','draining','destroying')
+		WHERE pool_role='shared'
+		  AND state IN ('provisioning','active','draining','destroying')
 	`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count live droplets: %w", err)
 	}
 	return n, nil
 }
 
+// CountLiveByRole keeps dedicated canary spend visible without including it in
+// the shared autoscaler's capacity decision.
+func (s *Store) CountLiveByRole(ctx context.Context, role string) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM recorder_droplets
+		WHERE pool_role=$1 AND state IN ('provisioning','active','draining','destroying')
+	`, role).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count live droplets by role: %w", err)
+	}
+	return n, nil
+}
+
 // ListByStates returns droplets in the given states.
 func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, error) {
+	return s.listDroplets(ctx, "state = ANY($1)", states)
+}
+
+func (s *Store) listDroplets(ctx context.Context, predicate string, states []string) ([]Droplet, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state,
+		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state, pool_role,
 		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
-		FROM recorder_droplets
-		WHERE state = ANY($1)
-		ORDER BY id ASC
+		FROM recorder_droplets WHERE `+predicate+` ORDER BY id ASC
 	`, states)
 	if err != nil {
 		return nil, fmt.Errorf("list droplets by state: %w", err)
@@ -374,7 +403,7 @@ func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, 
 	for rows.Next() {
 		var d Droplet
 		if err := rows.Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-			&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt); err != nil {
+			&d.Capacity, &d.State, &d.PoolRole, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan droplet: %w", err)
 		}
 		out = append(out, d)
@@ -385,17 +414,24 @@ func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, 
 	return out, nil
 }
 
+// ListSharedByStates is the shared autoscaler's view. Dedicated canary workers
+// remain visible to reconciliation through ListByStates, but never influence
+// shared capacity, idle drains, or build rollouts.
+func (s *Store) ListSharedByStates(ctx context.Context, states ...string) ([]Droplet, error) {
+	return s.listDroplets(ctx, "pool_role='shared' AND state = ANY($1)", states)
+}
+
 // FindByDODropletID returns the droplet row for a DO droplet id, or (nil) if no
 // row exists (an orphan).
 func (s *Store) FindByDODropletID(ctx context.Context, doDropletID int64) (*Droplet, error) {
 	var d Droplet
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state,
+		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state, pool_role,
 		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
 		FROM recorder_droplets
 		WHERE do_droplet_id=$1
 	`, doDropletID).Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-		&d.Capacity, &d.State, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt)
+		&d.Capacity, &d.State, &d.PoolRole, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

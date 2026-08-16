@@ -183,6 +183,9 @@ func usage() {
 	  stoaramactl survey delete-stream-captures --id N --apply
 	  stoaramactl recordability run-once [--batch 1 --window-sec 600 --segment-sec 60 --probe-host LABEL --json] (gated by STREAM_RECORDABILITY_PROBE_ENABLED)
 	  stoaramactl recorder-control run
+	  stoaramactl recorder-control dedicated-canary provision --recording-id N --owner NAME --ack-disposable [--ttl 8h]
+	  stoaramactl recorder-control dedicated-canary status --reservation-id UUID
+	  stoaramactl recorder-control dedicated-canary release --reservation-id UUID --owner NAME [--failed]
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recording-health summary

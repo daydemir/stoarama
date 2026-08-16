@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/billing"
@@ -25,7 +27,7 @@ import (
 // election because this service runs exactly one replica.
 func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatalf("usage: stoaramactl recorder-control run|drain")
+		log.Fatalf("usage: stoaramactl recorder-control run|drain|dedicated-canary")
 	}
 	switch args[0] {
 	case "run":
@@ -33,8 +35,11 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	case "drain":
 		runRecorderControlDrain(ctx, cfg, args[1:])
 		return
+	case "dedicated-canary":
+		runRecorderControlDedicatedCanary(ctx, cfg, args[1:])
+		return
 	default:
-		log.Fatalf("unknown recorder-control subcommand: %s (want run|drain)", args[0])
+		log.Fatalf("unknown recorder-control subcommand: %s (want run|drain|dedicated-canary)", args[0])
 	}
 	fs := flag.NewFlagSet("recorder-control run", flag.ExitOnError)
 	_ = fs.Parse(args[1:])
@@ -150,6 +155,94 @@ func runRecorderControl(ctx context.Context, cfg config.Config, args []string) {
 	}()
 
 	wg.Wait()
+}
+
+// runRecorderControlDedicatedCanary is an explicit operator command, not part
+// of the long-running autoscaler. It provisions only after a typed DB fence is
+// created and never changes the shared pool defaults.
+func runRecorderControlDedicatedCanary(ctx context.Context, cfg config.Config, args []string) {
+	if len(args) < 1 {
+		log.Fatalf("usage: stoaramactl recorder-control dedicated-canary provision|status|release")
+	}
+	switch args[0] {
+	case "provision":
+		fs := flag.NewFlagSet("recorder-control dedicated-canary provision", flag.ExitOnError)
+		recordingID := fs.Int64("recording-id", 0, "explicit disposable active cloud recording id")
+		owner := fs.String("owner", "", "owner fence value")
+		ttl := fs.Duration("ttl", 8*time.Hour, "reservation lifetime")
+		ack := fs.Bool("ack-disposable", false, "acknowledge that this recording is disposable and not Fine-potential")
+		_ = fs.Parse(args[1:])
+		if !*ack {
+			log.Fatalf("--ack-disposable is required; protected recordings are not admitted")
+		}
+		pool := mustOpenPool(ctx, cfg)
+		defer pool.Close()
+		doClient, err := dropletpool.NewGodoClient(cfg.DOAPIToken)
+		if err != nil {
+			log.Fatalf("init DigitalOcean client: %v", err)
+		}
+		operatorID, err := dropletpool.NewStore(pool).ResolveOperatorAccount(ctx, cfg.DropletPoolOperatorEmail)
+		if err != nil {
+			log.Fatalf("resolve recorder operator: %v", err)
+		}
+		res, err := dropletpool.ProvisionDedicatedCanary(ctx, pool, doClient, dropletpool.DedicatedCanarySpec{
+			RecordingID: *recordingID, Owner: *owner, TTL: *ttl, OperatorAccountID: operatorID,
+			Region: cfg.DropletPoolRegion, Size: cfg.DropletPoolSize, Image: cfg.DropletPoolImage,
+			SSHKey: cfg.DropletPoolSSHKey, ProjectID: cfg.DropletPoolProjectID, FirewallID: cfg.DropletPoolFirewallID,
+			BackendAPIURL: cfg.DropletPoolBackendAPIURL, HeartbeatSec: cfg.RecordingWorkerHeartbeatSec,
+			PollSec: cfg.RecordingWorkerPollSec, RepoURL: cfg.DropletPoolRepoURL, RepoRef: cfg.DropletPoolRepoRef,
+			BuildSHA: cfg.DropletPoolBuildSHA, RepoCloneToken: cfg.DropletPoolRepoCloneToken,
+		})
+		if err != nil {
+			log.Fatalf("provision dedicated canary: %v", err)
+		}
+		fmt.Printf("reservation_id=%s recording_id=%d worker_name=%s expires_at=%s state=%s\n", res.ID, res.RecordingID, res.WorkerName, res.ExpiresAt.UTC().Format(time.RFC3339), res.State)
+	case "status":
+		fs := flag.NewFlagSet("recorder-control dedicated-canary status", flag.ExitOnError)
+		reservationID := fs.String("reservation-id", "", "reservation UUID")
+		_ = fs.Parse(args[1:])
+		id, err := uuid.Parse(strings.TrimSpace(*reservationID))
+		if err != nil {
+			log.Fatalf("invalid --reservation-id: %v", err)
+		}
+		pool := mustOpenPool(ctx, cfg)
+		defer pool.Close()
+		res, err := dropletpool.NewStore(pool).DedicatedCanaryStatus(ctx, id)
+		if err != nil {
+			log.Fatalf("dedicated canary status: %v", err)
+		}
+		fmt.Printf("reservation_id=%s recording_id=%d worker_name=%s expires_at=%s state=%s worker_state=%s worker_ready=%t\n", res.ID, res.RecordingID, res.WorkerName, res.ExpiresAt.UTC().Format(time.RFC3339), res.State, res.WorkerState, res.WorkerReady)
+	case "release":
+		fs := flag.NewFlagSet("recorder-control dedicated-canary release", flag.ExitOnError)
+		reservationID := fs.String("reservation-id", "", "reservation UUID")
+		owner := fs.String("owner", "", "owner fence value")
+		failed := fs.Bool("failed", false, "record failed setup")
+		_ = fs.Parse(args[1:])
+		if strings.TrimSpace(*owner) == "" {
+			log.Fatalf("--owner is required")
+		}
+		id, err := uuid.Parse(strings.TrimSpace(*reservationID))
+		if err != nil {
+			log.Fatalf("invalid --reservation-id: %v", err)
+		}
+		pool := mustOpenPool(ctx, cfg)
+		defer pool.Close()
+		var res dropletpool.DedicatedCanaryReservation
+		if *failed {
+			if err := dropletpool.NewStore(pool).FailDedicatedCanaryReservation(ctx, id, *owner); err != nil {
+				log.Fatalf("fail dedicated canary reservation: %v", err)
+			}
+			fmt.Printf("reservation_id=%s state=failed\n", id)
+			return
+		}
+		res, err = dropletpool.NewStore(pool).ReleaseDedicatedCanary(ctx, id, *owner)
+		if err != nil {
+			log.Fatalf("release dedicated canary reservation: %v", err)
+		}
+		fmt.Printf("reservation_id=%s state=%s worker_name=%s\n", res.ID, res.State, res.WorkerName)
+	default:
+		log.Fatalf("unknown dedicated-canary subcommand %q", args[0])
+	}
 }
 
 // mustBuildStorageCipher builds the storage credential cipher (AES-256-GCM) from
