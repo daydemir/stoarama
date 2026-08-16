@@ -166,6 +166,13 @@ func (c *Controller) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	dedicatedLive, err := c.store.CountLiveByRole(ctx, dedicatedCanaryPoolRole)
+	if err != nil {
+		return err
+	}
+	if dedicatedLive > 0 {
+		log.Printf("droplet pool: dedicated canary billable workers=%d (excluded from shared cap=%d)", dedicatedLive, c.cfg.Max)
+	}
 	// Spend tripwire (S-cap): the live count must never exceed the hard cap. The
 	// write-ahead provisioning row + per-tick clamp make this impossible; if it ever
 	// trips it means a reconcile/counting bug is leaking billable droplets past the
@@ -173,7 +180,7 @@ func (c *Controller) tick(ctx context.Context) error {
 	if live > c.cfg.Max {
 		log.Printf("droplet pool: SPEND TRIPWIRE live=%d exceeds hard cap max=%d (reconcile/counting bug; investigate immediately)", live, c.cfg.Max)
 	}
-	active, err := c.store.ListByStates(ctx, "active")
+	active, err := c.store.ListSharedByStates(ctx, "active")
 	if err != nil {
 		return err
 	}
@@ -511,7 +518,7 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 	if strings.TrimSpace(c.cfg.BuildSHA) == "" {
 		return false, nil
 	}
-	workers, err := c.store.ListByStates(ctx, "active", "provisioning")
+	workers, err := c.store.ListSharedByStates(ctx, "active", "provisioning")
 	if err != nil {
 		return false, err
 	}
@@ -551,11 +558,11 @@ func (c *Controller) rolloutBuild(ctx context.Context, now time.Time, live, next
 	if !hasCurrentActive {
 		return true, nil
 	}
-	draining, err := c.store.ListByStates(ctx, "draining")
+	draining, err := c.store.ListSharedByStates(ctx, "draining")
 	if err != nil {
 		return true, err
 	}
-	active, err := c.store.ListByStates(ctx, "active")
+	active, err := c.store.ListSharedByStates(ctx, "active")
 	if err != nil {
 		return true, err
 	}
@@ -591,7 +598,7 @@ func canDrainStale(activeCapacity, candidateCapacity, requiredCapacity, draining
 // refreshIdle stamps/clears idle_since on active droplets based on whether they
 // currently hold a live leased job.
 func (c *Controller) refreshIdle(ctx context.Context) error {
-	active, err := c.store.ListByStates(ctx, "active")
+	active, err := c.store.ListSharedByStates(ctx, "active")
 	if err != nil {
 		return err
 	}

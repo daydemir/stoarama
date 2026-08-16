@@ -58,6 +58,68 @@ func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 	}
 }
 
+func TestDedicatedCanaryLeaseIsExactAndExpiresFailClosed(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id) VALUES(42);
+		INSERT INTO nodes(id,account_id,node_type,status,last_heartbeat_at,relay_max_streams)
+		VALUES(10,42,'local_recorder','active',now(),1);
+		INSERT INTO recorder_droplets(name,node_id,capacity,state,pool_role)
+		VALUES('cloud-canary',10,1,'active','dedicated_canary');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,capture_via)
+		VALUES(1,42,7,'stoarama-canary-335-5m','https://example.test/live.m3u8','active',now()-interval '1 hour','cloud');
+		INSERT INTO recording_jobs(id,recording_id,fire_at,scheduled_for,clip_duration_sec,status,attempt_count,idempotency_key,kind)
+		VALUES(1,1,now(),now(),300,'pending',0,'dedicated-lease','clip');
+		INSERT INTO recording_dedicated_canary_reservations(recording_id,worker_name,owner,expires_at,state)
+		VALUES(1,'cloud-canary','test-owner',now()+interval '1 hour','active')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryCloudLease(t, pool, "shared-worker", "shared"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("shared worker leased reserved recording: %v", err)
+	}
+	if _, err := queryCloudLease(t, pool, "other-canary", "dedicated_canary"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("wrong dedicated worker leased reservation: %v", err)
+	}
+	job, err := queryCloudLease(t, pool, "cloud-canary", "dedicated_canary")
+	if err != nil {
+		t.Fatalf("exact dedicated worker failed to lease: %v", err)
+	}
+	if job.JobID != 1 || job.LeaseToken == nil {
+		t.Fatalf("unexpected dedicated lease: %+v", job)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET status='leased',lease_owner='cloud-canary',lease_expires_at=now()+interval '5 minutes' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_dedicated_canary_reservations SET expires_at=now()-interval '1 second' WHERE recording_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	var renewed time.Time
+	err = pool.QueryRow(ctx, recordingJobHeartbeatCloudSQL, 1, "cloud-canary", 360, job.LeaseToken, recordingContinuousPostWindowLeaseSec).Scan(&renewed)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("expired dedicated worker heartbeat was accepted: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_jobs SET status='pending',lease_owner=NULL,lease_expires_at=NULL,scheduled_for=now() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryCloudLease(t, pool, "cloud-canary", "dedicated_canary"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("expired dedicated reservation was leased: %v", err)
+	}
+}
+
+func queryCloudLease(t *testing.T, pool *pgxpool.Pool, worker, role string) (recordingLeaseResponse, error) {
+	t.Helper()
+	var job recordingLeaseResponse
+	err := pool.QueryRow(context.Background(), cloudRecordingJobsLeaseSQL,
+		worker, true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true, role).Scan(
+		&job.JobID, &job.RecordingID, &job.SourceURL, &job.StreamID, &job.StreamProvider, &job.SourcePageURL, &job.ClipDurationSec,
+		&job.StorageDestinationID, &job.FireAt, &job.AttemptCount, &job.LeaseExpiresAt, &job.TargetFPS, &job.Kind, &job.WindowEndAt, &job.LeaseToken,
+	)
+	return job, err
+}
+
 func TestValidTimestampProvenanceVersionParity(t *testing.T) {
 	attempt := "123e4567-e89b-12d3-a456-426614174000"
 	contract := &capture.TimestampContract{Version: 1, Mode: "muxed_source_copy", AudioSelection: "first_optional", Tracks: []capture.TrackTimingContract{{
@@ -469,7 +531,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var blocked recordingLeaseResponse
 	err := pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false, "shared").Scan(
 		&blocked.JobID, &blocked.RecordingID, &blocked.SourceURL, &blocked.StreamID, &blocked.StreamProvider, &blocked.SourcePageURL, &blocked.ClipDurationSec,
 		&blocked.StorageDestinationID, &blocked.FireAt, &blocked.AttemptCount, &blocked.LeaseExpiresAt, &blocked.TargetFPS, &blocked.Kind, &blocked.WindowEndAt, &blocked.LeaseToken,
 	)
@@ -482,7 +544,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var priorOwner recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		"cloud-a", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false, "shared").Scan(
 		&priorOwner.JobID, &priorOwner.RecordingID, &priorOwner.SourceURL, &priorOwner.StreamID, &priorOwner.StreamProvider, &priorOwner.SourcePageURL, &priorOwner.ClipDurationSec,
 		&priorOwner.StorageDestinationID, &priorOwner.FireAt, &priorOwner.AttemptCount, &priorOwner.LeaseExpiresAt, &priorOwner.TargetFPS, &priorOwner.Kind, &priorOwner.WindowEndAt, &priorOwner.LeaseToken,
 	)
@@ -491,7 +553,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var job recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-b", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true).Scan(
+		"cloud-b", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, true, "shared").Scan(
 		&job.JobID, &job.RecordingID, &job.SourceURL, &job.StreamID, &job.StreamProvider, &job.SourcePageURL, &job.ClipDurationSec,
 		&job.StorageDestinationID, &job.FireAt, &job.AttemptCount, &job.LeaseExpiresAt, &job.TargetFPS, &job.Kind, &job.WindowEndAt, &job.LeaseToken,
 	)
@@ -553,7 +615,7 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	}
 	var expired recordingLeaseResponse
 	err = pool.QueryRow(ctx, cloudRecordingJobsLeaseSQL,
-		"cloud-c", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false).Scan(
+		"cloud-c", true, recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, recordingFreshnessGraceSec, 1, false, "shared").Scan(
 		&expired.JobID, &expired.RecordingID, &expired.SourceURL, &expired.StreamID, &expired.StreamProvider, &expired.SourcePageURL, &expired.ClipDurationSec,
 		&expired.StorageDestinationID, &expired.FireAt, &expired.AttemptCount, &expired.LeaseExpiresAt, &expired.TargetFPS, &expired.Kind, &expired.WindowEndAt, &expired.LeaseToken,
 	)
@@ -1344,7 +1406,15 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			name TEXT NOT NULL,
 			node_id BIGINT,
 			capacity INTEGER NOT NULL,
-			state TEXT NOT NULL
+			state TEXT NOT NULL,
+			pool_role TEXT NOT NULL DEFAULT 'shared'
+		)`,
+		`CREATE TABLE recording_dedicated_canary_reservations (
+			recording_id BIGINT NOT NULL,
+			worker_name TEXT NOT NULL,
+			owner TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			state TEXT NOT NULL DEFAULT 'active'
 		)`,
 		`CREATE TABLE account_billing (
 			account_id BIGINT NOT NULL,
