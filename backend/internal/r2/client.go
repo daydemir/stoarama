@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -36,9 +37,11 @@ type Config struct {
 }
 
 type ObjectHead struct {
-	ETag      string
-	SizeBytes int64
-	VersionID string
+	ETag        string
+	SizeBytes   int64
+	VersionID   string
+	Metadata    map[string]string
+	ContentType string
 }
 
 type ObjectInfo struct {
@@ -169,6 +172,33 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
+// Copy promotes an already-verified quarantine object to its immutable final
+// key without routing bytes back through the API process.
+func (c *Client) Copy(ctx context.Context, sourceKey, destinationKey, contentType string, metadata map[string]string) (ObjectHead, error) {
+	source := url.PathEscape(c.bucket + "/" + strings.TrimPrefix(sourceKey, "/"))
+	in := &s3.CopyObjectInput{
+		Bucket:     aws.String(c.bucket),
+		Key:        aws.String(destinationKey),
+		CopySource: aws.String(source),
+	}
+	if contentType != "" {
+		in.ContentType = aws.String(contentType)
+		in.MetadataDirective = types.MetadataDirectiveReplace
+	}
+	if len(metadata) != 0 {
+		in.Metadata = metadata
+		in.MetadataDirective = types.MetadataDirectiveReplace
+	}
+	out, err := c.s3.CopyObject(ctx, in)
+	if err != nil {
+		return ObjectHead{}, fmt.Errorf("copy object %s to %s: %w", sourceKey, destinationKey, err)
+	}
+	if out.CopyObjectResult == nil {
+		return ObjectHead{}, fmt.Errorf("copy object %s to %s returned no result", sourceKey, destinationKey)
+	}
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.CopyObjectResult.ETag)), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), Metadata: metadata, ContentType: contentType}, nil
+}
+
 // PutMultipart uploads body to key using S3 multipart upload with a bounded
 // part size, so peak memory stays flat (PartSize * Concurrency) regardless of
 // total object size. Use for multi-GB objects on small instances, where a
@@ -201,7 +231,7 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId))}, nil
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), Metadata: out.Metadata, ContentType: strings.TrimSpace(aws.ToString(out.ContentType))}, nil
 }
 
 // OpenExact returns the exact object generation observed by Head. If the store

@@ -461,6 +461,36 @@ func TestUpdateDrainRefusesNewLeases(t *testing.T) {
 	}
 }
 
+func TestTargetedProbeCannotPreemptOrdinaryLeasePoll(t *testing.T) {
+	var pathsMu sync.Mutex
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, r.URL.Path)
+		pathsMu.Unlock()
+		if r.URL.Path == "/api/v1/recording/jobs/lease" {
+			http.Error(w, "stop after authoritative footage poll", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, "targeted probe polled before footage", http.StatusConflict)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "node-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.drain(context.Background(), make(chan struct{}, 1), &sync.WaitGroup{})
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	if len(paths) != 1 || paths[0] != "/api/v1/recording/jobs/lease" {
+		t.Fatalf("lease order = %v, want footage poll only", paths)
+	}
+}
+
 func TestUpdateDrainStopsStalledContinuousCapture(t *testing.T) {
 	oldInterval := continuousUpdateDrainPollInterval
 	continuousUpdateDrainPollInterval = time.Millisecond
@@ -1119,6 +1149,35 @@ func TestEnsureCaptureTempDirRecreatesMissingRoot(t *testing.T) {
 	}
 	if err := worker.ensureCaptureTempDir(); err != nil {
 		t.Fatalf("recreate: %v", err)
+	}
+}
+
+func TestEnsureCaptureTempDirRepairsPermissionsAndRejectsLinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	insecure := filepath.Join(base, "insecure")
+	if err := os.Mkdir(insecure, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Worker{cfg: Config{CaptureTempDir: insecure}}).ensureCaptureTempDir(); err != nil {
+		t.Fatalf("repair capture spool permissions: %v", err)
+	}
+	info, err := os.Stat(insecure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("capture spool mode=%v", info.Mode().Perm())
+	}
+	private := filepath.Join(base, "private")
+	if err := os.Mkdir(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linked := filepath.Join(base, "linked")
+	if err := os.Symlink(private, linked); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Worker{cfg: Config{CaptureTempDir: linked}}).ensureCaptureTempDir(); err == nil {
+		t.Fatal("symlinked capture spool was accepted")
 	}
 }
 

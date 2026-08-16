@@ -18,8 +18,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
 )
 
@@ -34,6 +37,18 @@ var ErrContinuousSegmentDuplicate = errors.New("continuous segment is a duplicat
 // fenced frozen-live-edge observer. It says nothing about the playlist itself.
 var ErrContinuousNoOutput = errors.New("continuous ffmpeg made no output progress")
 
+// ErrContinuousStopRequired means the server froze the source/config snapshot
+// used by this finite producer and required it to stop opening new artifacts.
+// It is deliberately distinct from context cancellation: callers must retain
+// and account for the namespace returned by the stop barrier.
+var ErrContinuousStopRequired = errors.New("continuous producer stop required")
+
+// ContinuousStopBarrier runs only after the entire FFmpeg process group has
+// been confirmed stopped. It must atomically move the output namespace out of
+// FFmpeg's reach, install a non-directory sentinel at the old pathname, and
+// durably acknowledge the exact retained inventory before returning its new
+// directory. No callback runs after FFmpeg has been continued.
+type ContinuousStopBarrier func(context.Context, string) (string, error)
 type continuousNoOutputError struct{ message string }
 
 func (e *continuousNoOutputError) Error() string { return e.message }
@@ -300,14 +315,35 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 }
 
 func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), false)
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), false, nil)
 }
 
 func CaptureContinuousWithTimestampContract(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
 	if targetFPS != nil {
 		return fmt.Errorf("timestamp contract requires native source-copy capture")
 	}
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), true)
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), true, nil)
+}
+
+// CaptureContinuousWithFinitePlan preserves the one-process source-copy capture
+// path while replacing the open-ended segment cadence with the exact finite
+// split plan accepted by the server. The plan bounds file cardinality before
+// exec; it never changes codec selection.
+func CaptureContinuousWithFinitePlan(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, timestampContract bool, plan surrenderplan.Plan) error {
+	return CaptureContinuousWithFinitePlanAndStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, timestampContract, plan, nil, nil)
+}
+
+// CaptureContinuousWithFinitePlanAndStop is the finite-plan capture path with
+// the append-only source/config stop protocol. stopRequired is separate from
+// ctx so a source mutation cannot be mistaken for an ordinary window close.
+func CaptureContinuousWithFinitePlanAndStop(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, timestampContract bool, plan surrenderplan.Plan, stopRequired <-chan struct{}, stopBarrier ContinuousStopBarrier) error {
+	if targetFPS != nil && timestampContract {
+		return fmt.Errorf("timestamp contract requires native source-copy capture")
+	}
+	if stopRequired != nil && stopBarrier == nil {
+		return fmt.Errorf("finite capture stop signal requires a stop barrier")
+	}
+	return captureContinuousWithHeadersModeAndStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), timestampContract, &plan, stopRequired, stopBarrier)
 }
 
 func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
@@ -319,10 +355,14 @@ func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) tim
 }
 
 func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration) error {
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false)
+	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, nil)
 }
 
-func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool) error {
+func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool, finitePlan *surrenderplan.Plan) error {
+	return captureContinuousWithHeadersModeAndStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, timestampContract, finitePlan, nil, nil)
+}
+
+func captureContinuousWithHeadersModeAndStop(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool, finitePlan *surrenderplan.Plan, stopRequired <-chan struct{}, stopBarrier ContinuousStopBarrier) error {
 	if strings.TrimSpace(sourceURL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
@@ -338,7 +378,12 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	if startupTimeout <= 0 || progressTimeout <= 0 {
 		return fmt.Errorf("continuous watchdog timeouts must be > 0")
 	}
-	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract)
+	if finitePlan != nil {
+		if finitePlan.ClipDurationSecond != int(clipDuration/time.Second) || finitePlan.ArtifactCount < 1 || finitePlan.ArtifactCount > surrenderplan.MaxArtifacts || finitePlan.DurationMicro <= 0 || len(finitePlan.SplitTimesArgument) > surrenderplan.MaxSegmentTimesArgumentLen {
+			return fmt.Errorf("finite capture plan differs from capture parameters")
+		}
+	}
+	err := captureContinuousAttemptWithStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract, finitePlan, stopRequired, stopBarrier)
 	if !isMalformedAudioMuxError(err) {
 		return err
 	}
@@ -361,10 +406,14 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	// write that track and exits before producing any video. Retry once without
 	// audio; video remains a lossless stream copy and healthy audio is preserved
 	// on every source that did not hit this exact muxer failure.
-	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract)
+	return captureContinuousAttemptWithStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract, finitePlan, stopRequired, stopBarrier)
 }
 
-func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool) error {
+func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool, finitePlan *surrenderplan.Plan) error {
+	return captureContinuousAttemptWithStop(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, includeAudio, timestampContract, finitePlan, nil, nil)
+}
+
+func captureContinuousAttemptWithStop(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool, finitePlan *surrenderplan.Plan, stopRequired <-chan struct{}, stopBarrier ContinuousStopBarrier) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -375,7 +424,15 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		captureAttemptID = uuid.NewString()
 	}
 	args := buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio, timestampContract)
+	if finitePlan != nil {
+		args = applyFiniteContinuousPlan(args, *finitePlan)
+		argMax, err := platformExecArgumentLimit()
+		if err != nil || !surrenderplan.ExecFits(ffmpegBin(), args, os.Environ(), argMax) {
+			return fmt.Errorf("finite capture plan does not fit the platform exec argument limit")
+		}
+	}
 	cmd := exec.Command(ffmpegBin(), args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
@@ -405,18 +462,57 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 
 	// stopFFmpeg sends SIGINT for a clean trailer, then waits a bounded grace for
 	// the process to exit (falling back to Kill so we never hang on a wedged child).
+	var stopOnce sync.Once
 	stopFFmpeg := func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(os.Interrupt)
-		}
-		select {
-		case <-waitErr:
-		case <-time.After(continuousShutdownGrace):
+		stopOnce.Do(func() {
 			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
+				_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
 			}
-			<-waitErr
+			select {
+			case <-waitErr:
+			case <-time.After(continuousShutdownGrace):
+				if cmd.Process != nil {
+					_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
+				}
+				<-waitErr
+			}
+		})
+	}
+
+	retainedOutputDir := outDir
+	stopAtBarrier := func() error {
+		if cmd.Process == nil || stopBarrier == nil {
+			return fmt.Errorf("continuous stop barrier is unavailable")
 		}
+		if err := signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGSTOP); err != nil {
+			return fmt.Errorf("stop continuous process group: %w", err)
+		}
+		if err := waitContinuousProcessStopped(cmd.Process.Pid, 5*time.Second); err != nil {
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+			return err
+		}
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 30*time.Second)
+		movedDir, err := stopBarrier(barrierCtx, outDir)
+		cancelBarrier()
+		if err != nil {
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+			stopFFmpeg()
+			return fmt.Errorf("acknowledge continuous stop inventory: %w", err)
+		}
+		if strings.TrimSpace(movedDir) == "" || movedDir == outDir {
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+			_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+			stopFFmpeg()
+			return fmt.Errorf("continuous stop barrier did not isolate output namespace")
+		}
+		retainedOutputDir = movedDir
+		// SIGINT is queued while every process in the group remains stopped. Only
+		// after the namespace ACK is durable may the group continue and reap.
+		_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGINT)
+		_ = signalContinuousProcessGroup(cmd.Process.Pid, syscall.SIGCONT)
+		stopFFmpeg()
+		return nil
 	}
 
 	// sweepFinal scans outDir and hands every newly-finalized segment to onSegment.
@@ -424,7 +520,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 	// exists (steady state); finalizeAll=true treats every unprocessed segment as
 	// final (post-SIGINT sweep, when ffmpeg has closed the last trailer).
 	sweepFinal := func(probeCtx context.Context, finalizeAll bool) error {
-		segs, err := sortedSegments(outDir)
+		segs, err := sortedSegments(retainedOutputDir)
 		if err != nil {
 			return err
 		}
@@ -451,6 +547,17 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 
 	for {
 		select {
+		case <-stopRequired:
+			if err := stopAtBarrier(); err != nil {
+				stopFFmpeg()
+				return err
+			}
+			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancelFinalize()
+			if err := sweepFinal(finalizeCtx, true); err != nil {
+				return errors.Join(ErrContinuousStopRequired, err)
+			}
+			return ErrContinuousStopRequired
 		case <-ctx.Done():
 			stopFFmpeg()
 			// Final sweep: the last open segment now has a clean trailer.
@@ -507,6 +614,81 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 			}
 		}
 	}
+}
+
+var readExecArgumentLimit = func() (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/getconf", "ARG_MAX").Output()
+	if err != nil || len(output) > 32 {
+		return 0, fmt.Errorf("read ARG_MAX")
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("invalid ARG_MAX")
+	}
+	return value, nil
+}
+
+var signalContinuousProcessGroup = func(pid int, signal syscall.Signal) error {
+	if pid <= 0 {
+		return fmt.Errorf("invalid continuous process id")
+	}
+	return syscall.Kill(-pid, signal)
+}
+
+var readContinuousProcessGroupStates = func(pid int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/bin/ps", "-axo", "pgid=,state=").Output()
+	if err != nil {
+		return nil, err
+	}
+	var states []byte
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		pgid, parseErr := strconv.Atoi(fields[0])
+		if parseErr == nil && pgid == pid && fields[1] != "" {
+			states = append(states, fields[1][0])
+		}
+	}
+	if len(states) == 0 {
+		return nil, fmt.Errorf("continuous process group is empty")
+	}
+	return states, nil
+}
+
+func waitContinuousProcessStopped(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		states, err := readContinuousProcessGroupStates(pid)
+		if err == nil {
+			allStopped := true
+			for _, state := range states {
+				if state != 'T' && state != 't' {
+					allStopped = false
+					break
+				}
+			}
+			if allStopped {
+				return nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return fmt.Errorf("confirm continuous process group stopped: %w", err)
+			}
+			return fmt.Errorf("continuous process group did not stop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func platformExecArgumentLimit() (int, error) {
+	return readExecArgumentLimit()
 }
 
 func isMalformedAudioMuxError(err error) bool {
@@ -633,6 +815,70 @@ func sortedSegments(outDir string) ([]string, error) {
 // key the worker derives downstream is deterministic and ordered.
 func finalizeSegment(ctx context.Context, path string, fallbackSpan time.Duration) (Segment, error) {
 	return finalizeSegmentWithTimestampContract(ctx, path, fallbackSpan, false)
+}
+
+// RecoverContinuousSegment reconstructs the exact finalized-media metadata a
+// recorder needs to finish an upload-only recovery grant after its capture
+// process crashed. It never launches ffmpeg or opens a source URL.
+func RecoverContinuousSegment(ctx context.Context, path string, fallbackSpan time.Duration) (Segment, error) {
+	return finalizeSegmentWithTimestampContract(ctx, path, fallbackSpan, true)
+}
+
+// RecoverContinuousSegmentFile derives recovery metadata from one already-open
+// no-follow file identity.  The descriptor is passed to ffprobe as fd 3, so no
+// pathname lookup can substitute bytes between inventory, hashing, and probes.
+func RecoverContinuousSegmentFile(ctx context.Context, file *os.File, leaf string, fallbackSpan time.Duration) (Segment, error) {
+	if file == nil || filepath.Base(leaf) != leaf {
+		return Segment{}, fmt.Errorf("invalid recovery segment file")
+	}
+	startAt, err := parseSegmentStart(leaf)
+	if err != nil {
+		return Segment{}, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 {
+		return Segment{}, fmt.Errorf("stat recovery segment: %w", err)
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return Segment{}, err
+	}
+	readStarted := time.Now()
+	h := sha256.New()
+	written, err := io.Copy(h, io.LimitReader(file, info.Size()+1))
+	if err != nil || written != info.Size() {
+		return Segment{}, fmt.Errorf("read recovery segment: %w", err)
+	}
+	readDuration := time.Since(readStarted)
+	hashStarted := time.Now()
+	sha := hex.EncodeToString(h.Sum(nil))
+	hashDuration := time.Since(hashStarted)
+	probeStarted := time.Now()
+	meta, metaErr := probeSegmentFile(ctx, file)
+	contract, contractErr := probeTimestampContractFile(ctx, file)
+	probeDuration := time.Since(probeStarted)
+	status, reason := TimestampProbeComplete, ""
+	if contractErr != nil {
+		contract, status, reason = nil, TimestampProbeUnknown, timestampContractErrorCode(contractErr)
+	}
+	durationMs := meta.DurationMs
+	if durationMs <= 0 {
+		durationMs = fallbackSpan.Milliseconds()
+	}
+	videoCodec, audioCodec, audioPresent := meta.VideoCodec, meta.AudioCodec, meta.AudioPresent
+	if videoCodec == "" {
+		videoCodec = "h264"
+	}
+	if metaErr != nil {
+		meta = ffprobeMeta{VideoCodec: videoCodec, AudioCodec: audioCodec}
+	}
+	if status == TimestampProbeComplete {
+		audioPresent = timestampContractHasAudio(contract)
+	}
+	return Segment{Path: file.Name(), SourceKind: "live", StartAt: startAt, EndAt: startAt.Add(time.Duration(durationMs) * time.Millisecond), DurationMs: durationMs,
+		SizeBytes: info.Size(), SHA256: sha, MIMEType: "video/mp4", Container: "mp4", VideoCodec: videoCodec,
+		AudioCodec: audioCodec, AudioPresent: audioPresent, ActualFPS: meta.ActualFPS, VideoWidth: meta.VideoWidth,
+		VideoHeight: meta.VideoHeight, FinalizeReadDuration: readDuration, FinalizeHashDuration: hashDuration, FinalizeProbeDuration: probeDuration,
+		TimestampContract: contract, TimestampContractStatus: status, TimestampContractReason: reason}, nil
 }
 
 func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fallbackSpan time.Duration, timestampContractEnabled bool) (Segment, error) {
@@ -843,6 +1089,36 @@ func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string,
 		outPattern,
 	)
 	return args
+}
+
+func applyFiniteContinuousPlan(args []string, plan surrenderplan.Plan) []string {
+	bounded := make([]string, 0, len(args)+4)
+	insertedTimestampOrigin := false
+	for index := 0; index < len(args); index++ {
+		if args[index] == "-segment_time" && index+1 < len(args) {
+			bounded = append(bounded, "-segment_times", plan.SplitTimesArgument)
+			index++
+			continue
+		}
+		if !insertedTimestampOrigin && args[index] == "-i" {
+			bounded = append(bounded, "-copyts", "-start_at_zero")
+			insertedTimestampOrigin = true
+		}
+		if index == len(args)-1 {
+			bounded = append(bounded, "-t", canonicalMicroseconds(plan.DurationMicro))
+		}
+		bounded = append(bounded, args[index])
+	}
+	return bounded
+}
+
+func canonicalMicroseconds(value int64) string {
+	seconds, micros := value/1_000_000, value%1_000_000
+	if micros == 0 {
+		return strconv.FormatInt(seconds, 10)
+	}
+	fraction := strings.TrimRight(fmt.Sprintf("%06d", micros), "0")
+	return strconv.FormatInt(seconds, 10) + "." + fraction
 }
 
 // appendHLSLiveEdgeInputArgs keeps a restarted continuous recorder at the live
@@ -1120,6 +1396,13 @@ func extractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentT
 	}, nil
 }
 
+// ExtractSegmentThumbnail returns a bounded decoded-frame proof from finalized
+// bytes. Callers own the returned file and must remove it with their probe temp
+// directory. Capture bytes are never changed.
+func ExtractSegmentThumbnail(ctx context.Context, segmentPath string) (*SegmentThumbnail, error) {
+	return extractSegmentThumbnail(ctx, segmentPath)
+}
+
 type ffprobeMeta struct {
 	DurationMs   int64
 	ActualFPS    *float64
@@ -1128,6 +1411,36 @@ type ffprobeMeta struct {
 	AudioPresent bool
 	VideoWidth   int
 	VideoHeight  int
+}
+
+// SegmentFileMetadata is the server-verifiable native media contract read from
+// finalized bytes. It deliberately excludes paths and source identifiers.
+type SegmentFileMetadata struct {
+	DurationMs   int64
+	ActualFPS    *float64
+	VideoCodec   string
+	AudioCodec   string
+	AudioPresent bool
+	VideoWidth   int
+	VideoHeight  int
+}
+
+// InspectSegmentFile validates and returns typed native facts from exact local
+// bytes. Admission code uses this after an exact object-generation download;
+// worker-authored ffprobe facts are not authority.
+func InspectSegmentFile(ctx context.Context, path string) (SegmentFileMetadata, error) {
+	meta, err := probeSegment(ctx, path)
+	if err != nil {
+		return SegmentFileMetadata{}, fmt.Errorf("ffprobe: %w", err)
+	}
+	if meta.DurationMs <= 0 || strings.TrimSpace(meta.VideoCodec) == "" {
+		return SegmentFileMetadata{}, fmt.Errorf("ffprobe returned incomplete media facts")
+	}
+	return SegmentFileMetadata{
+		DurationMs: meta.DurationMs, ActualFPS: meta.ActualFPS,
+		VideoCodec: meta.VideoCodec, AudioCodec: meta.AudioCodec,
+		AudioPresent: meta.AudioPresent, VideoWidth: meta.VideoWidth, VideoHeight: meta.VideoHeight,
+	}, nil
 }
 
 // ValidateSegmentFile proves that a stored clip is a decodable media container
@@ -1264,6 +1577,17 @@ func runFFmpegHealthCommand(cmd *exec.Cmd) error {
 }
 
 func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
+	return probeSegmentCommand(ctx, path, nil)
+}
+
+func probeSegmentFile(ctx context.Context, file *os.File) (ffprobeMeta, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return ffprobeMeta{}, err
+	}
+	return probeSegmentCommand(ctx, "/dev/fd/3", file)
+}
+
+func probeSegmentCommand(ctx context.Context, path string, file *os.File) (ffprobeMeta, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx,
@@ -1273,6 +1597,9 @@ func probeSegment(ctx context.Context, path string) (ffprobeMeta, error) {
 		"-of", "json",
 		path,
 	)
+	if file != nil {
+		cmd.ExtraFiles = []*os.File{file}
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return ffprobeMeta{}, err
@@ -1338,6 +1665,17 @@ func (w *timestampProbeOutput) Write(p []byte) (int, error) {
 // order (packet PTS order is not presentation order with B-frames); audio keeps
 // its own sample-domain end evidence.
 func probeTimestampContract(ctx context.Context, path string) (*TimestampContract, error) {
+	return probeTimestampContractCommand(ctx, path, nil)
+}
+
+func probeTimestampContractFile(ctx context.Context, file *os.File) (*TimestampContract, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return probeTimestampContractCommand(ctx, "/dev/fd/3", file)
+}
+
+func probeTimestampContractCommand(ctx context.Context, path string, file *os.File) (*TimestampContract, error) {
 	// A clean window shutdown cancels capture before the final muxer trailer is
 	// swept. The finalized immutable bytes still require bounded provenance.
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1345,6 +1683,9 @@ func probeTimestampContract(ctx context.Context, path string) (*TimestampContrac
 	cmd := exec.CommandContext(probeCtx, ffprobeBin(), "-v", "error", "-show_frames", "-show_streams", "-show_data",
 		"-show_entries", "stream=index,codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,time_base,extradata,sample_rate,channels,channel_layout:frame=stream_index,media_type,best_effort_timestamp,pkt_dts,duration,pkt_duration,nb_samples",
 		"-of", "json", path)
+	if file != nil {
+		cmd.ExtraFiles = []*os.File{file}
+	}
 	var out timestampProbeOutput
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard

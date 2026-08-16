@@ -19,6 +19,45 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const testRelayLeaseAuthorityDDL = `
+	CREATE FUNCTION recording_surrender_relay_candidate_eligible(p_job_id BIGINT, p_node_id BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+	DECLARE candidate nodes%ROWTYPE; group_cap INT; own_count BIGINT; group_count BIGINT; least_count BIGINT; fairness_expired BOOLEAN; preferred_group BIGINT; better_group_exists BOOLEAN;
+	BEGIN
+		SELECT * INTO candidate FROM nodes WHERE id=p_node_id;
+		SELECT count(*) INTO own_count FROM recording_jobs WHERE status='leased' AND lease_expires_at>now() AND lease_owner='node:'||p_node_id::text;
+		IF candidate.relay_group_id IS NULL THEN RETURN own_count<candidate.relay_max_streams; END IF;
+		SELECT max_streams INTO group_cap FROM relay_groups WHERE id=candidate.relay_group_id;
+		SELECT count(*) INTO group_count FROM recording_jobs job JOIN nodes owner ON job.lease_owner='node:'||owner.id::text WHERE job.status='leased' AND job.lease_expires_at>now() AND owner.relay_group_id=candidate.relay_group_id;
+		SELECT min(live_count) INTO least_count FROM (
+			SELECT peer.id,count(job.id) live_count FROM nodes peer
+			LEFT JOIN recording_jobs job ON job.lease_owner='node:'||peer.id::text AND job.status='leased' AND job.lease_expires_at>now()
+			WHERE peer.relay_group_id=candidate.relay_group_id GROUP BY peer.id
+		) counts;
+		SELECT COALESCE(relay_fairness_started_at<=now()-interval '12 seconds',false) INTO fairness_expired FROM recording_jobs WHERE id=p_job_id;
+		SELECT recording.preferred_relay_group_id INTO preferred_group FROM recording_jobs job JOIN recordings recording ON recording.id=job.recording_id WHERE job.id=p_job_id;
+		SELECT EXISTS(
+			SELECT 1 FROM relay_groups peer_group
+			JOIN nodes peer_node ON peer_node.relay_group_id=peer_group.id AND peer_node.status='active' AND peer_node.last_heartbeat_at>=now()-interval '120 seconds'
+			LEFT JOIN recording_jobs peer_job ON peer_job.lease_owner='node:'||peer_node.id::text AND peer_job.status='leased' AND peer_job.lease_expires_at>now()
+			WHERE peer_group.account_id=candidate.account_id AND peer_group.id<>candidate.relay_group_id
+			GROUP BY peer_group.id,peer_group.max_streams
+			HAVING count(peer_job.id)<peer_group.max_streams AND (count(peer_job.id)+1)::numeric/peer_group.max_streams < (group_count+1)::numeric/group_cap
+		) INTO better_group_exists;
+		RETURN own_count<candidate.relay_max_streams AND group_count<group_cap
+			AND (own_count<=least_count OR fairness_expired)
+			AND (preferred_group=candidate.relay_group_id OR fairness_expired OR NOT better_group_exists);
+	END
+	$$;
+	CREATE FUNCTION recording_surrender_relay_alternate(BIGINT, TEXT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+	CREATE FUNCTION recording_surrender_token_can_access_lease(BIGINT, BIGINT, BIGINT, BIGINT) RETURNS BOOLEAN LANGUAGE sql AS 'SELECT true';
+	CREATE TABLE node_tokens (id BIGINT PRIMARY KEY, node_id BIGINT, revoked_at TIMESTAMPTZ, recording_claim_generation BIGINT, recording_claim_purpose TEXT);
+	CREATE TABLE recording_worker_claim_heads (node_id BIGINT PRIMARY KEY, generation BIGINT, claim_token_id BIGINT, state TEXT);
+	CREATE TABLE recording_capture_set_plans (id UUID PRIMARY KEY, recording_job_id BIGINT, lease_token UUID);
+	CREATE TABLE recording_capture_reservation_sets (id UUID PRIMARY KEY, plan_id UUID);
+	CREATE TABLE recording_capture_producer_stop_events (id UUID PRIMARY KEY, set_id UUID);
+	CREATE TABLE recording_capture_producer_stop_acks (stop_event_id UUID);
+`
+
 func TestRelayGroupLimits(t *testing.T) {
 	for _, max := range []int{relayGroupMinMaxStreams, relayGroupDefaultMaxStreams, relayGroupMaxMaxStreams} {
 		if err := validateRelayGroupMaxStreams(max); err != nil {
@@ -81,29 +120,9 @@ func TestRelayGroupChangeAllowed(t *testing.T) {
 }
 
 func TestRelayLeaseSQLIncludesTenantScopedGroupCap(t *testing.T) {
-	for _, want := range []string{
-		"n.relay_group_id IS NULL",
-		"j.relay_fairness_started_at <= now()-interval '12 seconds'",
-		"peer_group.id<>n.relay_group_id",
-		"n.relay_group_id=rec.preferred_relay_group_id",
-		"preferred_group.id=rec.preferred_relay_group_id",
-		"peer_group_node.last_heartbeat_at>=now()-interval '120 seconds'",
-		"peer_group_jobs.lease_expires_at>now()",
-		"peer.relay_group_id=n.relay_group_id",
-		"peer.last_heartbeat_at >= now()-interval '120 seconds'",
-		"pj.lease_owner='node:'||peer.id::text",
-		"gn.account_id=n.account_id",
-		"gn.relay_group_id=n.relay_group_id",
-		"g.account_id=n.account_id",
-		"peer_group.bandwidth_capacity_bps",
-		"recording_bandwidth_observations",
-		"source_stream.execution_class",
-		"n.capabilities_jsonb->'youtube_ready'",
-		"GREATEST(COALESCE(peer_group_bandwidth.observed_bandwidth_bps, 0), 4000000)",
-	} {
-		if !strings.Contains(relayLeaseSQL, want) {
-			t.Fatalf("relay lease SQL missing %q", want)
-		}
+	const authority = "recording_surrender_relay_candidate_eligible(j.id,$1)"
+	if strings.Count(relayLeaseSQL, authority) != 1 {
+		t.Fatalf("relay lease SQL must delegate capacity and fairness exactly once to %q", authority)
 	}
 }
 
@@ -153,7 +172,8 @@ func TestRelayLeaseRequiresYouTubeReadinessOnlyForYouTube(t *testing.T) {
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_bandwidth_observations (recording_id BIGINT PRIMARY KEY, observed_bandwidth_bps BIGINT NOT NULL, observed_at TIMESTAMPTZ NOT NULL DEFAULT now());
-		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, lease_node_token_id BIGINT, lease_claim_generation BIGINT, lease_credential_state TEXT NOT NULL DEFAULT 'legacy_unknown', attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
+		`+testRelayLeaseAuthorityDDL+`
 		`+testRecordingCanaryReservationsTableDDL+`;
 		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups VALUES (1,47,4,NULL);
@@ -235,7 +255,8 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY, has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY, account_id BIGINT NOT NULL, status TEXT NOT NULL, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ, capture_via TEXT NOT NULL, stream_url TEXT NOT NULL, stream_id BIGINT, storage_destination_id BIGINT NOT NULL, target_fps INT, preferred_relay_group_id BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_bandwidth_observations (recording_id BIGINT PRIMARY KEY, observed_bandwidth_bps BIGINT NOT NULL, observed_at TIMESTAMPTZ NOT NULL DEFAULT now());
-		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, lease_node_token_id BIGINT, lease_claim_generation BIGINT, lease_credential_state TEXT NOT NULL DEFAULT 'legacy_unknown', attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
+		`+testRelayLeaseAuthorityDDL+`
 		`+testRecordingCanaryReservationsTableDDL+`;
 		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups (id,account_id,max_streams) VALUES (1, 47, 1);
@@ -290,7 +311,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 	var renewedAt time.Time
 	if err := pool.QueryRow(ctx, recordingJobHeartbeatSQL, expiredJobID, expiredOwner,
 		recordingCaptureTimeoutMarginSec+recordingUploadMarginSec, nil,
-		recordingContinuousPostWindowLeaseSec).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
+		recordingContinuousPostWindowLeaseSec, 0, 1).Scan(&renewedAt); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired heartbeat err=%v, want pgx.ErrNoRows", err)
 	}
 

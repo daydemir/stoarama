@@ -85,9 +85,9 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	}
 	_, err = pool.Exec(ctx, `
 	 WITH ss AS (INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,capture_type,source_family,execution_class,capture_family,expected_fps)
-	   SELECT 'direct','q'||n,'stream-'||n,'qualification-'||n,'https://example.test/'||n||'.m3u8','','hls','video_manifest','video_live','continuous_video',30 FROM generate_series(1,50)n RETURNING id),
+	   SELECT 'direct','q'||n,'stream-'||n,'qualification-'||n,'https://example.test/'||n||'.m3u8','','hls','video_manifest','video_live','continuous_video',30 FROM generate_series(1,50)n RETURNING id,source_url),
 	 rr AS (INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,source_kind,cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,active_weekdays)
-	   SELECT $1,(SELECT id FROM storage_destinations WHERE account_id=$1 AND name='qual'),'recording-'||row_number() over(),'https://example.test/live.m3u8','hls_live','0 8 * * *','UTC',60,'active','2026-08-01',id,'continuous','08:00','20:00',127 FROM ss RETURNING stream_id),
+	   SELECT $1,(SELECT id FROM storage_destinations WHERE account_id=$1 AND name='qual'),'recording-'||row_number() over(),source_url,'hls_live','0 8 * * *','UTC',60,'active','2026-08-01',id,'continuous','08:00','20:00',127 FROM ss RETURNING stream_id),
 	 mo AS (INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256)
 	   SELECT 'r2','qual','frame-'||stream_id,'image/jpeg',1,lpad(to_hex(stream_id),64,'0') FROM rr RETURNING id,object_key,sha256),
 	 ff AS (INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind)
@@ -96,6 +96,17 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	 SELECT $1,ff.stream_id,ff.id,ff.raw_media_object_id,ff.captured_at,mo.sha256,lpad(to_hex(ff.stream_id+100000),64,'0'),'operator_visual',$2 FROM ff JOIN mo ON mo.id=ff.raw_media_object_id`, accountID, userID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var distinctRecordingURLs, sourceMismatches int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(DISTINCT recording.stream_url),
+		       count(*) FILTER (WHERE recording.stream_url IS DISTINCT FROM stream.source_url)
+		FROM recordings recording JOIN streams stream ON stream.id=recording.stream_id
+		WHERE recording.account_id=$1`, accountID).Scan(&distinctRecordingURLs, &sourceMismatches); err != nil {
+		t.Fatal(err)
+	}
+	if distinctRecordingURLs != 50 || sourceMismatches != 0 {
+		t.Fatalf("qualification fixtures do not preserve stream identity: distinct_urls=%d source_mismatches=%d", distinctRecordingURLs, sourceMismatches)
 	}
 	var ids []int64
 	rows, err := pool.Query(ctx, `SELECT id FROM recordings WHERE account_id=$1 ORDER BY id`, accountID)

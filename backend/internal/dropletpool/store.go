@@ -37,6 +37,40 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+const dropletHasCaptureAuthoritySQL = `
+	SELECT EXISTS (
+	  SELECT 1 FROM recording_jobs
+	  WHERE lease_owner=$1 AND status='leased' AND lease_expires_at>transaction_timestamp()
+	  UNION ALL
+	  SELECT 1
+	  FROM recording_job_recovery_grants grant_row
+	  JOIN recording_capture_producers producer ON producer.id=grant_row.producer_id
+	  WHERE producer.worker_id=$1
+	    AND grant_row.upload_grace_until>transaction_timestamp()
+	    AND NOT EXISTS(SELECT 1 FROM recording_job_recovery_grant_results grant_result WHERE grant_result.grant_id=grant_row.id)
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+	  UNION ALL
+	  SELECT 1
+	  FROM recording_capture_producers producer
+	  WHERE producer.worker_id=$1
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+	  UNION ALL
+	  SELECT 1
+	  FROM recording_capture_reservation_sets capture_set
+	  JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+	  JOIN recording_job_lease_generations generation
+	    ON generation.recording_job_id=plan.recording_job_id AND generation.lease_token=plan.lease_token
+	  WHERE generation.lease_owner=$1
+	    AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=capture_set.id)
+	  UNION ALL
+	  SELECT 1
+	  FROM recorder_droplets probe_droplet
+	  WHERE probe_droplet.name=$1
+	    AND probe_droplet.node_id IS NOT NULL
+	    AND recording_worker_targeted_probe_occupancy(probe_droplet.node_id)>0
+	)
+`
+
 func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
@@ -156,15 +190,89 @@ func (s *Store) MintNodeToken(ctx context.Context, operatorAccountID int64, name
 // decommissioned droplet's credential can never be reused (S-6). Both ids may be
 // nil for a droplet that failed before its token was minted.
 func (s *Store) RevokeNodeToken(ctx context.Context, nodeTokenID, nodeID *int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Credential teardown is an exclusive claim-authority transition. Existing
+	// leases and recovery uploads hold the shared fence, so a provider-loss or
+	// ordinary scale-down cannot revoke the credential underneath either path.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return fmt.Errorf("lock recorder token retirement: %w", err)
+	}
 	if nodeTokenID != nil {
-		if _, err := s.pool.Exec(ctx, `UPDATE node_tokens SET revoked_at=COALESCE(revoked_at, now()), updated_at=now() WHERE id=$1`, *nodeTokenID); err != nil {
-			return fmt.Errorf("revoke node token: %w", err)
+		var tokenNode, generation int64
+		var revoked bool
+		if err = tx.QueryRow(ctx, `
+			SELECT node_id,COALESCE(recording_claim_generation,0),revoked_at IS NOT NULL
+			FROM node_tokens WHERE id=$1 FOR UPDATE
+		`, *nodeTokenID).Scan(&tokenNode, &generation, &revoked); err != nil {
+			return fmt.Errorf("load recorder token retirement: %w", err)
+		}
+		if nodeID == nil || tokenNode != *nodeID {
+			return fmt.Errorf("recorder token/node retirement identity differs")
+		}
+		if !revoked {
+			var busy bool
+			if err = tx.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM recording_jobs job
+				WHERE job.lease_node_token_id=$1 AND job.status='leased'
+				UNION ALL
+				SELECT 1 FROM recording_capture_producers producer
+				WHERE producer.node_id=$2
+				  AND NOT EXISTS(SELECT 1 FROM recording_capture_producer_results result WHERE result.producer_id=producer.id)
+				UNION ALL
+				SELECT 1 FROM recording_capture_set_grants set_grant
+				JOIN recording_capture_reservation_sets capture_set ON capture_set.id=set_grant.set_id
+				JOIN recording_capture_set_plans plan ON plan.id=capture_set.plan_id
+				JOIN recording_job_lease_generations lease
+				  ON lease.recording_job_id=plan.recording_job_id AND lease.lease_token=plan.lease_token
+				WHERE lease.node_id=$2 AND plan.origin_claim_generation=$3
+				  AND NOT EXISTS(SELECT 1 FROM recording_capture_set_results result WHERE result.set_id=set_grant.set_id)
+				UNION ALL
+				SELECT 1
+				WHERE recording_worker_targeted_probe_occupancy($2)>0
+			)`, *nodeTokenID, tokenNode, generation).Scan(&busy); err != nil {
+				return fmt.Errorf("prove recorder token drained: %w", err)
+			}
+			if busy {
+				return fmt.Errorf("recorder token still owns capture authority")
+			}
+			if _, err = tx.Exec(ctx, `UPDATE node_tokens SET revoked_at=transaction_timestamp(),updated_at=transaction_timestamp() WHERE id=$1`, *nodeTokenID); err != nil {
+				return fmt.Errorf("seal recorder token retirement: %w", err)
+			}
+			if _, err = tx.Exec(ctx, `
+				INSERT INTO recording_worker_claim_generation_events
+				  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+				VALUES($2::bigint,$3::bigint,CASE WHEN $3::bigint=1 THEN NULL ELSE $3::bigint-1 END,$1::bigint,'host_lost',
+				  encode(sha256(convert_to('recording-worker-host-lost-v1','UTF8')
+				    ||decode('00','hex')||convert_to($2::bigint::text,'UTF8')
+				    ||decode('00','hex')||convert_to($3::bigint::text,'UTF8')
+				    ||decode('00','hex')||convert_to($1::bigint::text,'UTF8')),'hex'))
+			`, *nodeTokenID, tokenNode, generation); err != nil {
+				return fmt.Errorf("seal recorder token retirement: %w", err)
+			}
+			if _, err = tx.Exec(ctx, `
+				INSERT INTO recording_worker_claim_generation_events
+				  (node_id,generation,predecessor_generation,claim_token_id,event_type,facts_sha256)
+				VALUES($2::bigint,$3::bigint,CASE WHEN $3::bigint=1 THEN NULL ELSE $3::bigint-1 END,$1::bigint,'retired',
+				  encode(sha256(convert_to('recording-worker-claim-retired-v1','UTF8')
+				    ||decode('00','hex')||convert_to($2::bigint::text,'UTF8')
+				    ||decode('00','hex')||convert_to($3::bigint::text,'UTF8')
+				    ||decode('00','hex')||convert_to($1::bigint::text,'UTF8')),'hex'))
+			`, *nodeTokenID, tokenNode, generation); err != nil {
+				return fmt.Errorf("seal recorder token retirement: %w", err)
+			}
 		}
 	}
 	if nodeID != nil {
-		if _, err := s.pool.Exec(ctx, `UPDATE nodes SET status='disabled', updated_at=now() WHERE id=$1`, *nodeID); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE nodes SET status='disabled', updated_at=transaction_timestamp() WHERE id=$1`, *nodeID); err != nil {
 			return fmt.Errorf("disable recorder node: %w", err)
 		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit recorder token retirement: %w", err)
 	}
 	return nil
 }
@@ -223,6 +331,12 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		return false, err
+	}
 
 	var name, state string
 	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
@@ -235,7 +349,7 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, nil
 	}
 	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recording_jobs WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now())`, name).Scan(&busy); err != nil {
+	if err := tx.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&busy); err != nil {
 		return false, err
 	}
 	if busy {
@@ -265,6 +379,12 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		return false, err
+	}
 	var name, state string
 	if err := tx.QueryRow(ctx, `SELECT name, state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
 		return false, err
@@ -273,13 +393,55 @@ func (s *Store) MarkDrainingIfIdle(ctx context.Context, id int64) (bool, error) 
 		return false, nil
 	}
 	var busy bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM recording_jobs WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now())`, name).Scan(&busy); err != nil {
+	if err := tx.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&busy); err != nil {
 		return false, err
 	}
 	if busy {
 		return false, nil
 	}
 	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='draining', drain_started_at=now(), updated_at=now() WHERE id=$1`, id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BeginForcedDestroyAfterDrainTimeout preserves the historical bounded-drain
+// behavior for an ordinary expired/stuck lease, but never tears down the only
+// host holding bytes covered by an active upload-recovery capability. The
+// global fence serializes this proof with expiry reclamation/grant creation.
+func (s *Store) BeginForcedDestroyAfterDrainTimeout(ctx context.Context, id int64) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-worker-claim-v1',0))`); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('recording-surrender-cloud-capacity-v1',0))`); err != nil {
+		return false, err
+	}
+	var name, state string
+	if err := tx.QueryRow(ctx, `SELECT name,state FROM recorder_droplets WHERE id=$1 FOR UPDATE`, id).Scan(&name, &state); err != nil {
+		return false, err
+	}
+	if state == "destroying" {
+		return true, tx.Commit(ctx)
+	}
+	if state != "draining" {
+		return false, nil
+	}
+	var recoveryBusy bool
+	if err := tx.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&recoveryBusy); err != nil {
+		return false, err
+	}
+	if recoveryBusy {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying',updated_at=transaction_timestamp() WHERE id=$1`, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -422,16 +584,12 @@ func (s *Store) SetIdleSince(ctx context.Context, id int64, idle bool) error {
 }
 
 // HasInflightJob reports whether the named droplet currently holds a live leased
-// job. It is authoritative on the lease ledger and tolerant of expired leases
-// (D-isdrained): a job whose lease has expired does not count as in-flight.
+// job or an unexpired upload-only recovery producer. An expired lease alone is
+// not busy, but its fenced local-byte grace keeps the host alive until recovery
+// seals or honestly terminates that producer.
 func (s *Store) HasInflightJob(ctx context.Context, name string) (bool, error) {
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM recording_jobs
-			WHERE lease_owner=$1 AND status='leased' AND lease_expires_at > now()
-		)
-	`, name).Scan(&exists); err != nil {
+	if err := s.pool.QueryRow(ctx, dropletHasCaptureAuthoritySQL, name).Scan(&exists); err != nil {
 		return false, fmt.Errorf("check inflight job: %w", err)
 	}
 	return exists, nil
@@ -441,12 +599,7 @@ func (s *Store) HasInflightJob(ctx context.Context, name string) (bool, error) {
 // runs this at the top of its tick only when the scheduler is not running on the
 // same service (the scheduler owns reclaim otherwise).
 func (s *Store) ReclaimExpiredLeases(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE recording_jobs
-		SET status='pending', lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL,
-		    relay_fairness_started_at=NULL, updated_at=now()
-		WHERE status='leased' AND lease_expires_at < now()
-	`); err != nil {
+	if _, err := s.pool.Exec(ctx, `SELECT recording_surrender_reclaim_expired()`); err != nil {
 		return fmt.Errorf("reclaim expired leases: %w", err)
 	}
 	return nil

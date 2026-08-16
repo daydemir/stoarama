@@ -55,6 +55,10 @@ type accountPrincipal struct {
 	// Nil for browser-session principals. A key whose scopes contain
 	// accountScopePull is confined to the NAS pull endpoints by confineAccountScope.
 	KeyScopes []string
+	// credentialSHA256 is the one-way request credential proof already used by
+	// authentication. Raw cookies never cross into SQL arguments or loggable
+	// principal state.
+	credentialSHA256 string
 }
 
 // isPullScopedPrincipal reports whether the caller is an API key limited to the
@@ -221,6 +225,7 @@ func (s *Server) lookupAccountSession(ctx context.Context, raw string) (accountP
 	}
 	p.AuthType = "session"
 	p.SessionID = &sessionID
+	p.credentialSHA256 = hash
 	if memberEmail != nil {
 		p.MemberEmail = *memberEmail
 	}

@@ -97,6 +97,8 @@ func main() {
 		runRecordingPreopen(ctx, cfg, os.Args[2:])
 	case "recording-stitch":
 		runRecordingStitch(ctx, cfg, os.Args[2:])
+	case "recording-recovery":
+		runRecordingRecovery(ctx, cfg, os.Args[2:])
 	case "relay-connectivity":
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
 	case "relay-routing":
@@ -182,18 +184,25 @@ func usage() {
 	  stoaramactl survey coverage [--json]
 	  stoaramactl survey delete-stream-captures --id N --apply
 	  stoaramactl recordability run-once [--batch 1 --window-sec 600 --segment-sec 60 --probe-host LABEL --json] (gated by STREAM_RECORDABILITY_PROBE_ENABLED)
+	  stoaramactl recordability run-targeted --approval-id UUID --stream-ids IDS --session-cookie-file FILE [--json]
+	  stoaramactl recordability present-targeted --probe-evidence-ids UUIDS --output-dir PRIVATE_DIR --session-cookie-file FILE
+	  stoaramactl recordability review-targeted --approval-id UUID --probe-evidence-ids UUIDS --presentation-receipt-ids UUIDS --session-cookie-file FILE [--json]
+	  stoaramactl recordability expire-targeted --approval-id UUID --request-id UUID --session-cookie-file FILE
 	  stoaramactl recorder-control run
 	  stoaramactl recording-worker run [--backend-api-url URL --node-token TOKEN --worker-id ID --concurrency 1 --heartbeat-sec 15 --poll-sec 5 --duration 0]
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recording-health summary
 	  stoaramactl recording-preopen run [--dry-run --concurrency 4 --probe-sec 20 --frame-fresh-min 30]
+	  stoaramactl recording-recovery security-revoke --set-id UUID [--ordinal N] --reason suspected_capability_compromise|suspected_seed_compromise --idempotency-key UUID [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
 	  stoaramactl recordings naming allocate|get|set|preview
-	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --backend-api-url URL --api-token TOKEN]
+	  stoaramactl recordings approve-admission --spec FILE --session-cookie-file FILE [--backend-api-url URL]
+	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --session-cookie-file FILE --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-postflight (--recording-ids IDS | --batch-response FILE | --spec FILE) --session-cookie-file FILE [--max-nas-pending-clips N --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings capture-health --id ID [--from YYYY-MM-DD --to YYYY-MM-DD --backend-api-url URL --api-token TOKEN]
-	  stoaramactl recordings scene-attest --recording-id ID --frame-id ID --scene-identity TEXT --session-cookie-file FILE
+	  stoaramactl recordings scene-present --stream-id ID --frame-id ID --authority-code CODE --request-id UUID --output-file PRIVATE.jpg --session-cookie-file FILE
+	  stoaramactl recordings scene-attest (--recording-id ID | --presentation-id UUID) --frame-id ID --scene-identity TEXT --session-cookie-file FILE
 	  stoaramactl recordings qualification build --recording-ids IDS --sequence-start RFC3339 --session-cookie-file FILE
 	  stoaramactl recordings qualification freeze --recording-ids IDS --sequence-start RFC3339 --expected-plan-sha256 HASH --session-cookie-file FILE
 	  stoaramactl recordings qualification report [--backend-api-url URL --api-token TOKEN]

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,15 +11,18 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
+	"github.com/google/uuid"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | approve-admission | schedule-batch | campaign-postflight | capture-health | repair-source | authoritative-frame | scene-present | scene-attest | qualification build|freeze|report | streak-priority report"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -26,6 +30,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if args[0] == "schedule-batch" {
 		runRecordingScheduleBatch(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "approve-admission" {
+		runRecordingApproveAdmission(ctx, args[1:])
 		return
 	}
 	if args[0] == "campaign-postflight" {
@@ -42,6 +50,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if args[0] == "authoritative-frame" {
 		runRecordingClipAuthoritativeFrame(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "scene-present" {
+		runRecordingCandidateScenePresent(ctx, args[1:])
 		return
 	}
 	if args[0] == "scene-attest" {
@@ -162,6 +174,7 @@ func runRecordingSceneAttest(ctx context.Context, args []string) {
 	fs := flag.NewFlagSet("recordings scene-attest", flag.ExitOnError)
 	recordingID := fs.Int64("recording-id", 0, "recording id")
 	frameID := fs.Int64("frame-id", 0, "authoritative successful frame id")
+	presentationID := fs.String("presentation-id", "", "exact candidate baseline presentation UUID")
 	identity := fs.String("scene-identity", "", "operator-confirmed canonical scene identity")
 	cookieFile := fs.String("session-cookie-file", "", "file containing member session cookie")
 	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
@@ -170,10 +183,102 @@ func runRecordingSceneAttest(ctx context.Context, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *recordingID <= 0 || *frameID <= 0 || strings.TrimSpace(*identity) == "" {
-		log.Fatal("--recording-id, --frame-id, and --scene-identity are required")
+	payload, err := recordingSceneAttestPayload(*recordingID, *frameID, *presentationID, *identity)
+	if err != nil {
+		log.Fatal(err)
 	}
-	printJSON(postRecordingSessionJSON(ctx, *base, cookie, "/api/v1/account/recordings/qualification/scene-attest", map[string]any{"recording_id": *recordingID, "frame_id": *frameID, "scene_identity": strings.TrimSpace(*identity)}))
+	printJSON(postRecordingSessionJSON(ctx, *base, cookie, "/api/v1/account/recordings/qualification/scene-attest", payload))
+}
+
+func recordingSceneAttestPayload(recordingID, frameID int64, presentationID, identity string) (map[string]any, error) {
+	identity = strings.TrimSpace(identity)
+	presentationID = strings.TrimSpace(presentationID)
+	if frameID <= 0 || identity == "" {
+		return nil, fmt.Errorf("--frame-id and --scene-identity are required")
+	}
+	if recordingID > 0 && presentationID == "" {
+		return map[string]any{"recording_id": recordingID, "frame_id": frameID, "scene_identity": identity}, nil
+	}
+	if recordingID == 0 {
+		if _, err := uuid.Parse(presentationID); err == nil {
+			return map[string]any{"frame_id": frameID, "presentation_id": presentationID, "scene_identity": identity}, nil
+		}
+	}
+	return nil, fmt.Errorf("provide either --recording-id or UUID --presentation-id")
+}
+
+type candidateScenePresentation struct {
+	PresentationID string
+	FrameSHA256    string
+	Body           []byte
+}
+
+func runRecordingCandidateScenePresent(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("recordings scene-present", flag.ExitOnError)
+	streamID := fs.Int64("stream-id", 0, "decision-authorized candidate stream id")
+	frameID := fs.Int64("frame-id", 0, "authoritative successful frame id")
+	authorityCode := fs.String("authority-code", "", "immutable campaign decision code")
+	requestRaw := fs.String("request-id", "", "stable presentation request UUID")
+	outputFile := fs.String("output-file", "", "new private JPEG path")
+	cookieFile := fs.String("session-cookie-file", "", "file containing member session cookie")
+	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	_ = fs.Parse(args)
+	requestID, err := uuid.Parse(strings.TrimSpace(*requestRaw))
+	if err != nil || *streamID <= 0 || *frameID <= 0 || strings.TrimSpace(*authorityCode) == "" || strings.TrimSpace(*outputFile) == "" {
+		log.Fatal("--stream-id, --frame-id, --authority-code, UUID --request-id, and --output-file are required")
+	}
+	parent, err := os.Stat(filepath.Dir(*outputFile))
+	if err != nil || !parent.IsDir() || parent.Mode().Perm()&0o077 != 0 {
+		log.Fatal("--output-file parent must be an existing private directory (mode 0700)")
+	}
+	cookie, err := readCampaignSessionCookie(*cookieFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	presentation, err := getRecordingCandidateScenePresentation(ctx, *base, cookie, *streamID, *frameID, strings.TrimSpace(*authorityCode), requestID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := os.OpenFile(*outputFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		log.Fatalf("create protected scene frame: %v", err)
+	}
+	if _, err = f.Write(presentation.Body); err == nil {
+		err = f.Close()
+	} else {
+		_ = f.Close()
+	}
+	if err != nil {
+		_ = os.Remove(*outputFile)
+		log.Fatalf("write protected scene frame: %v", err)
+	}
+	printJSON(map[string]any{"stream_id": *streamID, "frame_id": *frameID, "authority_code": strings.TrimSpace(*authorityCode), "presentation_id": presentation.PresentationID, "frame_sha256": presentation.FrameSHA256, "local_frame": *outputFile})
+}
+
+func getRecordingCandidateScenePresentation(ctx context.Context, baseURL, cookie string, streamID, frameID int64, authorityCode string, requestID uuid.UUID) (candidateScenePresentation, error) {
+	query := url.Values{"stream_id": {strconv.FormatInt(streamID, 10)}, "authority_code": {authorityCode}, "request_id": {requestID.String()}}
+	path := fmt.Sprintf("/api/v1/account/recordings/qualification/scene-presentations/%d?%s", frameID, query.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+path, nil)
+	if err != nil {
+		return candidateScenePresentation{}, err
+	}
+	req.Header.Set("Cookie", cookie)
+	req.Header.Set("Accept", "image/jpeg")
+	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	if err != nil {
+		return candidateScenePresentation{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(recordability.TargetedFrameMaxBytes)+1))
+	presentationID := strings.TrimSpace(resp.Header.Get("X-Stoarama-Presentation-ID"))
+	frameSHA := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-Content-SHA256")))
+	if err != nil || resp.StatusCode != http.StatusOK || len(body) == 0 || len(body) > recordability.TargetedFrameMaxBytes || resp.Header.Get("Content-Type") != "image/jpeg" {
+		return candidateScenePresentation{}, fmt.Errorf("candidate scene presentation failed status=%d", resp.StatusCode)
+	}
+	if _, err := uuid.Parse(presentationID); err != nil || fmt.Sprintf("%x", sha256.Sum256(body)) != frameSHA {
+		return candidateScenePresentation{}, fmt.Errorf("candidate scene presentation identity is invalid")
+	}
+	return candidateScenePresentation{PresentationID: presentationID, FrameSHA256: frameSHA, Body: body}, nil
 }
 
 func parseQualificationIDs(raw string) []int64 {
@@ -389,6 +494,7 @@ type recordingBatchSpec struct {
 	Delivery                     recordingDeliveryMode    `json:"delivery"`
 	DryRun                       bool                     `json:"dry_run"`
 	RequiredRelaySlots           int                      `json:"required_relay_slots"`
+	CampaignAdmissionApprovalID  string                   `json:"campaign_admission_approval_id"`
 }
 
 type recordingBatchResult struct {
@@ -398,12 +504,14 @@ type recordingBatchResult struct {
 		Action      string `json:"action"`
 		Timezone    string `json:"timezone"`
 	} `json:"items"`
-	Created            int  `json:"created"`
-	Updated            int  `json:"updated"`
-	DryRun             bool `json:"dry_run"`
-	RelayStreams       int  `json:"relay_streams"`
-	OnlineRelaySlots   int  `json:"online_relay_slots"`
-	RequiredRelaySlots int  `json:"required_relay_slots"`
+	Created            int    `json:"created"`
+	Updated            int    `json:"updated"`
+	DryRun             bool   `json:"dry_run"`
+	RelayStreams       int    `json:"relay_streams"`
+	OnlineRelaySlots   int    `json:"online_relay_slots"`
+	RequiredRelaySlots int    `json:"required_relay_slots"`
+	CampaignTrackID    int64  `json:"campaign_track_id"`
+	AdmissionApproval  string `json:"campaign_admission_approval_id"`
 }
 
 func decodeRecordingBatchSpec(r io.Reader) (recordingBatchSpec, error) {
@@ -488,6 +596,7 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 	jsonOutput := fs.Bool("json", false, "print the complete JSON response for campaign postflight")
 	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
 	apiToken := fs.String("api-token", cfg.APIToken, "account API token")
+	sessionCookiePath := fs.String("session-cookie-file", "", "member-session cookie file (required for protected admission)")
 	_ = fs.Parse(args)
 	if strings.TrimSpace(*specPath) == "" {
 		log.Fatal("--spec is required")
@@ -511,7 +620,17 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 		spec.DryRun = dryRun.value
 	}
 	var result recordingBatchResult
-	if err := postJSONWithToken(ctx, *backendAPIURL, *apiToken, "/api/v1/account/recordings/batch-schedule", spec, &result); err != nil {
+	if strings.TrimSpace(spec.CampaignAdmissionApprovalID) != "" {
+		cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		generic := postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/batch-schedule", spec)
+		raw, _ := json.Marshal(generic)
+		if err := json.Unmarshal(raw, &result); err != nil {
+			log.Fatalf("decode protected schedule response: %v", err)
+		}
+	} else if err := postJSONWithToken(ctx, *backendAPIURL, *apiToken, "/api/v1/account/recordings/batch-schedule", spec, &result); err != nil {
 		log.Fatalf("schedule recordings: %v", err)
 	}
 	if *jsonOutput {
@@ -522,11 +641,52 @@ func runRecordingScheduleBatch(ctx context.Context, cfg config.Config, args []st
 		fmt.Println(string(out))
 		return
 	}
-	fmt.Printf("dry_run=%t created=%d updated=%d relay_streams=%d online_relay_slots=%d required_relay_slots=%d\n",
-		result.DryRun, result.Created, result.Updated, result.RelayStreams, result.OnlineRelaySlots, result.RequiredRelaySlots)
+	fmt.Printf("dry_run=%t created=%d updated=%d relay_streams=%d online_relay_slots=%d required_relay_slots=%d campaign_track_id=%d approval_id=%s\n",
+		result.DryRun, result.Created, result.Updated, result.RelayStreams, result.OnlineRelaySlots, result.RequiredRelaySlots, result.CampaignTrackID, result.AdmissionApproval)
 	for _, item := range result.Items {
 		fmt.Printf("stream_id=%d recording_id=%d action=%s timezone=%s\n", item.StreamID, item.RecordingID, item.Action, item.Timezone)
 	}
+}
+
+func runRecordingApproveAdmission(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("recordings approve-admission", flag.ExitOnError)
+	specPath := fs.String("spec", "", "strict JSON approval envelope")
+	sessionCookiePath := fs.String("session-cookie-file", "", "Deniz operator session cookie file")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	_ = fs.Parse(args)
+	if strings.TrimSpace(*specPath) == "" {
+		log.Fatal("--spec is required")
+	}
+	cookie, err := readCampaignSessionCookie(*sessionCookiePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	f, err := os.Open(*specPath)
+	if err != nil {
+		log.Fatalf("open --spec: %v", err)
+	}
+	defer f.Close()
+	payload, err := decodeCampaignAdmissionSpec(f)
+	if err != nil {
+		log.Fatalf("decode --spec: %v", err)
+	}
+	printJSON(postRecordingSessionJSON(ctx, *backendAPIURL, cookie, "/api/v1/account/recordings/campaign-admission/approvals", payload))
+}
+
+func decodeCampaignAdmissionSpec(r io.Reader) (json.RawMessage, error) {
+	dec := json.NewDecoder(io.LimitReader(r, 1<<20))
+	var payload json.RawMessage
+	if err := dec.Decode(&payload); err != nil {
+		return nil, err
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("approval spec must contain one JSON object")
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("approval spec must contain exactly one JSON object")
+	}
+	return payload, nil
 }
 
 func runRecordingNamingPreview(args []string) {

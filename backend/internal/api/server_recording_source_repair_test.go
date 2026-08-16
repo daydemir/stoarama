@@ -16,8 +16,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/daydemir/stoarama/backend/internal/db"
 )
 
 func TestSourceURLHashTrimsOnlyOuterWhitespace(t *testing.T) {
@@ -63,7 +61,7 @@ func TestRecordingSourceRepairDBFencesAndIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	if err = db.MigrateUp(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
+	if err = migrateAPITestSchema(ctx, pool, filepath.Join("..", "..", "..", "infra", "sql", "migrations")); err != nil {
 		t.Fatal(err)
 	}
 	var accountID, destID, streamID, recordingID, jobID int64

@@ -7,9 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/netguard"
+	"github.com/daydemir/stoarama/backend/internal/recordability"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 )
 
@@ -88,21 +91,25 @@ type Config struct {
 }
 
 type Worker struct {
-	cfg                     Config
-	heartbeatInt            time.Duration
-	leaseSafetyMargin       time.Duration
-	reconnectDelay          func(int64, int) time.Duration
-	lastDiskPauseLog        time.Time
-	lastDiskErrorLog        atomic.Int64
-	frozenHLSAllowlist      frozenHLSAllowlist
-	frozenHLSObserve        frozenHLSObserveFunc
-	frozenHLSObserveCurrent frozenHLSObserveCurrentFunc
-	frozenHLSPollMax        time.Duration
-	frozenHLSForceCapture   time.Duration
-	frozenHLSSafetyInterval time.Duration
-	frozenHLSWait           func(context.Context, time.Duration) error
-	frozenHLSProofSpan      func(time.Duration) time.Duration
-	continuousCapture       continuousCaptureFunc
+	cfg                          Config
+	heartbeatInt                 time.Duration
+	leaseSafetyMargin            time.Duration
+	reconnectDelay               func(int64, int) time.Duration
+	lastDiskPauseLog             time.Time
+	lastDiskErrorLog             atomic.Int64
+	frozenHLSAllowlist           frozenHLSAllowlist
+	frozenHLSObserve             frozenHLSObserveFunc
+	frozenHLSObserveCurrent      frozenHLSObserveCurrentFunc
+	frozenHLSPollMax             time.Duration
+	frozenHLSForceCapture        time.Duration
+	frozenHLSSafetyInterval      time.Duration
+	frozenHLSWait                func(context.Context, time.Duration) error
+	frozenHLSProofSpan           func(time.Duration) time.Duration
+	continuousCapture            continuousCaptureFunc
+	recoverContinuousSegment     func(context.Context, string, time.Duration) (capture.Segment, error)
+	recoverContinuousSegmentFile func(context.Context, *os.File, string, time.Duration) (capture.Segment, error)
+	surrenderJobs                sync.Map // job id -> *surrenderJobState
+	surrenderObservationMu       sync.Mutex
 }
 
 var (
@@ -160,15 +167,17 @@ func NewWorker(cfg Config) (*Worker, error) {
 		return nil, err
 	}
 	return &Worker{
-		cfg:                     cfg,
-		heartbeatInt:            time.Duration(cfg.HeartbeatSec) * time.Second,
-		leaseSafetyMargin:       5 * time.Second,
-		reconnectDelay:          reconnectBackoff,
-		frozenHLSAllowlist:      frozenHLSAllowlist,
-		frozenHLSObserve:        observeFrozenHLS,
-		frozenHLSPollMax:        30 * time.Second,
-		frozenHLSForceCapture:   frozenHLSForcedCaptureMax,
-		frozenHLSSafetyInterval: time.Second,
+		cfg:                          cfg,
+		heartbeatInt:                 time.Duration(cfg.HeartbeatSec) * time.Second,
+		leaseSafetyMargin:            5 * time.Second,
+		reconnectDelay:               reconnectBackoff,
+		frozenHLSAllowlist:           frozenHLSAllowlist,
+		frozenHLSObserve:             observeFrozenHLS,
+		frozenHLSPollMax:             30 * time.Second,
+		frozenHLSForceCapture:        frozenHLSForcedCaptureMax,
+		frozenHLSSafetyInterval:      time.Second,
+		recoverContinuousSegment:     capture.RecoverContinuousSegment,
+		recoverContinuousSegmentFile: capture.RecoverContinuousSegmentFile,
 	}, nil
 }
 
@@ -180,8 +189,32 @@ func (w *Worker) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Register every durable producer journal before the first lease poll. The
+	// recovery attempt may remain pending (for example while the API is down), but
+	// beginActiveSurrenderJob must already see that authority and refuse to start a
+	// second capture generation over bytes from the first one.
+	transportEnabled := w.surrenderTransportEnabled()
+	if transportEnabled {
+		if _, err := loadSurrenderTransportObservations(surrenderTransportObservationPath(w.surrenderJournalRoot())); err != nil {
+			return fmt.Errorf("validate surrender observation journal: %w", err)
+		}
+		if err := w.restoreClaimCredential(); err != nil {
+			return fmt.Errorf("restore recording claim credential: %w", err)
+		}
+		if err := w.recoverProducerJournals(ctx); err != nil {
+			return err
+		}
+	}
+
 	sem := make(chan struct{}, w.cfg.Concurrency)
 	var wg sync.WaitGroup
+	if transportEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.recoveryLoop(ctx)
+		}()
+	}
 
 	// Independent droplet-heartbeat ticker (SRE-drain-liveness): touch droplet
 	// liveness every HeartbeatSec regardless of whether a job is held, so an idle
@@ -260,7 +293,10 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			<-sem
 			return
 		}
-		job, err := w.cfg.Client.LeaseRecordingJob(ctx)
+		// Footage always wins the slot. A targeted qualification probe may be
+		// claimed only after the ordinary lease endpoint has authoritatively said
+		// that no recording job is due for this worker.
+		job, err := w.cfg.Client.LeaseRecordingJobWithSurrenderTransport(ctx, w.surrenderTransportEnabled())
 		if err != nil {
 			if w.cfg.LeaseGate != nil {
 				w.cfg.LeaseGate.RUnlock()
@@ -270,6 +306,24 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 				log.Printf("recording worker lease error: %v", err)
 			}
 			return
+		}
+		if job == nil && !w.cfg.SkipDropletHeartbeat {
+			probe, probeErr := w.cfg.Client.LeaseTargetedProbe(ctx)
+			if probeErr != nil && !errors.Is(probeErr, context.Canceled) {
+				log.Printf("recording worker targeted probe lease error: %v", probeErr)
+			}
+			if probe != nil {
+				if w.cfg.LeaseGate != nil {
+					w.cfg.LeaseGate.RUnlock()
+				}
+				wg.Add(1)
+				go func(lease recordingapi.TargetedProbeLease) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					w.processTargetedProbe(ctx, lease)
+				}(*probe)
+				continue
+			}
 		}
 		if job == nil {
 			if w.cfg.LeaseGate != nil {
@@ -297,6 +351,56 @@ func (w *Worker) drain(ctx context.Context, sem chan struct{}, wg *sync.WaitGrou
 			}
 			w.processJob(ctx, j)
 		}(*job)
+	}
+}
+
+func (w *Worker) processTargetedProbe(ctx context.Context, lease recordingapi.TargetedProbeLease) {
+	if lease.Target == nil {
+		return
+	}
+	evidence := recordability.ProbeStreamTargeted(ctx, *lease.Target, recordability.DefaultWindow, recordability.DefaultSegment)
+	if evidence.CleanupDir != "" {
+		defer func() { _ = os.RemoveAll(evidence.CleanupDir) }()
+	}
+	if evidence.Result == recordability.ResultOK {
+		mediaInfo, mediaErr := os.Stat(evidence.MediaPath)
+		frameInfo, frameErr := os.Stat(evidence.FramePath)
+		if mediaErr != nil || frameErr != nil || mediaInfo.Size() <= 0 || frameInfo.Size() <= 0 ||
+			(lease.Target.MediaMaxSizeBytes > 0 && mediaInfo.Size() > lease.Target.MediaMaxSizeBytes) ||
+			(lease.Target.FrameMaxSizeBytes > 0 && frameInfo.Size() > lease.Target.FrameMaxSizeBytes) ||
+			strings.TrimSpace(lease.Target.MediaUploadURL) == "" || strings.TrimSpace(lease.Target.FrameUploadURL) == "" {
+			log.Printf("recording worker targeted probe quarantine payload invalid stream_id=%d attempt_id=%s", lease.Target.ID, lease.Target.AttemptID)
+			return
+		}
+		if err := w.cfg.Client.UploadFile(ctx, lease.Target.MediaUploadURL, evidence.MediaPath, "application/zip"); err != nil {
+			log.Printf("recording worker targeted probe media upload failed stream_id=%d attempt_id=%s: %v", lease.Target.ID, lease.Target.AttemptID, err)
+			return
+		}
+		if err := w.cfg.Client.UploadFile(ctx, lease.Target.FrameUploadURL, evidence.FramePath, "image/jpeg"); err != nil {
+			log.Printf("recording worker targeted probe frame upload failed stream_id=%d attempt_id=%s: %v", lease.Target.ID, lease.Target.AttemptID, err)
+			return
+		}
+		// Quarantine objects are now the evidence transport. Never duplicate raw
+		// frame bytes into the JSON completion request.
+		evidence.FrameBase64 = ""
+	}
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		err := w.cfg.Client.SubmitTargetedProbeEvidence(ctx, lease, evidence)
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			log.Printf("recording worker targeted probe evidence submit failed stream_id=%d attempt_id=%s: %v", lease.Target.ID, lease.Target.AttemptID, err)
+			return
+		}
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
@@ -445,6 +549,12 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 // the same per-second keys (idempotent).
 func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.RecordingJob) {
 	w.cfg.RelayDiagnostics.Start(job)
+	jobState, stateErr := w.beginActiveSurrenderJob(job)
+	if stateErr != nil {
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_lifecycle_busy", stateErr)
+		return
+	}
+	defer w.endActiveSurrenderJob(jobState)
 	if err := w.ensureCaptureTempDir(); err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", err)
 		w.fail(ctx, job.JobID, job.LeaseToken, err)
@@ -453,7 +563,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	canceled := w.startHeartbeat(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
+	canceled, stopRequired := w.startHeartbeatWithSourceStop(jobCtx, cancel, job.JobID, job.LeaseToken, job.LeaseExpiresAt)
 
 	clipDuration := time.Duration(job.ClipDurationSec) * time.Second
 
@@ -489,7 +599,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// leaves the previous attempt's value untouched, as the inline path did).
 	segmentDeliveryPending := false
 	var captureSequence int64
-	seenSegmentSHA := make(map[string]struct{})
+	var captureOrdinal int64
 	// CaptureContinuous owns one media chain per ffmpeg attempt. This job-scoped
 	// high-water mark preserves genuine reconnect downtime while ensuring a
 	// restarted resolver or DVR tail can never move behind accepted footage.
@@ -497,7 +607,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// transcoded here.
 	var timelineEnd time.Time
 	progress := newContinuousProgress(time.Now())
-	deliverSegment := func(sourceURL string, seg capture.Segment) error {
+	deliverSegment := func(sourceURL string, producer *captureProducerJournal, seg capture.Segment) error {
 		w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "finalize_read", seg.FinalizeReadDuration)
 		w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "finalize_hash", seg.FinalizeHashDuration)
 		w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "finalize_probe", seg.FinalizeProbeDuration)
@@ -514,6 +624,17 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		segmentCtx, segmentCancel := continuousSegmentDeliveryContext(jobCtx, job.WindowEndAt, time.Now())
 		defer segmentCancel()
 		alreadyIngested := false
+		var artifact *captureArtifactJournal
+		var artifactErr error
+		var artifactDevice, artifactInode uint64
+		if producer != nil && producer.CaptureSet != nil {
+			artifact, artifactErr = w.materializeCaptureSetArtifact(segmentCtx, job, producer, seg.CaptureSequence)
+		} else {
+			artifact, artifactErr = captureArtifactForSequence(producer, seg.CaptureSequence)
+		}
+		if artifactErr != nil {
+			return artifactErr
+		}
 		err := deliverSegmentWithRetry(segmentCtx, segmentDeliveryRetryDelay, func() bool {
 			return w.diskHasSpace(w.cfg.MinActiveFreeBytes)
 		}, segmentDeliveryOps{
@@ -521,7 +642,21 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				started := time.Now()
 				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "reserve", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_reserve_upload")
-				reserved, err := w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs)
+				var reserved recordingapi.ClipUploadIntent
+				var err error
+				if producer != nil {
+					artifactDevice, artifactInode, err = w.recordProducerArtifact(job.JobID, producer, seg, artifact.IntentID)
+					if err != nil {
+						return recordingapi.ClipUploadIntent{}, err
+					}
+					if producer.CaptureSet != nil {
+						reserved, err = w.cfg.Client.SealCaptureSetArtifact(segmentCtx, job.JobID, job.LeaseToken, producer.CaptureSet.SetID, artifact.Ordinal, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, captureUnixMicro(seg.StartAt), seg.SizeBytes, seg.SHA256)
+					} else {
+						reserved, err = w.cfg.Client.SealCaptureArtifact(segmentCtx, job.JobID, job.LeaseToken, artifact.IntentID, producer.ProducerID, seg.CaptureSequence, segStartMs, seg.SizeBytes, seg.SHA256)
+					}
+				} else {
+					reserved, err = w.cfg.Client.ReserveClipUpload(segmentCtx, job.JobID, job.LeaseToken, seg.MIMEType, seg.SHA256, segStartMs)
+				}
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_reserve_upload_failed", err)
 				}
@@ -532,7 +667,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "put", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_uploading")
 				uploadCtx, uploadCancel := context.WithTimeout(segmentCtx, recordingapi.UploadTimeout)
-				err := w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+				var err error
+				if producer != nil {
+					err = w.cfg.Client.UploadFileExact(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType, artifactDevice, artifactInode, seg.SizeBytes)
+				} else {
+					err = w.cfg.Client.UploadFile(uploadCtx, intent.UploadURL, seg.Path, seg.MIMEType)
+				}
 				uploadCancel()
 				if err != nil {
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_upload_failed", err)
@@ -543,7 +683,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				started := time.Now()
 				defer func() { w.cfg.RelayDiagnostics.DeliveryPhase(job.JobID, "ingest", time.Since(started)) }()
 				w.cfg.RelayDiagnostics.Stage(job.JobID, "segment_ingesting")
-				_, err := w.cfg.Client.IngestClip(segmentCtx, recordingapi.IngestClipRequest{
+				result, err := w.cfg.Client.IngestClipWithResult(segmentCtx, recordingapi.IngestClipRequest{
 					IntentID:                intent.IntentID,
 					JobID:                   job.JobID,
 					SizeBytes:               seg.SizeBytes,
@@ -570,6 +710,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 					w.cfg.RelayDiagnostics.Error(job.JobID, "segment_ingest_failed", err)
 					return err
 				}
+				w.surrenderState(job.JobID).markHead(result)
 				return nil
 			},
 			AlreadyIngested: func() { alreadyIngested = true },
@@ -583,7 +724,18 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// A different lease generation may have ingested this exact byte run.
 			// Acknowledge and remove only this local replay, but do not move the
 			// no-progress clock or claim a new unique ingest.
-			capture.RemoveSegmentFile(seg)
+			var removeErr error
+			if producer != nil {
+				removeErr = removeRetainedArtifact(seg.Path, artifactDevice, artifactInode)
+			} else {
+				removeErr = os.Remove(seg.Path)
+			}
+			if removeErr != nil && !os.IsNotExist(removeErr) {
+				return removeErr
+			}
+			if journalErr := w.acknowledgeProducerArtifact(job.JobID, producer, seg.Path); journalErr != nil {
+				w.cfg.RelayDiagnostics.Error(job.JobID, "segment_journal_ack_failed", journalErr)
+			}
 			return errSegmentReplayAcknowledged
 		}
 		if err != nil {
@@ -593,7 +745,18 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			return err
 		}
 		progress.mark(time.Now())
-		capture.RemoveSegmentFile(seg)
+		var removeErr error
+		if producer != nil {
+			removeErr = removeRetainedArtifact(seg.Path, artifactDevice, artifactInode)
+		} else {
+			removeErr = os.Remove(seg.Path)
+		}
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return removeErr
+		}
+		if journalErr := w.acknowledgeProducerArtifact(job.JobID, producer, seg.Path); journalErr != nil {
+			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_journal_ack_failed", journalErr)
+		}
 		w.cfg.RelayDiagnostics.Segment(job.JobID, seg.StartAt)
 		log.Printf("recording worker job=%d recording=%d continuous segment ingested start=%s size=%d",
 			job.JobID, job.RecordingID, seg.StartAt.UTC().Format(time.RFC3339), seg.SizeBytes)
@@ -696,6 +859,38 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			continue
 		}
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_capturing")
+		producerOrdinal := captureOrdinal + 1
+		jobState.mu.Lock()
+		if jobState.producer != nil {
+			producerOrdinal = jobState.producer.CaptureOrdinal
+		}
+		jobState.mu.Unlock()
+		producer, finitePlan, producerErr := w.reserveCaptureSet(jobCtx, job, producerOrdinal, captureSequence+1, outDir)
+		if producerErr != nil {
+			w.cfg.RelayDiagnostics.Error(job.JobID, "capture_producer_reserve_failed", producerErr)
+			// Reservation response loss is ambiguous: the server may already have
+			// frozen this producer's source/config identity. Do not re-resolve and
+			// reparent that identity to a later ffmpeg attempt. The recovery loop
+			// proves absent/current/expired authority before cleanup or capture.
+			cancel()
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", producerErr)
+			return
+		}
+		if producer != nil && producer.CaptureOrdinal > captureOrdinal {
+			captureOrdinal = producer.CaptureOrdinal
+		}
+		if producer != nil && producer.CaptureSet != nil {
+			launch, preExecErr := w.preflightCommittedCaptureSet(jobCtx, job, producer, outDir)
+			if preExecErr != nil {
+				producerErr = preExecErr
+				w.cfg.RelayDiagnostics.Error(job.JobID, "capture_set_preexec_failed", producerErr)
+				cancel()
+				return
+			}
+			if !launch {
+				continue
+			}
+		}
 		// One delivery pool per attempt. attemptCtx lets the first delivery failure
 		// stop ffmpeg as promptly as the old inline upload did; it is a child of
 		// windowCtx, so aborting an attempt never looks like a window close (the
@@ -706,12 +901,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		var mediaLagged atomic.Bool
 		pool := startSegmentDeliveryPool(w.cfg.UploadWorkers, abortAttempt, func(seg capture.Segment) error {
 			// Measure age when an upload worker actually reaches the descriptor, not
-			// when capture enqueues it. Submit is intentionally nonblocking, so only
+			// when capture enqueues it. Submit may pause at the producer's hard
+			// outstanding bound, so only
 			// this point can detect a queue that is falling behind real time. Stopping
 			// capture is control flow only: this segment and the rest of the accepted
 			// spool still drain normally on jobCtx.
 			observeContinuousMediaLag(seg.EndAt, time.Now(), w.cfg.ContinuousMaxMediaLag, &mediaLagged, abortAttempt)
-			return deliverSegment(resolved, seg)
+			return deliverSegment(resolved, producer, seg)
 		}, func(depth int) { w.cfg.RelayDiagnostics.DeliveryQueue(job.JobID, depth) })
 		var diskPressure atomic.Bool
 		stopDiskMonitor := make(chan struct{})
@@ -721,13 +917,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			go monitorContinuousUpdateDrain(stopUpdateMonitor, w.cfg.DrainForUpdate, abortAttempt)
 		}
 		submitInCaptureOrder := func(seg capture.Segment) error {
-			if _, duplicate := seenSegmentSHA[seg.SHA256]; seg.SHA256 != "" && duplicate {
-				// A reconnect may replay the tail of an HLS playlist. Do not enqueue,
-				// sequence, or advance either media clock for exact bytes already
-				// accepted by this worker generation.
-				capture.RemoveSegmentFile(seg)
-				return capture.ErrContinuousSegmentDuplicate
-			}
 			seg = clampContinuousSegmentTimeline(seg, timelineEnd)
 			// Some live HLS origins briefly drain an already-published DVR tail
 			// faster than wall time after a reconnect. Keep every source-quality
@@ -749,9 +938,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			captureSequence = seg.CaptureSequence
 			timelineEnd = seg.EndAt
-			if seg.SHA256 != "" {
-				seenSegmentSHA[seg.SHA256] = struct{}{}
-			}
 			if w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load() {
 				abortAttempt()
 			}
@@ -761,42 +947,113 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if captureContinuous == nil {
 			captureContinuous = continuousCaptureForJob(job)
 		}
-		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
+		var captureErr error
+		if producer != nil && producer.CaptureSet != nil {
+			captureErr = capture.CaptureContinuousWithFinitePlanAndStop(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders, job.TimestampContractSupported, finitePlan, stopRequired, w.captureSetStopBarrier(job, producer, pool, &captureSequence))
+		} else {
+			captureErr = captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
+		}
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()
+		spoolDir := outDir
+		if producer != nil && strings.TrimSpace(producer.OutputDir) != "" {
+			spoolDir = producer.OutputDir
+		}
+		remainingProducerFiles, spoolErr := filepath.Glob(filepath.Join(spoolDir, "seg-*.mp4"))
+		durableProducerSpool := producer != nil && (delivery.pending > 0 || spoolErr != nil || len(remainingProducerFiles) > 0)
+		var producerFinishErr error
+		if durableProducerSpool {
+			producerFinishErr = fmt.Errorf("capture producer retains durable local spool")
+			if spoolErr != nil {
+				producerFinishErr = errors.Join(producerFinishErr, spoolErr)
+			}
+			captureErr = errors.Join(captureErr, producerFinishErr)
+		}
 		abortAttempt()
 		captureErr = joinSegmentDeliveryError(captureErr, delivery.err)
 		if diskPressure.Load() {
 			captureErr = errors.Join(captureErr, errDiskPressure)
 		}
-		if delivery.submitted > 0 {
-			segmentDeliveryPending = delivery.pending > 0
+		if delivery.submitted > 0 || durableProducerSpool {
+			segmentDeliveryPending = delivery.pending > 0 || durableProducerSpool
 		}
-		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr, mediaLagged.Load()) {
-			if removeErr := os.RemoveAll(outDir); removeErr != nil {
+		if shouldCleanupCaptureProducerAttempt(producer != nil, durableProducerSpool, segmentDeliveryPending, captureErr, mediaLagged.Load()) {
+			var removeErr error
+			if producer != nil {
+				if producer.OutputDir != outDir {
+					removeErr = removeCaptureNamespaceSentinel(outDir)
+				} else {
+					removeErr = removeEmptyRetainedDirectory(outDir)
+				}
+			} else {
+				removeErr = os.RemoveAll(outDir)
+			}
+			if removeErr != nil {
+				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
+			}
+		}
+		if producerFinishErr != nil {
+			// The producer reservation and any local/artifact bytes remain durably
+			// journaled. Stop heartbeating so the server can issue the exact upload-
+			// only recovery grant (or expose an already-committed terminal result)
+			// instead of looping forever behind a nonterminal producer ordinal.
+			cancel()
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", producerFinishErr)
+			return
+		}
+		if producer != nil {
+			if finishErr := w.finishCaptureProducer(jobCtx, job, producer, captureProducerTerminalResult(producer), ""); finishErr != nil {
+				cancel()
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", finishErr)
+				return
+			}
+			if producer.OutputDir != outDir {
+				if removeErr := removeEmptyRetainedDirectory(producer.OutputDir); removeErr != nil {
+					w.cfg.RelayDiagnostics.Error(job.JobID, "retained_temp_cleanup_failed", removeErr)
+				}
+			}
+			var removeErr error
+			if producer.OutputDir != outDir {
+				removeErr = removeCaptureNamespaceSentinel(outDir)
+			} else {
+				removeErr = removeEmptyRetainedDirectory(outDir)
+			}
+			if removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
 			}
 		}
 
 		if errors.Is(captureErr, errDiskPressure) {
-			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure)
-			return
+			if w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure) {
+				return
+			}
+			backoff(segmentDeliveryRetryDelay)
+			continue
 		}
 		windowClosed := continuousShouldStop(canceled(), windowCtx.Err() != nil)
 		if continuousSelfUpdateCanSurrender(w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load(), delivery.err, windowClosed) {
 			err := fmt.Errorf("relay is draining for a verified self-update")
-			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, err)
-			return
+			if w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, err) {
+				return
+			}
+			continue
 		}
 		if continuousMediaLagCanSurrender(mediaLagged.Load(), delivery.err, windowClosed) {
 			err := fmt.Errorf("continuous media timeline fell behind by at least %s", w.cfg.ContinuousMaxMediaLag)
-			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
-			return
+			if w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err) {
+				return
+			}
+			continue
 		}
 		if continuousDeliveryFailureShouldFail(captureErr, windowClosed) {
+			if finishErr := w.finishActiveCaptureProducer(jobCtx, job); finishErr != nil {
+				cancel()
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", finishErr)
+				return
+			}
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
 			w.fail(ctx, job.JobID, job.LeaseToken, captureErr)
 			return
@@ -824,11 +1081,15 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			)
 			switch {
 			case errors.Is(observeErr, errDiskPressure):
-				w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure)
-				return
+				if w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure) {
+					return
+				}
+				continue
 			case errors.Is(observeErr, errFrozenHLSSelfUpdate):
-				w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, observeErr)
-				return
+				if w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, observeErr) {
+					return
+				}
+				continue
 			case observeErr != nil && windowCtx.Err() != nil:
 				windowClosed = true
 			case cycleResult == frozenHLSCycleResumeCapture:
@@ -877,6 +1138,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	if canceled() {
 		log.Printf("recording worker job=%d continuous canceled", job.JobID)
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "canceled", nil)
+		return
+	}
+	if err := w.finishActiveCaptureProducer(ctx, job); err != nil {
+		cancel()
+		w.cfg.RelayDiagnostics.Finish(job.JobID, "producer_recovery_pending", err)
 		return
 	}
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "completing")
@@ -1100,10 +1366,45 @@ func (w *Worker) surrenderContinuousJob(ctx context.Context, cancel context.Canc
 }
 
 func (w *Worker) surrenderContinuousJobForReason(ctx context.Context, cancel context.CancelFunc, job recordingapi.RecordingJob, reason recordingapi.SurrenderReason, cause error) bool {
+	errorText := SanitizeDiagnosticError(cause)
+	if strings.TrimSpace(job.LeaseToken) != "" && job.SurrenderTransportVersion == 1 {
+		result, surrenderErr := w.surrenderRecordingJobV1(ctx, job, reason, errorText)
+		if surrenderErr != nil {
+			// The bounded v1 transport budget elapsed without an authoritative
+			// result. Stop heartbeating deliberately so the server's typed expiry
+			// recovery can take over; never leave an apparently live silent lease.
+			cancel()
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "surrender_transport_exhausted", surrenderErr)
+			log.Printf("recording worker job=%d surrender transport exhausted: %v", job.JobID, surrenderErr)
+			return true
+		}
+		switch result.Result {
+		case "committed", "stale_fence":
+			cancel()
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "surrendered", cause)
+			return true
+		case "window_closed":
+			completeCtx, completeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			completeErr := w.cfg.Client.CompleteRecordingJob(completeCtx, job.JobID, job.LeaseToken)
+			completeCancel()
+			cancel()
+			if completeErr == nil {
+				w.cfg.RelayDiagnostics.Finish(job.JobID, "done", nil)
+				return true
+			}
+			w.cfg.RelayDiagnostics.Finish(job.JobID, "complete_failed", completeErr)
+			return true
+		case "stale_progress", "ineligible_spool":
+			// The lease remains valid and its heartbeat has never stopped. The
+			// caller resumes capture/delivery rather than expiring useful work.
+			return false
+		default:
+			return false
+		}
+	}
 	cancel()
 	surrenderCtx, surrenderCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer surrenderCancel()
-	errorText := SanitizeDiagnosticError(cause)
 	if surrenderErr := w.cfg.Client.SurrenderRecordingJob(surrenderCtx, job.JobID, job.LeaseToken, reason, errorText); surrenderErr != nil {
 		if job.WindowEndAt != nil && !time.Now().Before(*job.WindowEndAt) {
 			completeCtx, completeCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -1276,17 +1577,39 @@ func shouldCleanupContinuousAttempt(deliveryPending bool, captureErr error, medi
 		errors.Is(captureErr, errSegmentDeliveryExhausted)
 }
 
+func shouldCleanupCaptureProducerAttempt(hasDurableProducer, durableProducerSpool, deliveryPending bool, captureErr error, mediaLagged bool) bool {
+	// A v1 producer is the server-side promise that this exact local spool will
+	// either ingest or receive an honest terminal result. Pending producer bytes
+	// therefore survive every ordinary capture/error/window-close classification;
+	// expiry recovery, not local cleanup, owns their final disposition.
+	if hasDurableProducer && durableProducerSpool {
+		return false
+	}
+	return shouldCleanupContinuousAttempt(deliveryPending, captureErr, mediaLagged)
+}
 func frozenHLSCanObserve(windowClosed bool, deliveryErr error, deliveryPending bool, captureErr error) bool {
 	return !windowClosed && deliveryErr == nil && !deliveryPending &&
 		capture.IsCleanContinuousNoOutput(captureErr)
 }
 
 func (w *Worker) ensureCaptureTempDir() error {
-	if strings.TrimSpace(w.cfg.CaptureTempDir) == "" {
+	root := strings.TrimSpace(w.cfg.CaptureTempDir)
+	if root == "" {
 		return nil
 	}
-	if err := os.MkdirAll(w.cfg.CaptureTempDir, 0o700); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return fmt.Errorf("create capture temp directory: %w", err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("capture temp directory is not a private real directory")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return fmt.Errorf("make capture temp directory private: %w", err)
+	}
+	info, err = os.Lstat(root)
+	if err != nil || info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("capture temp directory permissions are not private")
 	}
 	return nil
 }
@@ -1296,6 +1619,9 @@ func retryableTransportError(ctx context.Context, err error) bool {
 		return false
 	}
 	if errors.Is(err, errReplaySegmentDelivery) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
 	var statusErr *apihttp.StatusError
@@ -1321,8 +1647,25 @@ func isUploadIntentStateConflict(err error) bool {
 // job context (aborting ffmpeg). The returned func reports whether a cancel was
 // observed, so the caller skips ingest for a canceled job.
 func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) func() bool {
+	canceled, stopRequired := w.startHeartbeatWithSourceStop(ctx, cancel, jobID, leaseToken, leaseExpiresAt)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stopRequired:
+			cancel()
+		}
+	}()
+	return canceled
+}
+
+// startHeartbeatWithSourceStop keeps a source/config mutation distinct from a
+// lease cancellation. The finite capture process must enter its SIGSTOP +
+// namespace inventory protocol before the job context is canceled.
+func (w *Worker) startHeartbeatWithSourceStop(ctx context.Context, cancel context.CancelFunc, jobID int64, leaseToken string, leaseExpiresAt time.Time) (func() bool, <-chan struct{}) {
 	var mu sync.Mutex
 	wasCanceled := false
+	stopRequired := make(chan struct{})
+	var stopOnce sync.Once
 	markCanceled := func() {
 		mu.Lock()
 		wasCanceled = true
@@ -1344,7 +1687,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 				return
 			case <-ticker.C:
 				heartbeatCtx, heartbeatCancel := context.WithDeadline(ctx, leaseExpiresAt)
-				cancelSignal, renewedUntil, err := w.cfg.Client.HeartbeatRecordingJob(heartbeatCtx, jobID, leaseToken)
+				heartbeat, err := w.cfg.Client.HeartbeatRecordingJobState(heartbeatCtx, jobID, leaseToken)
 				heartbeatCancel()
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
@@ -1352,12 +1695,17 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 					}
 					continue
 				}
-				if cancelSignal {
+				if heartbeat.Cancel {
 					log.Printf("recording worker job=%d received cancel signal", jobID)
 					markCanceled()
 					return
 				}
-				leaseExpiresAt = renewedUntil
+				if heartbeat.StopRequired {
+					log.Printf("recording worker job=%d received source stop signal", jobID)
+					stopOnce.Do(func() { close(stopRequired) })
+					return
+				}
+				leaseExpiresAt = heartbeat.LeaseExpiresAt
 				if !leaseTimer.Stop() {
 					select {
 					case <-leaseTimer.C:
@@ -1372,7 +1720,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelFunc, 
 		mu.Lock()
 		defer mu.Unlock()
 		return wasCanceled
-	}
+	}, stopRequired
 }
 
 func (w *Worker) fail(ctx context.Context, jobID int64, leaseToken string, runErr error) {

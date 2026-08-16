@@ -321,6 +321,9 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	if !strings.Contains(out, "RECORDING_WORKER_CONCURRENCY='1'") {
 		t.Fatalf("cloud-init missing worker concurrency (must equal capacity)")
 	}
+	if !strings.Contains(out, "RECORDING_CAPTURE_TEMP_DIR='/var/lib/stoarama/recording-spool'") || !strings.Contains(out, "install -d -m 0700 -o root -g root /var/lib/stoarama/recording-spool") {
+		t.Fatal("cloud-init missing durable private recording spool")
+	}
 	if !strings.Contains(out, "BACKEND_API_URL='https://stoarama-api.onrender.com'") {
 		t.Fatalf("cloud-init missing BACKEND_API_URL env")
 	}

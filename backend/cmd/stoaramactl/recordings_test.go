@@ -1,10 +1,18 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestScheduleBatchDryRunFlagSupportsExplicitFalse(t *testing.T) {
@@ -75,5 +83,72 @@ func TestDecodeRecordingBatchSpecLimit(t *testing.T) {
 		if (err != nil) != wantErr {
 			t.Fatalf("count=%d err=%v", count, err)
 		}
+	}
+}
+
+func TestDecodeCampaignAdmissionSpecStrictSingleObject(t *testing.T) {
+	valid := `{"request_id":"00000000-0000-0000-0000-000000000001","entries":[]}`
+	got, err := decodeCampaignAdmissionSpec(strings.NewReader(valid))
+	if err != nil || string(got) != valid {
+		t.Fatalf("decode valid approval: got=%s err=%v", got, err)
+	}
+	for _, invalid := range []string{`[]`, `null`, `{}` + `{}`, ``} {
+		if _, err := decodeCampaignAdmissionSpec(strings.NewReader(invalid)); err == nil {
+			t.Fatalf("accepted invalid approval envelope %q", invalid)
+		}
+	}
+}
+
+func TestCandidateScenePresentationRequestAndResponse(t *testing.T) {
+	frame := []byte("jpeg-proof")
+	frameSHA := fmt.Sprintf("%x", sha256.Sum256(frame))
+	presentationID := uuid.New()
+	requestID := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/account/recordings/qualification/scene-presentations/22" || r.URL.Query().Get("stream_id") != "11" || r.URL.Query().Get("authority_code") != "decision" || r.URL.Query().Get("request_id") != requestID.String() || r.Header.Get("Cookie") != "stoarama_session=secret" || r.Header.Get("Accept") != "image/jpeg" {
+			t.Fatalf("unexpected presentation request: method=%s url=%s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("X-Stoarama-Presentation-ID", presentationID.String())
+		w.Header().Set("X-Content-SHA256", frameSHA)
+		_, _ = w.Write(frame)
+	}))
+	defer server.Close()
+	got, err := getRecordingCandidateScenePresentation(context.Background(), server.URL, "stoarama_session=secret", 11, 22, "decision", requestID)
+	if err != nil || got.PresentationID != presentationID.String() || got.FrameSHA256 != frameSHA || string(got.Body) != string(frame) {
+		t.Fatalf("presentation=%+v err=%v", got, err)
+	}
+}
+
+func TestRecordingSceneAttestPayloadModesAndRequest(t *testing.T) {
+	presentationID := uuid.NewString()
+	candidate, err := recordingSceneAttestPayload(0, 22, presentationID, "  Exact Scene  ")
+	if err != nil || candidate["presentation_id"] != presentationID || candidate["scene_identity"] != "Exact Scene" || candidate["stream_id"] != nil || candidate["authority_code"] != nil {
+		t.Fatalf("candidate payload=%v err=%v", candidate, err)
+	}
+	recording, err := recordingSceneAttestPayload(33, 22, "", "Exact Scene")
+	if err != nil || recording["recording_id"] != int64(33) {
+		t.Fatalf("recording payload=%v err=%v", recording, err)
+	}
+	for _, args := range []struct {
+		recordingID int64
+		receipt     string
+	}{{33, presentationID}, {0, "bad"}} {
+		if _, err := recordingSceneAttestPayload(args.recordingID, 22, args.receipt, "Exact Scene"); err == nil {
+			t.Fatalf("accepted ambiguous payload %+v", args)
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/account/recordings/qualification/scene-attest" || r.Header.Get("Cookie") != "stoarama_session=secret" || strings.Contains(string(body), `"stream_id"`) || strings.Contains(string(body), `"authority_code"`) || !strings.Contains(string(body), `"presentation_id":"`+presentationID+`"`) {
+			t.Fatalf("unexpected attest request: method=%s path=%s body=%s", r.Method, r.URL.Path, body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"evidence_id":44}`))
+	}))
+	defer server.Close()
+	if got := postRecordingSessionJSON(context.Background(), server.URL, "stoarama_session=secret", "/api/v1/account/recordings/qualification/scene-attest", candidate); got["evidence_id"] != float64(44) {
+		t.Fatalf("attest response=%v", got)
 	}
 }

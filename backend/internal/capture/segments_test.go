@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/surrenderplan"
 	"github.com/google/uuid"
 )
 
@@ -291,6 +294,35 @@ printf '%s\n' '{"format":{"duration":"60.0"},"streams":[{"codec_type":"video","c
 	}
 	if meta.VideoWidth != 1280 || meta.VideoHeight != 720 {
 		t.Fatalf("dimensions=%dx%d want 1280x720", meta.VideoWidth, meta.VideoHeight)
+	}
+}
+
+func TestRecoverContinuousSegmentFileKeepsInventoriedDescriptorAcrossPathSwap(t *testing.T) {
+	dir := t.TempDir()
+	installTimestampProbeFixture(t, dir)
+	path := filepath.Join(dir, "seg-20260814-120000.mp4")
+	original := []byte("inventoried recovery bytes")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err = os.Rename(path, path+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte("replacement bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	segment, err := RecoverContinuousSegmentFile(context.Background(), file, filepath.Base(path), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSHA := sha256.Sum256(original)
+	if segment.SizeBytes != int64(len(original)) || segment.SHA256 != hex.EncodeToString(wantSHA[:]) {
+		t.Fatalf("recovery segment read replacement: size=%d sha=%s", segment.SizeBytes, segment.SHA256)
 	}
 }
 
@@ -816,6 +848,85 @@ func TestCaptureContinuousStopsAliveStalledChild(t *testing.T) {
 	}
 }
 
+func TestFiniteCaptureStopBarrierSealsNamespaceBeforeContinue(t *testing.T) {
+	temp := t.TempDir()
+	installTimestampProbeFixture(t, temp)
+	ffmpeg := filepath.Join(temp, "ffmpeg")
+	script := `#!/bin/sh
+for last do :; done
+out=${last%/*}
+printf current > "$out/seg-20260814-120000.mp4"
+trap 'printf late > "$out/seg-20260814-120005.mp4" 2>/dev/null; exit 0' INT TERM
+while :; do sleep 0.05; done
+`
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", ffmpeg)
+	output := filepath.Join(temp, "output")
+	if err := os.Mkdir(output, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := surrenderplan.Build(time.Now().UTC(), time.Now().UTC().Add(10*time.Second), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	barrierEntered := make(chan struct{})
+	retained := output + ".retained"
+	barrier := func(_ context.Context, path string) (string, error) {
+		close(barrierEntered)
+		if err := os.Rename(path, retained); err != nil {
+			return "", err
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0)
+		if err != nil {
+			return "", err
+		}
+		if err = file.Close(); err != nil {
+			return "", err
+		}
+		return retained, nil
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- CaptureContinuousWithFinitePlanAndStop(
+			context.Background(), "https://example.com/live.m3u8", 5*time.Second, "", nil, output,
+			func(Segment) error { return nil }, "", false, plan, stop, barrier,
+		)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(output, "seg-20260814-120000.mp4")); err == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("fake ffmpeg did not create initial leaf")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(stop)
+	select {
+	case <-barrierEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop barrier was not entered")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrContinuousStopRequired) {
+			t.Fatalf("capture error=%v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("stopped capture did not reap")
+	}
+	if info, err := os.Lstat(output); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("old output namespace is not a sentinel: info=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(retained, "seg-20260814-120005.mp4")); !os.IsNotExist(err) {
+		t.Fatalf("continued child created a post-ACK leaf: %v", err)
+	}
+}
+
 func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
 	temp := t.TempDir()
 	installTimestampProbeFixture(t, temp)
@@ -893,7 +1004,7 @@ while :; do sleep 0.1; done
 			deliveredAttemptIDs = append(deliveredAttemptIDs, seg.CaptureAttemptID)
 			cancel()
 			return nil
-		}, "", time.Second, 5*time.Second, true,
+		}, "", 5*time.Second, 10*time.Second, true, nil,
 	)
 	if err != nil {
 		t.Fatalf("capture malformed-audio fallback: %v", err)
@@ -990,9 +1101,9 @@ exit 1
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- captureContinuousWithHeaders(ctx, "https://example.com/live.m3u8", time.Second, "", nil, output, func(Segment) error { return nil }, "", time.Second, time.Second)
+		errCh <- captureContinuousWithHeaders(ctx, "https://example.com/live.m3u8", time.Second, "", nil, output, func(Segment) error { return nil }, "", 5*time.Second, 5*time.Second)
 	}()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		body, _ := os.ReadFile(logPath)
 		if strings.Contains(string(body), "invoked") {
@@ -1031,14 +1142,14 @@ func TestCaptureContinuousRetriesFinalSweepAfterFinalizeFailure(t *testing.T) {
 	}
 
 	deliveries := 0
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	err := captureContinuousWithHeaders(
 		ctx, "https://example.com/live.m3u8", time.Second, "", nil, output,
 		func(Segment) error {
 			deliveries++
 			return nil
-		}, "", time.Second, 5*time.Second,
+		}, "", 5*time.Second, 10*time.Second,
 	)
 	if err == nil || !strings.Contains(err.Error(), "finalize after sweep failure") {
 		t.Fatalf("capture error=%v, want final-sweep recovery error", err)
@@ -1098,6 +1209,24 @@ func TestBuildFFmpegContinuousArgsSourceCopy(t *testing.T) {
 	wantTail := []string{"-f", "segment", "-segment_time", "60", "-reset_timestamps", "1", "-segment_format", "mp4", "-strftime", "1", "/out/seg-%Y%m%d-%H%M%S.mp4"}
 	if got := args[len(args)-len(wantTail):]; !slices.Equal(got, wantTail) {
 		t.Fatalf("legacy mux tail=%q want exact %q", got, wantTail)
+	}
+}
+
+func TestApplyFiniteContinuousPlanPinsCardinalityAndPTSOrigin(t *testing.T) {
+	start := time.Date(2026, 8, 14, 7, 0, 0, 500000000, time.UTC)
+	plan, err := surrenderplan.Build(start, start.Add(3*time.Minute+250*time.Millisecond), 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := buildFFmpegContinuousArgs("https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, "", nil)
+	joined := strings.Join(applyFiniteContinuousPlan(args, plan), "\n")
+	for _, want := range []string{"-copyts\n-start_at_zero\n-i", "-segment_times\n60,120,180", "-t\n180.25", "-reset_timestamps\n1"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("finite args missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "-segment_time\n") {
+		t.Fatalf("open-ended segment_time survived finite plan:\n%s", joined)
 	}
 }
 
