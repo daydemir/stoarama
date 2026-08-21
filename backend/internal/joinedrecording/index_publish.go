@@ -35,7 +35,7 @@ type BatchIndexReadCapabilityResolver func(context.Context, BatchIndexPublicatio
 type FinalizeBatchIndex func(context.Context, BatchIndexPublicationClaim, PublishedBatchIndex) error
 
 func (c BatchIndexPublicationClaim) Validate(now time.Time) ([]byte, string, error) {
-	_, canonical, sha, err := BuildBatchIndex(c.Index)
+	_, canonical, sha, err := canonicalSealedBatchIndex(c.Index)
 	objectKey, keyErr := CanonicalBatchIndexObjectKey(c.Index.BatchID)
 	if err != nil || keyErr != nil || c.ProtocolVersion != JoinedProtocolVersion || c.ScopeID != c.Index.BatchID || c.ArtifactID <= 0 || !validLeaseID(c.LeaseID) || !validOperationToken(c.OperationToken) || !c.LeaseExpires.After(now) || c.StorageAuthority == "" || c.StorageBucket == "" || c.ExpectedSize != int64(len(canonical)) || c.ExpectedSHA256 != sha {
 		return nil, "", fmt.Errorf("invalid or expired batch-index publication claim")

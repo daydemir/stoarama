@@ -161,8 +161,8 @@ func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 		t.Fatalf("ledger publication failed: %+v %v", ledgerPublished, err)
 	}
 
-	index := testBatchIndex(t)
-	_, indexJSON, indexSHA, _ := BuildBatchIndex(index)
+	index, indexLedgers := testBatchIndex(t)
+	_, indexJSON, indexSHA, _ := BuildBatchIndex(index, testLedgerResolver(indexLedgers))
 	indexClaim := BatchIndexPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ScopeID: index.BatchID, ArtifactID: 80, LeaseID: leaseID, OperationToken: initialToken, LeaseExpires: expires, StorageAuthority: "cap.test", StorageBucket: "recordings", Index: index, ExpectedSize: int64(len(indexJSON)), ExpectedSHA256: indexSHA}
 	if _, err := PublishBatchIndexRenewing(context.Background(), nil, "other.test", indexClaim, nil, nil, nil, nil); err == nil {
 		t.Fatal("batch-index publication trusted claim-supplied storage authority")

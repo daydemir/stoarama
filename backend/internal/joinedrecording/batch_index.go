@@ -15,9 +15,26 @@ import (
 )
 
 const (
-	BatchIndexSchemaVersion = 1
-	MaxCanonicalJSONBytes   = 16 << 20
+	BatchIndexSchemaVersion            = 1
+	FrozenDenominatorProjectionVersion = 1
+	MaxCanonicalJSONBytes              = 16 << 20
 )
+
+// FrozenDenominatorLedgerProjection is the one compact identity projection
+// consumed in final-index ledger order. SourceClaimSHA256 already commits the
+// ledger's exact ordered source-only canonical projection.
+type FrozenDenominatorLedgerProjection struct {
+	RecordingID       int64  `json:"recording_id"`
+	LocalDate         string `json:"local_date"`
+	SourceClaimSHA256 string `json:"source_claim_sha256"`
+	SourceCount       int    `json:"source_count"`
+	SourceBytes       int64  `json:"source_bytes"`
+}
+
+type FrozenDenominatorProjection struct {
+	ProjectionVersion int                                 `json:"projection_version"`
+	Ledgers           []FrozenDenominatorLedgerProjection `json:"ledgers"`
+}
 
 type BatchIndexHour struct {
 	HourManifestArtifactID int64              `json:"hour_manifest_artifact_id"`
@@ -85,8 +102,65 @@ type BatchIndex struct {
 	Hours                     []BatchIndexHour      `json:"hours"`
 }
 
-func BuildBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
-	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || !lowerHex64(index.BatchGenerationSHA256) || !lowerHex64(index.FrozenDenominatorSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || recordingIDsSHA(index.RecordingIDs) != index.RecordingIDSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
+type AllocationLedgerResolver func(AllocationLedgerRef) (StreamDayAllocation, error)
+
+// BuildAllocationLedgerRef derives every caller-visible reference fact from
+// the exact canonical ledger artifact. Only its database artifact ID is
+// supplied separately.
+func BuildAllocationLedgerRef(artifactID int64, ledger StreamDayAllocation) (AllocationLedgerRef, error) {
+	canonical, artifactSHA, err := CanonicalAllocationLedgerArtifact(ledger)
+	if err != nil || artifactID <= 0 {
+		return AllocationLedgerRef{}, fmt.Errorf("canonical allocation ledger artifact is required")
+	}
+	relativePath, objectKey, err := CanonicalAllocationLedgerPaths(ledger.BatchID, ledger.RecordingID, ledger.LocalDate)
+	if err != nil {
+		return AllocationLedgerRef{}, err
+	}
+	hourIDs := make([]string, 12)
+	for hour := 1; hour <= 12; hour++ {
+		hourIDs[hour-1], err = CanonicalHourID(ledger.BatchID, ledger.RecordingID, ledger.LocalDate, hour, ledger.Generation)
+		if err != nil {
+			return AllocationLedgerRef{}, err
+		}
+	}
+	return AllocationLedgerRef{
+		ArtifactID:        artifactID,
+		RecordingID:       ledger.RecordingID,
+		LocalDate:         ledger.LocalDate,
+		QualificationSHA:  ledger.QualificationSHA,
+		SourceClaimSHA256: ledger.SourceClaimSHA256,
+		RelativePath:      relativePath,
+		ObjectKey:         objectKey,
+		SizeBytes:         int64(len(canonical)),
+		SHA256:            artifactSHA,
+		LedgerSHA256:      ledger.LedgerSHA256,
+		SourceCount:       ledger.SourceClipCount,
+		SourceBytes:       ledger.SourceBytes,
+		ScheduledHourIDs:  hourIDs,
+	}, nil
+}
+
+func ValidateAllocationLedgerRef(ref AllocationLedgerRef, ledger StreamDayAllocation) error {
+	want, err := BuildAllocationLedgerRef(ref.ArtifactID, ledger)
+	if err != nil || !sameCanonical([]AllocationLedgerRef{ref}, []AllocationLedgerRef{want}) {
+		return fmt.Errorf("allocation ledger reference differs from canonical artifact")
+	}
+	return nil
+}
+
+func BuildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (BatchIndex, []byte, string, error) {
+	if resolveLedger == nil {
+		return BatchIndex{}, nil, "", fmt.Errorf("canonical allocation ledger resolver is required")
+	}
+	return buildBatchIndex(index, resolveLedger)
+}
+
+func canonicalSealedBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
+	return buildBatchIndex(index, nil)
+}
+
+func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (BatchIndex, []byte, string, error) {
+	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || recordingIDsSHA(index.RecordingIDs) != index.RecordingIDSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index denominator differs")
 	}
 	seenRecording := map[int64]bool{}
@@ -119,6 +193,12 @@ func BuildBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
 		relative, objectKey, err := CanonicalAllocationLedgerPaths(index.BatchID, ledger.RecordingID, ledger.LocalDate)
 		if err != nil || !seenRecording[ledger.RecordingID] || ledger.ArtifactID <= 0 || seenArtifacts[ledger.ArtifactID] || ledger.RelativePath != relative || ledger.ObjectKey != objectKey || ledger.SizeBytes <= 0 || !lowerHex64(ledger.SHA256) || !lowerHex64(ledger.LedgerSHA256) || !lowerHex64(ledger.QualificationSHA) || !lowerHex64(ledger.SourceClaimSHA256) || ledger.SourceCount < 0 || ledger.SourceBytes < 0 || len(ledger.ScheduledHourIDs) != 12 {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger differs")
+		}
+		if resolveLedger != nil {
+			canonicalLedger, resolveErr := resolveLedger(ledger)
+			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, canonicalLedger) != nil {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
+			}
 		}
 		seenArtifacts[ledger.ArtifactID] = true
 		for hour := 1; hour <= 12; hour++ {
@@ -171,6 +251,10 @@ func BuildBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
 	if len(expectedHours) != 0 || sourceCount != index.SourceClipCount || sourceBytes != index.SourceBytes || hourSources != sourceCount || hourBytes != sourceBytes || mediaCount != index.FinalMediaCount {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch proof root does not exactly account its denominator")
 	}
+	denominatorSHA, err := ComputeFrozenDenominatorSHA256(index.AllocationLedgers)
+	if err != nil || denominatorSHA != index.FrozenDenominatorSHA256 {
+		return BatchIndex{}, nil, "", fmt.Errorf("frozen denominator evidence differs")
+	}
 	if generationSHA, err := ComputeBatchGenerationSHA256(index); err != nil || generationSHA != index.BatchGenerationSHA256 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch generation evidence differs")
 	}
@@ -179,6 +263,39 @@ func BuildBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index exceeds canonical limit")
 	}
 	return index, canonical, sha, nil
+}
+
+// ComputeFrozenDenominatorSHA256 hashes the exact ordered ledger-source
+// identity projection used by the backend and independently reproduced by the
+// NAS after validating each referenced ledger. The projection is bounded by
+// the fixed ledger denominator, not by the source-clip count.
+func ComputeFrozenDenominatorSHA256(ledgers []AllocationLedgerRef) (string, error) {
+	if len(ledgers) == 0 {
+		return "", fmt.Errorf("frozen denominator requires allocation ledgers")
+	}
+	projection := FrozenDenominatorProjection{
+		ProjectionVersion: FrozenDenominatorProjectionVersion,
+		Ledgers:           make([]FrozenDenominatorLedgerProjection, len(ledgers)),
+	}
+	for i, ledger := range ledgers {
+		if ledger.RecordingID <= 0 || !validLocalDate(ledger.LocalDate) || !lowerHex64(ledger.SourceClaimSHA256) || ledger.SourceCount < 0 || ledger.SourceBytes < 0 {
+			return "", fmt.Errorf("frozen denominator ledger %d differs", i+1)
+		}
+		projection.Ledgers[i] = FrozenDenominatorLedgerProjection{
+			RecordingID:       ledger.RecordingID,
+			LocalDate:         ledger.LocalDate,
+			SourceClaimSHA256: ledger.SourceClaimSHA256,
+			SourceCount:       ledger.SourceCount,
+			SourceBytes:       ledger.SourceBytes,
+		}
+	}
+	digest, _, err := stitchcert.CanonicalSHA(projection)
+	return digest, err
+}
+
+func validLocalDate(value string) bool {
+	parsed, err := time.Parse("2006-01-02", value)
+	return err == nil && parsed.Format("2006-01-02") == value
 }
 
 func ComputeBatchGenerationSHA256(index BatchIndex) (string, error) {
@@ -216,13 +333,28 @@ func ComputeBatchGenerationSHA256(index BatchIndex) (string, error) {
 }
 
 func recordingIDsSHA(ids []int64) string {
+	digest, _ := RecordingIDsSHA256(ids)
+	return digest
+}
+
+// RecordingIDsSHA256 hashes the ordered base-10 ID list with one LF after
+// every ID, including the terminal LF.
+func RecordingIDsSHA256(ids []int64) (string, error) {
+	if len(ids) == 0 {
+		return "", fmt.Errorf("recording identity list is empty")
+	}
 	var payload strings.Builder
+	seen := make(map[int64]bool, len(ids))
 	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			return "", fmt.Errorf("recording identity list differs")
+		}
+		seen[id] = true
 		payload.WriteString(strconv.FormatInt(id, 10))
 		payload.WriteByte('\n')
 	}
 	sum := sha256.Sum256([]byte(payload.String()))
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func CanonicalBatchIndexObjectKey(batchID string) (string, error) {

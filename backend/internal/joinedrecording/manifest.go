@@ -122,6 +122,40 @@ type HourManifestInput struct {
 	AllocationLedger   StreamDayAllocation
 }
 
+// BuildHourManifestAllocation constructs the exact ledger artifact and
+// boundary subset bound into one canonical hour manifest.
+func BuildHourManifestAllocation(artifactID int64, plan BatchPlan, ledger StreamDayAllocation) (HourManifestAllocation, error) {
+	if err := ValidatePlan(plan); err != nil {
+		return HourManifestAllocation{}, err
+	}
+	relativePath, objectKey, pathErr := CanonicalAllocationLedgerPaths(plan.BatchID, plan.RecordingID, plan.LocalDate)
+	ledgerBytes, artifactSHA, ledgerErr := CanonicalAllocationLedgerArtifact(ledger)
+	wantQualificationDay, qualificationOK := qualifiedDay(plan.Qualification, plan.LocalDate)
+	if pathErr != nil || ledgerErr != nil || !qualificationOK || artifactID <= 0 || ledger.BatchID != plan.BatchID || ledger.Generation != plan.Generation || ledger.RecordingID != plan.RecordingID || ledger.Timezone != plan.Timezone || ledger.LocalDate != plan.LocalDate || ledger.QualificationSHA != plan.Qualification.EvidenceSHA || !sameCanonical([]QualifiedDay{ledger.QualificationDay}, []QualifiedDay{wantQualificationDay}) || ledger.LedgerSHA256 != plan.AllocationLedgerSHA || ledger.HourSourceSHA256[plan.LocalHour-1] != plan.SourceClaimSHA256 || !sameClipIDs(ledger.Hours[plan.LocalHour-1].SourceClipIDs, plan.Sources) {
+		return HourManifestAllocation{}, fmt.Errorf("hour manifest allocation evidence differs")
+	}
+	boundaries, crossDayBoundaries := hourBoundarySubset(ledger, plan.LocalHour)
+	return HourManifestAllocation{
+		ArtifactID:         artifactID,
+		RelativePath:       relativePath,
+		ObjectKey:          objectKey,
+		SizeBytes:          int64(len(ledgerBytes)),
+		SHA256:             artifactSHA,
+		LedgerSHA256:       ledger.LedgerSHA256,
+		HourSourceSHA256:   plan.SourceClaimSHA256,
+		Boundaries:         boundaries,
+		CrossDayBoundaries: crossDayBoundaries,
+	}, nil
+}
+
+func ValidateHourManifestAllocation(allocation HourManifestAllocation, plan BatchPlan, ledger StreamDayAllocation) error {
+	want, err := BuildHourManifestAllocation(allocation.ArtifactID, plan, ledger)
+	if err != nil || !sameCanonical([]HourManifestAllocation{allocation}, []HourManifestAllocation{want}) {
+		return fmt.Errorf("hour manifest allocation evidence differs")
+	}
+	return nil
+}
+
 // BuildHourManifest runs only after the fenced seal transaction has obtained
 // media artifact IDs. It returns the exact bytes, size, and full SHA used to
 // insert the manifest artifact row before the hour is atomically sealed.
@@ -130,15 +164,8 @@ func BuildHourManifest(input HourManifestInput) (HourManifest, []byte, string, e
 	if err := ValidatePlan(plan); err != nil {
 		return HourManifest{}, nil, "", err
 	}
-	wantRelative, wantObject, pathErr := CanonicalAllocationLedgerPaths(plan.BatchID, plan.RecordingID, plan.LocalDate)
-	ledgerBytes, ledgerArtifactSHA, ledgerErr := CanonicalAllocationLedgerArtifact(input.AllocationLedger)
-	wantQualificationDay, qualificationOK := qualifiedDay(plan.Qualification, plan.LocalDate)
-	if pathErr != nil || ledgerErr != nil || !qualificationOK || input.Allocation.ArtifactID <= 0 || input.Allocation.RelativePath != wantRelative || input.Allocation.ObjectKey != wantObject || input.Allocation.SizeBytes != int64(len(ledgerBytes)) || input.Allocation.SHA256 != ledgerArtifactSHA || input.Allocation.LedgerSHA256 != plan.AllocationLedgerSHA || input.Allocation.LedgerSHA256 != input.AllocationLedger.LedgerSHA256 || input.Allocation.HourSourceSHA256 != plan.SourceClaimSHA256 || input.AllocationLedger.BatchID != plan.BatchID || input.AllocationLedger.Generation != plan.Generation || input.AllocationLedger.RecordingID != plan.RecordingID || input.AllocationLedger.Timezone != plan.Timezone || input.AllocationLedger.LocalDate != plan.LocalDate || input.AllocationLedger.QualificationSHA != plan.Qualification.EvidenceSHA || !sameCanonical([]QualifiedDay{input.AllocationLedger.QualificationDay}, []QualifiedDay{wantQualificationDay}) || input.AllocationLedger.HourSourceSHA256[plan.LocalHour-1] != plan.SourceClaimSHA256 || !sameClipIDs(input.AllocationLedger.Hours[plan.LocalHour-1].SourceClipIDs, plan.Sources) {
-		return HourManifest{}, nil, "", fmt.Errorf("hour manifest allocation evidence differs")
-	}
-	expectedHourBoundaries, expectedDayBoundaries := hourBoundarySubset(input.AllocationLedger, plan.LocalHour)
-	if !sameCanonical(input.Allocation.Boundaries, expectedHourBoundaries) || !sameCanonical(input.Allocation.CrossDayBoundaries, expectedDayBoundaries) {
-		return HourManifest{}, nil, "", fmt.Errorf("hour manifest boundary evidence is not in its allocation ledger")
+	if err := ValidateHourManifestAllocation(input.Allocation, plan, input.AllocationLedger); err != nil {
+		return HourManifest{}, nil, "", err
 	}
 	status := HourStatusMedia
 	if plan.GapOnly {
