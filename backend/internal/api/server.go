@@ -438,6 +438,7 @@ func (s *Server) router() http.Handler {
 			admin.Get("/recorder-pool", s.handleAdminRecorderPool)
 			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
 			admin.Post("/recording/joined/freeze-tier1", s.handleAdminJoinedFreezeTier1)
+			admin.Get("/recording/joined/batches/status", s.handleAdminJoinedBatchStatus)
 			admin.Post("/recording/joined/stream-days/seal", s.handleAdminJoinedSealStreamDay)
 			admin.Post("/recording/joined/batches/final-freeze", s.handleAdminJoinedFinalFreeze)
 			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
