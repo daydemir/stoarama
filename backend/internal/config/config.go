@@ -386,11 +386,20 @@ func (c Config) ValidateJoined() error {
 	if bootstrap == "" || signing == "" {
 		return fmt.Errorf("joined recording requires distinct JOINED_WORKER_BOOTSTRAP_TOKEN and JOINED_WORKER_SIGNING_KEY")
 	}
+	if len(bootstrap) < 32 || len(signing) < 32 {
+		return fmt.Errorf("joined bootstrap and signing credentials must each be at least 32 bytes")
+	}
 	if bootstrap == signing {
 		return fmt.Errorf("joined bootstrap, signing, and generic service credentials must be distinct")
 	}
-	for _, protected := range []string{service, strings.TrimSpace(c.APIToken), strings.TrimSpace(c.DatabaseURL),
-		strings.TrimSpace(c.StorageCredKey), strings.TrimSpace(c.R2AccessKeyID), strings.TrimSpace(c.R2SecretAccessKey)} {
+	protected := []string{service, strings.TrimSpace(c.APIToken), strings.TrimSpace(c.DatabaseURL),
+		strings.TrimSpace(c.StorageCredKey), strings.TrimSpace(c.R2AccessKeyID), strings.TrimSpace(c.R2SecretAccessKey)}
+	if databaseURL, err := url.Parse(strings.TrimSpace(c.DatabaseURL)); err == nil && databaseURL.User != nil {
+		if password, ok := databaseURL.User.Password(); ok {
+			protected = append(protected, password)
+		}
+	}
+	for _, protected := range protected {
 		if protected != "" && (bootstrap == protected || signing == protected) {
 			return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
 		}

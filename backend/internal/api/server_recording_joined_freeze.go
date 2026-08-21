@@ -469,9 +469,14 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 	}
 	var existingBytes []byte
 	var existingSHA string
-	err = tx.QueryRow(ctx, `SELECT freeze_request_bytes,freeze_request_sha256
-		FROM recording_joined_batches WHERE batch_id=$1 FOR SHARE`, req.BatchID).Scan(&existingBytes, &existingSHA)
+	var existingProtocol int
+	err = tx.QueryRow(ctx, `SELECT b.freeze_request_bytes,b.freeze_request_sha256,c.joined_protocol_version
+		FROM recording_joined_batches b JOIN connections c ON c.id=b.connection_id
+		WHERE b.batch_id=$1 FOR SHARE OF b,c`, req.BatchID).Scan(&existingBytes, &existingSHA, &existingProtocol)
 	if err == nil {
+		if existingProtocol != joinedrecording.JoinedProtocolVersion {
+			return joinedTier1FreezePlan{}, false, errors.New("Tier-1 connection protocol is disabled")
+		}
 		if existingSHA != req.ExpectedRequestSHA256 {
 			return joinedTier1FreezePlan{}, false, errors.New("Tier-1 batch key already has different immutable evidence")
 		}

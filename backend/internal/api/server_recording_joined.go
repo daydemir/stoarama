@@ -543,6 +543,16 @@ func (s *Server) handleJoinedSourceCapability(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
 		return
 	}
+	secret, err := s.secrets.Decrypt(d.secretEnc)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "decrypt joined source storage credential")
+		return
+	}
+	bootstrap, signing := strings.TrimSpace(s.cfg.JoinedWorkerBootstrapToken), strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
+	if d.accessKeyID == bootstrap || d.accessKeyID == signing || string(secret) == bootstrap || string(secret) == signing {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined worker and source storage credentials must be distinct")
+		return
+	}
 	sourceAuthority, authorityErr := joinedrecording.CanonicalSourceEndpointAuthority(d.endpoint)
 	if provider == "" || authorityErr != nil {
 		util.WriteError(w, http.StatusBadGateway, "frozen joined source storage authority is invalid")

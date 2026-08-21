@@ -15,6 +15,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -486,8 +487,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	defer fixture.cleanup()
 	s, pool := fixture.s, fixture.pool
 	s.cfg.JoinedRecordingEnabled = true
-	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-key"
-	s.cfg.JoinedWorkerSigningKey = "joined-worker-signing-key"
+	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
+	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	s.cfg.R2Endpoint = "https://output.example.test"
 	s.cfg.R2Bucket = "joined-output"
 	s.cfg.R2Region = "auto"
@@ -691,6 +692,43 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		feed.Item.ArtifactID != ledgerArtifactID || feed.Item.ConnectionID != connectionID {
 		t.Fatalf("feed status=%d body=%s", feedRec.Code, feedRec.Body.String())
 	}
+	heartbeatTelemetry := func(caller accountPrincipal, artifactID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		attemptedAt := time.Now().UTC().Add(-time.Second)
+		body, _ := json.Marshal(connectionHeartbeatRequest{
+			ClientVersion: "joined-v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1,
+			JoinedDelivery: &connectionJoinedDelivery{ArtifactID: artifactID, Blocker: "download_failed", AttemptedAt: &attemptedAt},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", bytes.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, caller))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionHeartbeat(rec, req)
+		return rec
+	}
+	if rec := heartbeatTelemetry(principal, ledgerArtifactID); rec.Code != http.StatusOK {
+		t.Fatalf("eligible joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var attemptedArtifactID *int64
+	var blocker string
+	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker
+		FROM connections WHERE id=$1`, connectionID).Scan(&attemptedArtifactID, &blocker); err != nil ||
+		attemptedArtifactID == nil || *attemptedArtifactID != ledgerArtifactID || blocker != "download_failed" {
+		t.Fatalf("persisted joined blocker artifact=%v blocker=%q err=%v", attemptedArtifactID, blocker, err)
+	}
+	var foreignKeyID int64
+	_, foreignAccountID := seedUserOrg(t, pool, "joined-heartbeat-foreign@example.test", true)
+	if err := pool.QueryRow(ctx, `INSERT INTO account_api_keys(account_id,key_prefix,secret_hash,label,scopes)
+		VALUES($1,'sir_joined_foreign','foreign-key','Foreign NAS',ARRAY['stoarama.pull']) RETURNING id`, foreignAccountID).Scan(&foreignKeyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id)
+		VALUES($1,'nas_pull','Foreign NAS',$2)`, foreignAccountID, foreignKeyID); err != nil {
+		t.Fatal(err)
+	}
+	foreignPrincipal := accountPrincipal{AccountID: foreignAccountID, APIKeyID: &foreignKeyID, KeyScopes: []string{accountScopePull}}
+	if rec := heartbeatTelemetry(foreignPrincipal, ledgerArtifactID); rec.Code != http.StatusConflict {
+		t.Fatalf("foreign joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	wrongAck, _ := json.Marshal(joinedAckRequest{ArtifactID: ledgerArtifactID, RelativePath: "wrong.json",
 		SizeBytes: int64(len(ledgerBytes)), SHA256: ledgerArtifactSHA})
 	wrongReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/joined/ack", bytes.NewReader(wrongAck))
@@ -710,6 +748,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("exact ACK attempt=%d status=%d body=%s", attempt, rec.Code, rec.Body.String())
 		}
+	}
+	if rec := heartbeatTelemetry(principal, ledgerArtifactID); rec.Code != http.StatusConflict {
+		t.Fatalf("acked joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	// Publish the remaining ledgers through the same fenced DB transitions so
 	// the source-bearing day becomes eligible for the actual worker handlers.
@@ -830,6 +871,68 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if sourceClaimRec.Code != http.StatusOK || json.Unmarshal(sourceClaimRec.Body.Bytes(), &sourceClaim) != nil || len(sourceClaim.Sources) != 1 {
 		t.Fatalf("source claim status=%d body=%s expected=%+v", sourceClaimRec.Code, sourceClaimRec.Body.String(), sources)
 	}
+	sourceCapability := func() *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(joinedrecording.SourceCapabilityRequest{ProtocolVersion: 1, HourID: sourceClaim.HourID,
+			ClipID: sourceClaim.Sources[0].ClipID, Operation: "head"})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/capabilities/source", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+sourceClaim.OperationToken)
+		rec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedSourceCapability)).ServeHTTP(rec, req)
+		return rec
+	}
+	if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET access_key_id=$2 WHERE id=$1`, fixture.storageID,
+		s.cfg.JoinedWorkerBootstrapToken); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapAttempt := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", strings.NewReader(`{"protocol_version":1}`))
+	bootstrapAttempt.Header.Set("Authorization", "Bearer "+s.cfg.JoinedWorkerBootstrapToken)
+	bootstrapResult := httptest.NewRecorder()
+	s.requireJoinedWorkerBootstrapAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(bootstrapResult, bootstrapAttempt)
+	if bootstrapResult.Code != http.StatusUnauthorized {
+		t.Fatalf("source access key obtained bootstrap authority status=%d", bootstrapResult.Code)
+	}
+	if rec := sourceCapability(); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bootstrap/source access alias status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET access_key_id='key' WHERE id=$1`, fixture.storageID); err != nil {
+		t.Fatal(err)
+	}
+	aliasedSecret, err := s.secrets.Encrypt([]byte(s.cfg.JoinedWorkerSigningKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET secret_access_key_enc=$2 WHERE id=$1`, fixture.storageID,
+		aliasedSecret); err != nil {
+		t.Fatal(err)
+	}
+	forged, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, batchID, joinedauth.SubjectHour,
+		sourceClaim.HourID, uuid.New(), joinedauth.OperationPreflight, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedAttempt := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/heartbeat", nil)
+	forgedAttempt.Header.Set("Authorization", "Bearer "+forged)
+	forgedResult := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(forgedResult, forgedAttempt)
+	if forgedResult.Code != http.StatusUnauthorized {
+		t.Fatalf("source secret obtained operation authority status=%d", forgedResult.Code)
+	}
+	if rec := sourceCapability(); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("signing/source secret alias status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	sourceSecret, err := s.secrets.Encrypt([]byte("joined-source-storage-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET secret_access_key_enc=$2 WHERE id=$1`, fixture.storageID,
+		sourceSecret); err != nil {
+		t.Fatal(err)
+	}
 	mediaSHA := strings.Repeat("3", 64)
 	sealRequest := joinedrecording.SealHourRequest{ProtocolVersion: 1, HourID: sourceClaim.HourID,
 		SourceClaimSHA256: sourceClaim.SourceClaimSHA256, AccountedSources: sourceClaim.Sources,
@@ -924,6 +1027,14 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		recording_id,reason_code,evidence_sha256,canonical_evidence) VALUES($1,$2,$3,'later_source',$4,'{"late":true}')`,
 		batchRecordID, batchRecordingID, recordingID, strings.Repeat("e", 64)); err == nil {
 		t.Fatal("frozen batch accepted a late exclusion")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,batch_id,
+		scope_kind,scope_id,artifact_kind,relative_path,object_key,content_type,expected_size_bytes,expected_sha256,
+		canonical_bytes,publication_state) VALUES($1,$2,$3,$4,'batch_index',$4,'batch_index','coverage/batch.json',
+		$5,'application/json',2,$6,'{}','sealed')`, batchRecordID, accountID, connectionID, batchID,
+		"joined/"+batchID+"/coverage/batch.json", strings.Repeat("d", 64)); err == nil ||
+		!strings.Contains(err.Error(), "joined canonical artifact SHA differs") {
+		t.Fatalf("canonical JSON artifact mismatched SHA error=%v", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,batch_id,
 		scope_kind,scope_id,artifact_kind,relative_path,object_key,content_type,expected_size_bytes,expected_sha256,

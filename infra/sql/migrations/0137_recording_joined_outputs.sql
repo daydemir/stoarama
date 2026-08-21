@@ -115,12 +115,14 @@ CREATE TABLE recording_joined_batch_recordings (
 );
 
 CREATE FUNCTION guard_recording_joined_batch_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE request JSONB;
 BEGIN
   IF current_setting('transaction_isolation') <> 'read committed'
   THEN RAISE EXCEPTION 'joined snapshot apply requires read committed'; END IF;
   -- Freeze and purge share one transaction fence. This keeps the raw rows
   -- individually unlocked while making membership and retention linearizable.
   PERFORM pg_advisory_xact_lock(137, 1);
+	request := convert_from(NEW.freeze_request_bytes,'UTF8')::JSONB;
   IF NEW.state<>'snapshotting' OR NEW.freeze_started_at IS NOT NULL OR NEW.frozen_at IS NOT NULL
     OR NOT EXISTS(SELECT 1 FROM connections c
     WHERE c.id=NEW.connection_id AND c.account_id=NEW.account_id AND c.joined_protocol_version=1 FOR UPDATE)
@@ -129,6 +131,55 @@ BEGIN
       AND q.cohort_sha256=NEW.qualification_cohort_sha256
       AND q.windows_sha256=NEW.qualification_windows_sha256
       AND q.frozen_at=NEW.qualification_frozen_at FOR SHARE)
+	OR ARRAY(SELECT jsonb_object_keys(request) ORDER BY 1) IS DISTINCT FROM ARRAY['account_id','batch_id',
+	  'connection_id','expected_scheduled_hours','expected_stream_days','freeze_exclusions_sha256',
+	  'frozen_denominator_sha256','generation','media_tool','policy_version','provisional_exclusions',
+	  'provisional_source_bytes','provisional_source_clips','qualification_jobs_sha256','recording_ids',
+	  'recordings','schema_version','selection_authority','source_endpoint']::TEXT[]
+	OR (request->>'schema_version')::INTEGER IS DISTINCT FROM 1
+	OR request->>'batch_id' IS DISTINCT FROM NEW.batch_id
+	OR (request->>'generation')::INTEGER IS DISTINCT FROM NEW.generation
+	OR (request->>'account_id')::BIGINT IS DISTINCT FROM NEW.account_id
+	OR (request->>'connection_id')::BIGINT IS DISTINCT FROM NEW.connection_id
+	OR request->>'source_endpoint' IS DISTINCT FROM NEW.source_endpoint
+	OR request->>'policy_version' IS DISTINCT FROM NEW.policy_version
+	OR request->'media_tool' IS DISTINCT FROM NEW.media_tool
+	OR request->'media_tool'->>'identity_sha256' IS DISTINCT FROM NEW.media_tool_sha256
+	OR request->>'qualification_jobs_sha256' IS DISTINCT FROM NEW.qualification_jobs_sha256
+	OR request->>'frozen_denominator_sha256' IS DISTINCT FROM NEW.frozen_denominator_sha256
+	OR request->>'freeze_exclusions_sha256' IS DISTINCT FROM NEW.freeze_exclusions_sha256
+	OR (request->>'expected_stream_days')::INTEGER IS DISTINCT FROM NEW.expected_stream_days
+	OR (request->>'expected_scheduled_hours')::INTEGER IS DISTINCT FROM NEW.expected_scheduled_hours
+	OR (request->>'provisional_source_clips')::BIGINT IS DISTINCT FROM NEW.expected_source_clips
+	OR (request->>'provisional_source_bytes')::BIGINT IS DISTINCT FROM NEW.expected_source_bytes
+	OR (request->>'provisional_exclusions')::BIGINT IS DISTINCT FROM NEW.expected_freeze_exclusions
+	OR request->'recording_ids' IS DISTINCT FROM to_jsonb(ARRAY[
+	  377,335,337,355,385,350,382,384,348,403,380,379,383,404,401,408,406,
+	  409,422,418,419,413,420,428,423,425,416,421,437,440,429,431,439]::BIGINT[])
+	OR jsonb_typeof(request->'recordings') IS DISTINCT FROM 'array'
+	OR jsonb_array_length(request->'recordings') IS DISTINCT FROM 33
+	OR EXISTS(
+	  SELECT 1 FROM jsonb_array_elements(request->'recordings') WITH ORDINALITY frozen(item, ordinal)
+	  WHERE CASE
+	    WHEN jsonb_typeof(frozen.item) IS DISTINCT FROM 'object'
+	      OR jsonb_typeof(frozen.item->'frozen_recording') IS DISTINCT FROM 'object'
+	      OR jsonb_typeof(frozen.item->'qualification') IS DISTINCT FROM 'object' THEN TRUE
+	    ELSE (frozen.item->'frozen_recording'->>'recording_id')::BIGINT IS DISTINCT FROM
+	      (ARRAY[377,335,337,355,385,350,382,384,348,403,380,379,383,404,401,408,406,
+	        409,422,418,419,413,420,428,423,425,416,421,437,440,429,431,439]::BIGINT[])[frozen.ordinal]
+	      OR (frozen.item->'frozen_recording'->>'priority_ordinal')::BIGINT IS DISTINCT FROM frozen.ordinal
+	      OR frozen.item->'frozen_recording'->>'selection_tier' IS DISTINCT FROM 'good+'
+	  END)
+	OR request->'selection_authority'->>'selection_basis' IS DISTINCT FROM NEW.selection_basis
+	OR request->'selection_authority'->>'ordered_recording_ids_sha256' IS DISTINCT FROM NEW.ordered_recording_ids_sha256
+	OR (request->'selection_authority'->>'cutoff')::TIMESTAMPTZ IS DISTINCT FROM NEW.eligibility_cutoff
+	OR (request->'selection_authority'->>'qualification_run_id')::BIGINT IS DISTINCT FROM NEW.qualification_run_id
+	OR (request->'selection_authority'->>'qualification_run_frozen_at')::TIMESTAMPTZ IS DISTINCT FROM NEW.qualification_frozen_at
+	OR request->'selection_authority'->>'qualification_rule_version' IS DISTINCT FROM
+	  (SELECT q.definition_version FROM recording_qualification_runs q WHERE q.id=NEW.qualification_run_id)
+	OR request->'selection_authority'->>'qualification_cohort_sha256' IS DISTINCT FROM NEW.qualification_cohort_sha256
+	OR request->'selection_authority'->>'qualification_windows_sha256' IS DISTINCT FROM NEW.qualification_windows_sha256
+	OR request->'selection_authority'->>'selected_qualification_windows_sha256' IS DISTINCT FROM NEW.selected_qualification_windows_sha256
   THEN RAISE EXCEPTION 'joined batch must enter an owned snapshotting state'; END IF;
   RETURN NEW;
 END $$;
@@ -250,6 +301,8 @@ CREATE TABLE recording_joined_source_snapshots (
 
 CREATE UNIQUE INDEX recording_joined_source_snapshots_storage_identity_uq ON recording_joined_source_snapshots(
   connection_id,batch_record_id,storage_destination_id,provider,endpoint,region,bucket,object_key,ingest_etag);
+CREATE INDEX recording_joined_source_snapshots_clip_idx ON recording_joined_source_snapshots(clip_id);
+CREATE INDEX recording_joined_source_snapshots_destination_idx ON recording_joined_source_snapshots(storage_destination_id);
 
 CREATE TABLE recording_joined_day_boundaries (
   id BIGSERIAL PRIMARY KEY,
@@ -394,9 +447,10 @@ CREATE UNIQUE INDEX recording_joined_sources_storage_identity_uq ON recording_jo
   (CASE WHEN version_id <> '' THEN 'v:' || version_id ELSE 'e:' || etag END));
 
 CREATE FUNCTION validate_recording_joined_batch_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE batch recording_joined_batches%ROWTYPE;
+DECLARE batch recording_joined_batches%ROWTYPE; request JSONB;
 BEGIN
   SELECT * INTO STRICT batch FROM recording_joined_batches WHERE id=NEW.id FOR UPDATE;
+	request := convert_from(batch.freeze_request_bytes,'UTF8')::JSONB;
   IF batch.state<>'building' OR batch.freeze_started_at IS NOT NULL
     OR NOT EXISTS(SELECT 1 FROM connections c WHERE c.id=batch.connection_id AND c.account_id=batch.account_id
       AND c.joined_protocol_version=1 FOR UPDATE)
@@ -426,9 +480,9 @@ BEGIN
       JOIN recording_qualification_runs q ON q.id=br.qualification_run_id AND q.account_id=batch.account_id
       LEFT JOIN LATERAL (SELECT count(*) AS days FROM recording_joined_stream_days d
         WHERE d.batch_recording_id=br.id) actual ON TRUE
-      WHERE br.batch_record_id=batch.id AND (br.qualification_run_id<>batch.qualification_run_id
-        OR br.selection_tier<>'good+' OR br.qualification_policy_version<>q.definition_version
-        OR br.priority_ordinal<>(SELECT count(*) FROM recording_joined_batch_recordings earlier
+		WHERE br.batch_record_id=batch.id AND (br.qualification_run_id IS DISTINCT FROM batch.qualification_run_id
+		  OR br.selection_tier IS DISTINCT FROM 'good+' OR br.qualification_policy_version IS DISTINCT FROM q.definition_version
+		  OR br.priority_ordinal IS DISTINCT FROM (SELECT count(*) FROM recording_joined_batch_recordings earlier
           WHERE earlier.batch_record_id=br.batch_record_id AND earlier.priority_ordinal<=br.priority_ordinal)
         OR br.first_local_date IS DISTINCT FROM (SELECT w.local_open_at::DATE
           FROM recording_qualification_windows w
@@ -439,9 +493,27 @@ BEGIN
         OR br.completed_at>batch.eligibility_cutoff
         OR br.completed_at IS DISTINCT FROM (SELECT max(d.completed_at)
           FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id)
-        OR actual.days<>14
+		OR actual.days IS DISTINCT FROM 14
         OR br.authoritative_job_ids IS DISTINCT FROM ARRAY(SELECT d.recording_job_id
           FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id ORDER BY d.date_ordinal)))
+	OR jsonb_typeof(request->'recordings') IS DISTINCT FROM 'array'
+	OR jsonb_array_length(request->'recordings') IS DISTINCT FROM batch.expected_recordings
+	OR EXISTS(SELECT 1 FROM recording_joined_batch_recordings br
+	  CROSS JOIN LATERAL (SELECT request->'recordings'->(br.priority_ordinal-1) item) frozen
+	  WHERE br.batch_record_id=batch.id AND (
+	    ARRAY(SELECT jsonb_object_keys(frozen.item) ORDER BY 1) IS DISTINCT FROM ARRAY['frozen_recording','qualification']::TEXT[]
+	    OR ARRAY(SELECT jsonb_object_keys(frozen.item->'frozen_recording') ORDER BY 1) IS DISTINCT FROM
+	      ARRAY['completed_at','folder_name','naming_metadata','priority_ordinal','qualification_sha256',
+	        'recording_id','selection_tier','timezone']::TEXT[]
+	    OR (frozen.item->'frozen_recording'->>'recording_id')::BIGINT IS DISTINCT FROM br.recording_id
+	    OR (frozen.item->'frozen_recording'->>'priority_ordinal')::INTEGER IS DISTINCT FROM br.priority_ordinal
+	    OR frozen.item->'frozen_recording'->>'selection_tier' IS DISTINCT FROM br.selection_tier
+	    OR frozen.item->'frozen_recording'->>'qualification_sha256' IS DISTINCT FROM br.qualification_sha256
+	    OR (frozen.item->'frozen_recording'->>'completed_at')::TIMESTAMPTZ IS DISTINCT FROM br.completed_at
+	    OR frozen.item->'frozen_recording'->>'timezone' IS DISTINCT FROM br.timezone
+	    OR frozen.item->'frozen_recording'->>'folder_name' IS DISTINCT FROM br.folder_name
+	    OR frozen.item->'frozen_recording'->'naming_metadata' IS DISTINCT FROM br.naming_metadata
+	    OR frozen.item->'qualification' IS DISTINCT FROM br.qualification))
     OR EXISTS(SELECT 1 FROM recording_joined_stream_days d
       JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
       JOIN recording_qualification_windows w ON w.run_id=br.qualification_run_id
@@ -511,6 +583,7 @@ CREATE TABLE recording_joined_artifacts (
     OR (artifact_kind = 'batch_index' AND scope_kind = 'batch_index' AND stream_day_id IS NULL AND hour_record_id IS NULL
       AND content_type = 'application/json' AND canonical_bytes IS NOT NULL)),
   CHECK (canonical_bytes IS NULL OR octet_length(canonical_bytes) = expected_size_bytes),
+	CHECK (canonical_bytes IS NULL OR expected_sha256 = encode(sha256(canonical_bytes),'hex')),
   CHECK ((content_type = 'application/json' AND expected_size_bytes <= 16777216)
     OR (content_type = 'video/mp4' AND expected_size_bytes <= 5363466240)),
   CHECK ((artifact_kind <> 'media' AND publication_state IS NOT NULL)
@@ -623,12 +696,17 @@ BEGIN
     THEN RAISE EXCEPTION 'joined frozen source is retention protected'; END IF;
     RETURN OLD;
   END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id
+    AND EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=OLD.id)
+  THEN RAISE EXCEPTION 'joined frozen source identity is immutable'; END IF;
   IF OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
     AND EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=OLD.id)
   THEN RAISE EXCEPTION 'joined frozen source is retention protected'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_joined_clip_retention_update BEFORE UPDATE OF purged_at ON recording_clips
+FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_clip_retention();
+CREATE TRIGGER recording_joined_clip_identity_update BEFORE UPDATE OF id ON recording_clips
 FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_clip_retention();
 CREATE TRIGGER recording_joined_clip_retention_delete BEFORE DELETE ON recording_clips
 FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_clip_retention();
@@ -1058,6 +1136,9 @@ CREATE FUNCTION guard_recording_joined_artifact_insert() RETURNS trigger LANGUAG
 DECLARE root recording_joined_artifacts%ROWTYPE; h recording_joined_hours%ROWTYPE; d recording_joined_stream_days%ROWTYPE;
   batch recording_joined_batches%ROWTYPE;
 BEGIN
+  IF NEW.canonical_bytes IS NOT NULL AND NEW.expected_sha256 IS DISTINCT FROM
+      encode(sha256(NEW.canonical_bytes),'hex')
+  THEN RAISE EXCEPTION 'joined canonical artifact SHA differs'; END IF;
   IF NOT EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=NEW.batch_record_id AND
       ((NEW.artifact_kind='allocation_ledger' AND b.state='building' AND b.freeze_started_at IS NULL)
         OR (NEW.artifact_kind<>'allocation_ledger' AND b.state IN ('frozen','index_sealed'))) FOR KEY SHARE)
@@ -1481,27 +1562,28 @@ BEGIN
       OR EXISTS(SELECT 1 FROM recording_joined_batch_recordings br
         LEFT JOIN LATERAL (SELECT count(*) AS days FROM recording_joined_stream_days d
           WHERE d.batch_recording_id=br.id) actual ON TRUE
-        WHERE br.batch_record_id=OLD.id AND (actual.days<>14
-          OR br.priority_ordinal<>(SELECT count(*) FROM recording_joined_batch_recordings earlier
+		WHERE br.batch_record_id=OLD.id AND (actual.days IS DISTINCT FROM 14
+		  OR br.priority_ordinal IS DISTINCT FROM (SELECT count(*) FROM recording_joined_batch_recordings earlier
             WHERE earlier.batch_record_id=br.batch_record_id AND earlier.priority_ordinal<=br.priority_ordinal)
-          OR (br.qualification->>'recording_id')::BIGINT<>br.recording_id
-          OR br.qualification->>'timezone'<>br.timezone
-          OR br.qualification->>'evidence_sha256'<>br.qualification_sha256
-          OR jsonb_array_length(br.qualification->'days')<>14))
+		  OR (br.qualification->>'recording_id')::BIGINT IS DISTINCT FROM br.recording_id
+		  OR br.qualification->>'timezone' IS DISTINCT FROM br.timezone
+		  OR br.qualification->>'evidence_sha256' IS DISTINCT FROM br.qualification_sha256
+		  OR (br.qualification->>'frozen_at')::TIMESTAMPTZ IS DISTINCT FROM OLD.eligibility_cutoff
+		  OR jsonb_array_length(br.qualification->'days') IS DISTINCT FROM 14))
       OR EXISTS(SELECT 1 FROM recording_joined_stream_days d
         JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
         JOIN recording_qualification_windows w ON w.run_id=br.qualification_run_id
           AND w.recording_id=br.recording_id AND w.ordinal=d.date_ordinal
-        WHERE d.batch_record_id=OLD.id AND (d.local_date<>br.first_local_date+d.date_ordinal-1
-          OR br.qualification_run_id<>OLD.qualification_run_id
-          OR ROW(w.window_start_at,w.window_end_at) IS DISTINCT FROM ROW(d.scheduled_start_at,d.scheduled_end_at)
-          OR d.recording_job_id<>br.authoritative_job_ids[d.date_ordinal]
-          OR (br.qualification->'days'->(d.date_ordinal-1)->>'local_date')::DATE<>d.local_date
-          OR (br.qualification->'days'->(d.date_ordinal-1)->>'job_id')::BIGINT<>d.recording_job_id
-          OR (br.qualification->'days'->(d.date_ordinal-1)->>'qualification_window_ordinal')::INTEGER<>d.date_ordinal
-          OR (br.qualification->'days'->(d.date_ordinal-1)->>'window_start')::TIMESTAMPTZ<>d.scheduled_start_at
-          OR (br.qualification->'days'->(d.date_ordinal-1)->>'window_end')::TIMESTAMPTZ<>d.scheduled_end_at
-          OR (br.qualification->'days'->(d.date_ordinal-1)->>'completed_at')::TIMESTAMPTZ<>d.completed_at))
+		WHERE d.batch_record_id=OLD.id AND (d.local_date IS DISTINCT FROM br.first_local_date+d.date_ordinal-1
+		  OR br.qualification_run_id IS DISTINCT FROM OLD.qualification_run_id
+		  OR ROW(w.window_start_at,w.window_end_at) IS DISTINCT FROM ROW(d.scheduled_start_at,d.scheduled_end_at)
+		  OR d.recording_job_id IS DISTINCT FROM br.authoritative_job_ids[d.date_ordinal]
+		  OR (br.qualification->'days'->(d.date_ordinal-1)->>'local_date')::DATE IS DISTINCT FROM d.local_date
+		  OR (br.qualification->'days'->(d.date_ordinal-1)->>'job_id')::BIGINT IS DISTINCT FROM d.recording_job_id
+		  OR (br.qualification->'days'->(d.date_ordinal-1)->>'qualification_window_ordinal')::INTEGER IS DISTINCT FROM d.date_ordinal
+		  OR (br.qualification->'days'->(d.date_ordinal-1)->>'window_start')::TIMESTAMPTZ IS DISTINCT FROM d.scheduled_start_at
+		  OR (br.qualification->'days'->(d.date_ordinal-1)->>'window_end')::TIMESTAMPTZ IS DISTINCT FROM d.scheduled_end_at
+		  OR (br.qualification->'days'->(d.date_ordinal-1)->>'completed_at')::TIMESTAMPTZ IS DISTINCT FROM d.completed_at))
       OR (SELECT count(*) FROM recording_joined_artifacts a
         WHERE a.batch_record_id=OLD.id AND a.artifact_kind='allocation_ledger')<>OLD.expected_stream_days
       OR EXISTS(SELECT 1 FROM recording_joined_artifacts a
@@ -1509,14 +1591,21 @@ BEGIN
     THEN RAISE EXCEPTION 'joined batch freeze is incomplete'; END IF;
     PERFORM validate_recording_joined_stream_day(d.id) FROM recording_joined_stream_days d WHERE d.batch_record_id=OLD.id;
   ELSIF OLD.state = 'frozen' AND NEW.state = 'index_sealed' THEN
-    IF NEW.index_artifact_id IS NULL OR NEW.index_sealed_at IS NULL
+	IF OLD.frozen_at IS NULL OR NEW.frozen_at IS DISTINCT FROM OLD.frozen_at
+	  OR NEW.index_artifact_id IS NULL OR NEW.index_sealed_at IS NULL
+	  OR NOT EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.id=NEW.index_artifact_id
+	    AND a.batch_record_id=OLD.id AND a.artifact_kind='batch_index')
       OR (SELECT count(*) FROM recording_joined_batch_index_refs r
-        WHERE r.index_artifact_id = NEW.index_artifact_id AND r.reference_kind = 'allocation_ledger') <> OLD.expected_stream_days
+		WHERE r.batch_record_id=OLD.id AND r.index_artifact_id = NEW.index_artifact_id
+		  AND r.reference_kind = 'allocation_ledger') <> OLD.expected_stream_days
       OR (SELECT count(*) FROM recording_joined_batch_index_refs r
-        WHERE r.index_artifact_id = NEW.index_artifact_id AND r.reference_kind = 'hour_manifest') <> OLD.expected_scheduled_hours
+		WHERE r.batch_record_id=OLD.id AND r.index_artifact_id = NEW.index_artifact_id
+		  AND r.reference_kind = 'hour_manifest') <> OLD.expected_scheduled_hours
     THEN RAISE EXCEPTION 'joined batch index reference set is incomplete'; END IF;
   ELSIF OLD.state = 'index_sealed' AND NEW.state = 'published' THEN
-    IF NEW.index_artifact_id <> OLD.index_artifact_id OR NEW.index_sealed_at <> OLD.index_sealed_at OR NEW.published_at IS NULL
+	IF OLD.frozen_at IS NULL OR NEW.frozen_at IS DISTINCT FROM OLD.frozen_at
+	  OR NEW.index_artifact_id IS DISTINCT FROM OLD.index_artifact_id
+	  OR NEW.index_sealed_at IS DISTINCT FROM OLD.index_sealed_at OR NEW.published_at IS NULL
       OR NOT EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.id = OLD.index_artifact_id AND a.publication_state = 'published')
     THEN RAISE EXCEPTION 'invalid joined batch publication'; END IF;
   ELSIF OLD.state IN ('building', 'frozen', 'index_sealed') AND NEW.state = 'terminal_failed' THEN
