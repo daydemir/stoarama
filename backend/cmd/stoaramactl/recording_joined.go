@@ -67,10 +67,8 @@ func runRecordingJoined(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-// newJoinedOperatorService is intentionally an integration seam. Release B's
-// cloud/DB slice replaces this body once its contracts land.
-func newJoinedOperatorService(context.Context, config.Config) (joinedOperatorService, error) {
-	return nil, errors.New("joined recording service is not integrated")
+func newJoinedOperatorService(_ context.Context, cfg config.Config) (joinedOperatorService, error) {
+	return newRemoteJoinedOperatorService(cfg)
 }
 
 func joinedWorkerIsDisabled(result any) bool {
