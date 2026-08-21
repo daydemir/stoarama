@@ -351,21 +351,20 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 
 	pair := &joinedPairHeadTransport{started: make(chan struct{}, 2), release: make(chan struct{})}
 	fixture.s.joinedFreezeTransport = pair
-	concurrentResults := make(chan *httptest.ResponseRecorder, 2)
-	for i := 0; i < 2; i++ {
-		go func() { concurrentResults <- call(true) }()
+	concurrentResults := make(chan *httptest.ResponseRecorder, 1)
+	go func() { concurrentResults <- call(true) }()
+	<-pair.started
+	rejected := call(true)
+	select {
+	case <-pair.started:
+		t.Fatal("rejected concurrent stream-day seal performed a source HEAD")
+	default:
 	}
-	<-pair.started
-	<-pair.started
 	close(pair.release)
-	first, second := <-concurrentResults, <-concurrentResults
-	sealed, rejected := first, second
-	if sealed.Code != http.StatusOK {
-		sealed, rejected = second, first
-	}
+	sealed := <-concurrentResults
 	if sealed.Code != http.StatusOK || rejected.Code != http.StatusConflict {
-		t.Fatalf("concurrent differing retry statuses=%d,%d bodies=%s / %s", first.Code, second.Code,
-			first.Body.String(), second.Body.String())
+		t.Fatalf("concurrent differing retry statuses=%d,%d bodies=%s / %s", sealed.Code, rejected.Code,
+			sealed.Body.String(), rejected.Body.String())
 	}
 	var response joinedSealStreamDayResponse
 	if sealed.Code != http.StatusOK || json.Unmarshal(sealed.Body.Bytes(), &response) != nil || response.AlreadySealed ||
@@ -432,15 +431,28 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 	}
 	close(start)
 	identicalFirst, identicalSecond := <-identicalResults, <-identicalResults
-	var firstIdentity, secondIdentity joinedSealStreamDayResponse
-	if identicalFirst.Code != http.StatusOK || identicalSecond.Code != http.StatusOK ||
-		json.Unmarshal(identicalFirst.Body.Bytes(), &firstIdentity) != nil ||
-		json.Unmarshal(identicalSecond.Body.Bytes(), &secondIdentity) != nil ||
-		firstIdentity.SealRequestSHA != secondIdentity.SealRequestSHA ||
-		firstIdentity.LedgerArtifactID != secondIdentity.LedgerArtifactID ||
-		firstIdentity.AlreadySealed == secondIdentity.AlreadySealed {
+	success, retry := identicalFirst, identicalSecond
+	if success.Code != http.StatusOK {
+		success, retry = identicalSecond, identicalFirst
+	}
+	if success.Code != http.StatusOK || (retry.Code != http.StatusOK && retry.Code != http.StatusConflict) {
 		t.Fatalf("concurrent identical retries first=%d %s second=%d %s", identicalFirst.Code,
 			identicalFirst.Body.String(), identicalSecond.Code, identicalSecond.Body.String())
+	}
+	if retry.Code == http.StatusConflict {
+		httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/stream-days/seal", bytes.NewReader(identicalBody))
+		httpReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
+		retry = httptest.NewRecorder()
+		fixture.s.requireAdminAuth(http.HandlerFunc(fixture.s.handleAdminJoinedSealStreamDay)).ServeHTTP(retry, httpReq)
+	}
+	var successIdentity, retryIdentity joinedSealStreamDayResponse
+	if retry.Code != http.StatusOK || json.Unmarshal(success.Body.Bytes(), &successIdentity) != nil ||
+		json.Unmarshal(retry.Body.Bytes(), &retryIdentity) != nil ||
+		successIdentity.SealRequestSHA != retryIdentity.SealRequestSHA ||
+		successIdentity.LedgerArtifactID != retryIdentity.LedgerArtifactID ||
+		successIdentity.AlreadySealed || !retryIdentity.AlreadySealed {
+		t.Fatalf("identical retry replay first=%d %s second=%d %s", success.Code,
+			success.Body.String(), retry.Code, retry.Body.String())
 	}
 	t.Log("JOINED_STREAM_DAY_HEAD_SEAL_EXECUTED")
 }

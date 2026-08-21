@@ -37,6 +37,30 @@ func (*blockingCapabilityClient) Do(request *http.Request) (*http.Response, erro
 	return nil, request.Context().Err()
 }
 
+type streamingCapabilityClient struct{ requestCtx context.Context }
+
+func (*streamingCapabilityClient) joinedRedirectSafe() {}
+func (c *streamingCapabilityClient) Do(request *http.Request) (*http.Response, error) {
+	c.requestCtx = request.Context()
+	response := capabilityResponse(http.StatusOK, []byte("streamed"), "etag", "version")
+	response.Body = &contextAwareBody{ctx: request.Context(), reader: bytes.NewReader([]byte("streamed"))}
+	return response, nil
+}
+
+type contextAwareBody struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (b *contextAwareBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return b.reader.Read(p)
+}
+
+func (*contextAwareBody) Close() error { return nil }
+
 func TestCapabilityHTTPClientHasBoundedRequestLifetime(t *testing.T) {
 	client := NewCapabilityHTTPClient()
 	if client.Timeout != capabilityHTTPTimeout || client.Timeout <= maxPutCapabilityLifetime {
@@ -49,6 +73,32 @@ func TestCapabilityRequestCannotOutliveSignedExpiry(t *testing.T) {
 	_, err := capabilityRequest(context.Background(), &blockingCapabilityClient{}, request, time.Now().Add(time.Millisecond), nil, 0)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("capability expiry err=%v", err)
+	}
+}
+
+func TestCapabilityRequestKeepsStreamAliveUntilBodyClose(t *testing.T) {
+	client := &streamingCapabilityClient{}
+	request := signedRequest(http.MethodGet, "recordings", "raw/source.mp4", nil, "version", time.Minute)
+	response, err := capabilityRequest(context.Background(), client, request, time.Now().Add(time.Minute), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.requestCtx.Done():
+		t.Fatal("request context canceled before streaming body was consumed")
+	default:
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil || string(body) != "streamed" {
+		t.Fatalf("stream body=%q err=%v", body, err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.requestCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("request context remained live after body close")
 	}
 }
 
@@ -372,7 +422,7 @@ func TestCapabilityTransportErrorNeverLeaksSignedURL(t *testing.T) {
 	const secretQuery = "X-Amz-Signature=do-not-log-this"
 	request := SignedRequest{Method: http.MethodGet, URL: testSourceEndpoint + "/recordings/key?" + secretQuery, Scheme: "https", Authority: testSourceAuthority, EscapedPath: "/recordings/key", RawQuery: secretQuery, RequiredHeaders: map[string]string{}}
 	_, err := capabilityRequest(context.Background(), &errorCapabilityClient{err: errors.New("Get " + request.URL + ": transport failed")}, request, time.Now().Add(time.Minute), nil, 0)
-	if err == nil || strings.Contains(err.Error(), "do-not-log-this") || strings.Contains(err.Error(), request.URL) {
+	if err == nil || errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "do-not-log-this") || strings.Contains(err.Error(), request.URL) {
 		t.Fatalf("capability URL leaked through transport error: %v", err)
 	}
 }

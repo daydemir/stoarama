@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,15 +74,25 @@ func TestRebuildSealedHourUsesExactFrozenPartsAndCurrentLeaseScratch(t *testing.
 	client := &memoryCapabilityClient{objects: map[string][]byte{source.Object.Key: body}}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	scratch, err := RebuildSealedHourRenewing(ctx, claim, root, client, testSourceAuthority, noHeartbeat,
+	renewed := OperationCredentials{LeaseID: claim.LeaseID, OperationToken: strings.Repeat("r", 32), ExpiresAt: claim.LeaseExpires.Add(time.Minute)}
+	run := func(runCtx context.Context, initial OperationCredentials, _ HeartbeatOperation, work func(context.Context, func() OperationCredentials) error) error {
+		if initial.OperationToken != claim.OperationToken || initial.ExpiresAt != claim.LeaseExpires {
+			t.Fatalf("initial rebuild credentials differ: %+v", initial)
+		}
+		return work(runCtx, func() OperationCredentials { return renewed })
+	}
+	renewedClaim, scratch, err := rebuildSealedHourRenewing(ctx, claim, root, client, testSourceAuthority, noHeartbeat,
 		func(_ context.Context, got WorkerClaim, gotSource SourceClip, operation string) (SourceReadCapability, error) {
-			if got.HourID != claim.HourID || gotSource.ClipID != source.ClipID {
+			if got.HourID != claim.HourID || gotSource.ClipID != source.ClipID || got.OperationToken != renewed.OperationToken || got.LeaseExpires != renewed.ExpiresAt {
 				t.Fatalf("rebuild source claim differs: hour=%s clip=%s", got.HourID, strconv.FormatInt(gotSource.ClipID, 10))
 			}
 			return exactSourceCapability(source, operation), nil
-		})
+		}, run)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if renewedClaim.OperationToken != renewed.OperationToken || renewedClaim.LeaseExpires != renewed.ExpiresAt {
+		t.Fatalf("returned rebuild claim is stale: %+v", renewedClaim)
 	}
 	if scratch.publicationLeaseID != claim.LeaseID || len(scratch.verified.Built) != 1 ||
 		scratch.verified.Built[0].SHA256 != plan.Outputs[0].ExpectedSHA ||

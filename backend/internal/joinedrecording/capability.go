@@ -256,9 +256,9 @@ func verifyCapabilityHead(ctx context.Context, client CapabilityHTTPClient, requ
 
 func capabilityRequest(ctx context.Context, client CapabilityHTTPClient, signed SignedRequest, expiresAt time.Time, body io.Reader, contentLength int64) (*http.Response, error) {
 	requestCtx, cancel := context.WithDeadline(ctx, expiresAt)
-	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, signed.Method, signed.URL, body)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("construct storage capability request")
 	}
 	request.Header.Set("Accept-Encoding", "identity")
@@ -270,11 +270,14 @@ func capabilityRequest(ctx context.Context, client CapabilityHTTPClient, signed 
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		if ctxErr := requestCtx.Err(); ctxErr != nil {
+		ctxErr := requestCtx.Err()
+		cancel()
+		if ctxErr != nil {
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("execute storage capability request")
 	}
+	response.Body = cancelOnCloseBody{ReadCloser: response.Body, cancel: cancel}
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		response.Body.Close()
 		return nil, fmt.Errorf("storage capability redirect is forbidden")
@@ -284,6 +287,16 @@ func capabilityRequest(ctx context.Context, client CapabilityHTTPClient, signed 
 		return nil, fmt.Errorf("storage capability redirect is forbidden")
 	}
 	return response, nil
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelOnCloseBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
 }
 
 func responseSize(response *http.Response) int64 {

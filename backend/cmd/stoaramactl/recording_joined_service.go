@@ -505,7 +505,7 @@ func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response
 					ClipID: source.ClipID, Operation: operation,
 				})
 			}
-			scratch, err = joinedrecording.RebuildSealedHourRenewing(ctx, claim, scratchRoot, s.capabilityClient,
+			claim, scratch, err = joinedrecording.RebuildSealedHourRenewing(ctx, claim, scratchRoot, s.capabilityClient,
 				s.cfg.JoinedRecordingStorageAuthority, s.hourHeartbeat(claim.HourID), resolveSource)
 		}
 		if err != nil {

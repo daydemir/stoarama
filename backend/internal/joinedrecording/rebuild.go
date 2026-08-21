@@ -12,18 +12,26 @@ type RebuildSourceCapability func(context.Context, WorkerClaim, SourceClip, stri
 // parts, alter quarantine evidence, or change the sealed manifest identity.
 func RebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRoot string,
 	client CapabilityHTTPClient, storageAuthority string, heartbeat HeartbeatOperation,
-	resolveSource RebuildSourceCapability) (SealedHourScratch, error) {
+	resolveSource RebuildSourceCapability) (WorkerClaim, SealedHourScratch, error) {
+	return rebuildSealedHourRenewing(ctx, claim, scratchRoot, client, storageAuthority, heartbeat, resolveSource, defaultRenewableRunner)
+}
+
+func rebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRoot string,
+	client CapabilityHTTPClient, storageAuthority string, heartbeat HeartbeatOperation,
+	resolveSource RebuildSourceCapability, run renewableRunner) (WorkerClaim, SealedHourScratch, error) {
 	if resolveSource == nil || storageAuthority == "" || claim.StorageAuthority != storageAuthority {
-		return SealedHourScratch{}, fmt.Errorf("sealed-hour rebuild authority is incomplete")
+		return WorkerClaim{}, SealedHourScratch{}, fmt.Errorf("sealed-hour rebuild authority is incomplete")
 	}
 	initial := OperationCredentials{LeaseID: claim.LeaseID, OperationToken: claim.OperationToken, ExpiresAt: claim.LeaseExpires}
+	currentClaim := claim
 	var scratch SealedHourScratch
-	err := defaultRenewableRunner(ctx, initial, heartbeat, func(workCtx context.Context, current func() OperationCredentials) error {
+	err := run(ctx, initial, heartbeat, func(workCtx context.Context, current func() OperationCredentials) error {
 		fresh := func() (WorkerClaim, error) { return claim.WithOperation(current()) }
-		currentClaim, err := fresh()
+		refreshed, err := fresh()
 		if err != nil {
 			return err
 		}
+		currentClaim = refreshed
 		actualTool, err := InspectMediaToolEvidence(workCtx)
 		if err != nil || !sameCanonical([]MediaToolEvidence{actualTool}, []MediaToolEvidence{claim.Plan.MediaTool}) {
 			return fmt.Errorf("installed media tool differs from sealed hour")
@@ -87,5 +95,8 @@ func RebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRo
 			append([]QuarantineEvidence(nil), claim.HourManifest.QuarantineEvidence...))
 		return err
 	})
-	return scratch, err
+	if err != nil {
+		return WorkerClaim{}, SealedHourScratch{}, err
+	}
+	return currentClaim, scratch, nil
 }

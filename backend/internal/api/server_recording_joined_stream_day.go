@@ -198,17 +198,28 @@ func (s *Server) acquireJoinedStreamDayHeadLock(ctx context.Context, batchID str
 	if err != nil {
 		return nil, fmt.Errorf("acquire joined stream-day HEAD lock connection: %w", err)
 	}
-	conn := pooled.Hijack()
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended('joined-stream-day-head:'||$1,0))`, batchID); err != nil {
+	var locked bool
+	if err := pooled.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended('joined-stream-day-head:'||$1,0))`, batchID).Scan(&locked); err != nil {
+		// The server may have acquired the session lock before the client lost
+		// the result. Close the session instead of returning it to the pool.
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = conn.Close(closeCtx)
+		_ = pooled.Hijack().Close(closeCtx)
 		return nil, fmt.Errorf("acquire joined stream-day HEAD lock: %w", err)
 	}
+	if !locked {
+		pooled.Release()
+		return nil, fmt.Errorf("joined stream-day HEAD seal is already running")
+	}
 	return func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = conn.Close(closeCtx)
+		var unlocked bool
+		if err := pooled.QueryRow(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended('joined-stream-day-head:'||$1,0))`, batchID).Scan(&unlocked); err != nil || !unlocked {
+			_ = pooled.Hijack().Close(unlockCtx)
+			return
+		}
+		pooled.Release()
 	}, nil
 }
 
