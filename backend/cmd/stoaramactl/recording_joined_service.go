@@ -34,7 +34,7 @@ type remoteJoinedOperatorService struct {
 	api              *joinedAPIClient
 	capabilityClient joinedrecording.CapabilityHTTPClient
 	idlePoll         time.Duration
-	processClaim     func(context.Context, joinedrecording.PublicationClaimResponse) error
+	processClaim     func(context.Context, joinedrecording.PublicationClaimResponse, string) error
 	processPreflight func(context.Context, joinedrecording.PreflightHourClaim, string) error
 }
 
@@ -157,7 +157,7 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 		return false, err
 	}
 	if ok {
-		return true, s.processClaim(ctx, publication)
+		return true, s.processClaim(ctx, publication, req.ScratchRoot)
 	}
 	preflight, ok, err := s.api.claimPreflight(ctx, bootstrap.ClaimToken, claimRequest)
 	if err != nil || !ok {
@@ -192,7 +192,7 @@ func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, c
 	return nil
 }
 
-func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response joinedrecording.PublicationClaimResponse) error {
+func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response joinedrecording.PublicationClaimResponse, scratchRoot string) error {
 	switch response.Kind {
 	case "ledger":
 		claim := *response.Ledger
@@ -208,7 +208,19 @@ func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response
 			})
 		return err
 	case "hour":
-		return fmt.Errorf("reclaimed sealed hour %q cannot be rebuilt from the current publication claim; refusing unverified publication", response.Hour.HourID)
+		claim := *response.Hour
+		if !claim.Plan.GapOnly {
+			return fmt.Errorf("source-bearing reclaimed hour %q cannot yet be rebuilt; refusing unverified publication", claim.HourID)
+		}
+		scratch, err := joinedrecording.BindReclaimedGapOnlyHourScratch(claim, scratchRoot)
+		if err != nil {
+			return fmt.Errorf("rebuild reclaimed gap-only hour: %w", err)
+		}
+		_, err = joinedrecording.PublishClaimedHourRenewing(ctx, s.capabilityClient, s.cfg.JoinedRecordingStorageAuthority, claim, scratch, s.hourHeartbeat(claim.HourID), s.hourCreateCapability, s.hourReadCapability, s.finalizeHour)
+		if err != nil {
+			return fmt.Errorf("publish reclaimed gap-only hour: %w", err)
+		}
+		return nil
 	case "batch_index":
 		claim := *response.BatchIndex
 		_, err := joinedrecording.PublishBatchIndexRenewing(ctx, s.capabilityClient, s.cfg.JoinedRecordingStorageAuthority, claim, s.scopeHeartbeat("batch_index", claim.ScopeID),
@@ -362,21 +374,21 @@ func (c *joinedAPIClient) finalizeLedger(ctx context.Context, token string, requ
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	return c.postJSON(ctx, "/api/v1/recording/joined/publication/ledger/finalize", token, request, nil)
+	return c.postNoContent(ctx, "/api/v1/recording/joined/publication/ledger/finalize", token, request)
 }
 
 func (c *joinedAPIClient) finalizeHour(ctx context.Context, token string, request joinedrecording.FinalizeHourRequest) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	return c.postJSON(ctx, "/api/v1/recording/joined/publication/hour/finalize", token, request, nil)
+	return c.postNoContent(ctx, "/api/v1/recording/joined/publication/hour/finalize", token, request)
 }
 
 func (c *joinedAPIClient) finalizeBatchIndex(ctx context.Context, token string, request joinedrecording.FinalizeBatchIndexRequest) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	return c.postJSON(ctx, "/api/v1/recording/joined/publication/index/finalize", token, request, nil)
+	return c.postNoContent(ctx, "/api/v1/recording/joined/publication/index/finalize", token, request)
 }
 
 func publicationBatchID(response joinedrecording.PublicationClaimResponse) string {
@@ -398,6 +410,17 @@ func (c *joinedAPIClient) postJSON(ctx context.Context, path, token string, requ
 		return fmt.Errorf("joined API %s unexpectedly returned no content", path)
 	}
 	return err
+}
+
+func (c *joinedAPIClient) postNoContent(ctx context.Context, path, token string, request any) error {
+	hasContent, err := c.postOptionalJSON(ctx, path, token, request, nil)
+	if err != nil {
+		return err
+	}
+	if hasContent {
+		return fmt.Errorf("joined API %s unexpectedly returned content", path)
+	}
+	return nil
 }
 
 func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token string, payload, response any) (bool, error) {

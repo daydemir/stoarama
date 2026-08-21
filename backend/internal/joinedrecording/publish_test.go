@@ -196,6 +196,9 @@ func TestReclaimedPublisherCannotBindPriorLeaseScratch(t *testing.T) {
 	if _, err := BindRebuiltSealedHourScratch(reclaimed, root, priorDir, built, nil); err == nil {
 		t.Fatal("reclaimed lease bound prior lease scratch")
 	}
+	if _, err := BindReclaimedGapOnlyHourScratch(reclaimed, root); err == nil {
+		t.Fatal("source-bearing reclaimed hour bound empty scratch")
+	}
 }
 
 func TestPublishGapOnlyHourCreatesOnlyImmutableHourManifest(t *testing.T) {
@@ -212,16 +215,40 @@ func TestPublishGapOnlyHourCreatesOnlyImmutableHourManifest(t *testing.T) {
 	}
 	claim := sealedClaim(t, 8, plan, nil, nil)
 	client := &memoryCapabilityClient{objects: map[string][]byte{}}
-	directory, err := claim.ScratchDir(t.TempDir())
-	if err != nil || os.MkdirAll(directory, 0700) != nil {
+	root := t.TempDir()
+	sealedScratch, err := BindReclaimedGapOnlyHourScratch(claim, root)
+	if err != nil {
 		t.Fatal(err)
 	}
-	sealedScratch := bindTestScratch(t, claim, nil, nil, directory)
 	published, err := PublishClaimedHourRenewing(context.Background(), client, testSourceAuthority, claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(context.Context, WorkerClaim, PublishedHour) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(client.objects) != 1 || len(published.Outputs) != 0 || !lowerHex64(published.HourManifestSHA256) {
+	manifestBytes := client.objects[plan.CoverageObjectKey]
+	if len(client.objects) != 1 || len(published.Outputs) != 0 || published.HourManifestSHA256 != claim.HourManifestExpectedSHA || int64(len(manifestBytes)) != claim.HourManifestExpectedSize {
 		t.Fatalf("gap-only publication emitted media: %+v objects=%d", published, len(client.objects))
+	}
+}
+
+func TestReclaimedGapOnlyHourRejectsNonemptyScratch(t *testing.T) {
+	req := testRequest([]SourceClip{testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))})
+	req.Sources = nil
+	ledger, err := testLedger(req, "2026-05-04")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AllocationLedgerSHA = ledger.LedgerSHA256
+	plan, err := BuildGapOnlyHourPlan(req, "2026-05-04", 2, "no_source_clips")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := sealedClaim(t, 8, plan, nil, nil)
+	root := t.TempDir()
+	directory, err := claim.ScratchDir(root)
+	if err != nil || os.MkdirAll(directory, 0o700) != nil || os.WriteFile(filepath.Join(directory, "stale.part"), []byte("stale"), 0o600) != nil {
+		t.Fatal(err)
+	}
+	if _, err := BindReclaimedGapOnlyHourScratch(claim, root); err == nil {
+		t.Fatal("nonempty reclaimed gap-only scratch was accepted")
 	}
 }

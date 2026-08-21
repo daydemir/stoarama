@@ -92,6 +92,31 @@ func BindRebuiltSealedHourScratch(claim WorkerClaim, scratchRoot, directory stri
 	return bindSealedHourScratch(verified, claim)
 }
 
+// BindReclaimedGapOnlyHourScratch reconstructs the only publication scratch
+// that needs no source bytes: an empty, canonical gap-only hour. Any source,
+// output, quarantine, or stale scratch entry fails closed.
+func BindReclaimedGapOnlyHourScratch(claim WorkerClaim, scratchRoot string) (SealedHourScratch, error) {
+	if err := claim.Validate(time.Now().UTC()); err != nil || !claim.Plan.GapOnly || len(claim.Plan.Sources) != 0 || len(claim.Plan.QuarantinedSources) != 0 || len(claim.Plan.Outputs) != 0 || len(claim.MediaArtifactIDs) != 0 {
+		return SealedHourScratch{}, fmt.Errorf("only a canonical gap-only hour can rebuild empty scratch")
+	}
+	directory, err := claim.ScratchDir(scratchRoot)
+	if err != nil {
+		return SealedHourScratch{}, err
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return SealedHourScratch{}, fmt.Errorf("create reclaimed gap-only scratch: %w", err)
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || !info.IsDir() || info.Mode()&0o077 != 0 {
+		return SealedHourScratch{}, fmt.Errorf("reclaimed gap-only scratch is not a private directory")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil || len(entries) != 0 {
+		return SealedHourScratch{}, fmt.Errorf("reclaimed gap-only scratch is not empty")
+	}
+	return BindRebuiltSealedHourScratch(claim, scratchRoot, directory, nil, nil)
+}
+
 type FinalizeHour func(context.Context, WorkerClaim, PublishedHour) error
 type ReadCapabilityResolver func(context.Context, WorkerClaim, int64) (ObjectReadCapability, error)
 type CreateCapabilityResolver func(context.Context, WorkerClaim, int64) (ObjectCreateCapability, error)

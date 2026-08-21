@@ -132,11 +132,48 @@ func TestJoinedAPIRejectsRedirectAndDoesNotExposeResponseBody(t *testing.T) {
 	}
 }
 
+func TestJoinedFinalizeAcceptsExactNoContent(t *testing.T) {
+	t.Parallel()
+	const token = "operation-token-kept-secret"
+	paths := make(chan string, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("unexpected finalize request: %s auth=%q", r.Method, r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "bootstrap-token-kept-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	if err := api.finalizeLedger(context.Background(), token, joinedrecording.FinalizeLedgerRequest{ProtocolVersion: 1, Published: joinedrecording.PublishedLedger{ArtifactID: 1, ObjectKey: "joined/ledger.json", ETag: "etag", SizeBytes: 1, SHA256: sha}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.finalizeHour(context.Background(), token, joinedrecording.FinalizeHourRequest{ProtocolVersion: 1, Published: joinedrecording.PublishedHour{HourID: "hour", RecordingID: 1, LocalHour: 1, HourManifestObjectKey: "joined/hour.json", HourManifestETag: "etag", HourManifestSizeBytes: 1, HourManifestSHA256: sha}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.finalizeBatchIndex(context.Background(), token, joinedrecording.FinalizeBatchIndexRequest{ProtocolVersion: 1, Published: joinedrecording.PublishedBatchIndex{ArtifactID: 2, ObjectKey: "joined/index.json", ETag: "etag", SizeBytes: 1, SHA256: sha}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"/api/v1/recording/joined/publication/ledger/finalize",
+		"/api/v1/recording/joined/publication/hour/finalize",
+		"/api/v1/recording/joined/publication/index/finalize",
+	} {
+		if got := <-paths; got != want {
+			t.Fatalf("finalize path=%q want=%q", got, want)
+		}
+	}
+}
+
 func TestJoinedWorkerFailsClosedForReclaimedHour(t *testing.T) {
 	t.Parallel()
 	service := &remoteJoinedOperatorService{}
-	err := service.publishClaim(context.Background(), joinedrecording.PublicationClaimResponse{Kind: "hour", Hour: &joinedrecording.WorkerClaim{HourID: "sealed-hour"}})
-	if err == nil || !strings.Contains(err.Error(), "cannot be rebuilt") {
+	err := service.publishClaim(context.Background(), joinedrecording.PublicationClaimResponse{Kind: "hour", Hour: &joinedrecording.WorkerClaim{HourID: "sealed-hour"}}, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "cannot yet be rebuilt") {
 		t.Fatalf("reclaimed hour did not fail closed: %v", err)
 	}
 }
