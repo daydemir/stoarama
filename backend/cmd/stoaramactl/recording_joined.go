@@ -12,17 +12,44 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
 
 type joinedFreezeTier1Request struct {
-	ConnectionID                    int64  `json:"connection_id"`
+	ConnectionID          int64  `json:"connection_id"`
+	BatchID               string `json:"batch_id"`
+	Generation            int    `json:"generation"`
+	SourceEndpoint        string `json:"source_endpoint"`
+	QualificationRunID    int64  `json:"qualification_run_id"`
+	ExpectedRequestSHA256 string `json:"expected_request_sha256,omitempty"`
+	Apply                 bool   `json:"apply"`
+}
+
+type joinedSealStreamDayRequest struct {
+	BatchID     string `json:"batch_id"`
+	RecordingID int64  `json:"recording_id"`
+	LocalDate   string `json:"local_date"`
+	Apply       bool   `json:"-"`
+}
+
+type joinedFinalFreezeRequest struct {
 	BatchID                         string `json:"batch_id"`
-	ExpectedFrozenDenominatorSHA256 string `json:"expected_frozen_denominator_sha256,omitempty"`
-	Apply                           bool   `json:"apply"`
+	ExpectedFrozenDenominatorSHA256 string `json:"expected_frozen_denominator_sha256"`
+	Apply                           bool   `json:"-"`
+}
+
+type joinedSealRemainingDaysRequest struct {
+	BatchID                         string `json:"batch_id"`
+	CanaryRecordingID               int64  `json:"canary_recording_id"`
+	CanaryLocalDate                 string `json:"canary_local_date"`
+	ExpectedCanarySealRequestSHA256 string `json:"expected_canary_seal_request_sha256"`
+	Apply                           bool   `json:"-"`
 }
 
 type joinedWorkerRequest struct {
@@ -35,21 +62,17 @@ type joinedStatusRequest struct {
 	BatchID string `json:"batch_id"`
 }
 
-type joinedFinalizeIndexRequest struct {
-	BatchID                       string `json:"batch_id"`
-	ExpectedFinalBatchIndexSHA256 string `json:"expected_final_batch_index_sha256,omitempty"`
-	Apply                         bool   `json:"apply"`
-}
-
 // joinedOperatorService is the narrow boundary between operator parsing and
 // the joined-recording lifecycle. The integration supplies its DB/media/API
 // implementation without teaching the CLI about those clients.
 type joinedOperatorService interface {
 	FreezeTier1(context.Context, joinedFreezeTier1Request) (any, error)
+	SealStreamDay(context.Context, joinedSealStreamDayRequest) (any, error)
+	SealRemainingDays(context.Context, joinedSealRemainingDaysRequest) (any, error)
+	FinalFreeze(context.Context, joinedFinalFreezeRequest) (any, error)
 	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
 	RunWorker(context.Context, joinedWorkerRequest) error
 	Status(context.Context, joinedStatusRequest) (any, error)
-	FinalizeIndex(context.Context, joinedFinalizeIndexRequest) (any, error)
 }
 
 type joinedOperatorFactory func(context.Context, config.Config) (joinedOperatorService, error)
@@ -84,7 +107,7 @@ func waitForJoinedWorkerShutdown(ctx context.Context) {
 
 func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []string, factory joinedOperatorFactory) (any, error) {
 	if len(args) == 0 {
-		return nil, errors.New("expected freeze-tier1, worker run, status, or finalize-index")
+		return nil, errors.New("expected freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, worker run, or status")
 	}
 
 	switch args[0] {
@@ -101,6 +124,51 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 			return nil, err
 		}
 		return service.FreezeTier1(ctx, req)
+	case "seal-stream-day":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedSealStreamDay(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if !req.Apply {
+			return map[string]any{"dry_run": true, "request": req}, nil
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.SealStreamDay(ctx, req)
+	case "seal-remaining-days":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedSealRemainingDays(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.SealRemainingDays(ctx, req)
+	case "final-freeze":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedFinalFreeze(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if !req.Apply {
+			return map[string]any{"dry_run": true, "request": req}, nil
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.FinalFreeze(ctx, req)
 	case "worker":
 		if len(args) < 2 || args[1] != "run" {
 			return nil, errors.New("expected worker run")
@@ -142,19 +210,6 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 			return nil, err
 		}
 		return service.Status(ctx, req)
-	case "finalize-index":
-		if err := requireJoinedActiveProtocol(cfg); err != nil {
-			return nil, err
-		}
-		req, err := parseJoinedFinalizeIndex(cfg, args[1:])
-		if err != nil {
-			return nil, err
-		}
-		service, err := factory(ctx, cfg)
-		if err != nil {
-			return nil, err
-		}
-		return service.FinalizeIndex(ctx, req)
 	default:
 		return nil, fmt.Errorf("unknown subcommand %q", args[0])
 	}
@@ -168,11 +223,14 @@ func requireJoinedActiveProtocol(cfg config.Config) error {
 }
 
 func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1Request, error) {
-	var req joinedFreezeTier1Request
+	req := joinedFreezeTier1Request{BatchID: cfg.JoinedRecordingBatchID, Generation: 1}
 	flags := newJoinedFlagSet("recording-joined freeze-tier1")
 	flags.Int64Var(&req.ConnectionID, "connection-id", 0, "NAS connection identifier")
-	flags.StringVar(&req.BatchID, "batch-id", cfg.JoinedRecordingBatchID, "immutable batch identifier")
-	flags.StringVar(&req.ExpectedFrozenDenominatorSHA256, "expected-frozen-denominator-sha256", "", "expected frozen denominator hash")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.IntVar(&req.Generation, "generation", req.Generation, "immutable batch generation")
+	flags.StringVar(&req.SourceEndpoint, "source-endpoint", "", "exact frozen R2 endpoint")
+	flags.Int64Var(&req.QualificationRunID, "qualification-run-id", 0, "immutable qualification run identifier")
+	flags.StringVar(&req.ExpectedRequestSHA256, "expected-request-sha256", "", "request hash returned by dry-run")
 	flags.BoolVar(&req.Apply, "apply", false, "freeze the cohort")
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
@@ -183,7 +241,84 @@ func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1
 	if err := validateJoinedBatchID(req.BatchID); err != nil {
 		return req, err
 	}
+	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
+		return req, errors.New("--batch-id must end with the exact --generation")
+	}
+	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
+		return req, errors.New("--source-endpoint must be the exact supported R2 endpoint")
+	}
+	if req.QualificationRunID <= 0 {
+		return req, errors.New("--qualification-run-id must be positive")
+	}
+	if err := validateExpectedHash("--expected-request-sha256", req.ExpectedRequestSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedSealStreamDay(cfg config.Config, args []string) (joinedSealStreamDayRequest, error) {
+	req := joinedSealStreamDayRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined seal-stream-day")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.Int64Var(&req.RecordingID, "recording-id", 0, "frozen Tier-1 recording identifier")
+	flags.StringVar(&req.LocalDate, "local-date", "", "frozen local date (YYYY-MM-DD)")
+	flags.BoolVar(&req.Apply, "apply", false, "HEAD and seal this exact stream day")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if !slices.Contains(joinedrecording.Tier1RecordingIDs, req.RecordingID) {
+		return req, errors.New("--recording-id must be in the frozen Tier-1 cohort")
+	}
+	date, err := time.Parse("2006-01-02", req.LocalDate)
+	if err != nil || date.Format("2006-01-02") != req.LocalDate {
+		return req, errors.New("--local-date must be YYYY-MM-DD")
+	}
+	return req, nil
+}
+
+func parseJoinedFinalFreeze(cfg config.Config, args []string) (joinedFinalFreezeRequest, error) {
+	req := joinedFinalFreezeRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined final-freeze")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.StringVar(&req.ExpectedFrozenDenominatorSHA256, "expected-frozen-denominator-sha256", "", "apply-time frozen denominator hash")
+	flags.BoolVar(&req.Apply, "apply", false, "freeze the fully sealed batch")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
 	if err := validateExpectedHash("--expected-frozen-denominator-sha256", req.ExpectedFrozenDenominatorSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedSealRemainingDays(cfg config.Config, args []string) (joinedSealRemainingDaysRequest, error) {
+	req := joinedSealRemainingDaysRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined seal-remaining-days")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.Int64Var(&req.CanaryRecordingID, "canary-recording-id", 0, "approved canary recording identifier")
+	flags.StringVar(&req.CanaryLocalDate, "canary-local-date", "", "approved canary local date")
+	flags.StringVar(&req.ExpectedCanarySealRequestSHA256, "expected-canary-seal-request-sha256", "", "approved canary receipt hash")
+	flags.BoolVar(&req.Apply, "apply", false, "seal the other 461 stream days serially")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if !slices.Contains(joinedrecording.Tier1RecordingIDs, req.CanaryRecordingID) {
+		return req, errors.New("--canary-recording-id must be in the frozen Tier-1 cohort")
+	}
+	date, err := time.Parse("2006-01-02", req.CanaryLocalDate)
+	if err != nil || date.Format("2006-01-02") != req.CanaryLocalDate {
+		return req, errors.New("--canary-local-date must be YYYY-MM-DD")
+	}
+	if err := validateExpectedHash("--expected-canary-seal-request-sha256", req.ExpectedCanarySealRequestSHA256, true); err != nil {
 		return req, err
 	}
 	return req, nil
@@ -224,24 +359,6 @@ func parseJoinedStatus(cfg config.Config, args []string) (joinedStatusRequest, e
 		return req, err
 	}
 	return req, validateJoinedBatchID(req.BatchID)
-}
-
-func parseJoinedFinalizeIndex(cfg config.Config, args []string) (joinedFinalizeIndexRequest, error) {
-	req := joinedFinalizeIndexRequest{BatchID: cfg.JoinedRecordingBatchID}
-	flags := newJoinedFlagSet("recording-joined finalize-index")
-	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
-	flags.StringVar(&req.ExpectedFinalBatchIndexSHA256, "expected-final-batch-index-sha256", "", "expected final batch-index hash")
-	flags.BoolVar(&req.Apply, "apply", false, "publish the batch index")
-	if err := parseJoinedFlags(flags, args); err != nil {
-		return req, err
-	}
-	if err := validateJoinedBatchID(req.BatchID); err != nil {
-		return req, err
-	}
-	if err := validateExpectedHash("--expected-final-batch-index-sha256", req.ExpectedFinalBatchIndexSHA256, req.Apply); err != nil {
-		return req, err
-	}
-	return req, nil
 }
 
 func newJoinedFlagSet(name string) *flag.FlagSet {

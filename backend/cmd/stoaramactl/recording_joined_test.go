@@ -11,13 +11,15 @@ import (
 )
 
 type fakeJoinedOperator struct {
-	freezeReq   joinedFreezeTier1Request
-	workerReq   joinedWorkerRequest
-	statusReq   joinedStatusRequest
-	finalizeReq joinedFinalizeIndexRequest
-	startupReq  joinedWorkerRequest
-	startupErr  error
-	workerRuns  int
+	freezeReq    joinedFreezeTier1Request
+	dayReq       joinedSealStreamDayRequest
+	remainingReq joinedSealRemainingDaysRequest
+	finalReq     joinedFinalFreezeRequest
+	workerReq    joinedWorkerRequest
+	statusReq    joinedStatusRequest
+	startupReq   joinedWorkerRequest
+	startupErr   error
+	workerRuns   int
 }
 
 func validJoinedWorkerConfig() config.Config {
@@ -40,6 +42,21 @@ func (f *fakeJoinedOperator) FreezeTier1(_ context.Context, req joinedFreezeTier
 	return map[string]any{"status": "planned"}, nil
 }
 
+func (f *fakeJoinedOperator) SealStreamDay(_ context.Context, req joinedSealStreamDayRequest) (any, error) {
+	f.dayReq = req
+	return map[string]any{"status": "sealed"}, nil
+}
+
+func (f *fakeJoinedOperator) SealRemainingDays(_ context.Context, req joinedSealRemainingDaysRequest) (any, error) {
+	f.remainingReq = req
+	return map[string]any{"status": "sealed"}, nil
+}
+
+func (f *fakeJoinedOperator) FinalFreeze(_ context.Context, req joinedFinalFreezeRequest) (any, error) {
+	f.finalReq = req
+	return map[string]any{"status": "frozen"}, nil
+}
+
 func (f *fakeJoinedOperator) RunWorker(_ context.Context, req joinedWorkerRequest) error {
 	f.workerReq = req
 	f.workerRuns++
@@ -54,11 +71,6 @@ func (f *fakeJoinedOperator) CheckWorkerStartup(_ context.Context, req joinedWor
 func (f *fakeJoinedOperator) Status(_ context.Context, req joinedStatusRequest) (any, error) {
 	f.statusReq = req
 	return map[string]any{"status": "running"}, nil
-}
-
-func (f *fakeJoinedOperator) FinalizeIndex(_ context.Context, req joinedFinalizeIndexRequest) (any, error) {
-	f.finalizeReq = req
-	return map[string]any{"status": "published"}, nil
 }
 
 func TestJoinedWorkerDisabledBeforeFactory(t *testing.T) {
@@ -158,7 +170,7 @@ func TestJoinedWorkerStartupFailurePreventsClaimLoop(t *testing.T) {
 }
 
 func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
-	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
 	factory := func(context.Context, config.Config) (joinedOperatorService, error) {
 		t.Fatal("invalid request reached factory")
 		return nil, nil
@@ -167,8 +179,8 @@ func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"freeze-tier1", "--connection-id", "44", "--apply"}, "expected-frozen-denominator-sha256"},
-		{[]string{"finalize-index", "--apply"}, "expected-final-batch-index-sha256"},
+		{[]string{"freeze-tier1", "--connection-id", "44", "--source-endpoint", "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "--qualification-run-id", "7", "--apply"}, "expected-request-sha256"},
+		{[]string{"final-freeze", "--apply"}, "expected-frozen-denominator-sha256"},
 	} {
 		_, err := runRecordingJoinedWith(context.Background(), cfg, tc.args, factory)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -178,10 +190,10 @@ func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
 }
 
 func TestJoinedMutationsRejectAmbiguousLegacyExpectedHashFlag(t *testing.T) {
-	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
 	for _, args := range [][]string{
 		{"freeze-tier1", "--connection-id", "44", "--expected-manifest-sha256", strings.Repeat("a", 64)},
-		{"finalize-index", "--expected-manifest-sha256", strings.Repeat("a", 64)},
+		{"final-freeze", "--expected-manifest-sha256", strings.Repeat("a", 64)},
 	} {
 		_, err := runRecordingJoinedWith(context.Background(), cfg, args, nil)
 		if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
@@ -193,39 +205,64 @@ func TestJoinedMutationsRejectAmbiguousLegacyExpectedHashFlag(t *testing.T) {
 func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	fake := &fakeJoinedOperator{}
 	factory := func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil }
-	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
 	hash := strings.Repeat("a", 64)
+	endpoint := "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
 
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
-		"freeze-tier1", "--connection-id", "44", "--expected-frozen-denominator-sha256", hash, "--apply",
+		"freeze-tier1", "--connection-id", "44", "--source-endpoint", endpoint, "--qualification-run-id", "7",
+		"--expected-request-sha256", hash, "--apply",
 	}, factory); err != nil {
 		t.Fatal(err)
 	}
-	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08", ExpectedFrozenDenominatorSHA256: hash, Apply: true}) {
+	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08-generation-1",
+		Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7, ExpectedRequestSHA256: hash, Apply: true}) {
 		t.Fatalf("freeze request=%+v", fake.freezeReq)
+	}
+	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
+		"seal-stream-day", "--recording-id", "377", "--local-date", "2026-08-01", "--apply",
+	}, factory); err != nil {
+		t.Fatal(err)
+	}
+	if fake.dayReq != (joinedSealStreamDayRequest{BatchID: cfg.JoinedRecordingBatchID, RecordingID: 377,
+		LocalDate: "2026-08-01", Apply: true}) {
+		t.Fatalf("stream-day request=%+v", fake.dayReq)
+	}
+	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
+		"seal-remaining-days", "--canary-recording-id", "377", "--canary-local-date", "2026-08-01",
+		"--expected-canary-seal-request-sha256", hash, "--apply",
+	}, factory); err != nil {
+		t.Fatal(err)
+	}
+	if fake.remainingReq != (joinedSealRemainingDaysRequest{BatchID: cfg.JoinedRecordingBatchID,
+		CanaryRecordingID: 377, CanaryLocalDate: "2026-08-01", ExpectedCanarySealRequestSHA256: hash, Apply: true}) {
+		t.Fatalf("remaining-days request=%+v", fake.remainingReq)
+	}
+	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
+		"final-freeze", "--expected-frozen-denominator-sha256", hash, "--apply",
+	}, factory); err != nil {
+		t.Fatal(err)
+	}
+	if fake.finalReq != (joinedFinalFreezeRequest{BatchID: cfg.JoinedRecordingBatchID,
+		ExpectedFrozenDenominatorSHA256: hash, Apply: true}) {
+		t.Fatalf("final-freeze request=%+v", fake.finalReq)
 	}
 
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{"status"}, factory); err != nil {
 		t.Fatal(err)
 	}
-	if fake.statusReq.BatchID != "tier1-2026-08" {
+	if fake.statusReq.BatchID != cfg.JoinedRecordingBatchID {
 		t.Fatalf("status request=%+v", fake.statusReq)
 	}
 
-	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
-		"finalize-index", "--expected-final-batch-index-sha256", hash, "--apply",
-	}, factory); err != nil {
-		t.Fatal(err)
-	}
-	if fake.finalizeReq != (joinedFinalizeIndexRequest{BatchID: "tier1-2026-08", ExpectedFinalBatchIndexSHA256: hash, Apply: true}) {
-		t.Fatalf("finalize request=%+v", fake.finalizeReq)
-	}
 }
 
 func TestJoinedMutationsDormantBeforeFactory(t *testing.T) {
 	for _, args := range [][]string{
-		{"freeze-tier1", "--connection-id", "44", "--batch-id", "tier1-2026-08"},
-		{"finalize-index", "--batch-id", "tier1-2026-08"},
+		{"freeze-tier1", "--connection-id", "44", "--batch-id", "tier1-2026-08-generation-1"},
+		{"seal-stream-day", "--batch-id", "tier1-2026-08-generation-1"},
+		{"seal-remaining-days", "--batch-id", "tier1-2026-08-generation-1"},
+		{"final-freeze", "--batch-id", "tier1-2026-08-generation-1"},
 	} {
 		for _, cfg := range []config.Config{
 			{},

@@ -32,10 +32,32 @@ type joinedAPIClient struct {
 type remoteJoinedOperatorService struct {
 	cfg              config.Config
 	api              *joinedAPIClient
+	operatorToken    string
 	capabilityClient joinedrecording.CapabilityHTTPClient
 	idlePoll         time.Duration
 	processClaim     func(context.Context, joinedrecording.PublicationClaimResponse, string) error
 	processPreflight func(context.Context, joinedrecording.PreflightHourClaim, string) error
+}
+
+type joinedAdminBatchStatusStreamDay struct {
+	RecordingID       int64  `json:"recording_id"`
+	LocalDate         string `json:"local_date"`
+	State             string `json:"state"`
+	SourceCount       int    `json:"source_count"`
+	SourceBytes       int64  `json:"source_bytes"`
+	SealRequestSHA256 string `json:"seal_request_sha256"`
+}
+
+type joinedAdminBatchStatus struct {
+	ProtocolVersion         int                               `json:"protocol_version"`
+	BatchID                 string                            `json:"batch_id"`
+	State                   string                            `json:"state"`
+	FrozenDenominatorSHA256 string                            `json:"frozen_denominator_sha256"`
+	FreezeStartedAt         *time.Time                        `json:"freeze_started_at,omitempty"`
+	FrozenAt                *time.Time                        `json:"frozen_at,omitempty"`
+	ExpectedStreamDays      int                               `json:"expected_stream_days"`
+	ExpectedScheduledHours  int                               `json:"expected_scheduled_hours"`
+	StreamDays              []joinedAdminBatchStatusStreamDay `json:"stream_days"`
 }
 
 func newRemoteJoinedOperatorService(cfg config.Config) (*remoteJoinedOperatorService, error) {
@@ -62,9 +84,6 @@ func newJoinedAPIClient(baseURL, bootstrapToken string, httpClient *http.Client)
 		return nil, fmt.Errorf("APP_BASE_URL must be one HTTP(S) origin")
 	}
 	bootstrapToken = strings.TrimSpace(bootstrapToken)
-	if bootstrapToken == "" {
-		return nil, fmt.Errorf("joined worker bootstrap token is required")
-	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: joinedAPITimeout}
 	} else {
@@ -75,15 +94,152 @@ func newJoinedAPIClient(baseURL, bootstrapToken string, httpClient *http.Client)
 	return &joinedAPIClient{baseURL: baseURL, bootstrapToken: bootstrapToken, httpClient: httpClient}, nil
 }
 
-func (s *remoteJoinedOperatorService) FreezeTier1(context.Context, joinedFreezeTier1Request) (any, error) {
-	return nil, errors.New("joined Tier-1 freeze is an API operator action, not a media-worker action")
+func (s *remoteJoinedOperatorService) FreezeTier1(ctx context.Context, req joinedFreezeTier1Request) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	cutoff, err := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse frozen Tier-1 cutoff: %w", err)
+	}
+	payload := struct {
+		ProtocolVersion          int       `json:"protocol_version"`
+		ConnectionID             int64     `json:"connection_id"`
+		BatchID                  string    `json:"batch_id"`
+		Generation               int       `json:"generation"`
+		SourceEndpoint           string    `json:"source_endpoint"`
+		QualificationRunID       int64     `json:"qualification_run_id"`
+		RecordingIDs             []int64   `json:"recording_ids"`
+		OrderedRecordingIDSHA256 string    `json:"ordered_recording_ids_sha256"`
+		EligibilityCutoff        time.Time `json:"eligibility_cutoff"`
+		Apply                    bool      `json:"apply"`
+		ExpectedRequestSHA256    string    `json:"expected_request_sha256,omitempty"`
+	}{joinedrecording.JoinedProtocolVersion, req.ConnectionID, req.BatchID, req.Generation, req.SourceEndpoint,
+		req.QualificationRunID, append([]int64(nil), joinedrecording.Tier1RecordingIDs...),
+		joinedrecording.Tier1RecordingIDSHA, cutoff, req.Apply, req.ExpectedRequestSHA256}
+	var response map[string]any
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/freeze-tier1", token, payload, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
-func (s *remoteJoinedOperatorService) FinalizeIndex(context.Context, joinedFinalizeIndexRequest) (any, error) {
-	return nil, errors.New("joined final index freeze is an API operator action, not a media-worker action")
+func (s *remoteJoinedOperatorService) SealStreamDay(ctx context.Context, req joinedSealStreamDayRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		ProtocolVersion int    `json:"protocol_version"`
+		BatchID         string `json:"batch_id"`
+		RecordingID     int64  `json:"recording_id"`
+		LocalDate       string `json:"local_date"`
+	}{joinedrecording.JoinedProtocolVersion, req.BatchID, req.RecordingID, req.LocalDate}
+	var response map[string]any
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/stream-days/seal", token, payload, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (s *remoteJoinedOperatorService) SealRemainingDays(ctx context.Context, req joinedSealRemainingDaysRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	status, err := s.adminBatchStatus(ctx, token, req.BatchID)
+	if err != nil {
+		return nil, err
+	}
+	if status.ProtocolVersion != joinedrecording.JoinedProtocolVersion || status.BatchID != req.BatchID ||
+		status.State != "building" || status.FreezeStartedAt != nil || status.FrozenAt != nil ||
+		status.ExpectedStreamDays != len(joinedrecording.Tier1RecordingIDs)*14 ||
+		status.ExpectedScheduledHours != len(joinedrecording.Tier1RecordingIDs)*14*12 ||
+		len(status.StreamDays) != status.ExpectedStreamDays {
+		return nil, errors.New("joined batch is not ready for serial stream-day sealing")
+	}
+	canaryFound := false
+	pending := make([]joinedSealStreamDayRequest, 0, status.ExpectedStreamDays-1)
+	sealed := 0
+	for _, day := range status.StreamDays {
+		isCanary := day.RecordingID == req.CanaryRecordingID && day.LocalDate == req.CanaryLocalDate
+		if isCanary {
+			if canaryFound || day.State != "sealed" || day.SealRequestSHA256 != req.ExpectedCanarySealRequestSHA256 {
+				return nil, errors.New("joined canary receipt differs")
+			}
+			canaryFound = true
+			sealed++
+			continue
+		}
+		switch day.State {
+		case "sealed":
+			sealed++
+		case "pending":
+			if day.SealRequestSHA256 != "" {
+				return nil, errors.New("pending joined stream day carries a seal receipt")
+			}
+			pending = append(pending, joinedSealStreamDayRequest{BatchID: req.BatchID,
+				RecordingID: day.RecordingID, LocalDate: day.LocalDate, Apply: true})
+		default:
+			return nil, errors.New("joined stream-day state is not resumable")
+		}
+	}
+	if !canaryFound {
+		return nil, errors.New("approved joined canary is absent")
+	}
+	if !req.Apply {
+		return map[string]any{"dry_run": true, "batch_id": req.BatchID, "already_sealed": sealed,
+			"remaining": len(pending)}, nil
+	}
+	completed := 0
+	for _, day := range pending {
+		if _, err := s.SealStreamDay(ctx, day); err != nil {
+			return nil, fmt.Errorf("seal joined stream day %d/%s after %d completions: %w",
+				day.RecordingID, day.LocalDate, completed, err)
+		}
+		completed++
+	}
+	return map[string]any{"dry_run": false, "batch_id": req.BatchID, "already_sealed": sealed,
+		"sealed_now": completed, "remaining": 0}, nil
+}
+
+func (s *remoteJoinedOperatorService) adminBatchStatus(ctx context.Context, token, batchID string) (joinedAdminBatchStatus, error) {
+	var status joinedAdminBatchStatus
+	path := "/api/v1/recording/joined/batches/status?batch_id=" + url.QueryEscape(batchID)
+	err := s.api.getJSON(ctx, path, token, &status)
+	return status, err
+}
+
+func (s *remoteJoinedOperatorService) FinalFreeze(ctx context.Context, req joinedFinalFreezeRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		ProtocolVersion                 int    `json:"protocol_version"`
+		BatchID                         string `json:"batch_id"`
+		ExpectedFrozenDenominatorSHA256 string `json:"expected_frozen_denominator_sha256"`
+	}{joinedrecording.JoinedProtocolVersion, req.BatchID, req.ExpectedFrozenDenominatorSHA256}
+	var response map[string]any
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/batches/final-freeze", token, payload, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (s *remoteJoinedOperatorService) validOperatorToken() (string, error) {
+	token := strings.TrimSpace(s.operatorToken)
+	if len(token) < 32 || token == strings.TrimSpace(s.api.bootstrapToken) {
+		return "", errors.New("a distinct STOARAMA_JOINED_OPERATOR_TOKEN is required for operator actions")
+	}
+	return token, nil
 }
 
 func (s *remoteJoinedOperatorService) Status(ctx context.Context, req joinedStatusRequest) (any, error) {
+	if strings.TrimSpace(s.api.bootstrapToken) == "" {
+		return nil, errors.New("joined worker bootstrap token is required for worker status")
+	}
 	var status map[string]any
 	path := "/api/v1/recording/joined/status?batch_id=" + url.QueryEscape(req.BatchID)
 	if err := s.api.getJSON(ctx, path, s.api.bootstrapToken, &status); err != nil {
@@ -274,6 +430,9 @@ func (s *remoteJoinedOperatorService) finalizeHour(ctx context.Context, claim jo
 }
 
 func (c *joinedAPIClient) bootstrap(ctx context.Context, batchID string) (joinedrecording.WorkerBootstrapResponse, bool, error) {
+	if strings.TrimSpace(c.bootstrapToken) == "" {
+		return joinedrecording.WorkerBootstrapResponse{}, false, errors.New("joined worker bootstrap token is required")
+	}
 	request := joinedrecording.WorkerBootstrapRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: batchID}
 	var response joinedrecording.WorkerBootstrapResponse
 	if err := request.Validate(); err != nil {
