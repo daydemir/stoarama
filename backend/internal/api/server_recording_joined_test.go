@@ -58,12 +58,13 @@ func assertJoinedCapabilityExpiry(t *testing.T, rec *httptest.ResponseRecorder, 
 		t.Fatalf("signed capability lifetime=%q max=%s err=%v", query.Get("X-Amz-Expires"), max, err)
 	}
 	signedAt, err := time.Parse("20060102T150405Z", query.Get("X-Amz-Date"))
-	if err != nil || response.ExpiresAt.After(signedAt.Add(time.Duration(seconds)*time.Second)) {
-		t.Fatalf("response expiry=%s exceeds signer expiry=%s err=%v", response.ExpiresAt,
+	signedExpiry := signedAt.Add(time.Duration(seconds) * time.Second)
+	if err != nil || !response.ExpiresAt.Equal(signedExpiry) {
+		t.Fatalf("response expiry=%s differs from signer expiry=%s err=%v", response.ExpiresAt,
 			signedAt.Add(time.Duration(seconds)*time.Second), err)
 	}
-	if notAfter != nil && response.ExpiresAt.After(*notAfter) {
-		t.Fatalf("read expiry=%s exceeds DB lease=%s", response.ExpiresAt, *notAfter)
+	if notAfter != nil && signedExpiry.After(*notAfter) {
+		t.Fatalf("signed read expiry=%s exceeds DB lease=%s", signedExpiry, *notAfter)
 	}
 	if createOnly && response.Request.RequiredHeaders["If-None-Match"] != "*" {
 		t.Fatalf("PUT capability is not create-only: %+v", response.Request.RequiredHeaders)
@@ -71,21 +72,35 @@ func assertJoinedCapabilityExpiry(t *testing.T, rec *httptest.ResponseRecorder, 
 }
 
 type joinedOutputStoreStub struct {
-	head r2.ObjectHead
+	head              r2.ObjectHead
+	extraGetExpirySec int
+	extraPutExpirySec int
 }
 
 func (s joinedOutputStoreStub) Head(context.Context, string) (r2.ObjectHead, error) {
 	return s.head, nil
 }
 
-func (joinedOutputStoreStub) PresignPutCreateOnlyRequest(context.Context, string, string, int64, string, time.Duration) (r2.PresignedRequest, error) {
-	return r2.PresignedRequest{}, fmt.Errorf("unexpected PUT presign")
-}
-
-func (joinedOutputStoreStub) PresignGetExactRequest(_ context.Context, key, etag, versionID string, ttl time.Duration) (r2.PresignedRequest, error) {
+func (s joinedOutputStoreStub) PresignPutCreateOnlyRequest(_ context.Context, key, contentType string, sizeBytes int64, _ string, ttl time.Duration) (r2.PresignedRequest, error) {
 	query := url.Values{
 		"X-Amz-Date":    {time.Now().UTC().Format("20060102T150405Z")},
-		"X-Amz-Expires": {strconv.Itoa(int(ttl.Seconds()))},
+		"X-Amz-Expires": {strconv.Itoa(int(ttl.Seconds()) + s.extraPutExpirySec)},
+	}
+	return r2.PresignedRequest{
+		Method: http.MethodPut,
+		URL:    "https://output.example.test/joined-output/" + key + "?" + query.Encode(),
+		Headers: http.Header{
+			"Content-Length": {strconv.FormatInt(sizeBytes, 10)},
+			"Content-Type":   {contentType},
+			"If-None-Match":  {"*"},
+		},
+	}, nil
+}
+
+func (s joinedOutputStoreStub) PresignGetExactRequest(_ context.Context, key, etag, versionID string, ttl time.Duration) (r2.PresignedRequest, error) {
+	query := url.Values{
+		"X-Amz-Date":    {time.Now().UTC().Format("20060102T150405Z")},
+		"X-Amz-Expires": {strconv.Itoa(int(ttl.Seconds()) + s.extraGetExpirySec)},
 		"versionId":     {versionID},
 	}
 	return r2.PresignedRequest{
@@ -128,6 +143,12 @@ func TestJoinedCapabilityEnvelopeRejectsChangedAuthorityAndExpiredLease(t *testi
 	signedExpiry, err := joinedSignedRequestExpiry(joinedSignedRequest{RawQuery: "X-Amz-Date=20260821T120000Z&X-Amz-Expires=300"}, now.Add(10*time.Minute))
 	if err != nil || !signedExpiry.Equal(now.Add(5*time.Minute)) {
 		t.Fatalf("signed request expiry=%s err=%v", signedExpiry, err)
+	}
+	if _, err := joinedSignedRequestExpiry(joinedSignedRequest{RawQuery: "X-Amz-Date=20260821T120000Z&X-Amz-Expires=600"}, now.Add(5*time.Minute)); err == nil {
+		t.Fatal("read capability whose signed expiry outlives the DB lease was accepted")
+	}
+	if signedExpiry, err := joinedSignedRequestExpiry(joinedSignedRequest{RawQuery: "X-Amz-Date=20260821T120000Z&X-Amz-Expires=3600"}, now.Add(time.Hour)); err != nil || !signedExpiry.Equal(now.Add(time.Hour)) {
+		t.Fatalf("create-only signed expiry=%s err=%v", signedExpiry, err)
 	}
 }
 
@@ -895,6 +916,13 @@ func TestJoinedHourSealPublishFeedAndExactAck(t *testing.T) {
 		t.Fatalf("sealed output capability status=%d body=%s", artifactCapability.Code, artifactCapability.Body.String())
 	}
 	assertJoinedCapabilityExpiry(t, artifactCapability, time.Hour, nil, true)
+	s.joinedOutputStorage = joinedOutputStoreStub{extraPutExpirySec: 60}
+	skewedArtifactPutCapability := callArtifactPutCapability(publicationClaim, "")
+	s.joinedOutputStorage = nil
+	if skewedArtifactPutCapability.Code != http.StatusBadGateway || strings.Contains(skewedArtifactPutCapability.Body.String(), `"request"`) {
+		t.Fatalf("signed PUT beyond one-hour cap returned authority status=%d body=%s",
+			skewedArtifactPutCapability.Code, skewedArtifactPutCapability.Body.String())
+	}
 	callArtifactReadCapability := func() *httptest.ResponseRecorder {
 		t.Helper()
 		jobToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, batchID, joinedauth.SubjectHour,
@@ -917,6 +945,16 @@ func TestJoinedHourSealPublishFeedAndExactAck(t *testing.T) {
 		t.Fatalf("sealed output read capability status=%d body=%s", artifactReadCapability.Code, artifactReadCapability.Body.String())
 	}
 	assertJoinedCapabilityExpiry(t, artifactReadCapability, 15*time.Minute, &publicationLeaseExpires, false)
+	s.joinedOutputStorage = joinedOutputStoreStub{
+		head:              r2.ObjectHead{ETag: "output-etag", VersionID: "output-version", SizeBytes: 1000},
+		extraGetExpirySec: 60,
+	}
+	skewedArtifactReadCapability := callArtifactReadCapability()
+	s.joinedOutputStorage = nil
+	if skewedArtifactReadCapability.Code != http.StatusBadGateway || strings.Contains(skewedArtifactReadCapability.Body.String(), `"request"`) {
+		t.Fatalf("signed read beyond DB lease returned authority status=%d body=%s",
+			skewedArtifactReadCapability.Code, skewedArtifactReadCapability.Body.String())
+	}
 	publicationToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, batchID, joinedauth.SubjectHour,
 		hourCanonicalIDs[0], publicationClaim, joinedauth.OperationPublish, time.Now().Add(time.Minute))
 	if err != nil {
