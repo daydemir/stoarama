@@ -3,6 +3,7 @@
     "allocation_ledger": {
       "item": {
         "artifact_id": 1001,
+        "connection_id": 77,
         "batch_id": "goodplus-20260821-generation-1",
         "hour_id": null,
         "kind": "allocation_ledger",
@@ -22,6 +23,7 @@
     "hour_manifest": {
       "item": {
         "artifact_id": 1002,
+        "connection_id": 77,
         "batch_id": "goodplus-20260821-generation-1",
         "hour_id": "goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-01__generation-1",
         "kind": "hour_manifest",
@@ -41,6 +43,7 @@
     "media": {
       "item": {
         "artifact_id": 1003,
+        "connection_id": 77,
         "batch_id": "goodplus-20260821-generation-1",
         "hour_id": "goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-01__generation-1",
         "kind": "media",
@@ -60,6 +63,7 @@
     "batch_index": {
       "item": {
         "artifact_id": 1004,
+        "connection_id": 77,
         "batch_id": "goodplus-20260821-generation-1",
         "hour_id": null,
         "kind": "batch_index",

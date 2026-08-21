@@ -63,7 +63,7 @@ class JoinedDownloadTests(unittest.TestCase):
         })
         manifest["source_dispositions"][0].update({"media_artifact_id": 41, "media_ordinal": 1})
         item = {
-            "artifact_id": 41, "batch_id": manifest["batch_id"],
+            "artifact_id": 41, "connection_id": 77, "batch_id": manifest["batch_id"],
             "hour_id": manifest["hour_id"], "kind": "media",
             "content_type": "video/mp4",
             "relative_path": media["relative_path"],
@@ -95,8 +95,18 @@ class JoinedDownloadTests(unittest.TestCase):
             hour["source_clip_ids"] = []
         ledger["hour_source_claim_sha256"] = [empty_sha] * 12
         gap_manifest = self.golden("hour_manifest_gap_only_v1.golden.json")
-        ledger["cross_hour_boundaries"][0] = gap_manifest["allocation"]["boundaries"][0]
-        ledger["cross_day_boundaries"][0] = gap_manifest["allocation"]["cross_day_boundaries"][0]
+        first = gap_manifest["allocation"]["boundaries"][0]
+        ledger["cross_hour_boundaries"] = [{
+            **first, "previous_delivery_hour": hour, "next_delivery_hour": hour + 1,
+            "scheduled_utc": "2026-05-04T%02d:00:00Z" % (hour + 8),
+        } for hour in range(1, 12)]
+        first_day = gap_manifest["allocation"]["cross_day_boundaries"][0]
+        ledger["cross_day_boundaries"] = [first_day, {
+            **first_day,
+            "scheduled_previous_end_utc": "2026-05-04T20:00:00Z",
+            "scheduled_next_start_utc": "2026-05-05T08:00:00Z",
+            "allocation_decision": "no_next_day_source", "reason": "next_source_absent",
+        }]
         ledger["ledger_sha256"] = ""
         ledger["ledger_sha256"] = pull.joined_canonical_sha(ledger)
         return ledger
@@ -131,7 +141,7 @@ class JoinedDownloadTests(unittest.TestCase):
         content = self.manifest_bytes(None, gap)
         manifest = self.manifest_payload(None, gap)
         return {
-            "artifact_id": 40, "batch_id": manifest["batch_id"],
+            "artifact_id": 40, "connection_id": 77, "batch_id": manifest["batch_id"],
             "hour_id": manifest["hour_id"], "kind": "hour_manifest",
             "content_type": "application/json",
             "relative_path": "coverage/hours/%s.json" % manifest["hour_id"],
@@ -143,17 +153,27 @@ class JoinedDownloadTests(unittest.TestCase):
             "hour_manifest_relative_path": None, "hour_manifest_sha256": None,
         }, content
 
-    def install_manifest(self, cfg, item):
+    def install_manifest(self, cfg, item, acknowledged=True):
         path = cfg.output_dir / "joined" / item["batch_id"] / item["hour_manifest_relative_path"]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(self.manifest_bytes(item))
+        if acknowledged:
+            pull.persist_joined_ack_receipt(cfg, item["connection_id"], {
+                "artifact_id": item["hour_manifest_id"], "relative_path": item["hour_manifest_relative_path"],
+                "size_bytes": path.stat().st_size, "sha256": item["hour_manifest_sha256"],
+            })
         return path
 
-    def install_ledger(self, cfg, gap=False):
+    def install_ledger(self, cfg, gap=False, acknowledged=True):
         ledger = self.ledger_payload(gap)
         path = cfg.output_dir / "joined" / ledger["batch_id"] / "coverage" / "ledgers" / str(ledger["recording_id"]) / (ledger["local_date"] + ".json")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(pull.joined_canonical_bytes(ledger))
+        if acknowledged:
+            pull.persist_joined_ack_receipt(cfg, 77, {
+                "artifact_id": 39, "relative_path": "coverage/ledgers/%d/%s.json" % (ledger["recording_id"], ledger["local_date"]),
+                "size_bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
         return path
 
     def prepared(self, item):
@@ -190,7 +210,7 @@ class JoinedDownloadTests(unittest.TestCase):
             cfg = self.config(Path(raw)); self.assertEqual(pull.Runtime(cfg).heartbeat_payload(None)["joined_protocol_version"], 1)
         good = self.media_item(); self.assertEqual(pull.valid_joined_item(good)["kind"], "media")
         for change in (
-            {"artifact_id": 0}, {"batch_id": "../escape"}, {"batch_id": True}, {"batch_id": 7},
+            {"artifact_id": 0}, {"connection_id": 0}, {"connection_id": True}, {"batch_id": "../escape"}, {"batch_id": True}, {"batch_id": 7},
             {"relative_path": "../escape.mp4"}, {"relative_path": True},
             {"relative_path": "/absolute.mp4"}, {"relative_path": "joined/nested.mp4"}, {"sha256": "bad"},
             {"sha256": "A" * 64}, {"sha256": True}, {"download_path": True},
@@ -258,6 +278,58 @@ class JoinedDownloadTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "duplicate field"):
             pull.decode_joined_json(b'{"schema_version":1,"schema_version":1}')
+        with self.assertRaisesRegex(ValueError, "not canonical"):
+            pull.decode_joined_json(b'{ "schema_version":1}')
+        with self.assertRaisesRegex(ValueError, "field order"):
+            pull.decode_joined_json(b'{"b":1,"a":2}')
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            pull.decode_joined_json(b'{"duration_seconds":1e309}')
+        escaped = pull.joined_canonical_bytes({"category": "a&b<c>d\u2028e\u2029"})
+        self.assertIn(b"a\\u0026b\\u003cc\\u003ed\\u2028e\\u2029", escaped)
+        self.assertEqual(pull.decode_joined_json(escaped)["category"], "a&b<c>d\u2028e\u2029")
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        manifest["media"][0]["verification"]["output_fingerprint"]["duration_seconds"] = float("inf")
+        with self.assertRaisesRegex(ValueError, "invalid duration"):
+            pull.valid_hour_manifest(manifest)
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        manifest["media"][0]["utc_offset_seconds"] = 1
+        with self.assertRaisesRegex(ValueError, "timing conflicts"):
+            pull.valid_hour_manifest(manifest)
+
+    def test_self_rehashed_boundary_and_media_run_mutations_fail(self):
+        ledger = self.ledger_payload()
+        ledger["cross_hour_boundaries"][0]["allocation_decision"] = "no_sources"
+        ledger["ledger_sha256"] = ""
+        ledger["ledger_sha256"] = pull.joined_canonical_sha(ledger)
+        with self.assertRaisesRegex(ValueError, "absent boundary"):
+            pull.valid_allocation_ledger(pull.decode_joined_json(pull.joined_canonical_bytes(ledger)))
+
+        ledger = self.ledger_payload()
+        ledger["hours"][0]["source_clip_ids"] = [1]
+        ledger["hours"][1]["source_clip_ids"] = [2]
+        ledger["hour_source_claim_sha256"][0] = pull.source_claim_sha(ledger["sources"][:1])
+        ledger["hour_source_claim_sha256"][1] = pull.source_claim_sha(ledger["sources"][1:])
+        ledger["ledger_sha256"] = ""
+        ledger["ledger_sha256"] = pull.joined_canonical_sha(ledger)
+        with self.assertRaisesRegex(ValueError, "closest frozen seam"):
+            pull.valid_allocation_ledger(pull.decode_joined_json(pull.joined_canonical_bytes(ledger)))
+
+        ledger = self.ledger_payload()
+        ledger["cross_day_boundaries"][0]["allocation_decision"] = "no_next_day_source"
+        ledger["ledger_sha256"] = ""
+        ledger["ledger_sha256"] = pull.joined_canonical_sha(ledger)
+        with self.assertRaisesRegex(ValueError, "absence reason"):
+            pull.valid_allocation_ledger(pull.decode_joined_json(pull.joined_canonical_bytes(ledger)))
+
+        manifest = self.golden("hour_manifest_mixed_v1.golden.json")
+        manifest["source_dispositions"][1].update({
+            "disposition": "included", "media_artifact_id": 88, "media_ordinal": 1, "reason_code": "",
+        })
+        manifest["quarantine_evidence"] = []
+        manifest["media"][0]["source_clip_ids"] = [1, 2]
+        manifest["media"][0]["actual_end_utc"] = manifest["sources"][1]["end_utc"]
+        with self.assertRaisesRegex(ValueError, "crosses a gap"):
+            pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
 
     def test_protocol_zero_is_dormant_without_joined_api_or_storage_access(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -296,7 +368,7 @@ class JoinedDownloadTests(unittest.TestCase):
         ledger = self.ledger_payload()
         content = pull.joined_canonical_bytes(ledger)
         raw_item = {
-            "artifact_id": 55, "batch_id": ledger["batch_id"], "hour_id": None, "kind": "allocation_ledger",
+            "artifact_id": 55, "connection_id": 77, "batch_id": ledger["batch_id"], "hour_id": None, "kind": "allocation_ledger",
             "content_type": "application/json", "relative_path": "coverage/ledgers/377/2026-05-04.json",
             "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
             "download_path": "/api/v1/account/joined/55/download", "ledger_artifact_id": None,
@@ -346,6 +418,10 @@ class JoinedDownloadTests(unittest.TestCase):
             "ledger_sha256": ledger["ledger_sha256"], "source_count": 1, "source_bytes": source["object"]["size_bytes"],
         }
         manifests, hour_refs = {}, []
+        batch_golden = self.golden("batch_index_v1.golden.json")
+        frozen = batch_golden["frozen_recordings"][0]
+        media_tool = batch_golden["media_tool"]
+        media_path = "01_Europe_Italy_Bevagna_Piazza_Silvestri/May/Monday/01_Piazza_Silvestri_2026_May_W1_Monday_hour_01_080000-080100.mp4"
         for delivery_hour in range(1, 13):
             hour_id = "goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-%02d__generation-1" % delivery_hour
             path = "coverage/hours/%s.json" % hour_id
@@ -356,12 +432,17 @@ class JoinedDownloadTests(unittest.TestCase):
                 "hour_source_claim_sha256": ledger["hour_source_claim_sha256"][delivery_hour - 1],
             }
             allocation["boundaries"], allocation["cross_day_boundaries"] = pull.expected_hour_boundaries(ledger, delivery_hour)
-            media = [{"artifact_id": 88, "relative_path": "delivery/hour-01.mp4", "size_bytes": 6, "sha256": hashlib.sha256(b"media!").hexdigest()}] if delivery_hour == 1 else []
+            media = [{
+                "artifact_id": 88, "relative_path": media_path,
+                "size_bytes": 6, "sha256": hashlib.sha256(b"media!").hexdigest(), "part": 1, "parts": 1,
+                "actual_start_utc": source["start_utc"], "actual_end_utc": source["end_utc"],
+            }] if delivery_hour == 1 else []
             manifests[path] = {
                 "batch_id": ledger["batch_id"], "hour_id": hour_id, "recording_id": 377, "local_date": "2026-05-04",
                 "delivery_hour": delivery_hour, "status": "media" if media else "gap_only", "source_count": len(ids),
                 "qualification_sha256": ledger["qualification_sha256"],
                 "qualification_day": ledger["qualification_day"],
+                "timezone": ledger["timezone"], "media_tool": media_tool,
                 "sources": [source] if ids else [], "source_claim_sha256": ledger["hour_source_claim_sha256"][delivery_hour - 1],
                 "source_dispositions": [{"clip_id": source["clip_id"]}] if ids else [], "allocation": allocation, "media": media,
             }
@@ -373,6 +454,7 @@ class JoinedDownloadTests(unittest.TestCase):
             })
         index = {
             "batch_id": ledger["batch_id"], "allocation_ledgers": [ledger_ref], "hours": hour_refs,
+            "generation": ledger["generation"], "frozen_recordings": [frozen], "media_tool": media_tool,
             "source_clip_count": 1, "source_bytes": source["object"]["size_bytes"], "final_media_artifact_count": 1,
             "frozen_denominator_sha256": pull.frozen_denominator_sha([ledger]),
         }
@@ -380,7 +462,19 @@ class JoinedDownloadTests(unittest.TestCase):
             return ledger if path == ledger_ref["relative_path"] else manifests[path]
         with mock.patch.object(pull, "read_joined_json_path", side_effect=read), mock.patch.object(pull, "valid_allocation_ledger"), mock.patch.object(pull, "valid_hour_manifest"), mock.patch.object(pull, "verify_joined_relative_file") as verify:
             pull.validate_batch_index_proof(None, None, index, threading.Event())
-            verify.assert_called_once_with(None, None, ledger["batch_id"], "delivery/hour-01.mp4", 6, hashlib.sha256(b"media!").hexdigest(), mock.ANY)
+            verify.assert_called_once_with(None, None, ledger["batch_id"], media_path, 6, hashlib.sha256(b"media!").hexdigest(), mock.ANY)
+            ledger["generation"] += 1
+            with self.assertRaisesRegex(pull.ExistingFileMismatch, "ledger reference"):
+                pull.validate_batch_index_proof(None, None, index, threading.Event())
+            ledger["generation"] -= 1
+            manifests[hour_refs[0]["relative_path"]]["media_tool"] = {**media_tool, "ffmpeg_version": "mutated"}
+            with self.assertRaisesRegex(pull.ExistingFileMismatch, "hour reference"):
+                pull.validate_batch_index_proof(None, None, index, threading.Event())
+            manifests[hour_refs[0]["relative_path"]]["media_tool"] = media_tool
+            manifests[hour_refs[0]["relative_path"]]["media"][0]["relative_path"] = "wrong/May/Monday/wrong.mp4"
+            with self.assertRaisesRegex(pull.ExistingFileMismatch, "delivery path"):
+                pull.validate_batch_index_proof(None, None, index, threading.Event())
+            manifests[hour_refs[0]["relative_path"]]["media"][0]["relative_path"] = media_path
             manifests[hour_refs[0]["relative_path"]]["source_dispositions"][0]["clip_id"] = 999
             with self.assertRaisesRegex(pull.ExistingFileMismatch, "disposition union"):
                 pull.validate_batch_index_proof(None, None, index, threading.Event())
@@ -413,6 +507,42 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertEqual([r["If-match"] for r in requests], ['"etag-1"', '"etag-1"'])
             self.assertEqual(acks[0]["artifact_id"], 41); self.assertEqual(list(final.parent.glob(".*.part*")), [])
 
+    def test_installed_dependency_reacks_before_child_and_persists_receipt(self):
+        raw_item, _ = self.manifest_item(gap=True)
+        item = pull.valid_joined_item(raw_item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_ledger(cfg, gap=True, acknowledged=False)
+            with mock.patch.object(pull, "request_json", side_effect=urllib.error.URLError("ACK unavailable")), \
+                 mock.patch.object(pull, "open_joined_url") as download, self.assertRaisesRegex(urllib.error.URLError, "ACK unavailable"):
+                pull.download_joined_item(cfg, runtime, item, threading.Event())
+            download.assert_not_called()
+            self.assertFalse(pull.joined_output_path(cfg, item).exists())
+            acks = []
+            def api(_cfg, _method, path, body=None, **_kwargs):
+                if path.startswith("/account/clips?"): return {"clips": []}
+                acks.append(body); return {"ok": True}
+            with mock.patch.object(pull, "request_json", side_effect=api):
+                pull.ensure_joined_dependency_ack(cfg, runtime, item, threading.Event())
+            self.assertEqual(acks[0]["artifact_id"], item["ledger_artifact_id"])
+            acks.clear()
+            with mock.patch.object(pull, "request_json", side_effect=api):
+                pull.ensure_joined_dependency_ack(cfg, runtime, item, threading.Event())
+            self.assertEqual(acks, [])
+
+    def test_wrong_manifest_artifact_id_is_denied_before_media_work(self):
+        item = pull.valid_joined_item(self.media_item())
+        wrong = {**item, "hour_manifest_id": item["hour_manifest_id"] + 1}
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item, acknowledged=False)
+            def reject(_cfg, _method, path, body=None, **_kwargs):
+                if path.startswith("/account/clips?"): return {"clips": []}
+                self.assertEqual(body["artifact_id"], wrong["hour_manifest_id"])
+                raise pull.ExistingFileMismatch("foreign manifest artifact ID")
+            with mock.patch.object(pull, "request_json", side_effect=reject), mock.patch.object(pull, "open_joined_url") as download, \
+                 self.assertRaisesRegex(pull.ExistingFileMismatch, "foreign manifest artifact ID"):
+                pull.download_joined_item(cfg, runtime, wrong, threading.Event())
+            download.assert_not_called()
+
     def test_media_manifest_mismatch_or_missing_manifest_fails_before_download(self):
         item = pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
@@ -420,7 +550,9 @@ class JoinedDownloadTests(unittest.TestCase):
             with self.assertRaises(pull.ExistingFileMismatch): pull.download_joined_item(cfg, runtime, item, threading.Event())
             path = self.install_manifest(cfg, item); path.write_bytes(self.manifest_bytes({**item, "size_bytes": 7}))
             altered = {**item, "hour_manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-            with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "sealed hour manifest"):
+            with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(
+                pull, "request_json", side_effect=pull.ExistingFileMismatch("wrong dependency ACK identity")
+            ), self.assertRaisesRegex(pull.ExistingFileMismatch, "wrong dependency ACK identity"):
                 pull.download_joined_item(cfg, runtime, altered, threading.Event())
 
     def test_hash_is_bounded_cancellable_and_yields_to_raw(self):

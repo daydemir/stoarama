@@ -2400,16 +2400,19 @@ def valid_joined_item(raw):
     if not isinstance(raw, dict):
         raise ValueError("joined item is invalid")
     fields = {
-        "artifact_id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+        "artifact_id", "connection_id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
         "download_path", "ledger_artifact_id", "ledger_relative_path", "ledger_sha256",
         "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
     }
     if set(raw) != fields:
         raise ValueError("joined item has invalid fields")
     artifact_id = raw.get("artifact_id")
+    connection_id = raw.get("connection_id")
     size_bytes = raw.get("size_bytes")
     if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id < 1:
         raise ValueError("joined item has invalid id")
+    if isinstance(connection_id, bool) or not isinstance(connection_id, int) or connection_id < 1 or connection_id > 2**63 - 1:
+        raise ValueError("joined item has invalid connection_id")
     if (
         isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
         or size_bytes < 1 or size_bytes > JOINED_MAX_BYTES
@@ -2487,7 +2490,7 @@ def valid_joined_item(raw):
     if download_path != "/api/v1/account/joined/%d/download" % artifact_id:
         raise ValueError("joined item has invalid download_path")
     return {
-        "id": artifact_id, "batch_id": batch_id, "hour_id": hour_id, "kind": kind,
+        "id": artifact_id, "connection_id": connection_id, "batch_id": batch_id, "hour_id": hour_id, "kind": kind,
         "content_type": content_type, "relative_path": relative.as_posix(), "size_bytes": size_bytes,
         "sha256": sha256, "download_path": download_path, "ledger_artifact_id": ledger_id,
         "ledger_relative_path": ledger_path, "ledger_sha256": ledger_sha,
@@ -2622,7 +2625,7 @@ def joined_transfer_marker_bytes(item, prepared):
     payload = {
         "schema_version": 3,
         **{key: item[key] for key in (
-            "id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+            "id", "connection_id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
             "download_path", "ledger_artifact_id", "ledger_relative_path", "ledger_sha256",
             "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
         )},
@@ -2675,29 +2678,71 @@ def valid_joined_int64(value, label):
 
 JOINED_REASON = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 JOINED_BATCH = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
-QUALIFICATION_FIELDS = {"local_date", "job_id", "window_start", "window_end", "completed_at", "quality_tier"}
-OBJECT_FIELDS = {"key", "etag", "size_bytes", "sha256"}
-SEAM_FIELDS = {"verdict", "reason", "signed_gap_nanoseconds"}
-SOURCE_FIELDS = {
+QUALIFICATION_FIELDS = ("local_date", "job_id", "window_start", "window_end", "completed_at", "quality_tier")
+OBJECT_FIELDS = ("key", "etag", "size_bytes", "sha256")
+SEAM_FIELDS = ("verdict", "reason", "signed_gap_nanoseconds")
+SOURCE_FIELDS = (
     "clip_id", "recording_id", "recording_job_id", "provider", "endpoint", "region", "bucket",
     "start_utc", "end_utc", "object", "seam_to_previous",
-}
-CROSS_HOUR_FIELDS = {
+)
+CROSS_HOUR_FIELDS = (
     "previous_delivery_hour", "next_delivery_hour", "previous_clip_id", "next_clip_id",
     "previous_presentation_end_utc", "next_presentation_start_utc", "signed_gap_nanoseconds",
     "scheduled_utc", "actual_seam_utc", "boundary_skew_nanoseconds", "allocation_decision", "verdict", "reason",
-}
-CROSS_DAY_FIELDS = {
+)
+CROSS_DAY_FIELDS = (
     "previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc",
     "signed_gap_nanoseconds", "scheduled_previous_end_utc", "scheduled_next_start_utc",
     "boundary_skew_nanoseconds", "allocation_decision", "verdict", "reason",
-}
-MEDIA_TOOL_FIELDS = {"ffmpeg_version", "ffmpeg_sha256", "ffprobe_version", "ffprobe_sha256", "identity_sha256"}
+)
+MEDIA_TOOL_FIELDS = ("ffmpeg_version", "ffmpeg_sha256", "ffprobe_version", "ffprobe_sha256", "identity_sha256")
+
+JOINED_OBJECT_ORDERS = {}
+for _joined_order in (
+    ("schema_version", "policy_version", "status", "batch_id", "hour_id", "recording_id", "timezone", "local_date", "delivery_hour", "clock_hour", "scheduled_start_utc", "scheduled_end_utc", "qualification_day", "qualification_sha256", "allocation", "media_tool", "source_claim_sha256", "source_count", "sources", "source_dispositions", "gaps", "scheduled_gap", "quarantine_reason_code", "quarantine_evidence", "media"),
+    QUALIFICATION_FIELDS,
+    ("artifact_id", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "hour_source_claim_sha256", "boundaries", "cross_day_boundaries"),
+    CROSS_HOUR_FIELDS, CROSS_DAY_FIELDS, MEDIA_TOOL_FIELDS,
+    SOURCE_FIELDS,
+    ("clip_id", "recording_id", "recording_job_id", "provider", "endpoint", "region", "bucket", "start_utc", "end_utc", "object", "audio_sequence_contract", "seam_to_previous"),
+    OBJECT_FIELDS, ("key", "version_id", "etag", "size_bytes", "sha256"), SEAM_FIELDS,
+    ("clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"),
+    ("artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes", "sha256", "actual_start_utc", "actual_end_utc", "utc_offset_seconds", "media_tool_identity", "source_clip_ids", "verification", "maximality_evidence"),
+    ("status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("duration_seconds", "tracks"),
+    ("duration_seconds", "tracks", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
+    ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "first_timestamp", "last_timestamp", "timestamp_status"),
+    ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "decoded_samples", "first_timestamp", "last_timestamp", "timestamp_status"),
+    ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"),
+    ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding", "edit_list_kind", "edit_list_sha256"),
+    ("reason_code", "signed_gap_nanoseconds", "no_allocatable_sources"),
+    ("schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date", "qualification_day", "qualification_sha256", "source_claim_sha256", "source_clip_count", "source_bytes", "first_clip_id", "last_clip_id", "consecutive_pairs", "sources", "hours", "hour_source_claim_sha256", "cross_hour_boundaries", "cross_day_boundaries", "ledger_sha256"),
+    ("previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc", "signed_gap_nanoseconds"),
+    ("delivery_hour", "clock_hour", "source_clip_ids"),
+    ("reason_code", "source_clip_ids", "source_claim_sha256", "policy_version", "normalized_failure_facts", "failure_sha256", "evidence_sha256", "isolated_attempt_count", "media_tool_identity"),
+    ("candidate_clip_ids", "reason_code", "source_claim_sha256", "policy_version", "evidence_sha256", "normalized_failure_facts", "failure_sha256", "repeat_count", "media_tool_identity"),
+    ("schema_version", "policy_version", "allocation_schema_version", "hour_manifest_schema_version", "batch_id", "generation", "frozen_at", "batch_generation_sha256", "frozen_denominator_sha256", "recording_ids", "recording_ids_sha256", "frozen_recordings", "media_tool", "expected_ledger_count", "scheduled_hour_count", "source_clip_count", "source_bytes", "final_media_artifact_count", "allocation_ledgers", "hours"),
+    ("recording_id", "priority_ordinal", "eligibility_tier", "eligibility_cutoff", "completed_at", "timezone", "folder_name", "naming_metadata"),
+    ("plaza_id", "continent", "country", "city", "plaza_name"),
+    ("artifact_id", "recording_id", "local_date", "qualification_sha256", "source_claim_sha256", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count", "source_bytes", "scheduled_hour_ids"),
+    ("hour_manifest_artifact_id", "hour_id", "recording_id", "local_date", "delivery_hour", "status", "relative_path", "object_key", "size_bytes", "sha256", "source_count", "source_bytes", "media_artifact_count"),
+    ("previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"),
+    ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",),
+    ("source_claim_sha256", "reason_code", "failure_sha256", "policy_version", "media_tool_identity", "repeat_count"),
+    ("clip_id", "source_claim_sha256"),
+    ("projection_version", "ledgers"),
+    ("recording_id", "local_date", "source_claim_sha256", "source_count", "source_bytes"),
+):
+    JOINED_OBJECT_ORDERS.setdefault(frozenset(_joined_order), set()).add(_joined_order)
 
 
 def exact_joined_fields(value, fields, label):
-    if not isinstance(value, dict) or set(value) != fields:
+    expected = set(fields)
+    if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("joined %s has invalid fields" % label)
+    allowed = JOINED_OBJECT_ORDERS.get(frozenset(expected))
+    if allowed is not None and tuple(value) not in allowed:
+        raise ValueError("joined %s has noncanonical field order" % label)
     return value
 
 
@@ -2726,7 +2771,10 @@ def valid_joined_date(value, label="local_date"):
 
 def joined_canonical_bytes(value):
     raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    return raw.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").encode("utf-8")
+    return (
+        raw.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").encode("utf-8")
+    )
 
 
 def joined_canonical_sha(value):
@@ -2735,19 +2783,31 @@ def joined_canonical_sha(value):
 
 def decode_joined_json(content):
     def pairs(values):
+        keys = tuple(key for key, _value in values)
+        allowed = JOINED_OBJECT_ORDERS.get(frozenset(keys))
+        if (allowed is not None and keys not in allowed) or (allowed is None and keys != tuple(sorted(keys))):
+            raise ValueError("joined JSON object has noncanonical field order")
         out = {}
         for key, value in values:
             if key in out:
                 raise ValueError("joined JSON contains a duplicate field")
             out[key] = value
         return out
+    def finite_float(raw):
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("joined JSON contains a non-finite number")
+        return value
     try:
         payload = json.loads(
             content.decode("utf-8"), object_pairs_hook=pairs,
+            parse_float=finite_float,
             parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("joined JSON contains a non-finite number")),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("joined JSON artifact is not valid UTF-8 JSON") from exc
+    if content != joined_canonical_bytes(payload):
+        raise ValueError("joined JSON artifact is not canonical")
     return payload
 
 
@@ -2898,6 +2958,125 @@ def valid_boundary(boundary, cross_day=False):
     valid_joined_reason(boundary["reason"], "boundary reason")
 
 
+def local_boundary_nanoseconds(local_date, location, hour, day_delta=0):
+    day = datetime.date.fromisoformat(local_date) + datetime.timedelta(days=day_delta)
+    value = datetime.datetime(day.year, day.month, day.day, hour, tzinfo=location)
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    utc = value.astimezone(datetime.timezone.utc)
+    delta = utc - epoch
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000
+
+
+def validate_cross_hour_boundaries(payload, location, local_date):
+    sources = payload["sources"]
+    minimum = consumed = 0
+    for index, boundary in enumerate(payload["cross_hour_boundaries"]):
+        consumed += len(payload["hours"][index]["source_clip_ids"])
+        scheduled_ns = local_boundary_nanoseconds(local_date, location, 9 + index)
+        if joined_timestamp_nanoseconds(boundary["scheduled_utc"], "boundary scheduled_utc") != scheduled_ns:
+            raise ValueError("joined allocation ledger boundary schedule conflicts")
+        if not sources:
+            if boundary != {
+                "previous_delivery_hour": index + 1, "next_delivery_hour": index + 2,
+                "previous_clip_id": None, "next_clip_id": None,
+                "previous_presentation_end_utc": None, "next_presentation_start_utc": None,
+                "signed_gap_nanoseconds": None, "scheduled_utc": boundary["scheduled_utc"],
+                "actual_seam_utc": None, "boundary_skew_nanoseconds": None,
+                "allocation_decision": "no_sources", "verdict": "absent_source",
+                "reason": "both_sources_absent",
+            }:
+                raise ValueError("joined source-free boundary conflicts")
+            continue
+        candidates = []
+        for position in range(minimum, len(sources) + 1):
+            if position:
+                source = sources[position - 1]
+                at_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end")
+                candidates.append((abs(at_ns - scheduled_ns), at_ns, position, source["clip_id"], source["end_utc"]))
+            if position < len(sources):
+                source = sources[position]
+                at_ns = joined_timestamp_nanoseconds(source["start_utc"], "source start")
+                candidates.append((abs(at_ns - scheduled_ns), at_ns, position, source["clip_id"], source["start_utc"]))
+        _, best_ns, best_position, _, best_at = min(candidates)
+        if consumed != best_position:
+            raise ValueError("joined allocation ledger is not assigned at the closest frozen seam")
+        previous = sources[best_position - 1] if best_position else None
+        following = sources[best_position] if best_position < len(sources) else None
+        if (
+            boundary["previous_clip_id"] != (previous["clip_id"] if previous else None)
+            or boundary["previous_presentation_end_utc"] != (previous["end_utc"] if previous else None)
+            or boundary["next_clip_id"] != (following["clip_id"] if following else None)
+            or boundary["next_presentation_start_utc"] != (following["start_utc"] if following else None)
+        ):
+            raise ValueError("joined allocation ledger boundary source identity conflicts")
+        if previous is None or following is None:
+            decision, reason = ("no_source_before_boundary", "previous_source_absent") if previous is None else ("no_source_after_boundary", "next_source_absent")
+            if (
+                boundary["signed_gap_nanoseconds"] is not None or boundary["actual_seam_utc"] is not None
+                or boundary["boundary_skew_nanoseconds"] is not None
+                or boundary["allocation_decision"] != decision or boundary["verdict"] != "absent_source"
+                or boundary["reason"] != reason
+            ):
+                raise ValueError("joined allocation ledger absent boundary conflicts")
+        else:
+            gap = joined_timestamp_nanoseconds(following["start_utc"], "source start") - joined_timestamp_nanoseconds(previous["end_utc"], "source end")
+            if (
+                boundary["signed_gap_nanoseconds"] != gap
+                or joined_timestamp_nanoseconds(boundary["actual_seam_utc"], "boundary actual seam") != best_ns
+                or boundary["boundary_skew_nanoseconds"] != best_ns - scheduled_ns
+                or boundary["allocation_decision"] != "split_before_next_source"
+                or boundary["verdict"] != "allocated" or boundary["reason"] != "closest_source_boundary"
+            ):
+                raise ValueError("joined allocation ledger closest boundary conflicts")
+        minimum = best_position
+
+
+def validate_cross_day_boundaries(payload, location, local_date):
+    sources = payload["sources"]
+    schedules = (
+        (local_boundary_nanoseconds(local_date, location, 20, -1), local_boundary_nanoseconds(local_date, location, 8)),
+        (local_boundary_nanoseconds(local_date, location, 20), local_boundary_nanoseconds(local_date, location, 8, 1)),
+    )
+    for index, (boundary, schedule) in enumerate(zip(payload["cross_day_boundaries"], schedules)):
+        previous_scheduled = joined_timestamp_nanoseconds(boundary["scheduled_previous_end_utc"], "scheduled previous end")
+        next_scheduled = joined_timestamp_nanoseconds(boundary["scheduled_next_start_utc"], "scheduled next start")
+        if (previous_scheduled, next_scheduled) != schedule or previous_scheduled >= next_scheduled:
+            raise ValueError("joined cross-day boundary schedule conflicts")
+        previous_present = boundary["previous_clip_id"] is not None
+        next_present = boundary["next_clip_id"] is not None
+        if boundary["verdict"] == "absent_source":
+            if previous_present and next_present or boundary["signed_gap_nanoseconds"] is not None or boundary["boundary_skew_nanoseconds"] is not None:
+                raise ValueError("joined cross-day absent boundary conflicts")
+            reason, decision = ("previous_source_absent", "no_previous_day_source")
+            if index == 0 and previous_present:
+                reason, decision = "next_source_absent", "empty_day_after_previous_source"
+            elif index == 1:
+                reason, decision = "next_source_absent", "no_next_day_source"
+                if next_present:
+                    reason, decision = "previous_source_absent", "empty_day_before_next_source"
+            if boundary["reason"] != reason or boundary["allocation_decision"] != decision:
+                raise ValueError("joined cross-day absence reason conflicts")
+        else:
+            if not previous_present or not next_present:
+                raise ValueError("joined cross-day boundary lacks adjacent sources")
+            gap = joined_timestamp_nanoseconds(boundary["next_presentation_start_utc"], "cross-day next start") - joined_timestamp_nanoseconds(boundary["previous_presentation_end_utc"], "cross-day previous end")
+            skew = gap - (next_scheduled - previous_scheduled)
+            verdict = "overlap" if gap < 0 else "scheduled_gap"
+            if (
+                boundary["signed_gap_nanoseconds"] != gap or boundary["boundary_skew_nanoseconds"] != skew
+                or boundary["verdict"] != verdict or boundary["allocation_decision"] != "separate_local_days"
+                or boundary["reason"] != "scheduled_day_boundary"
+            ):
+                raise ValueError("joined cross-day boundary classification conflicts")
+    if sources and (
+        payload["cross_day_boundaries"][0]["next_clip_id"] != sources[0]["clip_id"]
+        or payload["cross_day_boundaries"][0]["next_presentation_start_utc"] != sources[0]["start_utc"]
+        or payload["cross_day_boundaries"][1]["previous_clip_id"] != sources[-1]["clip_id"]
+        or payload["cross_day_boundaries"][1]["previous_presentation_end_utc"] != sources[-1]["end_utc"]
+    ):
+        raise ValueError("joined cross-day boundary does not bind stream-day edges")
+
+
 def valid_allocation_ledger(payload):
     fields = {
         "schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date",
@@ -2973,6 +3152,8 @@ def valid_allocation_ledger(payload):
             raise ValueError("joined allocation ledger boundary order conflicts")
     for boundary in payload["cross_day_boundaries"]:
         valid_boundary(boundary, cross_day=True)
+    validate_cross_hour_boundaries(payload, location, local_date)
+    validate_cross_day_boundaries(payload, location, local_date)
     ledger_sha = valid_sha256(payload["ledger_sha256"], "allocation ledger")
     unsealed = dict(payload)
     unsealed["ledger_sha256"] = ""
@@ -2983,6 +3164,61 @@ def valid_allocation_ledger(payload):
 
 def recording_ids_sha(recording_ids):
     return hashlib.sha256("".join("%d\n" % recording_id for recording_id in recording_ids).encode("ascii")).hexdigest()
+
+
+def joined_naming_token(value):
+    out = []
+    for character in value.strip():
+        if character in "-.":
+            out.append(character)
+        elif character == "_" or character.isspace():
+            out.append("_")
+        elif character.isascii() and character.isalnum():
+            out.append(character)
+    return re.sub(r"_+", "_", "".join(out)).strip("_.")
+
+
+def joined_folder_name(recording_id, metadata, raw_folder):
+    plaza_id = metadata["plaza_id"].strip()
+    if not plaza_id.isascii() or not plaza_id.isdigit() or int(plaza_id) <= 0:
+        raise ValueError("joined frozen plaza identity is invalid")
+    for key in ("continent", "country", "city", "plaza_name"):
+        if not metadata[key].strip():
+            raise ValueError("joined frozen naming metadata is incomplete")
+    if raw_folder.strip():
+        parts = raw_folder.strip().strip("/").split("/")
+        clean = [joined_naming_token(part) for part in parts]
+        if not clean or any(part in ("", ".", "..") for part in clean):
+            raise ValueError("joined frozen folder is invalid")
+        return "/".join(clean)
+    return "_".join((
+        "%02d" % int(plaza_id), joined_naming_token(metadata["continent"]),
+        joined_naming_token(metadata["country"]), joined_naming_token(metadata["city"]),
+        joined_naming_token(metadata["plaza_name"]),
+    ))
+
+
+def joined_delivery_path(frozen, media, delivery_hour):
+    location = ZoneInfo(frozen["timezone"])
+    start = valid_joined_timestamp(media["actual_start_utc"], "delivery start").astimezone(location)
+    end = valid_joined_timestamp(media["actual_end_utc"], "delivery end").astimezone(location)
+    if end <= start or start.date() != end.date() or not 1 <= delivery_hour <= 12:
+        raise ValueError("joined delivery range is invalid")
+    ordinal = positive_joined_int(media["part"], "delivery part")
+    parts = positive_joined_int(media["parts"], "delivery parts")
+    if ordinal > parts or (parts == 1 and ordinal != 1):
+        raise ValueError("joined delivery part is invalid")
+    month = start.strftime("%B")
+    weekday = start.strftime("%A")
+    plaza_id = "%02d" % int(frozen["naming_metadata"]["plaza_id"].strip())
+    base = "%s_%s_%04d_%s_W%d_%s_hour_%02d" % (
+        plaza_id, joined_naming_token(frozen["naming_metadata"]["plaza_name"]), start.year,
+        month, (start.day - 1) // 7 + 1, weekday, delivery_hour,
+    )
+    if parts > 1:
+        base += "_part_%02d" % ordinal
+    base += "_%s-%s.mp4" % (start.strftime("%H%M%S"), end.strftime("%H%M%S"))
+    return "/".join((frozen["folder_name"], month, weekday, base))
 
 
 def frozen_denominator_sha(ledgers):
@@ -3037,9 +3273,10 @@ def valid_batch_index(payload, item=None):
             raise ValueError("joined frozen timezone is invalid") from exc
         if completed > cutoff:
             raise ValueError("joined frozen recording completed after cutoff")
-        valid_joined_relative_path(frozen["folder_name"])
         for key, value in frozen["naming_metadata"].items():
             valid_joined_string(value, "frozen naming %s" % key)
+        if valid_joined_relative_path(frozen["folder_name"]) != joined_folder_name(recording_id, frozen["naming_metadata"], frozen["folder_name"]):
+            raise ValueError("joined frozen recording folder conflicts")
     ledgers, hours = payload["allocation_ledgers"], payload["hours"]
     expected_ledger_count = positive_joined_int(payload["expected_ledger_count"], "expected_ledger_count")
     scheduled_hour_count = positive_joined_int(payload["scheduled_hour_count"], "scheduled_hour_count")
@@ -3168,7 +3405,12 @@ def valid_media_fingerprint(fingerprint, output):
     audio_fields = {"audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"}
     if not isinstance(fingerprint, dict) or set(fingerprint) not in (base_fields, base_fields | audio_fields):
         raise ValueError("joined media fingerprint has invalid fields")
-    if isinstance(fingerprint["duration_seconds"], bool) or not isinstance(fingerprint["duration_seconds"], (int, float)) or fingerprint["duration_seconds"] <= 0:
+    if (
+        isinstance(fingerprint["duration_seconds"], bool)
+        or not isinstance(fingerprint["duration_seconds"], (int, float))
+        or not math.isfinite(fingerprint["duration_seconds"])
+        or fingerprint["duration_seconds"] <= 0
+    ):
         raise ValueError("joined media fingerprint has invalid duration")
     tracks = fingerprint["tracks"]
     if not isinstance(tracks, dict) or set(tracks) not in ({"video"}, {"video", "audio"}):
@@ -3324,6 +3566,7 @@ def valid_hour_manifest(payload, item=None):
     gap_fields = {"previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"}
     if not isinstance(payload["gaps"], list):
         raise ValueError("joined hour gaps are invalid")
+    gap_pairs = set()
     for gap in payload["gaps"]:
         exact_joined_fields(gap, gap_fields, "hour gap")
         positive_joined_int(gap["previous_clip_id"], "gap previous_clip_id")
@@ -3337,6 +3580,10 @@ def valid_hour_manifest(payload, item=None):
             raise ValueError("joined hour gap source identity conflicts") from exc
         if position == 0 or source_ids[position - 1] != gap["previous_clip_id"] or gap["at_utc"] != payload["sources"][position]["start_utc"] or gap["signed_gap_nanoseconds"] != joined_timestamp_nanoseconds(payload["sources"][position]["start_utc"], "gap next start") - joined_timestamp_nanoseconds(payload["sources"][position - 1]["end_utc"], "gap previous end"):
             raise ValueError("joined hour gap evidence conflicts")
+        pair = (gap["previous_clip_id"], gap["next_clip_id"])
+        if pair in gap_pairs:
+            raise ValueError("joined hour gap evidence is duplicated")
+        gap_pairs.add(pair)
     quarantine_fields = {
         "reason_code", "source_clip_ids", "source_claim_sha256", "policy_version", "normalized_failure_facts",
         "failure_sha256", "evidence_sha256", "isolated_attempt_count", "media_tool_identity",
@@ -3392,11 +3639,32 @@ def valid_hour_manifest(payload, item=None):
             raise ValueError("joined hour media content identity conflicts")
         actual_start = valid_joined_timestamp(media["actual_start_utc"], "actual_start_utc")
         actual_end = valid_joined_timestamp(media["actual_end_utc"], "actual_end_utc")
-        if actual_end <= actual_start or not -86400 < valid_joined_int64(media["utc_offset_seconds"], "media UTC offset") < 86400:
+        offset = actual_start.astimezone(location).utcoffset()
+        expected_offset = int(offset.total_seconds()) if offset is not None else None
+        if (
+            actual_end <= actual_start
+            or not -86400 < valid_joined_int64(media["utc_offset_seconds"], "media UTC offset") < 86400
+            or media["utc_offset_seconds"] != expected_offset
+        ):
             raise ValueError("joined hour media timing conflicts")
         ids = media["source_clip_ids"]
-        if not isinstance(ids, list) or not ids or any(included.get(clip_id) != (artifact_id, ordinal) for clip_id in ids):
+        if not isinstance(ids, list) or not ids or len(ids) != len(set(ids)) or any(included.get(clip_id) != (artifact_id, ordinal) for clip_id in ids):
             raise ValueError("joined hour media source membership conflicts")
+        positions = [source_ids.index(clip_id) for clip_id in ids]
+        if positions != list(range(positions[0], positions[0] + len(positions))):
+            raise ValueError("joined hour media crosses a non-member source")
+        run_sources = [payload["sources"][position] for position in positions]
+        if media["actual_start_utc"] != run_sources[0]["start_utc"] or media["actual_end_utc"] != run_sources[-1]["end_utc"]:
+            raise ValueError("joined hour media range conflicts with its exact sources")
+        for previous, following in zip(run_sources, run_sources[1:]):
+            if (
+                (previous["clip_id"], following["clip_id"]) in gap_pairs
+                or following["start_utc"] != previous["end_utc"]
+                or following["seam_to_previous"] != {
+                    "verdict": "continuous", "reason": "packet_frame_audio_proof", "signed_gap_nanoseconds": 0,
+                }
+            ):
+                raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
         valid_verification(media["verification"])
         if not isinstance(media["maximality_evidence"], list):
@@ -3589,6 +3857,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
     # The compact index is ordered ledger-major and each ledger is immediately
     # followed logically by its exact 12 hour references. Never scan joined/.
     for ledger_position, ledger_ref in enumerate(index["allocation_ledgers"]):
+        frozen = index["frozen_recordings"][ledger_position // 14]
         ledger = read_joined_json_path(
             cfg, runtime, batch_id, ledger_ref["relative_path"], ledger_ref["size_bytes"], ledger_ref["sha256"], stop_event,
         )
@@ -3598,6 +3867,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
             or ledger["local_date"] != ledger_ref["local_date"] or ledger["qualification_sha256"] != ledger_ref["qualification_sha256"]
             or ledger["source_claim_sha256"] != ledger_ref["source_claim_sha256"] or ledger["ledger_sha256"] != ledger_ref["ledger_sha256"]
             or ledger["source_clip_count"] != ledger_ref["source_count"] or ledger["source_bytes"] != ledger_ref["source_bytes"]
+            or ledger["generation"] != index["generation"] or ledger["timezone"] != frozen["timezone"]
         ):
             raise ExistingFileMismatch("joined batch ledger reference conflicts")
         denominator_ledgers.append(ledger)
@@ -3614,6 +3884,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
                 or manifest["status"] != hour_ref["status"] or manifest["source_count"] != hour_ref["source_count"]
                 or sum(source["object"]["size_bytes"] for source in manifest["sources"]) != hour_ref["source_bytes"]
                 or len(manifest["media"]) != hour_ref["media_artifact_count"]
+                or manifest["timezone"] != frozen["timezone"] or manifest["media_tool"] != index["media_tool"]
             ):
                 raise ExistingFileMismatch("joined batch hour reference conflicts")
             validate_hour_against_ledger(
@@ -3622,6 +3893,8 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
             )
             day_dispositions.extend(disposition["clip_id"] for disposition in manifest["source_dispositions"])
             for media in manifest["media"]:
+                if media["relative_path"] != joined_delivery_path(frozen, media, delivery_hour):
+                    raise ExistingFileMismatch("joined batch media delivery path conflicts with frozen naming")
                 if media["artifact_id"] in seen_media_artifacts or media["relative_path"] in seen_media_paths:
                     raise ExistingFileMismatch("joined batch media reference is duplicated")
                 seen_media_artifacts.add(media["artifact_id"])
@@ -3972,6 +4245,7 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
 
 
 def download_joined_item(cfg, runtime, item, stop_event):
+    ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
     validate_media_manifest_binding(cfg, runtime, item, stop_event)
     directory_fd = open_joined_output_dir(cfg, item)
     final_name = Path(item["relative_path"]).name
@@ -4033,13 +4307,92 @@ def download_joined_item(cfg, runtime, item, stop_event):
         os.close(directory_fd)
 
 
-def ack_joined_item(cfg, item):
+def joined_ack_receipt_path(cfg, connection_id):
+    scope = hashlib.sha256((cfg.origin + "\0" + str(connection_id)).encode("utf-8")).hexdigest()[:16]
+    return cfg.state_dir / ("joined-ack-receipts-%s.json" % scope)
+
+
+def joined_ack_receipts(cfg, connection_id):
+    path = joined_ack_receipt_path(cfg, connection_id)
+    empty = {"schema_version": 1, "origin": cfg.origin, "connection_id": connection_id, "receipts": {}}
+    payload = read_json(path, empty)
+    if not isinstance(payload, dict) or set(payload) != set(empty) or payload["schema_version"] != 1 or payload["origin"] != cfg.origin or payload["connection_id"] != connection_id or not isinstance(payload["receipts"], dict):
+        raise RuntimeError("joined ACK receipt state conflicts with this connection")
+    fields = {"artifact_id", "relative_path", "size_bytes", "sha256"}
+    for key, receipt in payload["receipts"].items():
+        if (
+            not isinstance(key, str) or not key.isdigit() or not isinstance(receipt, dict) or set(receipt) != fields
+            or receipt["artifact_id"] != int(key) or isinstance(receipt["artifact_id"], bool)
+            or not isinstance(receipt["artifact_id"], int) or receipt["artifact_id"] < 1
+            or valid_joined_relative_path(receipt["relative_path"]) != receipt["relative_path"]
+            or positive_joined_int(receipt["size_bytes"], "ACK receipt size") > JOINED_MAX_BYTES
+            or valid_sha256(receipt["sha256"], "ACK receipt") != receipt["sha256"]
+        ):
+            raise RuntimeError("joined ACK receipt state is invalid")
+    return path, payload
+
+
+def joined_ack_identity(item, size_bytes=None):
+    return {
+        "artifact_id": item["id"], "relative_path": item["relative_path"],
+        "size_bytes": item["size_bytes"] if size_bytes is None else size_bytes, "sha256": item["sha256"],
+    }
+
+
+def has_joined_ack_receipt(cfg, connection_id, identity):
+    _, payload = joined_ack_receipts(cfg, connection_id)
+    return payload["receipts"].get(str(identity["artifact_id"])) == identity
+
+
+def persist_joined_ack_receipt(cfg, connection_id, identity):
+    path, payload = joined_ack_receipts(cfg, connection_id)
+    key = str(identity["artifact_id"])
+    existing = payload["receipts"].get(key)
+    if existing is not None and existing != identity:
+        raise RuntimeError("joined ACK receipt artifact identity conflicts")
+    payload["receipts"][key] = identity
+    atomic_write(path, joined_canonical_bytes(payload))
+
+
+def post_joined_ack(cfg, connection_id, identity):
     request_json(cfg, "POST", "/account/joined/ack", body={
-        "artifact_id": item["id"],
-        "relative_path": item["relative_path"],
-        "size_bytes": item["size_bytes"],
-        "sha256": item["sha256"],
+        "artifact_id": identity["artifact_id"], "relative_path": identity["relative_path"],
+        "size_bytes": identity["size_bytes"], "sha256": identity["sha256"],
     })
+    # The receipt is written only after the exact idempotent ACK succeeds.
+    persist_joined_ack_receipt(cfg, connection_id, identity)
+
+
+def ack_joined_item(cfg, item):
+    post_joined_ack(cfg, item["connection_id"], joined_ack_identity(item))
+
+
+def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
+    if item["kind"] == "hour_manifest":
+        dependency = {
+            "id": item["ledger_artifact_id"], "relative_path": item["ledger_relative_path"],
+            "sha256": item["ledger_sha256"],
+        }
+    elif item["kind"] == "media":
+        dependency = {
+            "id": item["hour_manifest_id"], "relative_path": item["hour_manifest_relative_path"],
+            "sha256": item["hour_manifest_sha256"],
+        }
+    else:
+        return
+    holder = {"batch_id": item["batch_id"], "relative_path": dependency["relative_path"]}
+    directory_fd = open_joined_output_dir(cfg, holder, create=False)
+    try:
+        size_bytes, digest, file_stat = hash_joined_entry(
+            cfg, runtime, directory_fd, Path(dependency["relative_path"]).name, stop_event,
+        )
+    finally:
+        os.close(directory_fd)
+    if file_stat.st_nlink != 1 or digest != dependency["sha256"] or size_bytes < 1 or size_bytes > JOINED_MANIFEST_MAX_BYTES:
+        raise ExistingFileMismatch("joined dependency file identity conflicts")
+    identity = joined_ack_identity({**dependency, "size_bytes": size_bytes})
+    if not has_joined_ack_receipt(cfg, item["connection_id"], identity):
+        post_joined_ack(cfg, item["connection_id"], identity)
 
 
 def drain_joined(cfg, runtime, stop_event):
