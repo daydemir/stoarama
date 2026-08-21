@@ -44,6 +44,9 @@ INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 JOINED_ROOT = "joined"
+JOINED_PROTOCOL_VERSION = 1
+JOINED_RANGE_BYTES = 64 * 1024 * 1024
+JOINED_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
 
 INVENTORY_SKIP_REASONS = frozenset((
     "changed_during_hash", "invalid_sidecar", "io_error",
@@ -105,6 +108,10 @@ class ToolProcessError(MediaCertificationError):
 
 
 class DeterministicMediaError(MediaCertificationError):
+    pass
+
+
+class JoinedDownloadYield(RuntimeError):
     pass
 
 
@@ -1036,6 +1043,7 @@ class Runtime:
                 "client_last_error_at": self.last_error_at,
                 "last_batch": self.batch.copy(),
                 "capacity_blocked": self.capacity_blocked,
+                "joined_protocol_version": JOINED_PROTOCOL_VERSION,
             }
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
@@ -2371,6 +2379,524 @@ def download_verified(url, temp_path, expected_bytes, expected_sha):
         raise RuntimeError("download checksum mismatch")
 
 
+def valid_joined_item(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("joined item is invalid")
+    output_id = raw.get("id")
+    size_bytes = raw.get("size_bytes")
+    if isinstance(output_id, bool) or not isinstance(output_id, int) or output_id < 1:
+        raise ValueError("joined item has invalid id")
+    if (
+        isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+        or size_bytes < 1 or size_bytes > JOINED_MAX_BYTES
+    ):
+        raise ValueError("joined item has invalid size_bytes")
+    campaign_id = str(raw.get("campaign_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", campaign_id):
+        raise ValueError("joined item has invalid campaign_id")
+    relative_raw = str(raw.get("relative_path") or "")
+    relative = Path(relative_raw)
+    if (
+        not relative_raw or relative.is_absolute() or relative_raw != relative.as_posix()
+        or "\\" in relative_raw or any(part in ("", ".", "..") for part in relative.parts)
+        or relative.parts[0] == JOINED_ROOT
+    ):
+        raise ValueError("joined item has invalid relative_path")
+    sha256 = str(raw.get("sha256") or "").lower()
+    campaign_manifest_sha = str(raw.get("campaign_manifest_sha256") or "").lower()
+    coverage_sha = str(raw.get("coverage_sha256") or "").lower()
+    if any(len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value) for value in (
+        sha256, campaign_manifest_sha, coverage_sha,
+    )):
+        raise ValueError("joined item has invalid sha256")
+    expected_outputs = raw.get("campaign_expected_outputs")
+    recording_id = raw.get("recording_id")
+    coverage_size = raw.get("coverage_size_bytes")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (
+        expected_outputs, recording_id, coverage_size,
+    )):
+        raise ValueError("joined item has invalid integer metadata")
+    coverage_key = str(raw.get("coverage_object_key") or "")
+    if not coverage_key or len(coverage_key) > 1024 or any(ord(ch) < 32 for ch in coverage_key):
+        raise ValueError("joined item has invalid coverage_object_key")
+    coverage_start = str(raw.get("coverage_start_at") or "")
+    coverage_end = str(raw.get("coverage_end_at") or "")
+    try:
+        coverage_start_at = datetime.datetime.fromisoformat(coverage_start.replace("Z", "+00:00"))
+        coverage_end_at = datetime.datetime.fromisoformat(coverage_end.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("joined item has invalid coverage timestamps") from exc
+    if (
+        coverage_start_at.tzinfo is None or coverage_end_at.tzinfo is None
+        or coverage_end_at <= coverage_start_at
+    ):
+        raise ValueError("joined item has invalid coverage timestamps")
+    download_path = str(raw.get("download_path") or "")
+    if download_path != "/api/v1/account/joined/%d/download" % output_id:
+        raise ValueError("joined item has invalid download_path")
+    return {
+        "id": output_id,
+        "campaign_id": campaign_id,
+        "campaign_expected_outputs": expected_outputs,
+        "campaign_manifest_sha256": campaign_manifest_sha,
+        "recording_id": recording_id,
+        "relative_path": relative.as_posix(),
+        "size_bytes": size_bytes,
+        "sha256": sha256,
+        "etag": normalized_etag(raw.get("etag")),
+        "version_id": str(raw.get("version_id") or ""),
+        "coverage_object_key": coverage_key,
+        "coverage_size_bytes": coverage_size,
+        "coverage_sha256": coverage_sha,
+        "coverage_etag": normalized_etag(raw.get("coverage_etag")),
+        "coverage_version_id": str(raw.get("coverage_version_id") or ""),
+        "coverage_start_at": coverage_start,
+        "coverage_end_at": coverage_end,
+        "download_path": download_path,
+    }
+
+
+def normalized_etag(value):
+    raw = str(value or "").strip()
+    if raw.startswith("W/"):
+        raise ValueError("joined item has weak etag")
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        raw = raw[1:-1]
+    if not raw or len(raw) > 256 or any(ord(ch) < 33 or ord(ch) > 126 for ch in raw):
+        raise ValueError("joined item has invalid etag")
+    return raw
+
+
+def joined_output_path(cfg, item):
+    return cfg.output_dir / JOINED_ROOT / item["campaign_id"] / item["relative_path"]
+
+
+def open_joined_output_dir(cfg, item):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(cfg.output_dir), flags)
+    parts = (JOINED_ROOT, item["campaign_id"], *Path(item["relative_path"]).parts[:-1])
+    try:
+        for part in parts:
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                os.fsync(descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def joined_entry_stat(directory_fd, name):
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISREG(current.st_mode):
+        raise ExistingFileMismatch("joined entry is not a regular file")
+    return current
+
+
+def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise ExistingFileMismatch("joined entry is not a regular file")
+        while True:
+            if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                raise JoinedDownloadYield("joined hashing yielded to raw clip delivery")
+            chunk = os.read(descriptor, JOINED_RANGE_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        path_after = joined_entry_stat(directory_fd, name)
+        if (
+            path_after is None or certification_identity(before) != certification_identity(after)
+            or certification_identity(after) != certification_identity(path_after)
+        ):
+            raise FileChangedDuringHash("joined file changed while hashing")
+    finally:
+        os.close(descriptor)
+    return size, digest.hexdigest(), after
+
+
+def verify_joined_entry(cfg, runtime, directory_fd, name, expected_bytes, expected_sha, stop_event):
+    if joined_entry_stat(directory_fd, name) is None:
+        return False
+    size, digest, _ = hash_joined_entry(cfg, runtime, directory_fd, name, stop_event)
+    if size != expected_bytes or digest != expected_sha:
+        raise ExistingFileMismatch("existing joined entry does not match API checksum: %s" % name)
+    return True
+
+
+def joined_sidecar_bytes(item):
+    payload = {"schema_version": 1, "output_id": item["id"], **{key: item[key] for key in (
+        "campaign_id", "campaign_expected_outputs", "campaign_manifest_sha256", "recording_id",
+        "relative_path", "size_bytes", "sha256", "etag", "version_id", "coverage_object_key",
+        "coverage_size_bytes", "coverage_sha256", "coverage_etag", "coverage_version_id",
+        "coverage_start_at", "coverage_end_at",
+    )}}
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def verify_joined_sidecar(cfg, runtime, directory_fd, name, expected, stop_event):
+    if joined_entry_stat(directory_fd, name) is None:
+        return False
+    size, digest, _ = hash_joined_entry(cfg, runtime, directory_fd, name, stop_event)
+    return size == len(expected) and digest == hashlib.sha256(expected).hexdigest()
+
+
+def write_joined_stage(directory_fd, name, content):
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        current = os.fstat(descriptor)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise ExistingFileMismatch("joined sidecar stage is not exclusively owned")
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def publish_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+    stage_name = name + ".stage"
+    marker_stat = joined_entry_stat(directory_fd, name)
+    stage_stat = joined_entry_stat(directory_fd, stage_name)
+    if marker_stat is not None:
+        if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+            raise ExistingFileMismatch("joined partial ownership marker conflicts")
+        marker_stat = joined_entry_stat(directory_fd, name)
+        if stage_stat is not None:
+            if marker_stat.st_nlink == 2 and same_joined_inode(marker_stat, stage_stat):
+                os.unlink(stage_name, dir_fd=directory_fd)
+            else:
+                raise ExistingFileMismatch("joined sidecar stage has an unknown hardlink")
+            os.fsync(directory_fd)
+        elif marker_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined marker has an unknown hardlink")
+        return
+    if stage_stat is None:
+        write_joined_stage(directory_fd, stage_name, content)
+    else:
+        # A stage surviving restart is unknown until its complete intended
+        # contents and exclusive inode ownership are proven; never truncate it.
+        if stage_stat.st_nlink != 1 or not verify_joined_sidecar(
+            cfg, runtime, directory_fd, stage_name, content, stop_event,
+        ):
+            raise ExistingFileMismatch("joined sidecar stage conflicts")
+    try:
+        os.link(stage_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+    except FileExistsError:
+        if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+            raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    os.fsync(directory_fd)
+    marker_stat = joined_entry_stat(directory_fd, name)
+    stage_stat = joined_entry_stat(directory_fd, stage_name)
+    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2 or not same_joined_inode(marker_stat, stage_stat):
+        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
+    if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+        raise ExistingFileMismatch("joined sidecar stage changed during publication")
+    os.unlink(stage_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+    if joined_entry_stat(directory_fd, name).st_nlink != 1:
+        raise ExistingFileMismatch("joined marker has an unknown hardlink")
+
+
+def same_joined_inode(left, right):
+    return left is not None and right is not None and (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def ensure_owned_joined_partial(cfg, runtime, directory_fd, part_name, marker_name, sidecar, stop_event):
+    part_stat = joined_entry_stat(directory_fd, part_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if marker_stat is None:
+        if part_stat is not None:
+            raise ExistingFileMismatch("joined partial has no ownership marker")
+        publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
+        marker_stat = joined_entry_stat(directory_fd, marker_name)
+    elif not verify_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event):
+        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if part_stat is None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(part_name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory_fd)
+        part_stat = joined_entry_stat(directory_fd, part_name)
+    if part_stat.st_nlink != 1 or marker_stat.st_nlink != 1:
+        raise ExistingFileMismatch("joined partial or marker has an unknown hardlink")
+    return part_stat
+
+
+def truncate_joined_part(directory_fd, name):
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        current = os.fstat(descriptor)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise ExistingFileMismatch("joined partial is not exclusively owned")
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def poll_raw_pending(cfg, runtime):
+    page = request_json(
+        cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
+    )
+    clips = page.get("clips", [])
+    if not isinstance(clips, list):
+        raise RuntimeError("clips response is not a list")
+    return bool(clips)
+
+
+def prepare_joined_download(cfg, item):
+    prepared = request_json(cfg, "GET", item["download_path"], base=cfg.origin)
+    url = str(prepared.get("url") or "")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise RuntimeError("joined download returned invalid URL")
+    if prepared.get("size_bytes") != item["size_bytes"] or str(prepared.get("sha256") or "").lower() != item["sha256"]:
+        raise ExistingFileMismatch("joined prepared bytes changed")
+    if normalized_etag(prepared.get("etag")) != item["etag"] or str(prepared.get("version_id") or "") != item["version_id"]:
+        raise ExistingFileMismatch("joined prepared object identity changed")
+    if_match = str(prepared.get("if_match") or "")
+    if if_match != '"%s"' % item["etag"]:
+        raise ExistingFileMismatch("joined prepared If-Match changed")
+    return url, if_match
+
+
+def append_joined_range(url, if_match, directory_fd, part_name, item, start, end):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Range": "bytes=%d-%d" % (start, end),
+        "If-Match": if_match,
+    }
+    request = urllib.request.Request(url, method="GET", headers=headers)
+    try:
+        response_context = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SEC)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 416:
+            truncate_joined_part(directory_fd, part_name)
+            raise RuntimeError("joined range was unsatisfiable; partial restarted") from exc
+        raise
+    with response_context as response:
+        status = getattr(response, "status", None) or response.getcode()
+        if status == 200:
+            truncate_joined_part(directory_fd, part_name)
+            raise RuntimeError("joined server ignored range; partial restarted")
+        if status != 206:
+            raise RuntimeError("joined range returned HTTP %s" % status)
+        response_etag = normalized_etag(response.headers.get("ETag"))
+        response_version = str(response.headers.get("x-amz-version-id") or "")
+        if response_etag != item["etag"] or response_version != item["version_id"]:
+            truncate_joined_part(directory_fd, part_name)
+            raise ExistingFileMismatch("joined range object identity drifted; partial restarted")
+        expected_range = "bytes %d-%d/%d" % (start, end, item["size_bytes"])
+        if response.headers.get("Content-Range") != expected_range:
+            raise RuntimeError("joined range returned invalid Content-Range")
+        chunk_bytes = end - start + 1
+        try:
+            content_length = int(response.headers.get("Content-Length", ""))
+        except ValueError as exc:
+            raise RuntimeError("joined range returned invalid Content-Length") from exc
+        if content_length != chunk_bytes:
+            raise RuntimeError("joined range returned invalid Content-Length")
+        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(part_name, flags, dir_fd=directory_fd)
+        written = 0
+        try:
+            opened = os.fstat(descriptor)
+            if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size != start:
+                raise ExistingFileMismatch("joined partial changed before range append")
+            os.lseek(descriptor, start, os.SEEK_SET)
+            while written < chunk_bytes:
+                block = response.read(min(1024 * 1024, chunk_bytes - written))
+                if not block:
+                    break
+                offset = 0
+                while offset < len(block):
+                    offset += os.write(descriptor, block[offset:])
+                written += len(block)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if written != chunk_bytes or response.read(1):
+            raise RuntimeError("joined range body length mismatch")
+
+
+def remove_owned_joined_transfer(directory_fd, part_name, marker_name, final_name, sidecar_name):
+    part_stat = joined_entry_stat(directory_fd, part_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    final_stat = joined_entry_stat(directory_fd, final_name)
+    sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
+    if part_stat is not None:
+        if part_stat.st_nlink != 2 or final_stat.st_nlink != 2 or not same_joined_inode(part_stat, final_stat):
+            raise ExistingFileMismatch("joined partial is not the published final")
+        # Only client-owned transfer scratch is disposable. Raw media, finals,
+        # unknown partials, and conflicting paths are never unlinked.
+        os.unlink(part_name, dir_fd=directory_fd)
+    if marker_stat is not None:
+        if marker_stat.st_nlink != 2 or sidecar_stat.st_nlink != 2 or not same_joined_inode(marker_stat, sidecar_stat):
+            raise ExistingFileMismatch("joined marker is not the published sidecar")
+        os.unlink(marker_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+    if joined_entry_stat(directory_fd, final_name).st_nlink != 1 or joined_entry_stat(directory_fd, sidecar_name).st_nlink != 1:
+        raise ExistingFileMismatch("joined published link count is invalid")
+
+
+def complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, stop_event):
+    final_name, sidecar_name, part_name, marker_name = names
+    final_stat = joined_entry_stat(directory_fd, final_name)
+    if final_stat is None:
+        return False
+    if not verify_joined_entry(
+        cfg, runtime, directory_fd, final_name, item["size_bytes"], item["sha256"], stop_event,
+    ):
+        raise ExistingFileMismatch("joined final disappeared")
+    final_stat = joined_entry_stat(directory_fd, final_name)
+    part_stat = joined_entry_stat(directory_fd, part_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
+    if part_stat is None:
+        if final_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined final has an unknown hardlink")
+    elif final_stat.st_nlink != 2 or part_stat.st_nlink != 2 or not same_joined_inode(final_stat, part_stat):
+        raise ExistingFileMismatch("joined partial conflicts with final")
+    if marker_stat is not None and not verify_joined_sidecar(
+        cfg, runtime, directory_fd, marker_name, sidecar, stop_event,
+    ):
+        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if sidecar_stat is None:
+        if marker_stat is None or part_stat is None:
+            raise ExistingFileMismatch("joined final has no immutable provenance sidecar")
+        os.link(marker_name, sidecar_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        os.fsync(directory_fd)
+        sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
+    if not verify_joined_sidecar(cfg, runtime, directory_fd, sidecar_name, sidecar, stop_event):
+        raise ExistingFileMismatch("joined final provenance sidecar conflicts")
+    sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if marker_stat is None:
+        if sidecar_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined final sidecar has an unknown hardlink")
+    elif sidecar_stat.st_nlink != 2 or marker_stat.st_nlink != 2 or not same_joined_inode(sidecar_stat, marker_stat):
+        raise ExistingFileMismatch("joined final sidecar has an unknown hardlink")
+    remove_owned_joined_transfer(directory_fd, part_name, marker_name, final_name, sidecar_name)
+    return True
+
+
+def download_joined_item(cfg, runtime, item, stop_event):
+    directory_fd = open_joined_output_dir(cfg, item)
+    final_name = Path(item["relative_path"]).name
+    sidecar_name = final_name + ".stoarama.json"
+    part_name = ".%s.joined-%d.part" % (final_name, item["id"])
+    marker_name = part_name + ".stoarama.json"
+    names = (final_name, sidecar_name, part_name, marker_name)
+    sidecar = joined_sidecar_bytes(item)
+    try:
+        if complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, stop_event):
+            return False
+        if joined_entry_stat(directory_fd, sidecar_name) is not None:
+            raise ExistingFileMismatch("joined sidecar exists without final")
+        part_stat = ensure_owned_joined_partial(
+            cfg, runtime, directory_fd, part_name, marker_name, sidecar, stop_event,
+        )
+        if part_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined partial has an unknown hardlink")
+        part_size = part_stat.st_size
+        if part_size > item["size_bytes"]:
+            truncate_joined_part(directory_fd, part_name)
+            part_size = 0
+        remaining = item["size_bytes"] - part_size
+        require_storage_capacity(cfg, runtime, remaining)
+        try:
+            while part_size < item["size_bytes"]:
+                if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                    raise JoinedDownloadYield("joined download yielded to raw clips")
+                try:
+                    url, if_match = prepare_joined_download(cfg, item)
+                except ExistingFileMismatch:
+                    truncate_joined_part(directory_fd, part_name)
+                    raise
+                end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
+                append_joined_range(url, if_match, directory_fd, part_name, item, part_size, end)
+                part_size = end + 1
+            try:
+                verify_joined_entry(
+                    cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
+                )
+            except ExistingFileMismatch:
+                truncate_joined_part(directory_fd, part_name)
+                raise RuntimeError("joined download checksum mismatch; partial restarted")
+            os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+            os.fsync(directory_fd)
+            os.link(marker_name, sidecar_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+            os.fsync(directory_fd)
+            if not complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, stop_event):
+                raise RuntimeError("joined publication disappeared")
+            return True
+        finally:
+            runtime.release_storage_reservation(remaining)
+    finally:
+        os.close(directory_fd)
+
+
+def ack_joined_item(cfg, item):
+    request_json(cfg, "POST", "/account/joined/ack", body={
+        "output_id": item["id"],
+        "relative_path": item["relative_path"],
+        "size_bytes": item["size_bytes"],
+        "sha256": item["sha256"],
+    })
+
+
+def drain_joined(cfg, runtime, stop_event):
+    if cfg.dry_run:
+        return False
+    page = request_json(cfg, "GET", "/account/joined")
+    if set(page) - {"item"}:
+        raise RuntimeError("joined response contains unknown fields")
+    raw_item = page.get("item")
+    if raw_item is None:
+        return False
+    item = valid_joined_item(raw_item)
+    runtime.set_phase(Phase.DRAINING)
+    try:
+        downloaded = download_joined_item(cfg, runtime, item, stop_event)
+    except JoinedDownloadYield:
+        log("INFO", "joined output_id=%d yielded to raw clip delivery" % item["id"])
+        return True
+    ack_joined_item(cfg, item)
+    log(
+        "INFO", "joined output_id=%d bytes=%d saved=%s%s"
+        % (item["id"], item["size_bytes"], joined_output_path(cfg, item), "" if downloaded else " existing"),
+    )
+    return True
+
+
 def release_clip(cfg, recording_id, clip_id):
     path = "/account/recordings/%d/clips/%d/release" % (recording_id, clip_id)
     try:
@@ -2758,7 +3284,16 @@ def run(cfg):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
-                if not progress:
+                if not progress and not stop_event.is_set():
+                    try:
+                        joined_progress = drain_joined(cfg, runtime, stop_event)
+                    except Exception as exc:
+                        runtime.set_error("joined delivery: %s" % exc)
+                        log("WARN", "joined delivery deferred: %s" % exc)
+                        stop_event.wait(min(cfg.poll_interval_sec, 10))
+                        continue
+                    if joined_progress:
+                        continue
                     try:
                         certified = maybe_run_native_stitch(cfg, runtime, inventory, stop_event)
                     except Exception as exc:
