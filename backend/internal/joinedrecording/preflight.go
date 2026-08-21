@@ -54,7 +54,7 @@ func (c PreflightHourClaim) Validate(now time.Time) error {
 
 func validatePreflightSource(source SourceClip, recordingID int64) error {
 	_, endpointErr := CanonicalSourceEndpointAuthority(source.Endpoint)
-	if source.ClipID <= 0 || source.RecordingID != recordingID || source.RecordingJobID <= 0 || !validFrozenSourceStorage(source.Provider, source.Region, source.Bucket) || endpointErr != nil || !source.EndUTC.After(source.StartUTC) || (source.ReleasedAt != nil && source.ReleasedAt.IsZero()) || !safeObjectKey(source.Object.Key) || !validObjectIdentity(source.Object.ETag, source.Object.VersionID) || source.Object.SizeBytes <= 0 || !lowerHex64(source.Object.SHA256) {
+	if source.ClipID <= 0 || source.RecordingID != recordingID || source.RecordingJobID <= 0 || source.StorageDestinationID <= 0 || !validFrozenSourceStorage(source.Provider, source.Region, source.Bucket) || endpointErr != nil || !source.EndUTC.After(source.StartUTC) || (source.ReleasedAt != nil && source.ReleasedAt.IsZero()) || !safeObjectKey(source.Object.Key) || !validObjectIdentity(source.Object.ETag, source.Object.VersionID) || source.Object.SizeBytes <= 0 || !lowerHex64(source.Object.SHA256) {
 		return fmt.Errorf("invalid exact preflight source identity")
 	}
 	return nil

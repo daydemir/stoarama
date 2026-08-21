@@ -14,7 +14,7 @@ import (
 
 func TestBatchIndexV1Golden(t *testing.T) {
 	index, ledgers, manifests := testBatchIndex(t)
-	_, canonical, _, err := BuildBatchIndex(index, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests))
+	_, canonical, _, err := BuildBatchIndex(index, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,10 +72,10 @@ func TestBatchIndexBindsRecordingSelectionEvidence(t *testing.T) {
 	mutated.FrozenRecordings = append([]FrozenRecording(nil), index.FrozenRecordings...)
 	mutated.FrozenRecordings[0].SelectionTier = "fine+"
 	mutated.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(mutated)
-	if _, _, _, err := BuildBatchIndex(mutated, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(mutated, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("non-good+ Tier-1 recording selection was accepted")
 	}
-	_, canonical, _, err := BuildBatchIndex(index, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests))
+	_, canonical, _, err := BuildBatchIndex(index, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,8 +92,88 @@ func TestBatchIndexBindsRecordingSelectionEvidence(t *testing.T) {
 	selfRehashed.SelectionAuthority.QualificationRunID++
 	selfRehashed.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(selfRehashed.SelectionAuthority, selfRehashed.FrozenRecordings, frozenDenominatorDays(selfRehashed.AllocationLedgers))
 	selfRehashed.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(selfRehashed)
-	if _, _, _, err := BuildBatchIndex(selfRehashed, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(selfRehashed, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("self-rehashed caller selection authority replaced server-frozen evidence")
+	}
+
+}
+
+func TestBatchIndexResolvesExactQualificationWindowsAndPersistedDenominator(t *testing.T) {
+	index, ledgers, manifests := testBatchIndex(t)
+	evidence, err := testSelectionResolver(index, ledgers)()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shiftedIndex, shiftedLedgers, shiftedManifests := testBatchIndexFrom(t, time.Date(2026, time.June, 1, 8, 0, 0, 0, time.UTC), 10_009)
+	if _, _, _, err := BuildBatchIndex(shiftedIndex, testSelectionResolver(shiftedIndex, shiftedLedgers), testLedgerResolver(shiftedLedgers), testHourResolver(shiftedManifests)); err != nil {
+		t.Fatalf("fully self-rehashed shifted qualification fixture is not canonical: %v", err)
+	}
+	if _, _, _, err := BuildBatchIndex(shiftedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(shiftedLedgers), testHourResolver(shiftedManifests)); err == nil {
+		t.Fatal("fully self-rehashed shifted qualification evidence replaced the server-frozen batch")
+	}
+
+	wrongDenominator := evidence
+	wrongDenominator.FrozenDenominatorSHA256 = strings.Repeat("9", 64)
+	if _, _, _, err := BuildBatchIndex(index, func() (FrozenBatchEvidence, error) { return wrongDenominator, nil }, testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+		t.Fatal("wrong persisted apply-time denominator was accepted")
+	}
+	if _, _, _, err := BuildBatchIndex(index, nil, testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+		t.Fatal("missing frozen-batch resolver was accepted")
+	}
+
+	nonCutoffIndex, nonCutoffLedgers, nonCutoffManifests := testBatchIndexFromWindowFrozenAt(t, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC), 9, testBatchCutoff().Add(time.Second))
+	if _, _, _, err := canonicalSealedBatchIndex(nonCutoffIndex); err != nil {
+		t.Fatalf("non-cutoff qualification fixture is not otherwise canonical: %v", err)
+	}
+	if _, _, _, err := BuildBatchIndex(nonCutoffIndex, testSelectionResolverWithWindowFrozenAt(nonCutoffIndex, nonCutoffLedgers, testBatchCutoff().Add(time.Second)), testLedgerResolver(nonCutoffLedgers), testHourResolver(nonCutoffManifests)); err == nil {
+		t.Fatal("qualification window frozen after the authoritative cutoff")
+	}
+
+	offsetCutoff := testBatchCutoff().In(time.FixedZone("EDT", -4*60*60))
+	offsetAuthority := index.SelectionAuthority
+	offsetAuthority.Cutoff = offsetCutoff
+	if ValidateSelectionAuthority(offsetAuthority, index.RecordingIDs) == nil {
+		t.Fatal("same-instant non-UTC selection cutoff representation was accepted")
+	}
+	offsetIndex, offsetLedgers, offsetManifests := testBatchIndexFromWindowFrozenAt(t, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC), 9, offsetCutoff)
+	if _, _, _, err := canonicalSealedBatchIndex(offsetIndex); err != nil {
+		t.Fatalf("offset qualification fixture is not otherwise canonical: %v", err)
+	}
+	if _, _, _, err := BuildBatchIndex(offsetIndex, testSelectionResolverWithWindowFrozenAt(offsetIndex, offsetLedgers, offsetCutoff), testLedgerResolver(offsetLedgers), testHourResolver(offsetManifests)); err == nil {
+		t.Fatal("same-instant non-UTC qualification cutoff representation was accepted")
+	}
+
+	completionIndex := testBatchIndexCopy(index)
+	completionIndex.FrozenRecordings = append([]FrozenRecording(nil), index.FrozenRecordings...)
+	completionIndex.FrozenRecordings[0].CompletedAt = completionIndex.FrozenRecordings[0].CompletedAt.Add(-time.Second)
+	completionIndex.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(completionIndex.SelectionAuthority, completionIndex.FrozenRecordings, frozenDenominatorDays(completionIndex.AllocationLedgers))
+	completionIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(completionIndex)
+	completionEvidence := evidence
+	completionEvidence.FrozenRecordings = append([]FrozenRecording(nil), completionIndex.FrozenRecordings...)
+	completionEvidence.FrozenDenominatorSHA256 = completionIndex.FrozenDenominatorSHA256
+	if _, _, _, err := canonicalSealedBatchIndex(completionIndex); err != nil {
+		t.Fatalf("wrong-completion fixture is not otherwise canonical: %v", err)
+	}
+	if _, _, _, err := BuildBatchIndex(completionIndex, func() (FrozenBatchEvidence, error) { return completionEvidence, nil }, testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+		t.Fatal("recording completion differed from the maximum qualified-day completion")
+	}
+
+	mutatedLedgers := append([]StreamDayAllocation(nil), ledgers...)
+	mutatedLedgers[1] = cloneAllocationLedger(t, ledgers[1])
+	mutatedLedgers[1].QualificationDay.JobID++
+	logical := mutatedLedgers[1]
+	logical.LedgerSHA256 = ""
+	mutatedLedgers[1].LedgerSHA256, _, _ = stitchcert.CanonicalSHA(logical)
+	mutatedRef, err := BuildAllocationLedgerRef(index.AllocationLedgers[1].ArtifactID, mutatedLedgers[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedIndex := testBatchIndexCopy(index)
+	mutatedIndex.AllocationLedgers[1] = mutatedRef
+	mutatedIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(mutatedIndex)
+	if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(mutatedLedgers), testHourResolver(manifests)); err == nil {
+		t.Fatal("self-rehashed ledger day differed from its exact sealed qualification window")
 	}
 }
 
@@ -122,11 +202,12 @@ func TestFrozenDenominatorUsesOnlyApplyTimeSourceFacts(t *testing.T) {
 	}
 	released := source.StartUTC.Add(time.Hour)
 	for name, mutate := range map[string]func(*FrozenSourceSnapshot){
-		"object key": func(source *FrozenSourceSnapshot) { source.ObjectKey += "-changed" },
-		"timing":     func(source *FrozenSourceSnapshot) { source.StartUTC = source.StartUTC.Add(time.Nanosecond) },
-		"size":       func(source *FrozenSourceSnapshot) { source.SizeBytes++ },
-		"ingest SHA": func(source *FrozenSourceSnapshot) { source.IngestSHA256 = strings.Repeat("9", 64) },
-		"release":    func(source *FrozenSourceSnapshot) { source.ReleasedAt = &released },
+		"storage destination": func(source *FrozenSourceSnapshot) { source.StorageDestinationID++ },
+		"object key":          func(source *FrozenSourceSnapshot) { source.ObjectKey += "-changed" },
+		"timing":              func(source *FrozenSourceSnapshot) { source.StartUTC = source.StartUTC.Add(time.Nanosecond) },
+		"size":                func(source *FrozenSourceSnapshot) { source.SizeBytes++ },
+		"ingest SHA":          func(source *FrozenSourceSnapshot) { source.IngestSHA256 = strings.Repeat("9", 64) },
+		"release":             func(source *FrozenSourceSnapshot) { source.ReleasedAt = &released },
 	} {
 		snapshots := FrozenSourceSnapshots([]SourceClip{source})
 		mutate(&snapshots[0])
@@ -144,7 +225,8 @@ func TestFrozenDenominatorUsesOnlyApplyTimeSourceFacts(t *testing.T) {
 		t.Fatal("non-chronological apply-time source order was accepted")
 	}
 	for name, mutate := range map[string]func(*FrozenSourceSnapshot){
-		"duplicate locator": func(second *FrozenSourceSnapshot) { second.ObjectKey = source.Object.Key },
+		"zero storage destination": func(second *FrozenSourceSnapshot) { second.StorageDestinationID = 0 },
+		"duplicate locator":        func(second *FrozenSourceSnapshot) { second.ObjectKey = source.Object.Key },
 		"outside window": func(second *FrozenSourceSnapshot) {
 			second.StartUTC = day.WindowEnd
 			second.EndUTC = day.WindowEnd.Add(time.Minute)
@@ -166,7 +248,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	index, ledgers, manifests := testBatchIndex(t)
 	canonicalIndex := testBatchIndexCopy(index)
 	want := index.FrozenDenominatorSHA256
-	if want != "0773b269c3b378f775c7aab6ba8324911c7fa132da06924b27ecd9548d0d517d" {
+	if want != "09b38447860262fa11c65080fae50f18a656b2bd051ff78d2e853a6a2a6c7135" {
 		t.Fatalf("canonical denominator fixture changed: %s", want)
 	}
 	if got, err := ComputeFrozenDenominatorSHA256(index.SelectionAuthority, index.FrozenRecordings, frozenDenominatorDays(index.AllocationLedgers)); err != nil || got != want {
@@ -202,22 +284,61 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	denominatorAttack := testBatchIndexCopy(canonicalIndex)
 	denominatorAttack.FrozenDenominatorSHA256 = strings.Repeat("a", 64)
 	denominatorAttack.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(denominatorAttack)
-	if _, _, _, err := BuildBatchIndex(denominatorAttack, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(denominatorAttack, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("batch index accepted caller-supplied denominator digest")
+	}
+
+	mutatedSources := append([]StreamDayAllocation(nil), ledgers...)
+	mutatedSources[0] = cloneAllocationLedger(t, ledgers[0])
+	mutatedSources[0].Sources[0].StorageDestinationID++
+	mutatedSources[0].FrozenSourceSHA256, _, _ = stitchcert.CanonicalSHA(FrozenSourceSnapshots(mutatedSources[0].Sources))
+	mutatedSources[0].SourceClaimSHA256, _, _ = CanonicalSourceClaim(mutatedSources[0].Sources)
+	mutatedSources[0].HourSourceSHA256[0], _, _ = CanonicalSourceClaim(mutatedSources[0].Sources)
+	logicalMutatedSources := mutatedSources[0]
+	logicalMutatedSources.LedgerSHA256 = ""
+	mutatedSources[0].LedgerSHA256, _, _ = stitchcert.CanonicalSHA(logicalMutatedSources)
+	mutatedSourceRef, err := BuildAllocationLedgerRef(canonicalIndex.AllocationLedgers[0].ArtifactID, mutatedSources[0])
+	if err != nil {
+		t.Fatalf("canonical storage-destination substitution fixture failed: %v", err)
+	}
+	mutatedSourceIndex := testBatchIndexCopy(canonicalIndex)
+	mutatedSourceIndex.AllocationLedgers[0] = mutatedSourceRef
+	mutatedManifests := append([]HourManifest(nil), manifests...)
+	for hour := 0; hour < 12; hour++ {
+		mutatedManifests[hour] = cloneHourManifest(t, manifests[hour])
+		if hour == 0 {
+			mutatedManifests[hour].Sources[0].StorageDestinationID++
+			mutatedManifests[hour].SourceClaimSHA256 = mutatedSources[0].HourSourceSHA256[hour]
+		}
+		boundaries, crossDay := hourBoundarySubset(mutatedSources[0], hour+1)
+		mutatedManifests[hour].Allocation = HourManifestAllocation{ArtifactID: mutatedSourceRef.ArtifactID, RelativePath: mutatedSourceRef.RelativePath, ObjectKey: mutatedSourceRef.ObjectKey, SizeBytes: mutatedSourceRef.SizeBytes, SHA256: mutatedSourceRef.SHA256, LedgerSHA256: mutatedSourceRef.LedgerSHA256, HourSourceSHA256: mutatedSources[0].HourSourceSHA256[hour], Boundaries: boundaries, CrossDayBoundaries: crossDay}
+		mutatedHourRef, err := BuildBatchIndexHour(canonicalIndex.Hours[hour].HourManifestArtifactID, mutatedManifests[hour])
+		if err != nil {
+			t.Fatalf("canonical storage-destination hour %d fixture failed: %v", hour+1, err)
+		}
+		mutatedSourceIndex.Hours[hour] = mutatedHourRef
+	}
+	mutatedSourceIndex.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(mutatedSourceIndex.SelectionAuthority, mutatedSourceIndex.FrozenRecordings, frozenDenominatorDays(mutatedSourceIndex.AllocationLedgers))
+	mutatedSourceIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(mutatedSourceIndex)
+	if _, _, _, err := BuildBatchIndex(mutatedSourceIndex, testSelectionResolver(mutatedSourceIndex, mutatedSources), testLedgerResolver(mutatedSources), testHourResolver(mutatedManifests)); err != nil {
+		t.Fatalf("fully self-rehashed source-destination fixture is not canonical: %v", err)
+	}
+	if _, _, _, err := BuildBatchIndex(mutatedSourceIndex, testSelectionResolver(index, ledgers), testLedgerResolver(mutatedSources), testHourResolver(mutatedManifests)); err == nil {
+		t.Fatal("fully self-rehashed source destination replaced persisted apply-time evidence")
 	}
 
 	attack := testBatchIndexCopy(canonicalIndex)
 	attack.AllocationLedgers[0].SourceClaimSHA256 = strings.Repeat("9", 64)
 	attack.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(attack.SelectionAuthority, attack.FrozenRecordings, frozenDenominatorDays(attack.AllocationLedgers))
 	attack.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(attack)
-	if _, _, _, err := BuildBatchIndex(attack, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(attack, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("batch index accepted recomputed hashes over a mutated ledger reference")
 	}
 
 	hourAttack := testBatchIndexCopy(canonicalIndex)
 	hourAttack.Hours[0].SHA256 = strings.Repeat("9", 64)
 	hourAttack.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(hourAttack)
-	if _, _, _, err := BuildBatchIndex(hourAttack, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(hourAttack, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("batch index accepted recomputed hashes over a mutated hour-manifest reference")
 	}
 
@@ -235,7 +356,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	ordinalIndex.AllocationLedgers[0] = ordinalRef
 	ordinalIndex.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(ordinalIndex.SelectionAuthority, ordinalIndex.FrozenRecordings, frozenDenominatorDays(ordinalIndex.AllocationLedgers))
 	ordinalIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(ordinalIndex)
-	if _, _, _, err := BuildBatchIndex(ordinalIndex, testSelectionResolver(index), testLedgerResolver(ordinalLedgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(ordinalIndex, testSelectionResolver(index, ledgers), testLedgerResolver(ordinalLedgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("ledger date accepted another qualification-window ordinal")
 	}
 
@@ -258,7 +379,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	mixedIndex.AllocationLedgers[1] = mixedRef
 	mixedIndex.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(mixedIndex.SelectionAuthority, mixedIndex.FrozenRecordings, frozenDenominatorDays(mixedIndex.AllocationLedgers))
 	mixedIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(mixedIndex)
-	if _, _, _, err := BuildBatchIndex(mixedIndex, testSelectionResolver(index), testLedgerResolver(mixedLedgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(mixedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(mixedLedgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("one recording mixed qualification-window identities across its 14 ledgers")
 	}
 
@@ -266,7 +387,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	lateRun.SelectionAuthority.QualificationRunFrozenAt = time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC)
 	lateRun.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(lateRun.SelectionAuthority, lateRun.FrozenRecordings, frozenDenominatorDays(lateRun.AllocationLedgers))
 	lateRun.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(lateRun)
-	if _, _, _, err := BuildBatchIndex(lateRun, testSelectionResolver(lateRun), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+	if _, _, _, err := BuildBatchIndex(lateRun, testSelectionResolver(lateRun, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("qualification run frozen after its scheduled windows was accepted")
 	}
 
@@ -286,7 +407,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 		}
 		mutatedIndex := testBatchIndexCopy(canonicalIndex)
 		mutatedIndex.Hours[0] = ref
-		if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+		if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
 			t.Fatal("batch index accepted equal-count, equal-byte source substitution")
 		}
 	})
@@ -305,7 +426,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 			}
 			mutatedIndex := testBatchIndexCopy(canonicalIndex)
 			mutatedIndex.Hours[0] = ref
-			if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+			if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
 				t.Fatal("batch index accepted an hour manifest bound to another allocation ledger")
 			}
 		})
@@ -349,7 +470,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 			}
 			mutatedIndex := testBatchIndexCopy(canonicalIndex)
 			mutatedIndex.Hours[0] = ref
-			if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+			if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
 				t.Fatal("batch index accepted a manifest outside frozen naming or tool identity")
 			}
 		})
@@ -367,7 +488,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 		}
 		mutatedIndex := testBatchIndexCopy(canonicalIndex)
 		mutatedIndex.Hours[0] = ref
-		if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+		if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
 			t.Fatal("media artifact ID collided with a canonical hour artifact ID")
 		}
 	})
@@ -388,23 +509,43 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 		mutatedIndex.AllocationLedgers[1] = mutatedRef
 		mutatedIndex.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(mutatedIndex.SelectionAuthority, mutatedIndex.FrozenRecordings, frozenDenominatorDays(mutatedIndex.AllocationLedgers))
 		mutatedIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(mutatedIndex)
-		if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index), testLedgerResolver(mutatedLedgers), testHourResolver(manifests)); err == nil {
+		if _, _, _, err := BuildBatchIndex(mutatedIndex, testSelectionResolver(index, ledgers), testLedgerResolver(mutatedLedgers), testHourResolver(manifests)); err == nil {
 			t.Fatal("consecutive ledgers accepted conflicting cross-day neighbor facts")
 		}
 	})
 }
 
 func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation, []HourManifest) {
+	return testBatchIndexFrom(t, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC), 9)
+}
+
+func testBatchIndexFrom(t *testing.T, start time.Time, recordingJobID int64) (BatchIndex, []StreamDayAllocation, []HourManifest) {
+	return testBatchIndexFromWindowFrozenAt(t, start, recordingJobID, testBatchCutoff())
+}
+
+func testBatchCutoff() time.Time {
+	return time.Date(2026, time.August, 21, 6, 59, 7, 0, time.UTC)
+}
+
+func testBatchIndexFromWindowFrozenAt(t *testing.T, start time.Time, recordingJobID int64, qualificationFrozenAt time.Time) (BatchIndex, []StreamDayAllocation, []HourManifest) {
 	t.Helper()
 	const batchID = "goodplus-20260821-generation-1"
-	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
-	baseRequest := testRequest([]SourceClip{testSource(1, start)})
+	source := testSource(1, start)
+	source.RecordingJobID = recordingJobID
+	baseRequest := testRequest([]SourceClip{source})
+	baseRequest.Qualification.FrozenAt = qualificationFrozenAt
+	baseRequest.Qualification.EvidenceSHA = ""
+	var err error
+	baseRequest.Qualification, err = SealQualificationWindow(baseRequest.Qualification)
+	if err != nil {
+		t.Fatal(err)
+	}
 	hours := make([]BatchIndexHour, 0, 14*12)
 	ledgerRefs := make([]AllocationLedgerRef, 0, 14)
 	ledgers := make([]StreamDayAllocation, 0, 14)
 	manifests := make([]HourManifest, 0, 14*12)
 	for day := 0; day < 14; day++ {
-		localDate := time.Date(2026, time.May, 4+day, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
+		localDate := start.AddDate(0, 0, day).Format("2006-01-02")
 		ledgerRequest := baseRequest
 		ledgerRequest.LocalDate = localDate
 		if day > 0 {
@@ -464,8 +605,14 @@ func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation, []HourMani
 	}
 	mediaTool, _ := SealMediaToolEvidence(MediaToolEvidence{FFmpegVersion: "ffmpeg pinned", FFmpegSHA256: strings.Repeat("e", 64), FFprobeVersion: "ffprobe pinned", FFprobeSHA256: strings.Repeat("f", 64)})
 	metadata := baseRequest.Metadata
-	cutoff := time.Date(2026, time.August, 21, 6, 59, 7, 0, time.UTC)
-	frozenRecordings := []FrozenRecording{{RecordingID: 377, PriorityOrdinal: 1, SelectionTier: "good+", QualificationSHA256: baseRequest.Qualification.EvidenceSHA, CompletedAt: cutoff.Add(-time.Hour), Timezone: "UTC", FolderName: "01_Europe_Italy_Bevagna_Piazza_Silvestri", NamingMetadata: metadata}}
+	cutoff := testBatchCutoff()
+	completedAt := baseRequest.Qualification.Days[0].CompletedAt
+	for _, day := range baseRequest.Qualification.Days[1:] {
+		if day.CompletedAt.After(completedAt) {
+			completedAt = day.CompletedAt
+		}
+	}
+	frozenRecordings := []FrozenRecording{{RecordingID: 377, PriorityOrdinal: 1, SelectionTier: "good+", QualificationSHA256: baseRequest.Qualification.EvidenceSHA, CompletedAt: completedAt, Timezone: "UTC", FolderName: "01_Europe_Italy_Bevagna_Piazza_Silvestri", NamingMetadata: metadata}}
 	selectedWindowsSHA, _ := SelectedQualificationWindowsSHA256(frozenRecordings)
 	authority := SelectionAuthority{SelectionBasis: OperatorApprovedSelectionBasis, OrderedRecordingIDSHA256: recordingIDsSHA([]int64{377}), Cutoff: cutoff, QualificationRunID: 44, QualificationRunFrozenAt: time.Date(2026, time.April, 1, 0, 0, 0, 0, time.UTC), QualificationRuleVersion: "recording-qualification-v1", QualificationCohortSHA256: strings.Repeat("c", 64), QualificationWindowsSHA256: strings.Repeat("d", 64), SelectedQualificationWindowsSHA256: selectedWindowsSHA}
 	index := BatchIndex{SchemaVersion: 1, PolicyVersion: PlanPolicyVersion, AllocationSchemaVersion: 1, HourManifestSchemaVersion: 1, BatchID: batchID, Generation: 1, FrozenAt: cutoff, RecordingIDs: []int64{377}, SelectionAuthority: authority, FrozenRecordings: frozenRecordings, MediaTool: mediaTool, ExpectedLedgerCount: 14, ScheduledHourCount: 168, SourceClipCount: 1, SourceBytes: 10, FinalMediaCount: 1, AllocationLedgers: ledgerRefs, Hours: hours}
@@ -485,9 +632,26 @@ func testLedgerResolver(ledgers []StreamDayAllocation) AllocationLedgerResolver 
 	}
 }
 
-func testSelectionResolver(index BatchIndex) SelectionEvidenceResolver {
-	return func() (SelectionAuthority, []FrozenRecording, error) {
-		return index.SelectionAuthority, append([]FrozenRecording(nil), index.FrozenRecordings...), nil
+func testSelectionResolver(index BatchIndex, ledgers []StreamDayAllocation) FrozenBatchEvidenceResolver {
+	return testSelectionResolverWithWindowFrozenAt(index, ledgers, index.SelectionAuthority.Cutoff)
+}
+
+func testSelectionResolverWithWindowFrozenAt(index BatchIndex, ledgers []StreamDayAllocation, frozenAt time.Time) FrozenBatchEvidenceResolver {
+	return func() (FrozenBatchEvidence, error) {
+		windows := make([]QualificationWindow, len(index.FrozenRecordings))
+		for i, recording := range index.FrozenRecordings {
+			days := make([]QualifiedDay, 14)
+			for day := range days {
+				days[day] = ledgers[i*14+day].QualificationDay
+			}
+			windows[i] = QualificationWindow{RecordingID: recording.RecordingID, Timezone: recording.Timezone, Days: days, FrozenAt: frozenAt, EvidenceSHA: recording.QualificationSHA256}
+		}
+		return FrozenBatchEvidence{
+			SelectionAuthority:      index.SelectionAuthority,
+			FrozenRecordings:        append([]FrozenRecording(nil), index.FrozenRecordings...),
+			QualificationWindows:    windows,
+			FrozenDenominatorSHA256: index.FrozenDenominatorSHA256,
+		}, nil
 	}
 }
 
