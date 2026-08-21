@@ -246,12 +246,12 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
         expected = {
-            "allocation_ledger_v1.golden.json": "255e2958738e5f87629224c4e537256b3638fb6abaeaa77a2054c559f5c4ef82",
-            "batch_index_v1.golden.json": "41f41aff2c2857562741e31a06137043a86a633106a0db5228cdc984cab243f3",
+            "allocation_ledger_v1.golden.json": "4871e037b4ca21d74b9eac5cec1b66dc9fdac1a699c13cbf28dfa41e98a0a64e",
+            "batch_index_v1.golden.json": "19973231ac2ff62b1596660f6357cbe571132f898ff90e005df2f5bed7d84329",
             "hour_manifest_gap_only_v1.golden.json": "8ec7e39c4cba19cbb5b8e11a3f04952656d53c0b77b879ef764767353af951a9",
-            "hour_manifest_mixed_v1.golden.json": "60858833815cc0240b76f3d43aa548f6a34189eaa46a59d191843de8729620cc",
-            "hour_manifest_quarantine_only_v1.golden.json": "0171c31d9b39af06b4075a2dd473266e490e15b8820390bf6821e0ca21b561dd",
-            "hour_manifest_v1.golden.json": "b39dd8c53656db81cd30d96203580ce41c441790b9b1984859243702c46a902a",
+            "hour_manifest_mixed_v1.golden.json": "265cc03cdfc078b66da75af72ecf62a9ea2fbcd28592e6f5e9d0e7a82260f08b",
+            "hour_manifest_quarantine_only_v1.golden.json": "c84c805450157c43b7e59638884901d8d00d357c4c729d4b66a6c773b20736d1",
+            "hour_manifest_v1.golden.json": "8ef9fcf1b6bf107d1f8a6e016cbff46ee5f1716405afb650833dd4f0ab58fa25",
         }
         for name, digest in expected.items():
             path = CLOUD_GOLDENS / name
@@ -424,17 +424,17 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def test_malformed_source_authorities_blank_fields_and_manifest_order_fail(self):
         source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
-        for endpoint in (
-            "https://cap.test ", "https:// cap.test", "https://cap.test:bad",
-            "https://cap\\test", "https://cap^test", "https://cap|test", "https://cap{test",
-            "https://cap`test", "https://cap\x7ftest", "https://cap%zztest", "https://cap%41test",
-        ):
+        vectors_path = CLOUD_GOLDENS / "source_endpoint_v1_vectors.json"
+        self.assertEqual(hashlib.sha256(vectors_path.read_bytes()).hexdigest(), "bfadc65966b2793bb199c673a6cf37e735d0edf499f2dc6ee4335e62b2c41aa4")
+        vectors = json.loads(vectors_path.read_text())
+        self.assertEqual(len(vectors["valid"]), 1)
+        for vector in vectors["valid"]:
+            changed = json.loads(json.dumps(source)); changed["endpoint"] = vector["endpoint"]
+            pull.valid_source(changed, 377, source_only=True)
+        for endpoint in vectors["invalid"]:
             changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(ValueError, "canonical HTTPS"):
                 pull.valid_source(changed, 377, source_only=True)
-        for endpoint in ("HTTPS://cap.test", "Https://cap.test", "https://cap\u00a0test"):
-            changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
-            pull.valid_source(changed, 377, source_only=True)
         for field in ("provider", "region", "bucket"):
             changed = json.loads(json.dumps(source)); changed[field] = "   "
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "blank"):
