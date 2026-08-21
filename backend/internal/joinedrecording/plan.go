@@ -6,6 +6,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,19 +34,20 @@ type SeamEvidence struct {
 }
 
 type SourceClip struct {
-	ClipID         int64                  `json:"clip_id"`
-	RecordingID    int64                  `json:"recording_id"`
-	RecordingJobID int64                  `json:"recording_job_id"`
-	Provider       string                 `json:"provider"`
-	Endpoint       string                 `json:"endpoint"`
-	Region         string                 `json:"region"`
-	Bucket         string                 `json:"bucket"`
-	StartUTC       time.Time              `json:"start_utc"`
-	EndUTC         time.Time              `json:"end_utc"`
-	ReleasedAt     *time.Time             `json:"released_at"`
-	Object         ObjectIdentity         `json:"object"`
-	AudioContract  *AudioSequenceContract `json:"audio_sequence_contract,omitempty"`
-	SeamToPrevious SeamEvidence           `json:"seam_to_previous,omitempty"`
+	ClipID               int64                  `json:"clip_id"`
+	RecordingID          int64                  `json:"recording_id"`
+	RecordingJobID       int64                  `json:"recording_job_id"`
+	StorageDestinationID int64                  `json:"storage_destination_id"`
+	Provider             string                 `json:"provider"`
+	Endpoint             string                 `json:"endpoint"`
+	Region               string                 `json:"region"`
+	Bucket               string                 `json:"bucket"`
+	StartUTC             time.Time              `json:"start_utc"`
+	EndUTC               time.Time              `json:"end_utc"`
+	ReleasedAt           *time.Time             `json:"released_at"`
+	Object               ObjectIdentity         `json:"object"`
+	AudioContract        *AudioSequenceContract `json:"audio_sequence_contract,omitempty"`
+	SeamToPrevious       SeamEvidence           `json:"seam_to_previous,omitempty"`
 }
 
 type PlanRequest struct {
@@ -253,7 +255,7 @@ func buildPlan(req PlanRequest, seal bool) (BatchPlan, error) {
 }
 
 func sourceStorageKey(source SourceClip) string {
-	return strings.Join([]string{source.Provider, source.Endpoint, source.Region, source.Bucket, source.Object.Key, source.Object.VersionID, source.Object.ETag}, "\x00")
+	return strings.Join([]string{strconv.FormatInt(source.StorageDestinationID, 10), source.Provider, source.Endpoint, source.Region, source.Bucket, source.Object.Key, source.Object.VersionID, source.Object.ETag}, "\x00")
 }
 
 func validateDerivedSeam(previous, next SourceClip) error {
@@ -590,7 +592,7 @@ func canonicalBatchCoverageKey(plan BatchPlan) string {
 
 func validateSource(c SourceClip, recordingID int64) error {
 	_, endpointErr := CanonicalSourceEndpointAuthority(c.Endpoint)
-	if c.ClipID <= 0 || c.RecordingID != recordingID || c.RecordingJobID <= 0 || strings.TrimSpace(c.Provider) == "" || endpointErr != nil || strings.TrimSpace(c.Region) == "" || strings.TrimSpace(c.Bucket) == "" || !c.EndUTC.After(c.StartUTC) || c.EndUTC.Sub(c.StartUTC) > 15*time.Minute {
+	if c.ClipID <= 0 || c.RecordingID != recordingID || c.RecordingJobID <= 0 || c.StorageDestinationID <= 0 || strings.TrimSpace(c.Provider) == "" || endpointErr != nil || strings.TrimSpace(c.Region) == "" || strings.TrimSpace(c.Bucket) == "" || !c.EndUTC.After(c.StartUTC) || c.EndUTC.Sub(c.StartUTC) > 15*time.Minute {
 		return fmt.Errorf("invalid clip identity or range")
 	}
 	if !safeObjectKey(c.Object.Key) || !validObjectIdentity(c.Object.ETag, c.Object.VersionID) || c.Object.SizeBytes <= 0 || !lowerHex64(c.Object.SHA256) {

@@ -162,7 +162,7 @@ func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 	}
 
 	index, indexLedgers, indexManifests := testBatchIndex(t)
-	_, indexJSON, indexSHA, _ := BuildBatchIndex(index, testSelectionResolver(index), testLedgerResolver(indexLedgers), testHourResolver(indexManifests))
+	_, indexJSON, indexSHA, _ := BuildBatchIndex(index, testSelectionResolver(index, indexLedgers), testLedgerResolver(indexLedgers), testHourResolver(indexManifests))
 	indexClaim := BatchIndexPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ScopeID: index.BatchID, ArtifactID: 80, LeaseID: leaseID, OperationToken: initialToken, LeaseExpires: expires, StorageAuthority: testSourceAuthority, StorageBucket: "recordings", Index: index, ExpectedSize: int64(len(indexJSON)), ExpectedSHA256: indexSHA}
 	if _, err := PublishBatchIndexRenewing(context.Background(), nil, "other.test", indexClaim, nil, nil, nil, nil); err == nil {
 		t.Fatal("batch-index publication trusted claim-supplied storage authority")

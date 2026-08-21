@@ -24,19 +24,20 @@ const (
 // FrozenSourceSnapshot is the stable pre-HEAD source identity frozen by the
 // atomic apply transaction.
 type FrozenSourceSnapshot struct {
-	ClipID         int64      `json:"clip_id"`
-	RecordingID    int64      `json:"recording_id"`
-	RecordingJobID int64      `json:"recording_job_id"`
-	Provider       string     `json:"provider"`
-	Endpoint       string     `json:"endpoint"`
-	Region         string     `json:"region"`
-	Bucket         string     `json:"bucket"`
-	ObjectKey      string     `json:"object_key"`
-	StartUTC       time.Time  `json:"start_utc"`
-	EndUTC         time.Time  `json:"end_utc"`
-	SizeBytes      int64      `json:"size_bytes"`
-	IngestSHA256   string     `json:"ingest_sha256"`
-	ReleasedAt     *time.Time `json:"released_at"`
+	ClipID               int64      `json:"clip_id"`
+	RecordingID          int64      `json:"recording_id"`
+	RecordingJobID       int64      `json:"recording_job_id"`
+	StorageDestinationID int64      `json:"storage_destination_id"`
+	Provider             string     `json:"provider"`
+	Endpoint             string     `json:"endpoint"`
+	Region               string     `json:"region"`
+	Bucket               string     `json:"bucket"`
+	ObjectKey            string     `json:"object_key"`
+	StartUTC             time.Time  `json:"start_utc"`
+	EndUTC               time.Time  `json:"end_utc"`
+	SizeBytes            int64      `json:"size_bytes"`
+	IngestSHA256         string     `json:"ingest_sha256"`
+	ReleasedAt           *time.Time `json:"released_at"`
 }
 
 // FrozenDenominatorDayProjection contains only facts available in the atomic
@@ -158,7 +159,14 @@ type BatchIndex struct {
 
 type AllocationLedgerResolver func(AllocationLedgerRef) (StreamDayAllocation, error)
 type HourManifestResolver func(BatchIndexHour) (HourManifest, error)
-type SelectionEvidenceResolver func() (SelectionAuthority, []FrozenRecording, error)
+type FrozenBatchEvidence struct {
+	SelectionAuthority      SelectionAuthority
+	FrozenRecordings        []FrozenRecording
+	QualificationWindows    []QualificationWindow
+	FrozenDenominatorSHA256 string
+}
+
+type FrozenBatchEvidenceResolver func() (FrozenBatchEvidence, error)
 
 // BuildAllocationLedgerRef derives every caller-visible reference fact from
 // the exact canonical ledger artifact. Only its database artifact ID is
@@ -243,19 +251,36 @@ func ValidateBatchIndexHour(ref BatchIndexHour, manifest HourManifest) error {
 	return nil
 }
 
-func BuildBatchIndex(index BatchIndex, resolveSelection SelectionEvidenceResolver, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
-	if resolveSelection == nil || resolveLedger == nil || resolveHour == nil {
+func BuildBatchIndex(index BatchIndex, resolveFrozenBatch FrozenBatchEvidenceResolver, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
+	if resolveFrozenBatch == nil || resolveLedger == nil || resolveHour == nil {
 		return BatchIndex{}, nil, "", fmt.Errorf("canonical selection, ledger, and hour resolvers are required")
 	}
-	wantAuthority, wantRecordings, err := resolveSelection()
-	if err != nil || !sameCanonical([]SelectionAuthority{index.SelectionAuthority}, []SelectionAuthority{wantAuthority}) || !sameCanonical(index.FrozenRecordings, wantRecordings) {
+	evidence, err := resolveFrozenBatch()
+	if err != nil || !sameCanonical([]SelectionAuthority{index.SelectionAuthority}, []SelectionAuthority{evidence.SelectionAuthority}) || !sameCanonical(index.FrozenRecordings, evidence.FrozenRecordings) || len(evidence.QualificationWindows) != len(evidence.FrozenRecordings) || !lowerHex64(evidence.FrozenDenominatorSHA256) || index.FrozenDenominatorSHA256 != evidence.FrozenDenominatorSHA256 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch selection evidence differs from its frozen authority")
 	}
-	return buildBatchIndex(index, resolveLedger, resolveHour)
+	for i, window := range evidence.QualificationWindows {
+		if ValidateQualificationWindow(window) != nil || window.RecordingID != evidence.FrozenRecordings[i].RecordingID || window.Timezone != evidence.FrozenRecordings[i].Timezone || window.EvidenceSHA != evidence.FrozenRecordings[i].QualificationSHA256 || !canonicalUTCTimestamp(window.FrozenAt) || !window.FrozenAt.Equal(evidence.SelectionAuthority.Cutoff) {
+			return BatchIndex{}, nil, "", fmt.Errorf("batch qualification window differs from its frozen authority")
+		}
+		var completedAt time.Time
+		for _, day := range window.Days {
+			if day.WindowStart.Before(evidence.SelectionAuthority.QualificationRunFrozenAt) || day.CompletedAt.After(evidence.SelectionAuthority.Cutoff) {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch qualification chronology differs from its frozen authority")
+			}
+			if day.CompletedAt.After(completedAt) {
+				completedAt = day.CompletedAt
+			}
+		}
+		if !evidence.FrozenRecordings[i].CompletedAt.Equal(completedAt) {
+			return BatchIndex{}, nil, "", fmt.Errorf("batch recording completion differs from its qualification window")
+		}
+	}
+	return buildBatchIndex(index, evidence.QualificationWindows, resolveLedger, resolveHour)
 }
 
 func canonicalSealedBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
-	return buildBatchIndex(index, nil, nil)
+	return buildBatchIndex(index, nil, nil, nil)
 }
 
 // ValidateSelectionAuthority binds one operator-frozen cohort authority to its
@@ -264,7 +289,7 @@ func ValidateSelectionAuthority(authority SelectionAuthority, recordingIDs []int
 	wantRecordingIDsSHA, err := RecordingIDsSHA256(recordingIDs)
 	if authority.SelectionBasis != OperatorApprovedSelectionBasis ||
 		err != nil || authority.OrderedRecordingIDSHA256 != wantRecordingIDsSHA ||
-		authority.Cutoff.IsZero() || authority.QualificationRunID <= 0 ||
+		!canonicalUTCTimestamp(authority.Cutoff) || authority.QualificationRunID <= 0 ||
 		authority.QualificationRunFrozenAt.IsZero() || authority.QualificationRunFrozenAt.After(authority.Cutoff) ||
 		strings.TrimSpace(authority.QualificationRuleVersion) != authority.QualificationRuleVersion ||
 		authority.QualificationRuleVersion == "" || len(authority.QualificationRuleVersion) > 128 ||
@@ -272,6 +297,11 @@ func ValidateSelectionAuthority(authority SelectionAuthority, recordingIDs []int
 		return fmt.Errorf("selection authority differs")
 	}
 	return nil
+}
+
+func canonicalUTCTimestamp(value time.Time) bool {
+	_, offset := value.Zone()
+	return !value.IsZero() && offset == 0
 }
 
 // SelectedQualificationWindowsSHA256 hashes the ordered selected recording and
@@ -298,7 +328,7 @@ func SelectedQualificationWindowsSHA256(recordings []FrozenRecording) (string, e
 	return digest, err
 }
 
-func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
+func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindow, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
 	selectedWindowsSHA, windowsErr := SelectedQualificationWindowsSHA256(index.FrozenRecordings)
 	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || index.FrozenAt.Before(index.SelectionAuthority.Cutoff) || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || ValidateSelectionAuthority(index.SelectionAuthority, index.RecordingIDs) != nil || windowsErr != nil || selectedWindowsSHA != index.SelectionAuthority.SelectedQualificationWindowsSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index denominator differs")
@@ -360,7 +390,7 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 		if resolveHour != nil && hourIndex%12 == 0 {
 			var resolveErr error
 			nextLedger, resolveErr := resolveLedger(ledger)
-			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone || nextLedger.QualificationDay.QualificationWindowOrdinal != ledgerIndex%14+1 || nextLedger.QualificationDay.WindowStart.Before(index.SelectionAuthority.QualificationRunFrozenAt) || nextLedger.QualificationDay.CompletedAt.After(index.SelectionAuthority.Cutoff) {
+			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone || nextLedger.QualificationDay.QualificationWindowOrdinal != ledgerIndex%14+1 || nextLedger.QualificationDay.WindowStart.Before(index.SelectionAuthority.QualificationRunFrozenAt) || nextLedger.QualificationDay.CompletedAt.After(index.SelectionAuthority.Cutoff) || len(qualificationWindows) != len(index.FrozenRecordings) || !sameCanonical([]QualifiedDay{nextLedger.QualificationDay}, []QualifiedDay{qualificationWindows[ledgerIndex/14].Days[ledgerIndex%14]}) {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
 			}
 			if previousCanonicalLedger.RecordingID == nextLedger.RecordingID && validateCrossDayLedgerLink(previousCanonicalLedger, nextLedger) != nil {
@@ -495,7 +525,8 @@ func FrozenSourceSnapshots(sources []SourceClip) []FrozenSourceSnapshot {
 	for i, source := range sources {
 		snapshots[i] = FrozenSourceSnapshot{
 			ClipID: source.ClipID, RecordingID: source.RecordingID, RecordingJobID: source.RecordingJobID,
-			Provider: source.Provider, Endpoint: source.Endpoint, Region: source.Region, Bucket: source.Bucket,
+			StorageDestinationID: source.StorageDestinationID,
+			Provider:             source.Provider, Endpoint: source.Endpoint, Region: source.Region, Bucket: source.Bucket,
 			ObjectKey: source.Object.Key, StartUTC: source.StartUTC, EndUTC: source.EndUTC,
 			SizeBytes: source.Object.SizeBytes, IngestSHA256: source.Object.SHA256, ReleasedAt: source.ReleasedAt,
 		}
@@ -509,13 +540,16 @@ func BuildFrozenDenominatorDayProjection(recordingID int64, day QualifiedDay, qu
 	}
 	sources = append([]FrozenSourceSnapshot{}, sources...)
 	seen := make(map[int64]bool, len(sources))
-	type storageLocator struct{ Provider, Endpoint, Region, Bucket, ObjectKey string }
+	type storageLocator struct {
+		StorageDestinationID                          int64
+		Provider, Endpoint, Region, Bucket, ObjectKey string
+	}
 	seenLocators := make(map[storageLocator]bool, len(sources))
 	var sourceBytes int64
 	for i, source := range sources {
 		_, endpointErr := CanonicalSourceEndpointAuthority(source.Endpoint)
-		locator := storageLocator{source.Provider, source.Endpoint, source.Region, source.Bucket, source.ObjectKey}
-		if source.ClipID <= 0 || seen[source.ClipID] || seenLocators[locator] || source.RecordingID != recordingID || source.RecordingJobID != day.JobID || !validFrozenSourceStorage(source.Provider, source.Region, source.Bucket) || endpointErr != nil || !safeObjectKey(source.ObjectKey) || !source.EndUTC.After(source.StartUTC) || source.EndUTC.Sub(source.StartUTC) > 15*time.Minute || !source.EndUTC.After(day.WindowStart) || !source.StartUTC.Before(day.WindowEnd) || (i > 0 && (source.StartUTC.Before(sources[i-1].StartUTC) || (source.StartUTC.Equal(sources[i-1].StartUTC) && source.ClipID <= sources[i-1].ClipID))) || source.SizeBytes <= 0 || !lowerHex64(source.IngestSHA256) || (source.ReleasedAt != nil && source.ReleasedAt.IsZero()) || source.SizeBytes > math.MaxInt64-sourceBytes {
+		locator := storageLocator{source.StorageDestinationID, source.Provider, source.Endpoint, source.Region, source.Bucket, source.ObjectKey}
+		if source.ClipID <= 0 || seen[source.ClipID] || seenLocators[locator] || source.RecordingID != recordingID || source.RecordingJobID != day.JobID || source.StorageDestinationID <= 0 || !validFrozenSourceStorage(source.Provider, source.Region, source.Bucket) || endpointErr != nil || !safeObjectKey(source.ObjectKey) || !source.EndUTC.After(source.StartUTC) || source.EndUTC.Sub(source.StartUTC) > 15*time.Minute || !source.EndUTC.After(day.WindowStart) || !source.StartUTC.Before(day.WindowEnd) || (i > 0 && (source.StartUTC.Before(sources[i-1].StartUTC) || (source.StartUTC.Equal(sources[i-1].StartUTC) && source.ClipID <= sources[i-1].ClipID))) || source.SizeBytes <= 0 || !lowerHex64(source.IngestSHA256) || (source.ReleasedAt != nil && source.ReleasedAt.IsZero()) || source.SizeBytes > math.MaxInt64-sourceBytes {
 			return FrozenDenominatorDayProjection{}, fmt.Errorf("frozen denominator source %d differs", i+1)
 		}
 		seen[source.ClipID] = true
