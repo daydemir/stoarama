@@ -2913,6 +2913,24 @@ def valid_source(source, recording_id, source_only=False):
     return clip_id
 
 
+def valid_derived_source_seams(sources):
+    empty = {"verdict": "", "reason": "", "signed_gap_nanoseconds": 0}
+    if sources and sources[0]["seam_to_previous"] != empty:
+        raise ValueError("joined first source has prior-seam evidence")
+    for previous, following in zip(sources, sources[1:]):
+        seam = following["seam_to_previous"]
+        signed_gap = joined_timestamp_nanoseconds(following["start_utc"], "seam next start") - joined_timestamp_nanoseconds(previous["end_utc"], "seam previous end")
+        valid_joined_reason(seam["reason"], "source seam reason")
+        valid = (
+            (seam["verdict"] == "continuous" and signed_gap == 0)
+            or (seam["verdict"] == "gap" and signed_gap > 0)
+            or (seam["verdict"] == "overlap" and signed_gap < 0)
+            or seam["verdict"] == "incompatible"
+        )
+        if not valid or seam["signed_gap_nanoseconds"] != signed_gap:
+            raise ValueError("joined derived source seam conflicts")
+
+
 def valid_boundary(boundary, cross_day=False):
     exact_joined_fields(boundary, CROSS_DAY_FIELDS if cross_day else CROSS_HOUR_FIELDS, "boundary")
     if not cross_day:
@@ -3437,19 +3455,24 @@ def valid_media_fingerprint(fingerprint, output):
         for key in ("first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds"):
             if not isinstance(track[key], str) or re.fullmatch(r"-?[0-9]+(?:/[1-9][0-9]*)?", track[key]) is None:
                 raise ValueError("joined media track has invalid rational")
+        for key in ("packet_duration_seconds", "decode_timeline_span_seconds"):
+            if int(track[key].split("/", 1)[0]) <= 0:
+                raise ValueError("joined media track has non-positive duration")
         for key in ("first_timestamp", "last_timestamp"):
             if isinstance(track[key], bool) or not isinstance(track[key], int):
                 raise ValueError("joined media track has invalid timestamp")
-        if output and track["timestamp_status"] != "monotonic":
+        if output and (track["timestamp_status"] != "monotonic" or track["decode_timeline_span_seconds"] != track["packet_duration_seconds"]):
             raise ValueError("joined output timestamps are not monotonic")
     if "audio" in tracks:
-        if set(fingerprint) != base_fields | audio_fields or not isinstance(fingerprint["audio_sequence_contracts"], list) or not fingerprint["audio_sequence_contracts"]:
+        if set(fingerprint) != base_fields | audio_fields or not isinstance(fingerprint["audio_sequence_contracts"], list) or not fingerprint["audio_sequence_contracts"] or (output and len(fingerprint["audio_sequence_contracts"]) != 1):
             raise ValueError("joined audio fingerprint lacks contracts")
         for contract in fingerprint["audio_sequence_contracts"]:
             valid_audio_contract(contract)
         positive_joined_int(fingerprint["effective_audio_bytes"], "effective_audio_bytes")
         positive_joined_int(fingerprint["effective_audio_sample_frames"], "effective_audio_sample_frames")
         valid_sha256(fingerprint["effective_audio_sha256"], "effective audio")
+    elif set(fingerprint) != base_fields:
+        raise ValueError("joined audio evidence exists without an audio track")
 
 
 def valid_verification(verification):
@@ -3540,6 +3563,7 @@ def valid_hour_manifest(payload, item=None):
     if not isinstance(payload["sources"], list) or len(payload["sources"]) != source_count:
         raise ValueError("joined hour manifest source count conflicts")
     source_ids = [valid_source(source, recording_id) for source in payload["sources"]]
+    valid_derived_source_seams(payload["sources"])
     if len(source_ids) != len(set(source_ids)) or source_claim_sha(payload["sources"]) != payload["source_claim_sha256"] or payload["source_claim_sha256"] != allocation["hour_source_claim_sha256"]:
         raise ValueError("joined hour manifest source claim conflicts")
     disposition_fields = {"clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"}
@@ -3567,6 +3591,8 @@ def valid_hour_manifest(payload, item=None):
     if not isinstance(payload["gaps"], list):
         raise ValueError("joined hour gaps are invalid")
     gap_pairs = set()
+    gap_reasons = {}
+    last_gap_position = -1
     for gap in payload["gaps"]:
         exact_joined_fields(gap, gap_fields, "hour gap")
         positive_joined_int(gap["previous_clip_id"], "gap previous_clip_id")
@@ -3578,12 +3604,24 @@ def valid_hour_manifest(payload, item=None):
             position = source_ids.index(gap["next_clip_id"])
         except ValueError as exc:
             raise ValueError("joined hour gap source identity conflicts") from exc
-        if position == 0 or source_ids[position - 1] != gap["previous_clip_id"] or gap["at_utc"] != payload["sources"][position - 1]["end_utc"] or gap["signed_gap_nanoseconds"] != joined_timestamp_nanoseconds(payload["sources"][position]["start_utc"], "gap next start") - joined_timestamp_nanoseconds(payload["sources"][position - 1]["end_utc"], "gap previous end"):
+        next_seam = payload["sources"][position]["seam_to_previous"] if position else None
+        quarantine_boundary = gap["previous_clip_id"] in quarantined or gap["next_clip_id"] in quarantined
+        if (
+            position == 0 or source_ids[position - 1] != gap["previous_clip_id"]
+            or gap["at_utc"] != payload["sources"][position - 1]["end_utc"]
+            or gap["signed_gap_nanoseconds"] != next_seam["signed_gap_nanoseconds"]
+            or gap["signed_gap_nanoseconds"] != joined_timestamp_nanoseconds(payload["sources"][position]["start_utc"], "gap next start") - joined_timestamp_nanoseconds(payload["sources"][position - 1]["end_utc"], "gap previous end")
+            or (gap["reason"] != next_seam["reason"] and not (quarantine_boundary and gap["reason"] == "source_quarantined"))
+        ):
             raise ValueError("joined hour gap evidence conflicts")
         pair = (gap["previous_clip_id"], gap["next_clip_id"])
         if pair in gap_pairs:
             raise ValueError("joined hour gap evidence is duplicated")
+        if position <= last_gap_position:
+            raise ValueError("joined hour gaps are not in source order")
+        last_gap_position = position
         gap_pairs.add(pair)
+        gap_reasons[pair] = gap["reason"]
     quarantine_fields = {
         "reason_code", "source_clip_ids", "source_claim_sha256", "policy_version", "normalized_failure_facts",
         "failure_sha256", "evidence_sha256", "isolated_attempt_count", "media_tool_identity",
@@ -3661,6 +3699,16 @@ def valid_hour_manifest(payload, item=None):
                 raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
         valid_verification(media["verification"])
+        source_fingerprint = media["verification"]["source_fingerprint"]
+        audio_contracts = [source["audio_sequence_contract"] for source in run_sources if "audio_sequence_contract" in source]
+        if (
+            ("audio" not in source_fingerprint["tracks"] and audio_contracts)
+            or ("audio" in source_fingerprint["tracks"] and (
+                len(audio_contracts) != len(run_sources)
+                or audio_contracts != source_fingerprint["audio_sequence_contracts"]
+            ))
+        ):
+            raise ValueError("joined source audio contracts conflict with verification")
         if not isinstance(media["maximality_evidence"], list):
             raise ValueError("joined media maximality evidence is invalid")
         for evidence in media["maximality_evidence"]:
@@ -3681,18 +3729,55 @@ def valid_hour_manifest(payload, item=None):
             if evidence["repeat_count"] != repeat_count or joined_canonical_sha(proof) != evidence["evidence_sha256"]:
                 raise ValueError("joined maximality evidence hash conflicts")
         if media["maximality_evidence"]:
+            first_length = len(media["maximality_evidence"][0]["candidate_clip_ids"])
+            for evidence_index, evidence in enumerate(media["maximality_evidence"]):
+                candidate_ids = evidence["candidate_clip_ids"]
+                expected_length = first_length - evidence_index
+                if (
+                    len(candidate_ids) != expected_length or len(candidate_ids) <= len(media["source_clip_ids"])
+                    or positions[0] + len(candidate_ids) > len(source_ids)
+                    or candidate_ids != source_ids[positions[0]:positions[0] + len(candidate_ids)]
+                ):
+                    raise ValueError("joined maximality peel order conflicts")
             adjacent = media["maximality_evidence"][-1]["candidate_clip_ids"]
             if adjacent[:-1] != media["source_clip_ids"] or positions[-1] + 1 >= len(source_ids) or adjacent[-1] != source_ids[positions[-1] + 1]:
                 raise ValueError("joined maximality evidence is not the immediate source extension")
     if media_sources != [clip_id for clip_id in source_ids if clip_id in included]:
         raise ValueError("joined media does not exactly cover included sources")
     broken = 0
+    sources_by_id = {source["clip_id"]: source for source in payload["sources"]}
+    media_by_id = {media["artifact_id"]: media for media in payload["media"]}
     for previous, following in zip(source_ids, source_ids[1:]):
         same_media = previous in included and following in included and included[previous][0] == included[following][0]
         has_gap = (previous, following) in gap_pairs
         if same_media == has_gap:
             raise ValueError("joined hour gaps do not exactly cover media run boundaries")
-        broken += not same_media
+        if same_media:
+            if sources_by_id[following]["seam_to_previous"]["verdict"] != "continuous":
+                raise ValueError("joined continuous media run seam conflicts")
+            continue
+        broken += 1
+        seam = sources_by_id[following]["seam_to_previous"]
+        signed_gap = seam["signed_gap_nanoseconds"]
+        if previous in quarantined or following in quarantined:
+            if gap_reasons[(previous, following)] != "source_quarantined":
+                raise ValueError("joined quarantine boundary reason conflicts")
+        elif signed_gap > 0:
+            if seam["verdict"] != "gap":
+                raise ValueError("joined signed gap verdict conflicts")
+        elif signed_gap < 0:
+            if seam["verdict"] != "overlap":
+                raise ValueError("joined signed overlap verdict conflicts")
+        else:
+            previous_media = media_by_id.get(included.get(previous, (0, 0))[0])
+            evidence = previous_media["maximality_evidence"][-1] if previous_media and previous_media["maximality_evidence"] else None
+            if (
+                seam["verdict"] != "incompatible" or evidence is None
+                or previous_media["source_clip_ids"][-1] != previous
+                or evidence["reason_code"] != seam["reason"]
+                or evidence["candidate_clip_ids"][-1] != following
+            ):
+                raise ValueError("joined zero-duration split lacks typed maximality evidence")
     if broken != len(gap_pairs):
         raise ValueError("joined hour gap count conflicts with media runs")
     status = payload["status"]
@@ -3818,6 +3903,20 @@ def validate_hour_against_ledger(manifest, ledger, ledger_artifact_id, ledger_re
         raise ExistingFileMismatch("joined hour boundary evidence conflicts with installed ledger")
 
 
+def validate_cross_day_ledger_link(previous, following):
+    if any(previous[key] != following[key] for key in ("batch_id", "generation", "recording_id", "timezone")):
+        raise ExistingFileMismatch("joined consecutive ledger scope conflicts")
+    fields = (
+        "previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc",
+        "signed_gap_nanoseconds", "scheduled_previous_end_utc", "scheduled_next_start_utc",
+        "boundary_skew_nanoseconds", "verdict",
+    )
+    previous_right = previous["cross_day_boundaries"][1]
+    following_left = following["cross_day_boundaries"][0]
+    if any(previous_right[field] != following_left[field] for field in fields):
+        raise ExistingFileMismatch("joined consecutive ledgers disagree on their shared day boundary")
+
+
 def validate_hour_ledger_binding(cfg, runtime, item, manifest, stop_event):
     if item["kind"] != "hour_manifest":
         return
@@ -3861,6 +3960,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
     }
     seen_media_paths = set()
     denominator_ledgers = []
+    previous_ledger = None
     # The compact index is ordered ledger-major and each ledger is immediately
     # followed logically by its exact 12 hour references. Never scan joined/.
     for ledger_position, ledger_ref in enumerate(index["allocation_ledgers"]):
@@ -3877,6 +3977,9 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
             or ledger["generation"] != index["generation"] or ledger["timezone"] != frozen["timezone"]
         ):
             raise ExistingFileMismatch("joined batch ledger reference conflicts")
+        if previous_ledger is not None and previous_ledger["recording_id"] == ledger["recording_id"]:
+            validate_cross_day_ledger_link(previous_ledger, ledger)
+        previous_ledger = ledger
         denominator_ledgers.append(ledger)
         day_dispositions = []
         hour_refs = index["hours"][ledger_position * 12:(ledger_position + 1) * 12]
