@@ -491,6 +491,44 @@ func TestQuarantineOnlyTwoSourcesPreservesItsOneAdjacency(t *testing.T) {
 	}
 }
 
+func TestQuarantineOnlyThreeSourcesRequiresExactOrderedAdjacencies(t *testing.T) {
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	sources := []SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute+time.Second)), testSource(3, start.Add(2*time.Minute))}
+	sources[1].SeamToPrevious = SeamEvidence{Verdict: "gap", Reason: "signed_presentation_gap", SignedGapNanoseconds: time.Second.Nanoseconds()}
+	sources[2].SeamToPrevious = SeamEvidence{Verdict: "overlap", Reason: "signed_presentation_gap", SignedGapNanoseconds: -time.Second.Nanoseconds()}
+	req := testRequest(sources)
+	ledger, err := testLedger(req, req.LocalDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AllocationLedgerSHA = ledger.LedgerSHA256
+	plan, err := BuildQuarantineOnlyHourPlan(req, req.LocalDate, 1, "corrupt_source_media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, canonicalLedger := testAllocation(plan)
+	evidence := []QuarantineEvidence{testQuarantineEvidence(plan, []int64{1, 2, 3}, "corrupt_source_media")}
+	manifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: canonicalLedger, QuarantineEvidence: evidence})
+	if err != nil || len(manifest.Gaps) != 2 || manifest.Gaps[0].PreviousClipID != 1 || manifest.Gaps[0].NextClipID != 2 || manifest.Gaps[0].SignedGapNanoseconds != time.Second.Nanoseconds() || manifest.Gaps[1].PreviousClipID != 2 || manifest.Gaps[1].NextClipID != 3 || manifest.Gaps[1].SignedGapNanoseconds != -time.Second.Nanoseconds() || manifest.Sources[1].SeamToPrevious != sources[1].SeamToPrevious || manifest.Sources[2].SeamToPrevious != sources[2].SeamToPrevious {
+		t.Fatalf("three-source quarantine adjacencies differ: %+v err=%v", manifest.Gaps, err)
+	}
+
+	for name, mutate := range map[string]func(*HourManifest){
+		"removed":        func(m *HourManifest) { m.Gaps = m.Gaps[:1] },
+		"swapped":        func(m *HourManifest) { m.Gaps[0], m.Gaps[1] = m.Gaps[1], m.Gaps[0] },
+		"duplicated":     func(m *HourManifest) { m.Gaps = append(m.Gaps, m.Gaps[0]) },
+		"wrong neighbor": func(m *HourManifest) { m.Gaps[0].NextClipID = 3 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := cloneHourManifest(t, manifest)
+			mutate(&mutated)
+			if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+				t.Fatal("malformed quarantine adjacency validated")
+			}
+		})
+	}
+}
+
 func TestManifestRequiresOrderedMaximalityProofForZeroDurationSplit(t *testing.T) {
 	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
 	sources := []SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute)), testSource(3, start.Add(2*time.Minute))}
