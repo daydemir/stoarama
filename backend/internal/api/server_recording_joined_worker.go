@@ -159,8 +159,8 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows, err := tx.Query(r.Context(), `
-		SELECT clip_id,recording_id,recording_job_id,provider,endpoint,region,bucket,start_at,end_at,
-		  object_key,version_id,etag,size_bytes,sha256
+		SELECT clip_id,recording_id,recording_job_id,storage_destination_id,provider,endpoint,region,bucket,start_at,end_at,
+		  released_at,object_key,version_id,etag,size_bytes,sha256
 		FROM recording_joined_sources WHERE hour_record_id=$1 ORDER BY hour_ordinal`, hourRecordID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load joined claim sources: %v", err))
@@ -170,13 +170,18 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	item.Sources = []joinedrecording.SourceClip{}
 	for rows.Next() {
 		var source joinedrecording.SourceClip
-		if err := rows.Scan(&source.ClipID, &source.RecordingID, &source.RecordingJobID, &source.Provider,
+		if err := rows.Scan(&source.ClipID, &source.RecordingID, &source.RecordingJobID, &source.StorageDestinationID, &source.Provider,
 			&source.Endpoint, &source.Region, &source.Bucket, &source.StartUTC, &source.EndUTC,
-			&source.Object.Key, &source.Object.VersionID, &source.Object.ETag, &source.Object.SizeBytes, &source.Object.SHA256); err != nil {
+			&source.ReleasedAt, &source.Object.Key, &source.Object.VersionID, &source.Object.ETag, &source.Object.SizeBytes,
+			&source.Object.SHA256); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan joined claim source: %v", err))
 			return
 		}
 		source.StartUTC, source.EndUTC = source.StartUTC.UTC(), source.EndUTC.UTC()
+		if source.ReleasedAt != nil {
+			releasedAt := source.ReleasedAt.UTC()
+			source.ReleasedAt = &releasedAt
+		}
 		item.Sources = append(item.Sources, source)
 	}
 	rows.Close()

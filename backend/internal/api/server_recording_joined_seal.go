@@ -170,20 +170,25 @@ func loadJoinedSealFacts(ctx context.Context, tx pgx.Tx, batchID, hourID string,
 		json.Unmarshal(mediaToolJSON, &claim.MediaTool) != nil || json.Unmarshal(ledgerJSON, &ledger) != nil {
 		return joinedrecording.PreflightHourClaim{}, joinedrecording.StreamDayAllocation{}, 0, 0, "", errors.New("load joined seal facts")
 	}
-	rows, err := tx.Query(ctx, `SELECT clip_id,recording_id,recording_job_id,provider,endpoint,region,bucket,start_at,end_at,
-		object_key,version_id,etag,size_bytes,sha256 FROM recording_joined_sources WHERE hour_record_id=$1 ORDER BY hour_ordinal`, hourRecordID)
+	rows, err := tx.Query(ctx, `SELECT clip_id,recording_id,recording_job_id,storage_destination_id,provider,endpoint,region,bucket,start_at,end_at,
+		released_at,object_key,version_id,etag,size_bytes,sha256 FROM recording_joined_sources WHERE hour_record_id=$1 ORDER BY hour_ordinal`, hourRecordID)
 	if err != nil {
 		return claim, ledger, ledgerArtifactID, hourRecordID, workerID, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var source joinedrecording.SourceClip
-		if err := rows.Scan(&source.ClipID, &source.RecordingID, &source.RecordingJobID, &source.Provider, &source.Endpoint,
-			&source.Region, &source.Bucket, &source.StartUTC, &source.EndUTC, &source.Object.Key, &source.Object.VersionID,
+		if err := rows.Scan(&source.ClipID, &source.RecordingID, &source.RecordingJobID, &source.StorageDestinationID,
+			&source.Provider, &source.Endpoint, &source.Region, &source.Bucket, &source.StartUTC, &source.EndUTC,
+			&source.ReleasedAt, &source.Object.Key, &source.Object.VersionID,
 			&source.Object.ETag, &source.Object.SizeBytes, &source.Object.SHA256); err != nil {
 			return claim, ledger, ledgerArtifactID, hourRecordID, workerID, err
 		}
 		source.StartUTC, source.EndUTC = source.StartUTC.UTC(), source.EndUTC.UTC()
+		if source.ReleasedAt != nil {
+			releasedAt := source.ReleasedAt.UTC()
+			source.ReleasedAt = &releasedAt
+		}
 		claim.Sources = append(claim.Sources, source)
 	}
 	return claim, ledger, ledgerArtifactID, hourRecordID, workerID, rows.Err()
@@ -195,6 +200,11 @@ func sameFrozenJoinedSources(frozen, accounted []joinedrecording.SourceClip) boo
 	}
 	for i := range frozen {
 		left, right := frozen[i], accounted[i]
+		if (left.ReleasedAt == nil) != (right.ReleasedAt == nil) ||
+			(left.ReleasedAt != nil && !left.ReleasedAt.Equal(*right.ReleasedAt)) {
+			return false
+		}
+		left.ReleasedAt, right.ReleasedAt = nil, nil
 		right.AudioContract, right.SeamToPrevious = nil, joinedrecording.SeamEvidence{}
 		if left != right {
 			return false

@@ -25,19 +25,29 @@ CREATE TABLE recording_joined_batches (
   batch_id TEXT NOT NULL CHECK (batch_id ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
   generation INTEGER NOT NULL CHECK (generation > 0),
   source_endpoint TEXT NOT NULL CHECK (source_endpoint ~ '^https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com$'),
+  qualification_run_id BIGINT NOT NULL,
+  qualification_cohort_sha256 TEXT NOT NULL CHECK (qualification_cohort_sha256 ~ '^[0-9a-f]{64}$'),
+  qualification_windows_sha256 TEXT NOT NULL CHECK (qualification_windows_sha256 ~ '^[0-9a-f]{64}$'),
+  selected_qualification_windows_sha256 TEXT NOT NULL CHECK (selected_qualification_windows_sha256 ~ '^[0-9a-f]{64}$'),
+  qualification_jobs_sha256 TEXT NOT NULL CHECK (qualification_jobs_sha256 ~ '^[0-9a-f]{64}$'),
+  qualification_frozen_at TIMESTAMPTZ NOT NULL,
+  ordered_recording_ids_sha256 TEXT NOT NULL CHECK (ordered_recording_ids_sha256 ~ '^[0-9a-f]{64}$'),
+  selection_basis TEXT NOT NULL CHECK (selection_basis = 'operator_approved_ordered_cohort_v1'),
   policy_version TEXT NOT NULL CHECK (policy_version = btrim(policy_version) AND policy_version <> '' AND octet_length(policy_version) <= 128),
   eligibility_cutoff TIMESTAMPTZ NOT NULL,
   media_tool JSONB NOT NULL CHECK (jsonb_typeof(media_tool) = 'object' AND media_tool <> '{}'::jsonb),
   media_tool_sha256 TEXT NOT NULL CHECK (media_tool_sha256 ~ '^[0-9a-f]{64}$'),
-  freeze_request JSONB NOT NULL CHECK (jsonb_typeof(freeze_request) = 'object' AND freeze_request <> '{}'::jsonb),
-  freeze_request_sha256 TEXT NOT NULL CHECK (freeze_request_sha256 ~ '^[0-9a-f]{64}$'),
+  freeze_request_bytes BYTEA NOT NULL CHECK (octet_length(freeze_request_bytes) BETWEEN 2 AND 16777216),
+  freeze_request_sha256 TEXT NOT NULL CHECK (freeze_request_sha256 = encode(sha256(freeze_request_bytes),'hex')),
   frozen_denominator_sha256 TEXT NOT NULL CHECK (frozen_denominator_sha256 ~ '^[0-9a-f]{64}$'),
+  freeze_exclusions_sha256 TEXT NOT NULL CHECK (freeze_exclusions_sha256 ~ '^[0-9a-f]{64}$'),
   expected_recordings INTEGER NOT NULL CHECK (expected_recordings > 0),
   expected_stream_days INTEGER NOT NULL CHECK (expected_stream_days > 0),
   expected_scheduled_hours INTEGER NOT NULL CHECK (expected_scheduled_hours > 0),
   expected_source_clips BIGINT NOT NULL CHECK (expected_source_clips >= 0),
   expected_source_bytes BIGINT NOT NULL CHECK (expected_source_bytes >= 0),
-  state TEXT NOT NULL DEFAULT 'building' CHECK (state IN ('building', 'frozen', 'index_sealed', 'published', 'terminal_failed')),
+  expected_freeze_exclusions BIGINT NOT NULL CHECK (expected_freeze_exclusions >= 0),
+  state TEXT NOT NULL DEFAULT 'snapshotting' CHECK (state IN ('snapshotting', 'building', 'frozen', 'index_sealed', 'published', 'terminal_failed')),
   index_artifact_id BIGINT,
   freeze_started_at TIMESTAMPTZ,
   frozen_at TIMESTAMPTZ,
@@ -46,11 +56,19 @@ CREATE TABLE recording_joined_batches (
   failure_reason_code TEXT NOT NULL DEFAULT '' CHECK (failure_reason_code = '' OR failure_reason_code ~ '^[a-z][a-z0-9_]{0,79}$'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (batch_id),
+  UNIQUE (id, account_id, connection_id),
   UNIQUE (id, account_id, connection_id, batch_id),
   UNIQUE (id, source_endpoint),
+  UNIQUE (id, qualification_run_id),
+  FOREIGN KEY (qualification_run_id, account_id)
+    REFERENCES recording_qualification_runs(id, account_id) ON DELETE RESTRICT,
   CHECK (expected_stream_days = expected_recordings * 14),
   CHECK (expected_scheduled_hours = expected_stream_days * 12),
-  CHECK ((state = 'building' AND frozen_at IS NULL AND index_artifact_id IS NULL AND index_sealed_at IS NULL AND published_at IS NULL
+  CHECK (expected_recordings = 33 AND expected_stream_days = 462 AND expected_scheduled_hours = 5544),
+  CHECK (ordered_recording_ids_sha256 = '6038d4a23be9b0b5c2bb29ea933743a5ceb7f06b8875e417a3f16b44051ebd71'),
+  CHECK (eligibility_cutoff = '2026-08-21T06:59:07.534131Z'::timestamptz),
+  CHECK ((state IN ('snapshotting','building') AND frozen_at IS NULL
+      AND index_artifact_id IS NULL AND index_sealed_at IS NULL AND published_at IS NULL
       AND failure_reason_code = '')
     OR (state = 'frozen' AND freeze_started_at IS NOT NULL AND frozen_at IS NOT NULL AND freeze_started_at <= frozen_at
       AND index_artifact_id IS NULL AND index_sealed_at IS NULL AND published_at IS NULL
@@ -66,6 +84,8 @@ CREATE TABLE recording_joined_batch_recordings (
   account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE RESTRICT,
   batch_id TEXT NOT NULL,
+  qualification_run_id BIGINT NOT NULL,
+  selection_tier TEXT NOT NULL CHECK (selection_tier = 'good+'),
   recording_id BIGINT NOT NULL CHECK (recording_id > 0),
   priority_ordinal INTEGER NOT NULL CHECK (priority_ordinal > 0),
   timezone TEXT NOT NULL CHECK (timezone = btrim(timezone) AND timezone <> ''),
@@ -76,10 +96,15 @@ CREATE TABLE recording_joined_batch_recordings (
   qualification JSONB NOT NULL CHECK (jsonb_typeof(qualification) = 'object' AND qualification <> '{}'::jsonb),
   qualification_sha256 TEXT NOT NULL CHECK (qualification_sha256 ~ '^[0-9a-f]{64}$'),
   qualification_policy_version TEXT NOT NULL CHECK (qualification_policy_version = btrim(qualification_policy_version) AND qualification_policy_version <> ''),
+  completed_at TIMESTAMPTZ NOT NULL,
   authoritative_job_ids BIGINT[] NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   FOREIGN KEY (batch_record_id, account_id, connection_id, batch_id)
     REFERENCES recording_joined_batches(id, account_id, connection_id, batch_id) ON DELETE RESTRICT,
+  FOREIGN KEY (batch_record_id, qualification_run_id)
+    REFERENCES recording_joined_batches(id, qualification_run_id) ON DELETE RESTRICT,
+  FOREIGN KEY (qualification_run_id, recording_id)
+    REFERENCES recording_qualification_members(run_id, recording_id) ON DELETE RESTRICT,
   CHECK (last_local_date = first_local_date + 13),
   CHECK (array_ndims(authoritative_job_ids) = 1 AND array_lower(authoritative_job_ids, 1) = 1
     AND cardinality(authoritative_job_ids) = 14 AND array_position(authoritative_job_ids, NULL) IS NULL),
@@ -91,10 +116,20 @@ CREATE TABLE recording_joined_batch_recordings (
 
 CREATE FUNCTION guard_recording_joined_batch_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  IF NEW.state<>'building' OR NEW.freeze_started_at IS NOT NULL OR NEW.frozen_at IS NOT NULL
+  IF current_setting('transaction_isolation') <> 'read committed'
+  THEN RAISE EXCEPTION 'joined snapshot apply requires read committed'; END IF;
+  -- Freeze and purge share one transaction fence. This keeps the raw rows
+  -- individually unlocked while making membership and retention linearizable.
+  PERFORM pg_advisory_xact_lock(137, 1);
+  IF NEW.state<>'snapshotting' OR NEW.freeze_started_at IS NOT NULL OR NEW.frozen_at IS NOT NULL
     OR NOT EXISTS(SELECT 1 FROM connections c
-    WHERE c.id=NEW.connection_id AND c.account_id=NEW.account_id FOR KEY SHARE)
-  THEN RAISE EXCEPTION 'joined batch must enter an owned building state'; END IF;
+    WHERE c.id=NEW.connection_id AND c.account_id=NEW.account_id AND c.joined_protocol_version=1 FOR UPDATE)
+    OR NOT EXISTS(SELECT 1 FROM recording_qualification_runs q
+    WHERE q.id=NEW.qualification_run_id AND q.account_id=NEW.account_id AND q.status='active'
+      AND q.cohort_sha256=NEW.qualification_cohort_sha256
+      AND q.windows_sha256=NEW.qualification_windows_sha256
+      AND q.frozen_at=NEW.qualification_frozen_at FOR SHARE)
+  THEN RAISE EXCEPTION 'joined batch must enter an owned snapshotting state'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_joined_batch_insert_guard BEFORE INSERT ON recording_joined_batches
@@ -128,24 +163,93 @@ CREATE TABLE recording_joined_stream_days (
   recording_job_id BIGINT NOT NULL REFERENCES recording_jobs(id) ON DELETE RESTRICT,
   scheduled_start_at TIMESTAMPTZ NOT NULL,
   scheduled_end_at TIMESTAMPTZ NOT NULL,
+  completed_at TIMESTAMPTZ NOT NULL,
   source_clip_count INTEGER NOT NULL CHECK (source_clip_count >= 0),
   source_bytes BIGINT NOT NULL CHECK (source_bytes >= 0),
-  source_manifest_sha256 TEXT NOT NULL CHECK (source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
-  ledger_sha256 TEXT NOT NULL CHECK (ledger_sha256 ~ '^[0-9a-f]{64}$'),
-  ledger_bytes BYTEA NOT NULL CHECK (octet_length(ledger_bytes) BETWEEN 2 AND 16777216),
-  ledger_artifact_sha256 TEXT NOT NULL CHECK (ledger_artifact_sha256 ~ '^[0-9a-f]{64}$'),
+  source_snapshot_sha256 TEXT NOT NULL CHECK (source_snapshot_sha256 ~ '^[0-9a-f]{64}$'),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','sealed')),
+  source_manifest_sha256 TEXT CHECK (source_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+  head_manifest_sha256 TEXT CHECK (head_manifest_sha256 ~ '^[0-9a-f]{64}$'),
+  seal_request_sha256 TEXT CHECK (seal_request_sha256 ~ '^[0-9a-f]{64}$'),
+  ledger_sha256 TEXT CHECK (ledger_sha256 ~ '^[0-9a-f]{64}$'),
+  ledger_bytes BYTEA CHECK (ledger_bytes IS NULL OR octet_length(ledger_bytes) BETWEEN 2 AND 16777216),
+  ledger_artifact_sha256 TEXT CHECK (ledger_artifact_sha256 ~ '^[0-9a-f]{64}$'),
+  sealed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   FOREIGN KEY (batch_record_id, account_id, connection_id, batch_id)
     REFERENCES recording_joined_batches(id, account_id, connection_id, batch_id) ON DELETE RESTRICT,
   FOREIGN KEY (batch_record_id, batch_recording_id, recording_id)
     REFERENCES recording_joined_batch_recordings(batch_record_id, id, recording_id) ON DELETE RESTRICT,
-  CHECK (scheduled_end_at > scheduled_start_at),
-  CHECK (ledger_artifact_sha256 = encode(sha256(ledger_bytes),'hex')),
+  CHECK (scheduled_end_at > scheduled_start_at AND completed_at >= scheduled_end_at),
+  CHECK ((state='pending' AND source_manifest_sha256 IS NULL AND head_manifest_sha256 IS NULL
+      AND seal_request_sha256 IS NULL AND ledger_sha256 IS NULL AND ledger_bytes IS NULL
+      AND ledger_artifact_sha256 IS NULL AND sealed_at IS NULL)
+    OR (state='sealed' AND source_manifest_sha256 IS NOT NULL AND head_manifest_sha256 IS NOT NULL
+      AND seal_request_sha256 IS NOT NULL AND ledger_sha256 IS NOT NULL AND ledger_bytes IS NOT NULL
+      AND ledger_artifact_sha256 = encode(sha256(ledger_bytes),'hex') AND sealed_at IS NOT NULL)),
   CHECK ((source_clip_count = 0 AND source_bytes = 0) OR (source_clip_count > 0 AND source_bytes > 0)),
   UNIQUE (batch_record_id, recording_id, local_date),
   UNIQUE (batch_recording_id, date_ordinal),
+  UNIQUE (batch_record_id, id, recording_id),
+  UNIQUE (batch_record_id, id, recording_id, recording_job_id)
+);
+
+-- Apply freezes the complete source-only denominator before any storage HEAD.
+-- These rows retain exact raw/database evidence; observed object generations
+-- live separately in recording_joined_sources after the day seals.
+CREATE TABLE recording_joined_source_snapshots (
+  id BIGSERIAL PRIMARY KEY,
+  batch_record_id BIGINT NOT NULL REFERENCES recording_joined_batches(id) ON DELETE RESTRICT,
+  stream_day_id BIGINT NOT NULL REFERENCES recording_joined_stream_days(id) ON DELETE RESTRICT,
+  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+  connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE RESTRICT,
+  recording_id BIGINT NOT NULL CHECK (recording_id > 0),
+  recording_job_id BIGINT NOT NULL REFERENCES recording_jobs(id) ON DELETE RESTRICT,
+  clip_id BIGINT NOT NULL CHECK (clip_id > 0),
+  storage_destination_id BIGINT NOT NULL REFERENCES storage_destinations(id) ON DELETE RESTRICT,
+  day_ordinal INTEGER NOT NULL CHECK (day_ordinal > 0),
+  provider TEXT NOT NULL CHECK (provider = btrim(provider) AND provider <> ''),
+  endpoint TEXT NOT NULL CHECK (endpoint ~ '^https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com$'),
+  region TEXT NOT NULL CHECK (region = btrim(region) AND octet_length(region) <= 128),
+  bucket TEXT NOT NULL CHECK (bucket = btrim(bucket) AND bucket <> '' AND octet_length(bucket) <= 255),
+  object_key TEXT NOT NULL CHECK (object_key = btrim(object_key) AND object_key <> '' AND octet_length(object_key) <= 2048),
+  ingest_etag TEXT NOT NULL CHECK (ingest_etag = btrim(ingest_etag) AND octet_length(ingest_etag) BETWEEN 1 AND 256),
+  size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
+  sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+  start_at TIMESTAMPTZ NOT NULL,
+  end_at TIMESTAMPTZ NOT NULL,
+  clip_created_at TIMESTAMPTZ NOT NULL,
+  released_at TIMESTAMPTZ,
+  capture_lease_token UUID,
+  capture_sequence BIGINT CHECK (capture_sequence IS NULL OR capture_sequence > 0),
+  capture_attempt_id UUID,
+  timestamp_contract_version TEXT,
+  timestamp_contract JSONB,
+  timestamp_contract_status TEXT,
+  timestamp_contract_reason TEXT,
+  db_retention_fenced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (batch_record_id, account_id, connection_id)
+    REFERENCES recording_joined_batches(id, account_id, connection_id) ON DELETE RESTRICT,
+  FOREIGN KEY (batch_record_id, endpoint)
+    REFERENCES recording_joined_batches(id, source_endpoint) ON DELETE RESTRICT,
+  FOREIGN KEY (batch_record_id, stream_day_id, recording_id)
+    REFERENCES recording_joined_stream_days(batch_record_id, id, recording_id) ON DELETE RESTRICT,
+  FOREIGN KEY (batch_record_id, stream_day_id, recording_id, recording_job_id)
+    REFERENCES recording_joined_stream_days(batch_record_id, id, recording_id, recording_job_id) ON DELETE RESTRICT,
+  CHECK (end_at > start_at AND end_at - start_at <= interval '15 minutes'),
+  CHECK ((capture_lease_token IS NULL) = (capture_sequence IS NULL)),
+  CHECK ((timestamp_contract IS NULL AND timestamp_contract_version IS NULL AND timestamp_contract_status IS NULL
+      AND timestamp_contract_reason IS NULL)
+    OR (jsonb_typeof(timestamp_contract)='object' AND timestamp_contract_version IS NOT NULL
+      AND timestamp_contract_status IS NOT NULL AND timestamp_contract_reason IS NOT NULL)),
+  UNIQUE (batch_record_id, clip_id),
+  UNIQUE (stream_day_id, day_ordinal),
   UNIQUE (batch_record_id, id, recording_id)
 );
+
+CREATE UNIQUE INDEX recording_joined_source_snapshots_storage_identity_uq ON recording_joined_source_snapshots(
+  connection_id,batch_record_id,storage_destination_id,provider,endpoint,region,bucket,object_key,ingest_etag);
 
 CREATE TABLE recording_joined_day_boundaries (
   id BIGSERIAL PRIMARY KEY,
@@ -237,6 +341,7 @@ CREATE INDEX recording_joined_hours_claim_idx ON recording_joined_hours(batch_re
 
 CREATE TABLE recording_joined_sources (
   id BIGSERIAL PRIMARY KEY,
+  source_snapshot_id BIGINT NOT NULL REFERENCES recording_joined_source_snapshots(id) ON DELETE RESTRICT,
   batch_record_id BIGINT NOT NULL REFERENCES recording_joined_batches(id) ON DELETE RESTRICT,
   stream_day_id BIGINT NOT NULL REFERENCES recording_joined_stream_days(id) ON DELETE RESTRICT,
   hour_record_id BIGINT NOT NULL REFERENCES recording_joined_hours(id) ON DELETE RESTRICT,
@@ -263,11 +368,15 @@ CREATE TABLE recording_joined_sources (
   seam_to_previous JSONB NOT NULL CHECK (jsonb_typeof(seam_to_previous) = 'object'),
   clip_created_at TIMESTAMPTZ NOT NULL,
   released_at TIMESTAMPTZ,
+  observed_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK (end_at > start_at AND end_at - start_at <= interval '15 minutes'),
   CHECK (audio_contract IS NULL OR jsonb_typeof(audio_contract) = 'object'),
   FOREIGN KEY (batch_record_id, endpoint)
     REFERENCES recording_joined_batches(id, source_endpoint) ON DELETE RESTRICT,
+  FOREIGN KEY (batch_record_id, source_snapshot_id, recording_id)
+    REFERENCES recording_joined_source_snapshots(batch_record_id, id, recording_id) ON DELETE RESTRICT,
+  UNIQUE (source_snapshot_id),
   UNIQUE (batch_record_id, clip_id),
   UNIQUE (stream_day_id, day_ordinal),
   UNIQUE (hour_record_id, hour_ordinal),
@@ -283,6 +392,79 @@ CREATE TABLE recording_joined_sources (
 CREATE UNIQUE INDEX recording_joined_sources_storage_identity_uq ON recording_joined_sources(
   connection_id,batch_record_id,storage_destination_id,provider,endpoint,region,bucket,object_key,
   (CASE WHEN version_id <> '' THEN 'v:' || version_id ELSE 'e:' || etag END));
+
+CREATE FUNCTION validate_recording_joined_batch_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE batch recording_joined_batches%ROWTYPE;
+BEGIN
+  SELECT * INTO STRICT batch FROM recording_joined_batches WHERE id=NEW.id FOR UPDATE;
+  IF batch.state<>'building' OR batch.freeze_started_at IS NOT NULL
+    OR NOT EXISTS(SELECT 1 FROM connections c WHERE c.id=batch.connection_id AND c.account_id=batch.account_id
+      AND c.joined_protocol_version=1 FOR UPDATE)
+    OR NOT EXISTS(SELECT 1 FROM recording_qualification_runs q
+      WHERE q.id=batch.qualification_run_id AND q.account_id=batch.account_id AND q.status='active'
+        AND q.cohort_sha256=batch.qualification_cohort_sha256
+        AND q.windows_sha256=batch.qualification_windows_sha256
+        AND q.frozen_at=batch.qualification_frozen_at FOR SHARE)
+    OR (SELECT count(*) FROM recording_joined_batch_recordings br WHERE br.batch_record_id=batch.id)<>batch.expected_recordings
+    OR ARRAY(SELECT br.recording_id FROM recording_joined_batch_recordings br
+      WHERE br.batch_record_id=batch.id ORDER BY br.priority_ordinal) IS DISTINCT FROM ARRAY[
+        377,335,337,355,385,350,382,384,348,403,380,379,383,404,401,408,406,
+        409,422,418,419,413,420,428,423,425,416,421,437,440,429,431,439]::BIGINT[]
+    OR (SELECT count(*) FROM recording_joined_stream_days d WHERE d.batch_record_id=batch.id)<>batch.expected_stream_days
+    OR (SELECT count(*) FROM recording_joined_stream_days d
+      WHERE d.batch_record_id=batch.id AND d.state='pending')<>batch.expected_stream_days
+    OR (SELECT count(*) FROM recording_joined_source_snapshots s WHERE s.batch_record_id=batch.id)<>batch.expected_source_clips
+    OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_source_snapshots s
+      WHERE s.batch_record_id=batch.id)<>batch.expected_source_bytes
+    OR (SELECT count(*) FROM recording_joined_freeze_exclusions e
+      WHERE e.batch_record_id=batch.id)<>batch.expected_freeze_exclusions
+    OR (SELECT encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',e.recording_id,
+        COALESCE(e.clip_id::TEXT,''),e.reason_code,e.evidence_sha256),'' ORDER BY e.recording_id,e.clip_id,
+        e.reason_code,e.evidence_sha256),''),'UTF8')),'hex') FROM recording_joined_freeze_exclusions e
+      WHERE e.batch_record_id=batch.id)<>batch.freeze_exclusions_sha256
+    OR EXISTS(SELECT 1 FROM recording_joined_batch_recordings br
+      JOIN recording_qualification_runs q ON q.id=br.qualification_run_id AND q.account_id=batch.account_id
+      LEFT JOIN LATERAL (SELECT count(*) AS days FROM recording_joined_stream_days d
+        WHERE d.batch_recording_id=br.id) actual ON TRUE
+      WHERE br.batch_record_id=batch.id AND (br.qualification_run_id<>batch.qualification_run_id
+        OR br.selection_tier<>'good+' OR br.qualification_policy_version<>q.definition_version
+        OR br.priority_ordinal<>(SELECT count(*) FROM recording_joined_batch_recordings earlier
+          WHERE earlier.batch_record_id=br.batch_record_id AND earlier.priority_ordinal<=br.priority_ordinal)
+        OR br.first_local_date IS DISTINCT FROM (SELECT w.local_open_at::DATE
+          FROM recording_qualification_windows w
+          WHERE w.run_id=br.qualification_run_id AND w.recording_id=br.recording_id AND w.ordinal=1)
+        OR br.last_local_date IS DISTINCT FROM (SELECT w.local_open_at::DATE
+          FROM recording_qualification_windows w
+          WHERE w.run_id=br.qualification_run_id AND w.recording_id=br.recording_id AND w.ordinal=14)
+        OR br.completed_at>batch.eligibility_cutoff
+        OR br.completed_at IS DISTINCT FROM (SELECT max(d.completed_at)
+          FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id)
+        OR actual.days<>14
+        OR br.authoritative_job_ids IS DISTINCT FROM ARRAY(SELECT d.recording_job_id
+          FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id ORDER BY d.date_ordinal)))
+    OR EXISTS(SELECT 1 FROM recording_joined_stream_days d
+      JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
+      JOIN recording_qualification_windows w ON w.run_id=br.qualification_run_id
+        AND w.recording_id=br.recording_id AND w.ordinal=d.date_ordinal
+      LEFT JOIN LATERAL (SELECT count(*) AS clips,COALESCE(sum(size_bytes),0) AS bytes
+        FROM recording_joined_source_snapshots s WHERE s.stream_day_id=d.id) actual ON TRUE
+      WHERE d.batch_record_id=batch.id AND (actual.clips<>d.source_clip_count OR actual.bytes<>d.source_bytes
+        OR d.local_date<>br.first_local_date+d.date_ordinal-1
+        OR ROW(d.scheduled_start_at,d.scheduled_end_at) IS DISTINCT FROM ROW(w.window_start_at,w.window_end_at)
+        OR d.completed_at<d.scheduled_end_at OR d.completed_at>batch.eligibility_cutoff
+        OR batch.qualification_frozen_at>d.scheduled_start_at
+        OR EXISTS(SELECT 1 FROM (
+          SELECT s.day_ordinal,row_number() OVER (ORDER BY s.start_at,s.clip_id) AS expected_ordinal
+          FROM recording_joined_source_snapshots s WHERE s.stream_day_id=d.id
+        ) ordered WHERE ordered.day_ordinal<>ordered.expected_ordinal)))
+    OR EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=batch.id)
+    OR EXISTS(SELECT 1 FROM recording_joined_sources s WHERE s.batch_record_id=batch.id)
+  THEN RAISE EXCEPTION 'joined building batch snapshot is incomplete'; END IF;
+  RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER recording_joined_batch_snapshot_complete
+AFTER INSERT ON recording_joined_batches DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION validate_recording_joined_batch_snapshot();
 
 CREATE TABLE recording_joined_artifacts (
   id BIGSERIAL PRIMARY KEY,
@@ -405,36 +587,54 @@ CREATE TABLE recording_joined_artifact_acks (
 );
 
 CREATE FUNCTION guard_recording_joined_source_insert() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE clip recording_clips%ROWTYPE; destination storage_destinations%ROWTYPE; h recording_joined_hours%ROWTYPE;
-  d recording_joined_stream_days%ROWTYPE; batch recording_joined_batches%ROWTYPE;
+DECLARE h recording_joined_hours%ROWTYPE; d recording_joined_stream_days%ROWTYPE;
+  batch recording_joined_batches%ROWTYPE;
+  snapshot recording_joined_source_snapshots%ROWTYPE;
 BEGIN
-  SELECT * INTO STRICT clip FROM recording_clips WHERE id = NEW.clip_id FOR KEY SHARE;
-  SELECT * INTO STRICT destination FROM storage_destinations WHERE id = NEW.storage_destination_id FOR KEY SHARE;
+  SELECT * INTO STRICT snapshot FROM recording_joined_source_snapshots WHERE id=NEW.source_snapshot_id FOR KEY SHARE;
   SELECT * INTO STRICT h FROM recording_joined_hours WHERE id = NEW.hour_record_id FOR KEY SHARE;
   SELECT * INTO STRICT d FROM recording_joined_stream_days WHERE id = NEW.stream_day_id FOR KEY SHARE;
   SELECT * INTO STRICT batch FROM recording_joined_batches WHERE id = NEW.batch_record_id FOR KEY SHARE;
-  IF clip.purged_at IS NOT NULL
-    OR ROW(clip.recording_id, clip.recording_job_id, clip.storage_destination_id, clip.endpoint, clip.bucket,
-      clip.object_key, clip.size_bytes, clip.sha256, clip.etag, clip.clip_start_at, clip.clip_end_at,
-      clip.created_at, clip.released_at)
-      IS DISTINCT FROM ROW(NEW.recording_id, NEW.recording_job_id, NEW.storage_destination_id, NEW.endpoint,
-        NEW.bucket, NEW.object_key, NEW.size_bytes, NEW.sha256, NEW.etag, NEW.start_at, NEW.end_at,
-        NEW.clip_created_at, NEW.released_at)
-    OR ROW(destination.account_id, destination.provider, destination.endpoint, destination.region, destination.bucket)
-      IS DISTINCT FROM ROW(NEW.account_id, NEW.provider, NEW.endpoint, NEW.region, NEW.bucket)
-    OR NEW.endpoint IS DISTINCT FROM batch.source_endpoint
-    OR ROW(h.batch_record_id, h.stream_day_id, h.account_id, h.connection_id, h.recording_id)
-      IS DISTINCT FROM ROW(NEW.batch_record_id, NEW.stream_day_id, NEW.account_id, NEW.connection_id, NEW.recording_id)
-    OR NEW.recording_job_id<>d.recording_job_id OR NEW.end_at<=d.scheduled_start_at OR NEW.start_at>=d.scheduled_end_at
-    OR NEW.clip_created_at > batch.eligibility_cutoff
-  THEN RAISE EXCEPTION 'joined source differs from frozen raw object'; END IF;
+  IF d.state<>'pending'
+    OR ROW(snapshot.batch_record_id,snapshot.stream_day_id,snapshot.account_id,snapshot.connection_id,snapshot.recording_id,
+      snapshot.recording_job_id,snapshot.clip_id,snapshot.storage_destination_id,snapshot.day_ordinal,snapshot.provider,
+      snapshot.endpoint,snapshot.region,snapshot.bucket,snapshot.object_key,snapshot.ingest_etag,snapshot.size_bytes,
+      snapshot.sha256,snapshot.start_at,snapshot.end_at,snapshot.clip_created_at,snapshot.released_at)
+      IS DISTINCT FROM ROW(NEW.batch_record_id,NEW.stream_day_id,NEW.account_id,NEW.connection_id,NEW.recording_id,
+        NEW.recording_job_id,NEW.clip_id,NEW.storage_destination_id,NEW.day_ordinal,NEW.provider,NEW.endpoint,NEW.region,
+        NEW.bucket,NEW.object_key,NEW.etag,NEW.size_bytes,NEW.sha256,NEW.start_at,NEW.end_at,NEW.clip_created_at,NEW.released_at)
+    OR ROW(h.batch_record_id,h.stream_day_id,h.account_id,h.connection_id,h.recording_id)
+      IS DISTINCT FROM ROW(NEW.batch_record_id,NEW.stream_day_id,NEW.account_id,NEW.connection_id,NEW.recording_id)
+    OR NEW.endpoint IS DISTINCT FROM batch.source_endpoint OR NEW.observed_at<snapshot.created_at
+    OR NEW.observed_at>clock_timestamp()+interval '5 minutes'
+  THEN RAISE EXCEPTION 'joined source differs from frozen snapshot or HEAD'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_joined_source_insert_guard BEFORE INSERT ON recording_joined_sources
 FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_source_insert();
 
+CREATE FUNCTION guard_recording_joined_clip_retention() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed'
+  THEN RAISE EXCEPTION 'joined source purge requires read committed'; END IF;
+  PERFORM pg_advisory_xact_lock_shared(137, 1);
+  IF TG_OP='DELETE' THEN
+    IF EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=OLD.id)
+    THEN RAISE EXCEPTION 'joined frozen source is retention protected'; END IF;
+    RETURN OLD;
+  END IF;
+  IF OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
+    AND EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=OLD.id)
+  THEN RAISE EXCEPTION 'joined frozen source is retention protected'; END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_joined_clip_retention_update BEFORE UPDATE OF purged_at ON recording_clips
+FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_clip_retention();
+CREATE TRIGGER recording_joined_clip_retention_delete BEFORE DELETE ON recording_clips
+FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_clip_retention();
+
 CREATE FUNCTION guard_recording_joined_freeze_child_insert() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE batch_key BIGINT;
+DECLARE batch_key BIGINT; batch_state TEXT; batch_freeze_started_at TIMESTAMPTZ;
 BEGIN
   IF TG_TABLE_NAME='recording_joined_day_boundaries' THEN
     SELECT batch_record_id INTO STRICT batch_key FROM recording_joined_stream_days
@@ -442,16 +642,57 @@ BEGIN
   ELSE
     batch_key := (to_jsonb(NEW)->>'batch_record_id')::BIGINT;
   END IF;
-  IF NOT EXISTS(SELECT 1 FROM recording_joined_batches WHERE id=batch_key AND state='building' FOR SHARE)
+  SELECT state,freeze_started_at INTO STRICT batch_state,batch_freeze_started_at
+    FROM recording_joined_batches WHERE id=batch_key FOR SHARE;
+  IF (TG_TABLE_NAME IN ('recording_joined_batch_recordings','recording_joined_freeze_exclusions',
+      'recording_joined_stream_days','recording_joined_source_snapshots') AND batch_state<>'snapshotting')
+    OR (TG_TABLE_NAME IN ('recording_joined_day_boundaries','recording_joined_hours','recording_joined_sources')
+      AND (batch_state<>'building' OR batch_freeze_started_at IS NOT NULL))
   THEN RAISE EXCEPTION 'joined frozen source scope is immutable'; END IF;
   IF TG_TABLE_NAME='recording_joined_batch_recordings' AND NOT EXISTS(SELECT 1 FROM recordings r
     WHERE r.id=(to_jsonb(NEW)->>'recording_id')::BIGINT AND r.account_id=(to_jsonb(NEW)->>'account_id')::BIGINT
       AND r.cron_timezone=to_jsonb(NEW)->>'timezone' AND r.mode='continuous' AND r.delivery='nas_pull'
       AND r.daily_window_start='08:00'::TIME AND r.daily_window_end='20:00'::TIME FOR KEY SHARE)
   THEN RAISE EXCEPTION 'joined recording scope differs'; END IF;
+  IF TG_TABLE_NAME='recording_joined_batch_recordings' AND NOT EXISTS(
+    SELECT 1 FROM recording_joined_batches b
+    JOIN recording_qualification_runs q ON q.id=b.qualification_run_id AND q.account_id=b.account_id
+    JOIN recording_qualification_members m ON m.run_id=b.qualification_run_id
+      AND m.recording_id=(to_jsonb(NEW)->>'recording_id')::BIGINT
+      AND m.account_id=(to_jsonb(NEW)->>'account_id')::BIGINT
+    WHERE b.id=batch_key AND b.qualification_run_id=(to_jsonb(NEW)->>'qualification_run_id')::BIGINT
+      AND q.status='active' AND q.definition_version=to_jsonb(NEW)->>'qualification_policy_version'
+      AND m.cron_timezone=to_jsonb(NEW)->>'timezone' FOR KEY SHARE OF b,q,m)
+  THEN RAISE EXCEPTION 'joined qualification member differs'; END IF;
+  IF TG_TABLE_NAME='recording_joined_stream_days' AND NOT EXISTS(
+    SELECT 1 FROM recording_joined_batch_recordings br
+    JOIN recording_joined_batches b ON b.id=br.batch_record_id
+    JOIN recording_qualification_windows w ON w.run_id=br.qualification_run_id
+      AND w.recording_id=br.recording_id
+      AND w.ordinal=(to_jsonb(NEW)->>'date_ordinal')::INTEGER
+    JOIN recording_jobs j ON j.id=(to_jsonb(NEW)->>'recording_job_id')::BIGINT
+    WHERE br.id=(to_jsonb(NEW)->>'batch_recording_id')::BIGINT
+      AND br.batch_record_id=batch_key
+      AND w.local_open_at::DATE=(to_jsonb(NEW)->>'local_date')::DATE
+      AND ROW(w.window_start_at,w.window_end_at)
+        IS NOT DISTINCT FROM ROW((to_jsonb(NEW)->>'scheduled_start_at')::TIMESTAMPTZ,
+          (to_jsonb(NEW)->>'scheduled_end_at')::TIMESTAMPTZ)
+      AND ROW(j.recording_id,j.fire_at,j.scheduled_for,j.kind,j.window_end_at,j.status,j.completed_at)
+        IS NOT DISTINCT FROM ROW(br.recording_id,w.window_start_at,w.window_start_at,'continuous_window',
+          w.window_end_at,'done',(to_jsonb(NEW)->>'completed_at')::TIMESTAMPTZ)
+      AND b.qualification_frozen_at<=w.window_start_at
+      AND j.completed_at>=j.window_end_at AND j.completed_at<=b.eligibility_cutoff
+    FOR KEY SHARE OF br,b,w FOR SHARE OF j)
+  THEN RAISE EXCEPTION 'joined qualification window differs'; END IF;
   IF TG_TABLE_NAME='recording_joined_hours' AND
     ((to_jsonb(NEW)->>'state')<>'pending' OR (to_jsonb(NEW)->>'attempt_count')::INTEGER<>0)
   THEN RAISE EXCEPTION 'joined hour must enter pending'; END IF;
+  IF TG_TABLE_NAME='recording_joined_stream_days' AND (to_jsonb(NEW)->>'state')<>'pending'
+  THEN RAISE EXCEPTION 'joined stream day must enter pending'; END IF;
+  IF TG_TABLE_NAME IN ('recording_joined_day_boundaries','recording_joined_hours','recording_joined_sources')
+    AND NOT EXISTS(SELECT 1 FROM recording_joined_stream_days d
+      WHERE d.id=(to_jsonb(NEW)->>'stream_day_id')::BIGINT AND d.state='pending' FOR SHARE)
+  THEN RAISE EXCEPTION 'joined sealed stream day is immutable'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_joined_batch_recording_insert_guard BEFORE INSERT ON recording_joined_batch_recordings
@@ -466,6 +707,38 @@ CREATE TRIGGER recording_joined_hour_insert_guard BEFORE INSERT ON recording_joi
   FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_freeze_child_insert();
 CREATE TRIGGER recording_joined_source_freeze_guard BEFORE INSERT ON recording_joined_sources
   FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_freeze_child_insert();
+
+CREATE FUNCTION guard_recording_joined_source_snapshot_statement() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS(SELECT 1 FROM inserted source
+    JOIN recording_joined_batches batch ON batch.id=source.batch_record_id
+    JOIN recording_joined_stream_days day ON day.id=source.stream_day_id
+    LEFT JOIN recording_clips clip ON clip.id=source.clip_id
+    LEFT JOIN storage_destinations destination ON destination.id=source.storage_destination_id
+    WHERE batch.state<>'snapshotting' OR batch.freeze_started_at IS NOT NULL OR day.state<>'pending'
+      OR ROW(day.batch_record_id,day.account_id,day.connection_id,day.recording_id,day.recording_job_id)
+        IS DISTINCT FROM ROW(source.batch_record_id,source.account_id,source.connection_id,source.recording_id,
+          source.recording_job_id)
+      OR source.endpoint IS DISTINCT FROM batch.source_endpoint
+      OR source.end_at<=day.scheduled_start_at OR source.start_at>=day.scheduled_end_at
+      OR source.clip_created_at>batch.eligibility_cutoff OR clip.id IS NULL OR destination.id IS NULL
+      OR clip.purged_at IS NOT NULL OR destination.account_id IS DISTINCT FROM source.account_id
+      OR ROW(clip.recording_id,clip.recording_job_id,clip.storage_destination_id,clip.endpoint,clip.bucket,
+          clip.object_key,clip.etag,clip.size_bytes,clip.sha256,clip.clip_start_at,clip.clip_end_at,clip.created_at,
+          clip.capture_lease_token,clip.capture_sequence,clip.capture_attempt_id,clip.timestamp_contract_version,
+          clip.timestamp_contract,clip.timestamp_contract_status,clip.timestamp_contract_reason)
+        IS DISTINCT FROM ROW(source.recording_id,source.recording_job_id,source.storage_destination_id,source.endpoint,
+          source.bucket,source.object_key,source.ingest_etag,source.size_bytes,source.sha256,source.start_at,source.end_at,
+          source.clip_created_at,source.capture_lease_token,source.capture_sequence,source.capture_attempt_id,
+          source.timestamp_contract_version,source.timestamp_contract,source.timestamp_contract_status,
+          source.timestamp_contract_reason)
+      OR ROW(destination.provider,destination.endpoint,destination.region,destination.bucket)
+        IS DISTINCT FROM ROW(source.provider,source.endpoint,source.region,source.bucket))
+  THEN RAISE EXCEPTION 'joined source snapshot scope differs'; END IF;
+  RETURN NULL;
+END $$;
+CREATE TRIGGER recording_joined_source_snapshot_freeze_guard AFTER INSERT ON recording_joined_source_snapshots
+  REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION guard_recording_joined_source_snapshot_statement();
 
 CREATE FUNCTION validate_recording_joined_stream_day(p_stream_day_id BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql AS $$
 DECLARE d recording_joined_stream_days%ROWTYPE; b recording_joined_day_boundaries%ROWTYPE;
@@ -486,15 +759,17 @@ BEGIN
     extract(month FROM d.local_date)::INTEGER,extract(day FROM d.local_date)::INTEGER,20,0,0,recording_timezone);
   SELECT count(*), COALESCE(sum(size_bytes), 0) INTO source_count, source_bytes
     FROM recording_joined_sources WHERE stream_day_id = d.id;
-  IF ARRAY(SELECT jsonb_object_keys(ledger) ORDER BY 1) IS DISTINCT FROM ARRAY['batch_id','consecutive_pairs',
-      'cross_day_boundaries','cross_hour_boundaries','first_clip_id','generation','hour_source_claim_sha256','hours',
+  IF d.state<>'sealed'
+    OR ARRAY(SELECT jsonb_object_keys(ledger) ORDER BY 1) IS DISTINCT FROM ARRAY['batch_id','consecutive_pairs',
+      'cross_day_boundaries','cross_hour_boundaries','first_clip_id','frozen_source_sha256','generation','hour_source_claim_sha256','hours',
       'last_clip_id','ledger_sha256','local_date','qualification_day','qualification_sha256','recording_id',
       'schema_version','source_bytes','source_claim_sha256','source_clip_count','sources','timezone']::TEXT[]
     OR ARRAY(SELECT jsonb_object_keys(ledger->'qualification_day') ORDER BY 1) IS DISTINCT FROM
-      ARRAY['completed_at','job_id','local_date','quality_tier','window_end','window_start']::TEXT[]
+      ARRAY['completed_at','job_id','local_date','qualification_window_ordinal','window_end','window_start']::TEXT[]
     OR EXISTS(SELECT 1 FROM jsonb_array_elements(ledger->'sources') source WHERE
       ARRAY(SELECT jsonb_object_keys(source) ORDER BY 1) IS DISTINCT FROM ARRAY['bucket','clip_id','end_utc','endpoint',
-        'object','provider','recording_id','recording_job_id','region','seam_to_previous','start_utc']::TEXT[]
+        'object','provider','recording_id','recording_job_id','region','released_at','seam_to_previous','start_utc',
+        'storage_destination_id']::TEXT[]
       OR ARRAY(SELECT jsonb_object_keys(source->'object') ORDER BY 1) NOT IN
         (ARRAY['etag','key','sha256','size_bytes']::TEXT[],ARRAY['etag','key','sha256','size_bytes','version_id']::TEXT[])
       OR ARRAY(SELECT jsonb_object_keys(source->'seam_to_previous') ORDER BY 1) IS DISTINCT FROM
@@ -521,6 +796,7 @@ BEGIN
     OR ledger->>'timezone' IS DISTINCT FROM recording_timezone OR (ledger->>'local_date')::DATE IS DISTINCT FROM d.local_date
     OR ledger->'qualification_day' IS DISTINCT FROM batch_recording.qualification->'days'->(d.date_ordinal-1)
     OR ledger->>'qualification_sha256' IS DISTINCT FROM batch_recording.qualification_sha256
+    OR ledger->>'frozen_source_sha256' IS DISTINCT FROM d.source_snapshot_sha256
     OR ledger->>'source_claim_sha256' IS DISTINCT FROM d.source_manifest_sha256
     OR (ledger->>'source_clip_count')::INTEGER IS DISTINCT FROM d.source_clip_count
     OR (ledger->>'source_bytes')::BIGINT IS DISTINCT FROM d.source_bytes
@@ -535,6 +811,19 @@ BEGIN
     OR (d.source_clip_count>0 AND ((ledger->>'first_clip_id')::BIGINT IS DISTINCT FROM (SELECT clip_id FROM recording_joined_sources WHERE stream_day_id=d.id ORDER BY day_ordinal LIMIT 1)
       OR (ledger->>'last_clip_id')::BIGINT IS DISTINCT FROM (SELECT clip_id FROM recording_joined_sources WHERE stream_day_id=d.id ORDER BY day_ordinal DESC LIMIT 1)))
     OR source_count <> d.source_clip_count OR source_bytes <> d.source_bytes
+    OR (SELECT count(*) FROM recording_joined_source_snapshots s WHERE s.stream_day_id=d.id)<>d.source_clip_count
+    OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_source_snapshots s
+      WHERE s.stream_day_id=d.id)<>d.source_bytes
+    OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots snapshot
+      LEFT JOIN recording_joined_sources observed ON observed.source_snapshot_id=snapshot.id
+      WHERE snapshot.stream_day_id=d.id AND (observed.id IS NULL OR observed.stream_day_id<>d.id
+        OR ROW(observed.clip_id,observed.recording_id,observed.recording_job_id,observed.storage_destination_id,
+          observed.provider,observed.endpoint,observed.region,observed.bucket,observed.object_key,observed.etag,
+          observed.size_bytes,observed.sha256,observed.start_at,observed.end_at,observed.clip_created_at,observed.released_at)
+          IS DISTINCT FROM ROW(snapshot.clip_id,snapshot.recording_id,snapshot.recording_job_id,
+          snapshot.storage_destination_id,snapshot.provider,snapshot.endpoint,snapshot.region,snapshot.bucket,
+          snapshot.object_key,snapshot.ingest_etag,snapshot.size_bytes,snapshot.sha256,snapshot.start_at,
+          snapshot.end_at,snapshot.clip_created_at,snapshot.released_at)))
     OR d.scheduled_start_at <> expected_day_start OR d.scheduled_end_at <> expected_day_end
     OR (source_count > 0 AND ((SELECT min(day_ordinal) FROM recording_joined_sources WHERE stream_day_id = d.id) <> 1
       OR (SELECT max(day_ordinal) FROM recording_joined_sources WHERE stream_day_id = d.id) <> source_count))
@@ -569,10 +858,12 @@ BEGIN
       OR (js.source->>'clip_id')::BIGINT IS DISTINCT FROM s.clip_id
       OR (js.source->>'recording_id')::BIGINT IS DISTINCT FROM s.recording_id
       OR (js.source->>'recording_job_id')::BIGINT IS DISTINCT FROM s.recording_job_id
+      OR (js.source->>'storage_destination_id')::BIGINT IS DISTINCT FROM s.storage_destination_id
       OR js.source->>'provider' IS DISTINCT FROM s.provider OR js.source->>'endpoint' IS DISTINCT FROM s.endpoint
       OR js.source->>'region' IS DISTINCT FROM s.region OR js.source->>'bucket' IS DISTINCT FROM s.bucket
       OR (js.source->>'start_utc')::TIMESTAMPTZ IS DISTINCT FROM s.start_at
       OR (js.source->>'end_utc')::TIMESTAMPTZ IS DISTINCT FROM s.end_at
+      OR (js.source->>'released_at')::TIMESTAMPTZ IS DISTINCT FROM s.released_at
       OR js.source->'object'->>'key' IS DISTINCT FROM s.object_key
       OR js.source->'object'->>'etag' IS DISTINCT FROM s.etag
       OR COALESCE(js.source->'object'->>'version_id','') IS DISTINCT FROM s.version_id
@@ -767,8 +1058,9 @@ CREATE FUNCTION guard_recording_joined_artifact_insert() RETURNS trigger LANGUAG
 DECLARE root recording_joined_artifacts%ROWTYPE; h recording_joined_hours%ROWTYPE; d recording_joined_stream_days%ROWTYPE;
   batch recording_joined_batches%ROWTYPE;
 BEGIN
-  IF NOT EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=NEW.batch_record_id
-      AND b.state IN ('frozen','index_sealed') FOR KEY SHARE)
+  IF NOT EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=NEW.batch_record_id AND
+      ((NEW.artifact_kind='allocation_ledger' AND b.state='building' AND b.freeze_started_at IS NULL)
+        OR (NEW.artifact_kind<>'allocation_ledger' AND b.state IN ('frozen','index_sealed'))) FOR KEY SHARE)
     OR NEW.published_at IS NOT NULL OR NEW.etag IS NOT NULL OR NEW.version_id IS NOT NULL OR NEW.finalized_token IS NOT NULL
     OR NEW.failure_reason_code <> ''
     OR (NEW.artifact_kind<>'media' AND NEW.ordinal<>1)
@@ -1138,18 +1430,31 @@ FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_index_ref_insert();
 
 CREATE FUNCTION guard_recording_joined_batch_update() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  IF ROW(NEW.account_id, NEW.connection_id, NEW.batch_id, NEW.generation, NEW.source_endpoint, NEW.policy_version, NEW.eligibility_cutoff,
-      NEW.media_tool, NEW.media_tool_sha256, NEW.freeze_request, NEW.freeze_request_sha256,
-      NEW.frozen_denominator_sha256, NEW.expected_recordings, NEW.expected_stream_days,
-      NEW.expected_scheduled_hours, NEW.expected_source_clips, NEW.expected_source_bytes, NEW.created_at)
-    IS DISTINCT FROM ROW(OLD.account_id, OLD.connection_id, OLD.batch_id, OLD.generation, OLD.source_endpoint, OLD.policy_version, OLD.eligibility_cutoff,
-      OLD.media_tool, OLD.media_tool_sha256, OLD.freeze_request, OLD.freeze_request_sha256,
-      OLD.frozen_denominator_sha256, OLD.expected_recordings, OLD.expected_stream_days,
-      OLD.expected_scheduled_hours, OLD.expected_source_clips, OLD.expected_source_bytes, OLD.created_at)
+  IF ROW(NEW.account_id, NEW.connection_id, NEW.batch_id, NEW.generation, NEW.source_endpoint,
+      NEW.qualification_run_id, NEW.qualification_cohort_sha256, NEW.qualification_windows_sha256,
+      NEW.selected_qualification_windows_sha256, NEW.qualification_jobs_sha256, NEW.qualification_frozen_at,
+      NEW.ordered_recording_ids_sha256, NEW.selection_basis,
+      NEW.policy_version, NEW.eligibility_cutoff, NEW.media_tool, NEW.media_tool_sha256,
+      NEW.freeze_request_bytes, NEW.freeze_request_sha256, NEW.frozen_denominator_sha256, NEW.freeze_exclusions_sha256,
+      NEW.expected_recordings, NEW.expected_stream_days,
+      NEW.expected_scheduled_hours, NEW.expected_source_clips, NEW.expected_source_bytes,
+      NEW.expected_freeze_exclusions, NEW.created_at)
+    IS DISTINCT FROM ROW(OLD.account_id, OLD.connection_id, OLD.batch_id, OLD.generation, OLD.source_endpoint,
+      OLD.qualification_run_id, OLD.qualification_cohort_sha256, OLD.qualification_windows_sha256,
+      OLD.selected_qualification_windows_sha256, OLD.qualification_jobs_sha256, OLD.qualification_frozen_at,
+      OLD.ordered_recording_ids_sha256, OLD.selection_basis,
+      OLD.policy_version, OLD.eligibility_cutoff, OLD.media_tool, OLD.media_tool_sha256,
+      OLD.freeze_request_bytes, OLD.freeze_request_sha256, OLD.frozen_denominator_sha256, OLD.freeze_exclusions_sha256,
+      OLD.expected_recordings, OLD.expected_stream_days,
+      OLD.expected_scheduled_hours, OLD.expected_source_clips, OLD.expected_source_bytes,
+      OLD.expected_freeze_exclusions, OLD.created_at)
   THEN RAISE EXCEPTION 'joined batch identity is immutable'; END IF;
   IF OLD.state<>'building' AND NEW.freeze_started_at IS DISTINCT FROM OLD.freeze_started_at
   THEN RAISE EXCEPTION 'joined batch freeze evidence is immutable'; END IF;
-  IF OLD.state='building' AND NEW.state='building' THEN
+  IF OLD.state='snapshotting' AND NEW.state='building' THEN
+    IF NEW.freeze_started_at IS NOT NULL OR NEW.frozen_at IS NOT NULL
+    THEN RAISE EXCEPTION 'invalid joined batch snapshot transition'; END IF;
+  ELSIF OLD.state='building' AND NEW.state='building' THEN
     IF current_setting('transaction_isolation') <> 'read committed' OR OLD.freeze_started_at IS NOT NULL
       OR NEW.freeze_started_at IS NULL OR NEW.freeze_started_at < OLD.created_at OR NEW.freeze_started_at > clock_timestamp()
     THEN RAISE EXCEPTION 'invalid joined batch freeze start'; END IF;
@@ -1158,8 +1463,18 @@ BEGIN
       OR OLD.freeze_started_at IS NULL OR NEW.freeze_started_at IS DISTINCT FROM OLD.freeze_started_at
       OR NEW.frozen_at IS NULL OR NEW.frozen_at < OLD.eligibility_cutoff OR NEW.frozen_at < OLD.freeze_started_at
       OR NEW.frozen_at > clock_timestamp()
+      OR NOT EXISTS(SELECT 1 FROM recording_qualification_runs q
+        WHERE q.id=OLD.qualification_run_id AND q.account_id=OLD.account_id
+          AND q.cohort_sha256=OLD.qualification_cohort_sha256
+          AND q.windows_sha256=OLD.qualification_windows_sha256
+          AND q.frozen_at=OLD.qualification_frozen_at FOR KEY SHARE)
       OR (SELECT count(*) FROM recording_joined_batch_recordings br WHERE br.batch_record_id=OLD.id)<>OLD.expected_recordings
       OR (SELECT count(*) FROM recording_joined_stream_days d WHERE d.batch_record_id=OLD.id)<>OLD.expected_stream_days
+      OR (SELECT count(*) FROM recording_joined_stream_days d
+        WHERE d.batch_record_id=OLD.id AND d.state='sealed')<>OLD.expected_stream_days
+      OR (SELECT count(*) FROM recording_joined_source_snapshots s WHERE s.batch_record_id=OLD.id)<>OLD.expected_source_clips
+      OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_source_snapshots s
+        WHERE s.batch_record_id=OLD.id)<>OLD.expected_source_bytes
       OR (SELECT count(*) FROM recording_joined_hours h WHERE h.batch_record_id=OLD.id)<>OLD.expected_scheduled_hours
       OR (SELECT count(*) FROM recording_joined_sources s WHERE s.batch_record_id=OLD.id)<>OLD.expected_source_clips
       OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_sources s WHERE s.batch_record_id=OLD.id)<>OLD.expected_source_bytes
@@ -1175,18 +1490,22 @@ BEGIN
           OR jsonb_array_length(br.qualification->'days')<>14))
       OR EXISTS(SELECT 1 FROM recording_joined_stream_days d
         JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
-        JOIN recording_jobs j ON j.id=d.recording_job_id
+        JOIN recording_qualification_windows w ON w.run_id=br.qualification_run_id
+          AND w.recording_id=br.recording_id AND w.ordinal=d.date_ordinal
         WHERE d.batch_record_id=OLD.id AND (d.local_date<>br.first_local_date+d.date_ordinal-1
+          OR br.qualification_run_id<>OLD.qualification_run_id
+          OR ROW(w.window_start_at,w.window_end_at) IS DISTINCT FROM ROW(d.scheduled_start_at,d.scheduled_end_at)
           OR d.recording_job_id<>br.authoritative_job_ids[d.date_ordinal]
-          OR ROW(j.recording_id,j.fire_at,j.scheduled_for,j.kind,j.window_end_at,j.status)
-            IS DISTINCT FROM ROW(d.recording_id,d.scheduled_start_at,d.scheduled_start_at,'continuous_window',d.scheduled_end_at,'done')
-          OR j.completed_at IS NULL OR j.completed_at<d.scheduled_end_at OR j.completed_at>NEW.frozen_at
           OR (br.qualification->'days'->(d.date_ordinal-1)->>'local_date')::DATE<>d.local_date
           OR (br.qualification->'days'->(d.date_ordinal-1)->>'job_id')::BIGINT<>d.recording_job_id
+          OR (br.qualification->'days'->(d.date_ordinal-1)->>'qualification_window_ordinal')::INTEGER<>d.date_ordinal
           OR (br.qualification->'days'->(d.date_ordinal-1)->>'window_start')::TIMESTAMPTZ<>d.scheduled_start_at
           OR (br.qualification->'days'->(d.date_ordinal-1)->>'window_end')::TIMESTAMPTZ<>d.scheduled_end_at
-          OR br.qualification->'days'->(d.date_ordinal-1)->>'quality_tier'<>'good+'))
-      OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=OLD.id)
+          OR (br.qualification->'days'->(d.date_ordinal-1)->>'completed_at')::TIMESTAMPTZ<>d.completed_at))
+      OR (SELECT count(*) FROM recording_joined_artifacts a
+        WHERE a.batch_record_id=OLD.id AND a.artifact_kind='allocation_ledger')<>OLD.expected_stream_days
+      OR EXISTS(SELECT 1 FROM recording_joined_artifacts a
+        WHERE a.batch_record_id=OLD.id AND a.artifact_kind<>'allocation_ledger')
     THEN RAISE EXCEPTION 'joined batch freeze is incomplete'; END IF;
     PERFORM validate_recording_joined_stream_day(d.id) FROM recording_joined_stream_days d WHERE d.batch_record_id=OLD.id;
   ELSIF OLD.state = 'frozen' AND NEW.state = 'index_sealed' THEN
@@ -1200,16 +1519,68 @@ BEGIN
     IF NEW.index_artifact_id <> OLD.index_artifact_id OR NEW.index_sealed_at <> OLD.index_sealed_at OR NEW.published_at IS NULL
       OR NOT EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.id = OLD.index_artifact_id AND a.publication_state = 'published')
     THEN RAISE EXCEPTION 'invalid joined batch publication'; END IF;
-  ELSIF OLD.state IN ('frozen', 'index_sealed') AND NEW.state = 'terminal_failed' THEN
-    IF NEW.failure_reason_code = '' THEN RAISE EXCEPTION 'joined terminal batch failure lacks reason'; END IF;
+  ELSIF OLD.state IN ('building', 'frozen', 'index_sealed') AND NEW.state = 'terminal_failed' THEN
+    IF NEW.failure_reason_code = '' OR OLD.failure_reason_code <> ''
+      OR ROW(NEW.index_artifact_id,NEW.freeze_started_at,NEW.frozen_at,NEW.index_sealed_at,NEW.published_at)
+        IS DISTINCT FROM ROW(OLD.index_artifact_id,OLD.freeze_started_at,OLD.frozen_at,OLD.index_sealed_at,OLD.published_at)
+    THEN RAISE EXCEPTION 'joined terminal batch failure lacks reason or rewrites evidence'; END IF;
   ELSE RAISE EXCEPTION 'invalid joined batch transition'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER recording_joined_batch_update_guard BEFORE UPDATE ON recording_joined_batches
 FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_batch_update();
 
+CREATE FUNCTION validate_recording_joined_freeze_finished() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS(SELECT 1 FROM recording_joined_batches b
+    WHERE b.id=NEW.id AND b.state='building' AND b.freeze_started_at IS NOT NULL)
+  THEN RAISE EXCEPTION 'joined batch freeze fence cannot commit unfinished'; END IF;
+  RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER recording_joined_batch_freeze_finished
+AFTER UPDATE OF freeze_started_at ON recording_joined_batches DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION validate_recording_joined_freeze_finished();
+
 CREATE FUNCTION reject_recording_joined_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN RAISE EXCEPTION 'joined recording evidence is append-only'; END $$;
+
+CREATE FUNCTION guard_recording_joined_stream_day_update() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.state<>'pending' OR NEW.state<>'sealed'
+    OR ROW(NEW.batch_record_id,NEW.batch_recording_id,NEW.account_id,NEW.connection_id,NEW.batch_id,
+      NEW.recording_id,NEW.local_date,NEW.date_ordinal,NEW.recording_job_id,NEW.scheduled_start_at,
+      NEW.scheduled_end_at,NEW.completed_at,NEW.source_clip_count,NEW.source_bytes,NEW.source_snapshot_sha256,NEW.created_at)
+      IS DISTINCT FROM ROW(OLD.batch_record_id,OLD.batch_recording_id,OLD.account_id,OLD.connection_id,OLD.batch_id,
+      OLD.recording_id,OLD.local_date,OLD.date_ordinal,OLD.recording_job_id,OLD.scheduled_start_at,
+      OLD.scheduled_end_at,OLD.completed_at,OLD.source_clip_count,OLD.source_bytes,OLD.source_snapshot_sha256,OLD.created_at)
+    OR NOT EXISTS(SELECT 1 FROM recording_joined_batches b
+      WHERE b.id=OLD.batch_record_id AND b.state='building' AND b.freeze_started_at IS NULL FOR SHARE)
+    OR (SELECT count(*) FROM recording_joined_source_snapshots s WHERE s.stream_day_id=OLD.id)<>OLD.source_clip_count
+    OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_source_snapshots s WHERE s.stream_day_id=OLD.id)<>OLD.source_bytes
+    OR (SELECT count(*) FROM recording_joined_sources s WHERE s.stream_day_id=OLD.id)<>OLD.source_clip_count
+    OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_sources s WHERE s.stream_day_id=OLD.id)<>OLD.source_bytes
+    OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots snapshot
+      LEFT JOIN recording_joined_sources observed ON observed.source_snapshot_id=snapshot.id
+      WHERE snapshot.stream_day_id=OLD.id AND (observed.id IS NULL OR observed.stream_day_id<>OLD.id))
+    OR (SELECT count(*) FROM recording_joined_hours h WHERE h.stream_day_id=OLD.id)<>12
+    OR (SELECT count(*) FROM recording_joined_day_boundaries b
+      WHERE b.stream_day_id=OLD.id AND b.boundary_kind='cross_hour')<>11
+    OR (SELECT count(*) FROM recording_joined_day_boundaries b
+      WHERE b.stream_day_id=OLD.id AND b.boundary_kind='cross_day')<>2
+  THEN RAISE EXCEPTION 'joined stream day seal differs from frozen snapshot'; END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER recording_joined_stream_day_update_guard BEFORE UPDATE ON recording_joined_stream_days
+FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_stream_day_update();
+
+CREATE FUNCTION validate_recording_joined_stream_day_after_seal() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM validate_recording_joined_stream_day(NEW.id);
+  RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER recording_joined_stream_day_validate_after_seal
+AFTER UPDATE OF state ON recording_joined_stream_days DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW WHEN (NEW.state='sealed') EXECUTE FUNCTION validate_recording_joined_stream_day_after_seal();
 
 CREATE TRIGGER recording_joined_batch_no_delete BEFORE DELETE ON recording_joined_batches
   FOR EACH ROW EXECUTE FUNCTION reject_recording_joined_mutation();
@@ -1217,7 +1588,9 @@ CREATE TRIGGER recording_joined_batch_recording_no_mutation BEFORE UPDATE OR DEL
   FOR EACH ROW EXECUTE FUNCTION reject_recording_joined_mutation();
 CREATE TRIGGER recording_joined_exclusion_no_mutation BEFORE UPDATE OR DELETE ON recording_joined_freeze_exclusions
   FOR EACH ROW EXECUTE FUNCTION reject_recording_joined_mutation();
-CREATE TRIGGER recording_joined_stream_day_no_mutation BEFORE UPDATE OR DELETE ON recording_joined_stream_days
+CREATE TRIGGER recording_joined_stream_day_no_delete BEFORE DELETE ON recording_joined_stream_days
+  FOR EACH ROW EXECUTE FUNCTION reject_recording_joined_mutation();
+CREATE TRIGGER recording_joined_source_snapshot_no_mutation BEFORE UPDATE OR DELETE ON recording_joined_source_snapshots
   FOR EACH ROW EXECUTE FUNCTION reject_recording_joined_mutation();
 CREATE TRIGGER recording_joined_boundary_no_mutation BEFORE UPDATE OR DELETE ON recording_joined_day_boundaries
   FOR EACH ROW EXECUTE FUNCTION reject_recording_joined_mutation();
@@ -1243,6 +1616,8 @@ CREATE TRIGGER recording_joined_batch_recording_no_truncate BEFORE TRUNCATE ON r
 CREATE TRIGGER recording_joined_exclusion_no_truncate BEFORE TRUNCATE ON recording_joined_freeze_exclusions
   FOR EACH STATEMENT EXECUTE FUNCTION reject_recording_joined_mutation();
 CREATE TRIGGER recording_joined_stream_day_no_truncate BEFORE TRUNCATE ON recording_joined_stream_days
+  FOR EACH STATEMENT EXECUTE FUNCTION reject_recording_joined_mutation();
+CREATE TRIGGER recording_joined_source_snapshot_no_truncate BEFORE TRUNCATE ON recording_joined_source_snapshots
   FOR EACH STATEMENT EXECUTE FUNCTION reject_recording_joined_mutation();
 CREATE TRIGGER recording_joined_boundary_no_truncate BEFORE TRUNCATE ON recording_joined_day_boundaries
   FOR EACH STATEMENT EXECUTE FUNCTION reject_recording_joined_mutation();
