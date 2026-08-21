@@ -94,14 +94,12 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1
-      - name: Install joined lifecycle test tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg postgresql-client
+      - name: Install FFmpeg for joined lifecycle tests
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Test joined Tier-1 freeze, retention, and canonical lifecycle
         env:
-          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_joined_test?sslmode=disable
-        run: |
-          createdb -h localhost -U stoarama stoarama_joined_test
-          go test ./internal/api -run '^(TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator|TestJoinedCanonicalLedgerPublicationFeedAndExactAck|TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly|TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly)$' -count=1 -v
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^(TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator|TestJoinedCanonicalLedgerPublicationFeedAndExactAck|TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly|TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly)$' -count=1 -v
       # The continuous-window revive rules decide whether a 12-hour window resumes
       # after a failure or stays forfeited, and every test covering them is
       # DB-backed, so they all skipped in CI until this step named them.
