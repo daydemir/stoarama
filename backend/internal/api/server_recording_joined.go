@@ -513,6 +513,8 @@ func (s *Server) handleJoinedSourceCapability(w http.ResponseWriter, r *http.Req
 		       CASE WHEN h.state='leased' THEN 'leased' ELSE root.publication_state END,now()
 		FROM recording_joined_sources src
 		JOIN recording_joined_hours h ON h.id=src.hour_record_id
+		JOIN recording_joined_batches b ON b.id=h.batch_record_id AND b.batch_id=h.batch_id
+		  AND b.source_endpoint=src.endpoint
 		LEFT JOIN recording_joined_artifacts root ON root.hour_record_id=h.id AND root.artifact_kind='hour_manifest'
 		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
 		JOIN storage_destinations sd ON sd.id=src.storage_destination_id AND sd.provider=src.provider
@@ -541,7 +543,7 @@ func (s *Server) handleJoinedSourceCapability(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusServiceUnavailable, "storage credential key is unset")
 		return
 	}
-	sourceAuthority, authorityErr := joinedOutputAuthority(d.endpoint)
+	sourceAuthority, authorityErr := joinedrecording.CanonicalSourceEndpointAuthority(d.endpoint)
 	if provider == "" || authorityErr != nil {
 		util.WriteError(w, http.StatusBadGateway, "frozen joined source storage authority is invalid")
 		return

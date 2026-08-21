@@ -24,6 +24,7 @@ CREATE TABLE recording_joined_batches (
   connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE RESTRICT,
   batch_id TEXT NOT NULL CHECK (batch_id ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
   generation INTEGER NOT NULL CHECK (generation > 0),
+  source_endpoint TEXT NOT NULL CHECK (source_endpoint ~ '^https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com$'),
   policy_version TEXT NOT NULL CHECK (policy_version = btrim(policy_version) AND policy_version <> '' AND octet_length(policy_version) <= 128),
   eligibility_cutoff TIMESTAMPTZ NOT NULL,
   media_tool JSONB NOT NULL CHECK (jsonb_typeof(media_tool) = 'object' AND media_tool <> '{}'::jsonb),
@@ -46,6 +47,7 @@ CREATE TABLE recording_joined_batches (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (batch_id),
   UNIQUE (id, account_id, connection_id, batch_id),
+  UNIQUE (id, source_endpoint),
   CHECK (expected_stream_days = expected_recordings * 14),
   CHECK (expected_scheduled_hours = expected_stream_days * 12),
   CHECK ((state = 'building' AND frozen_at IS NULL AND index_artifact_id IS NULL AND index_sealed_at IS NULL AND published_at IS NULL
@@ -264,10 +266,12 @@ CREATE TABLE recording_joined_sources (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK (end_at > start_at AND end_at - start_at <= interval '15 minutes'),
   CHECK (audio_contract IS NULL OR jsonb_typeof(audio_contract) = 'object'),
+  FOREIGN KEY (batch_record_id, endpoint)
+    REFERENCES recording_joined_batches(id, source_endpoint) ON DELETE RESTRICT,
   UNIQUE (batch_record_id, clip_id),
   UNIQUE (stream_day_id, day_ordinal),
   UNIQUE (hour_record_id, hour_ordinal),
-  CHECK (endpoint = btrim(endpoint) AND endpoint <> '' AND octet_length(endpoint) <= 2048
+  CHECK (endpoint ~ '^https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com$'
     AND region = btrim(region) AND octet_length(region) <= 128
     AND octet_length(bucket) <= 255 AND octet_length(object_key) <= 2048
     AND object_key NOT IN ('.','..') AND left(object_key,1)<>'/' AND object_key !~ E'\\\\'
@@ -402,12 +406,13 @@ CREATE TABLE recording_joined_artifact_acks (
 
 CREATE FUNCTION guard_recording_joined_source_insert() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE clip recording_clips%ROWTYPE; destination storage_destinations%ROWTYPE; h recording_joined_hours%ROWTYPE;
-  d recording_joined_stream_days%ROWTYPE;
+  d recording_joined_stream_days%ROWTYPE; batch recording_joined_batches%ROWTYPE;
 BEGIN
   SELECT * INTO STRICT clip FROM recording_clips WHERE id = NEW.clip_id FOR KEY SHARE;
   SELECT * INTO STRICT destination FROM storage_destinations WHERE id = NEW.storage_destination_id FOR KEY SHARE;
   SELECT * INTO STRICT h FROM recording_joined_hours WHERE id = NEW.hour_record_id FOR KEY SHARE;
   SELECT * INTO STRICT d FROM recording_joined_stream_days WHERE id = NEW.stream_day_id FOR KEY SHARE;
+  SELECT * INTO STRICT batch FROM recording_joined_batches WHERE id = NEW.batch_record_id FOR KEY SHARE;
   IF clip.purged_at IS NOT NULL
     OR ROW(clip.recording_id, clip.recording_job_id, clip.storage_destination_id, clip.endpoint, clip.bucket,
       clip.object_key, clip.size_bytes, clip.sha256, clip.etag, clip.clip_start_at, clip.clip_end_at,
@@ -417,10 +422,11 @@ BEGIN
         NEW.clip_created_at, NEW.released_at)
     OR ROW(destination.account_id, destination.provider, destination.endpoint, destination.region, destination.bucket)
       IS DISTINCT FROM ROW(NEW.account_id, NEW.provider, NEW.endpoint, NEW.region, NEW.bucket)
+    OR NEW.endpoint IS DISTINCT FROM batch.source_endpoint
     OR ROW(h.batch_record_id, h.stream_day_id, h.account_id, h.connection_id, h.recording_id)
       IS DISTINCT FROM ROW(NEW.batch_record_id, NEW.stream_day_id, NEW.account_id, NEW.connection_id, NEW.recording_id)
     OR NEW.recording_job_id<>d.recording_job_id OR NEW.end_at<=d.scheduled_start_at OR NEW.start_at>=d.scheduled_end_at
-    OR NEW.clip_created_at > (SELECT eligibility_cutoff FROM recording_joined_batches WHERE id = NEW.batch_record_id)
+    OR NEW.clip_created_at > batch.eligibility_cutoff
   THEN RAISE EXCEPTION 'joined source differs from frozen raw object'; END IF;
   RETURN NEW;
 END $$;
@@ -1132,11 +1138,11 @@ FOR EACH ROW EXECUTE FUNCTION guard_recording_joined_index_ref_insert();
 
 CREATE FUNCTION guard_recording_joined_batch_update() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  IF ROW(NEW.account_id, NEW.connection_id, NEW.batch_id, NEW.generation, NEW.policy_version, NEW.eligibility_cutoff,
+  IF ROW(NEW.account_id, NEW.connection_id, NEW.batch_id, NEW.generation, NEW.source_endpoint, NEW.policy_version, NEW.eligibility_cutoff,
       NEW.media_tool, NEW.media_tool_sha256, NEW.freeze_request, NEW.freeze_request_sha256,
       NEW.frozen_denominator_sha256, NEW.expected_recordings, NEW.expected_stream_days,
       NEW.expected_scheduled_hours, NEW.expected_source_clips, NEW.expected_source_bytes, NEW.created_at)
-    IS DISTINCT FROM ROW(OLD.account_id, OLD.connection_id, OLD.batch_id, OLD.generation, OLD.policy_version, OLD.eligibility_cutoff,
+    IS DISTINCT FROM ROW(OLD.account_id, OLD.connection_id, OLD.batch_id, OLD.generation, OLD.source_endpoint, OLD.policy_version, OLD.eligibility_cutoff,
       OLD.media_tool, OLD.media_tool_sha256, OLD.freeze_request, OLD.freeze_request_sha256,
       OLD.frozen_denominator_sha256, OLD.expected_recordings, OLD.expected_stream_days,
       OLD.expected_scheduled_hours, OLD.expected_source_clips, OLD.expected_source_bytes, OLD.created_at)
