@@ -73,16 +73,20 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	if err := (Config{}).ValidateJoined(); err != nil {
 		t.Fatalf("dormant unconfigured joined release: %v", err)
 	}
-	valid := Config{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "bootstrap", JoinedWorkerSigningKey: "signing"}
+	const bootstrap = "joined-bootstrap-credential-32bytes"
+	const signing = "joined-signing-credential-32-bytes"
+	valid := Config{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing}
 	if err := valid.ValidateJoined(); err != nil {
 		t.Fatalf("valid joined credentials: %v", err)
 	}
 	for _, cfg := range []Config{
-		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "", JoinedWorkerSigningKey: "signing"},
-		{JoinedRecordingEnabled: true, ServiceToken: "same", JoinedWorkerBootstrapToken: "same", JoinedWorkerSigningKey: "signing"},
-		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "same", JoinedWorkerSigningKey: "same"},
-		{JoinedRecordingEnabled: true, DatabaseURL: "same", JoinedWorkerBootstrapToken: "bootstrap", JoinedWorkerSigningKey: "same"},
-		{JoinedRecordingEnabled: true, R2SecretAccessKey: "same", JoinedWorkerBootstrapToken: "same", JoinedWorkerSigningKey: "signing"},
+		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "", JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, ServiceToken: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: bootstrap},
+		{JoinedRecordingEnabled: true, DatabaseURL: "postgres://user:" + signing + "@db.example.test/db", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, R2SecretAccessKey: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, JoinedWorkerBootstrapToken: strings.Repeat("b", 31), JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: strings.Repeat("s", 31)},
 	} {
 		if err := cfg.ValidateJoined(); err == nil {
 			t.Fatalf("unsafe joined credential configuration accepted: %+v", cfg)

@@ -45,6 +45,9 @@ type Server struct {
 	pool                    *pgxpool.Pool
 	r2                      *r2.Client
 	joinedOutputStorage     joinedOutputObjectStore
+	joinedFreezeSourceStore joinedFreezeSourceObjectStore
+	joinedFreezeTransport   http.RoundTripper
+	joinedCredentialCheck   func(context.Context) error
 	secrets                 *secretbox.Cipher
 	mailer                  email.Sender
 	streamsHTML             []byte
@@ -435,6 +438,7 @@ func (s *Server) router() http.Handler {
 			admin.Get("/recorder-pool", s.handleAdminRecorderPool)
 			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
 			admin.Post("/recording/joined/freeze-tier1", s.handleAdminJoinedFreezeTier1)
+			admin.Post("/recording/joined/stream-days/seal", s.handleAdminJoinedSealStreamDay)
 			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)

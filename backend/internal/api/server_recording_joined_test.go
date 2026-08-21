@@ -158,13 +158,16 @@ func TestJoinedCapabilityEnvelopeRejectsChangedAuthorityAndExpiredLease(t *testi
 }
 
 func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
+	const bootstrapCredential = "joined-bootstrap-credential-32bytes"
+	const signingCredential = "joined-signing-credential-32-bytes"
 	claim := uuid.New()
-	token, err := joinedauth.MintOperation("joined-signing-key", "batch-test", joinedauth.SubjectHour, "hour-test",
+	token, err := joinedauth.MintOperation(signingCredential, "batch-test", joinedauth.SubjectHour, "hour-test",
 		claim, joinedauth.OperationPreflight, time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{cfg: config.Config{ServiceToken: "generic-service-key", JoinedWorkerBootstrapToken: "joined-bootstrap-key", JoinedWorkerSigningKey: "joined-signing-key"}}
+	s := &Server{cfg: config.Config{ServiceToken: "generic-service-key", JoinedWorkerBootstrapToken: bootstrapCredential, JoinedWorkerSigningKey: signingCredential},
+		joinedCredentialCheck: func(context.Context) error { return nil }}
 	misconfigured := &Server{cfg: config.Config{JoinedRecordingEnabled: true, ServiceToken: "shared-secret",
 		JoinedWorkerBootstrapToken: "shared-secret", JoinedWorkerSigningKey: "shared-secret"}}
 	if misconfigured.joinedControlPlaneReady() {
@@ -234,7 +237,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 		t.Fatalf("joined job token service-route status=%d", rec.Code)
 	}
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/processing/worker-heartbeat", nil)
-	req.Header.Set("Authorization", "Bearer joined-bootstrap-key")
+	req.Header.Set("Authorization", "Bearer "+bootstrapCredential)
 	rec = httptest.NewRecorder()
 	s.requireServiceAuth(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("joined bootstrap token reached an unrelated service route")
@@ -248,7 +251,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	}{
 		{name: "missing", want: http.StatusUnauthorized},
 		{name: "generic service token", token: "generic-service-key", want: http.StatusUnauthorized},
-		{name: "joined bootstrap", token: "joined-bootstrap-key", want: http.StatusOK},
+		{name: "joined bootstrap", token: bootstrapCredential, want: http.StatusOK},
 	} {
 		t.Run("bootstrap "+tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/claim", nil)
@@ -285,7 +288,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	}
 	s.cfg.JoinedRecordingEnabled = true
 	bootstrapLeaseRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", strings.NewReader(`{"lease_id":"forbidden"}`))
-	bootstrapLeaseRequest.Header.Set("Authorization", "Bearer joined-bootstrap-key")
+	bootstrapLeaseRequest.Header.Set("Authorization", "Bearer "+bootstrapCredential)
 	bootstrapLeaseResponse := httptest.NewRecorder()
 	s.requireJoinedWorkerBootstrapAuth(http.HandlerFunc(s.handleJoinedToken)).ServeHTTP(bootstrapLeaseResponse, bootstrapLeaseRequest)
 	if bootstrapLeaseResponse.Code != http.StatusBadRequest {

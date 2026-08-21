@@ -932,9 +932,26 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		ct, err := tx.Exec(r.Context(), `
 			UPDATE connections c SET joined_last_attempt_artifact_id=$2,joined_last_blocker=$3,
 			  joined_last_attempt_at=$4,joined_retry_at=$5
-			WHERE c.id=$1 AND EXISTS(
-			  SELECT 1 FROM recording_joined_outputs o
-			  WHERE o.id=$2 AND o.connection_id=c.id AND o.nas_verified_at IS NULL)`,
+			WHERE c.id=$1 AND c.joined_protocol_version=1 AND EXISTS(
+			  SELECT 1 FROM recording_joined_artifacts a
+			  LEFT JOIN recording_joined_artifacts manifest ON a.artifact_kind='media'
+			    AND manifest.hour_record_id=a.hour_record_id AND manifest.artifact_kind='hour_manifest'
+			  LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
+			    AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
+			  LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id
+			    AND own_ack.connection_id=a.connection_id
+			  WHERE a.id=$2 AND a.connection_id=c.id AND own_ack.artifact_id IS NULL
+			    AND ((a.artifact_kind<>'media' AND a.publication_state='published')
+			      OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
+			    AND (a.artifact_kind='allocation_ledger'
+			      OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
+			        WHERE ack.artifact_id=ledger.id AND ack.connection_id=a.connection_id))
+			      OR (a.artifact_kind='media' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
+			        WHERE ack.artifact_id=manifest.id AND ack.connection_id=a.connection_id))
+			      OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
+			        LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
+			        WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index'
+			          AND ack.artifact_id IS NULL))))`,
 			connectionID, joined.ArtifactID, joined.Blocker, joined.AttemptedAt, joined.RetryAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("record joined delivery telemetry: %v", err))

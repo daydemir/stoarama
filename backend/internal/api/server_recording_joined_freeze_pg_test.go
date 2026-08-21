@@ -20,6 +20,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
+	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
 const joinedMigrationName = "0137_recording_joined_outputs.sql"
@@ -265,6 +266,7 @@ type joinedHistoricalTier1Fixture struct {
 	firstJobID      int64
 	clipID          int64
 	clipStart       time.Time
+	sessionToken    string
 	req             joinedTier1FreezeRequest
 	plan            joinedTier1FreezePlan
 	call            func(joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan)
@@ -275,11 +277,20 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	t.Helper()
 	s, pool, applyMigration, cleanup := testJoinedServerBeforeMigration(t)
 	ctx := context.Background()
+	cipher, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.secrets = cipher
+	sourceSecret, err := cipher.Encrypt([]byte("joined-source-storage-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	userID, accountID := seedUserOrg(t, pool, email, true)
 	var storageID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,
 		access_key_id,secret_access_key_enc,status,managed) VALUES($1,'joined-source','r2',$2,'auto','clips',
-		'key',$3,'verified',true) RETURNING id`, accountID, joinedTestSourceEndpoint, []byte{1}).Scan(&storageID); err != nil {
+		'key',$3,'verified',true) RETURNING id`, accountID, joinedTestSourceEndpoint, sourceSecret).Scan(&storageID); err != nil {
 		t.Fatal(err)
 	}
 	allIDs := append([]int64(nil), joinedrecording.Tier1RecordingIDs...)
@@ -371,8 +382,8 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		t.Fatal(err)
 	}
 	s.cfg.JoinedRecordingEnabled = true
-	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap"
-	s.cfg.JoinedWorkerSigningKey = "joined-signing"
+	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
+	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	token := "joined-freeze-admin-session"
 	insertSession(t, pool, accountID, userID, token)
 	callWithContext := func(callCtx context.Context, req joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan) {
@@ -399,7 +410,7 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	}
 	return joinedHistoricalTier1Fixture{s: s, pool: pool, cleanup: cleanup, userID: userID, accountID: accountID,
 		storageID: storageID, apiKeyID: apiKeyID, connectionID: connectionID, runID: runID, firstJobID: firstJobID,
-		clipID: clipID, clipStart: clipStart, req: req, plan: plan, call: call, callWithContext: callWithContext}
+		clipID: clipID, clipStart: clipStart, sessionToken: token, req: req, plan: plan, call: call, callWithContext: callWithContext}
 }
 
 func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
@@ -583,6 +594,15 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	if replay, _ := call(req); replay.Code != http.StatusOK {
 		t.Fatalf("exact apply replay status=%d body=%s", replay.Code, replay.Body.String())
 	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if replay, _ := call(req); replay.Code != http.StatusConflict {
+		t.Fatalf("protocol-zero apply replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	for name, mutate := range map[string]func(*joinedTier1FreezeRequest){
 		"connection":        func(changed *joinedTier1FreezeRequest) { changed.ConnectionID++ },
 		"qualification run": func(changed *joinedTier1FreezeRequest) { changed.QualificationRunID++ },
@@ -613,6 +633,72 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=$1`, clipID); err == nil {
 		t.Fatal("retention-protected source was purged")
+	}
+	var batchRecordID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).Scan(&batchRecordID); err != nil {
+		t.Fatal(err)
+	}
+	_, mismatchedRecordingErr := pool.Exec(ctx, `WITH altered AS (
+		SELECT b.*,convert_to(jsonb_set(jsonb_set(jsonb_set(convert_from(b.freeze_request_bytes,'UTF8')::jsonb,
+		  '{batch_id}',to_jsonb($2::text)),'{generation}','2'::jsonb),
+		  '{recordings,0,frozen_recording,recording_id}','999'::jsonb)::text,'UTF8') bytes
+		FROM recording_joined_batches b WHERE b.id=$1)
+		INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,source_endpoint,
+		  qualification_run_id,qualification_cohort_sha256,qualification_windows_sha256,
+		  selected_qualification_windows_sha256,qualification_jobs_sha256,qualification_frozen_at,
+		  ordered_recording_ids_sha256,selection_basis,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,
+		  freeze_request_bytes,freeze_request_sha256,frozen_denominator_sha256,freeze_exclusions_sha256,
+		  expected_recordings,expected_stream_days,expected_scheduled_hours,expected_source_clips,expected_source_bytes,
+		  expected_freeze_exclusions)
+		SELECT account_id,connection_id,$2,2,source_endpoint,qualification_run_id,qualification_cohort_sha256,
+		  qualification_windows_sha256,selected_qualification_windows_sha256,qualification_jobs_sha256,
+		  qualification_frozen_at,ordered_recording_ids_sha256,selection_basis,policy_version,eligibility_cutoff,
+		  media_tool,media_tool_sha256,bytes,encode(sha256(bytes),'hex'),frozen_denominator_sha256,
+		  freeze_exclusions_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
+		  expected_source_clips,expected_source_bytes,expected_freeze_exclusions FROM altered`, batchRecordID,
+		"tier1-historical-generation-2")
+	if mismatchedRecordingErr == nil || !strings.Contains(mismatchedRecordingErr.Error(), "owned snapshotting state") {
+		t.Fatalf("mismatched canonical recording ordinal error=%v", mismatchedRecordingErr)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET id=id+1000000 WHERE id=$1`, clipID); err == nil {
+		t.Fatal("retention-protected source changed its clip identity")
+	}
+	planTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planTx.Exec(ctx, `SET LOCAL enable_seqscan=off`); err != nil {
+		_ = planTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	rows, err := planTx.Query(ctx, `EXPLAIN (COSTS OFF) SELECT 1
+		FROM recording_joined_source_snapshots WHERE clip_id=$1`, clipID)
+	if err != nil {
+		_ = planTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	var retentionPlan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			rows.Close()
+			_ = planTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		retentionPlan.WriteString(line)
+		retentionPlan.WriteByte('\n')
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		_ = planTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if !strings.Contains(retentionPlan.String(), "recording_joined_source_snapshots_clip_idx") {
+		_ = planTx.Rollback(ctx)
+		t.Fatalf("retention lookup did not use clip index:\n%s", retentionPlan.String())
+	}
+	if err := planTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
 	}
 	t.Log("JOINED_HISTORICAL_APPLY_EXECUTED")
 }
