@@ -247,7 +247,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
         expected = {
             "allocation_ledger_v1.golden.json": "255e2958738e5f87629224c4e537256b3638fb6abaeaa77a2054c559f5c4ef82",
-            "batch_index_v1.golden.json": "834feb5fb3356f6ee964158b25249873138d9d04783d281c5cd5ccc6d72bfcf7",
+            "batch_index_v1.golden.json": "13e1dbd78d70da9bd9f458948df3b05013f89aeca6d5326f880041c26c7bd8e6",
             "hour_manifest_gap_only_v1.golden.json": "8ec7e39c4cba19cbb5b8e11a3f04952656d53c0b77b879ef764767353af951a9",
             "hour_manifest_mixed_v1.golden.json": "5af2dd888ed7db0a66f3d3d3c36223def703c14732b5515446555e9288a2cf22",
             "hour_manifest_quarantine_only_v1.golden.json": "addc432f0b6aec344e3152b233691035c491e5ed7f186329f8ab9db55a3a4593",
@@ -282,11 +282,34 @@ class JoinedDownloadTests(unittest.TestCase):
             pull.decode_joined_json(b'{ "schema_version":1}')
         with self.assertRaisesRegex(ValueError, "field order"):
             pull.decode_joined_json(b'{"b":1,"a":2}')
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        reordered = {"policy_version": manifest["policy_version"], "schema_version": manifest["schema_version"]}
+        reordered.update({key: value for key, value in manifest.items() if key not in reordered})
+        with self.assertRaisesRegex(ValueError, "field order"):
+            pull.decode_joined_json(pull.joined_canonical_bytes(reordered))
         with self.assertRaisesRegex(ValueError, "non-finite"):
             pull.decode_joined_json(b'{"duration_seconds":1e309}')
         escaped = pull.joined_canonical_bytes({"category": "a&b<c>d\u2028e\u2029"})
         self.assertIn(b"a\\u0026b\\u003cc\\u003ed\\u2028e\\u2029", escaped)
         self.assertEqual(pull.decode_joined_json(escaped)["category"], "a&b<c>d\u2028e\u2029")
+        batch = self.golden("batch_index_v1.golden.json")
+        batch["frozen_recordings"][0]["naming_metadata"]["plaza_name"] = "Piazza & Silvestri"
+        evidence_ledgers = [{
+            "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
+            "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
+            "ledger_sha256": ledger["ledger_sha256"], "source_count": ledger["source_count"], "source_bytes": ledger["source_bytes"],
+        } for ledger in batch["allocation_ledgers"]]
+        batch["batch_generation_sha256"] = pull.joined_canonical_sha({
+            "schema_version": batch["schema_version"], "policy_version": batch["policy_version"], "batch_id": batch["batch_id"],
+            "generation": batch["generation"], "frozen_at": batch["frozen_at"], "frozen_denominator_sha256": batch["frozen_denominator_sha256"],
+            "recording_ids_sha256": batch["recording_ids_sha256"], "frozen_recordings": batch["frozen_recordings"],
+            "media_tool_identity": batch["media_tool"]["identity_sha256"], "expected_ledger_count": batch["expected_ledger_count"],
+            "scheduled_hour_count": batch["scheduled_hour_count"], "source_clip_count": batch["source_clip_count"],
+            "source_bytes": batch["source_bytes"], "ledgers": evidence_ledgers,
+        })
+        batch_bytes = pull.joined_canonical_bytes(batch)
+        self.assertIn(b"Piazza \\u0026 Silvestri", batch_bytes)
+        pull.valid_batch_index(pull.decode_joined_json(batch_bytes))
         manifest = self.golden("hour_manifest_v1.golden.json")
         manifest["media"][0]["verification"]["output_fingerprint"]["duration_seconds"] = float("inf")
         with self.assertRaisesRegex(ValueError, "invalid duration"):

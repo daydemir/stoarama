@@ -3578,7 +3578,7 @@ def valid_hour_manifest(payload, item=None):
             position = source_ids.index(gap["next_clip_id"])
         except ValueError as exc:
             raise ValueError("joined hour gap source identity conflicts") from exc
-        if position == 0 or source_ids[position - 1] != gap["previous_clip_id"] or gap["at_utc"] != payload["sources"][position]["start_utc"] or gap["signed_gap_nanoseconds"] != joined_timestamp_nanoseconds(payload["sources"][position]["start_utc"], "gap next start") - joined_timestamp_nanoseconds(payload["sources"][position - 1]["end_utc"], "gap previous end"):
+        if position == 0 or source_ids[position - 1] != gap["previous_clip_id"] or gap["at_utc"] != payload["sources"][position - 1]["end_utc"] or gap["signed_gap_nanoseconds"] != joined_timestamp_nanoseconds(payload["sources"][position]["start_utc"], "gap next start") - joined_timestamp_nanoseconds(payload["sources"][position - 1]["end_utc"], "gap previous end"):
             raise ValueError("joined hour gap evidence conflicts")
         pair = (gap["previous_clip_id"], gap["next_clip_id"])
         if pair in gap_pairs:
@@ -3657,13 +3657,7 @@ def valid_hour_manifest(payload, item=None):
         if media["actual_start_utc"] != run_sources[0]["start_utc"] or media["actual_end_utc"] != run_sources[-1]["end_utc"]:
             raise ValueError("joined hour media range conflicts with its exact sources")
         for previous, following in zip(run_sources, run_sources[1:]):
-            if (
-                (previous["clip_id"], following["clip_id"]) in gap_pairs
-                or following["start_utc"] != previous["end_utc"]
-                or following["seam_to_previous"] != {
-                    "verdict": "continuous", "reason": "packet_frame_audio_proof", "signed_gap_nanoseconds": 0,
-                }
-            ):
+            if (previous["clip_id"], following["clip_id"]) in gap_pairs:
                 raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
         valid_verification(media["verification"])
@@ -3686,8 +3680,21 @@ def valid_hour_manifest(payload, item=None):
             }
             if evidence["repeat_count"] != repeat_count or joined_canonical_sha(proof) != evidence["evidence_sha256"]:
                 raise ValueError("joined maximality evidence hash conflicts")
+        if media["maximality_evidence"]:
+            adjacent = media["maximality_evidence"][-1]["candidate_clip_ids"]
+            if adjacent[:-1] != media["source_clip_ids"] or positions[-1] + 1 >= len(source_ids) or adjacent[-1] != source_ids[positions[-1] + 1]:
+                raise ValueError("joined maximality evidence is not the immediate source extension")
     if media_sources != [clip_id for clip_id in source_ids if clip_id in included]:
         raise ValueError("joined media does not exactly cover included sources")
+    broken = 0
+    for previous, following in zip(source_ids, source_ids[1:]):
+        same_media = previous in included and following in included and included[previous][0] == included[following][0]
+        has_gap = (previous, following) in gap_pairs
+        if same_media == has_gap:
+            raise ValueError("joined hour gaps do not exactly cover media run boundaries")
+        broken += not same_media
+    if broken != len(gap_pairs):
+        raise ValueError("joined hour gap count conflicts with media runs")
     status = payload["status"]
     if status == "media":
         if not source_ids or not payload["media"] or payload["scheduled_gap"] is not None or payload["quarantine_reason_code"] != "":
