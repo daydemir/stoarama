@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import http.server
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("stoarama_pull.py")
+PROTOCOL_GOLDEN = Path(__file__).with_name("testdata") / "joined_protocol_v1.golden.json"
 SPEC = importlib.util.spec_from_file_location("stoarama_pull_joined", MODULE_PATH)
 pull = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pull)
@@ -46,16 +48,20 @@ class JoinedDownloadTests(unittest.TestCase):
             legacy_progress_file=state / "cursor.json", runtime_file=state / "runtime.json",
             outage_file=state / "outage.json", capacity_file=state / "capacity.json",
             inventory_file=state / "inventory.sqlite3", download_workers=12, min_free_bytes=100, dry_run=False,
+            joined_protocol_version=1,
         )
 
     def media_item(self, content=b"abcdef", **changes):
         item = {
-            "id": 41, "batch_id": "batch-2026-08", "hour_id": 501, "kind": "media",
+            "artifact_id": 41, "batch_id": "batch-2026-08",
+            "hour_id": "batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1", "kind": "media",
             "content_type": "video/mp4",
             "relative_path": "MIT_North-America_US_Cambridge_Kendall/May/Monday/stream_hour_01_080000-090000.mp4",
             "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
-            "download_path": "/api/v1/account/joined/41/download", "hour_manifest_id": 40,
-            "hour_manifest_relative_path": "MIT_North-America_US_Cambridge_Kendall/May/Monday/stream_hour_01.hour.json",
+            "download_path": "/api/v1/account/joined/41/download",
+            "ledger_artifact_id": None, "ledger_relative_path": None, "ledger_sha256": None,
+            "hour_manifest_id": 40,
+            "hour_manifest_relative_path": "coverage/hours/batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1.json",
             "hour_manifest_sha256": None,
         }
         item.update(changes)
@@ -64,8 +70,9 @@ class JoinedDownloadTests(unittest.TestCase):
         return item
 
     def manifest_payload(self, media=None, gap=False):
+        media_id = None if media is None else media.get("id", media.get("artifact_id"))
         media_entries = [] if media is None else [{
-            "artifact_id": media["id"], "part_ordinal": 1, "relative_path": media["relative_path"],
+            "artifact_id": media_id, "part_ordinal": 1, "relative_path": media["relative_path"],
             "size_bytes": media["size_bytes"], "sha256": media["sha256"], "content_id": media["sha256"],
             "coverage_start_at": "2026-05-04T08:00:00Z", "coverage_end_at": "2026-05-04T09:00:00Z",
         }]
@@ -83,11 +90,15 @@ class JoinedDownloadTests(unittest.TestCase):
     def manifest_item(self, gap=True):
         content = self.manifest_bytes(None, gap)
         return {
-            "id": 40, "batch_id": "batch-2026-08", "hour_id": 501, "kind": "hour_manifest",
+            "artifact_id": 40, "batch_id": "batch-2026-08",
+            "hour_id": "batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1", "kind": "hour_manifest",
             "content_type": "application/json",
-            "relative_path": "MIT_North-America_US_Cambridge_Kendall/May/Monday/stream_hour_01.hour.json",
+            "relative_path": "coverage/hours/batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1.json",
             "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
-            "download_path": "/api/v1/account/joined/40/download", "hour_manifest_id": None,
+            "download_path": "/api/v1/account/joined/40/download",
+            "ledger_artifact_id": 39,
+            "ledger_relative_path": "coverage/ledgers/77/2026-05-04.json", "ledger_sha256": "c" * 64,
+            "hour_manifest_id": None,
             "hour_manifest_relative_path": None, "hour_manifest_sha256": None,
         }, content
 
@@ -101,12 +112,13 @@ class JoinedDownloadTests(unittest.TestCase):
         return {
             "url": "https://r2.test/exact-object", "etag": '"etag-1"', "if_match": '"etag-1"',
             "version_id": "", "size_bytes": item["size_bytes"], "sha256": item["sha256"],
-            "content_type": item["content_type"],
+            "content_type": item["content_type"], "expires_in_sec": 900,
         }
 
     def marker(self, item):
         return pull.joined_transfer_marker_bytes(item, {
             "etag": "etag-1", "version_id": "", "url": "https://r2.test/x", "if_match": '"etag-1"',
+            "url_scheme": "https", "url_authority": "r2.test", "url_path": "/x",
         })
 
     def storage(self): return {"available": True, "total_bytes": 10**13, "free_bytes": 10**13}
@@ -130,17 +142,49 @@ class JoinedDownloadTests(unittest.TestCase):
             cfg = self.config(Path(raw)); self.assertEqual(pull.Runtime(cfg).heartbeat_payload(None)["joined_protocol_version"], 1)
         good = self.media_item(); self.assertEqual(pull.valid_joined_item(good)["kind"], "media")
         for change in (
-            {"id": 0}, {"batch_id": "../escape"}, {"relative_path": "../escape.mp4"},
+            {"artifact_id": 0}, {"batch_id": "../escape"}, {"batch_id": True}, {"batch_id": 7},
+            {"relative_path": "../escape.mp4"}, {"relative_path": True},
             {"relative_path": "/absolute.mp4"}, {"relative_path": "joined/nested.mp4"}, {"sha256": "bad"},
+            {"sha256": "A" * 64}, {"sha256": True}, {"download_path": True},
             {"download_path": "/api/v1/account/joined/42/download"}, {"size_bytes": pull.JOINED_MAX_BYTES + 1},
             {"content_type": "application/json"}, {"hour_manifest_id": None}, {"surprise": True},
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 pull.valid_joined_item({**good, **change})
         batch = {**good, "kind": "batch_index", "content_type": "application/json", "hour_id": None,
-                 "relative_path": "batch.json", "hour_manifest_id": None, "hour_manifest_relative_path": None,
-                 "hour_manifest_sha256": None}
+                 "relative_path": "coverage/batch.json", "ledger_artifact_id": None, "ledger_relative_path": None,
+                 "ledger_sha256": None, "hour_manifest_id": None,
+                 "hour_manifest_relative_path": None, "hour_manifest_sha256": None}
         self.assertEqual(pull.valid_joined_item(batch)["kind"], "batch_index")
+
+    def test_protocol_v1_shared_golden(self):
+        fixture = json.loads(PROTOCOL_GOLDEN.read_text())
+        self.assertEqual(set(fixture), {"feed_responses", "prepare_response"})
+        self.assertEqual(set(fixture["feed_responses"]), {
+            "allocation_ledger", "hour_manifest", "media", "batch_index",
+        })
+        validated = {
+            kind: pull.valid_joined_item(response["item"])
+            for kind, response in fixture["feed_responses"].items()
+        }
+        self.assertEqual({kind: item["kind"] for kind, item in validated.items()}, {
+            kind: kind for kind in fixture["feed_responses"]
+        })
+        media = validated["media"]
+        with mock.patch.object(pull, "request_json", return_value=fixture["prepare_response"]):
+            prepared = pull.prepare_joined_download(SimpleNamespace(origin="https://stoarama.test"), media)
+        self.assertEqual(prepared["url_authority"], "joined.example.test")
+        self.assertEqual(prepared["url_path"], "/objects/%s.mp4" % media["sha256"])
+
+    def test_protocol_zero_is_dormant_without_joined_api_or_storage_access(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(pull.Config().joined_protocol_version, 0)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); cfg.joined_protocol_version = 0; runtime = pull.Runtime(cfg)
+            self.assertEqual(runtime.heartbeat_payload(None)["joined_protocol_version"], 0)
+            with mock.patch.object(pull, "request_json") as request, mock.patch.object(pull, "open_joined_output_dir") as storage:
+                self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))
+            request.assert_not_called(); storage.assert_not_called()
 
     def test_gap_only_hour_manifest_downloads_and_exact_acks(self):
         raw_item, content = self.manifest_item(gap=True); requests, acks = [], []
@@ -157,7 +201,7 @@ class JoinedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg)
             with mock.patch.object(pull, "JOINED_RANGE_BYTES", 64), mock.patch.object(pull, "storage_status", return_value=self.storage()), \
-                 mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull.urllib.request, "urlopen", side_effect=open_range):
+                 mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
             item = pull.valid_joined_item(raw_item); final = pull.joined_output_path(cfg, item)
             self.assertEqual(final.read_bytes(), content); self.assertFalse(list(final.parent.glob("*.mp4")))
@@ -180,7 +224,7 @@ class JoinedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg); self.install_manifest(cfg, raw_item)
             with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), mock.patch.object(pull, "storage_status", return_value=self.storage()), \
-                 mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull.urllib.request, "urlopen", side_effect=open_range):
+                 mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
             final = pull.joined_output_path(cfg, pull.valid_joined_item(raw_item))
             self.assertEqual(final.read_bytes(), content); self.assertFalse(final.with_name(final.name + ".stoarama.json").exists())
@@ -216,7 +260,10 @@ class JoinedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item)
             directory_fd, _, part, marker = self.names(cfg, item)
-            prepared = {"etag": "etag-1", "version_id": "", "url": "x", "if_match": '"etag-1"'}
+            prepared = {
+                "etag": "etag-1", "version_id": "", "url": "x", "if_match": '"etag-1"',
+                "url_scheme": "https", "url_authority": "r2.test", "url_path": "/x",
+            }
             try:
                 self.write_entry(directory_fd, part, b"unknown")
                 with mock.patch.object(pull, "prepare_joined_download", return_value=prepared), mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "ownership marker"):
@@ -313,15 +360,123 @@ class JoinedDownloadTests(unittest.TestCase):
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False): pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, self.marker(item), threading.Event())
                 response = RangeResponse(b"abcdef", 0, 5, 6); response.status = 200
                 descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd); os.write(descriptor, b"abc"); os.close(descriptor)
-                with mock.patch.object(pull.urllib.request, "urlopen", return_value=response), self.assertRaisesRegex(RuntimeError, "ignored range"):
+                with mock.patch.object(pull, "open_joined_url", return_value=response), self.assertRaisesRegex(RuntimeError, "ignored range"):
                     pull.append_joined_range(prepared, directory_fd, part, item, 0, 2)
                 self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 0)
                 descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd); os.write(descriptor, b"abc"); os.close(descriptor)
                 changed = RangeResponse(b"def", 3, 5, 6, etag="etag-2")
-                with mock.patch.object(pull.urllib.request, "urlopen", return_value=changed), self.assertRaisesRegex(pull.ExistingFileMismatch, "identity drifted"):
+                with mock.patch.object(pull, "open_joined_url", return_value=changed), self.assertRaisesRegex(pull.ExistingFileMismatch, "identity drifted"):
                     pull.append_joined_range(prepared, directory_fd, part, item, 3, 5)
                 self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 0)
             finally: os.close(directory_fd)
+
+    def test_joined_redirect_is_rejected_without_hitting_target(self):
+        target_hits = []
+
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/source":
+                    self.send_response(302); self.send_header("Location", "/should-not-be-hit")
+                    self.send_header("Content-Length", "0"); self.end_headers()
+                    return
+                target_hits.append(self.path)
+                self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers()
+            def log_message(self, _format, *_args): pass
+
+        redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        thread = threading.Thread(target=redirect.serve_forever, daemon=True); thread.start()
+        try:
+            request = pull.urllib.request.Request(
+                "http://127.0.0.1:%d/source" % redirect.server_port, method="GET",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                pull.open_joined_url(request)
+            self.assertEqual(raised.exception.code, 302)
+            self.assertEqual(target_hits, [])
+        finally:
+            redirect.shutdown(); redirect.server_close(); thread.join(timeout=2)
+
+    def test_joined_redirect_policy_does_not_change_raw_account_transport(self):
+        cfg = SimpleNamespace(api_base="https://stoarama.test/api/v1", api_key="sir_test")
+        with mock.patch.object(pull.urllib.request, "urlopen", return_value=io.BytesIO(b'{"clips":[]}')) as raw_open, \
+             mock.patch.object(pull.urllib.request, "build_opener") as joined_opener:
+            self.assertEqual(pull.request_json(cfg, "GET", "/account/clips?after_id=0&limit=1"), {"clips": []})
+        raw_open.assert_called_once(); joined_opener.assert_not_called()
+
+    def test_joined_prepare_pins_authority_port_and_escaped_path_but_not_query(self):
+        item = pull.valid_joined_item(self.media_item())
+        cfg = SimpleNamespace(origin="https://stoarama.test")
+
+        def prepared(url):
+            response = self.prepared(item); response["url"] = url
+            with mock.patch.object(pull, "request_json", return_value=response):
+                return pull.prepare_joined_download(cfg, item)
+
+        first = prepared("https://r2.test:443/exact%2Fobject?signature=one")
+        pull.validate_joined_download_renewal(
+            first, prepared("https://r2.test:443/exact%2Fobject?signature=two"),
+        )
+        for changed in (
+            "https://other.test:443/exact%2Fobject?signature=two",
+            "https://r2.test:444/exact%2Fobject?signature=two",
+            "https://r2.test:443/exact%2fobject?signature=two",
+            "https://r2.test:443/other?signature=two",
+        ):
+            with self.subTest(changed=changed), self.assertRaises(pull.ExistingFileMismatch):
+                pull.validate_joined_download_renewal(first, prepared(changed))
+        for invalid in (
+            "http://r2.test:443/exact%2Fobject?signature=two",
+            "https://user@r2.test:443/exact%2Fobject?signature=two",
+            "https://r2.test:443/exact%2Fobject?signature=two#fragment",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                prepared(invalid)
+        for invalid_expiry in (True, 0, 3601, "900"):
+            response = self.prepared(item); response["expires_in_sec"] = invalid_expiry
+            with self.subTest(expiry=invalid_expiry), mock.patch.object(pull, "request_json", return_value=response), self.assertRaisesRegex(RuntimeError, "expiry"):
+                pull.prepare_joined_download(cfg, item)
+        for field, invalid_values in {
+            "url": (True, 7),
+            "etag": (True, '"embedded"quote"', " padded ", '""'),
+            "if_match": (True, 7),
+            "version_id": (True, 7, " padded ", "line\nbreak", "x" * 1025),
+            "sha256": (True, "C" * 64),
+        }.items():
+            for invalid in invalid_values:
+                response = self.prepared(item); response[field] = invalid
+                with self.subTest(field=field, invalid=invalid), mock.patch.object(pull, "request_json", return_value=response), self.assertRaises((RuntimeError, ValueError)):
+                    pull.prepare_joined_download(cfg, item)
+
+    def test_resumable_marker_binds_download_target_but_not_renewable_query(self):
+        item = pull.valid_joined_item(self.media_item())
+        first = {
+            "url": "https://r2.test/exact?signature=one", "if_match": '"etag-1"',
+            "etag": "etag-1", "version_id": "version-1", "url_scheme": "https",
+            "url_authority": "r2.test", "url_path": "/exact",
+        }
+        renewed = {**first, "url": "https://r2.test/exact?signature=two"}
+        self.assertEqual(pull.joined_transfer_marker_bytes(item, first), pull.joined_transfer_marker_bytes(item, renewed))
+        changed = {**first, "url_authority": "other.test"}
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
+            directory_fd, _final, part, marker = self.names(cfg, item)
+            try:
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                    pull.ensure_owned_joined_partial(
+                        cfg, runtime, directory_fd, part, marker,
+                        pull.joined_transfer_marker_bytes(item, first), threading.Event(),
+                    )
+                descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd)
+                try: os.write(descriptor, b"resume")
+                finally: os.close(descriptor)
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "marker conflicts"):
+                    pull.ensure_owned_joined_partial(
+                        cfg, runtime, directory_fd, part, marker,
+                        pull.joined_transfer_marker_bytes(item, changed), threading.Event(),
+                    )
+                self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, len(b"resume"))
+            finally:
+                os.close(directory_fd)
 
     def test_ack_failure_replays_exact_final_without_download_or_sidecar(self):
         content, raw_item, fail_ack = b"abc", self.media_item(b"abc"), True
@@ -336,10 +491,10 @@ class JoinedDownloadTests(unittest.TestCase):
             raise AssertionError(path)
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, raw_item)
-            with mock.patch.object(pull, "storage_status", return_value=self.storage()), mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull.urllib.request, "urlopen", return_value=RangeResponse(content, 0, 2, 3)), self.assertRaisesRegex(urllib.error.URLError, "ack unavailable"):
+            with mock.patch.object(pull, "storage_status", return_value=self.storage()), mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", return_value=RangeResponse(content, 0, 2, 3)), self.assertRaisesRegex(urllib.error.URLError, "ack unavailable"):
                 pull.drain_joined(cfg, runtime, threading.Event())
             final = pull.joined_output_path(cfg, pull.valid_joined_item(raw_item)); before = final.read_bytes()
-            with mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull.urllib.request, "urlopen") as download:
+            with mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url") as download:
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
             download.assert_not_called(); self.assertEqual(final.read_bytes(), before); self.assertFalse(final.with_name(final.name + ".stoarama.json").exists())
 
@@ -353,7 +508,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 if path.startswith("/account/clips?"): return {"clips": []}
                 if path == "/account/joined/ack": return {"ok": True}
                 raise AssertionError(path)
-            with mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull.urllib.request, "urlopen") as download:
+            with mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url") as download:
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
             download.assert_not_called(); self.assertEqual(final.read_bytes(), content)
 
