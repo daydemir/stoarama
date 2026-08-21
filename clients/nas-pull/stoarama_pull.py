@@ -2887,12 +2887,18 @@ def valid_source(source, recording_id, source_only=False, location=None, local_d
         raise ValueError("joined source recording identity conflicts")
     positive_joined_int(source["recording_job_id"], "recording_job_id")
     for key in ("provider", "region", "bucket"):
-        valid_joined_string(source[key], "source %s" % key)
+        if not valid_joined_string(source[key], "source %s" % key).strip():
+            raise ValueError("joined source %s is blank" % key)
     endpoint = valid_joined_string(source["endpoint"], "source endpoint")
-    parsed_endpoint = urllib.parse.urlsplit(endpoint)
+    try:
+        parsed_endpoint = urllib.parse.urlsplit(endpoint)
+        parsed_endpoint.port
+    except ValueError as exc:
+        raise ValueError("joined source endpoint is not a canonical HTTPS authority") from exc
     if (
         not endpoint.startswith("https://") or parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc
         or parsed_endpoint.username is not None or parsed_endpoint.password is not None
+        or any(ch.isspace() or ord(ch) < 0x21 for ch in parsed_endpoint.netloc)
         or parsed_endpoint.query or parsed_endpoint.fragment or parsed_endpoint.path not in ("", "/")
     ):
         raise ValueError("joined source endpoint is not a canonical HTTPS authority")
@@ -3423,8 +3429,8 @@ def valid_audio_contract(contract):
     fields = {"codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"}
     if not isinstance(contract, dict) or set(contract) not in (fields, fields | {"edit_list_kind", "edit_list_sha256"}):
         raise ValueError("joined audio contract has invalid fields")
-    valid_joined_string(contract["codec_name"], "audio codec")
-    valid_joined_string(contract["channel_layout"], "audio channel layout")
+    if not valid_joined_string(contract["codec_name"], "audio codec").strip() or not valid_joined_string(contract["channel_layout"], "audio channel layout").strip():
+        raise ValueError("joined audio contract has blank format fields")
     positive_joined_int(contract["sample_rate"], "audio sample_rate")
     positive_joined_int(contract["channels"], "audio channels")
     for key in ("initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"):
@@ -3580,6 +3586,9 @@ def valid_hour_manifest(payload, item=None):
     if not isinstance(payload["sources"], list) or len(payload["sources"]) != source_count:
         raise ValueError("joined hour manifest source count conflicts")
     source_ids = [valid_source(source, recording_id, location=location, local_date=local_date) for source in payload["sources"]]
+    for previous, following in zip(payload["sources"], payload["sources"][1:]):
+        if (joined_timestamp_nanoseconds(following["start_utc"], "source start"), following["clip_id"]) <= (joined_timestamp_nanoseconds(previous["start_utc"], "source start"), previous["clip_id"]):
+            raise ValueError("joined hour manifest source order conflicts")
     valid_derived_source_seams(payload["sources"])
     storage_ids = {
         tuple(source[key] for key in ("provider", "endpoint", "region", "bucket"))
