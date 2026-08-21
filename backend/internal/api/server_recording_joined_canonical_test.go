@@ -38,6 +38,107 @@ type joinedCanonicalSnapshot struct {
 	clipCreatedAt                         time.Time
 }
 
+func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-final-freeze@example.test")
+	defer fixture.cleanup()
+	ctx := context.Background()
+	req := fixture.req
+	req.Apply, req.ExpectedRequestSHA256 = true, fixture.plan.RequestSHA256
+	if response, _ := fixture.call(req); response.Code != http.StatusOK {
+		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
+	}
+	var batchRecordID int64
+	if err := fixture.pool.QueryRow(ctx, `SELECT id FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).
+		Scan(&batchRecordID); err != nil {
+		t.Fatal(err)
+	}
+	ledgers, _, _, insertFinalChild := materializeJoinedCanonicalBatch(t, fixture, batchRecordID)
+	if len(ledgers) != 462 || insertFinalChild == nil {
+		t.Fatalf("materialized ledgers=%d final=%v", len(ledgers), insertFinalChild != nil)
+	}
+	childTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := insertFinalChild(childTx); err != nil {
+		_ = childTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := childTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.s.cfg.ServiceToken = "generic-service-credential-32-bytes"
+	freezeRequest := joinedFinalFreezeRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		BatchID: req.BatchID, ExpectedFrozenDenominatorSHA256: fixture.plan.FrozenDenominatorSHA256}
+	call := func(request joinedFinalFreezeRequest, cookie bool, token string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(request)
+		httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/batches/final-freeze", bytes.NewReader(body))
+		if cookie {
+			httpReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
+		}
+		if token != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+token)
+		}
+		recorder := httptest.NewRecorder()
+		fixture.s.requireAdminAuth(http.HandlerFunc(fixture.s.handleAdminJoinedFinalFreeze)).ServeHTTP(recorder, httpReq)
+		return recorder
+	}
+	claim, err := joinedauth.MintClaim(fixture.s.cfg.JoinedWorkerSigningKey, req.BatchID, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err := joinedauth.MintOperation(fixture.s.cfg.JoinedWorkerSigningKey, req.BatchID, joinedauth.SubjectHour,
+		"foreign-hour", uuid.New(), joinedauth.OperationPreflight, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, token := range map[string]string{"missing": "", "generic service": fixture.s.cfg.ServiceToken,
+		"joined bootstrap": fixture.s.cfg.JoinedWorkerBootstrapToken, "joined claim": claim, "joined operation": operation} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			if response := call(freezeRequest, false, token); response.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	wrong := freezeRequest
+	wrong.ExpectedFrozenDenominatorSHA256 = strings.Repeat("f", 64)
+	if response := call(wrong, true, ""); response.Code != http.StatusConflict {
+		t.Fatalf("wrong denominator status=%d body=%s", response.Code, response.Body.String())
+	}
+	var state string
+	var freezeStarted bool
+	if err := fixture.pool.QueryRow(ctx, `SELECT state,freeze_started_at IS NOT NULL FROM recording_joined_batches
+		WHERE id=$1`, batchRecordID).Scan(&state, &freezeStarted); err != nil || state != "building" || freezeStarted {
+		t.Fatalf("failed final freeze leaked state=%s started=%v err=%v", state, freezeStarted, err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, fixture.connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if response := call(freezeRequest, true, ""); response.Code != http.StatusConflict {
+		t.Fatalf("protocol-0 final freeze status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, fixture.connectionID); err != nil {
+		t.Fatal(err)
+	}
+
+	response := call(freezeRequest, true, "")
+	var frozen joinedFinalFreezeResponse
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &frozen) != nil ||
+		frozen.State != "frozen" || frozen.AlreadyFrozen || frozen.FrozenAt.IsZero() ||
+		frozen.FrozenDenominatorSHA256 != fixture.plan.FrozenDenominatorSHA256 ||
+		frozen.RecordingCount != 33 || frozen.StreamDayCount != 462 || frozen.ScheduledHourCount != 5544 {
+		t.Fatalf("final freeze status=%d body=%s", response.Code, response.Body.String())
+	}
+	replay := call(freezeRequest, true, "")
+	var replayed joinedFinalFreezeResponse
+	if replay.Code != http.StatusOK || json.Unmarshal(replay.Body.Bytes(), &replayed) != nil ||
+		!replayed.AlreadyFrozen || !replayed.FrozenAt.Equal(frozen.FrozenAt) {
+		t.Fatalf("final freeze replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	t.Log("JOINED_FINAL_FREEZE_EXECUTED")
+}
+
 type joinedCanonicalDay struct {
 	id, batchRecordingID, accountID, connectionID, recordingID int64
 	batchID, localDate, timezone                               string
