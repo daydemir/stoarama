@@ -149,7 +149,7 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 		t.Fatal(err)
 	}
 	if _, err := fixture.pool.Exec(ctx, `CREATE FUNCTION joined_test_delay_final_freeze() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN IF OLD.state='building' AND NEW.state='frozen' THEN PERFORM pg_sleep(0.5); END IF; RETURN NEW; END $$;
+		BEGIN IF OLD.state='building' AND NEW.state='frozen' THEN PERFORM pg_sleep(1); END IF; RETURN NEW; END $$;
 		CREATE TRIGGER zzz_joined_test_delay_final_freeze BEFORE UPDATE OF state ON recording_joined_batches
 		FOR EACH ROW EXECUTE FUNCTION joined_test_delay_final_freeze()`); err != nil {
 		t.Fatal(err)

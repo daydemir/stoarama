@@ -34,7 +34,7 @@ type joinedFinalFreezeResponse struct {
 
 const (
 	joinedFinalFreezeOperationTimeout = 10 * time.Second
-	joinedFinalFreezeLockTimeout      = time.Second
+	joinedFinalFreezeLockTimeout      = 5 * time.Second
 	joinedFinalFreezeStatementTimeout = 5 * time.Second
 )
 
