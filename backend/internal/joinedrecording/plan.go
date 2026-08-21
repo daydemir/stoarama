@@ -196,7 +196,7 @@ func buildPlan(req PlanRequest, seal bool) (BatchPlan, error) {
 		if !req.Qualification.permits(clip) {
 			return BatchPlan{}, fmt.Errorf("source %d is outside the frozen jobs or requested window", i+1)
 		}
-		storageKey := strings.Join([]string{clip.Provider, clip.Endpoint, clip.Region, clip.Bucket, clip.Object.Key, clip.Object.VersionID, clip.Object.ETag}, "\x00")
+		storageKey := sourceStorageKey(clip)
 		if seenIDs[clip.ClipID] || seenKeys[storageKey] {
 			return BatchPlan{}, fmt.Errorf("duplicate source identity")
 		}
@@ -245,6 +245,10 @@ func buildPlan(req PlanRequest, seal bool) (BatchPlan, error) {
 		return BatchPlan{}, fmt.Errorf("every preflight-built hour part identity is required before seal")
 	}
 	return finalizePlan(req, drafts, gaps, loc, seal)
+}
+
+func sourceStorageKey(source SourceClip) string {
+	return strings.Join([]string{source.Provider, source.Endpoint, source.Region, source.Bucket, source.Object.Key, source.Object.VersionID, source.Object.ETag}, "\x00")
 }
 
 // BuildGapOnlyHourPlan accounts for one completely missing scheduled hour.

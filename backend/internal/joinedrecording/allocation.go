@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"path"
-	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
@@ -487,7 +486,7 @@ func validateOrderedAllocationSources(sources []SourceClip, recordingID int64, l
 		if validatePreflightSource(source, recordingID) != nil || source.StartUTC.In(loc).Format("2006-01-02") != localDate || source.EndUTC.In(loc).Format("2006-01-02") != localDate || seenClips[source.ClipID] {
 			return fmt.Errorf("stream day source identity or date differs")
 		}
-		objectIdentity := strings.Join([]string{source.Provider, source.Endpoint, source.Region, source.Bucket, source.Object.Key, source.Object.VersionID, source.Object.ETag}, "\x00")
+		objectIdentity := sourceStorageKey(source)
 		if seenObjects[objectIdentity] {
 			return fmt.Errorf("stream day duplicates a frozen storage object")
 		}

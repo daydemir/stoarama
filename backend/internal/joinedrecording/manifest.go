@@ -3,7 +3,11 @@ package joinedrecording
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
+	"path"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
@@ -275,14 +279,237 @@ func BuildHourManifest(input HourManifestInput) (HourManifest, []byte, string, e
 		scheduledGap = &ScheduledGapEvidence{ReasonCode: plan.GapOnlyReason, SignedGapNanoseconds: scheduledEnd.Sub(scheduledStart).Nanoseconds(), NoAllocatableSources: true}
 	}
 	manifest := HourManifest{SchemaVersion: HourManifestSchemaVersion, PolicyVersion: PlanPolicyVersion, Status: status, BatchID: plan.BatchID, HourID: plan.HourID, RecordingID: plan.RecordingID, Timezone: plan.Timezone, LocalDate: plan.LocalDate, DeliveryHour: plan.LocalHour, ClockHour: clockHour, ScheduledStartUTC: scheduledStart, ScheduledEndUTC: scheduledEnd, QualificationDay: qualificationDay, QualificationSHA256: plan.Qualification.EvidenceSHA, Allocation: input.Allocation, MediaTool: plan.MediaTool, SourceClaimSHA256: plan.SourceClaimSHA256, SourceCount: len(plan.Sources), Sources: append([]SourceClip{}, plan.Sources...), SourceDispositions: dispositions, Gaps: append([]Gap{}, plan.Gaps...), ScheduledGap: scheduledGap, QuarantineReasonCode: plan.QuarantineReason, QuarantineEvidence: append([]QuarantineEvidence{}, input.QuarantineEvidence...), Media: media}
+	canonical, sha, err := CanonicalHourManifestArtifact(manifest)
+	return manifest, canonical, sha, err
+}
+
+// CanonicalHourManifestArtifact validates the independently stored canonical
+// artifact used to derive final-index hour references.
+func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error) {
+	hourPrefix := fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-", manifest.BatchID, manifest.RecordingID, manifest.LocalDate, manifest.DeliveryHour)
+	generation, generationErr := strconv.Atoi(strings.TrimPrefix(manifest.HourID, hourPrefix))
+	hourID, hourErr := CanonicalHourID(manifest.BatchID, manifest.RecordingID, manifest.LocalDate, manifest.DeliveryHour, generation)
+	loc, timezoneErr := time.LoadLocation(manifest.Timezone)
+	if timezoneErr != nil {
+		return nil, "", fmt.Errorf("canonical hour manifest timezone differs")
+	}
+	day, dateErr := time.ParseInLocation("2006-01-02", manifest.LocalDate, loc)
+	if generationErr != nil || hourErr != nil || dateErr != nil || manifest.SchemaVersion != HourManifestSchemaVersion || manifest.PolicyVersion != PlanPolicyVersion || manifest.HourID != hourID || manifest.ClockHour != manifest.DeliveryHour+7 || ValidateMediaToolEvidence(manifest.MediaTool) != nil || !lowerHex64(manifest.QualificationSHA256) || validateQualifiedLedgerDay(manifest.QualificationDay, manifest.RecordingID, manifest.Timezone, manifest.LocalDate) != nil {
+		return nil, "", fmt.Errorf("canonical hour manifest identity differs")
+	}
+	scheduledStart := time.Date(day.Year(), day.Month(), day.Day(), manifest.ClockHour, 0, 0, 0, loc).UTC()
+	if !manifest.ScheduledStartUTC.Equal(scheduledStart) || !manifest.ScheduledEndUTC.Equal(scheduledStart.Add(time.Hour)) || manifest.SourceCount != len(manifest.Sources) {
+		return nil, "", fmt.Errorf("canonical hour manifest schedule differs")
+	}
+	ledgerRelative, ledgerObject, ledgerPathErr := CanonicalAllocationLedgerPaths(manifest.BatchID, manifest.RecordingID, manifest.LocalDate)
+	if ledgerPathErr != nil || manifest.Allocation.ArtifactID <= 0 || manifest.Allocation.RelativePath != ledgerRelative || manifest.Allocation.ObjectKey != ledgerObject || manifest.Allocation.SizeBytes <= 0 || !lowerHex64(manifest.Allocation.SHA256) || !lowerHex64(manifest.Allocation.LedgerSHA256) || manifest.Allocation.HourSourceSHA256 != manifest.SourceClaimSHA256 {
+		return nil, "", fmt.Errorf("canonical hour manifest allocation differs")
+	}
+	claimSHA, _, claimErr := CanonicalSourceClaim(manifest.Sources)
+	seenSources := make(map[int64]SourceClip, len(manifest.Sources))
+	sourcePositions := make(map[int64]int, len(manifest.Sources))
+	seenStorage := make(map[string]bool, len(manifest.Sources))
+	var sourceBytes int64
+	for i, source := range manifest.Sources {
+		storageKey := sourceStorageKey(source)
+		if validatePreflightSource(source, manifest.RecordingID) != nil || seenSources[source.ClipID].ClipID != 0 || seenStorage[storageKey] || source.Object.SizeBytes > math.MaxInt64-sourceBytes || (i > 0 && (source.StartUTC.Before(manifest.Sources[i-1].StartUTC) || (source.StartUTC.Equal(manifest.Sources[i-1].StartUTC) && source.ClipID <= manifest.Sources[i-1].ClipID))) {
+			return nil, "", fmt.Errorf("canonical hour manifest source order differs")
+		}
+		seenSources[source.ClipID] = source
+		sourcePositions[source.ClipID] = i
+		seenStorage[storageKey] = true
+		sourceBytes += source.Object.SizeBytes
+	}
+	if claimErr != nil || claimSHA != manifest.SourceClaimSHA256 || len(manifest.SourceDispositions) != len(manifest.Sources) {
+		return nil, "", fmt.Errorf("canonical hour manifest source claim differs")
+	}
+	included := map[int64]SourceDisposition{}
+	quarantined := map[int64]SourceDisposition{}
+	seenArtifacts := map[int64]bool{}
+	splitPairs := make(map[[2]int64]bool, len(manifest.Gaps))
+	for _, gap := range manifest.Gaps {
+		splitPairs[[2]int64{gap.PreviousClipID, gap.NextClipID}] = true
+	}
+	lastMediaSourcePosition := -1
+	for i, media := range manifest.Media {
+		_, utcOffset := media.ActualStartUTC.In(loc).Zone()
+		if media.ArtifactID <= 0 || seenArtifacts[media.ArtifactID] || media.Ordinal != i+1 || media.Part != i+1 || media.Parts != len(manifest.Media) || media.ContentID != media.SHA256 || !lowerHex64(media.SHA256) || media.SizeBytes <= 0 || media.ObjectKey != path.Join("joined", manifest.BatchID, "objects", media.ContentID+".mp4") || len(media.SourceClipIDs) == 0 || !media.ActualEndUTC.After(media.ActualStartUTC) || media.UTCOffsetSeconds != utcOffset || media.MediaToolIdentity != manifest.MediaTool.IdentitySHA256 || validatePassedVerification(media.Verification) != nil {
+			return nil, "", fmt.Errorf("canonical hour manifest media differs")
+		}
+		firstPosition := sourcePositions[media.SourceClipIDs[0]]
+		if seenSources[media.SourceClipIDs[0]].ClipID == 0 || firstPosition <= lastMediaSourcePosition {
+			return nil, "", fmt.Errorf("canonical hour manifest media source order differs")
+		}
+		previousPosition := firstPosition - 1
+		for sourceIndex, clipID := range media.SourceClipIDs {
+			position, ok := sourcePositions[clipID]
+			if !ok || position != previousPosition+1 {
+				return nil, "", fmt.Errorf("canonical hour manifest media sources are not consecutive")
+			}
+			if sourceIndex > 0 && splitPairs[[2]int64{media.SourceClipIDs[sourceIndex-1], clipID}] {
+				return nil, "", fmt.Errorf("canonical hour manifest media crosses a recorded gap")
+			}
+			previousPosition = position
+		}
+		lastPosition := sourcePositions[media.SourceClipIDs[len(media.SourceClipIDs)-1]]
+		if !media.ActualStartUTC.Equal(manifest.Sources[firstPosition].StartUTC) || !media.ActualEndUTC.Equal(manifest.Sources[lastPosition].EndUTC) {
+			return nil, "", fmt.Errorf("canonical hour manifest media range differs from its sources")
+		}
+		for _, evidence := range media.MaximalityEvidence {
+			candidateSources, sourceErr := sourceSubsetByIDs(manifest.Sources, evidence.CandidateClipIDs)
+			expectedClaim, claimErr := candidateSourceClaimSHA(candidateSources)
+			if sourceErr != nil || claimErr != nil || validateMaximalityEvidence(evidence, manifest.MediaTool.IdentitySHA256, expectedClaim) != nil {
+				return nil, "", fmt.Errorf("canonical hour manifest maximality evidence differs")
+			}
+		}
+		if len(media.MaximalityEvidence) > 0 {
+			adjacent := media.MaximalityEvidence[len(media.MaximalityEvidence)-1]
+			if len(adjacent.CandidateClipIDs) != len(media.SourceClipIDs)+1 {
+				return nil, "", fmt.Errorf("canonical hour manifest maximality extension differs")
+			}
+			for sourceIndex, clipID := range media.SourceClipIDs {
+				if adjacent.CandidateClipIDs[sourceIndex] != clipID {
+					return nil, "", fmt.Errorf("canonical hour manifest maximality source order differs")
+				}
+			}
+			if lastPosition+1 >= len(manifest.Sources) || adjacent.CandidateClipIDs[len(adjacent.CandidateClipIDs)-1] != manifest.Sources[lastPosition+1].ClipID {
+				return nil, "", fmt.Errorf("canonical hour manifest maximality is not the immediate source extension")
+			}
+		}
+		lastMediaSourcePosition = lastPosition
+		seenArtifacts[media.ArtifactID] = true
+		for _, clipID := range media.SourceClipIDs {
+			if seenSources[clipID].ClipID == 0 || included[clipID].ClipID != 0 {
+				return nil, "", fmt.Errorf("canonical hour manifest media source differs")
+			}
+			included[clipID] = SourceDisposition{ClipID: clipID, Disposition: "included", MediaArtifactID: media.ArtifactID, MediaOrdinal: media.Ordinal}
+		}
+	}
+	for _, evidence := range manifest.QuarantineEvidence {
+		sources, err := sourceSubsetByIDs(manifest.Sources, evidence.SourceClipIDs)
+		expectedClaim, claimErr := candidateSourceClaimSHA(sources)
+		if err != nil || claimErr != nil || validateQuarantineEvidence(evidence, manifest.MediaTool.IdentitySHA256, expectedClaim) != nil {
+			return nil, "", fmt.Errorf("canonical hour manifest quarantine differs")
+		}
+		for _, clipID := range evidence.SourceClipIDs {
+			if included[clipID].ClipID != 0 || quarantined[clipID].ClipID != 0 {
+				return nil, "", fmt.Errorf("canonical hour manifest quarantine overlaps")
+			}
+			quarantined[clipID] = SourceDisposition{ClipID: clipID, Disposition: "quarantined", ReasonCode: evidence.ReasonCode}
+		}
+	}
+	for i, source := range manifest.Sources {
+		want := included[source.ClipID]
+		if want.ClipID == 0 {
+			want = quarantined[source.ClipID]
+		}
+		if want.ClipID == 0 || !sameCanonical([]SourceDisposition{manifest.SourceDispositions[i]}, []SourceDisposition{want}) {
+			return nil, "", fmt.Errorf("canonical hour manifest disposition differs")
+		}
+	}
+	validatedGaps := make(map[[2]int64]bool, len(manifest.Gaps))
+	for _, gap := range manifest.Gaps {
+		previousPosition, previousOK := sourcePositions[gap.PreviousClipID]
+		nextPosition, nextOK := sourcePositions[gap.NextClipID]
+		pair := [2]int64{gap.PreviousClipID, gap.NextClipID}
+		if !previousOK || !nextOK || nextPosition != previousPosition+1 || validatedGaps[pair] || !reasonCode.MatchString(gap.Reason) || !gap.AtUTC.Equal(manifest.Sources[previousPosition].EndUTC) || gap.SignedGapNanoseconds != manifest.Sources[nextPosition].StartUTC.Sub(manifest.Sources[previousPosition].EndUTC).Nanoseconds() {
+			return nil, "", fmt.Errorf("canonical hour manifest gap differs")
+		}
+		validatedGaps[pair] = true
+	}
+	brokenAdjacencies := 0
+	for i := 1; i < len(manifest.Sources); i++ {
+		previousID, nextID := manifest.Sources[i-1].ClipID, manifest.Sources[i].ClipID
+		previousMedia, nextMedia := included[previousID].MediaArtifactID, included[nextID].MediaArtifactID
+		sameMediaRun := previousMedia > 0 && previousMedia == nextMedia
+		hasGap := validatedGaps[[2]int64{previousID, nextID}]
+		if sameMediaRun == hasGap {
+			return nil, "", fmt.Errorf("canonical hour manifest run boundary differs")
+		}
+		if !sameMediaRun {
+			brokenAdjacencies++
+		}
+	}
+	if brokenAdjacencies != len(manifest.Gaps) {
+		return nil, "", fmt.Errorf("canonical hour manifest gaps do not exactly cover run boundaries")
+	}
+	switch manifest.Status {
+	case HourStatusMedia:
+		if len(manifest.Sources) == 0 || len(manifest.Media) == 0 || manifest.ScheduledGap != nil || manifest.QuarantineReasonCode != "" {
+			return nil, "", fmt.Errorf("canonical media hour differs")
+		}
+	case HourStatusGapOnly:
+		if len(manifest.Sources) != 0 || len(manifest.Media) != 0 || len(manifest.SourceDispositions) != 0 || manifest.ScheduledGap == nil || !manifest.ScheduledGap.NoAllocatableSources || !reasonCode.MatchString(manifest.ScheduledGap.ReasonCode) || manifest.ScheduledGap.SignedGapNanoseconds != time.Hour.Nanoseconds() || manifest.QuarantineReasonCode != "" || len(manifest.QuarantineEvidence) != 0 {
+			return nil, "", fmt.Errorf("canonical gap-only hour differs")
+		}
+	case HourStatusQuarantineOnly:
+		if len(manifest.Sources) == 0 || len(manifest.Media) != 0 || len(quarantined) != len(manifest.Sources) || !reasonCode.MatchString(manifest.QuarantineReasonCode) || manifest.ScheduledGap != nil {
+			return nil, "", fmt.Errorf("canonical quarantine-only hour differs")
+		}
+	default:
+		return nil, "", fmt.Errorf("canonical hour manifest status differs")
+	}
 	sha, canonical, err := stitchcert.CanonicalSHA(manifest)
-	if err != nil {
-		return HourManifest{}, nil, "", err
+	if err != nil || len(canonical) > MaxCanonicalJSONBytes {
+		return nil, "", fmt.Errorf("hour manifest exceeds canonical limit")
 	}
-	if len(canonical) > MaxCanonicalJSONBytes {
-		return HourManifest{}, nil, "", fmt.Errorf("hour manifest exceeds canonical limit")
+	return canonical, sha, nil
+}
+
+// ValidateHourManifestLedgerBinding proves that one canonical hour is exactly
+// the corresponding ordered source subset and allocation evidence from its
+// canonical stream-day ledger.
+func ValidateHourManifestLedgerBinding(manifest HourManifest, ledgerRef AllocationLedgerRef, ledger StreamDayAllocation) error {
+	if _, _, err := CanonicalHourManifestArtifact(manifest); err != nil {
+		return err
 	}
-	return manifest, canonical, sha, nil
+	if ValidateAllocationLedgerRef(ledgerRef, ledger) != nil || manifest.BatchID != ledger.BatchID || manifest.RecordingID != ledger.RecordingID || manifest.Timezone != ledger.Timezone || manifest.LocalDate != ledger.LocalDate || manifest.DeliveryHour < 1 || manifest.DeliveryHour > 12 || manifest.QualificationSHA256 != ledger.QualificationSHA || !sameCanonical([]QualifiedDay{manifest.QualificationDay}, []QualifiedDay{ledger.QualificationDay}) {
+		return fmt.Errorf("hour manifest belongs to a different allocation ledger")
+	}
+	hour := ledger.Hours[manifest.DeliveryHour-1]
+	boundaries, crossDayBoundaries := hourBoundarySubset(ledger, manifest.DeliveryHour)
+	wantAllocation := HourManifestAllocation{
+		ArtifactID:         ledgerRef.ArtifactID,
+		RelativePath:       ledgerRef.RelativePath,
+		ObjectKey:          ledgerRef.ObjectKey,
+		SizeBytes:          ledgerRef.SizeBytes,
+		SHA256:             ledgerRef.SHA256,
+		LedgerSHA256:       ledgerRef.LedgerSHA256,
+		HourSourceSHA256:   ledger.HourSourceSHA256[manifest.DeliveryHour-1],
+		Boundaries:         boundaries,
+		CrossDayBoundaries: crossDayBoundaries,
+	}
+	if !sameCanonical([]HourManifestAllocation{manifest.Allocation}, []HourManifestAllocation{wantAllocation}) || manifest.SourceClaimSHA256 != ledger.HourSourceSHA256[manifest.DeliveryHour-1] || len(manifest.Sources) != len(hour.SourceClipIDs) {
+		return fmt.Errorf("hour manifest allocation differs from canonical ledger")
+	}
+	ledgerSources := make(map[int64]SourceClip, len(ledger.Sources))
+	hourPositions := make(map[int64]int, len(hour.SourceClipIDs))
+	for _, source := range ledger.Sources {
+		ledgerSources[source.ClipID] = source
+	}
+	expectedSources := make([]SourceClip, len(hour.SourceClipIDs))
+	for i, clipID := range hour.SourceClipIDs {
+		source, ok := ledgerSources[clipID]
+		if !ok || manifest.Sources[i].ClipID != clipID {
+			return fmt.Errorf("hour manifest source order differs from canonical ledger")
+		}
+		expectedSources[i] = source
+		hourPositions[clipID] = i
+	}
+	if !sameCanonical(sourceOnlyClips(manifest.Sources), sourceOnlyClips(expectedSources)) {
+		return fmt.Errorf("hour manifest source identity differs from canonical ledger")
+	}
+	seenGaps := map[[2]int64]bool{}
+	for _, gap := range manifest.Gaps {
+		pair := [2]int64{gap.PreviousClipID, gap.NextClipID}
+		previous, previousOK := ledgerSources[gap.PreviousClipID]
+		next, nextOK := ledgerSources[gap.NextClipID]
+		if !previousOK || !nextOK || hourPositions[gap.NextClipID] != hourPositions[gap.PreviousClipID]+1 || seenGaps[pair] || !reasonCode.MatchString(gap.Reason) || !gap.AtUTC.Equal(previous.EndUTC) || gap.SignedGapNanoseconds != next.StartUTC.Sub(previous.EndUTC).Nanoseconds() {
+			return fmt.Errorf("hour manifest gap differs from canonical source timing")
+		}
+		seenGaps[pair] = true
+	}
+	return nil
 }
 
 func validateMaximalityEvidence(e MaximalityEvidence, toolIdentity, expectedSourceClaim string) error {
