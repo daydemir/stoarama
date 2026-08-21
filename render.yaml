@@ -19,29 +19,7 @@ services:
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoaramactl ./cmd/stoaramactl
-      archive_url="${JOINED_RECORDING_FFMPEG_ARCHIVE_URL:-}"
-      archive_sha="${JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256:-}"
-      ffmpeg_sha="${JOINED_RECORDING_FFMPEG_BINARY_SHA256:-}"
-      ffprobe_sha="${JOINED_RECORDING_FFPROBE_BINARY_SHA256:-}"
-      if [[ -z "$archive_url$archive_sha$ffmpeg_sha$ffprobe_sha" ]]; then
-        exit 0
-      fi
-      : "${archive_url:?missing joined FFmpeg archive URL}"
-      : "${archive_sha:?missing joined FFmpeg archive SHA-256}"
-      : "${ffmpeg_sha:?missing joined FFmpeg binary SHA-256}"
-      : "${ffprobe_sha:?missing joined FFprobe binary SHA-256}"
-      [[ "$archive_url" != *"/latest/"* ]] || { echo "joined FFmpeg archive URL must be immutable" >&2; exit 1; }
-      curl -fsSL -o /tmp/stoarama-joined-ffmpeg.tar "$archive_url"
-      printf '%s  %s\n' "$archive_sha" /tmp/stoarama-joined-ffmpeg.tar | sha256sum -c -
-      mkdir -p /tmp/stoarama-joined-ffmpeg
-      tar -xf /tmp/stoarama-joined-ffmpeg.tar -C /tmp/stoarama-joined-ffmpeg
-      ffmpeg_src="$(find /tmp/stoarama-joined-ffmpeg -type f -path '*/bin/ffmpeg' -print -quit)"
-      ffprobe_src="$(find /tmp/stoarama-joined-ffmpeg -type f -path '*/bin/ffprobe' -print -quit)"
-      [[ -n "$ffmpeg_src" && -n "$ffprobe_src" ]]
-      install -m 0755 "$ffmpeg_src" bin/ffmpeg
-      install -m 0755 "$ffprobe_src" bin/ffprobe
-      printf '%s  %s\n' "$ffmpeg_sha" bin/ffmpeg | sha256sum -c -
-      printf '%s  %s\n' "$ffprobe_sha" bin/ffprobe | sha256sum -c -
+      bash ./scripts/install-pinned-media-tools.sh optional
     startCommand: ./bin/stoaramactl recording-joined worker run
     envVars:
       - key: APP_BASE_URL
@@ -80,7 +58,8 @@ services:
     env: go
     rootDir: backend
     autoDeployTrigger: commit
-    # Vendor a linux ffmpeg into bin/ during build. Render env:go has no ffmpeg
+    # Vendor the exact same pinned linux ffmpeg/ffprobe pair as the joined
+    # worker. Render env:go has no ffmpeg
     # on PATH, and the recorder create-time reachability probe shells to
     # $FFMPEG_BIN. We use the BtbN gpl build: the johnvansickle static build
     # segfaults on any network input (TLS and plain http alike) on Render's
@@ -92,12 +71,7 @@ services:
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoarama-api ./cmd/stoarama-api
-      curl -fsSL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
-      mkdir -p /tmp/ffmpeg-extract
-      tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
-      cp /tmp/ffmpeg-extract/bin/ffmpeg bin/ffmpeg
-      chmod +x bin/ffmpeg
-      ./bin/ffmpeg -version
+      bash ./scripts/install-pinned-media-tools.sh
     startCommand: ./bin/stoarama-api
     # Fail a new release before cutover if legacy/stale recorder identity data
     # would make a live cloud recorder unable to authenticate. The currently
@@ -170,8 +144,20 @@ services:
         value: "5"
       - key: BOX_WORKER_RETRY_MAX_SEC
         value: "300"
+      # Shared verbatim with stoarama-joined-worker so freeze evidence and
+      # worker verification use byte-identical media tools.
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_URL
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_BINARY_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFPROBE_BINARY_SHA256
+        sync: false
       - key: FFMPEG_BIN
         value: ./bin/ffmpeg
+      - key: FFPROBE_BIN
+        value: ./bin/ffprobe
       # The BtbN ffmpeg (OpenSSL) reads its CA bundle from SSL_CERT_FILE; point
       # it at the Ubuntu base image's system bundle (present at both build and
       # run time) so HTTPS cert verification succeeds on the reachability probe.

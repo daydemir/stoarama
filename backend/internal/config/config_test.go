@@ -192,7 +192,7 @@ func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 	for _, required := range []string{
 		"numInstances: 1",
 		"startCommand: ./bin/stoaramactl recording-joined worker run",
-		"sha256sum -c -",
+		"bash ./scripts/install-pinned-media-tools.sh optional",
 		"key: JOINED_RECORDING_ENABLED\n        value: \"false\"",
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
 		"key: JOINED_RECORDING_ROLLING_ENABLED\n        value: \"false\"",
@@ -207,6 +207,56 @@ func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 	for _, forbidden := range []string{"DATABASE_URL", "R2_", "STORAGE_CRED_KEY", "SERVICE_TOKEN", "JOINED_WORKER_SIGNING_KEY", "JOINED_WORKER_BOOTSTRAP_TOKEN"} {
 		if strings.Contains(section, forbidden) {
 			t.Fatalf("joined worker contains privileged setting %q", forbidden)
+		}
+	}
+}
+
+func TestRenderAPIAndJoinedWorkerSharePinnedMediaTools(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := func(name string) string {
+		marker := "name: " + name
+		start := strings.Index(string(data), marker)
+		if start < 0 {
+			t.Fatalf("service %s not found", name)
+		}
+		section := string(data)[start:]
+		if next := strings.Index(section[len(marker):], "\n  - type:"); next >= 0 {
+			section = section[:len(marker)+next]
+		}
+		return section
+	}
+	api, worker := service("stoarama-api"), service("stoarama-joined-worker")
+	if strings.Contains(api, "install-pinned-media-tools.sh optional") || !strings.Contains(worker, "install-pinned-media-tools.sh optional") {
+		t.Fatal("API must require pinned tools while the ship-dark worker may omit them")
+	}
+	for _, section := range []string{api, worker} {
+		for _, required := range []string{
+			"scripts/install-pinned-media-tools.sh",
+			"key: JOINED_RECORDING_FFMPEG_ARCHIVE_URL",
+			"key: JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256",
+			"key: JOINED_RECORDING_FFMPEG_BINARY_SHA256",
+			"key: JOINED_RECORDING_FFPROBE_BINARY_SHA256",
+			"key: FFMPEG_BIN\n        value: ./bin/ffmpeg",
+			"key: FFPROBE_BIN\n        value: ./bin/ffprobe",
+		} {
+			if strings.Count(section, required) != 1 {
+				t.Fatalf("service media-tool declaration %q count=%d", required, strings.Count(section, required))
+			}
+		}
+		if strings.Contains(strings.ToLower(section), "/latest/") {
+			t.Fatal("service accepts a mutable latest media-tool archive")
+		}
+	}
+	script, err := os.ReadFile(filepath.Join("..", "..", "scripts", "install-pinned-media-tools.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"/latest/", "sha256sum -c -", "bin/ffmpeg", "bin/ffprobe"} {
+		if !strings.Contains(string(script), required) {
+			t.Fatalf("pinned media-tool installer lacks %q", required)
 		}
 	}
 }
