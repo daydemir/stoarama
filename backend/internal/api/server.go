@@ -528,9 +528,14 @@ func (s *Server) router() http.Handler {
 		api.Group(func(joinedWorker chi.Router) {
 			joinedWorker.Use(s.requireJoinedWorkerAuth)
 			joinedWorker.Post("/recording/joined/claim", s.handleJoinedClaim)
+			joinedWorker.Post("/recording/joined/publication/claim", s.handleJoinedPublicationClaim)
 			joinedWorker.Post("/recording/joined/heartbeat", s.handleJoinedHeartbeat)
 			joinedWorker.Post("/recording/joined/capabilities/source", s.handleJoinedSourceCapability)
 			joinedWorker.Post("/recording/joined/capabilities/artifact", s.handleJoinedArtifactCapability)
+			joinedWorker.Post("/recording/joined/hour/seal", s.handleJoinedSealHour)
+			joinedWorker.Post("/recording/joined/publication/ledger/finalize", s.handleJoinedFinalizeLedger)
+			joinedWorker.Post("/recording/joined/publication/hour/finalize", s.handleJoinedFinalizeHour)
+			joinedWorker.Post("/recording/joined/publication/index/finalize", s.handleJoinedFinalizeBatchIndex)
 		})
 		api.Group(func(joinedBootstrap chi.Router) {
 			joinedBootstrap.Use(s.requireJoinedWorkerBootstrapAuth)
