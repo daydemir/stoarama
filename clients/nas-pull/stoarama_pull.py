@@ -116,6 +116,15 @@ class JoinedDownloadYield(RuntimeError):
     pass
 
 
+class RejectJoinedRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _request, _file_pointer, _code, _message, _headers, _new_url):
+        return None
+
+
+def open_joined_url(request):
+    return urllib.request.build_opener(RejectJoinedRedirects()).open(request, timeout=HTTP_TIMEOUT_SEC)
+
+
 def inventory_skip_reason(exc, sidecar):
     if isinstance(exc, FileChangedDuringHash):
         return "changed_during_hash"
@@ -243,6 +252,9 @@ class Config:
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
+        # Dormant by default. Version 1 is activated only for a specifically
+        # approved connection after the backend feed and capacity gates pass.
+        self.joined_protocol_version = env_int("STOARAMA_JOINED_PROTOCOL_VERSION", 0)
         # Release/deploy safe by default. Operators enable only after migration,
         # API and a completed clean inventory are independently verified.
         self.native_stitch_enabled = env_str("STOARAMA_NATIVE_STITCH_ENABLED", "false").lower() == "true"
@@ -263,6 +275,8 @@ class Config:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
             raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
+        if self.joined_protocol_version not in (0, JOINED_PROTOCOL_VERSION):
+            raise SystemExit("STOARAMA_JOINED_PROTOCOL_VERSION must be 0 or %d" % JOINED_PROTOCOL_VERSION)
 
 
 def boot_id():
@@ -919,6 +933,7 @@ class Runtime:
         self.list_succeeded = False
         self.stable_marked = False
         self.inventory = inventory
+        self.joined_protocol_version = getattr(cfg, "joined_protocol_version", 0)
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1044,7 +1059,7 @@ class Runtime:
                 "client_last_error_at": self.last_error_at,
                 "last_batch": self.batch.copy(),
                 "capacity_blocked": self.capacity_blocked,
-                "joined_protocol_version": JOINED_PROTOCOL_VERSION,
+                "joined_protocol_version": self.joined_protocol_version,
             }
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
@@ -2384,12 +2399,13 @@ def valid_joined_item(raw):
     if not isinstance(raw, dict):
         raise ValueError("joined item is invalid")
     fields = {
-        "id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
-        "download_path", "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
+        "artifact_id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+        "download_path", "ledger_artifact_id", "ledger_relative_path", "ledger_sha256",
+        "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
     }
     if set(raw) != fields:
         raise ValueError("joined item has invalid fields")
-    artifact_id = raw.get("id")
+    artifact_id = raw.get("artifact_id")
     size_bytes = raw.get("size_bytes")
     if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id < 1:
         raise ValueError("joined item has invalid id")
@@ -2398,10 +2414,12 @@ def valid_joined_item(raw):
         or size_bytes < 1 or size_bytes > JOINED_MAX_BYTES
     ):
         raise ValueError("joined item has invalid size_bytes")
-    batch_id = str(raw.get("batch_id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", batch_id):
+    batch_id = raw.get("batch_id")
+    if not isinstance(batch_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", batch_id):
         raise ValueError("joined item has invalid batch_id")
-    relative_raw = str(raw.get("relative_path") or "")
+    relative_raw = raw.get("relative_path")
+    if not isinstance(relative_raw, str):
+        raise ValueError("joined item has invalid relative_path")
     relative = Path(relative_raw)
     if (
         not relative_raw or relative.is_absolute() or relative_raw != relative.as_posix()
@@ -2413,49 +2431,95 @@ def valid_joined_item(raw):
     kind = raw.get("kind")
     content_type = raw.get("content_type")
     hour_id = raw.get("hour_id")
-    if kind not in ("hour_manifest", "media", "batch_index"):
+    if kind not in ("allocation_ledger", "hour_manifest", "media", "batch_index"):
         raise ValueError("joined item has invalid kind")
     if content_type != ("video/mp4" if kind == "media" else "application/json"):
         raise ValueError("joined item has invalid content_type")
+    if kind != "media" and size_bytes > JOINED_MANIFEST_MAX_BYTES:
+        raise ValueError("joined JSON artifact exceeds size cap")
     if kind == "batch_index":
-        if hour_id is not None or relative.as_posix() != "batch.json":
-            raise ValueError("joined batch index has invalid path or hour_id")
-    elif isinstance(hour_id, bool) or not isinstance(hour_id, int) or hour_id < 1:
-        raise ValueError("joined item has invalid hour_id")
-    if kind == "hour_manifest" and not relative_raw.endswith(".hour.json"):
+        if hour_id is not None or relative.as_posix() != "coverage/batch.json":
+            raise ValueError("joined batch index has invalid hour identity or path")
+    elif kind == "allocation_ledger":
+        ledger_match = re.fullmatch(r"coverage/ledgers/([1-9][0-9]*)/([0-9]{4}-[0-9]{2}-[0-9]{2})\.json", relative_raw)
+        if hour_id is not None or ledger_match is None:
+            raise ValueError("joined allocation ledger has invalid hour identity or path")
+        try:
+            if datetime.date.fromisoformat(ledger_match.group(2)).isoformat() != ledger_match.group(2):
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("joined allocation ledger has invalid date") from exc
+    elif not valid_joined_hour_id(batch_id, hour_id):
+        raise ValueError("joined item has invalid hour identity")
+    manifest_path = "coverage/hours/%s.json" % hour_id if hour_id is not None else None
+    if kind == "hour_manifest" and relative_raw != manifest_path:
         raise ValueError("joined hour manifest has invalid suffix")
     if kind == "media" and not relative_raw.endswith(".mp4"):
         raise ValueError("joined media has invalid suffix")
+    ledger_id = raw.get("ledger_artifact_id")
+    ledger_path = raw.get("ledger_relative_path")
+    ledger_sha = raw.get("ledger_sha256")
     manifest_id = raw.get("hour_manifest_id")
-    manifest_path = raw.get("hour_manifest_relative_path")
+    manifest_relative_path = raw.get("hour_manifest_relative_path")
     manifest_sha = raw.get("hour_manifest_sha256")
     if kind == "media":
         if isinstance(manifest_id, bool) or not isinstance(manifest_id, int) or manifest_id < 1:
             raise ValueError("joined media has invalid hour_manifest_id")
-        manifest_path = valid_joined_relative_path(manifest_path, ".hour.json")
+        manifest_relative_path = valid_joined_relative_path(manifest_relative_path, ".json")
+        if manifest_relative_path != manifest_path:
+            raise ValueError("joined media has invalid hour manifest path")
         manifest_sha = valid_sha256(manifest_sha, "joined media manifest")
-    elif any(value is not None for value in (manifest_id, manifest_path, manifest_sha)):
+    elif any(value is not None for value in (manifest_id, manifest_relative_path, manifest_sha)):
         raise ValueError("joined non-media item has manifest binding")
-    download_path = str(raw.get("download_path") or "")
+    if kind == "hour_manifest":
+        if isinstance(ledger_id, bool) or not isinstance(ledger_id, int) or ledger_id < 1:
+            raise ValueError("joined hour manifest has invalid ledger_artifact_id")
+        ledger_path = valid_joined_relative_path(ledger_path, ".json")
+        if not re.fullmatch(r"coverage/ledgers/[1-9][0-9]*/[0-9]{4}-[0-9]{2}-[0-9]{2}\.json", ledger_path):
+            raise ValueError("joined hour manifest has invalid ledger path")
+        ledger_sha = valid_sha256(ledger_sha, "joined allocation ledger")
+    elif any(value is not None for value in (ledger_id, ledger_path, ledger_sha)):
+        raise ValueError("joined non-manifest item has ledger binding")
+    download_path = raw.get("download_path")
+    if not isinstance(download_path, str):
+        raise ValueError("joined item has invalid download_path")
     if download_path != "/api/v1/account/joined/%d/download" % artifact_id:
         raise ValueError("joined item has invalid download_path")
     return {
         "id": artifact_id, "batch_id": batch_id, "hour_id": hour_id, "kind": kind,
         "content_type": content_type, "relative_path": relative.as_posix(), "size_bytes": size_bytes,
-        "sha256": sha256, "download_path": download_path, "hour_manifest_id": manifest_id,
-        "hour_manifest_relative_path": manifest_path, "hour_manifest_sha256": manifest_sha,
+        "sha256": sha256, "download_path": download_path, "ledger_artifact_id": ledger_id,
+        "ledger_relative_path": ledger_path, "ledger_sha256": ledger_sha,
+        "hour_manifest_id": manifest_id,
+        "hour_manifest_relative_path": manifest_relative_path, "hour_manifest_sha256": manifest_sha,
     }
 
 
+def valid_joined_hour_id(batch_id, value):
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(
+        re.escape(batch_id) + r"__recording-([1-9][0-9]*)__date-([0-9]{4}-[0-9]{2}-[0-9]{2})__hour-(0[1-9]|1[0-2])__generation-([1-9][0-9]*)",
+        value,
+    )
+    if match is None:
+        return False
+    try:
+        return datetime.date.fromisoformat(match.group(2)).isoformat() == match.group(2)
+    except ValueError:
+        return False
+
+
 def valid_sha256(value, label):
-    digest = str(value or "").lower()
-    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+    if not isinstance(value, str) or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
         raise ValueError("joined item has invalid sha256")
-    return digest
+    return value
 
 
 def valid_joined_relative_path(value, suffix=None):
-    raw = str(value or "")
+    if not isinstance(value, str):
+        raise ValueError("joined item has invalid relative_path")
+    raw = value
     relative = Path(raw)
     if (
         not raw or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
@@ -2467,12 +2531,14 @@ def valid_joined_relative_path(value, suffix=None):
 
 
 def normalized_etag(value):
-    raw = str(value or "").strip()
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("joined item has invalid etag")
+    raw = value
     if raw.startswith("W/"):
         raise ValueError("joined item has weak etag")
     if len(raw) >= 2 and raw[0] == raw[-1] == '"':
         raw = raw[1:-1]
-    if not raw or len(raw) > 256 or any(ord(ch) < 33 or ord(ch) > 126 for ch in raw):
+    if not raw or len(raw) > 256 or '"' in raw or any(ord(ch) < 33 or ord(ch) > 126 for ch in raw):
         raise ValueError("joined item has invalid etag")
     return raw
 
@@ -2553,13 +2619,17 @@ def verify_joined_entry(cfg, runtime, directory_fd, name, expected_bytes, expect
 
 def joined_transfer_marker_bytes(item, prepared):
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         **{key: item[key] for key in (
             "id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
-            "download_path", "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
+            "download_path", "ledger_artifact_id", "ledger_relative_path", "ledger_sha256",
+            "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
         )},
         "etag": prepared["etag"],
         "version_id": prepared["version_id"],
+        "url_scheme": prepared["url_scheme"],
+        "url_authority": prepared["url_authority"],
+        "url_path": prepared["url_path"],
     }
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -2868,22 +2938,53 @@ def poll_raw_pending(cfg, runtime):
 
 def prepare_joined_download(cfg, item):
     prepared = request_json(cfg, "GET", item["download_path"], base=cfg.origin)
-    if set(prepared) != {"url", "etag", "if_match", "version_id", "size_bytes", "sha256", "content_type"}:
+    if set(prepared) != {
+        "url", "etag", "if_match", "version_id", "size_bytes", "sha256", "content_type", "expires_in_sec",
+    }:
         raise RuntimeError("joined download response has invalid fields")
-    url = str(prepared.get("url") or "")
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or not parsed.netloc:
+    url = prepared.get("url")
+    if not isinstance(url, str):
         raise RuntimeError("joined download returned invalid URL")
-    if prepared.get("size_bytes") != item["size_bytes"] or str(prepared.get("sha256") or "").lower() != item["sha256"]:
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise RuntimeError("joined download returned invalid URL") from exc
+    if (
+        parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+        or parsed.password is not None or parsed.fragment or not parsed.path.startswith("/")
+    ):
+        raise RuntimeError("joined download returned invalid URL")
+    if prepared.get("size_bytes") != item["size_bytes"] or prepared.get("sha256") != item["sha256"]:
         raise ExistingFileMismatch("joined prepared bytes changed")
     if prepared.get("content_type") != item["content_type"]:
         raise ExistingFileMismatch("joined prepared content type changed")
+    expires_in_sec = prepared.get("expires_in_sec")
+    if isinstance(expires_in_sec, bool) or not isinstance(expires_in_sec, int) or not 1 <= expires_in_sec <= 3600:
+        raise RuntimeError("joined download returned invalid expiry")
     etag = normalized_etag(prepared.get("etag"))
-    version_id = str(prepared.get("version_id") or "")
-    if_match = str(prepared.get("if_match") or "")
+    version_id = prepared.get("version_id")
+    if (
+        not isinstance(version_id, str) or len(version_id) > 1024 or version_id != version_id.strip()
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in version_id)
+    ):
+        raise RuntimeError("joined download returned invalid version_id")
+    if_match = prepared.get("if_match")
+    if not isinstance(if_match, str):
+        raise ExistingFileMismatch("joined prepared If-Match changed")
     if if_match != '"%s"' % etag:
         raise ExistingFileMismatch("joined prepared If-Match changed")
-    return {"url": url, "if_match": if_match, "etag": etag, "version_id": version_id}
+    return {
+        "url": url, "if_match": if_match, "etag": etag, "version_id": version_id,
+        "url_scheme": parsed.scheme, "url_authority": parsed.netloc, "url_path": parsed.path,
+    }
+
+
+def validate_joined_download_renewal(first, current):
+    if any(current[key] != first[key] for key in (
+        "etag", "version_id", "url_scheme", "url_authority", "url_path",
+    )):
+        raise ExistingFileMismatch("joined prepared object identity changed")
 
 
 def append_joined_range(prepared, directory_fd, part_name, item, start, end):
@@ -2894,7 +2995,7 @@ def append_joined_range(prepared, directory_fd, part_name, item, start, end):
     }
     request = urllib.request.Request(prepared["url"], method="GET", headers=headers)
     try:
-        response_context = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SEC)
+        response_context = open_joined_url(request)
     except urllib.error.HTTPError as exc:
         if exc.code == 416:
             truncate_joined_part(directory_fd, part_name)
@@ -3035,8 +3136,7 @@ def download_joined_item(cfg, runtime, item, stop_event):
                 except ExistingFileMismatch:
                     truncate_joined_part(directory_fd, part_name)
                     raise
-                if any(current_prepared[key] != prepared[key] for key in ("etag", "version_id")):
-                    raise ExistingFileMismatch("joined prepared object identity changed")
+                validate_joined_download_renewal(prepared, current_prepared)
                 end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
                 append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end)
                 part_size = end + 1
@@ -3069,7 +3169,7 @@ def ack_joined_item(cfg, item):
 
 
 def drain_joined(cfg, runtime, stop_event):
-    if cfg.dry_run:
+    if getattr(cfg, "joined_protocol_version", 0) != JOINED_PROTOCOL_VERSION or cfg.dry_run:
         return False
     page = request_json(cfg, "GET", "/account/joined")
     if set(page) - {"item"}:
