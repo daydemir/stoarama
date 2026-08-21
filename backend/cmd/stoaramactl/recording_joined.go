@@ -91,6 +91,9 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 
 	switch args[0] {
 	case "freeze-tier1":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
 		req, err := parseJoinedFreezeTier1(cfg, args[1:])
 		if err != nil {
 			return nil, err
@@ -142,6 +145,9 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 		}
 		return service.Status(ctx, req)
 	case "finalize-index":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
 		req, err := parseJoinedFinalizeIndex(cfg, args[1:])
 		if err != nil {
 			return nil, err
@@ -154,6 +160,13 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 	default:
 		return nil, fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+func requireJoinedActiveProtocol(cfg config.Config) error {
+	if !cfg.JoinedRecordingEnabled || cfg.JoinedRecordingProtocolVersion != 1 {
+		return errors.New("joined recording mutations require JOINED_RECORDING_ENABLED=true and JOINED_RECORDING_PROTOCOL_VERSION=1")
+	}
+	return nil
 }
 
 func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1Request, error) {

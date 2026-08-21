@@ -157,7 +157,7 @@ func TestJoinedWorkerStartupFailurePreventsClaimLoop(t *testing.T) {
 }
 
 func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
-	cfg := config.Config{JoinedRecordingBatchID: "tier1-2026-08"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08"}
 	factory := func(context.Context, config.Config) (joinedOperatorService, error) {
 		t.Fatal("invalid request reached factory")
 		return nil, nil
@@ -176,7 +176,7 @@ func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
 func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	fake := &fakeJoinedOperator{}
 	factory := func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil }
-	cfg := config.Config{JoinedRecordingBatchID: "tier1-2026-08"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08"}
 	hash := strings.Repeat("a", 64)
 
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
@@ -202,6 +202,32 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	}
 	if fake.finalizeReq != (joinedFinalizeIndexRequest{BatchID: "tier1-2026-08", ExpectedManifestSHA256: hash, Apply: true}) {
 		t.Fatalf("finalize request=%+v", fake.finalizeReq)
+	}
+}
+
+func TestJoinedMutationsDormantBeforeFactory(t *testing.T) {
+	for _, args := range [][]string{
+		{"freeze-tier1", "--connection-id", "44", "--batch-id", "tier1-2026-08"},
+		{"finalize-index", "--batch-id", "tier1-2026-08"},
+	} {
+		for _, cfg := range []config.Config{
+			{},
+			{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 0},
+			{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 2},
+		} {
+			factoryCalled := false
+			factory := func(context.Context, config.Config) (joinedOperatorService, error) {
+				factoryCalled = true
+				return nil, errors.New("must remain dormant")
+			}
+			_, err := runRecordingJoinedWith(context.Background(), cfg, args, factory)
+			if err == nil || !strings.Contains(err.Error(), "PROTOCOL_VERSION=1") {
+				t.Fatalf("args=%v cfg=%+v error=%v", args, cfg, err)
+			}
+			if factoryCalled {
+				t.Fatalf("args=%v cfg=%+v initialized service", args, cfg)
+			}
+		}
 	}
 }
 
