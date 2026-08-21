@@ -11,20 +11,27 @@ import (
 )
 
 func TestHeartbeatRefreshKeepsStableLeaseAndScratch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	leaseID := strings.Repeat("L", 43)
 	initial := OperationCredentials{LeaseID: leaseID, OperationToken: strings.Repeat("a", 32), ExpiresAt: now.Add(5 * time.Minute)}
 	ticks := make(chan time.Time, 1)
 	refreshed := OperationCredentials{LeaseID: leaseID, OperationToken: strings.Repeat("b", 32), ExpiresAt: now.Add(6 * time.Minute)}
-	err := runWithHeartbeat(context.Background(), initial, time.Minute, func(_ context.Context, token string) (OperationCredentials, error) {
+	err := runWithHeartbeat(ctx, initial, time.Minute, func(_ context.Context, token string) (OperationCredentials, error) {
 		if token != initial.OperationToken {
-			t.Fatalf("heartbeat used unexpected token")
+			return OperationCredentials{}, errors.New("heartbeat used unexpected token")
 		}
 		return refreshed, nil
-	}, func(_ context.Context, current func() OperationCredentials) error {
+	}, func(workCtx context.Context, current func() OperationCredentials) error {
 		ticks <- now.Add(time.Minute)
 		for current().OperationToken != refreshed.OperationToken {
-			runtime.Gosched()
+			select {
+			case <-workCtx.Done():
+				return workCtx.Err()
+			default:
+				runtime.Gosched()
+			}
 		}
 		if current().LeaseID != leaseID || current().ExpiresAt != refreshed.ExpiresAt {
 			t.Fatal("heartbeat changed lease or ignored greatest expiry")
@@ -41,25 +48,31 @@ func TestHeartbeatRefreshKeepsStableLeaseAndScratch(t *testing.T) {
 }
 
 func TestHeartbeatRetainsGreatestSameLeaseExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	leaseID := strings.Repeat("L", 43)
 	initial := OperationCredentials{LeaseID: leaseID, OperationToken: strings.Repeat("a", 32), ExpiresAt: now.Add(5 * time.Minute)}
 	ticks := make(chan time.Time, 2)
 	secondCalled := make(chan struct{})
 	var calls atomic.Int32
-	err := runWithHeartbeat(context.Background(), initial, time.Minute, func(_ context.Context, token string) (OperationCredentials, error) {
+	err := runWithHeartbeat(ctx, initial, time.Minute, func(_ context.Context, token string) (OperationCredentials, error) {
 		if calls.Add(1) == 1 {
 			return OperationCredentials{LeaseID: leaseID, OperationToken: strings.Repeat("b", 32), ExpiresAt: now.Add(4 * time.Minute)}, nil
 		}
 		if token != initial.OperationToken {
-			t.Fatalf("lower-expiry token was used on the next heartbeat")
+			return OperationCredentials{}, errors.New("lower-expiry token was used on the next heartbeat")
 		}
 		close(secondCalled)
 		return initial, nil
-	}, func(_ context.Context, current func() OperationCredentials) error {
+	}, func(workCtx context.Context, current func() OperationCredentials) error {
 		ticks <- now.Add(time.Minute)
 		ticks <- now.Add(2 * time.Minute)
-		<-secondCalled
+		select {
+		case <-secondCalled:
+		case <-workCtx.Done():
+			return workCtx.Err()
+		}
 		if current().OperationToken != initial.OperationToken {
 			t.Fatal("lower-expiry response replaced current credentials")
 		}
@@ -71,6 +84,8 @@ func TestHeartbeatRetainsGreatestSameLeaseExpiry(t *testing.T) {
 }
 
 func TestHeartbeatLostResponseCanRetryWithPriorToken(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	leaseID := strings.Repeat("L", 43)
 	initial := OperationCredentials{LeaseID: leaseID, OperationToken: strings.Repeat("a", 32), ExpiresAt: now.Add(5 * time.Minute)}
@@ -78,16 +93,16 @@ func TestHeartbeatLostResponseCanRetryWithPriorToken(t *testing.T) {
 	ticks := make(chan time.Time, 2)
 	first := make(chan struct{})
 	var calls atomic.Int32
-	err := runWithHeartbeat(context.Background(), initial, time.Minute, func(_ context.Context, token string) (OperationCredentials, error) {
+	err := runWithHeartbeat(ctx, initial, time.Minute, func(_ context.Context, token string) (OperationCredentials, error) {
 		if token != initial.OperationToken {
-			t.Fatalf("retry used uncommitted token")
+			return OperationCredentials{}, errors.New("retry used uncommitted token")
 		}
 		if calls.Add(1) == 1 {
 			close(first)
 			return OperationCredentials{}, errors.New("lost heartbeat response")
 		}
 		return refreshed, nil
-	}, func(_ context.Context, current func() OperationCredentials) error {
+	}, func(workCtx context.Context, current func() OperationCredentials) error {
 		ticks <- now.Add(time.Minute)
 		<-first
 		if current().OperationToken != initial.OperationToken {
@@ -95,7 +110,12 @@ func TestHeartbeatLostResponseCanRetryWithPriorToken(t *testing.T) {
 		}
 		ticks <- now.Add(2 * time.Minute)
 		for current().OperationToken != refreshed.OperationToken {
-			runtime.Gosched()
+			select {
+			case <-workCtx.Done():
+				return workCtx.Err()
+			default:
+				runtime.Gosched()
+			}
 		}
 		return nil
 	}, func() time.Time { return now }, ticks)

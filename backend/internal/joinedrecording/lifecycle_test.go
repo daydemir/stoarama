@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -122,6 +123,29 @@ func TestPreflightRejectsMismatchedInstalledToolBeforeSourceAccess(t *testing.T)
 	}
 }
 
+func TestPreflightPreservesMediaToolInspectionErrorBeforeSourceAccess(t *testing.T) {
+	t.Setenv("FFMPEG_BIN", "joined-test-missing-ffmpeg")
+	claim := PreflightHourClaim{LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("a", 32),
+		LeaseExpires: time.Now().Add(time.Hour)}
+	var sourceAccessed, sealed bool
+	_, _, err := runPreflightHourRenewing(context.Background(), claim, t.TempDir(),
+		&memoryCapabilityClient{objects: map[string][]byte{}}, testSourceAuthority, noHeartbeat,
+		func(context.Context, PreflightHourClaim, SourceClip, string) (SourceReadCapability, error) {
+			sourceAccessed = true
+			return SourceReadCapability{}, nil
+		}, func(context.Context, PreflightHourClaim, SealHourRequest) (WorkerClaim, error) {
+			sealed = true
+			return WorkerClaim{}, nil
+		}, func(ctx context.Context, initial OperationCredentials, _ HeartbeatOperation,
+			work func(context.Context, func() OperationCredentials) error) error {
+			return work(ctx, func() OperationCredentials { return initial })
+		})
+	var execErr *exec.Error
+	if err == nil || !errors.As(err, &execErr) || sourceAccessed || sealed {
+		t.Fatalf("tool inspection error was not preserved: err=%v source=%v sealed=%v", err, sourceAccessed, sealed)
+	}
+}
+
 func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 	leaseID := strings.Repeat("L", 43)
 	initialToken, refreshedToken := strings.Repeat("a", 32), strings.Repeat("b", 32)
@@ -159,6 +183,22 @@ func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 		}, refreshedRunner)
 	if err != nil || ledgerPublished.SHA256 != ledgerSHA {
 		t.Fatalf("ledger publication failed: %+v %v", ledgerPublished, err)
+	}
+	readFailure := errors.New("ledger reread unavailable")
+	var finalizedAfterReadFailure bool
+	failedReadClient := &memoryCapabilityClient{objects: map[string][]byte{}}
+	_, err = publishAllocationLedger(context.Background(), failedReadClient, ledgerClaim,
+		func(_ context.Context, got LedgerPublicationClaim) (ObjectCreateCapability, error) {
+			_, key, _ := CanonicalAllocationLedgerPaths(got.BatchID, got.Ledger.RecordingID, got.Ledger.LocalDate)
+			return createCapabilityIdentity(got.ArtifactID, got.StorageBucket, key, "application/json", got.ExpectedSize, got.ExpectedSHA256), nil
+		}, func(context.Context, LedgerPublicationClaim) (ObjectReadCapability, error) {
+			return ObjectReadCapability{}, readFailure
+		}, func(context.Context, LedgerPublicationClaim, PublishedLedger) error {
+			finalizedAfterReadFailure = true
+			return nil
+		})
+	if !errors.Is(err, readFailure) || finalizedAfterReadFailure {
+		t.Fatalf("ledger reread error was not preserved: err=%v finalized=%v", err, finalizedAfterReadFailure)
 	}
 
 	index, indexLedgers, indexManifests := testBatchIndex(t)

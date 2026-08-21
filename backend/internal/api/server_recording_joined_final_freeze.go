@@ -32,7 +32,11 @@ type joinedFinalFreezeResponse struct {
 	AlreadyFrozen           bool      `json:"already_frozen"`
 }
 
-const joinedFinalFreezeStatementTimeout = 5 * time.Second
+const (
+	joinedFinalFreezeOperationTimeout = 10 * time.Second
+	joinedFinalFreezeLockTimeout      = time.Second
+	joinedFinalFreezeStatementTimeout = 5 * time.Second
+)
 
 func (r joinedFinalFreezeRequest) validate() error {
 	if r.ProtocolVersion != joinedrecording.JoinedProtocolVersion || !joinedBatchIDPattern.MatchString(r.BatchID) ||
@@ -65,11 +69,17 @@ func (s *Server) handleAdminJoinedFinalFreeze(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFreezeRequest) (joinedFinalFreezeResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, joinedFinalFreezeOperationTimeout)
+	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return joinedFinalFreezeResponse{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)`,
+		joinedFinalFreezeLockTimeout.String(), joinedFinalFreezeStatementTimeout.String()); err != nil {
+		return joinedFinalFreezeResponse{}, fmt.Errorf("bound joined final freeze: %w", err)
+	}
 
 	response := joinedFinalFreezeResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: req.BatchID}
 	var batchRecordID, connectionID int64
@@ -131,9 +141,6 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 	if err != nil || denominator != response.FrozenDenominatorSHA256 || len(recordings) != response.RecordingCount ||
 		len(days) != response.StreamDayCount || response.ScheduledHourCount != response.StreamDayCount*12 {
 		return response, errors.New("joined final-freeze evidence differs")
-	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)`); err != nil {
-		return response, fmt.Errorf("bound joined final freeze: %w", err)
 	}
 	var protocolVersion int
 	if err := tx.QueryRow(ctx, `SELECT joined_protocol_version FROM connections WHERE id=$1

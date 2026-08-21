@@ -208,7 +208,7 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 		JoinedRecordingFFmpegArchiveSHA256: strings.Repeat("a", 64),
 		JoinedRecordingFFmpegSHA256:        strings.Repeat("b", 64),
 		JoinedRecordingFFprobeSHA256:       strings.Repeat("c", 64),
-		JoinedRecordingWorkerToken:         "joined-bootstrap-test-token",
+		JoinedRecordingWorkerToken:         strings.Repeat("w", 32),
 	}
 	if err := valid.ValidateJoinedRecording(); err != nil {
 		t.Fatal(err)
@@ -240,6 +240,16 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 	missingBootstrap.JoinedRecordingWorkerToken = ""
 	if err := missingBootstrap.ValidateJoinedRecording(); err == nil || !strings.Contains(err.Error(), "STOARAMA_JOINED_WORKER_TOKEN") {
 		t.Fatalf("missing bootstrap error=%v", err)
+	}
+	shortBootstrap := valid
+	shortBootstrap.JoinedRecordingWorkerToken = strings.Repeat("w", 31)
+	if err := shortBootstrap.ValidateJoinedRecording(); err == nil || !strings.Contains(err.Error(), "at least 32 bytes") {
+		t.Fatalf("short bootstrap error=%v", err)
+	}
+	trimmedBootstrap := valid
+	trimmedBootstrap.JoinedRecordingWorkerToken = " \t" + strings.Repeat("w", 32) + "\n"
+	if err := trimmedBootstrap.ValidateJoinedRecording(); err != nil {
+		t.Fatalf("trimmed 32-byte bootstrap: %v", err)
 	}
 }
 

@@ -41,7 +41,7 @@ func validJoinedWorkerConfig() config.Config {
 		JoinedRecordingFFmpegArchiveSHA256: strings.Repeat("a", 64),
 		JoinedRecordingFFmpegSHA256:        strings.Repeat("b", 64),
 		JoinedRecordingFFprobeSHA256:       strings.Repeat("c", 64),
-		JoinedRecordingWorkerToken:         "joined-bootstrap-test-token",
+		JoinedRecordingWorkerToken:         strings.Repeat("w", 32),
 	}
 }
 
@@ -150,7 +150,11 @@ func TestJoinedWorkerParsesFixedWorkerEnvelope(t *testing.T) {
 
 func TestJoinedWorkerAllowsExplicitActivationEnvelope(t *testing.T) {
 	fake := &fakeJoinedOperator{}
-	factory := func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil }
+	var factoryCfg config.Config
+	factory := func(_ context.Context, cfg config.Config) (joinedOperatorService, error) {
+		factoryCfg = cfg
+		return fake, nil
+	}
 	cfg := validJoinedWorkerConfig()
 	cfg.JoinedRecordingBatchID = ""
 	cfg.JoinedRecordingScratchRoot = ""
@@ -165,6 +169,9 @@ func TestJoinedWorkerAllowsExplicitActivationEnvelope(t *testing.T) {
 	}
 	if fake.workerReq.BatchID != "tier1-2026-08" || fake.workerReq.ScratchRoot != "/tmp/stoarama-joined" {
 		t.Fatalf("worker request=%+v", fake.workerReq)
+	}
+	if factoryCfg.JoinedRecordingBatchID != "tier1-2026-08" || factoryCfg.JoinedRecordingScratchRoot != "/tmp/stoarama-joined" {
+		t.Fatalf("factory config batch=%q scratch=%q", factoryCfg.JoinedRecordingBatchID, factoryCfg.JoinedRecordingScratchRoot)
 	}
 }
 

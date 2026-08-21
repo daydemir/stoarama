@@ -239,6 +239,7 @@ class JoinedDownloadTests(unittest.TestCase):
         self.assertEqual({kind: item["kind"] for kind, item in validated.items()}, {
             kind: kind for kind in fixture["feed_responses"]
         })
+        self.assertEqual(fixture["prepare_response"]["if_match"], '"%s"' % fixture["prepare_response"]["etag"])
         media = validated["media"]
         with mock.patch.object(pull, "request_json", return_value=fixture["prepare_response"]):
             prepared = pull.prepare_joined_download(SimpleNamespace(origin="https://stoarama.test"), media)

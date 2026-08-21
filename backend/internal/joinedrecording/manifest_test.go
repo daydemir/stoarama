@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -773,6 +774,21 @@ func TestHourManifestAllocationUsesCanonicalLedgerProjection(t *testing.T) {
 	}
 }
 
+func TestHourManifestAllocationRejectsOutOfRangePlanHourWithoutPanic(t *testing.T) {
+	for _, localHour := range []int{0, 13} {
+		t.Run(fmt.Sprintf("hour_%d", localHour), func(t *testing.T) {
+			plan := oneOutputPlan(t)
+			allocation, ledger := testAllocation(plan)
+			plan.LocalHour = localHour
+			plan.HourID = canonicalHourIDValue(plan.BatchID, plan.RecordingID, plan.LocalDate, localHour, plan.Generation)
+			plan.CoverageObjectKey = canonicalBatchCoverageKey(plan)
+			if _, err := BuildHourManifestAllocation(allocation.ArtifactID, plan, ledger); err == nil {
+				t.Fatal("out-of-range plan hour reached allocation indexing")
+			}
+		})
+	}
+}
+
 func TestHourManifestGapAndQuarantineAreDistinctTerminalCoverage(t *testing.T) {
 	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
 	req := testRequest([]SourceClip{testSource(1, start)})
@@ -1060,7 +1076,10 @@ func assertGolden(t *testing.T, name string, canonical []byte) {
 		}
 	}
 	want, err := os.ReadFile(name)
-	if err != nil || !bytes.Equal(canonical, bytes.TrimSpace(want)) {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(canonical, bytes.TrimSpace(want)) {
 		t.Fatalf("canonical fixture changed\n%s", canonical)
 	}
 }

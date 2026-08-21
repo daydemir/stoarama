@@ -37,7 +37,7 @@ func NewWorkScopeIdentity(batchID, workScope string, canaryHourIDs []string) (Wo
 }
 
 func (s WorkScopeIdentity) Validate(batchID string) error {
-	if !safeBatchID.MatchString(batchID) {
+	if !ValidBatchID(batchID) {
 		return fmt.Errorf("invalid joined work scope batch")
 	}
 	switch s.WorkScope {

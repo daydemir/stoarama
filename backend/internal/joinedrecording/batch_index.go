@@ -387,8 +387,7 @@ func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindo
 	for hourIndex, hour := range index.Hours {
 		ledgerIndex := hourIndex / 12
 		ledger := index.AllocationLedgers[ledgerIndex]
-		if resolveHour != nil && hourIndex%12 == 0 {
-			var resolveErr error
+		if resolveLedger != nil && hourIndex%12 == 0 {
 			nextLedger, resolveErr := resolveLedger(ledger)
 			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone || nextLedger.QualificationDay.QualificationWindowOrdinal != ledgerIndex%14+1 || nextLedger.QualificationDay.WindowStart.Before(index.SelectionAuthority.QualificationRunFrozenAt) || nextLedger.QualificationDay.CompletedAt.After(index.SelectionAuthority.Cutoff) || len(qualificationWindows) != len(index.FrozenRecordings) || !sameCanonical([]QualifiedDay{nextLedger.QualificationDay}, []QualifiedDay{qualificationWindows[ledgerIndex/14].Days[ledgerIndex%14]}) {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")

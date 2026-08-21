@@ -261,9 +261,8 @@ type joinedAckRequest struct {
 }
 
 func validateJoinedAck(req joinedAckRequest) error {
-	req.RelativePath = strings.TrimSpace(req.RelativePath)
-	req.SHA256 = strings.ToLower(strings.TrimSpace(req.SHA256))
-	if req.ArtifactID <= 0 || req.SizeBytes <= 0 || !validNASRelativePath(req.RelativePath) || len(req.SHA256) != 64 || !lowerHex(req.SHA256) {
+	if req.ArtifactID <= 0 || req.SizeBytes <= 0 || req.RelativePath != strings.TrimSpace(req.RelativePath) ||
+		!validNASRelativePath(req.RelativePath) || len(req.SHA256) != 64 || !lowerHex(req.SHA256) {
 		return errors.New("invalid joined acknowledgment identity")
 	}
 	return nil
@@ -280,8 +279,6 @@ func (s *Server) handleAccountJoinedAck(w http.ResponseWriter, r *http.Request) 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.RelativePath = strings.TrimSpace(req.RelativePath)
-	req.SHA256 = strings.ToLower(strings.TrimSpace(req.SHA256))
 	if err := validateJoinedAck(req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -378,15 +375,26 @@ func (s *Server) revalidateJoinedSourceCapability(ctx context.Context, hourID, b
 	if err != nil {
 		return err
 	}
-	err = tx.QueryRow(ctx, `
-		SELECT 1 FROM recording_joined_hours h
-		JOIN recording_joined_sources src ON src.hour_record_id=h.id AND src.clip_id=$3
-		LEFT JOIN recording_joined_artifacts root ON root.hour_record_id=h.id AND root.artifact_kind='hour_manifest'
-		WHERE h.hour_id=$1 AND h.batch_id=$2
-		  AND ((h.state='leased' AND $5='preflight' AND h.claim_token=$4 AND h.lease_expires_at>now())
-		    OR (h.state='sealed' AND $5='publish' AND root.publication_state='publishing'
-		      AND root.publication_token=$4 AND root.publication_lease_expires_at>now()))
-		FOR SHARE OF h,src,root`, hourID, batchID, clipID, lease, operation).Scan(&ok)
+	switch operation {
+	case joinedauth.OperationPreflight:
+		err = tx.QueryRow(ctx, `
+			SELECT 1 FROM recording_joined_hours h
+			JOIN recording_joined_sources src ON src.hour_record_id=h.id AND src.clip_id=$3
+			WHERE h.hour_id=$1 AND h.batch_id=$2 AND h.state='leased'
+			  AND h.claim_token=$4 AND h.lease_expires_at>now()
+			FOR SHARE OF h,src`, hourID, batchID, clipID, lease).Scan(&ok)
+	case joinedauth.OperationPublish:
+		err = tx.QueryRow(ctx, `
+			SELECT 1 FROM recording_joined_hours h
+			JOIN recording_joined_sources src ON src.hour_record_id=h.id AND src.clip_id=$3
+			JOIN recording_joined_artifacts root ON root.hour_record_id=h.id AND root.artifact_kind='hour_manifest'
+			WHERE h.hour_id=$1 AND h.batch_id=$2 AND h.state='sealed'
+			  AND root.publication_state='publishing' AND root.publication_token=$4
+			  AND root.publication_lease_expires_at>now()
+			FOR SHARE OF h,src,root`, hourID, batchID, clipID, lease).Scan(&ok)
+	default:
+		return errors.New("joined source capability operation differs")
+	}
 	if err != nil {
 		return err
 	}
@@ -449,6 +457,12 @@ func joinedSignedRequestFrom(capability r2.PresignedRequest, expectedAuthority s
 	for key, values := range capability.Headers {
 		if len(values) != 1 {
 			return joinedSignedRequest{}, errors.New("presigned storage capability has an ambiguous required header")
+		}
+		if strings.EqualFold(key, "Host") {
+			if values[0] != expectedAuthority {
+				return joinedSignedRequest{}, errors.New("presigned storage host differs from its frozen destination")
+			}
+			continue
 		}
 		headers[key] = values[0]
 	}

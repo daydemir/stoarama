@@ -566,8 +566,12 @@ func (c Config) ValidateJoinedRecording() error {
 			return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", item.name)
 		}
 	}
-	if c.JoinedRecordingWorkerToken == "" {
+	workerToken := strings.TrimSpace(c.JoinedRecordingWorkerToken)
+	if workerToken == "" {
 		return fmt.Errorf("STOARAMA_JOINED_WORKER_TOKEN is required when joined recording is enabled")
+	}
+	if len(workerToken) < 32 {
+		return fmt.Errorf("STOARAMA_JOINED_WORKER_TOKEN must be at least 32 bytes when joined recording is enabled")
 	}
 	return nil
 }

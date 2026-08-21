@@ -601,13 +601,6 @@ func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artif
 		RETURNING id`, artifactID, lease, etag, versionID).Scan(&updated); err != nil {
 		return errors.New("joined publication lease is stale")
 	}
-	if scopeKind == joinedauth.SubjectBatchIndex {
-		command, updateErr := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='published',published_at=now()
-		  WHERE batch_id=$1 AND index_artifact_id=$2 AND state='index_sealed'`, claims.BatchID, artifactID)
-		if updateErr != nil || command.RowsAffected() != 1 {
-			return errors.New("joined batch index state differs")
-		}
-	}
 	if scopeKind == joinedauth.SubjectLedger {
 		if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID); err != nil {
 			return errors.New("seal joined gap-only hours")

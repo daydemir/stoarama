@@ -106,13 +106,21 @@ func mediaToolVersion(ctx context.Context, binary string) (string, error) {
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
-	scanner := bufio.NewScanner(io.LimitReader(stdout, mediaCommandOutputLimit))
-	ok := scanner.Scan()
-	line := strings.TrimSpace(scanner.Text())
-	scanErr := scanner.Err()
+	out, readErr := io.ReadAll(io.LimitReader(stdout, mediaCommandOutputLimit+1))
+	tooLarge := len(out) > mediaCommandOutputLimit
+	if tooLarge && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 	waitErr := cmd.Wait()
-	if !ok || scanErr != nil || waitErr != nil || line == "" {
-		return "", fmt.Errorf("read media tool version: %v %v (%s)", scanErr, waitErr, stderr.String())
+	if readErr != nil {
+		return "", fmt.Errorf("read media tool version: %w", readErr)
+	}
+	if tooLarge {
+		return "", fmt.Errorf("media tool version exceeds bounded output")
+	}
+	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if waitErr != nil || line == "" {
+		return "", fmt.Errorf("read media tool version: %v (%s)", waitErr, stderr.String())
 	}
 	return line, nil
 }

@@ -109,6 +109,8 @@ func TestValidateJoinedAck(t *testing.T) {
 		{ArtifactID: 1, RelativePath: "../escape.mp4", SizeBytes: 1, SHA256: strings.Repeat("a", 64)},
 		{ArtifactID: 1, RelativePath: "ok.mp4", SizeBytes: 0, SHA256: strings.Repeat("a", 64)},
 		{ArtifactID: 1, RelativePath: "ok.mp4", SizeBytes: 1, SHA256: "bad"},
+		{ArtifactID: 1, RelativePath: " ok.mp4", SizeBytes: 1, SHA256: strings.Repeat("a", 64)},
+		{ArtifactID: 1, RelativePath: "ok.mp4", SizeBytes: 1, SHA256: strings.Repeat("A", 64)},
 	} {
 		if err := validateJoinedAck(bad); err == nil {
 			t.Fatalf("invalid acknowledgment accepted: %+v", bad)
@@ -195,11 +197,17 @@ func (s joinedOutputStoreStub) PresignGetExactRequest(_ context.Context, key, et
 }
 
 func TestJoinedCapabilityEnvelopeRejectsChangedAuthorityAndExpiredLease(t *testing.T) {
-	capability := r2.PresignedRequest{Method: http.MethodGet, URL: "https://storage.example.test/bucket/exact?signature=1", Headers: http.Header{"If-Match": []string{`"etag"`}}}
+	capability := r2.PresignedRequest{Method: http.MethodGet, URL: "https://storage.example.test/bucket/exact?signature=1",
+		Headers: http.Header{"Host": {"storage.example.test"}, "If-Match": {`"etag"`}}}
 	got, err := joinedSignedRequestFrom(capability, "storage.example.test")
-	if err != nil || got.Authority != "storage.example.test" || got.RequiredHeaders["If-Match"] != `"etag"` {
+	if err != nil || got.Authority != "storage.example.test" || got.RequiredHeaders["If-Match"] != `"etag"` || got.RequiredHeaders["Host"] != "" {
 		t.Fatalf("exact capability rejected: %+v %v", got, err)
 	}
+	capability.Headers.Set("Host", "other.example.test")
+	if _, err := joinedSignedRequestFrom(capability, "storage.example.test"); err == nil {
+		t.Fatal("changed signed Host accepted")
+	}
+	capability.Headers.Set("Host", "storage.example.test")
 	for _, raw := range []string{
 		"http://storage.example.test/bucket/exact?signature=1",
 		"https://other.example.test/bucket/exact?signature=1",

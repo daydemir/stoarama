@@ -23,6 +23,28 @@ func exactSourceCapability(source SourceClip, operation string) SourceReadCapabi
 		ETag: source.Object.ETag, VersionID: source.Object.VersionID, ExpiresAt: expires, Request: request}
 }
 
+func TestRebuildSealedHourRejectsMalformedClaimBeforeRunnerOrStorage(t *testing.T) {
+	plan := oneOutputPlan(t)
+	built := []BuiltOutput{{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA,
+		SourceCount: len(plan.Outputs[0].Sources), Verification: passingVerification()}}
+	claim := sealedClaim(t, 7, plan, built, nil)
+	claim.HourManifest.Media = nil
+	var ran, resolved bool
+	run := func(context.Context, OperationCredentials, HeartbeatOperation,
+		func(context.Context, func() OperationCredentials) error) error {
+		ran = true
+		return nil
+	}
+	_, _, err := rebuildSealedHourRenewing(context.Background(), claim, t.TempDir(), nil,
+		testSourceAuthority, noHeartbeat, func(context.Context, WorkerClaim, SourceClip, string) (SourceReadCapability, error) {
+			resolved = true
+			return SourceReadCapability{}, nil
+		}, run)
+	if err == nil || ran || resolved {
+		t.Fatalf("malformed rebuild reached runner or storage: err=%v ran=%v resolved=%v", err, ran, resolved)
+	}
+}
+
 func TestRebuildSealedHourUsesExactFrozenPartsAndCurrentLeaseScratch(t *testing.T) {
 	sourceDir := t.TempDir()
 	local := makeMediaClip(t, sourceDir, "source.mp4", 440, false)

@@ -26,7 +26,10 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 	err := run(ctx, initial, heartbeat, func(workCtx context.Context, current func() OperationCredentials) error {
 		fresh := func() (PreflightHourClaim, error) { return claim.WithOperation(current()) }
 		actualTool, err := InspectMediaToolEvidence(workCtx)
-		if err != nil || !sameCanonical([]MediaToolEvidence{actualTool}, []MediaToolEvidence{claim.MediaTool}) {
+		if err != nil {
+			return fmt.Errorf("inspect installed media tool: %w", err)
+		}
+		if !sameCanonical([]MediaToolEvidence{actualTool}, []MediaToolEvidence{claim.MediaTool}) {
 			return fmt.Errorf("installed media tool differs from frozen claim")
 		}
 		sourceCapability := func(callCtx context.Context, source SourceClip, operation string) (SourceReadCapability, error) {

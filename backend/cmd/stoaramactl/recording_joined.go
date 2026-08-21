@@ -209,7 +209,7 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 		if err := workerCfg.ValidateJoinedRecording(); err != nil {
 			return nil, err
 		}
-		service, err := factory(ctx, cfg)
+		service, err := factory(ctx, workerCfg)
 		if err != nil {
 			return nil, err
 		}

@@ -16,6 +16,12 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
 
+func TestJoinedAPIClientRejectsMalformedBaseURL(t *testing.T) {
+	if _, err := newJoinedAPIClient("https://%", "", nil); err == nil {
+		t.Fatal("malformed APP_BASE_URL was accepted")
+	}
+}
+
 func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 	t.Parallel()
 	const (

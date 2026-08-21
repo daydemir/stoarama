@@ -120,8 +120,36 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, fixture.connectionID); err != nil {
 		t.Fatal(err)
 	}
+	lockTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockTx.Exec(ctx, `SELECT id FROM recording_joined_batches WHERE id=$1 FOR UPDATE`, batchRecordID); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	lockedResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() { lockedResult <- call(freezeRequest, true, "") }()
+	select {
+	case response := <-lockedResult:
+		if response.Code != http.StatusConflict {
+			_ = lockTx.Rollback(ctx)
+			t.Fatalf("locked final freeze status=%d body=%s", response.Code, response.Body.String())
+		}
+	case <-time.After(joinedFinalFreezeLockTimeout + 2*time.Second):
+		_ = lockTx.Rollback(ctx)
+		t.Fatal("locked final freeze exceeded its server-owned lock bound")
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT state,freeze_started_at IS NOT NULL FROM recording_joined_batches
+		WHERE id=$1`, batchRecordID).Scan(&state, &freezeStarted); err != nil || state != "building" || freezeStarted {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("locked final freeze leaked state=%s started=%v err=%v", state, freezeStarted, err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.pool.Exec(ctx, `CREATE FUNCTION joined_test_delay_final_freeze() RETURNS trigger LANGUAGE plpgsql AS $$
-		BEGIN IF OLD.state='building' AND NEW.state='frozen' THEN PERFORM pg_sleep(1); END IF; RETURN NEW; END $$;
+		BEGIN IF OLD.state='building' AND NEW.state='frozen' THEN PERFORM pg_sleep(0.5); END IF; RETURN NEW; END $$;
 		CREATE TRIGGER zzz_joined_test_delay_final_freeze BEFORE UPDATE OF state ON recording_joined_batches
 		FOR EACH ROW EXECUTE FUNCTION joined_test_delay_final_freeze()`); err != nil {
 		t.Fatal(err)
@@ -957,42 +985,76 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		feed.Item.ArtifactID != ledgerArtifactID || feed.Item.ConnectionID != connectionID {
 		t.Fatalf("feed status=%d body=%s", feedRec.Code, feedRec.Body.String())
 	}
-	heartbeatTelemetry := func(caller accountPrincipal, artifactID int64) *httptest.ResponseRecorder {
+	type heartbeatTelemetryResponse struct {
+		OK                     bool  `json:"ok"`
+		JoinedDeliveryAccepted *bool `json:"joined_delivery_accepted"`
+	}
+	heartbeatTelemetry := func(caller accountPrincipal, artifactID, cursorID int64, inventoryGeneration, blocker string, freeBytes int64) (*httptest.ResponseRecorder, heartbeatTelemetryResponse) {
 		t.Helper()
 		attemptedAt := time.Now().UTC().Add(-time.Second)
 		body, _ := json.Marshal(connectionHeartbeatRequest{
+			CursorID: cursorID, ClipsPulled: cursorID, BytesPulled: cursorID * 10,
 			ClientVersion: "joined-v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1,
-			JoinedDelivery: &connectionJoinedDelivery{ArtifactID: artifactID, Blocker: "download_failed", AttemptedAt: &attemptedAt},
+			Inventory:      &connectionInventoryStatus{Generation: inventoryGeneration},
+			Storage:        &connectionStorageStatus{Available: true, TotalBytes: 1000, FreeBytes: freeBytes},
+			JoinedDelivery: &connectionJoinedDelivery{ArtifactID: artifactID, Blocker: blocker, AttemptedAt: &attemptedAt},
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", bytes.NewReader(body))
 		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, caller))
 		rec := httptest.NewRecorder()
 		s.handleAccountConnectionHeartbeat(rec, req)
-		return rec
+		var response heartbeatTelemetryResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &response)
+		return rec, response
 	}
-	if rec := heartbeatTelemetry(principal, ledgerArtifactID); rec.Code != http.StatusOK {
+	if rec, response := heartbeatTelemetry(principal, ledgerArtifactID, 100001, "eligible-report", "download_failed", 401); rec.Code != http.StatusOK ||
+		!response.OK || response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
 		t.Fatalf("eligible joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var attemptedArtifactID *int64
 	var blocker string
-	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker
-		FROM connections WHERE id=$1`, connectionID).Scan(&attemptedArtifactID, &blocker); err != nil ||
+	var attemptedAt, retryAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at
+		FROM connections WHERE id=$1`, connectionID).Scan(&attemptedArtifactID, &blocker, &attemptedAt, &retryAt); err != nil ||
 		attemptedArtifactID == nil || *attemptedArtifactID != ledgerArtifactID || blocker != "download_failed" {
 		t.Fatalf("persisted joined blocker artifact=%v blocker=%q err=%v", attemptedArtifactID, blocker, err)
 	}
+	assertRawHeartbeat := func(id, cursorID int64, inventoryGeneration string, freeBytes int64) {
+		t.Helper()
+		var gotCursor, gotFree int64
+		var gotGeneration string
+		var lastSeen, storageReportedAt *time.Time
+		if err := pool.QueryRow(ctx, `SELECT last_cursor_id,inventory_generation,nas_storage_free_bytes,
+			last_seen_at,nas_storage_reported_at FROM connections WHERE id=$1`, id).
+			Scan(&gotCursor, &gotGeneration, &gotFree, &lastSeen, &storageReportedAt); err != nil ||
+			gotCursor != cursorID || gotGeneration != inventoryGeneration || gotFree != freeBytes || lastSeen == nil || storageReportedAt == nil {
+			t.Fatalf("raw heartbeat id=%d cursor=%d generation=%q free=%d last_seen=%v storage_at=%v err=%v",
+				id, gotCursor, gotGeneration, gotFree, lastSeen, storageReportedAt, err)
+		}
+	}
+	assertRawHeartbeat(connectionID, 100001, "eligible-report", 401)
 	var foreignKeyID int64
 	_, foreignAccountID := seedUserOrg(t, pool, "joined-heartbeat-foreign@example.test", true)
 	if err := pool.QueryRow(ctx, `INSERT INTO account_api_keys(account_id,key_prefix,secret_hash,label,scopes)
 		VALUES($1,'sir_joined_foreign','foreign-key','Foreign NAS',ARRAY['stoarama.pull']) RETURNING id`, foreignAccountID).Scan(&foreignKeyID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id)
-		VALUES($1,'nas_pull','Foreign NAS',$2)`, foreignAccountID, foreignKeyID); err != nil {
+	var foreignConnectionID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id)
+		VALUES($1,'nas_pull','Foreign NAS',$2) RETURNING id`, foreignAccountID, foreignKeyID).Scan(&foreignConnectionID); err != nil {
 		t.Fatal(err)
 	}
 	foreignPrincipal := accountPrincipal{AccountID: foreignAccountID, APIKeyID: &foreignKeyID, KeyScopes: []string{accountScopePull}}
-	if rec := heartbeatTelemetry(foreignPrincipal, ledgerArtifactID); rec.Code != http.StatusConflict {
+	if rec, response := heartbeatTelemetry(foreignPrincipal, ledgerArtifactID, 200001, "foreign-report", "io_error", 302); rec.Code != http.StatusOK ||
+		!response.OK || response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {
 		t.Fatalf("foreign joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	assertRawHeartbeat(foreignConnectionID, 200001, "foreign-report", 302)
+	var foreignArtifactID *int64
+	var foreignBlocker string
+	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker FROM connections WHERE id=$1`,
+		foreignConnectionID).Scan(&foreignArtifactID, &foreignBlocker); err != nil || foreignArtifactID != nil || foreignBlocker != "" {
+		t.Fatalf("foreign joined telemetry mutated artifact=%v blocker=%q err=%v", foreignArtifactID, foreignBlocker, err)
 	}
 	wrongAck, _ := json.Marshal(joinedAckRequest{ArtifactID: ledgerArtifactID, RelativePath: "wrong.json",
 		SizeBytes: int64(len(ledgerBytes)), SHA256: ledgerArtifactSHA})
@@ -1002,6 +1064,26 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	s.handleAccountJoinedAck(wrongRec, wrongReq)
 	if wrongRec.Code != http.StatusConflict {
 		t.Fatalf("wrong ACK status=%d body=%s", wrongRec.Code, wrongRec.Body.String())
+	}
+	for name, ack := range map[string]joinedAckRequest{
+		"whitespace path": {ArtifactID: ledgerArtifactID, RelativePath: " " + ledgerRelative,
+			SizeBytes: int64(len(ledgerBytes)), SHA256: ledgerArtifactSHA},
+		"uppercase sha": {ArtifactID: ledgerArtifactID, RelativePath: ledgerRelative,
+			SizeBytes: int64(len(ledgerBytes)), SHA256: strings.ToUpper(ledgerArtifactSHA)},
+	} {
+		body, _ := json.Marshal(ack)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/joined/ack", bytes.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
+		rec := httptest.NewRecorder()
+		s.handleAccountJoinedAck(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s ACK status=%d body=%s", name, rec.Code, rec.Body.String())
+		}
+	}
+	var rejectedAckRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_artifact_acks WHERE artifact_id=$1`,
+		ledgerArtifactID).Scan(&rejectedAckRows); err != nil || rejectedAckRows != 0 {
+		t.Fatalf("noncanonical ACK rows=%d err=%v", rejectedAckRows, err)
 	}
 	exactAck, _ := json.Marshal(joinedAckRequest{ArtifactID: ledgerArtifactID, RelativePath: ledgerRelative,
 		SizeBytes: int64(len(ledgerBytes)), SHA256: ledgerArtifactSHA})
@@ -1014,8 +1096,28 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 			t.Fatalf("exact ACK attempt=%d status=%d body=%s", attempt, rec.Code, rec.Body.String())
 		}
 	}
-	if rec := heartbeatTelemetry(principal, ledgerArtifactID); rec.Code != http.StatusConflict {
+	var ackedArtifactID *int64
+	var ackedBlocker string
+	var ackedAttemptedAt, ackedRetryAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at
+		FROM connections WHERE id=$1`, connectionID).Scan(&ackedArtifactID, &ackedBlocker, &ackedAttemptedAt, &ackedRetryAt); err != nil ||
+		ackedArtifactID != nil || ackedBlocker != "" || ackedAttemptedAt != nil || ackedRetryAt != nil {
+		t.Fatalf("exact ACK did not clear joined telemetry artifact=%v blocker=%q attempted=%v retry=%v err=%v",
+			ackedArtifactID, ackedBlocker, ackedAttemptedAt, ackedRetryAt, err)
+	}
+	if rec, response := heartbeatTelemetry(principal, ledgerArtifactID, 300001, "acked-report", "storage_guard", 203); rec.Code != http.StatusOK ||
+		!response.OK || response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {
 		t.Fatalf("acked joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	assertRawHeartbeat(connectionID, 300001, "acked-report", 203)
+	var afterArtifactID *int64
+	var afterBlocker string
+	var afterAttemptedAt, afterRetryAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at
+		FROM connections WHERE id=$1`, connectionID).Scan(&afterArtifactID, &afterBlocker, &afterAttemptedAt, &afterRetryAt); err != nil ||
+		afterArtifactID != nil || afterBlocker != "" || afterAttemptedAt != nil || afterRetryAt != nil {
+		t.Fatalf("rejected ACKed telemetry changed cleared state artifact=%v blocker=%q attempted=%v retry=%v err=%v",
+			afterArtifactID, afterBlocker, afterAttemptedAt, afterRetryAt, err)
 	}
 	// Publish the remaining ledgers through the same fenced DB transitions so
 	// the source-bearing day becomes eligible for the actual worker handlers.
@@ -1226,6 +1328,59 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		unreferencedStorageID, sourceSecret); err != nil {
 		t.Fatal(err)
 	}
+	if rec := sourceCapability(); rec.Code != http.StatusOK {
+		t.Fatalf("preflight source capability status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var preflightLease uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT claim_token FROM recording_joined_hours WHERE hour_id=$1`,
+		sourceClaim.HourID).Scan(&preflightLease); err != nil {
+		t.Fatal(err)
+	}
+	waitForBlocked := func(fragment string) {
+		t.Helper()
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		for {
+			var blocked bool
+			if err := pool.QueryRow(waitCtx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity a
+				WHERE cardinality(pg_blocking_pids(a.pid))>0 AND a.query LIKE '%'||$1||'%')`, fragment).Scan(&blocked); err != nil {
+				t.Fatal(err)
+			}
+			if blocked {
+				return
+			}
+			if waitCtx.Err() != nil {
+				t.Fatalf("joined source capability never blocked at %q", fragment)
+			}
+		}
+	}
+	protocolTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocolTx.Exec(ctx, `SELECT id FROM connections WHERE id=$1 FOR UPDATE`, connectionID); err != nil {
+		_ = protocolTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	protocolResult := make(chan error, 1)
+	go func() {
+		protocolResult <- s.revalidateJoinedSourceCapability(ctx, sourceClaim.HourID, batchID,
+			sourceClaim.Sources[0].ClipID, preflightLease, joinedauth.OperationPreflight)
+	}()
+	waitForBlocked("SELECT c.id FROM connections c JOIN recording_joined_hours h")
+	if _, err := protocolTx.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
+		_ = protocolTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := protocolTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-protocolResult; err == nil {
+		t.Fatal("source capability survived a concurrent protocol downgrade")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	mediaSHA := strings.Repeat("3", 64)
 	sealRequest := joinedrecording.SealHourRequest{ProtocolVersion: 1, HourID: sourceClaim.HourID,
 		SourceClaimSHA256: sourceClaim.SourceClaimSHA256, AccountedSources: sourceClaim.Sources,
@@ -1255,6 +1410,10 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 			mediaRows, mediaSourceRows, dispositionRows, manifestRows, err)
 	}
 	mediaOutput := sealed.Plan.Outputs[0]
+	sourceClaim.OperationToken = sealed.OperationToken
+	if rec := sourceCapability(); rec.Code != http.StatusOK {
+		t.Fatalf("publish source capability status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	mediaETag, manifestETag := "media-etag", "manifest-etag"
 	hourHeadKeys := []string{}
 	s.joinedOutputStorage = joinedOutputStoreStub{heads: map[string]r2.ObjectHead{

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"regexp"
 	"strings"
 	"time"
 
@@ -15,8 +14,6 @@ import (
 )
 
 const Audience = "recording-joined-worker-v1"
-
-var safeBatchID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 const (
 	KindClaim     = "claim"
@@ -65,7 +62,7 @@ func MintOperation(signingKey, batchID, subjectKind, subjectID string, leaseToke
 }
 
 func validCommon(signingKey string, claims Claims, expiresAt time.Time) bool {
-	return strings.TrimSpace(signingKey) != "" && safeBatchID.MatchString(claims.BatchID) && expiresAt.Unix() > 0
+	return strings.TrimSpace(signingKey) != "" && joinedrecording.ValidBatchID(claims.BatchID) && expiresAt.Unix() > 0
 }
 
 func mint(signingKey string, claims Claims) (string, error) {
@@ -85,7 +82,7 @@ func Verify(signingKey, token string, now time.Time) (Claims, error) {
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil || json.Unmarshal(payload, &claims) != nil || claims.Version != 1 || claims.Audience != Audience ||
-		!safeBatchID.MatchString(claims.BatchID) || claims.ExpiresAt <= now.UTC().Unix() ||
+		!joinedrecording.ValidBatchID(claims.BatchID) || claims.ExpiresAt <= now.UTC().Unix() ||
 		claims.ExpiresAt > now.UTC().Add(time.Hour).Unix() {
 		return Claims{}, errors.New("invalid or expired joined worker token")
 	}

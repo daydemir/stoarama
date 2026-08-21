@@ -125,9 +125,23 @@ func TestLeaseIDIsStablePathSafeAndNotFenceToken(t *testing.T) {
 }
 
 func TestJoinedWorkerTokenRejectsUnsafeBatchID(t *testing.T) {
-	for _, batchID := range []string{"", " batch", "batch/name", strings.Repeat("a", 129)} {
-		if _, err := MintClaim("signing-key", batchID, testClaimWorkScope(t, "batch-test"), time.Unix(2_000_000_000, 0).UTC()); err == nil {
+	now := time.Unix(2_000_000_000, 0).UTC()
+	lease := uuid.New()
+	for _, batchID := range []string{"", " batch", "batch/name", "Batch-test", "batch.test", "batch_test", strings.Repeat("a", 64)} {
+		if _, err := MintClaim("signing-key", batchID, joinedrecording.WorkScopeIdentity{WorkScope: joinedrecording.WorkScopeFrozenBatch}, now.Add(time.Minute)); err == nil {
 			t.Fatalf("unsafe batch ID minted a token: %q", batchID)
+		}
+		if _, err := MintOperation("signing-key", batchID, SubjectHour, "hour-test", lease, OperationPreflight, now.Add(time.Minute)); err == nil {
+			t.Fatalf("unsafe batch ID minted an operation token: %q", batchID)
+		}
+		forged, err := mint("signing-key", Claims{Version: 1, Audience: Audience, ExpiresAt: now.Add(time.Minute).Unix(),
+			Kind: KindOperation, BatchID: batchID, SubjectKind: SubjectHour, SubjectID: "hour-test",
+			LeaseToken: lease.String(), Operation: OperationPreflight})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Verify("signing-key", forged, now); err == nil {
+			t.Fatalf("unsafe signed batch ID verified: %q", batchID)
 		}
 	}
 }

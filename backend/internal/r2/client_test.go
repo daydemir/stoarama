@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -160,13 +161,17 @@ func TestPutReaderIfAbsentVerifiedCreatesAndRereadsExactObject(t *testing.T) {
 	sum := sha256.Sum256(body)
 	sha := hex.EncodeToString(sum[:])
 	var putIfNoneMatch, getIfMatch string
+	var handlerMu sync.Mutex
+	var handlerError string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
 		switch r.Method {
 		case http.MethodPut:
 			putIfNoneMatch = r.Header.Get("If-None-Match")
 			got, _ := io.ReadAll(r.Body)
 			if string(got) != string(body) {
-				t.Fatalf("PUT body=%q", got)
+				handlerError = "PUT body=" + string(got)
 			}
 			w.Header().Set("ETag", `"etag-1"`)
 		case http.MethodHead:
@@ -177,7 +182,7 @@ func TestPutReaderIfAbsentVerifiedCreatesAndRereadsExactObject(t *testing.T) {
 			w.Header().Set("ETag", `"etag-1"`)
 			_, _ = w.Write(body)
 		default:
-			t.Fatalf("method=%s", r.Method)
+			handlerError = "method=" + r.Method
 		}
 	}))
 	defer server.Close()
@@ -188,6 +193,12 @@ func TestPutReaderIfAbsentVerifiedCreatesAndRereadsExactObject(t *testing.T) {
 	head, created, err := client.PutReaderIfAbsentVerified(context.Background(), "joined/x.mp4", "video/mp4", strings.NewReader(string(body)), int64(len(body)), sha)
 	if err != nil {
 		t.Fatal(err)
+	}
+	handlerMu.Lock()
+	gotHandlerError := handlerError
+	handlerMu.Unlock()
+	if gotHandlerError != "" {
+		t.Fatal(gotHandlerError)
 	}
 	if !created || head.ETag != "etag-1" || putIfNoneMatch != "*" || getIfMatch != `"etag-1"` {
 		t.Fatalf("created=%v head=%+v if-none-match=%q if-match=%q", created, head, putIfNoneMatch, getIfMatch)

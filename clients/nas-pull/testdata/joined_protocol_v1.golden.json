@@ -83,7 +83,7 @@
   },
   "prepare_response": {
     "url": "https://joined.example.test/objects/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.mp4?signature=renewable",
-    "etag": "\"exact-etag\"",
+    "etag": "exact-etag",
     "if_match": "\"exact-etag\"",
     "version_id": "version-1",
     "size_bytes": 6,

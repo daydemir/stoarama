@@ -244,6 +244,20 @@ func TestRepeatedENOSPCNeverTailPeels(t *testing.T) {
 	}
 }
 
+func TestMediaToolVersionRejectsOversizedOutputWithoutHanging(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "oversized-version")
+	script := "#!/bin/sh\ni=0\nwhile [ \"$i\" -le 65536 ]; do printf x; i=$((i+1)); done\n"
+	if err := os.WriteFile(fake, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := mediaToolVersion(ctx, fake); err == nil || !strings.Contains(err.Error(), "exceeds bounded output") {
+		t.Fatalf("oversized media-tool version err=%v", err)
+	}
+}
+
 func TestCompactEvidenceFingerprintIsBoundedForLargeHour(t *testing.T) {
 	const frames = 200000
 	accumulator := newMediaAccumulator()

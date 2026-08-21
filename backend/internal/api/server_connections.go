@@ -928,6 +928,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load heartbeat connection: %v", err))
 		return
 	}
+	joinedDeliveryAccepted := true
 	if joined := req.JoinedDelivery; joined != nil {
 		ct, err := tx.Exec(r.Context(), `
 			UPDATE connections c SET joined_last_attempt_artifact_id=$2,joined_last_blocker=$3,
@@ -958,15 +959,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 			return
 		}
 		if ct.RowsAffected() == 0 {
-			util.WriteError(w, http.StatusConflict, "joined delivery telemetry target is not the unacked connection output")
-			return
+			joinedDeliveryAccepted = false
 		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit heartbeat: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "joined_delivery_accepted": joinedDeliveryAccepted})
 }
 
 func storageAvailable(storage *connectionStorageStatus) any {

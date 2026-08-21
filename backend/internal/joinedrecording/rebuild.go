@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 type RebuildSourceCapability func(context.Context, WorkerClaim, SourceClip, string) (SourceReadCapability, error)
@@ -21,6 +22,9 @@ func rebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRo
 	resolveSource RebuildSourceCapability, run renewableRunner) (WorkerClaim, SealedHourScratch, error) {
 	if resolveSource == nil || storageAuthority == "" || claim.StorageAuthority != storageAuthority {
 		return WorkerClaim{}, SealedHourScratch{}, fmt.Errorf("sealed-hour rebuild authority is incomplete")
+	}
+	if err := claim.Validate(time.Now().UTC()); err != nil {
+		return WorkerClaim{}, SealedHourScratch{}, err
 	}
 	initial := OperationCredentials{LeaseID: claim.LeaseID, OperationToken: claim.OperationToken, ExpiresAt: claim.LeaseExpires}
 	currentClaim := claim

@@ -64,7 +64,7 @@ func publishAllocationLedger(ctx context.Context, client CapabilityHTTPClient, c
 	}
 	readCapability, err := resolveRead(ctx, claim)
 	if err != nil {
-		return PublishedLedger{}, fmt.Errorf("resolve exact allocation-ledger reread capability")
+		return PublishedLedger{}, fmt.Errorf("resolve exact allocation-ledger reread capability: %w", err)
 	}
 	head, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.ArtifactID, objectKey, claim.ExpectedSize, claim.ExpectedSHA256, readCapability.ETag, readCapability.VersionID, readCapability)
 	if err != nil {

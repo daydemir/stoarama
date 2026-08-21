@@ -38,6 +38,9 @@ func downloadClaimSources(ctx context.Context, claim PreflightHourClaim, scratch
 			locals = append(locals, local)
 			continue
 		}
+		if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("remove unverified source scratch: %w", err)
+		}
 		headCapability, err := sourceCapability(ctx, source, "head")
 		if err != nil || verifyExactSourceHeadCapability(ctx, client, storageAuthority, source, headCapability) != nil {
 			return nil, "", fmt.Errorf("source clip %d exact HEAD verification failed", source.ClipID)

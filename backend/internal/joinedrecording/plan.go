@@ -19,6 +19,11 @@ const PlanPolicyVersion = "joined-delivery-v1"
 
 var safeBatchID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
+// ValidBatchID reports whether batchID is one canonical joined batch identity.
+func ValidBatchID(batchID string) bool {
+	return safeBatchID.MatchString(batchID)
+}
+
 type ObjectIdentity struct {
 	Key       string `json:"key"`
 	VersionID string `json:"version_id,omitempty"`
@@ -512,7 +517,7 @@ func ValidatePlan(plan BatchPlan) error {
 	if plan.QuarantineReason != "" {
 		statusCount++
 	}
-	if plan.SchemaVersion != 1 || plan.PolicyVersion != PlanPolicyVersion || !safeBatchID.MatchString(plan.BatchID) || plan.HourID != canonicalHourIDValue(plan.BatchID, plan.RecordingID, plan.LocalDate, plan.LocalHour, plan.Generation) || plan.Generation <= 0 || plan.ExpectedOutputCount != len(plan.Outputs) || plan.CoverageObjectKey != canonicalBatchCoverageKey(plan) || statusCount != 1 || (plan.GapOnly && (!reasonCode.MatchString(plan.GapOnlyReason) || len(plan.Sources) != 0)) || (!plan.GapOnly && plan.GapOnlyReason != "") || (plan.QuarantineReason != "" && (!reasonCode.MatchString(plan.QuarantineReason) || len(plan.Sources) == 0)) {
+	if plan.SchemaVersion != 1 || plan.PolicyVersion != PlanPolicyVersion || !safeBatchID.MatchString(plan.BatchID) || plan.LocalHour < 1 || plan.LocalHour > 12 || plan.HourID != canonicalHourIDValue(plan.BatchID, plan.RecordingID, plan.LocalDate, plan.LocalHour, plan.Generation) || plan.Generation <= 0 || plan.ExpectedOutputCount != len(plan.Outputs) || plan.CoverageObjectKey != canonicalBatchCoverageKey(plan) || statusCount != 1 || (plan.GapOnly && (!reasonCode.MatchString(plan.GapOnlyReason) || len(plan.Sources) != 0)) || (!plan.GapOnly && plan.GapOnlyReason != "") || (plan.QuarantineReason != "" && (!reasonCode.MatchString(plan.QuarantineReason) || len(plan.Sources) == 0)) {
 		return fmt.Errorf("joined batch plan is not sealed")
 	}
 	if plan.GapOnly {

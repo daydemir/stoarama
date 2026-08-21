@@ -109,8 +109,11 @@ func newRemoteJoinedOperatorService(cfg config.Config) (*remoteJoinedOperatorSer
 func newJoinedAPIClient(baseURL, bootstrapToken string, httpClient *http.Client) (*joinedAPIClient, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	parsed, err := url.ParseRequestURI(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("APP_BASE_URL must be one HTTP(S) origin")
+	}
 	localTestHTTP := parsed.Scheme == "http" && (parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "localhost" || parsed.Hostname() == "::1")
-	if err != nil || (parsed.Scheme != "https" && !localTestHTTP) || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" {
+	if (parsed.Scheme != "https" && !localTestHTTP) || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" {
 		return nil, fmt.Errorf("APP_BASE_URL must be one HTTP(S) origin")
 	}
 	bootstrapToken = strings.TrimSpace(bootstrapToken)
