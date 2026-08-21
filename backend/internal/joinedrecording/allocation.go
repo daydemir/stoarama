@@ -325,6 +325,7 @@ type StreamDayAllocation struct {
 	LocalDate          string              `json:"local_date"`
 	QualificationDay   QualifiedDay        `json:"qualification_day"`
 	QualificationSHA   string              `json:"qualification_sha256"`
+	FrozenSourceSHA256 string              `json:"frozen_source_sha256"`
 	SourceClaimSHA256  string              `json:"source_claim_sha256"`
 	SourceClipCount    int                 `json:"source_clip_count"`
 	SourceBytes        int64               `json:"source_bytes"`
@@ -396,7 +397,11 @@ func SealStreamDayAllocation(draft StreamDayDraft) (StreamDayAllocation, error) 
 	for i := 1; i < len(sources); i++ {
 		pairs = append(pairs, SourcePair{PreviousClipID: sources[i-1].ClipID, NextClipID: sources[i].ClipID, PreviousPresentationEndUTC: sources[i-1].EndUTC, NextPresentationStartUTC: sources[i].StartUTC, SignedGapNanoseconds: sources[i].StartUTC.Sub(sources[i-1].EndUTC).Nanoseconds()})
 	}
-	ledger := StreamDayAllocation{SchemaVersion: 1, BatchID: draft.BatchID, Generation: draft.Generation, RecordingID: draft.RecordingID, Timezone: draft.Timezone, LocalDate: draft.LocalDate, QualificationDay: draft.QualificationDay, QualificationSHA: draft.QualificationSHA, SourceClaimSHA256: manifestSHA, SourceClipCount: len(sources), SourceBytes: sourceBytes, FirstClipID: firstClipID, LastClipID: lastClipID, ConsecutivePairs: pairs, Sources: append([]SourceClip{}, sources...), Hours: ledgerHours, HourSourceSHA256: hourSHAs, Boundaries: append([]CrossHourBoundary{}, draft.Boundaries...), CrossDayBoundaries: append([]CrossDayBoundary{}, draft.CrossDayBoundaries...)}
+	frozenDay, err := BuildFrozenDenominatorDayProjection(draft.RecordingID, draft.QualificationDay, draft.QualificationSHA, FrozenSourceSnapshots(sources))
+	if err != nil {
+		return StreamDayAllocation{}, err
+	}
+	ledger := StreamDayAllocation{SchemaVersion: 1, BatchID: draft.BatchID, Generation: draft.Generation, RecordingID: draft.RecordingID, Timezone: draft.Timezone, LocalDate: draft.LocalDate, QualificationDay: draft.QualificationDay, QualificationSHA: draft.QualificationSHA, FrozenSourceSHA256: frozenDay.FrozenSourceSHA256, SourceClaimSHA256: manifestSHA, SourceClipCount: len(sources), SourceBytes: sourceBytes, FirstClipID: firstClipID, LastClipID: lastClipID, ConsecutivePairs: pairs, Sources: append([]SourceClip{}, sources...), Hours: ledgerHours, HourSourceSHA256: hourSHAs, Boundaries: append([]CrossHourBoundary{}, draft.Boundaries...), CrossDayBoundaries: append([]CrossDayBoundary{}, draft.CrossDayBoundaries...)}
 	digest, _, err := stitchcert.CanonicalSHA(ledger)
 	if err != nil {
 		return StreamDayAllocation{}, err
@@ -616,7 +621,7 @@ func CanonicalAllocationLedgerArtifact(ledger StreamDayAllocation) ([]byte, stri
 	logical := ledger
 	logical.LedgerSHA256 = ""
 	digest, _, err := stitchcert.CanonicalSHA(logical)
-	if err != nil || digest != want || !lowerHex64(want) || ledger.SchemaVersion != 1 || !safeBatchID.MatchString(ledger.BatchID) || ledger.Generation <= 0 || ledger.RecordingID <= 0 || !lowerHex64(ledger.QualificationSHA) || validateQualifiedLedgerDay(ledger.QualificationDay, ledger.RecordingID, ledger.Timezone, ledger.LocalDate) != nil || len(ledger.Hours) != 12 || len(ledger.HourSourceSHA256) != 12 || ledger.SourceClipCount != len(ledger.Sources) || ledger.SourceBytes < 0 || len(ledger.ConsecutivePairs) != max(0, len(ledger.Sources)-1) {
+	if err != nil || digest != want || !lowerHex64(want) || ledger.SchemaVersion != 1 || !safeBatchID.MatchString(ledger.BatchID) || ledger.Generation <= 0 || ledger.RecordingID <= 0 || !lowerHex64(ledger.QualificationSHA) || !lowerHex64(ledger.FrozenSourceSHA256) || validateQualifiedLedgerDay(ledger.QualificationDay, ledger.RecordingID, ledger.Timezone, ledger.LocalDate) != nil || len(ledger.Hours) != 12 || len(ledger.HourSourceSHA256) != 12 || ledger.SourceClipCount != len(ledger.Sources) || ledger.SourceBytes < 0 || len(ledger.ConsecutivePairs) != max(0, len(ledger.Sources)-1) {
 		return nil, "", fmt.Errorf("allocation ledger is not canonically sealed")
 	}
 	var sourceBytes int64
@@ -666,6 +671,10 @@ func CanonicalAllocationLedgerArtifact(ledger StreamDayAllocation) ([]byte, stri
 	if digest, _, err := sourceClaimSHA(ledger.Sources); err != nil || digest != ledger.SourceClaimSHA256 {
 		return nil, "", fmt.Errorf("allocation ledger source identity differs")
 	}
+	frozenDay, err := BuildFrozenDenominatorDayProjection(ledger.RecordingID, ledger.QualificationDay, ledger.QualificationSHA, FrozenSourceSnapshots(ledger.Sources))
+	if err != nil || frozenDay.FrozenSourceSHA256 != ledger.FrozenSourceSHA256 || frozenDay.SourceCount != ledger.SourceClipCount || frozenDay.SourceBytes != ledger.SourceBytes {
+		return nil, "", fmt.Errorf("allocation ledger frozen source identity differs")
+	}
 	artifactSHA, canonical, err := stitchcert.CanonicalSHA(ledger)
 	if err != nil || len(canonical) > MaxCanonicalJSONBytes {
 		return nil, "", fmt.Errorf("allocation ledger artifact exceeds canonical limit")
@@ -686,7 +695,7 @@ func CanonicalAllocationLedgerPaths(batchID string, recordingID int64, localDate
 
 func validateQualifiedLedgerDay(day QualifiedDay, recordingID int64, timezone, localDate string) error {
 	loc, err := time.LoadLocation(timezone)
-	if err != nil || recordingID <= 0 || day.LocalDate != localDate || day.JobID <= 0 || day.QualityTier != "good+" || day.CompletedAt.Before(day.WindowEnd) {
+	if err != nil || recordingID <= 0 || day.LocalDate != localDate || day.QualificationWindowOrdinal < 1 || day.QualificationWindowOrdinal > 14 || day.JobID <= 0 || day.CompletedAt.Before(day.WindowEnd) {
 		return fmt.Errorf("allocation ledger qualification differs")
 	}
 	start, end := day.WindowStart.In(loc), day.WindowEnd.In(loc)

@@ -18,22 +18,65 @@ const (
 	BatchIndexSchemaVersion            = 1
 	FrozenDenominatorProjectionVersion = 1
 	MaxCanonicalJSONBytes              = 16 << 20
+	OperatorApprovedSelectionBasis     = "operator_approved_ordered_cohort_v1"
 )
 
-// FrozenDenominatorLedgerProjection is the one compact identity projection
-// consumed in final-index ledger order. SourceClaimSHA256 already commits the
-// ledger's exact ordered source-only canonical projection.
-type FrozenDenominatorLedgerProjection struct {
-	RecordingID       int64  `json:"recording_id"`
-	LocalDate         string `json:"local_date"`
-	SourceClaimSHA256 string `json:"source_claim_sha256"`
-	SourceCount       int    `json:"source_count"`
-	SourceBytes       int64  `json:"source_bytes"`
+// FrozenSourceSnapshot is the stable pre-HEAD source identity frozen by the
+// atomic apply transaction.
+type FrozenSourceSnapshot struct {
+	ClipID         int64      `json:"clip_id"`
+	RecordingID    int64      `json:"recording_id"`
+	RecordingJobID int64      `json:"recording_job_id"`
+	Provider       string     `json:"provider"`
+	Endpoint       string     `json:"endpoint"`
+	Region         string     `json:"region"`
+	Bucket         string     `json:"bucket"`
+	ObjectKey      string     `json:"object_key"`
+	StartUTC       time.Time  `json:"start_utc"`
+	EndUTC         time.Time  `json:"end_utc"`
+	SizeBytes      int64      `json:"size_bytes"`
+	IngestSHA256   string     `json:"ingest_sha256"`
+	ReleasedAt     *time.Time `json:"released_at"`
+}
+
+// FrozenDenominatorDayProjection contains only facts available in the atomic
+// apply-time source snapshot. HEAD and publication facts are deliberately
+// excluded.
+type FrozenDenominatorDayProjection struct {
+	RecordingID         int64  `json:"recording_id"`
+	LocalDate           string `json:"local_date"`
+	QualificationSHA256 string `json:"qualification_sha256"`
+	FrozenSourceSHA256  string `json:"frozen_source_sha256"`
+	SourceCount         int    `json:"source_count"`
+	SourceBytes         int64  `json:"source_bytes"`
+}
+
+type FrozenDenominatorRecordingProjection struct {
+	RecordingID     int64     `json:"recording_id"`
+	PriorityOrdinal int       `json:"priority_ordinal"`
+	SelectionTier   string    `json:"selection_tier"`
+	CompletedAt     time.Time `json:"completed_at"`
 }
 
 type FrozenDenominatorProjection struct {
-	ProjectionVersion int                                 `json:"projection_version"`
-	Ledgers           []FrozenDenominatorLedgerProjection `json:"ledgers"`
+	ProjectionVersion  int                                    `json:"projection_version"`
+	SelectionAuthority SelectionAuthority                     `json:"selection_authority"`
+	Recordings         []FrozenDenominatorRecordingProjection `json:"recordings"`
+	Days               []FrozenDenominatorDayProjection       `json:"days"`
+}
+
+// SelectionAuthority is the single immutable operator-frozen cohort authority.
+// Qualification windows prove scheduling/completion; they do not carry grades.
+type SelectionAuthority struct {
+	SelectionBasis                     string    `json:"selection_basis"`
+	OrderedRecordingIDSHA256           string    `json:"ordered_recording_ids_sha256"`
+	Cutoff                             time.Time `json:"cutoff"`
+	QualificationRunID                 int64     `json:"qualification_run_id"`
+	QualificationRunFrozenAt           time.Time `json:"qualification_run_frozen_at"`
+	QualificationRuleVersion           string    `json:"qualification_rule_version"`
+	QualificationCohortSHA256          string    `json:"qualification_cohort_sha256"`
+	QualificationWindowsSHA256         string    `json:"qualification_windows_sha256"`
+	SelectedQualificationWindowsSHA256 string    `json:"selected_qualification_windows_sha256"`
 }
 
 type BatchIndexHour struct {
@@ -53,30 +96,41 @@ type BatchIndexHour struct {
 }
 
 type AllocationLedgerRef struct {
-	ArtifactID        int64    `json:"artifact_id"`
-	RecordingID       int64    `json:"recording_id"`
-	LocalDate         string   `json:"local_date"`
-	QualificationSHA  string   `json:"qualification_sha256"`
-	SourceClaimSHA256 string   `json:"source_claim_sha256"`
-	RelativePath      string   `json:"relative_path"`
-	ObjectKey         string   `json:"object_key"`
-	SizeBytes         int64    `json:"size_bytes"`
-	SHA256            string   `json:"sha256"`
-	LedgerSHA256      string   `json:"ledger_sha256"`
-	SourceCount       int      `json:"source_count"`
-	SourceBytes       int64    `json:"source_bytes"`
-	ScheduledHourIDs  []string `json:"scheduled_hour_ids"`
+	ArtifactID         int64    `json:"artifact_id"`
+	RecordingID        int64    `json:"recording_id"`
+	LocalDate          string   `json:"local_date"`
+	QualificationSHA   string   `json:"qualification_sha256"`
+	FrozenSourceSHA256 string   `json:"frozen_source_sha256"`
+	SourceClaimSHA256  string   `json:"source_claim_sha256"`
+	RelativePath       string   `json:"relative_path"`
+	ObjectKey          string   `json:"object_key"`
+	SizeBytes          int64    `json:"size_bytes"`
+	SHA256             string   `json:"sha256"`
+	LedgerSHA256       string   `json:"ledger_sha256"`
+	SourceCount        int      `json:"source_count"`
+	SourceBytes        int64    `json:"source_bytes"`
+	ScheduledHourIDs   []string `json:"scheduled_hour_ids"`
 }
 
 type FrozenRecording struct {
-	RecordingID       int64                    `json:"recording_id"`
-	PriorityOrdinal   int                      `json:"priority_ordinal"`
-	EligibilityTier   string                   `json:"eligibility_tier"`
-	EligibilityCutoff time.Time                `json:"eligibility_cutoff"`
-	CompletedAt       time.Time                `json:"completed_at"`
-	Timezone          string                   `json:"timezone"`
-	FolderName        string                   `json:"folder_name"`
-	NamingMetadata    recordingnaming.Metadata `json:"naming_metadata"`
+	RecordingID         int64                    `json:"recording_id"`
+	PriorityOrdinal     int                      `json:"priority_ordinal"`
+	SelectionTier       string                   `json:"selection_tier"`
+	QualificationSHA256 string                   `json:"qualification_sha256"`
+	CompletedAt         time.Time                `json:"completed_at"`
+	Timezone            string                   `json:"timezone"`
+	FolderName          string                   `json:"folder_name"`
+	NamingMetadata      recordingnaming.Metadata `json:"naming_metadata"`
+}
+
+func (recording *FrozenRecording) UnmarshalJSON(data []byte) error {
+	type wire FrozenRecording
+	var decoded wire
+	if err := decodeStrictJSON(data, &decoded); err != nil {
+		return fmt.Errorf("invalid frozen recording: %w", err)
+	}
+	*recording = FrozenRecording(decoded)
+	return nil
 }
 
 type BatchIndex struct {
@@ -90,7 +144,7 @@ type BatchIndex struct {
 	BatchGenerationSHA256     string                `json:"batch_generation_sha256"`
 	FrozenDenominatorSHA256   string                `json:"frozen_denominator_sha256"`
 	RecordingIDs              []int64               `json:"recording_ids"`
-	RecordingIDSHA256         string                `json:"recording_ids_sha256"`
+	SelectionAuthority        SelectionAuthority    `json:"selection_authority"`
 	FrozenRecordings          []FrozenRecording     `json:"frozen_recordings"`
 	MediaTool                 MediaToolEvidence     `json:"media_tool"`
 	ExpectedLedgerCount       int                   `json:"expected_ledger_count"`
@@ -104,6 +158,7 @@ type BatchIndex struct {
 
 type AllocationLedgerResolver func(AllocationLedgerRef) (StreamDayAllocation, error)
 type HourManifestResolver func(BatchIndexHour) (HourManifest, error)
+type SelectionEvidenceResolver func() (SelectionAuthority, []FrozenRecording, error)
 
 // BuildAllocationLedgerRef derives every caller-visible reference fact from
 // the exact canonical ledger artifact. Only its database artifact ID is
@@ -125,19 +180,20 @@ func BuildAllocationLedgerRef(artifactID int64, ledger StreamDayAllocation) (All
 		}
 	}
 	return AllocationLedgerRef{
-		ArtifactID:        artifactID,
-		RecordingID:       ledger.RecordingID,
-		LocalDate:         ledger.LocalDate,
-		QualificationSHA:  ledger.QualificationSHA,
-		SourceClaimSHA256: ledger.SourceClaimSHA256,
-		RelativePath:      relativePath,
-		ObjectKey:         objectKey,
-		SizeBytes:         int64(len(canonical)),
-		SHA256:            artifactSHA,
-		LedgerSHA256:      ledger.LedgerSHA256,
-		SourceCount:       ledger.SourceClipCount,
-		SourceBytes:       ledger.SourceBytes,
-		ScheduledHourIDs:  hourIDs,
+		ArtifactID:         artifactID,
+		RecordingID:        ledger.RecordingID,
+		LocalDate:          ledger.LocalDate,
+		QualificationSHA:   ledger.QualificationSHA,
+		FrozenSourceSHA256: ledger.FrozenSourceSHA256,
+		SourceClaimSHA256:  ledger.SourceClaimSHA256,
+		RelativePath:       relativePath,
+		ObjectKey:          objectKey,
+		SizeBytes:          int64(len(canonical)),
+		SHA256:             artifactSHA,
+		LedgerSHA256:       ledger.LedgerSHA256,
+		SourceCount:        ledger.SourceClipCount,
+		SourceBytes:        ledger.SourceBytes,
+		ScheduledHourIDs:   hourIDs,
 	}, nil
 }
 
@@ -187,9 +243,13 @@ func ValidateBatchIndexHour(ref BatchIndexHour, manifest HourManifest) error {
 	return nil
 }
 
-func BuildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
-	if resolveLedger == nil || resolveHour == nil {
-		return BatchIndex{}, nil, "", fmt.Errorf("canonical ledger and hour resolvers are required")
+func BuildBatchIndex(index BatchIndex, resolveSelection SelectionEvidenceResolver, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
+	if resolveSelection == nil || resolveLedger == nil || resolveHour == nil {
+		return BatchIndex{}, nil, "", fmt.Errorf("canonical selection, ledger, and hour resolvers are required")
+	}
+	wantAuthority, wantRecordings, err := resolveSelection()
+	if err != nil || !sameCanonical([]SelectionAuthority{index.SelectionAuthority}, []SelectionAuthority{wantAuthority}) || !sameCanonical(index.FrozenRecordings, wantRecordings) {
+		return BatchIndex{}, nil, "", fmt.Errorf("batch selection evidence differs from its frozen authority")
 	}
 	return buildBatchIndex(index, resolveLedger, resolveHour)
 }
@@ -198,8 +258,49 @@ func canonicalSealedBatchIndex(index BatchIndex) (BatchIndex, []byte, string, er
 	return buildBatchIndex(index, nil, nil)
 }
 
+// ValidateSelectionAuthority binds one operator-frozen cohort authority to its
+// exact ordered recording IDs.
+func ValidateSelectionAuthority(authority SelectionAuthority, recordingIDs []int64) error {
+	wantRecordingIDsSHA, err := RecordingIDsSHA256(recordingIDs)
+	if authority.SelectionBasis != OperatorApprovedSelectionBasis ||
+		err != nil || authority.OrderedRecordingIDSHA256 != wantRecordingIDsSHA ||
+		authority.Cutoff.IsZero() || authority.QualificationRunID <= 0 ||
+		authority.QualificationRunFrozenAt.IsZero() || authority.QualificationRunFrozenAt.After(authority.Cutoff) ||
+		strings.TrimSpace(authority.QualificationRuleVersion) != authority.QualificationRuleVersion ||
+		authority.QualificationRuleVersion == "" || len(authority.QualificationRuleVersion) > 128 ||
+		!lowerHex64(authority.QualificationCohortSHA256) || !lowerHex64(authority.QualificationWindowsSHA256) || !lowerHex64(authority.SelectedQualificationWindowsSHA256) {
+		return fmt.Errorf("selection authority differs")
+	}
+	return nil
+}
+
+// SelectedQualificationWindowsSHA256 hashes the ordered selected recording and
+// sealed 14-day qualification-window identities. The run-wide window hash is a
+// separate immutable authority fact.
+func SelectedQualificationWindowsSHA256(recordings []FrozenRecording) (string, error) {
+	if len(recordings) == 0 {
+		return "", fmt.Errorf("selected qualification evidence is empty")
+	}
+	evidence := make([]struct {
+		RecordingID         int64  `json:"recording_id"`
+		QualificationSHA256 string `json:"qualification_sha256"`
+	}, len(recordings))
+	seen := make(map[int64]bool, len(recordings))
+	for i, recording := range recordings {
+		if recording.RecordingID <= 0 || seen[recording.RecordingID] || recording.PriorityOrdinal != i+1 || recording.SelectionTier != "good+" || !lowerHex64(recording.QualificationSHA256) {
+			return "", fmt.Errorf("recording qualification evidence differs")
+		}
+		seen[recording.RecordingID] = true
+		evidence[i].RecordingID = recording.RecordingID
+		evidence[i].QualificationSHA256 = recording.QualificationSHA256
+	}
+	digest, _, err := stitchcert.CanonicalSHA(evidence)
+	return digest, err
+}
+
 func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
-	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || recordingIDsSHA(index.RecordingIDs) != index.RecordingIDSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
+	selectedWindowsSHA, windowsErr := SelectedQualificationWindowsSHA256(index.FrozenRecordings)
+	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || index.FrozenAt.Before(index.SelectionAuthority.Cutoff) || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || ValidateSelectionAuthority(index.SelectionAuthority, index.RecordingIDs) != nil || windowsErr != nil || selectedWindowsSHA != index.SelectionAuthority.SelectedQualificationWindowsSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index denominator differs")
 	}
 	seenRecording := map[int64]bool{}
@@ -212,7 +313,7 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 		frozen := index.FrozenRecordings[i]
 		folder, folderErr := recordingnaming.BuildFolderName(recordingnaming.ProfilePlazaHourlyV1, id, frozen.NamingMetadata, frozen.FolderName)
 		_, timezoneErr := time.LoadLocation(frozen.Timezone)
-		if frozen.RecordingID != id || frozen.PriorityOrdinal != i+1 || frozen.EligibilityTier != "good+" || frozen.EligibilityCutoff.IsZero() || frozen.CompletedAt.IsZero() || frozen.CompletedAt.After(frozen.EligibilityCutoff) || timezoneErr != nil || folderErr != nil || folder != frozen.FolderName {
+		if frozen.RecordingID != id || frozen.PriorityOrdinal != i+1 || frozen.SelectionTier != "good+" || !lowerHex64(frozen.QualificationSHA256) || frozen.CompletedAt.IsZero() || frozen.CompletedAt.After(index.SelectionAuthority.Cutoff) || timezoneErr != nil || folderErr != nil || folder != frozen.FolderName {
 			return BatchIndex{}, nil, "", fmt.Errorf("frozen recording metadata differs")
 		}
 		frozenRecordings[id] = frozen
@@ -232,7 +333,7 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 		}
 		previousDate = date
 		relative, objectKey, err := CanonicalAllocationLedgerPaths(index.BatchID, ledger.RecordingID, ledger.LocalDate)
-		if err != nil || !seenRecording[ledger.RecordingID] || ledger.ArtifactID <= 0 || seenArtifacts[ledger.ArtifactID] || ledger.RelativePath != relative || ledger.ObjectKey != objectKey || ledger.SizeBytes <= 0 || !lowerHex64(ledger.SHA256) || !lowerHex64(ledger.LedgerSHA256) || !lowerHex64(ledger.QualificationSHA) || !lowerHex64(ledger.SourceClaimSHA256) || ledger.SourceCount < 0 || ledger.SourceBytes < 0 || len(ledger.ScheduledHourIDs) != 12 {
+		if err != nil || !seenRecording[ledger.RecordingID] || ledger.QualificationSHA != frozenRecordings[ledger.RecordingID].QualificationSHA256 || ledger.ArtifactID <= 0 || seenArtifacts[ledger.ArtifactID] || ledger.RelativePath != relative || ledger.ObjectKey != objectKey || ledger.SizeBytes <= 0 || !lowerHex64(ledger.SHA256) || !lowerHex64(ledger.LedgerSHA256) || !lowerHex64(ledger.QualificationSHA) || !lowerHex64(ledger.FrozenSourceSHA256) || !lowerHex64(ledger.SourceClaimSHA256) || ledger.SourceCount < 0 || ledger.SourceBytes < 0 || len(ledger.ScheduledHourIDs) != 12 {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger differs")
 		}
 		seenArtifacts[ledger.ArtifactID] = true
@@ -254,11 +355,12 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 	var canonicalLedger StreamDayAllocation
 	var previousCanonicalLedger StreamDayAllocation
 	for hourIndex, hour := range index.Hours {
-		ledger := index.AllocationLedgers[hourIndex/12]
+		ledgerIndex := hourIndex / 12
+		ledger := index.AllocationLedgers[ledgerIndex]
 		if resolveHour != nil && hourIndex%12 == 0 {
 			var resolveErr error
 			nextLedger, resolveErr := resolveLedger(ledger)
-			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone {
+			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone || nextLedger.QualificationDay.QualificationWindowOrdinal != ledgerIndex%14+1 || nextLedger.QualificationDay.WindowStart.Before(index.SelectionAuthority.QualificationRunFrozenAt) || nextLedger.QualificationDay.CompletedAt.After(index.SelectionAuthority.Cutoff) {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
 			}
 			if previousCanonicalLedger.RecordingID == nextLedger.RecordingID && validateCrossDayLedgerLink(previousCanonicalLedger, nextLedger) != nil {
@@ -324,7 +426,7 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 	if len(expectedHours) != 0 || sourceCount != index.SourceClipCount || sourceBytes != index.SourceBytes || hourSources != sourceCount || hourBytes != sourceBytes || mediaCount != index.FinalMediaCount {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch proof root does not exactly account its denominator")
 	}
-	denominatorSHA, err := ComputeFrozenDenominatorSHA256(index.AllocationLedgers)
+	denominatorSHA, err := ComputeFrozenDenominatorSHA256(index.SelectionAuthority, index.FrozenRecordings, frozenDenominatorDays(index.AllocationLedgers))
 	if err != nil || denominatorSHA != index.FrozenDenominatorSHA256 {
 		return BatchIndex{}, nil, "", fmt.Errorf("frozen denominator evidence differs")
 	}
@@ -385,32 +487,105 @@ func validateCrossDayLedgerLink(previous, next StreamDayAllocation) error {
 	return nil
 }
 
-// ComputeFrozenDenominatorSHA256 hashes the exact ordered ledger-source
-// identity projection used by the backend and independently reproduced by the
-// NAS after validating each referenced ledger. The projection is bounded by
-// the fixed ledger denominator, not by the source-clip count.
-func ComputeFrozenDenominatorSHA256(ledgers []AllocationLedgerRef) (string, error) {
-	if len(ledgers) == 0 {
-		return "", fmt.Errorf("frozen denominator requires allocation ledgers")
+// FrozenSourceSnapshots projects exact preflight sources back to facts that
+// existed in the atomic apply-time snapshot. It deliberately omits later HEAD
+// observations, derived media facts, and artifact identities.
+func FrozenSourceSnapshots(sources []SourceClip) []FrozenSourceSnapshot {
+	snapshots := make([]FrozenSourceSnapshot, len(sources))
+	for i, source := range sources {
+		snapshots[i] = FrozenSourceSnapshot{
+			ClipID: source.ClipID, RecordingID: source.RecordingID, RecordingJobID: source.RecordingJobID,
+			Provider: source.Provider, Endpoint: source.Endpoint, Region: source.Region, Bucket: source.Bucket,
+			ObjectKey: source.Object.Key, StartUTC: source.StartUTC, EndUTC: source.EndUTC,
+			SizeBytes: source.Object.SizeBytes, IngestSHA256: source.Object.SHA256, ReleasedAt: source.ReleasedAt,
+		}
+	}
+	return snapshots
+}
+
+func BuildFrozenDenominatorDayProjection(recordingID int64, day QualifiedDay, qualificationSHA256 string, sources []FrozenSourceSnapshot) (FrozenDenominatorDayProjection, error) {
+	if recordingID <= 0 || !validLocalDate(day.LocalDate) || day.QualificationWindowOrdinal < 1 || day.QualificationWindowOrdinal > 14 || day.JobID <= 0 || !day.WindowEnd.After(day.WindowStart) || day.WindowEnd.Sub(day.WindowStart) != 12*time.Hour || day.CompletedAt.Before(day.WindowEnd) || !lowerHex64(qualificationSHA256) {
+		return FrozenDenominatorDayProjection{}, fmt.Errorf("frozen denominator day identity differs")
+	}
+	sources = append([]FrozenSourceSnapshot{}, sources...)
+	seen := make(map[int64]bool, len(sources))
+	type storageLocator struct{ Provider, Endpoint, Region, Bucket, ObjectKey string }
+	seenLocators := make(map[storageLocator]bool, len(sources))
+	var sourceBytes int64
+	for i, source := range sources {
+		_, endpointErr := CanonicalSourceEndpointAuthority(source.Endpoint)
+		locator := storageLocator{source.Provider, source.Endpoint, source.Region, source.Bucket, source.ObjectKey}
+		if source.ClipID <= 0 || seen[source.ClipID] || seenLocators[locator] || source.RecordingID != recordingID || source.RecordingJobID != day.JobID || !validFrozenSourceStorage(source.Provider, source.Region, source.Bucket) || endpointErr != nil || !safeObjectKey(source.ObjectKey) || !source.EndUTC.After(source.StartUTC) || source.EndUTC.Sub(source.StartUTC) > 15*time.Minute || !source.EndUTC.After(day.WindowStart) || !source.StartUTC.Before(day.WindowEnd) || (i > 0 && (source.StartUTC.Before(sources[i-1].StartUTC) || (source.StartUTC.Equal(sources[i-1].StartUTC) && source.ClipID <= sources[i-1].ClipID))) || source.SizeBytes <= 0 || !lowerHex64(source.IngestSHA256) || (source.ReleasedAt != nil && source.ReleasedAt.IsZero()) || source.SizeBytes > math.MaxInt64-sourceBytes {
+			return FrozenDenominatorDayProjection{}, fmt.Errorf("frozen denominator source %d differs", i+1)
+		}
+		seen[source.ClipID] = true
+		seenLocators[locator] = true
+		sourceBytes += source.SizeBytes
+	}
+	digest, _, err := stitchcert.CanonicalSHA(sources)
+	if err != nil {
+		return FrozenDenominatorDayProjection{}, err
+	}
+	return FrozenDenominatorDayProjection{recordingID, day.LocalDate, qualificationSHA256, digest, len(sources), sourceBytes}, nil
+}
+
+// ComputeFrozenDenominatorSHA256 hashes only the selection and exact facts
+// available in the atomic apply-time source snapshot. The 462 day digests keep
+// the top-level projection bounded while preserving every ordered source fact.
+func ComputeFrozenDenominatorSHA256(authority SelectionAuthority, recordings []FrozenRecording, days []FrozenDenominatorDayProjection) (string, error) {
+	recordingIDs, idsErr := orderedDayRecordingIDs(days)
+	selectedWindowsSHA, windowsErr := SelectedQualificationWindowsSHA256(recordings)
+	if idsErr != nil || ValidateSelectionAuthority(authority, recordingIDs) != nil || windowsErr != nil || selectedWindowsSHA != authority.SelectedQualificationWindowsSHA256 || len(recordings) != len(recordingIDs) {
+		return "", fmt.Errorf("frozen denominator requires 14 days per recording")
 	}
 	projection := FrozenDenominatorProjection{
-		ProjectionVersion: FrozenDenominatorProjectionVersion,
-		Ledgers:           make([]FrozenDenominatorLedgerProjection, len(ledgers)),
+		ProjectionVersion:  FrozenDenominatorProjectionVersion,
+		SelectionAuthority: authority,
+		Recordings:         make([]FrozenDenominatorRecordingProjection, len(recordings)),
+		Days:               append([]FrozenDenominatorDayProjection(nil), days...),
 	}
-	for i, ledger := range ledgers {
-		if ledger.RecordingID <= 0 || !validLocalDate(ledger.LocalDate) || !lowerHex64(ledger.SourceClaimSHA256) || ledger.SourceCount < 0 || ledger.SourceBytes < 0 {
-			return "", fmt.Errorf("frozen denominator ledger %d differs", i+1)
+	for i, recording := range recordings {
+		if recording.RecordingID != recordingIDs[i] || recording.PriorityOrdinal != i+1 || recording.SelectionTier != "good+" || !lowerHex64(recording.QualificationSHA256) || recording.CompletedAt.IsZero() || recording.CompletedAt.After(authority.Cutoff) {
+			return "", fmt.Errorf("frozen denominator recording %d differs", i+1)
 		}
-		projection.Ledgers[i] = FrozenDenominatorLedgerProjection{
-			RecordingID:       ledger.RecordingID,
-			LocalDate:         ledger.LocalDate,
-			SourceClaimSHA256: ledger.SourceClaimSHA256,
-			SourceCount:       ledger.SourceCount,
-			SourceBytes:       ledger.SourceBytes,
+		projection.Recordings[i] = FrozenDenominatorRecordingProjection{recording.RecordingID, recording.PriorityOrdinal, recording.SelectionTier, recording.CompletedAt}
+	}
+	var previousDate time.Time
+	for i, day := range days {
+		date, dateErr := time.Parse("2006-01-02", day.LocalDate)
+		if day.RecordingID != recordingIDs[i/14] || !validLocalDate(day.LocalDate) || day.QualificationSHA256 != recordings[i/14].QualificationSHA256 || !lowerHex64(day.FrozenSourceSHA256) || day.SourceCount < 0 || day.SourceBytes < 0 {
+			return "", fmt.Errorf("frozen denominator day %d differs", i+1)
 		}
+		if dateErr != nil || (i%14 > 0 && !date.Equal(previousDate.AddDate(0, 0, 1))) {
+			return "", fmt.Errorf("frozen denominator day order differs")
+		}
+		previousDate = date
 	}
 	digest, _, err := stitchcert.CanonicalSHA(projection)
 	return digest, err
+}
+
+func frozenDenominatorDays(ledgers []AllocationLedgerRef) []FrozenDenominatorDayProjection {
+	days := make([]FrozenDenominatorDayProjection, len(ledgers))
+	for i, ledger := range ledgers {
+		days[i] = FrozenDenominatorDayProjection{ledger.RecordingID, ledger.LocalDate, ledger.QualificationSHA, ledger.FrozenSourceSHA256, ledger.SourceCount, ledger.SourceBytes}
+	}
+	return days
+}
+
+func orderedDayRecordingIDs(days []FrozenDenominatorDayProjection) ([]int64, error) {
+	if len(days) == 0 || len(days)%14 != 0 {
+		return nil, fmt.Errorf("frozen denominator day cardinality differs")
+	}
+	ids := make([]int64, 0, len(days)/14)
+	for i, day := range days {
+		if i%14 == 0 {
+			ids = append(ids, day.RecordingID)
+		} else if day.RecordingID != ids[len(ids)-1] {
+			return nil, fmt.Errorf("frozen denominator day order differs")
+		}
+	}
+	return ids, nil
 }
 
 func validLocalDate(value string) bool {
@@ -433,21 +608,21 @@ func ComputeBatchGenerationSHA256(index BatchIndex) (string, error) {
 		ledgers[i] = ledgerEvidence{ledger.RecordingID, ledger.LocalDate, ledger.QualificationSHA, ledger.SourceClaimSHA256, ledger.LedgerSHA256, ledger.SourceCount, ledger.SourceBytes}
 	}
 	evidence := struct {
-		SchemaVersion           int               `json:"schema_version"`
-		PolicyVersion           string            `json:"policy_version"`
-		BatchID                 string            `json:"batch_id"`
-		Generation              int               `json:"generation"`
-		FrozenAt                time.Time         `json:"frozen_at"`
-		FrozenDenominatorSHA256 string            `json:"frozen_denominator_sha256"`
-		RecordingIDSHA256       string            `json:"recording_ids_sha256"`
-		FrozenRecordings        []FrozenRecording `json:"frozen_recordings"`
-		MediaToolIdentity       string            `json:"media_tool_identity"`
-		ExpectedLedgerCount     int               `json:"expected_ledger_count"`
-		ScheduledHourCount      int               `json:"scheduled_hour_count"`
-		SourceClipCount         int               `json:"source_clip_count"`
-		SourceBytes             int64             `json:"source_bytes"`
-		Ledgers                 []ledgerEvidence  `json:"ledgers"`
-	}{index.SchemaVersion, index.PolicyVersion, index.BatchID, index.Generation, index.FrozenAt, index.FrozenDenominatorSHA256, index.RecordingIDSHA256, index.FrozenRecordings, index.MediaTool.IdentitySHA256, index.ExpectedLedgerCount, index.ScheduledHourCount, index.SourceClipCount, index.SourceBytes, ledgers}
+		SchemaVersion           int                `json:"schema_version"`
+		PolicyVersion           string             `json:"policy_version"`
+		BatchID                 string             `json:"batch_id"`
+		Generation              int                `json:"generation"`
+		FrozenAt                time.Time          `json:"frozen_at"`
+		FrozenDenominatorSHA256 string             `json:"frozen_denominator_sha256"`
+		SelectionAuthority      SelectionAuthority `json:"selection_authority"`
+		FrozenRecordings        []FrozenRecording  `json:"frozen_recordings"`
+		MediaToolIdentity       string             `json:"media_tool_identity"`
+		ExpectedLedgerCount     int                `json:"expected_ledger_count"`
+		ScheduledHourCount      int                `json:"scheduled_hour_count"`
+		SourceClipCount         int                `json:"source_clip_count"`
+		SourceBytes             int64              `json:"source_bytes"`
+		Ledgers                 []ledgerEvidence   `json:"ledgers"`
+	}{index.SchemaVersion, index.PolicyVersion, index.BatchID, index.Generation, index.FrozenAt, index.FrozenDenominatorSHA256, index.SelectionAuthority, index.FrozenRecordings, index.MediaTool.IdentitySHA256, index.ExpectedLedgerCount, index.ScheduledHourCount, index.SourceClipCount, index.SourceBytes, ledgers}
 	digest, _, err := stitchcert.CanonicalSHA(evidence)
 	return digest, err
 }

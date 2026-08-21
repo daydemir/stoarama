@@ -42,6 +42,7 @@ type SourceClip struct {
 	Bucket         string                 `json:"bucket"`
 	StartUTC       time.Time              `json:"start_utc"`
 	EndUTC         time.Time              `json:"end_utc"`
+	ReleasedAt     *time.Time             `json:"released_at"`
 	Object         ObjectIdentity         `json:"object"`
 	AudioContract  *AudioSequenceContract `json:"audio_sequence_contract,omitempty"`
 	SeamToPrevious SeamEvidence           `json:"seam_to_previous,omitempty"`
