@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import importlib.util
 import io
@@ -147,37 +148,96 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 7)
             finally: os.close(directory_fd)
 
-    def test_exact_sidecar_stage_surviving_crash_is_atomically_published(self):
+    def test_crash_before_link_orphan_is_ignored_and_never_modified(self):
         item = pull.valid_joined_item(self.item())
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _, _part, marker = self.names(cfg, item)
             try:
                 expected = pull.joined_sidecar_bytes(item)
-                self.write_entry(directory_fd, marker + ".stage", expected)
-                with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                orphan = marker + ".stage-" + "a" * 32
+                self.write_entry(directory_fd, orphan, expected)
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(
+                    pull.os, "urandom", return_value=b"\xbb" * 16,
+                ):
                     pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
                     self.assertTrue(pull.verify_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event()))
-                self.assertIsNone(pull.joined_entry_stat(directory_fd, marker + ".stage"))
+                descriptor = os.open(orphan, os.O_RDONLY, dir_fd=directory_fd)
+                try: self.assertEqual(os.read(descriptor, len(expected) + 1), expected)
+                finally: os.close(descriptor)
                 self.assertEqual(pull.joined_entry_stat(directory_fd, marker).st_nlink, 1)
             finally: os.close(directory_fd)
 
-    def test_conflicting_sidecar_stage_surviving_crash_is_never_modified(self):
+    def test_enospc_stage_does_not_poison_restart(self):
         item = pull.valid_joined_item(self.item())
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _, _part, marker = self.names(cfg, item)
             try:
-                conflicting = b"short-crash-write"
-                self.write_entry(directory_fd, marker + ".stage", conflicting)
+                expected = pull.joined_sidecar_bytes(item)
+                orphan = marker + ".stage-" + "a" * 32
+                real_write, calls = os.write, 0
+                def fail_write(descriptor, content):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return real_write(descriptor, content[:7])
+                    raise OSError(errno.ENOSPC, "no space left")
+                with mock.patch.object(pull.os, "urandom", return_value=b"\xaa" * 16), mock.patch.object(
+                    pull.os, "write", side_effect=fail_write,
+                ), self.assertRaisesRegex(OSError, "no space left"):
+                    pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
+                descriptor = os.open(orphan, os.O_RDONLY, dir_fd=directory_fd)
+                try: self.assertEqual(os.read(descriptor, 8), expected[:7])
+                finally: os.close(descriptor)
+                self.assertIsNone(pull.joined_entry_stat(directory_fd, marker))
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(
+                    pull.os, "urandom", return_value=b"\xbb" * 16,
+                ):
+                    pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
+                descriptor = os.open(orphan, os.O_RDONLY, dir_fd=directory_fd)
+                try: self.assertEqual(os.read(descriptor, 8), expected[:7])
+                finally: os.close(descriptor)
+                self.assertEqual(pull.joined_entry_stat(directory_fd, marker).st_nlink, 1)
+            finally: os.close(directory_fd)
+
+    def test_restart_after_link_removes_only_proven_stage_link(self):
+        item = pull.valid_joined_item(self.item())
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _, _part, marker = self.names(cfg, item)
+            try:
+                expected = pull.joined_sidecar_bytes(item)
+                linked_stage = marker + ".stage-" + "a" * 32
+                unknown_stage = marker + ".stage-" + "b" * 32
+                self.write_entry(directory_fd, linked_stage, expected)
+                self.write_entry(directory_fd, unknown_stage, b"unknown")
+                os.link(linked_stage, marker, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                os.fsync(directory_fd)
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                    pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
+                self.assertIsNone(pull.joined_entry_stat(directory_fd, linked_stage))
+                descriptor = os.open(unknown_stage, os.O_RDONLY, dir_fd=directory_fd)
+                try: self.assertEqual(os.read(descriptor, 8), b"unknown")
+                finally: os.close(descriptor)
+                self.assertEqual(pull.joined_entry_stat(directory_fd, marker).st_nlink, 1)
+            finally: os.close(directory_fd)
+
+    def test_conflicting_marker_and_unknown_stage_are_never_modified(self):
+        item = pull.valid_joined_item(self.item())
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _, _part, marker = self.names(cfg, item)
+            try:
+                unknown_stage = marker + ".stage-" + "a" * 32
+                self.write_entry(directory_fd, marker, b"conflicting-marker")
+                self.write_entry(directory_fd, unknown_stage, b"unknown-stage")
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(
-                    pull.ExistingFileMismatch, "stage conflicts"
+                    pull.ExistingFileMismatch, "ownership marker conflicts"
                 ):
                     pull.publish_joined_sidecar(
                         cfg, runtime, directory_fd, marker, pull.joined_sidecar_bytes(item), threading.Event(),
                     )
-                descriptor = os.open(marker + ".stage", os.O_RDONLY, dir_fd=directory_fd)
-                try: self.assertEqual(os.read(descriptor, len(conflicting) + 1), conflicting)
-                finally: os.close(descriptor)
-                self.assertIsNone(pull.joined_entry_stat(directory_fd, marker))
+                for name, expected in ((marker, b"conflicting-marker"), (unknown_stage, b"unknown-stage")):
+                    descriptor = os.open(name, os.O_RDONLY, dir_fd=directory_fd)
+                    try: self.assertEqual(os.read(descriptor, len(expected) + 1), expected)
+                    finally: os.close(descriptor)
             finally: os.close(directory_fd)
 
     def test_crash_after_final_link_is_completed_without_overwrite(self):
