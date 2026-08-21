@@ -19,7 +19,7 @@ const (
 
 func testSource(id int64, start time.Time) SourceClip {
 	return SourceClip{
-		ClipID: id, RecordingID: 377, RecordingJobID: 9, Provider: "r2", Endpoint: testSourceEndpoint, Region: "auto", Bucket: "recordings", StartUTC: start, EndUTC: start.Add(time.Minute),
+		ClipID: id, RecordingID: 377, RecordingJobID: 9, StorageDestinationID: 7, Provider: "r2", Endpoint: testSourceEndpoint, Region: "auto", Bucket: "recordings", StartUTC: start, EndUTC: start.Add(time.Minute),
 		Object:         ObjectIdentity{Key: "raw/" + start.Format("150405") + ".mp4", ETag: "etag", SizeBytes: 10, SHA256: strings.Repeat("b", 64)},
 		SeamToPrevious: SeamEvidence{Verdict: "continuous", Reason: "packet_frame_audio_proof"},
 	}
@@ -159,6 +159,14 @@ func TestSourceClaimIgnoresDownloadedAudioAndSeamEvidence(t *testing.T) {
 	}
 	if err := ValidateSourceClaim([]SourceClip{source}, strings.Repeat("0", 64)); err == nil {
 		t.Fatal("mismatched canonical source claim validated")
+	}
+	source.StorageDestinationID++
+	if digest, _, err := CanonicalSourceClaim([]SourceClip{source}); err != nil || digest == want {
+		t.Fatalf("storage destination substitution did not change source identity: %s (%v)", digest, err)
+	}
+	source.StorageDestinationID = 0
+	if err := validatePreflightSource(source, source.RecordingID); err == nil {
+		t.Fatal("zero storage destination was accepted")
 	}
 }
 
