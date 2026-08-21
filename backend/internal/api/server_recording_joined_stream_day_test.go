@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -47,6 +49,220 @@ type joinedFreezeTransportStub struct {
 	etag string
 }
 
+type joinedHeadStep struct {
+	status int
+	etag   string
+	err    error
+}
+
+type joinedScriptedHeadTransport struct {
+	mu    sync.Mutex
+	steps []joinedHeadStep
+	calls int
+}
+
+func (s *joinedScriptedHeadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	index := s.calls
+	s.calls++
+	step := joinedHeadStep{status: http.StatusOK, etag: strings.Trim(req.Header.Get("If-Match"), `"`)}
+	if index < len(s.steps) {
+		step = s.steps[index]
+	}
+	s.mu.Unlock()
+	if step.err != nil {
+		return nil, step.err
+	}
+	if step.status == 0 {
+		step.status = http.StatusOK
+	}
+	if step.etag == "" {
+		step.etag = strings.Trim(req.Header.Get("If-Match"), `"`)
+	}
+	headers := make(http.Header)
+	headers.Set("ETag", `"`+step.etag+`"`)
+	headers.Set("Content-Length", "10")
+	headers.Set("x-amz-version-id", "source-version-one")
+	return &http.Response{StatusCode: step.status, Header: headers, ContentLength: 10,
+		Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+}
+
+func (s *joinedScriptedHeadTransport) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+type joinedConcurrentHeadTransport struct {
+	mu      sync.Mutex
+	active  int
+	maximum int
+	started chan struct{}
+	release chan struct{}
+}
+
+type joinedPairHeadTransport struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *joinedPairHeadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	index := s.calls
+	s.calls++
+	s.mu.Unlock()
+	s.started <- struct{}{}
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-s.release:
+	}
+	etag := "other"
+	if index == 0 {
+		etag = strings.Trim(req.Header.Get("If-Match"), `"`)
+	}
+	headers := make(http.Header)
+	headers.Set("ETag", `"`+etag+`"`)
+	headers.Set("Content-Length", "10")
+	headers.Set("x-amz-version-id", "source-version-one")
+	return &http.Response{StatusCode: http.StatusOK, Header: headers, ContentLength: 10,
+		Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+}
+
+func (s *joinedConcurrentHeadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	s.active++
+	if s.active > s.maximum {
+		s.maximum = s.active
+	}
+	s.mu.Unlock()
+	s.started <- struct{}{}
+	select {
+	case <-req.Context().Done():
+		s.mu.Lock()
+		s.active--
+		s.mu.Unlock()
+		return nil, req.Context().Err()
+	case <-s.release:
+	}
+	s.mu.Lock()
+	s.active--
+	s.mu.Unlock()
+	headers := make(http.Header)
+	headers.Set("ETag", req.Header.Get("If-Match"))
+	headers.Set("Content-Length", "10")
+	headers.Set("x-amz-version-id", "source-version-one")
+	return &http.Response{StatusCode: http.StatusOK, Header: headers, ContentLength: 10,
+		Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+}
+
+func joinedHeadTestSnapshot(ordinal int) joinedStreamDaySnapshot {
+	start := time.Date(2026, 8, 1, 12, ordinal, 0, 0, time.UTC)
+	return joinedStreamDaySnapshot{ID: int64(ordinal + 1), Source: joinedrecording.SourceClip{
+		ClipID: int64(ordinal + 1), RecordingID: 377, RecordingJobID: 1, StorageDestinationID: 1,
+		Provider: "r2", Endpoint: joinedTestSourceEndpoint, Region: "auto", Bucket: "clips",
+		StartUTC: start, EndUTC: start.Add(time.Minute), Object: joinedrecording.ObjectIdentity{
+			Key: "raw/source.mp4", ETag: "etag-one", SizeBytes: 10,
+			SHA256: strings.Repeat("a", 64)}}}
+}
+
+func TestJoinedStreamDayHEADRetriesOnlyTransientFailures(t *testing.T) {
+	snapshot := joinedHeadTestSnapshot(0)
+	store := &joinedFreezeStoreStub{bucket: "clips"}
+	wait := func(context.Context, time.Duration) error { return nil }
+	for _, test := range []struct {
+		name      string
+		steps     []joinedHeadStep
+		wantCalls int
+		wantOK    bool
+	}{
+		{name: "network recovers", steps: []joinedHeadStep{{err: io.ErrUnexpectedEOF}, {}}, wantCalls: 2, wantOK: true},
+		{name: "timeout recovers", steps: []joinedHeadStep{{err: context.DeadlineExceeded}, {}}, wantCalls: 2, wantOK: true},
+		{name: "429 recovers", steps: []joinedHeadStep{{status: http.StatusTooManyRequests}, {}}, wantCalls: 2, wantOK: true},
+		{name: "500 recovers", steps: []joinedHeadStep{{status: http.StatusInternalServerError}, {}}, wantCalls: 2, wantOK: true},
+		{name: "transient exhausts", steps: []joinedHeadStep{{status: http.StatusServiceUnavailable},
+			{status: http.StatusServiceUnavailable}, {status: http.StatusServiceUnavailable}}, wantCalls: 3},
+		{name: "redirect denied", steps: []joinedHeadStep{{status: http.StatusTemporaryRedirect}}, wantCalls: 1},
+		{name: "other 4xx denied", steps: []joinedHeadStep{{status: http.StatusForbidden}}, wantCalls: 1},
+		{name: "non HTTP status class denied", steps: []joinedHeadStep{{status: 600}}, wantCalls: 1},
+		{name: "identity drift denied", steps: []joinedHeadStep{{status: http.StatusOK, etag: "other"}}, wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			transport := &joinedScriptedHeadTransport{steps: test.steps}
+			s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport}
+			s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
+			_, err := s.headJoinedStreamDaySourceRetry(context.Background(), store, snapshot, wait)
+			if (err == nil) != test.wantOK || transport.count() != test.wantCalls {
+				t.Fatalf("error=%v calls=%d want_ok=%v want_calls=%d", err, transport.count(), test.wantOK, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestJoinedStreamDayHEADCancellationStopsBackoff(t *testing.T) {
+	transport := &joinedScriptedHeadTransport{steps: []joinedHeadStep{{status: http.StatusTooManyRequests}, {}}}
+	s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport,
+		joinedFreezeSourceStore: &joinedFreezeStoreStub{bucket: "clips"}}
+	s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := false
+	wait := func(waitCtx context.Context, _ time.Duration) error {
+		waited = true
+		cancel()
+		<-waitCtx.Done()
+		return waitCtx.Err()
+	}
+	_, err := s.headJoinedStreamDaySourceRetry(ctx, &joinedFreezeStoreStub{bucket: "clips"},
+		joinedHeadTestSnapshot(0), wait)
+	if !waited || !errors.Is(err, context.Canceled) || transport.count() != 1 {
+		t.Fatalf("waited=%v error=%v calls=%d", waited, err, transport.count())
+	}
+}
+
+func TestJoinedStreamDayHEADConcurrencyIsCappedAtFour(t *testing.T) {
+	transport := &joinedConcurrentHeadTransport{started: make(chan struct{}, 9), release: make(chan struct{})}
+	s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport,
+		joinedFreezeSourceStore: &joinedFreezeStoreStub{bucket: "clips"}}
+	s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
+	plan := joinedStreamDayPlan{Sources: make([]joinedStreamDaySnapshot, 9)}
+	for i := range plan.Sources {
+		plan.Sources[i] = joinedHeadTestSnapshot(i)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.headJoinedStreamDaySources(context.Background(), plan)
+		done <- err
+	}()
+	for i := 0; i < joinedStreamDayHeadConcurrency; i++ {
+		<-transport.started
+	}
+	transport.mu.Lock()
+	active, maximum := transport.active, transport.maximum
+	transport.mu.Unlock()
+	if active != joinedStreamDayHeadConcurrency || maximum != joinedStreamDayHeadConcurrency {
+		t.Fatalf("active=%d maximum=%d", active, maximum)
+	}
+	close(transport.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	transport.mu.Lock()
+	maximum = transport.maximum
+	transport.mu.Unlock()
+	if maximum > joinedStreamDayHeadConcurrency {
+		t.Fatalf("maximum concurrent HEADs=%d", maximum)
+	}
+}
+
+func TestJoinedStreamDayGapOnlyNeedsNoObjectStore(t *testing.T) {
+	observations, err := (&Server{}).headJoinedStreamDaySources(context.Background(), joinedStreamDayPlan{})
+	if err != nil || observations == nil || len(observations) != 0 {
+		t.Fatalf("observations=%v error=%v", observations, err)
+	}
+}
+
 func (s *joinedFreezeTransportStub) RoundTrip(req *http.Request) (*http.Response, error) {
 	s.mu.Lock()
 	etag := s.etag
@@ -57,12 +273,6 @@ func (s *joinedFreezeTransportStub) RoundTrip(req *http.Request) (*http.Response
 	headers.Set("x-amz-version-id", "source-version-one")
 	return &http.Response{StatusCode: http.StatusOK, Header: headers, ContentLength: 10,
 		Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
-}
-
-func (s *joinedFreezeTransportStub) setETag(etag string) {
-	s.mu.Lock()
-	s.etag = etag
-	s.mu.Unlock()
 }
 
 func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
@@ -139,8 +349,24 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 			state, hours, sources, boundaries, ledgers, err)
 	}
 
-	transport.setETag("etag-one")
-	sealed := call(true)
+	pair := &joinedPairHeadTransport{started: make(chan struct{}, 2), release: make(chan struct{})}
+	fixture.s.joinedFreezeTransport = pair
+	concurrentResults := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
+		go func() { concurrentResults <- call(true) }()
+	}
+	<-pair.started
+	<-pair.started
+	close(pair.release)
+	first, second := <-concurrentResults, <-concurrentResults
+	sealed, rejected := first, second
+	if sealed.Code != http.StatusOK {
+		sealed, rejected = second, first
+	}
+	if sealed.Code != http.StatusOK || rejected.Code != http.StatusConflict {
+		t.Fatalf("concurrent differing retry statuses=%d,%d bodies=%s / %s", first.Code, second.Code,
+			first.Body.String(), second.Body.String())
+	}
 	var response joinedSealStreamDayResponse
 	if sealed.Code != http.StatusOK || json.Unmarshal(sealed.Body.Bytes(), &response) != nil || response.AlreadySealed ||
 		response.SourceCount != 1 || response.SourceBytes != 10 || response.LedgerArtifactID <= 0 {
@@ -166,6 +392,55 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 	}
 	if store.count() != headsBeforeReplay {
 		t.Fatal("exact sealed retry repeated source HEAD")
+	}
+	gapRequest := joinedSealStreamDayRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		BatchID: req.BatchID, RecordingID: joinedrecording.Tier1RecordingIDs[0], LocalDate: "2026-08-02"}
+	gapBody, _ := json.Marshal(gapRequest)
+	gapHTTP := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/stream-days/seal", bytes.NewReader(gapBody))
+	gapHTTP.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
+	gapRecorder := httptest.NewRecorder()
+	fixture.s.requireAdminAuth(http.HandlerFunc(fixture.s.handleAdminJoinedSealStreamDay)).ServeHTTP(gapRecorder, gapHTTP)
+	var gapResponse joinedSealStreamDayResponse
+	if gapRecorder.Code != http.StatusOK || json.Unmarshal(gapRecorder.Body.Bytes(), &gapResponse) != nil ||
+		gapResponse.SourceCount != 0 || gapResponse.SourceBytes != 0 || store.count() != headsBeforeReplay {
+		t.Fatalf("gap-only seal status=%d heads=%d body=%s", gapRecorder.Code, store.count(), gapRecorder.Body.String())
+	}
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT d.state,
+		(SELECT count(*) FROM recording_joined_hours h WHERE h.stream_day_id=d.id),
+		(SELECT count(*) FROM recording_joined_sources s WHERE s.stream_day_id=d.id),
+		(SELECT count(*) FROM recording_joined_day_boundaries b WHERE b.stream_day_id=d.id)
+		FROM recording_joined_stream_days d WHERE d.batch_id=$1 AND d.recording_id=$2 AND d.local_date=$3`,
+		gapRequest.BatchID, gapRequest.RecordingID, gapRequest.LocalDate).Scan(&state, &hours, &sources, &boundaries); err != nil ||
+		state != "sealed" || hours != 12 || sources != 0 || boundaries != 13 {
+		t.Fatalf("gap-only state=%s hours=%d sources=%d boundaries=%d err=%v", state, hours, sources, boundaries, err)
+	}
+	identicalRequest := gapRequest
+	identicalRequest.LocalDate = "2026-08-03"
+	identicalBody, _ := json.Marshal(identicalRequest)
+	start := make(chan struct{})
+	identicalResults := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/stream-days/seal",
+				bytes.NewReader(identicalBody))
+			httpReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
+			recorder := httptest.NewRecorder()
+			fixture.s.requireAdminAuth(http.HandlerFunc(fixture.s.handleAdminJoinedSealStreamDay)).ServeHTTP(recorder, httpReq)
+			identicalResults <- recorder
+		}()
+	}
+	close(start)
+	identicalFirst, identicalSecond := <-identicalResults, <-identicalResults
+	var firstIdentity, secondIdentity joinedSealStreamDayResponse
+	if identicalFirst.Code != http.StatusOK || identicalSecond.Code != http.StatusOK ||
+		json.Unmarshal(identicalFirst.Body.Bytes(), &firstIdentity) != nil ||
+		json.Unmarshal(identicalSecond.Body.Bytes(), &secondIdentity) != nil ||
+		firstIdentity.SealRequestSHA != secondIdentity.SealRequestSHA ||
+		firstIdentity.LedgerArtifactID != secondIdentity.LedgerArtifactID ||
+		firstIdentity.AlreadySealed == secondIdentity.AlreadySealed {
+		t.Fatalf("concurrent identical retries first=%d %s second=%d %s", identicalFirst.Code,
+			identicalFirst.Body.String(), identicalSecond.Code, identicalSecond.Body.String())
 	}
 	t.Log("JOINED_STREAM_DAY_HEAD_SEAL_EXECUTED")
 }

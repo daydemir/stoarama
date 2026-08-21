@@ -22,8 +22,12 @@ import (
 
 const (
 	joinedStreamDayHeadConcurrency = 4
-	joinedStreamDayHeadTimeout     = 30 * time.Second
+	joinedStreamDayHeadAttempts    = 3
+	joinedStreamDayHeadTimeout     = 8 * time.Second
+	joinedStreamDayHeadTotal       = 25 * time.Second
 	joinedStreamDayHeadTTL         = 2 * time.Minute
+	joinedStreamDayHeadBackoff1    = 100 * time.Millisecond
+	joinedStreamDayHeadBackoff2    = 250 * time.Millisecond
 )
 
 type joinedFreezeSourceObjectStore interface {
@@ -268,11 +272,16 @@ func joinedStreamDaySourceClips(snapshots []joinedStreamDaySnapshot) []joinedrec
 }
 
 func (s *Server) headJoinedStreamDaySources(ctx context.Context, plan joinedStreamDayPlan) ([]joinedStreamDayHeadObservation, error) {
+	if len(plan.Sources) == 0 {
+		return []joinedStreamDayHeadObservation{}, nil
+	}
 	store := s.joinedFreezeStore()
 	if store == nil || store.Bucket() != s.cfg.R2Bucket {
 		return nil, errors.New("joined source storage is unavailable")
 	}
 	observations := make([]joinedStreamDayHeadObservation, len(plan.Sources))
+	ctx, timeout := context.WithTimeout(ctx, joinedStreamDayHeadTotal)
+	defer timeout()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	semaphore := make(chan struct{}, joinedStreamDayHeadConcurrency)
@@ -312,14 +321,55 @@ func (s *Server) headJoinedStreamDaySources(ctx context.Context, plan joinedStre
 
 func (s *Server) headJoinedStreamDaySource(ctx context.Context, store joinedFreezeSourceObjectStore,
 	snapshot joinedStreamDaySnapshot) (joinedStreamDayHeadObservation, error) {
+	return s.headJoinedStreamDaySourceRetry(ctx, store, snapshot, waitJoinedStreamDayHeadRetry)
+}
+
+func waitJoinedStreamDayHeadRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *Server) headJoinedStreamDaySourceRetry(ctx context.Context, store joinedFreezeSourceObjectStore,
+	snapshot joinedStreamDaySnapshot, wait func(context.Context, time.Duration) error) (joinedStreamDayHeadObservation, error) {
+	retryCtx, cancel := context.WithTimeout(ctx, joinedStreamDayHeadTotal)
+	defer cancel()
+	var lastErr error
+	for attempt := 0; attempt < joinedStreamDayHeadAttempts; attempt++ {
+		observation, retry, err := s.headJoinedStreamDaySourceAttempt(retryCtx, store, snapshot)
+		if err == nil {
+			return observation, nil
+		}
+		lastErr = err
+		if !retry || attempt == joinedStreamDayHeadAttempts-1 {
+			return joinedStreamDayHeadObservation{}, err
+		}
+		delay := joinedStreamDayHeadBackoff2
+		if attempt == 0 {
+			delay = joinedStreamDayHeadBackoff1
+		}
+		if err := wait(retryCtx, delay); err != nil {
+			return joinedStreamDayHeadObservation{}, err
+		}
+	}
+	return joinedStreamDayHeadObservation{}, lastErr
+}
+
+func (s *Server) headJoinedStreamDaySourceAttempt(ctx context.Context, store joinedFreezeSourceObjectStore,
+	snapshot joinedStreamDaySnapshot) (joinedStreamDayHeadObservation, bool, error) {
 	source := snapshot.Source
 	if source.Provider != "r2" || source.Endpoint != s.cfg.R2Endpoint || source.Region != s.cfg.R2Region ||
 		source.Bucket != s.cfg.R2Bucket {
-		return joinedStreamDayHeadObservation{}, errors.New("joined source storage coordinates differ")
+		return joinedStreamDayHeadObservation{}, false, errors.New("joined source storage coordinates differ")
 	}
 	capability, err := store.PresignHeadExactRequest(ctx, source.Object.Key, source.Object.ETag, "", joinedStreamDayHeadTTL)
 	if err != nil {
-		return joinedStreamDayHeadObservation{}, fmt.Errorf("presign joined source HEAD: %w", err)
+		return joinedStreamDayHeadObservation{}, false, fmt.Errorf("presign joined source HEAD: %w", err)
 	}
 	parsed, err := url.Parse(capability.URL)
 	endpoint, endpointErr := url.Parse(source.Endpoint)
@@ -327,13 +377,13 @@ func (s *Server) headJoinedStreamDaySource(ctx context.Context, store joinedFree
 	if err != nil || endpointErr != nil || capability.Method != http.MethodHead || parsed.Scheme != "https" ||
 		parsed.Scheme != endpoint.Scheme || parsed.Host != endpoint.Host || parsed.EscapedPath() != expectedPath ||
 		capability.Headers.Get("If-Match") != `"`+source.Object.ETag+`"` {
-		return joinedStreamDayHeadObservation{}, errors.New("joined source HEAD capability differs")
+		return joinedStreamDayHeadObservation{}, false, errors.New("joined source HEAD capability differs")
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, joinedStreamDayHeadTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodHead, capability.URL, nil)
 	if err != nil {
-		return joinedStreamDayHeadObservation{}, err
+		return joinedStreamDayHeadObservation{}, false, err
 	}
 	request.Header = capability.Headers.Clone()
 	transport := s.joinedFreezeTransport
@@ -345,32 +395,37 @@ func (s *Server) headJoinedStreamDaySource(ctx context.Context, store joinedFree
 	}}
 	response, err := client.Do(request)
 	if err != nil {
-		return joinedStreamDayHeadObservation{}, fmt.Errorf("HEAD joined source: %w", err)
+		if ctx.Err() != nil {
+			return joinedStreamDayHeadObservation{}, false, ctx.Err()
+		}
+		return joinedStreamDayHeadObservation{}, true, fmt.Errorf("HEAD joined source: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return joinedStreamDayHeadObservation{}, fmt.Errorf("HEAD joined source status %d", response.StatusCode)
+		retry := response.StatusCode == http.StatusTooManyRequests ||
+			(response.StatusCode >= 500 && response.StatusCode <= 599)
+		return joinedStreamDayHeadObservation{}, retry, fmt.Errorf("HEAD joined source status %d", response.StatusCode)
 	}
 	etag := strings.TrimSpace(response.Header.Get("ETag"))
 	if strings.HasPrefix(etag, "W/") || len(etag) < 2 || etag[0] != '"' || etag[len(etag)-1] != '"' {
-		return joinedStreamDayHeadObservation{}, errors.New("joined source HEAD ETag differs")
+		return joinedStreamDayHeadObservation{}, false, errors.New("joined source HEAD ETag differs")
 	}
 	etag = etag[1 : len(etag)-1]
 	size := response.ContentLength
 	if size < 0 {
 		size, err = strconv.ParseInt(response.Header.Get("Content-Length"), 10, 64)
 		if err != nil {
-			return joinedStreamDayHeadObservation{}, errors.New("joined source HEAD size is missing")
+			return joinedStreamDayHeadObservation{}, false, errors.New("joined source HEAD size is missing")
 		}
 	}
 	if etag != source.Object.ETag || size != source.Object.SizeBytes {
-		return joinedStreamDayHeadObservation{}, errors.New("joined source HEAD identity drifted")
+		return joinedStreamDayHeadObservation{}, false, errors.New("joined source HEAD identity drifted")
 	}
 	return joinedStreamDayHeadObservation{SourceSnapshotID: snapshot.ID, ClipID: source.ClipID,
 		StorageDestinationID: source.StorageDestinationID, Provider: source.Provider, Endpoint: source.Endpoint,
 		Region: source.Region, Bucket: source.Bucket, ObjectKey: source.Object.Key,
 		VersionID: strings.TrimSpace(response.Header.Get("x-amz-version-id")), ETag: etag,
-		SizeBytes: size, SHA256: source.Object.SHA256, StartUTC: source.StartUTC, EndUTC: source.EndUTC}, nil
+		SizeBytes: size, SHA256: source.Object.SHA256, StartUTC: source.StartUTC, EndUTC: source.EndUTC}, false, nil
 }
 
 func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDayRequest, loaded joinedStreamDayPlan,
