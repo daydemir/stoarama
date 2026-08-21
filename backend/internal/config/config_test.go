@@ -69,6 +69,27 @@ func TestValidateStripeFailsClosed(t *testing.T) {
 	}
 }
 
+func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T) {
+	if err := (Config{}).ValidateJoined(); err != nil {
+		t.Fatalf("dormant unconfigured joined release: %v", err)
+	}
+	valid := Config{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "bootstrap", JoinedWorkerSigningKey: "signing"}
+	if err := valid.ValidateJoined(); err != nil {
+		t.Fatalf("valid joined credentials: %v", err)
+	}
+	for _, cfg := range []Config{
+		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "", JoinedWorkerSigningKey: "signing"},
+		{JoinedRecordingEnabled: true, ServiceToken: "same", JoinedWorkerBootstrapToken: "same", JoinedWorkerSigningKey: "signing"},
+		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "same", JoinedWorkerSigningKey: "same"},
+		{JoinedRecordingEnabled: true, DatabaseURL: "same", JoinedWorkerBootstrapToken: "bootstrap", JoinedWorkerSigningKey: "same"},
+		{JoinedRecordingEnabled: true, R2SecretAccessKey: "same", JoinedWorkerBootstrapToken: "same", JoinedWorkerSigningKey: "signing"},
+	} {
+		if err := cfg.ValidateJoined(); err == nil {
+			t.Fatalf("unsafe joined credential configuration accepted: %+v", cfg)
+		}
+	}
+}
+
 func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 	renderPath := filepath.Join("..", "..", "..", "render.yaml")
 	data, err := os.ReadFile(renderPath)
