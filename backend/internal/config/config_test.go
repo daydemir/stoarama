@@ -116,6 +116,7 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 		"JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256",
 		"JOINED_RECORDING_FFMPEG_BINARY_SHA256",
 		"JOINED_RECORDING_FFPROBE_BINARY_SHA256",
+		"STOARAMA_JOINED_WORKER_TOKEN",
 	} {
 		t.Setenv(key, "")
 	}
@@ -145,6 +146,7 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 		JoinedRecordingFFmpegArchiveSHA256: strings.Repeat("a", 64),
 		JoinedRecordingFFmpegSHA256:        strings.Repeat("b", 64),
 		JoinedRecordingFFprobeSHA256:       strings.Repeat("c", 64),
+		JoinedRecordingWorkerToken:         "joined-bootstrap-test-token",
 	}
 	if err := valid.ValidateJoinedRecording(); err != nil {
 		t.Fatal(err)
@@ -165,6 +167,11 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 	latest.JoinedRecordingFFmpegArchiveURL = "https://example.com/ffmpeg/latest/linux64.tar.xz"
 	if err := latest.ValidateJoinedRecording(); err == nil {
 		t.Fatal("mutable latest archive URL was accepted")
+	}
+	missingBootstrap := valid
+	missingBootstrap.JoinedRecordingWorkerToken = ""
+	if err := missingBootstrap.ValidateJoinedRecording(); err == nil || !strings.Contains(err.Error(), "STOARAMA_JOINED_WORKER_TOKEN") {
+		t.Fatalf("missing bootstrap error=%v", err)
 	}
 }
 
@@ -191,12 +198,13 @@ func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 		"key: JOINED_RECORDING_ROLLING_ENABLED\n        value: \"false\"",
 		"key: FFMPEG_BIN\n        value: ./bin/ffmpeg",
 		"key: FFPROBE_BIN\n        value: ./bin/ffprobe",
+		"key: STOARAMA_JOINED_WORKER_TOKEN\n        sync: false",
 	} {
 		if !strings.Contains(section, required) {
 			t.Fatalf("joined worker missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"DATABASE_URL", "R2_", "STORAGE_CRED_KEY"} {
+	for _, forbidden := range []string{"DATABASE_URL", "R2_", "STORAGE_CRED_KEY", "SERVICE_TOKEN", "JOINED_WORKER_SIGNING_KEY", "JOINED_WORKER_BOOTSTRAP_TOKEN"} {
 		if strings.Contains(section, forbidden) {
 			t.Fatalf("joined worker contains privileged setting %q", forbidden)
 		}

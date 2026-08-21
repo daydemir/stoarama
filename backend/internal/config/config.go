@@ -144,6 +144,7 @@ type Config struct {
 	JoinedRecordingFFmpegArchiveSHA256 string
 	JoinedRecordingFFmpegSHA256        string
 	JoinedRecordingFFprobeSHA256       string
+	JoinedRecordingWorkerToken         string
 
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
 	// control service alongside the scheduler). Empty/disabled by default.
@@ -274,6 +275,7 @@ func Load() (Config, error) {
 		JoinedRecordingFFmpegArchiveSHA256:    strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256")),
 		JoinedRecordingFFmpegSHA256:           strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_BINARY_SHA256")),
 		JoinedRecordingFFprobeSHA256:          strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFPROBE_BINARY_SHA256")),
+		JoinedRecordingWorkerToken:            strings.TrimSpace(os.Getenv("STOARAMA_JOINED_WORKER_TOKEN")),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
@@ -485,6 +487,9 @@ func (c Config) ValidateJoinedRecording() error {
 		if !validLowerSHA256(item.value) {
 			return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", item.name)
 		}
+	}
+	if c.JoinedRecordingWorkerToken == "" {
+		return fmt.Errorf("STOARAMA_JOINED_WORKER_TOKEN is required when joined recording is enabled")
 	}
 	return nil
 }

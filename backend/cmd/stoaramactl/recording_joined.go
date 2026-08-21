@@ -19,10 +19,10 @@ import (
 )
 
 type joinedFreezeTier1Request struct {
-	ConnectionID           int64  `json:"connection_id"`
-	BatchID                string `json:"batch_id"`
-	ExpectedManifestSHA256 string `json:"expected_manifest_sha256,omitempty"`
-	Apply                  bool   `json:"apply"`
+	ConnectionID                    int64  `json:"connection_id"`
+	BatchID                         string `json:"batch_id"`
+	ExpectedFrozenDenominatorSHA256 string `json:"expected_frozen_denominator_sha256,omitempty"`
+	Apply                           bool   `json:"apply"`
 }
 
 type joinedWorkerRequest struct {
@@ -36,9 +36,9 @@ type joinedStatusRequest struct {
 }
 
 type joinedFinalizeIndexRequest struct {
-	BatchID                string `json:"batch_id"`
-	ExpectedManifestSHA256 string `json:"expected_manifest_sha256,omitempty"`
-	Apply                  bool   `json:"apply"`
+	BatchID                       string `json:"batch_id"`
+	ExpectedFinalBatchIndexSHA256 string `json:"expected_final_batch_index_sha256,omitempty"`
+	Apply                         bool   `json:"apply"`
 }
 
 // joinedOperatorService is the narrow boundary between operator parsing and
@@ -174,7 +174,7 @@ func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1
 	flags := newJoinedFlagSet("recording-joined freeze-tier1")
 	flags.Int64Var(&req.ConnectionID, "connection-id", 0, "NAS connection identifier")
 	flags.StringVar(&req.BatchID, "batch-id", cfg.JoinedRecordingBatchID, "immutable batch identifier")
-	flags.StringVar(&req.ExpectedManifestSHA256, "expected-manifest-sha256", "", "expected cohort manifest hash")
+	flags.StringVar(&req.ExpectedFrozenDenominatorSHA256, "expected-frozen-denominator-sha256", "", "expected frozen denominator hash")
 	flags.BoolVar(&req.Apply, "apply", false, "freeze the cohort")
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
@@ -185,7 +185,7 @@ func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1
 	if err := validateJoinedBatchID(req.BatchID); err != nil {
 		return req, err
 	}
-	if err := validateExpectedHash(req.ExpectedManifestSHA256, req.Apply); err != nil {
+	if err := validateExpectedHash("--expected-frozen-denominator-sha256", req.ExpectedFrozenDenominatorSHA256, req.Apply); err != nil {
 		return req, err
 	}
 	return req, nil
@@ -232,7 +232,7 @@ func parseJoinedFinalizeIndex(cfg config.Config, args []string) (joinedFinalizeI
 	req := joinedFinalizeIndexRequest{BatchID: cfg.JoinedRecordingBatchID}
 	flags := newJoinedFlagSet("recording-joined finalize-index")
 	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
-	flags.StringVar(&req.ExpectedManifestSHA256, "expected-manifest-sha256", "", "expected batch-index hash")
+	flags.StringVar(&req.ExpectedFinalBatchIndexSHA256, "expected-final-batch-index-sha256", "", "expected final batch-index hash")
 	flags.BoolVar(&req.Apply, "apply", false, "publish the batch index")
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
@@ -240,7 +240,7 @@ func parseJoinedFinalizeIndex(cfg config.Config, args []string) (joinedFinalizeI
 	if err := validateJoinedBatchID(req.BatchID); err != nil {
 		return req, err
 	}
-	if err := validateExpectedHash(req.ExpectedManifestSHA256, req.Apply); err != nil {
+	if err := validateExpectedHash("--expected-final-batch-index-sha256", req.ExpectedFinalBatchIndexSHA256, req.Apply); err != nil {
 		return req, err
 	}
 	return req, nil
@@ -274,13 +274,13 @@ func validateJoinedBatchID(value string) error {
 	return nil
 }
 
-func validateExpectedHash(value string, required bool) error {
+func validateExpectedHash(flagName, value string, required bool) error {
 	if value == "" && !required {
 		return nil
 	}
 	decoded, err := hex.DecodeString(value)
 	if err != nil || len(decoded) != sha256.Size || value != strings.ToLower(value) {
-		return errors.New("--expected-manifest-sha256 must be a lowercase SHA-256 hex digest")
+		return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", flagName)
 	}
 	return nil
 }

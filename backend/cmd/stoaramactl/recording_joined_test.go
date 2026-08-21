@@ -31,6 +31,7 @@ func validJoinedWorkerConfig() config.Config {
 		JoinedRecordingFFmpegArchiveSHA256: strings.Repeat("a", 64),
 		JoinedRecordingFFmpegSHA256:        strings.Repeat("b", 64),
 		JoinedRecordingFFprobeSHA256:       strings.Repeat("c", 64),
+		JoinedRecordingWorkerToken:         "joined-bootstrap-test-token",
 	}
 }
 
@@ -162,12 +163,28 @@ func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
 		t.Fatal("invalid request reached factory")
 		return nil, nil
 	}
-	for _, args := range [][]string{
-		{"freeze-tier1", "--connection-id", "44", "--apply"},
-		{"finalize-index", "--apply"},
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"freeze-tier1", "--connection-id", "44", "--apply"}, "expected-frozen-denominator-sha256"},
+		{[]string{"finalize-index", "--apply"}, "expected-final-batch-index-sha256"},
 	} {
-		_, err := runRecordingJoinedWith(context.Background(), cfg, args, factory)
-		if err == nil || !strings.Contains(err.Error(), "expected-manifest-sha256") {
+		_, err := runRecordingJoinedWith(context.Background(), cfg, tc.args, factory)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("args=%v error=%v", tc.args, err)
+		}
+	}
+}
+
+func TestJoinedMutationsRejectAmbiguousLegacyExpectedHashFlag(t *testing.T) {
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08"}
+	for _, args := range [][]string{
+		{"freeze-tier1", "--connection-id", "44", "--expected-manifest-sha256", strings.Repeat("a", 64)},
+		{"finalize-index", "--expected-manifest-sha256", strings.Repeat("a", 64)},
+	} {
+		_, err := runRecordingJoinedWith(context.Background(), cfg, args, nil)
+		if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
 			t.Fatalf("args=%v error=%v", args, err)
 		}
 	}
@@ -180,11 +197,11 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	hash := strings.Repeat("a", 64)
 
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
-		"freeze-tier1", "--connection-id", "44", "--expected-manifest-sha256", hash, "--apply",
+		"freeze-tier1", "--connection-id", "44", "--expected-frozen-denominator-sha256", hash, "--apply",
 	}, factory); err != nil {
 		t.Fatal(err)
 	}
-	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08", ExpectedManifestSHA256: hash, Apply: true}) {
+	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08", ExpectedFrozenDenominatorSHA256: hash, Apply: true}) {
 		t.Fatalf("freeze request=%+v", fake.freezeReq)
 	}
 
@@ -196,11 +213,11 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	}
 
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
-		"finalize-index", "--expected-manifest-sha256", hash, "--apply",
+		"finalize-index", "--expected-final-batch-index-sha256", hash, "--apply",
 	}, factory); err != nil {
 		t.Fatal(err)
 	}
-	if fake.finalizeReq != (joinedFinalizeIndexRequest{BatchID: "tier1-2026-08", ExpectedManifestSHA256: hash, Apply: true}) {
+	if fake.finalizeReq != (joinedFinalizeIndexRequest{BatchID: "tier1-2026-08", ExpectedFinalBatchIndexSHA256: hash, Apply: true}) {
 		t.Fatalf("finalize request=%+v", fake.finalizeReq)
 	}
 }

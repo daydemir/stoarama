@@ -46,7 +46,9 @@ services:
     envVars:
       - key: APP_BASE_URL
         value: https://stoarama.com
-      - key: SERVICE_TOKEN
+      # Dedicated joined-only bootstrap credential for claim/reclaim/status.
+      # The backend returns separate short-lived hour/lease capability tokens.
+      - key: STOARAMA_JOINED_WORKER_TOKEN
         sync: false
       - key: JOINED_RECORDING_ENABLED
         value: "false"
