@@ -49,13 +49,11 @@ func testAllocation(plan BatchPlan) (HourManifestAllocation, StreamDayAllocation
 	if err != nil {
 		panic(err)
 	}
-	relative, objectKey, _ := CanonicalAllocationLedgerPaths(plan.BatchID, plan.RecordingID, plan.LocalDate)
-	canonical, artifactSHA, err := CanonicalAllocationLedgerArtifact(ledger)
+	allocation, err := BuildHourManifestAllocation(55, plan, ledger)
 	if err != nil {
 		panic(err)
 	}
-	hourBoundaries, dayBoundaries := hourBoundarySubset(ledger, plan.LocalHour)
-	return HourManifestAllocation{ArtifactID: 55, RelativePath: relative, ObjectKey: objectKey, SizeBytes: int64(len(canonical)), SHA256: artifactSHA, LedgerSHA256: ledger.LedgerSHA256, HourSourceSHA256: plan.SourceClaimSHA256, Boundaries: hourBoundaries, CrossDayBoundaries: dayBoundaries}, ledger
+	return allocation, ledger
 }
 
 func sealedClaim(t *testing.T, _ int64, plan BatchPlan, built []BuiltOutput, quarantine []QuarantineEvidence) WorkerClaim {

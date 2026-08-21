@@ -139,15 +139,44 @@ func TestBuildPlanRejectsFalseContinuousSeamOverRealGap(t *testing.T) {
 
 func TestSourceClaimIgnoresDownloadedAudioAndSeamEvidence(t *testing.T) {
 	source := testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
-	want, _, err := sourceClaimSHA([]SourceClip{source})
+	want, _, err := CanonicalSourceClaim([]SourceClip{source})
 	if err != nil {
 		t.Fatal(err)
 	}
 	source.AudioContract = &AudioSequenceContract{CodecName: "aac", SampleRate: 48000, Channels: 2, ChannelLayout: "stereo"}
 	source.SeamToPrevious = SeamEvidence{Verdict: "incompatible", Reason: "derived_probe", SignedGapNanoseconds: -1}
-	got, _, err := sourceClaimSHA([]SourceClip{source})
+	got, _, err := CanonicalSourceClaim([]SourceClip{source})
 	if err != nil || got != want {
 		t.Fatalf("derived media evidence changed source claim: %s != %s (%v)", got, want, err)
+	}
+	if err := ValidateSourceClaim([]SourceClip{source}, want); err != nil {
+		t.Fatalf("canonical source claim did not validate: %v", err)
+	}
+	if err := ValidateSourceClaim([]SourceClip{source}, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("mismatched canonical source claim validated")
+	}
+}
+
+func TestCanonicalHourAndRecordingIdentityHelpers(t *testing.T) {
+	hourID, err := CanonicalHourID("batch-1", 377, "2026-05-04", 1, 2)
+	if err != nil || hourID != "batch-1__recording-377__date-2026-05-04__hour-01__generation-2" {
+		t.Fatalf("canonical hour identity=%q err=%v", hourID, err)
+	}
+	if _, err := CanonicalHourID("batch-1", 377, "2026-05-04", 13, 2); err == nil {
+		t.Fatal("invalid delivery hour received an identity")
+	}
+	ledgerID, err := CanonicalLedgerID("batch-1", 377, "2026-05-04", 2)
+	if err != nil || ledgerID != "batch-1__recording-377__date-2026-05-04__generation-2" {
+		t.Fatalf("canonical ledger identity=%q err=%v", ledgerID, err)
+	}
+	payload := []byte("377\n335\n")
+	want := sha256.Sum256(payload)
+	got, err := RecordingIDsSHA256([]int64{377, 335})
+	if err != nil || got != hex.EncodeToString(want[:]) {
+		t.Fatalf("recording identity hash=%q err=%v", got, err)
+	}
+	if _, err := RecordingIDsSHA256([]int64{377, 377}); err == nil {
+		t.Fatal("duplicate recording identity list hashed")
 	}
 }
 

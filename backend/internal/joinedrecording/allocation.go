@@ -698,5 +698,13 @@ func validateQualifiedLedgerDay(day QualifiedDay, recordingID int64, timezone, l
 }
 
 func canonicalLedgerID(batchID string, recordingID int64, localDate string, generation int) string {
-	return fmt.Sprintf("%s__recording-%d__date-%s__generation-%d", batchID, recordingID, localDate, generation)
+	value, _ := CanonicalLedgerID(batchID, recordingID, localDate, generation)
+	return value
+}
+
+func CanonicalLedgerID(batchID string, recordingID int64, localDate string, generation int) (string, error) {
+	if !safeBatchID.MatchString(batchID) || recordingID <= 0 || !validLocalDate(localDate) || generation <= 0 {
+		return "", fmt.Errorf("invalid canonical allocation ledger identity")
+	}
+	return fmt.Sprintf("%s__recording-%d__date-%s__generation-%d", batchID, recordingID, localDate, generation), nil
 }

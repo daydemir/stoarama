@@ -377,7 +377,17 @@ func canonicalHourID(req PlanRequest, localDate string, localHour int, manifestS
 }
 
 func canonicalHourIDValue(batchID string, recordingID int64, localDate string, deliveryHour, generation int) string {
-	return fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", batchID, recordingID, localDate, deliveryHour, generation)
+	value, _ := CanonicalHourID(batchID, recordingID, localDate, deliveryHour, generation)
+	return value
+}
+
+// CanonicalHourID returns the one logical hour identity used on every wire
+// contract. Database surrogate IDs are deliberately excluded.
+func CanonicalHourID(batchID string, recordingID int64, localDate string, deliveryHour, generation int) (string, error) {
+	if !safeBatchID.MatchString(batchID) || recordingID <= 0 || !validLocalDate(localDate) || deliveryHour < 1 || deliveryHour > 12 || generation <= 0 {
+		return "", fmt.Errorf("invalid canonical hour identity")
+	}
+	return fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", batchID, recordingID, localDate, deliveryHour, generation), nil
 }
 
 func mergeAccountedSources(included, quarantined []SourceClip) ([]SourceClip, error) {
@@ -401,8 +411,22 @@ func mergeAccountedSources(included, quarantined []SourceClip) ([]SourceClip, er
 // sourceClaimSHA excludes media-derived audio and seam evidence so inspection
 // cannot change the source-only lease identity.
 func sourceClaimSHA(sources []SourceClip) (string, []byte, error) {
+	return CanonicalSourceClaim(sources)
+}
+
+// CanonicalSourceClaim is the one source-only projection used for preflight,
+// allocation ledgers, hour manifests, and denominator evidence.
+func CanonicalSourceClaim(sources []SourceClip) (string, []byte, error) {
 	claims := sourceOnlyClips(sources)
 	return stitchcert.CanonicalSHA(claims)
+}
+
+func ValidateSourceClaim(sources []SourceClip, expectedSHA256 string) error {
+	digest, _, err := CanonicalSourceClaim(sources)
+	if err != nil || !lowerHex64(expectedSHA256) || digest != expectedSHA256 {
+		return fmt.Errorf("source-only claim differs")
+	}
+	return nil
 }
 
 func sourceOnlyClips(sources []SourceClip) []SourceClip {
