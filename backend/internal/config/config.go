@@ -4,13 +4,14 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type Config struct {
@@ -392,12 +393,11 @@ func (c Config) ValidateJoined() error {
 	}
 	protected := []string{service, strings.TrimSpace(c.APIToken), strings.TrimSpace(c.DatabaseURL),
 		strings.TrimSpace(c.StorageCredKey), strings.TrimSpace(c.R2AccessKeyID), strings.TrimSpace(c.R2SecretAccessKey)}
-	if databaseURL, err := url.Parse(strings.TrimSpace(c.DatabaseURL)); err == nil && databaseURL.User != nil {
-		if password, ok := databaseURL.User.Password(); ok {
-			protected = append(protected, password)
-		}
+	if databaseConfig, err := pgx.ParseConfig(strings.TrimSpace(c.DatabaseURL)); err == nil {
+		protected = append(protected, databaseConfig.Password)
 	}
 	for _, protected := range protected {
+		protected = strings.TrimSpace(protected)
 		if protected != "" && (bootstrap == protected || signing == protected) {
 			return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
 		}

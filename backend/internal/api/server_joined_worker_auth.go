@@ -21,11 +21,8 @@ func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) e
 	if s.pool == nil {
 		return errors.New("joined storage credential isolation is unavailable")
 	}
-	rows, err := s.pool.Query(ctx, `SELECT sd.access_key_id,sd.secret_access_key_enc
-		FROM storage_destinations sd WHERE EXISTS (
-		  SELECT 1 FROM recording_joined_source_snapshots snapshot
-		  JOIN recording_joined_batches batch ON batch.id=snapshot.batch_record_id
-		  WHERE snapshot.storage_destination_id=sd.id AND batch.state<>'terminal_failed')`)
+	rows, err := s.pool.Query(ctx, `SELECT access_key_id,secret_access_key_enc
+		FROM storage_destinations WHERE provider='r2'`)
 	if err != nil {
 		return err
 	}
@@ -45,7 +42,9 @@ func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) e
 		if err != nil {
 			return err
 		}
-		if accessKey == bootstrap || accessKey == signing || string(secret) == bootstrap || string(secret) == signing {
+		accessKey = strings.TrimSpace(accessKey)
+		storageSecret := strings.TrimSpace(string(secret))
+		if accessKey == bootstrap || accessKey == signing || storageSecret == bootstrap || storageSecret == signing {
 			return errors.New("joined storage credential aliases worker authority")
 		}
 	}
