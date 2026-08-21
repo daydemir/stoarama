@@ -6,6 +6,73 @@ databases:
     storageAutoscalingEnabled: true
 
 services:
+  # Ship-dark, isolated Release B joined-delivery worker. Keep one fixed
+  # instance: service count is the only cloud concurrency control. It talks to
+  # the API contract and intentionally receives no database or R2 credentials.
+  - type: worker
+    name: stoarama-joined-worker
+    env: go
+    rootDir: backend
+    plan: starter
+    numInstances: 1
+    autoDeployTrigger: commit
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoaramactl ./cmd/stoaramactl
+      archive_url="${JOINED_RECORDING_FFMPEG_ARCHIVE_URL:-}"
+      archive_sha="${JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256:-}"
+      ffmpeg_sha="${JOINED_RECORDING_FFMPEG_BINARY_SHA256:-}"
+      ffprobe_sha="${JOINED_RECORDING_FFPROBE_BINARY_SHA256:-}"
+      if [[ -z "$archive_url$archive_sha$ffmpeg_sha$ffprobe_sha" ]]; then
+        exit 0
+      fi
+      : "${archive_url:?missing joined FFmpeg archive URL}"
+      : "${archive_sha:?missing joined FFmpeg archive SHA-256}"
+      : "${ffmpeg_sha:?missing joined FFmpeg binary SHA-256}"
+      : "${ffprobe_sha:?missing joined FFprobe binary SHA-256}"
+      [[ "$archive_url" != *"/latest/"* ]] || { echo "joined FFmpeg archive URL must be immutable" >&2; exit 1; }
+      curl -fsSL -o /tmp/stoarama-joined-ffmpeg.tar "$archive_url"
+      printf '%s  %s\n' "$archive_sha" /tmp/stoarama-joined-ffmpeg.tar | sha256sum -c -
+      mkdir -p /tmp/stoarama-joined-ffmpeg
+      tar -xf /tmp/stoarama-joined-ffmpeg.tar -C /tmp/stoarama-joined-ffmpeg
+      ffmpeg_src="$(find /tmp/stoarama-joined-ffmpeg -type f -path '*/bin/ffmpeg' -print -quit)"
+      ffprobe_src="$(find /tmp/stoarama-joined-ffmpeg -type f -path '*/bin/ffprobe' -print -quit)"
+      [[ -n "$ffmpeg_src" && -n "$ffprobe_src" ]]
+      install -m 0755 "$ffmpeg_src" bin/ffmpeg
+      install -m 0755 "$ffprobe_src" bin/ffprobe
+      printf '%s  %s\n' "$ffmpeg_sha" bin/ffmpeg | sha256sum -c -
+      printf '%s  %s\n' "$ffprobe_sha" bin/ffprobe | sha256sum -c -
+    startCommand: ./bin/stoaramactl recording-joined worker run
+    envVars:
+      - key: APP_BASE_URL
+        value: https://stoarama.com
+      - key: SERVICE_TOKEN
+        sync: false
+      - key: JOINED_RECORDING_ENABLED
+        value: "false"
+      - key: JOINED_RECORDING_PROTOCOL_VERSION
+        value: "0"
+      - key: JOINED_RECORDING_ROLLING_ENABLED
+        value: "false"
+      - key: JOINED_RECORDING_BATCH_ID
+        sync: false
+      - key: JOINED_RECORDING_SCRATCH_ROOT
+        value: /tmp/stoarama-joined
+      - key: JOINED_RECORDING_STORAGE_AUTHORITY
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_URL
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_BINARY_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFPROBE_BINARY_SHA256
+        sync: false
+      - key: FFMPEG_BIN
+        value: ./bin/ffmpeg
+      - key: FFPROBE_BIN
+        value: ./bin/ffprobe
+
   - type: web
     name: stoarama-api
     env: go

@@ -104,6 +104,105 @@ func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 	}
 }
 
+func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
+	for _, key := range []string{
+		"JOINED_RECORDING_ENABLED",
+		"JOINED_RECORDING_PROTOCOL_VERSION",
+		"JOINED_RECORDING_ROLLING_ENABLED",
+		"JOINED_RECORDING_BATCH_ID",
+		"JOINED_RECORDING_SCRATCH_ROOT",
+		"JOINED_RECORDING_STORAGE_AUTHORITY",
+		"JOINED_RECORDING_FFMPEG_ARCHIVE_URL",
+		"JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256",
+		"JOINED_RECORDING_FFMPEG_BINARY_SHA256",
+		"JOINED_RECORDING_FFPROBE_BINARY_SHA256",
+	} {
+		t.Setenv(key, "")
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.JoinedRecordingEnabled || cfg.JoinedRecordingRollingEnabled || cfg.JoinedRecordingProtocolVersion != 0 {
+		t.Fatalf("joined worker unexpectedly enabled: %+v", cfg)
+	}
+	if cfg.JoinedRecordingBatchID != "" || cfg.JoinedRecordingScratchRoot != "/tmp/stoarama-joined" {
+		t.Fatalf("joined defaults: batch=%q scratch=%q", cfg.JoinedRecordingBatchID, cfg.JoinedRecordingScratchRoot)
+	}
+	if err := cfg.ValidateJoinedRecording(); err != nil {
+		t.Fatalf("disabled validation: %v", err)
+	}
+}
+
+func TestValidateJoinedRecordingActivation(t *testing.T) {
+	valid := Config{
+		JoinedRecordingEnabled:             true,
+		JoinedRecordingProtocolVersion:     1,
+		JoinedRecordingBatchID:             "tier1-2026-08",
+		JoinedRecordingScratchRoot:         "/tmp/stoarama-joined",
+		JoinedRecordingStorageAuthority:    "example.r2.cloudflarestorage.com",
+		JoinedRecordingFFmpegArchiveURL:    "https://example.com/ffmpeg/7.1.1/linux64.tar.xz",
+		JoinedRecordingFFmpegArchiveSHA256: strings.Repeat("a", 64),
+		JoinedRecordingFFmpegSHA256:        strings.Repeat("b", 64),
+		JoinedRecordingFFprobeSHA256:       strings.Repeat("c", 64),
+	}
+	if err := valid.ValidateJoinedRecording(); err != nil {
+		t.Fatal(err)
+	}
+	tests := []Config{
+		{JoinedRecordingRollingEnabled: true},
+		{JoinedRecordingEnabled: true, JoinedRecordingScratchRoot: "/tmp/stoarama-joined"},
+		{JoinedRecordingEnabled: true, JoinedRecordingBatchID: "Tier1", JoinedRecordingScratchRoot: "/tmp/stoarama-joined"},
+		{JoinedRecordingEnabled: true, JoinedRecordingBatchID: "tier1", JoinedRecordingScratchRoot: "relative"},
+		{JoinedRecordingEnabled: true, JoinedRecordingBatchID: "tier1", JoinedRecordingScratchRoot: "/tmp/../joined"},
+	}
+	for i, cfg := range tests {
+		if err := cfg.ValidateJoinedRecording(); err == nil {
+			t.Fatalf("invalid config %d accepted: %+v", i, cfg)
+		}
+	}
+	latest := valid
+	latest.JoinedRecordingFFmpegArchiveURL = "https://example.com/ffmpeg/latest/linux64.tar.xz"
+	if err := latest.ValidateJoinedRecording(); err == nil {
+		t.Fatal("mutable latest archive URL was accepted")
+	}
+}
+
+func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
+	renderPath := filepath.Join("..", "..", "..", "render.yaml")
+	data, err := os.ReadFile(renderPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const marker = "name: stoarama-joined-worker"
+	if strings.Count(string(data), marker) != 1 {
+		t.Fatalf("joined worker declarations=%d want 1", strings.Count(string(data), marker))
+	}
+	section := string(data)[strings.Index(string(data), marker):]
+	if next := strings.Index(section[len(marker):], "\n  - type:"); next >= 0 {
+		section = section[:len(marker)+next]
+	}
+	for _, required := range []string{
+		"numInstances: 1",
+		"startCommand: ./bin/stoaramactl recording-joined worker run",
+		"sha256sum -c -",
+		"key: JOINED_RECORDING_ENABLED\n        value: \"false\"",
+		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
+		"key: JOINED_RECORDING_ROLLING_ENABLED\n        value: \"false\"",
+		"key: FFMPEG_BIN\n        value: ./bin/ffmpeg",
+		"key: FFPROBE_BIN\n        value: ./bin/ffprobe",
+	} {
+		if !strings.Contains(section, required) {
+			t.Fatalf("joined worker missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"DATABASE_URL", "R2_", "STORAGE_CRED_KEY"} {
+		if strings.Contains(section, forbidden) {
+			t.Fatalf("joined worker contains privileged setting %q", forbidden)
+		}
+	}
+}
+
 func testCookieSigningKey() string {
 	return strings.Repeat("test", 8)
 }

@@ -1,9 +1,12 @@
 package config
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -128,6 +131,20 @@ type Config struct {
 	// only add contention.
 	RelayUploadWorkers int
 
+	// Joined recording generation is ship-dark. The isolated worker must return
+	// before constructing any database, media, or storage client while disabled.
+	// Render instance count is the only production concurrency control.
+	JoinedRecordingEnabled             bool
+	JoinedRecordingProtocolVersion     int
+	JoinedRecordingRollingEnabled      bool
+	JoinedRecordingBatchID             string
+	JoinedRecordingScratchRoot         string
+	JoinedRecordingStorageAuthority    string
+	JoinedRecordingFFmpegArchiveURL    string
+	JoinedRecordingFFmpegArchiveSHA256 string
+	JoinedRecordingFFmpegSHA256        string
+	JoinedRecordingFFprobeSHA256       string
+
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
 	// control service alongside the scheduler). Empty/disabled by default.
 	DOAPIToken                      string
@@ -247,6 +264,16 @@ func Load() (Config, error) {
 		RecordingWorkerPollSec:                intEnv("RECORDING_WORKER_POLL_SEC", 5),
 		RecordingFrozenHLSQuiescenceAllowlist: strEnv("RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST", ""),
 		RelayUploadWorkers:                    RelayUploadWorkersFromEnv(),
+		JoinedRecordingEnabled:                boolEnv("JOINED_RECORDING_ENABLED", false),
+		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
+		JoinedRecordingRollingEnabled:         boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
+		JoinedRecordingBatchID:                strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
+		JoinedRecordingScratchRoot:            strEnv("JOINED_RECORDING_SCRATCH_ROOT", "/tmp/stoarama-joined"),
+		JoinedRecordingStorageAuthority:       strings.TrimSpace(os.Getenv("JOINED_RECORDING_STORAGE_AUTHORITY")),
+		JoinedRecordingFFmpegArchiveURL:       strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_URL")),
+		JoinedRecordingFFmpegArchiveSHA256:    strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256")),
+		JoinedRecordingFFmpegSHA256:           strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_BINARY_SHA256")),
+		JoinedRecordingFFprobeSHA256:          strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFPROBE_BINARY_SHA256")),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
@@ -423,6 +450,84 @@ func (c Config) ValidateStripe() error {
 
 func (c Config) ValidateWorker() error {
 	return c.ValidateR2()
+}
+
+// ValidateJoinedRecording validates the worker's activation envelope. An
+// inactive worker intentionally requires no service, media, or storage setup.
+func (c Config) ValidateJoinedRecording() error {
+	if c.JoinedRecordingRollingEnabled && !c.JoinedRecordingEnabled {
+		return fmt.Errorf("JOINED_RECORDING_ROLLING_ENABLED requires JOINED_RECORDING_ENABLED")
+	}
+	if !c.JoinedRecordingEnabled {
+		return nil
+	}
+	if c.JoinedRecordingProtocolVersion != 1 {
+		return fmt.Errorf("JOINED_RECORDING_PROTOCOL_VERSION must be 1 when enabled")
+	}
+	if !validJoinedRecordingBatchID(c.JoinedRecordingBatchID) {
+		return fmt.Errorf("JOINED_RECORDING_BATCH_ID must be a lowercase letters/numbers/hyphens identifier")
+	}
+	root := strings.TrimSpace(c.JoinedRecordingScratchRoot)
+	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || root == string(filepath.Separator) {
+		return fmt.Errorf("JOINED_RECORDING_SCRATCH_ROOT must be a clean absolute non-root path")
+	}
+	if !validJoinedRecordingStorageAuthority(c.JoinedRecordingStorageAuthority) {
+		return fmt.Errorf("JOINED_RECORDING_STORAGE_AUTHORITY must be one exact host authority")
+	}
+	if !validJoinedRecordingArchiveURL(c.JoinedRecordingFFmpegArchiveURL) {
+		return fmt.Errorf("JOINED_RECORDING_FFMPEG_ARCHIVE_URL must be an immutable versioned HTTPS URL")
+	}
+	for _, item := range []struct{ name, value string }{
+		{"JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256", c.JoinedRecordingFFmpegArchiveSHA256},
+		{"JOINED_RECORDING_FFMPEG_BINARY_SHA256", c.JoinedRecordingFFmpegSHA256},
+		{"JOINED_RECORDING_FFPROBE_BINARY_SHA256", c.JoinedRecordingFFprobeSHA256},
+	} {
+		if !validLowerSHA256(item.value) {
+			return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", item.name)
+		}
+	}
+	return nil
+}
+
+func validJoinedRecordingStorageAuthority(value string) bool {
+	if value == "" || strings.ContainsAny(value, "/?#@ ") {
+		return false
+	}
+	parsed, err := url.ParseRequestURI("https://" + value)
+	return err == nil && parsed.Host == value && parsed.Hostname() != "" && parsed.Path == ""
+}
+
+func validJoinedRecordingArchiveURL(value string) bool {
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	path := "/" + strings.Trim(parsed.Path, "/") + "/"
+	return !strings.Contains(strings.ToLower(path), "/latest/")
+}
+
+func validLowerSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validJoinedRecordingBatchID(value string) bool {
+	if len(value) < 1 || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, char := range value {
+		if char != '-' && (char < 'a' || char > 'z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Config) ValidateR2() error {

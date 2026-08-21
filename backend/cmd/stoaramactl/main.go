@@ -97,6 +97,8 @@ func main() {
 		runRecordingPreopen(ctx, cfg, os.Args[2:])
 	case "recording-stitch":
 		runRecordingStitch(ctx, cfg, os.Args[2:])
+	case "recording-joined":
+		runRecordingJoined(ctx, cfg, os.Args[2:])
 	case "relay-connectivity":
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
 	case "relay-routing":
@@ -190,6 +192,10 @@ func usage() {
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recording-health summary
 	  stoaramactl recording-preopen run [--dry-run --concurrency 4 --probe-sec 20 --frame-fresh-min 30]
+	  stoaramactl recording-joined freeze-tier1 --connection-id N --batch-id ID [--expected-manifest-sha256 HASH --apply]
+	  stoaramactl recording-joined worker run [--batch-id ID --worker-id ID --scratch-root ABS]
+	  stoaramactl recording-joined status --batch-id ID
+	  stoaramactl recording-joined finalize-index --batch-id ID [--expected-manifest-sha256 HASH --apply]
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
 	  stoaramactl recordings naming allocate|get|set|preview
