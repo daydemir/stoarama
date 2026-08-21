@@ -10,14 +10,83 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestPresignGetExactBindsConditionalGenerationIdentity(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := client.PresignGetExact(context.Background(), "clip.mp4", `"abc123"`, "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustURL(t, raw)
+	if u.Query().Get("versionId") != "version-7" {
+		t.Fatalf("versionId=%q", u.Query().Get("versionId"))
+	}
+	if !strings.Contains(u.Query().Get("X-Amz-SignedHeaders"), "if-match") {
+		t.Fatalf("signed headers do not bind If-Match: %q", u.Query().Get("X-Amz-SignedHeaders"))
+	}
+}
+
+func TestPresignedExactCapabilitiesBindMethodAuthorityKeyAndHeaders(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get, err := client.PresignGetExactRequest(context.Background(), "raw/exact clip.mp4", "abc123", "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := client.PresignHeadExactRequest(context.Background(), "raw/exact clip.mp4", "abc123", "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put, err := client.PresignPutCreateOnlyRequest(context.Background(), "joined/batch/objects/"+strings.Repeat("a", 64)+".mp4", "video/mp4", 1234, strings.Repeat("a", 64), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, method, path string
+		cap                PresignedRequest
+		headers            map[string]string
+	}{
+		{name: "get", method: http.MethodGet, path: "/bucket/raw/exact%20clip.mp4", cap: get, headers: map[string]string{"If-Match": `"abc123"`}},
+		{name: "head", method: http.MethodHead, path: "/bucket/raw/exact%20clip.mp4", cap: head, headers: map[string]string{"If-Match": `"abc123"`}},
+		{name: "put", method: http.MethodPut, path: "/bucket/joined/batch/objects/" + strings.Repeat("a", 64) + ".mp4", cap: put, headers: map[string]string{
+			"Content-Length": "1234", "Content-Type": "video/mp4", "If-None-Match": "*",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := mustURL(t, tc.cap.URL)
+			if tc.cap.Method != tc.method || u.Scheme != "https" || u.Host != "storage.example.test" || u.EscapedPath() != tc.path {
+				t.Fatalf("capability=%s %s%s, want %s https://storage.example.test%s", tc.cap.Method, u.Host, u.EscapedPath(), tc.method, tc.path)
+			}
+			if tc.name != "put" && u.Query().Get("versionId") != "version-7" {
+				t.Fatalf("versionId=%q", u.Query().Get("versionId"))
+			}
+			if tc.name == "put" && u.Query().Get("X-Amz-Checksum-Sha256") != "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=" {
+				t.Fatalf("checksum query is not bound: %q", u.Query().Get("X-Amz-Checksum-Sha256"))
+			}
+			for key, want := range tc.headers {
+				if got := tc.cap.Headers.Get(key); got != want {
+					t.Fatalf("%s=%q want %q (required=%v)", key, got, want, tc.cap.Headers)
+				}
+				if !strings.Contains(strings.ToLower(u.Query().Get("X-Amz-SignedHeaders")), strings.ToLower(key)) {
+					t.Fatalf("%s is not signed: %q", key, u.Query().Get("X-Amz-SignedHeaders"))
+				}
+			}
+		})
+	}
+}
 
 func TestSameAuthorityHTTPSRedirect(t *testing.T) {
 	origin := &http.Request{URL: mustURL(t, "https://storage.example.test:443/original")}
 	for _, tc := range []struct {
-		name    string
-		target  string
-		allowed bool
+		name, target string
+		allowed      bool
 	}{
 		{name: "same authority", target: "https://storage.example.test:443/redirected", allowed: true},
 		{name: "scheme case", target: "HTTPS://storage.example.test:443/redirected", allowed: true},

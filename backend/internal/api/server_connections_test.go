@@ -31,6 +31,9 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodPost, "/api/v1/account/connections/heartbeat", true},
 		{http.MethodPost, "/api/v1/account/connections/inventory", true},
 		{http.MethodPost, "/api/v1/account/clips/release", true},
+		{http.MethodGet, "/api/v1/account/joined", true},
+		{http.MethodGet, "/api/v1/account/joined/34/download", true},
+		{http.MethodPost, "/api/v1/account/joined/ack", true},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 
@@ -39,6 +42,8 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/connections/heartbeat", false},
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34/download", false},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/release", false},
+		{http.MethodPost, "/api/v1/account/joined/34/download", false},
+		{http.MethodGet, "/api/v1/account/joined/abc/download", false},
 
 		// Hard-delete is NO LONGER allowed for a pull key: it can release, not destroy.
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34", false},
@@ -97,6 +102,9 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 		{http.MethodPost, "/api/v1/account/connections/heartbeat"},
 		{http.MethodPost, "/api/v1/account/connections/inventory"},
 		{http.MethodPost, "/api/v1/account/clips/release"},
+		{http.MethodGet, "/api/v1/account/joined"},
+		{http.MethodGet, "/api/v1/account/joined/34/download"},
+		{http.MethodPost, "/api/v1/account/joined/ack"},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download"},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release"},
 	}
@@ -427,6 +435,13 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	if err := validateConnectionHeartbeat(starting); err != nil {
 		t.Fatalf("pre-batch worker telemetry rejected: %v", err)
 	}
+	retry := now.Add(time.Minute)
+	joined := starting
+	joined.JoinedProtocol = 1
+	joined.JoinedDelivery = &connectionJoinedDelivery{ArtifactID: 9, Blocker: "download_failed", AttemptedAt: &now, RetryAt: &retry}
+	if err := validateConnectionHeartbeat(joined); err != nil {
+		t.Fatalf("joined capability heartbeat rejected: %v", err)
+	}
 	legacy := connectionHeartbeatRequest{CursorID: 1, ClipsPulled: 1}
 	if err := validateConnectionHeartbeat(legacy); err != nil {
 		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)
@@ -455,6 +470,11 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: -1}},
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: 101}},
 		{Storage: &connectionStorageStatus{Available: false, TotalBytes: 100}},
+		{JoinedProtocol: 2},
+		{JoinedProtocol: 1},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "download_failed", AttemptedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 0, Blocker: "download_failed", AttemptedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "unknown", AttemptedAt: &now}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
