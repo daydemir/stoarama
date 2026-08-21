@@ -588,7 +588,7 @@ func canonicalBatchCoverageKey(plan BatchPlan) string {
 }
 
 func validateSource(c SourceClip, recordingID int64) error {
-	_, endpointErr := sourceStorageAuthority(c.Endpoint)
+	_, endpointErr := CanonicalSourceEndpointAuthority(c.Endpoint)
 	if c.ClipID <= 0 || c.RecordingID != recordingID || c.RecordingJobID <= 0 || strings.TrimSpace(c.Provider) == "" || endpointErr != nil || strings.TrimSpace(c.Region) == "" || strings.TrimSpace(c.Bucket) == "" || !c.EndUTC.After(c.StartUTC) || c.EndUTC.Sub(c.StartUTC) > 15*time.Minute {
 		return fmt.Errorf("invalid clip identity or range")
 	}

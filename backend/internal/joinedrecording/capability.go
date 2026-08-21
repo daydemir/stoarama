@@ -10,12 +10,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
+
+const SourceEndpointV1Pattern = `^https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com$`
+
+var sourceEndpointV1 = regexp.MustCompile(SourceEndpointV1Pattern)
 
 type CapabilityHTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
@@ -105,7 +110,7 @@ func canonicalObjectEscapedPath(bucket, key string) (string, error) {
 
 func (c SourceReadCapability) Validate(source SourceClip, operation, authority string, now time.Time) error {
 	objectPath, err := canonicalObjectEscapedPath(source.Bucket, source.Object.Key)
-	frozenAuthority, endpointErr := sourceStorageAuthority(source.Endpoint)
+	frozenAuthority, endpointErr := CanonicalSourceEndpointAuthority(source.Endpoint)
 	wantHeaders := map[string]string{"If-Match": quotedETag(source.Object.ETag)}
 	method := map[string]string{"head": http.MethodHead, "get": http.MethodGet}[operation]
 	if err != nil || endpointErr != nil || frozenAuthority != authority || c.ProtocolVersion != JoinedProtocolVersion || method == "" || c.Operation != operation || !validObjectIdentity(c.ETag, c.VersionID) || !validSignedCapabilityExpiry(c.Request, c.ExpiresAt, now, maxReadCapabilityLifetime) || c.ObjectKey != source.Object.Key || c.SizeBytes != source.Object.SizeBytes || c.SHA256 != source.Object.SHA256 || c.ETag != source.Object.ETag || c.VersionID != source.Object.VersionID || !sameHeaders(c.Request.RequiredHeaders, wantHeaders) || c.Request.validate(method, authority, objectPath) != nil {
@@ -120,12 +125,13 @@ func (c SourceReadCapability) Validate(source SourceClip, operation, authority s
 	return nil
 }
 
-func sourceStorageAuthority(endpoint string) (string, error) {
-	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") {
+// CanonicalSourceEndpointAuthority validates the exact protocol-v1 Cloudflare
+// R2 endpoint bytes shared by the backend, worker, and NAS client.
+func CanonicalSourceEndpointAuthority(endpoint string) (string, error) {
+	if !sourceEndpointV1.MatchString(endpoint) {
 		return "", fmt.Errorf("invalid frozen storage endpoint")
 	}
-	return parsed.Host, nil
+	return strings.TrimPrefix(endpoint, "https://"), nil
 }
 
 func (c ObjectCreateCapability) Validate(artifactID int64, bucket, key, contentType string, size int64, sha, authority string, now time.Time) error {

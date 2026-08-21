@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -84,8 +86,8 @@ func signedRequest(method, bucket, key string, headers map[string]string, versio
 	if version != "" {
 		values.Set("versionId", version)
 	}
-	parsed := &url.URL{Scheme: "https", Host: "cap.test", Path: "/" + bucket + "/" + key, RawQuery: values.Encode()}
-	return SignedRequest{Method: method, URL: parsed.String(), Scheme: "https", Authority: "cap.test", EscapedPath: parsed.EscapedPath(), RawQuery: parsed.RawQuery, RequiredHeaders: headers}
+	parsed := &url.URL{Scheme: "https", Host: testSourceAuthority, Path: "/" + bucket + "/" + key, RawQuery: values.Encode()}
+	return SignedRequest{Method: method, URL: parsed.String(), Scheme: "https", Authority: testSourceAuthority, EscapedPath: parsed.EscapedPath(), RawQuery: parsed.RawQuery, RequiredHeaders: headers}
 }
 
 func createCapability(id int64, bucket, key, contentType string, body []byte) ObjectCreateCapability {
@@ -139,12 +141,12 @@ func TestTwoStageCreateThenExactFullReread(t *testing.T) {
 	body, bucket, key := []byte("expected"), "recordings", "joined/key.mp4"
 	client := &memoryCapabilityClient{objects: map[string][]byte{}}
 	create := createCapability(7, bucket, key, "video/mp4", body)
-	observation, err := putCreateOnlyCapability(context.Background(), client, "cap.test", bucket, 7, key, "video/mp4", int64(len(body)), create.SHA256, create, bytes.NewReader(body))
+	observation, err := putCreateOnlyCapability(context.Background(), client, testSourceAuthority, bucket, 7, key, "video/mp4", int64(len(body)), create.SHA256, create, bytes.NewReader(body))
 	if err != nil || !observation.Created || observation.ETag == "" {
 		t.Fatalf("observation=%+v err=%v", observation, err)
 	}
 	read := readCapability(7, bucket, key, body)
-	head, err := reconcileExactCapability(context.Background(), client, "cap.test", bucket, 7, key, int64(len(body)), read.SHA256, read.ETag, read.VersionID, read)
+	head, err := reconcileExactCapability(context.Background(), client, testSourceAuthority, bucket, 7, key, int64(len(body)), read.SHA256, read.ETag, read.VersionID, read)
 	if err != nil || head.SizeBytes != int64(len(body)) {
 		t.Fatalf("head=%+v err=%v", head, err)
 	}
@@ -198,12 +200,12 @@ func TestCreateCapabilityRejectsCoordinateHeaderAndBodyMutation(t *testing.T) {
 	} {
 		capability := createCapability(7, bucket, key, "video/mp4", body)
 		mutate(&capability)
-		if _, err := putCreateOnlyCapability(context.Background(), &memoryCapabilityClient{objects: map[string][]byte{}}, "cap.test", bucket, 7, key, "video/mp4", int64(len(body)), original.SHA256, capability, bytes.NewReader(body)); err == nil {
+		if _, err := putCreateOnlyCapability(context.Background(), &memoryCapabilityClient{objects: map[string][]byte{}}, testSourceAuthority, bucket, 7, key, "video/mp4", int64(len(body)), original.SHA256, capability, bytes.NewReader(body)); err == nil {
 			t.Fatal("mutated capability succeeded")
 		}
 	}
 	capability := createCapability(7, bucket, key, "video/mp4", body)
-	if _, err := putCreateOnlyCapability(context.Background(), &memoryCapabilityClient{objects: map[string][]byte{}}, "cap.test", bucket, 7, key, "video/mp4", int64(len(body)), capability.SHA256, capability, bytes.NewReader([]byte("altered!"))); err == nil {
+	if _, err := putCreateOnlyCapability(context.Background(), &memoryCapabilityClient{objects: map[string][]byte{}}, testSourceAuthority, bucket, 7, key, "video/mp4", int64(len(body)), capability.SHA256, capability, bytes.NewReader([]byte("altered!"))); err == nil {
 		t.Fatal("altered body succeeded")
 	}
 }
@@ -212,20 +214,20 @@ func TestCapabilitiesRejectUnexpectedVersionAndSelfDescribedReconciliation(t *te
 	source := testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
 	capability := sourceReadCapability(source.Object.Key, source.Object.ETag, "surprise", "get")
 	capability.SizeBytes, capability.SHA256 = source.Object.SizeBytes, source.Object.SHA256
-	if capability.Validate(source, "get", "cap.test", time.Now()) == nil {
+	if capability.Validate(source, "get", testSourceAuthority, time.Now()) == nil {
 		t.Fatal("unfrozen version query accepted")
 	}
 	capability = sourceReadCapability(source.Object.Key, source.Object.ETag, source.Object.VersionID, "get")
 	capability.SizeBytes, capability.SHA256 = source.Object.SizeBytes, source.Object.SHA256
 	wrongEndpoint := source
 	wrongEndpoint.Endpoint = "https://other.test"
-	if capability.Validate(wrongEndpoint, "get", "cap.test", time.Now()) == nil {
+	if capability.Validate(wrongEndpoint, "get", testSourceAuthority, time.Now()) == nil {
 		t.Fatal("capability authority was not bound to frozen endpoint")
 	}
 	body, bucket, key := []byte("expected"), "recordings", "joined/key.mp4"
 	read := readCapability(7, bucket, key, body)
 	client := &memoryCapabilityClient{objects: map[string][]byte{key: body}}
-	if _, err := reconcileExactCapability(context.Background(), client, "cap.test", bucket, 7, key+"-different", int64(len(body)), read.SHA256, read.ETag, read.VersionID, read); err == nil {
+	if _, err := reconcileExactCapability(context.Background(), client, testSourceAuthority, bucket, 7, key+"-different", int64(len(body)), read.SHA256, read.ETag, read.VersionID, read); err == nil {
 		t.Fatal("read capability fields substituted for independently sealed key")
 	}
 }
@@ -235,7 +237,7 @@ func TestCapabilitiesRejectOverlongOrExpiredLifetime(t *testing.T) {
 	body, bucket, key := []byte("expected"), "recordings", "joined/key.mp4"
 	create := createCapability(7, bucket, key, "video/mp4", body)
 	create.ExpiresAt = now.Add(maxPutCapabilityLifetime + time.Second)
-	if create.Validate(7, bucket, key, "video/mp4", int64(len(body)), create.SHA256, "cap.test", now) == nil {
+	if create.Validate(7, bucket, key, "video/mp4", int64(len(body)), create.SHA256, testSourceAuthority, now) == nil {
 		t.Fatal("overlong create capability accepted")
 	}
 	create = createCapability(7, bucket, key, "video/mp4", body)
@@ -246,24 +248,24 @@ func TestCapabilitiesRejectOverlongOrExpiredLifetime(t *testing.T) {
 	parsedCreate.RawQuery = createQuery.Encode()
 	create.Request.URL, create.Request.RawQuery = parsedCreate.String(), parsedCreate.RawQuery
 	create.ExpiresAt, _ = signedRequestExpiry(create.Request)
-	if create.Validate(7, bucket, key, "video/mp4", int64(len(body)), create.SHA256, "cap.test", now) == nil {
+	if create.Validate(7, bucket, key, "video/mp4", int64(len(body)), create.SHA256, testSourceAuthority, now) == nil {
 		t.Fatal("future-skewed create capability exceeded the local one-hour authority bound")
 	}
 	read := readCapability(7, bucket, key, body)
 	read.ExpiresAt = now.Add(maxReadCapabilityLifetime + time.Second)
-	if read.Validate(7, bucket, key, int64(len(body)), read.SHA256, read.ETag, read.VersionID, "cap.test", now) == nil {
+	if read.Validate(7, bucket, key, int64(len(body)), read.SHA256, read.ETag, read.VersionID, testSourceAuthority, now) == nil {
 		t.Fatal("overlong read capability accepted")
 	}
 	read = readCapability(7, bucket, key, body)
 	read.ExpiresAt = read.ExpiresAt.Add(-time.Minute)
-	if read.Validate(7, bucket, key, int64(len(body)), read.SHA256, read.ETag, read.VersionID, "cap.test", now) == nil {
+	if read.Validate(7, bucket, key, int64(len(body)), read.SHA256, read.ETag, read.VersionID, testSourceAuthority, now) == nil {
 		t.Fatal("reported expiry hid a longer signed read capability")
 	}
 	source := testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
 	sourceCap := sourceReadCapability(source.Object.Key, source.Object.ETag, source.Object.VersionID, "get")
 	sourceCap.SizeBytes, sourceCap.SHA256 = source.Object.SizeBytes, source.Object.SHA256
 	sourceCap.ExpiresAt = now
-	if sourceCap.Validate(source, "get", "cap.test", now) == nil {
+	if sourceCap.Validate(source, "get", testSourceAuthority, now) == nil {
 		t.Fatal("expired source capability accepted")
 	}
 }
@@ -287,11 +289,40 @@ func TestFrozenObjectIdentityRejectsMalformedETagAndVersion(t *testing.T) {
 	if responseETag(`"valid-etag"`) != "valid-etag" || responseETag(`valid-etag`) != "" || responseETag(`"bad"quote"`) != "" {
 		t.Fatal("HTTP ETag canonicalization accepted malformed form")
 	}
-	for _, endpoint := range []string{"http://cap.test", "https://user@cap.test", "https://cap.test/raw", "https://cap.test/?secret=value", "https://cap.test/#fragment"} {
-		mutated := source
+}
+
+func TestCanonicalSourceEndpointV1Vectors(t *testing.T) {
+	var vectors struct {
+		Valid []struct {
+			Endpoint  string `json:"endpoint"`
+			Authority string `json:"authority"`
+		} `json:"valid"`
+		Invalid []string `json:"invalid"`
+	}
+	raw, err := os.ReadFile("testdata/source_endpoint_v1_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors.Valid) != 1 || len(vectors.Invalid) == 0 {
+		t.Fatal("source endpoint v1 vectors are incomplete")
+	}
+	for _, vector := range vectors.Valid {
+		authority, err := CanonicalSourceEndpointAuthority(vector.Endpoint)
+		if err != nil || authority != vector.Authority {
+			t.Fatalf("canonical endpoint %q differs: authority=%q err=%v", vector.Endpoint, authority, err)
+		}
+	}
+	for _, endpoint := range vectors.Invalid {
+		if authority, err := CanonicalSourceEndpointAuthority(endpoint); err == nil {
+			t.Fatalf("noncanonical endpoint %q returned authority %q", endpoint, authority)
+		}
+		mutated := testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
 		mutated.Endpoint = endpoint
-		if validatePreflightSource(mutated, mutated.RecordingID) == nil {
-			t.Fatalf("unsafe frozen endpoint %q was accepted", endpoint)
+		if validatePreflightSource(mutated, mutated.RecordingID) == nil || validateSource(mutated, mutated.RecordingID) == nil {
+			t.Fatalf("noncanonical source endpoint %q passed source validation", endpoint)
 		}
 	}
 }
@@ -316,7 +347,7 @@ func TestCapabilityHTTPClientNeverFollowsRedirect(t *testing.T) {
 
 func TestCapabilityTransportErrorNeverLeaksSignedURL(t *testing.T) {
 	const secretQuery = "X-Amz-Signature=do-not-log-this"
-	request := SignedRequest{Method: http.MethodGet, URL: "https://cap.test/recordings/key?" + secretQuery, Scheme: "https", Authority: "cap.test", EscapedPath: "/recordings/key", RawQuery: secretQuery, RequiredHeaders: map[string]string{}}
+	request := SignedRequest{Method: http.MethodGet, URL: testSourceEndpoint + "/recordings/key?" + secretQuery, Scheme: "https", Authority: testSourceAuthority, EscapedPath: "/recordings/key", RawQuery: secretQuery, RequiredHeaders: map[string]string{}}
 	_, err := capabilityRequest(context.Background(), &errorCapabilityClient{err: errors.New("Get " + request.URL + ": transport failed")}, request, nil, 0)
 	if err == nil || strings.Contains(err.Error(), "do-not-log-this") || strings.Contains(err.Error(), request.URL) {
 		t.Fatalf("capability URL leaked through transport error: %v", err)

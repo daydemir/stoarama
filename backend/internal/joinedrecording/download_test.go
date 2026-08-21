@@ -23,7 +23,7 @@ func TestDownloadClaimSourcesPinsHeadAndHashesBeforePublication(t *testing.T) {
 	}
 	claim := PreflightHourClaim{ProtocolVersion: JoinedProtocolVersion, HourID: plan.HourID, LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("t", 32), LeaseExpires: time.Now().Add(time.Hour), BatchID: plan.BatchID, Generation: plan.Generation, RecordingID: plan.RecordingID, Timezone: plan.Timezone, LocalDate: plan.LocalDate, LocalHour: plan.LocalHour, AllocationLedgerSHA: plan.AllocationLedgerSHA, Qualification: plan.Qualification, MediaTool: plan.MediaTool, SourceClaimSHA256: plan.SourceClaimSHA256, Sources: sourceOnlyClips(plan.Outputs[0].Sources)}
 	client := &memoryCapabilityClient{objects: map[string][]byte{source.Object.Key: []byte(body)}}
-	locals, scratch, err := downloadClaimSources(context.Background(), claim, t.TempDir(), client, "cap.test", func(_ context.Context, _ SourceClip, operation string) (SourceReadCapability, error) {
+	locals, scratch, err := downloadClaimSources(context.Background(), claim, t.TempDir(), client, testSourceAuthority, func(_ context.Context, _ SourceClip, operation string) (SourceReadCapability, error) {
 		capability := sourceReadCapability(source.Object.Key, source.Object.ETag, source.Object.VersionID, operation)
 		capability.SizeBytes, capability.SHA256 = source.Object.SizeBytes, source.Object.SHA256
 		return capability, nil

@@ -12,9 +12,14 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 )
 
+const (
+	testSourceAuthority = "0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+	testSourceEndpoint  = "https://" + testSourceAuthority
+)
+
 func testSource(id int64, start time.Time) SourceClip {
 	return SourceClip{
-		ClipID: id, RecordingID: 377, RecordingJobID: 9, Provider: "r2", Endpoint: "https://cap.test", Region: "auto", Bucket: "recordings", StartUTC: start, EndUTC: start.Add(time.Minute),
+		ClipID: id, RecordingID: 377, RecordingJobID: 9, Provider: "r2", Endpoint: testSourceEndpoint, Region: "auto", Bucket: "recordings", StartUTC: start, EndUTC: start.Add(time.Minute),
 		Object:         ObjectIdentity{Key: "raw/" + start.Format("150405") + ".mp4", ETag: "etag", SizeBytes: 10, SHA256: strings.Repeat("b", 64)},
 		SeamToPrevious: SeamEvidence{Verdict: "continuous", Reason: "packet_frame_audio_proof"},
 	}
@@ -381,7 +386,7 @@ func TestAllocationLedgerRejectsUnsafeIdentityAndCrossBatchPublication(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim := LedgerPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ArtifactID: 1, ScopeID: canonicalLedgerID("other-batch", ledger.RecordingID, ledger.LocalDate, ledger.Generation), LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("t", 32), LeaseExpires: time.Now().Add(time.Hour), StorageAuthority: "cap.test", StorageBucket: "recordings", BatchID: "other-batch", Ledger: ledger, ExpectedSize: int64(len(canonical)), ExpectedSHA256: sha}
+	claim := LedgerPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ArtifactID: 1, ScopeID: canonicalLedgerID("other-batch", ledger.RecordingID, ledger.LocalDate, ledger.Generation), LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("t", 32), LeaseExpires: time.Now().Add(time.Hour), StorageAuthority: testSourceAuthority, StorageBucket: "recordings", BatchID: "other-batch", Ledger: ledger, ExpectedSize: int64(len(canonical)), ExpectedSHA256: sha}
 	if _, _, err := claim.Validate(time.Now()); err == nil {
 		t.Fatal("ledger published through another batch identity")
 	}
