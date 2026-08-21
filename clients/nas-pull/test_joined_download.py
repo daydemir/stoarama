@@ -247,11 +247,11 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
         expected = {
             "allocation_ledger_v1.golden.json": "255e2958738e5f87629224c4e537256b3638fb6abaeaa77a2054c559f5c4ef82",
-            "batch_index_v1.golden.json": "13e1dbd78d70da9bd9f458948df3b05013f89aeca6d5326f880041c26c7bd8e6",
+            "batch_index_v1.golden.json": "41f41aff2c2857562741e31a06137043a86a633106a0db5228cdc984cab243f3",
             "hour_manifest_gap_only_v1.golden.json": "8ec7e39c4cba19cbb5b8e11a3f04952656d53c0b77b879ef764767353af951a9",
-            "hour_manifest_mixed_v1.golden.json": "5af2dd888ed7db0a66f3d3d3c36223def703c14732b5515446555e9288a2cf22",
-            "hour_manifest_quarantine_only_v1.golden.json": "addc432f0b6aec344e3152b233691035c491e5ed7f186329f8ab9db55a3a4593",
-            "hour_manifest_v1.golden.json": "9e498dcde096e42295d9c05e021be45c57b315d6f9a9e050f05d55e98a70e7f8",
+            "hour_manifest_mixed_v1.golden.json": "60858833815cc0240b76f3d43aa548f6a34189eaa46a59d191843de8729620cc",
+            "hour_manifest_quarantine_only_v1.golden.json": "0171c31d9b39af06b4075a2dd473266e490e15b8820390bf6821e0ca21b561dd",
+            "hour_manifest_v1.golden.json": "b39dd8c53656db81cd30d96203580ce41c441790b9b1984859243702c46a902a",
         }
         for name, digest in expected.items():
             path = CLOUD_GOLDENS / name
@@ -351,8 +351,47 @@ class JoinedDownloadTests(unittest.TestCase):
         manifest["quarantine_evidence"] = []
         manifest["media"][0]["source_clip_ids"] = [1, 2]
         manifest["media"][0]["actual_end_utc"] = manifest["sources"][1]["end_utc"]
-        with self.assertRaisesRegex(ValueError, "crosses a gap"):
+        with self.assertRaisesRegex(ValueError, "gap evidence conflicts"):
             pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
+
+    def test_corrected_cloud_hour_contract_rejects_self_rehashed_mutations(self):
+        quarantine = self.golden("hour_manifest_quarantine_only_v1.golden.json")
+        pull.valid_hour_manifest(quarantine)
+        quarantine["gaps"][0], quarantine["gaps"][1] = quarantine["gaps"][1], quarantine["gaps"][0]
+        with self.assertRaisesRegex(ValueError, "source order"):
+            pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(quarantine)))
+
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        manifest["sources"][0]["audio_sequence_contract"] = {
+            "codec_name": "aac", "sample_rate": 48000, "channels": 2, "channel_layout": "stereo",
+            "initial_padding": 0, "skip_samples": 0, "discard_padding": 0, "codec_delay": 0,
+            "trailing_padding": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "audio contracts"):
+            pull.valid_hour_manifest(manifest)
+
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        manifest["media"][0]["size_bytes"] = pull.JOINED_MAX_BYTES + 1
+        with self.assertRaisesRegex(ValueError, "size cap"):
+            pull.valid_hour_manifest(manifest)
+
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        fingerprint = manifest["media"][0]["verification"]["source_fingerprint"]
+        fingerprint.update({
+            "audio_sequence_contracts": [], "effective_audio_bytes": 0,
+            "effective_audio_sample_frames": 0, "effective_audio_sha256": "",
+        })
+        with self.assertRaisesRegex(ValueError, "audio evidence"):
+            pull.valid_hour_manifest(manifest)
+
+    def test_consecutive_ledgers_must_share_exact_cross_day_fact(self):
+        previous = self.ledger_payload()
+        following = self.ledger_payload()
+        following["cross_day_boundaries"][0] = dict(previous["cross_day_boundaries"][1])
+        pull.validate_cross_day_ledger_link(previous, following)
+        following["cross_day_boundaries"][0]["verdict"] = "gap"
+        with self.assertRaisesRegex(pull.ExistingFileMismatch, "shared day boundary"):
+            pull.validate_cross_day_ledger_link(previous, following)
 
     def test_protocol_zero_is_dormant_without_joined_api_or_storage_access(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -486,6 +525,10 @@ class JoinedDownloadTests(unittest.TestCase):
         with mock.patch.object(pull, "read_joined_json_path", side_effect=read), mock.patch.object(pull, "valid_allocation_ledger"), mock.patch.object(pull, "valid_hour_manifest"), mock.patch.object(pull, "verify_joined_relative_file") as verify:
             pull.validate_batch_index_proof(None, None, index, threading.Event())
             verify.assert_called_once_with(None, None, ledger["batch_id"], media_path, 6, hashlib.sha256(b"media!").hexdigest(), mock.ANY)
+            manifests[hour_refs[0]["relative_path"]]["media"][0]["artifact_id"] = hour_refs[0]["hour_manifest_artifact_id"]
+            with self.assertRaisesRegex(pull.ExistingFileMismatch, "duplicated"):
+                pull.validate_batch_index_proof(None, None, index, threading.Event())
+            manifests[hour_refs[0]["relative_path"]]["media"][0]["artifact_id"] = 88
             ledger["generation"] += 1
             with self.assertRaisesRegex(pull.ExistingFileMismatch, "ledger reference"):
                 pull.validate_batch_index_proof(None, None, index, threading.Event())
