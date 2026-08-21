@@ -35,7 +35,7 @@ func testRequest(sources []SourceClip) PlanRequest {
 		if i > 0 {
 			jobID += int64(1000 + i)
 		}
-		days[i] = QualifiedDay{LocalDate: start.Format("2006-01-02"), JobID: jobID, WindowStart: start, WindowEnd: start.Add(12 * time.Hour), CompletedAt: start.Add(12 * time.Hour), QualityTier: "good+"}
+		days[i] = QualifiedDay{LocalDate: start.Format("2006-01-02"), QualificationWindowOrdinal: i + 1, JobID: jobID, WindowStart: start, WindowEnd: start.Add(12 * time.Hour), CompletedAt: start.Add(12 * time.Hour)}
 	}
 	qualification, err := SealQualificationWindow(QualificationWindow{RecordingID: recordingID, Timezone: "UTC", Days: days, FrozenAt: time.Date(2027, time.January, 1, 0, 0, 0, 0, time.UTC)})
 	if err != nil {
@@ -422,7 +422,7 @@ func TestGapOnlyStreamDayPreservesOneSidedNeighborsAcrossDST(t *testing.T) {
 		date := firstDay.AddDate(0, 0, i)
 		start := time.Date(date.Year(), date.Month(), date.Day(), 8, 0, 0, 0, loc)
 		end := time.Date(date.Year(), date.Month(), date.Day(), 20, 0, 0, 0, loc)
-		days[i] = QualifiedDay{LocalDate: date.Format("2006-01-02"), JobID: int64(900 + i), WindowStart: start.UTC(), WindowEnd: end.UTC(), CompletedAt: end.UTC(), QualityTier: "good+"}
+		days[i] = QualifiedDay{LocalDate: date.Format("2006-01-02"), QualificationWindowOrdinal: i + 1, JobID: int64(900 + i), WindowStart: start.UTC(), WindowEnd: end.UTC(), CompletedAt: end.UTC()}
 	}
 	req.Qualification, _ = SealQualificationWindow(QualificationWindow{RecordingID: req.RecordingID, Timezone: req.Timezone, Days: days, FrozenAt: time.Date(2027, time.January, 1, 0, 0, 0, 0, time.UTC)})
 	previousStart := time.Date(2026, time.October, 31, 19, 59, 0, 0, loc).UTC()

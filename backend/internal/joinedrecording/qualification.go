@@ -1,7 +1,10 @@
 package joinedrecording
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"time"
 
@@ -11,12 +14,34 @@ import (
 var reasonCode = regexp.MustCompile(`^[a-z][a-z0-9_]{0,79}$`)
 
 type QualifiedDay struct {
-	LocalDate   string    `json:"local_date"`
-	JobID       int64     `json:"job_id,omitempty"`
-	WindowStart time.Time `json:"window_start"`
-	WindowEnd   time.Time `json:"window_end"`
-	CompletedAt time.Time `json:"completed_at,omitempty"`
-	QualityTier string    `json:"quality_tier,omitempty"`
+	LocalDate                  string    `json:"local_date"`
+	QualificationWindowOrdinal int       `json:"qualification_window_ordinal"`
+	JobID                      int64     `json:"job_id,omitempty"`
+	WindowStart                time.Time `json:"window_start"`
+	WindowEnd                  time.Time `json:"window_end"`
+	CompletedAt                time.Time `json:"completed_at,omitempty"`
+}
+
+func (day *QualifiedDay) UnmarshalJSON(data []byte) error {
+	type wire QualifiedDay
+	var decoded wire
+	if err := decodeStrictJSON(data, &decoded); err != nil {
+		return fmt.Errorf("invalid qualified day: %w", err)
+	}
+	*day = QualifiedDay(decoded)
+	return nil
+}
+
+func decodeStrictJSON(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("invalid trailing JSON")
+	}
+	return nil
 }
 
 // QualificationWindow freezes exactly 14 completed scheduled local days.
@@ -43,7 +68,7 @@ func SealQualificationWindow(window QualificationWindow) (QualificationWindow, e
 			return QualificationWindow{}, fmt.Errorf("qualification days must be 14 consecutive local 12-hour windows")
 		}
 		previousDate = date
-		if day.JobID <= 0 || seenJobs[day.JobID] || day.CompletedAt.Before(day.WindowEnd) || day.CompletedAt.After(window.FrozenAt) || day.QualityTier != "good+" {
+		if day.QualificationWindowOrdinal != i+1 || day.JobID <= 0 || seenJobs[day.JobID] || day.CompletedAt.Before(day.WindowEnd) || day.CompletedAt.After(window.FrozenAt) {
 			return QualificationWindow{}, fmt.Errorf("invalid completed qualification day")
 		}
 		seenJobs[day.JobID] = true
