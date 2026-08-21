@@ -54,10 +54,14 @@ func (c PreflightHourClaim) Validate(now time.Time) error {
 
 func validatePreflightSource(source SourceClip, recordingID int64) error {
 	_, endpointErr := CanonicalSourceEndpointAuthority(source.Endpoint)
-	if source.ClipID <= 0 || source.RecordingID != recordingID || source.RecordingJobID <= 0 || source.Provider == "" || endpointErr != nil || source.Region == "" || source.Bucket == "" || !source.EndUTC.After(source.StartUTC) || !safeObjectKey(source.Object.Key) || !validObjectIdentity(source.Object.ETag, source.Object.VersionID) || source.Object.SizeBytes <= 0 || !lowerHex64(source.Object.SHA256) {
+	if source.ClipID <= 0 || source.RecordingID != recordingID || source.RecordingJobID <= 0 || !validFrozenSourceStorage(source.Provider, source.Region, source.Bucket) || endpointErr != nil || !source.EndUTC.After(source.StartUTC) || (source.ReleasedAt != nil && source.ReleasedAt.IsZero()) || !safeObjectKey(source.Object.Key) || !validObjectIdentity(source.Object.ETag, source.Object.VersionID) || source.Object.SizeBytes <= 0 || !lowerHex64(source.Object.SHA256) {
 		return fmt.Errorf("invalid exact preflight source identity")
 	}
 	return nil
+}
+
+func validFrozenSourceStorage(provider, region, bucket string) bool {
+	return provider == "r2" && region == "auto" && canonicalSourceBucket.MatchString(bucket)
 }
 
 func (c PreflightHourClaim) ScratchDir(root string) (string, error) {
@@ -84,7 +88,10 @@ func leaseScratchDir(root, leaseID string) string {
 
 func validOperationToken(token string) bool { return len(token) >= 16 && len(token) <= 8192 }
 
-var leaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+var (
+	leaseIDPattern        = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	canonicalSourceBucket = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+)
 
 func validLeaseID(id string) bool { return leaseIDPattern.MatchString(id) }
 
