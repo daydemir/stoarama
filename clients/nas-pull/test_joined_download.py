@@ -384,6 +384,79 @@ class JoinedDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "audio evidence"):
             pull.valid_hour_manifest(manifest)
 
+    def test_source_identity_and_nanosecond_parity_with_cloud(self):
+        source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
+        for label, mutate in (
+            ("canonical HTTPS", lambda value: value.update(endpoint="https://cap.test/?secret=value")),
+            ("unsafe", lambda value: value["object"].update(key="raw/../escape.mp4")),
+            ("ETag", lambda value: value["object"].update(etag='W/"weak"')),
+        ):
+            changed = json.loads(json.dumps(source))
+            mutate(changed)
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, label):
+                pull.valid_source(changed, changed["recording_id"], source_only=True)
+        changed = json.loads(json.dumps(source))
+        changed["end_utc"] = "2026-05-04T08:15:00.000000001Z"
+        with self.assertRaisesRegex(ValueError, "range"):
+            pull.valid_source(changed, changed["recording_id"], source_only=True)
+        changed = json.loads(json.dumps(source))
+        changed["start_utc"], changed["end_utc"] = "2026-05-05T08:00:00Z", "2026-05-05T08:01:00Z"
+        with self.assertRaisesRegex(ValueError, "local date"):
+            pull.valid_source(changed, changed["recording_id"], source_only=True, location=pull.ZoneInfo("UTC"), local_date="2026-05-04")
+
+        qualification = self.golden("allocation_ledger_v1.golden.json")["qualification_day"]
+        changed = json.loads(json.dumps(qualification))
+        changed["window_end"] = "2026-05-04T20:00:00.000000001Z"
+        with self.assertRaisesRegex(ValueError, "qualification day"):
+            pull.valid_qualification_day(changed, 377, "UTC", "2026-05-04")
+        equivalent = json.loads(json.dumps(qualification))
+        equivalent.update({
+            "window_start": "2026-05-04T09:00:00+01:00",
+            "window_end": "2026-05-04T21:00:00+01:00",
+            "completed_at": "2026-05-04T21:00:00+01:00",
+        })
+        pull.valid_qualification_day(equivalent, 377, "UTC", "2026-05-04")
+
+        manifest = self.golden("hour_manifest_v1.golden.json")
+        manifest["scheduled_end_utc"] = "2026-05-04T09:00:00.000000001Z"
+        with self.assertRaisesRegex(ValueError, "schedule"):
+            pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
+
+    def test_audio_codec_and_quarantine_reason_are_exactly_bound(self):
+        verification = self.golden("hour_manifest_v1.golden.json")["media"][0]["verification"]
+        def audio_track(video):
+            track = {}
+            for key, value in video.items():
+                if key == "first_timestamp":
+                    track["decoded_samples"] = 1
+                track[key] = "audio" if key == "media_type" else value
+            return track
+        source_track = audio_track(verification["source_fingerprint"]["tracks"]["video"])
+        output_track = audio_track(verification["output_fingerprint"]["tracks"]["video"])
+        aac = {
+            "codec_name": "aac", "sample_rate": 48000, "channels": 2, "channel_layout": "stereo",
+            "initial_padding": 0, "skip_samples": 0, "discard_padding": 0, "codec_delay": 0,
+            "trailing_padding": 0,
+        }
+        opus = {**aac, "codec_name": "opus"}
+        for fingerprint, track, contract in (
+            (verification["source_fingerprint"], source_track, aac),
+            (verification["output_fingerprint"], output_track, opus),
+        ):
+            fingerprint["tracks"]["audio"] = track
+            fingerprint.update({
+                "audio_sequence_contracts": [contract], "effective_audio_bytes": 1,
+                "effective_audio_sample_frames": 1, "effective_audio_sha256": "a" * 64,
+            })
+        with self.assertRaisesRegex(ValueError, "audio format"):
+            pull.valid_verification(verification)
+
+        for fixture in ("hour_manifest_mixed_v1.golden.json", "hour_manifest_quarantine_only_v1.golden.json"):
+            manifest = self.golden(fixture)
+            manifest["source_dispositions"][-1]["reason_code"] = "different_failure"
+            with self.subTest(fixture=fixture), self.assertRaisesRegex(ValueError, "exactly cover"):
+                pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
+
     def test_consecutive_ledgers_must_share_exact_cross_day_fact(self):
         previous = self.ledger_payload()
         following = self.ledger_payload()

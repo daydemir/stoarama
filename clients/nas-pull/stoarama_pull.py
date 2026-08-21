@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import signal
 import socket
@@ -2651,6 +2652,9 @@ def valid_joined_timestamp(value, label):
     match = re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})", value)
     if match is None:
         raise ValueError("joined manifest has invalid %s" % label)
+    fraction = match.group(1) or ""
+    if fraction.endswith("0"):
+        raise ValueError("joined manifest has noncanonical %s" % label)
     normalized = value.replace("Z", "+00:00")
     if match.group(1) and len(match.group(1)) > 6:
         normalized = normalized.replace("." + match.group(1), "." + match.group(1)[:6], 1)
@@ -2846,19 +2850,17 @@ def valid_qualification_day(day, recording_id, timezone, local_date):
     exact_joined_fields(day, QUALIFICATION_FIELDS, "qualification day")
     if day["local_date"] != valid_joined_date(local_date) or positive_joined_int(day["job_id"], "job_id") < 1:
         raise ValueError("joined qualification day identity conflicts")
-    start = valid_joined_timestamp(day["window_start"], "qualification window_start")
-    end = valid_joined_timestamp(day["window_end"], "qualification window_end")
-    completed = valid_joined_timestamp(day["completed_at"], "qualification completed_at")
     try:
         location = ZoneInfo(valid_joined_string(timezone, "timezone", maximum=255))
     except ZoneInfoNotFoundError as exc:
         raise ValueError("joined timezone is invalid") from exc
-    local_start, local_end = start.astimezone(location), end.astimezone(location)
+    start_ns = joined_timestamp_nanoseconds(day["window_start"], "qualification window_start")
+    end_ns = joined_timestamp_nanoseconds(day["window_end"], "qualification window_end")
+    completed_ns = joined_timestamp_nanoseconds(day["completed_at"], "qualification completed_at")
     if (
-        end - start != datetime.timedelta(hours=12) or completed < end or day["quality_tier"] != "good+"
-        or local_start.date().isoformat() != local_date or local_end.date().isoformat() != local_date
-        or (local_start.hour, local_start.minute, local_start.second, local_start.microsecond) != (8, 0, 0, 0)
-        or (local_end.hour, local_end.minute, local_end.second, local_end.microsecond) != (20, 0, 0, 0)
+        end_ns - start_ns != 12 * 3_600_000_000_000 or completed_ns < end_ns or day["quality_tier"] != "good+"
+        or start_ns != local_boundary_nanoseconds(local_date, location, 8)
+        or end_ns != local_boundary_nanoseconds(local_date, location, 20)
     ):
         raise ValueError("joined qualification day is invalid")
 
@@ -2876,7 +2878,7 @@ def valid_media_tool(tool):
         raise ValueError("joined media tool identity conflicts")
 
 
-def valid_source(source, recording_id, source_only=False):
+def valid_source(source, recording_id, source_only=False, location=None, local_date=None):
     fields = set(SOURCE_FIELDS)
     if not isinstance(source, dict) or set(source) not in (fields, fields | {"audio_sequence_contract"}):
         raise ValueError("joined source has invalid fields")
@@ -2884,20 +2886,38 @@ def valid_source(source, recording_id, source_only=False):
     if source["recording_id"] != recording_id:
         raise ValueError("joined source recording identity conflicts")
     positive_joined_int(source["recording_job_id"], "recording_job_id")
-    for key in ("provider", "endpoint", "region", "bucket"):
+    for key in ("provider", "region", "bucket"):
         valid_joined_string(source[key], "source %s" % key)
+    endpoint = valid_joined_string(source["endpoint"], "source endpoint")
+    parsed_endpoint = urllib.parse.urlsplit(endpoint)
+    if (
+        not endpoint.startswith("https://") or parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc
+        or parsed_endpoint.username is not None or parsed_endpoint.password is not None
+        or parsed_endpoint.query or parsed_endpoint.fragment or parsed_endpoint.path not in ("", "/")
+    ):
+        raise ValueError("joined source endpoint is not a canonical HTTPS authority")
     start = valid_joined_timestamp(source["start_utc"], "source start_utc")
     end = valid_joined_timestamp(source["end_utc"], "source end_utc")
-    if end <= start:
+    start_ns = joined_timestamp_nanoseconds(source["start_utc"], "source start_utc")
+    end_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end_utc")
+    if end_ns <= start_ns or end_ns - start_ns > 15 * 60 * 1_000_000_000:
         raise ValueError("joined source range is invalid")
+    if location is not None and local_date is not None and (start.astimezone(location).date().isoformat() != local_date or end.astimezone(location).date().isoformat() != local_date):
+        raise ValueError("joined source local date conflicts")
     object_fields = set(OBJECT_FIELDS)
     if isinstance(source["object"], dict) and "version_id" in source["object"]:
         object_fields.add("version_id")
     exact_joined_fields(source["object"], object_fields, "source object")
-    for key in ("key", "etag"):
-        valid_joined_string(source["object"][key], "source object %s" % key)
+    key = valid_joined_string(source["object"]["key"], "source object key")
+    if key in (".", "..") or key.startswith("/") or posixpath.normpath(key) != key or "\\" in key or "\0" in key:
+        raise ValueError("joined source object key is unsafe")
+    etag = source["object"]["etag"]
+    if not isinstance(etag, str) or not 1 <= len(etag) <= 256 or etag.startswith("W/") or '"' in etag or any(not 0x21 <= ord(ch) <= 0x7e for ch in etag):
+        raise ValueError("joined source object ETag is invalid")
     if "version_id" in source["object"]:
-        valid_joined_string(source["object"]["version_id"], "source object version_id")
+        version_id = source["object"]["version_id"]
+        if not isinstance(version_id, str) or not 1 <= len(version_id) <= 1024 or any(not 0x21 <= ord(ch) <= 0x7e for ch in version_id):
+            raise ValueError("joined source object version_id is invalid")
     positive_joined_int(source["object"]["size_bytes"], "source object size_bytes")
     valid_sha256(source["object"]["sha256"], "source object")
     exact_joined_fields(source["seam_to_previous"], SEAM_FIELDS, "source seam")
@@ -3117,9 +3137,7 @@ def valid_allocation_ledger(payload):
         raise ValueError("joined allocation ledger source count conflicts")
     source_ids, object_ids, calculated_bytes = [], set(), 0
     for source in payload["sources"]:
-        source_ids.append(valid_source(source, recording_id, source_only=True))
-        if valid_joined_timestamp(source["start_utc"], "source start").astimezone(location).date().isoformat() != local_date or valid_joined_timestamp(source["end_utc"], "source end").astimezone(location).date().isoformat() != local_date:
-            raise ValueError("joined allocation ledger source date conflicts")
+        source_ids.append(valid_source(source, recording_id, source_only=True, location=location, local_date=local_date))
         object_identity = tuple(source[key] for key in ("provider", "endpoint", "region", "bucket")) + tuple(source["object"].get(key, "") for key in ("key", "version_id", "etag"))
         if object_identity in object_ids:
             raise ValueError("joined allocation ledger duplicates a source object")
@@ -3283,13 +3301,11 @@ def valid_batch_index(payload, item=None):
         exact_joined_fields(frozen["naming_metadata"], naming_fields, "frozen recording naming")
         if frozen["recording_id"] != recording_id or frozen["priority_ordinal"] != ordinal or frozen["eligibility_tier"] != "good+":
             raise ValueError("joined frozen recording order conflicts")
-        cutoff = valid_joined_timestamp(frozen["eligibility_cutoff"], "eligibility_cutoff")
-        completed = valid_joined_timestamp(frozen["completed_at"], "completed_at")
         try:
             ZoneInfo(valid_joined_string(frozen["timezone"], "frozen timezone", maximum=255))
         except ZoneInfoNotFoundError as exc:
             raise ValueError("joined frozen timezone is invalid") from exc
-        if completed > cutoff:
+        if joined_timestamp_nanoseconds(frozen["completed_at"], "completed_at") > joined_timestamp_nanoseconds(frozen["eligibility_cutoff"], "eligibility_cutoff"):
             raise ValueError("joined frozen recording completed after cutoff")
         for key, value in frozen["naming_metadata"].items():
             valid_joined_string(value, "frozen naming %s" % key)
@@ -3501,6 +3517,12 @@ def valid_verification(verification):
     for key in ("effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"):
         if expected.get(key) != actual.get(key):
             raise ValueError("joined decoded audio fingerprint conflicts")
+    if expected.get("audio_sequence_contracts"):
+        source_format = expected["audio_sequence_contracts"][0]
+        output_contracts = actual.get("audio_sequence_contracts", [])
+        format_fields = ("codec_name", "sample_rate", "channels", "channel_layout")
+        if len(output_contracts) != 1 or any(source_format[key] != output_contracts[0][key] for key in format_fields):
+            raise ValueError("joined effective audio format conflicts")
 
 
 def valid_hour_manifest(payload, item=None):
@@ -3523,18 +3545,13 @@ def valid_hour_manifest(payload, item=None):
     expected_hour = "%s__recording-%d__date-%s__hour-%02d__generation-" % (batch_id, recording_id, local_date, delivery_hour)
     if not hour_id.startswith(expected_hour):
         raise ValueError("joined hour manifest hour identity conflicts")
-    start = valid_joined_timestamp(payload["scheduled_start_utc"], "scheduled_start_utc")
-    end = valid_joined_timestamp(payload["scheduled_end_utc"], "scheduled_end_utc")
     try:
         location = ZoneInfo(payload["timezone"])
     except (TypeError, ZoneInfoNotFoundError) as exc:
         raise ValueError("joined hour timezone is invalid") from exc
-    local_start, local_end = start.astimezone(location), end.astimezone(location)
     if (
-        end - start != datetime.timedelta(hours=1) or local_start.date().isoformat() != local_date
-        or local_end.date().isoformat() != local_date or local_start.hour != delivery_hour + 7
-        or local_start.minute or local_start.second or local_start.microsecond
-        or local_end.hour != delivery_hour + 8 or local_end.minute or local_end.second or local_end.microsecond
+        joined_timestamp_nanoseconds(payload["scheduled_start_utc"], "scheduled_start_utc") != local_boundary_nanoseconds(local_date, location, delivery_hour + 7)
+        or joined_timestamp_nanoseconds(payload["scheduled_end_utc"], "scheduled_end_utc") != local_boundary_nanoseconds(local_date, location, delivery_hour + 8)
     ):
         raise ValueError("joined hour manifest schedule conflicts")
     valid_qualification_day(payload["qualification_day"], recording_id, payload["timezone"], local_date)
@@ -3562,14 +3579,19 @@ def valid_hour_manifest(payload, item=None):
     source_count = positive_joined_int(payload["source_count"], "source_count", allow_zero=True)
     if not isinstance(payload["sources"], list) or len(payload["sources"]) != source_count:
         raise ValueError("joined hour manifest source count conflicts")
-    source_ids = [valid_source(source, recording_id) for source in payload["sources"]]
+    source_ids = [valid_source(source, recording_id, location=location, local_date=local_date) for source in payload["sources"]]
     valid_derived_source_seams(payload["sources"])
-    if len(source_ids) != len(set(source_ids)) or source_claim_sha(payload["sources"]) != payload["source_claim_sha256"] or payload["source_claim_sha256"] != allocation["hour_source_claim_sha256"]:
+    storage_ids = {
+        tuple(source[key] for key in ("provider", "endpoint", "region", "bucket"))
+        + tuple(source["object"].get(key, "") for key in ("key", "version_id", "etag"))
+        for source in payload["sources"]
+    }
+    if len(source_ids) != len(set(source_ids)) or len(storage_ids) != len(source_ids) or source_claim_sha(payload["sources"]) != payload["source_claim_sha256"] or payload["source_claim_sha256"] != allocation["hour_source_claim_sha256"]:
         raise ValueError("joined hour manifest source claim conflicts")
     disposition_fields = {"clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"}
     if not isinstance(payload["source_dispositions"], list) or len(payload["source_dispositions"]) != source_count:
         raise ValueError("joined hour manifest dispositions conflict")
-    included, quarantined = {}, set()
+    included, quarantined = {}, {}
     for clip_id, disposition in zip(source_ids, payload["source_dispositions"]):
         exact_joined_fields(disposition, disposition_fields, "source disposition")
         if disposition["clip_id"] != clip_id:
@@ -3584,7 +3606,7 @@ def valid_hour_manifest(payload, item=None):
             if disposition["media_artifact_id"] != 0 or disposition["media_ordinal"] != 0:
                 raise ValueError("joined quarantined source references media")
             valid_joined_reason(disposition["reason_code"], "source quarantine")
-            quarantined.add(clip_id)
+            quarantined[clip_id] = disposition["reason_code"]
         else:
             raise ValueError("joined source disposition is invalid")
     gap_fields = {"previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"}
@@ -3628,7 +3650,7 @@ def valid_hour_manifest(payload, item=None):
     }
     if not isinstance(payload["quarantine_evidence"], list):
         raise ValueError("joined quarantine evidence is invalid")
-    evidenced = []
+    evidenced = {}
     for evidence in payload["quarantine_evidence"]:
         exact_joined_fields(evidence, quarantine_fields, "quarantine evidence")
         valid_joined_reason(evidence["reason_code"], "quarantine evidence")
@@ -3649,8 +3671,11 @@ def valid_hour_manifest(payload, item=None):
         }
         if joined_canonical_sha(proof) != evidence["evidence_sha256"]:
             raise ValueError("joined quarantine evidence hash conflicts")
-        evidenced.extend(ids)
-    if set(evidenced) != quarantined or len(evidenced) != len(set(evidenced)):
+        for clip_id in ids:
+            if clip_id in evidenced:
+                raise ValueError("joined quarantine evidence overlaps")
+            evidenced[clip_id] = evidence["reason_code"]
+    if evidenced != quarantined:
         raise ValueError("joined quarantine evidence does not exactly cover quarantined sources")
     media_fields = {
         "artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes",
@@ -3676,11 +3701,11 @@ def valid_hour_manifest(payload, item=None):
         if media["content_id"] != sha256 or media["media_tool_identity"] != payload["media_tool"]["identity_sha256"]:
             raise ValueError("joined hour media content identity conflicts")
         actual_start = valid_joined_timestamp(media["actual_start_utc"], "actual_start_utc")
-        actual_end = valid_joined_timestamp(media["actual_end_utc"], "actual_end_utc")
+        valid_joined_timestamp(media["actual_end_utc"], "actual_end_utc")
         offset = actual_start.astimezone(location).utcoffset()
         expected_offset = int(offset.total_seconds()) if offset is not None else None
         if (
-            actual_end <= actual_start
+            joined_timestamp_nanoseconds(media["actual_end_utc"], "actual_end_utc") <= joined_timestamp_nanoseconds(media["actual_start_utc"], "actual_start_utc")
             or not -86400 < valid_joined_int64(media["utc_offset_seconds"], "media UTC offset") < 86400
             or media["utc_offset_seconds"] != expected_offset
         ):
@@ -3793,7 +3818,7 @@ def valid_hour_manifest(payload, item=None):
             raise ValueError("joined scheduled gap duration conflicts")
     elif status == "quarantine_only":
         valid_joined_reason(payload["quarantine_reason_code"], "quarantine-only hour")
-        if not source_ids or payload["media"] or payload["scheduled_gap"] is not None or not payload["quarantine_evidence"] or set(source_ids) != quarantined:
+        if not source_ids or payload["media"] or payload["scheduled_gap"] is not None or not payload["quarantine_evidence"] or set(source_ids) != set(quarantined):
             raise ValueError("joined quarantine-only hour terminal state conflicts")
     else:
         raise ValueError("joined hour manifest has unknown status")
