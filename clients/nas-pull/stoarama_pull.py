@@ -43,6 +43,7 @@ INVENTORY_SYNC_BATCH = 200
 INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
+JOINED_ROOT = "joined"
 
 INVENTORY_SKIP_REASONS = frozenset((
     "changed_during_hash", "invalid_sidecar", "io_error",
@@ -703,7 +704,9 @@ class Inventory:
         self._meta_set({"scan_pass_started_at": pass_started_at, "scan_rows_visited": "0", "scan_rows_skipped": "0", "scan_skip_reasons": "{}"})
 
         known_paths = set()
-        for sidecar in cfg.output_dir.rglob("*.stoarama.json"):
+        for sidecar in walk_raw_files(cfg.output_dir):
+            if not sidecar.name.endswith(".stoarama.json"):
+                continue
             if stop_event.is_set():
                 self._commit_scan_batch((scanned, skipped, skip_reasons))
                 return
@@ -775,7 +778,7 @@ class Inventory:
                 reason = inventory_skip_reason(exc, sidecar=True)
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
-        for path in cfg.output_dir.rglob("*"):
+        for path in walk_raw_files(cfg.output_dir):
             if stop_event.is_set():
                 self._commit_scan_batch((scanned, skipped, skip_reasons))
                 return
@@ -1155,7 +1158,23 @@ def valid_relative_path(clip):
     parts = raw.split("/")
     if any(part in ("", ".", "..") or "\\" in part for part in parts):
         raise ValueError("clip %d has invalid relative_path" % int(clip["clip_id"]))
+    if parts[0] == JOINED_ROOT:
+        raise ValueError("clip %d uses reserved relative_path" % int(clip["clip_id"]))
     return Path(*parts)
+
+
+def walk_raw_files(root):
+    root = Path(root)
+
+    def fail_walk(error):
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
+        directory = Path(dirpath)
+        if directory == root:
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT]
+        for filename in filenames:
+            yield directory / filename
 
 
 def sha256_file(path):

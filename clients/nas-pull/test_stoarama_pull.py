@@ -206,9 +206,99 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
 
     def test_relative_path_is_required_and_confined(self):
         self.assertEqual(pull.valid_relative_path({"clip_id": 1, "relative_path": "a/b.mp4"}), Path("a/b.mp4"))
-        for value in ("", "../x", "a/../x", "a\\b"):
+        for value in ("", "../x", "a/../x", "a\\b", "joined", "joined/x.mp4"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 pull.valid_relative_path({"clip_id": 1, "relative_path": value})
+        for value in ("joined-other/x.mp4", "Joined/x.mp4", "raw/joined/x.mp4"):
+            with self.subTest(value=value):
+                self.assertEqual(str(pull.valid_relative_path({"clip_id": 1, "relative_path": value})), value)
+
+    def test_raw_tree_prunes_only_top_level_joined_and_fails_walk_errors(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for relative in (
+                "joined/hidden.mp4", "joined/hidden.mp4.stoarama.json",
+                "joined-other/visible.mp4", "raw/joined/visible.mp4",
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x")
+            self.assertEqual(
+                sorted(str(path.relative_to(root)) for path in pull.walk_raw_files(root)),
+                ["joined-other/visible.mp4", "raw/joined/visible.mp4"],
+            )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            visible = root / "Joined" / "visible.mp4"
+            visible.parent.mkdir()
+            visible.write_bytes(b"x")
+            self.assertEqual(
+                [str(path.relative_to(root)) for path in pull.walk_raw_files(root)],
+                ["Joined/visible.mp4"],
+            )
+
+        def denied_walk(*_args, **kwargs):
+            kwargs["onerror"](PermissionError("denied"))
+            return iter(())
+
+        with mock.patch.object(pull.os, "walk", side_effect=denied_walk), self.assertRaises(PermissionError):
+            list(pull.walk_raw_files(Path("/unused")))
+
+    def test_full_inventory_scan_ignores_joined_and_keeps_similar_paths(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            hidden = cfg.output_dir / "joined" / "hidden.mp4"
+            hidden.parent.mkdir(parents=True)
+            hidden.write_bytes(b"hidden")
+            hidden.with_name(hidden.name + ".stoarama.json").write_text("{broken", encoding="utf-8")
+            visible = [
+                cfg.output_dir / "joined-other" / "one.mp4",
+                cfg.output_dir / "raw" / "joined" / "three.mp4",
+            ]
+            for path in visible:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(path.name.encode("utf-8"))
+            external = cfg.output_dir.parent / "external"
+            external.mkdir()
+            (external / "symlink-only.mp4").write_bytes(b"outside")
+            (cfg.output_dir / "directory-link").symlink_to(external, target_is_directory=True)
+
+            inventory = pull.Inventory(cfg)
+            calls = []
+            original_hash = pull.sha256_file_throttled_stable
+
+            def checked_hash(path, *args):
+                self.assertNotEqual(path.relative_to(cfg.output_dir).parts[0], pull.JOINED_ROOT)
+                return original_hash(path, *args)
+
+            with mock.patch.object(pull, "sha256_file_throttled_stable", side_effect=checked_hash), mock.patch.object(
+                pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}
+            ):
+                inventory.full_scan(cfg, threading.Event())
+            rows = inventory.db.execute(
+                "SELECT relative_path FROM unmatched_files WHERE state='present' ORDER BY relative_path"
+            ).fetchall()
+            inventory.close()
+            self.assertEqual([row[0] for row in rows], [
+                "joined-other/one.mp4", "raw/joined/three.mp4",
+            ])
+            reported = [row["relative_path"] for call in calls for row in call.get("unmatched_files", [])]
+            self.assertNotIn("joined/hidden.mp4", reported)
+            self.assertNotIn("directory-link/symlink-only.mp4", reported)
+
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            visible = cfg.output_dir / "Joined" / "visible.mp4"
+            visible.parent.mkdir()
+            visible.write_bytes(b"visible")
+            inventory = pull.Inventory(cfg)
+            with mock.patch.object(pull, "request_json", return_value={}):
+                inventory.full_scan(cfg, threading.Event())
+            rows = inventory.db.execute(
+                "SELECT relative_path FROM unmatched_files WHERE state='present'"
+            ).fetchall()
+            inventory.close()
+            self.assertEqual(rows, [("Joined/visible.mp4",)])
 
     def test_atomic_write_is_durable_and_replaces(self):
         with tempfile.TemporaryDirectory() as raw:
