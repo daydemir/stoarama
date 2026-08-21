@@ -427,11 +427,12 @@ class JoinedDownloadTests(unittest.TestCase):
         for endpoint in (
             "https://cap.test ", "https:// cap.test", "https://cap.test:bad",
             "https://cap\\test", "https://cap^test", "https://cap|test", "https://cap{test",
+            "https://cap`test", "https://cap\x7ftest", "https://cap%zztest", "https://cap%41test",
         ):
             changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(ValueError, "canonical HTTPS"):
                 pull.valid_source(changed, 377, source_only=True)
-        for endpoint in ("HTTPS://cap.test", "Https://cap.test"):
+        for endpoint in ("HTTPS://cap.test", "Https://cap.test", "https://cap\u00a0test"):
             changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
             pull.valid_source(changed, 377, source_only=True)
         for field in ("provider", "region", "bucket"):
