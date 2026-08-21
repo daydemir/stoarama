@@ -424,10 +424,16 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def test_malformed_source_authorities_blank_fields_and_manifest_order_fail(self):
         source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
-        for endpoint in ("https://cap.test ", "https:// cap.test", "https://cap.test:bad"):
+        for endpoint in (
+            "https://cap.test ", "https:// cap.test", "https://cap.test:bad",
+            "https://cap\\test", "https://cap^test", "https://cap|test", "https://cap{test",
+        ):
             changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(ValueError, "canonical HTTPS"):
                 pull.valid_source(changed, 377, source_only=True)
+        for endpoint in ("HTTPS://cap.test", "Https://cap.test"):
+            changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
+            pull.valid_source(changed, 377, source_only=True)
         for field in ("provider", "region", "bucket"):
             changed = json.loads(json.dumps(source)); changed[field] = "   "
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "blank"):
@@ -446,9 +452,34 @@ class JoinedDownloadTests(unittest.TestCase):
         manifest = self.golden("hour_manifest_quarantine_only_v1.golden.json")
         manifest["sources"][0], manifest["sources"][1] = manifest["sources"][1], manifest["sources"][0]
         manifest["source_dispositions"][0], manifest["source_dispositions"][1] = manifest["source_dispositions"][1], manifest["source_dispositions"][0]
+        for index, source in enumerate(manifest["sources"]):
+            if index == 0:
+                source["seam_to_previous"] = {"verdict": "", "reason": "", "signed_gap_nanoseconds": 0}
+                continue
+            previous = manifest["sources"][index - 1]
+            signed_gap = pull.joined_timestamp_nanoseconds(source["start_utc"], "attack start") - pull.joined_timestamp_nanoseconds(previous["end_utc"], "attack end")
+            source["seam_to_previous"] = {
+                "verdict": "gap" if signed_gap > 0 else "overlap" if signed_gap < 0 else "continuous",
+                "reason": "signed_presentation_gap" if signed_gap else "timestamp_adjacent_preflight_candidate",
+                "signed_gap_nanoseconds": signed_gap,
+            }
+        manifest["gaps"] = [{
+            "previous_clip_id": previous["clip_id"], "next_clip_id": following["clip_id"],
+            "at_utc": previous["end_utc"],
+            "signed_gap_nanoseconds": following["seam_to_previous"]["signed_gap_nanoseconds"],
+            "reason": "source_quarantined",
+        } for previous, following in zip(manifest["sources"], manifest["sources"][1:])]
         source_sha = pull.source_claim_sha(manifest["sources"])
         manifest["source_claim_sha256"] = source_sha
         manifest["allocation"]["hour_source_claim_sha256"] = source_sha
+        evidence = manifest["quarantine_evidence"][0]
+        evidence["source_clip_ids"] = [source["clip_id"] for source in manifest["sources"]]
+        evidence["source_claim_sha256"] = pull.candidate_source_claim_sha(manifest["sources"])
+        evidence["evidence_sha256"] = pull.joined_canonical_sha({
+            "source_claim_sha256": evidence["source_claim_sha256"], "reason_code": evidence["reason_code"],
+            "failure_sha256": evidence["failure_sha256"], "policy_version": evidence["policy_version"],
+            "media_tool_identity": evidence["media_tool_identity"], "repeat_count": evidence["isolated_attempt_count"],
+        })
         with self.assertRaisesRegex(ValueError, "source order"):
             pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
 

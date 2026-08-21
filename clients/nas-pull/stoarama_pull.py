@@ -2896,9 +2896,10 @@ def valid_source(source, recording_id, source_only=False, location=None, local_d
     except ValueError as exc:
         raise ValueError("joined source endpoint is not a canonical HTTPS authority") from exc
     if (
-        not endpoint.startswith("https://") or parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc
+        parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc
         or parsed_endpoint.username is not None or parsed_endpoint.password is not None
         or any(ch.isspace() or ord(ch) < 0x21 for ch in parsed_endpoint.netloc)
+        or any(ch in "\\^|{}" for ch in parsed_endpoint.netloc)
         or parsed_endpoint.query or parsed_endpoint.fragment or parsed_endpoint.path not in ("", "/")
     ):
         raise ValueError("joined source endpoint is not a canonical HTTPS authority")
