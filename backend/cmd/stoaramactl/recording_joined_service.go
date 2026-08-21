@@ -68,6 +68,7 @@ func newRemoteJoinedOperatorService(cfg config.Config) (*remoteJoinedOperatorSer
 	service := &remoteJoinedOperatorService{
 		cfg:              cfg,
 		api:              api,
+		operatorToken:    cfg.JoinedOperatorToken,
 		capabilityClient: joinedrecording.NewCapabilityHTTPClient(),
 		idlePoll:         joinedWorkerIdlePoll,
 	}
