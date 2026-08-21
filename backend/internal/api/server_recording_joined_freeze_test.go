@@ -87,3 +87,16 @@ func TestJoinedTier1FreezeExistingBatchRequiresExactExplicitRequest(t *testing.T
 		})
 	}
 }
+
+func TestJoinedFinalFreezeReplayStates(t *testing.T) {
+	for _, state := range []string{"frozen", "index_sealed", "published"} {
+		if !joinedBatchHasFinalFreeze(state) {
+			t.Fatalf("state %q lost final-freeze replay", state)
+		}
+	}
+	for _, state := range []string{"snapshotting", "building", "terminal_failed", ""} {
+		if joinedBatchHasFinalFreeze(state) {
+			t.Fatalf("state %q incorrectly accepted as final-freeze replay", state)
+		}
+	}
+}

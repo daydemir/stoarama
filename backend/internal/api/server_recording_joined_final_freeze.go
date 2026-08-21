@@ -94,7 +94,7 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 	if response.FrozenDenominatorSHA256 != req.ExpectedFrozenDenominatorSHA256 {
 		return response, errors.New("joined final-freeze denominator differs")
 	}
-	if response.State == "frozen" {
+	if joinedBatchHasFinalFreeze(response.State) {
 		if !frozenAt.Valid {
 			return response, errors.New("joined frozen batch lacks frozen time")
 		}
@@ -140,6 +140,15 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		return response, err
 	}
 	return response, nil
+}
+
+func joinedBatchHasFinalFreeze(state string) bool {
+	switch state {
+	case "frozen", "index_sealed", "published":
+		return true
+	default:
+		return false
+	}
 }
 
 func loadJoinedFinalFreezeRecordings(ctx context.Context, tx pgx.Tx, batchRecordID int64) ([]joinedrecording.FrozenRecording, error) {
