@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -20,51 +22,10 @@ const (
 	joinedLeaseDuration         = 5 * time.Minute
 )
 
-type joinedClaimRequest struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	BatchID         string `json:"batch_id"`
-	WorkerID        string `json:"worker_id"`
-}
-
-type joinedClaimSource struct {
-	Ordinal            int             `json:"ordinal"`
-	ClipID             int64           `json:"clip_id"`
-	RecordingJobID     int64           `json:"recording_job_id"`
-	StorageDestination int64           `json:"storage_destination_id"`
-	Provider           string          `json:"provider"`
-	Endpoint           string          `json:"endpoint"`
-	Region             string          `json:"region"`
-	Bucket             string          `json:"bucket"`
-	ObjectKey          string          `json:"object_key"`
-	SizeBytes          int64           `json:"size_bytes"`
-	SHA256             string          `json:"sha256"`
-	ETag               string          `json:"etag"`
-	VersionID          string          `json:"version_id"`
-	StartUTC           time.Time       `json:"start_utc"`
-	EndUTC             time.Time       `json:"end_utc"`
-	ReleasedAt         *time.Time      `json:"released_at"`
-	AdjacencyFacts     json.RawMessage `json:"adjacency_facts"`
-	AllocationFacts    json.RawMessage `json:"allocation_facts"`
-}
-
-type joinedClaimItem struct {
-	ProtocolVersion     int                 `json:"protocol_version"`
-	HourID              string              `json:"hour_id"`
-	BatchID             string              `json:"batch_id"`
-	RecordingID         int64               `json:"recording_id"`
-	LocalDate           string              `json:"local_date"`
-	DeliveryHour        int                 `json:"delivery_hour"`
-	Timezone            string              `json:"timezone"`
-	ScheduledStartUTC   time.Time           `json:"scheduled_start_utc"`
-	ScheduledEndUTC     time.Time           `json:"scheduled_end_utc"`
-	SourceClaimSHA256   string              `json:"source_claim_sha256"`
-	QualificationSHA256 string              `json:"qualification_sha256"`
-	QualificationFacts  json.RawMessage     `json:"qualification_facts"`
-	ExpiresAt           time.Time           `json:"expires_at"`
-	LeaseID             string              `json:"lease_id"`
-	OperationToken      string              `json:"operation_token"`
-	Sources             []joinedClaimSource `json:"sources"`
-}
+// Temporary source aliases keep local API tests compiling while their wire
+// fixtures move from the former item wrapper to the canonical root DTO.
+type joinedClaimRequest = joinedrecording.WorkClaimRequest
+type joinedClaimItem = joinedrecording.PreflightHourClaim
 
 func validateJoinedWorkerID(workerID string) (string, error) {
 	workerID = strings.TrimSpace(workerID)
@@ -79,69 +40,63 @@ func (s *Server) joinedControlPlaneReady() bool {
 }
 
 func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ProtocolVersion int    `json:"protocol_version"`
-		BatchID         string `json:"batch_id"`
-	}
+	var req joinedrecording.WorkerBootstrapRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.ProtocolVersion != joinedWorkerProtocolVersion {
-		util.WriteError(w, http.StatusBadRequest, "unsupported joined protocol version")
-		return
-	}
-	batchID := strings.TrimSpace(req.BatchID)
-	if batchID == "" || batchID != req.BatchID || len(batchID) > 128 {
-		util.WriteError(w, http.StatusBadRequest, "batch_id is required")
+	if err := req.Validate(); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if !s.joinedControlPlaneReady() {
-		util.WriteJSON(w, http.StatusOK, map[string]any{"item": nil})
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var availableBatchID string
 	err := s.pool.QueryRow(r.Context(), `
-		SELECT h.batch_id FROM recording_joined_hours h JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
-		WHERE h.batch_id=$1 AND ((h.state='pending' AND h.next_attempt_at<=now())
-		   OR (h.state='leased' AND h.sealed_at IS NULL AND h.lease_expires_at<=now()))
-		ORDER BY h.batch_queue_order,h.priority_tier,h.priority_order,h.id LIMIT 1`, batchID).Scan(&availableBatchID)
+		SELECT b.batch_id FROM recording_joined_batches b
+		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
+		WHERE b.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND (EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=b.id
+		    AND h.source_clip_count>0 AND ((h.state='pending' AND h.next_attempt_at<=now())
+		      OR (h.state='leased' AND h.lease_expires_at<=now()))
+		    AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=h.stream_day_id
+		      AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'))
+		  OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id AND a.artifact_kind<>'media'
+		    AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
+		      OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))))
+		LIMIT 1`, req.BatchID).Scan(&availableBatchID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteJSON(w, http.StatusOK, map[string]any{"item": nil})
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("select joined batch: %v", err))
 		return
 	}
-	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+	expiresAt := time.Now().UTC().Truncate(time.Second).Add(10 * time.Minute)
 	token, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, availableBatchID, expiresAt)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mint joined claim token: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"item": map[string]any{
-		"protocol_version": joinedWorkerProtocolVersion, "batch_id": availableBatchID, "claim_token": token, "expires_at": expiresAt,
-	}})
+	util.WriteJSON(w, http.StatusOK, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedWorkerProtocolVersion,
+		BatchID: availableBatchID, ClaimToken: token, ExpiresAt: expiresAt})
 }
 
 func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
-	var req joinedClaimRequest
+	var req joinedrecording.WorkClaimRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.ProtocolVersion != joinedWorkerProtocolVersion {
-		util.WriteError(w, http.StatusBadRequest, "unsupported joined protocol version")
-		return
-	}
-	workerID, err := validateJoinedWorkerID(req.WorkerID)
-	if err != nil {
+	if err := req.Validate(); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	workerID := req.WorkerID
 	if !s.joinedControlPlaneReady() {
-		util.WriteJSON(w, http.StatusOK, map[string]any{"item": nil})
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
@@ -157,13 +112,17 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var hourRecordID int64
 	err = tx.QueryRow(r.Context(), `
-		SELECT h.id FROM recording_joined_hours h JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
-		WHERE h.batch_id=$1 AND ((h.state='pending' AND h.next_attempt_at<=now())
-		   OR (h.state='leased' AND h.sealed_at IS NULL AND h.lease_expires_at<=now()))
-		ORDER BY h.priority_tier,h.priority_order,h.next_attempt_at,h.id
+		SELECT h.id FROM recording_joined_hours h
+		JOIN recording_joined_artifacts ledger ON ledger.stream_day_id=h.stream_day_id
+		  AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
+		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
+		WHERE h.batch_id=$1 AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
+		  AND h.source_clip_count>0 AND ((h.state='pending' AND h.next_attempt_at<=now())
+		   OR (h.state='leased' AND h.lease_expires_at<=now()))
+		ORDER BY h.priority_ordinal,h.next_attempt_at,h.id
 		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID).Scan(&hourRecordID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteJSON(w, http.StatusOK, map[string]any{"item": nil})
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if err != nil {
@@ -171,40 +130,53 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claimToken := uuid.New()
-	var item joinedClaimItem
+	var item joinedrecording.PreflightHourClaim
+	var metadataJSON, qualificationJSON, mediaToolJSON []byte
 	err = tx.QueryRow(r.Context(), `
 		UPDATE recording_joined_hours SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
 		  lease_expires_at=date_trunc('second',now()+$4::interval),heartbeat_at=now()
 		WHERE id=$1 AND batch_id=$5
 		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.joined_protocol_version=1)
-		RETURNING canonical_hour_id,batch_id,recording_id,local_date::text,delivery_hour,local_timezone,
-		  hour_start_at,hour_end_at,source_manifest_sha256,qualification_sha256,qualification_facts,lease_expires_at`,
-		hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID).Scan(&item.HourID, &item.BatchID, &item.RecordingID,
-		&item.LocalDate, &item.DeliveryHour, &item.Timezone, &item.ScheduledStartUTC, &item.ScheduledEndUTC,
-		&item.SourceClaimSHA256, &item.QualificationSHA256, &item.QualificationFacts, &item.ExpiresAt)
+		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID).
+		Scan(&item.HourID, &item.LeaseExpires)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("claim joined hour: %v", err))
 		return
 	}
+	err = tx.QueryRow(r.Context(), `
+		SELECT h.batch_id,b.generation,h.recording_id,br.timezone,h.local_date::text,h.delivery_hour,
+		  br.folder_name,br.naming_metadata,day.ledger_sha256,br.qualification,b.media_tool,h.source_claim_sha256
+		FROM recording_joined_hours h
+		JOIN recording_joined_batches b ON b.id=h.batch_record_id
+		JOIN recording_joined_batch_recordings br ON br.batch_record_id=b.id AND br.recording_id=h.recording_id
+		JOIN recording_joined_stream_days day ON day.id=h.stream_day_id
+		WHERE h.id=$1`, hourRecordID).Scan(&item.BatchID, &item.Generation, &item.RecordingID, &item.Timezone,
+		&item.LocalDate, &item.LocalHour, &item.FolderName, &metadataJSON, &item.AllocationLedgerSHA,
+		&qualificationJSON, &mediaToolJSON, &item.SourceClaimSHA256)
+	if err != nil || json.Unmarshal(metadataJSON, &item.Metadata) != nil || json.Unmarshal(qualificationJSON, &item.Qualification) != nil ||
+		json.Unmarshal(mediaToolJSON, &item.MediaTool) != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load canonical joined claim facts")
+		return
+	}
 	rows, err := tx.Query(r.Context(), `
-		SELECT ordinal,clip_id,recording_job_id,storage_destination_id,provider,endpoint,region,bucket,object_key,
-		  size_bytes,sha256,etag,version_id,clip_start_at,clip_end_at,released_at,adjacency_facts,allocation_facts
-		FROM recording_joined_hour_sources WHERE hour_id=$1 ORDER BY ordinal`, hourRecordID)
+		SELECT clip_id,recording_id,recording_job_id,provider,endpoint,region,bucket,start_at,end_at,
+		  object_key,version_id,etag,size_bytes,sha256
+		FROM recording_joined_sources WHERE hour_record_id=$1 ORDER BY hour_ordinal`, hourRecordID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load joined claim sources: %v", err))
 		return
 	}
 	defer rows.Close()
-	item.Sources = []joinedClaimSource{}
+	item.Sources = []joinedrecording.SourceClip{}
 	for rows.Next() {
-		var source joinedClaimSource
-		if err := rows.Scan(&source.Ordinal, &source.ClipID, &source.RecordingJobID, &source.StorageDestination,
-			&source.Provider, &source.Endpoint, &source.Region, &source.Bucket, &source.ObjectKey, &source.SizeBytes,
-			&source.SHA256, &source.ETag, &source.VersionID, &source.StartUTC, &source.EndUTC, &source.ReleasedAt,
-			&source.AdjacencyFacts, &source.AllocationFacts); err != nil {
+		var source joinedrecording.SourceClip
+		if err := rows.Scan(&source.ClipID, &source.RecordingID, &source.RecordingJobID, &source.Provider,
+			&source.Endpoint, &source.Region, &source.Bucket, &source.StartUTC, &source.EndUTC,
+			&source.Object.Key, &source.Object.VersionID, &source.Object.ETag, &source.Object.SizeBytes, &source.Object.SHA256); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan joined claim source: %v", err))
 			return
 		}
+		source.StartUTC, source.EndUTC = source.StartUTC.UTC(), source.EndUTC.UTC()
 		item.Sources = append(item.Sources, source)
 	}
 	rows.Close()
@@ -215,23 +187,542 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	item.LeaseID = joinedauth.LeaseID(claimToken)
 	item.ProtocolVersion = joinedWorkerProtocolVersion
 	item.OperationToken, err = joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, item.BatchID, joinedauth.SubjectHour,
-		item.HourID, claimToken, joinedauth.OperationPreflight, item.ExpiresAt)
+		item.HourID, claimToken, joinedauth.OperationPreflight, item.LeaseExpires)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mint joined job token: %v", err))
+		return
+	}
+	if err := item.Validate(time.Now().UTC()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("validate canonical joined claim: %v", err))
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit joined claim: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"item": item})
+	util.WriteJSON(w, http.StatusOK, item)
 }
 
-type joinedHeartbeatRequest struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	ScopeKind       string `json:"scope_kind"`
-	ScopeID         string `json:"scope_id"`
+func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Request) {
+	var req joinedrecording.PublicationClaimRequest
+	if err := util.DecodeJSON(r, &req); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := req.Validate(); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !s.joinedControlPlaneReady() {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	claims, ok := joinedWorkerClaimsFromContext(r.Context())
+	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID {
+		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
+		return
+	}
+	workerID, err := validateJoinedWorkerID(req.WorkerID)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "begin joined publication claim")
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	var artifactID int64
+	err = tx.QueryRow(r.Context(), `SELECT a.id FROM recording_joined_artifacts a
+		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
+		LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
+		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
+		JOIN recording_joined_batches b ON b.id=a.batch_record_id
+		WHERE a.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND a.artifact_kind<>'media'
+		  AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
+		    OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
+		  AND (a.artifact_kind='allocation_ledger'
+		    OR (a.artifact_kind='hour_manifest' AND ledger.publication_state='published')
+		    OR (a.artifact_kind='batch_index' AND b.state='index_sealed' AND b.index_artifact_id=a.id))
+		ORDER BY CASE a.artifact_kind WHEN 'allocation_ledger' THEN 0 WHEN 'hour_manifest' THEN 1 ELSE 2 END,
+		  COALESCE((SELECT h.priority_ordinal FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0),a.id
+		FOR UPDATE OF a,c SKIP LOCKED LIMIT 1`, claims.BatchID).Scan(&artifactID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "select joined publication claim")
+		return
+	}
+	leaseToken := uuid.New()
+	var kind, scopeID string
+	var leaseExpires time.Time
+	err = tx.QueryRow(r.Context(), `UPDATE recording_joined_artifacts SET publication_state='publishing',
+		publication_attempt_count=publication_attempt_count+1,publication_token=$2,publication_claimed_by=$3,
+		publication_lease_expires_at=date_trunc('second',now()+$4::interval),publication_heartbeat_at=now()
+		WHERE id=$1 AND batch_id=$5 AND EXISTS(SELECT 1 FROM connections c
+		  WHERE c.id=recording_joined_artifacts.connection_id AND c.joined_protocol_version=1)
+		RETURNING artifact_kind,scope_id,publication_lease_expires_at`, artifactID, leaseToken, workerID,
+		joinedLeaseDuration.String(), claims.BatchID).Scan(&kind, &scopeID, &leaseExpires)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "claim joined publication")
+		return
+	}
+	operationToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, claims.BatchID,
+		map[string]string{"allocation_ledger": joinedauth.SubjectLedger, "hour_manifest": joinedauth.SubjectHour,
+			"batch_index": joinedauth.SubjectBatchIndex}[kind], scopeID, leaseToken, joinedauth.OperationPublish, leaseExpires)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "mint joined publication token")
+		return
+	}
+	authority, err := joinedOutputAuthority(s.cfg.R2Endpoint)
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined output storage authority is invalid")
+		return
+	}
+	response := joinedrecording.PublicationClaimResponse{ProtocolVersion: joinedWorkerProtocolVersion}
+	switch kind {
+	case "allocation_ledger":
+		var raw []byte
+		if err = tx.QueryRow(r.Context(), `SELECT d.ledger_bytes FROM recording_joined_artifacts a
+		  JOIN recording_joined_stream_days d ON d.id=a.stream_day_id WHERE a.id=$1`, artifactID).Scan(&raw); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load joined ledger claim")
+			return
+		}
+		claim := joinedrecording.LedgerPublicationClaim{ProtocolVersion: joinedWorkerProtocolVersion, ArtifactID: artifactID,
+			ScopeID: scopeID, LeaseID: joinedauth.LeaseID(leaseToken), OperationToken: operationToken,
+			LeaseExpires: leaseExpires, StorageAuthority: authority, StorageBucket: s.cfg.R2Bucket,
+			BatchID: claims.BatchID}
+		if err = json.Unmarshal(raw, &claim.Ledger); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "decode joined ledger claim")
+			return
+		}
+		if err = tx.QueryRow(r.Context(), `SELECT expected_size_bytes,expected_sha256 FROM recording_joined_artifacts WHERE id=$1`, artifactID).
+			Scan(&claim.ExpectedSize, &claim.ExpectedSHA256); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load joined ledger identity")
+			return
+		}
+		response.Kind, response.Ledger = "ledger", &claim
+	case "hour_manifest":
+		claim, loadErr := loadJoinedHourPublicationClaim(r.Context(), tx, artifactID, leaseToken, operationToken,
+			leaseExpires, authority, s.cfg.R2Bucket)
+		if loadErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load joined hour publication claim")
+			return
+		}
+		response.Kind, response.Hour = "hour", &claim
+	case "batch_index":
+		var raw []byte
+		claim := joinedrecording.BatchIndexPublicationClaim{ProtocolVersion: joinedWorkerProtocolVersion, ScopeID: scopeID,
+			ArtifactID: artifactID, LeaseID: joinedauth.LeaseID(leaseToken), OperationToken: operationToken,
+			LeaseExpires: leaseExpires, StorageAuthority: authority, StorageBucket: s.cfg.R2Bucket}
+		if err = tx.QueryRow(r.Context(), `SELECT canonical_bytes,expected_size_bytes,expected_sha256
+		  FROM recording_joined_artifacts WHERE id=$1`, artifactID).Scan(&raw, &claim.ExpectedSize, &claim.ExpectedSHA256); err != nil ||
+			json.Unmarshal(raw, &claim.Index) != nil {
+			util.WriteError(w, http.StatusInternalServerError, "load joined batch index claim")
+			return
+		}
+		response.Kind, response.BatchIndex = "batch_index", &claim
+	default:
+		util.WriteError(w, http.StatusInternalServerError, "invalid joined publication kind")
+		return
+	}
+	if err := response.Validate(time.Now().UTC()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("validate joined publication claim: %v", err))
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusConflict, "commit joined publication claim")
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, response)
 }
+
+func loadJoinedHourPublicationClaim(ctx context.Context, tx pgx.Tx, manifestID int64, leaseToken uuid.UUID,
+	operationToken string, leaseExpires time.Time, authority, bucket string) (joinedrecording.WorkerClaim, error) {
+	var claim joinedrecording.WorkerClaim
+	var planJSON, ledgerJSON, manifestJSON []byte
+	err := tx.QueryRow(ctx, `SELECT h.hour_id,h.canonical_plan,d.ledger_bytes,a.expected_size_bytes,a.expected_sha256,a.canonical_bytes
+		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		JOIN recording_joined_stream_days d ON d.id=a.stream_day_id WHERE a.id=$1`, manifestID).
+		Scan(&claim.HourID, &planJSON, &ledgerJSON, &claim.HourManifestExpectedSize, &claim.HourManifestExpectedSHA, &manifestJSON)
+	if err != nil || json.Unmarshal(planJSON, &claim.Plan) != nil || json.Unmarshal(ledgerJSON, &claim.AllocationLedger) != nil {
+		return joinedrecording.WorkerClaim{}, errors.New("decode sealed joined hour")
+	}
+	var manifest joinedrecording.HourManifest
+	if json.Unmarshal(manifestJSON, &manifest) != nil {
+		return joinedrecording.WorkerClaim{}, errors.New("decode joined hour manifest")
+	}
+	claim.ProtocolVersion, claim.LeaseID, claim.OperationToken, claim.LeaseExpires = joinedWorkerProtocolVersion,
+		joinedauth.LeaseID(leaseToken), operationToken, leaseExpires
+	claim.StorageAuthority, claim.StorageBucket = authority, bucket
+	claim.Allocation = manifest.Allocation
+	claim.HourManifestArtifactID = manifestID
+	rows, err := tx.Query(ctx, `SELECT id FROM recording_joined_artifacts WHERE hour_record_id=(SELECT hour_record_id
+		FROM recording_joined_artifacts WHERE id=$1) AND artifact_kind='media' ORDER BY ordinal`, manifestID)
+	if err != nil {
+		return joinedrecording.WorkerClaim{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return joinedrecording.WorkerClaim{}, err
+		}
+		claim.MediaArtifactIDs = append(claim.MediaArtifactIDs, id)
+	}
+	return claim, rows.Err()
+}
+
+func (s *Server) joinedPublishedObjectMatches(ctx context.Context, objectKey, etag, versionID string, sizeBytes int64) bool {
+	store := s.joinedOutputStore()
+	if store == nil || objectKey == "" || etag == "" || sizeBytes <= 0 {
+		return false
+	}
+	head, err := store.Head(ctx, objectKey)
+	return err == nil && head.ETag == etag && head.VersionID == versionID && head.SizeBytes == sizeBytes
+}
+
+func (s *Server) handleJoinedFinalizeLedger(w http.ResponseWriter, r *http.Request) {
+	var req joinedrecording.FinalizeLedgerRequest
+	if err := util.DecodeJSON(r, &req); err != nil || req.Validate() != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid joined ledger finalize")
+		return
+	}
+	if err := s.validateJoinedRootFinalizeIdentity(r.Context(), joinedauth.SubjectLedger, req.Published.ArtifactID,
+		req.Published.ObjectKey, req.Published.SizeBytes, req.Published.SHA256); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if !s.joinedPublishedObjectMatches(r.Context(), req.Published.ObjectKey, req.Published.ETag,
+		req.Published.VersionID, req.Published.SizeBytes) {
+		util.WriteError(w, http.StatusConflict, "joined ledger storage identity differs")
+		return
+	}
+	if err := s.finalizeJoinedRoot(r.Context(), joinedauth.SubjectLedger, req.Published.ArtifactID,
+		req.Published.ObjectKey, req.Published.ETag, req.Published.VersionID, req.Published.SizeBytes, req.Published.SHA256); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleJoinedFinalizeBatchIndex(w http.ResponseWriter, r *http.Request) {
+	var req joinedrecording.FinalizeBatchIndexRequest
+	if err := util.DecodeJSON(r, &req); err != nil || req.Validate() != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid joined batch index finalize")
+		return
+	}
+	if err := s.validateJoinedRootFinalizeIdentity(r.Context(), joinedauth.SubjectBatchIndex, req.Published.ArtifactID,
+		req.Published.ObjectKey, req.Published.SizeBytes, req.Published.SHA256); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if !s.joinedPublishedObjectMatches(r.Context(), req.Published.ObjectKey, req.Published.ETag,
+		req.Published.VersionID, req.Published.SizeBytes) {
+		util.WriteError(w, http.StatusConflict, "joined batch index storage identity differs")
+		return
+	}
+	if err := s.finalizeJoinedRoot(r.Context(), joinedauth.SubjectBatchIndex, req.Published.ArtifactID,
+		req.Published.ObjectKey, req.Published.ETag, req.Published.VersionID, req.Published.SizeBytes, req.Published.SHA256); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) validateJoinedRootFinalizeIdentity(ctx context.Context, scopeKind string, artifactID int64,
+	objectKey string, sizeBytes int64, sha256 string) error {
+	if !s.joinedControlPlaneReady() {
+		return errors.New("joined recording is disabled")
+	}
+	claims, ok := joinedWorkerClaimsFromContext(ctx)
+	if !ok || claims.Kind != joinedauth.KindOperation || claims.Operation != joinedauth.OperationPublish ||
+		claims.SubjectKind != scopeKind {
+		return errors.New("joined publication token scope differs")
+	}
+	lease, err := joinedCapabilityToken(claims.LeaseToken)
+	if err != nil {
+		return errors.New("joined publication lease differs")
+	}
+	var valid bool
+	err = s.pool.QueryRow(ctx, `SELECT a.scope_id=$4 AND a.object_key=$5 AND a.expected_size_bytes=$6 AND a.expected_sha256=$7
+		AND ((a.publication_state='publishing' AND a.publication_token=$8 AND a.publication_lease_expires_at>now())
+		  OR (a.publication_state='published' AND a.finalized_token=$8))
+		FROM recording_joined_artifacts a JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
+		WHERE a.id=$1 AND a.artifact_kind<>'media' AND a.scope_kind=$2 AND a.batch_id=$3 FOR SHARE OF a,c`, artifactID, scopeKind,
+		claims.BatchID, claims.SubjectID, objectKey, sizeBytes, sha256, lease).Scan(&valid)
+	if err != nil || !valid {
+		return errors.New("joined publication identity differs")
+	}
+	return nil
+}
+
+func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artifactID int64, objectKey, etag,
+	versionID string, sizeBytes int64, sha256 string) error {
+	if !s.joinedControlPlaneReady() {
+		return errors.New("joined recording is disabled")
+	}
+	claims, ok := joinedWorkerClaimsFromContext(ctx)
+	if !ok || claims.Kind != joinedauth.KindOperation || claims.Operation != joinedauth.OperationPublish ||
+		claims.SubjectKind != scopeKind {
+		return errors.New("joined publication token scope differs")
+	}
+	lease, err := joinedCapabilityToken(claims.LeaseToken)
+	if err != nil {
+		return errors.New("joined publication lease differs")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var state, scopeID, expectedKey, expectedSHA, currentETag, currentVersion string
+	var expectedSize int64
+	var currentFinalized *uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT a.publication_state,a.scope_id,a.object_key,a.expected_size_bytes,a.expected_sha256,
+		COALESCE(a.etag,''),COALESCE(a.version_id,''),a.finalized_token
+		FROM recording_joined_artifacts a JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
+		WHERE a.id=$1 AND a.artifact_kind<>'media' AND a.scope_kind=$2 AND a.batch_id=$3 FOR UPDATE OF a,c`,
+		artifactID, scopeKind, claims.BatchID).Scan(&state, &scopeID, &expectedKey, &expectedSize, &expectedSHA,
+		&currentETag, &currentVersion, &currentFinalized)
+	if err != nil || scopeID != claims.SubjectID || expectedKey != objectKey || expectedSize != sizeBytes || expectedSHA != sha256 {
+		return errors.New("joined publication identity differs")
+	}
+	if state == "published" {
+		if currentFinalized == nil || *currentFinalized != lease || currentETag != etag || currentVersion != versionID {
+			return errors.New("joined publication retry differs")
+		}
+		if scopeKind == joinedauth.SubjectLedger {
+			if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID); err != nil {
+				return errors.New("seal joined gap-only hours")
+			}
+		}
+		return tx.Commit(ctx)
+	}
+	if state != "publishing" {
+		return errors.New("joined publication lease is stale")
+	}
+	var updated int64
+	if err := tx.QueryRow(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',
+		publication_token=NULL,publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL,
+		finalized_token=$2,etag=$3,version_id=$4,published_at=now()
+		WHERE id=$1 AND publication_token=$2 AND publication_lease_expires_at>now()
+		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_artifacts.connection_id AND c.joined_protocol_version=1)
+		RETURNING id`, artifactID, lease, etag, versionID).Scan(&updated); err != nil {
+		return errors.New("joined publication lease is stale")
+	}
+	if scopeKind == joinedauth.SubjectBatchIndex {
+		command, updateErr := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='published',published_at=now()
+		  WHERE batch_id=$1 AND index_artifact_id=$2 AND state='index_sealed'`, claims.BatchID, artifactID)
+		if updateErr != nil || command.RowsAffected() != 1 {
+			return errors.New("joined batch index state differs")
+		}
+	}
+	if scopeKind == joinedauth.SubjectLedger {
+		if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID); err != nil {
+			return errors.New("seal joined gap-only hours")
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Server) handleJoinedFinalizeHour(w http.ResponseWriter, r *http.Request) {
+	var req joinedrecording.FinalizeHourRequest
+	if err := util.DecodeJSON(r, &req); err != nil || req.Validate() != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid joined hour finalize")
+		return
+	}
+	if err := s.validateJoinedHourFinalizeIdentity(r.Context(), req.Published); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	for _, output := range req.Published.Outputs {
+		if !s.joinedPublishedObjectMatches(r.Context(), output.ObjectKey, output.ETag, output.VersionID, output.SizeBytes) {
+			util.WriteError(w, http.StatusConflict, "joined media storage identity differs")
+			return
+		}
+	}
+	if !s.joinedPublishedObjectMatches(r.Context(), req.Published.HourManifestObjectKey, req.Published.HourManifestETag,
+		req.Published.HourManifestVersionID, req.Published.HourManifestSizeBytes) {
+		util.WriteError(w, http.StatusConflict, "joined hour manifest storage identity differs")
+		return
+	}
+	if err := s.finalizeJoinedHour(r.Context(), req.Published); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) validateJoinedHourFinalizeIdentity(ctx context.Context, published joinedrecording.PublishedHour) error {
+	if !s.joinedControlPlaneReady() {
+		return errors.New("joined recording is disabled")
+	}
+	claims, ok := joinedWorkerClaimsFromContext(ctx)
+	if !ok || claims.Kind != joinedauth.KindOperation || claims.Operation != joinedauth.OperationPublish ||
+		claims.SubjectKind != joinedauth.SubjectHour || claims.SubjectID != published.HourID {
+		return errors.New("joined hour publication token scope differs")
+	}
+	lease, err := joinedCapabilityToken(claims.LeaseToken)
+	if err != nil {
+		return errors.New("joined hour publication lease differs")
+	}
+	var manifestID int64
+	var key, sha, localDate string
+	var size, recordingID int64
+	var localHour int
+	var valid bool
+	err = s.pool.QueryRow(ctx, `SELECT root.id,root.object_key,root.expected_size_bytes,root.expected_sha256,
+		h.recording_id,h.local_date::text,h.delivery_hour,
+		((root.publication_state='publishing' AND root.publication_token=$3 AND root.publication_lease_expires_at>now())
+		 OR (root.publication_state='published' AND root.finalized_token=$3))
+		FROM recording_joined_artifacts root JOIN recording_joined_hours h ON h.id=root.hour_record_id
+		JOIN connections c ON c.id=root.connection_id AND c.joined_protocol_version=1
+		WHERE root.batch_id=$1 AND root.scope_id=$2 AND root.artifact_kind='hour_manifest' FOR SHARE OF root,h,c`, claims.BatchID,
+		published.HourID, lease).Scan(&manifestID, &key, &size, &sha, &recordingID, &localDate, &localHour, &valid)
+	if err != nil || !valid || key != published.HourManifestObjectKey || size != published.HourManifestSizeBytes ||
+		sha != published.HourManifestSHA256 || recordingID != published.RecordingID || localDate != published.LocalDate ||
+		localHour != published.LocalHour {
+		return errors.New("joined hour publication identity differs")
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id,object_key,expected_size_bytes,expected_sha256 FROM recording_joined_artifacts
+		WHERE hour_record_id=(SELECT hour_record_id FROM recording_joined_artifacts WHERE id=$1)
+		  AND artifact_kind='media' ORDER BY ordinal`, manifestID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for i := 0; rows.Next(); i++ {
+		if i >= len(published.Outputs) {
+			return errors.New("joined hour media cardinality differs")
+		}
+		var id, expectedSize int64
+		var expectedKey, expectedSHA string
+		if err := rows.Scan(&id, &expectedKey, &expectedSize, &expectedSHA); err != nil {
+			return err
+		}
+		got := published.Outputs[i]
+		if got.ArtifactID != id || got.ObjectKey != expectedKey || got.SizeBytes != expectedSize || got.SHA256 != expectedSHA {
+			return errors.New("joined hour media identity differs")
+		}
+		if i == len(published.Outputs)-1 {
+			if rows.Next() {
+				return errors.New("joined hour media cardinality differs")
+			}
+			return rows.Err()
+		}
+	}
+	if len(published.Outputs) != 0 {
+		return errors.New("joined hour media cardinality differs")
+	}
+	return rows.Err()
+}
+
+func (s *Server) finalizeJoinedHour(ctx context.Context, published joinedrecording.PublishedHour) error {
+	if !s.joinedControlPlaneReady() {
+		return errors.New("joined recording is disabled")
+	}
+	claims, ok := joinedWorkerClaimsFromContext(ctx)
+	if !ok || claims.Kind != joinedauth.KindOperation || claims.Operation != joinedauth.OperationPublish ||
+		claims.SubjectKind != joinedauth.SubjectHour || claims.SubjectID != published.HourID {
+		return errors.New("joined hour publication token scope differs")
+	}
+	lease, err := joinedCapabilityToken(claims.LeaseToken)
+	if err != nil {
+		return errors.New("joined hour publication lease differs")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var manifestID, recordingID int64
+	var state, manifestKey, manifestSHA, currentETag, currentVersion string
+	var localDate string
+	var localHour int
+	var manifestSize int64
+	var finalized *uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT a.id,a.publication_state,a.object_key,a.expected_size_bytes,a.expected_sha256,
+		COALESCE(a.etag,''),COALESCE(a.version_id,''),a.finalized_token,h.recording_id,h.local_date::text,h.delivery_hour
+		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
+		WHERE a.scope_kind='hour' AND a.scope_id=$1 AND a.batch_id=$2 AND a.artifact_kind='hour_manifest'
+		FOR UPDATE OF a,c`, published.HourID, claims.BatchID).Scan(&manifestID, &state, &manifestKey, &manifestSize,
+		&manifestSHA, &currentETag, &currentVersion, &finalized, &recordingID, &localDate, &localHour)
+	if err != nil || manifestKey != published.HourManifestObjectKey || manifestSize != published.HourManifestSizeBytes ||
+		manifestSHA != published.HourManifestSHA256 || recordingID != published.RecordingID || localDate != published.LocalDate ||
+		localHour != published.LocalHour {
+		return errors.New("joined hour manifest identity differs")
+	}
+	if state != "publishing" && state != "published" {
+		return errors.New("joined hour publication lease is stale")
+	}
+	rows, err := tx.Query(ctx, `SELECT id,object_key,expected_size_bytes,expected_sha256,
+		COALESCE(etag,''),COALESCE(version_id,''),finalized_token FROM recording_joined_artifacts
+		WHERE hour_record_id=(SELECT hour_record_id FROM recording_joined_artifacts WHERE id=$1)
+		  AND artifact_kind='media' ORDER BY ordinal FOR UPDATE`, manifestID)
+	if err != nil {
+		return err
+	}
+	type expectedOutput struct {
+		id, size                int64
+		key, sha, etag, version string
+		finalized               *uuid.UUID
+	}
+	expected := []expectedOutput{}
+	for rows.Next() {
+		var out expectedOutput
+		if err := rows.Scan(&out.id, &out.key, &out.size, &out.sha, &out.etag, &out.version, &out.finalized); err != nil {
+			rows.Close()
+			return err
+		}
+		expected = append(expected, out)
+	}
+	rows.Close()
+	if len(expected) != len(published.Outputs) {
+		return errors.New("joined hour media cardinality differs")
+	}
+	if state == "published" {
+		if finalized == nil || *finalized != lease || currentETag != published.HourManifestETag ||
+			currentVersion != published.HourManifestVersionID {
+			return errors.New("joined hour publication retry differs")
+		}
+		for i, output := range published.Outputs {
+			want := expected[i]
+			if output.ArtifactID != want.id || output.ObjectKey != want.key || output.SizeBytes != want.size ||
+				output.SHA256 != want.sha || output.ETag != want.etag || output.VersionID != want.version ||
+				want.finalized == nil || *want.finalized != lease {
+				return errors.New("joined hour media retry differs")
+			}
+		}
+		return tx.Commit(ctx)
+	}
+	for i, output := range published.Outputs {
+		want := expected[i]
+		if output.ArtifactID != want.id || output.ObjectKey != want.key || output.SizeBytes != want.size || output.SHA256 != want.sha {
+			return errors.New("joined hour media identity differs")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts SET finalized_token=$2,etag=$3,version_id=$4,published_at=now()
+		  WHERE id=$1 AND published_at IS NULL`, want.id, lease, output.ETag, output.VersionID); err != nil {
+			return err
+		}
+	}
+	var updated int64
+	if err := tx.QueryRow(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',
+		publication_token=NULL,publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL,
+		finalized_token=$2,etag=$3,version_id=$4,published_at=now()
+		WHERE id=$1 AND publication_token=$2 AND publication_lease_expires_at>now()
+		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_artifacts.connection_id AND c.joined_protocol_version=1)
+		RETURNING id`, manifestID, lease, published.HourManifestETag, published.HourManifestVersionID).Scan(&updated); err != nil {
+		return errors.New("joined hour publication lease is stale")
+	}
+	return tx.Commit(ctx)
+}
+
+type joinedHeartbeatRequest = joinedrecording.HeartbeatRequest
 
 func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !s.joinedControlPlaneReady() {
@@ -243,8 +734,8 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.ProtocolVersion != joinedWorkerProtocolVersion {
-		util.WriteError(w, http.StatusBadRequest, "unsupported joined protocol version")
+	if err := req.Validate(); err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
@@ -253,8 +744,8 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, err := joinedCapabilityToken(claims.LeaseToken)
-	if err != nil || req.ScopeKind != joinedauth.SubjectHour {
-		util.WriteError(w, http.StatusBadRequest, "unsupported joined heartbeat scope")
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, "invalid joined heartbeat lease")
 		return
 	}
 	tx, err := s.pool.Begin(r.Context())
@@ -265,9 +756,13 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var locked int
 	err = tx.QueryRow(r.Context(), `
-		SELECT c.id FROM connections c JOIN recording_joined_hours h ON h.connection_id=c.id
-		WHERE h.canonical_hour_id=$1 AND h.batch_id=$2 AND c.joined_protocol_version=1
-		FOR UPDATE OF c`, req.ScopeID, claims.BatchID).Scan(&locked)
+		SELECT c.id FROM connections c
+		JOIN recording_joined_batches b ON b.connection_id=c.id
+		WHERE b.batch_id=$1 AND c.joined_protocol_version=1 AND
+		  (($2='hour' AND EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=b.id AND h.hour_id=$3))
+		    OR ($2<>'hour' AND EXISTS(SELECT 1 FROM recording_joined_artifacts a
+		      WHERE a.batch_record_id=b.id AND a.scope_kind=$2 AND a.scope_id=$3)))
+		FOR UPDATE OF c`, claims.BatchID, req.ScopeKind, req.ScopeID).Scan(&locked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "joined heartbeat lease is stale or foreign")
 		return
@@ -277,18 +772,22 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var leaseExpires time.Time
-	err = tx.QueryRow(r.Context(), `
-		UPDATE recording_joined_hours SET
-		  lease_expires_at=CASE WHEN state='leased' THEN date_trunc('second',now()+$3::interval) ELSE lease_expires_at END,
-		  heartbeat_at=CASE WHEN state='leased' THEN now() ELSE heartbeat_at END,
-		  publish_lease_expires_at=CASE WHEN state='publishing' THEN date_trunc('second',now()+$3::interval) ELSE publish_lease_expires_at END,
-		  publish_heartbeat_at=CASE WHEN state='publishing' THEN now() ELSE publish_heartbeat_at END
-		WHERE canonical_hour_id=$1 AND batch_id=$5
-		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.joined_protocol_version=1)
-		  AND ((state='leased' AND $4='preflight' AND claim_token=$2 AND lease_expires_at>now())
-		    OR (state='publishing' AND $4='publish' AND publish_claim_token=$2 AND publish_lease_expires_at>now()))
-		RETURNING CASE WHEN state='leased' THEN lease_expires_at ELSE publish_lease_expires_at END`,
-		req.ScopeID, token, joinedLeaseDuration.String(), claims.Operation, claims.BatchID).Scan(&leaseExpires)
+	if claims.Operation == joinedauth.OperationPreflight && req.ScopeKind == joinedauth.SubjectHour {
+		err = tx.QueryRow(r.Context(), `UPDATE recording_joined_hours SET
+		  lease_expires_at=GREATEST(lease_expires_at+interval '1 second',date_trunc('second',now()+$3::interval)),heartbeat_at=now()
+		  WHERE hour_id=$1 AND batch_id=$4 AND state='leased' AND claim_token=$2 AND lease_expires_at>now()
+		    AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.joined_protocol_version=1)
+		  RETURNING lease_expires_at`, req.ScopeID, token, joinedLeaseDuration.String(), claims.BatchID).Scan(&leaseExpires)
+	} else if claims.Operation == joinedauth.OperationPublish {
+		err = tx.QueryRow(r.Context(), `UPDATE recording_joined_artifacts SET
+		  publication_lease_expires_at=GREATEST(publication_lease_expires_at+interval '1 second',date_trunc('second',now()+$4::interval)),publication_heartbeat_at=now()
+		  WHERE scope_kind=$1 AND scope_id=$2 AND batch_id=$5 AND artifact_kind<>'media'
+		    AND publication_state='publishing' AND publication_token=$3 AND publication_lease_expires_at>now()
+		    AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_artifacts.connection_id AND c.joined_protocol_version=1)
+		  RETURNING publication_lease_expires_at`, req.ScopeKind, req.ScopeID, token, joinedLeaseDuration.String(), claims.BatchID).Scan(&leaseExpires)
+	} else {
+		err = pgx.ErrNoRows
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "joined heartbeat lease is stale or foreign")
 		return
@@ -307,10 +806,9 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("renew joined job token: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{
-		"protocol_version": joinedWorkerProtocolVersion, "scope_kind": req.ScopeKind, "scope_id": req.ScopeID,
-		"lease_id": joinedauth.LeaseID(token), "expires_at": leaseExpires, "operation_token": jobToken,
-	})
+	util.WriteJSON(w, http.StatusOK, joinedrecording.HeartbeatResponse{ProtocolVersion: joinedWorkerProtocolVersion,
+		ScopeKind: req.ScopeKind, ScopeID: req.ScopeID, LeaseID: joinedauth.LeaseID(token),
+		ExpiresAt: leaseExpires, OperationToken: jobToken})
 }
 
 func (s *Server) handleJoinedStatus(w http.ResponseWriter, r *http.Request) {
