@@ -23,7 +23,7 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 		bootstrap = "bootstrap-token-kept-secret"
 		claim     = "claim-token-kept-secret-value"
 	)
-	paths := make(chan string, 3)
+	paths := make(chan string, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths <- r.URL.Path
 		if got := r.Header.Get("Authorization"); got != "Bearer "+map[string]string{
@@ -140,7 +140,7 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 		operatorToken = "joined-tier1-operator-token-at-least-32-bytes"
 		batchID       = "tier1-2026-08-generation-1"
 	)
-	paths := make(chan string, 3)
+	paths := make(chan string, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths <- r.URL.Path
 		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+operatorToken {
@@ -176,10 +176,15 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 		ExpectedFrozenDenominatorSHA256: strings.Repeat("a", 64), Apply: true}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := service.SealBatchIndex(context.Background(), joinedSealBatchIndexRequest{BatchID: batchID,
+		ExpectedSHA256: strings.Repeat("b", 64), Apply: true}); err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
 		"/api/v1/recording/joined/freeze-tier1",
 		"/api/v1/recording/joined/stream-days/seal",
 		"/api/v1/recording/joined/batches/final-freeze",
+		"/api/v1/recording/joined/batches/index/seal",
 	} {
 		if got := <-paths; got != want {
 			t.Fatalf("operator path=%q want=%q", got, want)
@@ -390,7 +395,7 @@ func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	status := joinedWorkerStatus{ProtocolVersion: joinedrecording.JoinedProtocolVersion, Enabled: true,
-		BatchID: cfg.JoinedRecordingBatchID, CanaryHourIDs: hours}
+		BatchID: cfg.JoinedRecordingBatchID, WorkScope: config.JoinedWorkScopeCanary, CanaryHourIDs: hours}
 	if err := validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, status); err != nil {
 		t.Fatal(err)
 	}
@@ -409,6 +414,21 @@ func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
 				t.Fatal("mismatched worker status accepted")
 			}
 		})
+	}
+}
+
+func TestJoinedWorkerStatusBindsFrozenBatchScopeWithoutCanaryHours(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	cfg.JoinedRecordingCanaryHourIDs = ""
+	status := joinedWorkerStatus{ProtocolVersion: joinedrecording.JoinedProtocolVersion, Enabled: true,
+		BatchID: cfg.JoinedRecordingBatchID, WorkScope: config.JoinedWorkScopeFrozenBatch, CanaryHourIDs: []string{}}
+	if err := validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, status); err != nil {
+		t.Fatal(err)
+	}
+	status.CanaryHourIDs = []string{"unexpected"}
+	if err := validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, status); err == nil {
+		t.Fatal("frozen-batch status accepted a canary allowlist")
 	}
 }
 

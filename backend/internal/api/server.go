@@ -441,6 +441,7 @@ func (s *Server) router() http.Handler {
 			admin.Get("/recording/joined/batches/status", s.handleAdminJoinedBatchStatus)
 			admin.Post("/recording/joined/stream-days/seal", s.handleAdminJoinedSealStreamDay)
 			admin.Post("/recording/joined/batches/final-freeze", s.handleAdminJoinedFinalFreeze)
+			admin.Post("/recording/joined/batches/index/seal", s.handleAdminJoinedSealBatchIndex)
 			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)

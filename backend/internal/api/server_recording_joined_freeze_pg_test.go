@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
@@ -383,6 +384,7 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	}
 	s.cfg.JoinedRecordingControlPlaneEnabled = true
 	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
 	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	token := "joined-freeze-admin-session"

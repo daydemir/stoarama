@@ -44,6 +44,12 @@ type joinedFinalFreezeRequest struct {
 	Apply                           bool   `json:"-"`
 }
 
+type joinedSealBatchIndexRequest struct {
+	BatchID        string `json:"batch_id"`
+	ExpectedSHA256 string `json:"expected_sha256"`
+	Apply          bool   `json:"apply"`
+}
+
 type joinedSealRemainingDaysRequest struct {
 	BatchID                         string `json:"batch_id"`
 	CanaryRecordingID               int64  `json:"canary_recording_id"`
@@ -70,6 +76,7 @@ type joinedOperatorService interface {
 	SealStreamDay(context.Context, joinedSealStreamDayRequest) (any, error)
 	SealRemainingDays(context.Context, joinedSealRemainingDaysRequest) (any, error)
 	FinalFreeze(context.Context, joinedFinalFreezeRequest) (any, error)
+	SealBatchIndex(context.Context, joinedSealBatchIndexRequest) (any, error)
 	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
 	RunWorker(context.Context, joinedWorkerRequest) error
 	Status(context.Context, joinedStatusRequest) (any, error)
@@ -107,7 +114,7 @@ func waitForJoinedWorkerShutdown(ctx context.Context) {
 
 func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []string, factory joinedOperatorFactory) (any, error) {
 	if len(args) == 0 {
-		return nil, errors.New("expected freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, worker run, or status")
+		return nil, errors.New("expected freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, seal-batch-index, worker run, or status")
 	}
 
 	switch args[0] {
@@ -169,6 +176,19 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 			return nil, err
 		}
 		return service.FinalFreeze(ctx, req)
+	case "seal-batch-index":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedSealBatchIndex(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.SealBatchIndex(ctx, req)
 	case "worker":
 		if len(args) < 2 || args[1] != "run" {
 			return nil, errors.New("expected worker run")
@@ -292,6 +312,24 @@ func parseJoinedFinalFreeze(cfg config.Config, args []string) (joinedFinalFreeze
 		return req, err
 	}
 	if err := validateExpectedHash("--expected-frozen-denominator-sha256", req.ExpectedFrozenDenominatorSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedSealBatchIndex(cfg config.Config, args []string) (joinedSealBatchIndexRequest, error) {
+	req := joinedSealBatchIndexRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined seal-batch-index")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.StringVar(&req.ExpectedSHA256, "expected-sha256", "", "canonical index hash returned by preview")
+	flags.BoolVar(&req.Apply, "apply", false, "seal the canonical final batch index")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if err := validateExpectedHash("--expected-sha256", req.ExpectedSHA256, req.Apply); err != nil {
 		return req, err
 	}
 	return req, nil

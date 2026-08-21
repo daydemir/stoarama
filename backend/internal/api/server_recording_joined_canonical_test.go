@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
@@ -1338,7 +1340,230 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		WHERE stream_day_id=$1 AND delivery_hour=2`, sourceLedger.streamDayID); err == nil {
 		t.Fatal("source-bearing hour bypassed its worker lease")
 	}
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	frozenClaimToken, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, batchID, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenPublicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1,
+		BatchID: batchID, WorkerID: "frozen-batch-worker"})
+	frozenPublicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim",
+		bytes.NewReader(frozenPublicationBody))
+	frozenPublicationRequest.Header.Set("Authorization", "Bearer "+frozenClaimToken)
+	frozenPublicationRecorder := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(frozenPublicationRecorder,
+		frozenPublicationRequest)
+	var frozenPublication joinedrecording.PublicationClaimResponse
+	if frozenPublicationRecorder.Code != http.StatusOK || json.Unmarshal(frozenPublicationRecorder.Body.Bytes(), &frozenPublication) != nil ||
+		frozenPublication.Kind != "ledger" || frozenPublication.Ledger == nil || frozenPublication.Ledger.BatchID != batchID {
+		t.Fatalf("frozen-batch ledger claim status=%d body=%s", frozenPublicationRecorder.Code, frozenPublicationRecorder.Body.String())
+	}
+	publishJoinedCanonicalRemainderForIndex(t, fixture, batchRecordID)
+	var missingHourID, missingState string
+	var missingPriority int64
+	if err := pool.QueryRow(ctx, `SELECT h.hour_id,h.state,h.priority_ordinal FROM recording_joined_hours h
+		WHERE h.batch_record_id=$1 AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts a
+		WHERE a.hour_record_id=h.id AND a.artifact_kind='hour_manifest' AND a.publication_state='published')
+		ORDER BY h.priority_ordinal LIMIT 1`, batchRecordID).Scan(&missingHourID, &missingState, &missingPriority); err == nil {
+		t.Fatalf("unpublished hour before index id=%s state=%s priority=%d", missingHourID, missingState, missingPriority)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatal(err)
+	}
+	sealIndex := func(request joinedSealBatchIndexRequest) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(request)
+		httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/batches/index/seal", bytes.NewReader(body))
+		httpReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
+		recorder := httptest.NewRecorder()
+		s.requireAdminAuth(http.HandlerFunc(s.handleAdminJoinedSealBatchIndex)).ServeHTTP(recorder, httpReq)
+		return recorder
+	}
+	previewRequest := joinedSealBatchIndexRequest{ProtocolVersion: 1, BatchID: batchID}
+	unauthorizedBody, _ := json.Marshal(previewRequest)
+	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/batches/index/seal",
+		bytes.NewReader(unauthorizedBody))
+	unauthorizedRequest.Header.Set("Authorization", "Bearer "+s.cfg.ServiceToken)
+	unauthorized := httptest.NewRecorder()
+	s.requireAdminAuth(http.HandlerFunc(s.handleAdminJoinedSealBatchIndex)).ServeHTTP(unauthorized, unauthorizedRequest)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("batch-index seal accepted generic service auth status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	preview := sealIndex(previewRequest)
+	var previewed joinedSealBatchIndexResponse
+	if preview.Code != http.StatusOK || json.Unmarshal(preview.Body.Bytes(), &previewed) != nil ||
+		!lowerHexSHA256(previewed.SHA256) || previewed.ArtifactID != 0 || previewed.State != "frozen" {
+		t.Fatalf("batch-index preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	wrongIndex := previewRequest
+	wrongIndex.Apply, wrongIndex.ExpectedSHA256 = true, strings.Repeat("f", 64)
+	if response := sealIndex(wrongIndex); response.Code != http.StatusConflict {
+		t.Fatalf("wrong batch-index hash status=%d body=%s", response.Code, response.Body.String())
+	}
+	applyIndex := previewRequest
+	applyIndex.Apply, applyIndex.ExpectedSHA256 = true, previewed.SHA256
+	sealedIndex := sealIndex(applyIndex)
+	var indexReceipt joinedSealBatchIndexResponse
+	if sealedIndex.Code != http.StatusOK || json.Unmarshal(sealedIndex.Body.Bytes(), &indexReceipt) != nil ||
+		indexReceipt.ArtifactID <= 0 || indexReceipt.State != "index_sealed" || indexReceipt.SHA256 != previewed.SHA256 {
+		t.Fatalf("batch-index apply status=%d body=%s", sealedIndex.Code, sealedIndex.Body.String())
+	}
+	retryIndex := sealIndex(applyIndex)
+	var retryReceipt joinedSealBatchIndexResponse
+	if retryIndex.Code != http.StatusOK || json.Unmarshal(retryIndex.Body.Bytes(), &retryReceipt) != nil ||
+		retryReceipt.ArtifactID != indexReceipt.ArtifactID || !retryReceipt.AlreadySealed {
+		t.Fatalf("batch-index retry status=%d body=%s", retryIndex.Code, retryIndex.Body.String())
+	}
+	indexClaimToken, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, batchID, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "index-worker"})
+	publicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(publicationBody))
+	publicationRequest.Header.Set("Authorization", "Bearer "+indexClaimToken)
+	publicationRecorder := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(publicationRecorder, publicationRequest)
+	var indexClaim joinedrecording.PublicationClaimResponse
+	if publicationRecorder.Code != http.StatusOK || json.Unmarshal(publicationRecorder.Body.Bytes(), &indexClaim) != nil ||
+		indexClaim.Kind != "batch_index" || indexClaim.BatchIndex == nil || indexClaim.BatchIndex.ArtifactID != indexReceipt.ArtifactID {
+		t.Fatalf("batch-index claim status=%d body=%s", publicationRecorder.Code, publicationRecorder.Body.String())
+	}
+	s.joinedOutputStorage = joinedOutputStoreStub{heads: map[string]r2.ObjectHead{
+		indexReceipt.ObjectKey: {ETag: "index-etag", SizeBytes: indexReceipt.SizeBytes},
+	}}
+	publishedIndex := joinedrecording.PublishedBatchIndex{ArtifactID: indexReceipt.ArtifactID, ObjectKey: indexReceipt.ObjectKey,
+		ETag: "index-etag", SizeBytes: indexReceipt.SizeBytes, SHA256: indexReceipt.SHA256}
+	finalizeIndexBody, _ := json.Marshal(joinedrecording.FinalizeBatchIndexRequest{ProtocolVersion: 1, Published: publishedIndex})
+	finalizeIndexRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/index/finalize", bytes.NewReader(finalizeIndexBody))
+	finalizeIndexRequest.Header.Set("Authorization", "Bearer "+indexClaim.BatchIndex.OperationToken)
+	finalizeIndexRecorder := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFinalizeBatchIndex)).ServeHTTP(finalizeIndexRecorder, finalizeIndexRequest)
+	if finalizeIndexRecorder.Code != http.StatusNoContent {
+		t.Fatalf("batch-index finalize status=%d body=%s", finalizeIndexRecorder.Code, finalizeIndexRecorder.Body.String())
+	}
 	t.Log("JOINED_CANONICAL_LIFECYCLE_EXECUTED")
+}
+
+func publishJoinedCanonicalRemainderForIndex(t *testing.T, fixture joinedHistoricalTier1Fixture, batchRecordID int64) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := fixture.pool.Query(ctx, `SELECT id FROM recording_joined_artifacts WHERE batch_record_id=$1
+		AND artifact_kind='allocation_ledger' ORDER BY id`, batchRecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ledgerIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ledgerIDs = append(ledgerIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	for _, id := range ledgerIDs {
+		tx, err := fixture.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		var currentToken *uuid.UUID
+		var leaseCurrent bool
+		if err := tx.QueryRow(ctx, `SELECT publication_state,publication_token,
+			COALESCE(publication_lease_expires_at>now(),false) FROM recording_joined_artifacts WHERE id=$1 FOR UPDATE`, id).
+			Scan(&state, &currentToken, &leaseCurrent); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if state != "published" {
+			token := uuid.New()
+			if state == "publishing" && leaseCurrent && currentToken != nil {
+				token = *currentToken
+			} else if state != "sealed" && state != "publishing" {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("unexpected ledger publication state %q", state)
+			}
+			if state == "sealed" || !leaseCurrent {
+				if _, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='publishing',
+				publication_attempt_count=publication_attempt_count+1,publication_token=$2,publication_claimed_by='index-fixture',
+				publication_lease_expires_at=now()+interval '5 minutes',publication_heartbeat_at=now() WHERE id=$1`, id, token); err != nil {
+					_ = tx.Rollback(ctx)
+					t.Fatal(err)
+				}
+			}
+			if _, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',publication_token=NULL,
+				publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL,finalized_token=$2,
+				etag='fixture-ledger-etag',version_id='',published_at=now() WHERE id=$1`, id, token); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatal(err)
+			}
+		}
+		if err := sealJoinedGapOnlyHoursTx(ctx, tx, id); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifestRows, err := fixture.pool.Query(ctx, `SELECT id FROM recording_joined_artifacts WHERE batch_record_id=$1
+		AND artifact_kind='hour_manifest' AND publication_state<>'published' ORDER BY id`, batchRecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifestIDs []int64
+	for manifestRows.Next() {
+		var id int64
+		if err := manifestRows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		manifestIDs = append(manifestIDs, id)
+	}
+	if err := manifestRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	manifestRows.Close()
+	for _, id := range manifestIDs {
+		tx, err := fixture.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		var currentToken *uuid.UUID
+		var leaseCurrent bool
+		if err := tx.QueryRow(ctx, `SELECT publication_state,publication_token,
+			COALESCE(publication_lease_expires_at>now(),false) FROM recording_joined_artifacts WHERE id=$1 FOR UPDATE`, id).
+			Scan(&state, &currentToken, &leaseCurrent); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		token := uuid.New()
+		if state == "publishing" && leaseCurrent && currentToken != nil {
+			token = *currentToken
+		} else if state != "sealed" && state != "publishing" {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("unexpected hour manifest publication state %q", state)
+		}
+		if state == "sealed" || !leaseCurrent {
+			if _, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='publishing',
+				publication_attempt_count=publication_attempt_count+1,publication_token=$2,publication_claimed_by='index-fixture',
+				publication_lease_expires_at=now()+interval '5 minutes',publication_heartbeat_at=now() WHERE id=$1`, id, token); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatal(err)
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',publication_token=NULL,
+			publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL,finalized_token=$2,
+			etag='fixture-manifest-etag',version_id='',published_at=now() WHERE id=$1`, id, token); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func joinedCanonicalPassingVerification() joinedrecording.Verification {

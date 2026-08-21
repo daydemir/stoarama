@@ -65,6 +65,7 @@ type joinedWorkerStatus struct {
 	ProtocolVersion int              `json:"protocol_version"`
 	Enabled         bool             `json:"enabled"`
 	BatchID         string           `json:"batch_id"`
+	WorkScope       string           `json:"work_scope"`
 	CanaryHourIDs   []string         `json:"canary_hour_ids"`
 	Hours           map[string]int64 `json:"hours"`
 }
@@ -293,6 +294,24 @@ func (s *remoteJoinedOperatorService) FinalFreeze(ctx context.Context, req joine
 	return response, nil
 }
 
+func (s *remoteJoinedOperatorService) SealBatchIndex(ctx context.Context, req joinedSealBatchIndexRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		ProtocolVersion int    `json:"protocol_version"`
+		BatchID         string `json:"batch_id"`
+		Apply           bool   `json:"apply"`
+		ExpectedSHA256  string `json:"expected_sha256,omitempty"`
+	}{joinedrecording.JoinedProtocolVersion, req.BatchID, req.Apply, req.ExpectedSHA256}
+	var response map[string]any
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/batches/index/seal", token, payload, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
 func (s *remoteJoinedOperatorService) validOperatorToken() (string, error) {
 	token := strings.TrimSpace(s.operatorToken)
 	if len(token) < 32 || token == strings.TrimSpace(s.api.bootstrapToken) {
@@ -340,11 +359,17 @@ func (s *remoteJoinedOperatorService) CheckWorkerStartup(ctx context.Context, re
 }
 
 func validateJoinedWorkerStatus(cfg config.Config, batchID string, status joinedWorkerStatus) error {
-	localHours, err := cfg.JoinedCanaryHourIDs()
-	if err != nil || !status.Enabled || status.ProtocolVersion != joinedrecording.JoinedProtocolVersion ||
+	workScope, scopeErr := cfg.JoinedWorkScope()
+	var localHours []string
+	var err error
+	if workScope == config.JoinedWorkScopeCanary {
+		localHours, err = cfg.JoinedCanaryHourIDs()
+	}
+	if err != nil || scopeErr != nil || !status.Enabled || status.ProtocolVersion != joinedrecording.JoinedProtocolVersion ||
 		status.BatchID != batchID || batchID != cfg.JoinedRecordingBatchID ||
+		status.WorkScope != workScope ||
 		strings.Join(status.CanaryHourIDs, ",") != strings.Join(localHours, ",") {
-		return errors.New("joined backend batch or canary scope differs")
+		return errors.New("joined backend batch or work scope differs")
 	}
 	return nil
 }
@@ -387,7 +412,7 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 		return false, err
 	}
 	if ok {
-		if err := joinedPublicationWithinCanary(s.cfg, publication); err != nil {
+		if err := joinedPublicationWithinScope(s.cfg, publication); err != nil {
 			return false, err
 		}
 		return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, func(taskCtx context.Context) error {
@@ -398,15 +423,22 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 	if err != nil || !ok {
 		return false, err
 	}
-	if !joinedHourWithinCanary(s.cfg, preflight.HourID) {
-		return false, errors.New("joined preflight claim is outside configured canary scope")
+	if !joinedHourWithinScope(s.cfg, preflight.HourID) {
+		return false, errors.New("joined preflight claim is outside configured work scope")
 	}
 	return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, func(taskCtx context.Context) error {
 		return s.processPreflight(taskCtx, preflight, req.ScratchRoot)
 	})
 }
 
-func joinedHourWithinCanary(cfg config.Config, hourID string) bool {
+func joinedHourWithinScope(cfg config.Config, hourID string) bool {
+	scope, scopeErr := cfg.JoinedWorkScope()
+	if scopeErr != nil {
+		return false
+	}
+	if scope == config.JoinedWorkScopeFrozenBatch {
+		return strings.HasPrefix(hourID, cfg.JoinedRecordingBatchID+"__recording-")
+	}
 	hours, err := cfg.JoinedCanaryHourIDs()
 	if err != nil {
 		return false
@@ -419,10 +451,20 @@ func joinedHourWithinCanary(cfg config.Config, hourID string) bool {
 	return false
 }
 
-func joinedPublicationWithinCanary(cfg config.Config, response joinedrecording.PublicationClaimResponse) error {
+func joinedPublicationWithinScope(cfg config.Config, response joinedrecording.PublicationClaimResponse) error {
+	scope, err := cfg.JoinedWorkScope()
+	if err != nil {
+		return err
+	}
+	if publicationBatchID(response) != cfg.JoinedRecordingBatchID {
+		return errors.New("joined publication claim has a foreign batch")
+	}
+	if scope == config.JoinedWorkScopeFrozenBatch {
+		return nil
+	}
 	switch response.Kind {
 	case "hour":
-		if response.Hour != nil && joinedHourWithinCanary(cfg, response.Hour.HourID) {
+		if response.Hour != nil && joinedHourWithinScope(cfg, response.Hour.HourID) {
 			return nil
 		}
 	case "ledger":
@@ -431,7 +473,7 @@ func joinedPublicationWithinCanary(cfg config.Config, response joinedrecording.P
 			for _, hour := range ledger.Hours {
 				hourID, err := joinedrecording.CanonicalHourID(ledger.BatchID, ledger.RecordingID, ledger.LocalDate,
 					hour.DeliveryHour, ledger.Generation)
-				if err == nil && joinedHourWithinCanary(cfg, hourID) {
+				if err == nil && joinedHourWithinScope(cfg, hourID) {
 					return nil
 				}
 			}

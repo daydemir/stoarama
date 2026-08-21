@@ -89,7 +89,7 @@ func (s *Server) requireJoinedWorkerAuth(next http.Handler) http.Handler {
 			return
 		}
 		if claims.Kind == joinedauth.KindOperation && s.joinedControlPlaneReady() &&
-			!s.joinedOperationWithinCanary(r.Context(), claims) {
+			!s.joinedOperationWithinScope(r.Context(), claims) {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -102,7 +102,30 @@ func (s *Server) requireJoinedWorkerAuth(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) joinedOperationWithinCanary(ctx context.Context, claims joinedauth.Claims) bool {
+func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedauth.Claims) bool {
+	if claims.BatchID != s.cfg.JoinedRecordingBatchID {
+		return false
+	}
+	scope, err := s.cfg.JoinedWorkScope()
+	if err != nil {
+		return false
+	}
+	if scope == "frozen_batch" {
+		if s.pool == nil {
+			return false
+		}
+		var allowed bool
+		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_batches b
+			JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
+			WHERE b.batch_id=$1 AND (($2='hour' AND EXISTS(SELECT 1 FROM recording_joined_hours h
+			  WHERE h.batch_record_id=b.id AND h.hour_id=$3)) OR ($2<>'hour' AND EXISTS(
+			  SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
+			    AND a.scope_kind=$2 AND a.scope_id=$3))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID).Scan(&allowed)
+		return err == nil && allowed
+	}
+	if scope != "canary" {
+		return false
+	}
 	hours := s.joinedCanaryHourIDs()
 	switch claims.SubjectKind {
 	case joinedauth.SubjectHour:

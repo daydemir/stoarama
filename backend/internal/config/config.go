@@ -143,6 +143,7 @@ type Config struct {
 	JoinedRecordingEnabled             bool
 	JoinedRecordingProtocolVersion     int
 	JoinedRecordingRollingEnabled      bool
+	JoinedRecordingWorkScope           string
 	JoinedRecordingBatchID             string
 	JoinedRecordingCanaryHourIDs       string
 	JoinedRecordingScratchRoot         string
@@ -279,6 +280,7 @@ func Load() (Config, error) {
 		JoinedRecordingEnabled:                boolEnv("JOINED_RECORDING_ENABLED", false),
 		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
 		JoinedRecordingRollingEnabled:         boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
+		JoinedRecordingWorkScope:              strings.TrimSpace(strEnv("STOARAMA_JOINED_WORK_SCOPE", "disabled")),
 		JoinedRecordingBatchID:                strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
 		JoinedRecordingCanaryHourIDs:          strings.TrimSpace(os.Getenv("JOINED_RECORDING_CANARY_HOUR_IDS")),
 		JoinedRecordingScratchRoot:            strEnv("JOINED_RECORDING_SCRATCH_ROOT", "/tmp/stoarama-joined"),
@@ -419,15 +421,18 @@ func (c Config) ValidateJoined() error {
 			}
 		}
 	}
+	if c.JoinedRecordingRollingEnabled {
+		return fmt.Errorf("JOINED_RECORDING_ROLLING_ENABLED must remain false")
+	}
+	if _, err := c.JoinedWorkScope(); err != nil {
+		return err
+	}
 	if c.JoinedRecordingControlPlaneEnabled {
 		if c.JoinedRecordingProtocolVersion != 1 {
 			return fmt.Errorf("JOINED_RECORDING_PROTOCOL_VERSION must be 1 when enabled")
 		}
 		if !validJoinedRecordingBatchID(c.JoinedRecordingBatchID) {
 			return fmt.Errorf("JOINED_RECORDING_BATCH_ID must be a lowercase letters/numbers/hyphens identifier")
-		}
-		if _, err := c.JoinedCanaryHourIDs(); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -526,11 +531,12 @@ func (c Config) ValidateWorker() error {
 // ValidateJoinedRecording validates the worker's activation envelope. An
 // inactive worker intentionally requires no service, media, or storage setup.
 func (c Config) ValidateJoinedRecording() error {
-	if c.JoinedRecordingRollingEnabled && !c.JoinedRecordingEnabled {
-		return fmt.Errorf("JOINED_RECORDING_ROLLING_ENABLED requires JOINED_RECORDING_ENABLED")
+	if c.JoinedRecordingRollingEnabled {
+		return fmt.Errorf("JOINED_RECORDING_ROLLING_ENABLED must remain false")
 	}
 	if !c.JoinedRecordingEnabled {
-		return nil
+		_, err := c.JoinedWorkScope()
+		return err
 	}
 	if c.JoinedRecordingProtocolVersion != 1 {
 		return fmt.Errorf("JOINED_RECORDING_PROTOCOL_VERSION must be 1 when enabled")
@@ -538,7 +544,7 @@ func (c Config) ValidateJoinedRecording() error {
 	if !validJoinedRecordingBatchID(c.JoinedRecordingBatchID) {
 		return fmt.Errorf("JOINED_RECORDING_BATCH_ID must be a lowercase letters/numbers/hyphens identifier")
 	}
-	if _, err := c.JoinedCanaryHourIDs(); err != nil {
+	if _, err := c.JoinedWorkScope(); err != nil {
 		return err
 	}
 	root := strings.TrimSpace(c.JoinedRecordingScratchRoot)
@@ -564,6 +570,42 @@ func (c Config) ValidateJoinedRecording() error {
 		return fmt.Errorf("STOARAMA_JOINED_WORKER_TOKEN is required when joined recording is enabled")
 	}
 	return nil
+}
+
+const (
+	JoinedWorkScopeDisabled    = "disabled"
+	JoinedWorkScopeCanary      = "canary"
+	JoinedWorkScopeFrozenBatch = "frozen_batch"
+)
+
+// JoinedWorkScope validates the explicit rollout authority shared by API and
+// worker. Automatic rolling has no scope value and remains unavailable.
+func (c Config) JoinedWorkScope() (string, error) {
+	scope := strings.TrimSpace(c.JoinedRecordingWorkScope)
+	switch scope {
+	case "", JoinedWorkScopeDisabled:
+		scope = JoinedWorkScopeDisabled
+		if c.JoinedRecordingControlPlaneEnabled || c.JoinedRecordingEnabled {
+			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=disabled requires joined recording to be disabled")
+		}
+	case JoinedWorkScopeCanary:
+		if !c.JoinedRecordingControlPlaneEnabled && !c.JoinedRecordingEnabled {
+			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=canary requires an enabled joined API or worker")
+		}
+		if _, err := c.JoinedCanaryHourIDs(); err != nil {
+			return "", err
+		}
+	case JoinedWorkScopeFrozenBatch:
+		if !c.JoinedRecordingControlPlaneEnabled && !c.JoinedRecordingEnabled {
+			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=frozen_batch requires an enabled joined API or worker")
+		}
+		if strings.TrimSpace(c.JoinedRecordingCanaryHourIDs) != "" {
+			return "", fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must be empty for frozen_batch scope")
+		}
+	default:
+		return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE must be disabled, canary, or frozen_batch")
+	}
+	return scope, nil
 }
 
 // JoinedCanaryHourIDs returns the exact, bounded work scope shared by the API

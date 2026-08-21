@@ -44,6 +44,11 @@ func (s *Server) joinedCanaryHourIDs() []string {
 	return hours
 }
 
+func (s *Server) joinedFrozenBatchScope() bool {
+	scope, err := s.cfg.JoinedWorkScope()
+	return err == nil && scope == "frozen_batch"
+}
+
 func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 	var req joinedrecording.WorkerBootstrapRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
@@ -58,13 +63,18 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusForbidden, "joined batch scope differs")
+		return
+	}
 	canaryHours := s.joinedCanaryHourIDs()
+	frozenBatch := s.joinedFrozenBatchScope()
 	var availableBatchID string
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT b.batch_id FROM recording_joined_batches b
 		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
 		WHERE b.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND (EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=b.id
-		    AND h.hour_id=ANY($2::text[])
+		    AND ($3 OR h.hour_id=ANY($2::text[]))
 		    AND h.source_clip_count>0 AND ((h.state='pending' AND h.next_attempt_at<=now())
 		      OR (h.state='leased' AND h.lease_expires_at<=now()))
 		    AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=h.stream_day_id
@@ -72,13 +82,15 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		  OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
 		    AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
 		      OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
-		    AND ((a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
+		    AND (($3 AND (a.artifact_kind<>'hour_manifest' OR EXISTS(SELECT 1 FROM recording_joined_artifacts published_ledger
+		          WHERE published_ledger.stream_day_id=a.stream_day_id AND published_ledger.artifact_kind='allocation_ledger'
+		            AND published_ledger.publication_state='published'))) OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		          WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
 		      OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		          WHERE allowed.id=a.hour_record_id AND allowed.hour_id=ANY($2::text[]))
 		        AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=a.stream_day_id
 		          AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published')))))
-		LIMIT 1`, req.BatchID, canaryHours).Scan(&availableBatchID)
+		LIMIT 1`, req.BatchID, canaryHours, frozenBatch).Scan(&availableBatchID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -113,8 +125,9 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	canaryHours := s.joinedCanaryHourIDs()
+	frozenBatch := s.joinedFrozenBatchScope()
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
-	if !ok || claims.Kind != joinedauth.KindClaim || req.BatchID != claims.BatchID {
+	if !ok || claims.Kind != joinedauth.KindClaim || req.BatchID != claims.BatchID || claims.BatchID != s.cfg.JoinedRecordingBatchID {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
 		return
 	}
@@ -130,12 +143,12 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		JOIN recording_joined_artifacts ledger ON ledger.stream_day_id=h.stream_day_id
 		  AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
 		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
-		WHERE h.batch_id=$1 AND h.hour_id=ANY($2::text[])
+		WHERE h.batch_id=$1 AND ($3 OR h.hour_id=ANY($2::text[]))
 		  AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
 		  AND h.source_clip_count>0 AND ((h.state='pending' AND h.next_attempt_at<=now())
 		   OR (h.state='leased' AND h.lease_expires_at<=now()))
 		ORDER BY h.priority_ordinal,h.next_attempt_at,h.id
-		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours).Scan(&hourRecordID)
+		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch).Scan(&hourRecordID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -150,9 +163,9 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	err = tx.QueryRow(r.Context(), `
 		UPDATE recording_joined_hours SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
 		  lease_expires_at=date_trunc('second',now()+$4::interval),heartbeat_at=now()
-		WHERE id=$1 AND batch_id=$5 AND hour_id=ANY($6::text[])
+		WHERE id=$1 AND batch_id=$5 AND ($7 OR hour_id=ANY($6::text[]))
 		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.joined_protocol_version=1)
-		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID, canaryHours).
+		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID, canaryHours, frozenBatch).
 		Scan(&item.HourID, &item.LeaseExpires)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("claim joined hour: %v", err))
@@ -238,8 +251,9 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		return
 	}
 	canaryHours := s.joinedCanaryHourIDs()
+	frozenBatch := s.joinedFrozenBatchScope()
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
-	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID {
+	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID || claims.BatchID != s.cfg.JoinedRecordingBatchID {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
 		return
 	}
@@ -255,7 +269,8 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var artifactID int64
-	err = tx.QueryRow(r.Context(), `SELECT a.id FROM recording_joined_artifacts a
+	var selectedKind string
+	err = tx.QueryRow(r.Context(), `SELECT a.id,a.artifact_kind FROM recording_joined_artifacts a
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
 		LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
@@ -263,20 +278,34 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		WHERE a.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND a.artifact_kind<>'media'
 		  AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
 		    OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
-		  AND ((a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
+		  AND (($3 AND (a.artifact_kind<>'hour_manifest' OR ledger.publication_state='published')) OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		      WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
 		    OR (a.artifact_kind='hour_manifest' AND ledger.publication_state='published'
 		      AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		        WHERE allowed.id=a.hour_record_id AND allowed.hour_id=ANY($2::text[]))))
 		ORDER BY CASE a.artifact_kind WHEN 'allocation_ledger' THEN 0 WHEN 'hour_manifest' THEN 1 ELSE 2 END,
 		  COALESCE((SELECT h.priority_ordinal FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0),a.id
-		FOR UPDATE OF a,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours).Scan(&artifactID)
+		FOR UPDATE OF a SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch).Scan(&artifactID, &selectedKind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "select joined publication claim")
+		return
+	}
+	if selectedKind == "batch_index" {
+		canonical, state, existingID, buildErr := loadJoinedCanonicalBatchIndex(r.Context(), tx, claims.BatchID, true)
+		if buildErr != nil || state != "index_sealed" || existingID != artifactID || canonical.SHA256 == "" {
+			util.WriteError(w, http.StatusConflict, "joined batch index evidence differs")
+			return
+		}
+	}
+	var lockedConnection int64
+	if err := tx.QueryRow(r.Context(), `SELECT c.id FROM recording_joined_artifacts a JOIN connections c
+		ON c.id=a.connection_id AND c.joined_protocol_version=1 WHERE a.id=$1 FOR SHARE OF c`, artifactID).
+		Scan(&lockedConnection); err != nil {
+		util.WriteError(w, http.StatusConflict, "joined publication protocol changed")
 		return
 	}
 	leaseToken := uuid.New()
@@ -486,6 +515,9 @@ func (s *Server) validateJoinedRootFinalizeIdentity(ctx context.Context, scopeKi
 
 func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artifactID int64, objectKey, etag,
 	versionID string, sizeBytes int64, sha256 string) error {
+	if scopeKind == joinedauth.SubjectBatchIndex {
+		return s.finalizeJoinedBatchIndexCanonical(ctx, artifactID, objectKey, etag, versionID, sizeBytes, sha256)
+	}
 	if !s.joinedControlPlaneReady() {
 		return errors.New("joined recording is disabled")
 	}
@@ -549,6 +581,69 @@ func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artif
 		if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID); err != nil {
 			return errors.New("seal joined gap-only hours")
 		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Server) finalizeJoinedBatchIndexCanonical(ctx context.Context, artifactID int64, objectKey, etag,
+	versionID string, sizeBytes int64, sha256 string) error {
+	if !s.joinedControlPlaneReady() || !s.joinedFrozenBatchScope() {
+		return errors.New("joined frozen-batch work is disabled")
+	}
+	claims, ok := joinedWorkerClaimsFromContext(ctx)
+	if !ok || claims.Kind != joinedauth.KindOperation || claims.Operation != joinedauth.OperationPublish ||
+		claims.SubjectKind != joinedauth.SubjectBatchIndex || claims.BatchID != s.cfg.JoinedRecordingBatchID {
+		return errors.New("joined batch-index token scope differs")
+	}
+	lease, err := joinedCapabilityToken(claims.LeaseToken)
+	if err != nil {
+		return errors.New("joined batch-index lease differs")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	canonical, batchState, existingID, err := loadJoinedCanonicalBatchIndex(ctx, tx, claims.BatchID, true)
+	if err != nil || existingID != artifactID || (batchState != "index_sealed" && batchState != "published") ||
+		canonical.SHA256 != sha256 || int64(len(canonical.Bytes)) != sizeBytes {
+		return errors.New("joined batch-index canonical evidence differs")
+	}
+	var state, scopeID, expectedKey, expectedSHA, currentETag, currentVersion string
+	var expectedSize int64
+	var currentFinalized *uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT publication_state,scope_id,object_key,expected_size_bytes,expected_sha256,
+		COALESCE(etag,''),COALESCE(version_id,''),finalized_token FROM recording_joined_artifacts
+		WHERE id=$1 AND batch_record_id=$2 AND artifact_kind='batch_index' FOR UPDATE`, artifactID, canonical.BatchRecordID).
+		Scan(&state, &scopeID, &expectedKey, &expectedSize, &expectedSHA, &currentETag, &currentVersion, &currentFinalized)
+	if err != nil || scopeID != claims.SubjectID || expectedKey != objectKey || expectedSize != sizeBytes || expectedSHA != sha256 {
+		return errors.New("joined batch-index publication identity differs")
+	}
+	if state == "published" {
+		if batchState != "published" || currentFinalized == nil || *currentFinalized != lease || currentETag != etag || currentVersion != versionID {
+			return errors.New("joined batch-index publication retry differs")
+		}
+		return tx.Commit(ctx)
+	}
+	if state != "publishing" || batchState != "index_sealed" {
+		return errors.New("joined batch-index publication lease is stale")
+	}
+	var lockedConnection int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM connections WHERE id=$1 AND joined_protocol_version=1 FOR SHARE`,
+		canonical.ConnectionID).Scan(&lockedConnection); err != nil {
+		return errors.New("joined batch-index protocol changed")
+	}
+	var updated int64
+	if err := tx.QueryRow(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',publication_token=NULL,
+		publication_claimed_by=NULL,publication_lease_expires_at=NULL,publication_heartbeat_at=NULL,finalized_token=$2,
+		etag=$3,version_id=$4,published_at=now() WHERE id=$1 AND publication_token=$2 AND publication_lease_expires_at>now()
+		RETURNING id`, artifactID, lease, etag, versionID).Scan(&updated); err != nil {
+		return errors.New("joined batch-index publication lease is stale")
+	}
+	command, err := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='published',published_at=now()
+		WHERE id=$1 AND state='index_sealed' AND index_artifact_id=$2`, canonical.BatchRecordID, artifactID)
+	if err != nil || command.RowsAffected() != 1 {
+		return errors.New("joined batch-index state differs")
 	}
 	return tx.Commit(ctx)
 }
@@ -858,7 +953,9 @@ func (s *Server) handleJoinedStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		counts[state] = count
 	}
+	workScope, _ := s.cfg.JoinedWorkScope()
 	util.WriteJSON(w, http.StatusOK, map[string]any{"protocol_version": joinedWorkerProtocolVersion,
 		"enabled":  s.joinedControlPlaneReady() && batchID == s.cfg.JoinedRecordingBatchID,
-		"batch_id": batchID, "canary_hour_ids": s.joinedCanaryHourIDs(), "hours": counts})
+		"batch_id": batchID, "work_scope": workScope,
+		"canary_hour_ids": s.joinedCanaryHourIDs(), "hours": counts})
 }

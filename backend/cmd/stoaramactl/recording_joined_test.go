@@ -15,6 +15,7 @@ type fakeJoinedOperator struct {
 	dayReq       joinedSealStreamDayRequest
 	remainingReq joinedSealRemainingDaysRequest
 	finalReq     joinedFinalFreezeRequest
+	indexReq     joinedSealBatchIndexRequest
 	workerReq    joinedWorkerRequest
 	statusReq    joinedStatusRequest
 	startupReq   joinedWorkerRequest
@@ -27,6 +28,7 @@ func validJoinedWorkerConfig() config.Config {
 	return config.Config{
 		JoinedRecordingEnabled:         true,
 		JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingWorkScope:       config.JoinedWorkScopeCanary,
 		JoinedRecordingBatchID:         batch,
 		JoinedRecordingCanaryHourIDs: strings.Join([]string{
 			batch + "__recording-377__date-2026-08-01__hour-01__generation-1",
@@ -61,6 +63,11 @@ func (f *fakeJoinedOperator) SealRemainingDays(_ context.Context, req joinedSeal
 func (f *fakeJoinedOperator) FinalFreeze(_ context.Context, req joinedFinalFreezeRequest) (any, error) {
 	f.finalReq = req
 	return map[string]any{"status": "frozen"}, nil
+}
+
+func (f *fakeJoinedOperator) SealBatchIndex(_ context.Context, req joinedSealBatchIndexRequest) (any, error) {
+	f.indexReq = req
+	return map[string]any{"sha256": req.ExpectedSHA256}, nil
 }
 
 func (f *fakeJoinedOperator) RunWorker(_ context.Context, req joinedWorkerRequest) error {
@@ -253,6 +260,15 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 		ExpectedFrozenDenominatorSHA256: hash, Apply: true}) {
 		t.Fatalf("final-freeze request=%+v", fake.finalReq)
 	}
+	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
+		"seal-batch-index", "--expected-sha256", hash, "--apply",
+	}, factory); err != nil {
+		t.Fatal(err)
+	}
+	if fake.indexReq != (joinedSealBatchIndexRequest{BatchID: cfg.JoinedRecordingBatchID,
+		ExpectedSHA256: hash, Apply: true}) {
+		t.Fatalf("batch-index request=%+v", fake.indexReq)
+	}
 
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{"status"}, factory); err != nil {
 		t.Fatal(err)
@@ -269,6 +285,7 @@ func TestJoinedMutationsDormantBeforeFactory(t *testing.T) {
 		{"seal-stream-day", "--batch-id", "tier1-2026-08-generation-1"},
 		{"seal-remaining-days", "--batch-id", "tier1-2026-08-generation-1"},
 		{"final-freeze", "--batch-id", "tier1-2026-08-generation-1"},
+		{"seal-batch-index", "--batch-id", "tier1-2026-08-generation-1"},
 	} {
 		for _, cfg := range []config.Config{
 			{},

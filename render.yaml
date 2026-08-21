@@ -34,6 +34,8 @@ services:
         value: "0"
       - key: JOINED_RECORDING_ROLLING_ENABLED
         value: "false"
+      - key: STOARAMA_JOINED_WORK_SCOPE
+        value: disabled
       - key: JOINED_RECORDING_BATCH_ID
         sync: false
       - key: JOINED_RECORDING_CANARY_HOUR_IDS
@@ -152,6 +154,8 @@ services:
         value: "false"
       - key: JOINED_RECORDING_PROTOCOL_VERSION
         value: "0"
+      - key: STOARAMA_JOINED_WORK_SCOPE
+        value: disabled
       - key: JOINED_RECORDING_BATCH_ID
         sync: false
       - key: JOINED_RECORDING_CANARY_HOUR_IDS

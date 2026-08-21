@@ -308,6 +308,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	s.cfg.JoinedRecordingControlPlaneEnabled = true
 	s.cfg.JoinedRecordingProtocolVersion = 1
 	s.cfg.JoinedRecordingBatchID = "batch-test"
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
 	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest("batch-test", "batch-test__recording-1__date-2026-08-01__hour-01__generation-1")
 	bootstrapLeaseRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", strings.NewReader(`{"lease_id":"forbidden"}`))
 	bootstrapLeaseRequest.Header.Set("Authorization", "Bearer "+bootstrapCredential)
@@ -352,6 +353,7 @@ func TestJoinedOperationTokenIsFencedByCurrentExactCanaryScope(t *testing.T) {
 	inside := batch + "__recording-377__date-2026-08-01__hour-01__generation-1"
 	cfg := config.Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
 		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: joinedCanaryScopeForTest(batch, inside),
+		JoinedRecordingWorkScope:   config.JoinedWorkScopeCanary,
 		JoinedWorkerBootstrapToken: "joined-bootstrap-credential-32bytes",
 		JoinedWorkerSigningKey:     "joined-signing-credential-32-bytes"}
 	s := &Server{cfg: cfg, joinedCredentialCheck: func(context.Context) error { return nil }}

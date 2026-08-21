@@ -87,6 +87,7 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	hour := joinedCanaryScope(batch)
 	valid := Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
 		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour, ServiceToken: "service",
+		JoinedRecordingWorkScope:   JoinedWorkScopeCanary,
 		JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing}
 	if err := valid.ValidateJoined(); err != nil {
 		t.Fatalf("valid joined credentials: %v", err)
@@ -144,12 +145,23 @@ func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 	}
 }
 
+func TestRenderJoinedWorkScopeShipsDisabled(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(string(data), "- key: STOARAMA_JOINED_WORK_SCOPE\n        value: disabled"); count != 2 {
+		t.Fatalf("disabled joined work scope declarations=%d want=2", count)
+	}
+}
+
 func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	for _, key := range []string{
 		"JOINED_RECORDING_CONTROL_PLANE_ENABLED",
 		"JOINED_RECORDING_ENABLED",
 		"JOINED_RECORDING_PROTOCOL_VERSION",
 		"JOINED_RECORDING_ROLLING_ENABLED",
+		"STOARAMA_JOINED_WORK_SCOPE",
 		"JOINED_RECORDING_BATCH_ID",
 		"JOINED_RECORDING_CANARY_HOUR_IDS",
 		"JOINED_RECORDING_SCRATCH_ROOT",
@@ -175,6 +187,9 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	if cfg.JoinedRecordingBatchID != "" || cfg.JoinedRecordingScratchRoot != "/tmp/stoarama-joined" {
 		t.Fatalf("joined defaults: batch=%q scratch=%q", cfg.JoinedRecordingBatchID, cfg.JoinedRecordingScratchRoot)
 	}
+	if cfg.JoinedRecordingWorkScope != JoinedWorkScopeDisabled {
+		t.Fatalf("joined default work scope=%q", cfg.JoinedRecordingWorkScope)
+	}
 	if err := cfg.ValidateJoinedRecording(); err != nil {
 		t.Fatalf("disabled validation: %v", err)
 	}
@@ -184,6 +199,7 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 	valid := Config{
 		JoinedRecordingEnabled:             true,
 		JoinedRecordingProtocolVersion:     1,
+		JoinedRecordingWorkScope:           JoinedWorkScopeCanary,
 		JoinedRecordingBatchID:             "tier1-2026-08",
 		JoinedRecordingCanaryHourIDs:       joinedCanaryScope("tier1-2026-08"),
 		JoinedRecordingScratchRoot:         "/tmp/stoarama-joined",
@@ -196,6 +212,12 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 	}
 	if err := valid.ValidateJoinedRecording(); err != nil {
 		t.Fatal(err)
+	}
+	frozenBatch := valid
+	frozenBatch.JoinedRecordingWorkScope = JoinedWorkScopeFrozenBatch
+	frozenBatch.JoinedRecordingCanaryHourIDs = ""
+	if err := frozenBatch.ValidateJoinedRecording(); err != nil {
+		t.Fatalf("frozen-batch worker activation: %v", err)
 	}
 	tests := []Config{
 		{JoinedRecordingRollingEnabled: true},
@@ -226,7 +248,7 @@ func TestJoinedCanaryScopeAndRoleSeparationFailClosed(t *testing.T) {
 	hour := joinedCanaryScope(batch)
 	hours := strings.Split(hour, ",")
 	base := Config{JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: batch,
-		JoinedRecordingCanaryHourIDs: hour}
+		JoinedRecordingCanaryHourIDs: hour, JoinedRecordingWorkScope: JoinedWorkScopeCanary}
 	invalidScopes := map[string]string{
 		"empty":        "",
 		"one hour":     hours[0],
@@ -296,9 +318,44 @@ func TestJoinedCanaryScopeAndRoleSeparationFailClosed(t *testing.T) {
 	}
 }
 
+func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
+	const batch = "tier1-2026-08"
+	canary := validJoinedAPIConfigForTest(batch, joinedCanaryScope(batch))
+	if scope, err := canary.JoinedWorkScope(); err != nil || scope != JoinedWorkScopeCanary {
+		t.Fatalf("canary scope=%q err=%v", scope, err)
+	}
+	frozen := canary
+	frozen.JoinedRecordingWorkScope = JoinedWorkScopeFrozenBatch
+	frozen.JoinedRecordingCanaryHourIDs = ""
+	if scope, err := frozen.JoinedWorkScope(); err != nil || scope != JoinedWorkScopeFrozenBatch {
+		t.Fatalf("frozen scope=%q err=%v", scope, err)
+	}
+	for name, edit := range map[string]func(*Config){
+		"implicit enabled": func(c *Config) { c.JoinedRecordingWorkScope = "" },
+		"disabled enabled": func(c *Config) { c.JoinedRecordingWorkScope = JoinedWorkScopeDisabled },
+		"frozen canary":    func(c *Config) { c.JoinedRecordingWorkScope = JoinedWorkScopeFrozenBatch },
+		"unknown":          func(c *Config) { c.JoinedRecordingWorkScope = "rolling" },
+		"rolling":          func(c *Config) { c.JoinedRecordingRollingEnabled = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := canary
+			edit(&candidate)
+			if err := candidate.ValidateJoined(); err == nil {
+				t.Fatal("unsafe joined work scope was accepted")
+			}
+		})
+	}
+	if scope, err := (Config{}).JoinedWorkScope(); err != nil || scope != JoinedWorkScopeDisabled {
+		t.Fatalf("dormant default scope=%q err=%v", scope, err)
+	}
+	if scope, err := (Config{JoinedRecordingCanaryHourIDs: joinedCanaryScope(batch)}).JoinedWorkScope(); err != nil || scope != JoinedWorkScopeDisabled {
+		t.Fatalf("disabled scope was affected by inert canary IDs scope=%q err=%v", scope, err)
+	}
+}
+
 func validJoinedAPIConfigForTest(batch, hour string) Config {
 	return Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
-		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour,
+		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour, JoinedRecordingWorkScope: JoinedWorkScopeCanary,
 		JoinedWorkerBootstrapToken: "joined-bootstrap-credential-32bytes",
 		JoinedWorkerSigningKey:     "joined-signing-credential-32-bytes"}
 }
@@ -310,6 +367,7 @@ func TestLoadAllowsWorkerWithoutBackendAuthority(t *testing.T) {
 		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
 		"JOINED_RECORDING_BATCH_ID":              "tier1-2026-08",
 		"JOINED_RECORDING_CANARY_HOUR_IDS":       joinedCanaryScope("tier1-2026-08"),
+		"STOARAMA_JOINED_WORK_SCOPE":             JoinedWorkScopeCanary,
 		"JOINED_WORKER_BOOTSTRAP_TOKEN":          "",
 		"JOINED_WORKER_SIGNING_KEY":              "",
 		"STOARAMA_JOINED_OPERATOR_TOKEN":         "",
