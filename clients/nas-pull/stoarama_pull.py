@@ -2575,37 +2575,56 @@ def write_joined_stage(directory_fd, name, content):
     os.fsync(directory_fd)
 
 
+def linked_joined_stage(directory_fd, marker_name, marker_stat):
+    prefix = marker_name + ".stage-"
+    matches = []
+    for candidate in os.listdir(directory_fd):
+        if not candidate.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}", candidate[len(prefix):]):
+            continue
+        try:
+            candidate_stat = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat_module.S_ISREG(candidate_stat.st_mode) and same_joined_inode(marker_stat, candidate_stat):
+            matches.append((candidate, candidate_stat))
+    if len(matches) != 1:
+        raise ExistingFileMismatch("joined marker has an unknown hardlink")
+    stage_name, stage_stat = matches[0]
+    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2:
+        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
+    return stage_name
+
+
 def publish_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-    stage_name = name + ".stage"
     marker_stat = joined_entry_stat(directory_fd, name)
-    stage_stat = joined_entry_stat(directory_fd, stage_name)
     if marker_stat is not None:
         if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
             raise ExistingFileMismatch("joined partial ownership marker conflicts")
         marker_stat = joined_entry_stat(directory_fd, name)
-        if stage_stat is not None:
-            if marker_stat.st_nlink == 2 and same_joined_inode(marker_stat, stage_stat):
-                os.unlink(stage_name, dir_fd=directory_fd)
-            else:
-                raise ExistingFileMismatch("joined sidecar stage has an unknown hardlink")
+        if marker_stat.st_nlink == 2:
+            stage_name = linked_joined_stage(directory_fd, name, marker_stat)
+            os.unlink(stage_name, dir_fd=directory_fd)
             os.fsync(directory_fd)
         elif marker_stat.st_nlink != 1:
             raise ExistingFileMismatch("joined marker has an unknown hardlink")
+        if joined_entry_stat(directory_fd, name).st_nlink != 1:
+            raise ExistingFileMismatch("joined marker has an unknown hardlink")
         return
-    if stage_stat is None:
-        write_joined_stage(directory_fd, stage_name, content)
+    for _attempt in range(8):
+        stage_name = name + ".stage-" + os.urandom(16).hex()
+        try:
+            write_joined_stage(directory_fd, stage_name, content)
+            break
+        except FileExistsError:
+            continue
     else:
-        # A stage surviving restart is unknown until its complete intended
-        # contents and exclusive inode ownership are proven; never truncate it.
-        if stage_stat.st_nlink != 1 or not verify_joined_sidecar(
-            cfg, runtime, directory_fd, stage_name, content, stop_event,
-        ):
-            raise ExistingFileMismatch("joined sidecar stage conflicts")
+        raise ExistingFileMismatch("could not allocate a private joined sidecar stage")
     try:
         os.link(stage_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
     except FileExistsError:
-        if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-            raise ExistingFileMismatch("joined partial ownership marker conflicts")
+        # Another publisher won. Our private, unlinked stage is left untouched;
+        # only an exact same-inode link is ever removed below or on restart.
+        raise ExistingFileMismatch("joined marker appeared during publication")
     os.fsync(directory_fd)
     marker_stat = joined_entry_stat(directory_fd, name)
     stage_stat = joined_entry_stat(directory_fd, stage_name)
