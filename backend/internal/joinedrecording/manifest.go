@@ -122,6 +122,24 @@ type HourManifestInput struct {
 	AllocationLedger   StreamDayAllocation
 }
 
+// BuildHourManifestAllocation constructs the exact ledger artifact and
+// boundary subset bound into one canonical hour manifest.
+func BuildHourManifestAllocation(artifactID int64, plan BatchPlan, ledger StreamDayAllocation) (HourManifestAllocation, error) {
+	if err := ValidatePlan(plan); err != nil {
+		return HourManifestAllocation{}, err
+	}
+	relativePath, objectKey, pathErr := CanonicalAllocationLedgerPaths(plan.BatchID, plan.RecordingID, plan.LocalDate)
+	ledgerBytes, artifactSHA, ledgerErr := CanonicalAllocationLedgerArtifact(ledger)
+	wantQualificationDay, qualificationOK := qualifiedDay(plan.Qualification, plan.LocalDate)
+	if pathErr != nil || ledgerErr != nil || !qualificationOK || artifactID <= 0 || ledger.BatchID != plan.BatchID || ledger.Generation != plan.Generation || ledger.RecordingID != plan.RecordingID || ledger.Timezone != plan.Timezone || ledger.LocalDate != plan.LocalDate || ledger.QualificationSHA != plan.Qualification.EvidenceSHA || !sameCanonical([]QualifiedDay{ledger.QualificationDay}, []QualifiedDay{wantQualificationDay}) || ledger.LedgerSHA256 != plan.AllocationLedgerSHA || ledger.HourSourceSHA256[plan.LocalHour-1] != plan.SourceClaimSHA256 || !sameClipIDs(ledger.Hours[plan.LocalHour-1].SourceClipIDs, plan.Sources) {
+		return HourManifestAllocation{}, fmt.Errorf("hour manifest allocation evidence differs")
+	}
+	boundaries, crossDayBoundaries := hourBoundarySubset(ledger, plan.LocalHour)
+	return HourManifestAllocation{ArtifactID: artifactID, RelativePath: relativePath, ObjectKey: objectKey,
+		SizeBytes: int64(len(ledgerBytes)), SHA256: artifactSHA, LedgerSHA256: ledger.LedgerSHA256,
+		HourSourceSHA256: plan.SourceClaimSHA256, Boundaries: boundaries, CrossDayBoundaries: crossDayBoundaries}, nil
+}
+
 // BuildHourManifest runs only after the fenced seal transaction has obtained
 // media artifact IDs. It returns the exact bytes, size, and full SHA used to
 // insert the manifest artifact row before the hour is atomically sealed.
