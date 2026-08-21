@@ -152,7 +152,7 @@ func TestHourManifestRejectsMutatedLedgerAndDowngradedEvidence(t *testing.T) {
 	allocation, ledger := testAllocation(plan)
 	unsafePlan := plan
 	unsafePlan.Sources = append([]SourceClip(nil), plan.Sources...)
-	unsafePlan.Sources[0].Endpoint = "https://cap.test/?secret=value"
+	unsafePlan.Sources[0].Endpoint = testSourceEndpoint + "/?secret=value"
 	unsafePlan.Outputs = append([]OutputPlan(nil), plan.Outputs...)
 	unsafePlan.Outputs[0].Sources = append([]SourceClip(nil), plan.Outputs[0].Sources...)
 	unsafePlan.Outputs[0].Sources[0].Endpoint = unsafePlan.Sources[0].Endpoint
