@@ -168,7 +168,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	}
 	s := &Server{cfg: config.Config{ServiceToken: "generic-service-key", JoinedWorkerBootstrapToken: bootstrapCredential, JoinedWorkerSigningKey: signingCredential},
 		joinedCredentialCheck: func(context.Context) error { return nil }}
-	misconfigured := &Server{cfg: config.Config{JoinedRecordingEnabled: true, ServiceToken: "shared-secret",
+	misconfigured := &Server{cfg: config.Config{JoinedRecordingControlPlaneEnabled: true, ServiceToken: "shared-secret",
 		JoinedWorkerBootstrapToken: "shared-secret", JoinedWorkerSigningKey: "shared-secret"}}
 	if misconfigured.joinedControlPlaneReady() {
 		t.Fatal("joined control plane accepted shared generic/bootstrap/signing credentials")
@@ -286,7 +286,10 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 			}
 		})
 	}
-	s.cfg.JoinedRecordingEnabled = true
+	s.cfg.JoinedRecordingControlPlaneEnabled = true
+	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingBatchID = "batch-test"
+	s.cfg.JoinedRecordingCanaryHourIDs = "batch-test__recording-1__date-2026-08-01__hour-01__generation-1"
 	bootstrapLeaseRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", strings.NewReader(`{"lease_id":"forbidden"}`))
 	bootstrapLeaseRequest.Header.Set("Authorization", "Bearer "+bootstrapCredential)
 	bootstrapLeaseResponse := httptest.NewRecorder()

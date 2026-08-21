@@ -36,6 +36,8 @@ services:
         value: "false"
       - key: JOINED_RECORDING_BATCH_ID
         sync: false
+      - key: JOINED_RECORDING_CANARY_HOUR_IDS
+        sync: false
       - key: JOINED_RECORDING_SCRATCH_ROOT
         value: /tmp/stoarama-joined
       - key: JOINED_RECORDING_STORAGE_AUTHORITY
@@ -144,6 +146,20 @@ services:
         value: "5"
       - key: BOX_WORKER_RETRY_MAX_SEC
         value: "300"
+      # Joined control plane is independently ship-dark. It never grants the
+      # isolated worker backend signing or storage credentials.
+      - key: JOINED_RECORDING_CONTROL_PLANE_ENABLED
+        value: "false"
+      - key: JOINED_RECORDING_PROTOCOL_VERSION
+        value: "0"
+      - key: JOINED_RECORDING_BATCH_ID
+        sync: false
+      - key: JOINED_RECORDING_CANARY_HOUR_IDS
+        sync: false
+      - key: JOINED_WORKER_BOOTSTRAP_TOKEN
+        sync: false
+      - key: JOINED_WORKER_SIGNING_KEY
+        sync: false
       # Shared verbatim with stoarama-joined-worker so freeze evidence and
       # worker verification use byte-identical media tools.
       - key: JOINED_RECORDING_FFMPEG_ARCHIVE_URL

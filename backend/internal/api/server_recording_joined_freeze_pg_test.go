@@ -381,7 +381,8 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
-	s.cfg.JoinedRecordingEnabled = true
+	s.cfg.JoinedRecordingControlPlaneEnabled = true
+	s.cfg.JoinedRecordingProtocolVersion = 1
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
 	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	token := "joined-freeze-admin-session"
@@ -403,6 +404,9 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	}
 	req := validJoinedTier1FreezeRequest(t)
 	req.ConnectionID, req.QualificationRunID = connectionID, runID
+	s.cfg.JoinedRecordingBatchID = req.BatchID
+	s.cfg.JoinedRecordingCanaryHourIDs = fmt.Sprintf("%s__recording-%d__date-2026-08-01__hour-01__generation-1",
+		req.BatchID, joinedrecording.Tier1RecordingIDs[0])
 	dry, plan := call(req)
 	if dry.Code != http.StatusOK || !lowerHexSHA256(plan.RequestSHA256) || !lowerHexSHA256(plan.FrozenDenominatorSHA256) ||
 		!lowerHexSHA256(plan.FreezeExclusionsSHA256) || plan.ProvisionalSourceClips != 1 || plan.ProvisionalSourceBytes != 10 {

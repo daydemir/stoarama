@@ -639,7 +639,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	fixture := newJoinedHistoricalTier1Fixture(t, "joined-canonical@example.test")
 	defer fixture.cleanup()
 	s, pool := fixture.s, fixture.pool
-	s.cfg.JoinedRecordingEnabled = true
+	s.cfg.JoinedRecordingControlPlaneEnabled = true
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
 	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	s.cfg.R2Endpoint = "https://output.example.test"
@@ -673,6 +673,20 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("canonical materialization ledgers=%d source=%v gap=%v final=%v", len(ledgers), sourceLedger != nil,
 			gapAtomicLedger != nil, insertFinalChild != nil)
 	}
+	var canaryGapHourID, canarySourceHourID string
+	if err := pool.QueryRow(ctx, `SELECT hour_id FROM recording_joined_hours
+		WHERE stream_day_id=$1 AND source_clip_count=0 ORDER BY delivery_hour LIMIT 1`, ledgers[0].streamDayID).
+		Scan(&canaryGapHourID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT hour_id FROM recording_joined_hours
+		WHERE stream_day_id=$1 AND source_clip_count>0 ORDER BY delivery_hour LIMIT 1`, sourceLedger.streamDayID).
+		Scan(&canarySourceHourID); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingBatchID = batchID
+	s.cfg.JoinedRecordingCanaryHourIDs = canaryGapHourID
 	recordingID, batchRecordingID := sourceLedger.recordingID, sourceLedger.batchRecordingID
 	var sources []joinedrecording.SourceClip
 	if err := json.Unmarshal(sourceLedger.bytes, &struct {
@@ -833,6 +847,44 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		Scan(&gapManifestCount); err != nil || gapManifestCount != 12 {
 		t.Fatalf("server gap-only manifests=%d err=%v", gapManifestCount, err)
 	}
+	exactHourReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
+	exactHourReq.Header.Set("Authorization", "Bearer "+claimToken)
+	exactHourRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(exactHourRec, exactHourReq)
+	var exactHour joinedrecording.PublicationClaimResponse
+	if exactHourRec.Code != http.StatusOK || json.Unmarshal(exactHourRec.Body.Bytes(), &exactHour) != nil ||
+		exactHour.Hour == nil || exactHour.Hour.HourID != canaryGapHourID {
+		t.Fatalf("exact canary hour claim status=%d body=%s", exactHourRec.Code, exactHourRec.Body.String())
+	}
+	noForeignReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
+	noForeignReq.Header.Set("Authorization", "Bearer "+claimToken)
+	noForeignRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(noForeignRec, noForeignReq)
+	if noForeignRec.Code != http.StatusNoContent {
+		t.Fatalf("canary claimed a foreign hour, day ledger, or batch index: status=%d body=%s", noForeignRec.Code, noForeignRec.Body.String())
+	}
+	s.cfg.JoinedRecordingCanaryHourIDs = canarySourceHourID
+	sourceLedgerClaimReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
+	sourceLedgerClaimReq.Header.Set("Authorization", "Bearer "+claimToken)
+	sourceLedgerClaimRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(sourceLedgerClaimRec, sourceLedgerClaimReq)
+	var sourceLedgerPublication joinedrecording.PublicationClaimResponse
+	if sourceLedgerClaimRec.Code != http.StatusOK || json.Unmarshal(sourceLedgerClaimRec.Body.Bytes(), &sourceLedgerPublication) != nil ||
+		sourceLedgerPublication.Ledger == nil || sourceLedgerPublication.Ledger.ArtifactID != sourceLedger.artifactID {
+		t.Fatalf("exact dependency ledger claim status=%d body=%s", sourceLedgerClaimRec.Code, sourceLedgerClaimRec.Body.String())
+	}
+	s.joinedOutputStorage = joinedOutputStoreStub{head: r2.ObjectHead{ETag: "source-ledger-etag", SizeBytes: int64(len(sourceLedger.bytes))}}
+	sourceLedgerFinalizeBody, _ := json.Marshal(joinedrecording.FinalizeLedgerRequest{ProtocolVersion: 1,
+		Published: joinedrecording.PublishedLedger{ArtifactID: sourceLedger.artifactID, ObjectKey: sourceLedger.objectKey,
+			ETag: "source-ledger-etag", SizeBytes: int64(len(sourceLedger.bytes)), SHA256: sourceLedger.sha}})
+	sourceLedgerFinalizeReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/ledger/finalize",
+		bytes.NewReader(sourceLedgerFinalizeBody))
+	sourceLedgerFinalizeReq.Header.Set("Authorization", "Bearer "+sourceLedgerPublication.Ledger.OperationToken)
+	sourceLedgerFinalizeRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFinalizeLedger)).ServeHTTP(sourceLedgerFinalizeRec, sourceLedgerFinalizeReq)
+	if sourceLedgerFinalizeRec.Code != http.StatusNoContent {
+		t.Fatalf("exact dependency ledger finalize status=%d body=%s", sourceLedgerFinalizeRec.Code, sourceLedgerFinalizeRec.Body.String())
+	}
 	principal := accountPrincipal{AccountID: accountID, APIKeyID: &apiKeyID, KeyScopes: []string{accountScopePull}}
 	feedReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/joined", nil)
 	feedReq = feedReq.WithContext(context.WithValue(feedReq.Context(), accountPrincipalContextKey, principal))
@@ -908,6 +960,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	// Publish the remaining ledgers through the same fenced DB transitions so
 	// the source-bearing day becomes eligible for the actual worker handlers.
 	for i := 1; i <= 12; i++ {
+		if ledgers[i].artifactID == sourceLedger.artifactID {
+			continue
+		}
 		token := fmt.Sprintf("00000000-0000-0000-0000-%012d", i+10)
 		if _, err := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='publishing',
 			publication_attempt_count=1,publication_token=$2,publication_claimed_by='fixture-publisher',

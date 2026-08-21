@@ -22,6 +22,7 @@ type Config struct {
 	ServiceToken                     string
 	JoinedWorkerBootstrapToken       string
 	JoinedWorkerSigningKey           string
+	JoinedOperatorToken              string
 	BootstrapAdminEmail              string
 	MigrationDir                     string
 	AutoMigrate                      bool
@@ -138,10 +139,12 @@ type Config struct {
 	// Joined recording generation is ship-dark. The isolated worker must return
 	// before constructing any database, media, or storage client while disabled.
 	// Render instance count is the only production concurrency control.
+	JoinedRecordingControlPlaneEnabled bool
 	JoinedRecordingEnabled             bool
 	JoinedRecordingProtocolVersion     int
 	JoinedRecordingRollingEnabled      bool
 	JoinedRecordingBatchID             string
+	JoinedRecordingCanaryHourIDs       string
 	JoinedRecordingScratchRoot         string
 	JoinedRecordingStorageAuthority    string
 	JoinedRecordingFFmpegArchiveURL    string
@@ -188,6 +191,7 @@ func Load() (Config, error) {
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
+		JoinedOperatorToken:              strings.TrimSpace(os.Getenv("STOARAMA_JOINED_OPERATOR_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
 		AutoMigrate:                      boolEnv("AUTO_MIGRATE", false),
@@ -271,10 +275,12 @@ func Load() (Config, error) {
 		RecordingWorkerPollSec:                intEnv("RECORDING_WORKER_POLL_SEC", 5),
 		RecordingFrozenHLSQuiescenceAllowlist: strEnv("RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST", ""),
 		RelayUploadWorkers:                    RelayUploadWorkersFromEnv(),
+		JoinedRecordingControlPlaneEnabled:    boolEnv("JOINED_RECORDING_CONTROL_PLANE_ENABLED", false),
 		JoinedRecordingEnabled:                boolEnv("JOINED_RECORDING_ENABLED", false),
 		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
 		JoinedRecordingRollingEnabled:         boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
 		JoinedRecordingBatchID:                strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
+		JoinedRecordingCanaryHourIDs:          strings.TrimSpace(os.Getenv("JOINED_RECORDING_CANARY_HOUR_IDS")),
 		JoinedRecordingScratchRoot:            strEnv("JOINED_RECORDING_SCRATCH_ROOT", "/tmp/stoarama-joined"),
 		JoinedRecordingStorageAuthority:       strings.TrimSpace(os.Getenv("JOINED_RECORDING_STORAGE_AUTHORITY")),
 		JoinedRecordingFFmpegArchiveURL:       strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_URL")),
@@ -379,28 +385,49 @@ func (c Config) ValidateAPI() error {
 func (c Config) ValidateJoined() error {
 	bootstrap := strings.TrimSpace(c.JoinedWorkerBootstrapToken)
 	signing := strings.TrimSpace(c.JoinedWorkerSigningKey)
+	operator := strings.TrimSpace(c.JoinedOperatorToken)
 	service := strings.TrimSpace(c.ServiceToken)
-	if bootstrap == "" && signing == "" && !c.JoinedRecordingEnabled {
-		return nil
-	}
-	if bootstrap == "" || signing == "" {
-		return fmt.Errorf("joined recording requires distinct JOINED_WORKER_BOOTSTRAP_TOKEN and JOINED_WORKER_SIGNING_KEY")
-	}
-	if len(bootstrap) < 32 || len(signing) < 32 {
-		return fmt.Errorf("joined bootstrap and signing credentials must each be at least 32 bytes")
-	}
-	if bootstrap == signing {
-		return fmt.Errorf("joined bootstrap, signing, and generic service credentials must be distinct")
-	}
 	protected := []string{service, strings.TrimSpace(c.APIToken), strings.TrimSpace(c.DatabaseURL),
 		strings.TrimSpace(c.StorageCredKey), strings.TrimSpace(c.R2AccessKeyID), strings.TrimSpace(c.R2SecretAccessKey)}
 	if databaseConfig, err := pgx.ParseConfig(strings.TrimSpace(c.DatabaseURL)); err == nil {
 		protected = append(protected, databaseConfig.Password)
 	}
-	for _, protected := range protected {
-		protected = strings.TrimSpace(protected)
-		if protected != "" && (bootstrap == protected || signing == protected) {
-			return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
+	if bootstrap != "" || signing != "" || c.JoinedRecordingControlPlaneEnabled {
+		if bootstrap == "" || signing == "" {
+			return fmt.Errorf("joined recording requires distinct JOINED_WORKER_BOOTSTRAP_TOKEN and JOINED_WORKER_SIGNING_KEY")
+		}
+		if len(bootstrap) < 32 || len(signing) < 32 {
+			return fmt.Errorf("joined bootstrap and signing credentials must each be at least 32 bytes")
+		}
+		if bootstrap == signing {
+			return fmt.Errorf("joined bootstrap, signing, and generic service credentials must be distinct")
+		}
+		for _, protected := range protected {
+			protected = strings.TrimSpace(protected)
+			if protected != "" && (bootstrap == protected || signing == protected) {
+				return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
+			}
+		}
+	}
+	if operator != "" {
+		if len(operator) < 32 {
+			return fmt.Errorf("STOARAMA_JOINED_OPERATOR_TOKEN must be at least 32 bytes when configured")
+		}
+		for _, protected := range append(protected, bootstrap, signing, strings.TrimSpace(c.JoinedRecordingWorkerToken)) {
+			if operator == strings.TrimSpace(protected) {
+				return fmt.Errorf("joined operator credential must differ from service, database, storage, backend, and worker credentials")
+			}
+		}
+	}
+	if c.JoinedRecordingControlPlaneEnabled {
+		if c.JoinedRecordingProtocolVersion != 1 {
+			return fmt.Errorf("JOINED_RECORDING_PROTOCOL_VERSION must be 1 when enabled")
+		}
+		if !validJoinedRecordingBatchID(c.JoinedRecordingBatchID) {
+			return fmt.Errorf("JOINED_RECORDING_BATCH_ID must be a lowercase letters/numbers/hyphens identifier")
+		}
+		if _, err := c.JoinedCanaryHourIDs(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -511,6 +538,9 @@ func (c Config) ValidateJoinedRecording() error {
 	if !validJoinedRecordingBatchID(c.JoinedRecordingBatchID) {
 		return fmt.Errorf("JOINED_RECORDING_BATCH_ID must be a lowercase letters/numbers/hyphens identifier")
 	}
+	if _, err := c.JoinedCanaryHourIDs(); err != nil {
+		return err
+	}
 	root := strings.TrimSpace(c.JoinedRecordingScratchRoot)
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root || root == string(filepath.Separator) {
 		return fmt.Errorf("JOINED_RECORDING_SCRATCH_ROOT must be a clean absolute non-root path")
@@ -534,6 +564,39 @@ func (c Config) ValidateJoinedRecording() error {
 		return fmt.Errorf("STOARAMA_JOINED_WORKER_TOKEN is required when joined recording is enabled")
 	}
 	return nil
+}
+
+// JoinedCanaryHourIDs returns the exact, bounded work scope shared by the API
+// and worker. Callers must first require joined recording to be enabled.
+func (c Config) JoinedCanaryHourIDs() ([]string, error) {
+	raw := c.JoinedRecordingCanaryHourIDs
+	if raw == "" {
+		return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain at least one canonical hour ID when enabled")
+	}
+	prefix := c.JoinedRecordingBatchID + "__recording-"
+	pattern := regexp.MustCompile(`^[1-9][0-9]*__date-([0-9]{4}-[0-9]{2}-[0-9]{2})__hour-(0[1-9]|1[0-2])__generation-[1-9][0-9]*$`)
+	items := strings.Split(raw, ",")
+	hours := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == "" || item != strings.TrimSpace(item) || !strings.HasPrefix(item, prefix) {
+			return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exact canonical IDs for JOINED_RECORDING_BATCH_ID")
+		}
+		match := pattern.FindStringSubmatch(strings.TrimPrefix(item, prefix))
+		if match == nil {
+			return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exact canonical IDs for JOINED_RECORDING_BATCH_ID")
+		}
+		date, err := time.Parse("2006-01-02", match[1])
+		if err != nil || date.Format("2006-01-02") != match[1] {
+			return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exact canonical IDs for JOINED_RECORDING_BATCH_ID")
+		}
+		if _, duplicate := seen[item]; duplicate {
+			return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must not contain duplicate hour IDs")
+		}
+		seen[item] = struct{}{}
+		hours = append(hours, item)
+	}
+	return hours, nil
 }
 
 func validJoinedRecordingStorageAuthority(value string) bool {

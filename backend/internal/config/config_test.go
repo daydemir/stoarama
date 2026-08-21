@@ -75,21 +75,25 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	}
 	const bootstrap = "joined-bootstrap-credential-32bytes"
 	const signing = "joined-signing-credential-32-bytes"
-	valid := Config{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing}
+	const batch = "tier1-2026-08"
+	const hour = batch + "__recording-377__date-2026-08-01__hour-01__generation-1"
+	valid := Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour, ServiceToken: "service",
+		JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing}
 	if err := valid.ValidateJoined(); err != nil {
 		t.Fatalf("valid joined credentials: %v", err)
 	}
 	for _, cfg := range []Config{
-		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "", JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, ServiceToken: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: bootstrap},
-		{JoinedRecordingEnabled: true, DatabaseURL: "postgres://user:" + signing + "@db.example.test/db", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, DatabaseURL: "host=db.example.test user=test password='" + signing + "'", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, R2SecretAccessKey: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, R2AccessKeyID: "  " + bootstrap + "  ", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, R2SecretAccessKey: "  " + signing + "  ", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, JoinedWorkerBootstrapToken: strings.Repeat("b", 31), JoinedWorkerSigningKey: signing},
-		{JoinedRecordingEnabled: true, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: strings.Repeat("s", 31)},
+		{JoinedRecordingControlPlaneEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: "", JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, ServiceToken: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: bootstrap},
+		{JoinedRecordingControlPlaneEnabled: true, DatabaseURL: "postgres://user:" + signing + "@db.example.test/db", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, DatabaseURL: "host=db.example.test user=test password='" + signing + "'", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, R2SecretAccessKey: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, R2AccessKeyID: "  " + bootstrap + "  ", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, R2SecretAccessKey: "  " + signing + "  ", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, JoinedWorkerBootstrapToken: strings.Repeat("b", 31), JoinedWorkerSigningKey: signing},
+		{JoinedRecordingControlPlaneEnabled: true, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: strings.Repeat("s", 31)},
 	} {
 		if err := cfg.ValidateJoined(); err == nil {
 			t.Fatalf("unsafe joined credential configuration accepted: %+v", cfg)
@@ -134,10 +138,12 @@ func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 
 func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	for _, key := range []string{
+		"JOINED_RECORDING_CONTROL_PLANE_ENABLED",
 		"JOINED_RECORDING_ENABLED",
 		"JOINED_RECORDING_PROTOCOL_VERSION",
 		"JOINED_RECORDING_ROLLING_ENABLED",
 		"JOINED_RECORDING_BATCH_ID",
+		"JOINED_RECORDING_CANARY_HOUR_IDS",
 		"JOINED_RECORDING_SCRATCH_ROOT",
 		"JOINED_RECORDING_STORAGE_AUTHORITY",
 		"JOINED_RECORDING_FFMPEG_ARCHIVE_URL",
@@ -145,6 +151,9 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 		"JOINED_RECORDING_FFMPEG_BINARY_SHA256",
 		"JOINED_RECORDING_FFPROBE_BINARY_SHA256",
 		"STOARAMA_JOINED_WORKER_TOKEN",
+		"JOINED_WORKER_BOOTSTRAP_TOKEN",
+		"JOINED_WORKER_SIGNING_KEY",
+		"STOARAMA_JOINED_OPERATOR_TOKEN",
 	} {
 		t.Setenv(key, "")
 	}
@@ -152,7 +161,7 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.JoinedRecordingEnabled || cfg.JoinedRecordingRollingEnabled || cfg.JoinedRecordingProtocolVersion != 0 {
+	if cfg.JoinedRecordingControlPlaneEnabled || cfg.JoinedRecordingEnabled || cfg.JoinedRecordingRollingEnabled || cfg.JoinedRecordingProtocolVersion != 0 {
 		t.Fatalf("joined worker unexpectedly enabled: %+v", cfg)
 	}
 	if cfg.JoinedRecordingBatchID != "" || cfg.JoinedRecordingScratchRoot != "/tmp/stoarama-joined" {
@@ -168,6 +177,7 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 		JoinedRecordingEnabled:             true,
 		JoinedRecordingProtocolVersion:     1,
 		JoinedRecordingBatchID:             "tier1-2026-08",
+		JoinedRecordingCanaryHourIDs:       "tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1",
 		JoinedRecordingScratchRoot:         "/tmp/stoarama-joined",
 		JoinedRecordingStorageAuthority:    "example.r2.cloudflarestorage.com",
 		JoinedRecordingFFmpegArchiveURL:    "https://example.com/ffmpeg/7.1.1/linux64.tar.xz",
@@ -203,6 +213,113 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 	}
 }
 
+func TestJoinedCanaryScopeAndRoleSeparationFailClosed(t *testing.T) {
+	const batch = "tier1-2026-08"
+	const hour = batch + "__recording-377__date-2026-08-01__hour-01__generation-1"
+	base := Config{JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: batch,
+		JoinedRecordingCanaryHourIDs: hour}
+	invalidScopes := map[string]string{
+		"empty":        "",
+		"malformed":    batch + "__recording-0377__date-2026-08-01__hour-01__generation-1",
+		"invalid date": batch + "__recording-377__date-2026-02-30__hour-01__generation-1",
+		"wrong batch":  "other-batch__recording-377__date-2026-08-01__hour-01__generation-1",
+		"duplicate":    hour + "," + hour,
+	}
+	for name, scope := range invalidScopes {
+		t.Run(name, func(t *testing.T) {
+			cfg := base
+			cfg.JoinedRecordingCanaryHourIDs = scope
+			if _, err := cfg.JoinedCanaryHourIDs(); err == nil {
+				t.Fatalf("unsafe canary scope accepted: %q", scope)
+			}
+		})
+	}
+
+	worker := base
+	worker.JoinedRecordingEnabled = true
+	worker.JoinedRecordingScratchRoot = "/tmp/stoarama-joined"
+	worker.JoinedRecordingStorageAuthority = "example.r2.cloudflarestorage.com"
+	worker.JoinedRecordingFFmpegArchiveURL = "https://example.com/ffmpeg/7.1.1/linux64.tar.xz"
+	worker.JoinedRecordingFFmpegArchiveSHA256 = strings.Repeat("a", 64)
+	worker.JoinedRecordingFFmpegSHA256 = strings.Repeat("b", 64)
+	worker.JoinedRecordingFFprobeSHA256 = strings.Repeat("c", 64)
+	worker.JoinedRecordingWorkerToken = "joined-worker-bootstrap-token-32bytes"
+	if worker.JoinedWorkerBootstrapToken != "" || worker.JoinedWorkerSigningKey != "" || worker.ValidateJoined() != nil || worker.ValidateJoinedRecording() != nil {
+		t.Fatal("worker activation incorrectly requires or receives backend signing authority")
+	}
+	for name, scope := range invalidScopes {
+		t.Run("activation "+name, func(t *testing.T) {
+			api := validJoinedAPIConfigForTest(batch, scope)
+			badWorker := worker
+			badWorker.JoinedRecordingCanaryHourIDs = scope
+			if api.ValidateJoined() == nil || badWorker.ValidateJoinedRecording() == nil {
+				t.Fatalf("API or worker activated with unsafe canary scope %q", scope)
+			}
+		})
+	}
+
+	api := base
+	api.JoinedRecordingControlPlaneEnabled = true
+	if err := api.ValidateJoined(); err == nil {
+		t.Fatal("enabled API accepted missing bootstrap and signing credentials")
+	}
+
+	for name, token := range map[string]string{
+		"short":             "short",
+		"backend bootstrap": "joined-bootstrap-credential-32bytes",
+		"backend signing":   "joined-signing-credential-32-bytes",
+		"worker":            worker.JoinedRecordingWorkerToken,
+	} {
+		t.Run("operator "+name, func(t *testing.T) {
+			cfg := validJoinedAPIConfigForTest(batch, hour)
+			cfg.JoinedRecordingWorkerToken = worker.JoinedRecordingWorkerToken
+			cfg.JoinedOperatorToken = token
+			if err := cfg.ValidateJoined(); err == nil {
+				t.Fatalf("unsafe operator token accepted: %s", name)
+			}
+		})
+	}
+	if err := (Config{JoinedOperatorToken: strings.Repeat("o", 32)}).ValidateJoined(); err != nil {
+		t.Fatalf("standalone operator credential: %v", err)
+	}
+}
+
+func validJoinedAPIConfigForTest(batch, hour string) Config {
+	return Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour,
+		JoinedWorkerBootstrapToken: "joined-bootstrap-credential-32bytes",
+		JoinedWorkerSigningKey:     "joined-signing-credential-32-bytes"}
+}
+
+func TestLoadAllowsWorkerWithoutBackendAuthority(t *testing.T) {
+	for key, value := range map[string]string{
+		"JOINED_RECORDING_CONTROL_PLANE_ENABLED": "false",
+		"JOINED_RECORDING_ENABLED":               "true",
+		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
+		"JOINED_RECORDING_BATCH_ID":              "tier1-2026-08",
+		"JOINED_RECORDING_CANARY_HOUR_IDS":       "tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1",
+		"JOINED_WORKER_BOOTSTRAP_TOKEN":          "",
+		"JOINED_WORKER_SIGNING_KEY":              "",
+		"STOARAMA_JOINED_OPERATOR_TOKEN":         "",
+		"STOARAMA_JOINED_WORKER_TOKEN":           "joined-worker-bootstrap-token-32bytes",
+		"JOINED_RECORDING_STORAGE_AUTHORITY":     "example.r2.cloudflarestorage.com",
+		"JOINED_RECORDING_FFMPEG_ARCHIVE_URL":    "https://example.com/ffmpeg/7.1.1/linux64.tar.xz",
+		"JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256": strings.Repeat("a", 64),
+		"JOINED_RECORDING_FFMPEG_BINARY_SHA256":  strings.Repeat("b", 64),
+		"JOINED_RECORDING_FFPROBE_BINARY_SHA256": strings.Repeat("c", 64),
+	} {
+		t.Setenv(key, value)
+	}
+	cfg, err := Load()
+	if err != nil || cfg.JoinedWorkerBootstrapToken != "" || cfg.JoinedWorkerSigningKey != "" {
+		t.Fatalf("isolated worker load err=%v bootstrap=%t signing=%t", err,
+			cfg.JoinedWorkerBootstrapToken != "", cfg.JoinedWorkerSigningKey != "")
+	}
+	if err := cfg.ValidateJoinedRecording(); err != nil {
+		t.Fatalf("isolated worker activation: %v", err)
+	}
+}
+
 func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 	renderPath := filepath.Join("..", "..", "..", "render.yaml")
 	data, err := os.ReadFile(renderPath)
@@ -224,6 +341,7 @@ func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 		"key: JOINED_RECORDING_ENABLED\n        value: \"false\"",
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
 		"key: JOINED_RECORDING_ROLLING_ENABLED\n        value: \"false\"",
+		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
 		"key: FFMPEG_BIN\n        value: ./bin/ffmpeg",
 		"key: FFPROBE_BIN\n        value: ./bin/ffprobe",
 		"key: STOARAMA_JOINED_WORKER_TOKEN\n        sync: false",
@@ -232,10 +350,40 @@ func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 			t.Fatalf("joined worker missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"DATABASE_URL", "R2_", "STORAGE_CRED_KEY", "SERVICE_TOKEN", "JOINED_WORKER_SIGNING_KEY", "JOINED_WORKER_BOOTSTRAP_TOKEN"} {
+	for _, forbidden := range []string{"DATABASE_URL", "R2_", "STORAGE_CRED_KEY", "SERVICE_TOKEN", "JOINED_WORKER_SIGNING_KEY", "JOINED_WORKER_BOOTSTRAP_TOKEN", "STOARAMA_JOINED_OPERATOR_TOKEN"} {
 		if strings.Contains(section, forbidden) {
 			t.Fatalf("joined worker contains privileged setting %q", forbidden)
 		}
+	}
+}
+
+func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := "name: stoarama-api"
+	section := string(data)[strings.Index(string(data), marker):]
+	if next := strings.Index(section[len(marker):], "\n  - type:"); next >= 0 {
+		section = section[:len(marker)+next]
+	}
+	for _, required := range []string{
+		"key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"false\"",
+		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
+		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
+		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
+		"key: JOINED_WORKER_BOOTSTRAP_TOKEN\n        sync: false",
+		"key: JOINED_WORKER_SIGNING_KEY\n        sync: false",
+	} {
+		if !strings.Contains(section, required) {
+			t.Fatalf("joined API missing %q", required)
+		}
+	}
+	if strings.Contains(section, "key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"true\"") {
+		t.Fatal("joined API control plane was enabled in source configuration")
+	}
+	if strings.Contains(section, "STOARAMA_JOINED_OPERATOR_TOKEN") {
+		t.Fatal("joined operator credential must not be deployed to the API")
 	}
 }
 

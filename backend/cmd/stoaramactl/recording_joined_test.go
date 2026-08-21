@@ -27,6 +27,7 @@ func validJoinedWorkerConfig() config.Config {
 		JoinedRecordingEnabled:             true,
 		JoinedRecordingProtocolVersion:     1,
 		JoinedRecordingBatchID:             "tier1-2026-08",
+		JoinedRecordingCanaryHourIDs:       "tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1",
 		JoinedRecordingScratchRoot:         "/tmp/stoarama-joined",
 		JoinedRecordingStorageAuthority:    "example.r2.cloudflarestorage.com",
 		JoinedRecordingFFmpegArchiveURL:    "https://example.com/ffmpeg/7.1.1/linux64.tar.xz",

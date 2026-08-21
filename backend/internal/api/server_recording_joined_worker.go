@@ -36,7 +36,12 @@ func validateJoinedWorkerID(workerID string) (string, error) {
 }
 
 func (s *Server) joinedControlPlaneReady() bool {
-	return s.cfg.JoinedRecordingEnabled && s.cfg.ValidateJoined() == nil
+	return s.cfg.JoinedRecordingControlPlaneEnabled && s.cfg.ValidateJoined() == nil
+}
+
+func (s *Server) joinedCanaryHourIDs() []string {
+	hours, _ := s.cfg.JoinedCanaryHourIDs()
+	return hours
 }
 
 func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
@@ -53,19 +58,27 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	canaryHours := s.joinedCanaryHourIDs()
 	var availableBatchID string
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT b.batch_id FROM recording_joined_batches b
 		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
 		WHERE b.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND (EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=b.id
+		    AND h.hour_id=ANY($2::text[])
 		    AND h.source_clip_count>0 AND ((h.state='pending' AND h.next_attempt_at<=now())
 		      OR (h.state='leased' AND h.lease_expires_at<=now()))
 		    AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=h.stream_day_id
 		      AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'))
-		  OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id AND a.artifact_kind<>'media'
+		  OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
 		    AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
-		      OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))))
-		LIMIT 1`, req.BatchID).Scan(&availableBatchID)
+		      OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
+		    AND ((a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
+		          WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
+		      OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
+		          WHERE allowed.id=a.hour_record_id AND allowed.hour_id=ANY($2::text[]))
+		        AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=a.stream_day_id
+		          AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published')))))
+		LIMIT 1`, req.BatchID, canaryHours).Scan(&availableBatchID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -99,6 +112,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	canaryHours := s.joinedCanaryHourIDs()
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
 	if !ok || claims.Kind != joinedauth.KindClaim || req.BatchID != claims.BatchID {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
@@ -116,11 +130,12 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		JOIN recording_joined_artifacts ledger ON ledger.stream_day_id=h.stream_day_id
 		  AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
 		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
-		WHERE h.batch_id=$1 AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
+		WHERE h.batch_id=$1 AND h.hour_id=ANY($2::text[])
+		  AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
 		  AND h.source_clip_count>0 AND ((h.state='pending' AND h.next_attempt_at<=now())
 		   OR (h.state='leased' AND h.lease_expires_at<=now()))
 		ORDER BY h.priority_ordinal,h.next_attempt_at,h.id
-		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID).Scan(&hourRecordID)
+		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours).Scan(&hourRecordID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -135,9 +150,9 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	err = tx.QueryRow(r.Context(), `
 		UPDATE recording_joined_hours SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
 		  lease_expires_at=date_trunc('second',now()+$4::interval),heartbeat_at=now()
-		WHERE id=$1 AND batch_id=$5
+		WHERE id=$1 AND batch_id=$5 AND hour_id=ANY($6::text[])
 		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.joined_protocol_version=1)
-		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID).
+		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID, canaryHours).
 		Scan(&item.HourID, &item.LeaseExpires)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("claim joined hour: %v", err))
@@ -222,6 +237,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	canaryHours := s.joinedCanaryHourIDs()
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
 	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
@@ -247,12 +263,14 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		WHERE a.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND a.artifact_kind<>'media'
 		  AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
 		    OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
-		  AND (a.artifact_kind='allocation_ledger'
-		    OR (a.artifact_kind='hour_manifest' AND ledger.publication_state='published')
-		    OR (a.artifact_kind='batch_index' AND b.state='index_sealed' AND b.index_artifact_id=a.id))
+		  AND ((a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
+		      WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
+		    OR (a.artifact_kind='hour_manifest' AND ledger.publication_state='published'
+		      AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
+		        WHERE allowed.id=a.hour_record_id AND allowed.hour_id=ANY($2::text[]))))
 		ORDER BY CASE a.artifact_kind WHEN 'allocation_ledger' THEN 0 WHEN 'hour_manifest' THEN 1 ELSE 2 END,
 		  COALESCE((SELECT h.priority_ordinal FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0),a.id
-		FOR UPDATE OF a,c SKIP LOCKED LIMIT 1`, claims.BatchID).Scan(&artifactID)
+		FOR UPDATE OF a,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours).Scan(&artifactID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
