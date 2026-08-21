@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,10 +37,11 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v1/recording/joined/token":
 			var request joinedrecording.WorkerBootstrapRequest
-			if json.NewDecoder(r.Body).Decode(&request) != nil || request.BatchID != batchID {
+			if json.NewDecoder(r.Body).Decode(&request) != nil || request.BatchID != batchID || request.Validate() != nil {
 				t.Errorf("unexpected bootstrap request: %+v", request)
 			}
-			writeJoinedTestJSON(t, w, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: batchID, ClaimToken: claim, ExpiresAt: time.Now().Add(time.Hour)})
+			writeJoinedTestJSON(t, w, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				BatchID: batchID, ClaimToken: claim, ExpiresAt: time.Now().Add(time.Hour), WorkScopeIdentity: request.WorkScopeIdentity})
 		case "/api/v1/recording/joined/publication/claim", "/api/v1/recording/joined/claim":
 			var request joinedrecording.WorkClaimRequest
 			if json.NewDecoder(r.Body).Decode(&request) != nil || request.BatchID != batchID || request.WorkerID != workerID {
@@ -56,7 +58,7 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &remoteJoinedOperatorService{cfg: config.Config{}, api: api}
+	service := &remoteJoinedOperatorService{cfg: validJoinedWorkerConfig(), api: api}
 	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{BatchID: batchID, WorkerID: workerID, ScratchRoot: t.TempDir()})
 	if err != nil || worked {
 		t.Fatalf("run once: worked=%v err=%v", worked, err)
@@ -88,7 +90,7 @@ func TestJoinedWorkerIdleCancellationStopsCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &remoteJoinedOperatorService{api: api, idlePoll: time.Hour}
+	service := &remoteJoinedOperatorService{cfg: validJoinedWorkerConfig(), api: api, idlePoll: time.Hour}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -126,11 +128,51 @@ func TestJoinedAPIRejectsRedirectAndDoesNotExposeResponseBody(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, _, err = api.bootstrap(context.Background(), "tier1-2026-08")
+			scope, scopeErr := joinedrecording.NewWorkScopeIdentity("tier1-2026-08", joinedrecording.WorkScopeFrozenBatch, nil)
+			if scopeErr != nil {
+				t.Fatal(scopeErr)
+			}
+			_, _, err = api.bootstrap(context.Background(), joinedrecording.WorkerBootstrapRequest{
+				ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: "tier1-2026-08", WorkScopeIdentity: scope})
 			if err == nil || strings.Contains(err.Error(), secret) {
 				t.Fatalf("unsafe API error: %v", err)
 			}
 		})
+	}
+}
+
+func TestJoinedWorkerRejectsBootstrapScopeDriftBeforeClaim(t *testing.T) {
+	t.Parallel()
+	cfg := validJoinedWorkerConfig()
+	var claimCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/recording/joined/token" {
+			claimCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var request joinedrecording.WorkerBootstrapRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Validate() != nil {
+			t.Errorf("invalid bootstrap request: %+v err=%v", request, err)
+		}
+		drifted, err := joinedrecording.NewWorkScopeIdentity(cfg.JoinedRecordingBatchID, joinedrecording.WorkScopeFrozenBatch, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeJoinedTestJSON(t, w, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+			BatchID: cfg.JoinedRecordingBatchID, ClaimToken: "claim-token-kept-secret-value", ExpiresAt: time.Now().Add(time.Hour),
+			WorkScopeIdentity: drifted})
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "bootstrap-token-kept-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{cfg: cfg, api: api}
+	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{BatchID: cfg.JoinedRecordingBatchID,
+		WorkerID: "worker-1", ScratchRoot: t.TempDir()})
+	if err == nil || worked || claimCalls.Load() != 0 {
+		t.Fatalf("scope drift crossed bootstrap fence: worked=%v claim_calls=%d err=%v", worked, claimCalls.Load(), err)
 	}
 }
 

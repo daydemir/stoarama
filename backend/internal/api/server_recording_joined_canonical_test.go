@@ -86,10 +86,7 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 		fixture.s.requireAdminAuth(http.HandlerFunc(fixture.s.handleAdminJoinedFinalFreeze)).ServeHTTP(recorder, httpReq)
 		return recorder
 	}
-	claim, err := joinedauth.MintClaim(fixture.s.cfg.JoinedWorkerSigningKey, req.BatchID, time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	claim := mintJoinedClaimForTest(t, fixture.s, req.BatchID)
 	operation, err := joinedauth.MintOperation(fixture.s.cfg.JoinedWorkerSigningKey, req.BatchID, joinedauth.SubjectHour,
 		"foreign-hour", uuid.New(), joinedauth.OperationPreflight, time.Now().Add(time.Minute))
 	if err != nil {
@@ -802,10 +799,70 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	ledgerArtifactID, ledgerRelative, ledgerObject := ledgers[0].artifactID, ledgers[0].relativePath, ledgers[0].objectKey
 	ledgerBytes, ledgerArtifactSHA := ledgers[0].bytes, ledgers[0].sha
 
-	claimToken, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, batchID, time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	var claimToken string
+	t.Run("bootstrap work scope drift mutates no lease or artifact", func(t *testing.T) {
+		workScope, err := s.joinedWorkScopeIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bootstrapBody, _ := json.Marshal(joinedrecording.WorkerBootstrapRequest{ProtocolVersion: 1,
+			BatchID: batchID, WorkScopeIdentity: workScope})
+		bootstrapReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", bytes.NewReader(bootstrapBody))
+		bootstrapReq.Header.Set("Authorization", "Bearer "+s.cfg.JoinedWorkerBootstrapToken)
+		bootstrapRec := httptest.NewRecorder()
+		s.requireJoinedWorkerBootstrapAuth(http.HandlerFunc(s.handleJoinedToken)).ServeHTTP(bootstrapRec, bootstrapReq)
+		var bootstrap joinedrecording.WorkerBootstrapResponse
+		if bootstrapRec.Code != http.StatusOK || json.Unmarshal(bootstrapRec.Body.Bytes(), &bootstrap) != nil ||
+			!bootstrap.WorkScopeIdentity.Equal(workScope) {
+			t.Fatalf("bootstrap status=%d body=%s", bootstrapRec.Code, bootstrapRec.Body.String())
+		}
+		claimToken = bootstrap.ClaimToken
+		snapshot := func() (string, string) {
+			t.Helper()
+			var hours, artifacts string
+			if err := pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(id,state,attempt_count,claim_token,
+				claimed_by,lease_expires_at,heartbeat_at,next_attempt_at,failure_reason_code,updated_at) ORDER BY id),'[]')::text
+				FROM recording_joined_hours WHERE batch_id=$1`, batchID).Scan(&hours); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(id,publication_state,
+				publication_attempt_count,publication_token,publication_claimed_by,publication_lease_expires_at,
+				publication_heartbeat_at,publication_next_attempt_at,finalized_token,etag,version_id,published_at,
+				failure_reason_code,updated_at) ORDER BY id),'[]')::text FROM recording_joined_artifacts WHERE batch_id=$1`,
+				batchID).Scan(&artifacts); err != nil {
+				t.Fatal(err)
+			}
+			return hours, artifacts
+		}
+		beforeHours, beforeArtifacts := snapshot()
+		canaryIDs := s.cfg.JoinedRecordingCanaryHourIDs
+		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+		s.cfg.JoinedRecordingCanaryHourIDs = ""
+		defer func() {
+			s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
+			s.cfg.JoinedRecordingCanaryHourIDs = canaryIDs
+		}()
+		for _, tc := range []struct {
+			path    string
+			handler http.HandlerFunc
+		}{
+			{path: "/api/v1/recording/joined/publication/claim", handler: s.handleJoinedPublicationClaim},
+			{path: "/api/v1/recording/joined/claim", handler: s.handleJoinedClaim},
+		} {
+			body, _ := json.Marshal(joinedrecording.WorkClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "drift-worker"})
+			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+claimToken)
+			rec := httptest.NewRecorder()
+			s.requireJoinedWorkerAuth(tc.handler).ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("drift claim path=%s status=%d body=%s", tc.path, rec.Code, rec.Body.String())
+			}
+		}
+		afterHours, afterArtifacts := snapshot()
+		if beforeHours != afterHours || beforeArtifacts != afterArtifacts {
+			t.Fatal("scope drift changed joined lease or artifact state")
+		}
+	})
 	claimBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "worker-1"})
 	claimReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
 	claimReq.Header.Set("Authorization", "Bearer "+claimToken)
@@ -1342,10 +1399,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	s.cfg.JoinedRecordingCanaryHourIDs = ""
-	frozenClaimToken, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, batchID, time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	frozenClaimToken := mintJoinedClaimForTest(t, s, batchID)
 	frozenPublicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1,
 		BatchID: batchID, WorkerID: "frozen-batch-worker"})
 	frozenPublicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim",
@@ -1526,10 +1580,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		retryReceipt.ArtifactID != indexReceipt.ArtifactID || !retryReceipt.AlreadySealed {
 		t.Fatalf("batch-index retry status=%d body=%s", retryIndex.Code, retryIndex.Body.String())
 	}
-	indexClaimToken, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, batchID, time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	indexClaimToken := mintJoinedClaimForTest(t, s, batchID)
 	publicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "index-worker"})
 	publicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(publicationBody))
 	publicationRequest.Header.Set("Authorization", "Bearer "+indexClaimToken)

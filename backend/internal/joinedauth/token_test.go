@@ -7,17 +7,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/google/uuid"
 )
 
+func testClaimWorkScope(t *testing.T, batchID string) joinedrecording.WorkScopeIdentity {
+	t.Helper()
+	scope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scope
+}
+
 func TestJoinedWorkerTokenScopeAndExpiry(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0).UTC()
-	claimToken, err := MintClaim("signing-key", "batch-test", now.Add(time.Minute))
+	claimToken, err := MintClaim("signing-key", "batch-test", testClaimWorkScope(t, "batch-test"), now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	claimScope, err := Verify("signing-key", claimToken, now)
-	if err != nil || claimScope.Kind != KindClaim || claimScope.BatchID != "batch-test" || claimScope.SubjectID != "" {
+	if err != nil || claimScope.Kind != KindClaim || claimScope.BatchID != "batch-test" || claimScope.SubjectID != "" ||
+		!claimScope.WorkScopeIdentity.Equal(testClaimWorkScope(t, "batch-test")) {
 		t.Fatalf("claim scope=%+v err=%v", claimScope, err)
 	}
 	claim := uuid.New()
@@ -68,6 +79,43 @@ func TestJoinedWorkerTokenScopeAndExpiry(t *testing.T) {
 	}
 }
 
+func TestJoinedClaimTokenBindsExactCanaryIdentity(t *testing.T) {
+	const batchID = "tier1-generation-1"
+	hours := []string{
+		batchID + "__recording-1__date-2026-08-01__hour-01__generation-1",
+		batchID + "__recording-2__date-2026-08-01__hour-02__generation-1",
+		batchID + "__recording-3__date-2026-08-01__hour-03__generation-1",
+	}
+	scope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeCanary, hours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(2_000_000_000, 0).UTC()
+	token, err := MintClaim("signing-key", batchID, scope, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Verify("signing-key", token, now)
+	if err != nil || !got.WorkScopeIdentity.Equal(scope) {
+		t.Fatalf("claims=%+v err=%v", got, err)
+	}
+	parts := strings.Split(token, ".")
+	payload, _ := base64.RawURLEncoding.DecodeString(parts[0])
+	var claims Claims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	claims.CanaryHourIDsSHA256 = strings.Repeat("0", 64)
+	payload, _ = json.Marshal(claims)
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	if _, err := Verify("signing-key", encoded+"."+signature("signing-key", encoded), now); err == nil {
+		t.Fatal("validly signed canary digest drift was accepted")
+	}
+	if _, err := MintClaim("signing-key", batchID, joinedrecording.WorkScopeIdentity{WorkScope: "rolling"}, now.Add(time.Minute)); err == nil {
+		t.Fatal("rolling claim authority was minted")
+	}
+}
+
 func TestLeaseIDIsStablePathSafeAndNotFenceToken(t *testing.T) {
 	lease := uuid.MustParse("123e4567-e89b-42d3-a456-426614174000")
 	got := LeaseID(lease)
@@ -78,7 +126,7 @@ func TestLeaseIDIsStablePathSafeAndNotFenceToken(t *testing.T) {
 
 func TestJoinedWorkerTokenRejectsUnsafeBatchID(t *testing.T) {
 	for _, batchID := range []string{"", " batch", "batch/name", strings.Repeat("a", 129)} {
-		if _, err := MintClaim("signing-key", batchID, time.Unix(2_000_000_000, 0).UTC()); err == nil {
+		if _, err := MintClaim("signing-key", batchID, testClaimWorkScope(t, "batch-test"), time.Unix(2_000_000_000, 0).UTC()); err == nil {
 			t.Fatalf("unsafe batch ID minted a token: %q", batchID)
 		}
 	}

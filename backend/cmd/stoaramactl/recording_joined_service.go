@@ -374,6 +374,21 @@ func validateJoinedWorkerStatus(cfg config.Config, batchID string, status joined
 	return nil
 }
 
+func joinedConfiguredWorkScope(cfg config.Config) (joinedrecording.WorkScopeIdentity, error) {
+	scope, err := cfg.JoinedWorkScope()
+	if err != nil {
+		return joinedrecording.WorkScopeIdentity{}, err
+	}
+	var hours []string
+	if scope == config.JoinedWorkScopeCanary {
+		hours, err = cfg.JoinedCanaryHourIDs()
+		if err != nil {
+			return joinedrecording.WorkScopeIdentity{}, err
+		}
+	}
+	return joinedrecording.NewWorkScopeIdentity(cfg.JoinedRecordingBatchID, scope, hours)
+}
+
 func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedWorkerRequest) error {
 	for {
 		if ctx.Err() != nil {
@@ -402,7 +417,13 @@ func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedW
 }
 
 func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joinedWorkerRequest) (bool, error) {
-	bootstrap, ok, err := s.api.bootstrap(ctx, req.BatchID)
+	workScope, err := joinedConfiguredWorkScope(s.cfg)
+	if err != nil {
+		return false, err
+	}
+	bootstrapRequest := joinedrecording.WorkerBootstrapRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		BatchID: req.BatchID, WorkScopeIdentity: workScope}
+	bootstrap, ok, err := s.api.bootstrap(ctx, bootstrapRequest)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -610,11 +631,10 @@ func (s *remoteJoinedOperatorService) finalizeHour(ctx context.Context, claim jo
 	return s.api.finalizeHour(ctx, claim.OperationToken, joinedrecording.FinalizeHourRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, Published: published})
 }
 
-func (c *joinedAPIClient) bootstrap(ctx context.Context, batchID string) (joinedrecording.WorkerBootstrapResponse, bool, error) {
+func (c *joinedAPIClient) bootstrap(ctx context.Context, request joinedrecording.WorkerBootstrapRequest) (joinedrecording.WorkerBootstrapResponse, bool, error) {
 	if strings.TrimSpace(c.bootstrapToken) == "" {
 		return joinedrecording.WorkerBootstrapResponse{}, false, errors.New("joined worker bootstrap token is required")
 	}
-	request := joinedrecording.WorkerBootstrapRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: batchID}
 	var response joinedrecording.WorkerBootstrapResponse
 	if err := request.Validate(); err != nil {
 		return response, false, err
@@ -622,8 +642,8 @@ func (c *joinedAPIClient) bootstrap(ctx context.Context, batchID string) (joined
 	ok, err := c.postOptionalJSON(ctx, "/api/v1/recording/joined/token", c.bootstrapToken, request, &response)
 	if err == nil && ok {
 		err = response.Validate(time.Now().UTC())
-		if err == nil && response.BatchID != batchID {
-			err = fmt.Errorf("joined bootstrap batch differs")
+		if err == nil && (response.BatchID != request.BatchID || !response.WorkScopeIdentity.Equal(request.WorkScopeIdentity)) {
+			err = fmt.Errorf("joined bootstrap batch or work scope differs")
 		}
 	}
 	return response, ok, err

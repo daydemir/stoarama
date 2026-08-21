@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,65 @@ func joinedCanaryScopeForTest(batch string, included ...string) string {
 		}
 	}
 	return strings.Join(hours, ",")
+}
+
+func mintJoinedClaimForTest(t *testing.T, s *Server, batchID string) string {
+	t.Helper()
+	scope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, batchID, scope, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
+func TestJoinedBootstrapAndClaimScopeDriftFailBeforeDatabaseMutation(t *testing.T) {
+	t.Parallel()
+	const batchID = "tier1-generation-1"
+	firstHour := batchID + "__recording-1__date-2026-08-01__hour-01__generation-1"
+	s := &Server{cfg: config.Config{
+		JoinedRecordingControlPlaneEnabled: true,
+		JoinedRecordingProtocolVersion:     1,
+		JoinedRecordingWorkScope:           config.JoinedWorkScopeCanary,
+		JoinedRecordingBatchID:             batchID,
+		JoinedRecordingCanaryHourIDs:       joinedCanaryScopeForTest(batchID, firstHour),
+		JoinedWorkerBootstrapToken:         "joined-bootstrap-credential-32bytes",
+		JoinedWorkerSigningKey:             "joined-signing-credential-32-bytes",
+	}, joinedCredentialCheck: func(context.Context) error { return nil }}
+	frozen, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapBody, _ := json.Marshal(joinedrecording.WorkerBootstrapRequest{ProtocolVersion: 1,
+		BatchID: batchID, WorkScopeIdentity: frozen})
+	bootstrapReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", bytes.NewReader(bootstrapBody))
+	bootstrapRec := httptest.NewRecorder()
+	s.handleJoinedToken(bootstrapRec, bootstrapReq)
+	if bootstrapRec.Code != http.StatusForbidden {
+		t.Fatalf("bootstrap scope drift status=%d body=%s", bootstrapRec.Code, bootstrapRec.Body.String())
+	}
+	claim := mintJoinedClaimForTest(t, s, batchID)
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	for _, tc := range []struct {
+		path    string
+		handler http.HandlerFunc
+	}{
+		{path: "/api/v1/recording/joined/publication/claim", handler: s.handleJoinedPublicationClaim},
+		{path: "/api/v1/recording/joined/claim", handler: s.handleJoinedClaim},
+	} {
+		body, _ := json.Marshal(joinedrecording.WorkClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "drift-worker"})
+		req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+claim)
+		rec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(tc.handler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("scope drift path=%s status=%d body=%s", tc.path, rec.Code, rec.Body.String())
+		}
+	}
 }
 
 func TestValidateJoinedAck(t *testing.T) {
@@ -317,10 +377,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	if bootstrapLeaseResponse.Code != http.StatusBadRequest {
 		t.Fatalf("response-only lease_id bootstrap status=%d body=%s", bootstrapLeaseResponse.Code, bootstrapLeaseResponse.Body.String())
 	}
-	claimAuth, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, "batch-test", time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	claimAuth := mintJoinedClaimForTest(t, s, "batch-test")
 	canaryHourID := strings.Split(s.cfg.JoinedRecordingCanaryHourIDs, ",")[0]
 	canaryToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, "batch-test", joinedauth.SubjectHour,
 		canaryHourID, claim, joinedauth.OperationPreflight, time.Now().Add(time.Minute))

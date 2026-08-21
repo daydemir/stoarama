@@ -9,12 +9,16 @@ import (
 )
 
 func TestJoinedLifecycleRequestWireContracts(t *testing.T) {
+	frozen, err := NewWorkScopeIdentity("tier1-generation-1", WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name string
 		got  any
 		want string
 	}{
-		{"bootstrap", WorkerBootstrapRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1"}, `{"protocol_version":1,"batch_id":"tier1-generation-1"}`},
+		{"bootstrap", WorkerBootstrapRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", WorkScopeIdentity: frozen}, `{"protocol_version":1,"batch_id":"tier1-generation-1","work_scope":"frozen_batch"}`},
 		{"claim", WorkClaimRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", WorkerID: "joined-worker-01"}, `{"protocol_version":1,"batch_id":"tier1-generation-1","worker_id":"joined-worker-01"}`},
 		{"publication claim", PublicationClaimRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", WorkerID: "joined-worker-01"}, `{"protocol_version":1,"batch_id":"tier1-generation-1","worker_id":"joined-worker-01"}`},
 		{"heartbeat", HeartbeatRequest{ProtocolVersion: 1, ScopeKind: "hour", ScopeID: "canonical-hour"}, `{"protocol_version":1,"scope_kind":"hour","scope_id":"canonical-hour"}`},
@@ -28,6 +32,50 @@ func TestJoinedLifecycleRequestWireContracts(t *testing.T) {
 				t.Fatalf("wire=%s want=%s err=%v", encoded, tc.want, err)
 			}
 		})
+	}
+}
+
+func TestWorkScopeIdentityBindsExactCanaryAndFrozenBatch(t *testing.T) {
+	const batchID = "tier1-generation-1"
+	hours := []string{
+		batchID + "__recording-1__date-2026-08-01__hour-01__generation-1",
+		batchID + "__recording-2__date-2026-08-01__hour-02__generation-1",
+		batchID + "__recording-3__date-2026-08-01__hour-03__generation-1",
+	}
+	canary, err := NewWorkScopeIdentity(batchID, WorkScopeCanary, hours)
+	if err != nil || canary.CanaryHourIDsSHA256 == "" || !canary.Equal(canary) {
+		t.Fatalf("canary=%+v err=%v", canary, err)
+	}
+	reordered := canary
+	reordered.CanaryHourIDs = append([]string(nil), canary.CanaryHourIDs...)
+	reordered.CanaryHourIDs[0], reordered.CanaryHourIDs[1] = reordered.CanaryHourIDs[1], reordered.CanaryHourIDs[0]
+	if reordered.Validate(batchID) == nil || canary.Equal(reordered) {
+		t.Fatal("canary order drift preserved authority")
+	}
+	tampered := canary
+	tampered.CanaryHourIDsSHA256 = strings.Repeat("0", 64)
+	if tampered.Validate(batchID) == nil {
+		t.Fatal("canary digest drift preserved authority")
+	}
+	for _, count := range []int{0, 1, 2, 4} {
+		candidate := append([]string(nil), hours...)
+		if count <= len(candidate) {
+			candidate = candidate[:count]
+		} else {
+			candidate = append(candidate, batchID+"__recording-4__date-2026-08-01__hour-04__generation-1")
+		}
+		if _, err := NewWorkScopeIdentity(batchID, WorkScopeCanary, candidate); err == nil {
+			t.Fatalf("canary accepted %d hours", count)
+		}
+	}
+	frozen, err := NewWorkScopeIdentity(batchID, WorkScopeFrozenBatch, nil)
+	if err != nil || !frozen.Equal(WorkScopeIdentity{WorkScope: WorkScopeFrozenBatch}) {
+		t.Fatalf("frozen=%+v err=%v", frozen, err)
+	}
+	for _, scope := range []string{"", "disabled", "rolling"} {
+		if _, err := NewWorkScopeIdentity(batchID, scope, nil); err == nil {
+			t.Fatalf("unsafe work scope %q accepted", scope)
+		}
 	}
 }
 
@@ -62,7 +110,11 @@ func TestGapOnlyHourSkipsPreflightAndUsesPublicationClaim(t *testing.T) {
 }
 
 func TestJoinedLifecycleRejectsVersionZeroAndRequestLeaseID(t *testing.T) {
-	if (WorkerBootstrapRequest{ProtocolVersion: 0, BatchID: "tier1-generation-1"}).Validate() == nil {
+	frozen, err := NewWorkScopeIdentity("tier1-generation-1", WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (WorkerBootstrapRequest{ProtocolVersion: 0, BatchID: "tier1-generation-1", WorkScopeIdentity: frozen}).Validate() == nil {
 		t.Fatal("dormant protocol claimed work")
 	}
 	if (WorkClaimRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", WorkerID: strings.Repeat("w", 257)}).Validate() == nil {

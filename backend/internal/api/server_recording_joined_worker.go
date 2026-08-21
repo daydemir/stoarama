@@ -49,6 +49,26 @@ func (s *Server) joinedFrozenBatchScope() bool {
 	return err == nil && scope == "frozen_batch"
 }
 
+func (s *Server) joinedWorkScopeIdentity() (joinedrecording.WorkScopeIdentity, error) {
+	scope, err := s.cfg.JoinedWorkScope()
+	if err != nil {
+		return joinedrecording.WorkScopeIdentity{}, err
+	}
+	var hours []string
+	if scope == joinedrecording.WorkScopeCanary {
+		hours, err = s.cfg.JoinedCanaryHourIDs()
+		if err != nil {
+			return joinedrecording.WorkScopeIdentity{}, err
+		}
+	}
+	return joinedrecording.NewWorkScopeIdentity(s.cfg.JoinedRecordingBatchID, scope, hours)
+}
+
+func (s *Server) joinedClaimMatchesCurrentScope(claims joinedauth.Claims) bool {
+	current, err := s.joinedWorkScopeIdentity()
+	return err == nil && claims.BatchID == s.cfg.JoinedRecordingBatchID && claims.WorkScopeIdentity.Equal(current)
+}
+
 func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 	var req joinedrecording.WorkerBootstrapRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
@@ -63,14 +83,15 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+	workScope, err := s.joinedWorkScopeIdentity()
+	if err != nil || req.BatchID != s.cfg.JoinedRecordingBatchID || !req.WorkScopeIdentity.Equal(workScope) {
 		util.WriteError(w, http.StatusForbidden, "joined batch scope differs")
 		return
 	}
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
 	var availableBatchID string
-	err := s.pool.QueryRow(r.Context(), `
+	err = s.pool.QueryRow(r.Context(), `
 		SELECT b.batch_id FROM recording_joined_batches b
 		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
 		WHERE b.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND (EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=b.id
@@ -100,13 +121,13 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expiresAt := time.Now().UTC().Truncate(time.Second).Add(10 * time.Minute)
-	token, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, availableBatchID, expiresAt)
+	token, err := joinedauth.MintClaim(s.cfg.JoinedWorkerSigningKey, availableBatchID, workScope, expiresAt)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("mint joined claim token: %v", err))
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedWorkerProtocolVersion,
-		BatchID: availableBatchID, ClaimToken: token, ExpiresAt: expiresAt})
+		BatchID: availableBatchID, ClaimToken: token, ExpiresAt: expiresAt, WorkScopeIdentity: workScope})
 }
 
 func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
@@ -127,7 +148,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
-	if !ok || claims.Kind != joinedauth.KindClaim || req.BatchID != claims.BatchID || claims.BatchID != s.cfg.JoinedRecordingBatchID {
+	if !ok || claims.Kind != joinedauth.KindClaim || req.BatchID != claims.BatchID || !s.joinedClaimMatchesCurrentScope(claims) {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
 		return
 	}
@@ -256,7 +277,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
-	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID || claims.BatchID != s.cfg.JoinedRecordingBatchID {
+	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID || !s.joinedClaimMatchesCurrentScope(claims) {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
 		return
 	}

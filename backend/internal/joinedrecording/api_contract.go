@@ -1,16 +1,84 @@
 package joinedrecording
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
 
 const JoinedProtocolVersion = 1
 
+const (
+	WorkScopeCanary      = "canary"
+	WorkScopeFrozenBatch = "frozen_batch"
+)
+
+// WorkScopeIdentity is the exact rollout authority shared by worker, API, and
+// signed claim tokens. Canary order is intentional and covered by the digest.
+type WorkScopeIdentity struct {
+	WorkScope           string   `json:"work_scope,omitempty"`
+	CanaryHourIDs       []string `json:"canary_hour_ids,omitempty"`
+	CanaryHourIDsSHA256 string   `json:"canary_hour_ids_sha256,omitempty"`
+}
+
+func NewWorkScopeIdentity(batchID, workScope string, canaryHourIDs []string) (WorkScopeIdentity, error) {
+	identity := WorkScopeIdentity{WorkScope: workScope, CanaryHourIDs: slices.Clone(canaryHourIDs)}
+	if workScope == WorkScopeCanary {
+		identity.CanaryHourIDsSHA256 = canaryHourIDsSHA256(identity.CanaryHourIDs)
+	}
+	if err := identity.Validate(batchID); err != nil {
+		return WorkScopeIdentity{}, err
+	}
+	return identity, nil
+}
+
+func (s WorkScopeIdentity) Validate(batchID string) error {
+	if !safeBatchID.MatchString(batchID) {
+		return fmt.Errorf("invalid joined work scope batch")
+	}
+	switch s.WorkScope {
+	case WorkScopeCanary:
+		if len(s.CanaryHourIDs) != 3 || !lowerHex64(s.CanaryHourIDsSHA256) ||
+			s.CanaryHourIDsSHA256 != canaryHourIDsSHA256(s.CanaryHourIDs) {
+			return fmt.Errorf("invalid joined canary work scope")
+		}
+		seen := make(map[string]bool, len(s.CanaryHourIDs))
+		prefix := batchID + "__recording-"
+		for _, hourID := range s.CanaryHourIDs {
+			if !strings.HasPrefix(hourID, prefix) || seen[hourID] {
+				return fmt.Errorf("invalid joined canary work scope")
+			}
+			seen[hourID] = true
+		}
+	case WorkScopeFrozenBatch:
+		if len(s.CanaryHourIDs) != 0 || s.CanaryHourIDsSHA256 != "" {
+			return fmt.Errorf("invalid joined frozen-batch work scope")
+		}
+	default:
+		return fmt.Errorf("invalid joined work scope")
+	}
+	return nil
+}
+
+func (s WorkScopeIdentity) Equal(other WorkScopeIdentity) bool {
+	return s.WorkScope == other.WorkScope && s.CanaryHourIDsSHA256 == other.CanaryHourIDsSHA256 &&
+		slices.Equal(s.CanaryHourIDs, other.CanaryHourIDs)
+}
+
+func canaryHourIDsSHA256(hourIDs []string) string {
+	canonical, _ := json.Marshal(hourIDs)
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
 type WorkerBootstrapRequest struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	BatchID         string `json:"batch_id"`
+	WorkScopeIdentity
 }
 
 type WorkerBootstrapResponse struct {
@@ -18,6 +86,7 @@ type WorkerBootstrapResponse struct {
 	BatchID         string    `json:"batch_id"`
 	ClaimToken      string    `json:"claim_token"`
 	ExpiresAt       time.Time `json:"expires_at"`
+	WorkScopeIdentity
 }
 
 type WorkClaimRequest struct {
@@ -110,14 +179,15 @@ type FinalizeBatchIndexRequest struct {
 }
 
 func (r WorkerBootstrapRequest) Validate() error {
-	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || r.WorkScopeIdentity.Validate(r.BatchID) != nil {
 		return fmt.Errorf("invalid joined worker bootstrap request")
 	}
 	return nil
 }
 
 func (r WorkerBootstrapResponse) Validate(now time.Time) error {
-	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || !validOperationToken(r.ClaimToken) || !r.ExpiresAt.After(now) {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || !validOperationToken(r.ClaimToken) ||
+		!r.ExpiresAt.After(now) || r.WorkScopeIdentity.Validate(r.BatchID) != nil {
 		return fmt.Errorf("invalid joined worker bootstrap response")
 	}
 	return nil
