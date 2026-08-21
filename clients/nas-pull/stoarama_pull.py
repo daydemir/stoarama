@@ -2683,12 +2683,12 @@ def valid_joined_int64(value, label):
 JOINED_REASON = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 JOINED_BATCH = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 SOURCE_ENDPOINT_V1 = re.compile(r"https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com\Z")
-QUALIFICATION_FIELDS = ("local_date", "job_id", "window_start", "window_end", "completed_at", "quality_tier")
+QUALIFICATION_FIELDS = ("local_date", "qualification_window_ordinal", "job_id", "window_start", "window_end", "completed_at")
 OBJECT_FIELDS = ("key", "etag", "size_bytes", "sha256")
 SEAM_FIELDS = ("verdict", "reason", "signed_gap_nanoseconds")
 SOURCE_FIELDS = (
-    "clip_id", "recording_id", "recording_job_id", "provider", "endpoint", "region", "bucket",
-    "start_utc", "end_utc", "object", "seam_to_previous",
+    "clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket",
+    "start_utc", "end_utc", "released_at", "object", "seam_to_previous",
 )
 CROSS_HOUR_FIELDS = (
     "previous_delivery_hour", "next_delivery_hour", "previous_clip_id", "next_clip_id",
@@ -2709,7 +2709,7 @@ for _joined_order in (
     ("artifact_id", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "hour_source_claim_sha256", "boundaries", "cross_day_boundaries"),
     CROSS_HOUR_FIELDS, CROSS_DAY_FIELDS, MEDIA_TOOL_FIELDS,
     SOURCE_FIELDS,
-    ("clip_id", "recording_id", "recording_job_id", "provider", "endpoint", "region", "bucket", "start_utc", "end_utc", "object", "audio_sequence_contract", "seam_to_previous"),
+    ("clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket", "start_utc", "end_utc", "released_at", "object", "audio_sequence_contract", "seam_to_previous"),
     OBJECT_FIELDS, ("key", "version_id", "etag", "size_bytes", "sha256"), SEAM_FIELDS,
     ("clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"),
     ("artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes", "sha256", "actual_start_utc", "actual_end_utc", "utc_offset_seconds", "media_tool_identity", "source_clip_ids", "verification", "maximality_evidence"),
@@ -2721,22 +2721,27 @@ for _joined_order in (
     ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"),
     ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding", "edit_list_kind", "edit_list_sha256"),
     ("reason_code", "signed_gap_nanoseconds", "no_allocatable_sources"),
-    ("schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date", "qualification_day", "qualification_sha256", "source_claim_sha256", "source_clip_count", "source_bytes", "first_clip_id", "last_clip_id", "consecutive_pairs", "sources", "hours", "hour_source_claim_sha256", "cross_hour_boundaries", "cross_day_boundaries", "ledger_sha256"),
+    ("schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date", "qualification_day", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "source_clip_count", "source_bytes", "first_clip_id", "last_clip_id", "consecutive_pairs", "sources", "hours", "hour_source_claim_sha256", "cross_hour_boundaries", "cross_day_boundaries", "ledger_sha256"),
     ("previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc", "signed_gap_nanoseconds"),
     ("delivery_hour", "clock_hour", "source_clip_ids"),
     ("reason_code", "source_clip_ids", "source_claim_sha256", "policy_version", "normalized_failure_facts", "failure_sha256", "evidence_sha256", "isolated_attempt_count", "media_tool_identity"),
     ("candidate_clip_ids", "reason_code", "source_claim_sha256", "policy_version", "evidence_sha256", "normalized_failure_facts", "failure_sha256", "repeat_count", "media_tool_identity"),
-    ("schema_version", "policy_version", "allocation_schema_version", "hour_manifest_schema_version", "batch_id", "generation", "frozen_at", "batch_generation_sha256", "frozen_denominator_sha256", "recording_ids", "recording_ids_sha256", "frozen_recordings", "media_tool", "expected_ledger_count", "scheduled_hour_count", "source_clip_count", "source_bytes", "final_media_artifact_count", "allocation_ledgers", "hours"),
-    ("recording_id", "priority_ordinal", "eligibility_tier", "eligibility_cutoff", "completed_at", "timezone", "folder_name", "naming_metadata"),
+    ("schema_version", "policy_version", "allocation_schema_version", "hour_manifest_schema_version", "batch_id", "generation", "frozen_at", "batch_generation_sha256", "frozen_denominator_sha256", "recording_ids", "selection_authority", "frozen_recordings", "media_tool", "expected_ledger_count", "scheduled_hour_count", "source_clip_count", "source_bytes", "final_media_artifact_count", "allocation_ledgers", "hours"),
+    ("selection_basis", "ordered_recording_ids_sha256", "cutoff", "qualification_run_id", "qualification_run_frozen_at", "qualification_rule_version", "qualification_cohort_sha256", "qualification_windows_sha256", "selected_qualification_windows_sha256"),
+    ("recording_id", "priority_ordinal", "selection_tier", "qualification_sha256", "completed_at", "timezone", "folder_name", "naming_metadata"),
     ("plaza_id", "continent", "country", "city", "plaza_name"),
-    ("artifact_id", "recording_id", "local_date", "qualification_sha256", "source_claim_sha256", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count", "source_bytes", "scheduled_hour_ids"),
+    ("artifact_id", "recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count", "source_bytes", "scheduled_hour_ids"),
     ("hour_manifest_artifact_id", "hour_id", "recording_id", "local_date", "delivery_hour", "status", "relative_path", "object_key", "size_bytes", "sha256", "source_count", "source_bytes", "media_artifact_count"),
     ("previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"),
     ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",),
     ("source_claim_sha256", "reason_code", "failure_sha256", "policy_version", "media_tool_identity", "repeat_count"),
     ("clip_id", "source_claim_sha256"),
-    ("projection_version", "ledgers"),
-    ("recording_id", "local_date", "source_claim_sha256", "source_count", "source_bytes"),
+    ("clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket", "object_key", "start_utc", "end_utc", "size_bytes", "ingest_sha256", "released_at"),
+    ("projection_version", "selection_authority", "recordings", "days"),
+    ("recording_id", "priority_ordinal", "selection_tier", "completed_at"),
+    ("recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_count", "source_bytes"),
+    ("recording_id", "qualification_sha256"),
+    ("recording_id", "timezone", "days", "frozen_at", "evidence_sha256"),
 ):
     JOINED_OBJECT_ORDERS.setdefault(frozenset(_joined_order), set()).add(_joined_order)
 
@@ -2826,10 +2831,17 @@ def joined_timestamp_nanoseconds(value, label):
     return (whole.days * 86400 + whole.seconds) * 1_000_000_000 + fraction
 
 
+def joined_timestamp_is_go_zero(parsed):
+    try:
+        return parsed.astimezone(datetime.timezone.utc) == datetime.datetime(1, 1, 1, tzinfo=datetime.timezone.utc)
+    except OverflowError:
+        return False
+
+
 def source_claim_projection(source):
     projected = {key: source[key] for key in (
-        "clip_id", "recording_id", "recording_job_id", "provider", "endpoint", "region", "bucket",
-        "start_utc", "end_utc", "object",
+        "clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket",
+        "start_utc", "end_utc", "released_at", "object",
     )}
     projected["seam_to_previous"] = {"verdict": "", "reason": "", "signed_gap_nanoseconds": 0}
     return projected
@@ -2847,9 +2859,50 @@ def candidate_source_claim_sha(sources):
     ])
 
 
+def frozen_source_sha(sources, qualification_day, recording_id):
+    window_start = joined_timestamp_nanoseconds(qualification_day["window_start"], "qualification window_start")
+    window_end = joined_timestamp_nanoseconds(qualification_day["window_end"], "qualification window_end")
+    snapshots = []
+    seen_clips, seen_locators = set(), set()
+    for source in sources:
+        clip_id = valid_source(source, recording_id, source_only=True)
+        locator = (source["storage_destination_id"],) + tuple(source[key] for key in ("provider", "endpoint", "region", "bucket")) + (source["object"]["key"],)
+        start_ns = joined_timestamp_nanoseconds(source["start_utc"], "source start_utc")
+        end_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end_utc")
+        if (
+            clip_id in seen_clips or locator in seen_locators
+            or source["recording_job_id"] != qualification_day["job_id"]
+            or end_ns <= window_start or start_ns >= window_end
+        ):
+            raise ValueError("joined frozen source identity conflicts")
+        seen_clips.add(clip_id)
+        seen_locators.add(locator)
+        snapshots.append({
+            "clip_id": clip_id,
+            "recording_id": source["recording_id"],
+            "recording_job_id": source["recording_job_id"],
+            "storage_destination_id": source["storage_destination_id"],
+            "provider": source["provider"],
+            "endpoint": source["endpoint"],
+            "region": source["region"],
+            "bucket": source["bucket"],
+            "object_key": source["object"]["key"],
+            "start_utc": source["start_utc"],
+            "end_utc": source["end_utc"],
+            "size_bytes": source["object"]["size_bytes"],
+            "ingest_sha256": source["object"]["sha256"],
+            "released_at": source["released_at"],
+        })
+    return joined_canonical_sha(snapshots)
+
+
 def valid_qualification_day(day, recording_id, timezone, local_date):
     exact_joined_fields(day, QUALIFICATION_FIELDS, "qualification day")
-    if day["local_date"] != valid_joined_date(local_date) or positive_joined_int(day["job_id"], "job_id") < 1:
+    if (
+        day["local_date"] != valid_joined_date(local_date)
+        or not 1 <= positive_joined_int(day["qualification_window_ordinal"], "qualification_window_ordinal") <= 14
+        or positive_joined_int(day["job_id"], "job_id") < 1
+    ):
         raise ValueError("joined qualification day identity conflicts")
     try:
         location = ZoneInfo(valid_joined_string(timezone, "timezone", maximum=255))
@@ -2859,7 +2912,7 @@ def valid_qualification_day(day, recording_id, timezone, local_date):
     end_ns = joined_timestamp_nanoseconds(day["window_end"], "qualification window_end")
     completed_ns = joined_timestamp_nanoseconds(day["completed_at"], "qualification completed_at")
     if (
-        end_ns - start_ns != 12 * 3_600_000_000_000 or completed_ns < end_ns or day["quality_tier"] != "good+"
+        end_ns - start_ns != 12 * 3_600_000_000_000 or completed_ns < end_ns
         or start_ns != local_boundary_nanoseconds(local_date, location, 8)
         or end_ns != local_boundary_nanoseconds(local_date, location, 20)
     ):
@@ -2887,9 +2940,9 @@ def valid_source(source, recording_id, source_only=False, location=None, local_d
     if source["recording_id"] != recording_id:
         raise ValueError("joined source recording identity conflicts")
     positive_joined_int(source["recording_job_id"], "recording_job_id")
-    for key in ("provider", "region", "bucket"):
-        if not valid_joined_string(source[key], "source %s" % key).strip():
-            raise ValueError("joined source %s is blank" % key)
+    positive_joined_int(source["storage_destination_id"], "storage_destination_id")
+    if source["provider"] != "r2" or source["region"] != "auto" or not isinstance(source["bucket"], str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", source["bucket"]) is None:
+        raise ValueError("joined source storage identity is invalid")
     endpoint = source["endpoint"]
     if not isinstance(endpoint, str) or SOURCE_ENDPOINT_V1.fullmatch(endpoint) is None:
         raise ValueError("joined source endpoint is not a canonical HTTPS authority")
@@ -2899,6 +2952,10 @@ def valid_source(source, recording_id, source_only=False, location=None, local_d
     end_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end_utc")
     if end_ns <= start_ns or end_ns - start_ns > 15 * 60 * 1_000_000_000:
         raise ValueError("joined source range is invalid")
+    if source["released_at"] is not None:
+        released_at = valid_joined_timestamp(source["released_at"], "source released_at")
+        if joined_timestamp_is_go_zero(released_at):
+            raise ValueError("joined source released_at is zero")
     if location is not None and local_date is not None and (start.astimezone(location).date().isoformat() != local_date or end.astimezone(location).date().isoformat() != local_date):
         raise ValueError("joined source local date conflicts")
     object_fields = set(OBJECT_FIELDS)
@@ -3115,7 +3172,7 @@ def validate_cross_day_boundaries(payload, location, local_date):
 def valid_allocation_ledger(payload):
     fields = {
         "schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date",
-        "qualification_day", "qualification_sha256", "source_claim_sha256", "source_clip_count", "source_bytes",
+        "qualification_day", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "source_clip_count", "source_bytes",
         "first_clip_id", "last_clip_id", "consecutive_pairs", "sources", "hours", "hour_source_claim_sha256",
         "cross_hour_boundaries", "cross_day_boundaries", "ledger_sha256",
     }
@@ -3128,6 +3185,7 @@ def valid_allocation_ledger(payload):
     valid_qualification_day(payload["qualification_day"], recording_id, payload["timezone"], local_date)
     location = ZoneInfo(payload["timezone"])
     valid_sha256(payload["qualification_sha256"], "qualification")
+    valid_sha256(payload["frozen_source_sha256"], "frozen source")
     source_count = positive_joined_int(payload["source_clip_count"], "source_clip_count", allow_zero=True)
     source_bytes = positive_joined_int(payload["source_bytes"], "source_bytes", allow_zero=True)
     if not isinstance(payload["sources"], list) or len(payload["sources"]) != source_count:
@@ -3135,7 +3193,7 @@ def valid_allocation_ledger(payload):
     source_ids, object_ids, calculated_bytes = [], set(), 0
     for source in payload["sources"]:
         source_ids.append(valid_source(source, recording_id, source_only=True, location=location, local_date=local_date))
-        object_identity = tuple(source[key] for key in ("provider", "endpoint", "region", "bucket")) + tuple(source["object"].get(key, "") for key in ("key", "version_id", "etag"))
+        object_identity = (source["storage_destination_id"],) + tuple(source[key] for key in ("provider", "endpoint", "region", "bucket")) + tuple(source["object"].get(key, "") for key in ("key", "version_id", "etag"))
         if object_identity in object_ids:
             raise ValueError("joined allocation ledger duplicates a source object")
         object_ids.add(object_identity)
@@ -3145,6 +3203,8 @@ def valid_allocation_ledger(payload):
             raise ValueError("joined allocation ledger source order conflicts")
     if len(source_ids) != len(set(source_ids)) or calculated_bytes != source_bytes:
         raise ValueError("joined allocation ledger source denominator conflicts")
+    if frozen_source_sha(payload["sources"], payload["qualification_day"], recording_id) != payload["frozen_source_sha256"]:
+        raise ValueError("joined allocation ledger frozen source identity conflicts")
     if (payload["first_clip_id"], payload["last_clip_id"]) != ((source_ids[0], source_ids[-1]) if source_ids else (None, None)):
         raise ValueError("joined allocation ledger edge identity conflicts")
     pair_fields = {
@@ -3254,15 +3314,111 @@ def joined_delivery_path(frozen, media, delivery_hour):
     return "/".join((frozen["folder_name"], month, weekday, base))
 
 
-def frozen_denominator_sha(ledgers):
+def selected_qualification_windows_sha(recordings):
+    return joined_canonical_sha([
+        {"recording_id": recording["recording_id"], "qualification_sha256": recording["qualification_sha256"]}
+        for recording in recordings
+    ])
+
+
+def qualification_window_sha(recording, days, cutoff, run_frozen_at):
+    if len(days) != 14:
+        raise ValueError("joined qualification window must contain 14 days")
+    cutoff_ns = joined_timestamp_nanoseconds(cutoff, "selection cutoff")
+    run_frozen_ns = joined_timestamp_nanoseconds(run_frozen_at, "qualification run frozen_at")
+    seen_jobs = set()
+    previous_date = None
+    completed = None
+    for ordinal, day in enumerate(days, 1):
+        valid_qualification_day(day, recording["recording_id"], recording["timezone"], day["local_date"])
+        date = datetime.date.fromisoformat(day["local_date"])
+        job_id = day["job_id"]
+        completed_ns = joined_timestamp_nanoseconds(day["completed_at"], "qualification completed_at")
+        if (
+            day["qualification_window_ordinal"] != ordinal or job_id in seen_jobs
+            or (previous_date is not None and date != previous_date + datetime.timedelta(days=1))
+            or joined_timestamp_nanoseconds(day["window_start"], "qualification window_start") < run_frozen_ns
+            or completed_ns > cutoff_ns
+        ):
+            raise ValueError("joined qualification window conflicts")
+        seen_jobs.add(job_id)
+        previous_date = date
+        completed = completed_ns if completed is None else max(completed, completed_ns)
+    if completed != joined_timestamp_nanoseconds(recording["completed_at"], "recording completed_at"):
+        raise ValueError("joined recording completion conflicts with qualification window")
+    return joined_canonical_sha({
+        "recording_id": recording["recording_id"],
+        "timezone": recording["timezone"],
+        "days": days,
+        "frozen_at": cutoff,
+        "evidence_sha256": "",
+    })
+
+
+def valid_selection_authority(authority, recording_ids, frozen_recordings):
+    fields = {
+        "selection_basis", "ordered_recording_ids_sha256", "cutoff", "qualification_run_id",
+        "qualification_run_frozen_at", "qualification_rule_version", "qualification_cohort_sha256",
+        "qualification_windows_sha256", "selected_qualification_windows_sha256",
+    }
+    exact_joined_fields(authority, fields, "selection authority")
+    cutoff = valid_joined_timestamp(authority["cutoff"], "selection cutoff")
+    cutoff_ns = joined_timestamp_nanoseconds(authority["cutoff"], "selection cutoff")
+    run_frozen = valid_joined_timestamp(authority["qualification_run_frozen_at"], "qualification run frozen_at")
+    run_frozen_ns = joined_timestamp_nanoseconds(authority["qualification_run_frozen_at"], "qualification run frozen_at")
+    rule = valid_joined_string(authority["qualification_rule_version"], "qualification rule version", maximum=128)
+    if (
+        authority["selection_basis"] != "operator_approved_ordered_cohort_v1" or not authority["cutoff"].endswith("Z")
+        or cutoff.utcoffset() != datetime.timedelta(0) or joined_timestamp_is_go_zero(cutoff)
+        or joined_timestamp_is_go_zero(run_frozen)
+        or authority["ordered_recording_ids_sha256"] != recording_ids_sha(recording_ids)
+        or run_frozen_ns > cutoff_ns or rule.strip() != rule or len(rule.encode("utf-8")) > 128
+        or positive_joined_int(authority["qualification_run_id"], "qualification_run_id") < 1
+    ):
+        raise ValueError("joined selection authority conflicts")
+    for key in ("qualification_cohort_sha256", "qualification_windows_sha256", "selected_qualification_windows_sha256"):
+        valid_sha256(authority[key], "selection authority")
+    if selected_qualification_windows_sha(frozen_recordings) != authority["selected_qualification_windows_sha256"]:
+        raise ValueError("joined selected qualification evidence conflicts")
+    return cutoff_ns
+
+
+def frozen_denominator_sha(selection_authority, recordings, ledgers):
     return joined_canonical_sha({
         "projection_version": 1,
-        "ledgers": [{
+        "selection_authority": selection_authority,
+        "recordings": [{
+            "recording_id": recording["recording_id"],
+            "priority_ordinal": recording["priority_ordinal"],
+            "selection_tier": recording["selection_tier"],
+            "completed_at": recording["completed_at"],
+        } for recording in recordings],
+        "days": [{
             "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
-            "source_claim_sha256": ledger["source_claim_sha256"],
+            "qualification_sha256": ledger["qualification_sha256"],
+            "frozen_source_sha256": ledger["frozen_source_sha256"],
             "source_count": ledger["source_count"] if "source_count" in ledger else ledger["source_clip_count"],
             "source_bytes": ledger["source_bytes"],
         } for ledger in ledgers],
+    })
+
+
+def batch_generation_sha(payload):
+    evidence_ledgers = [{
+        "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
+        "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
+        "ledger_sha256": ledger["ledger_sha256"], "source_count": ledger["source_count"],
+        "source_bytes": ledger["source_bytes"],
+    } for ledger in payload["allocation_ledgers"]]
+    return joined_canonical_sha({
+        "schema_version": payload["schema_version"], "policy_version": payload["policy_version"],
+        "batch_id": payload["batch_id"], "generation": payload["generation"], "frozen_at": payload["frozen_at"],
+        "frozen_denominator_sha256": payload["frozen_denominator_sha256"],
+        "selection_authority": payload["selection_authority"], "frozen_recordings": payload["frozen_recordings"],
+        "media_tool_identity": payload["media_tool"]["identity_sha256"],
+        "expected_ledger_count": payload["expected_ledger_count"], "scheduled_hour_count": payload["scheduled_hour_count"],
+        "source_clip_count": payload["source_clip_count"], "source_bytes": payload["source_bytes"],
+        "ledgers": evidence_ledgers,
     })
 
 
@@ -3270,7 +3426,7 @@ def valid_batch_index(payload, item=None):
     fields = {
         "schema_version", "policy_version", "allocation_schema_version", "hour_manifest_schema_version",
         "batch_id", "generation", "frozen_at", "batch_generation_sha256", "frozen_denominator_sha256",
-        "recording_ids", "recording_ids_sha256", "frozen_recordings", "media_tool", "expected_ledger_count",
+        "recording_ids", "selection_authority", "frozen_recordings", "media_tool", "expected_ledger_count",
         "scheduled_hour_count", "source_clip_count", "source_bytes", "final_media_artifact_count",
         "allocation_ledgers", "hours",
     }
@@ -3281,33 +3437,35 @@ def valid_batch_index(payload, item=None):
     if not isinstance(batch_id, str) or JOINED_BATCH.fullmatch(batch_id) is None:
         raise ValueError("joined batch index identity is invalid")
     generation = positive_joined_int(payload["generation"], "generation")
-    valid_joined_timestamp(payload["frozen_at"], "frozen_at")
+    frozen_at_ns = joined_timestamp_nanoseconds(payload["frozen_at"], "frozen_at")
     valid_sha256(payload["frozen_denominator_sha256"], "frozen denominator")
     recording_ids = payload["recording_ids"]
     if not isinstance(recording_ids, list) or not recording_ids or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in recording_ids) or len(set(recording_ids)) != len(recording_ids):
         raise ValueError("joined batch recording identities are invalid")
-    if recording_ids_sha(recording_ids) != payload["recording_ids_sha256"]:
-        raise ValueError("joined batch recording identity hash conflicts")
     valid_media_tool(payload["media_tool"])
-    frozen_fields = {"recording_id", "priority_ordinal", "eligibility_tier", "eligibility_cutoff", "completed_at", "timezone", "folder_name", "naming_metadata"}
+    frozen_fields = {"recording_id", "priority_ordinal", "selection_tier", "qualification_sha256", "completed_at", "timezone", "folder_name", "naming_metadata"}
     naming_fields = {"plaza_id", "continent", "country", "city", "plaza_name"}
     if not isinstance(payload["frozen_recordings"], list) or len(payload["frozen_recordings"]) != len(recording_ids):
         raise ValueError("joined frozen recording count conflicts")
     for ordinal, (recording_id, frozen) in enumerate(zip(recording_ids, payload["frozen_recordings"]), 1):
         exact_joined_fields(frozen, frozen_fields, "frozen recording")
         exact_joined_fields(frozen["naming_metadata"], naming_fields, "frozen recording naming")
-        if frozen["recording_id"] != recording_id or frozen["priority_ordinal"] != ordinal or frozen["eligibility_tier"] != "good+":
+        if frozen["recording_id"] != recording_id or frozen["priority_ordinal"] != ordinal or frozen["selection_tier"] != "good+":
             raise ValueError("joined frozen recording order conflicts")
         try:
             ZoneInfo(valid_joined_string(frozen["timezone"], "frozen timezone", maximum=255))
         except ZoneInfoNotFoundError as exc:
             raise ValueError("joined frozen timezone is invalid") from exc
-        if joined_timestamp_nanoseconds(frozen["completed_at"], "completed_at") > joined_timestamp_nanoseconds(frozen["eligibility_cutoff"], "eligibility_cutoff"):
-            raise ValueError("joined frozen recording completed after cutoff")
+        valid_sha256(frozen["qualification_sha256"], "recording qualification")
+        if joined_timestamp_is_go_zero(valid_joined_timestamp(frozen["completed_at"], "completed_at")):
+            raise ValueError("joined frozen recording completion is zero")
         for key, value in frozen["naming_metadata"].items():
             valid_joined_string(value, "frozen naming %s" % key)
         if valid_joined_relative_path(frozen["folder_name"]) != joined_folder_name(recording_id, frozen["naming_metadata"], frozen["folder_name"]):
             raise ValueError("joined frozen recording folder conflicts")
+    cutoff_ns = valid_selection_authority(payload["selection_authority"], recording_ids, payload["frozen_recordings"])
+    if frozen_at_ns < cutoff_ns or any(joined_timestamp_nanoseconds(recording["completed_at"], "completed_at") > cutoff_ns for recording in payload["frozen_recordings"]):
+        raise ValueError("joined batch selection cutoff conflicts")
     ledgers, hours = payload["allocation_ledgers"], payload["hours"]
     expected_ledger_count = positive_joined_int(payload["expected_ledger_count"], "expected_ledger_count")
     scheduled_hour_count = positive_joined_int(payload["scheduled_hour_count"], "scheduled_hour_count")
@@ -3317,7 +3475,7 @@ def valid_batch_index(payload, item=None):
     if not isinstance(ledgers, list) or expected_ledger_count != len(ledgers) or expected_ledger_count != len(recording_ids) * 14 or not isinstance(hours, list) or scheduled_hour_count != len(hours) or scheduled_hour_count != expected_ledger_count * 12:
         raise ValueError("joined batch denominator shape conflicts")
     ledger_fields = {
-        "artifact_id", "recording_id", "local_date", "qualification_sha256", "source_claim_sha256",
+        "artifact_id", "recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256",
         "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count",
         "source_bytes", "scheduled_hour_ids",
     }
@@ -3329,7 +3487,11 @@ def valid_batch_index(payload, item=None):
         recording_id, day_index = recording_ids[index // 14], index % 14
         local_date = valid_joined_date(ledger["local_date"])
         parsed_date = datetime.date.fromisoformat(local_date)
-        if ledger["recording_id"] != recording_id or (day_index and parsed_date != previous_date + datetime.timedelta(days=1)):
+        if (
+            ledger["recording_id"] != recording_id
+            or ledger["qualification_sha256"] != payload["frozen_recordings"][index // 14]["qualification_sha256"]
+            or (day_index and parsed_date != previous_date + datetime.timedelta(days=1))
+        ):
             raise ValueError("joined batch ledger order conflicts")
         previous_date = parsed_date
         artifact_id = positive_joined_int(ledger["artifact_id"], "ledger artifact_id")
@@ -3341,7 +3503,7 @@ def valid_batch_index(payload, item=None):
             raise ValueError("joined batch ledger path conflicts")
         if positive_joined_int(ledger["size_bytes"], "ledger size_bytes") > JOINED_MANIFEST_MAX_BYTES:
             raise ValueError("joined batch ledger exceeds JSON size cap")
-        for key in ("qualification_sha256", "source_claim_sha256", "sha256", "ledger_sha256"):
+        for key in ("qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "sha256", "ledger_sha256"):
             valid_sha256(ledger[key], "batch ledger")
         source_count += positive_joined_int(ledger["source_count"], "ledger source_count", allow_zero=True)
         source_bytes += positive_joined_int(ledger["source_bytes"], "ledger source_bytes", allow_zero=True)
@@ -3391,25 +3553,9 @@ def valid_batch_index(payload, item=None):
         media_count += media
     if source_count != payload["source_clip_count"] or source_bytes != payload["source_bytes"] or hour_source_count != source_count or hour_source_bytes != source_bytes or media_count != payload["final_media_artifact_count"]:
         raise ValueError("joined batch aggregate denominator conflicts")
-    if frozen_denominator_sha(ledgers) != payload["frozen_denominator_sha256"]:
+    if frozen_denominator_sha(payload["selection_authority"], payload["frozen_recordings"], ledgers) != payload["frozen_denominator_sha256"]:
         raise ValueError("joined frozen denominator hash conflicts")
-    evidence_ledgers = [{
-        "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
-        "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
-        "ledger_sha256": ledger["ledger_sha256"], "source_count": ledger["source_count"],
-        "source_bytes": ledger["source_bytes"],
-    } for ledger in ledgers]
-    generation_evidence = {
-        "schema_version": payload["schema_version"], "policy_version": payload["policy_version"],
-        "batch_id": batch_id, "generation": generation, "frozen_at": payload["frozen_at"],
-        "frozen_denominator_sha256": payload["frozen_denominator_sha256"],
-        "recording_ids_sha256": payload["recording_ids_sha256"], "frozen_recordings": payload["frozen_recordings"],
-        "media_tool_identity": payload["media_tool"]["identity_sha256"],
-        "expected_ledger_count": expected_ledger_count, "scheduled_hour_count": scheduled_hour_count,
-        "source_clip_count": payload["source_clip_count"], "source_bytes": payload["source_bytes"],
-        "ledgers": evidence_ledgers,
-    }
-    if joined_canonical_sha(generation_evidence) != payload["batch_generation_sha256"]:
+    if batch_generation_sha(payload) != payload["batch_generation_sha256"]:
         raise ValueError("joined batch generation hash conflicts")
     if item is not None and (item["batch_id"] != batch_id or item["relative_path"] != "coverage/batch.json"):
         raise ExistingFileMismatch("joined batch index identity conflicts")
@@ -3985,6 +4131,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
     }
     seen_media_paths = set()
     denominator_ledgers = []
+    qualification_days = []
     previous_ledger = None
     # The compact index is ordered ledger-major and each ledger is immediately
     # followed logically by its exact 12 hour references. Never scan joined/.
@@ -3997,11 +4144,22 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
         if (
             ledger["batch_id"] != batch_id or ledger["recording_id"] != ledger_ref["recording_id"]
             or ledger["local_date"] != ledger_ref["local_date"] or ledger["qualification_sha256"] != ledger_ref["qualification_sha256"]
+            or ledger["qualification_sha256"] != frozen["qualification_sha256"]
+            or ledger["frozen_source_sha256"] != ledger_ref["frozen_source_sha256"]
             or ledger["source_claim_sha256"] != ledger_ref["source_claim_sha256"] or ledger["ledger_sha256"] != ledger_ref["ledger_sha256"]
             or ledger["source_clip_count"] != ledger_ref["source_count"] or ledger["source_bytes"] != ledger_ref["source_bytes"]
             or ledger["generation"] != index["generation"] or ledger["timezone"] != frozen["timezone"]
         ):
             raise ExistingFileMismatch("joined batch ledger reference conflicts")
+        if (
+            ledger["qualification_day"]["qualification_window_ordinal"] != ledger_position % 14 + 1
+            or joined_timestamp_nanoseconds(ledger["qualification_day"]["window_start"], "qualification window_start")
+                < joined_timestamp_nanoseconds(index["selection_authority"]["qualification_run_frozen_at"], "qualification run frozen_at")
+            or joined_timestamp_nanoseconds(ledger["qualification_day"]["completed_at"], "qualification completed_at")
+                > joined_timestamp_nanoseconds(index["selection_authority"]["cutoff"], "selection cutoff")
+        ):
+            raise ExistingFileMismatch("joined batch qualification chronology conflicts")
+        qualification_days.append(ledger["qualification_day"])
         if previous_ledger is not None and previous_ledger["recording_id"] == ledger["recording_id"]:
             validate_cross_day_ledger_link(previous_ledger, ledger)
         previous_ledger = ledger
@@ -4042,7 +4200,22 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
             raise ExistingFileMismatch("joined batch day disposition union conflicts with ledger")
         total_sources += ledger["source_clip_count"]
         total_bytes += ledger["source_bytes"]
-    if total_sources != index["source_clip_count"] or total_bytes != index["source_bytes"] or total_media != index["final_media_artifact_count"] or frozen_denominator_sha(denominator_ledgers) != index["frozen_denominator_sha256"]:
+        if ledger_position % 14 == 13:
+            try:
+                qualification_sha = qualification_window_sha(
+                    frozen, qualification_days, index["selection_authority"]["cutoff"],
+                    index["selection_authority"]["qualification_run_frozen_at"],
+                )
+            except ValueError as exc:
+                raise ExistingFileMismatch("joined batch qualification window conflicts") from exc
+            if qualification_sha != frozen["qualification_sha256"]:
+                raise ExistingFileMismatch("joined batch qualification window seal conflicts")
+            qualification_days = []
+    if (
+        total_sources != index["source_clip_count"] or total_bytes != index["source_bytes"]
+        or total_media != index["final_media_artifact_count"]
+        or frozen_denominator_sha(index["selection_authority"], index["frozen_recordings"], denominator_ledgers) != index["frozen_denominator_sha256"]
+    ):
         raise ExistingFileMismatch("joined batch installed denominator conflicts")
 
 

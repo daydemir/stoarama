@@ -88,6 +88,7 @@ class JoinedDownloadTests(unittest.TestCase):
             return ledger
         empty_sha = pull.source_claim_sha([])
         ledger.update({
+            "frozen_source_sha256": pull.frozen_source_sha([], ledger["qualification_day"], ledger["recording_id"]),
             "source_claim_sha256": empty_sha, "source_clip_count": 0, "source_bytes": 0,
             "first_clip_id": None, "last_clip_id": None, "consecutive_pairs": [], "sources": [],
         })
@@ -246,12 +247,12 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
         expected = {
-            "allocation_ledger_v1.golden.json": "4871e037b4ca21d74b9eac5cec1b66dc9fdac1a699c13cbf28dfa41e98a0a64e",
-            "batch_index_v1.golden.json": "19973231ac2ff62b1596660f6357cbe571132f898ff90e005df2f5bed7d84329",
-            "hour_manifest_gap_only_v1.golden.json": "8ec7e39c4cba19cbb5b8e11a3f04952656d53c0b77b879ef764767353af951a9",
-            "hour_manifest_mixed_v1.golden.json": "265cc03cdfc078b66da75af72ecf62a9ea2fbcd28592e6f5e9d0e7a82260f08b",
-            "hour_manifest_quarantine_only_v1.golden.json": "c84c805450157c43b7e59638884901d8d00d357c4c729d4b66a6c773b20736d1",
-            "hour_manifest_v1.golden.json": "8ef9fcf1b6bf107d1f8a6e016cbff46ee5f1716405afb650833dd4f0ab58fa25",
+            "allocation_ledger_v1.golden.json": "aa5ea80fffb3d0396d7d10bdb130723d19fee3a5d7ac467f81fc9e00a2539902",
+            "batch_index_v1.golden.json": "cf74f099e40382ba183dffa6a4808439b2f0e4e43a22c98b2cbdb63779f28a93",
+            "hour_manifest_gap_only_v1.golden.json": "20de6f9405b19edfa9c80ea9b6fa0f505594b98a1ccad3f47809b878ceca1f53",
+            "hour_manifest_mixed_v1.golden.json": "887aadb50a3e9341038e5a9bf8ee583a3e59b65ac0f9a1df6b1a131d6eddb28c",
+            "hour_manifest_quarantine_only_v1.golden.json": "e87c781f0d7a9573691c29adadfa80c4e320430b1e16dda8ec392ae5296ef44c",
+            "hour_manifest_v1.golden.json": "ac60926bc9b3b7f9abb0853e69a47785fecd1ddb737c966f9f0d4a7e89870416",
         }
         for name, digest in expected.items():
             path = CLOUD_GOLDENS / name
@@ -294,19 +295,7 @@ class JoinedDownloadTests(unittest.TestCase):
         self.assertEqual(pull.decode_joined_json(escaped)["category"], "a&b<c>d\u2028e\u2029")
         batch = self.golden("batch_index_v1.golden.json")
         batch["frozen_recordings"][0]["naming_metadata"]["plaza_name"] = "Piazza & Silvestri"
-        evidence_ledgers = [{
-            "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
-            "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
-            "ledger_sha256": ledger["ledger_sha256"], "source_count": ledger["source_count"], "source_bytes": ledger["source_bytes"],
-        } for ledger in batch["allocation_ledgers"]]
-        batch["batch_generation_sha256"] = pull.joined_canonical_sha({
-            "schema_version": batch["schema_version"], "policy_version": batch["policy_version"], "batch_id": batch["batch_id"],
-            "generation": batch["generation"], "frozen_at": batch["frozen_at"], "frozen_denominator_sha256": batch["frozen_denominator_sha256"],
-            "recording_ids_sha256": batch["recording_ids_sha256"], "frozen_recordings": batch["frozen_recordings"],
-            "media_tool_identity": batch["media_tool"]["identity_sha256"], "expected_ledger_count": batch["expected_ledger_count"],
-            "scheduled_hour_count": batch["scheduled_hour_count"], "source_clip_count": batch["source_clip_count"],
-            "source_bytes": batch["source_bytes"], "ledgers": evidence_ledgers,
-        })
+        batch["batch_generation_sha256"] = pull.batch_generation_sha(batch)
         batch_bytes = pull.joined_canonical_bytes(batch)
         self.assertIn(b"Piazza \\u0026 Silvestri", batch_bytes)
         pull.valid_batch_index(pull.decode_joined_json(batch_bytes))
@@ -422,6 +411,86 @@ class JoinedDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schedule"):
             pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
 
+    def test_frozen_selection_window_and_storage_evidence(self):
+        ledger = self.golden("allocation_ledger_v1.golden.json")
+        source = ledger["sources"][0]
+        changed = json.loads(json.dumps(source)); changed["storage_destination_id"] = 0
+        with self.assertRaisesRegex(ValueError, "storage_destination_id"):
+            pull.valid_source(changed, ledger["recording_id"], source_only=True)
+        changed_ledger = json.loads(json.dumps(ledger)); changed_ledger["sources"][0]["released_at"] = "0001-01-01T01:00:00+01:00"
+        changed_ledger["source_claim_sha256"] = pull.source_claim_sha(changed_ledger["sources"])
+        by_id = {item["clip_id"]: item for item in changed_ledger["sources"]}
+        changed_ledger["hour_source_claim_sha256"] = [
+            pull.source_claim_sha([by_id[clip_id] for clip_id in hour["source_clip_ids"]])
+            for hour in changed_ledger["hours"]
+        ]
+        changed_ledger["frozen_source_sha256"] = pull.joined_canonical_sha([{
+            "clip_id": item["clip_id"], "recording_id": item["recording_id"],
+            "recording_job_id": item["recording_job_id"], "storage_destination_id": item["storage_destination_id"],
+            "provider": item["provider"], "endpoint": item["endpoint"], "region": item["region"],
+            "bucket": item["bucket"], "object_key": item["object"]["key"], "start_utc": item["start_utc"],
+            "end_utc": item["end_utc"], "size_bytes": item["object"]["size_bytes"],
+            "ingest_sha256": item["object"]["sha256"], "released_at": item["released_at"],
+        } for item in changed_ledger["sources"]])
+        changed_ledger["ledger_sha256"] = ""
+        changed_ledger["ledger_sha256"] = pull.joined_canonical_sha(changed_ledger)
+        with self.assertRaisesRegex(ValueError, "released_at is zero"):
+            pull.valid_allocation_ledger(pull.decode_joined_json(pull.joined_canonical_bytes(changed_ledger)))
+        changed = json.loads(json.dumps(ledger)); changed["qualification_day"]["quality_tier"] = "good+"
+        with self.assertRaisesRegex(ValueError, "invalid fields"):
+            pull.valid_allocation_ledger(changed)
+
+        batch = self.golden("batch_index_v1.golden.json")
+        changed = json.loads(json.dumps(batch)); changed["frozen_recordings"][0]["selection_tier"] = "fine+"
+        with self.assertRaisesRegex(ValueError, "recording order"):
+            pull.valid_batch_index(changed)
+        changed = json.loads(json.dumps(batch)); changed["frozen_recordings"][0]["completed_at"] = "0001-01-01T01:00:00+01:00"
+        changed["frozen_denominator_sha256"] = pull.frozen_denominator_sha(changed["selection_authority"], changed["frozen_recordings"], changed["allocation_ledgers"])
+        changed["batch_generation_sha256"] = pull.batch_generation_sha(changed)
+        with self.assertRaisesRegex(ValueError, "completion is zero"):
+            pull.valid_batch_index(changed)
+        changed = json.loads(json.dumps(batch)); changed["selection_authority"]["cutoff"] = "2026-08-21T06:59:07+00:00"
+        changed["frozen_denominator_sha256"] = pull.frozen_denominator_sha(changed["selection_authority"], changed["frozen_recordings"], changed["allocation_ledgers"])
+        changed["batch_generation_sha256"] = pull.batch_generation_sha(changed)
+        with self.assertRaisesRegex(ValueError, "selection authority"):
+            pull.valid_batch_index(changed)
+        for cutoff in ("2026-08-21T06:59:07.000Z", "2026-08-21T06:59:07.1200Z"):
+            changed = json.loads(json.dumps(batch)); changed["selection_authority"]["cutoff"] = cutoff
+            changed["frozen_denominator_sha256"] = pull.frozen_denominator_sha(changed["selection_authority"], changed["frozen_recordings"], changed["allocation_ledgers"])
+            changed["batch_generation_sha256"] = pull.batch_generation_sha(changed)
+            with self.subTest(cutoff=cutoff), self.assertRaisesRegex(ValueError, "noncanonical selection cutoff"):
+                pull.valid_batch_index(changed)
+        changed = json.loads(json.dumps(batch)); changed["selection_authority"]["qualification_run_frozen_at"] = "0001-01-01T01:00:00+01:00"
+        changed["frozen_denominator_sha256"] = pull.frozen_denominator_sha(changed["selection_authority"], changed["frozen_recordings"], changed["allocation_ledgers"])
+        changed["batch_generation_sha256"] = pull.batch_generation_sha(changed)
+        with self.assertRaisesRegex(ValueError, "selection authority"):
+            pull.valid_batch_index(changed)
+
+        first = pull.datetime.date(2026, 5, 4)
+        days = []
+        for ordinal in range(1, 15):
+            date = first + pull.datetime.timedelta(days=ordinal - 1)
+            days.append({
+                "local_date": date.isoformat(), "qualification_window_ordinal": ordinal, "job_id": 100 + ordinal,
+                "window_start": "%sT08:00:00Z" % date, "window_end": "%sT20:00:00Z" % date,
+                "completed_at": "%sT20:00:00Z" % date,
+            })
+        recording = {
+            "recording_id": 377, "timezone": "UTC", "completed_at": days[-1]["completed_at"],
+        }
+        cutoff, run_frozen = days[-1]["completed_at"], "2026-04-01T00:00:00Z"
+        expected = pull.joined_canonical_sha({
+            "recording_id": 377, "timezone": "UTC", "days": days,
+            "frozen_at": cutoff, "evidence_sha256": "",
+        })
+        self.assertEqual(pull.qualification_window_sha(recording, days, cutoff, run_frozen), expected)
+        changed = json.loads(json.dumps(days)); changed[7]["qualification_window_ordinal"] = 7
+        with self.assertRaisesRegex(ValueError, "window conflicts"):
+            pull.qualification_window_sha(recording, changed, cutoff, run_frozen)
+        changed_recording = dict(recording); changed_recording["completed_at"] = days[-2]["completed_at"]
+        with self.assertRaisesRegex(ValueError, "completion conflicts"):
+            pull.qualification_window_sha(changed_recording, days, cutoff, run_frozen)
+
     def test_malformed_source_authorities_blank_fields_and_manifest_order_fail(self):
         source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
         vectors_path = CLOUD_GOLDENS / "source_endpoint_v1_vectors.json"
@@ -437,7 +506,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 pull.valid_source(changed, 377, source_only=True)
         for field in ("provider", "region", "bucket"):
             changed = json.loads(json.dumps(source)); changed[field] = "   "
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "blank"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "storage identity"):
                 pull.valid_source(changed, 377, source_only=True)
 
         contract = {
@@ -611,12 +680,17 @@ class JoinedDownloadTests(unittest.TestCase):
         ledger_ref = {
             "artifact_id": 55, "relative_path": "coverage/ledgers/377/2026-05-04.json", "size_bytes": 10,
             "sha256": "a" * 64, "recording_id": 377, "local_date": "2026-05-04",
-            "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
+            "qualification_sha256": ledger["qualification_sha256"], "frozen_source_sha256": ledger["frozen_source_sha256"],
+            "source_claim_sha256": ledger["source_claim_sha256"],
             "ledger_sha256": ledger["ledger_sha256"], "source_count": 1, "source_bytes": source["object"]["size_bytes"],
         }
         manifests, hour_refs = {}, []
         batch_golden = self.golden("batch_index_v1.golden.json")
-        frozen = batch_golden["frozen_recordings"][0]
+        frozen = json.loads(json.dumps(batch_golden["frozen_recordings"][0]))
+        frozen["qualification_sha256"] = ledger["qualification_sha256"]
+        frozen["completed_at"] = ledger["qualification_day"]["completed_at"]
+        selection_authority = json.loads(json.dumps(batch_golden["selection_authority"]))
+        selection_authority["selected_qualification_windows_sha256"] = pull.selected_qualification_windows_sha([frozen])
         media_tool = batch_golden["media_tool"]
         media_path = "01_Europe_Italy_Bevagna_Piazza_Silvestri/May/Monday/01_Piazza_Silvestri_2026_May_W1_Monday_hour_01_080000-080100.mp4"
         for delivery_hour in range(1, 13):
@@ -652,8 +726,9 @@ class JoinedDownloadTests(unittest.TestCase):
         index = {
             "batch_id": ledger["batch_id"], "allocation_ledgers": [ledger_ref], "hours": hour_refs,
             "generation": ledger["generation"], "frozen_recordings": [frozen], "media_tool": media_tool,
+            "selection_authority": selection_authority,
             "source_clip_count": 1, "source_bytes": source["object"]["size_bytes"], "final_media_artifact_count": 1,
-            "frozen_denominator_sha256": pull.frozen_denominator_sha([ledger]),
+            "frozen_denominator_sha256": pull.frozen_denominator_sha(selection_authority, [frozen], [ledger]),
         }
         def read(_cfg, _runtime, _batch, path, *_args):
             return ledger if path == ledger_ref["relative_path"] else manifests[path]
@@ -681,7 +756,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 pull.validate_batch_index_proof(None, None, index, threading.Event())
             manifests[hour_refs[0]["relative_path"]]["source_dispositions"][0]["clip_id"] = source["clip_id"]
             ledger_ref["source_claim_sha256"] = "f" * 64
-            index["frozen_denominator_sha256"] = pull.frozen_denominator_sha([ledger_ref])
+            index["frozen_denominator_sha256"] = pull.frozen_denominator_sha(index["selection_authority"], index["frozen_recordings"], [ledger_ref])
             with self.assertRaisesRegex(pull.ExistingFileMismatch, "ledger reference conflicts"):
                 pull.validate_batch_index_proof(None, None, index, threading.Event())
 
