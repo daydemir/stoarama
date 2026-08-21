@@ -32,6 +32,8 @@ type joinedFinalFreezeResponse struct {
 	AlreadyFrozen           bool      `json:"already_frozen"`
 }
 
+const joinedFinalFreezeStatementTimeout = 5 * time.Second
+
 func (r joinedFinalFreezeRequest) validate() error {
 	if r.ProtocolVersion != joinedrecording.JoinedProtocolVersion || !joinedBatchIDPattern.MatchString(r.BatchID) ||
 		!lowerHexSHA256(r.ExpectedFrozenDenominatorSHA256) {
@@ -70,10 +72,10 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	response := joinedFinalFreezeResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: req.BatchID}
-	var batchRecordID int64
+	var batchRecordID, connectionID int64
 	var frozenAt, freezeStartedAt sql.NullTime
 	var authority joinedrecording.SelectionAuthority
-	err = tx.QueryRow(ctx, `SELECT b.id,b.state,b.frozen_at,b.freeze_started_at,b.frozen_denominator_sha256,
+	err = tx.QueryRow(ctx, `SELECT b.id,b.connection_id,b.state,b.frozen_at,b.freeze_started_at,b.frozen_denominator_sha256,
 		b.expected_recordings,b.expected_stream_days,b.expected_scheduled_hours,b.selection_basis,
 		b.ordered_recording_ids_sha256,b.eligibility_cutoff,b.qualification_run_id,b.qualification_frozen_at,
 		q.definition_version,b.qualification_cohort_sha256,b.qualification_windows_sha256,
@@ -81,7 +83,7 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		FROM recording_joined_batches b
 		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
 		JOIN recording_qualification_runs q ON q.id=b.qualification_run_id AND q.account_id=b.account_id
-		WHERE b.batch_id=$1 FOR UPDATE OF b,c FOR SHARE OF q`, req.BatchID).Scan(&batchRecordID, &response.State,
+		WHERE b.batch_id=$1 FOR UPDATE OF b FOR SHARE OF q`, req.BatchID).Scan(&batchRecordID, &connectionID, &response.State,
 		&frozenAt, &freezeStartedAt, &response.FrozenDenominatorSHA256, &response.RecordingCount,
 		&response.StreamDayCount, &response.ScheduledHourCount, &authority.SelectionBasis,
 		&authority.OrderedRecordingIDSHA256, &authority.Cutoff, &authority.QualificationRunID,
@@ -129,6 +131,15 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 	if err != nil || denominator != response.FrozenDenominatorSHA256 || len(recordings) != response.RecordingCount ||
 		len(days) != response.StreamDayCount || response.ScheduledHourCount != response.StreamDayCount*12 {
 		return response, errors.New("joined final-freeze evidence differs")
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)`); err != nil {
+		return response, fmt.Errorf("bound joined final freeze: %w", err)
+	}
+	var protocolVersion int
+	if err := tx.QueryRow(ctx, `SELECT joined_protocol_version FROM connections WHERE id=$1
+		AND joined_protocol_version=1 FOR SHARE`, connectionID).Scan(&protocolVersion); err != nil ||
+		protocolVersion != joinedrecording.JoinedProtocolVersion {
+		return response, errors.New("joined connection protocol changed before final freeze")
 	}
 	if err := tx.QueryRow(ctx, `UPDATE recording_joined_batches SET state='frozen',frozen_at=clock_timestamp()
 		WHERE id=$1 AND state='building' AND freeze_started_at IS NOT NULL RETURNING frozen_at`, batchRecordID).

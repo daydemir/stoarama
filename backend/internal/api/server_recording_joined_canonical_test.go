@@ -121,11 +121,42 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, fixture.connectionID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := fixture.pool.Exec(ctx, `CREATE FUNCTION joined_test_delay_final_freeze() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN IF OLD.state='building' AND NEW.state='frozen' THEN PERFORM pg_sleep(1); END IF; RETURN NEW; END $$;
+		CREATE TRIGGER zzz_joined_test_delay_final_freeze BEFORE UPDATE OF state ON recording_joined_batches
+		FOR EACH ROW EXECUTE FUNCTION joined_test_delay_final_freeze()`); err != nil {
+		t.Fatal(err)
+	}
 
 	results := make(chan *httptest.ResponseRecorder, 2)
-	for i := 0; i < 2; i++ {
-		go func() { results <- call(freezeRequest, true, "") }()
+	go func() { results <- call(freezeRequest, true, "") }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var validating bool
+		if err := fixture.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+			WHERE datname=current_database() AND state='active'
+			AND query LIKE 'UPDATE recording_joined_batches SET state=''frozen''%')`).Scan(&validating); err != nil {
+			t.Fatal(err)
+		}
+		if validating {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("final freeze never entered bounded validation")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	type heartbeatResult struct {
+		elapsed time.Duration
+		err     error
+	}
+	heartbeat := make(chan heartbeatResult, 1)
+	go func() {
+		started := time.Now()
+		_, err := fixture.pool.Exec(ctx, `UPDATE connections SET last_seen_at=now() WHERE id=$1`, fixture.connectionID)
+		heartbeat <- heartbeatResult{elapsed: time.Since(started), err: err}
+	}()
+	go func() { results <- call(freezeRequest, true, "") }()
 	var frozen joinedFinalFreezeResponse
 	alreadyFrozen := 0
 	for i := 0; i < 2; i++ {
@@ -145,6 +176,11 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	}
 	if alreadyFrozen != 1 || frozen.FrozenAt.IsZero() {
 		t.Fatalf("concurrent final freeze replays=%d frozen_at=%v", alreadyFrozen, frozen.FrozenAt)
+	}
+	heartbeatOutcome := <-heartbeat
+	if heartbeatOutcome.err != nil || heartbeatOutcome.elapsed < 100*time.Millisecond ||
+		heartbeatOutcome.elapsed > joinedFinalFreezeStatementTimeout+time.Second {
+		t.Fatalf("raw heartbeat final-freeze wait=%s err=%v", heartbeatOutcome.elapsed, heartbeatOutcome.err)
 	}
 	replay := call(freezeRequest, true, "")
 	var replayed joinedFinalFreezeResponse
