@@ -422,6 +422,36 @@ class JoinedDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schedule"):
             pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
 
+    def test_malformed_source_authorities_blank_fields_and_manifest_order_fail(self):
+        source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
+        for endpoint in ("https://cap.test ", "https:// cap.test", "https://cap.test:bad"):
+            changed = json.loads(json.dumps(source)); changed["endpoint"] = endpoint
+            with self.subTest(endpoint=endpoint), self.assertRaisesRegex(ValueError, "canonical HTTPS"):
+                pull.valid_source(changed, 377, source_only=True)
+        for field in ("provider", "region", "bucket"):
+            changed = json.loads(json.dumps(source)); changed[field] = "   "
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "blank"):
+                pull.valid_source(changed, 377, source_only=True)
+
+        contract = {
+            "codec_name": "aac", "sample_rate": 48000, "channels": 2, "channel_layout": "stereo",
+            "initial_padding": 0, "skip_samples": 0, "discard_padding": 0, "codec_delay": 0,
+            "trailing_padding": 0,
+        }
+        for field in ("codec_name", "channel_layout"):
+            changed = dict(contract); changed[field] = "  "
+            with self.subTest(audio_field=field), self.assertRaisesRegex(ValueError, "blank format"):
+                pull.valid_audio_contract(changed)
+
+        manifest = self.golden("hour_manifest_quarantine_only_v1.golden.json")
+        manifest["sources"][0], manifest["sources"][1] = manifest["sources"][1], manifest["sources"][0]
+        manifest["source_dispositions"][0], manifest["source_dispositions"][1] = manifest["source_dispositions"][1], manifest["source_dispositions"][0]
+        source_sha = pull.source_claim_sha(manifest["sources"])
+        manifest["source_claim_sha256"] = source_sha
+        manifest["allocation"]["hour_source_claim_sha256"] = source_sha
+        with self.assertRaisesRegex(ValueError, "source order"):
+            pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
+
     def test_audio_codec_and_quarantine_reason_are_exactly_bound(self):
         verification = self.golden("hour_manifest_v1.golden.json")["media"][0]["verification"]
         def audio_track(video):
