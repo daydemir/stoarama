@@ -3,6 +3,8 @@ package r2
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +21,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 )
+
+// MaxConditionalPutBytes is R2's exact single-part PUT ceiling: 5 GiB minus
+// the 5 MiB request allowance. Larger immutable writes need a separately
+// designed conditional multipart protocol; silently falling back would make
+// create-only publication overwrite-capable.
+const MaxConditionalPutBytes int64 = 5*1024*1024*1024 - 5*1024*1024
 
 type Client struct {
 	bucket    string
@@ -167,6 +175,78 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 		return "", fmt.Errorf("put object %s: %w", key, err)
 	}
 	return cleanETag(aws.ToString(out.ETag)), nil
+}
+
+// PutReaderIfAbsentVerified publishes one immutable object and then re-reads
+// the exact stored generation. A pre-existing key is accepted only when its
+// complete bytes match expectedSize and expectedSHA256. This makes a retry
+// after "object written, database transaction failed" safe and reconcilable.
+func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType string, body io.Reader, expectedSize int64, expectedSHA256 string) (ObjectHead, bool, error) {
+	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
+		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
+	}
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(c.bucket),
+		Key:           aws.String(key),
+		Body:          body,
+		ContentLength: aws.Int64(expectedSize),
+		IfNoneMatch:   aws.String("*"),
+	}
+	if contentType != "" {
+		in.ContentType = aws.String(contentType)
+	}
+	created := true
+	if _, err := c.s3.PutObject(ctx, in); err != nil {
+		if !isPreconditionFailed(err) {
+			return ObjectHead{}, false, fmt.Errorf("conditional put object %s: %w", key, err)
+		}
+		created = false
+	}
+	head, err := c.Head(ctx, key)
+	if err != nil {
+		return ObjectHead{}, false, fmt.Errorf("verify immutable object %s: %w", key, err)
+	}
+	if head.ETag == "" || head.SizeBytes != expectedSize {
+		return ObjectHead{}, false, fmt.Errorf("immutable object %s size mismatch: got %d want %d", key, head.SizeBytes, expectedSize)
+	}
+	rc, err := c.OpenExact(ctx, key, head.ETag, head.VersionID)
+	if err != nil {
+		return ObjectHead{}, false, fmt.Errorf("verify immutable object %s: %w", key, err)
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, rc)
+	closeErr := rc.Close()
+	if copyErr != nil {
+		return ObjectHead{}, false, fmt.Errorf("hash immutable object %s: %w", key, copyErr)
+	}
+	if closeErr != nil {
+		return ObjectHead{}, false, fmt.Errorf("close immutable object %s: %w", key, closeErr)
+	}
+	gotSHA := hex.EncodeToString(h.Sum(nil))
+	if n != expectedSize || gotSHA != expectedSHA256 {
+		return ObjectHead{}, false, fmt.Errorf("immutable object %s content mismatch", key)
+	}
+	return head, created, nil
+}
+
+func isLowerHexSHA256(raw string) bool {
+	if len(raw) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(raw)
+	return err == nil && raw == strings.ToLower(raw)
+}
+
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := strings.TrimSpace(apiErr.ErrorCode())
+		if code == "PreconditionFailed" || code == "412" {
+			return true
+		}
+	}
+	var responseErr *awshttp.ResponseError
+	return errors.As(err, &responseErr) && responseErr.HTTPStatusCode() == http.StatusPreconditionFailed
 }
 
 // PutMultipart uploads body to key using S3 multipart upload with a bounded
