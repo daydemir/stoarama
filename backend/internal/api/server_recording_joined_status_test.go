@@ -46,10 +46,7 @@ func TestJoinedAdminBatchStatusIsBoundedOrderedReadOnlyAndAdminOnly(t *testing.T
 	}
 	fixture.s.cfg.ServiceToken = "generic-service-credential-32-bytes"
 
-	claim, err := joinedauth.MintClaim(fixture.s.cfg.JoinedWorkerSigningKey, req.BatchID, time.Now().Add(time.Minute))
-	if err != nil {
-		t.Fatal(err)
-	}
+	claim := mintJoinedClaimForTest(t, fixture.s, req.BatchID)
 	operation, err := joinedauth.MintOperation(fixture.s.cfg.JoinedWorkerSigningKey, req.BatchID,
 		joinedauth.SubjectHour, "foreign-hour", uuid.New(), joinedauth.OperationPreflight, time.Now().Add(time.Minute))
 	if err != nil {

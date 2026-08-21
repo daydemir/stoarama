@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/google/uuid"
 )
 
@@ -39,12 +40,13 @@ type Claims struct {
 	SubjectID   string `json:"subject_id,omitempty"`
 	LeaseToken  string `json:"lease_token,omitempty"`
 	Operation   string `json:"operation,omitempty"`
+	joinedrecording.WorkScopeIdentity
 }
 
-func MintClaim(signingKey, batchID string, expiresAt time.Time) (string, error) {
+func MintClaim(signingKey, batchID string, workScope joinedrecording.WorkScopeIdentity, expiresAt time.Time) (string, error) {
 	claims := Claims{Version: 1, Audience: Audience, ExpiresAt: expiresAt.UTC().Unix(), Kind: KindClaim,
-		BatchID: batchID}
-	if !validCommon(signingKey, claims, expiresAt) {
+		BatchID: batchID, WorkScopeIdentity: workScope}
+	if !validCommon(signingKey, claims, expiresAt) || workScope.Validate(batchID) != nil {
 		return "", errors.New("invalid joined claim token scope")
 	}
 	return mint(signingKey, claims)
@@ -89,13 +91,15 @@ func Verify(signingKey, token string, now time.Time) (Claims, error) {
 	}
 	switch claims.Kind {
 	case KindClaim:
-		if claims.SubjectKind != "" || claims.SubjectID != "" || claims.LeaseToken != "" || claims.Operation != "" {
+		if claims.SubjectKind != "" || claims.SubjectID != "" || claims.LeaseToken != "" || claims.Operation != "" ||
+			claims.WorkScopeIdentity.Validate(claims.BatchID) != nil {
 			return Claims{}, errors.New("invalid joined claim token")
 		}
 	case KindOperation:
 		if claims.SubjectID == "" || len(claims.SubjectID) > 256 || uuid.Validate(claims.LeaseToken) != nil ||
 			(claims.SubjectKind != SubjectHour && claims.SubjectKind != SubjectLedger && claims.SubjectKind != SubjectBatchIndex) ||
-			(claims.Operation != OperationPreflight && claims.Operation != OperationPublish) {
+			(claims.Operation != OperationPreflight && claims.Operation != OperationPublish) || claims.WorkScope != "" ||
+			len(claims.CanaryHourIDs) != 0 || claims.CanaryHourIDsSHA256 != "" {
 			return Claims{}, errors.New("invalid joined operation token")
 		}
 	default:
