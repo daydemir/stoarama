@@ -20,7 +20,6 @@ type Config struct {
 	ServiceToken                     string
 	JoinedWorkerBootstrapToken       string
 	JoinedWorkerSigningKey           string
-	JoinedRecordingEnabled           bool
 	BootstrapAdminEmail              string
 	MigrationDir                     string
 	AutoMigrate                      bool
@@ -187,7 +186,6 @@ func Load() (Config, error) {
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
-		JoinedRecordingEnabled:           boolEnv("JOINED_RECORDING_ENABLED", false),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
 		AutoMigrate:                      boolEnv("AUTO_MIGRATE", false),
