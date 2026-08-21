@@ -122,13 +122,29 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 		t.Fatal(err)
 	}
 
-	response := call(freezeRequest, true, "")
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for i := 0; i < 2; i++ {
+		go func() { results <- call(freezeRequest, true, "") }()
+	}
 	var frozen joinedFinalFreezeResponse
-	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &frozen) != nil ||
-		frozen.State != "frozen" || frozen.AlreadyFrozen || frozen.FrozenAt.IsZero() ||
-		frozen.FrozenDenominatorSHA256 != fixture.plan.FrozenDenominatorSHA256 ||
-		frozen.RecordingCount != 33 || frozen.StreamDayCount != 462 || frozen.ScheduledHourCount != 5544 {
-		t.Fatalf("final freeze status=%d body=%s", response.Code, response.Body.String())
+	alreadyFrozen := 0
+	for i := 0; i < 2; i++ {
+		response := <-results
+		var candidate joinedFinalFreezeResponse
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &candidate) != nil ||
+			candidate.State != "frozen" || candidate.FrozenAt.IsZero() ||
+			candidate.FrozenDenominatorSHA256 != fixture.plan.FrozenDenominatorSHA256 ||
+			candidate.RecordingCount != 33 || candidate.StreamDayCount != 462 || candidate.ScheduledHourCount != 5544 {
+			t.Fatalf("concurrent final freeze status=%d body=%s", response.Code, response.Body.String())
+		}
+		if candidate.AlreadyFrozen {
+			alreadyFrozen++
+		} else {
+			frozen = candidate
+		}
+	}
+	if alreadyFrozen != 1 || frozen.FrozenAt.IsZero() {
+		t.Fatalf("concurrent final freeze replays=%d frozen_at=%v", alreadyFrozen, frozen.FrozenAt)
 	}
 	replay := call(freezeRequest, true, "")
 	var replayed joinedFinalFreezeResponse
