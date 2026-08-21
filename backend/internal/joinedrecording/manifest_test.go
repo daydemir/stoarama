@@ -12,8 +12,8 @@ import (
 )
 
 func TestBatchIndexV1Golden(t *testing.T) {
-	index, ledgers := testBatchIndex(t)
-	_, canonical, _, err := BuildBatchIndex(index, testLedgerResolver(ledgers))
+	index, ledgers, manifests := testBatchIndex(t)
+	_, canonical, _, err := BuildBatchIndex(index, testLedgerResolver(ledgers), testHourResolver(manifests))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +21,8 @@ func TestBatchIndexV1Golden(t *testing.T) {
 }
 
 func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
-	index, ledgers := testBatchIndex(t)
+	index, ledgers, manifests := testBatchIndex(t)
+	canonicalIndex := testBatchIndexCopy(index)
 	want := index.FrozenDenominatorSHA256
 	if want != "fcd56878c3c1b26e5b99995ffc2ad4c31ad9f8fef1ca3289fb2701d044e419d9" {
 		t.Fatalf("canonical denominator fixture changed: %s", want)
@@ -45,23 +46,115 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 		}
 	}
 
-	index.FrozenDenominatorSHA256 = strings.Repeat("a", 64)
-	index.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(index)
-	if _, _, _, err := BuildBatchIndex(index, testLedgerResolver(ledgers)); err == nil {
+	denominatorAttack := testBatchIndexCopy(canonicalIndex)
+	denominatorAttack.FrozenDenominatorSHA256 = strings.Repeat("a", 64)
+	denominatorAttack.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(denominatorAttack)
+	if _, _, _, err := BuildBatchIndex(denominatorAttack, testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("batch index accepted caller-supplied denominator digest")
 	}
 
-	attack := index
-	attack.AllocationLedgers = append([]AllocationLedgerRef(nil), index.AllocationLedgers...)
+	attack := testBatchIndexCopy(canonicalIndex)
 	attack.AllocationLedgers[0].SourceClaimSHA256 = strings.Repeat("9", 64)
 	attack.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(attack.AllocationLedgers)
 	attack.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(attack)
-	if _, _, _, err := BuildBatchIndex(attack, testLedgerResolver(ledgers)); err == nil {
+	if _, _, _, err := BuildBatchIndex(attack, testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
 		t.Fatal("batch index accepted recomputed hashes over a mutated ledger reference")
+	}
+
+	hourAttack := testBatchIndexCopy(canonicalIndex)
+	hourAttack.Hours[0].SHA256 = strings.Repeat("9", 64)
+	hourAttack.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(hourAttack)
+	if _, _, _, err := BuildBatchIndex(hourAttack, testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+		t.Fatal("batch index accepted recomputed hashes over a mutated hour-manifest reference")
+	}
+
+	t.Run("same-size source substitution", func(t *testing.T) {
+		mutated := append([]HourManifest(nil), manifests...)
+		mutated[0] = cloneHourManifest(t, manifests[0])
+		mutated[0].Sources[0].Object.Key = "raw/recording-377/clip-1-substituted.mp4"
+		claimSHA, _, err := CanonicalSourceClaim(mutated[0].Sources)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutated[0].SourceClaimSHA256 = claimSHA
+		mutated[0].Allocation.HourSourceSHA256 = claimSHA
+		ref, err := BuildBatchIndexHour(canonicalIndex.Hours[0].HourManifestArtifactID, mutated[0])
+		if err != nil {
+			t.Fatalf("mutated manifest should remain independently canonical: %v", err)
+		}
+		mutatedIndex := testBatchIndexCopy(canonicalIndex)
+		mutatedIndex.Hours[0] = ref
+		if _, _, _, err := BuildBatchIndex(mutatedIndex, testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+			t.Fatal("batch index accepted equal-count, equal-byte source substitution")
+		}
+	})
+
+	for name, mutate := range map[string]func(*HourManifest){
+		"logical ledger substitution":  func(manifest *HourManifest) { manifest.Allocation.LedgerSHA256 = strings.Repeat("9", 64) },
+		"ledger artifact substitution": func(manifest *HourManifest) { manifest.Allocation.ArtifactID++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := append([]HourManifest(nil), manifests...)
+			mutated[0] = cloneHourManifest(t, manifests[0])
+			mutate(&mutated[0])
+			ref, err := BuildBatchIndexHour(canonicalIndex.Hours[0].HourManifestArtifactID, mutated[0])
+			if err != nil {
+				t.Fatalf("mutated manifest should remain independently canonical: %v", err)
+			}
+			mutatedIndex := testBatchIndexCopy(canonicalIndex)
+			mutatedIndex.Hours[0] = ref
+			if _, _, _, err := BuildBatchIndex(mutatedIndex, testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+				t.Fatal("batch index accepted an hour manifest bound to another allocation ledger")
+			}
+		})
+	}
+
+	for name, mutate := range map[string]func(*HourManifest){
+		"invalid timezone":  func(manifest *HourManifest) { manifest.Timezone = "Not/A_Zone" },
+		"wrong UTC offset":  func(manifest *HourManifest) { manifest.Media[0].UTCOffsetSeconds++ },
+		"wrong part number": func(manifest *HourManifest) { manifest.Media[0].Part++ },
+		"invalid maximality fact": func(manifest *HourManifest) {
+			manifest.Media[0].MaximalityEvidence = []MaximalityEvidence{{ReasonCode: "deterministic_media_split"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := cloneHourManifest(t, manifests[0])
+			mutate(&mutated)
+			if _, err := BuildBatchIndexHour(canonicalIndex.Hours[0].HourManifestArtifactID, mutated); err == nil {
+				t.Fatal("invalid canonical hour manifest produced a batch-index reference")
+			}
+		})
+	}
+
+	for name, mutate := range map[string]func(*HourManifest){
+		"delivery path substitution": func(manifest *HourManifest) { manifest.Media[0].RelativePath = "other/place.mp4" },
+		"media tool substitution": func(manifest *HourManifest) {
+			tool, err := SealMediaToolEvidence(MediaToolEvidence{FFmpegVersion: "other ffmpeg", FFmpegSHA256: strings.Repeat("1", 64), FFprobeVersion: "other ffprobe", FFprobeSHA256: strings.Repeat("2", 64)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.MediaTool = tool
+			manifest.Media[0].MediaToolIdentity = tool.IdentitySHA256
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := append([]HourManifest(nil), manifests...)
+			mutated[0] = cloneHourManifest(t, manifests[0])
+			mutate(&mutated[0])
+			ref, err := BuildBatchIndexHour(canonicalIndex.Hours[0].HourManifestArtifactID, mutated[0])
+			if err != nil {
+				t.Fatalf("mutated manifest should remain independently canonical: %v", err)
+			}
+			mutatedIndex := testBatchIndexCopy(canonicalIndex)
+			mutatedIndex.Hours[0] = ref
+			if _, _, _, err := BuildBatchIndex(mutatedIndex, testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+				t.Fatal("batch index accepted a manifest outside frozen naming or tool identity")
+			}
+		})
 	}
 }
 
-func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation) {
+func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation, []HourManifest) {
 	t.Helper()
 	const batchID = "goodplus-20260821-generation-1"
 	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
@@ -69,6 +162,7 @@ func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation) {
 	hours := make([]BatchIndexHour, 0, 14*12)
 	ledgerRefs := make([]AllocationLedgerRef, 0, 14)
 	ledgers := make([]StreamDayAllocation, 0, 14)
+	manifests := make([]HourManifest, 0, 14*12)
 	for day := 0; day < 14; day++ {
 		localDate := time.Date(2026, time.May, 4+day, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
 		ledgerRequest := baseRequest
@@ -87,13 +181,41 @@ func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation) {
 		ledgers = append(ledgers, ledger)
 		ledgerRefs = append(ledgerRefs, ledgerRef)
 		for i := 0; i < 12; i++ {
-			hourID := ledgerRef.ScheduledHourIDs[i]
-			relative := "coverage/hours/" + hourID + ".json"
-			status, sourceCount, sourceBytes, mediaCount := HourStatusGapOnly, 0, int64(0), 0
+			hourRequest := baseRequest
+			hourRequest.LocalDate = localDate
+			hourRequest.DeliveryHour = i + 1
+			hourRequest.AllocationLedgerSHA = ledger.LedgerSHA256
+			hourRequest.Sources = nil
+			var plan BatchPlan
+			var built []BuiltOutput
+			var mediaArtifactIDs []int64
 			if day == 0 && i == 0 {
-				status, sourceCount, sourceBytes, mediaCount = HourStatusMedia, 1, 10, 1
+				hourRequest.Sources = baseRequest.Sources
+				plan, err = buildTestPlan(hourRequest)
+				if err == nil {
+					built = []BuiltOutput{{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA, SourceCount: 1, Verification: passingVerification()}}
+					mediaArtifactIDs = []int64{5000}
+				}
+			} else {
+				plan, err = BuildGapOnlyHourPlan(hourRequest, localDate, i+1, "no_source_clips")
 			}
-			hours = append(hours, BatchIndexHour{HourManifestArtifactID: int64(1000 + day*12 + i), HourID: hourID, RecordingID: 377, LocalDate: localDate, DeliveryHour: i + 1, Status: status, RelativePath: relative, ObjectKey: "joined/" + batchID + "/" + relative, SizeBytes: 1000, SHA256: strings.Repeat("b", 64), SourceCount: sourceCount, SourceBytes: sourceBytes, MediaArtifactCount: mediaCount})
+			if err != nil {
+				t.Fatal(err)
+			}
+			allocation, err := BuildHourManifestAllocation(ledgerRef.ArtifactID, plan, ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: mediaArtifactIDs, Built: built})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hourRef, err := BuildBatchIndexHour(int64(1000+day*12+i), manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifests = append(manifests, manifest)
+			hours = append(hours, hourRef)
 		}
 	}
 	mediaTool, _ := SealMediaToolEvidence(MediaToolEvidence{FFmpegVersion: "ffmpeg pinned", FFmpegSHA256: strings.Repeat("e", 64), FFprobeVersion: "ffprobe pinned", FFprobeSHA256: strings.Repeat("f", 64)})
@@ -102,7 +224,7 @@ func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation) {
 	index := BatchIndex{SchemaVersion: 1, PolicyVersion: PlanPolicyVersion, AllocationSchemaVersion: 1, HourManifestSchemaVersion: 1, BatchID: batchID, Generation: 1, FrozenAt: cutoff, RecordingIDs: []int64{377}, RecordingIDSHA256: recordingIDsSHA([]int64{377}), FrozenRecordings: []FrozenRecording{{RecordingID: 377, PriorityOrdinal: 1, EligibilityTier: "good+", EligibilityCutoff: cutoff, CompletedAt: cutoff.Add(-time.Hour), Timezone: "UTC", FolderName: "01_Europe_Italy_Bevagna_Piazza_Silvestri", NamingMetadata: metadata}}, MediaTool: mediaTool, ExpectedLedgerCount: 14, ScheduledHourCount: 168, SourceClipCount: 1, SourceBytes: 10, FinalMediaCount: 1, AllocationLedgers: ledgerRefs, Hours: hours}
 	index.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(index.AllocationLedgers)
 	index.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(index)
-	return index, ledgers
+	return index, ledgers, manifests
 }
 
 func testLedgerResolver(ledgers []StreamDayAllocation) AllocationLedgerResolver {
@@ -114,6 +236,37 @@ func testLedgerResolver(ledgers []StreamDayAllocation) AllocationLedgerResolver 
 		}
 		return StreamDayAllocation{}, os.ErrNotExist
 	}
+}
+
+func testHourResolver(manifests []HourManifest) HourManifestResolver {
+	return func(ref BatchIndexHour) (HourManifest, error) {
+		for _, manifest := range manifests {
+			if manifest.HourID == ref.HourID {
+				return manifest, nil
+			}
+		}
+		return HourManifest{}, os.ErrNotExist
+	}
+}
+
+func cloneHourManifest(t *testing.T, manifest HourManifest) HourManifest {
+	t.Helper()
+	_, canonical, err := stitchcert.CanonicalSHA(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cloned HourManifest
+	if err := json.Unmarshal(canonical, &cloned); err != nil {
+		t.Fatal(err)
+	}
+	return cloned
+}
+
+func testBatchIndexCopy(index BatchIndex) BatchIndex {
+	copy := index
+	copy.AllocationLedgers = append([]AllocationLedgerRef(nil), index.AllocationLedgers...)
+	copy.Hours = append([]BatchIndexHour(nil), index.Hours...)
+	return copy
 }
 
 func TestAllocationLedgerV1Golden(t *testing.T) {

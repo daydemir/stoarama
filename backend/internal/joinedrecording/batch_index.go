@@ -103,6 +103,7 @@ type BatchIndex struct {
 }
 
 type AllocationLedgerResolver func(AllocationLedgerRef) (StreamDayAllocation, error)
+type HourManifestResolver func(BatchIndexHour) (HourManifest, error)
 
 // BuildAllocationLedgerRef derives every caller-visible reference fact from
 // the exact canonical ledger artifact. Only its database artifact ID is
@@ -148,22 +149,61 @@ func ValidateAllocationLedgerRef(ref AllocationLedgerRef, ledger StreamDayAlloca
 	return nil
 }
 
-func BuildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (BatchIndex, []byte, string, error) {
-	if resolveLedger == nil {
-		return BatchIndex{}, nil, "", fmt.Errorf("canonical allocation ledger resolver is required")
+func BuildBatchIndexHour(artifactID int64, manifest HourManifest) (BatchIndexHour, error) {
+	canonical, artifactSHA, err := CanonicalHourManifestArtifact(manifest)
+	if err != nil || artifactID <= 0 {
+		return BatchIndexHour{}, fmt.Errorf("canonical hour manifest artifact is required")
 	}
-	return buildBatchIndex(index, resolveLedger)
+	var sourceBytes int64
+	for _, source := range manifest.Sources {
+		if source.Object.SizeBytes > math.MaxInt64-sourceBytes {
+			return BatchIndexHour{}, fmt.Errorf("hour manifest source bytes overflow")
+		}
+		sourceBytes += source.Object.SizeBytes
+	}
+	relativePath := path.Join("coverage", "hours", manifest.HourID+".json")
+	return BatchIndexHour{
+		HourManifestArtifactID: artifactID,
+		HourID:                 manifest.HourID,
+		RecordingID:            manifest.RecordingID,
+		LocalDate:              manifest.LocalDate,
+		DeliveryHour:           manifest.DeliveryHour,
+		Status:                 manifest.Status,
+		RelativePath:           relativePath,
+		ObjectKey:              path.Join("joined", manifest.BatchID, relativePath),
+		SizeBytes:              int64(len(canonical)),
+		SHA256:                 artifactSHA,
+		SourceCount:            manifest.SourceCount,
+		SourceBytes:            sourceBytes,
+		MediaArtifactCount:     len(manifest.Media),
+	}, nil
+}
+
+func ValidateBatchIndexHour(ref BatchIndexHour, manifest HourManifest) error {
+	want, err := BuildBatchIndexHour(ref.HourManifestArtifactID, manifest)
+	if err != nil || !sameCanonical([]BatchIndexHour{ref}, []BatchIndexHour{want}) {
+		return fmt.Errorf("hour-manifest reference differs from canonical artifact")
+	}
+	return nil
+}
+
+func BuildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
+	if resolveLedger == nil || resolveHour == nil {
+		return BatchIndex{}, nil, "", fmt.Errorf("canonical ledger and hour resolvers are required")
+	}
+	return buildBatchIndex(index, resolveLedger, resolveHour)
 }
 
 func canonicalSealedBatchIndex(index BatchIndex) (BatchIndex, []byte, string, error) {
-	return buildBatchIndex(index, nil)
+	return buildBatchIndex(index, nil, nil)
 }
 
-func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (BatchIndex, []byte, string, error) {
+func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
 	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || recordingIDsSHA(index.RecordingIDs) != index.RecordingIDSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index denominator differs")
 	}
 	seenRecording := map[int64]bool{}
+	frozenRecordings := make(map[int64]FrozenRecording, len(index.FrozenRecordings))
 	for i, id := range index.RecordingIDs {
 		if id <= 0 || seenRecording[id] {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch recording identity differs")
@@ -175,6 +215,7 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (
 		if frozen.RecordingID != id || frozen.PriorityOrdinal != i+1 || frozen.EligibilityTier != "good+" || frozen.EligibilityCutoff.IsZero() || frozen.CompletedAt.IsZero() || frozen.CompletedAt.After(frozen.EligibilityCutoff) || timezoneErr != nil || folderErr != nil || folder != frozen.FolderName {
 			return BatchIndex{}, nil, "", fmt.Errorf("frozen recording metadata differs")
 		}
+		frozenRecordings[id] = frozen
 	}
 	seenArtifacts, expectedHours := map[int64]bool{}, map[string]AllocationLedgerRef{}
 	var sourceCount int
@@ -194,12 +235,6 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (
 		if err != nil || !seenRecording[ledger.RecordingID] || ledger.ArtifactID <= 0 || seenArtifacts[ledger.ArtifactID] || ledger.RelativePath != relative || ledger.ObjectKey != objectKey || ledger.SizeBytes <= 0 || !lowerHex64(ledger.SHA256) || !lowerHex64(ledger.LedgerSHA256) || !lowerHex64(ledger.QualificationSHA) || !lowerHex64(ledger.SourceClaimSHA256) || ledger.SourceCount < 0 || ledger.SourceBytes < 0 || len(ledger.ScheduledHourIDs) != 12 {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger differs")
 		}
-		if resolveLedger != nil {
-			canonicalLedger, resolveErr := resolveLedger(ledger)
-			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, canonicalLedger) != nil {
-				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
-			}
-		}
 		seenArtifacts[ledger.ArtifactID] = true
 		for hour := 1; hour <= 12; hour++ {
 			want := canonicalHourIDValue(index.BatchID, ledger.RecordingID, ledger.LocalDate, hour, index.Generation)
@@ -216,12 +251,38 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (
 	}
 	var hourSources, mediaCount int
 	var hourBytes int64
+	var canonicalLedger StreamDayAllocation
 	for hourIndex, hour := range index.Hours {
 		ledger := index.AllocationLedgers[hourIndex/12]
+		if resolveHour != nil && hourIndex%12 == 0 {
+			var resolveErr error
+			canonicalLedger, resolveErr = resolveLedger(ledger)
+			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, canonicalLedger) != nil || canonicalLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
+			}
+		}
 		expected := expectedHours[hour.HourID]
 		wantRelative := path.Join("coverage", "hours", hour.HourID+".json")
 		if expected.ArtifactID == 0 || expected.ArtifactID != ledger.ArtifactID || hour.DeliveryHour != hourIndex%12+1 || hour.HourManifestArtifactID <= 0 || seenArtifacts[hour.HourManifestArtifactID] || hour.RecordingID != ledger.RecordingID || hour.LocalDate != ledger.LocalDate || hour.HourID != canonicalHourIDValue(index.BatchID, hour.RecordingID, hour.LocalDate, hour.DeliveryHour, index.Generation) || hour.RelativePath != wantRelative || hour.ObjectKey != path.Join("joined", index.BatchID, wantRelative) || hour.SizeBytes <= 0 || !lowerHex64(hour.SHA256) || hour.SourceCount < 0 || hour.SourceBytes < 0 || hour.MediaArtifactCount < 0 {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch hour identity differs")
+		}
+		if resolveHour != nil {
+			canonicalManifest, resolveErr := resolveHour(hour)
+			if resolveErr != nil {
+				return BatchIndex{}, nil, "", fmt.Errorf("resolve canonical hour manifest: %w", resolveErr)
+			}
+			if err := ValidateBatchIndexHour(hour, canonicalManifest); err != nil {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch hour does not match its canonical manifest artifact: %w", err)
+			}
+			if !sameCanonical([]MediaToolEvidence{canonicalManifest.MediaTool}, []MediaToolEvidence{index.MediaTool}) {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch hour media tool differs from frozen batch tool")
+			}
+			if err := validateHourManifestDelivery(canonicalManifest, frozenRecordings[hour.RecordingID]); err != nil {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch hour delivery path differs from frozen naming: %w", err)
+			}
+			if err := ValidateHourManifestLedgerBinding(canonicalManifest, ledger, canonicalLedger); err != nil {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch hour does not match its canonical allocation ledger: %w", err)
+			}
 		}
 		switch hour.Status {
 		case HourStatusMedia:
@@ -263,6 +324,28 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver) (
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index exceeds canonical limit")
 	}
 	return index, canonical, sha, nil
+}
+
+func validateHourManifestDelivery(manifest HourManifest, frozen FrozenRecording) error {
+	if manifest.RecordingID != frozen.RecordingID || manifest.Timezone != frozen.Timezone {
+		return fmt.Errorf("hour manifest recording naming scope differs")
+	}
+	for _, media := range manifest.Media {
+		want, err := recordingnaming.BuildJoinedPath(recordingnaming.JoinedPolicy{
+			FolderName:   frozen.FolderName,
+			Metadata:     frozen.NamingMetadata,
+			CronTimezone: frozen.Timezone,
+			ActualStart:  media.ActualStartUTC,
+			ActualEnd:    media.ActualEndUTC,
+			Hour:         manifest.DeliveryHour,
+			Part:         media.Part,
+			Parts:        media.Parts,
+		})
+		if err != nil || media.RelativePath != want {
+			return fmt.Errorf("media delivery path differs")
+		}
+	}
+	return nil
 }
 
 // ComputeFrozenDenominatorSHA256 hashes the exact ordered ledger-source
