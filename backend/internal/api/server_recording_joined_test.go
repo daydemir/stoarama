@@ -15,6 +15,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
@@ -327,5 +328,24 @@ func TestJoinedStorageAuthorityRequiresExactHTTPSRoot(t *testing.T) {
 	}
 	if got, err := joinedOutputAuthority("https://storage.example.test/"); err != nil || got != "storage.example.test" {
 		t.Fatalf("root authority got=%q err=%v", got, err)
+	}
+}
+
+func TestSameFrozenJoinedSourcesComparesReleaseTimeValues(t *testing.T) {
+	released := time.Date(2026, 8, 21, 1, 2, 3, 4, time.UTC)
+	sameValue := released
+	frozen := []joinedrecording.SourceClip{{ClipID: 1, ReleasedAt: &released}}
+	accounted := []joinedrecording.SourceClip{{ClipID: 1, ReleasedAt: &sameValue}}
+	if !sameFrozenJoinedSources(frozen, accounted) {
+		t.Fatal("equal release timestamps at different addresses did not match")
+	}
+	changed := sameValue.Add(time.Nanosecond)
+	accounted[0].ReleasedAt = &changed
+	if sameFrozenJoinedSources(frozen, accounted) {
+		t.Fatal("different release timestamps matched")
+	}
+	accounted[0].ReleasedAt = nil
+	if sameFrozenJoinedSources(frozen, accounted) {
+		t.Fatal("nil and non-nil release timestamps matched")
 	}
 }

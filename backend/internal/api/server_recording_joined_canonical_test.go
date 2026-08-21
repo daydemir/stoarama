@@ -14,7 +14,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
-	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
+	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -22,9 +22,469 @@ const joinedTestSourceEndpoint = "https://0123456789abcdef0123456789abcdef.r2.cl
 
 // This uses the real migration in a disposable PostgreSQL schema when the
 // standard repository test URL is configured.
+type joinedCanonicalLedgerFixture struct {
+	artifactID, streamDayID, batchRecordingID int64
+	recordingID                               int64
+	scopeID, relativePath, objectKey          string
+	bytes                                     []byte
+	sha                                       string
+}
+
+type joinedCanonicalSnapshot struct {
+	id, streamDayID, storageDestinationID int64
+	dayOrdinal                            int
+	source                                joinedrecording.SourceClip
+	clipCreatedAt                         time.Time
+}
+
+type joinedCanonicalDay struct {
+	id, batchRecordingID, accountID, connectionID, recordingID int64
+	batchID, localDate, timezone                               string
+	dateOrdinal, generation, priorityOrdinal                   int
+	qualification                                              joinedrecording.QualificationWindow
+	sources                                                    []joinedCanonicalSnapshot
+	ledger                                                     joinedrecording.StreamDayAllocation
+}
+
+func materializeJoinedCanonicalBatch(t *testing.T, fixture joinedHistoricalTier1Fixture, batchRecordID int64) (
+	[]joinedCanonicalLedgerFixture, *joinedCanonicalLedgerFixture, *joinedCanonicalLedgerFixture, func(pgx.Tx) error) {
+	t.Helper()
+	ctx, pool := context.Background(), fixture.pool
+	rows, err := pool.Query(ctx, `SELECT d.id,d.batch_recording_id,d.account_id,d.connection_id,d.batch_id,d.recording_id,
+		d.local_date::text,d.date_ordinal,b.generation,br.priority_ordinal,br.timezone,br.qualification
+		FROM recording_joined_stream_days d JOIN recording_joined_batches b ON b.id=d.batch_record_id
+		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
+		WHERE d.batch_record_id=$1 AND d.state='pending' ORDER BY br.priority_ordinal,d.date_ordinal`, batchRecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	days := make([]joinedCanonicalDay, 0, 462)
+	for rows.Next() {
+		var day joinedCanonicalDay
+		var qualificationJSON []byte
+		if err := rows.Scan(&day.id, &day.batchRecordingID, &day.accountID, &day.connectionID, &day.batchID,
+			&day.recordingID, &day.localDate, &day.dateOrdinal, &day.generation, &day.priorityOrdinal, &day.timezone,
+			&qualificationJSON); err != nil || json.Unmarshal(qualificationJSON, &day.qualification) != nil {
+			rows.Close()
+			t.Fatalf("load canonical stream day: %v", err)
+		}
+		days = append(days, day)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if len(days) != 462 {
+		t.Fatalf("applied canonical days=%d", len(days))
+	}
+	dayIndex := make(map[int64]int, len(days))
+	for i := range days {
+		dayIndex[days[i].id] = i
+	}
+	snapshotRows, err := pool.Query(ctx, `SELECT id,stream_day_id,clip_id,recording_id,recording_job_id,
+		storage_destination_id,day_ordinal,provider,endpoint,region,bucket,object_key,ingest_etag,size_bytes,sha256,
+		start_at,end_at,clip_created_at,released_at FROM recording_joined_source_snapshots
+		WHERE batch_record_id=$1 ORDER BY recording_id,recording_job_id,day_ordinal`, batchRecordID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for snapshotRows.Next() {
+		var snapshot joinedCanonicalSnapshot
+		if err := snapshotRows.Scan(&snapshot.id, &snapshot.streamDayID, &snapshot.source.ClipID,
+			&snapshot.source.RecordingID, &snapshot.source.RecordingJobID, &snapshot.storageDestinationID,
+			&snapshot.dayOrdinal, &snapshot.source.Provider, &snapshot.source.Endpoint, &snapshot.source.Region,
+			&snapshot.source.Bucket, &snapshot.source.Object.Key, &snapshot.source.Object.ETag,
+			&snapshot.source.Object.SizeBytes, &snapshot.source.Object.SHA256, &snapshot.source.StartUTC,
+			&snapshot.source.EndUTC, &snapshot.clipCreatedAt, &snapshot.source.ReleasedAt); err != nil {
+			snapshotRows.Close()
+			t.Fatal(err)
+		}
+		snapshot.source.StorageDestinationID = snapshot.storageDestinationID
+		snapshot.source.StartUTC, snapshot.source.EndUTC = snapshot.source.StartUTC.UTC(), snapshot.source.EndUTC.UTC()
+		if snapshot.source.ReleasedAt != nil {
+			released := snapshot.source.ReleasedAt.UTC()
+			snapshot.source.ReleasedAt = &released
+		}
+		index, ok := dayIndex[snapshot.streamDayID]
+		if !ok {
+			snapshotRows.Close()
+			t.Fatalf("snapshot %d has foreign stream day %d", snapshot.id, snapshot.streamDayID)
+		}
+		days[index].sources = append(days[index].sources, snapshot)
+	}
+	if err := snapshotRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	snapshotRows.Close()
+	byRecordingOrdinal := make(map[[2]int64]*joinedCanonicalDay, len(days))
+	for i := range days {
+		byRecordingOrdinal[[2]int64{days[i].recordingID, int64(days[i].dateOrdinal)}] = &days[i]
+	}
+	for i := range days {
+		day := &days[i]
+		sources := make([]joinedrecording.SourceClip, len(day.sources))
+		for j := range day.sources {
+			sources[j] = day.sources[j].source
+		}
+		request := joinedrecording.PlanRequest{BatchID: day.batchID, Generation: day.generation,
+			RecordingID: day.recordingID, Timezone: day.timezone, LocalDate: day.localDate,
+			Qualification: day.qualification, Sources: sources}
+		if previous := byRecordingOrdinal[[2]int64{day.recordingID, int64(day.dateOrdinal - 1)}]; previous != nil && len(previous.sources) > 0 {
+			value := previous.sources[len(previous.sources)-1].source
+			request.PreviousDayLast = &value
+		}
+		if next := byRecordingOrdinal[[2]int64{day.recordingID, int64(day.dateOrdinal + 1)}]; next != nil && len(next.sources) > 0 {
+			value := next.sources[0].source
+			request.NextDayFirst = &value
+		}
+		var draft joinedrecording.StreamDayDraft
+		if len(sources) == 0 {
+			draft, err = joinedrecording.BuildGapOnlyStreamDay(request, day.localDate)
+		} else {
+			draft, err = joinedrecording.AllocateStreamDay(request)
+		}
+		if err != nil {
+			t.Fatalf("allocate recording=%d day=%s: %v", day.recordingID, day.localDate, err)
+		}
+		day.ledger, err = joinedrecording.SealStreamDayAllocation(draft)
+		if err != nil {
+			t.Fatalf("seal recording=%d day=%s: %v", day.recordingID, day.localDate, err)
+		}
+	}
+	// Put one unrelated gap-only ledger first for publication/feed assertions,
+	// followed by the source-bearing ledger used by the worker lifecycle.
+	order := make([]int, 0, len(days))
+	order = append(order, 14, 0)
+	for i := range days {
+		if i != 14 && i != 0 && i != len(days)-1 {
+			order = append(order, i)
+		}
+	}
+	order = append(order, len(days)-1)
+	ledgers := make([]joinedCanonicalLedgerFixture, 0, len(days))
+	var sourceLedger, gapAtomicLedger *joinedCanonicalLedgerFixture
+	var insertFinalChild func(pgx.Tx) error
+	for position, dayIndex := range order {
+		day := &days[dayIndex]
+		ledgerBytes, ledgerSHA, err := joinedrecording.CanonicalAllocationLedgerArtifact(day.ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		relativePath, objectKey, err := joinedrecording.CanonicalAllocationLedgerPaths(day.batchID, day.recordingID, day.localDate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledgers = append(ledgers, joinedCanonicalLedgerFixture{streamDayID: day.id,
+			batchRecordingID: day.batchRecordingID, recordingID: day.recordingID,
+			scopeID: fmt.Sprintf("%s__recording-%d__date-%s__generation-%d", day.batchID, day.recordingID,
+				day.localDate, day.generation), relativePath: relativePath, objectKey: objectKey, bytes: ledgerBytes, sha: ledgerSHA})
+		ledgerFixture := &ledgers[len(ledgers)-1]
+		deferFinalChild := position == len(order)-1
+		hours := prepareJoinedCanonicalDay(t, fixture, batchRecordID, day, deferFinalChild)
+		if len(day.sources) > 0 {
+			assertJoinedCanonicalSourceMutations(t, fixture, batchRecordID, day, ledgerFixture, hours)
+		}
+		insertArtifact := func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,
+				batch_id,scope_kind,scope_id,stream_day_id,artifact_kind,ordinal,relative_path,object_key,content_type,
+				expected_size_bytes,expected_sha256,canonical_bytes,publication_state)
+				VALUES($1,$2,$3,$4,'ledger',$5,$6,'allocation_ledger',1,$7,$8,'application/json',$9,$10,$11,'sealed') RETURNING id`,
+				batchRecordID, day.accountID, day.connectionID, day.batchID, ledgerFixture.scopeID, day.id,
+				ledgerFixture.relativePath, ledgerFixture.objectKey, len(ledgerFixture.bytes), ledgerFixture.sha,
+				ledgerFixture.bytes).Scan(&ledgerFixture.artifactID)
+		}
+		completeDay := func(tx pgx.Tx) error {
+			if err := insertJoinedCanonicalSources(ctx, tx, batchRecordID, day, hours, false, false); err != nil {
+				return err
+			}
+			return sealJoinedCanonicalDay(ctx, tx, day, ledgerFixture)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deferFinalChild {
+			_ = tx.Rollback(ctx)
+			insertFinalChild = func(tx pgx.Tx) error {
+				if err := insertJoinedCanonicalCrossDayBoundary(ctx, tx, day.id, 2,
+					day.ledger.CrossDayBoundaries[1]); err != nil {
+					return err
+				}
+				if err := completeDay(tx); err != nil {
+					return err
+				}
+				return insertArtifact(tx)
+			}
+		} else {
+			if err := completeDay(tx); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("complete recording=%d day=%s: %v", day.recordingID, day.localDate, err)
+			}
+			if err := insertArtifact(tx); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("insert ledger recording=%d day=%s: %v", day.recordingID, day.localDate, err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatalf("commit recording=%d day=%s: %v", day.recordingID, day.localDate, err)
+			}
+		}
+		if len(day.sources) > 0 {
+			sourceLedger = ledgerFixture
+		}
+		if position == 2 {
+			gapAtomicLedger = ledgerFixture
+		}
+	}
+	return ledgers, sourceLedger, gapAtomicLedger, insertFinalChild
+}
+
+func prepareJoinedCanonicalDay(t *testing.T, fixture joinedHistoricalTier1Fixture, batchRecordID int64,
+	day *joinedCanonicalDay, deferFinalBoundary bool) map[int]int64 {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	hours := make(map[int]int64, 12)
+	sourceByID := make(map[int64]joinedrecording.SourceClip, len(day.ledger.Sources))
+	for _, source := range day.ledger.Sources {
+		sourceByID[source.ClipID] = source
+	}
+	for i, hour := range day.ledger.Hours {
+		var sourceBytes int64
+		for _, clipID := range hour.SourceClipIDs {
+			sourceBytes += sourceByID[clipID].Object.SizeBytes
+		}
+		hourID := fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", day.batchID,
+			day.recordingID, day.localDate, hour.DeliveryHour, day.generation)
+		scheduledStart := day.qualification.Days[day.dateOrdinal-1].WindowStart.Add(time.Duration(i) * time.Hour)
+		var hourRecordID int64
+		if err := tx.QueryRow(ctx, `INSERT INTO recording_joined_hours(batch_record_id,stream_day_id,account_id,
+			connection_id,batch_id,recording_id,hour_id,local_date,delivery_hour,clock_hour,scheduled_start_at,
+			scheduled_end_at,priority_ordinal,source_clip_count,source_bytes,source_claim_sha256)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`, batchRecordID,
+			day.id, day.accountID, day.connectionID, day.batchID, day.recordingID, hourID, day.localDate,
+			hour.DeliveryHour, hour.ClockHour, scheduledStart, scheduledStart.Add(time.Hour),
+			int64((day.priorityOrdinal-1)*168+(day.dateOrdinal-1)*12+hour.DeliveryHour), len(hour.SourceClipIDs),
+			sourceBytes, day.ledger.HourSourceSHA256[i]).Scan(&hourRecordID); err != nil {
+			t.Fatal(err)
+		}
+		hours[hour.DeliveryHour] = hourRecordID
+	}
+	for i, boundary := range day.ledger.Boundaries {
+		if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_day_boundaries(stream_day_id,boundary_kind,ordinal,
+			previous_delivery_hour,next_delivery_hour,previous_clip_id,next_clip_id,previous_presentation_end_at,
+			next_presentation_start_at,signed_gap_nanoseconds,scheduled_at,actual_seam_at,boundary_skew_nanoseconds,
+			allocation_decision,verdict,reason) VALUES($1,'cross_hour',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			day.id, i+1, boundary.PreviousHour, boundary.NextHour, boundary.PreviousClipID, boundary.NextClipID,
+			boundary.PreviousPresentationEndUTC, boundary.NextPresentationStartUTC, boundary.SignedGapNanoseconds,
+			boundary.ScheduledUTC, boundary.ActualSeamUTC, boundary.BoundarySkewNanoseconds, boundary.AllocationDecision,
+			boundary.Verdict, boundary.Reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, boundary := range day.ledger.CrossDayBoundaries {
+		if deferFinalBoundary && i == 1 {
+			continue
+		}
+		if err := insertJoinedCanonicalCrossDayBoundary(ctx, tx, day.id, i+1, boundary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return hours
+}
+
+func insertJoinedCanonicalCrossDayBoundary(ctx context.Context, tx pgx.Tx, streamDayID int64, ordinal int,
+	boundary joinedrecording.CrossDayBoundary) error {
+	_, err := tx.Exec(ctx, `INSERT INTO recording_joined_day_boundaries(stream_day_id,boundary_kind,ordinal,
+		previous_clip_id,next_clip_id,previous_presentation_end_at,next_presentation_start_at,signed_gap_nanoseconds,
+		scheduled_previous_end_at,scheduled_next_start_at,boundary_skew_nanoseconds,allocation_decision,verdict,reason)
+		VALUES($1,'cross_day',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, streamDayID, ordinal,
+		boundary.PreviousClipID, boundary.NextClipID, boundary.PreviousPresentationEndUTC,
+		boundary.NextPresentationStartUTC, boundary.SignedGapNanoseconds, boundary.ScheduledPreviousEndUTC,
+		boundary.ScheduledNextStartUTC, boundary.BoundarySkewNanoseconds, boundary.AllocationDecision,
+		boundary.Verdict, boundary.Reason)
+	return err
+}
+
+func insertJoinedCanonicalSources(ctx context.Context, tx pgx.Tx, batchRecordID int64, day *joinedCanonicalDay,
+	hours map[int]int64, wrongHour, fabricatedSeam bool) error {
+	snapshots := make(map[int64]joinedCanonicalSnapshot, len(day.sources))
+	for _, snapshot := range day.sources {
+		snapshots[snapshot.source.ClipID] = snapshot
+	}
+	dayOrdinal := 0
+	for hourIndex, hour := range day.ledger.Hours {
+		for hourOrdinal, source := range hour.SourceClipIDs {
+			dayOrdinal++
+			snapshot := snapshots[source]
+			ledgerSource := day.ledger.Sources[dayOrdinal-1]
+			seam, _ := json.Marshal(ledgerSource.SeamToPrevious)
+			if fabricatedSeam {
+				seam = []byte(`{"verdict":"fabricated","reason":"fabricated","signed_gap_nanoseconds":0}`)
+			}
+			deliveryHour := hourIndex + 1
+			if wrongHour {
+				deliveryHour = deliveryHour%12 + 1
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_sources(source_snapshot_id,batch_record_id,
+				stream_day_id,hour_record_id,account_id,connection_id,recording_id,recording_job_id,clip_id,
+				storage_destination_id,day_ordinal,hour_ordinal,provider,endpoint,region,bucket,object_key,version_id,
+				etag,size_bytes,sha256,start_at,end_at,seam_to_previous,clip_created_at,released_at,observed_at)
+				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'',$18,$19,$20,$21,$22,$23,$24,$25,clock_timestamp())`,
+				snapshot.id, batchRecordID, day.id, hours[deliveryHour], day.accountID, day.connectionID,
+				ledgerSource.RecordingID, ledgerSource.RecordingJobID, ledgerSource.ClipID,
+				ledgerSource.StorageDestinationID, dayOrdinal, hourOrdinal+1, ledgerSource.Provider,
+				ledgerSource.Endpoint, ledgerSource.Region, ledgerSource.Bucket, ledgerSource.Object.Key,
+				ledgerSource.Object.ETag, ledgerSource.Object.SizeBytes, ledgerSource.Object.SHA256,
+				ledgerSource.StartUTC, ledgerSource.EndUTC, seam, snapshot.clipCreatedAt, ledgerSource.ReleasedAt); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func sealJoinedCanonicalDay(ctx context.Context, tx pgx.Tx, day *joinedCanonicalDay,
+	ledgerFixture *joinedCanonicalLedgerFixture) error {
+	var ledger joinedrecording.StreamDayAllocation
+	if err := json.Unmarshal(ledgerFixture.bytes, &ledger); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `UPDATE recording_joined_stream_days SET state='sealed',source_manifest_sha256=$2,
+		head_manifest_sha256=$3,seal_request_sha256=$4,ledger_sha256=$5,ledger_bytes=$6,
+		ledger_artifact_sha256=$7,sealed_at=clock_timestamp() WHERE id=$1 AND state='pending'`, day.id,
+		ledger.SourceClaimSHA256, sha256Bytes([]byte("canonical-head:"+ledger.LedgerSHA256)),
+		sha256Bytes([]byte("canonical-seal:"+ledger.LedgerSHA256)), ledger.LedgerSHA256, ledgerFixture.bytes,
+		ledgerFixture.sha)
+	return err
+}
+
+func assertJoinedCanonicalSourceMutations(t *testing.T, fixture joinedHistoricalTier1Fixture, batchRecordID int64,
+	day *joinedCanonicalDay, original *joinedCanonicalLedgerFixture, hours map[int]int64) {
+	t.Helper()
+	ctx := context.Background()
+	var originalLedger joinedrecording.StreamDayAllocation
+	if err := json.Unmarshal(original.bytes, &originalLedger); err != nil {
+		t.Fatal(err)
+	}
+	rejectRoot := func(name string, body []byte, artifactSHA, ledgerSHA string) {
+		t.Run(name, func(t *testing.T) {
+			tx, err := fixture.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if err := insertJoinedCanonicalSources(ctx, tx, batchRecordID, day, hours, false, false); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE recording_joined_stream_days SET state='sealed',source_manifest_sha256=$2,
+				head_manifest_sha256=$3,seal_request_sha256=$4,ledger_sha256=$5,ledger_bytes=$6,
+				ledger_artifact_sha256=$7,sealed_at=clock_timestamp() WHERE id=$1 AND state='pending'`, day.id,
+				originalLedger.SourceClaimSHA256, sha256Bytes([]byte("canonical-head:"+ledgerSHA)),
+				sha256Bytes([]byte("canonical-seal:"+ledgerSHA)), ledgerSHA, body, artifactSHA); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, day.id); err == nil {
+				t.Fatal("accepted invalid frozen source root")
+			}
+		})
+	}
+	changedRoot := originalLedger
+	changedRoot.FrozenSourceSHA256 = strings.Repeat("9", 64)
+	changedRoot.LedgerSHA256 = ""
+	changedRoot.LedgerSHA256, _, _ = stitchcert.CanonicalSHA(changedRoot)
+	changedArtifactSHA, changedBody, err := stitchcert.CanonicalSHA(changedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectRoot("rebuilt ledger rejects changed frozen_source_sha256", changedBody, changedArtifactSHA,
+		changedRoot.LedgerSHA256)
+	nullBody := bytes.Replace(original.bytes,
+		[]byte(`"frozen_source_sha256":"`+originalLedger.FrozenSourceSHA256+`"`),
+		[]byte(`"frozen_source_sha256":null`), 1)
+	if bytes.Equal(nullBody, original.bytes) {
+		t.Fatal("frozen source root fixture was not replaced")
+	}
+	rejectRoot("ledger rejects null frozen_source_sha256", nullBody, sha256Bytes(nullBody), originalLedger.LedgerSHA256)
+	for name, mutate := range map[string]func(*joinedrecording.SourceClip){
+		"storage_destination_id": func(source *joinedrecording.SourceClip) { source.StorageDestinationID++ },
+		"released_at": func(source *joinedrecording.SourceClip) {
+			changed := source.EndUTC.Add(time.Second)
+			source.ReleasedAt = &changed
+		},
+	} {
+		t.Run("rebuilt ledger rejects changed "+name, func(t *testing.T) {
+			changed := day.sources[0].source
+			mutate(&changed)
+			draft, err := joinedrecording.AllocateStreamDay(joinedrecording.PlanRequest{BatchID: day.batchID,
+				Generation: day.generation, RecordingID: day.recordingID, Timezone: day.timezone,
+				LocalDate: day.localDate, Qualification: day.qualification, Sources: []joinedrecording.SourceClip{changed}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := joinedrecording.SealStreamDayAllocation(draft)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, artifactSHA, err := joinedrecording.CanonicalAllocationLedgerArtifact(ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changedFixture := *original
+			changedFixture.bytes, changedFixture.sha = body, artifactSHA
+			tx, err := fixture.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := insertJoinedCanonicalSources(ctx, tx, batchRecordID, day, hours, false, false); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatal(err)
+			}
+			if err := sealJoinedCanonicalDay(ctx, tx, day, &changedFixture); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, day.id); err == nil {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("accepted rebuilt %s mutation", name)
+			}
+			_ = tx.Rollback(ctx)
+		})
+	}
+	for _, invalid := range []struct {
+		name            string
+		wrongHour, seam bool
+	}{{"swapped hour membership", true, false}, {"ledger source evidence", false, true}} {
+		tx, err := fixture.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := insertJoinedCanonicalSources(ctx, tx, batchRecordID, day, hours, invalid.wrongHour, invalid.seam); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := sealJoinedCanonicalDay(ctx, tx, day, original); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, day.id); err == nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("accepted invalid %s", invalid.name)
+		}
+		_ = tx.Rollback(ctx)
+	}
+}
+
 func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
-	s, pool, cleanup := testIdentityServer(t)
-	defer cleanup()
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-canonical@example.test")
+	defer fixture.cleanup()
+	s, pool := fixture.s, fixture.pool
 	s.cfg.JoinedRecordingEnabled = true
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-key"
 	s.cfg.JoinedWorkerSigningKey = "joined-worker-signing-key"
@@ -34,312 +494,37 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	s.cfg.R2AccessKeyID = "output-key"
 	s.cfg.R2SecretAccessKey = "output-secret"
 	ctx := context.Background()
-	_, accountID := seedUserOrg(t, pool, "joined-canonical@example.test", false)
-
-	var storageID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,endpoint,region,bucket,
-		access_key_id,secret_access_key_enc,status) VALUES($1,'joined-test',$3,'auto',
-		'clips','key',$2,'verified') RETURNING id`, accountID, []byte{1}, joinedTestSourceEndpoint).Scan(&storageID); err != nil {
-		t.Fatal(err)
+	accountID, apiKeyID, connectionID := fixture.accountID, fixture.apiKeyID, fixture.connectionID
+	req := fixture.req
+	req.Apply, req.ExpectedRequestSHA256 = true, fixture.plan.RequestSHA256
+	applied, plan := fixture.call(req)
+	if applied.Code != http.StatusOK || plan.RequestSHA256 != fixture.plan.RequestSHA256 {
+		t.Fatalf("authenticated canonical apply status=%d body=%s", applied.Code, applied.Body.String())
 	}
-	var apiKeyID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO account_api_keys(account_id,key_prefix,secret_hash,label,scopes)
-		VALUES($1,'sir_joined','joined-test-hash','NAS',ARRAY['stoarama.pull']) RETURNING id`, accountID).Scan(&apiKeyID); err != nil {
-		t.Fatal(err)
-	}
-	var connectionID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id,joined_protocol_version)
-		VALUES($1,'nas_pull','NAS',$2,1) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
-		t.Fatal(err)
-	}
-	firstDate := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
-	var recordingID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,cron_timezone,
-		mode,daily_window_start,daily_window_end,delivery,start_at,end_at) VALUES($1,$2,'joined-recording',
-		'https://example.test/live.m3u8','UTC','continuous','08:00','20:00','nas_pull',$3,$4) RETURNING id`,
-		accountID, storageID, firstDate, firstDate.AddDate(0, 0, 14)).Scan(&recordingID); err != nil {
-		t.Fatal(err)
-	}
-	qualification := joinedrecording.QualificationWindow{RecordingID: recordingID, Timezone: "UTC",
-		FrozenAt: firstDate.AddDate(0, 0, 15)}
-	jobIDs := make([]int64, 14)
-	for day := 0; day < 14; day++ {
-		start := firstDate.AddDate(0, 0, day)
-		if err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,
-			idempotency_key,kind,window_end_at,completed_at) VALUES($1,$2,$2,60,'done',$3,'continuous_window',$4,$4)
-			RETURNING id`, recordingID, start, fmt.Sprintf("joined:%d:%d", recordingID, day), start.Add(12*time.Hour)).Scan(&jobIDs[day]); err != nil {
-			t.Fatal(err)
-		}
-		qualification.Days = append(qualification.Days, joinedrecording.QualifiedDay{LocalDate: start.Format("2006-01-02"),
-			JobID: jobIDs[day], WindowStart: start, WindowEnd: start.Add(12 * time.Hour), CompletedAt: start.Add(12 * time.Hour),
-			QualityTier: "good+"})
-	}
-	sourceDate := firstDate.AddDate(0, 0, 12)
-	sources := make([]joinedrecording.SourceClip, 3)
-	for i := range sources {
-		start := sourceDate.Add(time.Duration(50+i*20) * time.Minute)
-		key, etag, sha := fmt.Sprintf("raw/source-%d.mp4", i+1), fmt.Sprintf("etag-%d", i+1), strings.Repeat(fmt.Sprintf("%x", i+1), 64)
-		var clipID int64
-		if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,
-			endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,
-			audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,$9,
-			'clips',$4,$4,'video/mp4','mp4',10,$5,$6,60000,'h264',false,$7,$7,$8,$7) RETURNING id`, recordingID,
-			jobIDs[12], storageID, key, etag, sha, start, start.Add(time.Minute), joinedTestSourceEndpoint).Scan(&clipID); err != nil {
-			t.Fatal(err)
-		}
-		sources[i] = joinedrecording.SourceClip{ClipID: clipID, RecordingID: recordingID, RecordingJobID: jobIDs[12],
-			Provider: "s3_compatible", Endpoint: joinedTestSourceEndpoint, Region: "auto", Bucket: "clips", StartUTC: start,
-			EndUTC: start.Add(time.Minute), Object: joinedrecording.ObjectIdentity{Key: key, ETag: etag, SizeBytes: 10, SHA256: sha}}
-	}
-	const otherSourceEndpoint = "https://fedcba9876543210fedcba9876543210.r2.cloudflarestorage.com"
-	var otherStorageID, otherClipID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,endpoint,region,bucket,
-		access_key_id,secret_access_key_enc,status) VALUES($1,'joined-other',$3,'auto','clips','key',$2,'verified') RETURNING id`,
-		accountID, []byte{1}, otherSourceEndpoint).Scan(&otherStorageID); err != nil {
-		t.Fatal(err)
-	}
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,
-		endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,
-		audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,$4,'clips','raw/other.mp4',
-		'raw/other.mp4','video/mp4','mp4',10,'other-etag',$5,60000,'h264',false,$6,$6,$7,$6) RETURNING id`,
-		recordingID, jobIDs[12], otherStorageID, otherSourceEndpoint, strings.Repeat("d", 64), sourceDate,
-		sourceDate.Add(time.Minute)).Scan(&otherClipID); err != nil {
-		t.Fatal(err)
-	}
-	qualification, err := joinedrecording.SealQualificationWindow(qualification)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mediaTool, err := joinedrecording.SealMediaToolEvidence(joinedrecording.MediaToolEvidence{
-		FFmpegVersion: "ffmpeg pinned", FFmpegSHA256: strings.Repeat("e", 64),
-		FFprobeVersion: "ffprobe pinned", FFprobeSHA256: strings.Repeat("f", 64)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	metadata := recordingnaming.Metadata{PlazaID: "1", Continent: "Europe", Country: "Italy", City: "Bevagna", PlazaName: "Piazza"}
-	folder, err := recordingnaming.BuildFolderName(recordingnaming.ProfilePlazaHourlyV1, recordingID, metadata, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	batchID := "goodplus-20260821-generation-1"
-	qualificationJSON, _ := json.Marshal(qualification)
-	mediaToolJSON, _ := json.Marshal(mediaTool)
-	metadataJSON, _ := json.Marshal(metadata)
+	batchID := req.BatchID
 	var batchRecordID int64
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
-		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
-		expected_source_clips,expected_source_bytes,freeze_started_at)
-		VALUES($1,$2,'preseed-generation-1',1,$9,$3,$4,$5,$6,'{"schema_version":1}',$7,$8,1,14,168,0,0,now())`,
-		accountID, connectionID, joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON,
-		mediaTool.IdentitySHA256, strings.Repeat("9", 64), strings.Repeat("8", 64), joinedTestSourceEndpoint); err == nil {
-		t.Fatal("batch insert preseeded freeze evidence")
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
-		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
-		expected_source_clips,expected_source_bytes)
-		VALUES($1,$2,'invalid-endpoint-generation-1',1,$9,$3,$4,$5,$6,'{"schema_version":1}',$7,$8,1,14,168,0,0)`,
-		accountID, connectionID, joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON,
-		mediaTool.IdentitySHA256, strings.Repeat("9", 64), strings.Repeat("8", 64), joinedTestSourceEndpoint+"/"); err == nil {
-		t.Fatal("batch accepted a noncanonical source endpoint")
-	}
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
-		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
-		expected_source_clips,expected_source_bytes)
-		VALUES($1,$2,$3,1,$10,$4,$5,$6,$7,'{"schema_version":1}',$8,$9,1,14,168,3,30) RETURNING id`,
-		accountID, connectionID, batchID, joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON,
-		mediaTool.IdentitySHA256, strings.Repeat("a", 64), strings.Repeat("b", 64), joinedTestSourceEndpoint).Scan(&batchRecordID); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT id FROM recording_joined_batches WHERE batch_id=$1 AND state='building'`, batchID).
+		Scan(&batchRecordID); err != nil {
 		t.Fatal(err)
 	}
-	var batchRecordingID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_batch_recordings(batch_record_id,account_id,connection_id,
-		batch_id,recording_id,priority_ordinal,timezone,folder_name,naming_metadata,first_local_date,last_local_date,
-		qualification,qualification_sha256,qualification_policy_version,authoritative_job_ids)
-		VALUES($1,$2,$3,$4,$5,1,'UTC',$6,$7,$8,$8::date+13,$9,$10,'good-plus-v1',$11) RETURNING id`,
-		batchRecordID, accountID, connectionID, batchID, recordingID, folder, metadataJSON, firstDate.Format("2006-01-02"),
-		qualificationJSON, qualification.EvidenceSHA, jobIDs).Scan(&batchRecordingID); err != nil {
-		t.Fatal(err)
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,
+		batch_id,scope_kind,scope_id,artifact_kind,relative_path,object_key,content_type,expected_size_bytes,
+		expected_sha256,canonical_bytes,publication_state) VALUES($1,$2,$3,$4,'batch_index',$4,'batch_index',
+		'coverage/batch.json','joined/'||$4||'/coverage/batch.json','application/json',2,$5,'{}','sealed')`,
+		batchRecordID, accountID, connectionID, batchID, sha256Bytes([]byte("{}"))); err == nil {
+		t.Fatal("building batch accepted a non-ledger artifact")
 	}
-	type ledgerFixture struct {
-		artifactID, streamDayID          int64
-		scopeID, relativePath, objectKey string
-		bytes                            []byte
-		sha                              string
+	ledgers, sourceLedger, gapAtomicLedger, insertFinalChild := materializeJoinedCanonicalBatch(t, fixture, batchRecordID)
+	if len(ledgers) != 462 || sourceLedger == nil || gapAtomicLedger == nil || insertFinalChild == nil {
+		t.Fatalf("canonical materialization ledgers=%d source=%v gap=%v final=%v", len(ledgers), sourceLedger != nil,
+			gapAtomicLedger != nil, insertFinalChild != nil)
 	}
-	ledgers := make([]ledgerFixture, 0, 14)
-	var insertFinalSource func(pgx.Tx) error
-	for day := 0; day < 14; day++ {
-		date := firstDate.AddDate(0, 0, day)
-		request := joinedrecording.PlanRequest{BatchID: batchID, Generation: 1, RecordingID: recordingID,
-			Timezone: "UTC", LocalDate: date.Format("2006-01-02"), Qualification: qualification}
-		if day == 11 {
-			request.NextDayFirst = &sources[0]
-		} else if day == 12 {
-			request.Sources = sources
-		} else if day == 13 {
-			request.PreviousDayLast = &sources[len(sources)-1]
-		}
-		var draft joinedrecording.StreamDayDraft
-		var err error
-		if day == 12 {
-			draft, err = joinedrecording.AllocateStreamDay(request)
-		} else {
-			draft, err = joinedrecording.BuildGapOnlyStreamDay(request, date.Format("2006-01-02"))
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		ledger, err := joinedrecording.SealStreamDayAllocation(draft)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ledgerBytes, ledgerSHA, err := joinedrecording.CanonicalAllocationLedgerArtifact(ledger)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var streamDayID int64
-		if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_stream_days(batch_record_id,batch_recording_id,
-			account_id,connection_id,batch_id,recording_id,local_date,date_ordinal,recording_job_id,scheduled_start_at,
-			scheduled_end_at,source_clip_count,source_bytes,source_manifest_sha256,ledger_sha256,ledger_bytes,
-			ledger_artifact_sha256) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
-			batchRecordID, batchRecordingID, accountID, connectionID, batchID, recordingID, date.Format("2006-01-02"),
-			day+1, jobIDs[day], date, date.Add(12*time.Hour), len(request.Sources), int64(len(request.Sources)*10),
-			ledger.SourceClaimSHA256, ledger.LedgerSHA256, ledgerBytes, ledgerSHA).Scan(&streamDayID); err != nil {
-			t.Fatal(err)
-		}
-		for hour := 1; hour <= 12; hour++ {
-			hourID := fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-1", batchID, recordingID,
-				date.Format("2006-01-02"), hour)
-			scheduledStart := date.Add(time.Duration(hour-1) * time.Hour)
-			if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_hours(batch_record_id,stream_day_id,account_id,
-				connection_id,batch_id,recording_id,hour_id,local_date,delivery_hour,clock_hour,scheduled_start_at,
-				scheduled_end_at,priority_ordinal,source_clip_count,source_bytes,source_claim_sha256)
-				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, batchRecordID, streamDayID,
-				accountID, connectionID, batchID, recordingID, hourID, date.Format("2006-01-02"), hour, hour+7,
-				scheduledStart, scheduledStart.Add(time.Hour), int64(day*12+hour), len(ledger.Hours[hour-1].SourceClipIDs),
-				int64(len(ledger.Hours[hour-1].SourceClipIDs)*10), ledger.HourSourceSHA256[hour-1]); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if day == 12 {
-			if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_sources(batch_record_id,stream_day_id,
-				hour_record_id,account_id,connection_id,recording_id,recording_job_id,clip_id,storage_destination_id,
-				day_ordinal,hour_ordinal,provider,endpoint,region,bucket,object_key,version_id,etag,size_bytes,sha256,
-				start_at,end_at,seam_to_previous,clip_created_at)
-				SELECT $1,$2,h.id,$3,$4,rc.recording_id,rc.recording_job_id,rc.id,rc.storage_destination_id,4,4,
-				sd.provider,rc.endpoint,sd.region,rc.bucket,rc.object_key,'',rc.etag,rc.size_bytes,rc.sha256,
-				rc.clip_start_at,rc.clip_end_at,'{}',rc.created_at
-				FROM recording_joined_hours h, recording_clips rc JOIN storage_destinations sd ON sd.id=rc.storage_destination_id
-				WHERE h.stream_day_id=$2 AND h.delivery_hour=1 AND rc.id=$5`, batchRecordID, streamDayID,
-				accountID, connectionID, otherClipID); err == nil {
-				t.Fatal("batch accepted a source from another valid endpoint")
-			}
-			insertSources := func(tx pgx.Tx, swapHours, alterSeam bool, firstOrdinal, lastOrdinal int) error {
-				dayOrdinal := 0
-				for hourIndex, hour := range draft.Hours {
-					for hourOrdinal, source := range hour.Sources {
-						dayOrdinal++
-						if dayOrdinal < firstOrdinal || dayOrdinal > lastOrdinal {
-							continue
-						}
-						seam, _ := json.Marshal(source.SeamToPrevious)
-						if alterSeam && dayOrdinal == 2 {
-							seam = []byte(`{"verdict":"fabricated","reason":"fabricated","signed_gap_nanoseconds":0}`)
-						}
-						deliveryHour := hourIndex + 1
-						if swapHours {
-							deliveryHour = 3 - deliveryHour
-						}
-						if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_sources(batch_record_id,stream_day_id,
-						hour_record_id,account_id,connection_id,recording_id,recording_job_id,clip_id,storage_destination_id,
-						day_ordinal,hour_ordinal,provider,endpoint,region,bucket,object_key,version_id,etag,size_bytes,sha256,
-						start_at,end_at,seam_to_previous,clip_created_at,released_at)
-						SELECT $1,$2,h.id,$3,$4,rc.recording_id,rc.recording_job_id,rc.id,rc.storage_destination_id,$5,$6,
-						sd.provider,rc.endpoint,sd.region,rc.bucket,rc.object_key,'',rc.etag,rc.size_bytes,rc.sha256,
-						rc.clip_start_at,rc.clip_end_at,$7,rc.created_at,rc.released_at
-						FROM recording_joined_hours h, recording_clips rc JOIN storage_destinations sd ON sd.id=rc.storage_destination_id
-						WHERE h.stream_day_id=$2 AND h.delivery_hour=$8 AND rc.id=$9`, batchRecordID, streamDayID,
-							accountID, connectionID, dayOrdinal, hourOrdinal+1, seam, deliveryHour, source.ClipID); err != nil {
-							return err
-						}
-					}
-				}
-				return nil
-			}
-			insertFinalSource = func(tx pgx.Tx) error {
-				return insertSources(tx, false, false, len(sources), len(sources))
-			}
-			for _, invalid := range []struct {
-				name       string
-				swap, seam bool
-			}{{name: "swapped hour membership", swap: true}, {name: "ledger source evidence", seam: true}} {
-				badTx, err := pool.Begin(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := insertSources(badTx, invalid.swap, invalid.seam, 1, len(sources)); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := badTx.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, streamDayID); err == nil {
-					t.Fatalf("accepted invalid %s", invalid.name)
-				}
-				_ = badTx.Rollback(ctx)
-			}
-			goodTx, err := pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := insertSources(goodTx, false, false, 1, len(sources)-1); err != nil {
-				t.Fatal(err)
-			}
-			if err := goodTx.Commit(ctx); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for i, boundary := range ledger.Boundaries {
-			if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_day_boundaries(stream_day_id,boundary_kind,ordinal,
-				previous_delivery_hour,next_delivery_hour,previous_clip_id,next_clip_id,previous_presentation_end_at,
-				next_presentation_start_at,signed_gap_nanoseconds,scheduled_at,actual_seam_at,boundary_skew_nanoseconds,
-				allocation_decision,verdict,reason) VALUES($1,'cross_hour',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-				streamDayID, i+1, boundary.PreviousHour, boundary.NextHour, boundary.PreviousClipID, boundary.NextClipID,
-				boundary.PreviousPresentationEndUTC, boundary.NextPresentationStartUTC, boundary.SignedGapNanoseconds,
-				boundary.ScheduledUTC, boundary.ActualSeamUTC, boundary.BoundarySkewNanoseconds, boundary.AllocationDecision,
-				boundary.Verdict, boundary.Reason); err != nil {
-				t.Fatal(err)
-			}
-		}
-		for i, boundary := range ledger.CrossDayBoundaries {
-			if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_day_boundaries(stream_day_id,boundary_kind,ordinal,
-				previous_clip_id,next_clip_id,previous_presentation_end_at,next_presentation_start_at,signed_gap_nanoseconds,
-				scheduled_previous_end_at,scheduled_next_start_at,boundary_skew_nanoseconds,allocation_decision,verdict,reason)
-				VALUES($1,'cross_day',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, streamDayID, i+1,
-				boundary.PreviousClipID, boundary.NextClipID, boundary.PreviousPresentationEndUTC, boundary.NextPresentationStartUTC,
-				boundary.SignedGapNanoseconds, boundary.ScheduledPreviousEndUTC, boundary.ScheduledNextStartUTC,
-				boundary.BoundarySkewNanoseconds, boundary.AllocationDecision, boundary.Verdict, boundary.Reason); err != nil {
-				t.Fatal(err)
-			}
-		}
-		var artifactID int64
-		if err := pool.QueryRow(ctx, `SELECT nextval('recording_joined_artifacts_id_seq')`).Scan(&artifactID); err != nil {
-			t.Fatal(err)
-		}
-		relativePath, objectKey, err := joinedrecording.CanonicalAllocationLedgerPaths(batchID, recordingID, date.Format("2006-01-02"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		ledgers = append(ledgers, ledgerFixture{artifactID: artifactID, streamDayID: streamDayID,
-			scopeID:      fmt.Sprintf("%s__recording-%d__date-%s__generation-1", batchID, recordingID, date.Format("2006-01-02")),
-			relativePath: relativePath, objectKey: objectKey, bytes: ledgerBytes, sha: ledgerSHA})
-	}
-	for day, ledger := range ledgers {
-		if day >= 12 {
-			continue
-		}
-		if _, err := pool.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, ledger.streamDayID); err != nil {
-			t.Fatalf("validate stream day %d: %v", day+1, err)
-		}
+	recordingID, batchRecordingID := sourceLedger.recordingID, sourceLedger.batchRecordingID
+	var sources []joinedrecording.SourceClip
+	if err := json.Unmarshal(sourceLedger.bytes, &struct {
+		Sources *[]joinedrecording.SourceClip `json:"sources"`
+	}{Sources: &sources}); err != nil || len(sources) != 1 {
+		t.Fatalf("source ledger sources=%d err=%v", len(sources), err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_joined_batches SET state='frozen',frozen_at=clock_timestamp()
 		WHERE id=$1`, batchRecordID); err == nil {
@@ -381,10 +566,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if err := childTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&childPID); err != nil {
 		t.Fatal(err)
 	}
-	if insertFinalSource == nil {
-		t.Fatal("source-bearing fixture did not expose its final source")
-	}
-	if err := insertFinalSource(childTx); err != nil {
+	if err := insertFinalChild(childTx); err != nil {
 		t.Fatal(err)
 	}
 	freezeConn, err := pool.Acquire(ctx)
@@ -415,8 +597,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if err := <-freezeResult; err != nil {
 		t.Fatalf("freeze start after child commit: %v", err)
 	}
-	if _, err := freezeTx.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, ledgers[12].streamDayID); err != nil {
-		t.Fatalf("freeze did not see committed source child: %v", err)
+	if _, err := freezeTx.Exec(ctx, `SELECT validate_recording_joined_stream_day($1)`, ledgers[len(ledgers)-1].streamDayID); err != nil {
+		t.Fatalf("freeze did not see committed final child: %v", err)
 	}
 	if command, err := freezeTx.Exec(ctx, `UPDATE recording_joined_batches SET state='frozen',frozen_at=clock_timestamp()
 		WHERE id=$1`, batchRecordID); err != nil || command.RowsAffected() != 1 {
@@ -447,16 +629,6 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	lateConn.Release()
 	freezeConn.Release()
-	for _, ledger := range ledgers {
-		if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_artifacts(id,batch_record_id,account_id,connection_id,
-			batch_id,scope_kind,scope_id,stream_day_id,artifact_kind,ordinal,relative_path,object_key,content_type,
-			expected_size_bytes,expected_sha256,canonical_bytes,publication_state) VALUES($1,$2,$3,$4,$5,'ledger',$6,$7,
-			'allocation_ledger',1,$8,$9,'application/json',$10,$11,$12,'sealed')`, ledger.artifactID, batchRecordID,
-			accountID, connectionID, batchID, ledger.scopeID, ledger.streamDayID, ledger.relativePath, ledger.objectKey,
-			len(ledger.bytes), ledger.sha, ledger.bytes); err != nil {
-			t.Fatal(err)
-		}
-	}
 	ledgerArtifactID, ledgerRelative, ledgerObject := ledgers[0].artifactID, ledgers[0].relativePath, ledgers[0].objectKey
 	ledgerBytes, ledgerArtifactSHA := ledgers[0].bytes, ledgers[0].sha
 
@@ -565,8 +737,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		FROM connections WHERE id=$1 FOR UPDATE`, connectionID).Scan(&filesBefore, &bytesBefore); err != nil {
 		t.Fatal(err)
 	}
-	concurrentAck := joinedAckRequest{ArtifactID: ledgers[1].artifactID, RelativePath: ledgers[1].relativePath,
-		SizeBytes: int64(len(ledgers[1].bytes)), SHA256: ledgers[1].sha}
+	concurrentAck := joinedAckRequest{ArtifactID: gapAtomicLedger.artifactID, RelativePath: gapAtomicLedger.relativePath,
+		SizeBytes: int64(len(gapAtomicLedger.bytes)), SHA256: gapAtomicLedger.sha}
 	concurrentAckBody, _ := json.Marshal(concurrentAck)
 	ackDone := make(chan *httptest.ResponseRecorder, 2)
 	for range 2 {
@@ -613,10 +785,41 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	var filesAfter, bytesAfter int64
 	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM recording_joined_artifact_acks
 		WHERE artifact_id=$1 AND connection_id=$2),joined_files_pulled,joined_bytes_pulled
-		FROM connections WHERE id=$2`, ledgers[1].artifactID, connectionID).Scan(&ackRows, &filesAfter, &bytesAfter); err != nil ||
-		ackRows != 1 || filesAfter != filesBefore+1 || bytesAfter != bytesBefore+int64(len(ledgers[1].bytes)) {
+		FROM connections WHERE id=$2`, gapAtomicLedger.artifactID, connectionID).Scan(&ackRows, &filesAfter, &bytesAfter); err != nil ||
+		ackRows != 1 || filesAfter != filesBefore+1 || bytesAfter != bytesBefore+int64(len(gapAtomicLedger.bytes)) {
 		t.Fatalf("concurrent ACK rows=%d files=%d/%d bytes=%d/%d err=%v", ackRows, filesAfter, filesBefore,
 			bytesAfter, bytesBefore, err)
+	}
+	partialTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialToken := "00000000-0000-0000-0000-000000000003"
+	if _, err := partialTx.Exec(ctx, `UPDATE recording_joined_hours SET state='leased',attempt_count=1,claim_token=$2,
+		claimed_by='partial-seal-test',lease_expires_at=now()+interval '5 minutes',heartbeat_at=now()
+		WHERE stream_day_id=$1 AND delivery_hour=1`, sourceLedger.streamDayID, partialToken); err != nil {
+		_ = partialTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	partialSHA := strings.Repeat("5", 64)
+	if _, err := partialTx.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,
+		batch_id,scope_kind,scope_id,stream_day_id,hour_record_id,artifact_kind,ordinal,relative_path,object_key,
+		content_type,content_id,expected_size_bytes,expected_sha256)
+		SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,'media',1,
+		'partial.mp4','joined/'||batch_id||'/objects/'||$2||'.mp4','video/mp4',$2,1,$2
+		FROM recording_joined_hours WHERE stream_day_id=$1 AND delivery_hour=1`, sourceLedger.streamDayID, partialSHA); err != nil {
+		_ = partialTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := partialTx.Commit(ctx); err == nil {
+		t.Fatal("partial source-hour seal committed")
+	}
+	var partialState string
+	var partialArtifacts int
+	if err := pool.QueryRow(ctx, `SELECT state,(SELECT count(*) FROM recording_joined_artifacts a
+		WHERE a.hour_record_id=h.id) FROM recording_joined_hours h WHERE h.stream_day_id=$1 AND h.delivery_hour=1`,
+		sourceLedger.streamDayID).Scan(&partialState, &partialArtifacts); err != nil || partialState != "pending" || partialArtifacts != 0 {
+		t.Fatalf("partial source-hour seal leaked state=%s artifacts=%d err=%v", partialState, partialArtifacts, err)
 	}
 	sourceClaimBody, _ := json.Marshal(joinedrecording.WorkClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "source-worker"})
 	sourceClaimReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/claim", bytes.NewReader(sourceClaimBody))
@@ -704,8 +907,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if rec := ackArtifact(manifestAck); rec.Code == http.StatusOK {
 		t.Fatalf("manifest ACK bypassed ledger status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	sourceLedgerAck := joinedAckRequest{ArtifactID: ledgers[12].artifactID, RelativePath: ledgers[12].relativePath,
-		SizeBytes: int64(len(ledgers[12].bytes)), SHA256: ledgers[12].sha}
+	sourceLedgerAck := joinedAckRequest{ArtifactID: sourceLedger.artifactID, RelativePath: sourceLedger.relativePath,
+		SizeBytes: int64(len(sourceLedger.bytes)), SHA256: sourceLedger.sha}
 	if rec := ackArtifact(sourceLedgerAck); rec.Code != http.StatusOK {
 		t.Fatalf("source ledger ACK status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -730,20 +933,6 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		"joined/"+batchID+"/coverage/batch.json", strings.Repeat("d", 64), "00000000-0000-0000-0000-000000000001"); err == nil {
 		t.Fatal("artifact was born published")
 	}
-	var incompleteID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
-		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
-		expected_source_clips,expected_source_bytes) VALUES($1,$2,'incomplete-generation-1',1,$9,$3,$4,$5,$6,
-		'{"schema_version":1}',$7,$8,1,14,168,0,0) RETURNING id`, accountID, connectionID,
-		joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON, mediaTool.IdentitySHA256,
-		strings.Repeat("e", 64), strings.Repeat("f", 64), joinedTestSourceEndpoint).Scan(&incompleteID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_joined_batches SET state='frozen',frozen_at=$2 WHERE id=$1`,
-		incompleteID, qualification.FrozenAt); err == nil {
-		t.Fatal("incomplete joined batch froze")
-	}
 	malformedTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -752,7 +941,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	command, malformedErr := malformedTx.Exec(ctx, `UPDATE recording_joined_hours SET state='sealed',
 		source_only_sha256=source_claim_sha256,canonical_plan='{"expected_output_count":0}',manifest_bytes=$2,
 		manifest_sha256=encode(sha256($2),'hex'),sealed_at=now() WHERE stream_day_id=$1 AND delivery_hour=1`,
-		ledgers[1].streamDayID, malformedManifest)
+		gapAtomicLedger.streamDayID, malformedManifest)
 	if malformedErr == nil && command.RowsAffected() == 1 {
 		_, malformedErr = malformedTx.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,
 			connection_id,batch_id,scope_kind,scope_id,stream_day_id,hour_record_id,artifact_kind,ordinal,relative_path,
@@ -760,7 +949,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 			SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,'hour_manifest',1,
 			'coverage/hours/'||hour_id||'.json','joined/'||batch_id||'/coverage/hours/'||hour_id||'.json',
 			'application/json',$2,encode(sha256($3),'hex'),$3,'sealed' FROM recording_joined_hours
-			WHERE stream_day_id=$1 AND delivery_hour=1`, ledgers[1].streamDayID, len(malformedManifest), malformedManifest)
+			WHERE stream_day_id=$1 AND delivery_hour=1`, gapAtomicLedger.streamDayID, len(malformedManifest), malformedManifest)
 	}
 	if malformedErr == nil {
 		malformedErr = malformedTx.Commit(ctx)
@@ -774,7 +963,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	var malformedArtifacts int
 	if err := pool.QueryRow(ctx, `SELECT state,(SELECT count(*) FROM recording_joined_artifacts a
 		WHERE a.hour_record_id=h.id) FROM recording_joined_hours h WHERE h.stream_day_id=$1 AND h.delivery_hour=1`,
-		ledgers[1].streamDayID).Scan(&malformedState, &malformedArtifacts); err != nil || malformedState != "pending" || malformedArtifacts != 0 {
+		gapAtomicLedger.streamDayID).Scan(&malformedState, &malformedArtifacts); err != nil || malformedState != "pending" || malformedArtifacts != 0 {
 		t.Fatalf("malformed source-free seal leaked state=%s artifacts=%d err=%v", malformedState, malformedArtifacts, err)
 	}
 	sealTx, err := pool.Begin(ctx)
@@ -783,7 +972,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	var pendingHourID int64
 	if err := sealTx.QueryRow(ctx, `SELECT id FROM recording_joined_hours WHERE stream_day_id=$1 AND delivery_hour=1`,
-		ledgers[1].streamDayID).Scan(&pendingHourID); err != nil {
+		gapAtomicLedger.streamDayID).Scan(&pendingHourID); err != nil {
 		t.Fatal(err)
 	}
 	leaseToken := "00000000-0000-0000-0000-000000000002"
@@ -802,38 +991,10 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_joined_hours SET state='sealed',source_only_sha256=source_claim_sha256,
 		canonical_plan='{}',manifest_bytes='{}',manifest_sha256=encode(sha256('{}'::bytea),'hex'),sealed_at=now()
-		WHERE stream_day_id=$1 AND delivery_hour=2`, ledgers[12].streamDayID); err == nil {
+		WHERE stream_day_id=$1 AND delivery_hour=2`, sourceLedger.streamDayID); err == nil {
 		t.Fatal("source-bearing hour bypassed its worker lease")
 	}
-	partialTx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	partialToken := "00000000-0000-0000-0000-000000000003"
-	if _, err := partialTx.Exec(ctx, `UPDATE recording_joined_hours SET state='leased',attempt_count=1,claim_token=$2,
-		claimed_by='partial-seal-test',lease_expires_at=now()+interval '5 minutes',heartbeat_at=now()
-		WHERE stream_day_id=$1 AND delivery_hour=2`, ledgers[12].streamDayID, partialToken); err != nil {
-		t.Fatal(err)
-	}
-	partialSHA := strings.Repeat("5", 64)
-	if _, err := partialTx.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,
-		batch_id,scope_kind,scope_id,stream_day_id,hour_record_id,artifact_kind,ordinal,relative_path,object_key,
-		content_type,content_id,expected_size_bytes,expected_sha256)
-		SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,'media',1,
-		'partial.mp4','joined/'||batch_id||'/objects/'||$2||'.mp4','video/mp4',$2,1,$2
-		FROM recording_joined_hours WHERE stream_day_id=$1 AND delivery_hour=2`, ledgers[12].streamDayID, partialSHA); err != nil {
-		t.Fatal(err)
-	}
-	if err := partialTx.Commit(ctx); err == nil {
-		t.Fatal("partial source-hour seal committed")
-	}
-	var partialState string
-	var partialArtifacts int
-	if err := pool.QueryRow(ctx, `SELECT state,(SELECT count(*) FROM recording_joined_artifacts a
-		WHERE a.hour_record_id=h.id) FROM recording_joined_hours h WHERE h.stream_day_id=$1 AND h.delivery_hour=2`,
-		ledgers[12].streamDayID).Scan(&partialState, &partialArtifacts); err != nil || partialState != "pending" || partialArtifacts != 0 {
-		t.Fatalf("partial source-hour seal leaked state=%s artifacts=%d err=%v", partialState, partialArtifacts, err)
-	}
+	t.Log("JOINED_CANONICAL_LIFECYCLE_EXECUTED")
 }
 
 func joinedCanonicalPassingVerification() joinedrecording.Verification {
