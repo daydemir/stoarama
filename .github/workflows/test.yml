@@ -94,6 +94,8 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1
+      - name: Install FFmpeg for joined lifecycle tests
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Test joined Tier-1 freeze, retention, and canonical lifecycle
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
