@@ -256,6 +256,52 @@ func TestJoinedRemainingDaysProvesCanaryAndSealsSerially(t *testing.T) {
 	}
 }
 
+func TestJoinedRemainingDaysStopsAtFirstFailure(t *testing.T) {
+	t.Parallel()
+	const (
+		operatorToken = "joined-tier1-operator-token-at-least-32-bytes"
+		batchID       = "tier1-2026-08-generation-1"
+	)
+	canarySHA := strings.Repeat("a", 64)
+	days := make([]joinedAdminBatchStatusStreamDay, 0, len(joinedrecording.Tier1RecordingIDs)*14)
+	for _, recordingID := range joinedrecording.Tier1RecordingIDs {
+		for day := 1; day <= 14; day++ {
+			days = append(days, joinedAdminBatchStatusStreamDay{RecordingID: recordingID,
+				LocalDate: fmt.Sprintf("2026-08-%02d", day), State: "sealed", SourceCount: 1,
+				SourceBytes: 1, SealRequestSHA256: strings.Repeat("b", 64)})
+		}
+	}
+	days[0].SealRequestSHA256 = canarySHA
+	days[len(days)-2].State, days[len(days)-2].SealRequestSHA256 = "pending", ""
+	days[len(days)-1].State, days[len(days)-1].SealRequestSHA256 = "pending", ""
+	requests := make(chan string, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.Method
+		if r.Method == http.MethodGet {
+			writeJoinedTestJSON(t, w, joinedAdminBatchStatus{ProtocolVersion: 1, BatchID: batchID, State: "building",
+				FrozenDenominatorSHA256: strings.Repeat("c", 64), ExpectedStreamDays: len(days),
+				ExpectedScheduledHours: len(days) * 12, StreamDays: days})
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api, operatorToken: operatorToken}
+	_, err = service.SealRemainingDays(context.Background(), joinedSealRemainingDaysRequest{BatchID: batchID,
+		CanaryRecordingID: days[0].RecordingID, CanaryLocalDate: days[0].LocalDate,
+		ExpectedCanarySealRequestSHA256: canarySHA, Apply: true})
+	if err == nil {
+		t.Fatal("remaining-day failure was ignored")
+	}
+	if len(requests) != 2 || <-requests != http.MethodGet || <-requests != http.MethodPost {
+		t.Fatalf("remaining-day request count/order differs")
+	}
+}
+
 func TestJoinedFinalizeAcceptsExactNoContent(t *testing.T) {
 	t.Parallel()
 	const token = "operation-token-kept-secret"

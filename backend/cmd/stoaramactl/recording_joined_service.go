@@ -153,12 +153,8 @@ func (s *remoteJoinedOperatorService) SealRemainingDays(ctx context.Context, req
 	if err != nil {
 		return nil, err
 	}
-	if status.ProtocolVersion != joinedrecording.JoinedProtocolVersion || status.BatchID != req.BatchID ||
-		status.State != "building" || status.FreezeStartedAt != nil || status.FrozenAt != nil ||
-		status.ExpectedStreamDays != len(joinedrecording.Tier1RecordingIDs)*14 ||
-		status.ExpectedScheduledHours != len(joinedrecording.Tier1RecordingIDs)*14*12 ||
-		len(status.StreamDays) != status.ExpectedStreamDays {
-		return nil, errors.New("joined batch is not ready for serial stream-day sealing")
+	if err := validateJoinedAdminBatchStatus(status, req.BatchID); err != nil {
+		return nil, err
 	}
 	canaryFound := false
 	pending := make([]joinedSealStreamDayRequest, 0, status.ExpectedStreamDays-1)
@@ -203,6 +199,36 @@ func (s *remoteJoinedOperatorService) SealRemainingDays(ctx context.Context, req
 	}
 	return map[string]any{"dry_run": false, "batch_id": req.BatchID, "already_sealed": sealed,
 		"sealed_now": completed, "remaining": 0}, nil
+}
+
+func validateJoinedAdminBatchStatus(status joinedAdminBatchStatus, batchID string) error {
+	if status.ProtocolVersion != joinedrecording.JoinedProtocolVersion || status.BatchID != batchID ||
+		status.State != "building" || status.FreezeStartedAt != nil || status.FrozenAt != nil ||
+		status.ExpectedStreamDays != len(joinedrecording.Tier1RecordingIDs)*14 ||
+		status.ExpectedScheduledHours != len(joinedrecording.Tier1RecordingIDs)*14*12 ||
+		len(status.StreamDays) != status.ExpectedStreamDays ||
+		validateExpectedHash("frozen_denominator_sha256", status.FrozenDenominatorSHA256, true) != nil {
+		return errors.New("joined batch is not ready for serial stream-day sealing")
+	}
+	for index, day := range status.StreamDays {
+		if day.RecordingID != joinedrecording.Tier1RecordingIDs[index/14] || day.SourceCount < 0 || day.SourceBytes < 0 ||
+			(day.SourceCount == 0) != (day.SourceBytes == 0) || (day.State != "pending" && day.State != "sealed") ||
+			(day.State == "pending" && day.SealRequestSHA256 != "") ||
+			(day.State == "sealed" && validateExpectedHash("seal_request_sha256", day.SealRequestSHA256, true) != nil) {
+			return errors.New("joined stream-day status evidence differs")
+		}
+		date, err := time.Parse("2006-01-02", day.LocalDate)
+		if err != nil || date.Format("2006-01-02") != day.LocalDate {
+			return errors.New("joined stream-day status date differs")
+		}
+		if index%14 != 0 {
+			previous, _ := time.Parse("2006-01-02", status.StreamDays[index-1].LocalDate)
+			if !date.Equal(previous.AddDate(0, 0, 1)) {
+				return errors.New("joined stream-day status dates are not consecutive")
+			}
+		}
+	}
+	return nil
 }
 
 func (s *remoteJoinedOperatorService) adminBatchStatus(ctx context.Context, token, batchID string) (joinedAdminBatchStatus, error) {
