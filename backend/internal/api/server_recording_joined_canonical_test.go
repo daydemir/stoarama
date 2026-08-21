@@ -1086,6 +1086,31 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		sourceSecret); err != nil {
 		t.Fatal(err)
 	}
+	var unreferencedStorageID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,
+		access_key_id,secret_access_key_enc,status,managed) VALUES($1,'joined-unreferenced-alias','r2',$2,'auto',
+		'unreferenced','  '||$3||'  ',$4,'verified',false) RETURNING id`, accountID, joinedTestSourceEndpoint,
+		s.cfg.JoinedWorkerBootstrapToken, sourceSecret).Scan(&unreferencedStorageID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := sourceCapability(); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unreferenced whitespace access alias status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	whitespaceSigningSecret, err := s.secrets.Encrypt([]byte("  " + s.cfg.JoinedWorkerSigningKey + "  "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET access_key_id='safe-unreferenced-key',
+		secret_access_key_enc=$2 WHERE id=$1`, unreferencedStorageID, whitespaceSigningSecret); err != nil {
+		t.Fatal(err)
+	}
+	if rec := sourceCapability(); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unreferenced whitespace secret alias status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE storage_destinations SET secret_access_key_enc=$2 WHERE id=$1`,
+		unreferencedStorageID, sourceSecret); err != nil {
+		t.Fatal(err)
+	}
 	mediaSHA := strings.Repeat("3", 64)
 	sealRequest := joinedrecording.SealHourRequest{ProtocolVersion: 1, HourID: sourceClaim.HourID,
 		SourceClaimSHA256: sourceClaim.SourceClaimSHA256, AccountedSources: sourceClaim.Sources,

@@ -84,7 +84,10 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 		{JoinedRecordingEnabled: true, ServiceToken: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
 		{JoinedRecordingEnabled: true, ServiceToken: "service", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: bootstrap},
 		{JoinedRecordingEnabled: true, DatabaseURL: "postgres://user:" + signing + "@db.example.test/db", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, DatabaseURL: "host=db.example.test user=test password='" + signing + "'", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
 		{JoinedRecordingEnabled: true, R2SecretAccessKey: bootstrap, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, R2AccessKeyID: "  " + bootstrap + "  ", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
+		{JoinedRecordingEnabled: true, R2SecretAccessKey: "  " + signing + "  ", JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing},
 		{JoinedRecordingEnabled: true, JoinedWorkerBootstrapToken: strings.Repeat("b", 31), JoinedWorkerSigningKey: signing},
 		{JoinedRecordingEnabled: true, JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: strings.Repeat("s", 31)},
 	} {
