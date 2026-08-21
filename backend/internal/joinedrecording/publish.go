@@ -24,6 +24,7 @@ type WorkerClaim struct {
 	Plan                     BatchPlan              `json:"plan"`
 	Allocation               HourManifestAllocation `json:"allocation"`
 	AllocationLedger         StreamDayAllocation    `json:"allocation_ledger"`
+	HourManifest             HourManifest           `json:"hour_manifest"`
 	MediaArtifactIDs         []int64                `json:"media_artifact_ids"`
 	HourManifestArtifactID   int64                  `json:"hour_manifest_artifact_id"`
 	HourManifestExpectedSize int64                  `json:"hour_manifest_expected_size_bytes"`
@@ -132,6 +133,18 @@ func (c WorkerClaim) Validate(now time.Time) error {
 		}
 		seen[artifactID] = true
 	}
+	built := make([]BuiltOutput, len(c.HourManifest.Media))
+	for i, media := range c.HourManifest.Media {
+		built[i] = BuiltOutput{SizeBytes: media.SizeBytes, SHA256: media.SHA256, SourceCount: len(media.SourceClipIDs),
+			Verification: media.Verification, SplitEvidence: append([]MaximalityEvidence(nil), media.MaximalityEvidence...)}
+	}
+	manifest, canonical, sha, err := BuildHourManifest(HourManifestInput{Plan: c.Plan, Allocation: c.Allocation,
+		AllocationLedger: c.AllocationLedger, MediaArtifactIDs: c.MediaArtifactIDs, Built: built,
+		QuarantineEvidence: c.HourManifest.QuarantineEvidence})
+	if err != nil || int64(len(canonical)) != c.HourManifestExpectedSize || sha != c.HourManifestExpectedSHA ||
+		!sameCanonical([]HourManifest{manifest}, []HourManifest{c.HourManifest}) {
+		return fmt.Errorf("sealed joined hour manifest differs")
+	}
 	return nil
 }
 
@@ -211,13 +224,16 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	if err := finalize(ctx, claim, published); err != nil {
 		return PublishedHour{}, fmt.Errorf("immutable joined hour verified but fenced database reconciliation remains pending: %w", err)
 	}
+	if filepath.Base(scratchDir) != claim.LeaseID || filepath.Clean(scratchDir) != scratchDir {
+		return PublishedHour{}, fmt.Errorf("refusing cleanup outside current lease scratch")
+	}
 	for _, output := range built {
 		if !SafeScratchOutput(output.Path, scratchDir) {
 			return PublishedHour{}, fmt.Errorf("refusing cleanup outside scratch")
 		}
-		if err := os.Remove(output.Path); err != nil && !os.IsNotExist(err) {
-			return PublishedHour{}, fmt.Errorf("cleanup verified worker scratch: %w", err)
-		}
+	}
+	if err := os.RemoveAll(scratchDir); err != nil {
+		return PublishedHour{}, fmt.Errorf("cleanup verified worker scratch: %w", err)
 	}
 	return published, nil
 }

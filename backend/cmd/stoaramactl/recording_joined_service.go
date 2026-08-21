@@ -20,6 +20,7 @@ import (
 const (
 	joinedAPITimeout       = 60 * time.Second
 	joinedWorkerIdlePoll   = 2 * time.Second
+	joinedWorkerTaskLimit  = 2 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
 )
 
@@ -60,7 +61,34 @@ type joinedAdminBatchStatus struct {
 	StreamDays              []joinedAdminBatchStatusStreamDay `json:"stream_days"`
 }
 
+type joinedWorkerStatus struct {
+	ProtocolVersion int              `json:"protocol_version"`
+	Enabled         bool             `json:"enabled"`
+	BatchID         string           `json:"batch_id"`
+	CanaryHourIDs   []string         `json:"canary_hour_ids"`
+	Hours           map[string]int64 `json:"hours"`
+}
+
+type joinedSealStreamDayReceipt struct {
+	ProtocolVersion   int    `json:"protocol_version"`
+	BatchID           string `json:"batch_id"`
+	RecordingID       int64  `json:"recording_id"`
+	LocalDate         string `json:"local_date"`
+	SourceSnapshotSHA string `json:"source_snapshot_sha256"`
+	HeadManifestSHA   string `json:"head_manifest_sha256"`
+	LedgerSHA         string `json:"ledger_sha256"`
+	LedgerArtifactSHA string `json:"ledger_artifact_sha256"`
+	SealRequestSHA    string `json:"seal_request_sha256"`
+	LedgerArtifactID  int64  `json:"ledger_artifact_id"`
+	SourceCount       int    `json:"source_count"`
+	SourceBytes       int64  `json:"source_bytes"`
+	AlreadySealed     bool   `json:"already_sealed"`
+}
+
 func newRemoteJoinedOperatorService(cfg config.Config) (*remoteJoinedOperatorService, error) {
+	if err := cfg.ValidateJoined(); err != nil {
+		return nil, err
+	}
 	api, err := newJoinedAPIClient(cfg.AppBaseURL, cfg.JoinedRecordingWorkerToken, nil)
 	if err != nil {
 		return nil, err
@@ -137,9 +165,19 @@ func (s *remoteJoinedOperatorService) SealStreamDay(ctx context.Context, req joi
 		RecordingID     int64  `json:"recording_id"`
 		LocalDate       string `json:"local_date"`
 	}{joinedrecording.JoinedProtocolVersion, req.BatchID, req.RecordingID, req.LocalDate}
-	var response map[string]any
+	var response joinedSealStreamDayReceipt
 	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/stream-days/seal", token, payload, &response); err != nil {
 		return nil, err
+	}
+	if response.ProtocolVersion != joinedrecording.JoinedProtocolVersion || response.BatchID != req.BatchID ||
+		response.RecordingID != req.RecordingID || response.LocalDate != req.LocalDate || response.LedgerArtifactID <= 0 ||
+		response.SourceCount < 0 || response.SourceBytes < 0 || (response.SourceCount == 0) != (response.SourceBytes == 0) ||
+		validateExpectedHash("source_snapshot_sha256", response.SourceSnapshotSHA, true) != nil ||
+		validateExpectedHash("head_manifest_sha256", response.HeadManifestSHA, true) != nil ||
+		validateExpectedHash("ledger_sha256", response.LedgerSHA, true) != nil ||
+		validateExpectedHash("ledger_artifact_sha256", response.LedgerArtifactSHA, true) != nil ||
+		validateExpectedHash("seal_request_sha256", response.SealRequestSHA, true) != nil {
+		return nil, errors.New("joined stream-day seal receipt differs")
 	}
 	return response, nil
 }
@@ -267,7 +305,7 @@ func (s *remoteJoinedOperatorService) Status(ctx context.Context, req joinedStat
 	if strings.TrimSpace(s.api.bootstrapToken) == "" {
 		return nil, errors.New("joined worker bootstrap token is required for worker status")
 	}
-	var status map[string]any
+	var status joinedWorkerStatus
 	path := "/api/v1/recording/joined/status?batch_id=" + url.QueryEscape(req.BatchID)
 	if err := s.api.getJSON(ctx, path, s.api.bootstrapToken, &status); err != nil {
 		return nil, err
@@ -294,10 +332,19 @@ func (s *remoteJoinedOperatorService) CheckWorkerStartup(ctx context.Context, re
 	if err != nil {
 		return fmt.Errorf("read joined backend status: %w", err)
 	}
-	values, ok := status.(map[string]any)
-	enabled, present := values["enabled"].(bool)
-	if !ok || !present || !enabled {
+	values, ok := status.(joinedWorkerStatus)
+	if !ok || validateJoinedWorkerStatus(s.cfg, req.BatchID, values) != nil {
 		return fmt.Errorf("joined backend is not enabled")
+	}
+	return nil
+}
+
+func validateJoinedWorkerStatus(cfg config.Config, batchID string, status joinedWorkerStatus) error {
+	localHours, err := cfg.JoinedCanaryHourIDs()
+	if err != nil || !status.Enabled || status.ProtocolVersion != joinedrecording.JoinedProtocolVersion ||
+		status.BatchID != batchID || batchID != cfg.JoinedRecordingBatchID ||
+		strings.Join(status.CanaryHourIDs, ",") != strings.Join(localHours, ",") {
+		return errors.New("joined backend batch or canary scope differs")
 	}
 	return nil
 }
@@ -340,13 +387,68 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 		return false, err
 	}
 	if ok {
-		return true, s.processClaim(ctx, publication, req.ScratchRoot)
+		if err := joinedPublicationWithinCanary(s.cfg, publication); err != nil {
+			return false, err
+		}
+		return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, func(taskCtx context.Context) error {
+			return s.processClaim(taskCtx, publication, req.ScratchRoot)
+		})
 	}
 	preflight, ok, err := s.api.claimPreflight(ctx, bootstrap.ClaimToken, claimRequest)
 	if err != nil || !ok {
 		return false, err
 	}
-	return true, s.processPreflight(ctx, preflight, req.ScratchRoot)
+	if !joinedHourWithinCanary(s.cfg, preflight.HourID) {
+		return false, errors.New("joined preflight claim is outside configured canary scope")
+	}
+	return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, func(taskCtx context.Context) error {
+		return s.processPreflight(taskCtx, preflight, req.ScratchRoot)
+	})
+}
+
+func joinedHourWithinCanary(cfg config.Config, hourID string) bool {
+	hours, err := cfg.JoinedCanaryHourIDs()
+	if err != nil {
+		return false
+	}
+	for _, allowed := range hours {
+		if hourID == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func joinedPublicationWithinCanary(cfg config.Config, response joinedrecording.PublicationClaimResponse) error {
+	switch response.Kind {
+	case "hour":
+		if response.Hour != nil && joinedHourWithinCanary(cfg, response.Hour.HourID) {
+			return nil
+		}
+	case "ledger":
+		if response.Ledger != nil {
+			ledger := response.Ledger.Ledger
+			for _, hour := range ledger.Hours {
+				hourID, err := joinedrecording.CanonicalHourID(ledger.BatchID, ledger.RecordingID, ledger.LocalDate,
+					hour.DeliveryHour, ledger.Generation)
+				if err == nil && joinedHourWithinCanary(cfg, hourID) {
+					return nil
+				}
+			}
+		}
+	case "batch_index":
+		return errors.New("joined batch index is not eligible during the exact-hour canary")
+	}
+	return errors.New("joined publication claim is outside configured canary scope")
+}
+
+func runJoinedWorkerTask(ctx context.Context, limit time.Duration, work func(context.Context) error) error {
+	if limit <= 0 || work == nil {
+		return errors.New("joined worker task limit is required")
+	}
+	taskCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	return work(taskCtx)
 }
 
 func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, claim joinedrecording.PreflightHourClaim, scratchRoot string) error {
@@ -392,16 +494,26 @@ func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response
 		return err
 	case "hour":
 		claim := *response.Hour
-		if !claim.Plan.GapOnly {
-			return fmt.Errorf("source-bearing reclaimed hour %q cannot yet be rebuilt; refusing unverified publication", claim.HourID)
+		var scratch joinedrecording.SealedHourScratch
+		var err error
+		if claim.Plan.GapOnly {
+			scratch, err = joinedrecording.BindReclaimedGapOnlyHourScratch(claim, scratchRoot)
+		} else {
+			resolveSource := func(callCtx context.Context, current joinedrecording.WorkerClaim, source joinedrecording.SourceClip, operation string) (joinedrecording.SourceReadCapability, error) {
+				return s.api.sourceCapability(callCtx, current.OperationToken, joinedrecording.SourceCapabilityRequest{
+					ProtocolVersion: joinedrecording.JoinedProtocolVersion, HourID: current.HourID,
+					ClipID: source.ClipID, Operation: operation,
+				})
+			}
+			scratch, err = joinedrecording.RebuildSealedHourRenewing(ctx, claim, scratchRoot, s.capabilityClient,
+				s.cfg.JoinedRecordingStorageAuthority, s.hourHeartbeat(claim.HourID), resolveSource)
 		}
-		scratch, err := joinedrecording.BindReclaimedGapOnlyHourScratch(claim, scratchRoot)
 		if err != nil {
-			return fmt.Errorf("rebuild reclaimed gap-only hour: %w", err)
+			return fmt.Errorf("rebuild reclaimed joined hour: %w", err)
 		}
 		_, err = joinedrecording.PublishClaimedHourRenewing(ctx, s.capabilityClient, s.cfg.JoinedRecordingStorageAuthority, claim, scratch, s.hourHeartbeat(claim.HourID), s.hourCreateCapability, s.hourReadCapability, s.finalizeHour)
 		if err != nil {
-			return fmt.Errorf("publish reclaimed gap-only hour: %w", err)
+			return fmt.Errorf("publish reclaimed joined hour: %w", err)
 		}
 		return nil
 	case "batch_index":

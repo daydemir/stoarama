@@ -124,7 +124,7 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 	response := joinedrecording.WorkerClaim{ProtocolVersion: joinedWorkerProtocolVersion, HourID: plan.HourID,
 		LeaseID: joinedauth.LeaseID(publicationToken), OperationToken: operationToken, LeaseExpires: leaseExpires,
 		StorageAuthority: authority, StorageBucket: s.cfg.R2Bucket, Plan: plan, Allocation: manifest.Allocation,
-		AllocationLedger: ledger, MediaArtifactIDs: mediaIDs, HourManifestArtifactID: manifestID,
+		AllocationLedger: ledger, HourManifest: manifest, MediaArtifactIDs: mediaIDs, HourManifestArtifactID: manifestID,
 		HourManifestExpectedSize: int64(len(manifestBytes)), HourManifestExpectedSHA: manifestSHA}
 	if err := response.Validate(time.Now().UTC()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("validate joined hour publication: %v", err))

@@ -30,6 +30,14 @@ func completeStripeConfig(livemode bool) Config {
 	}
 }
 
+func joinedCanaryScope(batch string) string {
+	return strings.Join([]string{
+		batch + "__recording-377__date-2026-08-01__hour-01__generation-1",
+		batch + "__recording-335__date-2026-08-01__hour-02__generation-1",
+		batch + "__recording-337__date-2026-08-01__hour-03__generation-1",
+	}, ",")
+}
+
 func TestValidateStripeFailsClosed(t *testing.T) {
 	if err := (Config{}).ValidateStripe(); err != nil {
 		t.Fatalf("empty optional config: %v", err)
@@ -76,7 +84,7 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	const bootstrap = "joined-bootstrap-credential-32bytes"
 	const signing = "joined-signing-credential-32-bytes"
 	const batch = "tier1-2026-08"
-	const hour = batch + "__recording-377__date-2026-08-01__hour-01__generation-1"
+	hour := joinedCanaryScope(batch)
 	valid := Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
 		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour, ServiceToken: "service",
 		JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing}
@@ -177,7 +185,7 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 		JoinedRecordingEnabled:             true,
 		JoinedRecordingProtocolVersion:     1,
 		JoinedRecordingBatchID:             "tier1-2026-08",
-		JoinedRecordingCanaryHourIDs:       "tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1",
+		JoinedRecordingCanaryHourIDs:       joinedCanaryScope("tier1-2026-08"),
 		JoinedRecordingScratchRoot:         "/tmp/stoarama-joined",
 		JoinedRecordingStorageAuthority:    "example.r2.cloudflarestorage.com",
 		JoinedRecordingFFmpegArchiveURL:    "https://example.com/ffmpeg/7.1.1/linux64.tar.xz",
@@ -215,15 +223,19 @@ func TestValidateJoinedRecordingActivation(t *testing.T) {
 
 func TestJoinedCanaryScopeAndRoleSeparationFailClosed(t *testing.T) {
 	const batch = "tier1-2026-08"
-	const hour = batch + "__recording-377__date-2026-08-01__hour-01__generation-1"
+	hour := joinedCanaryScope(batch)
+	hours := strings.Split(hour, ",")
 	base := Config{JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: batch,
 		JoinedRecordingCanaryHourIDs: hour}
 	invalidScopes := map[string]string{
 		"empty":        "",
-		"malformed":    batch + "__recording-0377__date-2026-08-01__hour-01__generation-1",
-		"invalid date": batch + "__recording-377__date-2026-02-30__hour-01__generation-1",
-		"wrong batch":  "other-batch__recording-377__date-2026-08-01__hour-01__generation-1",
-		"duplicate":    hour + "," + hour,
+		"one hour":     hours[0],
+		"two hours":    strings.Join(hours[:2], ","),
+		"four hours":   hour + "," + batch + "__recording-355__date-2026-08-01__hour-04__generation-1",
+		"malformed":    strings.Join([]string{batch + "__recording-0377__date-2026-08-01__hour-01__generation-1", hours[1], hours[2]}, ","),
+		"invalid date": strings.Join([]string{batch + "__recording-377__date-2026-02-30__hour-01__generation-1", hours[1], hours[2]}, ","),
+		"wrong batch":  strings.Join([]string{"other-batch__recording-377__date-2026-08-01__hour-01__generation-1", hours[1], hours[2]}, ","),
+		"duplicate":    strings.Join([]string{hours[0], hours[0], hours[2]}, ","),
 	}
 	for name, scope := range invalidScopes {
 		t.Run(name, func(t *testing.T) {
@@ -297,7 +309,7 @@ func TestLoadAllowsWorkerWithoutBackendAuthority(t *testing.T) {
 		"JOINED_RECORDING_ENABLED":               "true",
 		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
 		"JOINED_RECORDING_BATCH_ID":              "tier1-2026-08",
-		"JOINED_RECORDING_CANARY_HOUR_IDS":       "tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1",
+		"JOINED_RECORDING_CANARY_HOUR_IDS":       joinedCanaryScope("tier1-2026-08"),
 		"JOINED_WORKER_BOOTSTRAP_TOKEN":          "",
 		"JOINED_WORKER_SIGNING_KEY":              "",
 		"STOARAMA_JOINED_OPERATOR_TOKEN":         "",

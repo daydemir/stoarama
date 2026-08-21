@@ -88,6 +88,11 @@ func (s *Server) requireJoinedWorkerAuth(next http.Handler) http.Handler {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		if claims.Kind == joinedauth.KindOperation && s.joinedControlPlaneReady() &&
+			!s.joinedOperationWithinCanary(r.Context(), claims) {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
 		if err := s.validateJoinedStorageCredentialIsolation(r.Context()); err != nil {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -95,6 +100,33 @@ func (s *Server) requireJoinedWorkerAuth(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), joinedWorkerClaimsContextKey{}, claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (s *Server) joinedOperationWithinCanary(ctx context.Context, claims joinedauth.Claims) bool {
+	hours := s.joinedCanaryHourIDs()
+	switch claims.SubjectKind {
+	case joinedauth.SubjectHour:
+		for _, hourID := range hours {
+			if claims.SubjectID == hourID {
+				return true
+			}
+		}
+		return false
+	case joinedauth.SubjectLedger:
+		if s.pool == nil {
+			return false
+		}
+		var allowed bool
+		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_artifacts a
+			JOIN recording_joined_hours h ON h.stream_day_id=a.stream_day_id
+			WHERE a.batch_id=$1 AND a.artifact_kind='allocation_ledger' AND a.scope_id=$2
+			  AND h.hour_id=ANY($3::text[]))`, claims.BatchID, claims.SubjectID, hours).Scan(&allowed)
+		return err == nil && allowed
+	case joinedauth.SubjectBatchIndex:
+		return false
+	default:
+		return false
+	}
 }
 
 func joinedWorkerClaimsFromContext(ctx context.Context) (joinedauth.Claims, bool) {

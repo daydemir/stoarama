@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +19,24 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
+
+func joinedCanaryScopeForTest(batch string, included ...string) string {
+	hours := append([]string(nil), included...)
+	for i := 1; len(hours) < 3; i++ {
+		candidate := fmt.Sprintf("%s__recording-99999%d__date-2026-08-01__hour-%02d__generation-1", batch, i, i)
+		duplicate := false
+		for _, hour := range hours {
+			if candidate == hour {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			hours = append(hours, candidate)
+		}
+	}
+	return strings.Join(hours, ",")
+}
 
 func TestValidateJoinedAck(t *testing.T) {
 	valid := joinedAckRequest{ArtifactID: 1, RelativePath: "site/May/Monday/hour_01_part_01_0800-0900.mp4", SizeBytes: 10, SHA256: strings.Repeat("a", 64)}
@@ -289,7 +308,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	s.cfg.JoinedRecordingControlPlaneEnabled = true
 	s.cfg.JoinedRecordingProtocolVersion = 1
 	s.cfg.JoinedRecordingBatchID = "batch-test"
-	s.cfg.JoinedRecordingCanaryHourIDs = "batch-test__recording-1__date-2026-08-01__hour-01__generation-1"
+	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest("batch-test", "batch-test__recording-1__date-2026-08-01__hour-01__generation-1")
 	bootstrapLeaseRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", strings.NewReader(`{"lease_id":"forbidden"}`))
 	bootstrapLeaseRequest.Header.Set("Authorization", "Bearer "+bootstrapCredential)
 	bootstrapLeaseResponse := httptest.NewRecorder()
@@ -301,14 +320,20 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	canaryHourID := strings.Split(s.cfg.JoinedRecordingCanaryHourIDs, ",")[0]
+	canaryToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, "batch-test", joinedauth.SubjectHour,
+		canaryHourID, claim, joinedauth.OperationPreflight, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name, path, body, auth string
 		handler                http.HandlerFunc
 	}{
 		{name: "claim", path: "/api/v1/recording/joined/claim", body: `{"worker_id":"worker","lease_id":"forbidden"}`, auth: claimAuth, handler: s.handleJoinedClaim},
-		{name: "heartbeat", path: "/api/v1/recording/joined/heartbeat", body: `{"scope_kind":"hour","scope_id":"hour-test","lease_id":"forbidden"}`, auth: token, handler: s.handleJoinedHeartbeat},
-		{name: "source capability", path: "/api/v1/recording/joined/capabilities/source", body: `{"hour_id":"hour-test","clip_id":1,"lease_id":"forbidden"}`, auth: token, handler: s.handleJoinedSourceCapability},
-		{name: "artifact capability", path: "/api/v1/recording/joined/capabilities/artifact", body: `{"scope_kind":"hour","scope_id":"hour-test","artifact_id":1,"operation":"put","lease_id":"forbidden"}`, auth: token, handler: s.handleJoinedArtifactCapability},
+		{name: "heartbeat", path: "/api/v1/recording/joined/heartbeat", body: `{"scope_kind":"hour","scope_id":"` + canaryHourID + `","lease_id":"forbidden"}`, auth: canaryToken, handler: s.handleJoinedHeartbeat},
+		{name: "source capability", path: "/api/v1/recording/joined/capabilities/source", body: `{"hour_id":"` + canaryHourID + `","clip_id":1,"lease_id":"forbidden"}`, auth: canaryToken, handler: s.handleJoinedSourceCapability},
+		{name: "artifact capability", path: "/api/v1/recording/joined/capabilities/artifact", body: `{"scope_kind":"hour","scope_id":"` + canaryHourID + `","artifact_id":1,"operation":"put","lease_id":"forbidden"}`, auth: canaryToken, handler: s.handleJoinedArtifactCapability},
 	} {
 		t.Run("response-only lease_id "+tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
@@ -319,6 +344,35 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestJoinedOperationTokenIsFencedByCurrentExactCanaryScope(t *testing.T) {
+	const batch = "tier1-2026-08"
+	inside := batch + "__recording-377__date-2026-08-01__hour-01__generation-1"
+	cfg := config.Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: joinedCanaryScopeForTest(batch, inside),
+		JoinedWorkerBootstrapToken: "joined-bootstrap-credential-32bytes",
+		JoinedWorkerSigningKey:     "joined-signing-credential-32-bytes"}
+	s := &Server{cfg: cfg, joinedCredentialCheck: func(context.Context) error { return nil }}
+	call := func(hourID string) int {
+		token, err := joinedauth.MintOperation(cfg.JoinedWorkerSigningKey, batch, joinedauth.SubjectHour, hourID,
+			uuid.New(), joinedauth.OperationPublish, time.Now().Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/heartbeat", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if status := call(inside); status != http.StatusNoContent {
+		t.Fatalf("current canary operation status=%d", status)
+	}
+	outside := batch + "__recording-377__date-2026-08-01__hour-04__generation-1"
+	if status := call(outside); status != http.StatusUnauthorized {
+		t.Fatalf("outside canary operation status=%d", status)
 	}
 }
 

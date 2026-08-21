@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -150,6 +151,10 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 			t.Errorf("operator request body=%v err=%v", body, err)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/recording/joined/stream-days/seal" {
+			writeJoinedTestJSON(t, w, joinedSealReceipt(batchID, 377, "2026-08-01"))
+			return
+		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
@@ -194,6 +199,23 @@ func TestJoinedOperatorRejectsWorkerTokenAliasBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestJoinedSealStreamDayRejectsUnboundSuccessReceipt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api, operatorToken: "joined-tier1-operator-token-at-least-32-bytes"}
+	if _, err := service.SealStreamDay(context.Background(), joinedSealStreamDayRequest{BatchID: "tier1-2026-08",
+		RecordingID: 377, LocalDate: "2026-08-01", Apply: true}); err == nil {
+		t.Fatal("unbound 2xx stream-day response was accepted")
+	}
+}
+
 func TestJoinedRemainingDaysProvesCanaryAndSealsSerially(t *testing.T) {
 	t.Parallel()
 	const (
@@ -231,7 +253,7 @@ func TestJoinedRemainingDaysProvesCanaryAndSealsSerially(t *testing.T) {
 			request["recording_id"] != float64(streamDays[pending].RecordingID) || request["local_date"] != streamDays[pending].LocalDate {
 			t.Errorf("pending request=%v err=%v", request, err)
 		}
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		writeJoinedTestJSON(t, w, joinedSealReceipt(batchID, streamDays[pending].RecordingID, streamDays[pending].LocalDate))
 	}))
 	defer server.Close()
 	api, err := newJoinedAPIClient(server.URL, "", server.Client())
@@ -339,12 +361,54 @@ func TestJoinedFinalizeAcceptsExactNoContent(t *testing.T) {
 	}
 }
 
-func TestJoinedWorkerFailsClosedForReclaimedHour(t *testing.T) {
+func TestJoinedWorkerRejectsMalformedReclaimedHourBeforeStorage(t *testing.T) {
 	t.Parallel()
 	service := &remoteJoinedOperatorService{}
 	err := service.publishClaim(context.Background(), joinedrecording.PublicationClaimResponse{Kind: "hour", Hour: &joinedrecording.WorkerClaim{HourID: "sealed-hour"}}, t.TempDir())
-	if err == nil || !strings.Contains(err.Error(), "cannot yet be rebuilt") {
-		t.Fatalf("reclaimed hour did not fail closed: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "authority is incomplete") {
+		t.Fatalf("malformed reclaimed hour did not fail before storage: %v", err)
+	}
+}
+
+func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
+	started := make(chan struct{})
+	err := runJoinedWorkerTask(context.Background(), time.Millisecond, func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	<-started
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("task deadline err=%v", err)
+	}
+}
+
+func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	hours, err := cfg.JoinedCanaryHourIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := joinedWorkerStatus{ProtocolVersion: joinedrecording.JoinedProtocolVersion, Enabled: true,
+		BatchID: cfg.JoinedRecordingBatchID, CanaryHourIDs: hours}
+	if err := validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, status); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*joinedWorkerStatus){
+		"disabled": func(s *joinedWorkerStatus) { s.Enabled = false },
+		"batch":    func(s *joinedWorkerStatus) { s.BatchID = "other-batch" },
+		"scope": func(s *joinedWorkerStatus) {
+			s.CanaryHourIDs[0], s.CanaryHourIDs[1] = s.CanaryHourIDs[1], s.CanaryHourIDs[0]
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := status
+			bad.CanaryHourIDs = append([]string(nil), status.CanaryHourIDs...)
+			mutate(&bad)
+			if validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, bad) == nil {
+				t.Fatal("mismatched worker status accepted")
+			}
+		})
 	}
 }
 
@@ -354,4 +418,12 @@ func writeJoinedTestJSON(t *testing.T, w http.ResponseWriter, value any) {
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func joinedSealReceipt(batchID string, recordingID int64, localDate string) joinedSealStreamDayReceipt {
+	return joinedSealStreamDayReceipt{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: batchID,
+		RecordingID: recordingID, LocalDate: localDate, SourceSnapshotSHA: strings.Repeat("a", 64),
+		HeadManifestSHA: strings.Repeat("b", 64), LedgerSHA: strings.Repeat("c", 64),
+		LedgerArtifactSHA: strings.Repeat("d", 64), SealRequestSHA: strings.Repeat("e", 64),
+		LedgerArtifactID: 1, SourceCount: 1, SourceBytes: 1}
 }

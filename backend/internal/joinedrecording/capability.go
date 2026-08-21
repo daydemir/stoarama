@@ -32,12 +32,13 @@ type capabilityHTTPClient struct{ *http.Client }
 const (
 	maxReadCapabilityLifetime = 15 * time.Minute
 	maxPutCapabilityLifetime  = time.Hour
+	capabilityHTTPTimeout     = 70 * time.Minute
 )
 
 func (*capabilityHTTPClient) joinedRedirectSafe() {}
 
 func NewCapabilityHTTPClient() *capabilityHTTPClient {
-	return &capabilityHTTPClient{&http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+	return &capabilityHTTPClient{&http.Client{Timeout: capabilityHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}}
 }
@@ -186,14 +187,14 @@ func verifyExactSourceHeadCapability(ctx context.Context, client CapabilityHTTPC
 	if client == nil || capability.Validate(source, "head", authority, time.Now().UTC()) != nil {
 		return fmt.Errorf("exact source HEAD capability is required")
 	}
-	return verifyCapabilityHead(ctx, client, capability.Request, source.Object.SizeBytes, source.Object.ETag, source.Object.VersionID)
+	return verifyCapabilityHead(ctx, client, capability.Request, capability.ExpiresAt, source.Object.SizeBytes, source.Object.ETag, source.Object.VersionID)
 }
 
 func openExactCapability(ctx context.Context, client CapabilityHTTPClient, authority string, source SourceClip, capability SourceReadCapability) (io.ReadCloser, error) {
 	if client == nil || capability.Validate(source, "get", authority, time.Now().UTC()) != nil {
 		return nil, fmt.Errorf("exact source capability is required")
 	}
-	response, err := capabilityRequest(ctx, client, capability.Request, nil, 0)
+	response, err := capabilityRequest(ctx, client, capability.Request, capability.ExpiresAt, nil, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +209,7 @@ func putCreateOnlyCapability(ctx context.Context, client CapabilityHTTPClient, a
 	if client == nil || capability.Validate(artifactID, bucket, key, contentType, size, sha, authority, time.Now().UTC()) != nil {
 		return putObservation{}, fmt.Errorf("exact create capability is required")
 	}
-	response, err := capabilityRequest(ctx, client, capability.Request, body, size)
+	response, err := capabilityRequest(ctx, client, capability.Request, capability.ExpiresAt, body, size)
 	if err != nil {
 		return putObservation{}, err
 	}
@@ -225,7 +226,7 @@ func reconcileExactCapability(ctx context.Context, client CapabilityHTTPClient, 
 	if client == nil || capability.Validate(artifactID, bucket, key, size, sha, etag, versionID, authority, time.Now().UTC()) != nil {
 		return r2.ObjectHead{}, fmt.Errorf("exact read capability is required")
 	}
-	response, err := capabilityRequest(ctx, client, capability.Request, nil, 0)
+	response, err := capabilityRequest(ctx, client, capability.Request, capability.ExpiresAt, nil, 0)
 	if err != nil {
 		return r2.ObjectHead{}, err
 	}
@@ -241,8 +242,8 @@ func reconcileExactCapability(ctx context.Context, client CapabilityHTTPClient, 
 	return r2.ObjectHead{ETag: capability.ETag, VersionID: capability.VersionID, SizeBytes: capability.SizeBytes}, nil
 }
 
-func verifyCapabilityHead(ctx context.Context, client CapabilityHTTPClient, request SignedRequest, size int64, etag, versionID string) error {
-	response, err := capabilityRequest(ctx, client, request, nil, 0)
+func verifyCapabilityHead(ctx context.Context, client CapabilityHTTPClient, request SignedRequest, expiresAt time.Time, size int64, etag, versionID string) error {
+	response, err := capabilityRequest(ctx, client, request, expiresAt, nil, 0)
 	if err != nil {
 		return err
 	}
@@ -253,8 +254,10 @@ func verifyCapabilityHead(ctx context.Context, client CapabilityHTTPClient, requ
 	return nil
 }
 
-func capabilityRequest(ctx context.Context, client CapabilityHTTPClient, signed SignedRequest, body io.Reader, contentLength int64) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, signed.Method, signed.URL, body)
+func capabilityRequest(ctx context.Context, client CapabilityHTTPClient, signed SignedRequest, expiresAt time.Time, body io.Reader, contentLength int64) (*http.Response, error) {
+	requestCtx, cancel := context.WithDeadline(ctx, expiresAt)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, signed.Method, signed.URL, body)
 	if err != nil {
 		return nil, fmt.Errorf("construct storage capability request")
 	}
@@ -267,7 +270,7 @@ func capabilityRequest(ctx context.Context, client CapabilityHTTPClient, signed 
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := requestCtx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("execute storage capability request")

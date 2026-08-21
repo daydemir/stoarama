@@ -576,6 +576,9 @@ func (c Config) JoinedCanaryHourIDs() ([]string, error) {
 	prefix := c.JoinedRecordingBatchID + "__recording-"
 	pattern := regexp.MustCompile(`^[1-9][0-9]*__date-([0-9]{4}-[0-9]{2}-[0-9]{2})__hour-(0[1-9]|1[0-2])__generation-[1-9][0-9]*$`)
 	items := strings.Split(raw, ",")
+	if len(items) != 3 {
+		return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exactly three canonical hour IDs")
+	}
 	hours := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))
 	for _, item := range items {

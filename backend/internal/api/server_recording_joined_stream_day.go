@@ -161,6 +161,20 @@ func (s *Server) handleAdminJoinedSealStreamDay(w http.ResponseWriter, r *http.R
 		util.WriteJSON(w, http.StatusOK, response)
 		return
 	}
+	releaseHeadLock, err := s.acquireJoinedStreamDayHeadLock(r.Context(), req.BatchID)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	defer releaseHeadLock()
+	if response, ok, err := s.loadSealedJoinedStreamDay(r.Context(), req); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	} else if ok {
+		response.AlreadySealed = true
+		util.WriteJSON(w, http.StatusOK, response)
+		return
+	}
 	plan, err := s.loadPendingJoinedStreamDay(r.Context(), req)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
@@ -177,6 +191,25 @@ func (s *Server) handleAdminJoinedSealStreamDay(w http.ResponseWriter, r *http.R
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) acquireJoinedStreamDayHeadLock(ctx context.Context, batchID string) (func(), error) {
+	pooled, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire joined stream-day HEAD lock connection: %w", err)
+	}
+	conn := pooled.Hijack()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended('joined-stream-day-head:'||$1,0))`, batchID); err != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+		return nil, fmt.Errorf("acquire joined stream-day HEAD lock: %w", err)
+	}
+	return func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Close(closeCtx)
+	}, nil
 }
 
 func (s *Server) loadSealedJoinedStreamDay(ctx context.Context, req joinedSealStreamDayRequest) (joinedSealStreamDayResponse, bool, error) {

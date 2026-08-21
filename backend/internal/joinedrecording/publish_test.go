@@ -63,12 +63,12 @@ func sealedClaim(t *testing.T, _ int64, plan BatchPlan, built []BuiltOutput, qua
 		artifactIDs[i] = int64(100 + i)
 	}
 	allocation, ledger := testAllocation(plan)
-	_, manifestJSON, manifestSHA, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: artifactIDs, Built: built, QuarantineEvidence: quarantine})
+	manifest, manifestJSON, manifestSHA, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: artifactIDs, Built: built, QuarantineEvidence: quarantine})
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifestArtifactID := int64(999)
-	return WorkerClaim{ProtocolVersion: JoinedProtocolVersion, HourID: plan.HourID, LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("p", 32), LeaseExpires: time.Now().Add(time.Hour), StorageAuthority: testSourceAuthority, StorageBucket: "recordings", Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: artifactIDs, HourManifestArtifactID: manifestArtifactID, HourManifestExpectedSize: int64(len(manifestJSON)), HourManifestExpectedSHA: manifestSHA}
+	return WorkerClaim{ProtocolVersion: JoinedProtocolVersion, HourID: plan.HourID, LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("p", 32), LeaseExpires: time.Now().Add(time.Hour), StorageAuthority: testSourceAuthority, StorageBucket: "recordings", Plan: plan, Allocation: allocation, AllocationLedger: ledger, HourManifest: manifest, MediaArtifactIDs: artifactIDs, HourManifestArtifactID: manifestArtifactID, HourManifestExpectedSize: int64(len(manifestJSON)), HourManifestExpectedSHA: manifestSHA}
 }
 
 func testCreateResolver() CreateCapabilityResolver {
@@ -129,6 +129,13 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 	if err := os.MkdirAll(scratch, 0700); err != nil {
 		t.Fatal(err)
 	}
+	outside := filepath.Join(root, "keep.txt")
+	if err := os.WriteFile(outside, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "downloaded-source.mp4"), []byte("source"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	mediaPath := filepath.Join(scratch, "joined.mp4")
 	if err := os.WriteFile(mediaPath, media, 0600); err != nil {
 		t.Fatal(err)
@@ -160,8 +167,11 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 	if !finalized || published.Outputs[0].Created || !lowerHex64(published.HourManifestSHA256) {
 		t.Fatalf("orphan not reconciled: %+v", published)
 	}
-	if _, err := os.Stat(mediaPath); !os.IsNotExist(err) {
-		t.Fatal("finalized scratch output was not removed")
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatal("finalized current-lease scratch tree was not removed")
+	}
+	if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
+		t.Fatalf("cleanup changed data outside current lease scratch: %q err=%v", data, err)
 	}
 }
 

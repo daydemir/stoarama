@@ -382,6 +382,7 @@ func loadJoinedHourPublicationClaim(ctx context.Context, tx pgx.Tx, manifestID i
 		joinedauth.LeaseID(leaseToken), operationToken, leaseExpires
 	claim.StorageAuthority, claim.StorageBucket = authority, bucket
 	claim.Allocation = manifest.Allocation
+	claim.HourManifest = manifest
 	claim.HourManifestArtifactID = manifestID
 	rows, err := tx.Query(ctx, `SELECT id FROM recording_joined_artifacts WHERE hour_record_id=(SELECT hour_record_id
 		FROM recording_joined_artifacts WHERE id=$1) AND artifact_kind='media' ORDER BY ordinal`, manifestID)
@@ -835,8 +836,14 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleJoinedStatus(w http.ResponseWriter, r *http.Request) {
+	batchIDs, ok := r.URL.Query()["batch_id"]
+	if !ok || len(batchIDs) != 1 || len(r.URL.Query()) != 1 || !joinedBatchIDPattern.MatchString(batchIDs[0]) {
+		util.WriteError(w, http.StatusBadRequest, "one canonical joined batch_id is required")
+		return
+	}
+	batchID := batchIDs[0]
 	counts := map[string]int64{}
-	rows, err := s.pool.Query(r.Context(), `SELECT state,count(*) FROM recording_joined_hours GROUP BY state ORDER BY state`)
+	rows, err := s.pool.Query(r.Context(), `SELECT state,count(*) FROM recording_joined_hours WHERE batch_id=$1 GROUP BY state ORDER BY state`, batchID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load joined status: %v", err))
 		return
@@ -851,5 +858,7 @@ func (s *Server) handleJoinedStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		counts[state] = count
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"enabled": s.joinedControlPlaneReady(), "hours": counts})
+	util.WriteJSON(w, http.StatusOK, map[string]any{"protocol_version": joinedWorkerProtocolVersion,
+		"enabled":  s.joinedControlPlaneReady() && batchID == s.cfg.JoinedRecordingBatchID,
+		"batch_id": batchID, "canary_hour_ids": s.joinedCanaryHourIDs(), "hours": counts})
 }

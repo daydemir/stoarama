@@ -405,8 +405,8 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	req := validJoinedTier1FreezeRequest(t)
 	req.ConnectionID, req.QualificationRunID = connectionID, runID
 	s.cfg.JoinedRecordingBatchID = req.BatchID
-	s.cfg.JoinedRecordingCanaryHourIDs = fmt.Sprintf("%s__recording-%d__date-2026-08-01__hour-01__generation-1",
-		req.BatchID, joinedrecording.Tier1RecordingIDs[0])
+	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(req.BatchID, fmt.Sprintf("%s__recording-%d__date-2026-08-01__hour-01__generation-1",
+		req.BatchID, joinedrecording.Tier1RecordingIDs[0]))
 	dry, plan := call(req)
 	if dry.Code != http.StatusOK || !lowerHexSHA256(plan.RequestSHA256) || !lowerHexSHA256(plan.FrozenDenominatorSHA256) ||
 		!lowerHexSHA256(plan.FreezeExclusionsSHA256) || plan.ProvisionalSourceClips != 1 || plan.ProvisionalSourceBytes != 10 {

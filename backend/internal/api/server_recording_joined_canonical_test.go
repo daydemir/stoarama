@@ -686,7 +686,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	s.cfg.JoinedRecordingProtocolVersion = 1
 	s.cfg.JoinedRecordingBatchID = batchID
-	s.cfg.JoinedRecordingCanaryHourIDs = canaryGapHourID
+	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(batchID, canaryGapHourID)
 	recordingID, batchRecordingID := sourceLedger.recordingID, sourceLedger.batchRecordingID
 	var sources []joinedrecording.SourceClip
 	if err := json.Unmarshal(sourceLedger.bytes, &struct {
@@ -863,7 +863,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if noForeignRec.Code != http.StatusNoContent {
 		t.Fatalf("canary claimed a foreign hour, day ledger, or batch index: status=%d body=%s", noForeignRec.Code, noForeignRec.Body.String())
 	}
-	s.cfg.JoinedRecordingCanaryHourIDs = canarySourceHourID
+	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(batchID, canarySourceHourID)
 	sourceLedgerClaimReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
 	sourceLedgerClaimReq.Header.Set("Authorization", "Bearer "+claimToken)
 	sourceLedgerClaimRec := httptest.NewRecorder()
