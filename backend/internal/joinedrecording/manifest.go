@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 )
 
@@ -312,8 +313,16 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 	var sourceBytes int64
 	for i, source := range manifest.Sources {
 		storageKey := sourceStorageKey(source)
-		if validatePreflightSource(source, manifest.RecordingID) != nil || seenSources[source.ClipID].ClipID != 0 || seenStorage[storageKey] || source.Object.SizeBytes > math.MaxInt64-sourceBytes || (i > 0 && (source.StartUTC.Before(manifest.Sources[i-1].StartUTC) || (source.StartUTC.Equal(manifest.Sources[i-1].StartUTC) && source.ClipID <= manifest.Sources[i-1].ClipID))) {
+		if validateSource(source, manifest.RecordingID) != nil || seenSources[source.ClipID].ClipID != 0 || seenStorage[storageKey] || source.Object.SizeBytes > math.MaxInt64-sourceBytes || (i > 0 && (source.StartUTC.Before(manifest.Sources[i-1].StartUTC) || (source.StartUTC.Equal(manifest.Sources[i-1].StartUTC) && source.ClipID <= manifest.Sources[i-1].ClipID))) {
 			return nil, "", fmt.Errorf("canonical hour manifest source order differs")
+		}
+		if i == 0 && source.SeamToPrevious != (SeamEvidence{}) {
+			return nil, "", fmt.Errorf("canonical hour manifest first source has prior-seam evidence")
+		}
+		if i > 0 {
+			if validateDerivedSeam(manifest.Sources[i-1], source) != nil {
+				return nil, "", fmt.Errorf("canonical hour manifest source seam differs")
+			}
 		}
 		seenSources[source.ClipID] = source
 		sourcePositions[source.ClipID] = i
@@ -333,7 +342,7 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 	lastMediaSourcePosition := -1
 	for i, media := range manifest.Media {
 		_, utcOffset := media.ActualStartUTC.In(loc).Zone()
-		if media.ArtifactID <= 0 || seenArtifacts[media.ArtifactID] || media.Ordinal != i+1 || media.Part != i+1 || media.Parts != len(manifest.Media) || media.ContentID != media.SHA256 || !lowerHex64(media.SHA256) || media.SizeBytes <= 0 || media.ObjectKey != path.Join("joined", manifest.BatchID, "objects", media.ContentID+".mp4") || len(media.SourceClipIDs) == 0 || !media.ActualEndUTC.After(media.ActualStartUTC) || media.UTCOffsetSeconds != utcOffset || media.MediaToolIdentity != manifest.MediaTool.IdentitySHA256 || validatePassedVerification(media.Verification) != nil {
+		if media.ArtifactID <= 0 || seenArtifacts[media.ArtifactID] || media.Ordinal != i+1 || media.Part != i+1 || media.Parts != len(manifest.Media) || media.ContentID != media.SHA256 || !lowerHex64(media.SHA256) || media.SizeBytes <= 0 || media.SizeBytes > r2.MaxConditionalPutBytes || media.ObjectKey != path.Join("joined", manifest.BatchID, "objects", media.ContentID+".mp4") || len(media.SourceClipIDs) == 0 || !media.ActualEndUTC.After(media.ActualStartUTC) || media.UTCOffsetSeconds != utcOffset || media.MediaToolIdentity != manifest.MediaTool.IdentitySHA256 || validatePassedVerification(media.Verification) != nil {
 			return nil, "", fmt.Errorf("canonical hour manifest media differs")
 		}
 		firstPosition := sourcePositions[media.SourceClipIDs[0]]
@@ -355,6 +364,16 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		if !media.ActualStartUTC.Equal(manifest.Sources[firstPosition].StartUTC) || !media.ActualEndUTC.Equal(manifest.Sources[lastPosition].EndUTC) {
 			return nil, "", fmt.Errorf("canonical hour manifest media range differs from its sources")
 		}
+		sourceAudioContracts := make([]AudioSequenceContract, 0, len(media.SourceClipIDs))
+		for _, clipID := range media.SourceClipIDs {
+			if contract := seenSources[clipID].AudioContract; contract != nil {
+				sourceAudioContracts = append(sourceAudioContracts, *contract)
+			}
+		}
+		sourceFingerprint := media.Verification.SourceFingerprint
+		if (sourceFingerprint.Tracks["audio"] == nil && len(sourceAudioContracts) != 0) || (sourceFingerprint.Tracks["audio"] != nil && (len(sourceAudioContracts) != len(media.SourceClipIDs) || !sameCanonical(sourceAudioContracts, sourceFingerprint.AudioContracts))) {
+			return nil, "", fmt.Errorf("canonical hour manifest audio contracts differ from verification")
+		}
 		for _, evidence := range media.MaximalityEvidence {
 			candidateSources, sourceErr := sourceSubsetByIDs(manifest.Sources, evidence.CandidateClipIDs)
 			expectedClaim, claimErr := candidateSourceClaimSHA(candidateSources)
@@ -363,6 +382,17 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 			}
 		}
 		if len(media.MaximalityEvidence) > 0 {
+			for evidenceIndex, evidence := range media.MaximalityEvidence {
+				wantLength := len(media.MaximalityEvidence[0].CandidateClipIDs) - evidenceIndex
+				if len(evidence.CandidateClipIDs) != wantLength || len(evidence.CandidateClipIDs) <= len(media.SourceClipIDs) || firstPosition+len(evidence.CandidateClipIDs) > len(manifest.Sources) {
+					return nil, "", fmt.Errorf("canonical hour manifest maximality peel order differs")
+				}
+				for candidateIndex, clipID := range evidence.CandidateClipIDs {
+					if manifest.Sources[firstPosition+candidateIndex].ClipID != clipID {
+						return nil, "", fmt.Errorf("canonical hour manifest maximality candidate order differs")
+					}
+				}
+			}
 			adjacent := media.MaximalityEvidence[len(media.MaximalityEvidence)-1]
 			if len(adjacent.CandidateClipIDs) != len(media.SourceClipIDs)+1 {
 				return nil, "", fmt.Errorf("canonical hour manifest maximality extension differs")
@@ -408,14 +438,21 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		}
 	}
 	validatedGaps := make(map[[2]int64]bool, len(manifest.Gaps))
+	gapReasons := make(map[[2]int64]string, len(manifest.Gaps))
 	for _, gap := range manifest.Gaps {
 		previousPosition, previousOK := sourcePositions[gap.PreviousClipID]
 		nextPosition, nextOK := sourcePositions[gap.NextClipID]
 		pair := [2]int64{gap.PreviousClipID, gap.NextClipID}
-		if !previousOK || !nextOK || nextPosition != previousPosition+1 || validatedGaps[pair] || !reasonCode.MatchString(gap.Reason) || !gap.AtUTC.Equal(manifest.Sources[previousPosition].EndUTC) || gap.SignedGapNanoseconds != manifest.Sources[nextPosition].StartUTC.Sub(manifest.Sources[previousPosition].EndUTC).Nanoseconds() {
+		if !previousOK || !nextOK || nextPosition != previousPosition+1 || validatedGaps[pair] {
+			return nil, "", fmt.Errorf("canonical hour manifest gap differs")
+		}
+		nextSeam := manifest.Sources[nextPosition].SeamToPrevious
+		quarantineBoundary := quarantined[gap.PreviousClipID].ClipID != 0 || quarantined[gap.NextClipID].ClipID != 0
+		if !reasonCode.MatchString(gap.Reason) || (gap.Reason != nextSeam.Reason && !(quarantineBoundary && gap.Reason == "source_quarantined")) || !gap.AtUTC.Equal(manifest.Sources[previousPosition].EndUTC) || gap.SignedGapNanoseconds != nextSeam.SignedGapNanoseconds || gap.SignedGapNanoseconds != manifest.Sources[nextPosition].StartUTC.Sub(manifest.Sources[previousPosition].EndUTC).Nanoseconds() {
 			return nil, "", fmt.Errorf("canonical hour manifest gap differs")
 		}
 		validatedGaps[pair] = true
+		gapReasons[pair] = gap.Reason
 	}
 	brokenAdjacencies := 0
 	for i := 1; i < len(manifest.Sources); i++ {
@@ -428,6 +465,28 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		}
 		if !sameMediaRun {
 			brokenAdjacencies++
+			nextSeam := manifest.Sources[i].SeamToPrevious
+			signedGap := manifest.Sources[i].StartUTC.Sub(manifest.Sources[i-1].EndUTC).Nanoseconds()
+			switch {
+			case quarantined[previousID].ClipID != 0 || quarantined[nextID].ClipID != 0:
+				if gapReasons[[2]int64{previousID, nextID}] != "source_quarantined" {
+					return nil, "", fmt.Errorf("canonical hour manifest quarantine boundary differs")
+				}
+			case signedGap > 0:
+				if nextSeam.Verdict != "gap" {
+					return nil, "", fmt.Errorf("canonical hour manifest signed gap verdict differs")
+				}
+			case signedGap < 0:
+				if nextSeam.Verdict != "overlap" {
+					return nil, "", fmt.Errorf("canonical hour manifest signed overlap verdict differs")
+				}
+			default:
+				if nextSeam.Verdict != "incompatible" || !maximalityBindsExtension(manifest.Media, previousMedia, previousID, nextID, nextSeam.Reason) {
+					return nil, "", fmt.Errorf("canonical hour manifest zero-duration split lacks typed evidence")
+				}
+			}
+		} else if manifest.Sources[i].SeamToPrevious.Verdict != "continuous" {
+			return nil, "", fmt.Errorf("canonical hour manifest continuous run seam differs")
 		}
 	}
 	if brokenAdjacencies != len(manifest.Gaps) {
@@ -454,6 +513,17 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		return nil, "", fmt.Errorf("hour manifest exceeds canonical limit")
 	}
 	return canonical, sha, nil
+}
+
+func maximalityBindsExtension(media []HourManifestMedia, artifactID, previousID, nextID int64, reason string) bool {
+	for _, artifact := range media {
+		if artifact.ArtifactID != artifactID || len(artifact.SourceClipIDs) == 0 || artifact.SourceClipIDs[len(artifact.SourceClipIDs)-1] != previousID || len(artifact.MaximalityEvidence) == 0 {
+			continue
+		}
+		adjacent := artifact.MaximalityEvidence[len(artifact.MaximalityEvidence)-1]
+		return adjacent.ReasonCode == reason && adjacent.CandidateClipIDs[len(adjacent.CandidateClipIDs)-1] == nextID
+	}
+	return false
 }
 
 // ValidateHourManifestLedgerBinding proves that one canonical hour is exactly
