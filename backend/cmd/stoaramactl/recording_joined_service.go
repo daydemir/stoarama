@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	joinedAPITimeout       = 60 * time.Second
+	joinedAPITimeout       = 55 * time.Second
 	joinedWorkerIdlePoll   = 2 * time.Second
 	joinedWorkerTaskLimit  = 2 * time.Hour
 	joinedAPIResponseLimit = 1 << 20

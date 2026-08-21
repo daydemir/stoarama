@@ -237,6 +237,9 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), joinedBatchIndexOperationTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	var req joinedrecording.PublicationClaimRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
@@ -295,6 +298,10 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if selectedKind == "batch_index" {
+		if buildErr := configureJoinedBatchIndexTransaction(r.Context(), tx); buildErr != nil {
+			util.WriteError(w, http.StatusConflict, "configure joined batch-index evidence transaction")
+			return
+		}
 		canonical, state, existingID, buildErr := loadJoinedCanonicalBatchIndex(r.Context(), tx, claims.BatchID, true)
 		if buildErr != nil || state != "index_sealed" || existingID != artifactID || canonical.SHA256 == "" {
 			util.WriteError(w, http.StatusConflict, "joined batch index evidence differs")
@@ -463,6 +470,9 @@ func (s *Server) handleJoinedFinalizeLedger(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleJoinedFinalizeBatchIndex(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), joinedBatchIndexOperationTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	var req joinedrecording.FinalizeBatchIndexRequest
 	if err := util.DecodeJSON(r, &req); err != nil || req.Validate() != nil {
 		util.WriteError(w, http.StatusBadRequest, "invalid joined batch index finalize")
@@ -587,6 +597,8 @@ func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artif
 
 func (s *Server) finalizeJoinedBatchIndexCanonical(ctx context.Context, artifactID int64, objectKey, etag,
 	versionID string, sizeBytes int64, sha256 string) error {
+	ctx, cancel := context.WithTimeout(ctx, joinedBatchIndexOperationTimeout)
+	defer cancel()
 	if !s.joinedControlPlaneReady() || !s.joinedFrozenBatchScope() {
 		return errors.New("joined frozen-batch work is disabled")
 	}
@@ -604,6 +616,9 @@ func (s *Server) finalizeJoinedBatchIndexCanonical(ctx context.Context, artifact
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := configureJoinedBatchIndexTransaction(ctx, tx); err != nil {
+		return err
+	}
 	canonical, batchState, existingID, err := loadJoinedCanonicalBatchIndex(ctx, tx, claims.BatchID, true)
 	if err != nil || existingID != artifactID || (batchState != "index_sealed" && batchState != "published") ||
 		canonical.SHA256 != sha256 || int64(len(canonical.Bytes)) != sizeBytes {

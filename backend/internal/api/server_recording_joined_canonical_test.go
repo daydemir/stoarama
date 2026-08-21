@@ -1378,6 +1378,13 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		s.requireAdminAuth(http.HandlerFunc(s.handleAdminJoinedSealBatchIndex)).ServeHTTP(recorder, httpReq)
 		return recorder
 	}
+	assertIndexDuration := func(operation string, started time.Time) {
+		t.Helper()
+		elapsed := time.Since(started)
+		if elapsed >= joinedBatchIndexOperationTimeout {
+			t.Fatalf("batch-index %s exceeded server deadline: %s", operation, elapsed)
+		}
+	}
 	previewRequest := joinedSealBatchIndexRequest{ProtocolVersion: 1, BatchID: batchID}
 	unauthorizedBody, _ := json.Marshal(previewRequest)
 	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/batches/index/seal",
@@ -1388,7 +1395,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("batch-index seal accepted generic service auth status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
+	previewStarted := time.Now()
 	preview := sealIndex(previewRequest)
+	assertIndexDuration("preview", previewStarted)
 	var previewed joinedSealBatchIndexResponse
 	if preview.Code != http.StatusOK || json.Unmarshal(preview.Body.Bytes(), &previewed) != nil ||
 		!lowerHexSHA256(previewed.SHA256) || previewed.ArtifactID != 0 || previewed.State != "frozen" {
@@ -1401,11 +1410,115 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	applyIndex := previewRequest
 	applyIndex.Apply, applyIndex.ExpectedSHA256 = true, previewed.SHA256
-	sealedIndex := sealIndex(applyIndex)
+	indexBlockerTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := indexBlockerTx.Exec(ctx, `SELECT id FROM recording_joined_batches WHERE id=$1 FOR UPDATE`, batchRecordID); err != nil {
+		_ = indexBlockerTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	blockedStarted := time.Now()
+	blockedApply := sealIndex(applyIndex)
+	blockedElapsed := time.Since(blockedStarted)
+	if blockedApply.Code != http.StatusConflict || blockedElapsed >= 20*time.Second {
+		_ = indexBlockerTx.Rollback(ctx)
+		t.Fatalf("blocked batch-index apply status=%d elapsed=%s body=%s", blockedApply.Code, blockedElapsed, blockedApply.Body.String())
+	}
+	var blockedState string
+	var partialIndexes, partialReferences int
+	if err := indexBlockerTx.QueryRow(ctx, `SELECT state,
+		(SELECT count(*) FROM recording_joined_artifacts WHERE batch_record_id=b.id AND artifact_kind='batch_index'),
+		(SELECT count(*) FROM recording_joined_batch_index_refs WHERE batch_record_id=b.id)
+		FROM recording_joined_batches b WHERE id=$1`, batchRecordID).Scan(&blockedState, &partialIndexes, &partialReferences); err != nil ||
+		blockedState != "frozen" || partialIndexes != 0 || partialReferences != 0 {
+		_ = indexBlockerTx.Rollback(ctx)
+		t.Fatalf("blocked batch-index apply leaked state=%s indexes=%d refs=%d err=%v", blockedState, partialIndexes,
+			partialReferences, err)
+	}
+	if err := indexBlockerTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	protocolBlockerTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocolBlockerTx.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
+		_ = protocolBlockerTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	protocolBlockedStarted := time.Now()
+	protocolBlocked := sealIndex(applyIndex)
+	protocolBlockedElapsed := time.Since(protocolBlockedStarted)
+	if protocolBlocked.Code != http.StatusConflict || protocolBlockedElapsed >= 20*time.Second {
+		_ = protocolBlockerTx.Rollback(ctx)
+		t.Fatalf("protocol-blocked batch-index apply status=%d elapsed=%s body=%s", protocolBlocked.Code,
+			protocolBlockedElapsed, protocolBlocked.Body.String())
+	}
+	var protocolBlockedState string
+	if err := protocolBlockerTx.QueryRow(ctx, `SELECT state FROM recording_joined_batches WHERE id=$1`, batchRecordID).
+		Scan(&protocolBlockedState); err != nil || protocolBlockedState != "frozen" {
+		_ = protocolBlockerTx.Rollback(ctx)
+		t.Fatalf("protocol-blocked batch-index state=%s err=%v", protocolBlockedState, err)
+	}
+	if err := protocolBlockerTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	protocolRejected := sealIndex(applyIndex)
+	if protocolRejected.Code != http.StatusConflict {
+		t.Fatalf("protocol-v0 batch-index apply status=%d body=%s", protocolRejected.Code, protocolRejected.Body.String())
+	}
+	var protocolIndexes, protocolReferences int
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM recording_joined_artifacts WHERE batch_record_id=$1 AND artifact_kind='batch_index'),
+		(SELECT count(*) FROM recording_joined_batch_index_refs WHERE batch_record_id=$1)`, batchRecordID).
+		Scan(&protocolIndexes, &protocolReferences); err != nil || protocolIndexes != 0 || protocolReferences != 0 {
+		t.Fatalf("protocol-v0 batch-index apply leaked indexes=%d refs=%d err=%v", protocolIndexes, protocolReferences, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	type applyResult struct {
+		recorder *httptest.ResponseRecorder
+		elapsed  time.Duration
+	}
+	applyResults := make(chan applyResult, 2)
+	applyStart := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-applyStart
+			started := time.Now()
+			applyResults <- applyResult{recorder: sealIndex(applyIndex), elapsed: time.Since(started)}
+		}()
+	}
+	close(applyStart)
 	var indexReceipt joinedSealBatchIndexResponse
-	if sealedIndex.Code != http.StatusOK || json.Unmarshal(sealedIndex.Body.Bytes(), &indexReceipt) != nil ||
-		indexReceipt.ArtifactID <= 0 || indexReceipt.State != "index_sealed" || indexReceipt.SHA256 != previewed.SHA256 {
-		t.Fatalf("batch-index apply status=%d body=%s", sealedIndex.Code, sealedIndex.Body.String())
+	created, alreadySealed := 0, 0
+	applyStarted := time.Now()
+	for range 2 {
+		result := <-applyResults
+		if result.elapsed >= joinedBatchIndexOperationTimeout {
+			t.Fatalf("concurrent batch-index apply exceeded server deadline: %s", result.elapsed)
+		}
+		var receipt joinedSealBatchIndexResponse
+		if result.recorder.Code != http.StatusOK || json.Unmarshal(result.recorder.Body.Bytes(), &receipt) != nil ||
+			receipt.ArtifactID <= 0 || receipt.State != "index_sealed" || receipt.SHA256 != previewed.SHA256 {
+			t.Fatalf("concurrent batch-index apply status=%d body=%s", result.recorder.Code, result.recorder.Body.String())
+		}
+		if indexReceipt.ArtifactID == 0 {
+			indexReceipt = receipt
+		} else if receipt.ArtifactID != indexReceipt.ArtifactID || receipt.SHA256 != indexReceipt.SHA256 {
+			t.Fatalf("concurrent batch-index apply identity differs first=%+v second=%+v", indexReceipt, receipt)
+		}
+		if receipt.AlreadySealed {
+			alreadySealed++
+		} else {
+			created++
+		}
+	}
+	assertIndexDuration("apply", applyStarted)
+	if created != 1 || alreadySealed != 1 {
+		t.Fatalf("concurrent batch-index apply created=%d already_sealed=%d", created, alreadySealed)
 	}
 	retryIndex := sealIndex(applyIndex)
 	var retryReceipt joinedSealBatchIndexResponse
@@ -1421,7 +1534,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	publicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(publicationBody))
 	publicationRequest.Header.Set("Authorization", "Bearer "+indexClaimToken)
 	publicationRecorder := httptest.NewRecorder()
+	claimStarted := time.Now()
 	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(publicationRecorder, publicationRequest)
+	assertIndexDuration("claim", claimStarted)
 	var indexClaim joinedrecording.PublicationClaimResponse
 	if publicationRecorder.Code != http.StatusOK || json.Unmarshal(publicationRecorder.Body.Bytes(), &indexClaim) != nil ||
 		indexClaim.Kind != "batch_index" || indexClaim.BatchIndex == nil || indexClaim.BatchIndex.ArtifactID != indexReceipt.ArtifactID {
@@ -1436,7 +1551,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	finalizeIndexRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/index/finalize", bytes.NewReader(finalizeIndexBody))
 	finalizeIndexRequest.Header.Set("Authorization", "Bearer "+indexClaim.BatchIndex.OperationToken)
 	finalizeIndexRecorder := httptest.NewRecorder()
+	finalizeStarted := time.Now()
 	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFinalizeBatchIndex)).ServeHTTP(finalizeIndexRecorder, finalizeIndexRequest)
+	assertIndexDuration("finalize", finalizeStarted)
 	if finalizeIndexRecorder.Code != http.StatusNoContent {
 		t.Fatalf("batch-index finalize status=%d body=%s", finalizeIndexRecorder.Code, finalizeIndexRecorder.Body.String())
 	}

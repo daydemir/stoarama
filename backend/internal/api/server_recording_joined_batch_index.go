@@ -8,11 +8,18 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/util"
+)
+
+const (
+	joinedBatchIndexOperationTimeout = 40 * time.Second
+	joinedBatchIndexStatementTimeout = "35s"
+	joinedBatchIndexLockTimeout      = "15s"
 )
 
 type joinedSealBatchIndexRequest struct {
@@ -52,6 +59,9 @@ type joinedCanonicalIndex struct {
 }
 
 func (s *Server) handleAdminJoinedSealBatchIndex(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), joinedBatchIndexOperationTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	if !s.joinedControlPlaneReady() || !s.joinedFrozenBatchScope() {
 		util.WriteError(w, http.StatusServiceUnavailable, "joined frozen-batch work is disabled")
 		return
@@ -74,11 +84,16 @@ func (s *Server) handleAdminJoinedSealBatchIndex(w http.ResponseWriter, r *http.
 }
 
 func (s *Server) sealJoinedBatchIndex(ctx context.Context, request joinedSealBatchIndexRequest) (joinedSealBatchIndexResponse, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	ctx, cancel := context.WithTimeout(ctx, joinedBatchIndexOperationTimeout)
+	defer cancel()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return joinedSealBatchIndexResponse{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := configureJoinedBatchIndexTransaction(ctx, tx); err != nil {
+		return joinedSealBatchIndexResponse{}, err
+	}
 
 	canonical, state, existingID, err := loadJoinedCanonicalBatchIndex(ctx, tx, request.BatchID, request.Apply)
 	if err != nil {
@@ -123,19 +138,25 @@ func (s *Server) sealJoinedBatchIndex(ctx context.Context, request joinedSealBat
 		response.ObjectKey, response.SizeBytes, response.SHA256, canonical.Bytes).Scan(&response.ArtifactID); err != nil {
 		return response, fmt.Errorf("insert joined batch index: %w", err)
 	}
+	referenceCount := len(canonical.Index.AllocationLedgers) + len(canonical.Index.Hours)
+	artifactIDs := make([]int64, 0, referenceCount)
+	referenceKinds := make([]string, 0, referenceCount)
+	ordinals := make([]int32, 0, referenceCount)
 	for ordinal, ref := range canonical.Index.AllocationLedgers {
-		if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_batch_index_refs(batch_record_id,index_artifact_id,
-			referenced_artifact_id,reference_kind,ordinal) VALUES($1,$2,$3,'allocation_ledger',$4)`, canonical.BatchRecordID,
-			response.ArtifactID, ref.ArtifactID, ordinal+1); err != nil {
-			return response, fmt.Errorf("insert joined ledger index reference: %w", err)
-		}
+		artifactIDs = append(artifactIDs, ref.ArtifactID)
+		referenceKinds = append(referenceKinds, "allocation_ledger")
+		ordinals = append(ordinals, int32(ordinal+1))
 	}
 	for ordinal, ref := range canonical.Index.Hours {
-		if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_batch_index_refs(batch_record_id,index_artifact_id,
-			referenced_artifact_id,reference_kind,ordinal) VALUES($1,$2,$3,'hour_manifest',$4)`, canonical.BatchRecordID,
-			response.ArtifactID, ref.HourManifestArtifactID, ordinal+1); err != nil {
-			return response, fmt.Errorf("insert joined hour index reference: %w", err)
-		}
+		artifactIDs = append(artifactIDs, ref.HourManifestArtifactID)
+		referenceKinds = append(referenceKinds, "hour_manifest")
+		ordinals = append(ordinals, int32(ordinal+1))
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_batch_index_refs(batch_record_id,index_artifact_id,
+		referenced_artifact_id,reference_kind,ordinal) SELECT $1,$2,artifact_id,kind,ordinal
+		FROM unnest($3::bigint[],$4::text[],$5::integer[]) AS refs(artifact_id,kind,ordinal)`, canonical.BatchRecordID,
+		response.ArtifactID, artifactIDs, referenceKinds, ordinals); err != nil {
+		return response, fmt.Errorf("insert joined batch-index references: %w", err)
 	}
 	command, err := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='index_sealed',index_artifact_id=$2,index_sealed_at=clock_timestamp()
 		WHERE id=$1 AND state='frozen' AND frozen_at IS NOT NULL AND EXISTS(SELECT 1 FROM connections c
@@ -148,6 +169,12 @@ func (s *Server) sealJoinedBatchIndex(ctx context.Context, request joinedSealBat
 		return response, err
 	}
 	return response, nil
+}
+
+func configureJoinedBatchIndexTransaction(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)`,
+		joinedBatchIndexLockTimeout, joinedBatchIndexStatementTimeout)
+	return err
 }
 
 func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID string, lock bool) (joinedCanonicalIndex, string, int64, error) {
@@ -208,36 +235,38 @@ func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID strin
 	for index, recording := range evidence.FrozenRecordings {
 		canonical.Index.RecordingIDs[index] = recording.RecordingID
 	}
-	for ordinal := 1; ordinal <= expectedLedgers; ordinal++ {
-		ref, _, err := loadJoinedLedgerReference(ctx, tx, canonical.BatchRecordID, int64(ordinal))
-		if err != nil {
-			return canonical, state, 0, err
-		}
-		canonical.Index.AllocationLedgers = append(canonical.Index.AllocationLedgers, ref)
+	var ledgerByID map[int64]joinedrecording.StreamDayAllocation
+	canonical.Index.AllocationLedgers, ledgerByID, err = loadJoinedLedgerReferences(ctx, tx, canonical.BatchRecordID,
+		expectedLedgers)
+	if err != nil {
+		return canonical, state, 0, err
 	}
-	for ordinal := 1; ordinal <= expectedHours; ordinal++ {
-		ref, manifest, err := loadJoinedHourReference(ctx, tx, canonical.BatchRecordID, int64(ordinal))
-		if err != nil {
-			return canonical, state, 0, err
-		}
-		canonical.Index.Hours = append(canonical.Index.Hours, ref)
-		canonical.Index.FinalMediaCount += len(manifest.Media)
+	var hourByID map[int64]joinedrecording.HourManifest
+	canonical.Index.Hours, hourByID, canonical.Index.FinalMediaCount, err = loadJoinedHourReferences(ctx, tx,
+		canonical.BatchRecordID, expectedHours)
+	if err != nil {
+		return canonical, state, 0, err
 	}
 	canonical.Index.BatchGenerationSHA256, err = joinedrecording.ComputeBatchGenerationSHA256(canonical.Index)
 	if err != nil {
 		return canonical, state, 0, err
 	}
 	resolveEvidence := func() (joinedrecording.FrozenBatchEvidence, error) {
-		return loadJoinedFrozenBatchEvidence(ctx, tx, canonical.BatchRecordID, canonical.Index.SelectionAuthority,
-			canonical.Index.FrozenDenominatorSHA256)
+		return evidence, nil
 	}
 	resolveLedger := func(ref joinedrecording.AllocationLedgerRef) (joinedrecording.StreamDayAllocation, error) {
-		_, ledger, err := loadJoinedLedgerReferenceByArtifact(ctx, tx, canonical.BatchRecordID, ref.ArtifactID)
-		return ledger, err
+		ledger, ok := ledgerByID[ref.ArtifactID]
+		if !ok {
+			return joinedrecording.StreamDayAllocation{}, errors.New("joined allocation ledger resolver identity differs")
+		}
+		return ledger, nil
 	}
 	resolveHour := func(ref joinedrecording.BatchIndexHour) (joinedrecording.HourManifest, error) {
-		_, manifest, err := loadJoinedHourReferenceByArtifact(ctx, tx, canonical.BatchRecordID, ref.HourManifestArtifactID)
-		return manifest, err
+		manifest, ok := hourByID[ref.HourManifestArtifactID]
+		if !ok {
+			return joinedrecording.HourManifest{}, errors.New("joined hour-manifest resolver identity differs")
+		}
+		return manifest, nil
 	}
 	canonical.Index, canonical.Bytes, canonical.SHA256, err = joinedrecording.BuildBatchIndex(canonical.Index,
 		resolveEvidence, resolveLedger, resolveHour)
@@ -352,100 +381,141 @@ func loadJoinedFrozenBatchEvidence(ctx context.Context, tx pgx.Tx, batchRecordID
 	return evidence, rows.Err()
 }
 
-func loadJoinedLedgerReference(ctx context.Context, tx pgx.Tx, batchRecordID, ordinal int64) (joinedrecording.AllocationLedgerRef,
-	joinedrecording.StreamDayAllocation, error) {
-	var artifactID int64
-	err := tx.QueryRow(ctx, `SELECT a.id FROM recording_joined_artifacts a JOIN recording_joined_stream_days d ON d.id=a.stream_day_id
+func loadJoinedLedgerReferences(ctx context.Context, tx pgx.Tx, batchRecordID int64, expected int) (
+	[]joinedrecording.AllocationLedgerRef, map[int64]joinedrecording.StreamDayAllocation, error) {
+	rows, err := tx.Query(ctx, `SELECT a.id,a.canonical_bytes,a.relative_path,a.object_key,a.expected_size_bytes,
+		a.expected_sha256,(br.priority_ordinal-1)*14+d.date_ordinal
+		FROM recording_joined_artifacts a JOIN recording_joined_stream_days d ON d.id=a.stream_day_id
 		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
 		WHERE a.batch_record_id=$1 AND a.artifact_kind='allocation_ledger' AND a.publication_state='published'
-		AND (br.priority_ordinal-1)*14+d.date_ordinal=$2`, batchRecordID, ordinal).Scan(&artifactID)
+		ORDER BY (br.priority_ordinal-1)*14+d.date_ordinal`, batchRecordID)
 	if err != nil {
-		return joinedrecording.AllocationLedgerRef{}, joinedrecording.StreamDayAllocation{}, fmt.Errorf("load joined ledger ordinal %d: %w", ordinal, err)
-	}
-	return loadJoinedLedgerReferenceByArtifact(ctx, tx, batchRecordID, artifactID)
-}
-
-func loadJoinedLedgerReferenceByArtifact(ctx context.Context, tx pgx.Tx, batchRecordID, artifactID int64) (
-	joinedrecording.AllocationLedgerRef, joinedrecording.StreamDayAllocation, error) {
-	var raw []byte
-	var relativePath, objectKey, expectedSHA string
-	var expectedSize int64
-	err := tx.QueryRow(ctx, `SELECT canonical_bytes,relative_path,object_key,expected_size_bytes,expected_sha256
-		FROM recording_joined_artifacts WHERE id=$1 AND batch_record_id=$2 AND artifact_kind='allocation_ledger'
-		AND publication_state='published'`, artifactID, batchRecordID).Scan(&raw, &relativePath, &objectKey, &expectedSize, &expectedSHA)
-	if err != nil {
-		return joinedrecording.AllocationLedgerRef{}, joinedrecording.StreamDayAllocation{}, err
-	}
-	var ledger joinedrecording.StreamDayAllocation
-	if err := json.Unmarshal(raw, &ledger); err != nil {
-		return joinedrecording.AllocationLedgerRef{}, ledger, errors.New("decode canonical joined allocation ledger")
-	}
-	ref, err := joinedrecording.BuildAllocationLedgerRef(artifactID, ledger)
-	if err != nil || ref.RelativePath != relativePath || ref.ObjectKey != objectKey || ref.SizeBytes != expectedSize || ref.SHA256 != expectedSHA {
-		return ref, ledger, errors.New("joined allocation ledger row differs from canonical bytes")
-	}
-	return ref, ledger, nil
-}
-
-func loadJoinedHourReference(ctx context.Context, tx pgx.Tx, batchRecordID, ordinal int64) (joinedrecording.BatchIndexHour,
-	joinedrecording.HourManifest, error) {
-	var artifactID int64
-	err := tx.QueryRow(ctx, `SELECT a.id FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id
-		WHERE a.batch_record_id=$1 AND a.artifact_kind='hour_manifest' AND a.publication_state='published'
-		AND h.state='sealed' AND h.priority_ordinal=$2`, batchRecordID, ordinal).Scan(&artifactID)
-	if err != nil {
-		return joinedrecording.BatchIndexHour{}, joinedrecording.HourManifest{}, fmt.Errorf("load joined hour ordinal %d: %w", ordinal, err)
-	}
-	return loadJoinedHourReferenceByArtifact(ctx, tx, batchRecordID, artifactID)
-}
-
-func loadJoinedHourReferenceByArtifact(ctx context.Context, tx pgx.Tx, batchRecordID, artifactID int64) (
-	joinedrecording.BatchIndexHour, joinedrecording.HourManifest, error) {
-	var raw []byte
-	var relativePath, objectKey, expectedSHA string
-	var expectedSize, hourRecordID int64
-	err := tx.QueryRow(ctx, `SELECT a.canonical_bytes,a.relative_path,a.object_key,a.expected_size_bytes,a.expected_sha256,a.hour_record_id
-		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.state='sealed'
-		WHERE a.id=$1 AND a.batch_record_id=$2 AND a.artifact_kind='hour_manifest' AND a.publication_state='published'`,
-		artifactID, batchRecordID).Scan(&raw, &relativePath, &objectKey, &expectedSize, &expectedSHA, &hourRecordID)
-	if err != nil {
-		return joinedrecording.BatchIndexHour{}, joinedrecording.HourManifest{}, err
-	}
-	var manifest joinedrecording.HourManifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return joinedrecording.BatchIndexHour{}, manifest, errors.New("decode canonical joined hour manifest")
-	}
-	ref, err := joinedrecording.BuildBatchIndexHour(artifactID, manifest)
-	if err != nil || ref.RelativePath != relativePath || ref.ObjectKey != objectKey || ref.SizeBytes != expectedSize || ref.SHA256 != expectedSHA {
-		return ref, manifest, errors.New("joined hour-manifest row differs from canonical bytes")
-	}
-	rows, err := tx.Query(ctx, `SELECT id,ordinal,relative_path,object_key,content_id,expected_size_bytes,expected_sha256
-		FROM recording_joined_artifacts WHERE hour_record_id=$1 AND artifact_kind='media' AND published_at IS NOT NULL ORDER BY ordinal`,
-		hourRecordID)
-	if err != nil {
-		return ref, manifest, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	mediaIndex := 0
+	refs := make([]joinedrecording.AllocationLedgerRef, 0, expected)
+	ledgers := make(map[int64]joinedrecording.StreamDayAllocation, expected)
 	for rows.Next() {
-		if mediaIndex >= len(manifest.Media) {
-			return ref, manifest, errors.New("joined hour media cardinality differs")
+		var artifactID, expectedSize int64
+		var ordinal int
+		var raw []byte
+		var relativePath, objectKey, expectedSHA string
+		if err := rows.Scan(&artifactID, &raw, &relativePath, &objectKey, &expectedSize, &expectedSHA, &ordinal); err != nil {
+			return nil, nil, err
 		}
-		var id, size int64
+		if ordinal != len(refs)+1 || len(refs) >= expected {
+			return nil, nil, errors.New("joined allocation ledger order differs")
+		}
+		var ledger joinedrecording.StreamDayAllocation
+		if err := json.Unmarshal(raw, &ledger); err != nil {
+			return nil, nil, errors.New("decode canonical joined allocation ledger")
+		}
+		ref, err := joinedrecording.BuildAllocationLedgerRef(artifactID, ledger)
+		if err != nil || ref.RelativePath != relativePath || ref.ObjectKey != objectKey || ref.SizeBytes != expectedSize ||
+			ref.SHA256 != expectedSHA {
+			return nil, nil, errors.New("joined allocation ledger row differs from canonical bytes")
+		}
+		refs = append(refs, ref)
+		ledgers[artifactID] = ledger
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(refs) != expected {
+		return nil, nil, errors.New("joined allocation ledger cardinality differs")
+	}
+	return refs, ledgers, nil
+}
+
+func loadJoinedHourReferences(ctx context.Context, tx pgx.Tx, batchRecordID int64, expected int) (
+	[]joinedrecording.BatchIndexHour, map[int64]joinedrecording.HourManifest, int, error) {
+	rows, err := tx.Query(ctx, `SELECT a.id,a.hour_record_id,a.canonical_bytes,a.relative_path,a.object_key,
+		a.expected_size_bytes,a.expected_sha256,h.priority_ordinal
+		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.state='sealed'
+		WHERE a.batch_record_id=$1 AND a.artifact_kind='hour_manifest' AND a.publication_state='published'
+		ORDER BY h.priority_ordinal`, batchRecordID)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	refs := make([]joinedrecording.BatchIndexHour, 0, expected)
+	manifests := make(map[int64]joinedrecording.HourManifest, expected)
+	hourArtifacts := make(map[int64]int64, expected)
+	finalMediaCount := 0
+	for rows.Next() {
+		var artifactID, hourRecordID, expectedSize int64
+		var ordinal int
+		var raw []byte
+		var relativePath, objectKey, expectedSHA string
+		if err := rows.Scan(&artifactID, &hourRecordID, &raw, &relativePath, &objectKey, &expectedSize, &expectedSHA,
+			&ordinal); err != nil {
+			rows.Close()
+			return nil, nil, 0, err
+		}
+		if ordinal != len(refs)+1 || len(refs) >= expected {
+			rows.Close()
+			return nil, nil, 0, errors.New("joined hour-manifest order differs")
+		}
+		var manifest joinedrecording.HourManifest
+		if err := json.Unmarshal(raw, &manifest); err != nil {
+			rows.Close()
+			return nil, nil, 0, errors.New("decode canonical joined hour manifest")
+		}
+		ref, err := joinedrecording.BuildBatchIndexHour(artifactID, manifest)
+		if err != nil || ref.RelativePath != relativePath || ref.ObjectKey != objectKey || ref.SizeBytes != expectedSize ||
+			ref.SHA256 != expectedSHA {
+			rows.Close()
+			return nil, nil, 0, errors.New("joined hour-manifest row differs from canonical bytes")
+		}
+		refs = append(refs, ref)
+		manifests[artifactID] = manifest
+		hourArtifacts[hourRecordID] = artifactID
+		finalMediaCount += len(manifest.Media)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, 0, err
+	}
+	rows.Close()
+	if len(refs) != expected {
+		return nil, nil, 0, errors.New("joined hour-manifest cardinality differs")
+	}
+	mediaRows, err := tx.Query(ctx, `SELECT a.hour_record_id,a.id,a.ordinal,a.relative_path,a.object_key,a.content_id,
+		a.expected_size_bytes,a.expected_sha256,a.published_at IS NOT NULL
+		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		WHERE h.batch_record_id=$1 AND a.artifact_kind='media' ORDER BY h.priority_ordinal,a.ordinal`, batchRecordID)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer mediaRows.Close()
+	mediaPositions := make(map[int64]int, expected)
+	for mediaRows.Next() {
+		var hourRecordID, id, size int64
 		var ordinal int
 		var path, key, contentID, sha string
-		if err := rows.Scan(&id, &ordinal, &path, &key, &contentID, &size, &sha); err != nil {
-			return ref, manifest, err
+		var published bool
+		if err := mediaRows.Scan(&hourRecordID, &id, &ordinal, &path, &key, &contentID, &size, &sha, &published); err != nil {
+			return nil, nil, 0, err
 		}
-		media := manifest.Media[mediaIndex]
+		artifactID, ok := hourArtifacts[hourRecordID]
+		manifest, exists := manifests[artifactID]
+		position := mediaPositions[hourRecordID]
+		if !ok || !exists || !published || position >= len(manifest.Media) {
+			return nil, nil, 0, errors.New("joined hour media cardinality differs")
+		}
+		media := manifest.Media[position]
 		if id != media.ArtifactID || ordinal != media.Ordinal || path != media.RelativePath || key != media.ObjectKey ||
 			contentID != media.ContentID || size != media.SizeBytes || sha != media.SHA256 {
-			return ref, manifest, errors.New("joined published media differs from hour manifest")
+			return nil, nil, 0, errors.New("joined published media differs from hour manifest")
 		}
-		mediaIndex++
+		mediaPositions[hourRecordID] = position + 1
 	}
-	if err := rows.Err(); err != nil || mediaIndex != len(manifest.Media) {
-		return ref, manifest, errors.New("joined hour media cardinality differs")
+	if err := mediaRows.Err(); err != nil {
+		return nil, nil, 0, err
 	}
-	return ref, manifest, nil
+	for hourRecordID, artifactID := range hourArtifacts {
+		if mediaPositions[hourRecordID] != len(manifests[artifactID].Media) {
+			return nil, nil, 0, errors.New("joined hour media cardinality differs")
+		}
+	}
+	return refs, manifests, finalMediaCount, nil
 }
