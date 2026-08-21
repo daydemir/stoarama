@@ -68,7 +68,7 @@ func sealedClaim(t *testing.T, _ int64, plan BatchPlan, built []BuiltOutput, qua
 		t.Fatal(err)
 	}
 	manifestArtifactID := int64(999)
-	return WorkerClaim{ProtocolVersion: JoinedProtocolVersion, HourID: plan.HourID, LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("p", 32), LeaseExpires: time.Now().Add(time.Hour), StorageAuthority: "cap.test", StorageBucket: "recordings", Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: artifactIDs, HourManifestArtifactID: manifestArtifactID, HourManifestExpectedSize: int64(len(manifestJSON)), HourManifestExpectedSHA: manifestSHA}
+	return WorkerClaim{ProtocolVersion: JoinedProtocolVersion, HourID: plan.HourID, LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("p", 32), LeaseExpires: time.Now().Add(time.Hour), StorageAuthority: testSourceAuthority, StorageBucket: "recordings", Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: artifactIDs, HourManifestArtifactID: manifestArtifactID, HourManifestExpectedSize: int64(len(manifestJSON)), HourManifestExpectedSHA: manifestSHA}
 }
 
 func testCreateResolver() CreateCapabilityResolver {
@@ -140,7 +140,7 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 	built.Path, built.SizeBytes, built.SHA256 = mediaPath, size, sha
 	sealedScratch := bindTestScratch(t, claim, []BuiltOutput{built}, nil, scratch)
 	client := &memoryCapabilityClient{objects: map[string][]byte{}}
-	if _, err := PublishClaimedHourRenewing(context.Background(), client, "cap.test", claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(context.Context, WorkerClaim, PublishedHour) error { return errors.New("database unavailable") }); err == nil {
+	if _, err := PublishClaimedHourRenewing(context.Background(), client, testSourceAuthority, claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(context.Context, WorkerClaim, PublishedHour) error { return errors.New("database unavailable") }); err == nil {
 		t.Fatal("database orphan was reported as finalized")
 	}
 	if _, err := os.Stat(mediaPath); err != nil {
@@ -150,7 +150,7 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 		t.Fatalf("objects=%d want media+hour coverage", len(client.objects))
 	}
 	var finalized bool
-	published, err := PublishClaimedHourRenewing(context.Background(), client, "cap.test", claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(_ context.Context, got WorkerClaim, output PublishedHour) error {
+	published, err := PublishClaimedHourRenewing(context.Background(), client, testSourceAuthority, claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(_ context.Context, got WorkerClaim, output PublishedHour) error {
 		finalized = got.OperationToken == claim.OperationToken && output.HourID == claim.HourID
 		return nil
 	})
@@ -217,7 +217,7 @@ func TestPublishGapOnlyHourCreatesOnlyImmutableHourManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	sealedScratch := bindTestScratch(t, claim, nil, nil, directory)
-	published, err := PublishClaimedHourRenewing(context.Background(), client, "cap.test", claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(context.Context, WorkerClaim, PublishedHour) error { return nil })
+	published, err := PublishClaimedHourRenewing(context.Background(), client, testSourceAuthority, claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(context.Context, WorkerClaim, PublishedHour) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

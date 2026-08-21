@@ -87,7 +87,7 @@ func TestPreflightRenewingUsesRefreshedTokenAndSourceOnlySeams(t *testing.T) {
 		published.LeaseID, published.OperationToken, published.LeaseExpires = strings.Repeat("P", 43), strings.Repeat("p", 32), time.Now().Add(time.Hour)
 		return published, nil
 	}
-	sealed, scratch, err := runPreflightHourRenewing(context.Background(), claim, t.TempDir(), client, "cap.test", heartbeat, resolve, seal, refreshedRunner)
+	sealed, scratch, err := runPreflightHourRenewing(context.Background(), claim, t.TempDir(), client, testSourceAuthority, heartbeat, resolve, seal, refreshedRunner)
 	if err != nil || sealed.HourID != claim.HourID || scratch.verified.HourID != claim.HourID || len(scratch.verified.Built) == 0 {
 		t.Fatalf("preflight lifecycle failed: sealed=%+v scratch=%+v err=%v", sealed, scratch, err)
 	}
@@ -106,7 +106,7 @@ func TestPreflightRejectsMismatchedInstalledToolBeforeSourceAccess(t *testing.T)
 	}
 	claim := PreflightHourClaim{LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("a", 32), LeaseExpires: time.Now().Add(time.Hour), MediaTool: want}
 	var sourceAccessed, sealed bool
-	_, _, err = runPreflightHourRenewing(context.Background(), claim, t.TempDir(), &memoryCapabilityClient{objects: map[string][]byte{}}, "cap.test", func(context.Context, string) (OperationCredentials, error) {
+	_, _, err = runPreflightHourRenewing(context.Background(), claim, t.TempDir(), &memoryCapabilityClient{objects: map[string][]byte{}}, testSourceAuthority, func(context.Context, string) (OperationCredentials, error) {
 		return OperationCredentials{}, errors.New("unexpected heartbeat")
 	}, func(context.Context, PreflightHourClaim, SourceClip, string) (SourceReadCapability, error) {
 		sourceAccessed = true
@@ -136,7 +136,7 @@ func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledgerJSON, ledgerSHA, _ := CanonicalAllocationLedgerArtifact(ledger)
-	ledgerClaim := LedgerPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ArtifactID: 70, ScopeID: canonicalLedgerID(req.BatchID, req.RecordingID, req.LocalDate, req.Generation), LeaseID: leaseID, OperationToken: initialToken, LeaseExpires: expires, StorageAuthority: "cap.test", StorageBucket: "recordings", BatchID: req.BatchID, Ledger: ledger, ExpectedSize: int64(len(ledgerJSON)), ExpectedSHA256: ledgerSHA}
+	ledgerClaim := LedgerPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ArtifactID: 70, ScopeID: canonicalLedgerID(req.BatchID, req.RecordingID, req.LocalDate, req.Generation), LeaseID: leaseID, OperationToken: initialToken, LeaseExpires: expires, StorageAuthority: testSourceAuthority, StorageBucket: "recordings", BatchID: req.BatchID, Ledger: ledger, ExpectedSize: int64(len(ledgerJSON)), ExpectedSHA256: ledgerSHA}
 	if _, err := PublishAllocationLedgerRenewing(context.Background(), nil, "other.test", ledgerClaim, nil, nil, nil, nil); err == nil {
 		t.Fatal("ledger publication trusted claim-supplied storage authority")
 	}
@@ -163,7 +163,7 @@ func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 
 	index, indexLedgers, indexManifests := testBatchIndex(t)
 	_, indexJSON, indexSHA, _ := BuildBatchIndex(index, testLedgerResolver(indexLedgers), testHourResolver(indexManifests))
-	indexClaim := BatchIndexPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ScopeID: index.BatchID, ArtifactID: 80, LeaseID: leaseID, OperationToken: initialToken, LeaseExpires: expires, StorageAuthority: "cap.test", StorageBucket: "recordings", Index: index, ExpectedSize: int64(len(indexJSON)), ExpectedSHA256: indexSHA}
+	indexClaim := BatchIndexPublicationClaim{ProtocolVersion: JoinedProtocolVersion, ScopeID: index.BatchID, ArtifactID: 80, LeaseID: leaseID, OperationToken: initialToken, LeaseExpires: expires, StorageAuthority: testSourceAuthority, StorageBucket: "recordings", Index: index, ExpectedSize: int64(len(indexJSON)), ExpectedSHA256: indexSHA}
 	if _, err := PublishBatchIndexRenewing(context.Background(), nil, "other.test", indexClaim, nil, nil, nil, nil); err == nil {
 		t.Fatal("batch-index publication trusted claim-supplied storage authority")
 	}
