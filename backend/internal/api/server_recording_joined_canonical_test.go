@@ -18,6 +18,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+const joinedTestSourceEndpoint = "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+
 // This uses the real migration in a disposable PostgreSQL schema when the
 // standard repository test URL is configured.
 func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
@@ -36,8 +38,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 
 	var storageID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,endpoint,region,bucket,
-		access_key_id,secret_access_key_enc,status) VALUES($1,'joined-test','https://source.example.test','auto',
-		'clips','key',$2,'verified') RETURNING id`, accountID, []byte{1}).Scan(&storageID); err != nil {
+		access_key_id,secret_access_key_enc,status) VALUES($1,'joined-test',$3,'auto',
+		'clips','key',$2,'verified') RETURNING id`, accountID, []byte{1}, joinedTestSourceEndpoint).Scan(&storageID); err != nil {
 		t.Fatal(err)
 	}
 	var apiKeyID int64
@@ -80,14 +82,29 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		var clipID int64
 		if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,
 			endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,
-			audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,'https://source.example.test',
+			audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,$9,
 			'clips',$4,$4,'video/mp4','mp4',10,$5,$6,60000,'h264',false,$7,$7,$8,$7) RETURNING id`, recordingID,
-			jobIDs[12], storageID, key, etag, sha, start, start.Add(time.Minute)).Scan(&clipID); err != nil {
+			jobIDs[12], storageID, key, etag, sha, start, start.Add(time.Minute), joinedTestSourceEndpoint).Scan(&clipID); err != nil {
 			t.Fatal(err)
 		}
 		sources[i] = joinedrecording.SourceClip{ClipID: clipID, RecordingID: recordingID, RecordingJobID: jobIDs[12],
-			Provider: "s3_compatible", Endpoint: "https://source.example.test", Region: "auto", Bucket: "clips", StartUTC: start,
+			Provider: "s3_compatible", Endpoint: joinedTestSourceEndpoint, Region: "auto", Bucket: "clips", StartUTC: start,
 			EndUTC: start.Add(time.Minute), Object: joinedrecording.ObjectIdentity{Key: key, ETag: etag, SizeBytes: 10, SHA256: sha}}
+	}
+	const otherSourceEndpoint = "https://fedcba9876543210fedcba9876543210.r2.cloudflarestorage.com"
+	var otherStorageID, otherClipID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,endpoint,region,bucket,
+		access_key_id,secret_access_key_enc,status) VALUES($1,'joined-other',$3,'auto','clips','key',$2,'verified') RETURNING id`,
+		accountID, []byte{1}, otherSourceEndpoint).Scan(&otherStorageID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,
+		endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,
+		audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,$4,'clips','raw/other.mp4',
+		'raw/other.mp4','video/mp4','mp4',10,'other-etag',$5,60000,'h264',false,$6,$6,$7,$6) RETURNING id`,
+		recordingID, jobIDs[12], otherStorageID, otherSourceEndpoint, strings.Repeat("d", 64), sourceDate,
+		sourceDate.Add(time.Minute)).Scan(&otherClipID); err != nil {
+		t.Fatal(err)
 	}
 	qualification, err := joinedrecording.SealQualificationWindow(qualification)
 	if err != nil {
@@ -110,21 +127,30 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	metadataJSON, _ := json.Marshal(metadata)
 	var batchRecordID int64
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
+		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
 		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
 		expected_source_clips,expected_source_bytes,freeze_started_at)
-		VALUES($1,$2,'preseed-generation-1',1,$3,$4,$5,$6,'{"schema_version":1}',$7,$8,1,14,168,0,0,now())`,
+		VALUES($1,$2,'preseed-generation-1',1,$9,$3,$4,$5,$6,'{"schema_version":1}',$7,$8,1,14,168,0,0,now())`,
 		accountID, connectionID, joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON,
-		mediaTool.IdentitySHA256, strings.Repeat("9", 64), strings.Repeat("8", 64)); err == nil {
+		mediaTool.IdentitySHA256, strings.Repeat("9", 64), strings.Repeat("8", 64), joinedTestSourceEndpoint); err == nil {
 		t.Fatal("batch insert preseeded freeze evidence")
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
+		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
 		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
 		expected_source_clips,expected_source_bytes)
-		VALUES($1,$2,$3,1,$4,$5,$6,$7,'{"schema_version":1}',$8,$9,1,14,168,3,30) RETURNING id`,
+		VALUES($1,$2,'invalid-endpoint-generation-1',1,$9,$3,$4,$5,$6,'{"schema_version":1}',$7,$8,1,14,168,0,0)`,
+		accountID, connectionID, joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON,
+		mediaTool.IdentitySHA256, strings.Repeat("9", 64), strings.Repeat("8", 64), joinedTestSourceEndpoint+"/"); err == nil {
+		t.Fatal("batch accepted a noncanonical source endpoint")
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
+		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
+		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
+		expected_source_clips,expected_source_bytes)
+		VALUES($1,$2,$3,1,$10,$4,$5,$6,$7,'{"schema_version":1}',$8,$9,1,14,168,3,30) RETURNING id`,
 		accountID, connectionID, batchID, joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON,
-		mediaTool.IdentitySHA256, strings.Repeat("a", 64), strings.Repeat("b", 64)).Scan(&batchRecordID); err != nil {
+		mediaTool.IdentitySHA256, strings.Repeat("a", 64), strings.Repeat("b", 64), joinedTestSourceEndpoint).Scan(&batchRecordID); err != nil {
 		t.Fatal(err)
 	}
 	var batchRecordingID int64
@@ -198,6 +224,18 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 			}
 		}
 		if day == 12 {
+			if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_sources(batch_record_id,stream_day_id,
+				hour_record_id,account_id,connection_id,recording_id,recording_job_id,clip_id,storage_destination_id,
+				day_ordinal,hour_ordinal,provider,endpoint,region,bucket,object_key,version_id,etag,size_bytes,sha256,
+				start_at,end_at,seam_to_previous,clip_created_at)
+				SELECT $1,$2,h.id,$3,$4,rc.recording_id,rc.recording_job_id,rc.id,rc.storage_destination_id,4,4,
+				sd.provider,rc.endpoint,sd.region,rc.bucket,rc.object_key,'',rc.etag,rc.size_bytes,rc.sha256,
+				rc.clip_start_at,rc.clip_end_at,'{}',rc.created_at
+				FROM recording_joined_hours h, recording_clips rc JOIN storage_destinations sd ON sd.id=rc.storage_destination_id
+				WHERE h.stream_day_id=$2 AND h.delivery_hour=1 AND rc.id=$5`, batchRecordID, streamDayID,
+				accountID, connectionID, otherClipID); err == nil {
+				t.Fatal("batch accepted a source from another valid endpoint")
+			}
 			insertSources := func(tx pgx.Tx, swapHours, alterSeam bool, firstOrdinal, lastOrdinal int) error {
 				dayOrdinal := 0
 				for hourIndex, hour := range draft.Hours {
@@ -694,12 +732,12 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	var incompleteID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
-		policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
+		source_endpoint,policy_version,eligibility_cutoff,media_tool,media_tool_sha256,freeze_request,freeze_request_sha256,
 		frozen_denominator_sha256,expected_recordings,expected_stream_days,expected_scheduled_hours,
-		expected_source_clips,expected_source_bytes) VALUES($1,$2,'incomplete-generation-1',1,$3,$4,$5,$6,
+		expected_source_clips,expected_source_bytes) VALUES($1,$2,'incomplete-generation-1',1,$9,$3,$4,$5,$6,
 		'{"schema_version":1}',$7,$8,1,14,168,0,0) RETURNING id`, accountID, connectionID,
 		joinedrecording.PlanPolicyVersion, qualification.FrozenAt, mediaToolJSON, mediaTool.IdentitySHA256,
-		strings.Repeat("e", 64), strings.Repeat("f", 64)).Scan(&incompleteID); err != nil {
+		strings.Repeat("e", 64), strings.Repeat("f", 64), joinedTestSourceEndpoint).Scan(&incompleteID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_joined_batches SET state='frozen',frozen_at=$2 WHERE id=$1`,
