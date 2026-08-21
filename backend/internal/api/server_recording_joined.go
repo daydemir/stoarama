@@ -487,10 +487,10 @@ func joinedSignedRequestExpiry(request joinedSignedRequest, upperBound time.Time
 		return time.Time{}, errors.New("presigned storage capability lifetime is invalid")
 	}
 	signedExpiry := signedAt.Add(time.Duration(seconds) * time.Second)
-	if signedExpiry.Before(upperBound) {
-		return signedExpiry, nil
+	if signedExpiry.After(upperBound) {
+		return time.Time{}, errors.New("presigned storage capability outlives its authority bound")
 	}
-	return upperBound, nil
+	return signedExpiry, nil
 }
 
 // handleJoinedSourceCapability mints reads only for a source already frozen
