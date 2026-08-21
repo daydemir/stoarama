@@ -2682,6 +2682,7 @@ def valid_joined_int64(value, label):
 
 JOINED_REASON = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 JOINED_BATCH = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+SOURCE_ENDPOINT_V1 = re.compile(r"https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com\Z")
 QUALIFICATION_FIELDS = ("local_date", "job_id", "window_start", "window_end", "completed_at", "quality_tier")
 OBJECT_FIELDS = ("key", "etag", "size_bytes", "sha256")
 SEAM_FIELDS = ("verdict", "reason", "signed_gap_nanoseconds")
@@ -2878,23 +2879,6 @@ def valid_media_tool(tool):
         raise ValueError("joined media tool identity conflicts")
 
 
-def valid_go_url_host(host):
-    allowed = "!$&'()*+,;=:[]<>\"-_.~"
-    index = 0
-    while index < len(host):
-        char = host[index]
-        if char == "%":
-            escape = host[index:index + 3]
-            if len(escape) != 3 or re.fullmatch(r"%[0-9A-Fa-f]{2}", escape) is None or (int(escape[1:], 16) < 0x80 and escape != "%25"):
-                return False
-            index += 3
-            continue
-        if ord(char) < 0x80 and not (char.isascii() and (char.isalnum() or char in allowed)):
-            return False
-        index += 1
-    return True
-
-
 def valid_source(source, recording_id, source_only=False, location=None, local_date=None):
     fields = set(SOURCE_FIELDS)
     if not isinstance(source, dict) or set(source) not in (fields, fields | {"audio_sequence_contract"}):
@@ -2906,18 +2890,8 @@ def valid_source(source, recording_id, source_only=False, location=None, local_d
     for key in ("provider", "region", "bucket"):
         if not valid_joined_string(source[key], "source %s" % key).strip():
             raise ValueError("joined source %s is blank" % key)
-    endpoint = valid_joined_string(source["endpoint"], "source endpoint")
-    try:
-        parsed_endpoint = urllib.parse.urlsplit(endpoint)
-        parsed_endpoint.port
-    except ValueError as exc:
-        raise ValueError("joined source endpoint is not a canonical HTTPS authority") from exc
-    if (
-        parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc
-        or parsed_endpoint.username is not None or parsed_endpoint.password is not None
-        or not valid_go_url_host(parsed_endpoint.netloc)
-        or parsed_endpoint.query or parsed_endpoint.fragment or parsed_endpoint.path not in ("", "/")
-    ):
+    endpoint = source["endpoint"]
+    if not isinstance(endpoint, str) or SOURCE_ENDPOINT_V1.fullmatch(endpoint) is None:
         raise ValueError("joined source endpoint is not a canonical HTTPS authority")
     start = valid_joined_timestamp(source["start_utc"], "source start_utc")
     end = valid_joined_timestamp(source["end_utc"], "source end_utc")
