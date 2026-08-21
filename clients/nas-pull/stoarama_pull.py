@@ -47,6 +47,7 @@ JOINED_ROOT = "joined"
 JOINED_PROTOCOL_VERSION = 1
 JOINED_RANGE_BYTES = 64 * 1024 * 1024
 JOINED_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
+JOINED_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 
 INVENTORY_SKIP_REASONS = frozenset((
     "changed_during_hash", "invalid_sidecar", "io_error",
@@ -2382,18 +2383,24 @@ def download_verified(url, temp_path, expected_bytes, expected_sha):
 def valid_joined_item(raw):
     if not isinstance(raw, dict):
         raise ValueError("joined item is invalid")
-    output_id = raw.get("id")
+    fields = {
+        "id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+        "download_path", "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
+    }
+    if set(raw) != fields:
+        raise ValueError("joined item has invalid fields")
+    artifact_id = raw.get("id")
     size_bytes = raw.get("size_bytes")
-    if isinstance(output_id, bool) or not isinstance(output_id, int) or output_id < 1:
+    if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id < 1:
         raise ValueError("joined item has invalid id")
     if (
         isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
         or size_bytes < 1 or size_bytes > JOINED_MAX_BYTES
     ):
         raise ValueError("joined item has invalid size_bytes")
-    campaign_id = str(raw.get("campaign_id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", campaign_id):
-        raise ValueError("joined item has invalid campaign_id")
+    batch_id = str(raw.get("batch_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", batch_id):
+        raise ValueError("joined item has invalid batch_id")
     relative_raw = str(raw.get("relative_path") or "")
     relative = Path(relative_raw)
     if (
@@ -2402,58 +2409,61 @@ def valid_joined_item(raw):
         or relative.parts[0] == JOINED_ROOT
     ):
         raise ValueError("joined item has invalid relative_path")
-    sha256 = str(raw.get("sha256") or "").lower()
-    campaign_manifest_sha = str(raw.get("campaign_manifest_sha256") or "").lower()
-    coverage_sha = str(raw.get("coverage_sha256") or "").lower()
-    if any(len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value) for value in (
-        sha256, campaign_manifest_sha, coverage_sha,
-    )):
-        raise ValueError("joined item has invalid sha256")
-    expected_outputs = raw.get("campaign_expected_outputs")
-    recording_id = raw.get("recording_id")
-    coverage_size = raw.get("coverage_size_bytes")
-    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (
-        expected_outputs, recording_id, coverage_size,
-    )):
-        raise ValueError("joined item has invalid integer metadata")
-    coverage_key = str(raw.get("coverage_object_key") or "")
-    if not coverage_key or len(coverage_key) > 1024 or any(ord(ch) < 32 for ch in coverage_key):
-        raise ValueError("joined item has invalid coverage_object_key")
-    coverage_start = str(raw.get("coverage_start_at") or "")
-    coverage_end = str(raw.get("coverage_end_at") or "")
-    try:
-        coverage_start_at = datetime.datetime.fromisoformat(coverage_start.replace("Z", "+00:00"))
-        coverage_end_at = datetime.datetime.fromisoformat(coverage_end.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("joined item has invalid coverage timestamps") from exc
-    if (
-        coverage_start_at.tzinfo is None or coverage_end_at.tzinfo is None
-        or coverage_end_at <= coverage_start_at
-    ):
-        raise ValueError("joined item has invalid coverage timestamps")
+    sha256 = valid_sha256(raw.get("sha256"), "joined item")
+    kind = raw.get("kind")
+    content_type = raw.get("content_type")
+    hour_id = raw.get("hour_id")
+    if kind not in ("hour_manifest", "media", "batch_index"):
+        raise ValueError("joined item has invalid kind")
+    if content_type != ("video/mp4" if kind == "media" else "application/json"):
+        raise ValueError("joined item has invalid content_type")
+    if kind == "batch_index":
+        if hour_id is not None or relative.as_posix() != "batch.json":
+            raise ValueError("joined batch index has invalid path or hour_id")
+    elif isinstance(hour_id, bool) or not isinstance(hour_id, int) or hour_id < 1:
+        raise ValueError("joined item has invalid hour_id")
+    if kind == "hour_manifest" and not relative_raw.endswith(".hour.json"):
+        raise ValueError("joined hour manifest has invalid suffix")
+    if kind == "media" and not relative_raw.endswith(".mp4"):
+        raise ValueError("joined media has invalid suffix")
+    manifest_id = raw.get("hour_manifest_id")
+    manifest_path = raw.get("hour_manifest_relative_path")
+    manifest_sha = raw.get("hour_manifest_sha256")
+    if kind == "media":
+        if isinstance(manifest_id, bool) or not isinstance(manifest_id, int) or manifest_id < 1:
+            raise ValueError("joined media has invalid hour_manifest_id")
+        manifest_path = valid_joined_relative_path(manifest_path, ".hour.json")
+        manifest_sha = valid_sha256(manifest_sha, "joined media manifest")
+    elif any(value is not None for value in (manifest_id, manifest_path, manifest_sha)):
+        raise ValueError("joined non-media item has manifest binding")
     download_path = str(raw.get("download_path") or "")
-    if download_path != "/api/v1/account/joined/%d/download" % output_id:
+    if download_path != "/api/v1/account/joined/%d/download" % artifact_id:
         raise ValueError("joined item has invalid download_path")
     return {
-        "id": output_id,
-        "campaign_id": campaign_id,
-        "campaign_expected_outputs": expected_outputs,
-        "campaign_manifest_sha256": campaign_manifest_sha,
-        "recording_id": recording_id,
-        "relative_path": relative.as_posix(),
-        "size_bytes": size_bytes,
-        "sha256": sha256,
-        "etag": normalized_etag(raw.get("etag")),
-        "version_id": str(raw.get("version_id") or ""),
-        "coverage_object_key": coverage_key,
-        "coverage_size_bytes": coverage_size,
-        "coverage_sha256": coverage_sha,
-        "coverage_etag": normalized_etag(raw.get("coverage_etag")),
-        "coverage_version_id": str(raw.get("coverage_version_id") or ""),
-        "coverage_start_at": coverage_start,
-        "coverage_end_at": coverage_end,
-        "download_path": download_path,
+        "id": artifact_id, "batch_id": batch_id, "hour_id": hour_id, "kind": kind,
+        "content_type": content_type, "relative_path": relative.as_posix(), "size_bytes": size_bytes,
+        "sha256": sha256, "download_path": download_path, "hour_manifest_id": manifest_id,
+        "hour_manifest_relative_path": manifest_path, "hour_manifest_sha256": manifest_sha,
     }
+
+
+def valid_sha256(value, label):
+    digest = str(value or "").lower()
+    if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("joined item has invalid sha256")
+    return digest
+
+
+def valid_joined_relative_path(value, suffix=None):
+    raw = str(value or "")
+    relative = Path(raw)
+    if (
+        not raw or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
+        or any(part in ("", ".", "..") for part in relative.parts) or relative.parts[0] == JOINED_ROOT
+        or (suffix is not None and not raw.endswith(suffix))
+    ):
+        raise ValueError("joined item has invalid relative_path")
+    return relative.as_posix()
 
 
 def normalized_etag(value):
@@ -2468,18 +2478,20 @@ def normalized_etag(value):
 
 
 def joined_output_path(cfg, item):
-    return cfg.output_dir / JOINED_ROOT / item["campaign_id"] / item["relative_path"]
+    return cfg.output_dir / JOINED_ROOT / item["batch_id"] / item["relative_path"]
 
 
-def open_joined_output_dir(cfg, item):
+def open_joined_output_dir(cfg, item, create=True):
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(str(cfg.output_dir), flags)
-    parts = (JOINED_ROOT, item["campaign_id"], *Path(item["relative_path"]).parts[:-1])
+    parts = (JOINED_ROOT, item["batch_id"], *Path(item["relative_path"]).parts[:-1])
     try:
         for part in parts:
             try:
                 child = os.open(part, flags, dir_fd=descriptor)
             except FileNotFoundError:
+                if not create:
+                    raise ExistingFileMismatch("joined manifest directory is missing")
                 os.mkdir(part, mode=0o755, dir_fd=descriptor)
                 os.fsync(descriptor)
                 child = os.open(part, flags, dir_fd=descriptor)
@@ -2539,13 +2551,16 @@ def verify_joined_entry(cfg, runtime, directory_fd, name, expected_bytes, expect
     return True
 
 
-def joined_sidecar_bytes(item):
-    payload = {"schema_version": 1, "output_id": item["id"], **{key: item[key] for key in (
-        "campaign_id", "campaign_expected_outputs", "campaign_manifest_sha256", "recording_id",
-        "relative_path", "size_bytes", "sha256", "etag", "version_id", "coverage_object_key",
-        "coverage_size_bytes", "coverage_sha256", "coverage_etag", "coverage_version_id",
-        "coverage_start_at", "coverage_end_at",
-    )}}
+def joined_transfer_marker_bytes(item, prepared):
+    payload = {
+        "schema_version": 2,
+        **{key: item[key] for key in (
+            "id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+            "download_path", "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
+        )},
+        "etag": prepared["etag"],
+        "version_id": prepared["version_id"],
+    }
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
@@ -2554,6 +2569,167 @@ def verify_joined_sidecar(cfg, runtime, directory_fd, name, expected, stop_event
         return False
     size, digest, _ = hash_joined_entry(cfg, runtime, directory_fd, name, stop_event)
     return size == len(expected) and digest == hashlib.sha256(expected).hexdigest()
+
+
+def valid_joined_timestamp(value, label):
+    if not isinstance(value, str) or not value:
+        raise ValueError("joined manifest has invalid %s" % label)
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("joined manifest has invalid %s" % label) from exc
+    if parsed.tzinfo is None:
+        raise ValueError("joined manifest has invalid %s" % label)
+    return parsed
+
+
+def positive_joined_int(value, label, allow_zero=False):
+    minimum = 0 if allow_zero else 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError("joined manifest has invalid %s" % label)
+    return value
+
+
+def valid_hour_manifest(payload, item):
+    fields = {
+        "schema_version", "batch_id", "hour_id", "recording_id", "local_date", "delivery_hour",
+        "local_timezone", "hour_start_at", "hour_end_at", "source_clip_count", "source_bytes",
+        "source_manifest_sha256", "gap_only", "media",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields or payload.get("schema_version") != 1:
+        raise ValueError("joined hour manifest has invalid fields")
+    if payload.get("batch_id") != item["batch_id"] or payload.get("hour_id") != item["hour_id"]:
+        raise ExistingFileMismatch("joined hour manifest identity conflicts")
+    positive_joined_int(payload.get("recording_id"), "recording_id")
+    local_date = payload.get("local_date")
+    try:
+        if not isinstance(local_date, str) or datetime.date.fromisoformat(local_date).isoformat() != local_date:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("joined manifest has invalid local_date") from exc
+    delivery_hour = positive_joined_int(payload.get("delivery_hour"), "delivery_hour")
+    if delivery_hour > 12:
+        raise ValueError("joined manifest has invalid delivery_hour")
+    timezone = payload.get("local_timezone")
+    if not isinstance(timezone, str) or not timezone or len(timezone) > 255:
+        raise ValueError("joined manifest has invalid local_timezone")
+    hour_start = valid_joined_timestamp(payload.get("hour_start_at"), "hour_start_at")
+    hour_end = valid_joined_timestamp(payload.get("hour_end_at"), "hour_end_at")
+    if hour_end <= hour_start:
+        raise ValueError("joined manifest has invalid hour range")
+    source_count = positive_joined_int(payload.get("source_clip_count"), "source_clip_count", allow_zero=True)
+    source_bytes = positive_joined_int(payload.get("source_bytes"), "source_bytes", allow_zero=True)
+    valid_sha256(payload.get("source_manifest_sha256"), "joined source manifest")
+    gap_only = payload.get("gap_only")
+    media = payload.get("media")
+    if not isinstance(gap_only, bool) or not isinstance(media, list):
+        raise ValueError("joined manifest has invalid gap/media fields")
+    if gap_only != (source_count == 0 and source_bytes == 0 and media == []) or (not gap_only and not media):
+        raise ValueError("joined manifest has inconsistent gap/media fields")
+    media_fields = {
+        "artifact_id", "part_ordinal", "relative_path", "size_bytes", "sha256", "content_id",
+        "coverage_start_at", "coverage_end_at",
+    }
+    seen_ids = set()
+    seen_paths = set()
+    for ordinal, entry in enumerate(media, 1):
+        if not isinstance(entry, dict) or set(entry) != media_fields:
+            raise ValueError("joined manifest has invalid media fields")
+        artifact_id = positive_joined_int(entry.get("artifact_id"), "artifact_id")
+        if positive_joined_int(entry.get("part_ordinal"), "part_ordinal") != ordinal:
+            raise ValueError("joined manifest media order is not contiguous")
+        path = valid_joined_relative_path(entry.get("relative_path"), ".mp4")
+        size_bytes = positive_joined_int(entry.get("size_bytes"), "media size_bytes")
+        sha256 = valid_sha256(entry.get("sha256"), "joined manifest media")
+        if entry.get("content_id") != sha256:
+            raise ValueError("joined manifest media content_id conflicts")
+        coverage_start = valid_joined_timestamp(entry.get("coverage_start_at"), "coverage_start_at")
+        coverage_end = valid_joined_timestamp(entry.get("coverage_end_at"), "coverage_end_at")
+        if coverage_end <= coverage_start or artifact_id in seen_ids or path in seen_paths:
+            raise ValueError("joined manifest has invalid media coverage or duplicate")
+        seen_ids.add(artifact_id)
+        seen_paths.add(path)
+        if item["kind"] == "media" and artifact_id == item["id"]:
+            if path != item["relative_path"] or size_bytes != item["size_bytes"] or sha256 != item["sha256"]:
+                raise ExistingFileMismatch("joined media conflicts with sealed hour manifest")
+    if item["kind"] == "media" and item["id"] not in seen_ids:
+        raise ExistingFileMismatch("joined media is absent from sealed hour manifest")
+    return payload
+
+
+def read_joined_content(cfg, runtime, directory_fd, name, limit, stop_event):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    content = bytearray()
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode) or before.st_nlink not in (1, 2):
+            raise ExistingFileMismatch("joined hour manifest has an unknown hardlink")
+        while True:
+            if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                raise JoinedDownloadYield("joined manifest validation yielded to raw clip delivery")
+            chunk = os.read(descriptor, min(JOINED_RANGE_BYTES, limit + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+            digest.update(chunk)
+            if len(content) > limit:
+                raise ValueError("joined JSON artifact is too large")
+        after = os.fstat(descriptor)
+        path_after = joined_entry_stat(directory_fd, name)
+        if path_after is None or certification_identity(before) != certification_identity(after) or certification_identity(after) != certification_identity(path_after):
+            raise FileChangedDuringHash("joined hour manifest changed while reading")
+    finally:
+        os.close(descriptor)
+    return bytes(content), digest.hexdigest()
+
+
+def read_joined_manifest(cfg, runtime, directory_fd, name, expected_sha, item, stop_event):
+    content, digest = read_joined_content(
+        cfg, runtime, directory_fd, name, JOINED_MANIFEST_MAX_BYTES, stop_event,
+    )
+    if digest != expected_sha:
+        raise ExistingFileMismatch("joined hour manifest checksum conflicts")
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("joined hour manifest is not valid UTF-8 JSON") from exc
+    return valid_hour_manifest(payload, item)
+
+
+def validate_joined_artifact(cfg, runtime, directory_fd, name, item, stop_event):
+    if item["kind"] == "hour_manifest":
+        read_joined_manifest(cfg, runtime, directory_fd, name, item["sha256"], item, stop_event)
+    elif item["kind"] == "batch_index":
+        if item["size_bytes"] > JOINED_MANIFEST_MAX_BYTES:
+            raise ValueError("joined batch index is too large")
+        try:
+            content, digest = read_joined_content(
+                cfg, runtime, directory_fd, name, JOINED_MANIFEST_MAX_BYTES, stop_event,
+            )
+            if digest != item["sha256"]:
+                raise ExistingFileMismatch("joined batch index checksum conflicts")
+            json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("joined batch index is not valid UTF-8 JSON") from exc
+
+
+def validate_media_manifest_binding(cfg, runtime, item, stop_event):
+    if item["kind"] != "media":
+        return
+    manifest_item = {
+        "batch_id": item["batch_id"],
+        "relative_path": item["hour_manifest_relative_path"],
+    }
+    directory_fd = open_joined_output_dir(cfg, manifest_item, create=False)
+    try:
+        read_joined_manifest(
+            cfg, runtime, directory_fd, Path(item["hour_manifest_relative_path"]).name,
+            item["hour_manifest_sha256"], item, stop_event,
+        )
+    finally:
+        os.close(directory_fd)
 
 
 def write_joined_stage(directory_fd, name, content):
@@ -2692,27 +2868,31 @@ def poll_raw_pending(cfg, runtime):
 
 def prepare_joined_download(cfg, item):
     prepared = request_json(cfg, "GET", item["download_path"], base=cfg.origin)
+    if set(prepared) != {"url", "etag", "if_match", "version_id", "size_bytes", "sha256", "content_type"}:
+        raise RuntimeError("joined download response has invalid fields")
     url = str(prepared.get("url") or "")
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or not parsed.netloc:
         raise RuntimeError("joined download returned invalid URL")
     if prepared.get("size_bytes") != item["size_bytes"] or str(prepared.get("sha256") or "").lower() != item["sha256"]:
         raise ExistingFileMismatch("joined prepared bytes changed")
-    if normalized_etag(prepared.get("etag")) != item["etag"] or str(prepared.get("version_id") or "") != item["version_id"]:
-        raise ExistingFileMismatch("joined prepared object identity changed")
+    if prepared.get("content_type") != item["content_type"]:
+        raise ExistingFileMismatch("joined prepared content type changed")
+    etag = normalized_etag(prepared.get("etag"))
+    version_id = str(prepared.get("version_id") or "")
     if_match = str(prepared.get("if_match") or "")
-    if if_match != '"%s"' % item["etag"]:
+    if if_match != '"%s"' % etag:
         raise ExistingFileMismatch("joined prepared If-Match changed")
-    return url, if_match
+    return {"url": url, "if_match": if_match, "etag": etag, "version_id": version_id}
 
 
-def append_joined_range(url, if_match, directory_fd, part_name, item, start, end):
+def append_joined_range(prepared, directory_fd, part_name, item, start, end):
     headers = {
         "User-Agent": USER_AGENT,
         "Range": "bytes=%d-%d" % (start, end),
-        "If-Match": if_match,
+        "If-Match": prepared["if_match"],
     }
-    request = urllib.request.Request(url, method="GET", headers=headers)
+    request = urllib.request.Request(prepared["url"], method="GET", headers=headers)
     try:
         response_context = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SEC)
     except urllib.error.HTTPError as exc:
@@ -2729,7 +2909,7 @@ def append_joined_range(url, if_match, directory_fd, part_name, item, start, end
             raise RuntimeError("joined range returned HTTP %s" % status)
         response_etag = normalized_etag(response.headers.get("ETag"))
         response_version = str(response.headers.get("x-amz-version-id") or "")
-        if response_etag != item["etag"] or response_version != item["version_id"]:
+        if response_etag != prepared["etag"] or response_version != prepared["version_id"]:
             truncate_joined_part(directory_fd, part_name)
             raise ExistingFileMismatch("joined range object identity drifted; partial restarted")
         expected_range = "bytes %d-%d/%d" % (start, end, item["size_bytes"])
@@ -2765,11 +2945,10 @@ def append_joined_range(url, if_match, directory_fd, part_name, item, start, end
             raise RuntimeError("joined range body length mismatch")
 
 
-def remove_owned_joined_transfer(directory_fd, part_name, marker_name, final_name, sidecar_name):
+def remove_owned_joined_transfer(cfg, runtime, directory_fd, part_name, marker_name, final_name, marker, stop_event):
     part_stat = joined_entry_stat(directory_fd, part_name)
     marker_stat = joined_entry_stat(directory_fd, marker_name)
     final_stat = joined_entry_stat(directory_fd, final_name)
-    sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
     if part_stat is not None:
         if part_stat.st_nlink != 2 or final_stat.st_nlink != 2 or not same_joined_inode(part_stat, final_stat):
             raise ExistingFileMismatch("joined partial is not the published final")
@@ -2777,16 +2956,18 @@ def remove_owned_joined_transfer(directory_fd, part_name, marker_name, final_nam
         # unknown partials, and conflicting paths are never unlinked.
         os.unlink(part_name, dir_fd=directory_fd)
     if marker_stat is not None:
-        if marker_stat.st_nlink != 2 or sidecar_stat.st_nlink != 2 or not same_joined_inode(marker_stat, sidecar_stat):
-            raise ExistingFileMismatch("joined marker is not the published sidecar")
+        if marker_stat.st_nlink != 1 or not verify_joined_sidecar(
+            cfg, runtime, directory_fd, marker_name, marker, stop_event,
+        ):
+            raise ExistingFileMismatch("joined transfer marker conflicts")
         os.unlink(marker_name, dir_fd=directory_fd)
     os.fsync(directory_fd)
-    if joined_entry_stat(directory_fd, final_name).st_nlink != 1 or joined_entry_stat(directory_fd, sidecar_name).st_nlink != 1:
+    if joined_entry_stat(directory_fd, final_name).st_nlink != 1:
         raise ExistingFileMismatch("joined published link count is invalid")
 
 
-def complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, stop_event):
-    final_name, sidecar_name, part_name, marker_name = names
+def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+    final_name, part_name, marker_name = names
     final_stat = joined_entry_stat(directory_fd, final_name)
     if final_stat is None:
         return False
@@ -2797,51 +2978,45 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, s
     final_stat = joined_entry_stat(directory_fd, final_name)
     part_stat = joined_entry_stat(directory_fd, part_name)
     marker_stat = joined_entry_stat(directory_fd, marker_name)
-    sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
     if part_stat is None:
         if final_stat.st_nlink != 1:
             raise ExistingFileMismatch("joined final has an unknown hardlink")
     elif final_stat.st_nlink != 2 or part_stat.st_nlink != 2 or not same_joined_inode(final_stat, part_stat):
         raise ExistingFileMismatch("joined partial conflicts with final")
     if marker_stat is not None and not verify_joined_sidecar(
-        cfg, runtime, directory_fd, marker_name, sidecar, stop_event,
+        cfg, runtime, directory_fd, marker_name, marker, stop_event,
     ):
         raise ExistingFileMismatch("joined partial ownership marker conflicts")
-    marker_stat = joined_entry_stat(directory_fd, marker_name)
-    if sidecar_stat is None:
-        if marker_stat is None or part_stat is None:
-            raise ExistingFileMismatch("joined final has no immutable provenance sidecar")
-        os.link(marker_name, sidecar_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-        os.fsync(directory_fd)
-        sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
-    if not verify_joined_sidecar(cfg, runtime, directory_fd, sidecar_name, sidecar, stop_event):
-        raise ExistingFileMismatch("joined final provenance sidecar conflicts")
-    sidecar_stat = joined_entry_stat(directory_fd, sidecar_name)
-    marker_stat = joined_entry_stat(directory_fd, marker_name)
-    if marker_stat is None:
-        if sidecar_stat.st_nlink != 1:
-            raise ExistingFileMismatch("joined final sidecar has an unknown hardlink")
-    elif sidecar_stat.st_nlink != 2 or marker_stat.st_nlink != 2 or not same_joined_inode(sidecar_stat, marker_stat):
-        raise ExistingFileMismatch("joined final sidecar has an unknown hardlink")
-    remove_owned_joined_transfer(directory_fd, part_name, marker_name, final_name, sidecar_name)
+    if part_stat is not None and marker_stat is None:
+        raise ExistingFileMismatch("joined published partial has no ownership marker")
+    validate_joined_artifact(cfg, runtime, directory_fd, final_name, item, stop_event)
+    remove_owned_joined_transfer(
+        cfg, runtime, directory_fd, part_name, marker_name, final_name, marker, stop_event,
+    )
     return True
 
 
 def download_joined_item(cfg, runtime, item, stop_event):
+    validate_media_manifest_binding(cfg, runtime, item, stop_event)
     directory_fd = open_joined_output_dir(cfg, item)
     final_name = Path(item["relative_path"]).name
-    sidecar_name = final_name + ".stoarama.json"
     part_name = ".%s.joined-%d.part" % (final_name, item["id"])
     marker_name = part_name + ".stoarama.json"
-    names = (final_name, sidecar_name, part_name, marker_name)
-    sidecar = joined_sidecar_bytes(item)
+    names = (final_name, part_name, marker_name)
     try:
-        if complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, stop_event):
+        final_stat = joined_entry_stat(directory_fd, final_name)
+        part_stat = joined_entry_stat(directory_fd, part_name)
+        marker_stat = joined_entry_stat(directory_fd, marker_name)
+        if final_stat is not None and part_stat is None and marker_stat is None and complete_existing_joined(
+            cfg, runtime, directory_fd, item, names, None, stop_event,
+        ):
             return False
-        if joined_entry_stat(directory_fd, sidecar_name) is not None:
-            raise ExistingFileMismatch("joined sidecar exists without final")
+        prepared = prepare_joined_download(cfg, item)
+        marker = joined_transfer_marker_bytes(item, prepared)
+        if complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+            return False
         part_stat = ensure_owned_joined_partial(
-            cfg, runtime, directory_fd, part_name, marker_name, sidecar, stop_event,
+            cfg, runtime, directory_fd, part_name, marker_name, marker, stop_event,
         )
         if part_stat.st_nlink != 1:
             raise ExistingFileMismatch("joined partial has an unknown hardlink")
@@ -2856,12 +3031,14 @@ def download_joined_item(cfg, runtime, item, stop_event):
                 if stop_event.is_set() or poll_raw_pending(cfg, runtime):
                     raise JoinedDownloadYield("joined download yielded to raw clips")
                 try:
-                    url, if_match = prepare_joined_download(cfg, item)
+                    current_prepared = prepare_joined_download(cfg, item)
                 except ExistingFileMismatch:
                     truncate_joined_part(directory_fd, part_name)
                     raise
+                if any(current_prepared[key] != prepared[key] for key in ("etag", "version_id")):
+                    raise ExistingFileMismatch("joined prepared object identity changed")
                 end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
-                append_joined_range(url, if_match, directory_fd, part_name, item, part_size, end)
+                append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end)
                 part_size = end + 1
             try:
                 verify_joined_entry(
@@ -2870,11 +3047,10 @@ def download_joined_item(cfg, runtime, item, stop_event):
             except ExistingFileMismatch:
                 truncate_joined_part(directory_fd, part_name)
                 raise RuntimeError("joined download checksum mismatch; partial restarted")
+            validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
             os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
             os.fsync(directory_fd)
-            os.link(marker_name, sidecar_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-            os.fsync(directory_fd)
-            if not complete_existing_joined(cfg, runtime, directory_fd, item, names, sidecar, stop_event):
+            if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
                 raise RuntimeError("joined publication disappeared")
             return True
         finally:
@@ -2885,7 +3061,7 @@ def download_joined_item(cfg, runtime, item, stop_event):
 
 def ack_joined_item(cfg, item):
     request_json(cfg, "POST", "/account/joined/ack", body={
-        "output_id": item["id"],
+        "artifact_id": item["id"],
         "relative_path": item["relative_path"],
         "size_bytes": item["size_bytes"],
         "sha256": item["sha256"],
@@ -2906,11 +3082,11 @@ def drain_joined(cfg, runtime, stop_event):
     try:
         downloaded = download_joined_item(cfg, runtime, item, stop_event)
     except JoinedDownloadYield:
-        log("INFO", "joined output_id=%d yielded to raw clip delivery" % item["id"])
+        log("INFO", "joined artifact_id=%d yielded to raw clip delivery" % item["id"])
         return True
     ack_joined_item(cfg, item)
     log(
-        "INFO", "joined output_id=%d bytes=%d saved=%s%s"
+        "INFO", "joined artifact_id=%d bytes=%d saved=%s%s"
         % (item["id"], item["size_bytes"], joined_output_path(cfg, item), "" if downloaded else " existing"),
     )
     return True
