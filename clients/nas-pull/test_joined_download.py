@@ -15,6 +15,7 @@ from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("stoarama_pull.py")
 PROTOCOL_GOLDEN = Path(__file__).with_name("testdata") / "joined_protocol_v1.golden.json"
+CLOUD_GOLDENS = Path(__file__).resolve().parents[2] / "backend" / "internal" / "joinedrecording" / "testdata"
 SPEC = importlib.util.spec_from_file_location("stoarama_pull_joined", MODULE_PATH)
 pull = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pull)
@@ -52,52 +53,92 @@ class JoinedDownloadTests(unittest.TestCase):
         )
 
     def media_item(self, content=b"abcdef", **changes):
+        manifest = self.manifest_payload()
+        media = manifest["media"][0]
+        media.update({
+            "artifact_id": 41, "relative_path": "MIT_North-America_US_Cambridge_Kendall/May/Monday/stream_hour_01_080000-090000.mp4",
+            "object_key": "joined/goodplus-20260821-generation-1/objects/%s.mp4" % hashlib.sha256(content).hexdigest(),
+            "content_id": hashlib.sha256(content).hexdigest(), "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+        manifest["source_dispositions"][0].update({"media_artifact_id": 41, "media_ordinal": 1})
         item = {
-            "artifact_id": 41, "batch_id": "batch-2026-08",
-            "hour_id": "batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1", "kind": "media",
+            "artifact_id": 41, "batch_id": manifest["batch_id"],
+            "hour_id": manifest["hour_id"], "kind": "media",
             "content_type": "video/mp4",
-            "relative_path": "MIT_North-America_US_Cambridge_Kendall/May/Monday/stream_hour_01_080000-090000.mp4",
+            "relative_path": media["relative_path"],
             "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
             "download_path": "/api/v1/account/joined/41/download",
             "ledger_artifact_id": None, "ledger_relative_path": None, "ledger_sha256": None,
             "hour_manifest_id": 40,
-            "hour_manifest_relative_path": "coverage/hours/batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1.json",
+            "hour_manifest_relative_path": "coverage/hours/%s.json" % manifest["hour_id"],
             "hour_manifest_sha256": None,
         }
         item.update(changes)
         if item["hour_manifest_sha256"] is None:
-            item["hour_manifest_sha256"] = hashlib.sha256(self.manifest_bytes(item)).hexdigest()
+            item["hour_manifest_sha256"] = hashlib.sha256(self.manifest_bytes(item, payload=manifest)).hexdigest()
         return item
 
-    def manifest_payload(self, media=None, gap=False):
-        media_id = None if media is None else media.get("id", media.get("artifact_id"))
-        media_entries = [] if media is None else [{
-            "artifact_id": media_id, "part_ordinal": 1, "relative_path": media["relative_path"],
-            "size_bytes": media["size_bytes"], "sha256": media["sha256"], "content_id": media["sha256"],
-            "coverage_start_at": "2026-05-04T08:00:00Z", "coverage_end_at": "2026-05-04T09:00:00Z",
-        }]
-        return {
-            "schema_version": 1, "batch_id": "batch-2026-08", "hour_id": 501, "recording_id": 77,
-            "local_date": "2026-05-04", "delivery_hour": 1, "local_timezone": "America/New_York",
-            "hour_start_at": "2026-05-04T08:00:00-04:00", "hour_end_at": "2026-05-04T09:00:00-04:00",
-            "source_clip_count": 0 if gap else 60, "source_bytes": 0 if gap else 123456,
-            "source_manifest_sha256": "a" * 64, "gap_only": gap, "media": media_entries,
-        }
+    def golden(self, name):
+        return json.loads((CLOUD_GOLDENS / name).read_text())
 
-    def manifest_bytes(self, media=None, gap=False):
-        return (json.dumps(self.manifest_payload(media, gap), sort_keys=True, separators=(",", ":")) + "\n").encode()
+    def ledger_payload(self, gap=False):
+        ledger = self.golden("allocation_ledger_v1.golden.json")
+        if not gap:
+            return ledger
+        empty_sha = pull.source_claim_sha([])
+        ledger.update({
+            "source_claim_sha256": empty_sha, "source_clip_count": 0, "source_bytes": 0,
+            "first_clip_id": None, "last_clip_id": None, "consecutive_pairs": [], "sources": [],
+        })
+        for hour in ledger["hours"]:
+            hour["source_clip_ids"] = []
+        ledger["hour_source_claim_sha256"] = [empty_sha] * 12
+        gap_manifest = self.golden("hour_manifest_gap_only_v1.golden.json")
+        ledger["cross_hour_boundaries"][0] = gap_manifest["allocation"]["boundaries"][0]
+        ledger["cross_day_boundaries"][0] = gap_manifest["allocation"]["cross_day_boundaries"][0]
+        ledger["ledger_sha256"] = ""
+        ledger["ledger_sha256"] = pull.joined_canonical_sha(ledger)
+        return ledger
+
+    def manifest_payload(self, media=None, gap=False):
+        manifest = self.golden("hour_manifest_gap_only_v1.golden.json" if gap else "hour_manifest_mixed_v1.golden.json")
+        if media is not None and not gap:
+            artifact_id = media.get("id", media.get("artifact_id"))
+            entry = manifest["media"][0]
+            entry.update({
+                "artifact_id": artifact_id, "relative_path": media["relative_path"],
+                "object_key": "joined/%s/objects/%s.mp4" % (manifest["batch_id"], media["sha256"]),
+                "content_id": media["sha256"], "size_bytes": media["size_bytes"], "sha256": media["sha256"],
+            })
+            manifest["source_dispositions"][0].update({"media_artifact_id": artifact_id, "media_ordinal": 1})
+        if gap:
+            ledger = self.ledger_payload(gap=True)
+            ledger_bytes = pull.joined_canonical_bytes(ledger)
+            manifest["allocation"].update({
+                "artifact_id": 39, "size_bytes": len(ledger_bytes), "sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+                "ledger_sha256": ledger["ledger_sha256"], "hour_source_claim_sha256": ledger["hour_source_claim_sha256"][0],
+                "boundaries": [ledger["cross_hour_boundaries"][0]],
+                "cross_day_boundaries": [ledger["cross_day_boundaries"][0]],
+            })
+            manifest["source_claim_sha256"] = ledger["hour_source_claim_sha256"][0]
+        return manifest
+
+    def manifest_bytes(self, media=None, gap=False, payload=None):
+        return pull.joined_canonical_bytes(payload if payload is not None else self.manifest_payload(media, gap))
 
     def manifest_item(self, gap=True):
         content = self.manifest_bytes(None, gap)
+        manifest = self.manifest_payload(None, gap)
         return {
-            "artifact_id": 40, "batch_id": "batch-2026-08",
-            "hour_id": "batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1", "kind": "hour_manifest",
+            "artifact_id": 40, "batch_id": manifest["batch_id"],
+            "hour_id": manifest["hour_id"], "kind": "hour_manifest",
             "content_type": "application/json",
-            "relative_path": "coverage/hours/batch-2026-08__recording-77__date-2026-05-04__hour-01__generation-1.json",
+            "relative_path": "coverage/hours/%s.json" % manifest["hour_id"],
             "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
             "download_path": "/api/v1/account/joined/40/download",
-            "ledger_artifact_id": 39,
-            "ledger_relative_path": "coverage/ledgers/77/2026-05-04.json", "ledger_sha256": "c" * 64,
+            "ledger_artifact_id": manifest["allocation"]["artifact_id"],
+            "ledger_relative_path": manifest["allocation"]["relative_path"], "ledger_sha256": manifest["allocation"]["sha256"],
             "hour_manifest_id": None,
             "hour_manifest_relative_path": None, "hour_manifest_sha256": None,
         }, content
@@ -106,6 +147,13 @@ class JoinedDownloadTests(unittest.TestCase):
         path = cfg.output_dir / "joined" / item["batch_id"] / item["hour_manifest_relative_path"]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(self.manifest_bytes(item))
+        return path
+
+    def install_ledger(self, cfg, gap=False):
+        ledger = self.ledger_payload(gap)
+        path = cfg.output_dir / "joined" / ledger["batch_id"] / "coverage" / "ledgers" / str(ledger["recording_id"]) / (ledger["local_date"] + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(pull.joined_canonical_bytes(ledger))
         return path
 
     def prepared(self, item):
@@ -117,8 +165,8 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def marker(self, item):
         return pull.joined_transfer_marker_bytes(item, {
-            "etag": "etag-1", "version_id": "", "url": "https://r2.test/x", "if_match": '"etag-1"',
-            "url_scheme": "https", "url_authority": "r2.test", "url_path": "/x",
+            "etag": "etag-1", "version_id": "", "url": "https://r2.test/exact-object", "if_match": '"etag-1"',
+            "url_scheme": "https", "url_authority": "r2.test", "url_path": "/exact-object",
         })
 
     def storage(self): return {"available": True, "total_bytes": 10**13, "free_bytes": 10**13}
@@ -176,6 +224,41 @@ class JoinedDownloadTests(unittest.TestCase):
         self.assertEqual(prepared["url_authority"], "joined.example.test")
         self.assertEqual(prepared["url_path"], "/objects/%s.mp4" % media["sha256"])
 
+    def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
+        expected = {
+            "allocation_ledger_v1.golden.json": "255e2958738e5f87629224c4e537256b3638fb6abaeaa77a2054c559f5c4ef82",
+            "batch_index_v1.golden.json": "834feb5fb3356f6ee964158b25249873138d9d04783d281c5cd5ccc6d72bfcf7",
+            "hour_manifest_gap_only_v1.golden.json": "8ec7e39c4cba19cbb5b8e11a3f04952656d53c0b77b879ef764767353af951a9",
+            "hour_manifest_mixed_v1.golden.json": "5af2dd888ed7db0a66f3d3d3c36223def703c14732b5515446555e9288a2cf22",
+            "hour_manifest_quarantine_only_v1.golden.json": "addc432f0b6aec344e3152b233691035c491e5ed7f186329f8ab9db55a3a4593",
+            "hour_manifest_v1.golden.json": "9e498dcde096e42295d9c05e021be45c57b315d6f9a9e050f05d55e98a70e7f8",
+        }
+        for name, digest in expected.items():
+            path = CLOUD_GOLDENS / name
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+            payload = json.loads(path.read_text())
+            validator = pull.valid_allocation_ledger if name.startswith("allocation") else pull.valid_batch_index if name.startswith("batch") else pull.valid_hour_manifest
+            validator(payload)
+        for name, descend in (
+            ("allocation_ledger_v1.golden.json", ("sources", 0, "object")),
+            ("hour_manifest_v1.golden.json", ("media", 0, "verification", "source_fingerprint", "tracks", "video")),
+            ("batch_index_v1.golden.json", ("allocation_ledgers", 0)),
+        ):
+            payload = self.golden(name)
+            target = payload
+            for key in descend:
+                target = target[key]
+            target["unknown"] = True
+            validator = pull.valid_allocation_ledger if name.startswith("allocation") else pull.valid_batch_index if name.startswith("batch") else pull.valid_hour_manifest
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "invalid fields"):
+                validator(payload)
+        self.assertEqual(
+            pull.joined_timestamp_nanoseconds("2026-05-04T08:00:00.000000009Z", "fixture")
+            - pull.joined_timestamp_nanoseconds("2026-05-04T08:00:00.000000001Z", "fixture"), 8,
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate field"):
+            pull.decode_joined_json(b'{"schema_version":1,"schema_version":1}')
+
     def test_protocol_zero_is_dormant_without_joined_api_or_storage_access(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(pull.Config().joined_protocol_version, 0)
@@ -199,7 +282,7 @@ class JoinedDownloadTests(unittest.TestCase):
             start, end = map(int, headers["Range"].removeprefix("bytes=").split("-"))
             return RangeResponse(content[start:end + 1], start, end, len(content))
         with tempfile.TemporaryDirectory() as raw:
-            cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg)
+            cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg); self.install_ledger(cfg, gap=True)
             with mock.patch.object(pull, "JOINED_RANGE_BYTES", 64), mock.patch.object(pull, "storage_status", return_value=self.storage()), \
                  mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
@@ -208,6 +291,104 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertEqual(acks, [{"artifact_id": 40, "relative_path": raw_item["relative_path"],
                                      "size_bytes": len(content), "sha256": raw_item["sha256"]}])
             self.assertTrue(requests); self.assertEqual(list(final.parent.glob(".*.part*")), [])
+
+    def test_allocation_ledger_downloads_and_exact_acks(self):
+        ledger = self.ledger_payload()
+        content = pull.joined_canonical_bytes(ledger)
+        raw_item = {
+            "artifact_id": 55, "batch_id": ledger["batch_id"], "hour_id": None, "kind": "allocation_ledger",
+            "content_type": "application/json", "relative_path": "coverage/ledgers/377/2026-05-04.json",
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "download_path": "/api/v1/account/joined/55/download", "ledger_artifact_id": None,
+            "ledger_relative_path": None, "ledger_sha256": None, "hour_manifest_id": None,
+            "hour_manifest_relative_path": None, "hour_manifest_sha256": None,
+        }
+        acks = []
+        def api(_cfg, _method, path, body=None, **_kwargs):
+            if path == "/account/joined": return {"item": raw_item}
+            if path.startswith("/account/clips?"): return {"clips": []}
+            if path == raw_item["download_path"]: return self.prepared(raw_item)
+            if path == "/account/joined/ack": acks.append(body); return {"ok": True}
+            raise AssertionError(path)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
+            with mock.patch.object(pull, "storage_status", return_value=self.storage()), mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", return_value=RangeResponse(content, 0, len(content) - 1, len(content))):
+                self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
+            final = pull.joined_output_path(cfg, pull.valid_joined_item(raw_item))
+            self.assertEqual(final.read_bytes(), content)
+            self.assertEqual(acks, [{"artifact_id": 55, "relative_path": raw_item["relative_path"], "size_bytes": len(content), "sha256": raw_item["sha256"]}])
+
+    def test_hour_manifest_requires_exact_installed_ledger(self):
+        raw_item, _content = self.manifest_item(gap=True)
+        item = pull.valid_joined_item(raw_item)
+        manifest = self.manifest_payload(gap=True)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
+            with self.assertRaises(pull.ExistingFileMismatch):
+                pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
+            ledger_path = self.install_ledger(cfg, gap=True)
+            ledger_path.write_bytes(ledger_path.read_bytes() + b"x")
+            with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaises(pull.ExistingFileMismatch):
+                pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
+
+    def test_final_index_proves_each_day_union_and_exact_media_without_scanning(self):
+        ledger = self.ledger_payload()
+        source = ledger["sources"][0]
+        ledger["sources"] = [source]
+        ledger["source_clip_count"] = 1
+        ledger["source_bytes"] = source["object"]["size_bytes"]
+        ledger["hours"][0]["source_clip_ids"] = [source["clip_id"]]
+        for hour in ledger["hours"][1:]: hour["source_clip_ids"] = []
+        ledger_ref = {
+            "artifact_id": 55, "relative_path": "coverage/ledgers/377/2026-05-04.json", "size_bytes": 10,
+            "sha256": "a" * 64, "recording_id": 377, "local_date": "2026-05-04",
+            "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
+            "ledger_sha256": ledger["ledger_sha256"], "source_count": 1, "source_bytes": source["object"]["size_bytes"],
+        }
+        manifests, hour_refs = {}, []
+        for delivery_hour in range(1, 13):
+            hour_id = "goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-%02d__generation-1" % delivery_hour
+            path = "coverage/hours/%s.json" % hour_id
+            ids = [source["clip_id"]] if delivery_hour == 1 else []
+            allocation = {
+                "artifact_id": 55, "relative_path": ledger_ref["relative_path"], "size_bytes": 10,
+                "sha256": ledger_ref["sha256"], "ledger_sha256": ledger["ledger_sha256"],
+                "hour_source_claim_sha256": ledger["hour_source_claim_sha256"][delivery_hour - 1],
+            }
+            allocation["boundaries"], allocation["cross_day_boundaries"] = pull.expected_hour_boundaries(ledger, delivery_hour)
+            media = [{"artifact_id": 88, "relative_path": "delivery/hour-01.mp4", "size_bytes": 6, "sha256": hashlib.sha256(b"media!").hexdigest()}] if delivery_hour == 1 else []
+            manifests[path] = {
+                "batch_id": ledger["batch_id"], "hour_id": hour_id, "recording_id": 377, "local_date": "2026-05-04",
+                "delivery_hour": delivery_hour, "status": "media" if media else "gap_only", "source_count": len(ids),
+                "qualification_sha256": ledger["qualification_sha256"],
+                "qualification_day": ledger["qualification_day"],
+                "sources": [source] if ids else [], "source_claim_sha256": ledger["hour_source_claim_sha256"][delivery_hour - 1],
+                "source_dispositions": [{"clip_id": source["clip_id"]}] if ids else [], "allocation": allocation, "media": media,
+            }
+            hour_refs.append({
+                "hour_manifest_artifact_id": 100 + delivery_hour, "hour_id": hour_id, "recording_id": 377, "local_date": "2026-05-04", "delivery_hour": delivery_hour,
+                "status": manifests[path]["status"], "relative_path": path, "size_bytes": 10, "sha256": str(delivery_hour) * 64,
+                "source_count": len(ids), "source_bytes": source["object"]["size_bytes"] if ids else 0,
+                "media_artifact_count": len(media),
+            })
+        index = {
+            "batch_id": ledger["batch_id"], "allocation_ledgers": [ledger_ref], "hours": hour_refs,
+            "source_clip_count": 1, "source_bytes": source["object"]["size_bytes"], "final_media_artifact_count": 1,
+            "frozen_denominator_sha256": pull.frozen_denominator_sha([ledger]),
+        }
+        def read(_cfg, _runtime, _batch, path, *_args):
+            return ledger if path == ledger_ref["relative_path"] else manifests[path]
+        with mock.patch.object(pull, "read_joined_json_path", side_effect=read), mock.patch.object(pull, "valid_allocation_ledger"), mock.patch.object(pull, "valid_hour_manifest"), mock.patch.object(pull, "verify_joined_relative_file") as verify:
+            pull.validate_batch_index_proof(None, None, index, threading.Event())
+            verify.assert_called_once_with(None, None, ledger["batch_id"], "delivery/hour-01.mp4", 6, hashlib.sha256(b"media!").hexdigest(), mock.ANY)
+            manifests[hour_refs[0]["relative_path"]]["source_dispositions"][0]["clip_id"] = 999
+            with self.assertRaisesRegex(pull.ExistingFileMismatch, "disposition union"):
+                pull.validate_batch_index_proof(None, None, index, threading.Event())
+            manifests[hour_refs[0]["relative_path"]]["source_dispositions"][0]["clip_id"] = source["clip_id"]
+            ledger_ref["source_claim_sha256"] = "f" * 64
+            index["frozen_denominator_sha256"] = pull.frozen_denominator_sha([ledger_ref])
+            with self.assertRaisesRegex(pull.ExistingFileMismatch, "ledger reference conflicts"):
+                pull.validate_batch_index_proof(None, None, index, threading.Event())
 
     def test_media_requires_and_matches_local_sealed_hour_manifest(self):
         content, raw_item, requests, acks = b"abcdef", self.media_item(), [], []
@@ -261,8 +442,8 @@ class JoinedDownloadTests(unittest.TestCase):
             cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item)
             directory_fd, _, part, marker = self.names(cfg, item)
             prepared = {
-                "etag": "etag-1", "version_id": "", "url": "x", "if_match": '"etag-1"',
-                "url_scheme": "https", "url_authority": "r2.test", "url_path": "/x",
+                "etag": "etag-1", "version_id": "", "url": "https://r2.test/exact-object", "if_match": '"etag-1"',
+                "url_scheme": "https", "url_authority": "r2.test", "url_path": "/exact-object",
             }
             try:
                 self.write_entry(directory_fd, part, b"unknown")
