@@ -44,6 +44,7 @@ type Server struct {
 	cfg                     config.Config
 	pool                    *pgxpool.Pool
 	r2                      *r2.Client
+	joinedOutputStorage     joinedOutputObjectStore
 	secrets                 *secretbox.Cipher
 	mailer                  email.Sender
 	streamsHTML             []byte
@@ -248,7 +249,7 @@ func (s *Server) router() http.Handler {
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
 			account.Use(s.requireAccountAuth)
-			// Confine a 'stoarama.pull'-scoped key to the 4 NAS pull endpoints; a
+			// Confine a 'stoarama.pull'-scoped key to the NAS pull endpoints; a
 			// session or full/read key is unaffected. Runs after requireAccountAuth
 			// so the principal is in context. Default-DENY: any non-pull account
 			// route 403s a pull key.
@@ -279,6 +280,9 @@ func (s *Server) router() http.Handler {
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/clips", s.handleAccountClips)
 			account.Post("/clips/release", s.handleAccountClipsReleaseBatch)
+			account.Get("/joined", s.handleAccountJoined)
+			account.Get("/joined/{joinedId}/download", s.handleAccountJoinedDownload)
+			account.Post("/joined/ack", s.handleAccountJoinedAck)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
@@ -520,6 +524,18 @@ func (s *Server) router() http.Handler {
 			worker.Post("/capture/ingest", s.handleCaptureIngest)
 			worker.Post("/capture/mark-unsupported", s.handleCaptureMarkUnsupported)
 			worker.Post("/media/upload-intents", s.handleUploadIntents)
+		})
+		api.Group(func(joinedWorker chi.Router) {
+			joinedWorker.Use(s.requireJoinedWorkerAuth)
+			joinedWorker.Post("/recording/joined/claim", s.handleJoinedClaim)
+			joinedWorker.Post("/recording/joined/heartbeat", s.handleJoinedHeartbeat)
+			joinedWorker.Post("/recording/joined/capabilities/source", s.handleJoinedSourceCapability)
+			joinedWorker.Post("/recording/joined/capabilities/artifact", s.handleJoinedArtifactCapability)
+		})
+		api.Group(func(joinedBootstrap chi.Router) {
+			joinedBootstrap.Use(s.requireJoinedWorkerBootstrapAuth)
+			joinedBootstrap.Post("/recording/joined/token", s.handleJoinedToken)
+			joinedBootstrap.Get("/recording/joined/status", s.handleJoinedStatus)
 		})
 
 		api.Group(func(service chi.Router) {

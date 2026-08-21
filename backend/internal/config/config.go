@@ -18,6 +18,9 @@ type Config struct {
 	DatabaseURL                      string
 	APIToken                         string
 	ServiceToken                     string
+	JoinedWorkerBootstrapToken       string
+	JoinedWorkerSigningKey           string
+	JoinedRecordingEnabled           bool
 	BootstrapAdminEmail              string
 	MigrationDir                     string
 	AutoMigrate                      bool
@@ -182,6 +185,9 @@ func Load() (Config, error) {
 		DatabaseURL:                      os.Getenv("DATABASE_URL"),
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
+		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
+		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
+		JoinedRecordingEnabled:           boolEnv("JOINED_RECORDING_ENABLED", false),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
 		AutoMigrate:                      boolEnv("AUTO_MIGRATE", false),
@@ -336,6 +342,9 @@ func Load() (Config, error) {
 	if cfg.SharedRecordingsPassword != "" && len(cfg.SharedRecordingsPassword) < 8 {
 		return Config{}, fmt.Errorf("MIT_SCL_RECORDINGS_READ_PASSWORD must contain at least 8 characters")
 	}
+	if err := cfg.ValidateJoined(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -361,7 +370,32 @@ func (c Config) ValidateAPI() error {
 	if err := c.ValidateR2(); err != nil {
 		return err
 	}
+	if err := c.ValidateJoined(); err != nil {
+		return err
+	}
 	return c.ValidateStripe()
+}
+
+func (c Config) ValidateJoined() error {
+	bootstrap := strings.TrimSpace(c.JoinedWorkerBootstrapToken)
+	signing := strings.TrimSpace(c.JoinedWorkerSigningKey)
+	service := strings.TrimSpace(c.ServiceToken)
+	if bootstrap == "" && signing == "" && !c.JoinedRecordingEnabled {
+		return nil
+	}
+	if bootstrap == "" || signing == "" {
+		return fmt.Errorf("joined recording requires distinct JOINED_WORKER_BOOTSTRAP_TOKEN and JOINED_WORKER_SIGNING_KEY")
+	}
+	if bootstrap == signing {
+		return fmt.Errorf("joined bootstrap, signing, and generic service credentials must be distinct")
+	}
+	for _, protected := range []string{service, strings.TrimSpace(c.APIToken), strings.TrimSpace(c.DatabaseURL),
+		strings.TrimSpace(c.StorageCredKey), strings.TrimSpace(c.R2AccessKeyID), strings.TrimSpace(c.R2SecretAccessKey)} {
+		if protected != "" && (bootstrap == protected || signing == protected) {
+			return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
+		}
+	}
+	return nil
 }
 
 // StripeBillingEnabled reports whether the complete billing configuration is

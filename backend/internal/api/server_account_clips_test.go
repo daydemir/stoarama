@@ -451,6 +451,13 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			nas_storage_free_bytes BIGINT,
 			nas_storage_reported_at TIMESTAMPTZ,
 			nas_capacity_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+			joined_protocol_version SMALLINT NOT NULL DEFAULT 0,
+			joined_files_pulled BIGINT NOT NULL DEFAULT 0,
+			joined_bytes_pulled BIGINT NOT NULL DEFAULT 0,
+			joined_last_attempt_artifact_id BIGINT,
+			joined_last_blocker TEXT NOT NULL DEFAULT '',
+			joined_last_attempt_at TIMESTAMPTZ,
+			joined_retry_at TIMESTAMPTZ,
 			CONSTRAINT chk_connections_nas_storage CHECK (
 				(nas_storage_total_bytes IS NULL AND nas_storage_free_bytes IS NULL AND nas_storage_reported_at IS NULL)
 				OR (nas_storage_total_bytes IS NOT NULL AND nas_storage_free_bytes IS NOT NULL AND nas_storage_reported_at IS NOT NULL
