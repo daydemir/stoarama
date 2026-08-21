@@ -4,89 +4,108 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
-	"github.com/daydemir/stoarama/backend/internal/stitchcert"
-	"github.com/google/uuid"
 )
 
-type ImmutableStore interface {
-	PutReaderIfAbsentVerified(context.Context, string, string, io.Reader, int64, string) (r2.ObjectHead, bool, error)
-}
-
+// WorkerClaim is a renewable publication lease for an already sealed hour.
+// It is intentionally distinct from the expired source-only preflight claim.
 type WorkerClaim struct {
-	TaskID        int64      `json:"task_id"`
-	ClaimToken    string     `json:"claim_token"`
-	LeaseExpires  time.Time  `json:"lease_expires_at"`
-	BatchPlanSHA  string     `json:"batch_plan_sha256"`
-	BatchID       string     `json:"batch_id"`
-	CampaignID    string     `json:"campaign_id"`
-	RecordingID   int64      `json:"recording_id"`
-	SourcePlanSHA string     `json:"source_manifest_sha256"`
-	ExpectedCount int        `json:"expected_campaign_output_count"`
-	Output        OutputPlan `json:"output"`
+	ProtocolVersion          int                    `json:"protocol_version"`
+	HourID                   string                 `json:"hour_id"`
+	LeaseID                  string                 `json:"lease_id"`
+	OperationToken           string                 `json:"operation_token"`
+	LeaseExpires             time.Time              `json:"lease_expires_at"`
+	StorageAuthority         string                 `json:"storage_authority"`
+	StorageBucket            string                 `json:"storage_bucket"`
+	Plan                     BatchPlan              `json:"plan"`
+	Allocation               HourManifestAllocation `json:"allocation"`
+	AllocationLedger         StreamDayAllocation    `json:"allocation_ledger"`
+	MediaArtifactIDs         []int64                `json:"media_artifact_ids"`
+	HourManifestArtifactID   int64                  `json:"hour_manifest_artifact_id"`
+	HourManifestExpectedSize int64                  `json:"hour_manifest_expected_size_bytes"`
+	HourManifestExpectedSHA  string                 `json:"hour_manifest_expected_sha256"`
 }
 
 type PublishedOutput struct {
-	TaskID            int64        `json:"task_id"`
-	PlanOrdinal       int          `json:"plan_ordinal"`
-	ObjectKey         string       `json:"object_key"`
-	ETag              string       `json:"etag"`
-	VersionID         string       `json:"version_id,omitempty"`
-	SizeBytes         int64        `json:"size_bytes"`
-	SHA256            string       `json:"sha256"`
-	CoverageObjectKey string       `json:"coverage_object_key"`
-	CoverageETag      string       `json:"coverage_etag"`
-	CoverageVersionID string       `json:"coverage_version_id,omitempty"`
-	CoverageSizeBytes int64        `json:"coverage_size_bytes"`
-	CoverageSHA256    string       `json:"coverage_sha256"`
-	Verification      Verification `json:"verification"`
-	Created           bool         `json:"-"`
+	ArtifactID int64  `json:"artifact_id"`
+	ObjectKey  string `json:"object_key"`
+	ETag       string `json:"etag"`
+	VersionID  string `json:"version_id,omitempty"`
+	SizeBytes  int64  `json:"size_bytes"`
+	SHA256     string `json:"sha256"`
+	Created    bool   `json:"-"`
 }
 
-type OutputCoverage struct {
-	SchemaVersion       int          `json:"schema_version"`
-	PolicyVersion       string       `json:"policy_version"`
-	CampaignID          string       `json:"campaign_id"`
-	BatchID             string       `json:"batch_id"`
-	BatchPlanSHA256     string       `json:"batch_plan_sha256"`
-	SourceManifestSHA   string       `json:"source_manifest_sha256"`
-	ExpectedOutputCount int          `json:"expected_campaign_output_count"`
-	RecordingID         int64        `json:"recording_id"`
-	Output              OutputPlan   `json:"output"`
-	MediaSizeBytes      int64        `json:"media_size_bytes"`
-	MediaSHA256         string       `json:"media_sha256"`
-	MediaETag           string       `json:"media_etag"`
-	MediaVersionID      string       `json:"media_version_id,omitempty"`
-	Verification        Verification `json:"verification"`
+type PublishedHour struct {
+	HourID                string            `json:"hour_id"`
+	RecordingID           int64             `json:"recording_id"`
+	LocalDate             string            `json:"local_date"`
+	LocalHour             int               `json:"local_hour"`
+	Outputs               []PublishedOutput `json:"outputs"`
+	HourManifestObjectKey string            `json:"hour_manifest_object_key"`
+	HourManifestETag      string            `json:"hour_manifest_etag"`
+	HourManifestVersionID string            `json:"hour_manifest_version_id,omitempty"`
+	HourManifestSizeBytes int64             `json:"hour_manifest_size_bytes"`
+	HourManifestSHA256    string            `json:"hour_manifest_sha256"`
 }
 
-type FinalizeOutput func(context.Context, WorkerClaim, PublishedOutput) error
+type verifiedHourScratch struct {
+	HourID            string
+	SourceClaimSHA256 string
+	OriginLeaseID     string
+	Directory         string
+	Built             []BuiltOutput
+	Quarantine        []QuarantineEvidence
+}
+
+type SealedHourScratch struct {
+	verified           verifiedHourScratch
+	publicationLeaseID string
+}
+
+func bindSealedHourScratch(verified verifiedHourScratch, claim WorkerClaim) (SealedHourScratch, error) {
+	if err := claim.Validate(time.Now().UTC()); err != nil || verified.HourID != claim.HourID || verified.SourceClaimSHA256 != claim.Plan.SourceClaimSHA256 || !validLeaseID(verified.OriginLeaseID) || !filepath.IsAbs(verified.Directory) || filepath.Base(verified.Directory) != verified.OriginLeaseID || len(verified.Built) != len(claim.Plan.Outputs) {
+		return SealedHourScratch{}, fmt.Errorf("verified scratch differs from sealed hour")
+	}
+	for i, built := range verified.Built {
+		output := claim.Plan.Outputs[i]
+		if !SafeScratchOutput(built.Path, verified.Directory) || built.SizeBytes != output.ExpectedSize || built.SHA256 != output.ExpectedSHA || built.SourceCount != len(output.Sources) || validatePassedVerification(built.Verification) != nil {
+			return SealedHourScratch{}, fmt.Errorf("verified scratch part %d differs from sealed output", i+1)
+		}
+	}
+	return SealedHourScratch{verified: verified, publicationLeaseID: claim.LeaseID}, nil
+}
+
+// BindRebuiltSealedHourScratch is for a reclaimed publication lease after the
+// prior worker's private scratch was lost. It accepts only scratch rooted in
+// the current lease's task directory and never references the prior lease.
+func BindRebuiltSealedHourScratch(claim WorkerClaim, scratchRoot, directory string, built []BuiltOutput, quarantine []QuarantineEvidence) (SealedHourScratch, error) {
+	want, err := claim.ScratchDir(scratchRoot)
+	if err != nil || filepath.Clean(directory) != filepath.Clean(want) {
+		return SealedHourScratch{}, fmt.Errorf("rebuilt scratch is outside current publication lease")
+	}
+	verified := verifiedHourScratch{HourID: claim.HourID, SourceClaimSHA256: claim.Plan.SourceClaimSHA256, OriginLeaseID: claim.LeaseID, Directory: directory, Built: built, Quarantine: quarantine}
+	return bindSealedHourScratch(verified, claim)
+}
+
+type FinalizeHour func(context.Context, WorkerClaim, PublishedHour) error
+type ReadCapabilityResolver func(context.Context, WorkerClaim, int64) (ObjectReadCapability, error)
+type CreateCapabilityResolver func(context.Context, WorkerClaim, int64) (ObjectCreateCapability, error)
 
 func (c WorkerClaim) Validate(now time.Time) error {
-	prefix := "joined/" + c.BatchID + "/"
-	if c.TaskID <= 0 || uuid.Validate(c.ClaimToken) != nil || !c.LeaseExpires.After(now) || !lowerHex64(c.BatchPlanSHA) || !lowerHex64(c.SourcePlanSHA) || c.ExpectedCount <= 0 || c.Output.Ordinal > c.ExpectedCount || c.BatchID != c.CampaignID || !safeCampaignID.MatchString(c.CampaignID) || c.RecordingID <= 0 || c.Output.Ordinal <= 0 || len(c.Output.Sources) == 0 || c.Output.ActualEnd.Sub(c.Output.ActualStart) > time.Hour || !c.Output.ActualEnd.After(c.Output.ActualStart) || !lowerHex64(c.Output.ContentID) || !strings.HasPrefix(c.Output.ObjectKey, prefix) || c.Output.CoverageKey != c.Output.ObjectKey+".coverage.json" {
-		return fmt.Errorf("invalid or expired fenced joined claim")
+	if c.ProtocolVersion != JoinedProtocolVersion || c.HourID != c.Plan.HourID || !validLeaseID(c.LeaseID) || !validOperationToken(c.OperationToken) || !c.LeaseExpires.After(now) || c.StorageAuthority == "" || c.StorageBucket == "" || ValidatePlan(c.Plan) != nil || c.HourManifestArtifactID <= 0 || c.HourManifestExpectedSize <= 0 || !lowerHex64(c.HourManifestExpectedSHA) || len(c.MediaArtifactIDs) != len(c.Plan.Outputs) {
+		return fmt.Errorf("invalid or expired fenced joined hour publication claim")
 	}
 	seen := map[int64]bool{}
-	for _, source := range c.Output.Sources {
-		if source.RecordingID != c.RecordingID || seen[source.ClipID] || validateSource(source, c.RecordingID) != nil {
-			return fmt.Errorf("claimed output crosses recordings")
+	for _, artifactID := range c.MediaArtifactIDs {
+		if artifactID <= 0 || seen[artifactID] {
+			return fmt.Errorf("joined media artifact identity differs")
 		}
-		seen[source.ClipID] = true
-	}
-	contentID, _, err := stitchcert.CanonicalSHA(struct {
-		Policy  string       `json:"policy"`
-		Sources []SourceClip `json:"sources"`
-	}{PlanPolicyVersion, c.Output.Sources})
-	if err != nil || contentID != c.Output.ContentID {
-		return fmt.Errorf("claimed output content identity drifted")
+		seen[artifactID] = true
 	}
 	return nil
 }
@@ -98,31 +117,150 @@ func (c WorkerClaim) ScratchDir(root string) (string, error) {
 	if !filepath.IsAbs(root) {
 		return "", fmt.Errorf("scratch root is required")
 	}
-	return filepath.Join(root, "task-"+strconv.FormatInt(c.TaskID, 10), c.ClaimToken), nil
+	return leaseScratchDir(root, c.LeaseID), nil
 }
 
-// PublishClaimedOutput publishes exactly one sealed <=1h task. The finalize
-// callback must perform a token-fenced DB UPDATE; if it rejects a stale lease,
-// retrying a fresh claim reconciles the exact immutable R2 objects.
-func PublishClaimedOutput(ctx context.Context, store ImmutableStore, claim WorkerClaim, built BuiltOutput, scratchDir string, finalize FinalizeOutput) (PublishedOutput, error) {
-	if store == nil || finalize == nil {
-		return PublishedOutput{}, fmt.Errorf("immutable store and fenced finalizer are required")
+// PublishClaimedHour publishes the already-sealed scratch bytes create-only,
+// then its precomputed canonical hour manifest. The callback must atomically
+// finalize the exact unexpired publication token.
+func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, scratch SealedHourScratch, resolveCreate CreateCapabilityResolver, resolveRead ReadCapabilityResolver, finalize FinalizeHour) (PublishedHour, error) {
+	built, quarantine, scratchDir := scratch.verified.Built, scratch.verified.Quarantine, scratch.verified.Directory
+	if client == nil || resolveCreate == nil || resolveRead == nil || finalize == nil {
+		return PublishedHour{}, fmt.Errorf("capability client and fenced finalizer are required")
 	}
 	if err := claim.Validate(time.Now().UTC()); err != nil {
-		return PublishedOutput{}, err
+		return PublishedHour{}, err
 	}
-	if built.SourceCount != len(claim.Output.Sources) || built.Verification.Status != "passed" || !SafeScratchOutput(built.Path, scratchDir) {
-		return PublishedOutput{}, fmt.Errorf("claimed output is not a verified scratch artifact")
+	if scratch.publicationLeaseID != claim.LeaseID {
+		return PublishedHour{}, fmt.Errorf("scratch is not bound to current publication lease")
 	}
-	size, sha, err := localIdentity(built.Path)
-	if err != nil || size != built.SizeBytes || sha != built.SHA256 || size > r2.MaxConditionalPutBytes {
-		return PublishedOutput{}, fmt.Errorf("claimed output changed before publication")
+	_, manifestJSON, manifestSHA, err := BuildHourManifest(HourManifestInput{Plan: claim.Plan, Allocation: claim.Allocation, AllocationLedger: claim.AllocationLedger, MediaArtifactIDs: claim.MediaArtifactIDs, Built: built, QuarantineEvidence: quarantine})
+	if err != nil || int64(len(manifestJSON)) != claim.HourManifestExpectedSize || manifestSHA != claim.HourManifestExpectedSHA {
+		return PublishedHour{}, fmt.Errorf("sealed hour manifest identity changed before publication")
 	}
+	type identity struct {
+		size int64
+		sha  string
+	}
+	identities := make([]identity, len(built))
+	for i := range built {
+		output := claim.Plan.Outputs[i]
+		if built[i].SourceCount != len(output.Sources) || built[i].Verification.Status != "passed" || !SafeScratchOutput(built[i].Path, scratchDir) {
+			return PublishedHour{}, fmt.Errorf("hour part %d is not a verified scratch artifact", i+1)
+		}
+		size, sha, identityErr := localIdentity(built[i].Path)
+		if identityErr != nil || size != built[i].SizeBytes || sha != built[i].SHA256 || size != output.ExpectedSize || sha != output.ExpectedSHA || size > r2.MaxConditionalPutBytes {
+			return PublishedHour{}, fmt.Errorf("hour part %d changed before publication", i+1)
+		}
+		identities[i] = identity{size: size, sha: sha}
+	}
+	published := PublishedHour{HourID: claim.HourID, RecordingID: claim.Plan.RecordingID, LocalDate: claim.Plan.LocalDate, LocalHour: claim.Plan.LocalHour, Outputs: make([]PublishedOutput, 0, len(built)), HourManifestObjectKey: claim.Plan.CoverageObjectKey}
+	for i := range built {
+		create, resolveErr := resolveCreate(ctx, claim, claim.MediaArtifactIDs[i])
+		if resolveErr != nil {
+			return PublishedHour{}, fmt.Errorf("resolve exact media create capability: %w", resolveErr)
+		}
+		output, publishErr := publishHourPart(ctx, client, claim, create, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i], built[i], identities[i].size, identities[i].sha, resolveRead)
+		if publishErr != nil {
+			return PublishedHour{}, publishErr
+		}
+		published.Outputs = append(published.Outputs, output)
+	}
+	manifestCreate, err := resolveCreate(ctx, claim, claim.HourManifestArtifactID)
+	if err != nil {
+		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest create capability: %w", err)
+	}
+	_, err = putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, "application/json", int64(len(manifestJSON)), manifestSHA, manifestCreate, bytes.NewReader(manifestJSON))
+	if err != nil {
+		return PublishedHour{}, err
+	}
+	manifestRead, err := resolveRead(ctx, claim, claim.HourManifestArtifactID)
+	if err != nil {
+		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest reread capability")
+	}
+	manifestHead, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, int64(len(manifestJSON)), manifestSHA, manifestRead.ETag, manifestRead.VersionID, manifestRead)
+	if err != nil {
+		return PublishedHour{}, err
+	}
+	published.HourManifestETag, published.HourManifestVersionID, published.HourManifestSizeBytes, published.HourManifestSHA256 = manifestHead.ETag, manifestHead.VersionID, int64(len(manifestJSON)), manifestSHA
+	if err := finalize(ctx, claim, published); err != nil {
+		return PublishedHour{}, fmt.Errorf("immutable joined hour verified but fenced database reconciliation remains pending: %w", err)
+	}
+	for _, output := range built {
+		if !SafeScratchOutput(output.Path, scratchDir) {
+			return PublishedHour{}, fmt.Errorf("refusing cleanup outside scratch")
+		}
+		if err := os.Remove(output.Path); err != nil && !os.IsNotExist(err) {
+			return PublishedHour{}, fmt.Errorf("cleanup verified worker scratch: %w", err)
+		}
+	}
+	return published, nil
+}
+
+// PublishClaimedHourRenewing keeps the publication lease alive while each
+// just-in-time capability and finalization call uses the newest same-lease
+// operation token. The create capability itself may outlive the DB lease, but
+// it cannot finalize or mint another capability.
+
+func PublishClaimedHourRenewing(ctx context.Context, client CapabilityHTTPClient, storageAuthority string, claim WorkerClaim, scratch SealedHourScratch, heartbeat HeartbeatOperation, resolveCreate CreateCapabilityResolver, resolveRead ReadCapabilityResolver, finalize FinalizeHour) (PublishedHour, error) {
+	if storageAuthority == "" || claim.StorageAuthority != storageAuthority {
+		return PublishedHour{}, fmt.Errorf("hour publication authority differs from configured storage")
+	}
+	return publishClaimedHourRenewing(ctx, client, claim, scratch, heartbeat, resolveCreate, resolveRead, finalize, defaultRenewableRunner)
+}
+
+func publishClaimedHourRenewing(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, scratch SealedHourScratch, heartbeat HeartbeatOperation, resolveCreate CreateCapabilityResolver, resolveRead ReadCapabilityResolver, finalize FinalizeHour, run renewableRunner) (PublishedHour, error) {
+	var published PublishedHour
+	initial := OperationCredentials{LeaseID: claim.LeaseID, OperationToken: claim.OperationToken, ExpiresAt: claim.LeaseExpires}
+	err := run(ctx, initial, heartbeat, func(workCtx context.Context, current func() OperationCredentials) error {
+		fresh := func() (WorkerClaim, error) { return claim.WithOperation(current()) }
+		create := func(callCtx context.Context, _ WorkerClaim, artifactID int64) (ObjectCreateCapability, error) {
+			if err := callCtx.Err(); err != nil {
+				return ObjectCreateCapability{}, err
+			}
+			currentClaim, err := fresh()
+			if err != nil {
+				return ObjectCreateCapability{}, err
+			}
+			return resolveCreate(callCtx, currentClaim, artifactID)
+		}
+		read := func(callCtx context.Context, _ WorkerClaim, artifactID int64) (ObjectReadCapability, error) {
+			if err := callCtx.Err(); err != nil {
+				return ObjectReadCapability{}, err
+			}
+			currentClaim, err := fresh()
+			if err != nil {
+				return ObjectReadCapability{}, err
+			}
+			capability, err := resolveRead(callCtx, currentClaim, artifactID)
+			if err == nil && capability.ExpiresAt.After(currentClaim.LeaseExpires) {
+				return ObjectReadCapability{}, fmt.Errorf("artifact read capability outlives current publication lease")
+			}
+			return capability, err
+		}
+		finish := func(callCtx context.Context, _ WorkerClaim, output PublishedHour) error {
+			if err := callCtx.Err(); err != nil {
+				return err
+			}
+			currentClaim, err := fresh()
+			if err != nil {
+				return err
+			}
+			return finalize(callCtx, currentClaim, output)
+		}
+		var err error
+		published, err = publishClaimedHour(workCtx, client, claim, scratch, create, read, finish)
+		return err
+	})
+	return published, err
+}
+
+func publishHourPart(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, capability ObjectCreateCapability, artifactID int64, output OutputPlan, built BuiltOutput, size int64, sha string, resolveRead ReadCapabilityResolver) (PublishedOutput, error) {
 	f, err := os.Open(built.Path)
 	if err != nil {
 		return PublishedOutput{}, err
 	}
-	head, created, putErr := store.PutReaderIfAbsentVerified(ctx, claim.Output.ObjectKey, "video/mp4", f, size, sha)
+	observation, putErr := putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, "video/mp4", size, sha, capability, f)
 	closeErr := f.Close()
 	if putErr != nil {
 		return PublishedOutput{}, putErr
@@ -130,24 +268,13 @@ func PublishClaimedOutput(ctx context.Context, store ImmutableStore, claim Worke
 	if closeErr != nil {
 		return PublishedOutput{}, closeErr
 	}
-	coverage := OutputCoverage{SchemaVersion: 1, PolicyVersion: PlanPolicyVersion, CampaignID: claim.CampaignID, BatchID: claim.BatchID, BatchPlanSHA256: claim.BatchPlanSHA, SourceManifestSHA: claim.SourcePlanSHA, ExpectedOutputCount: claim.ExpectedCount, RecordingID: claim.RecordingID, Output: claim.Output, MediaSizeBytes: size, MediaSHA256: sha, MediaETag: head.ETag, MediaVersionID: head.VersionID, Verification: built.Verification}
-	coverageSHA, coverageJSON, err := stitchcert.CanonicalSHA(coverage)
+	readCapability, err := resolveRead(ctx, claim, artifactID)
+	if err != nil {
+		return PublishedOutput{}, fmt.Errorf("resolve exact media reread capability")
+	}
+	head, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, size, sha, readCapability.ETag, readCapability.VersionID, readCapability)
 	if err != nil {
 		return PublishedOutput{}, err
 	}
-	coverageHead, _, err := store.PutReaderIfAbsentVerified(ctx, claim.Output.CoverageKey, "application/json", bytes.NewReader(coverageJSON), int64(len(coverageJSON)), coverageSHA)
-	if err != nil {
-		return PublishedOutput{}, err
-	}
-	published := PublishedOutput{TaskID: claim.TaskID, PlanOrdinal: claim.Output.Ordinal, ObjectKey: claim.Output.ObjectKey, ETag: head.ETag, VersionID: head.VersionID, SizeBytes: size, SHA256: sha, CoverageObjectKey: claim.Output.CoverageKey, CoverageETag: coverageHead.ETag, CoverageVersionID: coverageHead.VersionID, CoverageSizeBytes: int64(len(coverageJSON)), CoverageSHA256: coverageSHA, Verification: built.Verification, Created: created}
-	if err := finalize(ctx, claim, published); err != nil {
-		return PublishedOutput{}, fmt.Errorf("immutable joined objects verified but fenced database reconciliation remains pending: %w", err)
-	}
-	if !SafeScratchOutput(built.Path, scratchDir) {
-		return PublishedOutput{}, fmt.Errorf("refusing cleanup outside scratch")
-	}
-	if err := os.Remove(built.Path); err != nil && !os.IsNotExist(err) {
-		return PublishedOutput{}, fmt.Errorf("cleanup verified worker scratch: %w", err)
-	}
-	return published, nil
+	return PublishedOutput{ArtifactID: artifactID, ObjectKey: output.ObjectKey, ETag: head.ETag, VersionID: head.VersionID, SizeBytes: size, SHA256: sha, Created: observation.Created}, nil
 }

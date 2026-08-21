@@ -1,0 +1,292 @@
+package joinedrecording
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+const JoinedProtocolVersion = 1
+
+type WorkerBootstrapRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	BatchID         string `json:"batch_id"`
+}
+
+type WorkerBootstrapResponse struct {
+	ProtocolVersion int       `json:"protocol_version"`
+	BatchID         string    `json:"batch_id"`
+	ClaimToken      string    `json:"claim_token"`
+	ExpiresAt       time.Time `json:"expires_at"`
+}
+
+type WorkClaimRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	BatchID         string `json:"batch_id"`
+	WorkerID        string `json:"worker_id"`
+}
+
+type HeartbeatRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	ScopeKind       string `json:"scope_kind"`
+	ScopeID         string `json:"scope_id"`
+}
+
+type HeartbeatResponse struct {
+	ProtocolVersion int       `json:"protocol_version"`
+	ScopeKind       string    `json:"scope_kind"`
+	ScopeID         string    `json:"scope_id"`
+	LeaseID         string    `json:"lease_id"`
+	OperationToken  string    `json:"operation_token"`
+	ExpiresAt       time.Time `json:"expires_at"`
+}
+
+type SourceCapabilityRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	HourID          string `json:"hour_id"`
+	ClipID          int64  `json:"clip_id"`
+	Operation       string `json:"operation"`
+}
+
+// SealHourRequest contains only worker-derived evidence. The backend loads
+// and exact-compares the frozen batch, ledger, source, naming, policy, and tool
+// facts before it constructs the canonical plan and manifest.
+type SealHourRequest struct {
+	ProtocolVersion   int                  `json:"protocol_version"`
+	HourID            string               `json:"hour_id"`
+	SourceClaimSHA256 string               `json:"source_claim_sha256"`
+	AccountedSources  []SourceClip         `json:"accounted_sources"`
+	Media             []SealHourMedia      `json:"media"`
+	Quarantine        []QuarantineEvidence `json:"quarantine_evidence"`
+}
+
+type SealHourMedia struct {
+	Ordinal            int                  `json:"ordinal"`
+	SourceClipIDs      []int64              `json:"source_clip_ids"`
+	SizeBytes          int64                `json:"size_bytes"`
+	SHA256             string               `json:"sha256"`
+	Verification       Verification         `json:"verification"`
+	MaximalityEvidence []MaximalityEvidence `json:"maximality_evidence"`
+}
+
+// SealHourResponse is the exact sealed publication claim. An alias avoids a
+// second hour schema drifting from the worker's publication contract.
+type SealHourResponse = WorkerClaim
+
+type ArtifactCapabilityRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	ScopeKind       string `json:"scope_kind"`
+	ScopeID         string `json:"scope_id"`
+	ArtifactID      int64  `json:"artifact_id"`
+	Operation       string `json:"operation"`
+}
+
+// PublicationClaimRequest uses the same operator-selected batch and bounded
+// worker identity as a preflight claim. The backend chooses the highest
+// priority sealed ledger, hour, or final index; callers cannot choose a scope.
+type PublicationClaimRequest = WorkClaimRequest
+
+type PublicationClaimResponse struct {
+	ProtocolVersion int                         `json:"protocol_version"`
+	Kind            string                      `json:"kind"`
+	Ledger          *LedgerPublicationClaim     `json:"ledger,omitempty"`
+	Hour            *WorkerClaim                `json:"hour,omitempty"`
+	BatchIndex      *BatchIndexPublicationClaim `json:"batch_index,omitempty"`
+}
+
+type FinalizeLedgerRequest struct {
+	ProtocolVersion int             `json:"protocol_version"`
+	Published       PublishedLedger `json:"published"`
+}
+
+type FinalizeHourRequest struct {
+	ProtocolVersion int           `json:"protocol_version"`
+	Published       PublishedHour `json:"published"`
+}
+
+type FinalizeBatchIndexRequest struct {
+	ProtocolVersion int                 `json:"protocol_version"`
+	Published       PublishedBatchIndex `json:"published"`
+}
+
+func (r WorkerBootstrapRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) {
+		return fmt.Errorf("invalid joined worker bootstrap request")
+	}
+	return nil
+}
+
+func (r WorkerBootstrapResponse) Validate(now time.Time) error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || !validOperationToken(r.ClaimToken) || !r.ExpiresAt.After(now) {
+		return fmt.Errorf("invalid joined worker bootstrap response")
+	}
+	return nil
+}
+
+func (r WorkClaimRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || !validWorkerID(r.WorkerID) {
+		return fmt.Errorf("invalid joined work claim request")
+	}
+	return nil
+}
+
+func (r HeartbeatRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !validScope(r.ScopeKind, r.ScopeID) {
+		return fmt.Errorf("invalid joined heartbeat request")
+	}
+	return nil
+}
+
+func (r HeartbeatResponse) Validate(now time.Time) error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !validScope(r.ScopeKind, r.ScopeID) || !validLeaseID(r.LeaseID) || !validOperationToken(r.OperationToken) || !r.ExpiresAt.After(now) {
+		return fmt.Errorf("invalid joined heartbeat response")
+	}
+	return nil
+}
+
+func validWorkerID(workerID string) bool {
+	return len(workerID) > 0 && len(workerID) <= 256 && strings.TrimSpace(workerID) == workerID && visibleASCII(workerID)
+}
+
+func validScope(kind, id string) bool {
+	if strings.TrimSpace(id) == "" || len(id) > 1024 {
+		return false
+	}
+	switch kind {
+	case "hour", "ledger", "batch_index":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r SealHourRequest) Validate(recordingID int64, toolIdentity string) error {
+	if r.ProtocolVersion != JoinedProtocolVersion || r.HourID == "" || !lowerHex64(r.SourceClaimSHA256) || len(r.AccountedSources) == 0 || !lowerHex64(toolIdentity) {
+		return fmt.Errorf("invalid joined hour seal request")
+	}
+	claimSHA, _, err := sourceClaimSHA(r.AccountedSources)
+	if err != nil || claimSHA != r.SourceClaimSHA256 {
+		return fmt.Errorf("joined hour seal source claim differs")
+	}
+	accounted, disposed := map[int64]bool{}, map[int64]bool{}
+	for _, source := range r.AccountedSources {
+		if accounted[source.ClipID] || validatePreflightSource(source, recordingID) != nil {
+			return fmt.Errorf("joined hour seal source differs")
+		}
+		accounted[source.ClipID] = true
+	}
+	for i, media := range r.Media {
+		if media.Ordinal != i+1 || media.SizeBytes <= 0 || !lowerHex64(media.SHA256) || len(media.SourceClipIDs) == 0 || validatePassedVerification(media.Verification) != nil {
+			return fmt.Errorf("joined hour seal media differs")
+		}
+		for _, clipID := range media.SourceClipIDs {
+			if !accounted[clipID] || disposed[clipID] {
+				return fmt.Errorf("joined hour seal media source assignment differs")
+			}
+			disposed[clipID] = true
+		}
+		for _, evidence := range media.MaximalityEvidence {
+			candidateSources, sourceErr := sourceSubsetByIDs(r.AccountedSources, evidence.CandidateClipIDs)
+			expectedClaim, claimErr := candidateSourceClaimSHA(candidateSources)
+			if sourceErr != nil || claimErr != nil || validateMaximalityEvidence(evidence, toolIdentity, expectedClaim) != nil {
+				return fmt.Errorf("joined hour seal maximality differs")
+			}
+		}
+	}
+	for _, evidence := range r.Quarantine {
+		quarantineSources, sourceErr := sourceSubsetByIDs(r.AccountedSources, evidence.SourceClipIDs)
+		expectedClaim, claimErr := candidateSourceClaimSHA(quarantineSources)
+		if sourceErr != nil || claimErr != nil || validateQuarantineEvidence(evidence, toolIdentity, expectedClaim) != nil {
+			return fmt.Errorf("joined hour seal quarantine differs")
+		}
+		for _, clipID := range evidence.SourceClipIDs {
+			if !accounted[clipID] || disposed[clipID] {
+				return fmt.Errorf("joined hour seal quarantine source assignment differs")
+			}
+			disposed[clipID] = true
+		}
+	}
+	if len(disposed) != len(accounted) {
+		return fmt.Errorf("joined hour seal omits accounted sources")
+	}
+	return nil
+}
+
+func (r ArtifactCapabilityRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !validScope(r.ScopeKind, r.ScopeID) || r.ArtifactID <= 0 || (r.Operation != "put" && r.Operation != "read") {
+		return fmt.Errorf("invalid joined artifact capability request")
+	}
+	return nil
+}
+
+func (r PublicationClaimResponse) Validate(now time.Time) error {
+	present := 0
+	if r.Ledger != nil {
+		present++
+	}
+	if r.Hour != nil {
+		present++
+	}
+	if r.BatchIndex != nil {
+		present++
+	}
+	if r.ProtocolVersion != JoinedProtocolVersion || present != 1 {
+		return fmt.Errorf("invalid joined publication claim response")
+	}
+	switch r.Kind {
+	case "ledger":
+		if r.Ledger == nil {
+			return fmt.Errorf("joined publication claim kind differs")
+		}
+		_, _, err := r.Ledger.Validate(now)
+		return err
+	case "hour":
+		if r.Hour == nil {
+			return fmt.Errorf("joined publication claim kind differs")
+		}
+		return r.Hour.Validate(now)
+	case "batch_index":
+		if r.BatchIndex == nil {
+			return fmt.Errorf("joined publication claim kind differs")
+		}
+		_, _, err := r.BatchIndex.Validate(now)
+		return err
+	default:
+		return fmt.Errorf("invalid joined publication claim kind")
+	}
+}
+
+func (r FinalizeLedgerRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || r.Published.ArtifactID <= 0 || !safeObjectKey(r.Published.ObjectKey) || r.Published.SizeBytes <= 0 || !lowerHex64(r.Published.SHA256) || !validObjectIdentity(r.Published.ETag, r.Published.VersionID) {
+		return fmt.Errorf("invalid joined ledger finalize request")
+	}
+	return nil
+}
+
+func (r FinalizeHourRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || r.Published.HourID == "" || r.Published.RecordingID <= 0 || r.Published.LocalHour < 1 || r.Published.LocalHour > 12 || !safeObjectKey(r.Published.HourManifestObjectKey) || r.Published.HourManifestSizeBytes <= 0 || !lowerHex64(r.Published.HourManifestSHA256) || !validObjectIdentity(r.Published.HourManifestETag, r.Published.HourManifestVersionID) {
+		return fmt.Errorf("invalid joined hour finalize request")
+	}
+	seen := map[int64]bool{}
+	for _, output := range r.Published.Outputs {
+		if output.ArtifactID <= 0 || seen[output.ArtifactID] || !safeObjectKey(output.ObjectKey) || output.SizeBytes <= 0 || !lowerHex64(output.SHA256) || !validObjectIdentity(output.ETag, output.VersionID) {
+			return fmt.Errorf("invalid joined hour output finalize request")
+		}
+		seen[output.ArtifactID] = true
+	}
+	return nil
+}
+
+func (r FinalizeBatchIndexRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || r.Published.ArtifactID <= 0 || !safeObjectKey(r.Published.ObjectKey) || r.Published.SizeBytes <= 0 || !lowerHex64(r.Published.SHA256) || !validObjectIdentity(r.Published.ETag, r.Published.VersionID) {
+		return fmt.Errorf("invalid joined batch-index finalize request")
+	}
+	return nil
+}
+
+func (r SourceCapabilityRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || r.HourID == "" || r.ClipID <= 0 || (r.Operation != "head" && r.Operation != "get") {
+		return fmt.Errorf("invalid joined source capability request")
+	}
+	return nil
+}

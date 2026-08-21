@@ -9,22 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-
-	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
-type ExactSourceStore interface {
-	Head(context.Context, string) (r2.ObjectHead, error)
-	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
-}
+type sourceCapability func(context.Context, SourceClip, string) (SourceReadCapability, error)
 
-type SourceStore func(context.Context, SourceClip) (ExactSourceStore, error)
-
-// DownloadClaimSources reads only exact R2 generations into the claim's unique
+// downloadClaimSources reads only exact R2 generations into the claim's unique
 // scratch directory. Existing scratch files are reused only after full hashing.
-func DownloadClaimSources(ctx context.Context, claim WorkerClaim, scratchRoot string, sourceStore SourceStore) ([]LocalSource, string, error) {
-	if sourceStore == nil {
-		return nil, "", fmt.Errorf("source store resolver is required")
+func downloadClaimSources(ctx context.Context, claim PreflightHourClaim, scratchRoot string, client CapabilityHTTPClient, storageAuthority string, sourceCapability sourceCapability) ([]LocalSource, string, error) {
+	if client == nil || sourceCapability == nil || storageAuthority == "" {
+		return nil, "", fmt.Errorf("source capability client and resolver are required")
 	}
 	scratchDir, err := claim.ScratchDir(scratchRoot)
 	if err != nil {
@@ -33,23 +26,27 @@ func DownloadClaimSources(ctx context.Context, claim WorkerClaim, scratchRoot st
 	if err := os.MkdirAll(scratchDir, 0700); err != nil {
 		return nil, "", err
 	}
-	locals := make([]LocalSource, 0, len(claim.Output.Sources))
-	for _, source := range claim.Output.Sources {
+	locals := make([]LocalSource, 0)
+	for _, source := range claim.Sources {
 		finalPath := filepath.Join(scratchDir, "clip-"+strconv.FormatInt(source.ClipID, 10)+".mp4")
-		local := LocalSource{ClipID: source.ClipID, Path: finalPath, SizeBytes: source.Object.SizeBytes, SHA256: source.Object.SHA256}
+		sourceClaim, _, claimErr := sourceClaimSHA([]SourceClip{source})
+		if claimErr != nil {
+			return nil, "", claimErr
+		}
+		local := LocalSource{ClipID: source.ClipID, Path: finalPath, SizeBytes: source.Object.SizeBytes, SHA256: source.Object.SHA256, SourceClaimSHA256: sourceClaim}
 		if err := verifyLocalIdentity(local); err == nil {
 			locals = append(locals, local)
 			continue
 		}
-		store, err := sourceStore(ctx, source)
+		headCapability, err := sourceCapability(ctx, source, "head")
+		if err != nil || verifyExactSourceHeadCapability(ctx, client, storageAuthority, source, headCapability) != nil {
+			return nil, "", fmt.Errorf("source clip %d exact HEAD verification failed", source.ClipID)
+		}
+		capability, err := sourceCapability(ctx, source, "get")
 		if err != nil {
 			return nil, "", err
 		}
-		head, err := store.Head(ctx, source.Object.Key)
-		if err != nil || head.SizeBytes != source.Object.SizeBytes || head.ETag != source.Object.ETag || (source.Object.VersionID != "" && head.VersionID != source.Object.VersionID) {
-			return nil, "", fmt.Errorf("source clip %d R2 identity drifted", source.ClipID)
-		}
-		rc, err := store.OpenExact(ctx, source.Object.Key, head.ETag, head.VersionID)
+		rc, err := openExactCapability(ctx, client, storageAuthority, source, capability)
 		if err != nil {
 			return nil, "", err
 		}

@@ -4,45 +4,30 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"strings"
 	"testing"
-
-	"github.com/daydemir/stoarama/backend/internal/r2"
-	"github.com/daydemir/stoarama/backend/internal/stitchcert"
+	"time"
 )
 
-type memorySourceStore struct {
-	head r2.ObjectHead
-	body string
-}
-
-func (s memorySourceStore) Head(context.Context, string) (r2.ObjectHead, error) { return s.head, nil }
-func (s memorySourceStore) OpenExact(_ context.Context, _ string, etag, version string) (io.ReadCloser, error) {
-	if etag != s.head.ETag || version != s.head.VersionID {
-		return nil, io.ErrUnexpectedEOF
-	}
-	return io.NopCloser(strings.NewReader(s.body)), nil
-}
-
 func TestDownloadClaimSourcesPinsHeadAndHashesBeforePublication(t *testing.T) {
-	claim := oneOutputClaim(t)
 	body := "exact raw clip bytes"
 	sum := sha256.Sum256([]byte(body))
-	claim.Output.Sources[0].Object.SizeBytes = int64(len(body))
-	claim.Output.Sources[0].Object.SHA256 = hex.EncodeToString(sum[:])
-	claim.Output.Sources[0].Object.ETag = "source-etag"
-	claim.Output.Sources[0].Object.VersionID = "source-version"
-	contentID, _, err := stitchcert.CanonicalSHA(struct {
-		Policy  string       `json:"policy"`
-		Sources []SourceClip `json:"sources"`
-	}{PlanPolicyVersion, claim.Output.Sources})
+	source := testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
+	source.Object.SizeBytes = int64(len(body))
+	source.Object.SHA256 = hex.EncodeToString(sum[:])
+	source.Object.ETag = "etag-" + hex.EncodeToString(sum[:4])
+	source.Object.VersionID = "version"
+	plan, err := buildTestPlan(testRequest([]SourceClip{source}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim.Output.ContentID = contentID
-	store := memorySourceStore{head: r2.ObjectHead{ETag: "source-etag", VersionID: "source-version", SizeBytes: int64(len(body))}, body: body}
-	locals, scratch, err := DownloadClaimSources(context.Background(), claim, t.TempDir(), func(context.Context, SourceClip) (ExactSourceStore, error) { return store, nil })
+	claim := PreflightHourClaim{ProtocolVersion: JoinedProtocolVersion, HourID: plan.HourID, LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("t", 32), LeaseExpires: time.Now().Add(time.Hour), BatchID: plan.BatchID, Generation: plan.Generation, RecordingID: plan.RecordingID, Timezone: plan.Timezone, LocalDate: plan.LocalDate, LocalHour: plan.LocalHour, AllocationLedgerSHA: plan.AllocationLedgerSHA, Qualification: plan.Qualification, MediaTool: plan.MediaTool, SourceClaimSHA256: plan.SourceClaimSHA256, Sources: sourceOnlyClips(plan.Outputs[0].Sources)}
+	client := &memoryCapabilityClient{objects: map[string][]byte{source.Object.Key: []byte(body)}}
+	locals, scratch, err := downloadClaimSources(context.Background(), claim, t.TempDir(), client, "cap.test", func(_ context.Context, _ SourceClip, operation string) (SourceReadCapability, error) {
+		capability := sourceReadCapability(source.Object.Key, source.Object.ETag, source.Object.VersionID, operation)
+		capability.SizeBytes, capability.SHA256 = source.Object.SizeBytes, source.Object.SHA256
+		return capability, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
