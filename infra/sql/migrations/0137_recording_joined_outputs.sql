@@ -131,7 +131,7 @@ BEGIN
       AND q.cohort_sha256=NEW.qualification_cohort_sha256
       AND q.windows_sha256=NEW.qualification_windows_sha256
       AND q.frozen_at=NEW.qualification_frozen_at FOR SHARE)
-	OR ARRAY(SELECT jsonb_object_keys(request) ORDER BY 1) IS DISTINCT FROM ARRAY['account_id','batch_id',
+	OR ARRAY(SELECT key FROM jsonb_object_keys(request) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['account_id','batch_id',
 	  'connection_id','expected_scheduled_hours','expected_stream_days','freeze_exclusions_sha256',
 	  'frozen_denominator_sha256','generation','media_tool','policy_version','provisional_exclusions',
 	  'provisional_source_bytes','provisional_source_clips','qualification_jobs_sha256','recording_ids',
@@ -501,8 +501,8 @@ BEGIN
 	OR EXISTS(SELECT 1 FROM recording_joined_batch_recordings br
 	  CROSS JOIN LATERAL (SELECT request->'recordings'->(br.priority_ordinal-1) item) frozen
 	  WHERE br.batch_record_id=batch.id AND (
-	    ARRAY(SELECT jsonb_object_keys(frozen.item) ORDER BY 1) IS DISTINCT FROM ARRAY['frozen_recording','qualification']::TEXT[]
-	    OR ARRAY(SELECT jsonb_object_keys(frozen.item->'frozen_recording') ORDER BY 1) IS DISTINCT FROM
+	    ARRAY(SELECT key FROM jsonb_object_keys(frozen.item) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['frozen_recording','qualification']::TEXT[]
+	    OR ARRAY(SELECT key FROM jsonb_object_keys(frozen.item->'frozen_recording') AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM
 	      ARRAY['completed_at','folder_name','naming_metadata','priority_ordinal','qualification_sha256',
 	        'recording_id','selection_tier','timezone']::TEXT[]
 	    OR (frozen.item->'frozen_recording'->>'recording_id')::BIGINT IS DISTINCT FROM br.recording_id
@@ -838,33 +838,33 @@ BEGIN
   SELECT count(*), COALESCE(sum(size_bytes), 0) INTO source_count, source_bytes
     FROM recording_joined_sources WHERE stream_day_id = d.id;
   IF d.state<>'sealed'
-    OR ARRAY(SELECT jsonb_object_keys(ledger) ORDER BY 1) IS DISTINCT FROM ARRAY['batch_id','consecutive_pairs',
+    OR ARRAY(SELECT key FROM jsonb_object_keys(ledger) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['batch_id','consecutive_pairs',
       'cross_day_boundaries','cross_hour_boundaries','first_clip_id','frozen_source_sha256','generation','hour_source_claim_sha256','hours',
       'last_clip_id','ledger_sha256','local_date','qualification_day','qualification_sha256','recording_id',
       'schema_version','source_bytes','source_claim_sha256','source_clip_count','sources','timezone']::TEXT[]
-    OR ARRAY(SELECT jsonb_object_keys(ledger->'qualification_day') ORDER BY 1) IS DISTINCT FROM
+    OR ARRAY(SELECT key FROM jsonb_object_keys(ledger->'qualification_day') AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM
       ARRAY['completed_at','job_id','local_date','qualification_window_ordinal','window_end','window_start']::TEXT[]
     OR EXISTS(SELECT 1 FROM jsonb_array_elements(ledger->'sources') source WHERE
-      ARRAY(SELECT jsonb_object_keys(source) ORDER BY 1) IS DISTINCT FROM ARRAY['bucket','clip_id','end_utc','endpoint',
+      ARRAY(SELECT key FROM jsonb_object_keys(source) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['bucket','clip_id','end_utc','endpoint',
         'object','provider','recording_id','recording_job_id','region','released_at','seam_to_previous','start_utc',
         'storage_destination_id']::TEXT[]
-      OR ARRAY(SELECT jsonb_object_keys(source->'object') ORDER BY 1) NOT IN
+      OR ARRAY(SELECT key FROM jsonb_object_keys(source->'object') AS object_keys(key) ORDER BY key COLLATE "C") NOT IN
         (ARRAY['etag','key','sha256','size_bytes']::TEXT[],ARRAY['etag','key','sha256','size_bytes','version_id']::TEXT[])
-      OR ARRAY(SELECT jsonb_object_keys(source->'seam_to_previous') ORDER BY 1) IS DISTINCT FROM
+      OR ARRAY(SELECT key FROM jsonb_object_keys(source->'seam_to_previous') AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM
         ARRAY['reason','signed_gap_nanoseconds','verdict']::TEXT[])
     OR EXISTS(SELECT 1 FROM jsonb_array_elements(ledger->'hours') hour WHERE
-      ARRAY(SELECT jsonb_object_keys(hour) ORDER BY 1) IS DISTINCT FROM
+      ARRAY(SELECT key FROM jsonb_object_keys(hour) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM
         ARRAY['clock_hour','delivery_hour','source_clip_ids']::TEXT[])
     OR EXISTS(SELECT 1 FROM jsonb_array_elements(ledger->'consecutive_pairs') pair WHERE
-      ARRAY(SELECT jsonb_object_keys(pair) ORDER BY 1) IS DISTINCT FROM ARRAY['next_clip_id',
+      ARRAY(SELECT key FROM jsonb_object_keys(pair) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['next_clip_id',
         'next_presentation_start_utc','previous_clip_id','previous_presentation_end_utc','signed_gap_nanoseconds']::TEXT[])
     OR EXISTS(SELECT 1 FROM jsonb_array_elements(ledger->'cross_hour_boundaries') boundary WHERE
-      ARRAY(SELECT jsonb_object_keys(boundary) ORDER BY 1) IS DISTINCT FROM ARRAY['actual_seam_utc',
+      ARRAY(SELECT key FROM jsonb_object_keys(boundary) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['actual_seam_utc',
         'allocation_decision','boundary_skew_nanoseconds','next_clip_id','next_delivery_hour','next_presentation_start_utc',
         'previous_clip_id','previous_delivery_hour','previous_presentation_end_utc','reason','scheduled_utc',
         'signed_gap_nanoseconds','verdict']::TEXT[])
     OR EXISTS(SELECT 1 FROM jsonb_array_elements(ledger->'cross_day_boundaries') boundary WHERE
-      ARRAY(SELECT jsonb_object_keys(boundary) ORDER BY 1) IS DISTINCT FROM ARRAY['allocation_decision',
+      ARRAY(SELECT key FROM jsonb_object_keys(boundary) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY['allocation_decision',
         'boundary_skew_nanoseconds','next_clip_id','next_presentation_start_utc','previous_clip_id',
         'previous_presentation_end_utc','reason','scheduled_next_start_utc','scheduled_previous_end_utc',
         'signed_gap_nanoseconds','verdict']::TEXT[])
@@ -1292,7 +1292,7 @@ BEGIN
     IF OLD.source_clip_count<>0 OR NEW.attempt_count<>0 OR NEW.source_only_sha256 IS NULL
       OR NEW.canonical_plan IS NULL OR NEW.manifest_bytes IS NULL OR NEW.manifest_sha256 IS NULL OR NEW.sealed_at IS NULL
       OR NEW.failure_reason_code<>'' OR NEW.source_only_sha256<>OLD.source_claim_sha256
-      OR ARRAY(SELECT jsonb_object_keys(NEW.canonical_plan) ORDER BY 1) IS DISTINCT FROM ARRAY[
+      OR ARRAY(SELECT key FROM jsonb_object_keys(NEW.canonical_plan) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY[
         'allocation_ledger_sha256','batch_id','coverage_object_key','expected_output_count','folder_name','gap_only',
         'gap_only_reason','gaps','generation','hour_id','local_date','local_hour','media_tool','naming_metadata','outputs',
         'policy_version','qualification_window','quarantine_reason_code','quarantined_sources','recording_id','schema_version',
@@ -1311,12 +1311,12 @@ BEGIN
       OR NEW.canonical_plan->'quarantined_sources' IS DISTINCT FROM 'null'::jsonb
       OR COALESCE(jsonb_array_length(NEW.canonical_plan->'outputs'),-1)<>0
       OR COALESCE(jsonb_array_length(NEW.canonical_plan->'gaps'),-1)<>0
-      OR ARRAY(SELECT jsonb_object_keys(convert_from(NEW.manifest_bytes,'UTF8')::jsonb) ORDER BY 1) IS DISTINCT FROM ARRAY[
+      OR ARRAY(SELECT key FROM jsonb_object_keys(convert_from(NEW.manifest_bytes,'UTF8')::jsonb) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM ARRAY[
         'allocation','batch_id','clock_hour','delivery_hour','gaps','hour_id','local_date','media','media_tool',
         'policy_version','qualification_day','qualification_sha256','quarantine_evidence','quarantine_reason_code',
         'recording_id','scheduled_end_utc','scheduled_gap','scheduled_start_utc','schema_version','source_claim_sha256',
         'source_count','source_dispositions','sources','status','timezone']::TEXT[]
-      OR ARRAY(SELECT jsonb_object_keys(convert_from(NEW.manifest_bytes,'UTF8')::jsonb->'scheduled_gap') ORDER BY 1)
+      OR ARRAY(SELECT key FROM jsonb_object_keys(convert_from(NEW.manifest_bytes,'UTF8')::jsonb->'scheduled_gap') AS object_keys(key) ORDER BY key COLLATE "C")
         IS DISTINCT FROM ARRAY['no_allocatable_sources','reason_code','signed_gap_nanoseconds']::TEXT[]
       OR convert_from(NEW.manifest_bytes,'UTF8')::jsonb->>'status' IS DISTINCT FROM 'gap_only'
       OR convert_from(NEW.manifest_bytes,'UTF8')::jsonb->>'hour_id' IS DISTINCT FROM OLD.hour_id
