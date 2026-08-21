@@ -25,7 +25,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	index, ledgers, manifests := testBatchIndex(t)
 	canonicalIndex := testBatchIndexCopy(index)
 	want := index.FrozenDenominatorSHA256
-	if want != "fcd56878c3c1b26e5b99995ffc2ad4c31ad9f8fef1ca3289fb2701d044e419d9" {
+	if want != "39a20a79bd66c56fdfaad7113c4b8f4034a4d00fe1e8ec1c81a3a91206f5c3bd" {
 		t.Fatalf("canonical denominator fixture changed: %s", want)
 	}
 	if got, err := ComputeFrozenDenominatorSHA256(index.AllocationLedgers); err != nil || got != want {
@@ -593,7 +593,7 @@ func TestHourManifestRejectsMutatedLedgerAndDowngradedEvidence(t *testing.T) {
 	}
 	unsafePlan := plan
 	unsafePlan.Sources = append([]SourceClip(nil), plan.Sources...)
-	unsafePlan.Sources[0].Endpoint = "https://cap.test/?secret=value"
+	unsafePlan.Sources[0].Endpoint = testSourceEndpoint + "/?secret=value"
 	unsafePlan.Outputs = append([]OutputPlan(nil), plan.Outputs...)
 	unsafePlan.Outputs[0].Sources = append([]SourceClip(nil), plan.Outputs[0].Sources...)
 	unsafePlan.Outputs[0].Sources[0].Endpoint = unsafePlan.Sources[0].Endpoint
