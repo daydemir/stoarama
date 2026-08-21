@@ -84,11 +84,11 @@ func TestJoinedAdminBatchStatusIsBoundedOrderedReadOnlyAndAdminOnly(t *testing.T
 			t.Fatalf("bad path %q status=%d body=%s", badPath, response.Code, response.Body.String())
 		}
 	}
-	fixture.s.cfg.JoinedRecordingEnabled = false
+	fixture.s.cfg.JoinedRecordingControlPlaneEnabled = false
 	if response := call(fixture.sessionToken, "", path); response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("disabled status=%d body=%s", response.Code, response.Body.String())
 	}
-	fixture.s.cfg.JoinedRecordingEnabled = true
+	fixture.s.cfg.JoinedRecordingControlPlaneEnabled = true
 
 	if _, err := fixture.pool.Exec(ctx, `UPDATE accounts SET role='admin' WHERE id=$1`, fixture.accountID); err != nil {
 		t.Fatal(err)
