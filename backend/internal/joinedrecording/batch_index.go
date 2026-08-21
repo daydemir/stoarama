@@ -252,20 +252,27 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 	var hourSources, mediaCount int
 	var hourBytes int64
 	var canonicalLedger StreamDayAllocation
+	var previousCanonicalLedger StreamDayAllocation
 	for hourIndex, hour := range index.Hours {
 		ledger := index.AllocationLedgers[hourIndex/12]
 		if resolveHour != nil && hourIndex%12 == 0 {
 			var resolveErr error
-			canonicalLedger, resolveErr = resolveLedger(ledger)
-			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, canonicalLedger) != nil || canonicalLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone {
+			nextLedger, resolveErr := resolveLedger(ledger)
+			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
 			}
+			if previousCanonicalLedger.RecordingID == nextLedger.RecordingID && validateCrossDayLedgerLink(previousCanonicalLedger, nextLedger) != nil {
+				return BatchIndex{}, nil, "", fmt.Errorf("consecutive allocation ledgers disagree on their shared day boundary")
+			}
+			canonicalLedger = nextLedger
+			previousCanonicalLedger = nextLedger
 		}
 		expected := expectedHours[hour.HourID]
 		wantRelative := path.Join("coverage", "hours", hour.HourID+".json")
 		if expected.ArtifactID == 0 || expected.ArtifactID != ledger.ArtifactID || hour.DeliveryHour != hourIndex%12+1 || hour.HourManifestArtifactID <= 0 || seenArtifacts[hour.HourManifestArtifactID] || hour.RecordingID != ledger.RecordingID || hour.LocalDate != ledger.LocalDate || hour.HourID != canonicalHourIDValue(index.BatchID, hour.RecordingID, hour.LocalDate, hour.DeliveryHour, index.Generation) || hour.RelativePath != wantRelative || hour.ObjectKey != path.Join("joined", index.BatchID, wantRelative) || hour.SizeBytes <= 0 || !lowerHex64(hour.SHA256) || hour.SourceCount < 0 || hour.SourceBytes < 0 || hour.MediaArtifactCount < 0 {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch hour identity differs")
 		}
+		seenArtifacts[hour.HourManifestArtifactID] = true
 		if resolveHour != nil {
 			canonicalManifest, resolveErr := resolveHour(hour)
 			if resolveErr != nil {
@@ -282,6 +289,12 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 			}
 			if err := ValidateHourManifestLedgerBinding(canonicalManifest, ledger, canonicalLedger); err != nil {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch hour does not match its canonical allocation ledger: %w", err)
+			}
+			for _, media := range canonicalManifest.Media {
+				if seenArtifacts[media.ArtifactID] {
+					return BatchIndex{}, nil, "", fmt.Errorf("batch media artifact identity is reused")
+				}
+				seenArtifacts[media.ArtifactID] = true
 			}
 		}
 		switch hour.Status {
@@ -300,7 +313,6 @@ func buildBatchIndex(index BatchIndex, resolveLedger AllocationLedgerResolver, r
 		default:
 			return BatchIndex{}, nil, "", fmt.Errorf("unknown terminal hour status")
 		}
-		seenArtifacts[hour.HourManifestArtifactID] = true
 		delete(expectedHours, hour.HourID)
 		if hour.SourceCount > math.MaxInt-hourSources || hour.SourceBytes > math.MaxInt64-hourBytes || hour.MediaArtifactCount > math.MaxInt-mediaCount {
 			return BatchIndex{}, nil, "", fmt.Errorf("batch hour denominator overflow")
@@ -344,6 +356,31 @@ func validateHourManifestDelivery(manifest HourManifest, frozen FrozenRecording)
 		if err != nil || media.RelativePath != want {
 			return fmt.Errorf("media delivery path differs")
 		}
+	}
+	return nil
+}
+
+func validateCrossDayLedgerLink(previous, next StreamDayAllocation) error {
+	if previous.RecordingID != next.RecordingID || previous.BatchID != next.BatchID || previous.Generation != next.Generation || previous.Timezone != next.Timezone || len(previous.CrossDayBoundaries) != 2 || len(next.CrossDayBoundaries) != 2 {
+		return fmt.Errorf("cross-day ledger scope differs")
+	}
+	right, left := previous.CrossDayBoundaries[1], next.CrossDayBoundaries[0]
+	type sharedBoundaryFact struct {
+		PreviousClipID             *int64     `json:"previous_clip_id"`
+		NextClipID                 *int64     `json:"next_clip_id"`
+		PreviousPresentationEndUTC *time.Time `json:"previous_presentation_end_utc"`
+		NextPresentationStartUTC   *time.Time `json:"next_presentation_start_utc"`
+		SignedGapNanoseconds       *int64     `json:"signed_gap_nanoseconds"`
+		ScheduledPreviousEndUTC    time.Time  `json:"scheduled_previous_end_utc"`
+		ScheduledNextStartUTC      time.Time  `json:"scheduled_next_start_utc"`
+		BoundarySkewNanoseconds    *int64     `json:"boundary_skew_nanoseconds"`
+		Verdict                    string     `json:"verdict"`
+	}
+	project := func(boundary CrossDayBoundary) sharedBoundaryFact {
+		return sharedBoundaryFact{boundary.PreviousClipID, boundary.NextClipID, boundary.PreviousPresentationEndUTC, boundary.NextPresentationStartUTC, boundary.SignedGapNanoseconds, boundary.ScheduledPreviousEndUTC, boundary.ScheduledNextStartUTC, boundary.BoundarySkewNanoseconds, boundary.Verdict}
+	}
+	if !sameCanonical([]sharedBoundaryFact{project(right)}, []sharedBoundaryFact{project(left)}) {
+		return fmt.Errorf("cross-day neighbor facts differ")
 	}
 	return nil
 }

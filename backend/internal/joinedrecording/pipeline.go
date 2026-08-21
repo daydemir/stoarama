@@ -128,6 +128,9 @@ func deriveAllClaimedHourSeams(sources []SourceClip) []SourceClip {
 		if gap != 0 {
 			out[i].SeamToPrevious.Verdict = "gap"
 			out[i].SeamToPrevious.Reason = "signed_presentation_gap"
+			if gap < 0 {
+				out[i].SeamToPrevious.Verdict = "overlap"
+			}
 		}
 	}
 	return out

@@ -180,6 +180,10 @@ func buildPlan(req PlanRequest, seal bool) (BatchPlan, error) {
 		}
 		quarantinedIDs[source.ClipID] = true
 	}
+	if len(accountedSources) > 0 {
+		accountedSources[0].SeamToPrevious = SeamEvidence{}
+	}
+	applyAccountedSources(&req, accountedSources)
 	gaps := []Gap{}
 	drafts := []draftOutput{}
 	var current *draftOutput
@@ -217,7 +221,7 @@ func buildPlan(req PlanRequest, seal bool) (BatchPlan, error) {
 		if i > 0 {
 			prev := accountedSources[i-1]
 			actualGap := clip.StartUTC.Sub(prev.EndUTC).Nanoseconds()
-			if clip.StartUTC.Before(prev.StartUTC) || (clip.StartUTC.Equal(prev.StartUTC) && clip.ClipID <= prev.ClipID) || strings.TrimSpace(clip.SeamToPrevious.Reason) == "" || strings.TrimSpace(clip.SeamToPrevious.Verdict) == "" || clip.SeamToPrevious.SignedGapNanoseconds != actualGap {
+			if clip.StartUTC.Before(prev.StartUTC) || (clip.StartUTC.Equal(prev.StartUTC) && clip.ClipID <= prev.ClipID) || validateDerivedSeam(prev, clip) != nil {
 				return BatchPlan{}, fmt.Errorf("sources are not in chronological order")
 			}
 			continuous = !quarantinedIDs[prev.ClipID] && !quarantinedIDs[clip.ClipID] && clip.SeamToPrevious.Verdict == "continuous" && clip.SeamToPrevious.Reason != "" && clip.SeamToPrevious.SignedGapNanoseconds == 0
@@ -249,6 +253,31 @@ func buildPlan(req PlanRequest, seal bool) (BatchPlan, error) {
 
 func sourceStorageKey(source SourceClip) string {
 	return strings.Join([]string{source.Provider, source.Endpoint, source.Region, source.Bucket, source.Object.Key, source.Object.VersionID, source.Object.ETag}, "\x00")
+}
+
+func validateDerivedSeam(previous, next SourceClip) error {
+	signedGap := next.StartUTC.Sub(previous.EndUTC).Nanoseconds()
+	seam := next.SeamToPrevious
+	validVerdict := (seam.Verdict == "continuous" && signedGap == 0) || (seam.Verdict == "gap" && signedGap > 0) || (seam.Verdict == "overlap" && signedGap < 0) || seam.Verdict == "incompatible"
+	if !validVerdict || !reasonCode.MatchString(seam.Reason) || seam.SignedGapNanoseconds != signedGap {
+		return fmt.Errorf("derived source seam differs")
+	}
+	return nil
+}
+
+func applyAccountedSources(req *PlanRequest, accounted []SourceClip) {
+	byID := make(map[int64]SourceClip, len(accounted))
+	for _, source := range accounted {
+		byID[source.ClipID] = source
+	}
+	req.Sources = append([]SourceClip(nil), req.Sources...)
+	req.QuarantinedSources = append([]SourceClip(nil), req.QuarantinedSources...)
+	for i := range req.Sources {
+		req.Sources[i] = byID[req.Sources[i].ClipID]
+	}
+	for i := range req.QuarantinedSources {
+		req.QuarantinedSources[i] = byID[req.QuarantinedSources[i].ClipID]
+	}
 }
 
 // BuildGapOnlyHourPlan accounts for one completely missing scheduled hour.
@@ -295,9 +324,11 @@ func BuildQuarantineOnlyHourPlan(req PlanRequest, localDate string, deliveryHour
 	if err != nil || !qualificationContainsDate(req.Qualification, localDate) {
 		return BatchPlan{}, fmt.Errorf("quarantine-only hour is outside qualification window")
 	}
+	req.Sources = append([]SourceClip(nil), req.Sources...)
+	req.Sources[0].SeamToPrevious = SeamEvidence{}
 	seen := map[int64]bool{}
 	for i, source := range req.Sources {
-		if validatePreflightSource(source, req.RecordingID) != nil || !req.Qualification.permits(source) || seen[source.ClipID] || source.StartUTC.In(loc).Format("2006-01-02") != localDate || source.EndUTC.In(loc).Format("2006-01-02") != localDate {
+		if validatePreflightSource(source, req.RecordingID) != nil || (i > 0 && validateDerivedSeam(req.Sources[i-1], source) != nil) || !req.Qualification.permits(source) || seen[source.ClipID] || source.StartUTC.In(loc).Format("2006-01-02") != localDate || source.EndUTC.In(loc).Format("2006-01-02") != localDate {
 			return BatchPlan{}, fmt.Errorf("quarantine source %d differs", i+1)
 		}
 		seen[source.ClipID] = true
@@ -314,7 +345,12 @@ func BuildQuarantineOnlyHourPlan(req PlanRequest, localDate string, deliveryHour
 	if err != nil {
 		return BatchPlan{}, err
 	}
-	plan := BatchPlan{SchemaVersion: 1, PolicyVersion: PlanPolicyVersion, BatchID: req.BatchID, Generation: req.Generation, HourID: hourID, RecordingID: req.RecordingID, Timezone: req.Timezone, FolderName: folder, Metadata: req.Metadata, Qualification: req.Qualification, AllocationLedgerSHA: req.AllocationLedgerSHA, MediaTool: req.MediaTool, LocalDate: localDate, LocalHour: deliveryHour, SourceClaimSHA256: manifestSHA, ExpectedOutputCount: 0, QuarantineReason: reason, Sources: append([]SourceClip(nil), req.Sources...), QuarantinedSources: append([]SourceClip(nil), req.Sources...), Gaps: []Gap{}, Outputs: []OutputPlan{}}
+	gaps := make([]Gap, 0, len(req.Sources)-1)
+	for i := 1; i < len(req.Sources); i++ {
+		previous, next := req.Sources[i-1], req.Sources[i]
+		gaps = append(gaps, Gap{PreviousClipID: previous.ClipID, NextClipID: next.ClipID, AtUTC: previous.EndUTC, SignedGapNanoseconds: next.SeamToPrevious.SignedGapNanoseconds, Reason: "source_quarantined"})
+	}
+	plan := BatchPlan{SchemaVersion: 1, PolicyVersion: PlanPolicyVersion, BatchID: req.BatchID, Generation: req.Generation, HourID: hourID, RecordingID: req.RecordingID, Timezone: req.Timezone, FolderName: folder, Metadata: req.Metadata, Qualification: req.Qualification, AllocationLedgerSHA: req.AllocationLedgerSHA, MediaTool: req.MediaTool, LocalDate: localDate, LocalHour: deliveryHour, SourceClaimSHA256: manifestSHA, ExpectedOutputCount: 0, QuarantineReason: reason, Sources: append([]SourceClip(nil), req.Sources...), QuarantinedSources: append([]SourceClip(nil), req.Sources...), Gaps: gaps, Outputs: []OutputPlan{}}
 	plan.CoverageObjectKey = canonicalBatchCoverageKey(plan)
 	return plan, nil
 }

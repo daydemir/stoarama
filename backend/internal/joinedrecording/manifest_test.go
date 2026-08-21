@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 )
 
@@ -152,6 +153,44 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("media artifact collision", func(t *testing.T) {
+		mutated := append([]HourManifest(nil), manifests...)
+		mutated[0] = cloneHourManifest(t, manifests[0])
+		collisionID := canonicalIndex.Hours[1].HourManifestArtifactID
+		mutated[0].Media[0].ArtifactID = collisionID
+		mutated[0].SourceDispositions[0].MediaArtifactID = collisionID
+		ref, err := BuildBatchIndexHour(canonicalIndex.Hours[0].HourManifestArtifactID, mutated[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutatedIndex := testBatchIndexCopy(canonicalIndex)
+		mutatedIndex.Hours[0] = ref
+		if _, _, _, err := BuildBatchIndex(mutatedIndex, testLedgerResolver(ledgers), testHourResolver(mutated)); err == nil {
+			t.Fatal("media artifact ID collided with a canonical hour artifact ID")
+		}
+	})
+
+	t.Run("cross-day neighbor substitution", func(t *testing.T) {
+		mutatedLedgers := append([]StreamDayAllocation(nil), ledgers...)
+		mutatedLedgers[1] = cloneAllocationLedger(t, ledgers[1])
+		mutatedTime := mutatedLedgers[1].CrossDayBoundaries[0].PreviousPresentationEndUTC.Add(time.Second)
+		mutatedLedgers[1].CrossDayBoundaries[0].PreviousPresentationEndUTC = &mutatedTime
+		logical := mutatedLedgers[1]
+		logical.LedgerSHA256 = ""
+		mutatedLedgers[1].LedgerSHA256, _, _ = stitchcert.CanonicalSHA(logical)
+		mutatedRef, err := BuildAllocationLedgerRef(canonicalIndex.AllocationLedgers[1].ArtifactID, mutatedLedgers[1])
+		if err != nil {
+			t.Fatalf("mutated one-sided boundary should remain independently canonical: %v", err)
+		}
+		mutatedIndex := testBatchIndexCopy(canonicalIndex)
+		mutatedIndex.AllocationLedgers[1] = mutatedRef
+		mutatedIndex.FrozenDenominatorSHA256, _ = ComputeFrozenDenominatorSHA256(mutatedIndex.AllocationLedgers)
+		mutatedIndex.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(mutatedIndex)
+		if _, _, _, err := BuildBatchIndex(mutatedIndex, testLedgerResolver(mutatedLedgers), testHourResolver(manifests)); err == nil {
+			t.Fatal("consecutive ledgers accepted conflicting cross-day neighbor facts")
+		}
+	})
 }
 
 func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation, []HourManifest) {
@@ -169,6 +208,10 @@ func testBatchIndex(t *testing.T) (BatchIndex, []StreamDayAllocation, []HourMani
 		ledgerRequest.LocalDate = localDate
 		if day > 0 {
 			ledgerRequest.Sources = nil
+		}
+		if day == 1 {
+			previous := baseRequest.Sources[0]
+			ledgerRequest.PreviousDayLast = &previous
 		}
 		ledger, err := testLedger(ledgerRequest, localDate)
 		if err != nil {
@@ -262,6 +305,19 @@ func cloneHourManifest(t *testing.T, manifest HourManifest) HourManifest {
 	return cloned
 }
 
+func cloneAllocationLedger(t *testing.T, ledger StreamDayAllocation) StreamDayAllocation {
+	t.Helper()
+	_, canonical, err := stitchcert.CanonicalSHA(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cloned StreamDayAllocation
+	if err := json.Unmarshal(canonical, &cloned); err != nil {
+		t.Fatal(err)
+	}
+	return cloned
+}
+
 func testBatchIndexCopy(index BatchIndex) BatchIndex {
 	copy := index
 	copy.AllocationLedgers = append([]AllocationLedgerRef(nil), index.AllocationLedgers...)
@@ -285,6 +341,32 @@ func TestAllocationLedgerV1Golden(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertGolden(t, "testdata/allocation_ledger_v1.golden.json", canonical)
+}
+
+func TestCrossDayLedgerLinkCoversEmptyToNonemptyTransition(t *testing.T) {
+	dayOne := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	next := testSource(2, dayOne.AddDate(0, 0, 1))
+	emptyRequest := testRequest([]SourceClip{testSource(1, dayOne)})
+	emptyRequest.Sources = nil
+	emptyRequest.NextDayFirst = &next
+	empty, err := testLedger(emptyRequest, "2026-05-04")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextRequest := testRequest([]SourceClip{next})
+	nonempty, err := testLedger(nextRequest, "2026-05-05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCrossDayLedgerLink(empty, nonempty); err != nil {
+		t.Fatal(err)
+	}
+	mutated := cloneAllocationLedger(t, nonempty)
+	wrongClipID := int64(999)
+	mutated.CrossDayBoundaries[0].NextClipID = &wrongClipID
+	if err := validateCrossDayLedgerLink(empty, mutated); err == nil {
+		t.Fatal("empty-to-nonempty cross-day neighbor substitution validated")
+	}
 }
 
 func TestHourManifestV1Golden(t *testing.T) {
@@ -337,7 +419,8 @@ func TestHourManifestGapAndQuarantineAreDistinctTerminalCoverage(t *testing.T) {
 		t.Fatalf("invalid gap-only manifest: %+v %v", gapManifest, err)
 	}
 	assertGolden(t, "testdata/hour_manifest_gap_only_v1.golden.json", gapJSON)
-	req.Sources = sources
+	quarantineSources := []SourceClip{sources[0], testSource(2, start.Add(time.Minute)), testSource(3, start.Add(2*time.Minute))}
+	req = testRequest(quarantineSources)
 	quarantineLedger, err := testLedger(req, "2026-05-04")
 	if err != nil {
 		t.Fatal(err)
@@ -347,13 +430,23 @@ func TestHourManifestGapAndQuarantineAreDistinctTerminalCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := []QuarantineEvidence{testQuarantineEvidence(quarantine, []int64{1}, "ambiguous_audio_seam")}
+	evidence := []QuarantineEvidence{testQuarantineEvidence(quarantine, []int64{1, 2, 3}, "ambiguous_audio_seam")}
 	quarantineAllocation, quarantineLedgerRef := testAllocation(quarantine)
 	quarantineManifest, quarantineJSON, _, err := BuildHourManifest(HourManifestInput{Plan: quarantine, Allocation: quarantineAllocation, AllocationLedger: quarantineLedgerRef, QuarantineEvidence: evidence})
-	if err != nil || quarantineManifest.Status != HourStatusQuarantineOnly || quarantineManifest.QuarantineReasonCode != "ambiguous_audio_seam" || len(quarantineManifest.Media) != 0 || len(quarantineManifest.Sources) != 1 {
+	if err != nil || quarantineManifest.Status != HourStatusQuarantineOnly || quarantineManifest.QuarantineReasonCode != "ambiguous_audio_seam" || len(quarantineManifest.Media) != 0 || len(quarantineManifest.Sources) != 3 || len(quarantineManifest.Gaps) != 2 {
 		t.Fatalf("invalid quarantine-only manifest: %+v %v", quarantineManifest, err)
 	}
 	assertGolden(t, "testdata/hour_manifest_quarantine_only_v1.golden.json", quarantineJSON)
+	missingGap := cloneHourManifest(t, quarantineManifest)
+	missingGap.Gaps = missingGap.Gaps[:1]
+	if _, _, err := CanonicalHourManifestArtifact(missingGap); err == nil {
+		t.Fatal("multi-source quarantine manifest omitted an adjacent source fact")
+	}
+	changedReason := cloneHourManifest(t, quarantineManifest)
+	changedReason.Gaps[0].Reason = "signed_presentation_gap"
+	if _, _, err := CanonicalHourManifestArtifact(changedReason); err == nil {
+		t.Fatal("multi-source quarantine manifest changed its typed run-break reason")
+	}
 }
 
 func TestHourManifestMediaCanAccountForQuarantinedSource(t *testing.T) {
@@ -378,10 +471,88 @@ func TestHourManifestMediaCanAccountForQuarantinedSource(t *testing.T) {
 	}
 }
 
+func TestQuarantineOnlyTwoSourcesPreservesItsOneAdjacency(t *testing.T) {
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	req := testRequest([]SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute))})
+	ledger, err := testLedger(req, req.LocalDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AllocationLedgerSHA = ledger.LedgerSHA256
+	plan, err := BuildQuarantineOnlyHourPlan(req, req.LocalDate, 1, "corrupt_source_media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, canonicalLedger := testAllocation(plan)
+	evidence := []QuarantineEvidence{testQuarantineEvidence(plan, []int64{1, 2}, "corrupt_source_media")}
+	manifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: canonicalLedger, QuarantineEvidence: evidence})
+	if err != nil || len(manifest.Gaps) != 1 || manifest.Gaps[0].PreviousClipID != 1 || manifest.Gaps[0].NextClipID != 2 {
+		t.Fatalf("two-source quarantine adjacency differs: %+v err=%v", manifest.Gaps, err)
+	}
+}
+
+func TestManifestRequiresOrderedMaximalityProofForZeroDurationSplit(t *testing.T) {
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	sources := []SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute)), testSource(3, start.Add(2*time.Minute))}
+	sources[1].SeamToPrevious = SeamEvidence{Verdict: "incompatible", Reason: "decoded_audio_totals_mismatch"}
+	req := testRequest(sources)
+	plan, err := buildTestPlan(req)
+	if err != nil || len(plan.Outputs) != 2 {
+		t.Fatalf("split fixture plan differs: outputs=%d err=%v", len(plan.Outputs), err)
+	}
+	peels := []MaximalityEvidence{
+		testMaximalityEvidence(plan, []int64{1, 2, 3}, "decoded_audio_totals_mismatch"),
+		testMaximalityEvidence(plan, []int64{1, 2}, "decoded_audio_totals_mismatch"),
+	}
+	built := []BuiltOutput{
+		{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA, SourceCount: 1, Verification: passingVerification(), SplitEvidence: peels},
+		{SizeBytes: plan.Outputs[1].ExpectedSize, SHA256: plan.Outputs[1].ExpectedSHA, SourceCount: 2, Verification: passingVerification()},
+	}
+	allocation, ledger := testAllocation(plan)
+	manifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: []int64{88, 89}, Built: built})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := cloneHourManifest(t, manifest)
+	missing.Media[0].MaximalityEvidence = nil
+	if _, _, err := CanonicalHourManifestArtifact(missing); err == nil {
+		t.Fatal("zero-duration media split omitted its typed maximality proof")
+	}
+	reordered := cloneHourManifest(t, manifest)
+	reordered.Media[0].MaximalityEvidence[0], reordered.Media[0].MaximalityEvidence[1] = reordered.Media[0].MaximalityEvidence[1], reordered.Media[0].MaximalityEvidence[0]
+	if _, _, err := CanonicalHourManifestArtifact(reordered); err == nil {
+		t.Fatal("maximality peel evidence order was not canonical")
+	}
+	changedReason := cloneHourManifest(t, manifest)
+	changedReason.Gaps[0].Reason = "other_deterministic_split"
+	if _, _, err := CanonicalHourManifestArtifact(changedReason); err == nil {
+		t.Fatal("zero-duration split reason was detached from typed maximality proof")
+	}
+}
+
 func TestHourManifestRejectsMutatedLedgerAndDowngradedEvidence(t *testing.T) {
 	plan := oneOutputPlan(t)
 	built := []BuiltOutput{{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA, SourceCount: 1, Verification: passingVerification()}}
 	allocation, ledger := testAllocation(plan)
+	validManifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: []int64{88}, Built: built})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*HourManifest){
+		"invalid audio contract": func(manifest *HourManifest) { manifest.Sources[0].AudioContract = &AudioSequenceContract{} },
+		"audio contract without verified audio": func(manifest *HourManifest) {
+			manifest.Sources[0].AudioContract = &AudioSequenceContract{CodecName: "aac", SampleRate: 48000, Channels: 2, ChannelLayout: "stereo"}
+		},
+		"media over conditional put cap": func(manifest *HourManifest) { manifest.Media[0].SizeBytes = r2.MaxConditionalPutBytes + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := cloneHourManifest(t, validManifest)
+			mutate(&mutated)
+			if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+				t.Fatal("unsafe self-rehashed manifest validated")
+			}
+		})
+	}
 	unsafePlan := plan
 	unsafePlan.Sources = append([]SourceClip(nil), plan.Sources...)
 	unsafePlan.Sources[0].Endpoint = "https://cap.test/?secret=value"
@@ -450,6 +621,23 @@ func testQuarantineEvidence(plan BatchPlan, ids []int64, reason string) Quaranti
 	}{sourceClaim, reason, failureSHA, PlanPolicyVersion, plan.MediaTool.IdentitySHA256, 2}
 	evidenceSHA, _, _ := stitchcert.CanonicalSHA(proof)
 	return QuarantineEvidence{ReasonCode: reason, SourceClipIDs: ids, SourceClaimSHA256: sourceClaim, PolicyVersion: PlanPolicyVersion, NormalizedFacts: facts, FailureSHA256: failureSHA, EvidenceSHA256: evidenceSHA, AttemptCount: 2, MediaToolIdentity: plan.MediaTool.IdentitySHA256}
+}
+
+func testMaximalityEvidence(plan BatchPlan, ids []int64, reason string) MaximalityEvidence {
+	sources, _ := sourceSubsetByIDs(plan.Sources, ids)
+	sourceClaim, _ := candidateSourceClaimSHA(sources)
+	facts := json.RawMessage(`{"category":"fixture_failure"}`)
+	failureSHA, _, _ := stitchcert.CanonicalSHA(facts)
+	proof := struct {
+		SourceClaimSHA256 string `json:"source_claim_sha256"`
+		ReasonCode        string `json:"reason_code"`
+		FailureSHA256     string `json:"failure_sha256"`
+		PolicyVersion     string `json:"policy_version"`
+		MediaToolIdentity string `json:"media_tool_identity"`
+		RepeatCount       int    `json:"repeat_count"`
+	}{sourceClaim, reason, failureSHA, PlanPolicyVersion, plan.MediaTool.IdentitySHA256, 2}
+	evidenceSHA, _, _ := stitchcert.CanonicalSHA(proof)
+	return MaximalityEvidence{CandidateClipIDs: ids, ReasonCode: reason, SourceClaimSHA256: sourceClaim, PolicyVersion: PlanPolicyVersion, EvidenceSHA256: evidenceSHA, FailureFacts: facts, FailureSHA256: failureSHA, RepeatCount: 2, MediaToolIdentity: plan.MediaTool.IdentitySHA256}
 }
 
 func assertGolden(t *testing.T, name string, canonical []byte) {
