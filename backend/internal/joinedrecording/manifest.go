@@ -439,11 +439,12 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 	}
 	validatedGaps := make(map[[2]int64]bool, len(manifest.Gaps))
 	gapReasons := make(map[[2]int64]string, len(manifest.Gaps))
+	lastGapPosition := -1
 	for _, gap := range manifest.Gaps {
 		previousPosition, previousOK := sourcePositions[gap.PreviousClipID]
 		nextPosition, nextOK := sourcePositions[gap.NextClipID]
 		pair := [2]int64{gap.PreviousClipID, gap.NextClipID}
-		if !previousOK || !nextOK || nextPosition != previousPosition+1 || validatedGaps[pair] {
+		if !previousOK || !nextOK || previousPosition <= lastGapPosition || nextPosition != previousPosition+1 || validatedGaps[pair] {
 			return nil, "", fmt.Errorf("canonical hour manifest gap differs")
 		}
 		nextSeam := manifest.Sources[nextPosition].SeamToPrevious
@@ -453,6 +454,7 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		}
 		validatedGaps[pair] = true
 		gapReasons[pair] = gap.Reason
+		lastGapPosition = previousPosition
 	}
 	brokenAdjacencies := 0
 	for i := 1; i < len(manifest.Sources); i++ {
