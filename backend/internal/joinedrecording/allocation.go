@@ -695,7 +695,11 @@ func CanonicalAllocationLedgerPaths(batchID string, recordingID int64, localDate
 
 func validateQualifiedLedgerDay(day QualifiedDay, recordingID int64, timezone, localDate string) error {
 	loc, err := time.LoadLocation(timezone)
-	if err != nil || recordingID <= 0 || day.LocalDate != localDate || day.QualificationWindowOrdinal < 1 || day.QualificationWindowOrdinal > 14 || day.JobID <= 0 || day.CompletedAt.Before(day.WindowEnd) {
+	authorityKind := ""
+	if day.JobStatus != "" {
+		authorityKind = Tier1HistoricalAuthorityKind
+	}
+	if err != nil || recordingID <= 0 || day.LocalDate != localDate || day.QualificationWindowOrdinal < 1 || day.QualificationWindowOrdinal > 14 || day.JobID <= 0 || !validQualifiedDayAuthority(QualificationWindow{RecordingID: recordingID, AuthorityKind: authorityKind}, day) {
 		return fmt.Errorf("allocation ledger qualification differs")
 	}
 	start, end := day.WindowStart.In(loc), day.WindowEnd.In(loc)

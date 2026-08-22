@@ -505,6 +505,46 @@ class JoinedDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "completion conflicts"):
             pull.qualification_window_sha(changed_recording, days, cutoff, run_frozen)
 
+    def test_historical_qualification_preserves_drift_and_exact_error_day(self):
+        first = pull.datetime.date(2026, 7, 27)
+        days = []
+        for ordinal in range(1, 15):
+            date = first + pull.datetime.timedelta(days=ordinal - 1)
+            start = "%sT08:00:00Z" % date
+            end = "%sT20:00:00Z" % date
+            day = {
+                "local_date": date.isoformat(), "qualification_window_ordinal": ordinal,
+                "job_id": 200 + ordinal, "scheduled_for": start, "job_status": "done",
+                "reason_codes": [], "window_start": start, "window_end": end, "completed_at": end,
+            }
+            days.append(day)
+        days[0]["scheduled_for"] = "%sT08:01:00Z" % first
+        days[0]["reason_codes"] = ["scheduled_for_drift"]
+        days[2]["job_status"] = "error"
+        days[2]["reason_codes"] = ["terminal_job_error"]
+        days[2]["completed_at"] = "%sT09:00:00Z" % days[2]["local_date"]
+        recording = {"recording_id": 348, "timezone": "UTC", "completed_at": days[-1]["completed_at"]}
+        cutoff, imported_at = "2026-08-21T06:59:07.534131Z", "2026-08-22T00:00:00Z"
+        evidence = pull.qualification_window_sha(
+            recording, days, cutoff, imported_at, pull.TIER1_HISTORICAL_QUALIFICATION_VERSION,
+        )
+        expected = pull.joined_canonical_sha({
+            "recording_id": 348, "timezone": "UTC", "days": days, "frozen_at": cutoff,
+            "authority_kind": pull.TIER1_HISTORICAL_AUTHORITY_KIND, "evidence_sha256": "",
+        })
+        self.assertEqual(evidence, expected)
+        canonical = pull.decode_joined_json(pull.joined_canonical_bytes(days[0]))
+        pull.valid_qualification_day(canonical, 348, "UTC", "2026-07-27")
+
+        wrong_date = json.loads(json.dumps(days[2]))
+        wrong_date["local_date"] = "2026-07-30"
+        wrong_date["window_start"] = "2026-07-30T08:00:00Z"
+        wrong_date["window_end"] = "2026-07-30T20:00:00Z"
+        wrong_date["completed_at"] = "2026-07-30T09:00:00Z"
+        wrong_date["scheduled_for"] = wrong_date["window_start"]
+        with self.assertRaisesRegex(ValueError, "error day"):
+            pull.valid_qualification_day(wrong_date, 348, "UTC", "2026-07-30")
+
     def test_malformed_source_authorities_blank_fields_and_manifest_order_fail(self):
         source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
         vectors_path = CLOUD_GOLDENS / "source_endpoint_v1_vectors.json"

@@ -57,6 +57,19 @@ func TestQualificationJSONRejectsDayLevelQualityTier(t *testing.T) {
 	}
 }
 
+func TestQualificationWindowJSONRejectsUnknownTopLevelField(t *testing.T) {
+	window, err := SealQualificationWindow(qualificationFixture(t, "UTC", time.Date(2026, time.May, 1, 8, 0, 0, 0, time.UTC)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, _ := json.Marshal(window)
+	stale := strings.Replace(string(canonical), `"evidence_sha256":`, `"unknown":true,"evidence_sha256":`, 1)
+	var decoded QualificationWindow
+	if err := json.Unmarshal([]byte(stale), &decoded); err == nil {
+		t.Fatal("unknown qualification window field was accepted")
+	}
+}
+
 func TestQualificationWindowOrdinalIsExactAndDigestBound(t *testing.T) {
 	window := qualificationFixture(t, "UTC", time.Date(2026, time.May, 1, 8, 0, 0, 0, time.UTC))
 	sealed, err := SealQualificationWindow(window)
@@ -74,5 +87,44 @@ func TestQualificationWindowOrdinalIsExactAndDigestBound(t *testing.T) {
 	mutated.Days[0].QualificationWindowOrdinal = 2
 	if ValidateQualificationWindow(mutated) == nil {
 		t.Fatal("sealed qualification digest ignored its window ordinal")
+	}
+}
+
+func TestHistoricalQualificationPreservesDriftAndExactErrorDay(t *testing.T) {
+	window := qualificationFixture(t, "UTC", time.Date(2026, time.July, 27, 8, 0, 0, 0, time.UTC))
+	window.RecordingID = 348
+	window.AuthorityKind = Tier1HistoricalAuthorityKind
+	for i := range window.Days {
+		scheduled := window.Days[i].WindowStart
+		window.Days[i].ScheduledFor = &scheduled
+		window.Days[i].JobStatus = "done"
+	}
+	window.Days[0].ScheduledFor = timePointer(window.Days[0].WindowStart.Add(time.Minute))
+	window.Days[0].ReasonCodes = []string{"scheduled_for_drift"}
+	window.Days[2].JobStatus = "error"
+	window.Days[2].CompletedAt = window.Days[2].WindowStart.Add(time.Hour)
+	window.Days[2].ReasonCodes = []string{"terminal_job_error"}
+	sealed, err := SealQualificationWindow(window)
+	if err != nil || ValidateQualificationWindow(sealed) != nil {
+		t.Fatalf("exact historical evidence rejected: %v", err)
+	}
+
+	wrongDate := window
+	wrongDate.Days = append([]QualifiedDay(nil), window.Days...)
+	wrongDate.Days[2].JobStatus = "done"
+	wrongDate.Days[2].CompletedAt = wrongDate.Days[2].WindowEnd
+	wrongDate.Days[2].ReasonCodes = nil
+	wrongDate.Days[3].JobStatus = "error"
+	wrongDate.Days[3].CompletedAt = wrongDate.Days[3].WindowStart.Add(time.Hour)
+	wrongDate.Days[3].ReasonCodes = []string{"terminal_job_error"}
+	if _, err := SealQualificationWindow(wrongDate); err == nil {
+		t.Fatal("historical error was accepted on an unapproved recording/date")
+	}
+
+	prospective := qualificationFixture(t, "UTC", time.Date(2026, time.July, 27, 8, 0, 0, 0, time.UTC))
+	prospective.Days[0].ScheduledFor = timePointer(prospective.Days[0].WindowStart)
+	prospective.Days[0].JobStatus = "done"
+	if _, err := SealQualificationWindow(prospective); err == nil {
+		t.Fatal("prospective authority accepted historical job fields")
 	}
 }

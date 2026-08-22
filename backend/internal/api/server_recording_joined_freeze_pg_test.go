@@ -5,11 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,8 +22,10 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
-const joinedMigrationName = "0137_recording_joined_outputs.sql"
-const joinedReplicaRoleSetting = "session_replication_role"
+var joinedMigrationNames = []string{
+	"0137_recording_joined_outputs.sql",
+	"0138_joined_historical_qualification_authority.sql",
+}
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
 	t.Helper()
@@ -59,8 +59,10 @@ func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func
 	if _, err := pool.Exec(ctx, `CREATE TABLE schema_migrations(version TEXT PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, joinedMigrationName); err != nil {
-		t.Fatal(err)
+	for _, migration := range joinedMigrationNames {
+		if _, err := pool.Exec(ctx, `INSERT INTO schema_migrations(version) VALUES($1)`, migration); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := db.MigrateUp(ctx, pool, findMigrationsDir(t)); err != nil {
 		t.Fatal(err)
@@ -75,8 +77,10 @@ func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func
 	s := &Server{pool: pool}
 	applyMigration := func() {
 		t.Helper()
-		if _, err := pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version=$1`, joinedMigrationName); err != nil {
-			t.Fatal(err)
+		for _, migration := range joinedMigrationNames {
+			if _, err := pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version=$1`, migration); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := db.MigrateUp(ctx, pool, findMigrationsDir(t)); err != nil {
 			t.Fatal(err)
@@ -87,171 +91,7 @@ func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func
 		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
 		admin.Close()
 	}
-	t.Cleanup(func() { assertJoinedReplicaRoleTestOnly(t) })
 	return s, pool, applyMigration, cleanup
-}
-
-func seedJoinedHistoricalQualification(t *testing.T, pool *pgxpool.Pool, accountID int64, recordingIDs []int64) int64 {
-	t.Helper()
-	ctx := context.Background()
-	createdAt := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	sequenceStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
-	var runID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,definition_jsonb,
-		target_recording_count,window_sequence_start_at,created_at) VALUES($1,$2,'{"scope":"timeline_and_certification"}',
-		$3,$4,$5) RETURNING id`, accountID, recordingQualificationDefinition, len(recordingIDs), sequenceStart, createdAt).Scan(&runID); err != nil {
-		t.Fatal(err)
-	}
-	for ordinal, recordingID := range recordingIDs {
-		var streamID, evidenceID int64
-		if err := pool.QueryRow(ctx, `SELECT r.stream_id,e.id FROM recordings r JOIN recording_scene_frame_evidence e
-			ON e.account_id=r.account_id AND e.stream_id=r.stream_id WHERE r.id=$1 AND r.account_id=$2`, recordingID, accountID).
-			Scan(&streamID, &evidenceID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,ordinal,
-			stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,
-			daily_window_start,daily_window_end,active_weekdays,schedule_start_at,window_generator_version)
-			SELECT $1,$2,r.id,$3,r.stream_id,r.name,s.name,e.scene_identity_sha256,e.id,r.cron_timezone,
-			r.daily_window_start,r.daily_window_end,r.active_weekdays,r.start_at,'recsched-next-full-v1'
-			FROM recordings r JOIN streams s ON s.id=r.stream_id JOIN recording_scene_frame_evidence e ON e.id=$4
-			WHERE r.id=$5 AND r.account_id=$2`, runID, accountID, ordinal+1, evidenceID, recordingID); err != nil {
-			t.Fatal(err)
-		}
-		for day := 0; day < 14; day++ {
-			start := sequenceStart.AddDate(0, 0, day).Add(8 * time.Hour)
-			if _, err := pool.Exec(ctx, `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,
-				local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,
-				expected_seconds) VALUES($1,$2,$3,$4::timestamp,$5::timestamp,0,0,$4,$5,43200)`, runID,
-				recordingID, day+1, start, start.Add(12*time.Hour)); err != nil {
-				t.Fatal(err)
-			}
-		}
-		_ = streamID
-	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active',frozen_at=now()
-		WHERE id=$1 AND status='building'`, runID); err != nil {
-		t.Fatal(err)
-	}
-	historicalFrozenAt := time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC)
-	correctJoinedHistoricalFrozenAt(t, pool, runID, accountID, createdAt, historicalFrozenAt)
-	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_members SET recording_name='forbidden' WHERE run_id=$1`, runID); err == nil {
-		t.Fatal("ordinary mutation changed an active qualification member")
-	}
-	return runID
-}
-
-func correctJoinedHistoricalFrozenAt(t *testing.T, pool *pgxpool.Pool, runID, accountID int64, createdAt, historicalFrozenAt time.Time) {
-	t.Helper()
-	cfg := pool.Config()
-	ip := net.ParseIP(cfg.ConnConfig.Host)
-	if (cfg.ConnConfig.Host != "localhost" && (ip == nil || !ip.IsLoopback())) || !createdAt.Before(historicalFrozenAt) {
-		t.Fatal("historical fixture requires a disposable loopback database and ordered timestamps")
-	}
-	ctx := context.Background()
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	discard := true
-	defer func() {
-		if discard {
-			_ = conn.Conn().PgConn().Close(context.Background())
-		} else {
-			conn.Release()
-		}
-	}()
-	var schema, sentinel, role string
-	if err := conn.QueryRow(ctx, `SELECT current_schema(),value,current_setting($1) FROM joined_disposable_test_sentinel`,
-		joinedReplicaRoleSetting).Scan(&schema, &sentinel, &role); err != nil || !strings.HasPrefix(schema, "joined_freeze_") || !strings.HasPrefix(sentinel, schema+":") || role != "origin" {
-		t.Fatalf("disposable fixture sentinel failed schema=%q role=%q err=%v", schema, role, err)
-	}
-	var originalFrozen time.Time
-	var cohortSHA, windowsSHA, beforeRun, beforeMembers, beforeWindows string
-	var runCount, memberCount, windowCount int
-	if err := conn.QueryRow(ctx, `SELECT frozen_at,cohort_sha256,windows_sha256,
-		encode(sha256(convert_to((to_jsonb(q)-'frozen_at')::text,'UTF8')),'hex'),
-		(SELECT encode(sha256(convert_to(jsonb_agg(to_jsonb(m) ORDER BY ordinal)::text,'UTF8')),'hex') FROM recording_qualification_members m WHERE m.run_id=q.id),
-		(SELECT encode(sha256(convert_to(jsonb_agg(to_jsonb(w) ORDER BY recording_id,ordinal)::text,'UTF8')),'hex') FROM recording_qualification_windows w WHERE w.run_id=q.id),
-		(SELECT count(*) FROM recording_qualification_runs),(SELECT count(*) FROM recording_qualification_members),
-		(SELECT count(*) FROM recording_qualification_windows)
-		FROM recording_qualification_runs q WHERE q.id=$1 AND q.account_id=$2 AND q.status='active' AND q.created_at=$3`,
-		runID, accountID, createdAt).Scan(&originalFrozen, &cohortSHA, &windowsSHA, &beforeRun, &beforeMembers,
-		&beforeWindows, &runCount, &memberCount, &windowCount); err != nil {
-		t.Fatal(err)
-	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var firstWindowStart time.Time
-	if err := conn.QueryRow(ctx, `SELECT min(window_start_at) FROM recording_qualification_windows WHERE run_id=$1`, runID).Scan(&firstWindowStart); err != nil || historicalFrozenAt.After(firstWindowStart) {
-		t.Fatalf("historical frozen_at is after first window: %v %v", historicalFrozenAt, err)
-	}
-	setting := joinedReplicaRoleSetting
-	if _, err := tx.Exec(ctx, `SET LOCAL `+setting+`=replica`); err != nil {
-		_ = tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	tag, err := tx.Exec(ctx, `UPDATE recording_qualification_runs SET frozen_at=$1 WHERE id=$2 AND account_id=$3
-		AND status='active' AND created_at=$4 AND frozen_at=$5 AND cohort_sha256=$6 AND windows_sha256=$7`,
-		historicalFrozenAt, runID, accountID, createdAt, originalFrozen, cohortSHA, windowsSHA)
-	if err != nil || tag.RowsAffected() != 1 {
-		_ = tx.Rollback(ctx)
-		t.Fatalf("correct historical frozen_at rows=%d err=%v", tag.RowsAffected(), err)
-	}
-	if _, err := tx.Exec(ctx, `SET LOCAL `+setting+`=origin`); err != nil {
-		_ = tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := tx.QueryRow(ctx, `SELECT current_setting($1)`, setting).Scan(&role); err != nil || role != "origin" {
-		_ = tx.Rollback(ctx)
-		t.Fatalf("fixture role was not restored in transaction: %q %v", role, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.QueryRow(ctx, `SELECT current_setting($1)`, setting).Scan(&role); err != nil || role != "origin" {
-		t.Fatalf("fixture role was not restored after commit: %q %v", role, err)
-	}
-	var afterRun, afterMembers, afterWindows string
-	var afterRunCount, afterMemberCount, afterWindowCount int
-	if err := conn.QueryRow(ctx, `SELECT encode(sha256(convert_to((to_jsonb(q)-'frozen_at')::text,'UTF8')),'hex'),
-		(SELECT encode(sha256(convert_to(jsonb_agg(to_jsonb(m) ORDER BY ordinal)::text,'UTF8')),'hex') FROM recording_qualification_members m WHERE m.run_id=q.id),
-		(SELECT encode(sha256(convert_to(jsonb_agg(to_jsonb(w) ORDER BY recording_id,ordinal)::text,'UTF8')),'hex') FROM recording_qualification_windows w WHERE w.run_id=q.id),
-		(SELECT count(*) FROM recording_qualification_runs),(SELECT count(*) FROM recording_qualification_members),
-		(SELECT count(*) FROM recording_qualification_windows)
-		FROM recording_qualification_runs q WHERE q.id=$1 AND q.account_id=$2 AND q.status='active' AND q.created_at=$3
-		AND q.frozen_at=$4 AND q.cohort_sha256=$5 AND q.windows_sha256=$6`, runID, accountID, createdAt,
-		historicalFrozenAt, cohortSHA, windowsSHA).Scan(&afterRun, &afterMembers, &afterWindows, &afterRunCount,
-		&afterMemberCount, &afterWindowCount); err != nil {
-		t.Fatal(err)
-	}
-	if beforeRun != afterRun || beforeMembers != afterMembers || beforeWindows != afterWindows ||
-		runCount != afterRunCount || memberCount != afterMemberCount || windowCount != afterWindowCount {
-		t.Fatal("historical fixture changed evidence other than frozen_at")
-	}
-	discard = false
-}
-
-func assertJoinedReplicaRoleTestOnly(t *testing.T) {
-	t.Helper()
-	needle := joinedReplicaRoleSetting
-	root := filepath.Clean(filepath.Join("..", "..", ".."))
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || strings.HasSuffix(path, "_test.go") ||
-			(!strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, ".sql")) {
-			return err
-		}
-		body, readErr := os.ReadFile(path)
-		if readErr == nil && bytes.Contains(body, []byte(needle)) {
-			return fmt.Errorf("replica role setting escaped test-only helper: %s", path)
-		}
-		return readErr
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 }
 
 type joinedHistoricalTier1Fixture struct {
@@ -277,6 +117,7 @@ type joinedHistoricalTier1Fixture struct {
 func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistoricalTier1Fixture {
 	t.Helper()
 	s, pool, applyMigration, cleanup := testJoinedServerBeforeMigration(t)
+	applyMigration()
 	ctx := context.Background()
 	cipher, err := secretbox.NewFromBase64Key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
@@ -294,14 +135,10 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		'key',$3,'verified',true) RETURNING id`, accountID, joinedTestSourceEndpoint, sourceSecret).Scan(&storageID); err != nil {
 		t.Fatal(err)
 	}
-	allIDs := append([]int64(nil), joinedrecording.Tier1RecordingIDs...)
-	for i := 0; i < 17; i++ {
-		allIDs = append(allIDs, int64(10001+i))
-	}
 	metadata := recordingnaming.Metadata{PlazaID: "1", Continent: "Europe", Country: "Italy", City: "Bevagna", PlazaName: "Piazza"}
 	metadataJSON, _ := json.Marshal(metadata)
-	for ordinal, recordingID := range allIDs {
-		var streamID, mediaID, frameID int64
+	for _, recordingID := range joinedrecording.Tier1RecordingIDs {
+		var streamID int64
 		if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,
 			capture_type,source_family,execution_class,capture_family,expected_fps) VALUES('direct',$1,$2,$1,$3,'','hls',
 			'video_manifest','video_live','continuous_video',30) RETURNING id`, fmt.Sprintf("joined-%d", recordingID),
@@ -320,50 +157,122 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 			fmt.Sprintf("https://example.test/%d.m3u8", recordingID), streamID, folder, metadataJSON); err != nil {
 			t.Fatal(err)
 		}
-		sha := fmt.Sprintf("%064x", ordinal+1)
-		if err := pool.QueryRow(ctx, `INSERT INTO media_objects(storage_provider,bucket,object_key,mime_type,size_bytes,sha256)
-			VALUES('r2','frames',$1,'image/jpeg',1,$2) RETURNING id`, fmt.Sprintf("frame-%d", recordingID), sha).Scan(&mediaID); err != nil {
-			t.Fatal(err)
-		}
-		if err := pool.QueryRow(ctx, `INSERT INTO frames(stream_id,captured_at,raw_media_object_id,capture_status,source_kind)
-			VALUES($1,now()-interval '1 hour',$2,'success','live') RETURNING id`, streamID, mediaID).Scan(&frameID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO recording_scene_frame_evidence(account_id,stream_id,frame_id,media_object_id,
-			captured_at,frame_sha256,scene_identity_sha256,verification_method,verified_by_user_id,verified_at)
-			SELECT $1,$2,$3,$4,f.captured_at,$5,$6,'operator_visual',$7,now() FROM frames f WHERE f.id=$3`, accountID, streamID,
-			frameID, mediaID, sha, fmt.Sprintf("%064x", ordinal+1000), userID); err != nil {
-			t.Fatal(err)
-		}
 	}
-	runID := seedJoinedHistoricalQualification(t, pool, accountID, allIDs)
 	var apiKeyID, connectionID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO account_api_keys(account_id,key_prefix,secret_hash,label,scopes)
 		VALUES($1,'sir_freeze','freeze-key','NAS',ARRAY['stoarama.pull']) RETURNING id`, accountID).Scan(&apiKeyID); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id)
-		VALUES($1,'nas_pull','NAS',$2) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id,joined_protocol_version)
+		VALUES($1,'nas_pull','NAS',$2,1) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
 		t.Fatal(err)
 	}
+	jobMap := make([]joinedHistoricalQualificationJobs, len(joinedrecording.Tier1RecordingIDs))
+	firstDate := time.Date(2026, 7, 29, 8, 0, 0, 0, time.UTC)
 	var firstJobID int64
-	for _, recordingID := range joinedrecording.Tier1RecordingIDs {
+	for recordingOrdinal, recordingID := range joinedrecording.Tier1RecordingIDs {
+		jobMap[recordingOrdinal] = joinedHistoricalQualificationJobs{RecordingID: recordingID, JobIDs: make([]int64, 14)}
 		for day := 0; day < 14; day++ {
-			start := time.Date(2026, 8, 1+day, 8, 0, 0, 0, time.UTC)
+			start := firstDate.AddDate(0, 0, day)
+			scheduled := start
+			if day == 1 {
+				scheduled = start.Add(time.Minute)
+			}
+			status, completed := "done", start.Add(12*time.Hour+time.Minute)
+			localDate := start.Format("2006-01-02")
+			if (recordingID == 348 && localDate == "2026-07-29") ||
+				((recordingID == 408 || recordingID == 406 || recordingID == 409) && localDate == "2026-08-11") {
+				status, completed = "error", start.Add(time.Hour)
+			}
 			var jobID int64
 			if err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,
-				status,idempotency_key,kind,window_end_at,completed_at) VALUES($1,$2,$2,60,'done',$3,'continuous_window',$4,$5)
-				RETURNING id`, recordingID, start, fmt.Sprintf("joined-freeze:%d:%d", recordingID, day),
-				start.Add(12*time.Hour), start.Add(12*time.Hour+time.Minute)).Scan(&jobID); err != nil {
+				status,idempotency_key,kind,window_end_at,completed_at) VALUES($1,$2,$3,60,$4,$5,'continuous_window',$6,$7)
+				RETURNING id`, recordingID, start, scheduled, status, fmt.Sprintf("joined-historical:%d:%d", recordingID, day),
+				start.Add(12*time.Hour), completed).Scan(&jobID); err != nil {
 				t.Fatal(err)
 			}
-			if firstJobID == 0 {
+			jobMap[recordingOrdinal].JobIDs[day] = jobID
+			if recordingOrdinal == 0 && day == 0 {
 				firstJobID = jobID
 			}
 		}
 	}
+	s.cfg.JoinedRecordingControlPlaneEnabled = true
+	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
+	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
+	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
+	s.cfg.JoinedRecordingBatchID = joinedrecording.Tier1BatchID
+	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(joinedrecording.Tier1BatchID,
+		fmt.Sprintf("%s__recording-%d__date-2026-08-01__hour-01__generation-1",
+			joinedrecording.Tier1BatchID, joinedrecording.Tier1RecordingIDs[0]))
+	token := "joined-freeze-admin-session"
+	insertSession(t, pool, accountID, userID, token)
+	callHistorical := func(req joinedHistoricalQualificationRequest) (*httptest.ResponseRecorder, joinedHistoricalQualificationPlan, int64) {
+		body, _ := json.Marshal(req)
+		httpReq := httptest.NewRequest(http.MethodPost,
+			"/api/v1/recording/joined/qualification/import-tier1-historical", bytes.NewReader(body))
+		httpReq.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: token})
+		recorder := httptest.NewRecorder()
+		s.requireAdminAuth(http.HandlerFunc(s.handleAdminJoinedHistoricalQualification)).ServeHTTP(recorder, httpReq)
+		var response struct {
+			Plan  joinedHistoricalQualificationPlan `json:"plan"`
+			RunID int64                             `json:"run_id"`
+		}
+		_ = json.Unmarshal(recorder.Body.Bytes(), &response)
+		return recorder, response.Plan, response.RunID
+	}
+	historicalRequest := joinedHistoricalQualificationRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		ConnectionID: connectionID, BatchID: joinedrecording.Tier1BatchID, Generation: 1, RecordingJobs: jobMap}
+	dryHistorical, historicalPlan, _ := callHistorical(historicalRequest)
+	if dryHistorical.Code != http.StatusOK || !lowerHexSHA256(historicalPlan.RequestSHA256) ||
+		len(historicalPlan.Members) != 33 || historicalPlan.Members[0].Qualification.Days[1].ReasonCodes[0] != "scheduled_for_drift" {
+		t.Fatalf("historical authority dry-run status=%d body=%s", dryHistorical.Code, dryHistorical.Body.String())
+	}
+	badApply := historicalRequest
+	badApply.Apply, badApply.ExpectedRequestSHA256 = true, strings.Repeat("0", 64)
+	if response, _, _ := callHistorical(badApply); response.Code != http.StatusConflict {
+		t.Fatalf("historical authority accepted wrong approval hash: status=%d body=%s", response.Code, response.Body.String())
+	}
+	var runsBefore int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_qualification_runs`).Scan(&runsBefore); err != nil || runsBefore != 0 {
+		t.Fatalf("failed historical apply mutated runs=%d err=%v", runsBefore, err)
+	}
+	historicalRequest.Apply, historicalRequest.ExpectedRequestSHA256 = true, historicalPlan.RequestSHA256
+	appliedHistorical, appliedPlan, runID := callHistorical(historicalRequest)
+	if appliedHistorical.Code != http.StatusOK || runID <= 0 || appliedPlan.RequestSHA256 != historicalPlan.RequestSHA256 {
+		t.Fatalf("historical authority apply status=%d body=%s", appliedHistorical.Code, appliedHistorical.Body.String())
+	}
+	cutoff, _ := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	var runFrozen time.Time
+	var members, windows, nullScenes, errorJobs int
+	if err := pool.QueryRow(ctx, `SELECT q.frozen_at,
+		(SELECT count(*) FROM recording_qualification_members m WHERE m.run_id=q.id),
+		(SELECT count(*) FROM recording_qualification_windows w WHERE w.run_id=q.id),
+		(SELECT count(*) FROM recording_qualification_members m WHERE m.run_id=q.id
+		  AND m.scene_identity_sha256 IS NULL AND m.scene_frame_evidence_id IS NULL),
+		(SELECT count(*) FROM recording_jobs j WHERE j.id=ANY(ARRAY(
+		  SELECT jobs.job_id::bigint FROM jsonb_array_elements(q.definition_jsonb->'recording_jobs') AS entries(item)
+		  CROSS JOIN LATERAL jsonb_array_elements_text(entries.item->'job_ids') AS jobs(job_id))) AND j.status='error')
+		FROM recording_qualification_runs q WHERE q.id=$1 AND q.status='active'
+		AND q.definition_version=$2`, runID, joinedrecording.Tier1HistoricalQualificationVersion).
+		Scan(&runFrozen, &members, &windows, &nullScenes, &errorJobs); err != nil ||
+		!runFrozen.After(cutoff) || members != 33 || windows != 462 || nullScenes != 33 || errorJobs != 4 {
+		t.Fatalf("historical authority persisted frozen=%v members=%d windows=%d null_scenes=%d errors=%d err=%v",
+			runFrozen, members, windows, nullScenes, errorJobs, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_members SET recording_name='forbidden' WHERE run_id=$1`, runID); err == nil {
+		t.Fatal("ordinary mutation changed an active historical qualification member")
+	}
+	if tag, err := pool.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=scheduled_for+interval '1 minute' WHERE id=$1`, firstJobID); err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("raw historical job update must remain trigger-free: tag=%v err=%v", tag, err)
+	}
+	if replay, replayPlan, replayRunID := callHistorical(historicalRequest); replay.Code != http.StatusOK ||
+		replayRunID != runID || replayPlan.RequestSHA256 != historicalPlan.RequestSHA256 {
+		t.Fatalf("immutable historical authority replay after raw update status=%d body=%s", replay.Code, replay.Body.String())
+	}
 	var clipID int64
-	clipStart := time.Date(2026, 8, 1, 8, 0, 0, 0, time.UTC)
+	clipStart := firstDate
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,
 		endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,
 		audio_present,fire_at,clip_start_at,clip_end_at,created_at,released_at) VALUES($1,$2,$3,$4,'clips','raw/one.mp4',
@@ -372,23 +281,6 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		clipStart, clipStart.Add(time.Minute)).Scan(&clipID); err != nil {
 		t.Fatal(err)
 	}
-	var lateCompletions int
-	cutoff, _ := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_jobs WHERE recording_id=ANY($1::bigint[])
-		AND completed_at>$2`, joinedrecording.Tier1RecordingIDs, cutoff).Scan(&lateCompletions); err != nil || lateCompletions != 0 {
-		t.Fatalf("late completions=%d err=%v", lateCompletions, err)
-	}
-	applyMigration()
-	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
-		t.Fatal(err)
-	}
-	s.cfg.JoinedRecordingControlPlaneEnabled = true
-	s.cfg.JoinedRecordingProtocolVersion = 1
-	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
-	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
-	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
-	token := "joined-freeze-admin-session"
-	insertSession(t, pool, accountID, userID, token)
 	callWithContext := func(callCtx context.Context, req joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan) {
 		body, _ := json.Marshal(req)
 		httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/freeze-tier1", bytes.NewReader(body)).WithContext(callCtx)
@@ -413,6 +305,11 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	if dry.Code != http.StatusOK || !lowerHexSHA256(plan.RequestSHA256) || !lowerHexSHA256(plan.FrozenDenominatorSHA256) ||
 		!lowerHexSHA256(plan.FreezeExclusionsSHA256) || plan.ProvisionalSourceClips != 1 || plan.ProvisionalSourceBytes != 10 {
 		t.Fatalf("dry-run status=%d body=%s", dry.Code, dry.Body.String())
+	}
+	firstImportedDay := plan.Recordings[0].Qualification.Days[0]
+	if firstImportedDay.ScheduledFor == nil || !firstImportedDay.ScheduledFor.Equal(firstImportedDay.WindowStart) ||
+		len(firstImportedDay.ReasonCodes) != 0 {
+		t.Fatalf("post-import raw job mutation changed immutable qualification: %+v", firstImportedDay)
 	}
 	return joinedHistoricalTier1Fixture{s: s, pool: pool, cleanup: cleanup, userID: userID, accountID: accountID,
 		storageID: storageID, apiKeyID: apiKeyID, connectionID: connectionID, runID: runID, firstJobID: firstJobID,
@@ -707,6 +604,109 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("JOINED_HISTORICAL_APPLY_EXECUTED")
+}
+
+func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-historical-lock@example.test")
+	defer fixture.cleanup()
+	ctx := context.Background()
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_jobs j SET scheduled_for=
+		(q.definition_jsonb->'canonical_plan'->'members'->0->'qualification'->'days'->0->>'scheduled_for')::timestamptz
+		FROM recording_qualification_runs q WHERE q.id=$1 AND j.id=$2`, fixture.runID, fixture.firstJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='canceled' WHERE id=$1`, fixture.runID); err != nil {
+		t.Fatal(err)
+	}
+	var candidateID int64
+	if err := fixture.pool.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,
+		definition_jsonb,target_recording_count,target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at)
+		SELECT account_id,definition_version,definition_jsonb,target_recording_count,target_window_count,
+		required_good_or_great,max_acceptable,window_sequence_start_at FROM recording_qualification_runs WHERE id=$1 RETURNING id`,
+		fixture.runID).Scan(&candidateID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,
+		ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,
+		daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version)
+		SELECT $2,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,
+		scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,active_weekdays,schedule_start_at,
+		schedule_end_at,window_generator_version FROM recording_qualification_members WHERE run_id=$1`,
+		fixture.runID, candidateID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,
+		local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds)
+		SELECT $2,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,
+		window_start_at,window_end_at,expected_seconds FROM recording_qualification_windows WHERE run_id=$1`,
+		fixture.runID, candidateID); err != nil {
+		t.Fatal(err)
+	}
+	mutation, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutation.Exec(ctx, `UPDATE recording_jobs SET scheduled_for=scheduled_for+interval '2 minutes' WHERE id=$1`,
+		fixture.firstJobID); err != nil {
+		_ = mutation.Rollback(ctx)
+		t.Fatal(err)
+	}
+	activation := make(chan error, 1)
+	go func() {
+		_, activateErr := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, candidateID)
+		activation <- activateErr
+	}()
+	waitJoinedDatabaseCondition(t, fixture.pool, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+		WHERE pid<>pg_backend_pid() AND wait_event_type='Lock'
+		AND query LIKE 'UPDATE recording_qualification_runs SET status=''active''%')`)
+	if err := mutation.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-activation; err == nil {
+		t.Fatal("historical activation accepted raw facts changed while waiting for its share lock")
+	}
+	var status string
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM recording_qualification_runs WHERE id=$1`, candidateID).Scan(&status); err != nil || status != "building" {
+		t.Fatalf("failed historical activation status=%s err=%v", status, err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_jobs j SET scheduled_for=
+		(q.definition_jsonb->'canonical_plan'->'members'->0->'qualification'->'days'->0->>'scheduled_for')::timestamptz
+		FROM recording_qualification_runs q WHERE q.id=$1 AND j.id=$2`, fixture.runID, fixture.firstJobID); err != nil {
+		t.Fatal(err)
+	}
+	var forgedID int64
+	if err := fixture.pool.QueryRow(ctx, `WITH source AS (
+		SELECT *,jsonb_build_object('qualification_jobs_sha256',definition_jsonb->>'qualification_jobs_sha256') AS minimal
+		FROM recording_qualification_runs WHERE id=$1), forged AS (
+		SELECT *,encode(sha256(convert_to(minimal::text,'UTF8')),'hex') AS forged_sha FROM source)
+		INSERT INTO recording_qualification_runs(account_id,definition_version,definition_jsonb,target_recording_count,
+		target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at)
+		SELECT account_id,definition_version,definition_jsonb||jsonb_build_object(
+			'request_canonical',minimal::text,'request_sha256',forged_sha,
+			'canonical_plan',minimal||jsonb_build_object('request_sha256',forged_sha)),
+			target_recording_count,target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at
+		FROM forged RETURNING id`, fixture.runID).Scan(&forgedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,
+		ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,
+		daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version)
+		SELECT $2,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,
+		scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,active_weekdays,schedule_start_at,
+		schedule_end_at,window_generator_version FROM recording_qualification_members WHERE run_id=$1;
+		`, fixture.runID, forgedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,local_open_at,local_end_at,
+		open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds)
+		SELECT $2,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,
+		window_start_at,window_end_at,expected_seconds FROM recording_qualification_windows WHERE run_id=$1`,
+		fixture.runID, forgedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, forgedID); err == nil {
+		t.Fatal("self-hashed historical authority without exact member/day facts activated")
+	}
 }
 
 func waitJoinedDatabaseCondition(t *testing.T, pool *pgxpool.Pool, query string) {

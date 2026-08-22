@@ -31,6 +31,20 @@ type joinedFreezeTier1Request struct {
 	Apply                 bool   `json:"apply"`
 }
 
+type joinedHistoricalQualificationJobs struct {
+	RecordingID int64   `json:"recording_id"`
+	JobIDs      []int64 `json:"job_ids"`
+}
+
+type joinedImportHistoricalQualificationRequest struct {
+	ConnectionID          int64                               `json:"connection_id"`
+	BatchID               string                              `json:"batch_id"`
+	Generation            int                                 `json:"generation"`
+	RecordingJobs         []joinedHistoricalQualificationJobs `json:"recording_jobs"`
+	ExpectedRequestSHA256 string                              `json:"expected_request_sha256,omitempty"`
+	Apply                 bool                                `json:"apply"`
+}
+
 type joinedSealStreamDayRequest struct {
 	BatchID     string `json:"batch_id"`
 	RecordingID int64  `json:"recording_id"`
@@ -72,6 +86,7 @@ type joinedStatusRequest struct {
 // the joined-recording lifecycle. The integration supplies its DB/media/API
 // implementation without teaching the CLI about those clients.
 type joinedOperatorService interface {
+	ImportHistoricalQualification(context.Context, joinedImportHistoricalQualificationRequest) (any, error)
 	FreezeTier1(context.Context, joinedFreezeTier1Request) (any, error)
 	SealStreamDay(context.Context, joinedSealStreamDayRequest) (any, error)
 	SealRemainingDays(context.Context, joinedSealRemainingDaysRequest) (any, error)
@@ -114,10 +129,23 @@ func waitForJoinedWorkerShutdown(ctx context.Context) {
 
 func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []string, factory joinedOperatorFactory) (any, error) {
 	if len(args) == 0 {
-		return nil, errors.New("expected freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, seal-batch-index, worker run, or status")
+		return nil, errors.New("expected import-tier1-historical, freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, seal-batch-index, worker run, or status")
 	}
 
 	switch args[0] {
+	case "import-tier1-historical":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedImportHistoricalQualification(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.ImportHistoricalQualification(ctx, req)
 	case "freeze-tier1":
 		if err := requireJoinedActiveProtocol(cfg); err != nil {
 			return nil, err
@@ -233,6 +261,47 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 	default:
 		return nil, fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+func parseJoinedImportHistoricalQualification(cfg config.Config, args []string) (joinedImportHistoricalQualificationRequest, error) {
+	req := joinedImportHistoricalQualificationRequest{BatchID: joinedrecording.Tier1BatchID, Generation: 1}
+	flags := newJoinedFlagSet("recording-joined import-tier1-historical")
+	flags.Int64Var(&req.ConnectionID, "connection-id", 0, "NAS connection identifier")
+	evidenceFile := flags.String("evidence-file", "", "strict JSON file containing the exact ordered 33x14 job-ID map")
+	flags.StringVar(&req.ExpectedRequestSHA256, "expected-request-sha256", "", "request hash returned by dry-run")
+	flags.BoolVar(&req.Apply, "apply", false, "create and freeze the historical authority")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if req.ConnectionID <= 0 {
+		return req, errors.New("exact Tier-1 connection is required")
+	}
+	var evidence struct {
+		RecordingJobs []joinedHistoricalQualificationJobs `json:"recording_jobs"`
+	}
+	if err := decodeStrictJSONFile(strings.TrimSpace(*evidenceFile), &evidence); err != nil {
+		return req, fmt.Errorf("read --evidence-file: %w", err)
+	}
+	req.RecordingJobs = evidence.RecordingJobs
+	if len(req.RecordingJobs) != len(joinedrecording.Tier1RecordingIDs) {
+		return req, errors.New("--evidence-file must contain exactly 33 recordings")
+	}
+	seenJobs := make(map[int64]bool, len(req.RecordingJobs)*14)
+	for i, recording := range req.RecordingJobs {
+		if recording.RecordingID != joinedrecording.Tier1RecordingIDs[i] || len(recording.JobIDs) != 14 {
+			return req, errors.New("--evidence-file recording order or day cardinality differs")
+		}
+		for _, jobID := range recording.JobIDs {
+			if jobID <= 0 || seenJobs[jobID] {
+				return req, errors.New("--evidence-file job IDs must be unique positive integers")
+			}
+			seenJobs[jobID] = true
+		}
+	}
+	if err := validateExpectedHash("--expected-request-sha256", req.ExpectedRequestSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
 }
 
 func requireJoinedActiveProtocol(cfg config.Config) error {

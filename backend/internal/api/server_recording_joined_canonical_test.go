@@ -215,6 +215,12 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 		!replayed.AlreadyFrozen || !replayed.FrozenAt.Equal(frozen.FrozenAt) {
 		t.Fatalf("final freeze replay status=%d body=%s", replay.Code, replay.Body.String())
 	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='canceled' WHERE id=$1`, fixture.runID); err != nil {
+		t.Fatal(err)
+	}
+	if revoked := call(freezeRequest, true, ""); revoked.Code != http.StatusConflict {
+		t.Fatalf("canceled qualification final-freeze replay status=%d body=%s", revoked.Code, revoked.Body.String())
+	}
 	t.Log("JOINED_FINAL_FREEZE_EXECUTED")
 }
 

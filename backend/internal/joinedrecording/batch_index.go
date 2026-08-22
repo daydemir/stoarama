@@ -265,7 +265,7 @@ func BuildBatchIndex(index BatchIndex, resolveFrozenBatch FrozenBatchEvidenceRes
 		}
 		var completedAt time.Time
 		for _, day := range window.Days {
-			if day.WindowStart.Before(evidence.SelectionAuthority.QualificationRunFrozenAt) || day.CompletedAt.After(evidence.SelectionAuthority.Cutoff) {
+			if (!historicalSelectionAuthority(evidence.SelectionAuthority) && day.WindowStart.Before(evidence.SelectionAuthority.QualificationRunFrozenAt)) || day.CompletedAt.After(evidence.SelectionAuthority.Cutoff) {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch qualification chronology differs from its frozen authority")
 			}
 			if day.CompletedAt.After(completedAt) {
@@ -290,13 +290,19 @@ func ValidateSelectionAuthority(authority SelectionAuthority, recordingIDs []int
 	if authority.SelectionBasis != OperatorApprovedSelectionBasis ||
 		err != nil || authority.OrderedRecordingIDSHA256 != wantRecordingIDsSHA ||
 		!canonicalUTCTimestamp(authority.Cutoff) || authority.QualificationRunID <= 0 ||
-		authority.QualificationRunFrozenAt.IsZero() || authority.QualificationRunFrozenAt.After(authority.Cutoff) ||
+		authority.QualificationRunFrozenAt.IsZero() ||
+		(!historicalSelectionAuthority(authority) && authority.QualificationRunFrozenAt.After(authority.Cutoff)) ||
+		(historicalSelectionAuthority(authority) && !authority.QualificationRunFrozenAt.After(authority.Cutoff)) ||
 		strings.TrimSpace(authority.QualificationRuleVersion) != authority.QualificationRuleVersion ||
 		authority.QualificationRuleVersion == "" || len(authority.QualificationRuleVersion) > 128 ||
 		!lowerHex64(authority.QualificationCohortSHA256) || !lowerHex64(authority.QualificationWindowsSHA256) || !lowerHex64(authority.SelectedQualificationWindowsSHA256) {
 		return fmt.Errorf("selection authority differs")
 	}
 	return nil
+}
+
+func historicalSelectionAuthority(authority SelectionAuthority) bool {
+	return authority.QualificationRuleVersion == Tier1HistoricalQualificationVersion
 }
 
 func canonicalUTCTimestamp(value time.Time) bool {
@@ -389,7 +395,7 @@ func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindo
 		ledger := index.AllocationLedgers[ledgerIndex]
 		if resolveLedger != nil && hourIndex%12 == 0 {
 			nextLedger, resolveErr := resolveLedger(ledger)
-			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone || nextLedger.QualificationDay.QualificationWindowOrdinal != ledgerIndex%14+1 || nextLedger.QualificationDay.WindowStart.Before(index.SelectionAuthority.QualificationRunFrozenAt) || nextLedger.QualificationDay.CompletedAt.After(index.SelectionAuthority.Cutoff) || len(qualificationWindows) != len(index.FrozenRecordings) || !sameCanonical([]QualifiedDay{nextLedger.QualificationDay}, []QualifiedDay{qualificationWindows[ledgerIndex/14].Days[ledgerIndex%14]}) {
+			if resolveErr != nil || ValidateAllocationLedgerRef(ledger, nextLedger) != nil || nextLedger.Timezone != frozenRecordings[ledger.RecordingID].Timezone || nextLedger.QualificationDay.QualificationWindowOrdinal != ledgerIndex%14+1 || (!historicalSelectionAuthority(index.SelectionAuthority) && nextLedger.QualificationDay.WindowStart.Before(index.SelectionAuthority.QualificationRunFrozenAt)) || nextLedger.QualificationDay.CompletedAt.After(index.SelectionAuthority.Cutoff) || len(qualificationWindows) != len(index.FrozenRecordings) || !sameCanonical([]QualifiedDay{nextLedger.QualificationDay}, []QualifiedDay{qualificationWindows[ledgerIndex/14].Days[ledgerIndex%14]}) {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch allocation ledger does not match its canonical artifact")
 			}
 			if previousCanonicalLedger.RecordingID == nextLedger.RecordingID && validateCrossDayLedgerLink(previousCanonicalLedger, nextLedger) != nil {
@@ -534,7 +540,11 @@ func FrozenSourceSnapshots(sources []SourceClip) []FrozenSourceSnapshot {
 }
 
 func BuildFrozenDenominatorDayProjection(recordingID int64, day QualifiedDay, qualificationSHA256 string, sources []FrozenSourceSnapshot) (FrozenDenominatorDayProjection, error) {
-	if recordingID <= 0 || !validLocalDate(day.LocalDate) || day.QualificationWindowOrdinal < 1 || day.QualificationWindowOrdinal > 14 || day.JobID <= 0 || !day.WindowEnd.After(day.WindowStart) || day.WindowEnd.Sub(day.WindowStart) != 12*time.Hour || day.CompletedAt.Before(day.WindowEnd) || !lowerHex64(qualificationSHA256) {
+	authorityKind := ""
+	if day.JobStatus != "" {
+		authorityKind = Tier1HistoricalAuthorityKind
+	}
+	if recordingID <= 0 || !validLocalDate(day.LocalDate) || day.QualificationWindowOrdinal < 1 || day.QualificationWindowOrdinal > 14 || day.JobID <= 0 || !day.WindowEnd.After(day.WindowStart) || day.WindowEnd.Sub(day.WindowStart) != 12*time.Hour || !validQualifiedDayAuthority(QualificationWindow{RecordingID: recordingID, AuthorityKind: authorityKind}, day) || !lowerHex64(qualificationSHA256) {
 		return FrozenDenominatorDayProjection{}, fmt.Errorf("frozen denominator day identity differs")
 	}
 	sources = append([]FrozenSourceSnapshot{}, sources...)

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -92,7 +93,7 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		b.selected_qualification_windows_sha256
 		FROM recording_joined_batches b
 		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
-		JOIN recording_qualification_runs q ON q.id=b.qualification_run_id AND q.account_id=b.account_id
+		JOIN recording_qualification_runs q ON q.id=b.qualification_run_id AND q.account_id=b.account_id AND q.status='active'
 		WHERE b.batch_id=$1 FOR UPDATE OF b FOR SHARE OF q`, req.BatchID).Scan(&batchRecordID, &connectionID, &response.State,
 		&frozenAt, &freezeStartedAt, &response.FrozenDenominatorSHA256, &response.RecordingCount,
 		&response.StreamDayCount, &response.ScheduledHourCount, &authority.SelectionBasis,
@@ -128,7 +129,7 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		return response, fmt.Errorf("start joined final freeze: rows=%d", command.RowsAffected())
 	}
 
-	recordings, err := loadJoinedFinalFreezeRecordings(ctx, tx, batchRecordID)
+	recordings, qualificationWindows, err := loadJoinedFinalFreezeRecordings(ctx, tx, batchRecordID)
 	if err != nil {
 		return response, err
 	}
@@ -137,6 +138,9 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		return response, err
 	}
 	authority.Cutoff, authority.QualificationRunFrozenAt = authority.Cutoff.UTC(), authority.QualificationRunFrozenAt.UTC()
+	if err := validateJoinedFinalFreezeQualificationAuthority(authority, recordings, qualificationWindows); err != nil {
+		return response, err
+	}
 	denominator, err := joinedrecording.ComputeFrozenDenominatorSHA256(authority, recordings, days)
 	if err != nil || denominator != response.FrozenDenominatorSHA256 || len(recordings) != response.RecordingCount ||
 		len(days) != response.StreamDayCount || response.ScheduledHourCount != response.StreamDayCount*12 {
@@ -169,24 +173,60 @@ func joinedBatchHasFinalFreeze(state string) bool {
 	}
 }
 
-func loadJoinedFinalFreezeRecordings(ctx context.Context, tx pgx.Tx, batchRecordID int64) ([]joinedrecording.FrozenRecording, error) {
-	rows, err := tx.Query(ctx, `SELECT recording_id,priority_ordinal,selection_tier,qualification_sha256,completed_at
+func loadJoinedFinalFreezeRecordings(ctx context.Context, tx pgx.Tx, batchRecordID int64) ([]joinedrecording.FrozenRecording, []joinedrecording.QualificationWindow, error) {
+	rows, err := tx.Query(ctx, `SELECT recording_id,priority_ordinal,selection_tier,qualification_sha256,completed_at,
+		qualification::text
 		FROM recording_joined_batch_recordings WHERE batch_record_id=$1 ORDER BY priority_ordinal`, batchRecordID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	var recordings []joinedrecording.FrozenRecording
+	var qualificationWindows []joinedrecording.QualificationWindow
 	for rows.Next() {
 		var recording joinedrecording.FrozenRecording
+		var qualificationJSON string
 		if err := rows.Scan(&recording.RecordingID, &recording.PriorityOrdinal, &recording.SelectionTier,
-			&recording.QualificationSHA256, &recording.CompletedAt); err != nil {
-			return nil, err
+			&recording.QualificationSHA256, &recording.CompletedAt, &qualificationJSON); err != nil {
+			return nil, nil, err
+		}
+		var qualification joinedrecording.QualificationWindow
+		if err := json.Unmarshal([]byte(qualificationJSON), &qualification); err != nil {
+			return nil, nil, fmt.Errorf("decode joined final-freeze qualification: %w", err)
 		}
 		recording.CompletedAt = recording.CompletedAt.UTC()
 		recordings = append(recordings, recording)
+		qualificationWindows = append(qualificationWindows, qualification)
 	}
-	return recordings, rows.Err()
+	return recordings, qualificationWindows, rows.Err()
+}
+
+func validateJoinedFinalFreezeQualificationAuthority(authority joinedrecording.SelectionAuthority,
+	recordings []joinedrecording.FrozenRecording, windows []joinedrecording.QualificationWindow) error {
+	if len(recordings) != len(windows) {
+		return errors.New("joined final-freeze qualification evidence differs")
+	}
+	recordingIDs := make([]int64, len(recordings))
+	historical := authority.QualificationRuleVersion == joinedrecording.Tier1HistoricalQualificationVersion
+	for i := range recordings {
+		recordingIDs[i] = recordings[i].RecordingID
+		wantAuthorityKind := ""
+		if historical {
+			wantAuthorityKind = joinedrecording.Tier1HistoricalAuthorityKind
+		}
+		if windows[i].RecordingID != recordings[i].RecordingID ||
+			windows[i].AuthorityKind != wantAuthorityKind || !windows[i].FrozenAt.Equal(authority.Cutoff) ||
+			joinedrecording.ValidateQualificationWindow(windows[i]) != nil ||
+			windows[i].EvidenceSHA != recordings[i].QualificationSHA256 {
+			return errors.New("joined final-freeze qualification evidence differs")
+		}
+	}
+	selectedSHA, err := joinedrecording.SelectedQualificationWindowsSHA256(recordings)
+	if err != nil || selectedSHA != authority.SelectedQualificationWindowsSHA256 ||
+		joinedrecording.ValidateSelectionAuthority(authority, recordingIDs) != nil {
+		return errors.New("joined final-freeze qualification authority differs")
+	}
+	return nil
 }
 
 func loadJoinedFinalFreezeDays(ctx context.Context, tx pgx.Tx, batchRecordID int64) ([]joinedrecording.FrozenDenominatorDayProjection, error) {
