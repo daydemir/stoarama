@@ -1313,7 +1313,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	var unreferencedStorageID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,
-		access_key_id,secret_access_key_enc,status,managed) VALUES($1,'joined-unreferenced-alias','r2',$2,'auto',
+		access_key_id,secret_access_key_enc,status,managed) VALUES($1,'joined-unreferenced-alias','r2_managed',$2,'auto',
 		'unreferenced','  '||$3||'  ',$4,'verified',false) RETURNING id`, accountID, joinedTestSourceEndpoint,
 		s.cfg.JoinedWorkerBootstrapToken, sourceSecret).Scan(&unreferencedStorageID); err != nil {
 		t.Fatal(err)

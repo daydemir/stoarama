@@ -22,7 +22,7 @@ func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) e
 		return errors.New("joined storage credential isolation is unavailable")
 	}
 	rows, err := s.pool.Query(ctx, `SELECT access_key_id,secret_access_key_enc
-		FROM storage_destinations WHERE provider='r2'`)
+		FROM storage_destinations WHERE provider IN('r2','r2_managed')`)
 	if err != nil {
 		return err
 	}

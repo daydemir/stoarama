@@ -407,7 +407,7 @@ func (s *Server) headJoinedStreamDaySourceRetry(ctx context.Context, store joine
 func (s *Server) headJoinedStreamDaySourceAttempt(ctx context.Context, store joinedFreezeSourceObjectStore,
 	snapshot joinedStreamDaySnapshot) (joinedStreamDayHeadObservation, bool, error) {
 	source := snapshot.Source
-	if source.Provider != "r2" || source.Endpoint != s.cfg.R2Endpoint || source.Region != s.cfg.R2Region ||
+	if (source.Provider != "r2" && source.Provider != "r2_managed") || source.Endpoint != s.cfg.R2Endpoint || source.Region != s.cfg.R2Region ||
 		source.Bucket != s.cfg.R2Bucket {
 		return joinedStreamDayHeadObservation{}, false, errors.New("joined source storage coordinates differ")
 	}
