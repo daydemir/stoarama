@@ -134,7 +134,10 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 	if req.ExpectedRequestSHA256 != plan.RequestSHA256 {
 		return plan, 0, "", false, errors.New("expected_request_sha256 differs from current Tier-1 plan")
 	}
-	mediaToolJSON, _ := json.Marshal(plan.MediaTool)
+	mediaToolJSON, err := json.Marshal(plan.MediaTool)
+	if err != nil {
+		return plan, 0, "", false, fmt.Errorf("marshal media tool evidence: %w", err)
+	}
 	if err := tx.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
 		source_endpoint,qualification_run_id,qualification_cohort_sha256,qualification_windows_sha256,
 		selected_qualification_windows_sha256,qualification_jobs_sha256,qualification_frozen_at,
@@ -154,7 +157,10 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 		return plan, 0, "", false, err
 	}
 	for _, recording := range plan.Recordings {
-		qualificationJSON, _ := json.Marshal(recording.Qualification)
+		qualificationJSON, err := json.Marshal(recording.Qualification)
+		if err != nil {
+			return plan, 0, "", false, fmt.Errorf("marshal qualification for recording %d: %w", recording.Frozen.RecordingID, err)
+		}
 		var batchRecordingID int64
 		if err := tx.QueryRow(ctx, `INSERT INTO recording_joined_batch_recordings(batch_record_id,account_id,connection_id,
 			batch_id,qualification_run_id,selection_tier,recording_id,priority_ordinal,timezone,folder_name,naming_metadata,
@@ -278,7 +284,7 @@ func (s *Server) snapshotJoinedTier1Recording(ctx context.Context, tx pgx.Tx, ba
 		plan.ConnectionID, batchRecordingID); err != nil {
 		return err
 	}
-	receiptBytes, _ := json.Marshal(struct {
+	receiptBytes, err := json.Marshal(struct {
 		Priority      int    `json:"priority"`
 		RecordingID   int64  `json:"recording_id"`
 		SourceClips   int64  `json:"source_clips"`
@@ -287,6 +293,9 @@ func (s *Server) snapshotJoinedTier1Recording(ctx context.Context, tx pgx.Tx, ba
 		ExclusionsSHA string `json:"exclusions_sha256"`
 	}{priority, recording.Frozen.RecordingID, recording.ExpectedSourceClips, recording.ExpectedSourceBytes,
 		recording.ExpectedExclusions, recording.ExpectedExclusionsSHA256})
+	if err != nil {
+		return fmt.Errorf("marshal snapshot receipt for recording %d: %w", recording.Frozen.RecordingID, err)
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_snapshot_chunks(batch_record_id,batch_recording_id,
 		priority_ordinal,recording_id,expected_source_clips,expected_source_bytes,expected_exclusions,
 		expected_exclusions_sha256,actual_source_clips,actual_source_bytes,actual_exclusions,

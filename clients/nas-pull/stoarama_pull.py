@@ -2935,7 +2935,9 @@ def frozen_source_sha(sources, qualification_day, recording_id):
             "end_utc": source["end_utc"],
             "size_bytes": source["object"]["size_bytes"],
             "ingest_sha256": source["object"]["sha256"],
-            "released_at": source["released_at"],
+            # V2 retains released_at in the ledger for audit, but it is mutable
+            # transfer bookkeeping and is not part of denominator identity.
+            "released_at": None,
         })
     return joined_canonical_sha(snapshots)
 

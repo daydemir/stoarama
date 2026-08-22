@@ -428,6 +428,12 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_frozen_selection_window_and_storage_evidence(self):
         ledger = self.golden("allocation_ledger_v1.golden.json")
         source = ledger["sources"][0]
+        released = json.loads(json.dumps(source))
+        released["released_at"] = "2026-08-22T12:34:56Z"
+        self.assertEqual(
+            pull.frozen_source_sha([source], ledger["qualification_day"], ledger["recording_id"]),
+            pull.frozen_source_sha([released], ledger["qualification_day"], ledger["recording_id"]),
+        )
         changed = json.loads(json.dumps(source)); changed["storage_destination_id"] = 0
         with self.assertRaisesRegex(ValueError, "storage_destination_id"):
             pull.valid_source(changed, ledger["recording_id"], source_only=True)
@@ -444,7 +450,7 @@ class JoinedDownloadTests(unittest.TestCase):
             "provider": item["provider"], "endpoint": item["endpoint"], "region": item["region"],
             "bucket": item["bucket"], "object_key": item["object"]["key"], "start_utc": item["start_utc"],
             "end_utc": item["end_utc"], "size_bytes": item["object"]["size_bytes"],
-            "ingest_sha256": item["object"]["sha256"], "released_at": item["released_at"],
+            "ingest_sha256": item["object"]["sha256"], "released_at": None,
         } for item in changed_ledger["sources"]])
         changed_ledger["ledger_sha256"] = ""
         changed_ledger["ledger_sha256"] = pull.joined_canonical_sha(changed_ledger)

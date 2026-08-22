@@ -689,7 +689,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if applied.Code != http.StatusOK || plan.RequestSHA256 != fixture.plan.RequestSHA256 {
 		t.Fatalf("authenticated canonical apply status=%d body=%s", applied.Code, applied.Body.String())
 	}
-	for callNumber := 2; callNumber <= 34; callNumber++ {
+	for callNumber := 2; callNumber <= len(joinedrecording.Tier1RecordingIDs)+2; callNumber++ {
 		if response, _ := fixture.call(req); response.Code != http.StatusOK {
 			t.Fatalf("resumable canonical apply call=%d status=%d body=%s", callNumber, response.Code, response.Body.String())
 		}

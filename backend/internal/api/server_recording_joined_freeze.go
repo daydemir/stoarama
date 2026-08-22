@@ -157,7 +157,7 @@ func (s *Server) handleAdminJoinedFreezeTier1(w http.ResponseWriter, r *http.Req
 	}
 	progress, err := s.joinedTier1FreezeProgress(r.Context(), req.BatchID)
 	if err != nil {
-		util.WriteError(w, http.StatusConflict, err.Error())
+		util.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": false, "created": created, "plan": plan, "progress": progress})
@@ -334,7 +334,10 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 	if err := joinedrecording.ValidateSelectionAuthority(plan.SelectionAuthority, plan.RecordingIDs); err != nil {
 		return plan, nil, err
 	}
-	jobsBytes, _ := json.Marshal(jobs)
+	jobsBytes, err := json.Marshal(jobs)
+	if err != nil {
+		return plan, nil, fmt.Errorf("marshal qualification jobs: %w", err)
+	}
 	plan.QualificationJobsSHA256 = sha256Bytes(jobsBytes)
 	if !countSources {
 		return plan, nil, nil
@@ -719,7 +722,10 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 	if req.ExpectedRequestSHA256 != plan.RequestSHA256 {
 		return joinedTier1FreezePlan{}, false, errors.New("expected_request_sha256 differs from current Tier-1 plan")
 	}
-	mediaToolJSON, _ := json.Marshal(plan.MediaTool)
+	mediaToolJSON, err := json.Marshal(plan.MediaTool)
+	if err != nil {
+		return joinedTier1FreezePlan{}, false, fmt.Errorf("marshal media tool evidence: %w", err)
+	}
 	var batchRecordID int64
 	if err := tx.QueryRow(ctx, `INSERT INTO recording_joined_batches(account_id,connection_id,batch_id,generation,
 		source_endpoint,qualification_run_id,qualification_cohort_sha256,qualification_windows_sha256,
@@ -740,7 +746,10 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 		return joinedTier1FreezePlan{}, false, err
 	}
 	for _, recording := range plan.Recordings {
-		qualificationJSON, _ := json.Marshal(recording.Qualification)
+		qualificationJSON, err := json.Marshal(recording.Qualification)
+		if err != nil {
+			return joinedTier1FreezePlan{}, false, fmt.Errorf("marshal qualification for recording %d: %w", recording.Frozen.RecordingID, err)
+		}
 		jobIDs := joinedTier1JobIDs(recording.Qualification.Days)
 		var batchRecordingID int64
 		if err := tx.QueryRow(ctx, `INSERT INTO recording_joined_batch_recordings(batch_record_id,account_id,connection_id,

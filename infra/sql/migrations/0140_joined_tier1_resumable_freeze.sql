@@ -82,17 +82,98 @@ CREATE TRIGGER recording_joined_snapshot_chunks_no_truncate
 -- V1 validated completeness on the initial INSERT. V2 keeps snapshotting
 -- intentionally partial and validates only the explicit visibility transition.
 DROP TRIGGER recording_joined_batch_snapshot_complete ON recording_joined_batches;
-DO $$
-DECLARE definition TEXT;
+CREATE OR REPLACE FUNCTION validate_recording_joined_batch_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE batch recording_joined_batches%ROWTYPE; request JSONB;
 BEGIN
-  definition := pg_get_functiondef('validate_recording_joined_batch_snapshot()'::regprocedure);
-  definition := replace(definition,
-    'ARRAY[''frozen_recording'',''qualification'']::TEXT[]',
-    'ARRAY[''expected_exclusions'',''expected_exclusions_sha256'',''expected_source_bytes'',''expected_source_clips'',''frozen_recording'',''qualification'',''snapshot_days'']::TEXT[]');
-  IF definition NOT LIKE '%expected_exclusions_sha256%' THEN
-    RAISE EXCEPTION 'joined v2 completeness validator rewrite failed';
-  END IF;
-  EXECUTE definition;
+  SELECT * INTO STRICT batch FROM recording_joined_batches WHERE id=NEW.id FOR UPDATE;
+  request := convert_from(batch.freeze_request_bytes,'UTF8')::JSONB;
+  IF batch.state<>'building' OR batch.freeze_started_at IS NOT NULL
+    OR NOT EXISTS(SELECT 1 FROM connections c WHERE c.id=batch.connection_id AND c.account_id=batch.account_id
+      AND c.joined_protocol_version=1 FOR UPDATE)
+    OR NOT EXISTS(SELECT 1 FROM recording_qualification_runs q
+      WHERE q.id=batch.qualification_run_id AND q.account_id=batch.account_id AND q.status='active'
+        AND q.cohort_sha256=batch.qualification_cohort_sha256 AND q.windows_sha256=batch.qualification_windows_sha256
+        AND q.frozen_at=batch.qualification_frozen_at FOR SHARE)
+    OR (SELECT count(*) FROM recording_joined_batch_recordings br WHERE br.batch_record_id=batch.id)<>batch.expected_recordings
+    OR ARRAY(SELECT br.recording_id FROM recording_joined_batch_recordings br WHERE br.batch_record_id=batch.id
+      ORDER BY br.priority_ordinal) IS DISTINCT FROM ARRAY[377,335,337,355,385,350,382,384,348,403,380,379,
+      383,404,401,408,406,409,422,418,419,413,420,428,423,425,416,421,437,440,429,431,439]::BIGINT[]
+    OR (SELECT count(*) FROM recording_joined_stream_days d WHERE d.batch_record_id=batch.id)<>batch.expected_stream_days
+    OR (SELECT count(*) FROM recording_joined_stream_days d WHERE d.batch_record_id=batch.id AND d.state='pending')<>batch.expected_stream_days
+    OR (SELECT count(*) FROM recording_joined_source_snapshots s WHERE s.batch_record_id=batch.id)<>batch.expected_source_clips
+    OR (SELECT COALESCE(sum(size_bytes),0) FROM recording_joined_source_snapshots s WHERE s.batch_record_id=batch.id)<>batch.expected_source_bytes
+    OR (SELECT count(*) FROM recording_joined_freeze_exclusions e WHERE e.batch_record_id=batch.id)<>batch.expected_freeze_exclusions
+    OR (SELECT encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',e.recording_id,
+        COALESCE(e.clip_id::TEXT,''),e.reason_code,e.evidence_sha256),'' ORDER BY e.recording_id,e.clip_id,
+        e.reason_code,e.evidence_sha256),''),'UTF8')),'hex') FROM recording_joined_freeze_exclusions e
+      WHERE e.batch_record_id=batch.id)<>batch.freeze_exclusions_sha256
+    OR EXISTS(SELECT 1 FROM recording_joined_batch_recordings br
+      JOIN recording_qualification_runs q ON q.id=br.qualification_run_id AND q.account_id=batch.account_id
+      LEFT JOIN LATERAL (SELECT count(*) AS days FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id) actual ON TRUE
+      LEFT JOIN LATERAL (SELECT q.definition_jsonb->'canonical_plan'->'members'->(br.priority_ordinal-1) AS member) imported ON TRUE
+      WHERE br.batch_record_id=batch.id AND (br.qualification_run_id IS DISTINCT FROM batch.qualification_run_id
+        OR br.selection_tier IS DISTINCT FROM 'good+' OR br.qualification_policy_version IS DISTINCT FROM q.definition_version
+        OR br.priority_ordinal IS DISTINCT FROM (SELECT count(*) FROM recording_joined_batch_recordings earlier
+          WHERE earlier.batch_record_id=br.batch_record_id AND earlier.priority_ordinal<=br.priority_ordinal)
+        OR br.first_local_date IS DISTINCT FROM (SELECT w.local_open_at::DATE FROM recording_qualification_windows w
+          WHERE w.run_id=br.qualification_run_id AND w.recording_id=br.recording_id AND w.ordinal=1)
+        OR br.last_local_date IS DISTINCT FROM (SELECT w.local_open_at::DATE FROM recording_qualification_windows w
+          WHERE w.run_id=br.qualification_run_id AND w.recording_id=br.recording_id AND w.ordinal=14)
+        OR br.completed_at>batch.eligibility_cutoff OR br.completed_at IS DISTINCT FROM
+          (SELECT max(d.completed_at) FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id)
+        OR actual.days IS DISTINCT FROM 14 OR br.authoritative_job_ids IS DISTINCT FROM ARRAY(
+          SELECT d.recording_job_id FROM recording_joined_stream_days d WHERE d.batch_recording_id=br.id ORDER BY d.date_ordinal)
+        OR (q.definition_version='recording-qualification-tier1-historical-import-v1' AND (
+          imported.member IS NULL OR (imported.member->>'recording_id')::BIGINT IS DISTINCT FROM br.recording_id OR
+          imported.member->'qualification' IS DISTINCT FROM br.qualification))))
+    OR jsonb_typeof(request->'recordings') IS DISTINCT FROM 'array'
+    OR jsonb_array_length(request->'recordings') IS DISTINCT FROM batch.expected_recordings
+    OR EXISTS(SELECT 1 FROM recording_joined_batch_recordings br
+      CROSS JOIN LATERAL (SELECT request->'recordings'->(br.priority_ordinal-1) item) frozen
+      WHERE br.batch_record_id=batch.id AND (
+        ARRAY(SELECT key FROM jsonb_object_keys(frozen.item) AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM
+          ARRAY['expected_exclusions','expected_exclusions_sha256','expected_source_bytes','expected_source_clips','frozen_recording','qualification','snapshot_days']::TEXT[]
+        OR ARRAY(SELECT key FROM jsonb_object_keys(frozen.item->'frozen_recording') AS object_keys(key) ORDER BY key COLLATE "C") IS DISTINCT FROM
+          ARRAY['completed_at','folder_name','naming_metadata','priority_ordinal','qualification_sha256','recording_id','selection_tier','timezone']::TEXT[]
+        OR (frozen.item->'frozen_recording'->>'recording_id')::BIGINT IS DISTINCT FROM br.recording_id
+        OR (frozen.item->'frozen_recording'->>'priority_ordinal')::INTEGER IS DISTINCT FROM br.priority_ordinal
+        OR frozen.item->'frozen_recording'->>'selection_tier' IS DISTINCT FROM br.selection_tier
+        OR frozen.item->'frozen_recording'->>'qualification_sha256' IS DISTINCT FROM br.qualification_sha256
+        OR (frozen.item->'frozen_recording'->>'completed_at')::TIMESTAMPTZ IS DISTINCT FROM br.completed_at
+        OR frozen.item->'frozen_recording'->>'timezone' IS DISTINCT FROM br.timezone
+        OR frozen.item->'frozen_recording'->>'folder_name' IS DISTINCT FROM br.folder_name
+        OR frozen.item->'frozen_recording'->'naming_metadata' IS DISTINCT FROM br.naming_metadata
+        OR frozen.item->'qualification' IS DISTINCT FROM br.qualification))
+    OR EXISTS(SELECT 1 FROM recording_joined_stream_days d
+      JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
+      JOIN recording_qualification_runs q ON q.id=br.qualification_run_id
+      JOIN recording_qualification_windows w ON w.run_id=br.qualification_run_id AND w.recording_id=br.recording_id
+        AND w.ordinal=d.date_ordinal
+      LEFT JOIN LATERAL (SELECT br.qualification->'days'->(d.date_ordinal-1) AS day) imported ON TRUE
+      LEFT JOIN LATERAL (SELECT count(*) AS clips,COALESCE(sum(size_bytes),0) AS bytes
+        FROM recording_joined_source_snapshots s WHERE s.stream_day_id=d.id) actual ON TRUE
+      WHERE d.batch_record_id=batch.id AND (actual.clips<>d.source_clip_count OR actual.bytes<>d.source_bytes
+        OR d.local_date<>br.first_local_date+d.date_ordinal-1
+        OR ROW(d.scheduled_start_at,d.scheduled_end_at) IS DISTINCT FROM ROW(w.window_start_at,w.window_end_at)
+        OR d.completed_at>batch.eligibility_cutoff
+        OR (br.qualification_policy_version<>'recording-qualification-tier1-historical-import-v1'
+          AND (d.completed_at<d.scheduled_end_at OR batch.qualification_frozen_at>d.scheduled_start_at))
+        OR (br.qualification_policy_version='recording-qualification-tier1-historical-import-v1'
+          AND (d.completed_at<d.scheduled_start_at OR batch.qualification_frozen_at<=batch.eligibility_cutoff OR
+            imported.day IS NULL OR
+            (imported.day->>'qualification_window_ordinal')::INTEGER IS DISTINCT FROM d.date_ordinal OR
+            imported.day->>'local_date' IS DISTINCT FROM d.local_date::TEXT OR
+            (imported.day->>'job_id')::BIGINT IS DISTINCT FROM d.recording_job_id OR
+            ROW((imported.day->>'window_start')::TIMESTAMPTZ,(imported.day->>'window_end')::TIMESTAMPTZ,
+              (imported.day->>'completed_at')::TIMESTAMPTZ) IS DISTINCT FROM
+              ROW(d.scheduled_start_at,d.scheduled_end_at,d.completed_at)))
+        OR EXISTS(SELECT 1 FROM (SELECT s.day_ordinal,row_number() OVER (ORDER BY s.start_at,s.clip_id) AS expected_ordinal
+          FROM recording_joined_source_snapshots s WHERE s.stream_day_id=d.id) ordered
+          WHERE ordered.day_ordinal<>ordered.expected_ordinal)))
+    OR EXISTS(SELECT 1 FROM recording_joined_hours h WHERE h.batch_record_id=batch.id)
+    OR EXISTS(SELECT 1 FROM recording_joined_sources s WHERE s.batch_record_id=batch.id)
+  THEN RAISE EXCEPTION 'joined building batch snapshot is incomplete'; END IF;
+  RETURN NULL;
 END $$;
 CREATE CONSTRAINT TRIGGER recording_joined_batch_snapshot_complete
 AFTER UPDATE ON recording_joined_batches DEFERRABLE INITIALLY DEFERRED
