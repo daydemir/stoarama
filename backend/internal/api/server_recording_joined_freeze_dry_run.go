@@ -290,25 +290,15 @@ func (s *Server) stepJoinedTier1DryRun(ctx context.Context, req joinedTier1DryRu
 	if err != nil {
 		return joinedTier1DryRunProgress{}, err
 	}
-	exclusionRows, err := tx.Query(ctx, `WITH selected AS (
+	exclusionScopeSQL := `
 		SELECT s.recording_id,s.recording_job_id job_id,s.high_water_clip_id,
-		 (q->>'window_start')::timestamptz window_start,(q->>'window_end')::timestamptz window_end
+		 (q->>'window_start')::timestamptz window_start,(q->>'window_end')::timestamptz window_end,$4::timestamptz cutoff
 		FROM recording_joined_dry_run_scopes s
 		JOIN LATERAL jsonb_array_elements($3::jsonb->'days') q ON (q->>'job_id')::bigint=s.recording_job_id
-		WHERE s.dry_run_id=$1 AND s.priority_ordinal=$2
-	), evidence AS (
-		SELECT c.recording_id,c.id clip_id,CASE WHEN c.created_at>$4 THEN 'after_cutoff'
-		 WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
-		 ELSE 'nonpositive_source_size' END reason_code,
-		 encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
-		 'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
-		 'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
-		 'window_end_at',d.window_end,'cutoff',$4)::text,'UTF8')),'hex') evidence_sha256
-		FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
-		WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND (c.created_at>$4 OR c.clip_end_at<=d.window_start
-		 OR c.clip_start_at>=d.window_end OR c.size_bytes<=0))
+		WHERE s.dry_run_id=$1 AND s.priority_ordinal=$2`
+	exclusionRows, err := tx.Query(ctx, joinedTier1ExclusionQuery(exclusionScopeSQL, `
 		SELECT recording_id,clip_id,reason_code,evidence_sha256
-		FROM evidence ORDER BY recording_id,clip_id,reason_code,evidence_sha256`, req.RunID, req.PriorityOrdinal,
+		FROM evidence ORDER BY recording_id,clip_id,reason_code,evidence_sha256`), req.RunID, req.PriorityOrdinal,
 		qualificationBytes, skeleton.SelectionAuthority.Cutoff)
 	if err != nil {
 		return joinedTier1DryRunProgress{}, err

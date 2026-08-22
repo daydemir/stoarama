@@ -22,6 +22,22 @@ import (
 
 const joinedTier1SelectionBasis = "operator_approved_ordered_cohort_v1"
 
+const joinedTier1ExclusionEvidenceSQL = `, evidence AS (
+	SELECT c.recording_id,c.id clip_id,CASE WHEN c.created_at>d.cutoff THEN 'after_cutoff'
+	 WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
+	 ELSE 'nonpositive_source_size' END reason_code,
+	 encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
+	 'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
+	 'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
+	 'window_end_at',d.window_end,'cutoff',d.cutoff)::text,'UTF8')),'hex') evidence_sha256
+	FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
+	WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND (c.created_at>d.cutoff OR c.clip_end_at<=d.window_start
+	 OR c.clip_start_at>=d.window_end OR c.size_bytes<=0))`
+
+func joinedTier1ExclusionQuery(scopeSQL, projectionSQL string) string {
+	return "WITH selected AS (" + scopeSQL + ")" + joinedTier1ExclusionEvidenceSQL + projectionSQL
+}
+
 var joinedBatchIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 type joinedTier1FreezeRequest struct {
@@ -547,21 +563,11 @@ func populateJoinedTier1FrozenEvidenceWithWatermarks(ctx context.Context, q join
 		plan.FrozenDenominatorSHA256 = denominatorSHA
 	}
 
-	exclusionQuery := `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[],$5::bigint[])
-		AS d(recording_id,job_id,window_start,window_end,high_water_clip_id)), evidence AS (
-		SELECT c.recording_id,c.id clip_id,
-			CASE WHEN c.created_at>$6 THEN 'after_cutoff'
-			  WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
-			  ELSE 'nonpositive_source_size' END reason_code,
-			encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
-			  'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
-			  'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
-			  'window_end_at',d.window_end,'cutoff',$6)::text,'UTF8')),'hex') evidence_sha256
-		FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
-		WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND (c.created_at>$6 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end
-		  OR c.size_bytes<=0))
+	exclusionScopeSQL := `SELECT d.*,$6::timestamptz cutoff FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],
+		$4::timestamptz[],$5::bigint[]) AS d(recording_id,job_id,window_start,window_end,high_water_clip_id)`
+	exclusionQuery := joinedTier1ExclusionQuery(exclusionScopeSQL, `
 		SELECT count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',recording_id,
-			clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex') FROM evidence`
+		 clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex') FROM evidence`)
 	exclusionArgs := []any{recordingIDs, jobIDs, windowStarts, windowEnds, watermarkValues, plan.SelectionAuthority.Cutoff}
 	if fromApplySnapshot {
 		exclusionQuery = `SELECT count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',
@@ -573,20 +579,10 @@ func populateJoinedTier1FrozenEvidenceWithWatermarks(ctx context.Context, q join
 		return nil, fmt.Errorf("load Tier-1 freeze exclusions: %w", err)
 	}
 	if !fromApplySnapshot {
-		exclusionRows, err := q.Query(ctx, `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[],$5::bigint[])
-			AS d(recording_id,job_id,window_start,window_end,high_water_clip_id)), evidence AS (
-			SELECT c.recording_id,c.id clip_id,CASE WHEN c.created_at>$6 THEN 'after_cutoff'
-			 WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
-			 ELSE 'nonpositive_source_size' END reason_code,
-			 encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
-			 'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
-			 'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
-			 'window_end_at',d.window_end,'cutoff',$6)::text,'UTF8')),'hex') evidence_sha256
-			FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
-			WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND (c.created_at>$6 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end OR c.size_bytes<=0))
+		exclusionRows, err := q.Query(ctx, joinedTier1ExclusionQuery(exclusionScopeSQL, `
 			SELECT recording_id,count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',recording_id,
-			clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex')
-			FROM evidence GROUP BY recording_id`, recordingIDs, jobIDs, windowStarts, windowEnds, watermarkValues, plan.SelectionAuthority.Cutoff)
+			 clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex')
+			FROM evidence GROUP BY recording_id`), recordingIDs, jobIDs, windowStarts, windowEnds, watermarkValues, plan.SelectionAuthority.Cutoff)
 		if err != nil {
 			return nil, fmt.Errorf("load Tier-1 recording exclusions: %w", err)
 		}
