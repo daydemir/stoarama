@@ -262,8 +262,8 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
         expected = {
             "allocation_ledger_v1.golden.json": "aa5ea80fffb3d0396d7d10bdb130723d19fee3a5d7ac467f81fc9e00a2539902",
-            "batch_index_v1.golden.json": "cf74f099e40382ba183dffa6a4808439b2f0e4e43a22c98b2cbdb63779f28a93",
-            "hour_manifest_gap_only_v1.golden.json": "20de6f9405b19edfa9c80ea9b6fa0f505594b98a1ccad3f47809b878ceca1f53",
+            "batch_index_v1.golden.json": "0792a2b7aeac8bc0327ca61b58331dbf76af83cef44becb404578b0b39fd8dd1",
+            "hour_manifest_gap_only_v1.golden.json": "5ee63dcdc7a809b50d26a4ce63f537d91efb5b118e757a99f27fa5c8c8459c32",
             "hour_manifest_mixed_v1.golden.json": "887aadb50a3e9341038e5a9bf8ee583a3e59b65ac0f9a1df6b1a131d6eddb28c",
             "hour_manifest_quarantine_only_v1.golden.json": "e87c781f0d7a9573691c29adadfa80c4e320430b1e16dda8ec392ae5296ef44c",
             "hour_manifest_v1.golden.json": "ac60926bc9b3b7f9abb0853e69a47785fecd1ddb737c966f9f0d4a7e89870416",
