@@ -770,66 +770,6 @@ func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 		evidenceForgedID); err == nil {
 		t.Fatal("self-hashed historical authority with forged qualification evidence SHA activated")
 	}
-	rehashDefinition := func(definition map[string]any, plan map[string]any) {
-		t.Helper()
-		delete(plan, "request_sha256")
-		canonical, err := json.Marshal(plan)
-		if err != nil {
-			t.Fatal(err)
-		}
-		requestSHA := sha256Hex(canonical)
-		plan["request_sha256"] = requestSHA
-		definition["canonical_plan"] = plan
-		definition["request_canonical"] = string(canonical)
-		definition["request_sha256"] = requestSHA
-	}
-	for name, suffix := range map[string]string{"zero offset": "+00:00", "redundant fraction": ".000000Z"} {
-		t.Run("rejects non-Go timestamp "+name, func(t *testing.T) {
-			var timestampDefinition map[string]any
-			if err := json.Unmarshal(definitionJSON, &timestampDefinition); err != nil {
-				t.Fatal(err)
-			}
-			timestampPlan := timestampDefinition["canonical_plan"].(map[string]any)
-			firstDay := timestampPlan["members"].([]any)[0].(map[string]any)["qualification"].(map[string]any)["days"].([]any)[0].(map[string]any)
-			scheduled, ok := firstDay["scheduled_for"].(string)
-			if !ok || !strings.HasSuffix(scheduled, "Z") {
-				t.Fatal("valid historical definition lacks canonical timestamp fixture")
-			}
-			firstDay["scheduled_for"] = strings.TrimSuffix(scheduled, "Z") + suffix
-			rehashDefinition(timestampDefinition, timestampPlan)
-			timestampID := cloneJoinedHistoricalQualificationRun(t, fixture, timestampDefinition)
-			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, timestampID); err == nil {
-				t.Fatal("self-hashed historical authority with non-Go timestamp spelling activated")
-			}
-		})
-	}
-	for name, mutate := range map[string]func(map[string]any){
-		"outer plan": func(plan map[string]any) { plan["schema_version"] = json.Number("1.0") },
-		"member": func(plan map[string]any) {
-			member := plan["members"].([]any)[0].(map[string]any)
-			member["stream_id"] = json.Number(member["stream_id"].(json.Number).String() + ".0")
-		},
-		"day": func(plan map[string]any) {
-			qualification := plan["members"].([]any)[0].(map[string]any)["qualification"].(map[string]any)
-			qualification["days"].([]any)[0].(map[string]any)["qualification_window_ordinal"] = json.Number("1.0")
-		},
-	} {
-		t.Run("rejects non-Go integer spelling in "+name, func(t *testing.T) {
-			var numericDefinition map[string]any
-			numericDecoder := json.NewDecoder(bytes.NewReader(definitionJSON))
-			numericDecoder.UseNumber()
-			if err := numericDecoder.Decode(&numericDefinition); err != nil {
-				t.Fatal(err)
-			}
-			numericPlan := numericDefinition["canonical_plan"].(map[string]any)
-			mutate(numericPlan)
-			rehashDefinition(numericDefinition, numericPlan)
-			numericID := cloneJoinedHistoricalQualificationRun(t, fixture, numericDefinition)
-			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, numericID); err == nil {
-				t.Fatal("self-hashed historical authority with non-Go integer spelling activated")
-			}
-		})
-	}
 	decodeCanonicalDefinition := func() (map[string]any, joinedHistoricalQualificationPlan) {
 		t.Helper()
 		var decoded map[string]any
@@ -843,6 +783,82 @@ func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 			t.Fatal(err)
 		}
 		return decoded, plan
+	}
+	_, basePlan := decodeCanonicalDefinition()
+	baseCanonical := joinedHistoricalQualificationApprovalBytes(basePlan)
+	replaceCanonical := func(canonical []byte, old, replacement string) []byte {
+		t.Helper()
+		if !bytes.Contains(canonical, []byte(old)) {
+			t.Fatalf("canonical fixture lacks target %q", old)
+		}
+		return bytes.Replace(canonical, []byte(old), []byte(replacement), 1)
+	}
+	rehashDefinition := func(definition map[string]any, plan map[string]any, canonical []byte) {
+		t.Helper()
+		requestSHA := sha256Hex(canonical)
+		plan["request_sha256"] = requestSHA
+		definition["canonical_plan"] = plan
+		definition["request_canonical"] = string(canonical)
+		definition["request_sha256"] = requestSHA
+	}
+	for name, suffix := range map[string]string{"zero offset": "+00:00", "redundant fraction": ".000000Z"} {
+		t.Run("rejects non-Go timestamp "+name, func(t *testing.T) {
+			timestampDefinition, _ := decodeCanonicalDefinition()
+			timestampPlan := timestampDefinition["canonical_plan"].(map[string]any)
+			firstDay := timestampPlan["members"].([]any)[0].(map[string]any)["qualification"].(map[string]any)["days"].([]any)[0].(map[string]any)
+			scheduled, ok := firstDay["scheduled_for"].(string)
+			if !ok || !strings.HasSuffix(scheduled, "Z") {
+				t.Fatal("valid historical definition lacks canonical timestamp fixture")
+			}
+			mutated := strings.TrimSuffix(scheduled, "Z") + suffix
+			firstDay["scheduled_for"] = mutated
+			scheduledJSON, _ := json.Marshal(scheduled)
+			mutatedJSON, _ := json.Marshal(mutated)
+			oldToken := `"scheduled_for":` + string(scheduledJSON)
+			newToken := `"scheduled_for":` + string(mutatedJSON)
+			canonical := replaceCanonical(baseCanonical, oldToken, newToken)
+			rehashDefinition(timestampDefinition, timestampPlan, canonical)
+			timestampID := cloneJoinedHistoricalQualificationRun(t, fixture, timestampDefinition)
+			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, timestampID); err == nil {
+				t.Fatal("self-hashed historical authority with non-Go timestamp spelling activated")
+			}
+		})
+	}
+	for name, mutation := range map[string]struct {
+		mutatePlan         func(map[string]any)
+		oldToken, newToken string
+	}{
+		"outer plan": {
+			mutatePlan: func(plan map[string]any) { plan["schema_version"] = json.Number("1.0") },
+			oldToken:   `"schema_version":1`, newToken: `"schema_version":1.0`,
+		},
+		"member": {
+			mutatePlan: func(plan map[string]any) {
+				member := plan["members"].([]any)[0].(map[string]any)
+				member["stream_id"] = json.Number(member["stream_id"].(json.Number).String() + ".0")
+			},
+			oldToken: fmt.Sprintf(`"stream_id":%d`, basePlan.Members[0].StreamID),
+			newToken: fmt.Sprintf(`"stream_id":%d.0`, basePlan.Members[0].StreamID),
+		},
+		"day": {
+			mutatePlan: func(plan map[string]any) {
+				qualification := plan["members"].([]any)[0].(map[string]any)["qualification"].(map[string]any)
+				qualification["days"].([]any)[0].(map[string]any)["qualification_window_ordinal"] = json.Number("1.0")
+			},
+			oldToken: `"qualification_window_ordinal":1`, newToken: `"qualification_window_ordinal":1.0`,
+		},
+	} {
+		t.Run("rejects non-Go integer spelling in "+name, func(t *testing.T) {
+			numericDefinition, _ := decodeCanonicalDefinition()
+			numericPlan := numericDefinition["canonical_plan"].(map[string]any)
+			mutation.mutatePlan(numericPlan)
+			canonical := replaceCanonical(baseCanonical, mutation.oldToken, mutation.newToken)
+			rehashDefinition(numericDefinition, numericPlan, canonical)
+			numericID := cloneJoinedHistoricalQualificationRun(t, fixture, numericDefinition)
+			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, numericID); err == nil {
+				t.Fatal("self-hashed historical authority with non-Go integer spelling activated")
+			}
+		})
 	}
 	for name, mutate := range map[string]func(string) string{
 		"whitespace": func(canonical string) string { return " " + canonical },
