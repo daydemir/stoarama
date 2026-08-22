@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,17 +14,63 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
 
+func TestParseHistoricalQualificationEvidenceIsExact(t *testing.T) {
+	evidence := struct {
+		RecordingJobs []joinedHistoricalQualificationJobs `json:"recording_jobs"`
+	}{RecordingJobs: make([]joinedHistoricalQualificationJobs, len(joinedrecording.Tier1RecordingIDs))}
+	var jobID int64 = 1
+	for i, recordingID := range joinedrecording.Tier1RecordingIDs {
+		evidence.RecordingJobs[i] = joinedHistoricalQualificationJobs{RecordingID: recordingID, JobIDs: make([]int64, 14)}
+		for day := range evidence.RecordingJobs[i].JobIDs {
+			evidence.RecordingJobs[i].JobIDs[day] = jobID
+			jobID++
+		}
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "historical-jobs.json")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--connection-id", "9", "--evidence-file", path}
+	request, err := parseJoinedImportHistoricalQualification(config.Config{}, args)
+	if err != nil || request.ConnectionID != 9 || len(request.RecordingJobs) != 33 || request.Apply {
+		t.Fatalf("exact historical dry-run evidence rejected: request=%+v err=%v", request, err)
+	}
+	if _, err := parseJoinedImportHistoricalQualification(config.Config{}, append(args, "--apply")); err == nil {
+		t.Fatal("historical apply without expected preview hash was accepted")
+	}
+
+	evidence.RecordingJobs[1].JobIDs[0] = evidence.RecordingJobs[0].JobIDs[0]
+	encoded, _ = json.Marshal(evidence)
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseJoinedImportHistoricalQualification(config.Config{}, args); err == nil {
+		t.Fatal("duplicate historical job evidence was accepted")
+	}
+}
+
 type fakeJoinedOperator struct {
-	freezeReq    joinedFreezeTier1Request
-	dayReq       joinedSealStreamDayRequest
-	remainingReq joinedSealRemainingDaysRequest
-	finalReq     joinedFinalFreezeRequest
-	indexReq     joinedSealBatchIndexRequest
-	workerReq    joinedWorkerRequest
-	statusReq    joinedStatusRequest
-	startupReq   joinedWorkerRequest
-	startupErr   error
-	workerRuns   int
+	historicalReq joinedImportHistoricalQualificationRequest
+	freezeReq     joinedFreezeTier1Request
+	dayReq        joinedSealStreamDayRequest
+	remainingReq  joinedSealRemainingDaysRequest
+	finalReq      joinedFinalFreezeRequest
+	indexReq      joinedSealBatchIndexRequest
+	workerReq     joinedWorkerRequest
+	statusReq     joinedStatusRequest
+	startupReq    joinedWorkerRequest
+	startupErr    error
+	workerRuns    int
+}
+
+func (f *fakeJoinedOperator) ImportHistoricalQualification(_ context.Context,
+	req joinedImportHistoricalQualificationRequest) (any, error) {
+	f.historicalReq = req
+	return map[string]any{"status": "planned"}, nil
 }
 
 func validJoinedWorkerConfig() config.Config {

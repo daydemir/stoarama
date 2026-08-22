@@ -164,19 +164,45 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 		return plan, nil, errors.New("Tier-1 connection or active qualification run differs")
 	}
 	plan.MediaTool = tool
-	rows, err := q.Query(ctx, `SELECT chosen.ord,m.recording_id,m.cron_timezone,r.naming_profile,r.folder_name,
+	historical := historicalQualificationVersion(plan.SelectionAuthority.QualificationRuleVersion)
+	historicalImportedAfterCutoff := historicalAuthorityImportedAfterCutoff(
+		plan.SelectionAuthority.QualificationRuleVersion,
+		plan.SelectionAuthority.QualificationRunFrozenAt, req.EligibilityCutoff)
+	qualificationQuery := `SELECT chosen.ord,m.recording_id,m.cron_timezone,r.naming_profile,r.folder_name,
 		r.naming_metadata_jsonb,w.ordinal,to_char(w.local_open_at,'YYYY-MM-DD'),w.window_start_at,w.window_end_at,
-		matched.id,matched.completed_at
+		matched.id,matched.scheduled_for,matched.status,matched.completed_at
 		FROM unnest($3::bigint[]) WITH ORDINALITY chosen(recording_id,ord)
 		JOIN recording_qualification_members m ON m.run_id=$2 AND m.recording_id=chosen.recording_id AND m.account_id=$1
 		JOIN recordings r ON r.id=m.recording_id AND r.account_id=$1 AND r.mode='continuous' AND r.delivery='nas_pull'
 		  AND r.cron_timezone=m.cron_timezone AND r.daily_window_start='08:00'::time AND r.daily_window_end='20:00'::time
 		JOIN recording_qualification_windows w ON w.run_id=m.run_id AND w.recording_id=m.recording_id
-		JOIN LATERAL (SELECT min(j.id) id,min(j.completed_at) completed_at,count(*) matches
+		JOIN LATERAL (SELECT min(j.id) id,min(j.scheduled_for) scheduled_for,min(j.status) status,
+		  min(j.completed_at) completed_at,count(*) matches
 		  FROM recording_jobs j WHERE j.recording_id=m.recording_id AND j.fire_at=w.window_start_at
 		    AND j.scheduled_for=w.window_start_at AND j.kind='continuous_window' AND j.window_end_at=w.window_end_at
 		    AND j.status='done' AND j.completed_at>=w.window_end_at AND j.completed_at<=$4) matched ON matched.matches=1
-		ORDER BY chosen.ord,w.ordinal`, plan.AccountID, req.QualificationRunID, req.RecordingIDs, req.EligibilityCutoff)
+		ORDER BY chosen.ord,w.ordinal`
+	if historical {
+		qualificationQuery = `SELECT chosen.ord,m.recording_id,m.cron_timezone,r.naming_profile,r.folder_name,
+			r.naming_metadata_jsonb,w.ordinal,to_char(w.local_open_at,'YYYY-MM-DD'),w.window_start_at,w.window_end_at,
+			(day.item->>'job_id')::BIGINT,(day.item->>'scheduled_for')::TIMESTAMPTZ,
+			day.item->>'job_status',(day.item->>'completed_at')::TIMESTAMPTZ
+			FROM unnest($3::bigint[]) WITH ORDINALITY chosen(recording_id,ord)
+			JOIN recording_qualification_runs q ON q.id=$2 AND q.account_id=$1
+			JOIN recording_qualification_members m ON m.run_id=q.id AND m.recording_id=chosen.recording_id AND m.account_id=$1
+			JOIN recordings r ON r.id=m.recording_id AND r.account_id=$1 AND r.mode='continuous' AND r.delivery='nas_pull'
+			  AND r.cron_timezone=m.cron_timezone AND r.daily_window_start='08:00'::time AND r.daily_window_end='20:00'::time
+			JOIN recording_qualification_windows w ON w.run_id=m.run_id AND w.recording_id=m.recording_id
+			JOIN LATERAL (SELECT q.definition_jsonb->'canonical_plan'->'members'->((chosen.ord-1)::INTEGER) item) imported
+			  ON (imported.item->>'recording_id')::BIGINT=m.recording_id
+			JOIN LATERAL (SELECT imported.item->'qualification'->'days'->(w.ordinal-1) item) day
+			  ON (day.item->>'qualification_window_ordinal')::INTEGER=w.ordinal
+			  AND (day.item->>'window_start')::TIMESTAMPTZ=w.window_start_at
+			  AND (day.item->>'window_end')::TIMESTAMPTZ=w.window_end_at
+			  AND (day.item->>'completed_at')::TIMESTAMPTZ<=$4
+			ORDER BY chosen.ord,w.ordinal`
+	}
+	rows, err := q.Query(ctx, qualificationQuery, plan.AccountID, req.QualificationRunID, req.RecordingIDs, req.EligibilityCutoff)
 	if err != nil {
 		return plan, nil, fmt.Errorf("load Tier-1 qualification facts: %w", err)
 	}
@@ -185,11 +211,11 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 	for rows.Next() {
 		var ordinal, windowOrdinal int
 		var recordingID, jobID int64
-		var timezone, profileRaw, folderRaw, localDate string
+		var timezone, profileRaw, folderRaw, localDate, jobStatus string
 		var metadataRaw []byte
-		var windowStart, windowEnd, completedAt time.Time
+		var windowStart, windowEnd, scheduledFor, completedAt time.Time
 		if err := rows.Scan(&ordinal, &recordingID, &timezone, &profileRaw, &folderRaw, &metadataRaw,
-			&windowOrdinal, &localDate, &windowStart, &windowEnd, &jobID, &completedAt); err != nil {
+			&windowOrdinal, &localDate, &windowStart, &windowEnd, &jobID, &scheduledFor, &jobStatus, &completedAt); err != nil {
 			return plan, nil, err
 		}
 		if ordinal < 1 || ordinal > len(req.RecordingIDs) || req.RecordingIDs[ordinal-1] != recordingID || windowOrdinal < 1 || windowOrdinal > 14 {
@@ -206,7 +232,7 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 				Frozen: joinedrecording.FrozenRecording{RecordingID: recordingID, PriorityOrdinal: ordinal,
 					SelectionTier: "good+", Timezone: timezone, FolderName: folder, NamingMetadata: metadata},
 				Qualification: joinedrecording.QualificationWindow{RecordingID: recordingID, Timezone: timezone,
-					FrozenAt: req.EligibilityCutoff.UTC()},
+					FrozenAt: req.EligibilityCutoff.UTC(), AuthorityKind: historicalAuthorityKind(historical)},
 			})
 		}
 		if len(plan.Recordings) != ordinal {
@@ -229,12 +255,23 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 			startLocal.Format("2006-01-02") != localDate || endLocal.Format("2006-01-02") != localDate ||
 			startLocal.Hour() != 8 || startLocal.Minute() != 0 || startLocal.Second() != 0 || startLocal.Nanosecond() != 0 ||
 			endLocal.Hour() != 20 || endLocal.Minute() != 0 || endLocal.Second() != 0 || endLocal.Nanosecond() != 0 ||
-			(windowOrdinal > 1 && !date.Equal(previousDate.AddDate(0, 0, 1))) ||
-			plan.SelectionAuthority.QualificationRunFrozenAt.After(windowStart) || completedAt.Before(windowEnd) || completedAt.After(req.EligibilityCutoff) {
+			(windowOrdinal > 1 && !date.Equal(previousDate.AddDate(0, 0, 1))) || completedAt.After(req.EligibilityCutoff) ||
+			(!historical && (plan.SelectionAuthority.QualificationRunFrozenAt.After(windowStart) || completedAt.Before(windowEnd))) ||
+			(historical && !historicalImportedAfterCutoff) {
 			return plan, nil, errors.New("Tier-1 completed job/window facts differ")
 		}
 		day := joinedrecording.QualifiedDay{QualificationWindowOrdinal: windowOrdinal, LocalDate: localDate,
 			WindowStart: windowStart.UTC(), WindowEnd: windowEnd.UTC(), JobID: jobID, CompletedAt: completedAt.UTC()}
+		if historical {
+			scheduledUTC := scheduledFor.UTC()
+			day.ScheduledFor, day.JobStatus = &scheduledUTC, jobStatus
+			if !scheduledFor.Equal(windowStart) {
+				day.ReasonCodes = append(day.ReasonCodes, "scheduled_for_drift")
+			}
+			if jobStatus == "error" {
+				day.ReasonCodes = append(day.ReasonCodes, "terminal_job_error")
+			}
+		}
 		recording.Qualification.Days = append(recording.Qualification.Days, day)
 		jobs = append(jobs, day)
 	}

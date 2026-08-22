@@ -2720,6 +2720,12 @@ JOINED_REASON = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 JOINED_BATCH = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 SOURCE_ENDPOINT_V1 = re.compile(r"https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com\Z")
 QUALIFICATION_FIELDS = ("local_date", "qualification_window_ordinal", "job_id", "window_start", "window_end", "completed_at")
+HISTORICAL_QUALIFICATION_FIELDS = (
+    "local_date", "qualification_window_ordinal", "job_id", "scheduled_for", "job_status", "reason_codes",
+    "window_start", "window_end", "completed_at",
+)
+TIER1_HISTORICAL_QUALIFICATION_VERSION = "recording-qualification-tier1-historical-import-v1"
+TIER1_HISTORICAL_AUTHORITY_KIND = "historical_operator_import_v1"
 OBJECT_FIELDS = ("key", "etag", "size_bytes", "sha256")
 SEAM_FIELDS = ("verdict", "reason", "signed_gap_nanoseconds")
 SOURCE_FIELDS = (
@@ -2742,6 +2748,7 @@ JOINED_OBJECT_ORDERS = {}
 for _joined_order in (
     ("schema_version", "policy_version", "status", "batch_id", "hour_id", "recording_id", "timezone", "local_date", "delivery_hour", "clock_hour", "scheduled_start_utc", "scheduled_end_utc", "qualification_day", "qualification_sha256", "allocation", "media_tool", "source_claim_sha256", "source_count", "sources", "source_dispositions", "gaps", "scheduled_gap", "quarantine_reason_code", "quarantine_evidence", "media"),
     QUALIFICATION_FIELDS,
+    HISTORICAL_QUALIFICATION_FIELDS,
     ("artifact_id", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "hour_source_claim_sha256", "boundaries", "cross_day_boundaries"),
     CROSS_HOUR_FIELDS, CROSS_DAY_FIELDS, MEDIA_TOOL_FIELDS,
     SOURCE_FIELDS,
@@ -2778,6 +2785,7 @@ for _joined_order in (
     ("recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_count", "source_bytes"),
     ("recording_id", "qualification_sha256"),
     ("recording_id", "timezone", "days", "frozen_at", "evidence_sha256"),
+    ("recording_id", "timezone", "days", "frozen_at", "authority_kind", "evidence_sha256"),
 ):
     JOINED_OBJECT_ORDERS.setdefault(frozenset(_joined_order), set()).add(_joined_order)
 
@@ -2933,7 +2941,10 @@ def frozen_source_sha(sources, qualification_day, recording_id):
 
 
 def valid_qualification_day(day, recording_id, timezone, local_date):
-    exact_joined_fields(day, QUALIFICATION_FIELDS, "qualification day")
+    fields = set(day) if isinstance(day, dict) else set()
+    historical = fields == set(HISTORICAL_QUALIFICATION_FIELDS)
+    if fields not in (set(QUALIFICATION_FIELDS), set(HISTORICAL_QUALIFICATION_FIELDS)):
+        raise ValueError("qualification day has invalid fields")
     if (
         day["local_date"] != valid_joined_date(local_date)
         or not 1 <= positive_joined_int(day["qualification_window_ordinal"], "qualification_window_ordinal") <= 14
@@ -2948,11 +2959,31 @@ def valid_qualification_day(day, recording_id, timezone, local_date):
     end_ns = joined_timestamp_nanoseconds(day["window_end"], "qualification window_end")
     completed_ns = joined_timestamp_nanoseconds(day["completed_at"], "qualification completed_at")
     if (
-        end_ns - start_ns != 12 * 3_600_000_000_000 or completed_ns < end_ns
+        end_ns - start_ns != 12 * 3_600_000_000_000
         or start_ns != local_boundary_nanoseconds(local_date, location, 8)
         or end_ns != local_boundary_nanoseconds(local_date, location, 20)
     ):
         raise ValueError("joined qualification day is invalid")
+    if not historical:
+        if completed_ns < end_ns:
+            raise ValueError("joined qualification day is incomplete")
+        return
+    scheduled_ns = joined_timestamp_nanoseconds(day["scheduled_for"], "qualification scheduled_for")
+    status = day["job_status"]
+    reasons = []
+    if scheduled_ns != start_ns:
+        reasons.append("scheduled_for_drift")
+    if status == "error":
+        reasons.append("terminal_job_error")
+        allowed_error = (recording_id == 348 and local_date == "2026-07-29") or (
+            recording_id in (408, 406, 409) and local_date == "2026-08-11"
+        )
+        if not allowed_error:
+            raise ValueError("joined historical error day conflicts")
+    elif status != "done" or completed_ns < end_ns:
+        raise ValueError("joined historical qualification status conflicts")
+    if completed_ns < start_ns or day["reason_codes"] != reasons:
+        raise ValueError("joined historical qualification reason conflicts")
 
 
 def valid_media_tool(tool):
@@ -3357,7 +3388,7 @@ def selected_qualification_windows_sha(recordings):
     ])
 
 
-def qualification_window_sha(recording, days, cutoff, run_frozen_at):
+def qualification_window_sha(recording, days, cutoff, run_frozen_at, rule=""):
     if len(days) != 14:
         raise ValueError("joined qualification window must contain 14 days")
     cutoff_ns = joined_timestamp_nanoseconds(cutoff, "selection cutoff")
@@ -3373,7 +3404,8 @@ def qualification_window_sha(recording, days, cutoff, run_frozen_at):
         if (
             day["qualification_window_ordinal"] != ordinal or job_id in seen_jobs
             or (previous_date is not None and date != previous_date + datetime.timedelta(days=1))
-            or joined_timestamp_nanoseconds(day["window_start"], "qualification window_start") < run_frozen_ns
+            or (rule != TIER1_HISTORICAL_QUALIFICATION_VERSION
+                and joined_timestamp_nanoseconds(day["window_start"], "qualification window_start") < run_frozen_ns)
             or completed_ns > cutoff_ns
         ):
             raise ValueError("joined qualification window conflicts")
@@ -3382,13 +3414,16 @@ def qualification_window_sha(recording, days, cutoff, run_frozen_at):
         completed = completed_ns if completed is None else max(completed, completed_ns)
     if completed != joined_timestamp_nanoseconds(recording["completed_at"], "recording completed_at"):
         raise ValueError("joined recording completion conflicts with qualification window")
-    return joined_canonical_sha({
+    window = {
         "recording_id": recording["recording_id"],
         "timezone": recording["timezone"],
         "days": days,
         "frozen_at": cutoff,
-        "evidence_sha256": "",
-    })
+    }
+    if rule == TIER1_HISTORICAL_QUALIFICATION_VERSION:
+        window["authority_kind"] = TIER1_HISTORICAL_AUTHORITY_KIND
+    window["evidence_sha256"] = ""
+    return joined_canonical_sha(window)
 
 
 def valid_selection_authority(authority, recording_ids, frozen_recordings):
@@ -3408,7 +3443,9 @@ def valid_selection_authority(authority, recording_ids, frozen_recordings):
         or cutoff.utcoffset() != datetime.timedelta(0) or joined_timestamp_is_go_zero(cutoff)
         or joined_timestamp_is_go_zero(run_frozen)
         or authority["ordered_recording_ids_sha256"] != recording_ids_sha(recording_ids)
-        or run_frozen_ns > cutoff_ns or rule.strip() != rule or len(rule.encode("utf-8")) > 128
+        or (rule != TIER1_HISTORICAL_QUALIFICATION_VERSION and run_frozen_ns > cutoff_ns)
+        or (rule == TIER1_HISTORICAL_QUALIFICATION_VERSION and run_frozen_ns <= cutoff_ns)
+        or rule.strip() != rule or len(rule.encode("utf-8")) > 128
         or positive_joined_int(authority["qualification_run_id"], "qualification_run_id") < 1
     ):
         raise ValueError("joined selection authority conflicts")
@@ -4189,8 +4226,9 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
             raise ExistingFileMismatch("joined batch ledger reference conflicts")
         if (
             ledger["qualification_day"]["qualification_window_ordinal"] != ledger_position % 14 + 1
-            or joined_timestamp_nanoseconds(ledger["qualification_day"]["window_start"], "qualification window_start")
-                < joined_timestamp_nanoseconds(index["selection_authority"]["qualification_run_frozen_at"], "qualification run frozen_at")
+            or (index["selection_authority"]["qualification_rule_version"] != TIER1_HISTORICAL_QUALIFICATION_VERSION
+                and joined_timestamp_nanoseconds(ledger["qualification_day"]["window_start"], "qualification window_start")
+                    < joined_timestamp_nanoseconds(index["selection_authority"]["qualification_run_frozen_at"], "qualification run frozen_at"))
             or joined_timestamp_nanoseconds(ledger["qualification_day"]["completed_at"], "qualification completed_at")
                 > joined_timestamp_nanoseconds(index["selection_authority"]["cutoff"], "selection cutoff")
         ):
@@ -4241,6 +4279,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
                 qualification_sha = qualification_window_sha(
                     frozen, qualification_days, index["selection_authority"]["cutoff"],
                     index["selection_authority"]["qualification_run_frozen_at"],
+                    index["selection_authority"]["qualification_rule_version"],
                 )
             except ValueError as exc:
                 raise ExistingFileMismatch("joined batch qualification window conflicts") from exc

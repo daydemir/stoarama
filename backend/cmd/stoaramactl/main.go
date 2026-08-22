@@ -192,6 +192,7 @@ func usage() {
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recording-health summary
 	  stoaramactl recording-preopen run [--dry-run --concurrency 4 --probe-sec 20 --frame-fresh-min 30]
+	  stoaramactl recording-joined import-tier1-historical --connection-id N --evidence-file FILE [--expected-request-sha256 HASH --apply]
 	  stoaramactl recording-joined freeze-tier1 --connection-id N --batch-id ID --source-endpoint URL --qualification-run-id N [--generation N --expected-request-sha256 HASH --apply]
 	  stoaramactl recording-joined seal-stream-day --batch-id ID --recording-id N --local-date YYYY-MM-DD [--apply]
 	  stoaramactl recording-joined seal-remaining-days --batch-id ID --canary-recording-id N --canary-local-date YYYY-MM-DD --expected-canary-seal-request-sha256 HASH [--apply]

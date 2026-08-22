@@ -158,6 +158,30 @@ func (s *remoteJoinedOperatorService) FreezeTier1(ctx context.Context, req joine
 	return response, nil
 }
 
+func (s *remoteJoinedOperatorService) ImportHistoricalQualification(ctx context.Context,
+	req joinedImportHistoricalQualificationRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		ProtocolVersion       int                                 `json:"protocol_version"`
+		ConnectionID          int64                               `json:"connection_id"`
+		BatchID               string                              `json:"batch_id"`
+		Generation            int                                 `json:"generation"`
+		RecordingJobs         []joinedHistoricalQualificationJobs `json:"recording_jobs"`
+		Apply                 bool                                `json:"apply"`
+		ExpectedRequestSHA256 string                              `json:"expected_request_sha256,omitempty"`
+	}{joinedrecording.JoinedProtocolVersion, req.ConnectionID, req.BatchID, req.Generation,
+		req.RecordingJobs, req.Apply, req.ExpectedRequestSHA256}
+	var response map[string]any
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/qualification/import-tier1-historical", token,
+		payload, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
 func (s *remoteJoinedOperatorService) SealStreamDay(ctx context.Context, req joinedSealStreamDayRequest) (any, error) {
 	token, err := s.validOperatorToken()
 	if err != nil {

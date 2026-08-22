@@ -193,6 +193,47 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if stale.Code != http.StatusConflict {
 		t.Fatalf("stale status=%d body=%s", stale.Code, stale.Body.String())
 	}
+	// Migration 0138 relaxes the physical NULL constraint only for the exact
+	// historical authority. Prospective activation must still fail closed.
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='active',paused_at=NULL WHERE account_id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	var activeRunID, nullSceneRunID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM recording_qualification_runs WHERE account_id=$1 AND status='active'`, accountID).
+		Scan(&activeRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='canceled' WHERE id=$1`, activeRunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,definition_jsonb,
+		target_recording_count,target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at)
+		SELECT account_id,definition_version,definition_jsonb,target_recording_count,target_window_count,
+		required_good_or_great,max_acceptable,window_sequence_start_at FROM recording_qualification_runs WHERE id=$1 RETURNING id`,
+		activeRunID).Scan(&nullSceneRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,ordinal,
+		stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,
+		daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version)
+		SELECT $2,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,
+		CASE WHEN ordinal=1 THEN NULL ELSE scene_identity_sha256 END,
+		CASE WHEN ordinal=1 THEN NULL ELSE scene_frame_evidence_id END,cron_timezone,daily_window_start,daily_window_end,
+		active_weekdays,schedule_start_at,schedule_end_at,window_generator_version
+		FROM recording_qualification_members WHERE run_id=$1`, activeRunID, nullSceneRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,local_open_at,
+		local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds)
+		SELECT $2,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,
+		window_start_at,window_end_at,expected_seconds FROM recording_qualification_windows WHERE run_id=$1`,
+		activeRunID, nullSceneRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, nullSceneRunID); err == nil ||
+		!strings.Contains(err.Error(), "qualification evidence or window set is invalid") {
+		t.Fatalf("prospective missing-scene activation err=%v", err)
+	}
 }
 
 func TestQualificationBuildFailsClosedBelowFiftyBeforeDatabase(t *testing.T) {
