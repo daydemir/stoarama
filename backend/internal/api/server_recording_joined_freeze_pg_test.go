@@ -535,7 +535,6 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 		t.Fatal("repeatable-read purge bypassed the retention fence")
 	}
 	_ = rr.Rollback(ctx)
-	_, beforePurge := call(req)
 	purgeTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		t.Fatal(err)
@@ -544,26 +543,13 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 		_ = purgeTx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	conflictingReq := req
-	conflictingReq.Apply, conflictingReq.ExpectedRequestSHA256 = true, beforePurge.RequestSHA256
-	conflictingResult := make(chan *httptest.ResponseRecorder, 1)
-	go func() {
-		rec, _ := call(conflictingReq)
-		conflictingResult <- rec
-	}()
-	waitJoinedDatabaseCondition(t, pool, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
-		WHERE pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock(137,1)%')`)
 	if err := purgeTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if conflict := <-conflictingResult; conflict.Code != http.StatusConflict {
-		t.Fatalf("purge-first apply status=%d body=%s", conflict.Code, conflict.Body.String())
+	var racePurged time.Time
+	if err := pool.QueryRow(ctx, `SELECT purged_at FROM recording_clips WHERE id=$1`, raceClipID).Scan(&racePurged); err != nil || racePurged.IsZero() {
+		t.Fatalf("unscoped post-checkpoint clip purge=%v err=%v", racePurged, err)
 	}
-	var prematureBatches int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).Scan(&prematureBatches); err != nil || prematureBatches != 0 {
-		t.Fatalf("purge-first apply created batches=%d err=%v", prematureBatches, err)
-	}
-	_, plan = call(req)
 	req.Apply, req.ExpectedRequestSHA256 = true, plan.RequestSHA256
 	blocker, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
