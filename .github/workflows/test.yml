@@ -94,8 +94,15 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1
-      - name: Install FFmpeg for joined lifecycle tests
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: Install pinned FFmpeg for joined lifecycle tests
+        env:
+          JOINED_RECORDING_FFMPEG_ARCHIVE_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz
+          JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256: b2ad9015c296a61c1f6127c4aa3ce8614a9bd8d7519987b6e0d151edaa7f39fb
+          JOINED_RECORDING_FFMPEG_BINARY_SHA256: eab722b24d599876819f89f503cc142b39a096a971d7d7913a0282b0484b9d5e
+          JOINED_RECORDING_FFPROBE_BINARY_SHA256: 95cda0f6de6e2d0c48cc2afe24e8ef9bcb8b4ffc5897af77158b1a59b303a97a
+        run: |
+          bash ./scripts/install-pinned-media-tools.sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
       - name: Test joined Tier-1 freeze, retention, and canonical lifecycle
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -149,5 +156,8 @@ jobs:
       - name: Test NAS pull client
         working-directory: .
         run: python3 -m unittest -q clients/nas-pull/test_stoarama_pull.py
+      - name: Test NAS pull joined download
+        working-directory: .
+        run: python3 -m unittest -q clients/nas-pull/test_joined_download.py
       - name: Vet
         run: go vet ./...

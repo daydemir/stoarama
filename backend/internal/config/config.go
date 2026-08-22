@@ -678,7 +678,7 @@ func validLowerSHA256(value string) bool {
 }
 
 func validJoinedRecordingBatchID(value string) bool {
-	if len(value) < 1 || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+	if len(value) < 1 || len(value) > 63 || value[0] == '-' {
 		return false
 	}
 	for _, char := range value {

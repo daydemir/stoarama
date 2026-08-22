@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
 
 type fakeJoinedOperator struct {
@@ -172,6 +173,30 @@ func TestJoinedWorkerAllowsExplicitActivationEnvelope(t *testing.T) {
 	}
 	if factoryCfg.JoinedRecordingBatchID != "tier1-2026-08" || factoryCfg.JoinedRecordingScratchRoot != "/tmp/stoarama-joined" {
 		t.Fatalf("factory config batch=%q scratch=%q", factoryCfg.JoinedRecordingBatchID, factoryCfg.JoinedRecordingScratchRoot)
+	}
+}
+
+func TestJoinedBatchIDGrammarMatchesSharedContract(t *testing.T) {
+	for _, value := range []string{"a", "batch-", strings.Repeat("a", 63)} {
+		if !joinedrecording.ValidBatchID(value) {
+			t.Fatalf("shared grammar rejected %q", value)
+		}
+		if err := validateJoinedBatchID(value); err != nil {
+			t.Fatalf("CLI grammar rejected %q: %v", value, err)
+		}
+	}
+	for _, value := range []string{"", "-batch", "Batch", "batch_name", strings.Repeat("a", 64)} {
+		if joinedrecording.ValidBatchID(value) || validateJoinedBatchID(value) == nil {
+			t.Fatalf("joined batch grammars accepted %q", value)
+		}
+	}
+
+	_, err := parseJoinedFreezeTier1(config.Config{}, []string{
+		"--connection-id", "44", "--batch-id", "batch-", "--source-endpoint",
+		"https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "--qualification-run-id", "7",
+	})
+	if err == nil || !strings.Contains(err.Error(), "exact --generation") {
+		t.Fatalf("Tier-1 generation suffix error=%v", err)
 	}
 }
 

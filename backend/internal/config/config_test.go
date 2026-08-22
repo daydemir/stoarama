@@ -38,6 +38,19 @@ func joinedCanaryScope(batch string) string {
 	}, ",")
 }
 
+func TestJoinedBatchIDGrammar(t *testing.T) {
+	for _, value := range []string{"a", "batch-", strings.Repeat("a", 63)} {
+		if !validJoinedRecordingBatchID(value) {
+			t.Fatalf("valid joined batch ID rejected: %q", value)
+		}
+	}
+	for _, value := range []string{"", "-batch", "Batch", "batch_name", strings.Repeat("a", 64)} {
+		if validJoinedRecordingBatchID(value) {
+			t.Fatalf("invalid joined batch ID accepted: %q", value)
+		}
+	}
+}
+
 func TestValidateStripeFailsClosed(t *testing.T) {
 	if err := (Config{}).ValidateStripe(); err != nil {
 		t.Fatalf("empty optional config: %v", err)

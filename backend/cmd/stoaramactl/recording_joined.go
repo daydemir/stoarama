@@ -416,13 +416,8 @@ func parseJoinedFlags(flags *flag.FlagSet, args []string) error {
 }
 
 func validateJoinedBatchID(value string) error {
-	if len(value) < 1 || len(value) > 63 || value[0] == '-' || value[len(value)-1] == '-' {
+	if !joinedrecording.ValidBatchID(value) {
 		return errors.New("--batch-id must use 1-63 lowercase letters, numbers, or hyphens")
-	}
-	for _, char := range value {
-		if char != '-' && (char < 'a' || char > 'z') && (char < '0' || char > '9') {
-			return errors.New("--batch-id must use 1-63 lowercase letters, numbers, or hyphens")
-		}
 	}
 	return nil
 }
