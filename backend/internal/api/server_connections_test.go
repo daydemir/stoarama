@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -574,6 +575,29 @@ func TestDesiredJoinedProtocolIsExactAndFailClosed(t *testing.T) {
 				t.Fatalf("desired=(%d,%d) want=(%d,%d)", gotVersion, gotGeneration, tc.wantVersion, tc.wantGeneration)
 			}
 		})
+	}
+}
+
+func TestPullJoinedConnectionIDRejectsStaleObservedProtocol(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(47), int64(123)
+	var connectionID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,api_key_id,joined_protocol_version)
+		VALUES($1,'nas_pull',$2,1) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
+	}
+	principal := accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}
+	s := &Server{pool: pool, cfg: config.Config{
+		JoinedRecordingConnectionID: int(connectionID), JoinedRecordingProtocolGeneration: 2,
+	}}
+	if _, err := s.pullJoinedConnectionID(ctx, pool, principal, false); !errors.Is(err, errJoinedProtocolDisabled) {
+		t.Fatalf("stale database protocol survived desired downgrade: %v", err)
+	}
+	s.cfg = validRemoteJoinedProtocolConfig(int(connectionID), 3)
+	if got, err := s.pullJoinedConnectionID(ctx, pool, principal, false); err != nil || got != connectionID {
+		t.Fatalf("current exact protocol connection=%d err=%v", got, err)
 	}
 }
 

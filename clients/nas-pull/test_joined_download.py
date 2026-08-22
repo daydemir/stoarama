@@ -49,14 +49,19 @@ class JoinedDownloadTests(unittest.TestCase):
             legacy_progress_file=state / "cursor.json", runtime_file=state / "runtime.json",
             outage_file=state / "outage.json", capacity_file=state / "capacity.json",
             inventory_file=state / "inventory.sqlite3", download_workers=12, min_free_bytes=100, dry_run=False,
-            joined_protocol_version=1,
         )
+
+    def protocol_response(self, version, generation, **changes):
+        response = {
+            "ok": True, "joined_delivery_accepted": True,
+            "joined_protocol_version": version, "joined_protocol_generation": generation,
+        }
+        response.update(changes)
+        return response
 
     def runtime(self, cfg):
         runtime = pull.Runtime(cfg)
-        runtime.apply_joined_protocol_response({
-            "joined_protocol_version": 1, "joined_protocol_generation": 1,
-        })
+        runtime.apply_joined_protocol_response(self.protocol_response(1, 1))
         return runtime
 
     def media_item(self, content=b"abcdef", **changes):
@@ -606,10 +611,10 @@ class JoinedDownloadTests(unittest.TestCase):
             pull.validate_cross_day_ledger_link(previous, following)
 
     def test_protocol_zero_is_dormant_without_joined_api_or_storage_access(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(pull.Config().joined_protocol_version, 0)
+        with mock.patch.dict(os.environ, {"STOARAMA_JOINED_PROTOCOL_VERSION": "invalid-dead-setting"}):
+            self.assertFalse(hasattr(pull.Config(), "joined_protocol_version"))
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); cfg.joined_protocol_version = 0; runtime = pull.Runtime(cfg)
+            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
             self.assertEqual(runtime.heartbeat_payload(None)["joined_protocol_version"], 0)
             with mock.patch.object(pull, "request_json") as request, mock.patch.object(pull, "open_joined_output_dir") as storage:
                 self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))
@@ -621,38 +626,25 @@ class JoinedDownloadTests(unittest.TestCase):
             runtime = pull.Runtime(cfg)
             self.assertFalse(runtime.joined_protocol_enabled())
 
-            runtime.apply_joined_protocol_response({
-                "joined_protocol_version": 1, "joined_protocol_generation": 4,
-            })
+            runtime.apply_joined_protocol_response(self.protocol_response(1, 4))
             self.assertTrue(runtime.joined_protocol_enabled())
             self.assertEqual(runtime.heartbeat_payload(None)["joined_protocol_version"], 1)
-            runtime.apply_joined_protocol_response({
-                "joined_protocol_version": 1, "joined_protocol_generation": 4,
-            })
+            runtime.apply_joined_protocol_response(self.protocol_response(1, 4))
             self.assertTrue(runtime.joined_protocol_enabled())
 
-            runtime.apply_joined_protocol_response({
-                "joined_protocol_version": 1, "joined_protocol_generation": 3,
-            })
+            runtime.apply_joined_protocol_response(self.protocol_response(1, 3))
             self.assertFalse(runtime.joined_protocol_enabled())
-            runtime.apply_joined_protocol_response({
-                "joined_protocol_version": 1, "joined_protocol_generation": 4,
-            })
+            runtime.apply_joined_protocol_response(self.protocol_response(1, 4))
             self.assertFalse(runtime.joined_protocol_enabled())
 
-            runtime.apply_joined_protocol_response({
-                "joined_protocol_version": 0, "joined_protocol_generation": 5,
-            })
+            runtime.apply_joined_protocol_response(self.protocol_response(0, 5))
             self.assertFalse(runtime.joined_protocol_enabled())
-            runtime.apply_joined_protocol_response({
-                "joined_protocol_version": 1, "joined_protocol_generation": 6,
-            })
+            runtime.apply_joined_protocol_response(self.protocol_response(1, 6))
             self.assertTrue(runtime.joined_protocol_enabled())
-            for malformed in ({}, None, {
-                "joined_protocol_version": True, "joined_protocol_generation": 7,
-            }, {
-                "joined_protocol_version": 1, "joined_protocol_generation": 0,
-            }):
+            for malformed in ({}, None, self.protocol_response(True, 7),
+                              self.protocol_response(1, 0), self.protocol_response(1, 7, extra=True),
+                              self.protocol_response(1, 7, ok=False),
+                              self.protocol_response(1, 7, joined_delivery_accepted=1)):
                 runtime.apply_joined_protocol_response(malformed)
                 self.assertFalse(runtime.joined_protocol_enabled())
 
@@ -661,14 +653,57 @@ class JoinedDownloadTests(unittest.TestCase):
             cfg = self.config(Path(raw))
             runtime = self.runtime(cfg)
             def feed(*_args, **_kwargs):
-                runtime.apply_joined_protocol_response({
-                    "joined_protocol_version": 0, "joined_protocol_generation": 2,
-                })
+                runtime.apply_joined_protocol_response(self.protocol_response(0, 2))
                 return {"item": self.media_item()}
             with mock.patch.object(pull, "request_json", side_effect=feed), \
                  mock.patch.object(pull, "download_joined_item") as download:
                 self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))
             download.assert_not_called()
+
+    def test_active_download_downgrade_yields_at_next_range_boundary(self):
+        content = b"abcdef"
+        raw_item = self.media_item(content)
+        item = pull.valid_joined_item(raw_item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            self.install_manifest(cfg, item)
+            ranges = []
+            def open_range(request, **_kwargs):
+                start, end = map(int, dict(request.header_items())["Range"].removeprefix("bytes=").split("-"))
+                ranges.append((start, end))
+                runtime.apply_joined_protocol_response(self.protocol_response(0, 2))
+                return RangeResponse(content[start:end + 1], start, end, len(content))
+            with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), \
+                 mock.patch.object(pull, "poll_raw_pending", return_value=False), \
+                 mock.patch.object(pull, "storage_status", return_value=self.storage()), \
+                 mock.patch.object(pull, "request_json", return_value=self.prepared(raw_item)), \
+                 mock.patch.object(pull, "open_joined_url", side_effect=open_range), \
+                 self.assertRaises(pull.JoinedDownloadYield):
+                pull.download_joined_item(cfg, runtime, item, threading.Event())
+            self.assertEqual(ranges, [(0, 2)])
+            final = pull.joined_output_path(cfg, item)
+            self.assertFalse(final.exists())
+            self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
+
+    def test_downgrade_after_download_stops_before_ack(self):
+        raw_item = self.media_item()
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            paths = []
+            def api(_cfg, _method, path, **_kwargs):
+                paths.append(path)
+                if path == "/account/joined":
+                    return {"item": raw_item}
+                raise AssertionError("ACK attempted after downgrade")
+            def download(*_args):
+                runtime.apply_joined_protocol_response(self.protocol_response(0, 2))
+                return True
+            with mock.patch.object(pull, "request_json", side_effect=api), \
+                 mock.patch.object(pull, "download_joined_item", side_effect=download):
+                self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
+            self.assertEqual(paths, ["/account/joined"])
 
     def test_gap_only_hour_manifest_downloads_and_exact_acks(self):
         raw_item, content = self.manifest_item(gap=True); requests, acks = [], []

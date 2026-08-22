@@ -1568,7 +1568,8 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 payloads.append(body)
                 if len(payloads) == 2:
                     stop_event.set()
-                return {"ok": True, "joined_protocol_version": 1, "joined_protocol_generation": 3}
+                return {"ok": True, "joined_delivery_accepted": True,
+                        "joined_protocol_version": 1, "joined_protocol_generation": 3}
 
             with mock.patch.object(pull, "request_json", side_effect=heartbeat), \
                  mock.patch.object(pull, "HEARTBEAT_INTERVAL_SEC", 0):

@@ -67,6 +67,22 @@ func pullConnectionID(ctx context.Context, q interface {
 	return id, err
 }
 
+var errJoinedProtocolDisabled = errors.New("joined protocol is not currently authorized")
+
+func (s *Server) pullJoinedConnectionID(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, principal accountPrincipal, forUpdate bool) (int64, error) {
+	connectionID, err := pullConnectionID(ctx, q, principal, forUpdate)
+	if err != nil {
+		return 0, err
+	}
+	protocol, generation := desiredJoinedProtocol(s.cfg, connectionID)
+	if protocol != 1 || generation != s.cfg.JoinedRecordingProtocolGeneration {
+		return 0, errJoinedProtocolDisabled
+	}
+	return connectionID, nil
+}
+
 // handleAccountJoined returns exactly one sealed, highest-priority unacked
 // artifact. There is deliberately no numeric cursor: a blocked head item repeats
 // until its exact NAS acknowledgment arrives.
@@ -82,9 +98,13 @@ func (s *Server) handleAccountJoined(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	connectionID, err := pullConnectionID(r.Context(), tx, principal, true)
+	connectionID, err := s.pullJoinedConnectionID(r.Context(), tx, principal, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "joined delivery requires a NAS pull key")
+		return
+	}
+	if errors.Is(err, errJoinedProtocolDisabled) {
+		util.WriteJSON(w, http.StatusOK, map[string]any{"item": nil})
 		return
 	}
 	if err != nil {
@@ -149,9 +169,13 @@ func (s *Server) handleAccountJoinedDownload(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
-	connectionID, err := pullConnectionID(r.Context(), s.pool, principal, false)
+	connectionID, err := s.pullJoinedConnectionID(r.Context(), s.pool, principal, false)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "joined delivery requires a NAS pull key")
+		return
+	}
+	if errors.Is(err, errJoinedProtocolDisabled) {
+		util.WriteError(w, http.StatusNotFound, "joined output not found")
 		return
 	}
 	if err != nil {
@@ -223,7 +247,7 @@ func (s *Server) revalidateAccountJoinedDownload(ctx context.Context, principal 
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	connectionID, err := pullConnectionID(ctx, tx, principal, true)
+	connectionID, err := s.pullJoinedConnectionID(ctx, tx, principal, true)
 	if err != nil {
 		return err
 	}
@@ -289,9 +313,13 @@ func (s *Server) handleAccountJoinedAck(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	connectionID, err := pullConnectionID(r.Context(), tx, principal, true)
+	connectionID, err := s.pullJoinedConnectionID(r.Context(), tx, principal, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "joined delivery requires a NAS pull key")
+		return
+	}
+	if errors.Is(err, errJoinedProtocolDisabled) {
+		util.WriteError(w, http.StatusNotFound, "joined output not found")
 		return
 	}
 	if err != nil {
