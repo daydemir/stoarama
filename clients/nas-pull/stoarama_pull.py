@@ -2935,7 +2935,9 @@ def frozen_source_sha(sources, qualification_day, recording_id):
             "end_utc": source["end_utc"],
             "size_bytes": source["object"]["size_bytes"],
             "ingest_sha256": source["object"]["sha256"],
-            "released_at": source["released_at"],
+            # V2 retains released_at in the ledger for audit, but it is mutable
+            # transfer bookkeeping and is not part of denominator identity.
+            "released_at": None,
         })
     return joined_canonical_sha(snapshots)
 
@@ -3458,7 +3460,7 @@ def valid_selection_authority(authority, recording_ids, frozen_recordings):
 
 def frozen_denominator_sha(selection_authority, recordings, ledgers):
     return joined_canonical_sha({
-        "projection_version": 1,
+        "projection_version": 2,
         "selection_authority": selection_authority,
         "recordings": [{
             "recording_id": recording["recording_id"],

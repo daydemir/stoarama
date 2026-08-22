@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,6 +43,7 @@ func TestJoinedAdminBatchStatusIsBoundedOrderedReadOnlyAndAdminOnly(t *testing.T
 	if response, _ := fixture.call(req); response.Code != http.StatusOK {
 		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
 	}
+	finishJoinedTier1Fixture(t, fixture, req)
 	fixture.s.cfg.ServiceToken = "generic-service-credential-32-bytes"
 
 	claim := mintJoinedClaimForTest(t, fixture.s, req.BatchID)
@@ -128,7 +128,7 @@ func TestJoinedAdminBatchStatusIsBoundedOrderedReadOnlyAndAdminOnly(t *testing.T
 	fixture.s.joinedFreezeSourceStore = &joinedFreezeStoreStub{bucket: "clips"}
 	fixture.s.joinedFreezeTransport = &joinedFreezeTransportStub{etag: "etag-one"}
 	sealRequest := joinedSealStreamDayRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
-		BatchID: req.BatchID, RecordingID: joinedrecording.Tier1RecordingIDs[0], LocalDate: "2026-08-01"}
+		BatchID: req.BatchID, RecordingID: joinedrecording.Tier1RecordingIDs[0], LocalDate: fixture.clipStart.Format("2006-01-02")}
 	body, _ := json.Marshal(sealRequest)
 	httpRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/stream-days/seal", bytes.NewReader(body))
 	httpRequest.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
@@ -161,7 +161,7 @@ func assertJoinedAdminBatchStatus(t *testing.T, got joinedAdminBatchStatusRespon
 	}
 	for i, day := range got.StreamDays {
 		wantRecording := joinedrecording.Tier1RecordingIDs[i/14]
-		wantDate := fmt.Sprintf("2026-08-%02d", i%14+1)
+		wantDate := time.Date(2026, time.July, 29, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i%14).Format("2006-01-02")
 		if day.RecordingID != wantRecording || day.LocalDate != wantDate {
 			t.Fatalf("day %d=%+v want recording=%d date=%s", i, day, wantRecording, wantDate)
 		}

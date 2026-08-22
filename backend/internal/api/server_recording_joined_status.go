@@ -51,7 +51,7 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 		FROM recording_joined_batches b
 		JOIN recording_joined_batch_recordings br ON br.batch_record_id=b.id
 		JOIN recording_joined_stream_days d ON d.batch_record_id=b.id AND d.batch_recording_id=br.id
-		WHERE b.batch_id=$1
+		WHERE b.batch_id=$1 AND b.state<>'snapshotting'
 		ORDER BY br.priority_ordinal,d.date_ordinal
 		LIMIT $2`, batchIDs[0], joinedAdminBatchStatusStreamDays+1)
 	if err != nil {

@@ -190,6 +190,7 @@ func TestFrozenDenominatorUsesOnlyApplyTimeSourceFacts(t *testing.T) {
 		"etag":    func(source *SourceClip) { source.Object.ETag = "changed" },
 		"version": func(source *SourceClip) { source.Object.VersionID = "changed" },
 		"audio":   func(source *SourceClip) { source.AudioContract = &AudioSequenceContract{} },
+		"release": func(source *SourceClip) { released := source.StartUTC.Add(time.Hour); source.ReleasedAt = &released },
 		"derived seam": func(source *SourceClip) {
 			source.SeamToPrevious = SeamEvidence{Verdict: "gap", Reason: "changed", SignedGapNanoseconds: 1}
 		},
@@ -201,14 +202,12 @@ func TestFrozenDenominatorUsesOnlyApplyTimeSourceFacts(t *testing.T) {
 			t.Fatalf("later %s fact changed apply-time denominator: got=%+v err=%v", name, got, err)
 		}
 	}
-	released := source.StartUTC.Add(time.Hour)
 	for name, mutate := range map[string]func(*FrozenSourceSnapshot){
 		"storage destination": func(source *FrozenSourceSnapshot) { source.StorageDestinationID++ },
 		"object key":          func(source *FrozenSourceSnapshot) { source.ObjectKey += "-changed" },
 		"timing":              func(source *FrozenSourceSnapshot) { source.StartUTC = source.StartUTC.Add(time.Nanosecond) },
 		"size":                func(source *FrozenSourceSnapshot) { source.SizeBytes++ },
 		"ingest SHA":          func(source *FrozenSourceSnapshot) { source.IngestSHA256 = strings.Repeat("9", 64) },
-		"release":             func(source *FrozenSourceSnapshot) { source.ReleasedAt = &released },
 	} {
 		snapshots := FrozenSourceSnapshots([]SourceClip{source})
 		mutate(&snapshots[0])
@@ -284,7 +283,7 @@ func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	index, ledgers, manifests := testBatchIndex(t)
 	canonicalIndex := testBatchIndexCopy(index)
 	want := index.FrozenDenominatorSHA256
-	if want != "09b38447860262fa11c65080fae50f18a656b2bd051ff78d2e853a6a2a6c7135" {
+	if want != "1e8d249abad247fd89d8046de378026f5babc31ea0852717b7f7e2c4ee7e6d95" {
 		t.Fatalf("canonical denominator fixture changed: %s", want)
 	}
 	if got, err := ComputeFrozenDenominatorSHA256(index.SelectionAuthority, index.FrozenRecordings, frozenDenominatorDays(index.AllocationLedgers)); err != nil || got != want {

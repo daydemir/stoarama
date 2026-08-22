@@ -16,7 +16,7 @@ import (
 
 const (
 	BatchIndexSchemaVersion            = 1
-	FrozenDenominatorProjectionVersion = 1
+	FrozenDenominatorProjectionVersion = 2
 	MaxCanonicalJSONBytes              = 16 << 20
 	OperatorApprovedSelectionBasis     = "operator_approved_ordered_cohort_v1"
 )
@@ -565,7 +565,11 @@ func BuildFrozenDenominatorDayProjection(recordingID int64, day QualifiedDay, qu
 		seenLocators[locator] = true
 		sourceBytes += source.SizeBytes
 	}
-	digest, _, err := stitchcert.CanonicalSHA(sources)
+	canonicalSources := append([]FrozenSourceSnapshot(nil), sources...)
+	for i := range canonicalSources {
+		canonicalSources[i].ReleasedAt = nil
+	}
+	digest, _, err := stitchcert.CanonicalSHA(canonicalSources)
 	if err != nil {
 		return FrozenDenominatorDayProjection{}, err
 	}
