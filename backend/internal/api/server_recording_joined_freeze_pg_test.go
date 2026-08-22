@@ -134,7 +134,7 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	userID, accountID := seedUserOrg(t, pool, email, true)
 	var storageID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,
-		access_key_id,secret_access_key_enc,status,managed) VALUES($1,'joined-source','r2',$2,'auto','clips',
+		access_key_id,secret_access_key_enc,status,managed) VALUES($1,'joined-source','r2_managed',$2,'auto','clips',
 		'key',$3,'verified',true) RETURNING id`, accountID, joinedTestSourceEndpoint, sourceSecret).Scan(&storageID); err != nil {
 		t.Fatal(err)
 	}

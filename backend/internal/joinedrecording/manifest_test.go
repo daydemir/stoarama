@@ -245,6 +245,41 @@ func TestFrozenDenominatorUsesOnlyApplyTimeSourceFacts(t *testing.T) {
 	}
 }
 
+func TestFrozenDenominatorAcceptsManagedR2Source(t *testing.T) {
+	source := testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
+	source.Provider = "r2_managed"
+	day := QualifiedDay{LocalDate: "2026-05-04", QualificationWindowOrdinal: 1,
+		JobID: source.RecordingJobID, WindowStart: source.StartUTC, WindowEnd: source.StartUTC.Add(12 * time.Hour),
+		CompletedAt: source.StartUTC.Add(12 * time.Hour)}
+	if _, err := BuildFrozenDenominatorDayProjection(source.RecordingID, day, strings.Repeat("a", 64),
+		FrozenSourceSnapshots([]SourceClip{source})); err != nil {
+		t.Fatalf("managed R2 source rejected: %v", err)
+	}
+}
+
+func TestValidFrozenSourceStorageProviderPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		provider, region, bucket string
+		want                     bool
+	}{
+		{"direct R2", "r2", "auto", "recordings", true},
+		{"managed R2", "r2_managed", "auto", "recordings", true},
+		{"S3 compatible", "s3_compatible", "auto", "recordings", false},
+		{"WebDAV", "webdav", "auto", "recordings", false},
+		{"provider whitespace", " r2", "auto", "recordings", false},
+		{"region", "r2_managed", "us-east-1", "recordings", false},
+		{"bucket whitespace", "r2_managed", "auto", " recordings", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validFrozenSourceStorage(test.provider, test.region, test.bucket); got != test.want {
+				t.Fatalf("validFrozenSourceStorage(%q,%q,%q)=%v want %v",
+					test.provider, test.region, test.bucket, got, test.want)
+			}
+		})
+	}
+}
+
 func TestFrozenDenominatorIsCanonicalOrderedLedgerProjection(t *testing.T) {
 	index, ledgers, manifests := testBatchIndex(t)
 	canonicalIndex := testBatchIndexCopy(index)

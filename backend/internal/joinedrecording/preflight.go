@@ -61,7 +61,7 @@ func validatePreflightSource(source SourceClip, recordingID int64) error {
 }
 
 func validFrozenSourceStorage(provider, region, bucket string) bool {
-	return provider == "r2" && region == "auto" && canonicalSourceBucket.MatchString(bucket)
+	return (provider == "r2" || provider == "r2_managed") && region == "auto" && canonicalSourceBucket.MatchString(bucket)
 }
 
 func (c PreflightHourClaim) ScratchDir(root string) (string, error) {

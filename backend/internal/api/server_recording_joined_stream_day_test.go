@@ -351,7 +351,13 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 	fixture.s.joinedFreezeTransport = pair
 	concurrentResults := make(chan *httptest.ResponseRecorder, 1)
 	go func() { concurrentResults <- call(true) }()
-	<-pair.started
+	select {
+	case <-pair.started:
+	case early := <-concurrentResults:
+		t.Fatalf("stream-day seal returned before source HEAD: status=%d body=%s", early.Code, early.Body.String())
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream-day seal did not reach source HEAD")
+	}
 	rejected := call(true)
 	select {
 	case <-pair.started:
