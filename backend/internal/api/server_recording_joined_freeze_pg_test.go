@@ -25,6 +25,7 @@ import (
 var joinedMigrationNames = []string{
 	"0137_recording_joined_outputs.sql",
 	"0138_joined_historical_qualification_authority.sql",
+	"0139_joined_historical_completed_recordings.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
@@ -112,6 +113,8 @@ type joinedHistoricalTier1Fixture struct {
 	plan            joinedTier1FreezePlan
 	call            func(joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan)
 	callWithContext func(context.Context, joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan)
+	callHistorical  func(joinedHistoricalQualificationRequest) (*httptest.ResponseRecorder, joinedHistoricalQualificationPlan, int64)
+	historicalReq   joinedHistoricalQualificationRequest
 }
 
 func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistoricalTier1Fixture {
@@ -138,6 +141,10 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	metadata := recordingnaming.Metadata{PlazaID: "1", Continent: "Europe", Country: "Italy", City: "Bevagna", PlazaName: "Piazza"}
 	metadataJSON, _ := json.Marshal(metadata)
 	for _, recordingID := range joinedrecording.Tier1RecordingIDs {
+		recordingStatus := "active"
+		if recordingID == joinedrecording.Tier1RecordingIDs[0] {
+			recordingStatus = "completed"
+		}
 		var streamID int64
 		if err := pool.QueryRow(ctx, `INSERT INTO streams(provider,external_id,name,slug,source_url,source_page_url,
 			capture_type,source_family,execution_class,capture_family,expected_fps) VALUES('direct',$1,$2,$1,$3,'','hls',
@@ -152,9 +159,9 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		if _, err := pool.Exec(ctx, `INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,source_kind,
 			cron_expr,cron_timezone,clip_duration_sec,status,start_at,stream_id,mode,daily_window_start,daily_window_end,
 			active_weekdays,delivery,naming_profile,folder_name,naming_metadata_jsonb) VALUES($1,$2,$3,$4,$5,'hls_live',
-			'0 8 * * *','UTC',60,'active','2026-07-01', $6,'continuous','08:00','20:00',127,'nas_pull',
-			'plaza_hourly_v1',$7,$8)`, recordingID, accountID, storageID, fmt.Sprintf("recording-%d", recordingID),
-			fmt.Sprintf("https://example.test/%d.m3u8", recordingID), streamID, folder, metadataJSON); err != nil {
+			'0 8 * * *','UTC',60,$6,'2026-07-01', $7,'continuous','08:00','20:00',127,'nas_pull',
+			'plaza_hourly_v1',$8,$9)`, recordingID, accountID, storageID, fmt.Sprintf("recording-%d", recordingID),
+			fmt.Sprintf("https://example.test/%d.m3u8", recordingID), recordingStatus, streamID, folder, metadataJSON); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -316,7 +323,30 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	}
 	return joinedHistoricalTier1Fixture{s: s, pool: pool, cleanup: cleanup, userID: userID, accountID: accountID,
 		storageID: storageID, apiKeyID: apiKeyID, connectionID: connectionID, runID: runID, firstJobID: firstJobID,
-		clipID: clipID, clipStart: clipStart, sessionToken: token, req: req, plan: plan, call: call, callWithContext: callWithContext}
+		clipID: clipID, clipStart: clipStart, sessionToken: token, req: req, plan: plan, call: call, callWithContext: callWithContext,
+		callHistorical: callHistorical, historicalReq: historicalRequest}
+}
+
+func TestJoinedHistoricalQualificationRecordingStatuses(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-historical-status@example.test")
+	defer fixture.cleanup()
+	for _, recordingStatus := range []string{"paused", "canceled"} {
+		t.Run(recordingStatus, func(t *testing.T) {
+			if _, err := fixture.pool.Exec(context.Background(), `UPDATE recordings SET status=$1,
+				paused_at=CASE WHEN $1='paused' THEN now() ELSE NULL END WHERE id=$2`,
+				recordingStatus, joinedrecording.Tier1RecordingIDs[0]); err != nil {
+				t.Fatal(err)
+			}
+			req := fixture.historicalReq
+			req.Apply = false
+			req.ExpectedRequestSHA256 = ""
+			response, _, _ := fixture.callHistorical(req)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("historical qualification accepted recording status %q: status=%d body=%s",
+					recordingStatus, response.Code, response.Body.String())
+			}
+		})
+	}
 }
 
 func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
