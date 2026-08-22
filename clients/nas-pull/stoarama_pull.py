@@ -1033,6 +1033,7 @@ class Runtime:
             and type(version) is int and version in (0, JOINED_PROTOCOL_VERSION)
             and type(generation) is int and 0 <= generation <= 0x7fffffffffffffff
             and (generation > 0 or version == 0)
+            and (response.get("joined_delivery_accepted") is True or (version == 0 and generation == 0))
         )
         with self.lock:
             if not valid or generation < self.joined_protocol_generation:
