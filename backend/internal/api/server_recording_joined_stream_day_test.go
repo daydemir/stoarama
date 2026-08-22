@@ -283,6 +283,7 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 	if response, _ := fixture.call(req); response.Code != http.StatusOK {
 		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
 	}
+	finishJoinedTier1Fixture(t, fixture, req)
 	fixture.s.cfg.ServiceToken = "generic-service-credential-32-bytes"
 	fixture.s.cfg.R2Endpoint = joinedTestSourceEndpoint
 	fixture.s.cfg.R2Region = "auto"

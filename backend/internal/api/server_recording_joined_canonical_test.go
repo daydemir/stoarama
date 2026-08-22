@@ -49,6 +49,7 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	if response, _ := fixture.call(req); response.Code != http.StatusOK {
 		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
 	}
+	finishJoinedTier1Fixture(t, fixture, req)
 	var batchRecordID int64
 	if err := fixture.pool.QueryRow(ctx, `SELECT id FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).
 		Scan(&batchRecordID); err != nil {

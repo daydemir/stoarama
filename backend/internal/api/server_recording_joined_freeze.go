@@ -62,8 +62,32 @@ type joinedTier1FreezePlan struct {
 }
 
 type joinedTier1FreezeRecording struct {
-	Frozen        joinedrecording.FrozenRecording     `json:"frozen_recording"`
-	Qualification joinedrecording.QualificationWindow `json:"qualification"`
+	Frozen                   joinedrecording.FrozenRecording     `json:"frozen_recording"`
+	Qualification            joinedrecording.QualificationWindow `json:"qualification"`
+	SnapshotDays             []joinedTier1FreezeDayScope         `json:"snapshot_days"`
+	ExpectedSourceClips      int64                               `json:"expected_source_clips"`
+	ExpectedSourceBytes      int64                               `json:"expected_source_bytes"`
+	ExpectedExclusions       int64                               `json:"expected_exclusions"`
+	ExpectedExclusionsSHA256 string                              `json:"expected_exclusions_sha256"`
+}
+
+type joinedTier1FreezeDayScope struct {
+	LocalDate            string `json:"local_date"`
+	DateOrdinal          int    `json:"date_ordinal"`
+	RecordingJobID       int64  `json:"recording_job_id"`
+	HighWaterClipID      int64  `json:"high_water_clip_id"`
+	ExpectedSourceClips  int    `json:"expected_source_clips"`
+	ExpectedSourceBytes  int64  `json:"expected_source_bytes"`
+	ExpectedSourceSHA256 string `json:"expected_source_sha256"`
+}
+
+type joinedTier1FreezeProgress struct {
+	State               string `json:"state"`
+	CompletedRecordings int    `json:"completed_recordings"`
+	ExpectedRecordings  int    `json:"expected_recordings"`
+	CompletedStreamDays int    `json:"completed_stream_days"`
+	ExpectedStreamDays  int    `json:"expected_stream_days"`
+	NextPriorityOrdinal *int   `json:"next_priority_ordinal,omitempty"`
 }
 
 type joinedTier1FreezeQuerier interface {
@@ -126,12 +150,17 @@ func (s *Server) handleAdminJoinedFreezeTier1(w http.ResponseWriter, r *http.Req
 		util.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": true, "plan": plan})
 		return
 	}
-	plan, created, err := s.applyJoinedTier1Freeze(r.Context(), req)
+	plan, created, err := s.applyJoinedTier1FreezeResumable(r.Context(), req)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": false, "created": created, "plan": plan})
+	progress, err := s.joinedTier1FreezeProgress(r.Context(), req.BatchID)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": false, "created": created, "plan": plan, "progress": progress})
 }
 
 func (s *Server) buildJoinedTier1FreezePlan(ctx context.Context, q joinedTier1FreezeQuerier, req joinedTier1FreezeRequest) (joinedTier1FreezePlan, []byte, error) {
@@ -145,7 +174,7 @@ func (s *Server) buildJoinedTier1FreezePlan(ctx context.Context, q joinedTier1Fr
 func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joinedTier1FreezeQuerier, req joinedTier1FreezeRequest,
 	tool joinedrecording.MediaToolEvidence, countSources bool) (joinedTier1FreezePlan, []byte, error) {
 	var plan joinedTier1FreezePlan
-	plan.SchemaVersion = 1
+	plan.SchemaVersion = 2
 	plan.BatchID, plan.Generation = req.BatchID, req.Generation
 	plan.ConnectionID, plan.SourceEndpoint = req.ConnectionID, req.SourceEndpoint
 	plan.RecordingIDs = append([]int64(nil), req.RecordingIDs...)
@@ -343,16 +372,42 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 			windowStarts, windowEnds = append(windowStarts, day.WindowStart), append(windowEnds, day.WindowEnd)
 		}
 	}
-	sourceQuery := `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[])
-		AS d(recording_id,job_id,window_start,window_end))
+	watermarks := make(map[int64]int64, len(jobIDs))
+	if !fromApplySnapshot {
+		watermarkRows, err := q.Query(ctx, `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[]) AS d(recording_id,job_id))
+			SELECT d.job_id,COALESCE(max(c.id),0)::bigint FROM selected d LEFT JOIN recording_clips c
+			  ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id GROUP BY d.job_id`, recordingIDs, jobIDs)
+		if err != nil {
+			return nil, fmt.Errorf("load Tier-1 clip watermarks: %w", err)
+		}
+		for watermarkRows.Next() {
+			var jobID, watermark int64
+			if err := watermarkRows.Scan(&jobID, &watermark); err != nil {
+				watermarkRows.Close()
+				return nil, err
+			}
+			watermarks[jobID] = watermark
+		}
+		if err := watermarkRows.Err(); err != nil {
+			watermarkRows.Close()
+			return nil, err
+		}
+		watermarkRows.Close()
+	}
+	watermarkValues := make([]int64, len(jobIDs))
+	for i, jobID := range jobIDs {
+		watermarkValues[i] = watermarks[jobID]
+	}
+	sourceQuery := `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[],$5::bigint[])
+		AS d(recording_id,job_id,window_start,window_end,high_water_clip_id))
 		SELECT c.id,c.recording_id,c.recording_job_id,c.storage_destination_id,sd.account_id,sd.provider,c.endpoint,
 			sd.endpoint,sd.region,c.bucket,sd.bucket,c.object_key,c.etag,c.size_bytes,c.sha256,c.clip_start_at,c.clip_end_at,c.released_at
 		FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
 		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
-		WHERE c.purged_at IS NULL AND c.size_bytes>0 AND c.created_at<=$5
+		WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND c.size_bytes>0 AND c.created_at<=$6
 		  AND c.clip_end_at>d.window_start AND c.clip_start_at<d.window_end
 		ORDER BY c.recording_id,c.recording_job_id,c.clip_start_at,c.id`
-	args := []any{recordingIDs, jobIDs, windowStarts, windowEnds, plan.SelectionAuthority.Cutoff}
+	args := []any{recordingIDs, jobIDs, windowStarts, windowEnds, watermarkValues, plan.SelectionAuthority.Cutoff}
 	if fromApplySnapshot {
 		sourceQuery = `SELECT clip_id,recording_id,recording_job_id,storage_destination_id,account_id,provider,endpoint,
 			destination_endpoint,region,bucket,destination_bucket,object_key,ingest_etag,size_bytes,sha256,start_at,end_at,released_at
@@ -389,8 +444,14 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 		if !ok || projected[evidence.index] {
 			return errors.New("Tier-1 source job differs from qualification evidence")
 		}
+		canonicalSources := append([]joinedrecording.FrozenSourceSnapshot(nil), currentSources...)
+		// released_at is mutable bookkeeping. V2 records it in the retained source
+		// snapshot, but it is deliberately outside denominator identity.
+		for i := range canonicalSources {
+			canonicalSources[i].ReleasedAt = nil
+		}
 		projection, err := joinedrecording.BuildFrozenDenominatorDayProjection(evidence.recordingID,
-			evidence.day, evidence.qualificationSHA, currentSources)
+			evidence.day, evidence.qualificationSHA, canonicalSources)
 		if err != nil {
 			return err
 		}
@@ -441,7 +502,8 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 
 	frozenRecordings := make([]joinedrecording.FrozenRecording, len(plan.Recordings))
 	var sourceCount, sourceBytes int64
-	for i, recording := range plan.Recordings {
+	for i := range plan.Recordings {
+		recording := plan.Recordings[i]
 		frozenRecordings[i] = recording.Frozen
 		for _, day := range recording.Qualification.Days {
 			evidence := daysByJob[day.JobID]
@@ -456,31 +518,40 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 			projection := dayProjections[evidence.index]
 			sourceCount += int64(projection.SourceCount)
 			sourceBytes += projection.SourceBytes
+			plan.Recordings[i].SnapshotDays = append(plan.Recordings[i].SnapshotDays, joinedTier1FreezeDayScope{
+				LocalDate: day.LocalDate, DateOrdinal: day.QualificationWindowOrdinal, RecordingJobID: day.JobID,
+				HighWaterClipID: watermarks[day.JobID], ExpectedSourceClips: projection.SourceCount,
+				ExpectedSourceBytes: projection.SourceBytes, ExpectedSourceSHA256: projection.FrozenSourceSHA256,
+			})
+			plan.Recordings[i].ExpectedSourceClips += int64(projection.SourceCount)
+			plan.Recordings[i].ExpectedSourceBytes += projection.SourceBytes
 		}
 	}
-	denominatorSHA, err := joinedrecording.ComputeFrozenDenominatorSHA256(plan.SelectionAuthority, frozenRecordings, dayProjections)
-	if err != nil {
-		return nil, err
-	}
 	plan.ProvisionalSourceClips, plan.ProvisionalSourceBytes = sourceCount, sourceBytes
-	plan.FrozenDenominatorSHA256 = denominatorSHA
+	if !fromApplySnapshot || len(plan.Recordings) == len(joinedrecording.Tier1RecordingIDs) {
+		denominatorSHA, err := joinedrecording.ComputeFrozenDenominatorSHA256(plan.SelectionAuthority, frozenRecordings, dayProjections)
+		if err != nil {
+			return nil, err
+		}
+		plan.FrozenDenominatorSHA256 = denominatorSHA
+	}
 
-	exclusionQuery := `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[])
-		AS d(recording_id,job_id,window_start,window_end)), evidence AS (
+	exclusionQuery := `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[],$5::bigint[])
+		AS d(recording_id,job_id,window_start,window_end,high_water_clip_id)), evidence AS (
 		SELECT c.recording_id,c.id clip_id,
-			CASE WHEN c.created_at>$5 THEN 'after_cutoff'
+			CASE WHEN c.created_at>$6 THEN 'after_cutoff'
 			  WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
 			  ELSE 'nonpositive_source_size' END reason_code,
 			encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
 			  'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
 			  'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
-			  'window_end_at',d.window_end,'cutoff',$5)::text,'UTF8')),'hex') evidence_sha256
+			  'window_end_at',d.window_end,'cutoff',$6)::text,'UTF8')),'hex') evidence_sha256
 		FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
-		WHERE c.purged_at IS NULL AND (c.created_at>$5 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end
+		WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND (c.created_at>$6 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end
 		  OR c.size_bytes<=0))
 		SELECT count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',recording_id,
 			clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex') FROM evidence`
-	exclusionArgs := []any{recordingIDs, jobIDs, windowStarts, windowEnds, plan.SelectionAuthority.Cutoff}
+	exclusionArgs := []any{recordingIDs, jobIDs, windowStarts, windowEnds, watermarkValues, plan.SelectionAuthority.Cutoff}
 	if fromApplySnapshot {
 		exclusionQuery = `SELECT count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',
 			recording_id,clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex')
@@ -489,6 +560,50 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 	}
 	if err := q.QueryRow(ctx, exclusionQuery, exclusionArgs...).Scan(&plan.ProvisionalExclusions, &plan.FreezeExclusionsSHA256); err != nil {
 		return nil, fmt.Errorf("load Tier-1 freeze exclusions: %w", err)
+	}
+	if !fromApplySnapshot {
+		exclusionRows, err := q.Query(ctx, `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[],$5::bigint[])
+			AS d(recording_id,job_id,window_start,window_end,high_water_clip_id)), evidence AS (
+			SELECT c.recording_id,c.id clip_id,CASE WHEN c.created_at>$6 THEN 'after_cutoff'
+			 WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
+			 ELSE 'nonpositive_source_size' END reason_code,
+			 encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
+			 'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
+			 'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
+			 'window_end_at',d.window_end,'cutoff',$6)::text,'UTF8')),'hex') evidence_sha256
+			FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
+			WHERE c.id<=d.high_water_clip_id AND c.purged_at IS NULL AND (c.created_at>$6 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end OR c.size_bytes<=0))
+			SELECT recording_id,count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',recording_id,
+			clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex')
+			FROM evidence GROUP BY recording_id`, recordingIDs, jobIDs, windowStarts, windowEnds, watermarkValues, plan.SelectionAuthority.Cutoff)
+		if err != nil {
+			return nil, fmt.Errorf("load Tier-1 recording exclusions: %w", err)
+		}
+		byID := make(map[int64]int, len(plan.Recordings))
+		for i := range plan.Recordings {
+			byID[plan.Recordings[i].Frozen.RecordingID] = i
+			plan.Recordings[i].ExpectedExclusionsSHA256 = sha256Bytes(nil)
+		}
+		for exclusionRows.Next() {
+			var recordingID, count int64
+			var digest string
+			if err := exclusionRows.Scan(&recordingID, &count, &digest); err != nil {
+				exclusionRows.Close()
+				return nil, err
+			}
+			i, ok := byID[recordingID]
+			if !ok {
+				exclusionRows.Close()
+				return nil, errors.New("Tier-1 exclusion recording differs")
+			}
+			plan.Recordings[i].ExpectedExclusions = count
+			plan.Recordings[i].ExpectedExclusionsSHA256 = digest
+		}
+		if err := exclusionRows.Err(); err != nil {
+			exclusionRows.Close()
+			return nil, err
+		}
+		exclusionRows.Close()
 	}
 	return dayProjections, nil
 }

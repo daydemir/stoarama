@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,7 @@ var joinedMigrationNames = []string{
 	"0137_recording_joined_outputs.sql",
 	"0138_joined_historical_qualification_authority.sql",
 	"0139_joined_historical_completed_recordings.sql",
+	"0140_joined_tier1_resumable_freeze.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
@@ -116,6 +118,24 @@ type joinedHistoricalTier1Fixture struct {
 	callWithContext func(context.Context, joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan)
 	callHistorical  func(joinedHistoricalQualificationRequest) (*httptest.ResponseRecorder, joinedHistoricalQualificationPlan, int64)
 	historicalReq   joinedHistoricalQualificationRequest
+}
+
+func finishJoinedTier1Fixture(t *testing.T, fixture joinedHistoricalTier1Fixture, req joinedTier1FreezeRequest) {
+	t.Helper()
+	for call := 1; call <= len(joinedrecording.Tier1RecordingIDs)+2; call++ {
+		var state string
+		err := fixture.pool.QueryRow(context.Background(), `SELECT state FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).Scan(&state)
+		if err == nil && state != "snapshotting" {
+			return
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		if response, _ := fixture.call(req); response.Code != http.StatusOK {
+			t.Fatalf("finish resumable freeze call=%d status=%d body=%s", call, response.Code, response.Body.String())
+		}
+	}
+	t.Fatal("resumable freeze did not reach building")
 }
 
 func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistoricalTier1Fixture {
@@ -566,6 +586,7 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 			}
 		})
 	}
+	finishJoinedTier1Fixture(t, fixture, req)
 	if err := <-purgeResult; err == nil {
 		t.Fatal("apply-first purge removed a frozen source")
 	}
@@ -685,6 +706,12 @@ func TestJoinedTier1FreezeChunkedSnapshotsPreserveCanonicalPlan(t *testing.T) {
 		applied.FreezeExclusionsSHA256 != fixture.plan.FreezeExclusionsSHA256 {
 		t.Fatalf("chunked apply changed canonical plan: applied=%+v dry=%+v", applied, fixture.plan)
 	}
+	for call := 2; call <= len(joinedrecording.Tier1RecordingIDs)+1; call++ {
+		response, applied = fixture.call(req)
+		if response.Code != http.StatusOK || applied.RequestSHA256 != fixture.plan.RequestSHA256 {
+			t.Fatalf("resumable apply call=%d status=%d body=%s", call, response.Code, response.Body.String())
+		}
+	}
 	if chunks != 33 {
 		t.Fatalf("chunks=%d want=33", chunks)
 	}
@@ -702,11 +729,27 @@ func TestJoinedTier1FreezeChunkedSnapshotsPreserveCanonicalPlan(t *testing.T) {
 	}
 }
 
-func TestJoinedTier1FreezeChunkCancellationRollsBackEverything(t *testing.T) {
+func TestJoinedTier1FreezeChunkCancellationPreservesEarlierReceipts(t *testing.T) {
 	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-chunk-cancel@example.test")
 	defer fixture.cleanup()
-
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
 	chunks := 0
+	fixture.s.joinedFreezeChunkHook = func(context.Context, int) error { chunks++; return nil }
+	for call := 1; call <= 16; call++ {
+		if response, _ := fixture.call(req); response.Code != http.StatusOK {
+			t.Fatalf("apply call=%d status=%d body=%s", call, response.Code, response.Body.String())
+		}
+	}
+	statusRequest := httptest.NewRequest(http.MethodGet,
+		"/api/v1/recording/joined/batches/status?batch_id="+req.BatchID, nil)
+	statusRequest.AddCookie(&http.Cookie{Name: accountSessionCookie, Value: fixture.sessionToken})
+	statusResponse := httptest.NewRecorder()
+	fixture.s.router().ServeHTTP(statusResponse, statusRequest)
+	if statusResponse.Code != http.StatusNotFound {
+		t.Fatalf("partial snapshot leaked through status: status=%d body=%s", statusResponse.Code, statusResponse.Body.String())
+	}
 	callCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fixture.s.joinedFreezeChunkHook = func(ctx context.Context, priority int) error {
@@ -716,26 +759,247 @@ func TestJoinedTier1FreezeChunkCancellationRollsBackEverything(t *testing.T) {
 		}
 		return ctx.Err()
 	}
-	req := fixture.req
-	req.Apply = true
-	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
 	response, _ := fixture.callWithContext(callCtx, req)
 	if response.Code != http.StatusConflict || chunks != 17 {
-		t.Fatalf("canceled chunked apply status=%d chunks=%d body=%s", response.Code, chunks, response.Body.String())
+		t.Fatalf("canceled chunk status=%d chunks=%d body=%s", response.Code, chunks, response.Body.String())
 	}
-	var batches, recordings, days, snapshots, exclusions int
+	var batches, recordings, scopes, receipts, days, snapshots, exclusions int
 	if err := fixture.pool.QueryRow(context.Background(), `SELECT
 		(SELECT count(*) FROM recording_joined_batches WHERE batch_id=$1),
 		(SELECT count(*) FROM recording_joined_batch_recordings WHERE batch_id=$1),
+		(SELECT count(*) FROM recording_joined_snapshot_scopes s JOIN recording_joined_batches b ON b.id=s.batch_record_id WHERE b.batch_id=$1),
+		(SELECT count(*) FROM recording_joined_snapshot_chunks c JOIN recording_joined_batches b ON b.id=c.batch_record_id WHERE b.batch_id=$1),
 		(SELECT count(*) FROM recording_joined_stream_days WHERE batch_id=$1),
 		(SELECT count(*) FROM recording_joined_source_snapshots s JOIN recording_joined_batches b ON b.id=s.batch_record_id WHERE b.batch_id=$1),
 		(SELECT count(*) FROM recording_joined_freeze_exclusions e JOIN recording_joined_batches b ON b.id=e.batch_record_id WHERE b.batch_id=$1)`, req.BatchID).
-		Scan(&batches, &recordings, &days, &snapshots, &exclusions); err != nil {
+		Scan(&batches, &recordings, &scopes, &receipts, &days, &snapshots, &exclusions); err != nil {
 		t.Fatal(err)
 	}
-	if batches != 0 || recordings != 0 || days != 0 || snapshots != 0 || exclusions != 0 {
-		t.Fatalf("canceled apply leaked batches=%d recordings=%d days=%d snapshots=%d exclusions=%d",
-			batches, recordings, days, snapshots, exclusions)
+	if batches != 1 || recordings != 33 || scopes != 462 || receipts != 16 || days != 224 || snapshots != 1 || exclusions != 1 {
+		t.Fatalf("canceled progress batches=%d recordings=%d scopes=%d receipts=%d days=%d snapshots=%d exclusions=%d",
+			batches, recordings, scopes, receipts, days, snapshots, exclusions)
+	}
+	fixture.s.joinedFreezeChunkHook = nil
+	for call := 17; call <= 34; call++ {
+		if response, _ := fixture.call(req); response.Code != http.StatusOK {
+			t.Fatalf("resume call=%d status=%d body=%s", call, response.Code, response.Body.String())
+		}
+	}
+	var state string
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT state FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).Scan(&state); err != nil || state != "building" {
+		t.Fatalf("resumed state=%q err=%v", state, err)
+	}
+}
+
+func TestJoinedTier1FreezeWatermarkExcludesLateClipAndReleaseIsInformational(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-watermark@example.test")
+	defer fixture.cleanup()
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	if response, _ := fixture.call(req); response.Code != http.StatusOK {
+		t.Fatalf("initial snapshot status=%d body=%s", response.Code, response.Body.String())
+	}
+	var capturedRelease time.Time
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT released_at FROM recording_joined_source_snapshots WHERE clip_id=$1`, fixture.clipID).Scan(&capturedRelease); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(context.Background(), `UPDATE recording_clips SET size_bytes=size_bytes+1 WHERE id=$1`, fixture.clipID); err == nil {
+		t.Fatal("denominator-defining update changed a scoped clip")
+	}
+	if _, err := fixture.pool.Exec(context.Background(), `UPDATE recording_clips SET released_at=released_at+interval '1 hour' WHERE id=$1`, fixture.clipID); err != nil {
+		t.Fatalf("released_at bookkeeping was fenced: %v", err)
+	}
+	var recordingID, jobID int64
+	var start time.Time
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT scope.recording_id,scope.recording_job_id,
+		scope.scheduled_start_at FROM recording_joined_snapshot_scopes scope
+		JOIN recording_joined_batch_recordings br ON br.id=scope.batch_recording_id
+		WHERE scope.priority_ordinal=2 AND scope.date_ordinal=1`).Scan(&recordingID, &jobID, &start); err != nil {
+		t.Fatal(err)
+	}
+	var lateClipID int64
+	if err := fixture.pool.QueryRow(context.Background(), `INSERT INTO recording_clips(recording_id,recording_job_id,
+		storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,
+		video_codec,audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,$4,'clips','raw/late-watermark.mp4',
+		'raw/late-watermark.mp4','video/mp4','mp4',12,'etag-late-watermark',$5,60000,'h264',false,$6,$6,$7,$6)
+		RETURNING id`, recordingID, jobID, fixture.storageID, joinedTestSourceEndpoint, strings.Repeat("c", 64), start,
+		start.Add(time.Minute)).Scan(&lateClipID); err != nil {
+		t.Fatal(err)
+	}
+	finishJoinedTier1Fixture(t, fixture, req)
+	var lateEvidence int
+	var storedRelease, rawRelease time.Time
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM recording_joined_source_snapshots WHERE clip_id=$1)+
+		(SELECT count(*) FROM recording_joined_freeze_exclusions WHERE clip_id=$1),
+		(SELECT released_at FROM recording_joined_source_snapshots WHERE clip_id=$2),
+		(SELECT released_at FROM recording_clips WHERE id=$2)`, lateClipID, fixture.clipID).
+		Scan(&lateEvidence, &storedRelease, &rawRelease); err != nil {
+		t.Fatal(err)
+	}
+	if lateEvidence != 0 || !storedRelease.Equal(capturedRelease) || rawRelease.Equal(storedRelease) {
+		t.Fatalf("late evidence=%d stored_release=%v captured=%v raw_release=%v", lateEvidence, storedRelease, capturedRelease, rawRelease)
+	}
+}
+
+func TestJoinedTier1FreezeLinearizesTerminalInsertAboveWatermark(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-insert-fence@example.test")
+	defer fixture.cleanup()
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	started, release := make(chan struct{}), make(chan struct{})
+	fixture.s.joinedFreezeChunkHook = func(context.Context, int) error { close(started); <-release; return nil }
+	applyResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() { response, _ := fixture.call(req); applyResult <- response }()
+	<-started
+	recording := fixture.plan.Recordings[1]
+	day := recording.Qualification.Days[0]
+	lateResult := make(chan struct {
+		id  int64
+		err error
+	}, 1)
+	go func() {
+		var id int64
+		err := fixture.pool.QueryRow(context.Background(), `INSERT INTO recording_clips(recording_id,recording_job_id,
+			storage_destination_id,endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,
+			video_codec,audio_present,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,$3,$4,'clips','raw/concurrent-late.mp4',
+			'raw/concurrent-late.mp4','video/mp4','mp4',12,'etag-concurrent-late',$5,60000,'h264',false,$6,$6,$7,$6)
+			RETURNING id`, recording.Frozen.RecordingID, day.JobID, fixture.storageID, joinedTestSourceEndpoint,
+			strings.Repeat("d", 64), day.WindowStart, day.WindowStart.Add(time.Minute)).Scan(&id)
+		lateResult <- struct {
+			id  int64
+			err error
+		}{id, err}
+	}()
+	waitJoinedDatabaseCondition(t, fixture.pool, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+		WHERE pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE 'INSERT INTO recording_clips%concurrent-late%')`)
+	select {
+	case result := <-lateResult:
+		close(release)
+		t.Fatalf("terminal insert crossed active freeze fence: id=%d err=%v", result.id, result.err)
+	default:
+	}
+	close(release)
+	if response := <-applyResult; response.Code != http.StatusOK {
+		t.Fatalf("apply status=%d body=%s", response.Code, response.Body.String())
+	}
+	late := <-lateResult
+	if late.err != nil || late.id <= recording.SnapshotDays[0].HighWaterClipID {
+		t.Fatalf("late insert id=%d watermark=%d err=%v", late.id, recording.SnapshotDays[0].HighWaterClipID, late.err)
+	}
+	fixture.s.joinedFreezeChunkHook = nil
+	finishJoinedTier1Fixture(t, fixture, req)
+	var evidence int
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM recording_joined_source_snapshots WHERE clip_id=$1)+
+		(SELECT count(*) FROM recording_joined_freeze_exclusions WHERE clip_id=$1)`, late.id).Scan(&evidence); err != nil || evidence != 0 {
+		t.Fatalf("late evidence=%d err=%v", evidence, err)
+	}
+}
+
+func TestJoinedTier1FreezeConcurrentCallsAdvanceDistinctOrderedChunks(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-concurrent@example.test")
+	defer fixture.cleanup()
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	if response, _ := fixture.call(req); response.Code != http.StatusOK {
+		t.Fatalf("initial status=%d body=%s", response.Code, response.Body.String())
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	priorities := make(chan int, 2)
+	fixture.s.joinedFreezeChunkHook = func(_ context.Context, priority int) error {
+		priorities <- priority
+		if priority == 2 {
+			close(started)
+			<-release
+		}
+		return nil
+	}
+	results := make(chan *httptest.ResponseRecorder, 2)
+	go func() { response, _ := fixture.call(req); results <- response }()
+	<-started
+	go func() { response, _ := fixture.call(req); results <- response }()
+	waitJoinedDatabaseCondition(t, fixture.pool, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+		WHERE pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock(137,1)%')`)
+	select {
+	case response := <-results:
+		close(release)
+		t.Fatalf("concurrent call escaped serialization: %d %s", response.Code, response.Body.String())
+	default:
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if response := <-results; response.Code != http.StatusOK {
+			t.Fatalf("concurrent status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	first, second := <-priorities, <-priorities
+	if first != 2 || second != 3 {
+		t.Fatalf("priorities=(%d,%d) want (2,3)", first, second)
+	}
+	var receipts, days int
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM recording_joined_snapshot_chunks),(SELECT count(*) FROM recording_joined_stream_days)`).Scan(&receipts, &days); err != nil || receipts != 3 || days != 42 {
+		t.Fatalf("receipts=%d days=%d err=%v", receipts, days, err)
+	}
+}
+
+func TestJoinedTier1ResumableMigrationRejectsExistingV1Batch(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-migration-gate@example.test")
+	defer fixture.cleanup()
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	finishJoinedTier1Fixture(t, fixture, req)
+	if _, err := fixture.pool.Exec(context.Background(), `DELETE FROM schema_migrations WHERE version='0140_joined_tier1_resumable_freeze.sql'`); err != nil {
+		t.Fatal(err)
+	}
+	err := db.MigrateUp(context.Background(), fixture.pool, findMigrationsDir(t))
+	if err == nil || !strings.Contains(err.Error(), "cannot install denominator v2 while a v1 joined batch exists") {
+		t.Fatalf("migration accepted existing joined batch: %v", err)
+	}
+}
+
+func TestJoinedTier1ChunkReceiptRejectsEqualCountByteSourceTamper(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-receipt-tamper@example.test")
+	defer fixture.cleanup()
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	if response, _ := fixture.call(req); response.Code != http.StatusOK {
+		t.Fatalf("initial status=%d body=%s", response.Code, response.Body.String())
+	}
+	tx, err := fixture.pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	statements := []string{
+		`CREATE TEMP TABLE saved_joined_receipt ON COMMIT DROP AS SELECT * FROM recording_joined_snapshot_chunks WHERE priority_ordinal=1`,
+		`ALTER TABLE recording_joined_snapshot_chunks DISABLE TRIGGER USER`,
+		`DELETE FROM recording_joined_snapshot_chunks WHERE priority_ordinal=1`,
+		`ALTER TABLE recording_joined_snapshot_chunks ENABLE TRIGGER USER`,
+		`ALTER TABLE recording_joined_source_snapshots DISABLE TRIGGER USER`,
+		`UPDATE recording_joined_source_snapshots SET sha256=repeat('e',64) WHERE clip_id=` + fmt.Sprint(fixture.clipID),
+		`ALTER TABLE recording_joined_source_snapshots ENABLE TRIGGER USER`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(context.Background(), statement); err != nil {
+			t.Fatalf("prepare tamper: %v", err)
+		}
+	}
+	_, err = tx.Exec(context.Background(), `INSERT INTO recording_joined_snapshot_chunks(batch_record_id,batch_recording_id,
+		priority_ordinal,recording_id,expected_source_clips,expected_source_bytes,expected_exclusions,
+		expected_exclusions_sha256,actual_source_clips,actual_source_bytes,actual_exclusions,
+		actual_exclusions_sha256,receipt_sha256,completed_at)
+		SELECT batch_record_id,batch_recording_id,priority_ordinal,recording_id,expected_source_clips,
+		expected_source_bytes,expected_exclusions,expected_exclusions_sha256,actual_source_clips,actual_source_bytes,
+		actual_exclusions,actual_exclusions_sha256,receipt_sha256,completed_at FROM saved_joined_receipt`)
+	if err == nil || !strings.Contains(err.Error(), "joined snapshot chunk receipt differs") {
+		t.Fatalf("receipt accepted equal-count/equal-byte source tamper: %v", err)
 	}
 }
 
