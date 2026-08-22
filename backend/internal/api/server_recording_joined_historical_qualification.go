@@ -122,7 +122,7 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 	rows, err := q.Query(ctx, `SELECT expected.recording_id,expected.day_ordinal,r.stream_id,r.name,s.name,
 		r.cron_timezone,r.active_weekdays,r.start_at,r.end_at,j.id,j.fire_at,j.scheduled_for,j.window_end_at,j.completed_at,j.status
 		FROM unnest($2::bigint[],$3::bigint[],$4::integer[]) expected(recording_id,job_id,day_ordinal)
-		JOIN recordings r ON r.id=expected.recording_id AND r.account_id=$1 AND r.status='active'
+		JOIN recordings r ON r.id=expected.recording_id AND r.account_id=$1 AND r.status IN('active','completed')
 		  AND r.mode='continuous' AND r.delivery='nas_pull' AND r.daily_window_start='08:00'::time
 		  AND r.daily_window_end='20:00'::time
 		JOIN streams s ON s.id=r.stream_id
