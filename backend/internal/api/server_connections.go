@@ -21,19 +21,21 @@ import (
 // param routes and literal+method checks for the rest. Default is DENY: any account
 // route not in this allowlist is 403d for a pull-scoped key automatically.
 var (
-	pullDownloadPathRe = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/download$`)
-	pullReleasePathRe  = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
+	pullDownloadPathRe       = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/download$`)
+	pullReleasePathRe        = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
+	pullJoinedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
 )
 
 // pullPathAllowed reports whether a pull-scoped key may call (method, path). It is
 // the single source of truth for pull confinement and is exercised directly by the
-// table tests. The 4 allowed shapes (list + download + release + heartbeat):
+// table tests. The allowed shapes are the raw pull/inventory/certification paths
+// plus the independent joined feed/download/ack paths:
 //   - GET  /api/v1/account/clips                                        (cursor list)
 //   - POST /api/v1/account/connections/heartbeat                       (heartbeat)
 //   - GET  /api/v1/account/recordings/{id}/clips/{clipId}/download      (presign)
 //   - POST /api/v1/account/recordings/{id}/clips/{clipId}/release       (release one clip)
 //
-// The pull key can report its inventory and RELEASE a clip (detach it from the org, keeping the R2 object)
+// The pull key can report its inventory and RELEASE a raw clip (detach it from the org, keeping the R2 object)
 // but can NOT hard-delete: the old DELETE .../clips/{clipId} allowance is removed,
 // so a leaked NAS key can never destroy recorded content.
 func pullPathAllowed(method, path string) bool {
@@ -50,6 +52,12 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/clips/release":
 		return true
+	case method == http.MethodGet && path == "/api/v1/account/joined":
+		return true
+	case method == http.MethodPost && path == "/api/v1/account/joined/ack":
+		return true
+	case method == http.MethodGet && pullJoinedDownloadPathRe.MatchString(path):
+		return true
 	case method == http.MethodGet && pullDownloadPathRe.MatchString(path):
 		return true
 	case method == http.MethodPost && pullReleasePathRe.MatchString(path):
@@ -61,7 +69,7 @@ func pullPathAllowed(method, path string) bool {
 
 // confineAccountScope is registered immediately after requireAccountAuth on the
 // account group, so the principal is already in context. A session or full/read
-// key passes through untouched; a pull-scoped key is allowed ONLY on the 4 pull
+// key passes through untouched; a pull-scoped key is allowed ONLY on the pull
 // endpoints and 403d everywhere else. Default-DENY means a newly added account
 // route is automatically out of reach for a leaked NAS key.
 func (s *Server) confineAccountScope(next http.Handler) http.Handler {
@@ -624,6 +632,15 @@ type connectionHeartbeatRequest struct {
 	Inventory          *connectionInventoryStatus `json:"inventory,omitempty"`
 	Storage            *connectionStorageStatus   `json:"storage,omitempty"`
 	CapacityBlocked    bool                       `json:"capacity_blocked"`
+	JoinedProtocol     int                        `json:"joined_protocol_version"`
+	JoinedDelivery     *connectionJoinedDelivery  `json:"joined_delivery,omitempty"`
+}
+
+type connectionJoinedDelivery struct {
+	ArtifactID  int64      `json:"artifact_id"`
+	Blocker     string     `json:"blocker"`
+	AttemptedAt *time.Time `json:"attempted_at"`
+	RetryAt     *time.Time `json:"retry_at"`
 }
 
 type connectionStorageStatus struct {
@@ -667,6 +684,10 @@ type connectionHeartbeatOutage struct {
 var connectionPhases = map[string]bool{"starting": true, "idle": true, "draining": true, "updating": true, "blocked": true, "degraded": true}
 var connectionPreviousExits = map[string]bool{"unknown": true, "clean": true, "self_update": true, "unclean_process": true, "unclean_reboot": true}
 var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": true, "connection": true, "http": true, "other": true}
+var connectionJoinedBlockers = map[string]bool{
+	"download_failed": true, "hash_mismatch": true, "http_error": true,
+	"io_error": true, "path_conflict": true, "storage_guard": true,
+}
 var inventorySkipReasons = map[string]bool{
 	"changed_during_hash": true, "invalid_sidecar": true, "io_error": true,
 	"permission_denied": true, "unexpected": true, "vanished_during_scan": true,
@@ -733,6 +754,19 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 			(storage.Available && (storage.TotalBytes <= 0 || storage.FreeBytes < 0 || storage.FreeBytes > storage.TotalBytes)) {
 			return errors.New("invalid NAS storage telemetry")
 		}
+	}
+	if req.JoinedProtocol < 0 || req.JoinedProtocol > 1 {
+		return errors.New("invalid joined_protocol_version")
+	}
+	if joined := req.JoinedDelivery; joined != nil {
+		if req.JoinedProtocol != 1 || joined.ArtifactID <= 0 || !connectionJoinedBlockers[joined.Blocker] || joined.AttemptedAt == nil ||
+			joined.AttemptedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) ||
+			(joined.RetryAt != nil && (joined.RetryAt.Before(*joined.AttemptedAt) || joined.RetryAt.After(time.Now().Add(24*time.Hour)))) {
+			return errors.New("invalid joined delivery telemetry")
+		}
+	}
+	if req.JoinedProtocol == 1 && req.ClientVersion == "" {
+		return errors.New("joined protocol capability requires client_version")
 	}
 	if req.ClientVersion == "" {
 		return nil // Backward compatibility for the old NAS client during rollout.
@@ -813,7 +847,13 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryUnmatched = req.Inventory.Unmatched
 		inventoryDigest = req.Inventory.Digest
 	}
-	ct, err := s.pool.Exec(r.Context(), `
+	tx, err := s.pool.Begin(r.Context())
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin heartbeat: %v", err))
+		return
+	}
+	defer func() { _ = tx.Rollback(r.Context()) }()
+	ct, err := tx.Exec(r.Context(), `
 		UPDATE connections
 		SET last_seen_at=now(),
 		    last_cursor_id=GREATEST(last_cursor_id, $1),
@@ -859,6 +899,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    nas_storage_free_bytes=CASE WHEN $33::boolean IS NULL THEN nas_storage_free_bytes WHEN $33 THEN $35 ELSE NULL END,
 		    nas_storage_reported_at=CASE WHEN $33::boolean IS NULL THEN nas_storage_reported_at WHEN $33 THEN now() ELSE NULL END,
 		    nas_capacity_blocked=$40,
+		    joined_protocol_version=$41,
 		    updated_at=now()
 		WHERE api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
@@ -873,7 +914,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
 		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage),
 		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON,
-		req.CapacityBlocked)
+		req.CapacityBlocked, req.JoinedProtocol)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
@@ -882,7 +923,50 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	var connectionID int64
+	if err := tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load heartbeat connection: %v", err))
+		return
+	}
+	joinedDeliveryAccepted := true
+	if joined := req.JoinedDelivery; joined != nil {
+		ct, err := tx.Exec(r.Context(), `
+			UPDATE connections c SET joined_last_attempt_artifact_id=$2,joined_last_blocker=$3,
+			  joined_last_attempt_at=$4,joined_retry_at=$5
+			WHERE c.id=$1 AND c.joined_protocol_version=1 AND EXISTS(
+			  SELECT 1 FROM recording_joined_artifacts a
+			  LEFT JOIN recording_joined_artifacts manifest ON a.artifact_kind='media'
+			    AND manifest.hour_record_id=a.hour_record_id AND manifest.artifact_kind='hour_manifest'
+			  LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
+			    AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
+			  LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id
+			    AND own_ack.connection_id=a.connection_id
+			  WHERE a.id=$2 AND a.connection_id=c.id AND own_ack.artifact_id IS NULL
+			    AND ((a.artifact_kind<>'media' AND a.publication_state='published')
+			      OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
+			    AND (a.artifact_kind='allocation_ledger'
+			      OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
+			        WHERE ack.artifact_id=ledger.id AND ack.connection_id=a.connection_id))
+			      OR (a.artifact_kind='media' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
+			        WHERE ack.artifact_id=manifest.id AND ack.connection_id=a.connection_id))
+			      OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
+			        LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
+			        WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index'
+			          AND ack.artifact_id IS NULL))))`,
+			connectionID, joined.ArtifactID, joined.Blocker, joined.AttemptedAt, joined.RetryAt)
+		if err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("record joined delivery telemetry: %v", err))
+			return
+		}
+		if ct.RowsAffected() == 0 {
+			joinedDeliveryAccepted = false
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit heartbeat: %v", err))
+		return
+	}
+	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "joined_delivery_accepted": joinedDeliveryAccepted})
 }
 
 func storageAvailable(storage *connectionStorageStatus) any {

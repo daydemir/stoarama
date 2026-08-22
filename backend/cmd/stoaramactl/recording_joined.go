@@ -1,0 +1,444 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"slices"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
+)
+
+type joinedFreezeTier1Request struct {
+	ConnectionID          int64  `json:"connection_id"`
+	BatchID               string `json:"batch_id"`
+	Generation            int    `json:"generation"`
+	SourceEndpoint        string `json:"source_endpoint"`
+	QualificationRunID    int64  `json:"qualification_run_id"`
+	ExpectedRequestSHA256 string `json:"expected_request_sha256,omitempty"`
+	Apply                 bool   `json:"apply"`
+}
+
+type joinedSealStreamDayRequest struct {
+	BatchID     string `json:"batch_id"`
+	RecordingID int64  `json:"recording_id"`
+	LocalDate   string `json:"local_date"`
+	Apply       bool   `json:"-"`
+}
+
+type joinedFinalFreezeRequest struct {
+	BatchID                         string `json:"batch_id"`
+	ExpectedFrozenDenominatorSHA256 string `json:"expected_frozen_denominator_sha256"`
+	Apply                           bool   `json:"-"`
+}
+
+type joinedSealBatchIndexRequest struct {
+	BatchID        string `json:"batch_id"`
+	ExpectedSHA256 string `json:"expected_sha256"`
+	Apply          bool   `json:"apply"`
+}
+
+type joinedSealRemainingDaysRequest struct {
+	BatchID                         string `json:"batch_id"`
+	CanaryRecordingID               int64  `json:"canary_recording_id"`
+	CanaryLocalDate                 string `json:"canary_local_date"`
+	ExpectedCanarySealRequestSHA256 string `json:"expected_canary_seal_request_sha256"`
+	Apply                           bool   `json:"-"`
+}
+
+type joinedWorkerRequest struct {
+	BatchID     string `json:"batch_id"`
+	WorkerID    string `json:"worker_id"`
+	ScratchRoot string `json:"scratch_root"`
+}
+
+type joinedStatusRequest struct {
+	BatchID string `json:"batch_id"`
+}
+
+// joinedOperatorService is the narrow boundary between operator parsing and
+// the joined-recording lifecycle. The integration supplies its DB/media/API
+// implementation without teaching the CLI about those clients.
+type joinedOperatorService interface {
+	FreezeTier1(context.Context, joinedFreezeTier1Request) (any, error)
+	SealStreamDay(context.Context, joinedSealStreamDayRequest) (any, error)
+	SealRemainingDays(context.Context, joinedSealRemainingDaysRequest) (any, error)
+	FinalFreeze(context.Context, joinedFinalFreezeRequest) (any, error)
+	SealBatchIndex(context.Context, joinedSealBatchIndexRequest) (any, error)
+	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
+	RunWorker(context.Context, joinedWorkerRequest) error
+	Status(context.Context, joinedStatusRequest) (any, error)
+}
+
+type joinedOperatorFactory func(context.Context, config.Config) (joinedOperatorService, error)
+
+func runRecordingJoined(ctx context.Context, cfg config.Config, args []string) {
+	result, err := runRecordingJoinedWith(ctx, cfg, args, newJoinedOperatorService)
+	if err != nil {
+		log.Fatalf("recording-joined: %v", err)
+	}
+	if result != nil {
+		printJSON(result)
+	}
+	if joinedWorkerIsDisabled(result) {
+		waitForJoinedWorkerShutdown(ctx)
+	}
+}
+
+func newJoinedOperatorService(_ context.Context, cfg config.Config) (joinedOperatorService, error) {
+	return newRemoteJoinedOperatorService(cfg)
+}
+
+func joinedWorkerIsDisabled(result any) bool {
+	status, ok := result.(map[string]any)
+	return ok && status["enabled"] == false && status["status"] == "disabled"
+}
+
+func waitForJoinedWorkerShutdown(ctx context.Context) {
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+}
+
+func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []string, factory joinedOperatorFactory) (any, error) {
+	if len(args) == 0 {
+		return nil, errors.New("expected freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, seal-batch-index, worker run, or status")
+	}
+
+	switch args[0] {
+	case "freeze-tier1":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedFreezeTier1(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.FreezeTier1(ctx, req)
+	case "seal-stream-day":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedSealStreamDay(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if !req.Apply {
+			return map[string]any{"dry_run": true, "request": req}, nil
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.SealStreamDay(ctx, req)
+	case "seal-remaining-days":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedSealRemainingDays(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.SealRemainingDays(ctx, req)
+	case "final-freeze":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedFinalFreeze(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if !req.Apply {
+			return map[string]any{"dry_run": true, "request": req}, nil
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.FinalFreeze(ctx, req)
+	case "seal-batch-index":
+		if err := requireJoinedActiveProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedSealBatchIndex(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.SealBatchIndex(ctx, req)
+	case "worker":
+		if len(args) < 2 || args[1] != "run" {
+			return nil, errors.New("expected worker run")
+		}
+		if cfg.JoinedRecordingRollingEnabled && !cfg.JoinedRecordingEnabled {
+			return nil, errors.New("JOINED_RECORDING_ROLLING_ENABLED requires JOINED_RECORDING_ENABLED")
+		}
+		if !cfg.JoinedRecordingEnabled {
+			return map[string]any{"enabled": false, "status": "disabled"}, nil
+		}
+		req, err := parseJoinedWorker(cfg, args[2:])
+		if err != nil {
+			return nil, err
+		}
+		workerCfg := cfg
+		workerCfg.JoinedRecordingBatchID = req.BatchID
+		workerCfg.JoinedRecordingScratchRoot = req.ScratchRoot
+		if err := workerCfg.ValidateJoinedRecording(); err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, workerCfg)
+		if err != nil {
+			return nil, err
+		}
+		if err := service.CheckWorkerStartup(ctx, req); err != nil {
+			return nil, fmt.Errorf("startup check: %w", err)
+		}
+		if err := service.RunWorker(ctx, req); err != nil {
+			return nil, err
+		}
+		return map[string]any{"batch_id": req.BatchID, "status": "stopped"}, nil
+	case "status":
+		req, err := parseJoinedStatus(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.Status(ctx, req)
+	default:
+		return nil, fmt.Errorf("unknown subcommand %q", args[0])
+	}
+}
+
+func requireJoinedActiveProtocol(cfg config.Config) error {
+	if !cfg.JoinedRecordingEnabled || cfg.JoinedRecordingProtocolVersion != 1 {
+		return errors.New("joined recording mutations require JOINED_RECORDING_ENABLED=true and JOINED_RECORDING_PROTOCOL_VERSION=1")
+	}
+	return nil
+}
+
+func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1Request, error) {
+	req := joinedFreezeTier1Request{BatchID: cfg.JoinedRecordingBatchID, Generation: 1}
+	flags := newJoinedFlagSet("recording-joined freeze-tier1")
+	flags.Int64Var(&req.ConnectionID, "connection-id", 0, "NAS connection identifier")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.IntVar(&req.Generation, "generation", req.Generation, "immutable batch generation")
+	flags.StringVar(&req.SourceEndpoint, "source-endpoint", "", "exact frozen R2 endpoint")
+	flags.Int64Var(&req.QualificationRunID, "qualification-run-id", 0, "immutable qualification run identifier")
+	flags.StringVar(&req.ExpectedRequestSHA256, "expected-request-sha256", "", "request hash returned by dry-run")
+	flags.BoolVar(&req.Apply, "apply", false, "freeze the cohort")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if req.ConnectionID <= 0 {
+		return req, errors.New("--connection-id must be positive")
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
+		return req, errors.New("--batch-id must end with the exact --generation")
+	}
+	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
+		return req, errors.New("--source-endpoint must be the exact supported R2 endpoint")
+	}
+	if req.QualificationRunID <= 0 {
+		return req, errors.New("--qualification-run-id must be positive")
+	}
+	if err := validateExpectedHash("--expected-request-sha256", req.ExpectedRequestSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedSealStreamDay(cfg config.Config, args []string) (joinedSealStreamDayRequest, error) {
+	req := joinedSealStreamDayRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined seal-stream-day")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.Int64Var(&req.RecordingID, "recording-id", 0, "frozen Tier-1 recording identifier")
+	flags.StringVar(&req.LocalDate, "local-date", "", "frozen local date (YYYY-MM-DD)")
+	flags.BoolVar(&req.Apply, "apply", false, "HEAD and seal this exact stream day")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if !slices.Contains(joinedrecording.Tier1RecordingIDs, req.RecordingID) {
+		return req, errors.New("--recording-id must be in the frozen Tier-1 cohort")
+	}
+	date, err := time.Parse("2006-01-02", req.LocalDate)
+	if err != nil || date.Format("2006-01-02") != req.LocalDate {
+		return req, errors.New("--local-date must be YYYY-MM-DD")
+	}
+	return req, nil
+}
+
+func parseJoinedFinalFreeze(cfg config.Config, args []string) (joinedFinalFreezeRequest, error) {
+	req := joinedFinalFreezeRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined final-freeze")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.StringVar(&req.ExpectedFrozenDenominatorSHA256, "expected-frozen-denominator-sha256", "", "apply-time frozen denominator hash")
+	flags.BoolVar(&req.Apply, "apply", false, "freeze the fully sealed batch")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if err := validateExpectedHash("--expected-frozen-denominator-sha256", req.ExpectedFrozenDenominatorSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedSealBatchIndex(cfg config.Config, args []string) (joinedSealBatchIndexRequest, error) {
+	req := joinedSealBatchIndexRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined seal-batch-index")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.StringVar(&req.ExpectedSHA256, "expected-sha256", "", "canonical index hash returned by preview")
+	flags.BoolVar(&req.Apply, "apply", false, "seal the canonical final batch index")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if err := validateExpectedHash("--expected-sha256", req.ExpectedSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedSealRemainingDays(cfg config.Config, args []string) (joinedSealRemainingDaysRequest, error) {
+	req := joinedSealRemainingDaysRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined seal-remaining-days")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.Int64Var(&req.CanaryRecordingID, "canary-recording-id", 0, "approved canary recording identifier")
+	flags.StringVar(&req.CanaryLocalDate, "canary-local-date", "", "approved canary local date")
+	flags.StringVar(&req.ExpectedCanarySealRequestSHA256, "expected-canary-seal-request-sha256", "", "approved canary receipt hash")
+	flags.BoolVar(&req.Apply, "apply", false, "seal the other 461 stream days serially")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if !slices.Contains(joinedrecording.Tier1RecordingIDs, req.CanaryRecordingID) {
+		return req, errors.New("--canary-recording-id must be in the frozen Tier-1 cohort")
+	}
+	date, err := time.Parse("2006-01-02", req.CanaryLocalDate)
+	if err != nil || date.Format("2006-01-02") != req.CanaryLocalDate {
+		return req, errors.New("--canary-local-date must be YYYY-MM-DD")
+	}
+	if err := validateExpectedHash("--expected-canary-seal-request-sha256", req.ExpectedCanarySealRequestSHA256, true); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedWorker(cfg config.Config, args []string) (joinedWorkerRequest, error) {
+	req := joinedWorkerRequest{
+		BatchID:     cfg.JoinedRecordingBatchID,
+		WorkerID:    defaultJoinedWorkerID(),
+		ScratchRoot: cfg.JoinedRecordingScratchRoot,
+	}
+	flags := newJoinedFlagSet("recording-joined worker run")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.StringVar(&req.WorkerID, "worker-id", req.WorkerID, "stable worker identifier")
+	flags.StringVar(&req.ScratchRoot, "scratch-root", req.ScratchRoot, "absolute scratch directory")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	req.WorkerID = strings.TrimSpace(req.WorkerID)
+	if req.WorkerID == "" || len(req.WorkerID) > 128 || strings.IndexFunc(req.WorkerID, func(r rune) bool { return r <= ' ' }) >= 0 {
+		return req, errors.New("--worker-id must be 1-128 non-whitespace characters")
+	}
+	req.ScratchRoot = strings.TrimSpace(req.ScratchRoot)
+	if !filepath.IsAbs(req.ScratchRoot) || filepath.Clean(req.ScratchRoot) != req.ScratchRoot || req.ScratchRoot == string(filepath.Separator) {
+		return req, errors.New("--scratch-root must be a clean absolute non-root path")
+	}
+	return req, nil
+}
+
+func parseJoinedStatus(cfg config.Config, args []string) (joinedStatusRequest, error) {
+	req := joinedStatusRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined status")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	return req, validateJoinedBatchID(req.BatchID)
+}
+
+func newJoinedFlagSet(name string) *flag.FlagSet {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	return flags
+}
+
+func parseJoinedFlags(flags *flag.FlagSet, args []string) error {
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	return nil
+}
+
+func validateJoinedBatchID(value string) error {
+	if !joinedrecording.ValidBatchID(value) {
+		return errors.New("--batch-id must use 1-63 lowercase letters, numbers, or hyphens")
+	}
+	return nil
+}
+
+func validateExpectedHash(flagName, value string, required bool) error {
+	if value == "" && !required {
+		return nil
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size || value != strings.ToLower(value) {
+		return fmt.Errorf("%s must be a lowercase SHA-256 hex digest", flagName)
+	}
+	return nil
+}
+
+func defaultJoinedWorkerID() string {
+	if value := strings.TrimSpace(os.Getenv("RENDER_INSTANCE_ID")); value != "" {
+		return value
+	}
+	if value, err := os.Hostname(); err == nil && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return "joined-worker"
+}

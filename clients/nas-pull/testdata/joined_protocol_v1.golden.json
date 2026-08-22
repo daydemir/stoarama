@@ -1,0 +1,94 @@
+{
+  "feed_responses": {
+    "allocation_ledger": {
+      "item": {
+        "artifact_id": 1001,
+        "connection_id": 77,
+        "batch_id": "goodplus-20260821-generation-1",
+        "hour_id": null,
+        "kind": "allocation_ledger",
+        "content_type": "application/json",
+        "relative_path": "coverage/ledgers/377/2026-05-04.json",
+        "size_bytes": 4096,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "download_path": "/api/v1/account/joined/1001/download",
+        "hour_manifest_id": null,
+        "hour_manifest_relative_path": null,
+        "hour_manifest_sha256": null,
+        "ledger_artifact_id": null,
+        "ledger_relative_path": null,
+        "ledger_sha256": null
+      }
+    },
+    "hour_manifest": {
+      "item": {
+        "artifact_id": 1002,
+        "connection_id": 77,
+        "batch_id": "goodplus-20260821-generation-1",
+        "hour_id": "goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-01__generation-1",
+        "kind": "hour_manifest",
+        "content_type": "application/json",
+        "relative_path": "coverage/hours/goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-01__generation-1.json",
+        "size_bytes": 8192,
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "download_path": "/api/v1/account/joined/1002/download",
+        "hour_manifest_id": null,
+        "hour_manifest_relative_path": null,
+        "hour_manifest_sha256": null,
+        "ledger_artifact_id": 1001,
+        "ledger_relative_path": "coverage/ledgers/377/2026-05-04.json",
+        "ledger_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "media": {
+      "item": {
+        "artifact_id": 1003,
+        "connection_id": 77,
+        "batch_id": "goodplus-20260821-generation-1",
+        "hour_id": "goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-01__generation-1",
+        "kind": "media",
+        "content_type": "video/mp4",
+        "relative_path": "01_North-America_United-States_Cambridge_Kendall-Square/May/Monday/01_Kendall-Square_2026_May_W1_Monday_hour_01_080000-090000.mp4",
+        "size_bytes": 6,
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "download_path": "/api/v1/account/joined/1003/download",
+        "hour_manifest_id": 1002,
+        "hour_manifest_relative_path": "coverage/hours/goodplus-20260821-generation-1__recording-377__date-2026-05-04__hour-01__generation-1.json",
+        "hour_manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "ledger_artifact_id": null,
+        "ledger_relative_path": null,
+        "ledger_sha256": null
+      }
+    },
+    "batch_index": {
+      "item": {
+        "artifact_id": 1004,
+        "connection_id": 77,
+        "batch_id": "goodplus-20260821-generation-1",
+        "hour_id": null,
+        "kind": "batch_index",
+        "content_type": "application/json",
+        "relative_path": "coverage/batch.json",
+        "size_bytes": 16384,
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "download_path": "/api/v1/account/joined/1004/download",
+        "hour_manifest_id": null,
+        "hour_manifest_relative_path": null,
+        "hour_manifest_sha256": null,
+        "ledger_artifact_id": null,
+        "ledger_relative_path": null,
+        "ledger_sha256": null
+      }
+    }
+  },
+  "prepare_response": {
+    "url": "https://joined.example.test/objects/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.mp4?signature=renewable",
+    "etag": "exact-etag",
+    "if_match": "\"exact-etag\"",
+    "version_id": "version-1",
+    "size_bytes": 6,
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "content_type": "video/mp4",
+    "expires_in_sec": 900
+  }
+}

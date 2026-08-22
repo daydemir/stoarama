@@ -166,3 +166,39 @@ func TestBuildStoaramaContinuousPathPreservesLegacyKey(t *testing.T) {
 		t.Fatalf("path=%q want %q", got, want)
 	}
 }
+
+func TestBuildJoinedPathCleanAndGapParts(t *testing.T) {
+	meta := Metadata{PlazaID: "8", Continent: "Europe", Country: "Finland", City: "Kuopio", PlazaName: "Market Square"}
+	folder, err := BuildFolderName(ProfilePlazaHourlyV1, 8, meta, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 125, time.UTC)
+	clean, err := BuildJoinedPath(JoinedPolicy{FolderName: folder, Metadata: meta, CronTimezone: "UTC", ActualStart: start, ActualEnd: start.Add(time.Hour), Hour: 1, Part: 1, Parts: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "08_Europe_Finland_Kuopio_Market_Square/May/Monday/08_Market_Square_2026_May_W1_Monday_hour_01_080000-090000.mp4"
+	if clean != want {
+		t.Fatalf("path=%q want %q", clean, want)
+	}
+	part, err := BuildJoinedPath(JoinedPolicy{FolderName: folder, Metadata: meta, CronTimezone: "UTC", ActualStart: start.Add(14 * time.Minute), ActualEnd: start.Add(32*time.Minute + 7*time.Second), Hour: 1, Part: 2, Parts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "08_Europe_Finland_Kuopio_Market_Square/May/Monday/08_Market_Square_2026_May_W1_Monday_hour_01_part_02_081400-083207.mp4"
+	if part != want {
+		t.Fatalf("path=%q want %q", part, want)
+	}
+}
+
+func TestBuildJoinedPathRejectsCrossDayAndBadPart(t *testing.T) {
+	meta := Metadata{PlazaID: "8", Continent: "Europe", Country: "Finland", City: "Kuopio", PlazaName: "Market Square"}
+	start := time.Date(2026, time.May, 4, 23, 59, 0, 0, time.UTC)
+	if _, err := BuildJoinedPath(JoinedPolicy{FolderName: "safe", Metadata: meta, CronTimezone: "UTC", ActualStart: start, ActualEnd: start.Add(2 * time.Minute), Hour: 1, Part: 1, Parts: 1}); err == nil {
+		t.Fatal("cross-day output was accepted")
+	}
+	if _, err := BuildJoinedPath(JoinedPolicy{FolderName: "safe", Metadata: meta, CronTimezone: "UTC", ActualStart: start.Add(-time.Hour), ActualEnd: start, Hour: 1, Part: 2, Parts: 1}); err == nil {
+		t.Fatal("bad part ordinal was accepted")
+	}
+}

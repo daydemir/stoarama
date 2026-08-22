@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import signal
 import socket
@@ -25,6 +26,7 @@ import urllib.parse
 import urllib.request
 from enum import Enum
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
 LIST_PAGE_LIMIT = 200
@@ -44,6 +46,10 @@ INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 JOINED_ROOT = "joined"
+JOINED_PROTOCOL_VERSION = 1
+JOINED_RANGE_BYTES = 64 * 1024 * 1024
+JOINED_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
+JOINED_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 
 INVENTORY_SKIP_REASONS = frozenset((
     "changed_during_hash", "invalid_sidecar", "io_error",
@@ -106,6 +112,19 @@ class ToolProcessError(MediaCertificationError):
 
 class DeterministicMediaError(MediaCertificationError):
     pass
+
+
+class JoinedDownloadYield(RuntimeError):
+    pass
+
+
+class RejectJoinedRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, _request, _file_pointer, _code, _message, _headers, _new_url):
+        return None
+
+
+def open_joined_url(request):
+    return urllib.request.build_opener(RejectJoinedRedirects()).open(request, timeout=HTTP_TIMEOUT_SEC)
 
 
 def inventory_skip_reason(exc, sidecar):
@@ -235,6 +254,9 @@ class Config:
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
+        # Dormant by default. Version 1 is activated only for a specifically
+        # approved connection after the backend feed and capacity gates pass.
+        self.joined_protocol_version = env_int("STOARAMA_JOINED_PROTOCOL_VERSION", 0)
         # Release/deploy safe by default. Operators enable only after migration,
         # API and a completed clean inventory are independently verified.
         self.native_stitch_enabled = env_str("STOARAMA_NATIVE_STITCH_ENABLED", "false").lower() == "true"
@@ -255,6 +277,8 @@ class Config:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
             raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
+        if self.joined_protocol_version not in (0, JOINED_PROTOCOL_VERSION):
+            raise SystemExit("STOARAMA_JOINED_PROTOCOL_VERSION must be 0 or %d" % JOINED_PROTOCOL_VERSION)
 
 
 def boot_id():
@@ -911,6 +935,7 @@ class Runtime:
         self.list_succeeded = False
         self.stable_marked = False
         self.inventory = inventory
+        self.joined_protocol_version = getattr(cfg, "joined_protocol_version", 0)
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1036,6 +1061,7 @@ class Runtime:
                 "client_last_error_at": self.last_error_at,
                 "last_batch": self.batch.copy(),
                 "capacity_blocked": self.capacity_blocked,
+                "joined_protocol_version": self.joined_protocol_version,
             }
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
@@ -2371,6 +2397,2336 @@ def download_verified(url, temp_path, expected_bytes, expected_sha):
         raise RuntimeError("download checksum mismatch")
 
 
+def valid_joined_item(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("joined item is invalid")
+    fields = {
+        "artifact_id", "connection_id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+        "download_path", "ledger_artifact_id", "ledger_relative_path", "ledger_sha256",
+        "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
+    }
+    if set(raw) != fields:
+        raise ValueError("joined item has invalid fields")
+    artifact_id = raw.get("artifact_id")
+    connection_id = raw.get("connection_id")
+    size_bytes = raw.get("size_bytes")
+    if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id < 1:
+        raise ValueError("joined item has invalid id")
+    if isinstance(connection_id, bool) or not isinstance(connection_id, int) or connection_id < 1 or connection_id > 2**63 - 1:
+        raise ValueError("joined item has invalid connection_id")
+    if (
+        isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+        or size_bytes < 1 or size_bytes > JOINED_MAX_BYTES
+    ):
+        raise ValueError("joined item has invalid size_bytes")
+    batch_id = raw.get("batch_id")
+    if not isinstance(batch_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", batch_id):
+        raise ValueError("joined item has invalid batch_id")
+    relative_raw = raw.get("relative_path")
+    if not isinstance(relative_raw, str):
+        raise ValueError("joined item has invalid relative_path")
+    relative = Path(relative_raw)
+    if (
+        not relative_raw or relative.is_absolute() or relative_raw != relative.as_posix()
+        or "\\" in relative_raw or any(part in ("", ".", "..") for part in relative.parts)
+        or relative.parts[0] == JOINED_ROOT
+    ):
+        raise ValueError("joined item has invalid relative_path")
+    sha256 = valid_sha256(raw.get("sha256"), "joined item")
+    kind = raw.get("kind")
+    content_type = raw.get("content_type")
+    hour_id = raw.get("hour_id")
+    if kind not in ("allocation_ledger", "hour_manifest", "media", "batch_index"):
+        raise ValueError("joined item has invalid kind")
+    if content_type != ("video/mp4" if kind == "media" else "application/json"):
+        raise ValueError("joined item has invalid content_type")
+    if kind != "media" and size_bytes > JOINED_MANIFEST_MAX_BYTES:
+        raise ValueError("joined JSON artifact exceeds size cap")
+    if kind == "batch_index":
+        if hour_id is not None or relative.as_posix() != "coverage/batch.json":
+            raise ValueError("joined batch index has invalid hour identity or path")
+    elif kind == "allocation_ledger":
+        ledger_match = re.fullmatch(r"coverage/ledgers/([1-9][0-9]*)/([0-9]{4}-[0-9]{2}-[0-9]{2})\.json", relative_raw)
+        if hour_id is not None or ledger_match is None:
+            raise ValueError("joined allocation ledger has invalid hour identity or path")
+        try:
+            if datetime.date.fromisoformat(ledger_match.group(2)).isoformat() != ledger_match.group(2):
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("joined allocation ledger has invalid date") from exc
+    elif not valid_joined_hour_id(batch_id, hour_id):
+        raise ValueError("joined item has invalid hour identity")
+    manifest_path = "coverage/hours/%s.json" % hour_id if hour_id is not None else None
+    if kind == "hour_manifest" and relative_raw != manifest_path:
+        raise ValueError("joined hour manifest has invalid suffix")
+    if kind == "media" and not relative_raw.endswith(".mp4"):
+        raise ValueError("joined media has invalid suffix")
+    ledger_id = raw.get("ledger_artifact_id")
+    ledger_path = raw.get("ledger_relative_path")
+    ledger_sha = raw.get("ledger_sha256")
+    manifest_id = raw.get("hour_manifest_id")
+    manifest_relative_path = raw.get("hour_manifest_relative_path")
+    manifest_sha = raw.get("hour_manifest_sha256")
+    if kind == "media":
+        if isinstance(manifest_id, bool) or not isinstance(manifest_id, int) or manifest_id < 1:
+            raise ValueError("joined media has invalid hour_manifest_id")
+        manifest_relative_path = valid_joined_relative_path(manifest_relative_path, ".json")
+        if manifest_relative_path != manifest_path:
+            raise ValueError("joined media has invalid hour manifest path")
+        manifest_sha = valid_sha256(manifest_sha, "joined media manifest")
+    elif any(value is not None for value in (manifest_id, manifest_relative_path, manifest_sha)):
+        raise ValueError("joined non-media item has manifest binding")
+    if kind == "hour_manifest":
+        if isinstance(ledger_id, bool) or not isinstance(ledger_id, int) or ledger_id < 1:
+            raise ValueError("joined hour manifest has invalid ledger_artifact_id")
+        ledger_path = valid_joined_relative_path(ledger_path, ".json")
+        if not re.fullmatch(r"coverage/ledgers/[1-9][0-9]*/[0-9]{4}-[0-9]{2}-[0-9]{2}\.json", ledger_path):
+            raise ValueError("joined hour manifest has invalid ledger path")
+        ledger_sha = valid_sha256(ledger_sha, "joined allocation ledger")
+    elif any(value is not None for value in (ledger_id, ledger_path, ledger_sha)):
+        raise ValueError("joined non-manifest item has ledger binding")
+    download_path = raw.get("download_path")
+    if not isinstance(download_path, str):
+        raise ValueError("joined item has invalid download_path")
+    if download_path != "/api/v1/account/joined/%d/download" % artifact_id:
+        raise ValueError("joined item has invalid download_path")
+    return {
+        "id": artifact_id, "connection_id": connection_id, "batch_id": batch_id, "hour_id": hour_id, "kind": kind,
+        "content_type": content_type, "relative_path": relative.as_posix(), "size_bytes": size_bytes,
+        "sha256": sha256, "download_path": download_path, "ledger_artifact_id": ledger_id,
+        "ledger_relative_path": ledger_path, "ledger_sha256": ledger_sha,
+        "hour_manifest_id": manifest_id,
+        "hour_manifest_relative_path": manifest_relative_path, "hour_manifest_sha256": manifest_sha,
+    }
+
+
+def valid_joined_hour_id(batch_id, value):
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(
+        re.escape(batch_id) + r"__recording-([1-9][0-9]*)__date-([0-9]{4}-[0-9]{2}-[0-9]{2})__hour-(0[1-9]|1[0-2])__generation-([1-9][0-9]*)",
+        value,
+    )
+    if match is None:
+        return False
+    try:
+        return datetime.date.fromisoformat(match.group(2)).isoformat() == match.group(2)
+    except ValueError:
+        return False
+
+
+def valid_sha256(value, label):
+    if not isinstance(value, str) or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+        raise ValueError("joined item has invalid sha256")
+    return value
+
+
+def valid_joined_relative_path(value, suffix=None):
+    if not isinstance(value, str):
+        raise ValueError("joined item has invalid relative_path")
+    raw = value
+    relative = Path(raw)
+    if (
+        not raw or relative.is_absolute() or raw != relative.as_posix() or "\\" in raw
+        or any(part in ("", ".", "..") for part in relative.parts) or relative.parts[0] == JOINED_ROOT
+        or (suffix is not None and not raw.endswith(suffix))
+    ):
+        raise ValueError("joined item has invalid relative_path")
+    return relative.as_posix()
+
+
+def normalized_etag(value):
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("joined item has invalid etag")
+    raw = value
+    if raw.startswith("W/"):
+        raise ValueError("joined item has weak etag")
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        raw = raw[1:-1]
+    if not raw or len(raw) > 256 or '"' in raw or any(ord(ch) < 33 or ord(ch) > 126 for ch in raw):
+        raise ValueError("joined item has invalid etag")
+    return raw
+
+
+def joined_output_path(cfg, item):
+    return cfg.output_dir / JOINED_ROOT / item["batch_id"] / item["relative_path"]
+
+
+def open_joined_output_dir(cfg, item, create=True):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(cfg.output_dir), flags)
+    parts = (JOINED_ROOT, item["batch_id"], *Path(item["relative_path"]).parts[:-1])
+    try:
+        for part in parts:
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise ExistingFileMismatch("joined manifest directory is missing")
+                os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                os.fsync(descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def joined_entry_stat(directory_fd, name):
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISREG(current.st_mode):
+        raise ExistingFileMismatch("joined entry is not a regular file")
+    return current
+
+
+def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise ExistingFileMismatch("joined entry is not a regular file")
+        while True:
+            if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                raise JoinedDownloadYield("joined hashing yielded to raw clip delivery")
+            chunk = os.read(descriptor, JOINED_RANGE_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        path_after = joined_entry_stat(directory_fd, name)
+        if (
+            path_after is None or certification_identity(before) != certification_identity(after)
+            or certification_identity(after) != certification_identity(path_after)
+        ):
+            raise FileChangedDuringHash("joined file changed while hashing")
+    finally:
+        os.close(descriptor)
+    return size, digest.hexdigest(), after
+
+
+def verify_joined_entry(cfg, runtime, directory_fd, name, expected_bytes, expected_sha, stop_event):
+    if joined_entry_stat(directory_fd, name) is None:
+        return False
+    size, digest, _ = hash_joined_entry(cfg, runtime, directory_fd, name, stop_event)
+    if size != expected_bytes or digest != expected_sha:
+        raise ExistingFileMismatch("existing joined entry does not match API checksum: %s" % name)
+    return True
+
+
+def joined_transfer_marker_bytes(item, prepared):
+    payload = {
+        "schema_version": 3,
+        **{key: item[key] for key in (
+            "id", "connection_id", "batch_id", "hour_id", "kind", "content_type", "relative_path", "size_bytes", "sha256",
+            "download_path", "ledger_artifact_id", "ledger_relative_path", "ledger_sha256",
+            "hour_manifest_id", "hour_manifest_relative_path", "hour_manifest_sha256",
+        )},
+        "etag": prepared["etag"],
+        "version_id": prepared["version_id"],
+        "url_scheme": prepared["url_scheme"],
+        "url_authority": prepared["url_authority"],
+        "url_path": prepared["url_path"],
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def verify_joined_sidecar(cfg, runtime, directory_fd, name, expected, stop_event):
+    if joined_entry_stat(directory_fd, name) is None:
+        return False
+    size, digest, _ = hash_joined_entry(cfg, runtime, directory_fd, name, stop_event)
+    return size == len(expected) and digest == hashlib.sha256(expected).hexdigest()
+
+
+def valid_joined_timestamp(value, label):
+    if not isinstance(value, str) or not value:
+        raise ValueError("joined manifest has invalid %s" % label)
+    match = re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})", value)
+    if match is None:
+        raise ValueError("joined manifest has invalid %s" % label)
+    fraction = match.group(1) or ""
+    if fraction.endswith("0"):
+        raise ValueError("joined manifest has noncanonical %s" % label)
+    normalized = value.replace("Z", "+00:00")
+    if match.group(1) and len(match.group(1)) > 6:
+        normalized = normalized.replace("." + match.group(1), "." + match.group(1)[:6], 1)
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("joined manifest has invalid %s" % label) from exc
+    if parsed.tzinfo is None:
+        raise ValueError("joined manifest has invalid %s" % label)
+    return parsed
+
+
+def positive_joined_int(value, label, allow_zero=False):
+    minimum = 0 if allow_zero else 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or value > 2**63 - 1:
+        raise ValueError("joined manifest has invalid %s" % label)
+    return value
+
+
+def valid_joined_int64(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or not -(2**63) <= value <= 2**63 - 1:
+        raise ValueError("joined manifest has invalid %s" % label)
+    return value
+
+
+JOINED_REASON = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
+JOINED_BATCH = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+SOURCE_ENDPOINT_V1 = re.compile(r"https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com\Z")
+QUALIFICATION_FIELDS = ("local_date", "qualification_window_ordinal", "job_id", "window_start", "window_end", "completed_at")
+OBJECT_FIELDS = ("key", "etag", "size_bytes", "sha256")
+SEAM_FIELDS = ("verdict", "reason", "signed_gap_nanoseconds")
+SOURCE_FIELDS = (
+    "clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket",
+    "start_utc", "end_utc", "released_at", "object", "seam_to_previous",
+)
+CROSS_HOUR_FIELDS = (
+    "previous_delivery_hour", "next_delivery_hour", "previous_clip_id", "next_clip_id",
+    "previous_presentation_end_utc", "next_presentation_start_utc", "signed_gap_nanoseconds",
+    "scheduled_utc", "actual_seam_utc", "boundary_skew_nanoseconds", "allocation_decision", "verdict", "reason",
+)
+CROSS_DAY_FIELDS = (
+    "previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc",
+    "signed_gap_nanoseconds", "scheduled_previous_end_utc", "scheduled_next_start_utc",
+    "boundary_skew_nanoseconds", "allocation_decision", "verdict", "reason",
+)
+MEDIA_TOOL_FIELDS = ("ffmpeg_version", "ffmpeg_sha256", "ffprobe_version", "ffprobe_sha256", "identity_sha256")
+
+JOINED_OBJECT_ORDERS = {}
+for _joined_order in (
+    ("schema_version", "policy_version", "status", "batch_id", "hour_id", "recording_id", "timezone", "local_date", "delivery_hour", "clock_hour", "scheduled_start_utc", "scheduled_end_utc", "qualification_day", "qualification_sha256", "allocation", "media_tool", "source_claim_sha256", "source_count", "sources", "source_dispositions", "gaps", "scheduled_gap", "quarantine_reason_code", "quarantine_evidence", "media"),
+    QUALIFICATION_FIELDS,
+    ("artifact_id", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "hour_source_claim_sha256", "boundaries", "cross_day_boundaries"),
+    CROSS_HOUR_FIELDS, CROSS_DAY_FIELDS, MEDIA_TOOL_FIELDS,
+    SOURCE_FIELDS,
+    ("clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket", "start_utc", "end_utc", "released_at", "object", "audio_sequence_contract", "seam_to_previous"),
+    OBJECT_FIELDS, ("key", "version_id", "etag", "size_bytes", "sha256"), SEAM_FIELDS,
+    ("clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"),
+    ("artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes", "sha256", "actual_start_utc", "actual_end_utc", "utc_offset_seconds", "media_tool_identity", "source_clip_ids", "verification", "maximality_evidence"),
+    ("status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("duration_seconds", "tracks"),
+    ("duration_seconds", "tracks", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
+    ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "first_timestamp", "last_timestamp", "timestamp_status"),
+    ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "decoded_samples", "first_timestamp", "last_timestamp", "timestamp_status"),
+    ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"),
+    ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding", "edit_list_kind", "edit_list_sha256"),
+    ("reason_code", "signed_gap_nanoseconds", "no_allocatable_sources"),
+    ("schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date", "qualification_day", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "source_clip_count", "source_bytes", "first_clip_id", "last_clip_id", "consecutive_pairs", "sources", "hours", "hour_source_claim_sha256", "cross_hour_boundaries", "cross_day_boundaries", "ledger_sha256"),
+    ("previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc", "signed_gap_nanoseconds"),
+    ("delivery_hour", "clock_hour", "source_clip_ids"),
+    ("reason_code", "source_clip_ids", "source_claim_sha256", "policy_version", "normalized_failure_facts", "failure_sha256", "evidence_sha256", "isolated_attempt_count", "media_tool_identity"),
+    ("candidate_clip_ids", "reason_code", "source_claim_sha256", "policy_version", "evidence_sha256", "normalized_failure_facts", "failure_sha256", "repeat_count", "media_tool_identity"),
+    ("schema_version", "policy_version", "allocation_schema_version", "hour_manifest_schema_version", "batch_id", "generation", "frozen_at", "batch_generation_sha256", "frozen_denominator_sha256", "recording_ids", "selection_authority", "frozen_recordings", "media_tool", "expected_ledger_count", "scheduled_hour_count", "source_clip_count", "source_bytes", "final_media_artifact_count", "allocation_ledgers", "hours"),
+    ("selection_basis", "ordered_recording_ids_sha256", "cutoff", "qualification_run_id", "qualification_run_frozen_at", "qualification_rule_version", "qualification_cohort_sha256", "qualification_windows_sha256", "selected_qualification_windows_sha256"),
+    ("recording_id", "priority_ordinal", "selection_tier", "qualification_sha256", "completed_at", "timezone", "folder_name", "naming_metadata"),
+    ("plaza_id", "continent", "country", "city", "plaza_name"),
+    ("artifact_id", "recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count", "source_bytes", "scheduled_hour_ids"),
+    ("hour_manifest_artifact_id", "hour_id", "recording_id", "local_date", "delivery_hour", "status", "relative_path", "object_key", "size_bytes", "sha256", "source_count", "source_bytes", "media_artifact_count"),
+    ("previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"),
+    ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",),
+    ("source_claim_sha256", "reason_code", "failure_sha256", "policy_version", "media_tool_identity", "repeat_count"),
+    ("clip_id", "source_claim_sha256"),
+    ("clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket", "object_key", "start_utc", "end_utc", "size_bytes", "ingest_sha256", "released_at"),
+    ("projection_version", "selection_authority", "recordings", "days"),
+    ("recording_id", "priority_ordinal", "selection_tier", "completed_at"),
+    ("recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_count", "source_bytes"),
+    ("recording_id", "qualification_sha256"),
+    ("recording_id", "timezone", "days", "frozen_at", "evidence_sha256"),
+):
+    JOINED_OBJECT_ORDERS.setdefault(frozenset(_joined_order), set()).add(_joined_order)
+
+
+def exact_joined_fields(value, fields, label):
+    expected = set(fields)
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("joined %s has invalid fields" % label)
+    allowed = JOINED_OBJECT_ORDERS.get(frozenset(expected))
+    if allowed is not None and tuple(value) not in allowed:
+        raise ValueError("joined %s has noncanonical field order" % label)
+    return value
+
+
+def valid_joined_string(value, label, allow_empty=False, maximum=4096):
+    if not isinstance(value, str) or len(value) > maximum or (not allow_empty and not value) or any(ord(ch) < 32 for ch in value):
+        raise ValueError("joined %s has invalid string" % label)
+    return value
+
+
+def valid_joined_reason(value, label, allow_empty=False):
+    if value == "" and allow_empty:
+        return value
+    if not isinstance(value, str) or JOINED_REASON.fullmatch(value) is None:
+        raise ValueError("joined %s has invalid reason" % label)
+    return value
+
+
+def valid_joined_date(value, label="local_date"):
+    try:
+        if not isinstance(value, str) or datetime.date.fromisoformat(value).isoformat() != value:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("joined %s is invalid" % label) from exc
+    return value
+
+
+def joined_canonical_bytes(value):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return (
+        raw.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").encode("utf-8")
+    )
+
+
+def joined_canonical_sha(value):
+    return hashlib.sha256(joined_canonical_bytes(value)).hexdigest()
+
+
+def decode_joined_json(content):
+    def pairs(values):
+        keys = tuple(key for key, _value in values)
+        allowed = JOINED_OBJECT_ORDERS.get(frozenset(keys))
+        if (allowed is not None and keys not in allowed) or (allowed is None and keys != tuple(sorted(keys))):
+            raise ValueError("joined JSON object has noncanonical field order")
+        out = {}
+        for key, value in values:
+            if key in out:
+                raise ValueError("joined JSON contains a duplicate field")
+            out[key] = value
+        return out
+    def finite_float(raw):
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("joined JSON contains a non-finite number")
+        return value
+    try:
+        payload = json.loads(
+            content.decode("utf-8"), object_pairs_hook=pairs,
+            parse_float=finite_float,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("joined JSON contains a non-finite number")),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("joined JSON artifact is not valid UTF-8 JSON") from exc
+    if content != joined_canonical_bytes(payload):
+        raise ValueError("joined JSON artifact is not canonical")
+    return payload
+
+
+def joined_timestamp_nanoseconds(value, label):
+    parsed = valid_joined_timestamp(value, label)
+    match = re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?(?:Z|[+-][0-9]{2}:[0-9]{2})", value)
+    if match is None:
+        raise ValueError("joined manifest has invalid %s" % label)
+    fraction = int((match.group(1) or "").ljust(9, "0"))
+    whole = parsed.astimezone(datetime.timezone.utc).replace(microsecond=0) - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    return (whole.days * 86400 + whole.seconds) * 1_000_000_000 + fraction
+
+
+def joined_timestamp_is_go_zero(parsed):
+    try:
+        return parsed.astimezone(datetime.timezone.utc) == datetime.datetime(1, 1, 1, tzinfo=datetime.timezone.utc)
+    except OverflowError:
+        return False
+
+
+def source_claim_projection(source):
+    projected = {key: source[key] for key in (
+        "clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket",
+        "start_utc", "end_utc", "released_at", "object",
+    )}
+    projected["seam_to_previous"] = {"verdict": "", "reason": "", "signed_gap_nanoseconds": 0}
+    return projected
+
+
+def source_claim_sha(sources):
+    # Go's empty source-only slice is nil and therefore serializes as null.
+    return joined_canonical_sha([source_claim_projection(source) for source in sources] if sources else None)
+
+
+def candidate_source_claim_sha(sources):
+    return joined_canonical_sha([
+        {"clip_id": source["clip_id"], "source_claim_sha256": source_claim_sha([source])}
+        for source in sources
+    ])
+
+
+def frozen_source_sha(sources, qualification_day, recording_id):
+    window_start = joined_timestamp_nanoseconds(qualification_day["window_start"], "qualification window_start")
+    window_end = joined_timestamp_nanoseconds(qualification_day["window_end"], "qualification window_end")
+    snapshots = []
+    seen_clips, seen_locators = set(), set()
+    for source in sources:
+        clip_id = valid_source(source, recording_id, source_only=True)
+        locator = (source["storage_destination_id"],) + tuple(source[key] for key in ("provider", "endpoint", "region", "bucket")) + (source["object"]["key"],)
+        start_ns = joined_timestamp_nanoseconds(source["start_utc"], "source start_utc")
+        end_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end_utc")
+        if (
+            clip_id in seen_clips or locator in seen_locators
+            or source["recording_job_id"] != qualification_day["job_id"]
+            or end_ns <= window_start or start_ns >= window_end
+        ):
+            raise ValueError("joined frozen source identity conflicts")
+        seen_clips.add(clip_id)
+        seen_locators.add(locator)
+        snapshots.append({
+            "clip_id": clip_id,
+            "recording_id": source["recording_id"],
+            "recording_job_id": source["recording_job_id"],
+            "storage_destination_id": source["storage_destination_id"],
+            "provider": source["provider"],
+            "endpoint": source["endpoint"],
+            "region": source["region"],
+            "bucket": source["bucket"],
+            "object_key": source["object"]["key"],
+            "start_utc": source["start_utc"],
+            "end_utc": source["end_utc"],
+            "size_bytes": source["object"]["size_bytes"],
+            "ingest_sha256": source["object"]["sha256"],
+            "released_at": source["released_at"],
+        })
+    return joined_canonical_sha(snapshots)
+
+
+def valid_qualification_day(day, recording_id, timezone, local_date):
+    exact_joined_fields(day, QUALIFICATION_FIELDS, "qualification day")
+    if (
+        day["local_date"] != valid_joined_date(local_date)
+        or not 1 <= positive_joined_int(day["qualification_window_ordinal"], "qualification_window_ordinal") <= 14
+        or positive_joined_int(day["job_id"], "job_id") < 1
+    ):
+        raise ValueError("joined qualification day identity conflicts")
+    try:
+        location = ZoneInfo(valid_joined_string(timezone, "timezone", maximum=255))
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("joined timezone is invalid") from exc
+    start_ns = joined_timestamp_nanoseconds(day["window_start"], "qualification window_start")
+    end_ns = joined_timestamp_nanoseconds(day["window_end"], "qualification window_end")
+    completed_ns = joined_timestamp_nanoseconds(day["completed_at"], "qualification completed_at")
+    if (
+        end_ns - start_ns != 12 * 3_600_000_000_000 or completed_ns < end_ns
+        or start_ns != local_boundary_nanoseconds(local_date, location, 8)
+        or end_ns != local_boundary_nanoseconds(local_date, location, 20)
+    ):
+        raise ValueError("joined qualification day is invalid")
+
+
+def valid_media_tool(tool):
+    exact_joined_fields(tool, MEDIA_TOOL_FIELDS, "media tool")
+    valid_joined_string(tool["ffmpeg_version"], "ffmpeg_version")
+    valid_joined_string(tool["ffprobe_version"], "ffprobe_version")
+    valid_sha256(tool["ffmpeg_sha256"], "ffmpeg")
+    valid_sha256(tool["ffprobe_sha256"], "ffprobe")
+    identity = valid_sha256(tool["identity_sha256"], "media tool")
+    unsealed = dict(tool)
+    unsealed["identity_sha256"] = ""
+    if joined_canonical_sha(unsealed) != identity:
+        raise ValueError("joined media tool identity conflicts")
+
+
+def valid_source(source, recording_id, source_only=False, location=None, local_date=None):
+    fields = set(SOURCE_FIELDS)
+    if not isinstance(source, dict) or set(source) not in (fields, fields | {"audio_sequence_contract"}):
+        raise ValueError("joined source has invalid fields")
+    clip_id = positive_joined_int(source["clip_id"], "clip_id")
+    if source["recording_id"] != recording_id:
+        raise ValueError("joined source recording identity conflicts")
+    positive_joined_int(source["recording_job_id"], "recording_job_id")
+    positive_joined_int(source["storage_destination_id"], "storage_destination_id")
+    if source["provider"] != "r2" or source["region"] != "auto" or not isinstance(source["bucket"], str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", source["bucket"]) is None:
+        raise ValueError("joined source storage identity is invalid")
+    endpoint = source["endpoint"]
+    if not isinstance(endpoint, str) or SOURCE_ENDPOINT_V1.fullmatch(endpoint) is None:
+        raise ValueError("joined source endpoint is not a canonical HTTPS authority")
+    start = valid_joined_timestamp(source["start_utc"], "source start_utc")
+    end = valid_joined_timestamp(source["end_utc"], "source end_utc")
+    start_ns = joined_timestamp_nanoseconds(source["start_utc"], "source start_utc")
+    end_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end_utc")
+    if end_ns <= start_ns or end_ns - start_ns > 15 * 60 * 1_000_000_000:
+        raise ValueError("joined source range is invalid")
+    if source["released_at"] is not None:
+        released_at = valid_joined_timestamp(source["released_at"], "source released_at")
+        if joined_timestamp_is_go_zero(released_at):
+            raise ValueError("joined source released_at is zero")
+    if location is not None and local_date is not None and (start.astimezone(location).date().isoformat() != local_date or end.astimezone(location).date().isoformat() != local_date):
+        raise ValueError("joined source local date conflicts")
+    object_fields = set(OBJECT_FIELDS)
+    if isinstance(source["object"], dict) and "version_id" in source["object"]:
+        object_fields.add("version_id")
+    exact_joined_fields(source["object"], object_fields, "source object")
+    key = valid_joined_string(source["object"]["key"], "source object key")
+    if key in (".", "..") or key.startswith("/") or posixpath.normpath(key) != key or "\\" in key or "\0" in key:
+        raise ValueError("joined source object key is unsafe")
+    etag = source["object"]["etag"]
+    if not isinstance(etag, str) or not 1 <= len(etag) <= 256 or etag.startswith("W/") or '"' in etag or any(not 0x21 <= ord(ch) <= 0x7e for ch in etag):
+        raise ValueError("joined source object ETag is invalid")
+    if "version_id" in source["object"]:
+        version_id = source["object"]["version_id"]
+        if not isinstance(version_id, str) or not 1 <= len(version_id) <= 1024 or any(not 0x21 <= ord(ch) <= 0x7e for ch in version_id):
+            raise ValueError("joined source object version_id is invalid")
+    positive_joined_int(source["object"]["size_bytes"], "source object size_bytes")
+    valid_sha256(source["object"]["sha256"], "source object")
+    exact_joined_fields(source["seam_to_previous"], SEAM_FIELDS, "source seam")
+    if source_only:
+        if "audio_sequence_contract" in source or source["seam_to_previous"] != {"verdict": "", "reason": "", "signed_gap_nanoseconds": 0}:
+            raise ValueError("joined source-only claim contains derived evidence")
+    else:
+        valid_joined_string(source["seam_to_previous"]["verdict"], "source seam verdict", allow_empty=True)
+        valid_joined_string(source["seam_to_previous"]["reason"], "source seam reason", allow_empty=True)
+        valid_joined_int64(source["seam_to_previous"]["signed_gap_nanoseconds"], "source seam gap")
+        if "audio_sequence_contract" in source:
+            valid_audio_contract(source["audio_sequence_contract"])
+    return clip_id
+
+
+def valid_derived_source_seams(sources):
+    empty = {"verdict": "", "reason": "", "signed_gap_nanoseconds": 0}
+    if sources and sources[0]["seam_to_previous"] != empty:
+        raise ValueError("joined first source has prior-seam evidence")
+    for previous, following in zip(sources, sources[1:]):
+        seam = following["seam_to_previous"]
+        signed_gap = joined_timestamp_nanoseconds(following["start_utc"], "seam next start") - joined_timestamp_nanoseconds(previous["end_utc"], "seam previous end")
+        valid_joined_reason(seam["reason"], "source seam reason")
+        valid = (
+            (seam["verdict"] == "continuous" and signed_gap == 0)
+            or (seam["verdict"] == "gap" and signed_gap > 0)
+            or (seam["verdict"] == "overlap" and signed_gap < 0)
+            or seam["verdict"] == "incompatible"
+        )
+        if not valid or seam["signed_gap_nanoseconds"] != signed_gap:
+            raise ValueError("joined derived source seam conflicts")
+
+
+def valid_boundary(boundary, cross_day=False):
+    exact_joined_fields(boundary, CROSS_DAY_FIELDS if cross_day else CROSS_HOUR_FIELDS, "boundary")
+    if not cross_day:
+        previous = positive_joined_int(boundary["previous_delivery_hour"], "previous_delivery_hour")
+        following = positive_joined_int(boundary["next_delivery_hour"], "next_delivery_hour")
+        if following != previous + 1 or following > 12:
+            raise ValueError("joined boundary hour identity conflicts")
+        valid_joined_timestamp(boundary["scheduled_utc"], "boundary scheduled_utc")
+    else:
+        valid_joined_timestamp(boundary["scheduled_previous_end_utc"], "boundary scheduled_previous_end_utc")
+        valid_joined_timestamp(boundary["scheduled_next_start_utc"], "boundary scheduled_next_start_utc")
+    pairs = (
+        ("previous_clip_id", "previous_presentation_end_utc"),
+        ("next_clip_id", "next_presentation_start_utc"),
+    )
+    present = []
+    for id_key, time_key in pairs:
+        clip_id, timestamp = boundary[id_key], boundary[time_key]
+        if (clip_id is None) != (timestamp is None):
+            raise ValueError("joined boundary has partial source identity")
+        if clip_id is not None:
+            positive_joined_int(clip_id, id_key)
+            valid_joined_timestamp(timestamp, time_key)
+            present.append(True)
+        else:
+            present.append(False)
+    signed_gap = boundary["signed_gap_nanoseconds"]
+    if (signed_gap is None) != (not all(present)) or (signed_gap is not None and (isinstance(signed_gap, bool) or not isinstance(signed_gap, int))):
+        raise ValueError("joined boundary has invalid signed gap")
+    if signed_gap is not None:
+        valid_joined_int64(signed_gap, "boundary signed gap")
+        want_gap = joined_timestamp_nanoseconds(boundary["next_presentation_start_utc"], "boundary next start") - joined_timestamp_nanoseconds(boundary["previous_presentation_end_utc"], "boundary previous end")
+        if signed_gap != want_gap:
+            raise ValueError("joined boundary signed gap conflicts")
+    actual = None if cross_day else boundary["actual_seam_utc"]
+    skew = boundary["boundary_skew_nanoseconds"]
+    if actual is not None:
+        valid_joined_timestamp(actual, "boundary actual_seam_utc")
+    if skew is not None:
+        valid_joined_int64(skew, "boundary skew")
+    valid_joined_reason(boundary["allocation_decision"], "boundary allocation_decision")
+    valid_joined_reason(boundary["verdict"], "boundary verdict")
+    valid_joined_reason(boundary["reason"], "boundary reason")
+
+
+def local_boundary_nanoseconds(local_date, location, hour, day_delta=0):
+    day = datetime.date.fromisoformat(local_date) + datetime.timedelta(days=day_delta)
+    value = datetime.datetime(day.year, day.month, day.day, hour, tzinfo=location)
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    utc = value.astimezone(datetime.timezone.utc)
+    delta = utc - epoch
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000
+
+
+def validate_cross_hour_boundaries(payload, location, local_date):
+    sources = payload["sources"]
+    minimum = consumed = 0
+    for index, boundary in enumerate(payload["cross_hour_boundaries"]):
+        consumed += len(payload["hours"][index]["source_clip_ids"])
+        scheduled_ns = local_boundary_nanoseconds(local_date, location, 9 + index)
+        if joined_timestamp_nanoseconds(boundary["scheduled_utc"], "boundary scheduled_utc") != scheduled_ns:
+            raise ValueError("joined allocation ledger boundary schedule conflicts")
+        if not sources:
+            if boundary != {
+                "previous_delivery_hour": index + 1, "next_delivery_hour": index + 2,
+                "previous_clip_id": None, "next_clip_id": None,
+                "previous_presentation_end_utc": None, "next_presentation_start_utc": None,
+                "signed_gap_nanoseconds": None, "scheduled_utc": boundary["scheduled_utc"],
+                "actual_seam_utc": None, "boundary_skew_nanoseconds": None,
+                "allocation_decision": "no_sources", "verdict": "absent_source",
+                "reason": "both_sources_absent",
+            }:
+                raise ValueError("joined source-free boundary conflicts")
+            continue
+        candidates = []
+        for position in range(minimum, len(sources) + 1):
+            if position:
+                source = sources[position - 1]
+                at_ns = joined_timestamp_nanoseconds(source["end_utc"], "source end")
+                candidates.append((abs(at_ns - scheduled_ns), at_ns, position, source["clip_id"], source["end_utc"]))
+            if position < len(sources):
+                source = sources[position]
+                at_ns = joined_timestamp_nanoseconds(source["start_utc"], "source start")
+                candidates.append((abs(at_ns - scheduled_ns), at_ns, position, source["clip_id"], source["start_utc"]))
+        _, best_ns, best_position, _, best_at = min(candidates)
+        if consumed != best_position:
+            raise ValueError("joined allocation ledger is not assigned at the closest frozen seam")
+        previous = sources[best_position - 1] if best_position else None
+        following = sources[best_position] if best_position < len(sources) else None
+        if (
+            boundary["previous_clip_id"] != (previous["clip_id"] if previous else None)
+            or boundary["previous_presentation_end_utc"] != (previous["end_utc"] if previous else None)
+            or boundary["next_clip_id"] != (following["clip_id"] if following else None)
+            or boundary["next_presentation_start_utc"] != (following["start_utc"] if following else None)
+        ):
+            raise ValueError("joined allocation ledger boundary source identity conflicts")
+        if previous is None or following is None:
+            decision, reason = ("no_source_before_boundary", "previous_source_absent") if previous is None else ("no_source_after_boundary", "next_source_absent")
+            if (
+                boundary["signed_gap_nanoseconds"] is not None or boundary["actual_seam_utc"] is not None
+                or boundary["boundary_skew_nanoseconds"] is not None
+                or boundary["allocation_decision"] != decision or boundary["verdict"] != "absent_source"
+                or boundary["reason"] != reason
+            ):
+                raise ValueError("joined allocation ledger absent boundary conflicts")
+        else:
+            gap = joined_timestamp_nanoseconds(following["start_utc"], "source start") - joined_timestamp_nanoseconds(previous["end_utc"], "source end")
+            if (
+                boundary["signed_gap_nanoseconds"] != gap
+                or joined_timestamp_nanoseconds(boundary["actual_seam_utc"], "boundary actual seam") != best_ns
+                or boundary["boundary_skew_nanoseconds"] != best_ns - scheduled_ns
+                or boundary["allocation_decision"] != "split_before_next_source"
+                or boundary["verdict"] != "allocated" or boundary["reason"] != "closest_source_boundary"
+            ):
+                raise ValueError("joined allocation ledger closest boundary conflicts")
+        minimum = best_position
+
+
+def validate_cross_day_boundaries(payload, location, local_date):
+    sources = payload["sources"]
+    schedules = (
+        (local_boundary_nanoseconds(local_date, location, 20, -1), local_boundary_nanoseconds(local_date, location, 8)),
+        (local_boundary_nanoseconds(local_date, location, 20), local_boundary_nanoseconds(local_date, location, 8, 1)),
+    )
+    for index, (boundary, schedule) in enumerate(zip(payload["cross_day_boundaries"], schedules)):
+        previous_scheduled = joined_timestamp_nanoseconds(boundary["scheduled_previous_end_utc"], "scheduled previous end")
+        next_scheduled = joined_timestamp_nanoseconds(boundary["scheduled_next_start_utc"], "scheduled next start")
+        if (previous_scheduled, next_scheduled) != schedule or previous_scheduled >= next_scheduled:
+            raise ValueError("joined cross-day boundary schedule conflicts")
+        previous_present = boundary["previous_clip_id"] is not None
+        next_present = boundary["next_clip_id"] is not None
+        if boundary["verdict"] == "absent_source":
+            if previous_present and next_present or boundary["signed_gap_nanoseconds"] is not None or boundary["boundary_skew_nanoseconds"] is not None:
+                raise ValueError("joined cross-day absent boundary conflicts")
+            reason, decision = ("previous_source_absent", "no_previous_day_source")
+            if index == 0 and previous_present:
+                reason, decision = "next_source_absent", "empty_day_after_previous_source"
+            elif index == 1:
+                reason, decision = "next_source_absent", "no_next_day_source"
+                if next_present:
+                    reason, decision = "previous_source_absent", "empty_day_before_next_source"
+            if boundary["reason"] != reason or boundary["allocation_decision"] != decision:
+                raise ValueError("joined cross-day absence reason conflicts")
+        else:
+            if not previous_present or not next_present:
+                raise ValueError("joined cross-day boundary lacks adjacent sources")
+            gap = joined_timestamp_nanoseconds(boundary["next_presentation_start_utc"], "cross-day next start") - joined_timestamp_nanoseconds(boundary["previous_presentation_end_utc"], "cross-day previous end")
+            skew = gap - (next_scheduled - previous_scheduled)
+            verdict = "overlap" if gap < 0 else "scheduled_gap"
+            if (
+                boundary["signed_gap_nanoseconds"] != gap or boundary["boundary_skew_nanoseconds"] != skew
+                or boundary["verdict"] != verdict or boundary["allocation_decision"] != "separate_local_days"
+                or boundary["reason"] != "scheduled_day_boundary"
+            ):
+                raise ValueError("joined cross-day boundary classification conflicts")
+    if sources and (
+        payload["cross_day_boundaries"][0]["next_clip_id"] != sources[0]["clip_id"]
+        or payload["cross_day_boundaries"][0]["next_presentation_start_utc"] != sources[0]["start_utc"]
+        or payload["cross_day_boundaries"][1]["previous_clip_id"] != sources[-1]["clip_id"]
+        or payload["cross_day_boundaries"][1]["previous_presentation_end_utc"] != sources[-1]["end_utc"]
+    ):
+        raise ValueError("joined cross-day boundary does not bind stream-day edges")
+
+
+def valid_allocation_ledger(payload):
+    fields = {
+        "schema_version", "batch_id", "generation", "recording_id", "timezone", "local_date",
+        "qualification_day", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "source_clip_count", "source_bytes",
+        "first_clip_id", "last_clip_id", "consecutive_pairs", "sources", "hours", "hour_source_claim_sha256",
+        "cross_hour_boundaries", "cross_day_boundaries", "ledger_sha256",
+    }
+    exact_joined_fields(payload, fields, "allocation ledger")
+    if payload["schema_version"] != 1 or not isinstance(payload["batch_id"], str) or JOINED_BATCH.fullmatch(payload["batch_id"]) is None:
+        raise ValueError("joined allocation ledger identity is invalid")
+    positive_joined_int(payload["generation"], "generation")
+    recording_id = positive_joined_int(payload["recording_id"], "recording_id")
+    local_date = valid_joined_date(payload["local_date"])
+    valid_qualification_day(payload["qualification_day"], recording_id, payload["timezone"], local_date)
+    location = ZoneInfo(payload["timezone"])
+    valid_sha256(payload["qualification_sha256"], "qualification")
+    valid_sha256(payload["frozen_source_sha256"], "frozen source")
+    source_count = positive_joined_int(payload["source_clip_count"], "source_clip_count", allow_zero=True)
+    source_bytes = positive_joined_int(payload["source_bytes"], "source_bytes", allow_zero=True)
+    if not isinstance(payload["sources"], list) or len(payload["sources"]) != source_count:
+        raise ValueError("joined allocation ledger source count conflicts")
+    source_ids, object_ids, calculated_bytes = [], set(), 0
+    for source in payload["sources"]:
+        source_ids.append(valid_source(source, recording_id, source_only=True, location=location, local_date=local_date))
+        object_identity = (source["storage_destination_id"],) + tuple(source[key] for key in ("provider", "endpoint", "region", "bucket")) + tuple(source["object"].get(key, "") for key in ("key", "version_id", "etag"))
+        if object_identity in object_ids:
+            raise ValueError("joined allocation ledger duplicates a source object")
+        object_ids.add(object_identity)
+        calculated_bytes += source["object"]["size_bytes"]
+    for previous, following in zip(payload["sources"], payload["sources"][1:]):
+        if (joined_timestamp_nanoseconds(following["start_utc"], "source start") , following["clip_id"]) <= (joined_timestamp_nanoseconds(previous["start_utc"], "source start"), previous["clip_id"]):
+            raise ValueError("joined allocation ledger source order conflicts")
+    if len(source_ids) != len(set(source_ids)) or calculated_bytes != source_bytes:
+        raise ValueError("joined allocation ledger source denominator conflicts")
+    if frozen_source_sha(payload["sources"], payload["qualification_day"], recording_id) != payload["frozen_source_sha256"]:
+        raise ValueError("joined allocation ledger frozen source identity conflicts")
+    if (payload["first_clip_id"], payload["last_clip_id"]) != ((source_ids[0], source_ids[-1]) if source_ids else (None, None)):
+        raise ValueError("joined allocation ledger edge identity conflicts")
+    pair_fields = {
+        "previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc",
+        "signed_gap_nanoseconds",
+    }
+    if not isinstance(payload["consecutive_pairs"], list) or len(payload["consecutive_pairs"]) != max(0, source_count - 1):
+        raise ValueError("joined allocation ledger pair count conflicts")
+    for index, pair in enumerate(payload["consecutive_pairs"], 1):
+        exact_joined_fields(pair, pair_fields, "allocation pair")
+        previous, following = payload["sources"][index - 1], payload["sources"][index]
+        previous_end = valid_joined_timestamp(pair["previous_presentation_end_utc"], "pair previous end")
+        following_start = valid_joined_timestamp(pair["next_presentation_start_utc"], "pair next start")
+        gap = joined_timestamp_nanoseconds(pair["next_presentation_start_utc"], "pair next start") - joined_timestamp_nanoseconds(pair["previous_presentation_end_utc"], "pair previous end")
+        valid_joined_int64(pair["signed_gap_nanoseconds"], "pair signed gap")
+        if pair["previous_clip_id"] != previous["clip_id"] or pair["next_clip_id"] != following["clip_id"] or pair["previous_presentation_end_utc"] != previous["end_utc"] or pair["next_presentation_start_utc"] != following["start_utc"] or pair["signed_gap_nanoseconds"] != gap:
+            raise ValueError("joined allocation ledger pair conflicts")
+    if not isinstance(payload["hours"], list) or len(payload["hours"]) != 12 or not isinstance(payload["hour_source_claim_sha256"], list) or len(payload["hour_source_claim_sha256"]) != 12:
+        raise ValueError("joined allocation ledger must contain 12 hours")
+    flat_ids, cursor = [], 0
+    for index, hour in enumerate(payload["hours"], 1):
+        exact_joined_fields(hour, {"delivery_hour", "clock_hour", "source_clip_ids"}, "allocation hour")
+        if hour["delivery_hour"] != index or hour["clock_hour"] != index + 7 or not isinstance(hour["source_clip_ids"], list):
+            raise ValueError("joined allocation ledger hour identity conflicts")
+        count = len(hour["source_clip_ids"])
+        hour_sources = payload["sources"][cursor:cursor + count]
+        if hour["source_clip_ids"] != [source["clip_id"] for source in hour_sources] or source_claim_sha(hour_sources) != payload["hour_source_claim_sha256"][index - 1]:
+            raise ValueError("joined allocation ledger hour source claim conflicts")
+        flat_ids.extend(hour["source_clip_ids"])
+        cursor += count
+    if flat_ids != source_ids or source_claim_sha(payload["sources"]) != valid_sha256(payload["source_claim_sha256"], "allocation source claim"):
+        raise ValueError("joined allocation ledger ordered source claim conflicts")
+    if not isinstance(payload["cross_hour_boundaries"], list) or len(payload["cross_hour_boundaries"]) != 11 or not isinstance(payload["cross_day_boundaries"], list) or len(payload["cross_day_boundaries"]) != 2:
+        raise ValueError("joined allocation ledger boundary count conflicts")
+    for index, boundary in enumerate(payload["cross_hour_boundaries"], 1):
+        valid_boundary(boundary)
+        if boundary["previous_delivery_hour"] != index:
+            raise ValueError("joined allocation ledger boundary order conflicts")
+    for boundary in payload["cross_day_boundaries"]:
+        valid_boundary(boundary, cross_day=True)
+    validate_cross_hour_boundaries(payload, location, local_date)
+    validate_cross_day_boundaries(payload, location, local_date)
+    ledger_sha = valid_sha256(payload["ledger_sha256"], "allocation ledger")
+    unsealed = dict(payload)
+    unsealed["ledger_sha256"] = ""
+    if joined_canonical_sha(unsealed) != ledger_sha:
+        raise ValueError("joined allocation ledger seal conflicts")
+    return payload
+
+
+def recording_ids_sha(recording_ids):
+    return hashlib.sha256("".join("%d\n" % recording_id for recording_id in recording_ids).encode("ascii")).hexdigest()
+
+
+def joined_naming_token(value):
+    out = []
+    for character in value.strip():
+        if character in "-.":
+            out.append(character)
+        elif character == "_" or character.isspace():
+            out.append("_")
+        elif character.isascii() and character.isalnum():
+            out.append(character)
+    return re.sub(r"_+", "_", "".join(out)).strip("_.")
+
+
+def joined_folder_name(recording_id, metadata, raw_folder):
+    plaza_id = metadata["plaza_id"].strip()
+    if not plaza_id.isascii() or not plaza_id.isdigit() or int(plaza_id) <= 0:
+        raise ValueError("joined frozen plaza identity is invalid")
+    for key in ("continent", "country", "city", "plaza_name"):
+        if not metadata[key].strip():
+            raise ValueError("joined frozen naming metadata is incomplete")
+    if raw_folder.strip():
+        parts = raw_folder.strip().strip("/").split("/")
+        clean = [joined_naming_token(part) for part in parts]
+        if not clean or any(part in ("", ".", "..") for part in clean):
+            raise ValueError("joined frozen folder is invalid")
+        return "/".join(clean)
+    return "_".join((
+        "%02d" % int(plaza_id), joined_naming_token(metadata["continent"]),
+        joined_naming_token(metadata["country"]), joined_naming_token(metadata["city"]),
+        joined_naming_token(metadata["plaza_name"]),
+    ))
+
+
+def joined_delivery_path(frozen, media, delivery_hour):
+    location = ZoneInfo(frozen["timezone"])
+    start = valid_joined_timestamp(media["actual_start_utc"], "delivery start").astimezone(location)
+    end = valid_joined_timestamp(media["actual_end_utc"], "delivery end").astimezone(location)
+    if end <= start or start.date() != end.date() or not 1 <= delivery_hour <= 12:
+        raise ValueError("joined delivery range is invalid")
+    ordinal = positive_joined_int(media["part"], "delivery part")
+    parts = positive_joined_int(media["parts"], "delivery parts")
+    if ordinal > parts or (parts == 1 and ordinal != 1):
+        raise ValueError("joined delivery part is invalid")
+    month = start.strftime("%B")
+    weekday = start.strftime("%A")
+    plaza_id = "%02d" % int(frozen["naming_metadata"]["plaza_id"].strip())
+    base = "%s_%s_%04d_%s_W%d_%s_hour_%02d" % (
+        plaza_id, joined_naming_token(frozen["naming_metadata"]["plaza_name"]), start.year,
+        month, (start.day - 1) // 7 + 1, weekday, delivery_hour,
+    )
+    if parts > 1:
+        base += "_part_%02d" % ordinal
+    base += "_%s-%s.mp4" % (start.strftime("%H%M%S"), end.strftime("%H%M%S"))
+    return "/".join((frozen["folder_name"], month, weekday, base))
+
+
+def selected_qualification_windows_sha(recordings):
+    return joined_canonical_sha([
+        {"recording_id": recording["recording_id"], "qualification_sha256": recording["qualification_sha256"]}
+        for recording in recordings
+    ])
+
+
+def qualification_window_sha(recording, days, cutoff, run_frozen_at):
+    if len(days) != 14:
+        raise ValueError("joined qualification window must contain 14 days")
+    cutoff_ns = joined_timestamp_nanoseconds(cutoff, "selection cutoff")
+    run_frozen_ns = joined_timestamp_nanoseconds(run_frozen_at, "qualification run frozen_at")
+    seen_jobs = set()
+    previous_date = None
+    completed = None
+    for ordinal, day in enumerate(days, 1):
+        valid_qualification_day(day, recording["recording_id"], recording["timezone"], day["local_date"])
+        date = datetime.date.fromisoformat(day["local_date"])
+        job_id = day["job_id"]
+        completed_ns = joined_timestamp_nanoseconds(day["completed_at"], "qualification completed_at")
+        if (
+            day["qualification_window_ordinal"] != ordinal or job_id in seen_jobs
+            or (previous_date is not None and date != previous_date + datetime.timedelta(days=1))
+            or joined_timestamp_nanoseconds(day["window_start"], "qualification window_start") < run_frozen_ns
+            or completed_ns > cutoff_ns
+        ):
+            raise ValueError("joined qualification window conflicts")
+        seen_jobs.add(job_id)
+        previous_date = date
+        completed = completed_ns if completed is None else max(completed, completed_ns)
+    if completed != joined_timestamp_nanoseconds(recording["completed_at"], "recording completed_at"):
+        raise ValueError("joined recording completion conflicts with qualification window")
+    return joined_canonical_sha({
+        "recording_id": recording["recording_id"],
+        "timezone": recording["timezone"],
+        "days": days,
+        "frozen_at": cutoff,
+        "evidence_sha256": "",
+    })
+
+
+def valid_selection_authority(authority, recording_ids, frozen_recordings):
+    fields = {
+        "selection_basis", "ordered_recording_ids_sha256", "cutoff", "qualification_run_id",
+        "qualification_run_frozen_at", "qualification_rule_version", "qualification_cohort_sha256",
+        "qualification_windows_sha256", "selected_qualification_windows_sha256",
+    }
+    exact_joined_fields(authority, fields, "selection authority")
+    cutoff = valid_joined_timestamp(authority["cutoff"], "selection cutoff")
+    cutoff_ns = joined_timestamp_nanoseconds(authority["cutoff"], "selection cutoff")
+    run_frozen = valid_joined_timestamp(authority["qualification_run_frozen_at"], "qualification run frozen_at")
+    run_frozen_ns = joined_timestamp_nanoseconds(authority["qualification_run_frozen_at"], "qualification run frozen_at")
+    rule = valid_joined_string(authority["qualification_rule_version"], "qualification rule version", maximum=128)
+    if (
+        authority["selection_basis"] != "operator_approved_ordered_cohort_v1" or not authority["cutoff"].endswith("Z")
+        or cutoff.utcoffset() != datetime.timedelta(0) or joined_timestamp_is_go_zero(cutoff)
+        or joined_timestamp_is_go_zero(run_frozen)
+        or authority["ordered_recording_ids_sha256"] != recording_ids_sha(recording_ids)
+        or run_frozen_ns > cutoff_ns or rule.strip() != rule or len(rule.encode("utf-8")) > 128
+        or positive_joined_int(authority["qualification_run_id"], "qualification_run_id") < 1
+    ):
+        raise ValueError("joined selection authority conflicts")
+    for key in ("qualification_cohort_sha256", "qualification_windows_sha256", "selected_qualification_windows_sha256"):
+        valid_sha256(authority[key], "selection authority")
+    if selected_qualification_windows_sha(frozen_recordings) != authority["selected_qualification_windows_sha256"]:
+        raise ValueError("joined selected qualification evidence conflicts")
+    return cutoff_ns
+
+
+def frozen_denominator_sha(selection_authority, recordings, ledgers):
+    return joined_canonical_sha({
+        "projection_version": 1,
+        "selection_authority": selection_authority,
+        "recordings": [{
+            "recording_id": recording["recording_id"],
+            "priority_ordinal": recording["priority_ordinal"],
+            "selection_tier": recording["selection_tier"],
+            "completed_at": recording["completed_at"],
+        } for recording in recordings],
+        "days": [{
+            "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
+            "qualification_sha256": ledger["qualification_sha256"],
+            "frozen_source_sha256": ledger["frozen_source_sha256"],
+            "source_count": ledger["source_count"] if "source_count" in ledger else ledger["source_clip_count"],
+            "source_bytes": ledger["source_bytes"],
+        } for ledger in ledgers],
+    })
+
+
+def batch_generation_sha(payload):
+    evidence_ledgers = [{
+        "recording_id": ledger["recording_id"], "local_date": ledger["local_date"],
+        "qualification_sha256": ledger["qualification_sha256"], "source_claim_sha256": ledger["source_claim_sha256"],
+        "ledger_sha256": ledger["ledger_sha256"], "source_count": ledger["source_count"],
+        "source_bytes": ledger["source_bytes"],
+    } for ledger in payload["allocation_ledgers"]]
+    return joined_canonical_sha({
+        "schema_version": payload["schema_version"], "policy_version": payload["policy_version"],
+        "batch_id": payload["batch_id"], "generation": payload["generation"], "frozen_at": payload["frozen_at"],
+        "frozen_denominator_sha256": payload["frozen_denominator_sha256"],
+        "selection_authority": payload["selection_authority"], "frozen_recordings": payload["frozen_recordings"],
+        "media_tool_identity": payload["media_tool"]["identity_sha256"],
+        "expected_ledger_count": payload["expected_ledger_count"], "scheduled_hour_count": payload["scheduled_hour_count"],
+        "source_clip_count": payload["source_clip_count"], "source_bytes": payload["source_bytes"],
+        "ledgers": evidence_ledgers,
+    })
+
+
+def valid_batch_index(payload, item=None):
+    fields = {
+        "schema_version", "policy_version", "allocation_schema_version", "hour_manifest_schema_version",
+        "batch_id", "generation", "frozen_at", "batch_generation_sha256", "frozen_denominator_sha256",
+        "recording_ids", "selection_authority", "frozen_recordings", "media_tool", "expected_ledger_count",
+        "scheduled_hour_count", "source_clip_count", "source_bytes", "final_media_artifact_count",
+        "allocation_ledgers", "hours",
+    }
+    exact_joined_fields(payload, fields, "batch index")
+    if payload["schema_version"] != 1 or payload["policy_version"] != "joined-delivery-v1" or payload["allocation_schema_version"] != 1 or payload["hour_manifest_schema_version"] != 1:
+        raise ValueError("joined batch index schema conflicts")
+    batch_id = payload["batch_id"]
+    if not isinstance(batch_id, str) or JOINED_BATCH.fullmatch(batch_id) is None:
+        raise ValueError("joined batch index identity is invalid")
+    generation = positive_joined_int(payload["generation"], "generation")
+    frozen_at_ns = joined_timestamp_nanoseconds(payload["frozen_at"], "frozen_at")
+    valid_sha256(payload["frozen_denominator_sha256"], "frozen denominator")
+    recording_ids = payload["recording_ids"]
+    if not isinstance(recording_ids, list) or not recording_ids or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in recording_ids) or len(set(recording_ids)) != len(recording_ids):
+        raise ValueError("joined batch recording identities are invalid")
+    valid_media_tool(payload["media_tool"])
+    frozen_fields = {"recording_id", "priority_ordinal", "selection_tier", "qualification_sha256", "completed_at", "timezone", "folder_name", "naming_metadata"}
+    naming_fields = {"plaza_id", "continent", "country", "city", "plaza_name"}
+    if not isinstance(payload["frozen_recordings"], list) or len(payload["frozen_recordings"]) != len(recording_ids):
+        raise ValueError("joined frozen recording count conflicts")
+    for ordinal, (recording_id, frozen) in enumerate(zip(recording_ids, payload["frozen_recordings"]), 1):
+        exact_joined_fields(frozen, frozen_fields, "frozen recording")
+        exact_joined_fields(frozen["naming_metadata"], naming_fields, "frozen recording naming")
+        if frozen["recording_id"] != recording_id or frozen["priority_ordinal"] != ordinal or frozen["selection_tier"] != "good+":
+            raise ValueError("joined frozen recording order conflicts")
+        try:
+            ZoneInfo(valid_joined_string(frozen["timezone"], "frozen timezone", maximum=255))
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("joined frozen timezone is invalid") from exc
+        valid_sha256(frozen["qualification_sha256"], "recording qualification")
+        if joined_timestamp_is_go_zero(valid_joined_timestamp(frozen["completed_at"], "completed_at")):
+            raise ValueError("joined frozen recording completion is zero")
+        for key, value in frozen["naming_metadata"].items():
+            valid_joined_string(value, "frozen naming %s" % key)
+        if valid_joined_relative_path(frozen["folder_name"]) != joined_folder_name(recording_id, frozen["naming_metadata"], frozen["folder_name"]):
+            raise ValueError("joined frozen recording folder conflicts")
+    cutoff_ns = valid_selection_authority(payload["selection_authority"], recording_ids, payload["frozen_recordings"])
+    if frozen_at_ns < cutoff_ns or any(joined_timestamp_nanoseconds(recording["completed_at"], "completed_at") > cutoff_ns for recording in payload["frozen_recordings"]):
+        raise ValueError("joined batch selection cutoff conflicts")
+    ledgers, hours = payload["allocation_ledgers"], payload["hours"]
+    expected_ledger_count = positive_joined_int(payload["expected_ledger_count"], "expected_ledger_count")
+    scheduled_hour_count = positive_joined_int(payload["scheduled_hour_count"], "scheduled_hour_count")
+    positive_joined_int(payload["source_clip_count"], "source_clip_count", allow_zero=True)
+    positive_joined_int(payload["source_bytes"], "source_bytes", allow_zero=True)
+    positive_joined_int(payload["final_media_artifact_count"], "final_media_artifact_count", allow_zero=True)
+    if not isinstance(ledgers, list) or expected_ledger_count != len(ledgers) or expected_ledger_count != len(recording_ids) * 14 or not isinstance(hours, list) or scheduled_hour_count != len(hours) or scheduled_hour_count != expected_ledger_count * 12:
+        raise ValueError("joined batch denominator shape conflicts")
+    ledger_fields = {
+        "artifact_id", "recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256",
+        "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count",
+        "source_bytes", "scheduled_hour_ids",
+    }
+    seen_artifacts, expected_hours = set(), {}
+    source_count = source_bytes = 0
+    previous_date = None
+    for index, ledger in enumerate(ledgers):
+        exact_joined_fields(ledger, ledger_fields, "batch ledger reference")
+        recording_id, day_index = recording_ids[index // 14], index % 14
+        local_date = valid_joined_date(ledger["local_date"])
+        parsed_date = datetime.date.fromisoformat(local_date)
+        if (
+            ledger["recording_id"] != recording_id
+            or ledger["qualification_sha256"] != payload["frozen_recordings"][index // 14]["qualification_sha256"]
+            or (day_index and parsed_date != previous_date + datetime.timedelta(days=1))
+        ):
+            raise ValueError("joined batch ledger order conflicts")
+        previous_date = parsed_date
+        artifact_id = positive_joined_int(ledger["artifact_id"], "ledger artifact_id")
+        if artifact_id in seen_artifacts:
+            raise ValueError("joined batch artifact identity is duplicated")
+        seen_artifacts.add(artifact_id)
+        relative = "coverage/ledgers/%d/%s.json" % (recording_id, local_date)
+        if ledger["relative_path"] != relative or ledger["object_key"] != "joined/%s/%s" % (batch_id, relative):
+            raise ValueError("joined batch ledger path conflicts")
+        if positive_joined_int(ledger["size_bytes"], "ledger size_bytes") > JOINED_MANIFEST_MAX_BYTES:
+            raise ValueError("joined batch ledger exceeds JSON size cap")
+        for key in ("qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "sha256", "ledger_sha256"):
+            valid_sha256(ledger[key], "batch ledger")
+        source_count += positive_joined_int(ledger["source_count"], "ledger source_count", allow_zero=True)
+        source_bytes += positive_joined_int(ledger["source_bytes"], "ledger source_bytes", allow_zero=True)
+        if not isinstance(ledger["scheduled_hour_ids"], list) or len(ledger["scheduled_hour_ids"]) != 12:
+            raise ValueError("joined batch ledger hour identities are invalid")
+        for delivery_hour, hour_id in enumerate(ledger["scheduled_hour_ids"], 1):
+            expected = "%s__recording-%d__date-%s__hour-%02d__generation-%d" % (batch_id, recording_id, local_date, delivery_hour, generation)
+            if hour_id != expected or hour_id in expected_hours:
+                raise ValueError("joined batch ledger hour identity conflicts")
+            expected_hours[hour_id] = ledger
+    hour_fields = {
+        "hour_manifest_artifact_id", "hour_id", "recording_id", "local_date", "delivery_hour", "status",
+        "relative_path", "object_key", "size_bytes", "sha256", "source_count", "source_bytes",
+        "media_artifact_count",
+    }
+    hour_source_count = hour_source_bytes = media_count = 0
+    for index, hour in enumerate(hours):
+        exact_joined_fields(hour, hour_fields, "batch hour reference")
+        ledger = ledgers[index // 12]
+        hour_id = hour["hour_id"]
+        artifact_id = positive_joined_int(hour["hour_manifest_artifact_id"], "hour manifest artifact_id")
+        if artifact_id in seen_artifacts or hour_id != ledger["scheduled_hour_ids"][index % 12] or expected_hours.get(hour_id) is not ledger or hour["delivery_hour"] != index % 12 + 1 or hour["recording_id"] != ledger["recording_id"] or hour["local_date"] != ledger["local_date"]:
+            raise ValueError("joined batch hour order conflicts")
+        seen_artifacts.add(artifact_id)
+        relative = "coverage/hours/%s.json" % hour_id
+        if hour["relative_path"] != relative or hour["object_key"] != "joined/%s/%s" % (batch_id, relative):
+            raise ValueError("joined batch hour path conflicts")
+        if positive_joined_int(hour["size_bytes"], "hour size_bytes") > JOINED_MANIFEST_MAX_BYTES:
+            raise ValueError("joined batch hour exceeds JSON size cap")
+        valid_sha256(hour["sha256"], "batch hour")
+        count = positive_joined_int(hour["source_count"], "hour source_count", allow_zero=True)
+        byte_count = positive_joined_int(hour["source_bytes"], "hour source_bytes", allow_zero=True)
+        media = positive_joined_int(hour["media_artifact_count"], "media artifact count", allow_zero=True)
+        if hour["status"] == "media":
+            if count == 0 or media == 0:
+                raise ValueError("joined media hour lacks sources or artifacts")
+        elif hour["status"] == "gap_only":
+            if count or byte_count or media:
+                raise ValueError("joined gap-only hour accounts sources")
+        elif hour["status"] == "quarantine_only":
+            if count == 0 or media:
+                raise ValueError("joined quarantine-only hour conflicts")
+        else:
+            raise ValueError("joined batch hour status is invalid")
+        hour_source_count += count
+        hour_source_bytes += byte_count
+        media_count += media
+    if source_count != payload["source_clip_count"] or source_bytes != payload["source_bytes"] or hour_source_count != source_count or hour_source_bytes != source_bytes or media_count != payload["final_media_artifact_count"]:
+        raise ValueError("joined batch aggregate denominator conflicts")
+    if frozen_denominator_sha(payload["selection_authority"], payload["frozen_recordings"], ledgers) != payload["frozen_denominator_sha256"]:
+        raise ValueError("joined frozen denominator hash conflicts")
+    if batch_generation_sha(payload) != payload["batch_generation_sha256"]:
+        raise ValueError("joined batch generation hash conflicts")
+    if item is not None and (item["batch_id"] != batch_id or item["relative_path"] != "coverage/batch.json"):
+        raise ExistingFileMismatch("joined batch index identity conflicts")
+    return payload
+
+
+def valid_audio_contract(contract):
+    fields = {"codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"}
+    if not isinstance(contract, dict) or set(contract) not in (fields, fields | {"edit_list_kind", "edit_list_sha256"}):
+        raise ValueError("joined audio contract has invalid fields")
+    if not valid_joined_string(contract["codec_name"], "audio codec").strip() or not valid_joined_string(contract["channel_layout"], "audio channel layout").strip():
+        raise ValueError("joined audio contract has blank format fields")
+    positive_joined_int(contract["sample_rate"], "audio sample_rate")
+    positive_joined_int(contract["channels"], "audio channels")
+    for key in ("initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"):
+        positive_joined_int(contract[key], key, allow_zero=True)
+    if "edit_list_sha256" in contract:
+        valid_joined_string(contract["edit_list_kind"], "edit list kind")
+        valid_sha256(contract["edit_list_sha256"], "edit list")
+
+
+def valid_media_fingerprint(fingerprint, output):
+    base_fields = {"duration_seconds", "tracks"}
+    audio_fields = {"audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"}
+    if not isinstance(fingerprint, dict) or set(fingerprint) not in (base_fields, base_fields | audio_fields):
+        raise ValueError("joined media fingerprint has invalid fields")
+    if (
+        isinstance(fingerprint["duration_seconds"], bool)
+        or not isinstance(fingerprint["duration_seconds"], (int, float))
+        or not math.isfinite(fingerprint["duration_seconds"])
+        or fingerprint["duration_seconds"] <= 0
+    ):
+        raise ValueError("joined media fingerprint has invalid duration")
+    tracks = fingerprint["tracks"]
+    if not isinstance(tracks, dict) or set(tracks) not in ({"video"}, {"video", "audio"}):
+        raise ValueError("joined media fingerprint has invalid tracks")
+    track_base = {
+        "media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases",
+        "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds",
+        "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "first_timestamp", "last_timestamp",
+        "timestamp_status",
+    }
+    for media_type, track in tracks.items():
+        fields = track_base | ({"decoded_samples"} if media_type == "audio" else set())
+        exact_joined_fields(track, fields, "media track fingerprint")
+        if track["media_type"] != media_type:
+            raise ValueError("joined media track identity conflicts")
+        for key in ("packet_count", "decoded_frames"):
+            positive_joined_int(track[key], "media track %s" % key)
+        if media_type == "audio":
+            positive_joined_int(track["decoded_samples"], "decoded_samples")
+        for key in ("packet_chain_sha256", "packet_timing_sha256"):
+            valid_sha256(track[key], "media track")
+        if not isinstance(track["packet_time_bases"], list) or not track["packet_time_bases"] or not all(isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*/[1-9][0-9]*", value) for value in track["packet_time_bases"]):
+            raise ValueError("joined media track has invalid time base")
+        for key in ("first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds"):
+            if not isinstance(track[key], str) or re.fullmatch(r"-?[0-9]+(?:/[1-9][0-9]*)?", track[key]) is None:
+                raise ValueError("joined media track has invalid rational")
+        for key in ("packet_duration_seconds", "decode_timeline_span_seconds"):
+            if int(track[key].split("/", 1)[0]) <= 0:
+                raise ValueError("joined media track has non-positive duration")
+        for key in ("first_timestamp", "last_timestamp"):
+            if isinstance(track[key], bool) or not isinstance(track[key], int):
+                raise ValueError("joined media track has invalid timestamp")
+        if output and (track["timestamp_status"] != "monotonic" or track["decode_timeline_span_seconds"] != track["packet_duration_seconds"]):
+            raise ValueError("joined output timestamps are not monotonic")
+    if "audio" in tracks:
+        if set(fingerprint) != base_fields | audio_fields or not isinstance(fingerprint["audio_sequence_contracts"], list) or not fingerprint["audio_sequence_contracts"] or (output and len(fingerprint["audio_sequence_contracts"]) != 1):
+            raise ValueError("joined audio fingerprint lacks contracts")
+        for contract in fingerprint["audio_sequence_contracts"]:
+            valid_audio_contract(contract)
+        positive_joined_int(fingerprint["effective_audio_bytes"], "effective_audio_bytes")
+        positive_joined_int(fingerprint["effective_audio_sample_frames"], "effective_audio_sample_frames")
+        valid_sha256(fingerprint["effective_audio_sha256"], "effective audio")
+    elif set(fingerprint) != base_fields:
+        raise ValueError("joined audio evidence exists without an audio track")
+
+
+def valid_verification(verification):
+    fields = {
+        "status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status",
+        "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint",
+    }
+    exact_joined_fields(verification, fields, "media verification")
+    for key in fields - {"source_fingerprint", "output_fingerprint"}:
+        if verification[key] != "passed":
+            raise ValueError("joined media verification did not pass")
+    valid_media_fingerprint(verification["source_fingerprint"], False)
+    valid_media_fingerprint(verification["output_fingerprint"], True)
+    expected, actual = verification["source_fingerprint"], verification["output_fingerprint"]
+    if set(expected["tracks"]) != set(actual["tracks"]) or abs(actual["duration_seconds"] - expected["duration_seconds"]) > 2:
+        raise ValueError("joined media fingerprint stream set conflicts")
+    for media_type, want in expected["tracks"].items():
+        got = actual["tracks"][media_type]
+        comparable = (
+            "packet_time_bases", "packet_duration_seconds", "first_packet_pts_seconds", "last_packet_pts_seconds",
+            "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_count", "packet_chain_sha256",
+            "packet_timing_sha256", "decoded_frames",
+        ) + (("decoded_samples",) if media_type == "audio" else ())
+        if want["timestamp_status"] != "source_clips_independent" or any(want[key] != got[key] for key in comparable):
+            raise ValueError("joined media fingerprint sequence conflicts")
+    for key in ("effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"):
+        if expected.get(key) != actual.get(key):
+            raise ValueError("joined decoded audio fingerprint conflicts")
+    if expected.get("audio_sequence_contracts"):
+        source_format = expected["audio_sequence_contracts"][0]
+        output_contracts = actual.get("audio_sequence_contracts", [])
+        format_fields = ("codec_name", "sample_rate", "channels", "channel_layout")
+        if len(output_contracts) != 1 or any(source_format[key] != output_contracts[0][key] for key in format_fields):
+            raise ValueError("joined effective audio format conflicts")
+
+
+def valid_hour_manifest(payload, item=None):
+    fields = {
+        "schema_version", "policy_version", "status", "batch_id", "hour_id", "recording_id", "timezone",
+        "local_date", "delivery_hour", "clock_hour", "scheduled_start_utc", "scheduled_end_utc",
+        "qualification_day", "qualification_sha256", "allocation", "media_tool", "source_claim_sha256",
+        "source_count", "sources", "source_dispositions", "gaps", "scheduled_gap", "quarantine_reason_code",
+        "quarantine_evidence", "media",
+    }
+    exact_joined_fields(payload, fields, "hour manifest")
+    batch_id, hour_id = payload["batch_id"], payload["hour_id"]
+    if payload["schema_version"] != 1 or payload["policy_version"] != "joined-delivery-v1" or not isinstance(batch_id, str) or JOINED_BATCH.fullmatch(batch_id) is None or not valid_joined_hour_id(batch_id, hour_id):
+        raise ValueError("joined hour manifest identity is invalid")
+    recording_id = positive_joined_int(payload["recording_id"], "recording_id")
+    local_date = valid_joined_date(payload["local_date"])
+    delivery_hour = positive_joined_int(payload["delivery_hour"], "delivery_hour")
+    if delivery_hour > 12 or payload["clock_hour"] != delivery_hour + 7:
+        raise ValueError("joined hour manifest clock identity conflicts")
+    expected_hour = "%s__recording-%d__date-%s__hour-%02d__generation-" % (batch_id, recording_id, local_date, delivery_hour)
+    if not hour_id.startswith(expected_hour):
+        raise ValueError("joined hour manifest hour identity conflicts")
+    try:
+        location = ZoneInfo(payload["timezone"])
+    except (TypeError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("joined hour timezone is invalid") from exc
+    if (
+        joined_timestamp_nanoseconds(payload["scheduled_start_utc"], "scheduled_start_utc") != local_boundary_nanoseconds(local_date, location, delivery_hour + 7)
+        or joined_timestamp_nanoseconds(payload["scheduled_end_utc"], "scheduled_end_utc") != local_boundary_nanoseconds(local_date, location, delivery_hour + 8)
+    ):
+        raise ValueError("joined hour manifest schedule conflicts")
+    valid_qualification_day(payload["qualification_day"], recording_id, payload["timezone"], local_date)
+    valid_sha256(payload["qualification_sha256"], "qualification")
+    valid_media_tool(payload["media_tool"])
+    allocation_fields = {
+        "artifact_id", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256",
+        "hour_source_claim_sha256", "boundaries", "cross_day_boundaries",
+    }
+    allocation = exact_joined_fields(payload["allocation"], allocation_fields, "hour allocation")
+    positive_joined_int(allocation["artifact_id"], "allocation artifact_id")
+    want_ledger_path = "coverage/ledgers/%d/%s.json" % (recording_id, local_date)
+    if valid_joined_relative_path(allocation["relative_path"], ".json") != want_ledger_path or allocation["object_key"] != "joined/%s/%s" % (batch_id, want_ledger_path):
+        raise ValueError("joined hour allocation path conflicts")
+    if positive_joined_int(allocation["size_bytes"], "allocation size_bytes") > JOINED_MANIFEST_MAX_BYTES:
+        raise ValueError("joined hour allocation exceeds JSON size cap")
+    for key in ("sha256", "ledger_sha256", "hour_source_claim_sha256"):
+        valid_sha256(allocation[key], "hour allocation")
+    if not isinstance(allocation["boundaries"], list) or not isinstance(allocation["cross_day_boundaries"], list):
+        raise ValueError("joined hour allocation boundaries are invalid")
+    for boundary in allocation["boundaries"]:
+        valid_boundary(boundary)
+    for boundary in allocation["cross_day_boundaries"]:
+        valid_boundary(boundary, cross_day=True)
+    source_count = positive_joined_int(payload["source_count"], "source_count", allow_zero=True)
+    if not isinstance(payload["sources"], list) or len(payload["sources"]) != source_count:
+        raise ValueError("joined hour manifest source count conflicts")
+    source_ids = [valid_source(source, recording_id, location=location, local_date=local_date) for source in payload["sources"]]
+    for previous, following in zip(payload["sources"], payload["sources"][1:]):
+        if (joined_timestamp_nanoseconds(following["start_utc"], "source start"), following["clip_id"]) <= (joined_timestamp_nanoseconds(previous["start_utc"], "source start"), previous["clip_id"]):
+            raise ValueError("joined hour manifest source order conflicts")
+    valid_derived_source_seams(payload["sources"])
+    storage_ids = {
+        tuple(source[key] for key in ("provider", "endpoint", "region", "bucket"))
+        + tuple(source["object"].get(key, "") for key in ("key", "version_id", "etag"))
+        for source in payload["sources"]
+    }
+    if len(source_ids) != len(set(source_ids)) or len(storage_ids) != len(source_ids) or source_claim_sha(payload["sources"]) != payload["source_claim_sha256"] or payload["source_claim_sha256"] != allocation["hour_source_claim_sha256"]:
+        raise ValueError("joined hour manifest source claim conflicts")
+    disposition_fields = {"clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"}
+    if not isinstance(payload["source_dispositions"], list) or len(payload["source_dispositions"]) != source_count:
+        raise ValueError("joined hour manifest dispositions conflict")
+    included, quarantined = {}, {}
+    for clip_id, disposition in zip(source_ids, payload["source_dispositions"]):
+        exact_joined_fields(disposition, disposition_fields, "source disposition")
+        if disposition["clip_id"] != clip_id:
+            raise ValueError("joined source disposition order conflicts")
+        if disposition["disposition"] == "included":
+            positive_joined_int(disposition["media_artifact_id"], "disposition media_artifact_id")
+            positive_joined_int(disposition["media_ordinal"], "disposition media_ordinal")
+            if disposition["reason_code"] != "":
+                raise ValueError("joined included source has a quarantine reason")
+            included[clip_id] = (disposition["media_artifact_id"], disposition["media_ordinal"])
+        elif disposition["disposition"] == "quarantined":
+            if disposition["media_artifact_id"] != 0 or disposition["media_ordinal"] != 0:
+                raise ValueError("joined quarantined source references media")
+            valid_joined_reason(disposition["reason_code"], "source quarantine")
+            quarantined[clip_id] = disposition["reason_code"]
+        else:
+            raise ValueError("joined source disposition is invalid")
+    gap_fields = {"previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"}
+    if not isinstance(payload["gaps"], list):
+        raise ValueError("joined hour gaps are invalid")
+    gap_pairs = set()
+    gap_reasons = {}
+    last_gap_position = -1
+    for gap in payload["gaps"]:
+        exact_joined_fields(gap, gap_fields, "hour gap")
+        positive_joined_int(gap["previous_clip_id"], "gap previous_clip_id")
+        positive_joined_int(gap["next_clip_id"], "gap next_clip_id")
+        valid_joined_timestamp(gap["at_utc"], "gap at_utc")
+        valid_joined_int64(gap["signed_gap_nanoseconds"], "hour gap duration")
+        valid_joined_reason(gap["reason"], "hour gap")
+        try:
+            position = source_ids.index(gap["next_clip_id"])
+        except ValueError as exc:
+            raise ValueError("joined hour gap source identity conflicts") from exc
+        next_seam = payload["sources"][position]["seam_to_previous"] if position else None
+        quarantine_boundary = gap["previous_clip_id"] in quarantined or gap["next_clip_id"] in quarantined
+        if (
+            position == 0 or source_ids[position - 1] != gap["previous_clip_id"]
+            or gap["at_utc"] != payload["sources"][position - 1]["end_utc"]
+            or gap["signed_gap_nanoseconds"] != next_seam["signed_gap_nanoseconds"]
+            or gap["signed_gap_nanoseconds"] != joined_timestamp_nanoseconds(payload["sources"][position]["start_utc"], "gap next start") - joined_timestamp_nanoseconds(payload["sources"][position - 1]["end_utc"], "gap previous end")
+            or (gap["reason"] != next_seam["reason"] and not (quarantine_boundary and gap["reason"] == "source_quarantined"))
+        ):
+            raise ValueError("joined hour gap evidence conflicts")
+        pair = (gap["previous_clip_id"], gap["next_clip_id"])
+        if pair in gap_pairs:
+            raise ValueError("joined hour gap evidence is duplicated")
+        if position <= last_gap_position:
+            raise ValueError("joined hour gaps are not in source order")
+        last_gap_position = position
+        gap_pairs.add(pair)
+        gap_reasons[pair] = gap["reason"]
+    quarantine_fields = {
+        "reason_code", "source_clip_ids", "source_claim_sha256", "policy_version", "normalized_failure_facts",
+        "failure_sha256", "evidence_sha256", "isolated_attempt_count", "media_tool_identity",
+    }
+    if not isinstance(payload["quarantine_evidence"], list):
+        raise ValueError("joined quarantine evidence is invalid")
+    evidenced = {}
+    for evidence in payload["quarantine_evidence"]:
+        exact_joined_fields(evidence, quarantine_fields, "quarantine evidence")
+        valid_joined_reason(evidence["reason_code"], "quarantine evidence")
+        ids = evidence["source_clip_ids"]
+        if not isinstance(ids, list) or not ids or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in ids):
+            raise ValueError("joined quarantine evidence sources are invalid")
+        subset = [payload["sources"][source_ids.index(clip_id)] for clip_id in ids if clip_id in source_ids]
+        if len(subset) != len(ids) or len(set(ids)) != len(ids) or candidate_source_claim_sha(subset) != evidence["source_claim_sha256"]:
+            raise ValueError("joined quarantine source claim conflicts")
+        if evidence["policy_version"] != payload["policy_version"] or evidence["media_tool_identity"] != payload["media_tool"]["identity_sha256"] or evidence["isolated_attempt_count"] != 2 or not isinstance(evidence["normalized_failure_facts"], dict) or not evidence["normalized_failure_facts"]:
+            raise ValueError("joined quarantine evidence conflicts")
+        if joined_canonical_sha(evidence["normalized_failure_facts"]) != evidence["failure_sha256"]:
+            raise ValueError("joined quarantine failure hash conflicts")
+        proof = {
+            "source_claim_sha256": evidence["source_claim_sha256"], "reason_code": evidence["reason_code"],
+            "failure_sha256": evidence["failure_sha256"], "policy_version": evidence["policy_version"],
+            "media_tool_identity": evidence["media_tool_identity"], "repeat_count": evidence["isolated_attempt_count"],
+        }
+        if joined_canonical_sha(proof) != evidence["evidence_sha256"]:
+            raise ValueError("joined quarantine evidence hash conflicts")
+        for clip_id in ids:
+            if clip_id in evidenced:
+                raise ValueError("joined quarantine evidence overlaps")
+            evidenced[clip_id] = evidence["reason_code"]
+    if evidenced != quarantined:
+        raise ValueError("joined quarantine evidence does not exactly cover quarantined sources")
+    media_fields = {
+        "artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes",
+        "sha256", "actual_start_utc", "actual_end_utc", "utc_offset_seconds", "media_tool_identity",
+        "source_clip_ids", "verification", "maximality_evidence",
+    }
+    if not isinstance(payload["media"], list):
+        raise ValueError("joined hour media is invalid")
+    seen_media, media_sources = set(), []
+    for ordinal, media in enumerate(payload["media"], 1):
+        exact_joined_fields(media, media_fields, "hour media")
+        artifact_id = positive_joined_int(media["artifact_id"], "media artifact_id")
+        if artifact_id in seen_media or media["ordinal"] != ordinal or media["part"] != ordinal or media["parts"] != len(payload["media"]):
+            raise ValueError("joined hour media order conflicts")
+        seen_media.add(artifact_id)
+        path = valid_joined_relative_path(media["relative_path"], ".mp4")
+        if media["object_key"] != "joined/%s/objects/%s.mp4" % (batch_id, media["content_id"]):
+            raise ValueError("joined hour media object identity conflicts")
+        size_bytes = positive_joined_int(media["size_bytes"], "media size_bytes")
+        if size_bytes > JOINED_MAX_BYTES:
+            raise ValueError("joined hour media exceeds size cap")
+        sha256 = valid_sha256(media["sha256"], "hour media")
+        if media["content_id"] != sha256 or media["media_tool_identity"] != payload["media_tool"]["identity_sha256"]:
+            raise ValueError("joined hour media content identity conflicts")
+        actual_start = valid_joined_timestamp(media["actual_start_utc"], "actual_start_utc")
+        valid_joined_timestamp(media["actual_end_utc"], "actual_end_utc")
+        offset = actual_start.astimezone(location).utcoffset()
+        expected_offset = int(offset.total_seconds()) if offset is not None else None
+        if (
+            joined_timestamp_nanoseconds(media["actual_end_utc"], "actual_end_utc") <= joined_timestamp_nanoseconds(media["actual_start_utc"], "actual_start_utc")
+            or not -86400 < valid_joined_int64(media["utc_offset_seconds"], "media UTC offset") < 86400
+            or media["utc_offset_seconds"] != expected_offset
+        ):
+            raise ValueError("joined hour media timing conflicts")
+        ids = media["source_clip_ids"]
+        if not isinstance(ids, list) or not ids or len(ids) != len(set(ids)) or any(included.get(clip_id) != (artifact_id, ordinal) for clip_id in ids):
+            raise ValueError("joined hour media source membership conflicts")
+        positions = [source_ids.index(clip_id) for clip_id in ids]
+        if positions != list(range(positions[0], positions[0] + len(positions))):
+            raise ValueError("joined hour media crosses a non-member source")
+        run_sources = [payload["sources"][position] for position in positions]
+        if media["actual_start_utc"] != run_sources[0]["start_utc"] or media["actual_end_utc"] != run_sources[-1]["end_utc"]:
+            raise ValueError("joined hour media range conflicts with its exact sources")
+        for previous, following in zip(run_sources, run_sources[1:]):
+            if (previous["clip_id"], following["clip_id"]) in gap_pairs:
+                raise ValueError("joined hour media crosses a gap or non-continuous seam")
+        media_sources.extend(ids)
+        valid_verification(media["verification"])
+        source_fingerprint = media["verification"]["source_fingerprint"]
+        audio_contracts = [source["audio_sequence_contract"] for source in run_sources if "audio_sequence_contract" in source]
+        if (
+            ("audio" not in source_fingerprint["tracks"] and audio_contracts)
+            or ("audio" in source_fingerprint["tracks"] and (
+                len(audio_contracts) != len(run_sources)
+                or audio_contracts != source_fingerprint["audio_sequence_contracts"]
+            ))
+        ):
+            raise ValueError("joined source audio contracts conflict with verification")
+        if not isinstance(media["maximality_evidence"], list):
+            raise ValueError("joined media maximality evidence is invalid")
+        for evidence in media["maximality_evidence"]:
+            exact_joined_fields(evidence, {"candidate_clip_ids", "reason_code", "source_claim_sha256", "policy_version", "evidence_sha256", "normalized_failure_facts", "failure_sha256", "repeat_count", "media_tool_identity"}, "maximality evidence")
+            valid_joined_reason(evidence["reason_code"], "maximality evidence")
+            ids = evidence["candidate_clip_ids"]
+            candidates = [payload["sources"][source_ids.index(clip_id)] for clip_id in ids if clip_id in source_ids]
+            if not isinstance(ids, list) or not ids or len(candidates) != len(ids) or len(set(ids)) != len(ids) or candidate_source_claim_sha(candidates) != evidence["source_claim_sha256"] or evidence["policy_version"] != payload["policy_version"] or evidence["media_tool_identity"] != payload["media_tool"]["identity_sha256"] or not isinstance(evidence["normalized_failure_facts"], dict) or not evidence["normalized_failure_facts"]:
+                raise ValueError("joined maximality evidence conflicts")
+            if joined_canonical_sha(evidence["normalized_failure_facts"]) != evidence["failure_sha256"]:
+                raise ValueError("joined maximality failure hash conflicts")
+            repeat_count = 1 if evidence["reason_code"] == "output_exceeds_put_cap" else 2
+            proof = {
+                "source_claim_sha256": evidence["source_claim_sha256"], "reason_code": evidence["reason_code"],
+                "failure_sha256": evidence["failure_sha256"], "policy_version": evidence["policy_version"],
+                "media_tool_identity": evidence["media_tool_identity"], "repeat_count": evidence["repeat_count"],
+            }
+            if evidence["repeat_count"] != repeat_count or joined_canonical_sha(proof) != evidence["evidence_sha256"]:
+                raise ValueError("joined maximality evidence hash conflicts")
+        if media["maximality_evidence"]:
+            first_length = len(media["maximality_evidence"][0]["candidate_clip_ids"])
+            for evidence_index, evidence in enumerate(media["maximality_evidence"]):
+                candidate_ids = evidence["candidate_clip_ids"]
+                expected_length = first_length - evidence_index
+                if (
+                    len(candidate_ids) != expected_length or len(candidate_ids) <= len(media["source_clip_ids"])
+                    or positions[0] + len(candidate_ids) > len(source_ids)
+                    or candidate_ids != source_ids[positions[0]:positions[0] + len(candidate_ids)]
+                ):
+                    raise ValueError("joined maximality peel order conflicts")
+            adjacent = media["maximality_evidence"][-1]["candidate_clip_ids"]
+            if adjacent[:-1] != media["source_clip_ids"] or positions[-1] + 1 >= len(source_ids) or adjacent[-1] != source_ids[positions[-1] + 1]:
+                raise ValueError("joined maximality evidence is not the immediate source extension")
+    if media_sources != [clip_id for clip_id in source_ids if clip_id in included]:
+        raise ValueError("joined media does not exactly cover included sources")
+    broken = 0
+    sources_by_id = {source["clip_id"]: source for source in payload["sources"]}
+    media_by_id = {media["artifact_id"]: media for media in payload["media"]}
+    for previous, following in zip(source_ids, source_ids[1:]):
+        same_media = previous in included and following in included and included[previous][0] == included[following][0]
+        has_gap = (previous, following) in gap_pairs
+        if same_media == has_gap:
+            raise ValueError("joined hour gaps do not exactly cover media run boundaries")
+        if same_media:
+            if sources_by_id[following]["seam_to_previous"]["verdict"] != "continuous":
+                raise ValueError("joined continuous media run seam conflicts")
+            continue
+        broken += 1
+        seam = sources_by_id[following]["seam_to_previous"]
+        signed_gap = seam["signed_gap_nanoseconds"]
+        if previous in quarantined or following in quarantined:
+            if gap_reasons[(previous, following)] != "source_quarantined":
+                raise ValueError("joined quarantine boundary reason conflicts")
+        elif signed_gap > 0:
+            if seam["verdict"] != "gap":
+                raise ValueError("joined signed gap verdict conflicts")
+        elif signed_gap < 0:
+            if seam["verdict"] != "overlap":
+                raise ValueError("joined signed overlap verdict conflicts")
+        else:
+            previous_media = media_by_id.get(included.get(previous, (0, 0))[0])
+            evidence = previous_media["maximality_evidence"][-1] if previous_media and previous_media["maximality_evidence"] else None
+            if (
+                seam["verdict"] != "incompatible" or evidence is None
+                or previous_media["source_clip_ids"][-1] != previous
+                or evidence["reason_code"] != seam["reason"]
+                or evidence["candidate_clip_ids"][-1] != following
+            ):
+                raise ValueError("joined zero-duration split lacks typed maximality evidence")
+    if broken != len(gap_pairs):
+        raise ValueError("joined hour gap count conflicts with media runs")
+    status = payload["status"]
+    if status == "media":
+        if not source_ids or not payload["media"] or payload["scheduled_gap"] is not None or payload["quarantine_reason_code"] != "":
+            raise ValueError("joined media hour terminal state conflicts")
+    elif status == "gap_only":
+        exact_joined_fields(payload["scheduled_gap"], {"reason_code", "signed_gap_nanoseconds", "no_allocatable_sources"}, "scheduled gap")
+        if source_ids or payload["media"] or payload["quarantine_evidence"] or payload["quarantine_reason_code"] != "" or payload["scheduled_gap"]["no_allocatable_sources"] is not True:
+            raise ValueError("joined gap-only hour terminal state conflicts")
+        valid_joined_reason(payload["scheduled_gap"]["reason_code"], "scheduled gap")
+        if payload["scheduled_gap"]["signed_gap_nanoseconds"] != 3_600_000_000_000:
+            raise ValueError("joined scheduled gap duration conflicts")
+    elif status == "quarantine_only":
+        valid_joined_reason(payload["quarantine_reason_code"], "quarantine-only hour")
+        if not source_ids or payload["media"] or payload["scheduled_gap"] is not None or not payload["quarantine_evidence"] or set(source_ids) != set(quarantined):
+            raise ValueError("joined quarantine-only hour terminal state conflicts")
+    else:
+        raise ValueError("joined hour manifest has unknown status")
+    if item is not None:
+        if batch_id != item["batch_id"] or hour_id != item["hour_id"]:
+            raise ExistingFileMismatch("joined hour manifest identity conflicts")
+        if item["kind"] == "media":
+            matches = [media for media in payload["media"] if media["artifact_id"] == item["id"]]
+            if len(matches) != 1 or matches[0]["relative_path"] != item["relative_path"] or matches[0]["size_bytes"] != item["size_bytes"] or matches[0]["sha256"] != item["sha256"]:
+                raise ExistingFileMismatch("joined media conflicts with sealed hour manifest")
+    return payload
+
+
+def read_joined_content(cfg, runtime, directory_fd, name, limit, stop_event):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    content = bytearray()
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode) or before.st_nlink not in (1, 2):
+            raise ExistingFileMismatch("joined hour manifest has an unknown hardlink")
+        while True:
+            if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                raise JoinedDownloadYield("joined manifest validation yielded to raw clip delivery")
+            chunk = os.read(descriptor, min(JOINED_RANGE_BYTES, limit + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+            digest.update(chunk)
+            if len(content) > limit:
+                raise ValueError("joined JSON artifact is too large")
+        after = os.fstat(descriptor)
+        path_after = joined_entry_stat(directory_fd, name)
+        if path_after is None or certification_identity(before) != certification_identity(after) or certification_identity(after) != certification_identity(path_after):
+            raise FileChangedDuringHash("joined hour manifest changed while reading")
+    finally:
+        os.close(descriptor)
+    return bytes(content), digest.hexdigest()
+
+
+def read_joined_manifest(cfg, runtime, directory_fd, name, expected_sha, item, stop_event):
+    content, digest = read_joined_content(
+        cfg, runtime, directory_fd, name, JOINED_MANIFEST_MAX_BYTES, stop_event,
+    )
+    if digest != expected_sha:
+        raise ExistingFileMismatch("joined hour manifest checksum conflicts")
+    return valid_hour_manifest(decode_joined_json(content), item)
+
+
+def read_joined_json_path(cfg, runtime, batch_id, relative_path, expected_size, expected_sha, stop_event):
+    holder = {"batch_id": batch_id, "relative_path": relative_path}
+    directory_fd = open_joined_output_dir(cfg, holder, create=False)
+    try:
+        content, digest = read_joined_content(
+            cfg, runtime, directory_fd, Path(relative_path).name, JOINED_MANIFEST_MAX_BYTES, stop_event,
+        )
+    finally:
+        os.close(directory_fd)
+    if len(content) != expected_size or digest != expected_sha:
+        raise ExistingFileMismatch("joined JSON reference conflicts: %s" % relative_path)
+    return decode_joined_json(content)
+
+
+def expected_hour_boundaries(ledger, delivery_hour):
+    boundaries = []
+    cross_day = []
+    if delivery_hour > 1:
+        boundaries.append(ledger["cross_hour_boundaries"][delivery_hour - 2])
+    if delivery_hour < 12:
+        boundaries.append(ledger["cross_hour_boundaries"][delivery_hour - 1])
+    if delivery_hour == 1:
+        cross_day.append(ledger["cross_day_boundaries"][0])
+    if delivery_hour == 12:
+        cross_day.append(ledger["cross_day_boundaries"][1])
+    return boundaries, cross_day
+
+
+def validate_hour_against_ledger(manifest, ledger, ledger_artifact_id, ledger_relative_path, ledger_size, ledger_sha):
+    allocation = manifest["allocation"]
+    if (
+        ledger["batch_id"] != manifest["batch_id"] or ledger["recording_id"] != manifest["recording_id"]
+        or ledger["local_date"] != manifest["local_date"] or ledger["qualification_sha256"] != manifest["qualification_sha256"]
+        or ledger["qualification_day"] != manifest["qualification_day"]
+        or allocation["artifact_id"] != ledger_artifact_id or allocation["relative_path"] != ledger_relative_path
+        or allocation["size_bytes"] != ledger_size or allocation["sha256"] != ledger_sha
+        or allocation["ledger_sha256"] != ledger["ledger_sha256"]
+    ):
+        raise ExistingFileMismatch("joined hour allocation conflicts with installed ledger")
+    delivery_hour = manifest["delivery_hour"]
+    hour = ledger["hours"][delivery_hour - 1]
+    ledger_sources = []
+    by_id = {source["clip_id"]: source for source in ledger["sources"]}
+    for clip_id in hour["source_clip_ids"]:
+        if clip_id not in by_id:
+            raise ExistingFileMismatch("joined hour source is absent from installed ledger")
+        ledger_sources.append(by_id[clip_id])
+    if (
+        [source["clip_id"] for source in manifest["sources"]] != hour["source_clip_ids"]
+        or [source_claim_projection(source) for source in manifest["sources"]] != [source_claim_projection(source) for source in ledger_sources]
+        or manifest["source_claim_sha256"] != ledger["hour_source_claim_sha256"][delivery_hour - 1]
+        or allocation["hour_source_claim_sha256"] != manifest["source_claim_sha256"]
+    ):
+        raise ExistingFileMismatch("joined hour source claim conflicts with installed ledger")
+    boundaries, cross_day = expected_hour_boundaries(ledger, delivery_hour)
+    if allocation["boundaries"] != boundaries or allocation["cross_day_boundaries"] != cross_day:
+        raise ExistingFileMismatch("joined hour boundary evidence conflicts with installed ledger")
+
+
+def validate_cross_day_ledger_link(previous, following):
+    if any(previous[key] != following[key] for key in ("batch_id", "generation", "recording_id", "timezone")):
+        raise ExistingFileMismatch("joined consecutive ledger scope conflicts")
+    fields = (
+        "previous_clip_id", "next_clip_id", "previous_presentation_end_utc", "next_presentation_start_utc",
+        "signed_gap_nanoseconds", "scheduled_previous_end_utc", "scheduled_next_start_utc",
+        "boundary_skew_nanoseconds", "verdict",
+    )
+    previous_right = previous["cross_day_boundaries"][1]
+    following_left = following["cross_day_boundaries"][0]
+    if any(previous_right[field] != following_left[field] for field in fields):
+        raise ExistingFileMismatch("joined consecutive ledgers disagree on their shared day boundary")
+
+
+def validate_hour_ledger_binding(cfg, runtime, item, manifest, stop_event):
+    if item["kind"] != "hour_manifest":
+        return
+    allocation = manifest["allocation"]
+    if (
+        allocation["artifact_id"] != item["ledger_artifact_id"]
+        or allocation["relative_path"] != item["ledger_relative_path"]
+        or allocation["sha256"] != item["ledger_sha256"]
+    ):
+        raise ExistingFileMismatch("joined hour feed lineage conflicts with sealed manifest")
+    ledger = read_joined_json_path(
+        cfg, runtime, item["batch_id"], item["ledger_relative_path"],
+        allocation["size_bytes"], item["ledger_sha256"], stop_event,
+    )
+    valid_allocation_ledger(ledger)
+    validate_hour_against_ledger(
+        manifest, ledger, item["ledger_artifact_id"], item["ledger_relative_path"],
+        allocation["size_bytes"], item["ledger_sha256"],
+    )
+
+
+def verify_joined_relative_file(cfg, runtime, batch_id, relative_path, size_bytes, sha256, stop_event):
+    holder = {"batch_id": batch_id, "relative_path": relative_path}
+    directory_fd = open_joined_output_dir(cfg, holder, create=False)
+    try:
+        if not verify_joined_entry(
+            cfg, runtime, directory_fd, Path(relative_path).name, size_bytes, sha256, stop_event,
+        ):
+            raise ExistingFileMismatch("joined referenced file is missing: %s" % relative_path)
+    finally:
+        os.close(directory_fd)
+
+
+def validate_batch_index_proof(cfg, runtime, index, stop_event):
+    batch_id = index["batch_id"]
+    total_sources = total_bytes = total_media = 0
+    seen_media_artifacts = {
+        reference["artifact_id"] for reference in index["allocation_ledgers"]
+    } | {
+        reference["hour_manifest_artifact_id"] for reference in index["hours"]
+    }
+    seen_media_paths = set()
+    denominator_ledgers = []
+    qualification_days = []
+    previous_ledger = None
+    # The compact index is ordered ledger-major and each ledger is immediately
+    # followed logically by its exact 12 hour references. Never scan joined/.
+    for ledger_position, ledger_ref in enumerate(index["allocation_ledgers"]):
+        frozen = index["frozen_recordings"][ledger_position // 14]
+        ledger = read_joined_json_path(
+            cfg, runtime, batch_id, ledger_ref["relative_path"], ledger_ref["size_bytes"], ledger_ref["sha256"], stop_event,
+        )
+        valid_allocation_ledger(ledger)
+        if (
+            ledger["batch_id"] != batch_id or ledger["recording_id"] != ledger_ref["recording_id"]
+            or ledger["local_date"] != ledger_ref["local_date"] or ledger["qualification_sha256"] != ledger_ref["qualification_sha256"]
+            or ledger["qualification_sha256"] != frozen["qualification_sha256"]
+            or ledger["frozen_source_sha256"] != ledger_ref["frozen_source_sha256"]
+            or ledger["source_claim_sha256"] != ledger_ref["source_claim_sha256"] or ledger["ledger_sha256"] != ledger_ref["ledger_sha256"]
+            or ledger["source_clip_count"] != ledger_ref["source_count"] or ledger["source_bytes"] != ledger_ref["source_bytes"]
+            or ledger["generation"] != index["generation"] or ledger["timezone"] != frozen["timezone"]
+        ):
+            raise ExistingFileMismatch("joined batch ledger reference conflicts")
+        if (
+            ledger["qualification_day"]["qualification_window_ordinal"] != ledger_position % 14 + 1
+            or joined_timestamp_nanoseconds(ledger["qualification_day"]["window_start"], "qualification window_start")
+                < joined_timestamp_nanoseconds(index["selection_authority"]["qualification_run_frozen_at"], "qualification run frozen_at")
+            or joined_timestamp_nanoseconds(ledger["qualification_day"]["completed_at"], "qualification completed_at")
+                > joined_timestamp_nanoseconds(index["selection_authority"]["cutoff"], "selection cutoff")
+        ):
+            raise ExistingFileMismatch("joined batch qualification chronology conflicts")
+        qualification_days.append(ledger["qualification_day"])
+        if previous_ledger is not None and previous_ledger["recording_id"] == ledger["recording_id"]:
+            validate_cross_day_ledger_link(previous_ledger, ledger)
+        previous_ledger = ledger
+        denominator_ledgers.append(ledger)
+        day_dispositions = []
+        hour_refs = index["hours"][ledger_position * 12:(ledger_position + 1) * 12]
+        for delivery_hour, hour_ref in enumerate(hour_refs, 1):
+            manifest = read_joined_json_path(
+                cfg, runtime, batch_id, hour_ref["relative_path"], hour_ref["size_bytes"], hour_ref["sha256"], stop_event,
+            )
+            valid_hour_manifest(manifest)
+            if (
+                manifest["hour_id"] != hour_ref["hour_id"] or manifest["recording_id"] != hour_ref["recording_id"]
+                or manifest["local_date"] != hour_ref["local_date"] or manifest["delivery_hour"] != delivery_hour
+                or manifest["status"] != hour_ref["status"] or manifest["source_count"] != hour_ref["source_count"]
+                or sum(source["object"]["size_bytes"] for source in manifest["sources"]) != hour_ref["source_bytes"]
+                or len(manifest["media"]) != hour_ref["media_artifact_count"]
+                or manifest["timezone"] != frozen["timezone"] or manifest["media_tool"] != index["media_tool"]
+            ):
+                raise ExistingFileMismatch("joined batch hour reference conflicts")
+            validate_hour_against_ledger(
+                manifest, ledger, ledger_ref["artifact_id"], ledger_ref["relative_path"],
+                ledger_ref["size_bytes"], ledger_ref["sha256"],
+            )
+            day_dispositions.extend(disposition["clip_id"] for disposition in manifest["source_dispositions"])
+            for media in manifest["media"]:
+                if media["relative_path"] != joined_delivery_path(frozen, media, delivery_hour):
+                    raise ExistingFileMismatch("joined batch media delivery path conflicts with frozen naming")
+                if media["artifact_id"] in seen_media_artifacts or media["relative_path"] in seen_media_paths:
+                    raise ExistingFileMismatch("joined batch media reference is duplicated")
+                seen_media_artifacts.add(media["artifact_id"])
+                seen_media_paths.add(media["relative_path"])
+                verify_joined_relative_file(
+                    cfg, runtime, batch_id, media["relative_path"], media["size_bytes"], media["sha256"], stop_event,
+                )
+                total_media += 1
+        if day_dispositions != [source["clip_id"] for source in ledger["sources"]]:
+            raise ExistingFileMismatch("joined batch day disposition union conflicts with ledger")
+        total_sources += ledger["source_clip_count"]
+        total_bytes += ledger["source_bytes"]
+        if ledger_position % 14 == 13:
+            try:
+                qualification_sha = qualification_window_sha(
+                    frozen, qualification_days, index["selection_authority"]["cutoff"],
+                    index["selection_authority"]["qualification_run_frozen_at"],
+                )
+            except ValueError as exc:
+                raise ExistingFileMismatch("joined batch qualification window conflicts") from exc
+            if qualification_sha != frozen["qualification_sha256"]:
+                raise ExistingFileMismatch("joined batch qualification window seal conflicts")
+            qualification_days = []
+    if (
+        total_sources != index["source_clip_count"] or total_bytes != index["source_bytes"]
+        or total_media != index["final_media_artifact_count"]
+        or frozen_denominator_sha(index["selection_authority"], index["frozen_recordings"], denominator_ledgers) != index["frozen_denominator_sha256"]
+    ):
+        raise ExistingFileMismatch("joined batch installed denominator conflicts")
+
+
+def validate_joined_artifact(cfg, runtime, directory_fd, name, item, stop_event):
+    if item["kind"] == "media":
+        return
+    content, digest = read_joined_content(
+        cfg, runtime, directory_fd, name, JOINED_MANIFEST_MAX_BYTES, stop_event,
+    )
+    if digest != item["sha256"]:
+        raise ExistingFileMismatch("joined JSON artifact checksum conflicts")
+    payload = decode_joined_json(content)
+    if item["kind"] == "allocation_ledger":
+        valid_allocation_ledger(payload)
+        if payload["batch_id"] != item["batch_id"] or item["relative_path"] != "coverage/ledgers/%d/%s.json" % (payload["recording_id"], payload["local_date"]):
+            raise ExistingFileMismatch("joined allocation ledger identity conflicts")
+    elif item["kind"] == "hour_manifest":
+        valid_hour_manifest(payload, item)
+        validate_hour_ledger_binding(cfg, runtime, item, payload, stop_event)
+    elif item["kind"] == "batch_index":
+        valid_batch_index(payload, item)
+        validate_batch_index_proof(cfg, runtime, payload, stop_event)
+
+
+def validate_media_manifest_binding(cfg, runtime, item, stop_event):
+    if item["kind"] != "media":
+        return
+    manifest_item = {
+        "batch_id": item["batch_id"],
+        "relative_path": item["hour_manifest_relative_path"],
+    }
+    directory_fd = open_joined_output_dir(cfg, manifest_item, create=False)
+    try:
+        read_joined_manifest(
+            cfg, runtime, directory_fd, Path(item["hour_manifest_relative_path"]).name,
+            item["hour_manifest_sha256"], item, stop_event,
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def write_joined_stage(directory_fd, name, content):
+    flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        current = os.fstat(descriptor)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise ExistingFileMismatch("joined sidecar stage is not exclusively owned")
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def linked_joined_stage(directory_fd, marker_name, marker_stat):
+    prefix = marker_name + ".stage-"
+    matches = []
+    for candidate in os.listdir(directory_fd):
+        if not candidate.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}", candidate[len(prefix):]):
+            continue
+        try:
+            candidate_stat = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if stat_module.S_ISREG(candidate_stat.st_mode) and same_joined_inode(marker_stat, candidate_stat):
+            matches.append((candidate, candidate_stat))
+    if len(matches) != 1:
+        raise ExistingFileMismatch("joined marker has an unknown hardlink")
+    stage_name, stage_stat = matches[0]
+    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2:
+        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
+    return stage_name
+
+
+def publish_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+    marker_stat = joined_entry_stat(directory_fd, name)
+    if marker_stat is not None:
+        if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+            raise ExistingFileMismatch("joined partial ownership marker conflicts")
+        marker_stat = joined_entry_stat(directory_fd, name)
+        if marker_stat.st_nlink == 2:
+            stage_name = linked_joined_stage(directory_fd, name, marker_stat)
+            os.unlink(stage_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        elif marker_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined marker has an unknown hardlink")
+        if joined_entry_stat(directory_fd, name).st_nlink != 1:
+            raise ExistingFileMismatch("joined marker has an unknown hardlink")
+        return
+    for _attempt in range(8):
+        stage_name = name + ".stage-" + os.urandom(16).hex()
+        try:
+            write_joined_stage(directory_fd, stage_name, content)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise ExistingFileMismatch("could not allocate a private joined sidecar stage")
+    try:
+        os.link(stage_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+    except FileExistsError:
+        # Another publisher won. Our private, unlinked stage is left untouched;
+        # only an exact same-inode link is ever removed below or on restart.
+        raise ExistingFileMismatch("joined marker appeared during publication")
+    os.fsync(directory_fd)
+    marker_stat = joined_entry_stat(directory_fd, name)
+    stage_stat = joined_entry_stat(directory_fd, stage_name)
+    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2 or not same_joined_inode(marker_stat, stage_stat):
+        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
+    if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+        raise ExistingFileMismatch("joined sidecar stage changed during publication")
+    os.unlink(stage_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+    if joined_entry_stat(directory_fd, name).st_nlink != 1:
+        raise ExistingFileMismatch("joined marker has an unknown hardlink")
+
+
+def same_joined_inode(left, right):
+    return left is not None and right is not None and (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def ensure_owned_joined_partial(cfg, runtime, directory_fd, part_name, marker_name, sidecar, stop_event):
+    part_stat = joined_entry_stat(directory_fd, part_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if marker_stat is None:
+        if part_stat is not None:
+            raise ExistingFileMismatch("joined partial has no ownership marker")
+        publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
+        marker_stat = joined_entry_stat(directory_fd, marker_name)
+    elif not verify_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event):
+        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if part_stat is None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(part_name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory_fd)
+        part_stat = joined_entry_stat(directory_fd, part_name)
+    if part_stat.st_nlink != 1 or marker_stat.st_nlink != 1:
+        raise ExistingFileMismatch("joined partial or marker has an unknown hardlink")
+    return part_stat
+
+
+def truncate_joined_part(directory_fd, name):
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        current = os.fstat(descriptor)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise ExistingFileMismatch("joined partial is not exclusively owned")
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def poll_raw_pending(cfg, runtime):
+    page = request_json(
+        cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
+    )
+    clips = page.get("clips", [])
+    if not isinstance(clips, list):
+        raise RuntimeError("clips response is not a list")
+    return bool(clips)
+
+
+def prepare_joined_download(cfg, item):
+    prepared = request_json(cfg, "GET", item["download_path"], base=cfg.origin)
+    if set(prepared) != {
+        "url", "etag", "if_match", "version_id", "size_bytes", "sha256", "content_type", "expires_in_sec",
+    }:
+        raise RuntimeError("joined download response has invalid fields")
+    url = prepared.get("url")
+    if not isinstance(url, str):
+        raise RuntimeError("joined download returned invalid URL")
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise RuntimeError("joined download returned invalid URL") from exc
+    if (
+        parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+        or parsed.password is not None or parsed.fragment or not parsed.path.startswith("/")
+    ):
+        raise RuntimeError("joined download returned invalid URL")
+    if prepared.get("size_bytes") != item["size_bytes"] or prepared.get("sha256") != item["sha256"]:
+        raise ExistingFileMismatch("joined prepared bytes changed")
+    if prepared.get("content_type") != item["content_type"]:
+        raise ExistingFileMismatch("joined prepared content type changed")
+    expires_in_sec = prepared.get("expires_in_sec")
+    if isinstance(expires_in_sec, bool) or not isinstance(expires_in_sec, int) or not 1 <= expires_in_sec <= 3600:
+        raise RuntimeError("joined download returned invalid expiry")
+    etag = normalized_etag(prepared.get("etag"))
+    version_id = prepared.get("version_id")
+    if (
+        not isinstance(version_id, str) or len(version_id) > 1024 or version_id != version_id.strip()
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in version_id)
+    ):
+        raise RuntimeError("joined download returned invalid version_id")
+    if_match = prepared.get("if_match")
+    if not isinstance(if_match, str):
+        raise ExistingFileMismatch("joined prepared If-Match changed")
+    if if_match != '"%s"' % etag:
+        raise ExistingFileMismatch("joined prepared If-Match changed")
+    return {
+        "url": url, "if_match": if_match, "etag": etag, "version_id": version_id,
+        "url_scheme": parsed.scheme, "url_authority": parsed.netloc, "url_path": parsed.path,
+    }
+
+
+def validate_joined_download_renewal(first, current):
+    if any(current[key] != first[key] for key in (
+        "etag", "version_id", "url_scheme", "url_authority", "url_path",
+    )):
+        raise ExistingFileMismatch("joined prepared object identity changed")
+
+
+def append_joined_range(prepared, directory_fd, part_name, item, start, end):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Range": "bytes=%d-%d" % (start, end),
+        "If-Match": prepared["if_match"],
+    }
+    request = urllib.request.Request(prepared["url"], method="GET", headers=headers)
+    try:
+        response_context = open_joined_url(request)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 416:
+            truncate_joined_part(directory_fd, part_name)
+            raise RuntimeError("joined range was unsatisfiable; partial restarted") from exc
+        raise
+    with response_context as response:
+        status = getattr(response, "status", None) or response.getcode()
+        if status == 200:
+            truncate_joined_part(directory_fd, part_name)
+            raise RuntimeError("joined server ignored range; partial restarted")
+        if status != 206:
+            raise RuntimeError("joined range returned HTTP %s" % status)
+        response_etag = normalized_etag(response.headers.get("ETag"))
+        response_version = str(response.headers.get("x-amz-version-id") or "")
+        if response_etag != prepared["etag"] or response_version != prepared["version_id"]:
+            truncate_joined_part(directory_fd, part_name)
+            raise ExistingFileMismatch("joined range object identity drifted; partial restarted")
+        expected_range = "bytes %d-%d/%d" % (start, end, item["size_bytes"])
+        if response.headers.get("Content-Range") != expected_range:
+            raise RuntimeError("joined range returned invalid Content-Range")
+        chunk_bytes = end - start + 1
+        try:
+            content_length = int(response.headers.get("Content-Length", ""))
+        except ValueError as exc:
+            raise RuntimeError("joined range returned invalid Content-Length") from exc
+        if content_length != chunk_bytes:
+            raise RuntimeError("joined range returned invalid Content-Length")
+        flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(part_name, flags, dir_fd=directory_fd)
+        written = 0
+        try:
+            opened = os.fstat(descriptor)
+            if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size != start:
+                raise ExistingFileMismatch("joined partial changed before range append")
+            os.lseek(descriptor, start, os.SEEK_SET)
+            while written < chunk_bytes:
+                block = response.read(min(1024 * 1024, chunk_bytes - written))
+                if not block:
+                    break
+                offset = 0
+                while offset < len(block):
+                    offset += os.write(descriptor, block[offset:])
+                written += len(block)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if written != chunk_bytes or response.read(1):
+            raise RuntimeError("joined range body length mismatch")
+
+
+def remove_owned_joined_transfer(cfg, runtime, directory_fd, part_name, marker_name, final_name, marker, stop_event):
+    part_stat = joined_entry_stat(directory_fd, part_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    final_stat = joined_entry_stat(directory_fd, final_name)
+    if part_stat is not None:
+        if part_stat.st_nlink != 2 or final_stat.st_nlink != 2 or not same_joined_inode(part_stat, final_stat):
+            raise ExistingFileMismatch("joined partial is not the published final")
+        # Only client-owned transfer scratch is disposable. Raw media, finals,
+        # unknown partials, and conflicting paths are never unlinked.
+        os.unlink(part_name, dir_fd=directory_fd)
+    if marker_stat is not None:
+        if marker_stat.st_nlink != 1 or not verify_joined_sidecar(
+            cfg, runtime, directory_fd, marker_name, marker, stop_event,
+        ):
+            raise ExistingFileMismatch("joined transfer marker conflicts")
+        os.unlink(marker_name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+    if joined_entry_stat(directory_fd, final_name).st_nlink != 1:
+        raise ExistingFileMismatch("joined published link count is invalid")
+
+
+def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+    final_name, part_name, marker_name = names
+    final_stat = joined_entry_stat(directory_fd, final_name)
+    if final_stat is None:
+        return False
+    if not verify_joined_entry(
+        cfg, runtime, directory_fd, final_name, item["size_bytes"], item["sha256"], stop_event,
+    ):
+        raise ExistingFileMismatch("joined final disappeared")
+    final_stat = joined_entry_stat(directory_fd, final_name)
+    part_stat = joined_entry_stat(directory_fd, part_name)
+    marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if part_stat is None:
+        if final_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined final has an unknown hardlink")
+    elif final_stat.st_nlink != 2 or part_stat.st_nlink != 2 or not same_joined_inode(final_stat, part_stat):
+        raise ExistingFileMismatch("joined partial conflicts with final")
+    if marker_stat is not None and not verify_joined_sidecar(
+        cfg, runtime, directory_fd, marker_name, marker, stop_event,
+    ):
+        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    if part_stat is not None and marker_stat is None:
+        raise ExistingFileMismatch("joined published partial has no ownership marker")
+    validate_joined_artifact(cfg, runtime, directory_fd, final_name, item, stop_event)
+    remove_owned_joined_transfer(
+        cfg, runtime, directory_fd, part_name, marker_name, final_name, marker, stop_event,
+    )
+    return True
+
+
+def download_joined_item(cfg, runtime, item, stop_event):
+    ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
+    validate_media_manifest_binding(cfg, runtime, item, stop_event)
+    directory_fd = open_joined_output_dir(cfg, item)
+    final_name = Path(item["relative_path"]).name
+    part_name = ".%s.joined-%d.part" % (final_name, item["id"])
+    marker_name = part_name + ".stoarama.json"
+    names = (final_name, part_name, marker_name)
+    try:
+        final_stat = joined_entry_stat(directory_fd, final_name)
+        part_stat = joined_entry_stat(directory_fd, part_name)
+        marker_stat = joined_entry_stat(directory_fd, marker_name)
+        if final_stat is not None and part_stat is None and marker_stat is None and complete_existing_joined(
+            cfg, runtime, directory_fd, item, names, None, stop_event,
+        ):
+            return False
+        prepared = prepare_joined_download(cfg, item)
+        marker = joined_transfer_marker_bytes(item, prepared)
+        if complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+            return False
+        part_stat = ensure_owned_joined_partial(
+            cfg, runtime, directory_fd, part_name, marker_name, marker, stop_event,
+        )
+        if part_stat.st_nlink != 1:
+            raise ExistingFileMismatch("joined partial has an unknown hardlink")
+        part_size = part_stat.st_size
+        if part_size > item["size_bytes"]:
+            truncate_joined_part(directory_fd, part_name)
+            part_size = 0
+        remaining = item["size_bytes"] - part_size
+        require_storage_capacity(cfg, runtime, remaining)
+        try:
+            while part_size < item["size_bytes"]:
+                if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                    raise JoinedDownloadYield("joined download yielded to raw clips")
+                try:
+                    current_prepared = prepare_joined_download(cfg, item)
+                except ExistingFileMismatch:
+                    truncate_joined_part(directory_fd, part_name)
+                    raise
+                validate_joined_download_renewal(prepared, current_prepared)
+                end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
+                append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end)
+                part_size = end + 1
+            try:
+                verify_joined_entry(
+                    cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
+                )
+            except ExistingFileMismatch:
+                truncate_joined_part(directory_fd, part_name)
+                raise RuntimeError("joined download checksum mismatch; partial restarted")
+            validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
+            os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+            os.fsync(directory_fd)
+            if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+                raise RuntimeError("joined publication disappeared")
+            return True
+        finally:
+            runtime.release_storage_reservation(remaining)
+    finally:
+        os.close(directory_fd)
+
+
+def joined_ack_receipt_path(cfg, connection_id):
+    scope = hashlib.sha256((cfg.origin + "\0" + str(connection_id)).encode("utf-8")).hexdigest()[:16]
+    return cfg.state_dir / ("joined-ack-receipts-%s.json" % scope)
+
+
+def joined_ack_receipts(cfg, connection_id):
+    path = joined_ack_receipt_path(cfg, connection_id)
+    empty = {"schema_version": 1, "origin": cfg.origin, "connection_id": connection_id, "receipts": {}}
+    payload = read_json(path, empty)
+    if not isinstance(payload, dict) or set(payload) != set(empty) or payload["schema_version"] != 1 or payload["origin"] != cfg.origin or payload["connection_id"] != connection_id or not isinstance(payload["receipts"], dict):
+        raise RuntimeError("joined ACK receipt state conflicts with this connection")
+    fields = {"artifact_id", "relative_path", "size_bytes", "sha256"}
+    for key, receipt in payload["receipts"].items():
+        if (
+            not isinstance(key, str) or not key.isdigit() or not isinstance(receipt, dict) or set(receipt) != fields
+            or receipt["artifact_id"] != int(key) or isinstance(receipt["artifact_id"], bool)
+            or not isinstance(receipt["artifact_id"], int) or receipt["artifact_id"] < 1
+            or valid_joined_relative_path(receipt["relative_path"]) != receipt["relative_path"]
+            or positive_joined_int(receipt["size_bytes"], "ACK receipt size") > JOINED_MAX_BYTES
+            or valid_sha256(receipt["sha256"], "ACK receipt") != receipt["sha256"]
+        ):
+            raise RuntimeError("joined ACK receipt state is invalid")
+    return path, payload
+
+
+def joined_ack_identity(item, size_bytes=None):
+    return {
+        "artifact_id": item["id"], "relative_path": item["relative_path"],
+        "size_bytes": item["size_bytes"] if size_bytes is None else size_bytes, "sha256": item["sha256"],
+    }
+
+
+def has_joined_ack_receipt(cfg, connection_id, identity):
+    _, payload = joined_ack_receipts(cfg, connection_id)
+    return payload["receipts"].get(str(identity["artifact_id"])) == identity
+
+
+def persist_joined_ack_receipt(cfg, connection_id, identity):
+    path, payload = joined_ack_receipts(cfg, connection_id)
+    key = str(identity["artifact_id"])
+    existing = payload["receipts"].get(key)
+    if existing is not None and existing != identity:
+        raise RuntimeError("joined ACK receipt artifact identity conflicts")
+    payload["receipts"][key] = identity
+    atomic_write(path, joined_canonical_bytes(payload))
+
+
+def post_joined_ack(cfg, connection_id, identity):
+    request_json(cfg, "POST", "/account/joined/ack", body={
+        "artifact_id": identity["artifact_id"], "relative_path": identity["relative_path"],
+        "size_bytes": identity["size_bytes"], "sha256": identity["sha256"],
+    })
+    # The receipt is written only after the exact idempotent ACK succeeds.
+    persist_joined_ack_receipt(cfg, connection_id, identity)
+
+
+def ack_joined_item(cfg, item):
+    post_joined_ack(cfg, item["connection_id"], joined_ack_identity(item))
+
+
+def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
+    if item["kind"] == "hour_manifest":
+        dependency = {
+            "id": item["ledger_artifact_id"], "relative_path": item["ledger_relative_path"],
+            "sha256": item["ledger_sha256"],
+        }
+    elif item["kind"] == "media":
+        dependency = {
+            "id": item["hour_manifest_id"], "relative_path": item["hour_manifest_relative_path"],
+            "sha256": item["hour_manifest_sha256"],
+        }
+    else:
+        return
+    holder = {"batch_id": item["batch_id"], "relative_path": dependency["relative_path"]}
+    directory_fd = open_joined_output_dir(cfg, holder, create=False)
+    try:
+        size_bytes, digest, file_stat = hash_joined_entry(
+            cfg, runtime, directory_fd, Path(dependency["relative_path"]).name, stop_event,
+        )
+    finally:
+        os.close(directory_fd)
+    if file_stat.st_nlink != 1 or digest != dependency["sha256"] or size_bytes < 1 or size_bytes > JOINED_MANIFEST_MAX_BYTES:
+        raise ExistingFileMismatch("joined dependency file identity conflicts")
+    identity = joined_ack_identity({**dependency, "size_bytes": size_bytes})
+    if not has_joined_ack_receipt(cfg, item["connection_id"], identity):
+        post_joined_ack(cfg, item["connection_id"], identity)
+
+
+def drain_joined(cfg, runtime, stop_event):
+    if getattr(cfg, "joined_protocol_version", 0) != JOINED_PROTOCOL_VERSION or cfg.dry_run:
+        return False
+    page = request_json(cfg, "GET", "/account/joined")
+    if set(page) - {"item"}:
+        raise RuntimeError("joined response contains unknown fields")
+    raw_item = page.get("item")
+    if raw_item is None:
+        return False
+    item = valid_joined_item(raw_item)
+    runtime.set_phase(Phase.DRAINING)
+    try:
+        downloaded = download_joined_item(cfg, runtime, item, stop_event)
+    except JoinedDownloadYield:
+        log("INFO", "joined artifact_id=%d yielded to raw clip delivery" % item["id"])
+        return True
+    ack_joined_item(cfg, item)
+    log(
+        "INFO", "joined artifact_id=%d bytes=%d saved=%s%s"
+        % (item["id"], item["size_bytes"], joined_output_path(cfg, item), "" if downloaded else " existing"),
+    )
+    return True
+
+
 def release_clip(cfg, recording_id, clip_id):
     path = "/account/recordings/%d/clips/%d/release" % (recording_id, clip_id)
     try:
@@ -2758,7 +5114,16 @@ def run(cfg):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
-                if not progress:
+                if not progress and not stop_event.is_set():
+                    try:
+                        joined_progress = drain_joined(cfg, runtime, stop_event)
+                    except Exception as exc:
+                        runtime.set_error("joined delivery: %s" % exc)
+                        log("WARN", "joined delivery deferred: %s" % exc)
+                        stop_event.wait(min(cfg.poll_interval_sec, 10))
+                        continue
+                    if joined_progress:
+                        continue
                     try:
                         certified = maybe_run_native_stitch(cfg, runtime, inventory, stop_event)
                     except Exception as exc:

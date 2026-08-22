@@ -2,20 +2,92 @@ package r2
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestPresignGetExactBindsConditionalGenerationIdentity(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := client.PresignGetExact(context.Background(), "clip.mp4", `"abc123"`, "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustURL(t, raw)
+	if u.Query().Get("versionId") != "version-7" {
+		t.Fatalf("versionId=%q", u.Query().Get("versionId"))
+	}
+	if !strings.Contains(u.Query().Get("X-Amz-SignedHeaders"), "if-match") {
+		t.Fatalf("signed headers do not bind If-Match: %q", u.Query().Get("X-Amz-SignedHeaders"))
+	}
+}
+
+func TestPresignedExactCapabilitiesBindMethodAuthorityKeyAndHeaders(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	get, err := client.PresignGetExactRequest(context.Background(), "raw/exact clip.mp4", "abc123", "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := client.PresignHeadExactRequest(context.Background(), "raw/exact clip.mp4", "abc123", "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put, err := client.PresignPutCreateOnlyRequest(context.Background(), "joined/batch/objects/"+strings.Repeat("a", 64)+".mp4", "video/mp4", 1234, strings.Repeat("a", 64), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, method, path string
+		cap                PresignedRequest
+		headers            map[string]string
+	}{
+		{name: "get", method: http.MethodGet, path: "/bucket/raw/exact%20clip.mp4", cap: get, headers: map[string]string{"If-Match": `"abc123"`}},
+		{name: "head", method: http.MethodHead, path: "/bucket/raw/exact%20clip.mp4", cap: head, headers: map[string]string{"If-Match": `"abc123"`}},
+		{name: "put", method: http.MethodPut, path: "/bucket/joined/batch/objects/" + strings.Repeat("a", 64) + ".mp4", cap: put, headers: map[string]string{
+			"Content-Length": "1234", "Content-Type": "video/mp4", "If-None-Match": "*",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := mustURL(t, tc.cap.URL)
+			if tc.cap.Method != tc.method || u.Scheme != "https" || u.Host != "storage.example.test" || u.EscapedPath() != tc.path {
+				t.Fatalf("capability=%s %s%s, want %s https://storage.example.test%s", tc.cap.Method, u.Host, u.EscapedPath(), tc.method, tc.path)
+			}
+			if tc.name != "put" && u.Query().Get("versionId") != "version-7" {
+				t.Fatalf("versionId=%q", u.Query().Get("versionId"))
+			}
+			if tc.name == "put" && u.Query().Get("X-Amz-Checksum-Sha256") != "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=" {
+				t.Fatalf("checksum query is not bound: %q", u.Query().Get("X-Amz-Checksum-Sha256"))
+			}
+			for key, want := range tc.headers {
+				if got := tc.cap.Headers.Get(key); got != want {
+					t.Fatalf("%s=%q want %q (required=%v)", key, got, want, tc.cap.Headers)
+				}
+				if !strings.Contains(strings.ToLower(u.Query().Get("X-Amz-SignedHeaders")), strings.ToLower(key)) {
+					t.Fatalf("%s is not signed: %q", key, u.Query().Get("X-Amz-SignedHeaders"))
+				}
+			}
+		})
+	}
+}
 
 func TestSameAuthorityHTTPSRedirect(t *testing.T) {
 	origin := &http.Request{URL: mustURL(t, "https://storage.example.test:443/original")}
 	for _, tc := range []struct {
-		name    string
-		target  string
-		allowed bool
+		name, target string
+		allowed      bool
 	}{
 		{name: "same authority", target: "https://storage.example.test:443/redirected", allowed: true},
 		{name: "scheme case", target: "HTTPS://storage.example.test:443/redirected", allowed: true},
@@ -81,5 +153,94 @@ func TestOpenExactSendsConditionalGenerationIdentity(t *testing.T) {
 	}
 	if strings.Contains(ifMatch, "clip") {
 		t.Fatal("object key leaked into conditional identity")
+	}
+}
+
+func TestPutReaderIfAbsentVerifiedCreatesAndRereadsExactObject(t *testing.T) {
+	body := []byte("joined-media")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	var putIfNoneMatch, getIfMatch string
+	var handlerMu sync.Mutex
+	var handlerError string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		switch r.Method {
+		case http.MethodPut:
+			putIfNoneMatch = r.Header.Get("If-None-Match")
+			got, _ := io.ReadAll(r.Body)
+			if string(got) != string(body) {
+				handlerError = "PUT body=" + string(got)
+			}
+			w.Header().Set("ETag", `"etag-1"`)
+		case http.MethodHead:
+			w.Header().Set("ETag", `"etag-1"`)
+			w.Header().Set("Content-Length", "12")
+		case http.MethodGet:
+			getIfMatch = r.Header.Get("If-Match")
+			w.Header().Set("ETag", `"etag-1"`)
+			_, _ = w.Write(body)
+		default:
+			handlerError = "method=" + r.Method
+		}
+	}))
+	defer server.Close()
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, created, err := client.PutReaderIfAbsentVerified(context.Background(), "joined/x.mp4", "video/mp4", strings.NewReader(string(body)), int64(len(body)), sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlerMu.Lock()
+	gotHandlerError := handlerError
+	handlerMu.Unlock()
+	if gotHandlerError != "" {
+		t.Fatal(gotHandlerError)
+	}
+	if !created || head.ETag != "etag-1" || putIfNoneMatch != "*" || getIfMatch != `"etag-1"` {
+		t.Fatalf("created=%v head=%+v if-none-match=%q if-match=%q", created, head, putIfNoneMatch, getIfMatch)
+	}
+}
+
+func TestPutReaderIfAbsentVerifiedReconcilesOnlyExactExistingObject(t *testing.T) {
+	body := []byte("joined-media")
+	sum := sha256.Sum256(body)
+	sha := hex.EncodeToString(sum[:])
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusPreconditionFailed)
+			_, _ = io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+		case http.MethodHead:
+			w.Header().Set("ETag", `"existing"`)
+			w.Header().Set("Content-Length", "12")
+		case http.MethodGet:
+			_, _ = w.Write(body)
+		}
+	}))
+	defer server.Close()
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, created, err := client.PutReaderIfAbsentVerified(context.Background(), "joined/x.mp4", "video/mp4", strings.NewReader(string(body)), int64(len(body)), sha)
+	if err != nil || created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+	bad := strings.Repeat("0", 64)
+	if _, _, err := client.PutReaderIfAbsentVerified(context.Background(), "joined/x.mp4", "video/mp4", strings.NewReader(string(body)), int64(len(body)), bad); err == nil {
+		t.Fatal("mismatched existing object was accepted")
+	}
+}
+
+func TestPutReaderIfAbsentVerifiedRejectsUnconditionalPutCeiling(t *testing.T) {
+	client := &Client{}
+	sha := strings.Repeat("a", 64)
+	if _, _, err := client.PutReaderIfAbsentVerified(context.Background(), "joined/x.mp4", "video/mp4", strings.NewReader("x"), MaxConditionalPutBytes+1, sha); err == nil {
+		t.Fatal("oversized single-part object was accepted")
 	}
 }

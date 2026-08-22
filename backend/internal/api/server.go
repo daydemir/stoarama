@@ -44,6 +44,10 @@ type Server struct {
 	cfg                     config.Config
 	pool                    *pgxpool.Pool
 	r2                      *r2.Client
+	joinedOutputStorage     joinedOutputObjectStore
+	joinedFreezeSourceStore joinedFreezeSourceObjectStore
+	joinedFreezeTransport   http.RoundTripper
+	joinedCredentialCheck   func(context.Context) error
 	secrets                 *secretbox.Cipher
 	mailer                  email.Sender
 	streamsHTML             []byte
@@ -248,7 +252,7 @@ func (s *Server) router() http.Handler {
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
 			account.Use(s.requireAccountAuth)
-			// Confine a 'stoarama.pull'-scoped key to the 4 NAS pull endpoints; a
+			// Confine a 'stoarama.pull'-scoped key to the NAS pull endpoints; a
 			// session or full/read key is unaffected. Runs after requireAccountAuth
 			// so the principal is in context. Default-DENY: any non-pull account
 			// route 403s a pull key.
@@ -279,6 +283,9 @@ func (s *Server) router() http.Handler {
 			account.Post("/recordings/probe", s.handleAccountRecordingsProbe)
 			account.Get("/clips", s.handleAccountClips)
 			account.Post("/clips/release", s.handleAccountClipsReleaseBatch)
+			account.Get("/joined", s.handleAccountJoined)
+			account.Get("/joined/{joinedId}/download", s.handleAccountJoinedDownload)
+			account.Post("/joined/ack", s.handleAccountJoinedAck)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
@@ -430,6 +437,11 @@ func (s *Server) router() http.Handler {
 			admin.Post("/source-candidates/{id}/import", s.handleSourceCandidateImport)
 			admin.Get("/recorder-pool", s.handleAdminRecorderPool)
 			admin.Get("/recording/alert-deliveries", s.handleAlertDeliveryEventsList)
+			admin.Post("/recording/joined/freeze-tier1", s.handleAdminJoinedFreezeTier1)
+			admin.Get("/recording/joined/batches/status", s.handleAdminJoinedBatchStatus)
+			admin.Post("/recording/joined/stream-days/seal", s.handleAdminJoinedSealStreamDay)
+			admin.Post("/recording/joined/batches/final-freeze", s.handleAdminJoinedFinalFreeze)
+			admin.Post("/recording/joined/batches/index/seal", s.handleAdminJoinedSealBatchIndex)
 			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
@@ -520,6 +532,23 @@ func (s *Server) router() http.Handler {
 			worker.Post("/capture/ingest", s.handleCaptureIngest)
 			worker.Post("/capture/mark-unsupported", s.handleCaptureMarkUnsupported)
 			worker.Post("/media/upload-intents", s.handleUploadIntents)
+		})
+		api.Group(func(joinedWorker chi.Router) {
+			joinedWorker.Use(s.requireJoinedWorkerAuth)
+			joinedWorker.Post("/recording/joined/claim", s.handleJoinedClaim)
+			joinedWorker.Post("/recording/joined/publication/claim", s.handleJoinedPublicationClaim)
+			joinedWorker.Post("/recording/joined/heartbeat", s.handleJoinedHeartbeat)
+			joinedWorker.Post("/recording/joined/capabilities/source", s.handleJoinedSourceCapability)
+			joinedWorker.Post("/recording/joined/capabilities/artifact", s.handleJoinedArtifactCapability)
+			joinedWorker.Post("/recording/joined/hour/seal", s.handleJoinedSealHour)
+			joinedWorker.Post("/recording/joined/publication/ledger/finalize", s.handleJoinedFinalizeLedger)
+			joinedWorker.Post("/recording/joined/publication/hour/finalize", s.handleJoinedFinalizeHour)
+			joinedWorker.Post("/recording/joined/publication/index/finalize", s.handleJoinedFinalizeBatchIndex)
+		})
+		api.Group(func(joinedBootstrap chi.Router) {
+			joinedBootstrap.Use(s.requireJoinedWorkerBootstrapAuth)
+			joinedBootstrap.Post("/recording/joined/token", s.handleJoinedToken)
+			joinedBootstrap.Get("/recording/joined/status", s.handleJoinedStatus)
 		})
 
 		api.Group(func(service chi.Router) {

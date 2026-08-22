@@ -31,6 +31,9 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodPost, "/api/v1/account/connections/heartbeat", true},
 		{http.MethodPost, "/api/v1/account/connections/inventory", true},
 		{http.MethodPost, "/api/v1/account/clips/release", true},
+		{http.MethodGet, "/api/v1/account/joined", true},
+		{http.MethodGet, "/api/v1/account/joined/34/download", true},
+		{http.MethodPost, "/api/v1/account/joined/ack", true},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 
@@ -39,6 +42,8 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/connections/heartbeat", false},
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34/download", false},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/release", false},
+		{http.MethodPost, "/api/v1/account/joined/34/download", false},
+		{http.MethodGet, "/api/v1/account/joined/abc/download", false},
 
 		// Hard-delete is NO LONGER allowed for a pull key: it can release, not destroy.
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34", false},
@@ -97,6 +102,9 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 		{http.MethodPost, "/api/v1/account/connections/heartbeat"},
 		{http.MethodPost, "/api/v1/account/connections/inventory"},
 		{http.MethodPost, "/api/v1/account/clips/release"},
+		{http.MethodGet, "/api/v1/account/joined"},
+		{http.MethodGet, "/api/v1/account/joined/34/download"},
+		{http.MethodPost, "/api/v1/account/joined/ack"},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download"},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release"},
 	}
@@ -387,6 +395,8 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	future := now.Add(connectionHeartbeatFutureSkew + time.Minute)
+	beforeAttempt := now.Add(-time.Minute)
+	farRetry := now.Add(25 * time.Hour)
 	valid := connectionHeartbeatRequest{
 		CursorID:           8,
 		ClipsPulled:        5,
@@ -427,6 +437,13 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	if err := validateConnectionHeartbeat(starting); err != nil {
 		t.Fatalf("pre-batch worker telemetry rejected: %v", err)
 	}
+	retry := now.Add(time.Minute)
+	joined := starting
+	joined.JoinedProtocol = 1
+	joined.JoinedDelivery = &connectionJoinedDelivery{ArtifactID: 9, Blocker: "download_failed", AttemptedAt: &now, RetryAt: &retry}
+	if err := validateConnectionHeartbeat(joined); err != nil {
+		t.Fatalf("joined capability heartbeat rejected: %v", err)
+	}
 	legacy := connectionHeartbeatRequest{CursorID: 1, ClipsPulled: 1}
 	if err := validateConnectionHeartbeat(legacy); err != nil {
 		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)
@@ -455,11 +472,61 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: -1}},
 		{Storage: &connectionStorageStatus{Available: true, TotalBytes: 100, FreeBytes: 101}},
 		{Storage: &connectionStorageStatus{Available: false, TotalBytes: 100}},
+		{JoinedProtocol: 2},
+		{JoinedProtocol: 1},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "download_failed", AttemptedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 0, Blocker: "download_failed", AttemptedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "unknown", AttemptedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "io_error", AttemptedAt: &future}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "io_error", AttemptedAt: &now, RetryAt: &beforeAttempt}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "io_error", AttemptedAt: &now, RetryAt: &farRetry}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
 			t.Errorf("invalid heartbeat %d accepted: %+v", i, request)
 		}
+	}
+}
+
+func TestConnectionHeartbeatJoinedProtocolTracksCurrentClientCapability(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(47), int64(123)
+	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,api_key_id,joined_protocol_version)
+		VALUES($1,'nas_pull',$2,1)`, accountID, apiKeyID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(body string) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", strings.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey,
+			accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionHeartbeat(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	protocol := func() int {
+		var got int
+		if err := pool.QueryRow(ctx, `SELECT joined_protocol_version FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	call(`{"cursor_id":1,"clips_pulled":1}`)
+	if got := protocol(); got != 0 {
+		t.Fatalf("legacy heartbeat preserved stale joined protocol=%d", got)
+	}
+	call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":1}`)
+	if got := protocol(); got != 1 {
+		t.Fatalf("explicit joined protocol 1 persisted=%d", got)
+	}
+	call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":0}`)
+	if got := protocol(); got != 0 {
+		t.Fatalf("explicit joined protocol 0 persisted=%d", got)
 	}
 }
 

@@ -97,6 +97,8 @@ func main() {
 		runRecordingPreopen(ctx, cfg, os.Args[2:])
 	case "recording-stitch":
 		runRecordingStitch(ctx, cfg, os.Args[2:])
+	case "recording-joined":
+		runRecordingJoined(ctx, cfg, os.Args[2:])
 	case "relay-connectivity":
 		runRelayConnectivity(ctx, cfg, os.Args[2:])
 	case "relay-routing":
@@ -190,6 +192,13 @@ func usage() {
 	  stoaramactl recording-health run [--dry-run --freshness-min 10]
 	  stoaramactl recording-health summary
 	  stoaramactl recording-preopen run [--dry-run --concurrency 4 --probe-sec 20 --frame-fresh-min 30]
+	  stoaramactl recording-joined freeze-tier1 --connection-id N --batch-id ID --source-endpoint URL --qualification-run-id N [--generation N --expected-request-sha256 HASH --apply]
+	  stoaramactl recording-joined seal-stream-day --batch-id ID --recording-id N --local-date YYYY-MM-DD [--apply]
+	  stoaramactl recording-joined seal-remaining-days --batch-id ID --canary-recording-id N --canary-local-date YYYY-MM-DD --expected-canary-seal-request-sha256 HASH [--apply]
+	  stoaramactl recording-joined final-freeze --batch-id ID --expected-frozen-denominator-sha256 HASH [--apply]
+	  stoaramactl recording-joined seal-batch-index --batch-id ID --expected-sha256 HASH [--apply]
+	  stoaramactl recording-joined worker run [--batch-id ID --worker-id ID --scratch-root ABS]
+	  stoaramactl recording-joined status --batch-id ID
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
 	  stoaramactl recordings naming allocate|get|set|preview

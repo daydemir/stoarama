@@ -6,12 +6,64 @@ databases:
     storageAutoscalingEnabled: true
 
 services:
+  # Ship-dark, isolated Release B joined-delivery worker. Keep one fixed
+  # instance: service count is the only cloud concurrency control. It talks to
+  # the API contract and intentionally receives no database or R2 credentials.
+  - type: worker
+    name: stoarama-joined-worker
+    env: go
+    rootDir: backend
+    plan: starter
+    numInstances: 1
+    autoDeployTrigger: commit
+    buildCommand: |
+      set -euo pipefail
+      go build -o bin/stoaramactl ./cmd/stoaramactl
+      bash ./scripts/install-pinned-media-tools.sh optional
+    startCommand: ./bin/stoaramactl recording-joined worker run
+    envVars:
+      - key: APP_BASE_URL
+        value: https://stoarama.com
+      # Dedicated joined-only bootstrap credential for claim/reclaim/status.
+      # The backend returns separate short-lived hour/lease capability tokens.
+      - key: STOARAMA_JOINED_WORKER_TOKEN
+        sync: false
+      - key: JOINED_RECORDING_ENABLED
+        value: "false"
+      - key: JOINED_RECORDING_PROTOCOL_VERSION
+        value: "0"
+      - key: JOINED_RECORDING_ROLLING_ENABLED
+        value: "false"
+      - key: STOARAMA_JOINED_WORK_SCOPE
+        value: disabled
+      - key: JOINED_RECORDING_BATCH_ID
+        sync: false
+      - key: JOINED_RECORDING_CANARY_HOUR_IDS
+        sync: false
+      - key: JOINED_RECORDING_SCRATCH_ROOT
+        value: /tmp/stoarama-joined
+      - key: JOINED_RECORDING_STORAGE_AUTHORITY
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_URL
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_BINARY_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFPROBE_BINARY_SHA256
+        sync: false
+      - key: FFMPEG_BIN
+        value: ./bin/ffmpeg
+      - key: FFPROBE_BIN
+        value: ./bin/ffprobe
+
   - type: web
     name: stoarama-api
     env: go
     rootDir: backend
     autoDeployTrigger: commit
-    # Vendor a linux ffmpeg into bin/ during build. Render env:go has no ffmpeg
+    # Vendor the exact same pinned linux ffmpeg/ffprobe pair as the joined
+    # worker. Render env:go has no ffmpeg
     # on PATH, and the recorder create-time reachability probe shells to
     # $FFMPEG_BIN. We use the BtbN gpl build: the johnvansickle static build
     # segfaults on any network input (TLS and plain http alike) on Render's
@@ -23,12 +75,7 @@ services:
     buildCommand: |
       set -euo pipefail
       go build -o bin/stoarama-api ./cmd/stoarama-api
-      curl -fsSL -o /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
-      mkdir -p /tmp/ffmpeg-extract
-      tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract --strip-components=1
-      cp /tmp/ffmpeg-extract/bin/ffmpeg bin/ffmpeg
-      chmod +x bin/ffmpeg
-      ./bin/ffmpeg -version
+      bash ./scripts/install-pinned-media-tools.sh
     startCommand: ./bin/stoarama-api
     # Fail a new release before cutover if legacy/stale recorder identity data
     # would make a live cloud recorder unable to authenticate. The currently
@@ -101,8 +148,36 @@ services:
         value: "5"
       - key: BOX_WORKER_RETRY_MAX_SEC
         value: "300"
+      # Joined control plane is independently ship-dark. It never grants the
+      # isolated worker backend signing or storage credentials.
+      - key: JOINED_RECORDING_CONTROL_PLANE_ENABLED
+        value: "false"
+      - key: JOINED_RECORDING_PROTOCOL_VERSION
+        value: "0"
+      - key: STOARAMA_JOINED_WORK_SCOPE
+        value: disabled
+      - key: JOINED_RECORDING_BATCH_ID
+        sync: false
+      - key: JOINED_RECORDING_CANARY_HOUR_IDS
+        sync: false
+      - key: JOINED_WORKER_BOOTSTRAP_TOKEN
+        sync: false
+      - key: JOINED_WORKER_SIGNING_KEY
+        sync: false
+      # Shared verbatim with stoarama-joined-worker so freeze evidence and
+      # worker verification use byte-identical media tools.
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_URL
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFMPEG_BINARY_SHA256
+        sync: false
+      - key: JOINED_RECORDING_FFPROBE_BINARY_SHA256
+        sync: false
       - key: FFMPEG_BIN
         value: ./bin/ffmpeg
+      - key: FFPROBE_BIN
+        value: ./bin/ffprobe
       # The BtbN ffmpeg (OpenSSL) reads its CA bundle from SSL_CERT_FILE; point
       # it at the Ubuntu base image's system bundle (present at both build and
       # run time) so HTTPS cert verification succeeds on the reachability probe.

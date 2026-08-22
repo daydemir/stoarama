@@ -1,0 +1,39 @@
+{
+  "valid": [
+    {
+      "endpoint": "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+      "authority": "0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+    }
+  ],
+  "invalid": [
+    "",
+    "http://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+    "HTTPS://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+    "https://0123456789ABCDEF0123456789ABCDEF.r2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcde.r2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcdef0.r2.cloudflarestorage.com",
+    "https://g123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcdef.eu.r2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.net",
+    "https://0123456789abcdef0123456789abcdef.R2.CLOUDFLARESTORAGE.COM",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com.",
+    "https://user@0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com:443",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com:99999",
+    "https://[0123456789abcdef0123456789abcdef].r2.cloudflarestorage.com",
+    "https://[2001:db8::1]",
+    "https://127.0.0.1",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/raw",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com?secret=value",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com#fragment",
+    "https://0123456789abcdef0123456789abcdef%2er2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com ",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com\n",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com\t",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com\u0000",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com\u00a0",
+    "https://0123456789abcdef0123456789abcdef\uff0er2.cloudflarestorage.com",
+    "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com\uff0fraw"
+  ]
+}

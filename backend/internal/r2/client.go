@@ -3,6 +3,9 @@ package r2
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +22,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 )
+
+// MaxConditionalPutBytes is R2's exact single-part PUT ceiling: 5 GiB minus
+// the 5 MiB request allowance. Larger immutable writes need a separately
+// designed conditional multipart protocol; silently falling back would make
+// create-only publication overwrite-capable.
+const MaxConditionalPutBytes int64 = 5*1024*1024*1024 - 5*1024*1024
 
 type Client struct {
 	bucket    string
@@ -46,6 +55,14 @@ type ObjectInfo struct {
 	ETag         string
 	SizeBytes    int64
 	LastModified time.Time
+}
+
+// PresignedRequest is the complete capability a caller must exercise. Headers
+// are part of the SigV4 signature and may not be changed or omitted.
+type PresignedRequest struct {
+	URL     string
+	Method  string
+	Headers http.Header
 }
 
 func New(ctx context.Context, cfg Config) (*Client, error) {
@@ -103,6 +120,81 @@ func (c *Client) PresignGet(ctx context.Context, key string, ttl time.Duration) 
 		return "", fmt.Errorf("presign get %s: %w", key, err)
 	}
 	return out.URL, nil
+}
+
+// PresignGetExact signs the immutable generation recorded by the caller. The
+// downloader must send If-Match with the same quoted ETag on every request.
+func (c *Client) PresignGetExact(ctx context.Context, key, etag, versionID string, ttl time.Duration) (string, error) {
+	out, err := c.PresignGetExactRequest(ctx, key, etag, versionID, ttl)
+	if err != nil {
+		return "", err
+	}
+	return out.URL, nil
+}
+
+func (c *Client) PresignGetExactRequest(ctx context.Context, key, etag, versionID string, ttl time.Duration) (PresignedRequest, error) {
+	clean := cleanETag(etag)
+	if clean == "" {
+		return PresignedRequest{}, errors.New("presign exact get: etag is required")
+	}
+	in := &s3.GetObjectInput{
+		Bucket:  aws.String(c.bucket),
+		Key:     aws.String(key),
+		IfMatch: aws.String(`"` + clean + `"`),
+	}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.presigner.PresignGetObject(ctx, in, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return PresignedRequest{}, fmt.Errorf("presign exact get %s: %w", key, err)
+	}
+	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
+}
+
+func (c *Client) PresignHeadExactRequest(ctx context.Context, key, etag, versionID string, ttl time.Duration) (PresignedRequest, error) {
+	clean := cleanETag(etag)
+	if clean == "" {
+		return PresignedRequest{}, errors.New("presign exact head: etag is required")
+	}
+	in := &s3.HeadObjectInput{
+		Bucket:  aws.String(c.bucket),
+		Key:     aws.String(key),
+		IfMatch: aws.String(`"` + clean + `"`),
+	}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.presigner.PresignHeadObject(ctx, in, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return PresignedRequest{}, fmt.Errorf("presign exact head %s: %w", key, err)
+	}
+	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
+}
+
+// PresignPutCreateOnlyRequest permits one exact immutable object creation. The
+// key, media type, length, checksum, and no-overwrite precondition are signed.
+func (c *Client) PresignPutCreateOnlyRequest(ctx context.Context, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration) (PresignedRequest, error) {
+	if sizeBytes <= 0 {
+		return PresignedRequest{}, errors.New("presign create-only put: size must be positive")
+	}
+	digest, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(sha256Hex)))
+	if err != nil || len(digest) != 32 {
+		return PresignedRequest{}, errors.New("presign create-only put: sha256 must be 64 lowercase hex characters")
+	}
+	in := &s3.PutObjectInput{
+		Bucket:         aws.String(c.bucket),
+		Key:            aws.String(key),
+		ContentLength:  aws.Int64(sizeBytes),
+		ContentType:    aws.String(contentType),
+		ChecksumSHA256: aws.String(base64.StdEncoding.EncodeToString(digest)),
+		IfNoneMatch:    aws.String("*"),
+	}
+	out, err := c.presigner.PresignPutObject(ctx, in, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return PresignedRequest{}, fmt.Errorf("presign create-only put %s: %w", key, err)
+	}
+	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
 }
 
 // PresignGetDownload presigns a GET that sets Content-Disposition: attachment so
@@ -169,6 +261,78 @@ func (c *Client) PutReader(ctx context.Context, key, contentType string, body io
 	return cleanETag(aws.ToString(out.ETag)), nil
 }
 
+// PutReaderIfAbsentVerified publishes one immutable object and then re-reads
+// the exact stored generation. A pre-existing key is accepted only when its
+// complete bytes match expectedSize and expectedSHA256. This makes a retry
+// after "object written, database transaction failed" safe and reconcilable.
+func (c *Client) PutReaderIfAbsentVerified(ctx context.Context, key, contentType string, body io.Reader, expectedSize int64, expectedSHA256 string) (ObjectHead, bool, error) {
+	if expectedSize <= 0 || expectedSize > MaxConditionalPutBytes || !isLowerHexSHA256(expectedSHA256) {
+		return ObjectHead{}, false, fmt.Errorf("invalid bounded immutable object identity")
+	}
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(c.bucket),
+		Key:           aws.String(key),
+		Body:          body,
+		ContentLength: aws.Int64(expectedSize),
+		IfNoneMatch:   aws.String("*"),
+	}
+	if contentType != "" {
+		in.ContentType = aws.String(contentType)
+	}
+	created := true
+	if _, err := c.s3.PutObject(ctx, in); err != nil {
+		if !isPreconditionFailed(err) {
+			return ObjectHead{}, false, fmt.Errorf("conditional put object %s: %w", key, err)
+		}
+		created = false
+	}
+	head, err := c.Head(ctx, key)
+	if err != nil {
+		return ObjectHead{}, false, fmt.Errorf("verify immutable object %s: %w", key, err)
+	}
+	if head.ETag == "" || head.SizeBytes != expectedSize {
+		return ObjectHead{}, false, fmt.Errorf("immutable object %s size mismatch: got %d want %d", key, head.SizeBytes, expectedSize)
+	}
+	rc, err := c.OpenExact(ctx, key, head.ETag, head.VersionID)
+	if err != nil {
+		return ObjectHead{}, false, fmt.Errorf("verify immutable object %s: %w", key, err)
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, rc)
+	closeErr := rc.Close()
+	if copyErr != nil {
+		return ObjectHead{}, false, fmt.Errorf("hash immutable object %s: %w", key, copyErr)
+	}
+	if closeErr != nil {
+		return ObjectHead{}, false, fmt.Errorf("close immutable object %s: %w", key, closeErr)
+	}
+	gotSHA := hex.EncodeToString(h.Sum(nil))
+	if n != expectedSize || gotSHA != expectedSHA256 {
+		return ObjectHead{}, false, fmt.Errorf("immutable object %s content mismatch", key)
+	}
+	return head, created, nil
+}
+
+func isLowerHexSHA256(raw string) bool {
+	if len(raw) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(raw)
+	return err == nil && raw == strings.ToLower(raw)
+}
+
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := strings.TrimSpace(apiErr.ErrorCode())
+		if code == "PreconditionFailed" || code == "412" {
+			return true
+		}
+	}
+	var responseErr *awshttp.ResponseError
+	return errors.As(err, &responseErr) && responseErr.HTTPStatusCode() == http.StatusPreconditionFailed
+}
+
 // PutMultipart uploads body to key using S3 multipart upload with a bounded
 // part size, so peak memory stays flat (PartSize * Concurrency) regardless of
 // total object size. Use for multi-GB objects on small instances, where a
@@ -200,6 +364,23 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	})
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
+	}
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId))}, nil
+}
+
+// HeadExact resolves one immutable generation and refuses a changed ETag.
+func (c *Client) HeadExact(ctx context.Context, key, etag, versionID string) (ObjectHead, error) {
+	clean := cleanETag(etag)
+	if clean == "" {
+		return ObjectHead{}, errors.New("head exact: etag is required")
+	}
+	in := &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + clean + `"`)}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.s3.HeadObject(ctx, in)
+	if err != nil {
+		return ObjectHead{}, fmt.Errorf("head exact object %s: %w", key, err)
 	}
 	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId))}, nil
 }

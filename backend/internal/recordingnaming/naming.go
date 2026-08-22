@@ -74,6 +74,48 @@ type Policy struct {
 	ClipStartedAt time.Time
 }
 
+type JoinedPolicy struct {
+	FolderName   string
+	Metadata     Metadata
+	CronTimezone string
+	ActualStart  time.Time
+	ActualEnd    time.Time
+	Hour         int
+	Part         int
+	Parts        int
+}
+
+// BuildJoinedPath emits the delivery hierarchy for a verified presentation
+// range. Subsecond/UTC evidence belongs in the coverage manifest; filenames
+// intentionally remain second-readable for manual gap review.
+func BuildJoinedPath(p JoinedPolicy) (string, error) {
+	if err := p.Metadata.ValidatePlazaHourly(); err != nil {
+		return "", err
+	}
+	folder, err := sanitizePath(p.FolderName)
+	if err != nil {
+		return "", err
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(p.CronTimezone))
+	if err != nil {
+		return "", fmt.Errorf("load naming timezone: %w", err)
+	}
+	start, end := p.ActualStart.In(loc), p.ActualEnd.In(loc)
+	if !end.After(start) || start.Year() != end.Year() || start.YearDay() != end.YearDay() || p.Hour < 1 || p.Hour > 12 {
+		return "", fmt.Errorf("invalid joined presentation range")
+	}
+	if p.Parts < 1 || p.Part < 1 || p.Part > p.Parts || (p.Parts == 1 && p.Part != 1) {
+		return "", fmt.Errorf("invalid joined part ordinal")
+	}
+	plazaID := twoDigitID(p.Metadata.PlazaID, 0)
+	base := fmt.Sprintf("%s_%s_%04d_%s_W%d_%s_hour_%02d", plazaID, sanitizeToken(p.Metadata.PlazaName), start.Year(), start.Month().String(), ((start.Day()-1)/7)+1, start.Weekday().String(), p.Hour)
+	if p.Parts > 1 {
+		base += fmt.Sprintf("_part_%02d", p.Part)
+	}
+	base += fmt.Sprintf("_%s-%s.mp4", start.Format("150405"), end.Format("150405"))
+	return path.Join(folder, start.Month().String(), start.Weekday().String(), base), nil
+}
+
 func BuildDisplayPath(p Policy) (string, error) {
 	switch p.Profile {
 	case ProfileStoaramaV1:
