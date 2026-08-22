@@ -81,4 +81,16 @@ func TestFinalFreezeRevalidatesProspectiveAndHistoricalQualificationEvidence(t *
 	if err := validateJoinedFinalFreezeQualificationAuthority(authority, recordings, windows); err == nil {
 		t.Fatal("selected qualification window hash substitution was accepted")
 	}
+	prospectiveAuthority, prospectiveRecordings, prospectiveWindows := finalFreezeQualificationFixture(t, false)
+	prospectiveAuthority.QualificationRuleVersion = joinedrecording.Tier1HistoricalQualificationVersion
+	prospectiveAuthority.QualificationRunFrozenAt = prospectiveAuthority.Cutoff.Add(time.Hour)
+	if err := validateJoinedFinalFreezeQualificationAuthority(prospectiveAuthority, prospectiveRecordings, prospectiveWindows); err == nil {
+		t.Fatal("historical rule accepted prospective qualification authority kind")
+	}
+	historicalAuthority, historicalRecordings, historicalWindows := finalFreezeQualificationFixture(t, true)
+	historicalAuthority.QualificationRuleVersion = "recording-qualification-v1"
+	historicalAuthority.QualificationRunFrozenAt = historicalAuthority.Cutoff.Add(-time.Hour)
+	if err := validateJoinedFinalFreezeQualificationAuthority(historicalAuthority, historicalRecordings, historicalWindows); err == nil {
+		t.Fatal("prospective rule accepted historical qualification authority kind")
+	}
 }

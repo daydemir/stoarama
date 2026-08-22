@@ -1,5 +1,3 @@
-BEGIN;
-
 ALTER TABLE recording_qualification_runs
   DROP CONSTRAINT recording_qualification_runs_target_recording_count_check;
 ALTER TABLE recording_qualification_runs
@@ -968,6 +966,3 @@ BEGIN
   END LOOP;
   RETURN TRUE;
 END $$;
-
-
-COMMIT;

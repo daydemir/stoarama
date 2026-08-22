@@ -226,7 +226,9 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		ConnectionID: connectionID, BatchID: joinedrecording.Tier1BatchID, Generation: 1, RecordingJobs: jobMap}
 	dryHistorical, historicalPlan, _ := callHistorical(historicalRequest)
 	if dryHistorical.Code != http.StatusOK || !lowerHexSHA256(historicalPlan.RequestSHA256) ||
-		len(historicalPlan.Members) != 33 || historicalPlan.Members[0].Qualification.Days[1].ReasonCodes[0] != "scheduled_for_drift" {
+		len(historicalPlan.Members) != 33 || len(historicalPlan.Members[0].Qualification.Days) != 14 ||
+		len(historicalPlan.Members[0].Qualification.Days[1].ReasonCodes) != 1 ||
+		historicalPlan.Members[0].Qualification.Days[1].ReasonCodes[0] != "scheduled_for_drift" {
 		t.Fatalf("historical authority dry-run status=%d body=%s", dryHistorical.Code, dryHistorical.Body.String())
 	}
 	badApply := historicalRequest
@@ -303,7 +305,8 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		req.BatchID, joinedrecording.Tier1RecordingIDs[0]))
 	dry, plan := call(req)
 	if dry.Code != http.StatusOK || !lowerHexSHA256(plan.RequestSHA256) || !lowerHexSHA256(plan.FrozenDenominatorSHA256) ||
-		!lowerHexSHA256(plan.FreezeExclusionsSHA256) || plan.ProvisionalSourceClips != 1 || plan.ProvisionalSourceBytes != 10 {
+		!lowerHexSHA256(plan.FreezeExclusionsSHA256) || plan.ProvisionalSourceClips != 1 || plan.ProvisionalSourceBytes != 10 ||
+		len(plan.Recordings) != 33 || len(plan.Recordings[0].Qualification.Days) != 14 {
 		t.Fatalf("dry-run status=%d body=%s", dry.Code, dry.Body.String())
 	}
 	firstImportedDay := plan.Recordings[0].Qualification.Days[0]

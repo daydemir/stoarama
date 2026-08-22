@@ -165,6 +165,9 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 	}
 	plan.MediaTool = tool
 	historical := historicalQualificationVersion(plan.SelectionAuthority.QualificationRuleVersion)
+	historicalImportedAfterCutoff := historicalAuthorityImportedAfterCutoff(
+		plan.SelectionAuthority.QualificationRuleVersion,
+		plan.SelectionAuthority.QualificationRunFrozenAt, req.EligibilityCutoff)
 	qualificationQuery := `SELECT chosen.ord,m.recording_id,m.cron_timezone,r.naming_profile,r.folder_name,
 		r.naming_metadata_jsonb,w.ordinal,to_char(w.local_open_at,'YYYY-MM-DD'),w.window_start_at,w.window_end_at,
 		matched.id,matched.scheduled_for,matched.status,matched.completed_at
@@ -254,8 +257,7 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 			endLocal.Hour() != 20 || endLocal.Minute() != 0 || endLocal.Second() != 0 || endLocal.Nanosecond() != 0 ||
 			(windowOrdinal > 1 && !date.Equal(previousDate.AddDate(0, 0, 1))) || completedAt.After(req.EligibilityCutoff) ||
 			(!historical && (plan.SelectionAuthority.QualificationRunFrozenAt.After(windowStart) || completedAt.Before(windowEnd))) ||
-			(historical && !historicalAuthorityAllowsImportedAfterWindows(plan.SelectionAuthority.QualificationRuleVersion,
-				plan.SelectionAuthority.QualificationRunFrozenAt, req.EligibilityCutoff)) {
+			(historical && !historicalImportedAfterCutoff) {
 			return plan, nil, errors.New("Tier-1 completed job/window facts differ")
 		}
 		day := joinedrecording.QualifiedDay{QualificationWindowOrdinal: windowOrdinal, LocalDate: localDate,

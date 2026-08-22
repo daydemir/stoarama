@@ -120,6 +120,20 @@ func TestHistoricalQualificationPreservesDriftAndExactErrorDay(t *testing.T) {
 	if _, err := SealQualificationWindow(wrongDate); err == nil {
 		t.Fatal("historical error was accepted on an unapproved recording/date")
 	}
+	reversedReasons := window
+	reversedReasons.Days = append([]QualifiedDay(nil), window.Days...)
+	reversedReasons.Days[2].ScheduledFor = timePointer(reversedReasons.Days[2].WindowStart.Add(time.Minute))
+	reversedReasons.Days[2].ReasonCodes = []string{"terminal_job_error", "scheduled_for_drift"}
+	if _, err := SealQualificationWindow(reversedReasons); err == nil {
+		t.Fatal("historical reasons were accepted out of canonical order")
+	}
+	earlyDone := window
+	earlyDone.Days = append([]QualifiedDay(nil), window.Days...)
+	earlyDone.Days[2].JobStatus = "done"
+	earlyDone.Days[2].ReasonCodes = nil
+	if _, err := SealQualificationWindow(earlyDone); err == nil {
+		t.Fatal("historical done job completed before its window end")
+	}
 
 	prospective := qualificationFixture(t, "UTC", time.Date(2026, time.July, 27, 8, 0, 0, 0, time.UTC))
 	prospective.Days[0].ScheduledFor = timePointer(prospective.Days[0].WindowStart)

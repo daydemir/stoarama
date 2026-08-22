@@ -398,6 +398,6 @@ func historicalAuthorityKind(historical bool) string {
 	return ""
 }
 
-func historicalAuthorityAllowsImportedAfterWindows(version string, importedAt, cutoff time.Time) bool {
+func historicalAuthorityImportedAfterCutoff(version string, importedAt, cutoff time.Time) bool {
 	return historicalQualificationVersion(version) && !importedAt.IsZero() && importedAt.After(cutoff)
 }

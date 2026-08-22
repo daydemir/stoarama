@@ -230,8 +230,9 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 		activeRunID, nullSceneRunID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, nullSceneRunID); err == nil {
-		t.Fatal("prospective qualification activated with missing scene evidence")
+	if _, err := pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, nullSceneRunID); err == nil ||
+		!strings.Contains(err.Error(), "qualification evidence or window set is invalid") {
+		t.Fatalf("prospective missing-scene activation err=%v", err)
 	}
 }
 
