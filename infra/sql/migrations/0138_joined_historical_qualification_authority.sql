@@ -32,19 +32,25 @@ RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
   FROM parsed;
 $$;
 
-CREATE OR REPLACE FUNCTION recording_historical_qualification_evidence_sha256(qualification JSONB)
+CREATE OR REPLACE FUNCTION recording_historical_go_string_json(value TEXT)
 RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
-  SELECT encode(sha256(convert_to(
+  SELECT replace(replace(replace(replace(replace(to_jsonb(value)::TEXT,
+    '<',E'\\u003c'),'>',E'\\u003e'),'&',E'\\u0026'),chr(8232),E'\\u2028'),chr(8233),E'\\u2029');
+$$;
+
+CREATE OR REPLACE FUNCTION recording_historical_qualification_canonical(qualification JSONB, clear_evidence BOOLEAN)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
+  SELECT
     '{"recording_id":'||(qualification->>'recording_id')::BIGINT::TEXT||
-    ',"timezone":'||(qualification->'timezone')::TEXT||
+    ',"timezone":'||recording_historical_go_string_json(qualification->>'timezone')||
     ',"days":['||COALESCE((
       SELECT string_agg(
-        '{"local_date":'||(day->'local_date')::TEXT||
+        '{"local_date":'||recording_historical_go_string_json(day->>'local_date')||
         ',"qualification_window_ordinal":'||(day->>'qualification_window_ordinal')::INTEGER::TEXT||
         ',"job_id":'||(day->>'job_id')::BIGINT::TEXT||
         ',"scheduled_for":'||recording_historical_go_utc_time_json(day->'scheduled_for')||
-        ',"job_status":'||(day->'job_status')::TEXT||
-        ',"reason_codes":['||COALESCE((SELECT string_agg(to_jsonb(reason)::TEXT,',' ORDER BY reason_ordinal)
+        ',"job_status":'||recording_historical_go_string_json(day->>'job_status')||
+        ',"reason_codes":['||COALESCE((SELECT string_agg(recording_historical_go_string_json(reason),',' ORDER BY reason_ordinal)
           FROM jsonb_array_elements_text(day->'reason_codes') WITH ORDINALITY reasons(reason,reason_ordinal)),'')||']'||
         ',"window_start":'||recording_historical_go_utc_time_json(day->'window_start')||
         ',"window_end":'||recording_historical_go_utc_time_json(day->'window_end')||
@@ -52,9 +58,54 @@ RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
       FROM jsonb_array_elements(qualification->'days') WITH ORDINALITY days(day,day_ordinal)
     ),'')||']'||
     ',"frozen_at":'||recording_historical_go_utc_time_json(qualification->'frozen_at')||
-    ',"authority_kind":'||(qualification->'authority_kind')::TEXT||
-    ',"evidence_sha256":""}',
-    'UTF8')),'hex');
+    ',"authority_kind":'||recording_historical_go_string_json(qualification->>'authority_kind')||
+    ',"evidence_sha256":'||CASE WHEN clear_evidence THEN '""' ELSE
+      recording_historical_go_string_json(qualification->>'evidence_sha256') END||'}';
+$$;
+
+CREATE OR REPLACE FUNCTION recording_historical_qualification_evidence_sha256(qualification JSONB)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
+  SELECT encode(sha256(convert_to(recording_historical_qualification_canonical(qualification,TRUE),'UTF8')),'hex');
+$$;
+
+CREATE OR REPLACE FUNCTION recording_historical_qualification_jobs_canonical(recording_jobs JSONB)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
+  SELECT '['||COALESCE(string_agg(
+    '{"recording_id":'||(entry->>'recording_id')::BIGINT::TEXT||
+    ',"job_ids":['||COALESCE((SELECT string_agg((job#>>'{}')::BIGINT::TEXT,',' ORDER BY job_ordinal)
+      FROM jsonb_array_elements(entry->'job_ids') WITH ORDINALITY jobs(job,job_ordinal)),'')||']}',
+    ',' ORDER BY entry_ordinal),'')||']'
+  FROM jsonb_array_elements(recording_jobs) WITH ORDINALITY entries(entry,entry_ordinal);
+$$;
+
+CREATE OR REPLACE FUNCTION recording_historical_request_canonical(plan JSONB)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
+  SELECT
+    '{"schema_version":'||(plan->>'schema_version')::INTEGER::TEXT||
+    ',"authority_kind":'||recording_historical_go_string_json(plan->>'authority_kind')||
+    ',"batch_id":'||recording_historical_go_string_json(plan->>'batch_id')||
+    ',"generation":'||(plan->>'generation')::INTEGER::TEXT||
+    ',"account_id":'||(plan->>'account_id')::BIGINT::TEXT||
+    ',"connection_id":'||(plan->>'connection_id')::BIGINT::TEXT||
+    ',"cutoff":'||recording_historical_go_utc_time_json(plan->'cutoff')||
+    ',"ordered_recording_ids_sha256":'||recording_historical_go_string_json(plan->>'ordered_recording_ids_sha256')||
+    ',"qualification_rule_version":'||recording_historical_go_string_json(plan->>'qualification_rule_version')||
+    ',"qualification_jobs_sha256":'||recording_historical_go_string_json(plan->>'qualification_jobs_sha256')||
+    ',"members":['||COALESCE((
+      SELECT string_agg(
+        '{"recording_id":'||(member->>'recording_id')::BIGINT::TEXT||
+        ',"stream_id":'||(member->>'stream_id')::BIGINT::TEXT||
+        ',"recording_name":'||recording_historical_go_string_json(member->>'recording_name')||
+        ',"stream_name":'||recording_historical_go_string_json(member->>'stream_name')||
+        ',"timezone":'||recording_historical_go_string_json(member->>'timezone')||
+        ',"schedule_start_at":'||recording_historical_go_utc_time_json(member->'schedule_start_at')||
+        CASE WHEN member ? 'schedule_end_at' THEN
+          ',"schedule_end_at":'||recording_historical_go_utc_time_json(member->'schedule_end_at') ELSE '' END||
+        ',"active_weekdays":'||(member->>'active_weekdays')::SMALLINT::TEXT||
+        ',"qualification":'||recording_historical_qualification_canonical(member->'qualification',FALSE)||'}',
+        ',' ORDER BY member_ordinal)
+      FROM jsonb_array_elements(plan->'members') WITH ORDINALITY members(member,member_ordinal)
+    ),'')||']}';
 $$;
 
 CREATE OR REPLACE FUNCTION enforce_recording_qualification_run_lifecycle()
@@ -142,11 +193,17 @@ BEGIN
          COALESCE(OLD.definition_jsonb->>'qualification_jobs_sha256','') !~ '^[0-9a-f]{64}$' OR
 	     COALESCE(OLD.definition_jsonb->>'qualification_jobs_canonical','')='' OR
 	     COALESCE(OLD.definition_jsonb->>'request_canonical','')='' OR
-	     encode(sha256(convert_to(OLD.definition_jsonb->>'qualification_jobs_canonical','UTF8')),'hex')
+	     OLD.definition_jsonb->>'qualification_jobs_canonical' IS DISTINCT FROM
+	       recording_historical_qualification_jobs_canonical(OLD.definition_jsonb->'recording_jobs') OR
+	     encode(sha256(convert_to(recording_historical_qualification_jobs_canonical(
+	       OLD.definition_jsonb->'recording_jobs'),'UTF8')),'hex')
 	       IS DISTINCT FROM OLD.definition_jsonb->>'qualification_jobs_sha256' OR
 	     (OLD.definition_jsonb->>'qualification_jobs_canonical')::JSONB
 	       IS DISTINCT FROM OLD.definition_jsonb->'recording_jobs' OR
-	     encode(sha256(convert_to(OLD.definition_jsonb->>'request_canonical','UTF8')),'hex')
+	     OLD.definition_jsonb->>'request_canonical' IS DISTINCT FROM
+	       recording_historical_request_canonical(OLD.definition_jsonb->'canonical_plan') OR
+	     encode(sha256(convert_to(recording_historical_request_canonical(
+	       OLD.definition_jsonb->'canonical_plan'),'UTF8')),'hex')
 	       IS DISTINCT FROM OLD.definition_jsonb->>'request_sha256' OR
 	     (OLD.definition_jsonb->>'request_canonical')::JSONB
 	       IS DISTINCT FROM (OLD.definition_jsonb->'canonical_plan')-'request_sha256'::TEXT OR

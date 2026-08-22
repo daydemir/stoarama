@@ -617,6 +617,13 @@ func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 			IS DISTINCT FROM member->'qualification'->>'evidence_sha256'`, fixture.runID).Scan(&evidenceMismatches); err != nil || evidenceMismatches != 0 {
 		t.Fatalf("database qualification wire hash parity mismatches=%d err=%v", evidenceMismatches, err)
 	}
+	escapingFixture := "<>&\u2028\u2029\n\t\"\\"
+	escapingJSON, _ := json.Marshal(escapingFixture)
+	var databaseEscaping string
+	if err := fixture.pool.QueryRow(ctx, `SELECT recording_historical_go_string_json($1)`, escapingFixture).
+		Scan(&databaseEscaping); err != nil || databaseEscaping != string(escapingJSON) {
+		t.Fatalf("database Go string escaping parity got=%q want=%q err=%v", databaseEscaping, escapingJSON, err)
+	}
 	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_jobs j SET scheduled_for=
 		(q.definition_jsonb->'canonical_plan'->'members'->0->'qualification'->'days'->0->>'scheduled_for')::timestamptz
 		FROM recording_qualification_runs q WHERE q.id=$1 AND j.id=$2`, fixture.runID, fixture.firstJobID); err != nil {
@@ -817,6 +824,67 @@ func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 			numericID := cloneJoinedHistoricalQualificationRun(t, fixture, numericDefinition)
 			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, numericID); err == nil {
 				t.Fatal("self-hashed historical authority with non-Go integer spelling activated")
+			}
+		})
+	}
+	decodeCanonicalDefinition := func() (map[string]any, joinedHistoricalQualificationPlan) {
+		t.Helper()
+		var decoded map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(definitionJSON))
+		decoder.UseNumber()
+		if err := decoder.Decode(&decoded); err != nil {
+			t.Fatal(err)
+		}
+		var plan joinedHistoricalQualificationPlan
+		if err := json.Unmarshal(planJSON, &plan); err != nil {
+			t.Fatal(err)
+		}
+		return decoded, plan
+	}
+	for name, mutate := range map[string]func(string) string{
+		"whitespace": func(canonical string) string { return " " + canonical },
+		"integer spelling": func(canonical string) string {
+			return strings.Replace(canonical, `"schema_version":1`, `"schema_version":1.0`, 1)
+		},
+	} {
+		t.Run("rejects non-Go request canonical "+name, func(t *testing.T) {
+			requestDefinition, requestPlan := decodeCanonicalDefinition()
+			mutated := mutate(string(joinedHistoricalQualificationApprovalBytes(requestPlan)))
+			requestSHA := sha256Hex([]byte(mutated))
+			requestPlan.RequestSHA256 = requestSHA
+			requestDefinition["canonical_plan"] = requestPlan
+			requestDefinition["request_canonical"] = mutated
+			requestDefinition["request_sha256"] = requestSHA
+			requestID := cloneJoinedHistoricalQualificationRun(t, fixture, requestDefinition)
+			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, requestID); err == nil {
+				t.Fatal("self-hashed historical authority with non-Go request canonical bytes activated")
+			}
+		})
+	}
+	for name, mutate := range map[string]func(string) string{
+		"whitespace": func(canonical string) string { return canonical + " " },
+		"integer spelling": func(canonical string) string {
+			needle := fmt.Sprintf(`"recording_id":%d`, joinedrecording.Tier1RecordingIDs[0])
+			return strings.Replace(canonical, needle, needle+".0", 1)
+		},
+	} {
+		t.Run("rejects non-Go qualification jobs canonical "+name, func(t *testing.T) {
+			jobsDefinition, jobsPlan := decodeCanonicalDefinition()
+			canonical := jobsDefinition["qualification_jobs_canonical"].(string)
+			mutated := mutate(canonical)
+			jobsSHA := sha256Hex([]byte(mutated))
+			jobsPlan.QualificationJobsSHA256 = jobsSHA
+			requestCanonical := joinedHistoricalQualificationApprovalBytes(jobsPlan)
+			requestSHA := sha256Hex(requestCanonical)
+			jobsPlan.RequestSHA256 = requestSHA
+			jobsDefinition["qualification_jobs_canonical"] = mutated
+			jobsDefinition["qualification_jobs_sha256"] = jobsSHA
+			jobsDefinition["canonical_plan"] = jobsPlan
+			jobsDefinition["request_canonical"] = string(requestCanonical)
+			jobsDefinition["request_sha256"] = requestSHA
+			jobsID := cloneJoinedHistoricalQualificationRun(t, fixture, jobsDefinition)
+			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, jobsID); err == nil {
+				t.Fatal("self-hashed historical authority with non-Go qualification jobs canonical bytes activated")
 			}
 		})
 	}
