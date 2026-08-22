@@ -349,7 +349,8 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 			sd.endpoint,sd.region,c.bucket,sd.bucket,c.object_key,c.etag,c.size_bytes,c.sha256,c.clip_start_at,c.clip_end_at,c.released_at
 		FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
 		JOIN storage_destinations sd ON sd.id=c.storage_destination_id
-		WHERE c.purged_at IS NULL AND c.created_at<=$5 AND c.clip_end_at>d.window_start AND c.clip_start_at<d.window_end
+		WHERE c.purged_at IS NULL AND c.size_bytes>0 AND c.created_at<=$5
+		  AND c.clip_end_at>d.window_start AND c.clip_start_at<d.window_end
 		ORDER BY c.recording_id,c.recording_job_id,c.clip_start_at,c.id`
 	args := []any{recordingIDs, jobIDs, windowStarts, windowEnds, plan.SelectionAuthority.Cutoff}
 	if fromApplySnapshot {
@@ -467,12 +468,16 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 	exclusionQuery := `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[],$3::timestamptz[],$4::timestamptz[])
 		AS d(recording_id,job_id,window_start,window_end)), evidence AS (
 		SELECT c.recording_id,c.id clip_id,
-			CASE WHEN c.created_at>$5 THEN 'after_cutoff' ELSE 'outside_qualification_window' END reason_code,
+			CASE WHEN c.created_at>$5 THEN 'after_cutoff'
+			  WHEN c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end THEN 'outside_qualification_window'
+			  ELSE 'nonpositive_source_size' END reason_code,
 			encode(sha256(convert_to(jsonb_build_object('clip_id',c.id,'recording_id',c.recording_id,
 			  'recording_job_id',c.recording_job_id,'created_at',c.created_at,'clip_start_at',c.clip_start_at,
-			  'clip_end_at',c.clip_end_at,'window_start_at',d.window_start,'window_end_at',d.window_end,'cutoff',$5)::text,'UTF8')),'hex') evidence_sha256
+			  'clip_end_at',c.clip_end_at,'size_bytes',c.size_bytes,'window_start_at',d.window_start,
+			  'window_end_at',d.window_end,'cutoff',$5)::text,'UTF8')),'hex') evidence_sha256
 		FROM selected d JOIN recording_clips c ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id
-		WHERE c.purged_at IS NULL AND (c.created_at>$5 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end))
+		WHERE c.purged_at IS NULL AND (c.created_at>$5 OR c.clip_end_at<=d.window_start OR c.clip_start_at>=d.window_end
+		  OR c.size_bytes<=0))
 		SELECT count(*)::bigint,encode(sha256(convert_to(COALESCE(string_agg(format('%s\n%s\n%s\n%s\n',recording_id,
 			clip_id,reason_code,evidence_sha256),'' ORDER BY recording_id,clip_id,reason_code,evidence_sha256),''),'UTF8')),'hex') FROM evidence`
 	exclusionArgs := []any{recordingIDs, jobIDs, windowStarts, windowEnds, plan.SelectionAuthority.Cutoff}
@@ -570,18 +575,22 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 			c.timestamp_contract,c.timestamp_contract_status,c.timestamp_contract_reason,
 			row_number() OVER (PARTITION BY c.recording_job_id ORDER BY c.start_at,c.clip_id)::integer day_ordinal
 		FROM joined_tier1_apply_candidates c
-		WHERE c.clip_created_at<=c.cutoff AND c.end_at>c.window_start AND c.start_at<c.window_end`); err != nil {
+		WHERE c.clip_created_at<=c.cutoff AND c.end_at>c.window_start AND c.start_at<c.window_end
+		  AND c.size_bytes>0`); err != nil {
 		return joinedTier1FreezePlan{}, false, err
 	}
 	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE joined_tier1_apply_exclusions ON COMMIT DROP AS
 		SELECT evidence.*,encode(sha256(convert_to(evidence.canonical_evidence::text,'UTF8')),'hex') evidence_sha256 FROM (
 		SELECT c.clip_id,c.recording_id,
-			CASE WHEN c.clip_created_at>c.cutoff THEN 'after_cutoff' ELSE 'outside_qualification_window' END reason_code,
+			CASE WHEN c.clip_created_at>c.cutoff THEN 'after_cutoff'
+			  WHEN c.end_at<=c.window_start OR c.start_at>=c.window_end THEN 'outside_qualification_window'
+			  ELSE 'nonpositive_source_size' END reason_code,
 			jsonb_build_object('clip_id',c.clip_id,'recording_id',c.recording_id,'recording_job_id',c.recording_job_id,
-			  'created_at',c.clip_created_at,'clip_start_at',c.start_at,'clip_end_at',c.end_at,
+			  'created_at',c.clip_created_at,'clip_start_at',c.start_at,'clip_end_at',c.end_at,'size_bytes',c.size_bytes,
 			  'window_start_at',c.window_start,'window_end_at',c.window_end,'cutoff',c.cutoff) canonical_evidence
 		FROM joined_tier1_apply_candidates c
-		WHERE c.clip_created_at>c.cutoff OR c.end_at<=c.window_start OR c.start_at>=c.window_end) evidence`); err != nil {
+		WHERE c.clip_created_at>c.cutoff OR c.end_at<=c.window_start OR c.start_at>=c.window_end
+		  OR c.size_bytes<=0) evidence`); err != nil {
 		return joinedTier1FreezePlan{}, false, err
 	}
 	dayProjections, err := populateJoinedTier1FrozenEvidence(ctx, tx, &plan, true)

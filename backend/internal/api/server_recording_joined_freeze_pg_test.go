@@ -107,6 +107,7 @@ type joinedHistoricalTier1Fixture struct {
 	runID           int64
 	firstJobID      int64
 	clipID          int64
+	zeroClipID      int64
 	clipStart       time.Time
 	sessionToken    string
 	req             joinedTier1FreezeRequest
@@ -290,6 +291,15 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 		clipStart, clipStart.Add(time.Minute)).Scan(&clipID); err != nil {
 		t.Fatal(err)
 	}
+	var zeroClipID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,
+		endpoint,bucket,object_key,display_path,mime_type,container,size_bytes,etag,sha256,duration_ms,video_codec,
+		audio_present,fire_at,clip_start_at,clip_end_at,created_at,released_at) VALUES($1,$2,$3,$4,'clips','raw/zero.mp4',
+		'raw/zero.mp4','video/mp4','mp4',0,'etag-zero',$5,60000,'h264',false,$6,$6,$7,$6,$7) RETURNING id`,
+		joinedrecording.Tier1RecordingIDs[0], firstJobID, storageID, joinedTestSourceEndpoint, strings.Repeat("0", 64),
+		clipStart.Add(time.Minute), clipStart.Add(2*time.Minute)).Scan(&zeroClipID); err != nil {
+		t.Fatal(err)
+	}
 	callWithContext := func(callCtx context.Context, req joinedTier1FreezeRequest) (*httptest.ResponseRecorder, joinedTier1FreezePlan) {
 		body, _ := json.Marshal(req)
 		httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/freeze-tier1", bytes.NewReader(body)).WithContext(callCtx)
@@ -313,6 +323,7 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	dry, plan := call(req)
 	if dry.Code != http.StatusOK || !lowerHexSHA256(plan.RequestSHA256) || !lowerHexSHA256(plan.FrozenDenominatorSHA256) ||
 		!lowerHexSHA256(plan.FreezeExclusionsSHA256) || plan.ProvisionalSourceClips != 1 || plan.ProvisionalSourceBytes != 10 ||
+		plan.ProvisionalExclusions != 1 ||
 		len(plan.Recordings) != 33 || len(plan.Recordings[0].Qualification.Days) != 14 {
 		t.Fatalf("dry-run status=%d body=%s", dry.Code, dry.Body.String())
 	}
@@ -323,7 +334,7 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	}
 	return joinedHistoricalTier1Fixture{s: s, pool: pool, cleanup: cleanup, userID: userID, accountID: accountID,
 		storageID: storageID, apiKeyID: apiKeyID, connectionID: connectionID, runID: runID, firstJobID: firstJobID,
-		clipID: clipID, clipStart: clipStart, sessionToken: token, req: req, plan: plan, call: call, callWithContext: callWithContext,
+		clipID: clipID, zeroClipID: zeroClipID, clipStart: clipStart, sessionToken: token, req: req, plan: plan, call: call, callWithContext: callWithContext,
 		callHistorical: callHistorical, historicalReq: historicalRequest}
 }
 
@@ -356,7 +367,7 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	pool := fixture.pool
 	accountID := fixture.accountID
 	storageID, connectionID, runID := fixture.storageID, fixture.connectionID, fixture.runID
-	firstJobID, clipID, clipStart := fixture.firstJobID, fixture.clipID, fixture.clipStart
+	firstJobID, clipID, zeroClipID, clipStart := fixture.firstJobID, fixture.clipID, fixture.zeroClipID, fixture.clipStart
 	req, plan, call, callWithContext := fixture.req, fixture.plan, fixture.call, fixture.callWithContext
 	var secondStorageID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO storage_destinations(account_id,name,provider,endpoint,region,bucket,
@@ -566,6 +577,17 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 		FROM recording_joined_batches b WHERE b.batch_id=$1`, req.BatchID).Scan(&state, &recordings, &days, &snapshots); err != nil ||
 		state != "building" || recordings != 33 || days != 462 || snapshots != 1 {
 		t.Fatalf("applied state=%s recordings=%d days=%d snapshots=%d err=%v", state, recordings, days, snapshots, err)
+	}
+	var zeroSnapshots, zeroExclusions int
+	var zeroReason string
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM recording_joined_source_snapshots WHERE clip_id=$1),
+		(SELECT count(*) FROM recording_joined_freeze_exclusions WHERE clip_id=$1),
+		COALESCE((SELECT reason_code FROM recording_joined_freeze_exclusions WHERE clip_id=$1),'')`, zeroClipID).
+		Scan(&zeroSnapshots, &zeroExclusions, &zeroReason); err != nil || zeroSnapshots != 0 ||
+		zeroExclusions != 1 || zeroReason != "nonpositive_source_size" {
+		t.Fatalf("zero-size evidence snapshots=%d exclusions=%d reason=%q err=%v",
+			zeroSnapshots, zeroExclusions, zeroReason, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=$1`, clipID); err == nil {
 		t.Fatal("retention-protected source was purged")
