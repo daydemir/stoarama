@@ -406,7 +406,10 @@ func TestJoinedHistoricalQualificationRecordingStatuses(t *testing.T) {
 }
 
 func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
-	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze@example.test")
+	// This test deliberately mutates a source before checkpoint creation to
+	// prove the dry-run evidence changes. Retention fencing is exercised after
+	// the checkpoint starts by the dedicated checkpointed-dry-run test.
+	fixture := newJoinedHistoricalTier1FixtureWithoutCheckpoint(t, "joined-freeze@example.test")
 	defer fixture.cleanup()
 	ctx := context.Background()
 	pool := fixture.pool
@@ -429,6 +432,21 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE recording_clips SET storage_destination_id=$1 WHERE id=$2`, storageID, clipID); err != nil {
 		t.Fatal(err)
+	}
+	checkpoint, err := fixture.s.startJoinedTier1DryRun(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ordinal := 1; ordinal <= len(joinedrecording.Tier1RecordingIDs); ordinal++ {
+		checkpoint, err = fixture.s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{
+			RunID: checkpoint.RunID, PriorityOrdinal: ordinal,
+		})
+		if err != nil {
+			t.Fatalf("checkpoint step %d: %v", ordinal, err)
+		}
+	}
+	if checkpoint.RequestSHA256 == nil || *checkpoint.RequestSHA256 != plan.RequestSHA256 {
+		t.Fatalf("checkpoint hash=%v want=%s", checkpoint.RequestSHA256, plan.RequestSHA256)
 	}
 	protocolTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
