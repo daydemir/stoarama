@@ -402,6 +402,8 @@ func finalizeJoinedTier1DryRun(ctx context.Context, tx pgx.Tx, runID string, pla
 		return a.EvidenceSHA256 < b.EvidenceSHA256
 	})
 	var exclusionCanonical strings.Builder
+	// Keep the literal backslash-n separators identical to the SQL
+	// canonicalization; this is load-bearing for exclusion-hash parity.
 	for _, row := range exclusionRows {
 		fmt.Fprintf(&exclusionCanonical, "%d\\n%d\\n%s\\n%s\\n", row.RecordingID, row.ClipID, row.ReasonCode, row.EvidenceSHA256)
 	}

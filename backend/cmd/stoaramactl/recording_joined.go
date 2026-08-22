@@ -347,6 +347,25 @@ func requireJoinedCheckpointProtocol(cfg config.Config) error {
 	return nil
 }
 
+func validateJoinedFreezeTier1Fields(req joinedFreezeTier1Request) error {
+	if req.ConnectionID <= 0 {
+		return errors.New("--connection-id must be positive")
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return err
+	}
+	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
+		return errors.New("--batch-id must end with the exact --generation")
+	}
+	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
+		return errors.New("--source-endpoint must be the exact supported R2 endpoint")
+	}
+	if req.QualificationRunID <= 0 {
+		return errors.New("--qualification-run-id must be positive")
+	}
+	return nil
+}
+
 func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1Request, error) {
 	req := joinedFreezeTier1Request{BatchID: cfg.JoinedRecordingBatchID, Generation: 1}
 	flags := newJoinedFlagSet("recording-joined freeze-tier1")
@@ -360,20 +379,8 @@ func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
 	}
-	if req.ConnectionID <= 0 {
-		return req, errors.New("--connection-id must be positive")
-	}
-	if err := validateJoinedBatchID(req.BatchID); err != nil {
+	if err := validateJoinedFreezeTier1Fields(req); err != nil {
 		return req, err
-	}
-	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
-		return req, errors.New("--batch-id must end with the exact --generation")
-	}
-	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
-		return req, errors.New("--source-endpoint must be the exact supported R2 endpoint")
-	}
-	if req.QualificationRunID <= 0 {
-		return req, errors.New("--qualification-run-id must be positive")
 	}
 	if err := validateExpectedHash("--expected-request-sha256", req.ExpectedRequestSHA256, req.Apply); err != nil {
 		return req, err
@@ -392,20 +399,8 @@ func parseJoinedFreezeTier1Checkpointed(cfg config.Config, args []string) (joine
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
 	}
-	if req.ConnectionID <= 0 {
-		return req, errors.New("--connection-id must be positive")
-	}
-	if err := validateJoinedBatchID(req.BatchID); err != nil {
+	if err := validateJoinedFreezeTier1Fields(req); err != nil {
 		return req, err
-	}
-	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
-		return req, errors.New("--batch-id must end with the exact --generation")
-	}
-	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
-		return req, errors.New("--source-endpoint must be the exact supported R2 endpoint")
-	}
-	if req.QualificationRunID <= 0 {
-		return req, errors.New("--qualification-run-id must be positive")
 	}
 	return req, nil
 }

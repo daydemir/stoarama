@@ -21,7 +21,8 @@ CREATE TABLE recording_joined_dry_runs (
   ready_at TIMESTAMPTZ,
   invalidated_at TIMESTAMPTZ,
   UNIQUE (batch_id,generation),
-  CHECK ((state='building' AND final_plan_bytes IS NULL AND final_plan_sha256 IS NULL AND ready_at IS NULL)
+  CHECK ((state='building' AND final_plan_bytes IS NULL AND final_plan_sha256 IS NULL
+      AND ready_at IS NULL AND invalidated_at IS NULL)
     OR (state='ready' AND completed_recordings=33 AND final_plan_bytes IS NOT NULL
       AND final_plan_sha256 IS NOT NULL AND ready_at IS NOT NULL AND invalidated_at IS NULL)
     OR (state='invalidated' AND final_plan_bytes IS NULL AND final_plan_sha256 IS NULL
@@ -111,8 +112,10 @@ BEGIN
     OR (OLD.state IN ('ready','invalidated') AND ROW(NEW.state,NEW.completed_recordings,NEW.final_plan_bytes,NEW.final_plan_sha256,NEW.ready_at,NEW.invalidated_at)
       IS DISTINCT FROM ROW(OLD.state,OLD.completed_recordings,OLD.final_plan_bytes,OLD.final_plan_sha256,OLD.ready_at,OLD.invalidated_at))
     OR (OLD.state='building' AND (
-      (NEW.state='building' AND NEW.completed_recordings NOT IN (OLD.completed_recordings,OLD.completed_recordings+1))
-      OR (NEW.state='ready' AND ROW(OLD.completed_recordings,NEW.completed_recordings) IS DISTINCT FROM ROW(32::SMALLINT,33::SMALLINT))
+      (NEW.state='building' AND (NEW.completed_recordings NOT IN (OLD.completed_recordings,OLD.completed_recordings+1)
+        OR NEW.invalidated_at IS NOT NULL))
+      OR (NEW.state='ready' AND (ROW(OLD.completed_recordings,NEW.completed_recordings) IS DISTINCT FROM ROW(32::SMALLINT,33::SMALLINT)
+        OR NEW.invalidated_at IS NOT NULL))
       OR (NEW.state='ready' AND ((SELECT count(*) FROM recording_joined_dry_run_scopes s WHERE s.dry_run_id=OLD.id)<>462
         OR (SELECT count(*) FROM recording_joined_dry_run_recordings r WHERE r.dry_run_id=OLD.id)<>33
         OR EXISTS(SELECT 1 FROM recording_joined_dry_run_scopes s

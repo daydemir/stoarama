@@ -319,6 +319,10 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	}, factory); err != nil {
 		t.Fatal(err)
 	}
+	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08-generation-1",
+		Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7, ExpectedRequestSHA256: hash, Apply: true}) {
+		t.Fatalf("freeze request=%+v", fake.freezeReq)
+	}
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
 		"freeze-tier1-checkpointed", "--connection-id", "44", "--source-endpoint", endpoint, "--qualification-run-id", "7",
 	}, factory); err != nil {
@@ -338,10 +342,6 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 		"freeze-tier1-checkpointed", "--connection-id", "44", "--source-endpoint", endpoint, "--qualification-run-id", "7",
 	}, factory); err != nil {
 		t.Fatalf("checkpointed dry-run with disabled worker: %v", err)
-	}
-	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08-generation-1",
-		Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7, ExpectedRequestSHA256: hash, Apply: true}) {
-		t.Fatalf("freeze request=%+v", fake.freezeReq)
 	}
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
 		"seal-stream-day", "--recording-id", "377", "--local-date", "2026-08-01", "--apply",

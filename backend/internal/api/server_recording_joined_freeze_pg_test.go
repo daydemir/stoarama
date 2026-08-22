@@ -871,6 +871,15 @@ func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testi
 	}
 	apply := req
 	apply.Apply, apply.ExpectedRequestSHA256 = true, *progress.RequestSHA256
+	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, fixture.connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if rejected, _ := fixture.call(apply); rejected.Code != http.StatusConflict {
+		t.Fatalf("checkpointed apply accepted disabled protocol status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, fixture.connectionID); err != nil {
+		t.Fatal(err)
+	}
 	response, _ := fixture.call(apply)
 	if response.Code != http.StatusOK {
 		t.Fatalf("checkpointed apply status=%d body=%s", response.Code, response.Body.String())
