@@ -661,6 +661,84 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	t.Log("JOINED_HISTORICAL_APPLY_EXECUTED")
 }
 
+func TestJoinedTier1FreezeChunkedSnapshotsPreserveCanonicalPlan(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-chunk-parity@example.test")
+	defer fixture.cleanup()
+
+	var chunks int
+	fixture.s.joinedFreezeChunkHook = func(ctx context.Context, priority int) error {
+		chunks++
+		if priority != chunks {
+			t.Fatalf("chunk priority=%d want=%d", priority, chunks)
+		}
+		return nil
+	}
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	response, applied := fixture.call(req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("chunked apply status=%d body=%s", response.Code, response.Body.String())
+	}
+	if applied.RequestSHA256 != fixture.plan.RequestSHA256 ||
+		applied.FrozenDenominatorSHA256 != fixture.plan.FrozenDenominatorSHA256 ||
+		applied.FreezeExclusionsSHA256 != fixture.plan.FreezeExclusionsSHA256 {
+		t.Fatalf("chunked apply changed canonical plan: applied=%+v dry=%+v", applied, fixture.plan)
+	}
+	if chunks != 33 {
+		t.Fatalf("chunks=%d want=33", chunks)
+	}
+	var state string
+	var recordings, days, snapshots int
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT b.state,
+		(SELECT count(*) FROM recording_joined_batch_recordings WHERE batch_record_id=b.id),
+		(SELECT count(*) FROM recording_joined_stream_days WHERE batch_record_id=b.id),
+		(SELECT count(*) FROM recording_joined_source_snapshots WHERE batch_record_id=b.id)
+		FROM recording_joined_batches b WHERE b.batch_id=$1`, req.BatchID).
+		Scan(&state, &recordings, &days, &snapshots); err != nil || state != "building" ||
+		recordings != 33 || days != 462 || snapshots != 1 {
+		t.Fatalf("committed state=%s recordings=%d days=%d snapshots=%d err=%v",
+			state, recordings, days, snapshots, err)
+	}
+}
+
+func TestJoinedTier1FreezeChunkCancellationRollsBackEverything(t *testing.T) {
+	fixture := newJoinedHistoricalTier1Fixture(t, "joined-freeze-chunk-cancel@example.test")
+	defer fixture.cleanup()
+
+	chunks := 0
+	callCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fixture.s.joinedFreezeChunkHook = func(ctx context.Context, priority int) error {
+		chunks++
+		if priority == 17 {
+			cancel()
+		}
+		return ctx.Err()
+	}
+	req := fixture.req
+	req.Apply = true
+	req.ExpectedRequestSHA256 = fixture.plan.RequestSHA256
+	response, _ := fixture.callWithContext(callCtx, req)
+	if response.Code != http.StatusConflict || chunks != 17 {
+		t.Fatalf("canceled chunked apply status=%d chunks=%d body=%s", response.Code, chunks, response.Body.String())
+	}
+	var batches, recordings, days, snapshots, exclusions int
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM recording_joined_batches WHERE batch_id=$1),
+		(SELECT count(*) FROM recording_joined_batch_recordings WHERE batch_id=$1),
+		(SELECT count(*) FROM recording_joined_stream_days WHERE batch_id=$1),
+		(SELECT count(*) FROM recording_joined_source_snapshots s JOIN recording_joined_batches b ON b.id=s.batch_record_id WHERE b.batch_id=$1),
+		(SELECT count(*) FROM recording_joined_freeze_exclusions e JOIN recording_joined_batches b ON b.id=e.batch_record_id WHERE b.batch_id=$1)`, req.BatchID).
+		Scan(&batches, &recordings, &days, &snapshots, &exclusions); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 0 || recordings != 0 || days != 0 || snapshots != 0 || exclusions != 0 {
+		t.Fatalf("canceled apply leaked batches=%d recordings=%d days=%d snapshots=%d exclusions=%d",
+			batches, recordings, days, snapshots, exclusions)
+	}
+}
+
 func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 	fixture := newJoinedHistoricalTier1Fixture(t, "joined-historical-lock@example.test")
 	defer fixture.cleanup()
