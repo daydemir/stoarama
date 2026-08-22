@@ -123,16 +123,18 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 		return plan, 0, "", false, err
 	}
 
-	plan, _, err = s.buildJoinedTier1FreezePlanWithTool(ctx, tx, req, tool, true)
-	if err != nil {
-		return plan, 0, "", false, err
+	if err := tx.QueryRow(ctx, `SELECT final_plan_bytes,final_plan_sha256 FROM recording_joined_dry_runs
+		WHERE batch_id=$1 AND generation=$2 AND state='ready' AND final_plan_sha256=$3 FOR SHARE`,
+		req.BatchID, req.Generation, req.ExpectedRequestSHA256).Scan(&requestBytes, &requestSHA); err != nil {
+		return plan, 0, "", false, errors.New("ready checkpointed Tier-1 dry-run plan not found")
 	}
-	plan, requestBytes, err = sealJoinedTier1FreezePlan(plan)
-	if err != nil {
-		return plan, 0, "", false, err
+	if err := json.Unmarshal(requestBytes, &plan); err != nil || plan.SchemaVersion != 2 ||
+		requestSHA != req.ExpectedRequestSHA256 || !joinedTier1FreezeRequestMatchesPlan(req, plan) {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 dry-run plan differs")
 	}
-	if req.ExpectedRequestSHA256 != plan.RequestSHA256 {
-		return plan, 0, "", false, errors.New("expected_request_sha256 differs from current Tier-1 plan")
+	plan.RequestSHA256 = requestSHA
+	if plan.MediaTool.IdentitySHA256 != tool.IdentitySHA256 {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 media tool differs")
 	}
 	mediaToolJSON, err := json.Marshal(plan.MediaTool)
 	if err != nil {

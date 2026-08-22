@@ -54,17 +54,18 @@ func TestParseHistoricalQualificationEvidenceIsExact(t *testing.T) {
 }
 
 type fakeJoinedOperator struct {
-	historicalReq joinedImportHistoricalQualificationRequest
-	freezeReq     joinedFreezeTier1Request
-	dayReq        joinedSealStreamDayRequest
-	remainingReq  joinedSealRemainingDaysRequest
-	finalReq      joinedFinalFreezeRequest
-	indexReq      joinedSealBatchIndexRequest
-	workerReq     joinedWorkerRequest
-	statusReq     joinedStatusRequest
-	startupReq    joinedWorkerRequest
-	startupErr    error
-	workerRuns    int
+	historicalReq   joinedImportHistoricalQualificationRequest
+	freezeReq       joinedFreezeTier1Request
+	checkpointedReq joinedFreezeTier1Request
+	dayReq          joinedSealStreamDayRequest
+	remainingReq    joinedSealRemainingDaysRequest
+	finalReq        joinedFinalFreezeRequest
+	indexReq        joinedSealBatchIndexRequest
+	workerReq       joinedWorkerRequest
+	statusReq       joinedStatusRequest
+	startupReq      joinedWorkerRequest
+	startupErr      error
+	workerRuns      int
 }
 
 func (f *fakeJoinedOperator) ImportHistoricalQualification(_ context.Context,
@@ -98,6 +99,11 @@ func validJoinedWorkerConfig() config.Config {
 func (f *fakeJoinedOperator) FreezeTier1(_ context.Context, req joinedFreezeTier1Request) (any, error) {
 	f.freezeReq = req
 	return map[string]any{"status": "planned"}, nil
+}
+
+func (f *fakeJoinedOperator) FreezeTier1Checkpointed(_ context.Context, req joinedFreezeTier1Request) (any, error) {
+	f.checkpointedReq = req
+	return map[string]any{"state": "ready", "request_sha256": strings.Repeat("a", 64)}, nil
 }
 
 func (f *fakeJoinedOperator) SealStreamDay(_ context.Context, req joinedSealStreamDayRequest) (any, error) {
@@ -264,7 +270,7 @@ func TestJoinedWorkerStartupFailurePreventsClaimLoop(t *testing.T) {
 }
 
 func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
-	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
 	factory := func(context.Context, config.Config) (joinedOperatorService, error) {
 		t.Fatal("invalid request reached factory")
 		return nil, nil
@@ -280,6 +286,10 @@ func TestJoinedMutationsRequireExpectedHashWhenApplied(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("args=%v error=%v", tc.args, err)
 		}
+	}
+	checkpointedArgs := []string{"freeze-tier1-checkpointed", "--connection-id", "44", "--source-endpoint", "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com", "--qualification-run-id", "7", "--apply"}
+	if _, err := runRecordingJoinedWith(context.Background(), cfg, checkpointedArgs, nil); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("checkpointed command exposed apply: %v", err)
 	}
 }
 
@@ -299,7 +309,7 @@ func TestJoinedMutationsRejectAmbiguousLegacyExpectedHashFlag(t *testing.T) {
 func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	fake := &fakeJoinedOperator{}
 	factory := func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil }
-	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
+	cfg := config.Config{JoinedRecordingEnabled: true, JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingBatchID: "tier1-2026-08-generation-1"}
 	hash := strings.Repeat("a", 64)
 	endpoint := "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
 
@@ -308,6 +318,26 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 		"--expected-request-sha256", hash, "--apply",
 	}, factory); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
+		"freeze-tier1-checkpointed", "--connection-id", "44", "--source-endpoint", endpoint, "--qualification-run-id", "7",
+	}, factory); err != nil {
+		t.Fatal(err)
+	}
+	if fake.checkpointedReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08-generation-1",
+		Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7}) {
+		t.Fatalf("checkpointed freeze request=%+v", fake.checkpointedReq)
+	}
+
+	// The operator checkpoint remains callable while the joined worker is
+	// disabled; only the API control plane and protocol need to be enabled.
+	disabledWorkerCfg := cfg
+	disabledWorkerCfg.JoinedRecordingEnabled = false
+	disabledWorkerCfg.JoinedRecordingControlPlaneEnabled = true
+	if _, err := runRecordingJoinedWith(context.Background(), disabledWorkerCfg, []string{
+		"freeze-tier1-checkpointed", "--connection-id", "44", "--source-endpoint", endpoint, "--qualification-run-id", "7",
+	}, factory); err != nil {
+		t.Fatalf("checkpointed dry-run with disabled worker: %v", err)
 	}
 	if fake.freezeReq != (joinedFreezeTier1Request{ConnectionID: 44, BatchID: "tier1-2026-08-generation-1",
 		Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7, ExpectedRequestSHA256: hash, Apply: true}) {

@@ -367,6 +367,11 @@ func joinedTier1JobIDs(days []joinedrecording.QualifiedDay) []int64 {
 }
 
 func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQuerier, plan *joinedTier1FreezePlan, fromApplySnapshot bool) ([]joinedrecording.FrozenDenominatorDayProjection, error) {
+	return populateJoinedTier1FrozenEvidenceWithWatermarks(ctx, q, plan, fromApplySnapshot, nil)
+}
+
+func populateJoinedTier1FrozenEvidenceWithWatermarks(ctx context.Context, q joinedTier1FreezeQuerier, plan *joinedTier1FreezePlan,
+	fromApplySnapshot bool, fixedWatermarks map[int64]int64) ([]joinedrecording.FrozenDenominatorDayProjection, error) {
 	recordingIDs, jobIDs := make([]int64, 0, plan.ExpectedStreamDays), make([]int64, 0, plan.ExpectedStreamDays)
 	windowStarts, windowEnds := make([]time.Time, 0, plan.ExpectedStreamDays), make([]time.Time, 0, plan.ExpectedStreamDays)
 	for _, recording := range plan.Recordings {
@@ -375,8 +380,11 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 			windowStarts, windowEnds = append(windowStarts, day.WindowStart), append(windowEnds, day.WindowEnd)
 		}
 	}
-	watermarks := make(map[int64]int64, len(jobIDs))
-	if !fromApplySnapshot {
+	watermarks := fixedWatermarks
+	if watermarks == nil {
+		watermarks = make(map[int64]int64, len(jobIDs))
+	}
+	if !fromApplySnapshot && fixedWatermarks == nil {
 		watermarkRows, err := q.Query(ctx, `WITH selected AS (SELECT * FROM unnest($1::bigint[],$2::bigint[]) AS d(recording_id,job_id))
 			SELECT d.job_id,COALESCE(max(c.id),0)::bigint FROM selected d LEFT JOIN recording_clips c
 			  ON c.recording_id=d.recording_id AND c.recording_job_id=d.job_id GROUP BY d.job_id`, recordingIDs, jobIDs)
@@ -531,7 +539,7 @@ func populateJoinedTier1FrozenEvidence(ctx context.Context, q joinedTier1FreezeQ
 		}
 	}
 	plan.ProvisionalSourceClips, plan.ProvisionalSourceBytes = sourceCount, sourceBytes
-	if !fromApplySnapshot || len(plan.Recordings) == len(joinedrecording.Tier1RecordingIDs) {
+	if len(plan.Recordings) == len(joinedrecording.Tier1RecordingIDs) {
 		denominatorSHA, err := joinedrecording.ComputeFrozenDenominatorSHA256(plan.SelectionAuthority, frozenRecordings, dayProjections)
 		if err != nil {
 			return nil, err

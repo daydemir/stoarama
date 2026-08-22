@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ var joinedMigrationNames = []string{
 	"0138_joined_historical_qualification_authority.sql",
 	"0139_joined_historical_completed_recordings.sql",
 	"0140_joined_tier1_resumable_freeze.sql",
+	"0141_joined_tier1_checkpointed_dry_run.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
@@ -139,6 +141,14 @@ func finishJoinedTier1Fixture(t *testing.T, fixture joinedHistoricalTier1Fixture
 }
 
 func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistoricalTier1Fixture {
+	return newJoinedHistoricalTier1FixtureWithCheckpoint(t, email, true)
+}
+
+func newJoinedHistoricalTier1FixtureWithoutCheckpoint(t *testing.T, email string) joinedHistoricalTier1Fixture {
+	return newJoinedHistoricalTier1FixtureWithCheckpoint(t, email, false)
+}
+
+func newJoinedHistoricalTier1FixtureWithCheckpoint(t *testing.T, email string, seedCheckpoint bool) joinedHistoricalTier1Fixture {
 	t.Helper()
 	s, pool, applyMigration, cleanup := testJoinedServerBeforeMigration(t)
 	applyMigration()
@@ -351,6 +361,21 @@ func newJoinedHistoricalTier1Fixture(t *testing.T, email string) joinedHistorica
 	if firstImportedDay.ScheduledFor == nil || !firstImportedDay.ScheduledFor.Equal(firstImportedDay.WindowStart) ||
 		len(firstImportedDay.ReasonCodes) != 0 {
 		t.Fatalf("post-import raw job mutation changed immutable qualification: %+v", firstImportedDay)
+	}
+	if seedCheckpoint {
+		progress, err := s.startJoinedTier1DryRun(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for ordinal := 1; ordinal <= len(joinedrecording.Tier1RecordingIDs); ordinal++ {
+			progress, err = s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{RunID: progress.RunID, PriorityOrdinal: ordinal})
+			if err != nil {
+				t.Fatalf("seed checkpoint step %d: %v", ordinal, err)
+			}
+		}
+		if progress.RequestSHA256 == nil || *progress.RequestSHA256 != plan.RequestSHA256 {
+			t.Fatalf("seed checkpoint sha=%v want=%s", progress.RequestSHA256, plan.RequestSHA256)
+		}
 	}
 	return joinedHistoricalTier1Fixture{s: s, pool: pool, cleanup: cleanup, userID: userID, accountID: accountID,
 		storageID: storageID, apiKeyID: apiKeyID, connectionID: connectionID, runID: runID, firstJobID: firstJobID,
@@ -680,6 +705,172 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("JOINED_HISTORICAL_APPLY_EXECUTED")
+}
+
+func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testing.T) {
+	fixture := newJoinedHistoricalTier1FixtureWithoutCheckpoint(t, "joined-freeze-checkpointed-dry-run@example.test")
+	defer fixture.cleanup()
+	ctx := context.Background()
+	req := fixture.req
+	req.Apply, req.ExpectedRequestSHA256 = false, ""
+	empty := []byte(`{}`)
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_joined_dry_runs(account_id,connection_id,batch_id,generation,
+		qualification_run_id,input_bytes,input_sha256,skeleton_bytes,skeleton_sha256,state,completed_recordings,
+		final_plan_bytes,final_plan_sha256,ready_at) VALUES($1,$2,$3,1,$4,$5,$6,$5,$6,'ready',33,$5,$6,clock_timestamp())`,
+		fixture.accountID, fixture.connectionID, req.BatchID+"-direct", fixture.runID, empty, sha256Bytes(empty)); err == nil {
+		t.Fatal("direct ready dry-run insert succeeded")
+	}
+	abandonedReq := req
+	abandonedReq.Generation = 2
+	abandonedReq.BatchID = strings.TrimSuffix(req.BatchID, "-generation-1") + "-generation-2"
+	abandoned, err := fixture.s.startJoinedTier1DryRun(ctx, abandonedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_joined_dry_runs SET state='invalidated',invalidated_at=clock_timestamp()
+		WHERE id=$1`, abandoned.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{RunID: abandoned.RunID, PriorityOrdinal: 1}); err == nil {
+		t.Fatal("invalidated dry-run resumed")
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=$1`, fixture.clipID); err == nil {
+		t.Fatal("invalidated dry-run released retention authority")
+	}
+	progress, err := fixture.s.startJoinedTier1DryRun(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.State != "building" || progress.CompletedRecordings != 0 || progress.NextPriorityOrdinal == nil || *progress.NextPriorityOrdinal != 1 {
+		t.Fatalf("start progress=%+v", progress)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, fixture.connectionID); err != nil {
+		t.Fatal(err)
+	}
+	reconciled, err := fixture.s.startJoinedTier1DryRun(ctx, req)
+	if err != nil || reconciled.RunID != progress.RunID {
+		t.Fatalf("lost-start reconciliation progress=%+v err=%v", reconciled, err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, fixture.connectionID); err != nil {
+		t.Fatal(err)
+	}
+	statusRequest := httptest.NewRequest(http.MethodGet, "/api/v1/admin/recording/joined/freeze-tier1/dry-run/status?batch_id="+
+		url.QueryEscape(req.BatchID)+"&generation=1", nil)
+	statusResponse := httptest.NewRecorder()
+	fixture.s.handleAdminJoinedFreezeTier1DryRunStatus(statusResponse, statusRequest)
+	if statusResponse.Code != http.StatusOK || !bytes.Contains(statusResponse.Body.Bytes(), []byte(progress.RunID)) {
+		t.Fatalf("status by key code=%d body=%s", statusResponse.Code, statusResponse.Body.String())
+	}
+	var scopes, batches int
+	if err := fixture.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM recording_joined_dry_run_scopes WHERE dry_run_id=$1),
+		(SELECT count(*) FROM recording_joined_batches WHERE batch_id=$2)`, progress.RunID, req.BatchID).Scan(&scopes, &batches); err != nil {
+		t.Fatal(err)
+	}
+	if scopes != 462 || batches != 0 {
+		t.Fatalf("start scopes=%d batches=%d, want 462/0", scopes, batches)
+	}
+	var mismatchedWatermarks int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_dry_run_scopes s
+		JOIN recording_joined_dry_runs r ON r.id=s.dry_run_id
+		CROSS JOIN LATERAL (SELECT convert_from(r.skeleton_bytes,'UTF8')::jsonb->'recordings'->(s.priority_ordinal-1)
+		 ->'snapshot_days'->(s.date_ordinal-1) expected) x
+		WHERE s.dry_run_id=$1 AND (x.expected->>'high_water_clip_id')::bigint IS DISTINCT FROM s.high_water_clip_id`, progress.RunID).
+		Scan(&mismatchedWatermarks); err != nil || mismatchedWatermarks != 0 {
+		t.Fatalf("watermark authority mismatches=%d err=%v", mismatchedWatermarks, err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=$1`, fixture.clipID); err == nil {
+		t.Fatal("checkpointed dry-run scope allowed raw purge")
+	}
+	for ordinal := 1; ordinal <= len(joinedrecording.Tier1RecordingIDs); ordinal++ {
+		progress, err = fixture.s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{
+			RunID: progress.RunID, PriorityOrdinal: ordinal,
+		})
+		if err != nil {
+			t.Fatalf("step %d: %v", ordinal, err)
+		}
+	}
+	if progress.State != "ready" || progress.RequestSHA256 == nil || *progress.RequestSHA256 != fixture.plan.RequestSHA256 {
+		got := ""
+		if progress.RequestSHA256 != nil {
+			got = *progress.RequestSHA256
+		}
+		var finalBytes []byte
+		var finalPlan joinedTier1FreezePlan
+		if err := fixture.pool.QueryRow(ctx, `SELECT final_plan_bytes FROM recording_joined_dry_runs WHERE id=$1`, progress.RunID).Scan(&finalBytes); err == nil {
+			_ = json.Unmarshal(finalBytes, &finalPlan)
+		}
+		t.Fatalf("ready state=%s completed=%d sha=%s want_sha=%s denominator=%s/%s exclusions=%s/%s rec-exclusions=%s/%s counts=%d,%d,%d/%d,%d,%d",
+			progress.State, progress.CompletedRecordings, got, fixture.plan.RequestSHA256,
+			finalPlan.FrozenDenominatorSHA256, fixture.plan.FrozenDenominatorSHA256,
+			finalPlan.FreezeExclusionsSHA256, fixture.plan.FreezeExclusionsSHA256,
+			finalPlan.Recordings[0].ExpectedExclusionsSHA256, fixture.plan.Recordings[0].ExpectedExclusionsSHA256,
+			finalPlan.ProvisionalSourceClips, finalPlan.ProvisionalSourceBytes, finalPlan.ProvisionalExclusions,
+			fixture.plan.ProvisionalSourceClips, fixture.plan.ProvisionalSourceBytes, fixture.plan.ProvisionalExclusions)
+	}
+	var skeletonBytes, finalBytes []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT skeleton_bytes,final_plan_bytes FROM recording_joined_dry_runs WHERE id=$1`, progress.RunID).
+		Scan(&skeletonBytes, &finalBytes); err != nil {
+		t.Fatal(err)
+	}
+	var tamperSkeleton, tamperFinal joinedTier1FreezePlan
+	if err := json.Unmarshal(skeletonBytes, &tamperSkeleton); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(finalBytes, &tamperFinal); err != nil {
+		t.Fatal(err)
+	}
+	tamperReq := req
+	tamperReq.Generation = 3
+	tamperReq.BatchID = strings.TrimSuffix(req.BatchID, "-generation-1") + "-generation-3"
+	tamperSkeleton.Generation, tamperSkeleton.BatchID = tamperReq.Generation, tamperReq.BatchID
+	tamperFinal.Generation, tamperFinal.BatchID = tamperReq.Generation, tamperReq.BatchID
+	tamperFinal.PolicyVersion += "-tampered"
+	tamperInputBytes, _ := json.Marshal(tamperReq)
+	tamperSkeletonBytes, _ := json.Marshal(tamperSkeleton)
+	_, tamperFinalBytes, err := sealJoinedTier1FreezePlan(tamperFinal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tamperRunID string
+	if err := fixture.pool.QueryRow(ctx, `INSERT INTO recording_joined_dry_runs(account_id,connection_id,batch_id,generation,
+		qualification_run_id,input_bytes,input_sha256,skeleton_bytes,skeleton_sha256)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id::text`, fixture.accountID, fixture.connectionID,
+		tamperReq.BatchID, tamperReq.Generation, fixture.runID, tamperInputBytes, sha256Bytes(tamperInputBytes),
+		tamperSkeletonBytes, sha256Bytes(tamperSkeletonBytes)).Scan(&tamperRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_joined_dry_run_scopes SELECT $1::uuid,recording_id,
+		priority_ordinal,local_date,date_ordinal,recording_job_id,high_water_clip_id,clock_timestamp()
+		FROM recording_joined_dry_run_scopes WHERE dry_run_id=$2`, tamperRunID, progress.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_joined_dry_run_recordings SELECT $1::uuid,priority_ordinal,
+		recording_id,evidence_bytes,evidence_sha256,source_clips,source_bytes,exclusions,exclusions_sha256,clock_timestamp()
+		FROM recording_joined_dry_run_recordings WHERE dry_run_id=$2`, tamperRunID, progress.RunID); err != nil {
+		t.Fatal(err)
+	}
+	for completed := 1; completed <= 32; completed++ {
+		if _, err := fixture.pool.Exec(ctx, `UPDATE recording_joined_dry_runs SET completed_recordings=$2 WHERE id=$1`, tamperRunID, completed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_joined_dry_runs SET state='ready',completed_recordings=33,
+		final_plan_bytes=$2,final_plan_sha256=$3,ready_at=clock_timestamp() WHERE id=$1`, tamperRunID, tamperFinalBytes,
+		sha256Bytes(tamperFinalBytes)); err == nil {
+		t.Fatal("top-level final plan authority tamper reached ready")
+	}
+	// Replay is read-only and retains the same canonical result.
+	replayed, err := fixture.s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{RunID: progress.RunID, PriorityOrdinal: 33})
+	if err != nil || replayed.RequestSHA256 == nil || *replayed.RequestSHA256 != *progress.RequestSHA256 {
+		t.Fatalf("ready replay=%+v err=%v", replayed, err)
+	}
+	apply := req
+	apply.Apply, apply.ExpectedRequestSHA256 = true, *progress.RequestSHA256
+	response, _ := fixture.call(apply)
+	if response.Code != http.StatusOK {
+		t.Fatalf("checkpointed apply status=%d body=%s", response.Code, response.Body.String())
+	}
 }
 
 func TestJoinedTier1FreezeChunkedSnapshotsPreserveCanonicalPlan(t *testing.T) {
