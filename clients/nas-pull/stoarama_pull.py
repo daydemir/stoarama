@@ -254,9 +254,6 @@ class Config:
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
-        # Dormant by default. Version 1 is activated only for a specifically
-        # approved connection after the backend feed and capacity gates pass.
-        self.joined_protocol_version = env_int("STOARAMA_JOINED_PROTOCOL_VERSION", 0)
         # Release/deploy safe by default. Operators enable only after migration,
         # API and a completed clean inventory are independently verified.
         self.native_stitch_enabled = env_str("STOARAMA_NATIVE_STITCH_ENABLED", "false").lower() == "true"
@@ -277,8 +274,6 @@ class Config:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
             raise SystemExit("STOARAMA_MIN_FREE_BYTES must be positive")
-        if self.joined_protocol_version not in (0, JOINED_PROTOCOL_VERSION):
-            raise SystemExit("STOARAMA_JOINED_PROTOCOL_VERSION must be 0 or %d" % JOINED_PROTOCOL_VERSION)
 
 
 def boot_id():
@@ -935,7 +930,10 @@ class Runtime:
         self.list_succeeded = False
         self.stable_marked = False
         self.inventory = inventory
-        self.joined_protocol_version = getattr(cfg, "joined_protocol_version", 0)
+        # Remote authorization is process-local and fail-closed. A restart must
+        # negotiate again; no manifest, environment, or progress file enables it.
+        self.joined_protocol_version = 0
+        self.joined_protocol_generation = 0
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1019,6 +1017,44 @@ class Runtime:
     def is_capacity_blocked(self):
         with self.lock:
             return self.capacity_blocked
+
+    def joined_protocol_enabled(self):
+        with self.lock:
+            return self.joined_protocol_version == JOINED_PROTOCOL_VERSION
+
+    def apply_joined_protocol_response(self, response):
+        version = response.get("joined_protocol_version") if isinstance(response, dict) else None
+        generation = response.get("joined_protocol_generation") if isinstance(response, dict) else None
+        valid = (
+            isinstance(response, dict) and set(response) == {
+                "ok", "joined_delivery_accepted", "joined_protocol_version", "joined_protocol_generation",
+            }
+            and response.get("ok") is True and type(response.get("joined_delivery_accepted")) is bool
+            and type(version) is int and version in (0, JOINED_PROTOCOL_VERSION)
+            and type(generation) is int and 0 <= generation <= 0x7fffffffffffffff
+            and (generation > 0 or version == 0)
+            and (response.get("joined_delivery_accepted") is True or (version == 0 and generation == 0))
+        )
+        with self.lock:
+            if not valid or generation < self.joined_protocol_generation:
+                self.joined_protocol_version = 0
+                return
+            if generation == self.joined_protocol_generation:
+                if version != self.joined_protocol_version:
+                    self.joined_protocol_version = 0
+                return
+            self.joined_protocol_generation = generation
+            self.joined_protocol_version = version
+
+    def run_joined_completion(self, operation):
+        # Completion is serialized with heartbeat response application. Once
+        # admitted, the operation finishes; HTTP operations remain bounded by
+        # HTTP_TIMEOUT_SEC. The next joined boundary observes any downgrade.
+        with self.lock:
+            if self.joined_protocol_version != JOINED_PROTOCOL_VERSION:
+                return False
+            operation()
+            return True
 
     def reserve_storage(self, cfg, storage, expected_bytes=0):
         """Atomically admit expected bytes and persist hysteresis across restarts."""
@@ -4585,7 +4621,7 @@ def download_joined_item(cfg, runtime, item, stop_event):
         require_storage_capacity(cfg, runtime, remaining)
         try:
             while part_size < item["size_bytes"]:
-                if stop_event.is_set() or poll_raw_pending(cfg, runtime):
+                if not runtime.joined_protocol_enabled() or stop_event.is_set() or poll_raw_pending(cfg, runtime):
                     raise JoinedDownloadYield("joined download yielded to raw clips")
                 try:
                     current_prepared = prepare_joined_download(cfg, item)
@@ -4596,6 +4632,8 @@ def download_joined_item(cfg, runtime, item, stop_event):
                 end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
                 append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end)
                 part_size = end + 1
+            if not runtime.joined_protocol_enabled():
+                raise JoinedDownloadYield("joined protocol was disabled")
             try:
                 verify_joined_entry(
                     cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
@@ -4604,8 +4642,11 @@ def download_joined_item(cfg, runtime, item, stop_event):
                 truncate_joined_part(directory_fd, part_name)
                 raise RuntimeError("joined download checksum mismatch; partial restarted")
             validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
-            os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-            os.fsync(directory_fd)
+            def publish_final():
+                os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+                os.fsync(directory_fd)
+            if not runtime.run_joined_completion(publish_final):
+                raise JoinedDownloadYield("joined protocol was disabled")
             if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
                 raise RuntimeError("joined publication disappeared")
             return True
@@ -4671,8 +4712,11 @@ def post_joined_ack(cfg, connection_id, identity):
     persist_joined_ack_receipt(cfg, connection_id, identity)
 
 
-def ack_joined_item(cfg, item):
-    post_joined_ack(cfg, item["connection_id"], joined_ack_identity(item))
+def ack_joined_item(cfg, runtime, item):
+    if not runtime.run_joined_completion(
+        lambda: post_joined_ack(cfg, item["connection_id"], joined_ack_identity(item))
+    ):
+        raise JoinedDownloadYield("joined protocol was disabled")
 
 
 def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
@@ -4700,13 +4744,16 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
         raise ExistingFileMismatch("joined dependency file identity conflicts")
     identity = joined_ack_identity({**dependency, "size_bytes": size_bytes})
     if not has_joined_ack_receipt(cfg, item["connection_id"], identity):
-        post_joined_ack(cfg, item["connection_id"], identity)
+        if not runtime.run_joined_completion(lambda: post_joined_ack(cfg, item["connection_id"], identity)):
+            raise JoinedDownloadYield("joined protocol was disabled")
 
 
 def drain_joined(cfg, runtime, stop_event):
-    if getattr(cfg, "joined_protocol_version", 0) != JOINED_PROTOCOL_VERSION or cfg.dry_run:
+    if not runtime.joined_protocol_enabled() or cfg.dry_run:
         return False
     page = request_json(cfg, "GET", "/account/joined")
+    if not runtime.joined_protocol_enabled():
+        return False
     if set(page) - {"item"}:
         raise RuntimeError("joined response contains unknown fields")
     raw_item = page.get("item")
@@ -4716,10 +4763,10 @@ def drain_joined(cfg, runtime, stop_event):
     runtime.set_phase(Phase.DRAINING)
     try:
         downloaded = download_joined_item(cfg, runtime, item, stop_event)
+        ack_joined_item(cfg, runtime, item)
     except JoinedDownloadYield:
         log("INFO", "joined artifact_id=%d yielded to raw clip delivery" % item["id"])
         return True
-    ack_joined_item(cfg, item)
     log(
         "INFO", "joined artifact_id=%d bytes=%d saved=%s%s"
         % (item["id"], item["size_bytes"], joined_output_path(cfg, item), "" if downloaded else " existing"),
@@ -4932,23 +4979,25 @@ def heartbeat_loop(cfg, runtime, stop_event):
     outage = load_outage(cfg)
     while not stop_event.is_set():
         try:
-            request_json(
+            response = request_json(
                 cfg,
                 "POST",
                 "/account/connections/heartbeat",
                 body=runtime.heartbeat_payload(outage),
                 timeout=HEARTBEAT_TIMEOUT_SEC,
             )
+            runtime.apply_joined_protocol_response(response)
             runtime.heartbeat_succeeded = True
             if outage:
                 outage["recovered_at"] = utc_now()
-                request_json(
+                response = request_json(
                     cfg,
                     "POST",
                     "/account/connections/heartbeat",
                     body=runtime.heartbeat_payload(outage),
                     timeout=HEARTBEAT_TIMEOUT_SEC,
                 )
+                runtime.apply_joined_protocol_response(response)
                 outage = None
                 try:
                     cfg.outage_file.unlink()

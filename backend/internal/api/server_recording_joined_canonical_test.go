@@ -712,6 +712,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingConnectionID = int(connectionID)
+	s.cfg.JoinedRecordingProtocolGeneration = 1
 	s.cfg.JoinedRecordingBatchID = batchID
 	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(batchID, canaryGapHourID)
 	recordingID, batchRecordingID := sourceLedger.recordingID, sourceLedger.batchRecordingID

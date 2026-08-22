@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/config"
 )
 
 // TestPullPathAllowed asserts the pure allowlist that confines a NAS pull key.
@@ -497,8 +500,9 @@ func TestConnectionHeartbeatJoinedProtocolTracksCurrentClientCapability(t *testi
 		VALUES($1,'nas_pull',$2,1)`, accountID, apiKeyID); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{pool: pool}
-	call := func(body string) {
+	remoteConfig := validRemoteJoinedProtocolConfig(999999999, 7)
+	s := &Server{pool: pool, cfg: remoteConfig}
+	call := func(body string) connectionHeartbeatResponse {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", strings.NewReader(body))
 		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey,
 			accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
@@ -507,6 +511,11 @@ func TestConnectionHeartbeatJoinedProtocolTracksCurrentClientCapability(t *testi
 		if rec.Code != http.StatusOK {
 			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
 		}
+		var response connectionHeartbeatResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		return response
 	}
 	protocol := func() int {
 		var got int
@@ -516,17 +525,92 @@ func TestConnectionHeartbeatJoinedProtocolTracksCurrentClientCapability(t *testi
 		return got
 	}
 
-	call(`{"cursor_id":1,"clips_pulled":1}`)
+	response := call(`{"cursor_id":1,"clips_pulled":1}`)
+	if response.JoinedProtocolVersion != 0 || response.JoinedProtocolGeneration != 0 {
+		t.Fatalf("mismatched connection response=%+v", response)
+	}
 	if got := protocol(); got != 0 {
 		t.Fatalf("legacy heartbeat preserved stale joined protocol=%d", got)
 	}
-	call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":1}`)
-	if got := protocol(); got != 1 {
-		t.Fatalf("explicit joined protocol 1 persisted=%d", got)
+	var connectionID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
 	}
-	call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":0}`)
-	if got := protocol(); got != 0 {
-		t.Fatalf("explicit joined protocol 0 persisted=%d", got)
+	s.cfg.JoinedRecordingConnectionID = int(connectionID)
+	response = call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":0}`)
+	if response.JoinedProtocolVersion != 1 || response.JoinedProtocolGeneration != 7 || protocol() != 0 {
+		t.Fatalf("enable handshake response=%+v persisted=%d", response, protocol())
+	}
+	response = call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":1}`)
+	if protocol() != 1 {
+		t.Fatalf("authorized joined protocol persisted=%d response=%+v", protocol(), response)
+	}
+	s.cfg.JoinedRecordingControlPlaneEnabled = false
+	s.cfg.JoinedRecordingProtocolVersion = 0
+	s.cfg.JoinedRecordingProtocolGeneration = 8
+	response = call(`{"client_version":"v1","client_phase":"idle","client_previous_exit":"clean","joined_protocol_version":1}`)
+	if response.JoinedProtocolVersion != 0 || response.JoinedProtocolGeneration != 8 || protocol() != 0 {
+		t.Fatalf("downgrade response=%+v persisted=%d", response, protocol())
+	}
+}
+
+func TestDesiredJoinedProtocolIsExactAndFailClosed(t *testing.T) {
+	base := validRemoteJoinedProtocolConfig(42, 9)
+	for _, tc := range []struct {
+		name                        string
+		cfg                         config.Config
+		connectionID                int64
+		wantVersion, wantGeneration int
+	}{
+		{"exact enabled", base, 42, 1, 9},
+		{"mismatch", base, 41, 0, 0},
+		{"missing target", config.Config{}, 42, 0, 0},
+		{"invalid joined control config", config.Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingConnectionID: 42, JoinedRecordingProtocolGeneration: 9}, 42, 0, 9},
+		{"invalid version", config.Config{JoinedRecordingProtocolVersion: 2, JoinedRecordingConnectionID: 42, JoinedRecordingProtocolGeneration: 9}, 42, 0, 0},
+		{"control disabled downgrade", config.Config{JoinedRecordingConnectionID: 42, JoinedRecordingProtocolGeneration: 10}, 42, 0, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotVersion, gotGeneration := desiredJoinedProtocol(tc.cfg, tc.connectionID)
+			if gotVersion != tc.wantVersion || gotGeneration != tc.wantGeneration {
+				t.Fatalf("desired=(%d,%d) want=(%d,%d)", gotVersion, gotGeneration, tc.wantVersion, tc.wantGeneration)
+			}
+		})
+	}
+}
+
+func TestPullJoinedConnectionIDRejectsStaleObservedProtocol(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(47), int64(123)
+	var connectionID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,api_key_id,joined_protocol_version)
+		VALUES($1,'nas_pull',$2,1) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
+		t.Fatal(err)
+	}
+	principal := accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}
+	s := &Server{pool: pool, cfg: config.Config{
+		JoinedRecordingConnectionID: int(connectionID), JoinedRecordingProtocolGeneration: 2,
+	}}
+	if _, err := s.pullJoinedConnectionID(ctx, pool, principal, false); !errors.Is(err, errJoinedProtocolDisabled) {
+		t.Fatalf("stale database protocol survived desired downgrade: %v", err)
+	}
+	s.cfg = validRemoteJoinedProtocolConfig(int(connectionID), 3)
+	if got, err := s.pullJoinedConnectionID(ctx, pool, principal, false); err != nil || got != connectionID {
+		t.Fatalf("current exact protocol connection=%d err=%v", got, err)
+	}
+}
+
+func validRemoteJoinedProtocolConfig(connectionID, generation int) config.Config {
+	return config.Config{
+		JoinedRecordingControlPlaneEnabled: true,
+		JoinedRecordingProtocolVersion:     1,
+		JoinedRecordingConnectionID:        connectionID,
+		JoinedRecordingProtocolGeneration:  generation,
+		JoinedRecordingWorkScope:           config.JoinedWorkScopeFrozenBatch,
+		JoinedRecordingBatchID:             "tier1-2026-08",
+		JoinedWorkerBootstrapToken:         "joined-bootstrap-credential-32bytes",
+		JoinedWorkerSigningKey:             "joined-signing-credential-32-bytes",
 	}
 }
 

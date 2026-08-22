@@ -99,6 +99,7 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	const batch = "tier1-2026-08"
 	hour := joinedCanaryScope(batch)
 	valid := Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingConnectionID: 77, JoinedRecordingProtocolGeneration: 1,
 		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour, ServiceToken: "service",
 		JoinedRecordingWorkScope:   JoinedWorkScopeCanary,
 		JoinedWorkerBootstrapToken: bootstrap, JoinedWorkerSigningKey: signing}
@@ -173,6 +174,8 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 		"JOINED_RECORDING_CONTROL_PLANE_ENABLED",
 		"JOINED_RECORDING_ENABLED",
 		"JOINED_RECORDING_PROTOCOL_VERSION",
+		"JOINED_RECORDING_CONNECTION_ID",
+		"JOINED_RECORDING_PROTOCOL_GENERATION",
 		"JOINED_RECORDING_ROLLING_ENABLED",
 		"STOARAMA_JOINED_WORK_SCOPE",
 		"JOINED_RECORDING_BATCH_ID",
@@ -196,6 +199,9 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	}
 	if cfg.JoinedRecordingControlPlaneEnabled || cfg.JoinedRecordingEnabled || cfg.JoinedRecordingRollingEnabled || cfg.JoinedRecordingProtocolVersion != 0 {
 		t.Fatalf("joined worker unexpectedly enabled: %+v", cfg)
+	}
+	if cfg.JoinedRecordingConnectionID != 0 || cfg.JoinedRecordingProtocolGeneration != 0 {
+		t.Fatalf("joined remote protocol unexpectedly targeted: %+v", cfg)
 	}
 	if cfg.JoinedRecordingBatchID != "" || cfg.JoinedRecordingScratchRoot != "/tmp/stoarama-joined" {
 		t.Fatalf("joined defaults: batch=%q scratch=%q", cfg.JoinedRecordingBatchID, cfg.JoinedRecordingScratchRoot)
@@ -378,6 +384,7 @@ func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
 
 func validJoinedAPIConfigForTest(batch, hour string) Config {
 	return Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingConnectionID: 77, JoinedRecordingProtocolGeneration: 1,
 		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: hour, JoinedRecordingWorkScope: JoinedWorkScopeCanary,
 		JoinedWorkerBootstrapToken: "joined-bootstrap-credential-32bytes",
 		JoinedWorkerSigningKey:     "joined-signing-credential-32-bytes"}
@@ -463,6 +470,8 @@ func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
 	for _, required := range []string{
 		"key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"false\"",
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
+		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"0\"",
+		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"0\"",
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
 		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
 		"key: JOINED_WORKER_BOOTSTRAP_TOKEN\n        sync: false",

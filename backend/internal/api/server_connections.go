@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -636,6 +637,26 @@ type connectionHeartbeatRequest struct {
 	JoinedDelivery     *connectionJoinedDelivery  `json:"joined_delivery,omitempty"`
 }
 
+type connectionHeartbeatResponse struct {
+	OK                       bool `json:"ok"`
+	JoinedDeliveryAccepted   bool `json:"joined_delivery_accepted"`
+	JoinedProtocolVersion    int  `json:"joined_protocol_version"`
+	JoinedProtocolGeneration int  `json:"joined_protocol_generation"`
+}
+
+func desiredJoinedProtocol(cfg config.Config, connectionID int64) (int, int) {
+	if connectionID <= 0 || cfg.JoinedRecordingConnectionID <= 0 ||
+		cfg.JoinedRecordingProtocolGeneration <= 0 ||
+		connectionID != int64(cfg.JoinedRecordingConnectionID) ||
+		(cfg.JoinedRecordingProtocolVersion != 0 && cfg.JoinedRecordingProtocolVersion != 1) {
+		return 0, 0
+	}
+	if cfg.JoinedRecordingControlPlaneEnabled && cfg.JoinedRecordingProtocolVersion == 1 && cfg.ValidateJoined() == nil {
+		return 1, cfg.JoinedRecordingProtocolGeneration
+	}
+	return 0, cfg.JoinedRecordingProtocolGeneration
+}
+
 type connectionJoinedDelivery struct {
 	ArtifactID  int64      `json:"artifact_id"`
 	Blocker     string     `json:"blocker"`
@@ -853,6 +874,21 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	var connectionID int64
+	if err := tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`,
+		*principal.APIKeyID, principal.AccountID).Scan(&connectionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, http.StatusForbidden, "no connection for this key")
+			return
+		}
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load heartbeat connection: %v", err))
+		return
+	}
+	desiredProtocol, desiredGeneration := desiredJoinedProtocol(s.cfg, connectionID)
+	effectiveProtocol := 0
+	if desiredProtocol == 1 && req.JoinedProtocol == 1 {
+		effectiveProtocol = 1
+	}
 	ct, err := tx.Exec(r.Context(), `
 		UPDATE connections
 		SET last_seen_at=now(),
@@ -901,7 +937,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		    nas_capacity_blocked=$40,
 		    joined_protocol_version=$41,
 		    updated_at=now()
-		WHERE api_key_id=$23 AND account_id=$24
+		WHERE id=$42 AND api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
 		req.ClientStartedAt, req.ClientBootID, req.ClientPhase, req.ClientPreviousExit,
 		req.ClientLastSuccess, req.ClientLastError, req.ClientLastErrorAt,
@@ -914,18 +950,13 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		inventoryClips, inventoryBytes, inventoryMismatches, inventoryUnmatched, inventoryDigest,
 		storageAvailable(req.Storage), storageTotal(req.Storage), storageFree(req.Storage),
 		inventoryScanPassStartedAt, inventoryRowsVisited, inventoryRowsSkipped, inventorySkipReasonsJSON,
-		req.CapacityBlocked, req.JoinedProtocol)
+		req.CapacityBlocked, effectiveProtocol, connectionID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat: %v", err))
 		return
 	}
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
-		return
-	}
-	var connectionID int64
-	if err := tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID); err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load heartbeat connection: %v", err))
 		return
 	}
 	joinedDeliveryAccepted := true
@@ -966,7 +997,10 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit heartbeat: %v", err))
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "joined_delivery_accepted": joinedDeliveryAccepted})
+	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
+		OK: true, JoinedDeliveryAccepted: joinedDeliveryAccepted,
+		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,
+	})
 }
 
 func storageAvailable(storage *connectionStorageStatus) any {
