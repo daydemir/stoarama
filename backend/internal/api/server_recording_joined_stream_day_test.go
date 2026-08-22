@@ -293,7 +293,8 @@ func TestJoinedStreamDayHEADSealIsAtomicIdempotentAndAdminOnly(t *testing.T) {
 	fixture.s.joinedFreezeTransport = transport
 
 	dayRequest := joinedSealStreamDayRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
-		BatchID: req.BatchID, RecordingID: joinedrecording.Tier1RecordingIDs[0], LocalDate: "2026-08-01"}
+		BatchID: req.BatchID, RecordingID: joinedrecording.Tier1RecordingIDs[0],
+		LocalDate: fixture.clipStart.Format("2006-01-02")}
 	body, _ := json.Marshal(dayRequest)
 	call := func(cookie bool) *httptest.ResponseRecorder {
 		httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/stream-days/seal", bytes.NewReader(body))

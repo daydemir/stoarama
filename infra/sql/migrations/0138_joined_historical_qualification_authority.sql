@@ -20,6 +20,43 @@ ALTER TABLE recording_joined_stream_days
     scheduled_end_at > scheduled_start_at AND completed_at >= scheduled_start_at
   );
 
+-- Reproduce the exact Go QualificationWindow wire bytes with evidence_sha256
+-- cleared. This makes the inner evidence seal independently enforceable even
+-- for a direct database activation; the outer operator request hash alone is
+-- intentionally insufficient.
+CREATE OR REPLACE FUNCTION recording_historical_go_utc_time_json(value JSONB)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
+  WITH parsed AS (SELECT (value#>>'{}')::TIMESTAMPTZ AT TIME ZONE 'UTC' AS moment)
+  SELECT to_jsonb(to_char(moment,'YYYY-MM-DD"T"HH24:MI:SS')||
+    CASE WHEN to_char(moment,'US')='000000' THEN '' ELSE '.'||rtrim(to_char(moment,'US'),'0') END||'Z')::TEXT
+  FROM parsed;
+$$;
+
+CREATE OR REPLACE FUNCTION recording_historical_qualification_evidence_sha256(qualification JSONB)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE STRICT AS $$
+  SELECT encode(sha256(convert_to(
+    '{"recording_id":'||(qualification->>'recording_id')::BIGINT::TEXT||
+    ',"timezone":'||(qualification->'timezone')::TEXT||
+    ',"days":['||COALESCE((
+      SELECT string_agg(
+        '{"local_date":'||(day->'local_date')::TEXT||
+        ',"qualification_window_ordinal":'||(day->>'qualification_window_ordinal')::INTEGER::TEXT||
+        ',"job_id":'||(day->>'job_id')::BIGINT::TEXT||
+        ',"scheduled_for":'||recording_historical_go_utc_time_json(day->'scheduled_for')||
+        ',"job_status":'||(day->'job_status')::TEXT||
+        ',"reason_codes":['||COALESCE((SELECT string_agg(to_jsonb(reason)::TEXT,',' ORDER BY reason_ordinal)
+          FROM jsonb_array_elements_text(day->'reason_codes') WITH ORDINALITY reasons(reason,reason_ordinal)),'')||']'||
+        ',"window_start":'||recording_historical_go_utc_time_json(day->'window_start')||
+        ',"window_end":'||recording_historical_go_utc_time_json(day->'window_end')||
+        ',"completed_at":'||recording_historical_go_utc_time_json(day->'completed_at')||'}',',' ORDER BY day_ordinal)
+      FROM jsonb_array_elements(qualification->'days') WITH ORDINALITY days(day,day_ordinal)
+    ),'')||']'||
+    ',"frozen_at":'||recording_historical_go_utc_time_json(qualification->'frozen_at')||
+    ',"authority_kind":'||(qualification->'authority_kind')::TEXT||
+    ',"evidence_sha256":""}',
+    'UTF8')),'hex');
+$$;
+
 CREATE OR REPLACE FUNCTION enforce_recording_qualification_run_lifecycle()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
@@ -98,7 +135,8 @@ BEGIN
          OLD.definition_jsonb->>'authority_kind' IS DISTINCT FROM 'historical_operator_import_v1' OR
          OLD.definition_jsonb->>'batch_id' IS DISTINCT FROM 'goodplus-20260821-generation-1' OR
          (OLD.definition_jsonb->>'generation')::INTEGER IS DISTINCT FROM 1 OR
-         (OLD.definition_jsonb->>'cutoff')::TIMESTAMPTZ IS DISTINCT FROM '2026-08-21T06:59:07.534131Z'::TIMESTAMPTZ OR
+         (OLD.definition_jsonb->'generation')::TEXT IS DISTINCT FROM '1' OR
+         OLD.definition_jsonb->'cutoff' IS DISTINCT FROM '"2026-08-21T06:59:07.534131Z"'::JSONB OR
          OLD.definition_jsonb->>'ordered_recording_ids_sha256' IS DISTINCT FROM '6038d4a23be9b0b5c2bb29ea933743a5ceb7f06b8875e417a3f16b44051ebd71' OR
          COALESCE(OLD.definition_jsonb->>'request_sha256','') !~ '^[0-9a-f]{64}$' OR
          COALESCE(OLD.definition_jsonb->>'qualification_jobs_sha256','') !~ '^[0-9a-f]{64}$' OR
@@ -124,14 +162,18 @@ BEGIN
              'cutoff','generation','members','ordered_recording_ids_sha256','qualification_jobs_sha256',
              'qualification_rule_version','request_sha256','schema_version']::TEXT[] OR
          (OLD.definition_jsonb->'canonical_plan'->>'schema_version')::INTEGER IS DISTINCT FROM 1 OR
+         (OLD.definition_jsonb->'canonical_plan'->'schema_version')::TEXT IS DISTINCT FROM '1' OR
          OLD.definition_jsonb->'canonical_plan'->>'authority_kind' IS DISTINCT FROM 'historical_operator_import_v1' OR
          OLD.definition_jsonb->'canonical_plan'->>'batch_id' IS DISTINCT FROM 'goodplus-20260821-generation-1' OR
          (OLD.definition_jsonb->'canonical_plan'->>'generation')::INTEGER IS DISTINCT FROM 1 OR
+         (OLD.definition_jsonb->'canonical_plan'->'generation')::TEXT IS DISTINCT FROM '1' OR
          (OLD.definition_jsonb->'canonical_plan'->>'account_id')::BIGINT IS DISTINCT FROM OLD.account_id OR
+         (OLD.definition_jsonb->'canonical_plan'->'account_id')::TEXT IS DISTINCT FROM OLD.account_id::TEXT OR
          NOT EXISTS(SELECT 1 FROM connections c WHERE c.id=(OLD.definition_jsonb->'canonical_plan'->>'connection_id')::BIGINT
            AND c.account_id=OLD.account_id) OR
-         (OLD.definition_jsonb->'canonical_plan'->>'cutoff')::TIMESTAMPTZ IS DISTINCT FROM
-           '2026-08-21T06:59:07.534131Z'::TIMESTAMPTZ OR
+         (OLD.definition_jsonb->'canonical_plan'->'connection_id')::TEXT IS DISTINCT FROM
+           (OLD.definition_jsonb->'canonical_plan'->>'connection_id')::BIGINT::TEXT OR
+         OLD.definition_jsonb->'canonical_plan'->'cutoff' IS DISTINCT FROM '"2026-08-21T06:59:07.534131Z"'::JSONB OR
          OLD.definition_jsonb->'canonical_plan'->>'ordered_recording_ids_sha256' IS DISTINCT FROM
            '6038d4a23be9b0b5c2bb29ea933743a5ceb7f06b8875e417a3f16b44051ebd71' OR
          OLD.definition_jsonb->'canonical_plan'->>'qualification_rule_version' IS DISTINCT FROM OLD.definition_version OR
@@ -150,7 +192,11 @@ BEGIN
              (item->>'recording_id')::BIGINT IS DISTINCT FROM
                (ARRAY[377,335,337,355,385,350,382,384,348,403,380,379,383,404,401,408,406,
                  409,422,418,419,413,420,428,423,425,416,421,437,440,429,431,439]::BIGINT[])[ord] OR
+             (item->'recording_id')::TEXT IS DISTINCT FROM (item->>'recording_id')::BIGINT::TEXT OR
              jsonb_typeof(item->'job_ids') IS DISTINCT FROM 'array' OR jsonb_array_length(item->'job_ids')<>14) OR
+         EXISTS(SELECT 1 FROM jsonb_array_elements(OLD.definition_jsonb->'recording_jobs') entries(item)
+           CROSS JOIN LATERAL jsonb_array_elements(entries.item->'job_ids') jobs(job_id)
+           WHERE job_id::TEXT IS DISTINCT FROM (job_id#>>'{}')::BIGINT::TEXT) OR
          (SELECT count(DISTINCT jobs.job_id::BIGINT)
             FROM jsonb_array_elements(OLD.definition_jsonb->'recording_jobs') AS entries(item)
             CROSS JOIN LATERAL jsonb_array_elements_text(entries.item->'job_ids') AS jobs(job_id))<>462 THEN
@@ -203,27 +249,46 @@ BEGIN
           IS DISTINCT FROM ARRAY['completed_at','job_id','job_status','local_date','qualification_window_ordinal',
             'reason_codes','scheduled_for','window_end','window_start']::TEXT[] OR
         (imported.member->>'recording_id')::BIGINT IS DISTINCT FROM m.recording_id OR
+        (imported.member->'recording_id')::TEXT IS DISTINCT FROM m.recording_id::TEXT OR
         (imported.member->>'stream_id')::BIGINT IS DISTINCT FROM m.stream_id OR
+        (imported.member->'stream_id')::TEXT IS DISTINCT FROM m.stream_id::TEXT OR
         imported.member->>'recording_name' IS DISTINCT FROM m.recording_name OR
         imported.member->>'stream_name' IS DISTINCT FROM m.stream_name OR
         imported.member->>'timezone' IS DISTINCT FROM m.cron_timezone OR
         (imported.member->>'schedule_start_at')::TIMESTAMPTZ IS DISTINCT FROM m.schedule_start_at OR
+        (imported.member->'schedule_start_at')::TEXT IS DISTINCT FROM
+          recording_historical_go_utc_time_json(imported.member->'schedule_start_at') OR
         (imported.member->>'schedule_end_at')::TIMESTAMPTZ IS DISTINCT FROM m.schedule_end_at OR
+        (imported.member ? 'schedule_end_at' AND (imported.member->'schedule_end_at')::TEXT IS DISTINCT FROM
+          recording_historical_go_utc_time_json(imported.member->'schedule_end_at')) OR
         (imported.member->>'active_weekdays')::SMALLINT IS DISTINCT FROM m.active_weekdays OR
+        (imported.member->'active_weekdays')::TEXT IS DISTINCT FROM m.active_weekdays::TEXT OR
         (imported.member->'qualification'->>'recording_id')::BIGINT IS DISTINCT FROM m.recording_id OR
+        (imported.member->'qualification'->'recording_id')::TEXT IS DISTINCT FROM m.recording_id::TEXT OR
         imported.member->'qualification'->>'timezone' IS DISTINCT FROM m.cron_timezone OR
         imported.member->'qualification'->>'authority_kind' IS DISTINCT FROM 'historical_operator_import_v1' OR
-        (imported.member->'qualification'->>'frozen_at')::TIMESTAMPTZ IS DISTINCT FROM
-          '2026-08-21T06:59:07.534131Z'::TIMESTAMPTZ OR
+        imported.member->'qualification'->'frozen_at' IS DISTINCT FROM '"2026-08-21T06:59:07.534131Z"'::JSONB OR
         COALESCE(imported.member->'qualification'->>'evidence_sha256','') !~ '^[0-9a-f]{64}$' OR
+        recording_historical_qualification_evidence_sha256(imported.member->'qualification')
+          IS DISTINCT FROM imported.member->'qualification'->>'evidence_sha256' OR
         (imported.day->>'qualification_window_ordinal')::INTEGER IS DISTINCT FROM w.ordinal OR
+        (imported.day->'qualification_window_ordinal')::TEXT IS DISTINCT FROM w.ordinal::TEXT OR
         imported.day->>'local_date' IS DISTINCT FROM to_char(w.local_open_at,'YYYY-MM-DD') OR
         (imported.day->>'job_id')::BIGINT IS DISTINCT FROM selected.job_id OR
+        (imported.day->'job_id')::TEXT IS DISTINCT FROM selected.job_id::TEXT OR
+        (imported.day->'scheduled_for')::TEXT IS DISTINCT FROM
+          recording_historical_go_utc_time_json(imported.day->'scheduled_for') OR
         (imported.day->>'scheduled_for')::TIMESTAMPTZ IS DISTINCT FROM j.scheduled_for OR
         imported.day->>'job_status' IS DISTINCT FROM j.status OR
         (imported.day->>'window_start')::TIMESTAMPTZ IS DISTINCT FROM w.window_start_at OR
+        (imported.day->'window_start')::TEXT IS DISTINCT FROM
+          recording_historical_go_utc_time_json(imported.day->'window_start') OR
         (imported.day->>'window_end')::TIMESTAMPTZ IS DISTINCT FROM w.window_end_at OR
+        (imported.day->'window_end')::TEXT IS DISTINCT FROM
+          recording_historical_go_utc_time_json(imported.day->'window_end') OR
         (imported.day->>'completed_at')::TIMESTAMPTZ IS DISTINCT FROM j.completed_at OR
+        (imported.day->'completed_at')::TEXT IS DISTINCT FROM
+          recording_historical_go_utc_time_json(imported.day->'completed_at') OR
         imported.day->'reason_codes' IS DISTINCT FROM to_jsonb(array_remove(ARRAY[
           CASE WHEN j.scheduled_for<>j.fire_at THEN 'scheduled_for_drift' END,
           CASE WHEN j.status='error' THEN 'terminal_job_error' END]::TEXT[],NULL)) OR

@@ -610,6 +610,13 @@ func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 	fixture := newJoinedHistoricalTier1Fixture(t, "joined-historical-lock@example.test")
 	defer fixture.cleanup()
 	ctx := context.Background()
+	var evidenceMismatches int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_qualification_runs q
+		CROSS JOIN LATERAL jsonb_array_elements(q.definition_jsonb->'canonical_plan'->'members') member
+		WHERE q.id=$1 AND recording_historical_qualification_evidence_sha256(member->'qualification')
+			IS DISTINCT FROM member->'qualification'->>'evidence_sha256'`, fixture.runID).Scan(&evidenceMismatches); err != nil || evidenceMismatches != 0 {
+		t.Fatalf("database qualification wire hash parity mismatches=%d err=%v", evidenceMismatches, err)
+	}
 	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_jobs j SET scheduled_for=
 		(q.definition_jsonb->'canonical_plan'->'members'->0->'qualification'->'days'->0->>'scheduled_for')::timestamptz
 		FROM recording_qualification_runs q WHERE q.id=$1 AND j.id=$2`, fixture.runID, fixture.firstJobID); err != nil {
@@ -707,6 +714,142 @@ func TestJoinedHistoricalActivationLocksRawFacts(t *testing.T) {
 	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, forgedID); err == nil {
 		t.Fatal("self-hashed historical authority without exact member/day facts activated")
 	}
+	var definitionJSON, planJSON []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT definition_jsonb,definition_jsonb->'canonical_plan'
+		FROM recording_qualification_runs WHERE id=$1`, fixture.runID).Scan(&definitionJSON, &planJSON); err != nil {
+		t.Fatal(err)
+	}
+	var definition map[string]any
+	var evidenceForgedPlan joinedHistoricalQualificationPlan
+	if err := json.Unmarshal(definitionJSON, &definition); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(planJSON, &evidenceForgedPlan); err != nil {
+		t.Fatal(err)
+	}
+	evidenceForgedPlan.Members[0].Qualification.EvidenceSHA = strings.Repeat("f", 64)
+	evidenceForgedPlan.RequestSHA256 = sha256Hex(joinedHistoricalQualificationApprovalBytes(evidenceForgedPlan))
+	definition["canonical_plan"] = evidenceForgedPlan
+	definition["request_sha256"] = evidenceForgedPlan.RequestSHA256
+	definition["request_canonical"] = string(joinedHistoricalQualificationApprovalBytes(evidenceForgedPlan))
+	var evidenceForgedID int64
+	if err := fixture.pool.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,
+		definition_jsonb,target_recording_count,target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at)
+		SELECT account_id,definition_version,$2,target_recording_count,target_window_count,
+		required_good_or_great,max_acceptable,window_sequence_start_at FROM recording_qualification_runs WHERE id=$1 RETURNING id`,
+		fixture.runID, definition).Scan(&evidenceForgedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,
+		ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,
+		daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version)
+		SELECT $2,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,
+		scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,active_weekdays,schedule_start_at,
+		schedule_end_at,window_generator_version FROM recording_qualification_members WHERE run_id=$1`,
+		fixture.runID, evidenceForgedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,
+		local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds)
+		SELECT $2,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,
+		window_start_at,window_end_at,expected_seconds FROM recording_qualification_windows WHERE run_id=$1`,
+		fixture.runID, evidenceForgedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`,
+		evidenceForgedID); err == nil {
+		t.Fatal("self-hashed historical authority with forged qualification evidence SHA activated")
+	}
+	rehashDefinition := func(definition map[string]any, plan map[string]any) {
+		t.Helper()
+		delete(plan, "request_sha256")
+		canonical, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requestSHA := sha256Hex(canonical)
+		plan["request_sha256"] = requestSHA
+		definition["canonical_plan"] = plan
+		definition["request_canonical"] = string(canonical)
+		definition["request_sha256"] = requestSHA
+	}
+	for name, suffix := range map[string]string{"zero offset": "+00:00", "redundant fraction": ".000000Z"} {
+		t.Run("rejects non-Go timestamp "+name, func(t *testing.T) {
+			var timestampDefinition map[string]any
+			if err := json.Unmarshal(definitionJSON, &timestampDefinition); err != nil {
+				t.Fatal(err)
+			}
+			timestampPlan := timestampDefinition["canonical_plan"].(map[string]any)
+			firstDay := timestampPlan["members"].([]any)[0].(map[string]any)["qualification"].(map[string]any)["days"].([]any)[0].(map[string]any)
+			scheduled, ok := firstDay["scheduled_for"].(string)
+			if !ok || !strings.HasSuffix(scheduled, "Z") {
+				t.Fatal("valid historical definition lacks canonical timestamp fixture")
+			}
+			firstDay["scheduled_for"] = strings.TrimSuffix(scheduled, "Z") + suffix
+			rehashDefinition(timestampDefinition, timestampPlan)
+			timestampID := cloneJoinedHistoricalQualificationRun(t, fixture, timestampDefinition)
+			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, timestampID); err == nil {
+				t.Fatal("self-hashed historical authority with non-Go timestamp spelling activated")
+			}
+		})
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"outer plan": func(plan map[string]any) { plan["schema_version"] = json.Number("1.0") },
+		"member": func(plan map[string]any) {
+			member := plan["members"].([]any)[0].(map[string]any)
+			member["stream_id"] = json.Number(member["stream_id"].(json.Number).String() + ".0")
+		},
+		"day": func(plan map[string]any) {
+			qualification := plan["members"].([]any)[0].(map[string]any)["qualification"].(map[string]any)
+			qualification["days"].([]any)[0].(map[string]any)["qualification_window_ordinal"] = json.Number("1.0")
+		},
+	} {
+		t.Run("rejects non-Go integer spelling in "+name, func(t *testing.T) {
+			var numericDefinition map[string]any
+			numericDecoder := json.NewDecoder(bytes.NewReader(definitionJSON))
+			numericDecoder.UseNumber()
+			if err := numericDecoder.Decode(&numericDefinition); err != nil {
+				t.Fatal(err)
+			}
+			numericPlan := numericDefinition["canonical_plan"].(map[string]any)
+			mutate(numericPlan)
+			rehashDefinition(numericDefinition, numericPlan)
+			numericID := cloneJoinedHistoricalQualificationRun(t, fixture, numericDefinition)
+			if _, err := fixture.pool.Exec(ctx, `UPDATE recording_qualification_runs SET status='active' WHERE id=$1`, numericID); err == nil {
+				t.Fatal("self-hashed historical authority with non-Go integer spelling activated")
+			}
+		})
+	}
+}
+
+func cloneJoinedHistoricalQualificationRun(t *testing.T, fixture joinedHistoricalTier1Fixture, definition any) int64 {
+	t.Helper()
+	ctx := context.Background()
+	var runID int64
+	if err := fixture.pool.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,
+		definition_jsonb,target_recording_count,target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at)
+		SELECT account_id,definition_version,$2,target_recording_count,target_window_count,
+		required_good_or_great,max_acceptable,window_sequence_start_at FROM recording_qualification_runs WHERE id=$1 RETURNING id`,
+		fixture.runID, definition).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_members(run_id,account_id,recording_id,
+		ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,scene_frame_evidence_id,cron_timezone,
+		daily_window_start,daily_window_end,active_weekdays,schedule_start_at,schedule_end_at,window_generator_version)
+		SELECT $2,account_id,recording_id,ordinal,stream_id,recording_name,stream_name,scene_identity_sha256,
+		scene_frame_evidence_id,cron_timezone,daily_window_start,daily_window_end,active_weekdays,schedule_start_at,
+		schedule_end_at,window_generator_version FROM recording_qualification_members WHERE run_id=$1`,
+		fixture.runID, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO recording_qualification_windows(run_id,recording_id,ordinal,
+		local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,window_start_at,window_end_at,expected_seconds)
+		SELECT $2,recording_id,ordinal,local_open_at,local_end_at,open_utc_offset_seconds,end_utc_offset_seconds,
+		window_start_at,window_end_at,expected_seconds FROM recording_qualification_windows WHERE run_id=$1`,
+		fixture.runID, runID); err != nil {
+		t.Fatal(err)
+	}
+	return runID
 }
 
 func waitJoinedDatabaseCondition(t *testing.T, pool *pgxpool.Pool, query string) {
