@@ -142,6 +142,8 @@ type Config struct {
 	JoinedRecordingControlPlaneEnabled bool
 	JoinedRecordingEnabled             bool
 	JoinedRecordingProtocolVersion     int
+	JoinedRecordingConnectionID        int
+	JoinedRecordingProtocolGeneration  int
 	JoinedRecordingRollingEnabled      bool
 	JoinedRecordingWorkScope           string
 	JoinedRecordingBatchID             string
@@ -279,6 +281,8 @@ func Load() (Config, error) {
 		JoinedRecordingControlPlaneEnabled:    boolEnv("JOINED_RECORDING_CONTROL_PLANE_ENABLED", false),
 		JoinedRecordingEnabled:                boolEnv("JOINED_RECORDING_ENABLED", false),
 		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
+		JoinedRecordingConnectionID:           intEnv("JOINED_RECORDING_CONNECTION_ID", 0),
+		JoinedRecordingProtocolGeneration:     intEnv("JOINED_RECORDING_PROTOCOL_GENERATION", 0),
 		JoinedRecordingRollingEnabled:         boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
 		JoinedRecordingWorkScope:              strings.TrimSpace(strEnv("STOARAMA_JOINED_WORK_SCOPE", "disabled")),
 		JoinedRecordingBatchID:                strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
@@ -423,6 +427,13 @@ func (c Config) ValidateJoined() error {
 	}
 	if c.JoinedRecordingRollingEnabled {
 		return fmt.Errorf("JOINED_RECORDING_ROLLING_ENABLED must remain false")
+	}
+	if c.JoinedRecordingConnectionID < 0 || c.JoinedRecordingProtocolGeneration < 0 ||
+		(c.JoinedRecordingConnectionID == 0) != (c.JoinedRecordingProtocolGeneration == 0) {
+		return fmt.Errorf("JOINED_RECORDING_CONNECTION_ID and JOINED_RECORDING_PROTOCOL_GENERATION must both be positive or both be zero")
+	}
+	if c.JoinedRecordingConnectionID > 0 && c.JoinedRecordingProtocolVersion != 0 && c.JoinedRecordingProtocolVersion != 1 {
+		return fmt.Errorf("JOINED_RECORDING_PROTOCOL_VERSION must be 0 or 1 for a targeted connection")
 	}
 	if _, err := c.JoinedWorkScope(); err != nil {
 		return err

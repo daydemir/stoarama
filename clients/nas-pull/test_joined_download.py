@@ -52,6 +52,13 @@ class JoinedDownloadTests(unittest.TestCase):
             joined_protocol_version=1,
         )
 
+    def runtime(self, cfg):
+        runtime = pull.Runtime(cfg)
+        runtime.apply_joined_protocol_response({
+            "joined_protocol_version": 1, "joined_protocol_generation": 1,
+        })
+        return runtime
+
     def media_item(self, content=b"abcdef", **changes):
         manifest = self.manifest_payload()
         media = manifest["media"][0]
@@ -208,7 +215,7 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def test_protocol_artifact_shape_and_kind_validation(self):
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); self.assertEqual(pull.Runtime(cfg).heartbeat_payload(None)["joined_protocol_version"], 1)
+            cfg = self.config(Path(raw)); self.assertEqual(pull.Runtime(cfg).heartbeat_payload(None)["joined_protocol_version"], 0)
         good = self.media_item(); self.assertEqual(pull.valid_joined_item(good)["kind"], "media")
         for change in (
             {"artifact_id": 0}, {"connection_id": 0}, {"connection_id": True}, {"batch_id": "../escape"}, {"batch_id": True}, {"batch_id": 7},
@@ -608,6 +615,61 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))
             request.assert_not_called(); storage.assert_not_called()
 
+    def test_remote_protocol_generation_is_monotonic_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            self.assertFalse(runtime.joined_protocol_enabled())
+
+            runtime.apply_joined_protocol_response({
+                "joined_protocol_version": 1, "joined_protocol_generation": 4,
+            })
+            self.assertTrue(runtime.joined_protocol_enabled())
+            self.assertEqual(runtime.heartbeat_payload(None)["joined_protocol_version"], 1)
+            runtime.apply_joined_protocol_response({
+                "joined_protocol_version": 1, "joined_protocol_generation": 4,
+            })
+            self.assertTrue(runtime.joined_protocol_enabled())
+
+            runtime.apply_joined_protocol_response({
+                "joined_protocol_version": 1, "joined_protocol_generation": 3,
+            })
+            self.assertFalse(runtime.joined_protocol_enabled())
+            runtime.apply_joined_protocol_response({
+                "joined_protocol_version": 1, "joined_protocol_generation": 4,
+            })
+            self.assertFalse(runtime.joined_protocol_enabled())
+
+            runtime.apply_joined_protocol_response({
+                "joined_protocol_version": 0, "joined_protocol_generation": 5,
+            })
+            self.assertFalse(runtime.joined_protocol_enabled())
+            runtime.apply_joined_protocol_response({
+                "joined_protocol_version": 1, "joined_protocol_generation": 6,
+            })
+            self.assertTrue(runtime.joined_protocol_enabled())
+            for malformed in ({}, None, {
+                "joined_protocol_version": True, "joined_protocol_generation": 7,
+            }, {
+                "joined_protocol_version": 1, "joined_protocol_generation": 0,
+            }):
+                runtime.apply_joined_protocol_response(malformed)
+                self.assertFalse(runtime.joined_protocol_enabled())
+
+    def test_downgrade_after_feed_fetch_stops_before_joined_item(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            def feed(*_args, **_kwargs):
+                runtime.apply_joined_protocol_response({
+                    "joined_protocol_version": 0, "joined_protocol_generation": 2,
+                })
+                return {"item": self.media_item()}
+            with mock.patch.object(pull, "request_json", side_effect=feed), \
+                 mock.patch.object(pull, "download_joined_item") as download:
+                self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))
+            download.assert_not_called()
+
     def test_gap_only_hour_manifest_downloads_and_exact_acks(self):
         raw_item, content = self.manifest_item(gap=True); requests, acks = [], []
         def api(_cfg, _method, path, body=None, **_kwargs):
@@ -621,7 +683,7 @@ class JoinedDownloadTests(unittest.TestCase):
             start, end = map(int, headers["Range"].removeprefix("bytes=").split("-"))
             return RangeResponse(content[start:end + 1], start, end, len(content))
         with tempfile.TemporaryDirectory() as raw:
-            cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg); self.install_ledger(cfg, gap=True)
+            cfg, runtime = self.config(Path(raw)), None; runtime = self.runtime(cfg); self.install_ledger(cfg, gap=True)
             with mock.patch.object(pull, "JOINED_RANGE_BYTES", 64), mock.patch.object(pull, "storage_status", return_value=self.storage()), \
                  mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
@@ -650,7 +712,7 @@ class JoinedDownloadTests(unittest.TestCase):
             if path == "/account/joined/ack": acks.append(body); return {"ok": True}
             raise AssertionError(path)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
             with mock.patch.object(pull, "storage_status", return_value=self.storage()), mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", return_value=RangeResponse(content, 0, len(content) - 1, len(content))):
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
             final = pull.joined_output_path(cfg, pull.valid_joined_item(raw_item))
@@ -662,7 +724,7 @@ class JoinedDownloadTests(unittest.TestCase):
         item = pull.valid_joined_item(raw_item)
         manifest = self.manifest_payload(gap=True)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
             with self.assertRaises(pull.ExistingFileMismatch):
                 pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
             ledger_path = self.install_ledger(cfg, gap=True)
@@ -774,7 +836,7 @@ class JoinedDownloadTests(unittest.TestCase):
             start, end = map(int, headers["Range"].removeprefix("bytes=").split("-"))
             return RangeResponse(content[start:end + 1], start, end, len(content))
         with tempfile.TemporaryDirectory() as raw:
-            cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg); self.install_manifest(cfg, raw_item)
+            cfg, runtime = self.config(Path(raw)), None; runtime = self.runtime(cfg); self.install_manifest(cfg, raw_item)
             with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), mock.patch.object(pull, "storage_status", return_value=self.storage()), \
                  mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
                 self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
@@ -788,7 +850,7 @@ class JoinedDownloadTests(unittest.TestCase):
         raw_item, _ = self.manifest_item(gap=True)
         item = pull.valid_joined_item(raw_item)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_ledger(cfg, gap=True, acknowledged=False)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); self.install_ledger(cfg, gap=True, acknowledged=False)
             with mock.patch.object(pull, "request_json", side_effect=urllib.error.URLError("ACK unavailable")), \
                  mock.patch.object(pull, "open_joined_url") as download, self.assertRaisesRegex(urllib.error.URLError, "ACK unavailable"):
                 pull.download_joined_item(cfg, runtime, item, threading.Event())
@@ -810,7 +872,7 @@ class JoinedDownloadTests(unittest.TestCase):
         item = pull.valid_joined_item(self.media_item())
         wrong = {**item, "hour_manifest_id": item["hour_manifest_id"] + 1}
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item, acknowledged=False)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); self.install_manifest(cfg, item, acknowledged=False)
             def reject(_cfg, _method, path, body=None, **_kwargs):
                 if path.startswith("/account/clips?"): return {"clips": []}
                 self.assertEqual(body["artifact_id"], wrong["hour_manifest_id"])
@@ -823,7 +885,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_media_manifest_mismatch_or_missing_manifest_fails_before_download(self):
         item = pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
-            cfg, runtime = self.config(Path(raw)), None; runtime = pull.Runtime(cfg)
+            cfg, runtime = self.config(Path(raw)), None; runtime = self.runtime(cfg)
             with self.assertRaises(pull.ExistingFileMismatch): pull.download_joined_item(cfg, runtime, item, threading.Event())
             path = self.install_manifest(cfg, item); path.write_bytes(self.manifest_bytes({**item, "size_bytes": 7}))
             altered = {**item, "hour_manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -835,7 +897,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_hash_is_bounded_cancellable_and_yields_to_raw(self):
         content, item = b"abcdef", pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, _, part, marker = self.names(cfg, item)
             try:
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False):
                     pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, self.marker(item), threading.Event())
@@ -848,7 +910,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_unknown_partial_and_hardlink_are_never_modified(self):
         item = pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); self.install_manifest(cfg, item)
             directory_fd, _, part, marker = self.names(cfg, item)
             prepared = {
                 "etag": "etag-1", "version_id": "", "url": "https://r2.test/exact-object", "if_match": '"etag-1"',
@@ -868,7 +930,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_private_stage_crash_enospc_restart_and_conflict_safety(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
             try:
                 orphan = marker + ".stage-" + "a" * 32; self.write_entry(directory_fd, orphan, expected)
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(pull.os, "urandom", return_value=b"\xbb" * 16):
@@ -879,7 +941,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 finally: os.close(descriptor)
             finally: os.close(directory_fd)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
             try:
                 real_write, calls = os.write, 0
                 def fail_write(descriptor, content):
@@ -898,7 +960,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_restart_after_stage_link_removes_only_proven_link(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
             try:
                 linked = marker + ".stage-" + "a" * 32; unknown = marker + ".stage-" + "b" * 32
                 self.write_entry(directory_fd, linked, expected); self.write_entry(directory_fd, unknown, b"unknown")
@@ -911,7 +973,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_conflicting_marker_is_never_modified(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, _, _part, marker = self.names(cfg, item)
             try:
                 self.write_entry(directory_fd, marker, b"conflicting-marker")
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "marker conflicts"):
@@ -922,7 +984,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_crash_after_final_link_completes_without_final_sidecar(self):
         content, raw_item = b"abcdef", self.media_item(); item = pull.valid_joined_item(raw_item)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); self.install_manifest(cfg, item)
             directory_fd, final, part, marker = self.names(cfg, item)
             try:
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False): pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, self.marker(item), threading.Event())
@@ -944,7 +1006,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_http_restart_rules_truncate_only_owned_partial(self):
         item = pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, _, part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, _, part, marker = self.names(cfg, item)
             prepared = {"url": "https://r2.test/x", "if_match": '"etag-1"', "etag": "etag-1", "version_id": ""}
             try:
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False): pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, self.marker(item), threading.Event())
@@ -1048,7 +1110,7 @@ class JoinedDownloadTests(unittest.TestCase):
         self.assertEqual(pull.joined_transfer_marker_bytes(item, first), pull.joined_transfer_marker_bytes(item, renewed))
         changed = {**first, "url_authority": "other.test"}
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
             directory_fd, _final, part, marker = self.names(cfg, item)
             try:
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False):
@@ -1080,7 +1142,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 return {"ok": True}
             raise AssertionError(path)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, raw_item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); self.install_manifest(cfg, raw_item)
             with mock.patch.object(pull, "storage_status", return_value=self.storage()), mock.patch.object(pull, "request_json", side_effect=api), mock.patch.object(pull, "open_joined_url", return_value=RangeResponse(content, 0, 2, 3)), self.assertRaisesRegex(urllib.error.URLError, "ack unavailable"):
                 pull.drain_joined(cfg, runtime, threading.Event())
             final = pull.joined_output_path(cfg, pull.valid_joined_item(raw_item)); before = final.read_bytes()
@@ -1091,7 +1153,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_exact_preexisting_final_is_acked_without_download(self):
         content, raw_item = b"abcdef", self.media_item(); item = pull.valid_joined_item(raw_item)
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); self.install_manifest(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); self.install_manifest(cfg, item)
             final = pull.joined_output_path(cfg, item); final.parent.mkdir(parents=True, exist_ok=True); final.write_bytes(content)
             def api(_cfg, _method, path, **_kwargs):
                 if path == "/account/joined": return {"item": raw_item}
@@ -1105,7 +1167,7 @@ class JoinedDownloadTests(unittest.TestCase):
     def test_unknown_third_final_link_is_rejected(self):
         content, item = b"abcdef", pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = pull.Runtime(cfg); directory_fd, final, part, marker = self.names(cfg, item)
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg); directory_fd, final, part, marker = self.names(cfg, item)
             try:
                 self.write_entry(directory_fd, part, content); self.write_entry(directory_fd, marker, self.marker(item))
                 os.link(part, final, src_dir_fd=directory_fd, dst_dir_fd=directory_fd); os.link(final, "unknown-third-link", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
@@ -1118,7 +1180,7 @@ class JoinedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             with mock.patch.object(pull, "request_json", return_value={"item": None, "surprise": True}), self.assertRaisesRegex(RuntimeError, "unknown fields"):
-                pull.drain_joined(cfg, pull.Runtime(cfg), threading.Event())
+                pull.drain_joined(cfg, self.runtime(cfg), threading.Event())
 
 
 if __name__ == "__main__": unittest.main()

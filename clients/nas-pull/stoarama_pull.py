@@ -935,7 +935,10 @@ class Runtime:
         self.list_succeeded = False
         self.stable_marked = False
         self.inventory = inventory
-        self.joined_protocol_version = getattr(cfg, "joined_protocol_version", 0)
+        # Remote authorization is process-local and fail-closed. A restart must
+        # negotiate again; no manifest, environment, or progress file enables it.
+        self.joined_protocol_version = 0
+        self.joined_protocol_generation = 0
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1019,6 +1022,29 @@ class Runtime:
     def is_capacity_blocked(self):
         with self.lock:
             return self.capacity_blocked
+
+    def joined_protocol_enabled(self):
+        with self.lock:
+            return self.joined_protocol_version == JOINED_PROTOCOL_VERSION
+
+    def apply_joined_protocol_response(self, response):
+        version = response.get("joined_protocol_version") if isinstance(response, dict) else None
+        generation = response.get("joined_protocol_generation") if isinstance(response, dict) else None
+        valid = (
+            type(version) is int and version in (0, JOINED_PROTOCOL_VERSION)
+            and type(generation) is int and 0 <= generation <= 0x7fffffffffffffff
+            and (generation > 0 or version == 0)
+        )
+        with self.lock:
+            if not valid or generation < self.joined_protocol_generation:
+                self.joined_protocol_version = 0
+                return
+            if generation == self.joined_protocol_generation:
+                if version != self.joined_protocol_version:
+                    self.joined_protocol_version = 0
+                return
+            self.joined_protocol_generation = generation
+            self.joined_protocol_version = version
 
     def reserve_storage(self, cfg, storage, expected_bytes=0):
         """Atomically admit expected bytes and persist hysteresis across restarts."""
@@ -4704,9 +4730,11 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
 
 
 def drain_joined(cfg, runtime, stop_event):
-    if getattr(cfg, "joined_protocol_version", 0) != JOINED_PROTOCOL_VERSION or cfg.dry_run:
+    if not runtime.joined_protocol_enabled() or cfg.dry_run:
         return False
     page = request_json(cfg, "GET", "/account/joined")
+    if not runtime.joined_protocol_enabled():
+        return False
     if set(page) - {"item"}:
         raise RuntimeError("joined response contains unknown fields")
     raw_item = page.get("item")
@@ -4932,23 +4960,25 @@ def heartbeat_loop(cfg, runtime, stop_event):
     outage = load_outage(cfg)
     while not stop_event.is_set():
         try:
-            request_json(
+            response = request_json(
                 cfg,
                 "POST",
                 "/account/connections/heartbeat",
                 body=runtime.heartbeat_payload(outage),
                 timeout=HEARTBEAT_TIMEOUT_SEC,
             )
+            runtime.apply_joined_protocol_response(response)
             runtime.heartbeat_succeeded = True
             if outage:
                 outage["recovered_at"] = utc_now()
-                request_json(
+                response = request_json(
                     cfg,
                     "POST",
                     "/account/connections/heartbeat",
                     body=runtime.heartbeat_payload(outage),
                     timeout=HEARTBEAT_TIMEOUT_SEC,
                 )
+                runtime.apply_joined_protocol_response(response)
                 outage = None
                 try:
                     cfg.outage_file.unlink()

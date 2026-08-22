@@ -1556,6 +1556,28 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             # bookkeeping write, instead of dying on the first one.
             self.assertGreaterEqual(len(beats), 3)
 
+    def test_heartbeat_applies_remote_protocol_to_next_advertisement(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            stop_event = threading.Event()
+            payloads = []
+
+            def heartbeat(_cfg, _method, path, body=None, **_kwargs):
+                self.assertEqual(path, "/account/connections/heartbeat")
+                payloads.append(body)
+                if len(payloads) == 2:
+                    stop_event.set()
+                return {"ok": True, "joined_protocol_version": 1, "joined_protocol_generation": 3}
+
+            with mock.patch.object(pull, "request_json", side_effect=heartbeat), \
+                 mock.patch.object(pull, "HEARTBEAT_INTERVAL_SEC", 0):
+                pull.heartbeat_loop(cfg, runtime, stop_event)
+
+            self.assertEqual([body["joined_protocol_version"] for body in payloads], [0, 1])
+            self.assertEqual(payloads[0]["cursor_id"], payloads[1]["cursor_id"])
+            self.assertEqual(payloads[0]["clips_pulled"], payloads[1]["clips_pulled"])
+
     def test_update_check_runs_immediately_on_startup(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
