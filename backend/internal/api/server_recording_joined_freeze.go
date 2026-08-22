@@ -660,7 +660,70 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 			ON br.batch_record_id=$1 AND br.recording_id=e.recording_id`, batchRecordID); err != nil {
 		return joinedTier1FreezePlan{}, false, err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_source_snapshots(batch_record_id,stream_day_id,account_id,
+	if err := s.insertJoinedTier1SourceSnapshots(ctx, tx, batchRecordID, plan.AccountID, plan.ConnectionID); err != nil {
+		return joinedTier1FreezePlan{}, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return joinedTier1FreezePlan{}, false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='building' WHERE id=$1 AND state='snapshotting'`, batchRecordID); err != nil {
+		return joinedTier1FreezePlan{}, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return joinedTier1FreezePlan{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return joinedTier1FreezePlan{}, false, err
+	}
+	return plan, true, nil
+}
+
+func (s *Server) insertJoinedTier1SourceSnapshots(ctx context.Context, tx pgx.Tx, batchRecordID, accountID, connectionID int64) error {
+	type streamDay struct {
+		id          int64
+		sourceCount int64
+		priority    int
+	}
+	rows, err := tx.Query(ctx, `SELECT d.id,d.source_clip_count,br.priority_ordinal
+		FROM recording_joined_stream_days d JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
+		WHERE d.batch_record_id=$1 ORDER BY br.priority_ordinal,d.date_ordinal,d.id`, batchRecordID)
+	if err != nil {
+		return fmt.Errorf("load Tier-1 source snapshot stream days: %w", err)
+	}
+	streamDays := make([]streamDay, 0, len(joinedrecording.Tier1RecordingIDs)*14)
+	for rows.Next() {
+		var day streamDay
+		if err := rows.Scan(&day.id, &day.sourceCount, &day.priority); err != nil {
+			rows.Close()
+			return fmt.Errorf("load Tier-1 source snapshot stream day: %w", err)
+		}
+		streamDays = append(streamDays, day)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("load Tier-1 source snapshot stream days: %w", err)
+	}
+
+	if len(streamDays) != len(joinedrecording.Tier1RecordingIDs)*14 {
+		return fmt.Errorf("load Tier-1 source snapshot stream days: got %d want %d",
+			len(streamDays), len(joinedrecording.Tier1RecordingIDs)*14)
+	}
+	for start := 0; start < len(streamDays); start += 14 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := min(start+14, len(streamDays))
+		streamDayIDs := make([]int64, 0, end-start)
+		var expectedSources int64
+		priority := streamDays[start].priority
+		for _, day := range streamDays[start:end] {
+			if day.priority != priority {
+				return errors.New("Tier-1 source snapshot recording chunk differs")
+			}
+			streamDayIDs = append(streamDayIDs, day.id)
+			expectedSources += day.sourceCount
+		}
+		command, err := tx.Exec(ctx, `INSERT INTO recording_joined_source_snapshots(batch_record_id,stream_day_id,account_id,
 		connection_id,recording_id,recording_job_id,clip_id,storage_destination_id,day_ordinal,provider,endpoint,region,
 		bucket,object_key,ingest_etag,size_bytes,sha256,start_at,end_at,clip_created_at,released_at,capture_lease_token,
 		capture_sequence,capture_attempt_id,timestamp_contract_version,timestamp_contract,timestamp_contract_status,
@@ -670,17 +733,23 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 			t.clip_created_at,t.released_at,t.capture_lease_token,t.capture_sequence,t.capture_attempt_id,
 			t.timestamp_contract_version,t.timestamp_contract,t.timestamp_contract_status,t.timestamp_contract_reason
 		FROM joined_tier1_apply_sources t JOIN recording_joined_stream_days d
-			ON d.batch_record_id=$1 AND d.recording_job_id=t.recording_job_id ORDER BY t.recording_id,t.recording_job_id,t.day_ordinal`,
-		batchRecordID, plan.AccountID, plan.ConnectionID); err != nil {
-		return joinedTier1FreezePlan{}, false, err
+			ON d.batch_record_id=$1 AND d.recording_id=t.recording_id AND d.recording_job_id=t.recording_job_id
+		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
+		WHERE d.id=ANY($4::bigint[]) ORDER BY br.priority_ordinal,d.date_ordinal,t.day_ordinal`,
+			batchRecordID, accountID, connectionID, streamDayIDs)
+		if err != nil {
+			return fmt.Errorf("insert Tier-1 source snapshot chunk: %w", err)
+		}
+		if command.RowsAffected() != expectedSources {
+			return fmt.Errorf("insert Tier-1 source snapshot chunk: rows=%d want=%d", command.RowsAffected(), expectedSources)
+		}
+		if s.joinedFreezeChunkHook != nil {
+			if err := s.joinedFreezeChunkHook(ctx, priority); err != nil {
+				return fmt.Errorf("after Tier-1 source snapshot chunk: %w", err)
+			}
+		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='building' WHERE id=$1 AND state='snapshotting'`, batchRecordID); err != nil {
-		return joinedTier1FreezePlan{}, false, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return joinedTier1FreezePlan{}, false, err
-	}
-	return plan, true, nil
+	return nil
 }
 
 func sha256Bytes(value []byte) string {

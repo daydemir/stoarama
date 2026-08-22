@@ -48,6 +48,7 @@ type Server struct {
 	joinedFreezeSourceStore joinedFreezeSourceObjectStore
 	joinedFreezeTransport   http.RoundTripper
 	joinedCredentialCheck   func(context.Context) error
+	joinedFreezeChunkHook   func(context.Context, int) error
 	secrets                 *secretbox.Cipher
 	mailer                  email.Sender
 	streamsHTML             []byte
