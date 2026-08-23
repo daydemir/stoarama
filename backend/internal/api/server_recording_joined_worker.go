@@ -1005,19 +1005,21 @@ func (s *Server) handleJoinedStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 type joinedConnectionStatusResponse struct {
-	ConnectionID               int64      `json:"connection_id"`
-	ExpectedProtocolVersion    int        `json:"expected_protocol_version"`
-	ExpectedProtocolGeneration int        `json:"expected_protocol_generation"`
-	ObservedProtocolVersion    int        `json:"observed_protocol_version"`
-	LastSeenAt                 *time.Time `json:"last_seen_at,omitempty"`
-	HeartbeatAgeSeconds        *int64     `json:"heartbeat_age_seconds,omitempty"`
-	HeartbeatStale             bool       `json:"heartbeat_stale"`
-	PollIntervalSeconds        int        `json:"poll_interval_seconds"`
-	ClientVersion              string     `json:"client_version,omitempty"`
-	ClientPhase                string     `json:"client_phase,omitempty"`
-	ClientPreviousExit         string     `json:"client_previous_exit,omitempty"`
-	ClientErrorAt              *time.Time `json:"client_error_at,omitempty"`
-	ClientErrorPresent         bool       `json:"client_error_present"`
+	ConnectionID                    int64      `json:"connection_id"`
+	ExpectedProtocolVersion         int        `json:"expected_protocol_version"`
+	ExpectedProtocolGeneration      int        `json:"expected_protocol_generation"`
+	ServerDesiredProtocolVersion    int        `json:"server_desired_protocol_version"`
+	ServerDesiredProtocolGeneration int        `json:"server_desired_protocol_generation"`
+	ObservedProtocolVersion         int        `json:"observed_protocol_version"`
+	LastSeenAt                      *time.Time `json:"last_seen_at,omitempty"`
+	HeartbeatAgeSeconds             *int64     `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale                  bool       `json:"heartbeat_stale"`
+	PollIntervalSeconds             int        `json:"poll_interval_seconds"`
+	ClientVersion                   string     `json:"client_version,omitempty"`
+	ClientPhase                     string     `json:"client_phase,omitempty"`
+	ClientPreviousExit              string     `json:"client_previous_exit,omitempty"`
+	ClientErrorAt                   *time.Time `json:"client_error_at,omitempty"`
+	ClientErrorPresent              bool       `json:"client_error_present"`
 }
 
 func boundedJoinedDiagnosticText(value string) string {
@@ -1091,6 +1093,7 @@ func (s *Server) handleJoinedConnectionStatus(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusInternalServerError, "load joined connection status failed")
 		return
 	}
+	desiredProtocol, desiredGeneration := desiredJoinedProtocol(s.cfg, observedID)
 	now := time.Now().UTC()
 	var ageSeconds *int64
 	stale := true
@@ -1109,8 +1112,9 @@ func (s *Server) handleJoinedConnectionStatus(w http.ResponseWriter, r *http.Req
 	log.Printf("joined connection status read connection_id=%d observed_protocol=%d stale=%t", observedID, observedProtocol, stale)
 	util.WriteJSON(w, http.StatusOK, joinedConnectionStatusResponse{
 		ConnectionID: observedID, ExpectedProtocolVersion: s.cfg.JoinedRecordingProtocolVersion,
-		ExpectedProtocolGeneration: s.cfg.JoinedRecordingProtocolGeneration,
-		ObservedProtocolVersion:    observedProtocol, LastSeenAt: lastSeen,
+		ExpectedProtocolGeneration:   s.cfg.JoinedRecordingProtocolGeneration,
+		ServerDesiredProtocolVersion: desiredProtocol, ServerDesiredProtocolGeneration: desiredGeneration,
+		ObservedProtocolVersion: observedProtocol, LastSeenAt: lastSeen,
 		HeartbeatAgeSeconds: ageSeconds, HeartbeatStale: stale,
 		PollIntervalSeconds: pollInterval, ClientVersion: boundedJoinedDiagnosticText(clientVersion),
 		ClientPhase: boundedJoinedDiagnosticText(clientPhase), ClientPreviousExit: boundedJoinedDiagnosticText(clientPreviousExit),
