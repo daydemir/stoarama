@@ -41,32 +41,34 @@ import (
 )
 
 type Server struct {
-	cfg                     config.Config
-	pool                    *pgxpool.Pool
-	r2                      *r2.Client
-	joinedOutputStorage     joinedOutputObjectStore
-	joinedFreezeSourceStore joinedFreezeSourceObjectStore
-	joinedFreezeTransport   http.RoundTripper
-	joinedCredentialCheck   func(context.Context) error
-	joinedFreezeChunkHook   func(context.Context, int) error
-	secrets                 *secretbox.Cipher
-	mailer                  email.Sender
-	streamsHTML             []byte
-	recordingsHTML          []byte
-	accountHTML             []byte
-	orgSettingsHTML         []byte
-	nasFilesHTML            []byte
-	docsHTML                []byte
-	pricingHTML             []byte
-	adminHTML               []byte
-	billing                 *billing.Client
-	exportMu                sync.Mutex
-	frameExports            map[string]*frameExportJob
-	dayZipMu                sync.Mutex
-	dayZips                 map[string]*dayZipJob
-	dayZipSlot              chan struct{}
-	authLinkLimiter         *authLinkLimiter
-	sharedRecordingsLimiter *sharedRecordingsLimiter
+	cfg                      config.Config
+	pool                     *pgxpool.Pool
+	r2                       *r2.Client
+	joinedOutputStorage      joinedOutputObjectStore
+	joinedFreezeSourceStore  joinedFreezeSourceObjectStore
+	joinedFreezeTransport    http.RoundTripper
+	joinedCredentialCheck    func(context.Context) error
+	joinedFreezeChunkHook    func(context.Context, int) error
+	secrets                  *secretbox.Cipher
+	mailer                   email.Sender
+	streamsHTML              []byte
+	recordingsHTML           []byte
+	accountHTML              []byte
+	orgSettingsHTML          []byte
+	nasFilesHTML             []byte
+	docsHTML                 []byte
+	pricingHTML              []byte
+	adminHTML                []byte
+	billing                  *billing.Client
+	exportMu                 sync.Mutex
+	frameExports             map[string]*frameExportJob
+	dayZipMu                 sync.Mutex
+	dayZips                  map[string]*dayZipJob
+	dayZipSlot               chan struct{}
+	authLinkLimiter          *authLinkLimiter
+	sharedRecordingsLimiter  *sharedRecordingsLimiter
+	joinedConnectionStatusMu sync.Mutex
+	joinedConnectionStatusAt time.Time
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -558,6 +560,7 @@ func (s *Server) router() http.Handler {
 			joinedBootstrap.Use(s.requireJoinedWorkerBootstrapAuth)
 			joinedBootstrap.Post("/recording/joined/token", s.handleJoinedToken)
 			joinedBootstrap.Get("/recording/joined/status", s.handleJoinedStatus)
+			joinedBootstrap.Get("/recording/joined/connection-status", s.handleJoinedConnectionStatus)
 		})
 
 		api.Group(func(service chi.Router) {
