@@ -34,9 +34,12 @@ type joinedFinalFreezeResponse struct {
 }
 
 const (
-	joinedFinalFreezeOperationTimeout = 10 * time.Second
+	// Final freeze revalidates the complete frozen denominator in one guarded
+	// transaction. Keep this budget local to final freeze so ordinary API
+	// requests retain their existing deadlines.
+	joinedFinalFreezeOperationTimeout = 45 * time.Second
 	joinedFinalFreezeLockTimeout      = 5 * time.Second
-	joinedFinalFreezeStatementTimeout = 5 * time.Second
+	joinedFinalFreezeStatementTimeout = 30 * time.Second
 )
 
 func (r joinedFinalFreezeRequest) validate() error {
