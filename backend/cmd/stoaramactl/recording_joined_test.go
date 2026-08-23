@@ -59,6 +59,7 @@ type fakeJoinedOperator struct {
 	checkpointedReq joinedFreezeTier1Request
 	dayReq          joinedSealStreamDayRequest
 	remainingReq    joinedSealRemainingDaysRequest
+	validationReq   joinedFinalFreezeRequest
 	finalReq        joinedFinalFreezeRequest
 	indexReq        joinedSealBatchIndexRequest
 	workerReq       joinedWorkerRequest
@@ -119,6 +120,11 @@ func (f *fakeJoinedOperator) SealRemainingDays(_ context.Context, req joinedSeal
 func (f *fakeJoinedOperator) FinalFreeze(_ context.Context, req joinedFinalFreezeRequest) (any, error) {
 	f.finalReq = req
 	return map[string]any{"status": "frozen"}, nil
+}
+
+func (f *fakeJoinedOperator) FinalValidation(_ context.Context, req joinedFinalFreezeRequest) (any, error) {
+	f.validationReq = req
+	return map[string]any{"state": "ready"}, nil
 }
 
 func (f *fakeJoinedOperator) SealBatchIndex(_ context.Context, req joinedSealBatchIndexRequest) (any, error) {
@@ -370,6 +376,9 @@ func TestJoinedOperatorCommandsDispatchTypedRequests(t *testing.T) {
 	if fake.finalReq != (joinedFinalFreezeRequest{BatchID: cfg.JoinedRecordingBatchID,
 		ExpectedFrozenDenominatorSHA256: hash, Apply: true}) {
 		t.Fatalf("final-freeze request=%+v", fake.finalReq)
+	}
+	if fake.validationReq != fake.finalReq {
+		t.Fatalf("final-validation request=%+v final=%+v", fake.validationReq, fake.finalReq)
 	}
 	if _, err := runRecordingJoinedWith(context.Background(), cfg, []string{
 		"seal-batch-index", "--expected-sha256", hash, "--apply",

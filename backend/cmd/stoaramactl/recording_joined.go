@@ -70,6 +70,17 @@ type joinedFinalFreezeRequest struct {
 	Apply                           bool   `json:"-"`
 }
 
+type joinedFinalValidationProgress struct {
+	RunID                     string  `json:"run_id"`
+	BatchID                   string  `json:"batch_id"`
+	State                     string  `json:"state"`
+	CompletedScopes           int     `json:"completed_scopes"`
+	ExpectedScopes            int     `json:"expected_scopes"`
+	NextOrdinal               *int    `json:"next_ordinal,omitempty"`
+	ReceiptSetSHA256          *string `json:"receipt_set_sha256,omitempty"`
+	ExpectedDenominatorSHA256 string  `json:"expected_frozen_denominator_sha256"`
+}
+
 type joinedSealBatchIndexRequest struct {
 	BatchID        string `json:"batch_id"`
 	ExpectedSHA256 string `json:"expected_sha256"`
@@ -103,6 +114,7 @@ type joinedOperatorService interface {
 	FreezeTier1Checkpointed(context.Context, joinedFreezeTier1Request) (any, error)
 	SealStreamDay(context.Context, joinedSealStreamDayRequest) (any, error)
 	SealRemainingDays(context.Context, joinedSealRemainingDaysRequest) (any, error)
+	FinalValidation(context.Context, joinedFinalFreezeRequest) (any, error)
 	FinalFreeze(context.Context, joinedFinalFreezeRequest) (any, error)
 	SealBatchIndex(context.Context, joinedSealBatchIndexRequest) (any, error)
 	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
@@ -229,7 +241,15 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 		if err != nil {
 			return nil, err
 		}
-		return service.FinalFreeze(ctx, req)
+		validation, err := service.FinalValidation(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		frozen, err := service.FinalFreeze(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"validation": validation, "final_freeze": frozen}, nil
 	case "seal-batch-index":
 		if err := requireJoinedActiveProtocol(cfg); err != nil {
 			return nil, err

@@ -70,6 +70,26 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	if err := childTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	validation, err := fixture.s.startJoinedFinalValidation(ctx, joinedFinalValidationStartRequest{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		BatchID:         req.BatchID, ExpectedFrozenDenominatorSHA256: fixture.plan.FrozenDenominatorSHA256,
+	})
+	if err != nil {
+		t.Fatalf("start final-validation checkpoint: %v", err)
+	}
+	for validation.State != "ready" {
+		if validation.NextOrdinal == nil {
+			t.Fatalf("final-validation checkpoint stalled: %+v", validation)
+		}
+		ordinal := *validation.NextOrdinal
+		validation, err = fixture.s.stepJoinedFinalValidation(ctx, joinedFinalValidationStepRequest{
+			ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+			RunID:           validation.RunID, Ordinal: ordinal,
+		})
+		if err != nil {
+			t.Fatalf("step final-validation checkpoint %d: %v", ordinal, err)
+		}
+	}
 
 	fixture.s.cfg.ServiceToken = "generic-service-credential-32-bytes"
 	freezeRequest := joinedFinalFreezeRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
@@ -778,6 +798,39 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if err := insertFinalChild(childTx); err != nil {
 		t.Fatal(err)
 	}
+	if err := childTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	validation, err := fixture.s.startJoinedFinalValidation(ctx, joinedFinalValidationStartRequest{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		BatchID:         batchID, ExpectedFrozenDenominatorSHA256: fixture.plan.FrozenDenominatorSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for validation.State != "ready" {
+		if validation.NextOrdinal == nil {
+			t.Fatalf("final-validation checkpoint stalled: %+v", validation)
+		}
+		ordinal := *validation.NextOrdinal
+		validation, err = fixture.s.stepJoinedFinalValidation(ctx, joinedFinalValidationStepRequest{
+			ProtocolVersion: joinedrecording.JoinedProtocolVersion, RunID: validation.RunID, Ordinal: ordinal,
+		})
+		if err != nil {
+			t.Fatalf("step final-validation checkpoint %d: %v", ordinal, err)
+		}
+	}
+	blockerTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockerPID int32
+	if err := blockerTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blockerTx.Exec(ctx, `SELECT id FROM recording_joined_batches WHERE id=$1 FOR UPDATE`, batchRecordID); err != nil {
+		t.Fatal(err)
+	}
 	freezeConn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -799,8 +852,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		}
 		freezeResult <- updateErr
 	}()
-	waitForBlocker(freezePID, childPID)
-	if err := childTx.Commit(ctx); err != nil {
+	waitForBlocker(freezePID, blockerPID)
+	if err := blockerTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-freezeResult; err != nil {
