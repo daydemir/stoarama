@@ -30,7 +30,7 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 		bootstrap = "bootstrap-token-kept-secret"
 		claim     = "claim-token-kept-secret-value"
 	)
-	paths := make(chan string, 4)
+	paths := make(chan string, 5)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths <- r.URL.Path
 		if got := r.Header.Get("Authorization"); got != "Bearer "+map[string]string{
@@ -188,19 +188,24 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 		operatorToken = "joined-tier1-operator-token-at-least-32-bytes"
 		batchID       = "tier1-2026-08-generation-1"
 	)
-	paths := make(chan string, 4)
+	paths := make(chan string, 5)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths <- r.URL.Path
 		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+operatorToken {
 			t.Errorf("operator request method=%s auth=%q", r.Method, r.Header.Get("Authorization"))
 		}
 		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["protocol_version"] != float64(1) || body["batch_id"] != batchID {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["protocol_version"] != float64(1) ||
+			(strings.HasSuffix(r.URL.Path, "/freeze-tier1") || strings.HasSuffix(r.URL.Path, "/stream-days/seal") || strings.HasSuffix(r.URL.Path, "/batches/final-freeze") || strings.HasSuffix(r.URL.Path, "/batches/index/seal")) && body["batch_id"] != batchID {
 			t.Errorf("operator request body=%v err=%v", body, err)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/api/v1/recording/joined/stream-days/seal" {
 			writeJoinedTestJSON(t, w, joinedSealReceipt(batchID, 377, "2026-08-01"))
+			return
+		}
+		if r.URL.Path == "/api/v1/recording/joined/batches/final-freeze/validation/start" {
+			_, _ = w.Write([]byte(`{"run_id":"11111111-1111-4111-8111-111111111111","batch_id":"tier1-2026-08-generation-1","state":"ready","completed_scopes":462,"expected_scopes":462}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -220,6 +225,10 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 		RecordingID: 377, LocalDate: "2026-08-01", Apply: true}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := service.FinalValidation(context.Background(), joinedFinalFreezeRequest{BatchID: batchID,
+		ExpectedFrozenDenominatorSHA256: strings.Repeat("a", 64), Apply: true}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := service.FinalFreeze(context.Background(), joinedFinalFreezeRequest{BatchID: batchID,
 		ExpectedFrozenDenominatorSHA256: strings.Repeat("a", 64), Apply: true}); err != nil {
 		t.Fatal(err)
@@ -231,6 +240,7 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 	for _, want := range []string{
 		"/api/v1/recording/joined/freeze-tier1",
 		"/api/v1/recording/joined/stream-days/seal",
+		"/api/v1/recording/joined/batches/final-freeze/validation/start",
 		"/api/v1/recording/joined/batches/final-freeze",
 		"/api/v1/recording/joined/batches/index/seal",
 	} {

@@ -442,6 +442,67 @@ func (s *remoteJoinedOperatorService) FinalFreeze(ctx context.Context, req joine
 	return response, nil
 }
 
+// FinalValidation runs the server-owned stream-day certificate checkpoint
+// serially. Status is reconciled after every step, including ambiguous
+// transport failures, so the operator never guesses whether a receipt landed.
+func (s *remoteJoinedOperatorService) FinalValidation(ctx context.Context, req joinedFinalFreezeRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	start := struct {
+		ProtocolVersion                 int    `json:"protocol_version"`
+		BatchID                         string `json:"batch_id"`
+		ExpectedFrozenDenominatorSHA256 string `json:"expected_frozen_denominator_sha256"`
+	}{joinedrecording.JoinedProtocolVersion, req.BatchID, req.ExpectedFrozenDenominatorSHA256}
+	var progress joinedFinalValidationProgress
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/batches/final-freeze/validation/start", token, start, &progress); err != nil {
+		return nil, err
+	}
+	for {
+		if progress.State == "ready" {
+			return progress, nil
+		}
+		if progress.NextOrdinal == nil || *progress.NextOrdinal != progress.CompletedScopes+1 {
+			return nil, errors.New("joined final-validation cursor is not the next serial ordinal")
+		}
+		step := struct {
+			ProtocolVersion int    `json:"protocol_version"`
+			RunID           string `json:"run_id"`
+			Ordinal         int    `json:"ordinal"`
+		}{joinedrecording.JoinedProtocolVersion, progress.RunID, *progress.NextOrdinal}
+		var stepProgress joinedFinalValidationProgress
+		stepErr := s.api.postJSON(ctx, "/api/v1/recording/joined/batches/final-freeze/validation/step", token, step, &stepProgress)
+		status, statusErr := s.finalValidationStatus(ctx, token, progress.RunID)
+		if statusErr != nil {
+			if stepErr != nil {
+				return nil, fmt.Errorf("joined final-validation step %d failed and status reconciliation failed: %w", step.Ordinal, statusErr)
+			}
+			return nil, fmt.Errorf("joined final-validation step %d status reconciliation failed: %w", step.Ordinal, statusErr)
+		}
+		if stepErr != nil {
+			if status.CompletedScopes <= progress.CompletedScopes {
+				return nil, fmt.Errorf("joined final-validation step %d did not advance; reconcile before retry: %w", step.Ordinal, stepErr)
+			}
+			progress = status
+			continue
+		}
+		if status.CompletedScopes <= progress.CompletedScopes {
+			return nil, fmt.Errorf("joined final-validation step %d response advanced but status did not", step.Ordinal)
+		}
+		progress = status
+	}
+}
+
+func (s *remoteJoinedOperatorService) finalValidationStatus(ctx context.Context, token, runID string) (joinedFinalValidationProgress, error) {
+	var progress joinedFinalValidationProgress
+	path := "/api/v1/recording/joined/batches/final-freeze/validation/status?run_id=" + url.QueryEscape(runID)
+	if err := s.api.getJSON(ctx, path, token, &progress); err != nil {
+		return progress, err
+	}
+	return progress, nil
+}
+
 func (s *remoteJoinedOperatorService) SealBatchIndex(ctx context.Context, req joinedSealBatchIndexRequest) (any, error) {
 	token, err := s.validOperatorToken()
 	if err != nil {

@@ -70,6 +70,25 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	if err := childTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	validation, err := fixture.s.startJoinedFinalValidation(ctx, joinedFinalValidationStartRequest{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+		BatchID:         req.BatchID, ExpectedFrozenDenominatorSHA256: fixture.plan.FrozenDenominatorSHA256,
+	})
+	if err != nil {
+		t.Fatalf("start final-validation checkpoint: %v", err)
+	}
+	for validation.State != "ready" {
+		if validation.NextOrdinal == nil {
+			t.Fatalf("final-validation checkpoint stalled: %+v", validation)
+		}
+		validation, err = fixture.s.stepJoinedFinalValidation(ctx, joinedFinalValidationStepRequest{
+			ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+			RunID:           validation.RunID, Ordinal: *validation.NextOrdinal,
+		})
+		if err != nil {
+			t.Fatalf("step final-validation checkpoint %d: %v", *validation.NextOrdinal, err)
+		}
+	}
 
 	fixture.s.cfg.ServiceToken = "generic-service-credential-32-bytes"
 	freezeRequest := joinedFinalFreezeRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
