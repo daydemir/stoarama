@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	joinedStreamDayHeadConcurrency = 4
+	joinedStreamDayHeadConcurrency = 16
 	joinedStreamDayHeadAttempts    = 3
 	joinedStreamDayHeadTimeout     = 8 * time.Second
 	joinedStreamDayHeadTotal       = 25 * time.Second
@@ -319,9 +320,12 @@ func (s *Server) headJoinedStreamDaySources(ctx context.Context, plan joinedStre
 	if len(plan.Sources) == 0 {
 		return []joinedStreamDayHeadObservation{}, nil
 	}
+	started := time.Now()
 	store := s.joinedFreezeStore()
 	if store == nil || store.Bucket() != s.cfg.R2Bucket {
-		return nil, errors.New("joined source storage is unavailable")
+		err := errors.New("joined source storage is unavailable")
+		logJoinedStreamDayHeadFailure(plan, started, err)
+		return nil, err
 	}
 	observations := make([]joinedStreamDayHeadObservation, len(plan.Sources))
 	ctx, timeout := context.WithTimeout(ctx, joinedStreamDayHeadTotal)
@@ -358,9 +362,30 @@ func (s *Server) headJoinedStreamDaySources(ctx context.Context, plan joinedStre
 	}
 	wg.Wait()
 	if firstErr != nil {
+		logJoinedStreamDayHeadFailure(plan, started, firstErr)
 		return nil, firstErr
 	}
+	log.Printf("joined stream-day HEAD validation complete recording_id=%d local_date=%s source_count=%d concurrency=%d elapsed=%s",
+		plan.RecordingID, plan.LocalDate, len(plan.Sources), joinedStreamDayHeadConcurrency, time.Since(started))
 	return observations, nil
+}
+
+func logJoinedStreamDayHeadFailure(plan joinedStreamDayPlan, started time.Time, err error) {
+	log.Printf("joined stream-day HEAD validation failed recording_id=%d local_date=%s source_count=%d concurrency=%d elapsed=%s failure_class=%s error=%v",
+		plan.RecordingID, plan.LocalDate, len(plan.Sources), joinedStreamDayHeadConcurrency, time.Since(started), joinedStreamDayHeadFailureClass(err), err)
+}
+
+func joinedStreamDayHeadFailureClass(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case strings.Contains(err.Error(), "storage is unavailable"):
+		return "storage_unavailable"
+	default:
+		return "validation"
+	}
 }
 
 func (s *Server) headJoinedStreamDaySource(ctx context.Context, store joinedFreezeSourceObjectStore,

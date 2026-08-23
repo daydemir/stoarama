@@ -101,6 +101,46 @@ type joinedConcurrentHeadTransport struct {
 	release chan struct{}
 }
 
+type joinedDelayedHeadTransport struct {
+	mu      sync.Mutex
+	active  int
+	maximum int
+	delay   time.Duration
+}
+
+func (s *joinedDelayedHeadTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	s.mu.Lock()
+	s.active++
+	if s.active > s.maximum {
+		s.maximum = s.active
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.active--
+		s.mu.Unlock()
+	}()
+	timer := time.NewTimer(s.delay)
+	defer timer.Stop()
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-timer.C:
+	}
+	headers := make(http.Header)
+	headers.Set("ETag", req.Header.Get("If-Match"))
+	headers.Set("Content-Length", "10")
+	headers.Set("x-amz-version-id", "source-version-one")
+	return &http.Response{StatusCode: http.StatusOK, Header: headers,
+		ContentLength: 10, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+}
+
+func (s *joinedDelayedHeadTransport) maxActive() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maximum
+}
+
 type joinedPairHeadTransport struct {
 	mu      sync.Mutex
 	calls   int
@@ -221,12 +261,16 @@ func TestJoinedStreamDayHEADCancellationStopsBackoff(t *testing.T) {
 	}
 }
 
-func TestJoinedStreamDayHEADConcurrencyIsCappedAtFour(t *testing.T) {
-	transport := &joinedConcurrentHeadTransport{started: make(chan struct{}, 9), release: make(chan struct{})}
+func TestJoinedStreamDayHEADConcurrencyIsCappedAtSixteen(t *testing.T) {
+	const expectedConcurrency = 16
+	transport := &joinedConcurrentHeadTransport{started: make(chan struct{}, 33), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(transport.release) }) }
+	defer release()
 	s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport,
 		joinedFreezeSourceStore: &joinedFreezeStoreStub{bucket: "clips"}}
 	s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
-	plan := joinedStreamDayPlan{Sources: make([]joinedStreamDaySnapshot, 9)}
+	plan := joinedStreamDayPlan{Sources: make([]joinedStreamDaySnapshot, 33)}
 	for i := range plan.Sources {
 		plan.Sources[i] = joinedHeadTestSnapshot(i)
 	}
@@ -235,24 +279,55 @@ func TestJoinedStreamDayHEADConcurrencyIsCappedAtFour(t *testing.T) {
 		_, err := s.headJoinedStreamDaySources(context.Background(), plan)
 		done <- err
 	}()
-	for i := 0; i < joinedStreamDayHeadConcurrency; i++ {
-		<-transport.started
+	for i := 0; i < expectedConcurrency; i++ {
+		select {
+		case <-transport.started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only observed %d concurrent HEADs", i)
+		}
 	}
 	transport.mu.Lock()
 	active, maximum := transport.active, transport.maximum
 	transport.mu.Unlock()
-	if active != joinedStreamDayHeadConcurrency || maximum != joinedStreamDayHeadConcurrency {
+	if active != expectedConcurrency || maximum != expectedConcurrency {
 		t.Fatalf("active=%d maximum=%d", active, maximum)
 	}
-	close(transport.release)
+	release()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	transport.mu.Lock()
 	maximum = transport.maximum
 	transport.mu.Unlock()
-	if maximum > joinedStreamDayHeadConcurrency {
+	if maximum > expectedConcurrency {
 		t.Fatalf("maximum concurrent HEADs=%d", maximum)
+	}
+}
+
+func TestJoinedStreamDayHEADHandlesLargeDayWithinBoundedBudget(t *testing.T) {
+	const sourceCount = 1069
+	transport := &joinedDelayedHeadTransport{delay: 100 * time.Millisecond}
+	s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport,
+		joinedFreezeSourceStore: &joinedFreezeStoreStub{bucket: "clips"}}
+	s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
+	plan := joinedStreamDayPlan{Sources: make([]joinedStreamDaySnapshot, sourceCount)}
+	for i := range plan.Sources {
+		plan.Sources[i] = joinedHeadTestSnapshot(i)
+	}
+	started := time.Now()
+	observations, err := s.headJoinedStreamDaySources(context.Background(), plan)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != sourceCount {
+		t.Fatalf("observations=%d want=%d", len(observations), sourceCount)
+	}
+	if maximum := transport.maxActive(); maximum != joinedStreamDayHeadConcurrency {
+		t.Fatalf("maximum concurrent HEADs=%d want=%d", maximum, joinedStreamDayHeadConcurrency)
+	}
+	if elapsed >= 15*time.Second {
+		t.Fatalf("large-day HEAD validation took %s", elapsed)
 	}
 }
 
