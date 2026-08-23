@@ -81,12 +81,13 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 		if validation.NextOrdinal == nil {
 			t.Fatalf("final-validation checkpoint stalled: %+v", validation)
 		}
+		ordinal := *validation.NextOrdinal
 		validation, err = fixture.s.stepJoinedFinalValidation(ctx, joinedFinalValidationStepRequest{
 			ProtocolVersion: joinedrecording.JoinedProtocolVersion,
-			RunID:           validation.RunID, Ordinal: *validation.NextOrdinal,
+			RunID:           validation.RunID, Ordinal: ordinal,
 		})
 		if err != nil {
-			t.Fatalf("step final-validation checkpoint %d: %v", *validation.NextOrdinal, err)
+			t.Fatalf("step final-validation checkpoint %d: %v", ordinal, err)
 		}
 	}
 
