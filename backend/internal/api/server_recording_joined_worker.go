@@ -472,6 +472,14 @@ func (s *Server) handleJoinedFinalizeLedger(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusBadRequest, "invalid joined ledger finalize")
 		return
 	}
+	// Operation tokens deliberately carry no rollout scope. Bind the current
+	// server scope once for both identity validation and gap-only sealing so a
+	// single request cannot observe two different scope decisions.
+	workScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "joined work scope is invalid")
+		return
+	}
 	if err := s.validateJoinedRootFinalizeIdentity(r.Context(), joinedauth.SubjectLedger, req.Published.ArtifactID,
 		req.Published.ObjectKey, req.Published.SizeBytes, req.Published.SHA256); err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
@@ -483,7 +491,7 @@ func (s *Server) handleJoinedFinalizeLedger(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := s.finalizeJoinedRoot(r.Context(), joinedauth.SubjectLedger, req.Published.ArtifactID,
-		req.Published.ObjectKey, req.Published.ETag, req.Published.VersionID, req.Published.SizeBytes, req.Published.SHA256); err != nil {
+		req.Published.ObjectKey, req.Published.ETag, req.Published.VersionID, req.Published.SizeBytes, req.Published.SHA256, workScope); err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -510,7 +518,8 @@ func (s *Server) handleJoinedFinalizeBatchIndex(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err := s.finalizeJoinedRoot(r.Context(), joinedauth.SubjectBatchIndex, req.Published.ArtifactID,
-		req.Published.ObjectKey, req.Published.ETag, req.Published.VersionID, req.Published.SizeBytes, req.Published.SHA256); err != nil {
+		req.Published.ObjectKey, req.Published.ETag, req.Published.VersionID, req.Published.SizeBytes, req.Published.SHA256,
+		joinedrecording.WorkScopeIdentity{}); err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -545,7 +554,7 @@ func (s *Server) validateJoinedRootFinalizeIdentity(ctx context.Context, scopeKi
 }
 
 func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artifactID int64, objectKey, etag,
-	versionID string, sizeBytes int64, sha256 string) error {
+	versionID string, sizeBytes int64, sha256 string, workScope joinedrecording.WorkScopeIdentity) error {
 	if scopeKind == joinedauth.SubjectBatchIndex {
 		return s.finalizeJoinedBatchIndexCanonical(ctx, artifactID, objectKey, etag, versionID, sizeBytes, sha256)
 	}
@@ -556,6 +565,11 @@ func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artif
 	if !ok || claims.Kind != joinedauth.KindOperation || claims.Operation != joinedauth.OperationPublish ||
 		claims.SubjectKind != scopeKind {
 		return errors.New("joined publication token scope differs")
+	}
+	if scopeKind == joinedauth.SubjectLedger {
+		if err := workScope.Validate(claims.BatchID); err != nil {
+			return errors.New("joined work scope is invalid")
+		}
 	}
 	lease, err := joinedCapabilityToken(claims.LeaseToken)
 	if err != nil {
@@ -583,7 +597,7 @@ func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artif
 			return errors.New("joined publication retry differs")
 		}
 		if scopeKind == joinedauth.SubjectLedger {
-			if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID); err != nil {
+			if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID, workScope); err != nil {
 				return errors.New("seal joined gap-only hours")
 			}
 		}
@@ -602,7 +616,7 @@ func (s *Server) finalizeJoinedRoot(ctx context.Context, scopeKind string, artif
 		return errors.New("joined publication lease is stale")
 	}
 	if scopeKind == joinedauth.SubjectLedger {
-		if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID); err != nil {
+		if err := sealJoinedGapOnlyHoursTx(ctx, tx, artifactID, workScope); err != nil {
 			return errors.New("seal joined gap-only hours")
 		}
 	}

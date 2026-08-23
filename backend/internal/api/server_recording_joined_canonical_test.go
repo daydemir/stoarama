@@ -998,8 +998,41 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	var gapManifestCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_artifacts
 		WHERE stream_day_id=$1 AND artifact_kind='hour_manifest' AND publication_state='sealed'`, ledgers[0].streamDayID).
-		Scan(&gapManifestCount); err != nil || gapManifestCount != 12 {
+		Scan(&gapManifestCount); err != nil || gapManifestCount != 1 {
 		t.Fatalf("server gap-only manifests=%d err=%v", gapManifestCount, err)
+	}
+	var gapHourStates int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_hours
+		WHERE stream_day_id=$1 AND state='sealed' AND source_clip_count=0`, ledgers[0].streamDayID).
+		Scan(&gapHourStates); err != nil || gapHourStates != 1 {
+		t.Fatalf("server gap-only sealed hours=%d err=%v", gapHourStates, err)
+	}
+	var sealedGapHourID string
+	if err := pool.QueryRow(ctx, `SELECT hour_id FROM recording_joined_hours
+		WHERE stream_day_id=$1 AND state='sealed' AND source_clip_count=0`, ledgers[0].streamDayID).
+		Scan(&sealedGapHourID); err != nil || sealedGapHourID != canaryGapHourID {
+		t.Fatalf("server sealed gap hour=%q want=%q err=%v", sealedGapHourID, canaryGapHourID, err)
+	}
+	var pendingForeignGaps int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_hours
+		WHERE stream_day_id=$1 AND state='pending' AND source_clip_count=0 AND hour_id<>$2`, ledgers[0].streamDayID, canaryGapHourID).
+		Scan(&pendingForeignGaps); err != nil || pendingForeignGaps != 11 {
+		t.Fatalf("server foreign pending gap hours=%d err=%v", pendingForeignGaps, err)
+	}
+	// The idempotent published-finalize path must apply the same exact canary
+	// filter and must not create or seal any additional gap-only hour.
+	retryFinalizeReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/ledger/finalize", bytes.NewReader(finalizeBody))
+	retryFinalizeReq.Header.Set("Authorization", "Bearer "+publication.Ledger.OperationToken)
+	retryFinalizeRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFinalizeLedger)).ServeHTTP(retryFinalizeRec, retryFinalizeReq)
+	if retryFinalizeRec.Code != http.StatusNoContent {
+		t.Fatalf("retry finalize status=%d body=%s", retryFinalizeRec.Code, retryFinalizeRec.Body.String())
+	}
+	var retryGapManifestCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_artifacts
+		WHERE stream_day_id=$1 AND artifact_kind='hour_manifest'`, ledgers[0].streamDayID).
+		Scan(&retryGapManifestCount); err != nil || retryGapManifestCount != 1 {
+		t.Fatalf("retry gap-only manifests=%d err=%v", retryGapManifestCount, err)
 	}
 	exactHourReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
 	exactHourReq.Header.Set("Authorization", "Bearer "+claimToken)
@@ -1895,7 +1928,12 @@ func publishJoinedCanonicalRemainderForIndex(t *testing.T, fixture joinedHistori
 				t.Fatal(err)
 			}
 		}
-		if err := sealJoinedGapOnlyHoursTx(ctx, tx, id); err != nil {
+		frozenScope, err := joinedrecording.NewWorkScopeIdentity(joinedrecording.Tier1BatchID, joinedrecording.WorkScopeFrozenBatch, nil)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := sealJoinedGapOnlyHoursTx(ctx, tx, id, frozenScope); err != nil {
 			_ = tx.Rollback(ctx)
 			t.Fatal(err)
 		}
