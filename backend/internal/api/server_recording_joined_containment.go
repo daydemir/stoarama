@@ -91,6 +91,10 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusServiceUnavailable, "joined containment is unavailable")
 		return
 	}
+	if !s.joinedControlPlaneReady() {
+		util.WriteError(w, http.StatusConflict, "joined control plane is not ready")
+		return
+	}
 	workScope, err := s.cfg.JoinedWorkScope()
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
