@@ -562,6 +562,10 @@ func (s *Server) router() http.Handler {
 			joinedBootstrap.Get("/recording/joined/status", s.handleJoinedStatus)
 			joinedBootstrap.Get("/recording/joined/connection-status", s.handleJoinedConnectionStatus)
 		})
+		api.Group(func(joinedOperator chi.Router) {
+			joinedOperator.Use(s.requireJoinedOperatorAuth)
+			joinedOperator.Get("/recording/joined/containment", s.handleJoinedContainment)
+		})
 
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
