@@ -643,16 +643,11 @@ func (s *Server) loadJoinedStreamDayNeighbors(ctx context.Context, plan joinedSt
 			order = "DESC"
 		}
 		var source joinedrecording.SourceClip
-		// Cross-day evidence is authoritative only after the adjacent day has
-		// sealed. Pending snapshots must not influence this day’s ledger: the
-		// database validator resolves neighbors from recording_joined_sources,
-		// which is populated only by sealed days.
 		err := s.pool.QueryRow(ctx, `SELECT snapshot.clip_id,snapshot.recording_id,snapshot.recording_job_id,
 			snapshot.storage_destination_id,snapshot.provider,snapshot.endpoint,snapshot.region,snapshot.bucket,
 			snapshot.object_key,snapshot.ingest_etag,snapshot.size_bytes,snapshot.sha256,snapshot.start_at,snapshot.end_at,
 			snapshot.released_at FROM recording_joined_stream_days day JOIN recording_joined_source_snapshots snapshot
 			ON snapshot.stream_day_id=day.id WHERE day.batch_record_id=$1 AND day.recording_id=$2 AND day.date_ordinal=$3
-			AND day.state='sealed'
 			ORDER BY snapshot.day_ordinal `+order+` LIMIT 1`, plan.BatchRecordID, plan.RecordingID, dateOrdinal).Scan(
 			&source.ClipID, &source.RecordingID, &source.RecordingJobID, &source.StorageDestinationID, &source.Provider,
 			&source.Endpoint, &source.Region, &source.Bucket, &source.Object.Key, &source.Object.ETag,
