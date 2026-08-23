@@ -36,11 +36,15 @@ func TestJoinedConnectionStatusIsAuthenticatedReadOnlyAndScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{pool: pool, cfg: config.Config{
-		JoinedRecordingBatchID:            batchID,
-		JoinedRecordingConnectionID:       connectionID,
-		JoinedRecordingProtocolVersion:    1,
-		JoinedRecordingProtocolGeneration: 1,
-		JoinedWorkerBootstrapToken:        bootstrap,
+		JoinedRecordingControlPlaneEnabled: true,
+		JoinedRecordingBatchID:             batchID,
+		JoinedRecordingWorkScope:           config.JoinedWorkScopeCanary,
+		JoinedRecordingCanaryHourIDs:       joinedCanaryScopeForTest(batchID),
+		JoinedRecordingConnectionID:        connectionID,
+		JoinedRecordingProtocolVersion:     1,
+		JoinedRecordingProtocolGeneration:  1,
+		JoinedWorkerBootstrapToken:         bootstrap,
+		JoinedWorkerSigningKey:             "joined-signing-credential-32-bytes",
 	}, joinedCredentialCheck: func(context.Context) error { return nil }}
 
 	call := func(path, token string) *httptest.ResponseRecorder {
@@ -68,6 +72,7 @@ func TestJoinedConnectionStatusIsAuthenticatedReadOnlyAndScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.ConnectionID != connectionID || got.ExpectedProtocolVersion != 1 || got.ExpectedProtocolGeneration != 1 ||
+		got.ServerDesiredProtocolVersion != 1 || got.ServerDesiredProtocolGeneration != 1 ||
 		got.ObservedProtocolVersion != 0 || got.HeartbeatStale || got.ClientVersion != "pull-test" || got.ClientPhase != "idle" {
 		t.Fatalf("unexpected status: %+v", got)
 	}
