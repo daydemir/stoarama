@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -1001,4 +1002,118 @@ func (s *Server) handleJoinedStatus(w http.ResponseWriter, r *http.Request) {
 		"enabled":  s.joinedControlPlaneReady() && batchID == s.cfg.JoinedRecordingBatchID,
 		"batch_id": batchID, "work_scope": workScope,
 		"canary_hour_ids": s.joinedCanaryHourIDs(), "hours": counts})
+}
+
+type joinedConnectionStatusResponse struct {
+	ConnectionID               int64      `json:"connection_id"`
+	ExpectedProtocolVersion    int        `json:"expected_protocol_version"`
+	ExpectedProtocolGeneration int        `json:"expected_protocol_generation"`
+	ObservedProtocolVersion    int        `json:"observed_protocol_version"`
+	LastSeenAt                 *time.Time `json:"last_seen_at,omitempty"`
+	HeartbeatAgeSeconds        *int64     `json:"heartbeat_age_seconds,omitempty"`
+	HeartbeatStale             bool       `json:"heartbeat_stale"`
+	PollIntervalSeconds        int        `json:"poll_interval_seconds"`
+	ClientVersion              string     `json:"client_version,omitempty"`
+	ClientPhase                string     `json:"client_phase,omitempty"`
+	ClientPreviousExit         string     `json:"client_previous_exit,omitempty"`
+	ClientErrorAt              *time.Time `json:"client_error_at,omitempty"`
+	ClientErrorPresent         bool       `json:"client_error_present"`
+}
+
+func boundedJoinedDiagnosticText(value string) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) > 128 {
+		runes = runes[:128]
+	}
+	return string(runes)
+}
+
+// joinedConnectionStatusAllowed rate-limits the authenticated diagnostic to
+// one read per instance every five seconds. The endpoint is intentionally
+// narrow and read-only, but it must not become a high-rate database probe.
+func (s *Server) joinedConnectionStatusAllowed(now time.Time) bool {
+	s.joinedConnectionStatusMu.Lock()
+	defer s.joinedConnectionStatusMu.Unlock()
+	if !s.joinedConnectionStatusAt.IsZero() && now.Sub(s.joinedConnectionStatusAt) < 5*time.Second {
+		return false
+	}
+	s.joinedConnectionStatusAt = now
+	return true
+}
+
+func (s *Server) handleJoinedConnectionStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	batchIDs, ok := r.URL.Query()["batch_id"]
+	if !ok || len(batchIDs) != 1 || len(r.URL.Query()) != 1 ||
+		!joinedBatchIDPattern.MatchString(batchIDs[0]) {
+		util.WriteError(w, http.StatusBadRequest, "one canonical joined batch_id is required")
+		return
+	}
+	if batchIDs[0] != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusForbidden, "joined batch scope differs")
+		return
+	}
+	if !s.joinedConnectionStatusAllowed(time.Now().UTC()) {
+		util.WriteError(w, http.StatusTooManyRequests, "joined connection status is rate limited")
+		return
+	}
+	connectionID := s.cfg.JoinedRecordingConnectionID
+	if connectionID <= 0 {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined connection target is not configured")
+		return
+	}
+	if s.pool == nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined connection status is unavailable")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	var (
+		observedID                                     int64
+		observedProtocol, pollInterval                 int
+		lastSeen, clientErrorAt                        *time.Time
+		clientVersion, clientPhase, clientPreviousExit string
+	)
+	err := s.pool.QueryRow(ctx, `SELECT c.id,c.joined_protocol_version,c.last_seen_at,c.poll_interval_sec,
+		client_version,client_phase,client_previous_exit,client_last_error_at
+		FROM connections c
+		WHERE c.id=$1 AND c.kind='nas_pull' AND EXISTS (
+			SELECT 1 FROM recording_joined_batches b WHERE b.batch_id=$2 AND b.connection_id=c.id
+		)`, connectionID, batchIDs[0]).Scan(
+		&observedID, &observedProtocol, &lastSeen, &pollInterval,
+		&clientVersion, &clientPhase, &clientPreviousExit, &clientErrorAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusNotFound, "joined connection target not found")
+		return
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "load joined connection status failed")
+		return
+	}
+	now := time.Now().UTC()
+	var ageSeconds *int64
+	stale := true
+	if lastSeen != nil {
+		age := int64(now.Sub(lastSeen.UTC()).Seconds())
+		if age < 0 {
+			age = 0
+		}
+		ageSeconds = &age
+		interval := pollInterval
+		if interval < 10 {
+			interval = 10
+		}
+		stale = now.After(lastSeen.UTC().Add(time.Duration(interval*3) * time.Second))
+	}
+	log.Printf("joined connection status read connection_id=%d observed_protocol=%d stale=%t", observedID, observedProtocol, stale)
+	util.WriteJSON(w, http.StatusOK, joinedConnectionStatusResponse{
+		ConnectionID: observedID, ExpectedProtocolVersion: s.cfg.JoinedRecordingProtocolVersion,
+		ExpectedProtocolGeneration: s.cfg.JoinedRecordingProtocolGeneration,
+		ObservedProtocolVersion:    observedProtocol, LastSeenAt: lastSeen,
+		HeartbeatAgeSeconds: ageSeconds, HeartbeatStale: stale,
+		PollIntervalSeconds: pollInterval, ClientVersion: boundedJoinedDiagnosticText(clientVersion),
+		ClientPhase: boundedJoinedDiagnosticText(clientPhase), ClientPreviousExit: boundedJoinedDiagnosticText(clientPreviousExit),
+		ClientErrorAt: clientErrorAt, ClientErrorPresent: clientErrorAt != nil,
+	})
 }
