@@ -15,6 +15,16 @@ import (
 
 const joinedContainmentArtifactSampleLimit = 64
 
+const joinedContainmentOutsideScopeWhere = `a.batch_id=$1 AND a.batch_record_id=$2
+			AND NOT COALESCE((
+				(a.artifact_kind='allocation_ledger' AND EXISTS (
+					SELECT 1 FROM recording_joined_hours allowed
+					WHERE allowed.batch_record_id=a.batch_record_id AND allowed.stream_day_id=a.stream_day_id
+					  AND allowed.hour_id=ANY($3::text[])))
+				OR (a.artifact_kind IN ('hour_manifest','media') AND h.batch_record_id=a.batch_record_id
+					AND h.id=a.hour_record_id AND h.hour_id=ANY($3::text[]))
+			), false)`
+
 type joinedContainmentHour struct {
 	HourID           string     `json:"hour_id"`
 	RecordingID      int64      `json:"recording_id"`
@@ -69,7 +79,13 @@ type joinedContainmentResponse struct {
 // view is a bounded, authenticated read-only database probe and must not be a
 // high-rate production query.
 func (s *Server) joinedContainmentAllowed(now time.Time) bool {
-	return s.joinedConnectionStatusAllowed(now)
+	s.joinedContainmentMu.Lock()
+	defer s.joinedContainmentMu.Unlock()
+	if !s.joinedContainmentAt.IsZero() && now.Sub(s.joinedContainmentAt) < 5*time.Second {
+		return false
+	}
+	s.joinedContainmentAt = now
+	return true
 }
 
 func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request) {
@@ -128,10 +144,11 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		ArtifactStates:     make([]joinedContainmentArtifactState, 0),
 		OutsideScopeSample: make([]joinedContainmentArtifactSample, 0),
 	}
-	if err := tx.QueryRow(ctx, `SELECT b.state,b.generation,c.joined_protocol_version
+	var batchRecordID int64
+	if err := tx.QueryRow(ctx, `SELECT b.id,b.state,b.generation,c.joined_protocol_version
 		FROM recording_joined_batches b JOIN connections c ON c.id=b.connection_id
 		WHERE b.batch_id=$1 AND b.connection_id=$2`,
-		batchIDs[0], s.cfg.JoinedRecordingConnectionID).Scan(&response.BatchState, &response.BatchGeneration,
+		batchIDs[0], s.cfg.JoinedRecordingConnectionID).Scan(&batchRecordID, &response.BatchState, &response.BatchGeneration,
 		&response.ConnectionProtocolVersion); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "joined batch not found")
@@ -219,24 +236,15 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 	}
 	stateRows.Close()
 
-	if err := tx.QueryRow(ctx, `
-		WITH outside_scope AS (
+	if err := tx.QueryRow(ctx, `WITH outside_scope AS (
 			SELECT a.* FROM recording_joined_artifacts a
 			LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
-			WHERE a.batch_id=$1 AND a.batch_record_id=(SELECT id FROM recording_joined_batches WHERE batch_id=$1 AND connection_id=$2)
-			  AND NOT COALESCE((
-				(a.artifact_kind='allocation_ledger' AND EXISTS (
-					SELECT 1 FROM recording_joined_hours allowed
-					WHERE allowed.batch_record_id=a.batch_record_id AND allowed.stream_day_id=a.stream_day_id
-					  AND allowed.hour_id=ANY($3::text[])))
-				OR (a.artifact_kind IN ('hour_manifest','media') AND h.batch_record_id=a.batch_record_id
-					AND h.id=a.hour_record_id AND h.hour_id=ANY($3::text[]))
-			), false)
+			WHERE `+joinedContainmentOutsideScopeWhere+`
 		)
 		SELECT count(*) FILTER (WHERE artifact_kind<>'media' AND publication_state IN ('published','publishing'))::bigint,
 		       count(*) FILTER (WHERE artifact_kind<>'media' AND publication_state='publishing' AND publication_lease_expires_at>now())::bigint,
 		       count(*) FILTER (WHERE artifact_kind='media')::bigint
-		FROM outside_scope`, batchIDs[0], s.cfg.JoinedRecordingConnectionID, canaryIDs).
+		FROM outside_scope`, batchIDs[0], batchRecordID, canaryIDs).
 		Scan(&response.OutsideScopePublishedOrPublishingCount, &response.OutsideScopeActivePublicationLeaseCount,
 			&response.OutsideScopeMediaCount); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined outside-scope artifact counts failed")
@@ -248,18 +256,10 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		       a.publication_lease_expires_at,a.published_at
 		FROM recording_joined_artifacts a
 		LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
-		WHERE a.batch_id=$1 AND a.batch_record_id=(SELECT id FROM recording_joined_batches WHERE batch_id=$1 AND connection_id=$2)
-		  AND NOT COALESCE((
-				(a.artifact_kind='allocation_ledger' AND EXISTS (
-					SELECT 1 FROM recording_joined_hours allowed
-					WHERE allowed.batch_record_id=a.batch_record_id AND allowed.stream_day_id=a.stream_day_id
-					  AND allowed.hour_id=ANY($3::text[])))
-				OR (a.artifact_kind IN ('hour_manifest','media') AND h.batch_record_id=a.batch_record_id
-					AND h.id=a.hour_record_id AND h.hour_id=ANY($3::text[]))
-			), false)
+		WHERE `+joinedContainmentOutsideScopeWhere+`
 		  AND a.artifact_kind<>'media' AND a.publication_state IN ('published','publishing')
 		ORDER BY a.id
-		LIMIT $4`, batchIDs[0], s.cfg.JoinedRecordingConnectionID, canaryIDs, joinedContainmentArtifactSampleLimit)
+		LIMIT $4`, batchIDs[0], batchRecordID, canaryIDs, joinedContainmentArtifactSampleLimit)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined outside-scope artifact sample failed")
 		return
