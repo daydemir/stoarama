@@ -264,6 +264,9 @@ func TestJoinedStreamDayHEADCancellationStopsBackoff(t *testing.T) {
 func TestJoinedStreamDayHEADConcurrencyIsCappedAtSixteen(t *testing.T) {
 	const expectedConcurrency = 16
 	transport := &joinedConcurrentHeadTransport{started: make(chan struct{}, 33), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(transport.release) }) }
+	defer release()
 	s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport,
 		joinedFreezeSourceStore: &joinedFreezeStoreStub{bucket: "clips"}}
 	s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
@@ -277,7 +280,11 @@ func TestJoinedStreamDayHEADConcurrencyIsCappedAtSixteen(t *testing.T) {
 		done <- err
 	}()
 	for i := 0; i < expectedConcurrency; i++ {
-		<-transport.started
+		select {
+		case <-transport.started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only observed %d concurrent HEADs", i)
+		}
 	}
 	transport.mu.Lock()
 	active, maximum := transport.active, transport.maximum
@@ -285,7 +292,7 @@ func TestJoinedStreamDayHEADConcurrencyIsCappedAtSixteen(t *testing.T) {
 	if active != expectedConcurrency || maximum != expectedConcurrency {
 		t.Fatalf("active=%d maximum=%d", active, maximum)
 	}
-	close(transport.release)
+	release()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
