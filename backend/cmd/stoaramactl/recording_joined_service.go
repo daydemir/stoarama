@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
@@ -156,6 +158,125 @@ func (s *remoteJoinedOperatorService) FreezeTier1(ctx context.Context, req joine
 		return nil, err
 	}
 	return response, nil
+}
+
+// FreezeTier1Checkpointed builds the immutable denominator through the
+// server-owned dry-run checkpoints. It deliberately never calls the applying
+// freeze endpoint. After every step, including an error, status is the only
+// source of truth for selecting the next ordinal, so a client timeout cannot
+// duplicate or skip a recording.
+func (s *remoteJoinedOperatorService) FreezeTier1Checkpointed(ctx context.Context, req joinedFreezeTier1Request) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	if req.Apply || strings.TrimSpace(req.ExpectedRequestSHA256) != "" {
+		return nil, errors.New("checkpointed Tier-1 command cannot apply")
+	}
+	payload, err := joinedTier1FreezePayload(req)
+	if err != nil {
+		return nil, err
+	}
+	var progress joinedTier1CheckpointedProgress
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/freeze-tier1/dry-run/start", token, payload, &progress); err != nil {
+		return nil, err
+	}
+	for {
+		if err := validateJoinedTier1CheckpointedProgress(progress); err != nil {
+			return nil, err
+		}
+		if progress.State == "ready" {
+			if progress.RequestSHA256 == nil || validateExpectedHash("request_sha256", *progress.RequestSHA256, true) != nil {
+				return nil, errors.New("checkpointed Tier-1 dry run is ready without a valid request hash")
+			}
+			return progress, nil
+		}
+		if progress.NextPriorityOrdinal == nil || *progress.NextPriorityOrdinal != progress.CompletedRecordings+1 {
+			return nil, errors.New("checkpointed Tier-1 dry-run cursor is not the next serial ordinal")
+		}
+		step := struct {
+			RunID           string `json:"run_id"`
+			PriorityOrdinal int    `json:"priority_ordinal"`
+		}{progress.RunID, *progress.NextPriorityOrdinal}
+		var stepProgress joinedTier1CheckpointedProgress
+		stepErr := s.api.postJSON(ctx, "/api/v1/recording/joined/freeze-tier1/dry-run/step", token, step, &stepProgress)
+		// A step may have committed before the HTTP request timed out. Always
+		// reconcile through status before deciding whether to retry/resume.
+		statusProgress, statusErr := s.joinedTier1CheckpointedStatus(ctx, token, progress.RunID)
+		if statusErr != nil {
+			if stepErr != nil {
+				return nil, fmt.Errorf("checkpointed step %d failed and status reconciliation failed: %w", step.PriorityOrdinal, statusErr)
+			}
+			return nil, fmt.Errorf("checkpointed step %d status reconciliation failed: %w", step.PriorityOrdinal, statusErr)
+		}
+		if stepErr != nil {
+			// A deterministic API rejection must stop. Only continue when the
+			// status proves that an ambiguous transport failure committed the
+			// step; otherwise a bad request/409 would spin forever.
+			if statusProgress.CompletedRecordings <= progress.CompletedRecordings {
+				return nil, fmt.Errorf("checkpointed step %d did not advance; reconcile status before rerunning: %w", step.PriorityOrdinal, stepErr)
+			}
+			progress = statusProgress
+			continue
+		}
+		if err := validateJoinedTier1CheckpointedProgress(stepProgress); err != nil {
+			return nil, err
+		}
+		// Prefer the freshly reread server status over the POST response. This
+		// keeps the resume cursor authoritative even if a proxy returned stale
+		// content after the transaction committed.
+		if statusProgress.CompletedRecordings <= progress.CompletedRecordings {
+			return nil, fmt.Errorf("checkpointed step %d response advanced but status did not", step.PriorityOrdinal)
+		}
+		progress = statusProgress
+	}
+}
+
+func joinedTier1FreezePayload(req joinedFreezeTier1Request) (any, error) {
+	cutoff, err := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse frozen Tier-1 cutoff: %w", err)
+	}
+	return struct {
+		ProtocolVersion          int       `json:"protocol_version"`
+		ConnectionID             int64     `json:"connection_id"`
+		BatchID                  string    `json:"batch_id"`
+		Generation               int       `json:"generation"`
+		SourceEndpoint           string    `json:"source_endpoint"`
+		QualificationRunID       int64     `json:"qualification_run_id"`
+		RecordingIDs             []int64   `json:"recording_ids"`
+		OrderedRecordingIDSHA256 string    `json:"ordered_recording_ids_sha256"`
+		EligibilityCutoff        time.Time `json:"eligibility_cutoff"`
+		Apply                    bool      `json:"apply"`
+	}{joinedrecording.JoinedProtocolVersion, req.ConnectionID, req.BatchID, req.Generation, req.SourceEndpoint,
+		req.QualificationRunID, append([]int64(nil), joinedrecording.Tier1RecordingIDs...),
+		joinedrecording.Tier1RecordingIDSHA, cutoff, false}, nil
+}
+
+func (s *remoteJoinedOperatorService) joinedTier1CheckpointedStatus(ctx context.Context, token, runID string) (joinedTier1CheckpointedProgress, error) {
+	var progress joinedTier1CheckpointedProgress
+	path := "/api/v1/recording/joined/freeze-tier1/dry-run/status?run_id=" + url.QueryEscape(runID)
+	if err := s.api.getJSON(ctx, path, token, &progress); err != nil {
+		return progress, err
+	}
+	return progress, nil
+}
+
+func validateJoinedTier1CheckpointedProgress(progress joinedTier1CheckpointedProgress) error {
+	if _, err := uuid.Parse(progress.RunID); err != nil || progress.ExpectedRecordings != len(joinedrecording.Tier1RecordingIDs) ||
+		progress.CompletedRecordings < 0 || progress.CompletedRecordings > progress.ExpectedRecordings {
+		return errors.New("checkpointed Tier-1 dry-run progress differs")
+	}
+	if progress.State != "building" && progress.State != "ready" {
+		return fmt.Errorf("checkpointed Tier-1 dry-run state %q is not resumable", progress.State)
+	}
+	if progress.State == "building" && progress.NextPriorityOrdinal == nil {
+		return errors.New("checkpointed Tier-1 building progress has no next ordinal")
+	}
+	if progress.State == "ready" && progress.CompletedRecordings != progress.ExpectedRecordings {
+		return errors.New("checkpointed Tier-1 ready progress is incomplete")
+	}
+	return nil
 }
 
 func (s *remoteJoinedOperatorService) ImportHistoricalQualification(ctx context.Context,

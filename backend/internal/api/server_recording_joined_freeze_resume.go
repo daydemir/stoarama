@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -123,16 +124,35 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 		return plan, 0, "", false, err
 	}
 
-	plan, _, err = s.buildJoinedTier1FreezePlanWithTool(ctx, tx, req, tool, true)
-	if err != nil {
-		return plan, 0, "", false, err
+	var liveAccountID int64
+	var liveProtocol int
+	var liveQualificationStatus, liveQualificationVersion, liveCohortSHA, liveWindowsSHA string
+	var liveQualificationFrozenAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT run.final_plan_bytes,run.final_plan_sha256,c.account_id,c.joined_protocol_version,
+		q.status,q.definition_version,q.cohort_sha256,q.windows_sha256,q.frozen_at
+		FROM recording_joined_dry_runs run
+		JOIN connections c ON c.id=run.connection_id
+		JOIN recording_qualification_runs q ON q.id=run.qualification_run_id AND q.account_id=run.account_id
+		WHERE run.batch_id=$1 AND run.generation=$2 AND run.state='ready' AND run.final_plan_sha256=$3
+		FOR SHARE OF run,c,q`, req.BatchID, req.Generation, req.ExpectedRequestSHA256).
+		Scan(&requestBytes, &requestSHA, &liveAccountID, &liveProtocol, &liveQualificationStatus,
+			&liveQualificationVersion, &liveCohortSHA, &liveWindowsSHA, &liveQualificationFrozenAt); err != nil {
+		return plan, 0, "", false, errors.New("ready checkpointed Tier-1 dry-run plan not found")
 	}
-	plan, requestBytes, err = sealJoinedTier1FreezePlan(plan)
-	if err != nil {
-		return plan, 0, "", false, err
+	if err := json.Unmarshal(requestBytes, &plan); err != nil || plan.SchemaVersion != 2 ||
+		requestSHA != req.ExpectedRequestSHA256 || !joinedTier1FreezeRequestMatchesPlan(req, plan) {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 dry-run plan differs")
 	}
-	if req.ExpectedRequestSHA256 != plan.RequestSHA256 {
-		return plan, 0, "", false, errors.New("expected_request_sha256 differs from current Tier-1 plan")
+	plan.RequestSHA256 = requestSHA
+	if liveAccountID != plan.AccountID || liveProtocol != joinedrecording.JoinedProtocolVersion || liveQualificationStatus != "active" ||
+		liveQualificationVersion != plan.SelectionAuthority.QualificationRuleVersion ||
+		liveCohortSHA != plan.SelectionAuthority.QualificationCohortSHA256 ||
+		liveWindowsSHA != plan.SelectionAuthority.QualificationWindowsSHA256 ||
+		!liveQualificationFrozenAt.Equal(plan.SelectionAuthority.QualificationRunFrozenAt) {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 live authority differs")
+	}
+	if plan.MediaTool.IdentitySHA256 != tool.IdentitySHA256 {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 media tool differs")
 	}
 	mediaToolJSON, err := json.Marshal(plan.MediaTool)
 	if err != nil {

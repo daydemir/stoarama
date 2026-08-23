@@ -240,6 +240,138 @@ func TestJoinedOperatorUsesOnlyDedicatedAdminToken(t *testing.T) {
 	}
 }
 
+func TestJoinedCheckpointedFreezeResumesFromAuthoritativeStatusWithoutApplying(t *testing.T) {
+	t.Parallel()
+	const (
+		operatorToken = "joined-tier1-operator-token-at-least-32-bytes"
+		batchID       = "tier1-2026-08-generation-1"
+		runID         = "11111111-1111-4111-8111-111111111111"
+	)
+	endpoint := "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+	requestCount := 0
+	completed := 0
+	ready := false
+	firstStepFailed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.Header.Get("Authorization") != "Bearer "+operatorToken {
+			t.Errorf("checkpointed auth=%q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		progress := func() joinedTier1CheckpointedProgress {
+			p := joinedTier1CheckpointedProgress{RunID: runID, State: "building", CompletedRecordings: completed, ExpectedRecordings: 33}
+			if ready {
+				p.State = "ready"
+				sha := strings.Repeat("a", 64)
+				p.RequestSHA256 = &sha
+			} else {
+				next := completed + 1
+				p.NextPriorityOrdinal = &next
+			}
+			return p
+		}
+		switch r.URL.Path {
+		case "/api/v1/recording/joined/freeze-tier1/dry-run/start":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["apply"] != false {
+				t.Errorf("unsafe checkpointed start body=%v err=%v", body, err)
+			}
+			writeJoinedTestJSON(t, w, progress())
+		case "/api/v1/recording/joined/freeze-tier1/dry-run/step":
+			var body struct {
+				RunID           string `json:"run_id"`
+				PriorityOrdinal int    `json:"priority_ordinal"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.RunID != runID || body.PriorityOrdinal != completed+1 {
+				t.Errorf("checkpointed step body=%+v err=%v completed=%d", body, err, completed)
+			}
+			completed = body.PriorityOrdinal
+			if completed == 33 {
+				ready = true
+			}
+			if completed == 1 && !firstStepFailed {
+				firstStepFailed = true
+				w.WriteHeader(http.StatusGatewayTimeout)
+				return
+			}
+			writeJoinedTestJSON(t, w, progress())
+		case "/api/v1/recording/joined/freeze-tier1/dry-run/status":
+			if r.URL.Query().Get("run_id") != runID {
+				t.Errorf("status run_id=%q", r.URL.Query().Get("run_id"))
+			}
+			writeJoinedTestJSON(t, w, progress())
+		default:
+			t.Errorf("unexpected checkpointed path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api, operatorToken: operatorToken}
+	result, err := service.FreezeTier1Checkpointed(context.Background(), joinedFreezeTier1Request{
+		ConnectionID: 44, BatchID: batchID, Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress, ok := result.(joinedTier1CheckpointedProgress)
+	if !ok || progress.State != "ready" || progress.CompletedRecordings != 33 || progress.RequestSHA256 == nil {
+		t.Fatalf("checkpointed result=%+v", result)
+	}
+	if requestCount != 67 {
+		t.Fatalf("checkpointed request count=%d want 67 (start + 33 steps + 33 status)", requestCount)
+	}
+}
+
+func TestJoinedCheckpointedFreezeStopsOnDeterministicStepRejection(t *testing.T) {
+	const (
+		operatorToken = "joined-tier1-operator-token-at-least-32-bytes"
+		batchID       = "tier1-2026-08-generation-1"
+		runID         = "11111111-1111-4111-8111-111111111111"
+	)
+	endpoint := "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+	stepCalls := 0
+	statusCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/recording/joined/freeze-tier1/dry-run/start":
+			writeJoinedTestJSON(t, w, joinedTier1CheckpointedProgress{RunID: runID, State: "building",
+				CompletedRecordings: 0, ExpectedRecordings: 33, NextPriorityOrdinal: intPointer(1)})
+		case "/api/v1/recording/joined/freeze-tier1/dry-run/step":
+			stepCalls++
+			w.WriteHeader(http.StatusConflict)
+		case "/api/v1/recording/joined/freeze-tier1/dry-run/status":
+			statusCalls++
+			writeJoinedTestJSON(t, w, joinedTier1CheckpointedProgress{RunID: runID, State: "building",
+				CompletedRecordings: 0, ExpectedRecordings: 33, NextPriorityOrdinal: intPointer(1)})
+		default:
+			t.Errorf("unexpected checkpointed path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api, operatorToken: operatorToken}
+	_, err = service.FreezeTier1Checkpointed(context.Background(), joinedFreezeTier1Request{
+		ConnectionID: 44, BatchID: batchID, Generation: 1, SourceEndpoint: endpoint, QualificationRunID: 7,
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("deterministic rejection error=%v", err)
+	}
+	if stepCalls != 1 || statusCalls != 1 {
+		t.Fatalf("deterministic rejection spun: step_calls=%d status_calls=%d", stepCalls, statusCalls)
+	}
+}
+
+func intPointer(value int) *int { return &value }
+
 func TestJoinedOperatorRejectsWorkerTokenAliasBeforeRequest(t *testing.T) {
 	t.Parallel()
 	api, err := newJoinedAPIClient("https://example.test", "same-token-at-least-32-bytes-long", nil)

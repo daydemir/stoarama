@@ -31,6 +31,18 @@ type joinedFreezeTier1Request struct {
 	Apply                 bool   `json:"apply"`
 }
 
+// joinedTier1CheckpointedProgress is the server-owned resume cursor for the
+// operator-only denominator dry run. The CLI never treats a failed step as
+// committed; it rereads this record before choosing the next ordinal.
+type joinedTier1CheckpointedProgress struct {
+	RunID               string  `json:"run_id"`
+	State               string  `json:"state"`
+	CompletedRecordings int     `json:"completed_recordings"`
+	ExpectedRecordings  int     `json:"expected_recordings"`
+	NextPriorityOrdinal *int    `json:"next_priority_ordinal,omitempty"`
+	RequestSHA256       *string `json:"request_sha256,omitempty"`
+}
+
 type joinedHistoricalQualificationJobs struct {
 	RecordingID int64   `json:"recording_id"`
 	JobIDs      []int64 `json:"job_ids"`
@@ -88,6 +100,7 @@ type joinedStatusRequest struct {
 type joinedOperatorService interface {
 	ImportHistoricalQualification(context.Context, joinedImportHistoricalQualificationRequest) (any, error)
 	FreezeTier1(context.Context, joinedFreezeTier1Request) (any, error)
+	FreezeTier1Checkpointed(context.Context, joinedFreezeTier1Request) (any, error)
 	SealStreamDay(context.Context, joinedSealStreamDayRequest) (any, error)
 	SealRemainingDays(context.Context, joinedSealRemainingDaysRequest) (any, error)
 	FinalFreeze(context.Context, joinedFinalFreezeRequest) (any, error)
@@ -159,6 +172,19 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 			return nil, err
 		}
 		return service.FreezeTier1(ctx, req)
+	case "freeze-tier1-checkpointed":
+		if err := requireJoinedCheckpointProtocol(cfg); err != nil {
+			return nil, err
+		}
+		req, err := parseJoinedFreezeTier1Checkpointed(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.FreezeTier1Checkpointed(ctx, req)
 	case "seal-stream-day":
 		if err := requireJoinedActiveProtocol(cfg); err != nil {
 			return nil, err
@@ -311,6 +337,35 @@ func requireJoinedActiveProtocol(cfg config.Config) error {
 	return nil
 }
 
+// The checkpoint is an operator-only control-plane operation. It must remain
+// usable while the joined media worker is disabled; applying or claiming work
+// continues to require the stronger active-worker guard above.
+func requireJoinedCheckpointProtocol(cfg config.Config) error {
+	if !cfg.JoinedRecordingControlPlaneEnabled || cfg.JoinedRecordingProtocolVersion != 1 {
+		return errors.New("checkpointed Tier-1 dry-run requires JOINED_RECORDING_CONTROL_PLANE_ENABLED=true and JOINED_RECORDING_PROTOCOL_VERSION=1")
+	}
+	return nil
+}
+
+func validateJoinedFreezeTier1Fields(req joinedFreezeTier1Request) error {
+	if req.ConnectionID <= 0 {
+		return errors.New("--connection-id must be positive")
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return err
+	}
+	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
+		return errors.New("--batch-id must end with the exact --generation")
+	}
+	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
+		return errors.New("--source-endpoint must be the exact supported R2 endpoint")
+	}
+	if req.QualificationRunID <= 0 {
+		return errors.New("--qualification-run-id must be positive")
+	}
+	return nil
+}
+
 func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1Request, error) {
 	req := joinedFreezeTier1Request{BatchID: cfg.JoinedRecordingBatchID, Generation: 1}
 	flags := newJoinedFlagSet("recording-joined freeze-tier1")
@@ -324,22 +379,27 @@ func parseJoinedFreezeTier1(cfg config.Config, args []string) (joinedFreezeTier1
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
 	}
-	if req.ConnectionID <= 0 {
-		return req, errors.New("--connection-id must be positive")
-	}
-	if err := validateJoinedBatchID(req.BatchID); err != nil {
+	if err := validateJoinedFreezeTier1Fields(req); err != nil {
 		return req, err
 	}
-	if req.Generation <= 0 || !strings.HasSuffix(req.BatchID, fmt.Sprintf("-generation-%d", req.Generation)) {
-		return req, errors.New("--batch-id must end with the exact --generation")
-	}
-	if _, err := joinedrecording.CanonicalSourceEndpointAuthority(req.SourceEndpoint); err != nil {
-		return req, errors.New("--source-endpoint must be the exact supported R2 endpoint")
-	}
-	if req.QualificationRunID <= 0 {
-		return req, errors.New("--qualification-run-id must be positive")
-	}
 	if err := validateExpectedHash("--expected-request-sha256", req.ExpectedRequestSHA256, req.Apply); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func parseJoinedFreezeTier1Checkpointed(cfg config.Config, args []string) (joinedFreezeTier1Request, error) {
+	req := joinedFreezeTier1Request{BatchID: cfg.JoinedRecordingBatchID, Generation: 1}
+	flags := newJoinedFlagSet("recording-joined freeze-tier1-checkpointed")
+	flags.Int64Var(&req.ConnectionID, "connection-id", 0, "NAS connection identifier")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.IntVar(&req.Generation, "generation", req.Generation, "immutable batch generation")
+	flags.StringVar(&req.SourceEndpoint, "source-endpoint", "", "exact frozen R2 endpoint")
+	flags.Int64Var(&req.QualificationRunID, "qualification-run-id", 0, "immutable qualification run identifier")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedFreezeTier1Fields(req); err != nil {
 		return req, err
 	}
 	return req, nil
