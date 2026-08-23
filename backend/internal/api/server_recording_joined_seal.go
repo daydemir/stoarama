@@ -330,7 +330,16 @@ func insertJoinedMediaArtifacts(ctx context.Context, tx pgx.Tx, hourRecordID int
 	return mediaIDs, nil
 }
 
-func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID int64) error {
+func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID int64, scope joinedrecording.WorkScopeIdentity) error {
+	var batchID string
+	if err := tx.QueryRow(ctx, `SELECT batch_id FROM recording_joined_artifacts
+		WHERE id=$1 AND artifact_kind='allocation_ledger'`, ledgerArtifactID).Scan(&batchID); err != nil {
+		return err
+	}
+	if err := scope.Validate(batchID); err != nil {
+		return fmt.Errorf("validate joined gap-only scope: %w", err)
+	}
+	allGapHours := scope.WorkScope == joinedrecording.WorkScopeFrozenBatch
 	type gapHour struct {
 		recordID int64
 		claim    joinedrecording.PreflightHourClaim
@@ -344,8 +353,9 @@ func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID i
 		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
 		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
 		WHERE ledger.id=$1 AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
-		  AND b.state='frozen' AND h.state='pending' AND h.source_clip_count=0 ORDER BY h.delivery_hour
-		FOR UPDATE OF h,c`, ledgerArtifactID)
+		  AND b.state='frozen' AND h.state='pending' AND h.source_clip_count=0
+		  AND ($2::boolean OR h.hour_id=ANY($3::text[])) ORDER BY h.delivery_hour
+		FOR UPDATE OF h,c`, ledgerArtifactID, allGapHours, scope.CanaryHourIDs)
 	if err != nil {
 		return err
 	}
