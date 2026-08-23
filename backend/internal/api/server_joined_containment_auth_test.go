@@ -51,7 +51,7 @@ func TestJoinedContainmentRequiresDedicatedOperatorToken(t *testing.T) {
 		"signing":   s.cfg.JoinedWorkerSigningKey,
 	} {
 		t.Run("rejects "+name+" operator configuration", func(t *testing.T) {
-			bad := *s
+			bad := &Server{cfg: s.cfg}
 			bad.cfg.JoinedOperatorToken = collision
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/containment?batch_id=test", nil)
 			req.Header.Set("Authorization", "Bearer "+s.cfg.JoinedOperatorToken)

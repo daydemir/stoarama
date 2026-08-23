@@ -45,7 +45,7 @@ func TestJoinedContainmentHandlerRejectsUnsafeRequestsBeforeDatabase(t *testing.
 		{name: "duplicate batch", server: func() *Server { return base }, path: "/api/v1/recording/joined/containment?batch_id=" + batchID + "&batch_id=" + batchID, want: http.StatusBadRequest},
 		{name: "mismatched batch", server: func() *Server { return base }, path: "/api/v1/recording/joined/containment?batch_id=other-generation-1", want: http.StatusForbidden},
 		{name: "nil pool", server: func() *Server { return base }, path: "/api/v1/recording/joined/containment?batch_id=" + batchID, want: http.StatusServiceUnavailable},
-		{name: "rate limited", server: func() *Server { s := *base; s.joinedContainmentAt = time.Now().UTC(); return &s }, path: "/api/v1/recording/joined/containment?batch_id=" + batchID, want: http.StatusTooManyRequests},
+		{name: "rate limited", server: func() *Server { s := &Server{cfg: base.cfg}; s.joinedContainmentAt = time.Now().UTC(); return s }, path: "/api/v1/recording/joined/containment?batch_id=" + batchID, want: http.StatusTooManyRequests},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
