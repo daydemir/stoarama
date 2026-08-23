@@ -88,6 +88,19 @@ type joinedSealStreamDayReceipt struct {
 	AlreadySealed     bool   `json:"already_sealed"`
 }
 
+type joinedStreamDayHeadPreflightProgress struct {
+	RunID                 string `json:"run_id"`
+	BatchID               string `json:"batch_id"`
+	RecordingID           int64  `json:"recording_id"`
+	LocalDate             string `json:"local_date"`
+	State                 string `json:"state"`
+	CompletedObservations int    `json:"completed_observations"`
+	ExpectedObservations  int    `json:"expected_observations"`
+	NextDayOrdinal        *int   `json:"next_day_ordinal,omitempty"`
+	SourceSnapshotSHA256  string `json:"source_snapshot_sha256"`
+	ExpectedSourceBytes   int64  `json:"expected_source_bytes"`
+}
+
 func newRemoteJoinedOperatorService(cfg config.Config) (*remoteJoinedOperatorService, error) {
 	if err := cfg.ValidateJoined(); err != nil {
 		return nil, err
@@ -331,6 +344,95 @@ func (s *remoteJoinedOperatorService) SealStreamDay(ctx context.Context, req joi
 	return response, nil
 }
 
+// SealStreamDayCheckpointed performs source HEADs in server-owned bounded
+// steps. The final seal endpoint is a short database transaction; no worker
+// claim, media artifact, or raw clip is touched by this path.
+func (s *remoteJoinedOperatorService) SealStreamDayCheckpointed(ctx context.Context, req joinedSealStreamDayRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	start := struct {
+		ProtocolVersion int    `json:"protocol_version"`
+		BatchID         string `json:"batch_id"`
+		RecordingID     int64  `json:"recording_id"`
+		LocalDate       string `json:"local_date"`
+	}{joinedrecording.JoinedProtocolVersion, req.BatchID, req.RecordingID, req.LocalDate}
+	var progress joinedStreamDayHeadPreflightProgress
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/stream-days/head-preflight/start", token, start, &progress); err != nil {
+		return nil, err
+	}
+	if err := validateJoinedStreamDayHeadPreflightProgress(progress, req); err != nil {
+		return nil, err
+	}
+	for progress.State == "building" {
+		before := progress.CompletedObservations
+		step := struct {
+			RunID string `json:"run_id"`
+			Limit int    `json:"limit"`
+		}{progress.RunID, 16}
+		var stepped joinedStreamDayHeadPreflightProgress
+		stepErr := s.api.postJSON(ctx, "/api/v1/recording/joined/stream-days/head-preflight/step", token, step, &stepped)
+		// The step may have committed before a proxy timeout. Reconcile through
+		// the idempotent start/status endpoint before deciding whether to retry.
+		var status joinedStreamDayHeadPreflightProgress
+		statusErr := s.api.postJSON(ctx, "/api/v1/recording/joined/stream-days/head-preflight/start", token, start, &status)
+		if statusErr != nil {
+			if stepErr != nil {
+				return nil, fmt.Errorf("joined HEAD preflight step reconciliation failed: %w", statusErr)
+			}
+			return nil, statusErr
+		}
+		if err := validateJoinedStreamDayHeadPreflightProgress(status, req); err != nil {
+			return nil, err
+		}
+		if stepErr != nil && status.CompletedObservations <= before && status.State == "building" {
+			return nil, fmt.Errorf("joined HEAD preflight step did not advance: %w", stepErr)
+		}
+		if stepErr == nil && validateJoinedStreamDayHeadPreflightProgress(stepped, req) != nil && status.CompletedObservations <= before {
+			return nil, errors.New("joined HEAD preflight step response differs")
+		}
+		progress = status
+	}
+	if progress.State != "ready" {
+		return nil, errors.New("joined HEAD preflight did not become ready")
+	}
+	var response joinedSealStreamDayReceipt
+	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/stream-days/head-preflight/seal", token,
+		struct {
+			RunID string `json:"run_id"`
+		}{progress.RunID}, &response); err != nil {
+		return nil, err
+	}
+	if response.ProtocolVersion != joinedrecording.JoinedProtocolVersion || response.BatchID != req.BatchID ||
+		response.RecordingID != req.RecordingID || response.LocalDate != req.LocalDate || response.LedgerArtifactID <= 0 ||
+		response.SourceCount < 0 || response.SourceBytes < 0 || (response.SourceCount == 0) != (response.SourceBytes == 0) ||
+		validateExpectedHash("source_snapshot_sha256", response.SourceSnapshotSHA, true) != nil ||
+		validateExpectedHash("head_manifest_sha256", response.HeadManifestSHA, true) != nil ||
+		validateExpectedHash("ledger_sha256", response.LedgerSHA, true) != nil ||
+		validateExpectedHash("ledger_artifact_sha256", response.LedgerArtifactSHA, true) != nil ||
+		validateExpectedHash("seal_request_sha256", response.SealRequestSHA, true) != nil {
+		return nil, errors.New("joined checkpointed stream-day seal receipt differs")
+	}
+	return response, nil
+}
+
+func validateJoinedStreamDayHeadPreflightProgress(progress joinedStreamDayHeadPreflightProgress,
+	req joinedSealStreamDayRequest) error {
+	if _, err := uuid.Parse(progress.RunID); err != nil || progress.BatchID != req.BatchID ||
+		progress.RecordingID != req.RecordingID || progress.LocalDate != req.LocalDate ||
+		(progress.State != "building" && progress.State != "ready" && progress.State != "sealed") ||
+		progress.CompletedObservations < 0 || progress.ExpectedObservations < 0 ||
+		progress.CompletedObservations > progress.ExpectedObservations ||
+		validateExpectedHash("source_snapshot_sha256", progress.SourceSnapshotSHA256, true) != nil {
+		return errors.New("joined HEAD preflight progress differs")
+	}
+	if progress.State == "ready" && progress.CompletedObservations != progress.ExpectedObservations {
+		return errors.New("joined HEAD preflight ready progress is incomplete")
+	}
+	return nil
+}
+
 func (s *remoteJoinedOperatorService) SealRemainingDays(ctx context.Context, req joinedSealRemainingDaysRequest) (any, error) {
 	token, err := s.validOperatorToken()
 	if err != nil {
@@ -378,7 +480,7 @@ func (s *remoteJoinedOperatorService) SealRemainingDays(ctx context.Context, req
 	}
 	completed := 0
 	for _, day := range pending {
-		if _, err := s.SealStreamDay(ctx, day); err != nil {
+		if _, err := s.SealStreamDayCheckpointed(ctx, day); err != nil {
 			return nil, fmt.Errorf("seal joined stream day %d/%s after %d completions: %w",
 				day.RecordingID, day.LocalDate, completed, err)
 		}

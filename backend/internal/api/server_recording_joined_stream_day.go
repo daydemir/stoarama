@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	joinedStreamDayHeadConcurrency = 4
+	joinedStreamDayHeadConcurrency = 16
 	joinedStreamDayHeadAttempts    = 3
 	joinedStreamDayHeadTimeout     = 8 * time.Second
 	joinedStreamDayHeadTotal       = 25 * time.Second
@@ -60,6 +61,7 @@ type joinedSealStreamDayResponse struct {
 
 type joinedStreamDaySnapshot struct {
 	ID                int64
+	DayOrdinal        int
 	ClipCreatedAt     time.Time
 	CaptureLeaseToken *string
 	CaptureSequence   *int64
@@ -175,6 +177,13 @@ func (s *Server) handleAdminJoinedSealStreamDay(w http.ResponseWriter, r *http.R
 		util.WriteJSON(w, http.StatusOK, response)
 		return
 	}
+	if preflightExists, err := s.joinedStreamDayHeadPreflightExists(r.Context(), req); err != nil {
+		util.WriteError(w, http.StatusConflict, "load joined HEAD preflight")
+		return
+	} else if preflightExists {
+		util.WriteError(w, http.StatusConflict, "joined stream-day has a checkpointed HEAD preflight")
+		return
+	}
 	plan, err := s.loadPendingJoinedStreamDay(r.Context(), req)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
@@ -268,7 +277,7 @@ func (s *Server) loadPendingJoinedStreamDay(ctx context.Context, req joinedSealS
 		joinedrecording.ValidateQualificationWindow(plan.Qualification) != nil {
 		return plan, errors.New("joined stream-day qualification differs")
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id,clip_id,recording_id,recording_job_id,storage_destination_id,provider,
+	rows, err := s.pool.Query(ctx, `SELECT id,day_ordinal,clip_id,recording_id,recording_job_id,storage_destination_id,provider,
 		endpoint,region,bucket,object_key,ingest_etag,size_bytes,sha256,start_at,end_at,clip_created_at,released_at,
 		capture_lease_token::text,capture_sequence,capture_attempt_id::text,timestamp_contract_version,
 		timestamp_contract,timestamp_contract_status,timestamp_contract_reason
@@ -279,7 +288,7 @@ func (s *Server) loadPendingJoinedStreamDay(ctx context.Context, req joinedSealS
 	defer rows.Close()
 	for rows.Next() {
 		var snapshot joinedStreamDaySnapshot
-		if err := rows.Scan(&snapshot.ID, &snapshot.Source.ClipID, &snapshot.Source.RecordingID,
+		if err := rows.Scan(&snapshot.ID, &snapshot.DayOrdinal, &snapshot.Source.ClipID, &snapshot.Source.RecordingID,
 			&snapshot.Source.RecordingJobID, &snapshot.Source.StorageDestinationID, &snapshot.Source.Provider,
 			&snapshot.Source.Endpoint, &snapshot.Source.Region, &snapshot.Source.Bucket, &snapshot.Source.Object.Key,
 			&snapshot.Source.Object.ETag, &snapshot.Source.Object.SizeBytes, &snapshot.Source.Object.SHA256,
@@ -474,6 +483,11 @@ func (s *Server) headJoinedStreamDaySourceAttempt(ctx context.Context, store joi
 
 func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDayRequest, loaded joinedStreamDayPlan,
 	observations []joinedStreamDayHeadObservation) (joinedSealStreamDayResponse, error) {
+	return s.sealJoinedStreamDayWithPreflight(ctx, req, loaded, observations, nil)
+}
+
+func (s *Server) sealJoinedStreamDayWithPreflight(ctx context.Context, req joinedSealStreamDayRequest,
+	loaded joinedStreamDayPlan, observations []joinedStreamDayHeadObservation, preflightID *uuid.UUID) (joinedSealStreamDayResponse, error) {
 	if len(observations) != len(loaded.Sources) {
 		return joinedSealStreamDayResponse{}, errors.New("joined stream-day HEAD count differs")
 	}
@@ -481,8 +495,11 @@ func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDa
 	for i := range sources {
 		if observations[i].SourceSnapshotID != loaded.Sources[i].ID || observations[i].ClipID != sources[i].ClipID ||
 			observations[i].StorageDestinationID != sources[i].StorageDestinationID ||
-			observations[i].ObjectKey != sources[i].Object.Key || observations[i].SHA256 != sources[i].Object.SHA256 ||
-			observations[i].SizeBytes != sources[i].Object.SizeBytes {
+			observations[i].Provider != sources[i].Provider || observations[i].Endpoint != sources[i].Endpoint ||
+			observations[i].Region != sources[i].Region || observations[i].Bucket != sources[i].Bucket ||
+			observations[i].ObjectKey != sources[i].Object.Key || observations[i].ETag != sources[i].Object.ETag ||
+			observations[i].SHA256 != sources[i].Object.SHA256 || observations[i].SizeBytes != sources[i].Object.SizeBytes ||
+			!observations[i].StartUTC.Equal(sources[i].StartUTC) || !observations[i].EndUTC.Equal(sources[i].EndUTC) {
 			return joinedSealStreamDayResponse{}, errors.New("joined stream-day HEAD order differs")
 		}
 		sources[i].Object.ETag = observations[i].ETag
@@ -549,9 +566,50 @@ func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDa
 	if !sameJoinedStreamDayPlan(loaded, current) {
 		return joinedSealStreamDayResponse{}, errors.New("joined stream-day snapshot changed during HEAD")
 	}
+	if preflightID != nil {
+		var state string
+		var streamDayID int64
+		var sourceSHA string
+		var expectedCount int
+		if err := tx.QueryRow(ctx, `SELECT state,stream_day_id,source_snapshot_sha256,expected_source_count
+			FROM recording_joined_stream_day_head_preflights WHERE id=$1 FOR UPDATE`, *preflightID).
+			Scan(&state, &streamDayID, &sourceSHA, &expectedCount); err != nil {
+			return joinedSealStreamDayResponse{}, errors.New("joined HEAD preflight is unavailable")
+		}
+		if state != "ready" || streamDayID != current.StreamDayID || sourceSHA != current.SourceSnapshotSHA ||
+			expectedCount != len(current.Sources) || len(observations) != expectedCount {
+			return joinedSealStreamDayResponse{}, errors.New("joined HEAD preflight identity is incomplete")
+		}
+		var observedCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM recording_joined_stream_day_head_observations WHERE preflight_id=$1`, *preflightID).
+			Scan(&observedCount); err != nil || observedCount != expectedCount {
+			return joinedSealStreamDayResponse{}, errors.New("joined HEAD preflight observations are incomplete")
+		}
+		var mismatchedCount, missingCount int
+		if err := tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM recording_joined_stream_day_head_observations o
+			 JOIN recording_joined_source_snapshots s ON s.id=o.source_snapshot_id
+			 WHERE o.preflight_id=$1 AND (o.stream_day_id<>s.stream_day_id OR o.day_ordinal<>s.day_ordinal
+			   OR o.clip_id<>s.clip_id OR o.storage_destination_id<>s.storage_destination_id
+			   OR o.provider<>s.provider OR o.endpoint<>s.endpoint OR o.region<>s.region
+			   OR o.bucket<>s.bucket OR o.object_key<>s.object_key OR o.etag<>s.ingest_etag
+			   OR o.size_bytes<>s.size_bytes OR o.sha256<>s.sha256 OR o.start_at<>s.start_at OR o.end_at<>s.end_at)),
+			(SELECT count(*) FROM recording_joined_source_snapshots s
+			 WHERE s.stream_day_id=$2 AND NOT EXISTS (SELECT 1 FROM recording_joined_stream_day_head_observations o
+			   WHERE o.preflight_id=$1 AND o.source_snapshot_id=s.id))`, *preflightID, current.StreamDayID).
+			Scan(&mismatchedCount, &missingCount); err != nil || mismatchedCount != 0 || missingCount != 0 {
+			return joinedSealStreamDayResponse{}, errors.New("joined HEAD preflight source identity differs")
+		}
+	}
 	if err := insertJoinedStreamDayEvidence(ctx, tx, current, ledger, ledgerBytes, ledgerArtifactSHA, observations,
 		headSHA, sealSHA); err != nil {
 		return joinedSealStreamDayResponse{}, err
+	}
+	if preflightID != nil {
+		if _, err := tx.Exec(ctx, `UPDATE recording_joined_stream_day_head_preflights
+			SET state='sealed',sealed_at=clock_timestamp() WHERE id=$1 AND state='ready'`, *preflightID); err != nil {
+			return joinedSealStreamDayResponse{}, errors.New("seal joined HEAD preflight")
+		}
 	}
 	response, err := joinedSealedStreamDayResponse(ctx, tx, req)
 	if err != nil {
@@ -586,7 +644,7 @@ func loadJoinedStreamDayForSeal(ctx context.Context, tx pgx.Tx, req joinedSealSt
 	if err := json.Unmarshal(qualification, &plan.Qualification); err != nil {
 		return plan, state, err
 	}
-	rows, err := tx.Query(ctx, `SELECT id,clip_id,recording_id,recording_job_id,storage_destination_id,provider,
+	rows, err := tx.Query(ctx, `SELECT id,day_ordinal,clip_id,recording_id,recording_job_id,storage_destination_id,provider,
 		endpoint,region,bucket,object_key,ingest_etag,size_bytes,sha256,start_at,end_at,clip_created_at,released_at,
 		capture_lease_token::text,capture_sequence,capture_attempt_id::text,timestamp_contract_version,
 		timestamp_contract,timestamp_contract_status,timestamp_contract_reason
@@ -597,7 +655,7 @@ func loadJoinedStreamDayForSeal(ctx context.Context, tx pgx.Tx, req joinedSealSt
 	defer rows.Close()
 	for rows.Next() {
 		var snapshot joinedStreamDaySnapshot
-		if err := rows.Scan(&snapshot.ID, &snapshot.Source.ClipID, &snapshot.Source.RecordingID,
+		if err := rows.Scan(&snapshot.ID, &snapshot.DayOrdinal, &snapshot.Source.ClipID, &snapshot.Source.RecordingID,
 			&snapshot.Source.RecordingJobID, &snapshot.Source.StorageDestinationID, &snapshot.Source.Provider,
 			&snapshot.Source.Endpoint, &snapshot.Source.Region, &snapshot.Source.Bucket, &snapshot.Source.Object.Key,
 			&snapshot.Source.Object.ETag, &snapshot.Source.Object.SizeBytes, &snapshot.Source.Object.SHA256,

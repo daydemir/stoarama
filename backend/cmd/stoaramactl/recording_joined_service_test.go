@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
@@ -420,7 +422,9 @@ func TestJoinedRemainingDaysProvesCanaryAndSealsSerially(t *testing.T) {
 	streamDays[0].SealRequestSHA256 = canarySHA
 	pending := len(streamDays) - 1
 	streamDays[pending].State, streamDays[pending].SealRequestSHA256 = "pending", ""
-	requests := make(chan string, 2)
+	requests := make(chan string, 8)
+	runID := uuid.NewString()
+	startCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.Method + " " + r.URL.RequestURI()
 		if r.Header.Get("Authorization") != "Bearer "+operatorToken {
@@ -433,12 +437,32 @@ func TestJoinedRemainingDaysProvesCanaryAndSealsSerially(t *testing.T) {
 				ExpectedScheduledHours: len(streamDays) * 12, StreamDays: streamDays})
 			return
 		}
-		var request map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil ||
-			request["recording_id"] != float64(streamDays[pending].RecordingID) || request["local_date"] != streamDays[pending].LocalDate {
-			t.Errorf("pending request=%v err=%v", request, err)
+		switch r.URL.Path {
+		case "/api/v1/recording/joined/stream-days/head-preflight/start":
+			startCalls++
+			var request map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil ||
+				request["recording_id"] != float64(streamDays[pending].RecordingID) || request["local_date"] != streamDays[pending].LocalDate {
+				t.Errorf("preflight start request=%v err=%v", request, err)
+			}
+			state, completed := "building", 0
+			if startCalls > 1 {
+				state, completed = "ready", 1
+			}
+			writeJoinedTestJSON(t, w, joinedStreamDayHeadPreflightProgress{RunID: runID, BatchID: batchID,
+				RecordingID: streamDays[pending].RecordingID, LocalDate: streamDays[pending].LocalDate,
+				State: state, CompletedObservations: completed, ExpectedObservations: 1,
+				SourceSnapshotSHA256: strings.Repeat("a", 64)})
+		case "/api/v1/recording/joined/stream-days/head-preflight/step":
+			writeJoinedTestJSON(t, w, joinedStreamDayHeadPreflightProgress{RunID: runID, BatchID: batchID,
+				RecordingID: streamDays[pending].RecordingID, LocalDate: streamDays[pending].LocalDate,
+				State: "ready", CompletedObservations: 1, ExpectedObservations: 1,
+				SourceSnapshotSHA256: strings.Repeat("a", 64)})
+		case "/api/v1/recording/joined/stream-days/head-preflight/seal":
+			writeJoinedTestJSON(t, w, joinedSealReceipt(batchID, streamDays[pending].RecordingID, streamDays[pending].LocalDate))
+		default:
+			t.Errorf("unexpected POST path %q", r.URL.Path)
 		}
-		writeJoinedTestJSON(t, w, joinedSealReceipt(batchID, streamDays[pending].RecordingID, streamDays[pending].LocalDate))
 	}))
 	defer server.Close()
 	api, err := newJoinedAPIClient(server.URL, "", server.Client())
@@ -458,8 +482,15 @@ func TestJoinedRemainingDaysProvesCanaryAndSealsSerially(t *testing.T) {
 	if got := <-requests; got != "GET /api/v1/recording/joined/batches/status?batch_id="+batchID {
 		t.Fatalf("status request=%q", got)
 	}
-	if got := <-requests; got != "POST /api/v1/recording/joined/stream-days/seal" {
-		t.Fatalf("seal request=%q", got)
+	for _, want := range []string{
+		"POST /api/v1/recording/joined/stream-days/head-preflight/start",
+		"POST /api/v1/recording/joined/stream-days/head-preflight/step",
+		"POST /api/v1/recording/joined/stream-days/head-preflight/start",
+		"POST /api/v1/recording/joined/stream-days/head-preflight/seal",
+	} {
+		if got := <-requests; got != want {
+			t.Fatalf("preflight request=%q want=%q", got, want)
+		}
 	}
 }
 

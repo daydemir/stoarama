@@ -221,12 +221,13 @@ func TestJoinedStreamDayHEADCancellationStopsBackoff(t *testing.T) {
 	}
 }
 
-func TestJoinedStreamDayHEADConcurrencyIsCappedAtFour(t *testing.T) {
-	transport := &joinedConcurrentHeadTransport{started: make(chan struct{}, 9), release: make(chan struct{})}
+func TestJoinedStreamDayHEADConcurrencyIsCappedAtSixteen(t *testing.T) {
+	const expectedConcurrency = 16
+	transport := &joinedConcurrentHeadTransport{started: make(chan struct{}, 33), release: make(chan struct{})}
 	s := &Server{cfg: config.Config{}, joinedFreezeTransport: transport,
 		joinedFreezeSourceStore: &joinedFreezeStoreStub{bucket: "clips"}}
 	s.cfg.R2Endpoint, s.cfg.R2Region, s.cfg.R2Bucket = joinedTestSourceEndpoint, "auto", "clips"
-	plan := joinedStreamDayPlan{Sources: make([]joinedStreamDaySnapshot, 9)}
+	plan := joinedStreamDayPlan{Sources: make([]joinedStreamDaySnapshot, 33)}
 	for i := range plan.Sources {
 		plan.Sources[i] = joinedHeadTestSnapshot(i)
 	}
@@ -235,13 +236,13 @@ func TestJoinedStreamDayHEADConcurrencyIsCappedAtFour(t *testing.T) {
 		_, err := s.headJoinedStreamDaySources(context.Background(), plan)
 		done <- err
 	}()
-	for i := 0; i < joinedStreamDayHeadConcurrency; i++ {
+	for i := 0; i < expectedConcurrency; i++ {
 		<-transport.started
 	}
 	transport.mu.Lock()
 	active, maximum := transport.active, transport.maximum
 	transport.mu.Unlock()
-	if active != joinedStreamDayHeadConcurrency || maximum != joinedStreamDayHeadConcurrency {
+	if active != expectedConcurrency || maximum != expectedConcurrency {
 		t.Fatalf("active=%d maximum=%d", active, maximum)
 	}
 	close(transport.release)
@@ -251,7 +252,7 @@ func TestJoinedStreamDayHEADConcurrencyIsCappedAtFour(t *testing.T) {
 	transport.mu.Lock()
 	maximum = transport.maximum
 	transport.mu.Unlock()
-	if maximum > joinedStreamDayHeadConcurrency {
+	if maximum > expectedConcurrency {
 		t.Fatalf("maximum concurrent HEADs=%d", maximum)
 	}
 }
