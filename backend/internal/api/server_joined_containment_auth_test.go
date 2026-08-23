@@ -44,4 +44,24 @@ func TestJoinedContainmentRequiresDedicatedOperatorToken(t *testing.T) {
 			}
 		})
 	}
+	for name, collision := range map[string]string{
+		"empty":     "",
+		"service":   s.cfg.ServiceToken,
+		"bootstrap": s.cfg.JoinedWorkerBootstrapToken,
+		"signing":   s.cfg.JoinedWorkerSigningKey,
+	} {
+		t.Run("rejects "+name+" operator configuration", func(t *testing.T) {
+			bad := *s
+			bad.cfg.JoinedOperatorToken = collision
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/containment?batch_id=test", nil)
+			req.Header.Set("Authorization", "Bearer "+s.cfg.JoinedOperatorToken)
+			rec := httptest.NewRecorder()
+			bad.requireJoinedOperatorAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})).ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status=%d want=%d", rec.Code, http.StatusUnauthorized)
+			}
+		})
+	}
 }

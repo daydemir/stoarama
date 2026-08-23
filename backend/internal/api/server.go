@@ -69,6 +69,8 @@ type Server struct {
 	sharedRecordingsLimiter  *sharedRecordingsLimiter
 	joinedConnectionStatusMu sync.Mutex
 	joinedConnectionStatusAt time.Time
+	joinedContainmentMu      sync.Mutex
+	joinedContainmentAt      time.Time
 }
 
 const accountSessionCookie = "stoarama_session"
