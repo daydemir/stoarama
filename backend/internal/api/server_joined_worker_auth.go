@@ -70,6 +70,23 @@ func (s *Server) requireJoinedWorkerBootstrapAuth(next http.Handler) http.Handle
 	})
 }
 
+func (s *Server) requireJoinedOperatorAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expected := strings.TrimSpace(s.cfg.JoinedOperatorToken)
+		serviceToken := strings.TrimSpace(s.cfg.ServiceToken)
+		bootstrap := strings.TrimSpace(s.cfg.JoinedWorkerBootstrapToken)
+		signingKey := strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		if expected == "" || expected == serviceToken || expected == bootstrap || expected == signingKey ||
+			!strings.HasPrefix(authorization, "Bearer ") ||
+			subtle.ConstantTimeCompare([]byte(strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))), []byte(expected)) != 1 {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) requireJoinedWorkerAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		signingKey := strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
