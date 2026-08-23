@@ -215,10 +215,10 @@ func (s *Server) stepJoinedFinalValidation(ctx context.Context, req joinedFinalV
 		(run_id,ordinal,stream_day_id,recording_id,local_date,date_ordinal,source_snapshot_sha256,
 		source_clip_count,source_bytes,ledger_sha256,validator_version,receipt_sha256)
 		SELECT s.run_id,s.ordinal,s.stream_day_id,s.recording_id,s.local_date,s.date_ordinal,
-		s.source_snapshot_sha256,s.source_clip_count,s.source_bytes,s.ledger_sha256,$3,
+		s.source_snapshot_sha256,s.source_clip_count,s.source_bytes,s.ledger_sha256,$3::TEXT,
 		encode(sha256(convert_to(concat_ws(E'\n',s.run_id::TEXT,s.ordinal::TEXT,s.stream_day_id::TEXT,
 			s.recording_id::TEXT,s.local_date::TEXT,s.date_ordinal::TEXT,s.source_snapshot_sha256,
-			s.source_clip_count::TEXT,s.source_bytes::TEXT,s.ledger_sha256,$3),'UTF8')),'hex')
+			s.source_clip_count::TEXT,s.source_bytes::TEXT,s.ledger_sha256,$3::TEXT),'UTF8')),'hex')
 		FROM recording_joined_final_validation_scopes s WHERE s.run_id=$1 AND s.ordinal=$2`,
 		req.RunID, ordinal, joinedFinalValidationVersion); err != nil {
 		return joinedFinalValidationProgress{}, fmt.Errorf("record joined final-validation receipt: %w", err)
