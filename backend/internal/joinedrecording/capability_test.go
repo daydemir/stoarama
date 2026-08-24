@@ -109,6 +109,7 @@ func (c *memoryCapabilityClient) Do(request *http.Request) (*http.Response, erro
 	}
 	switch request.Method {
 	case http.MethodPut:
+		defer request.Body.Close()
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
 			return nil, err
