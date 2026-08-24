@@ -743,6 +743,10 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		Scan(&canarySourceHourID); err != nil {
 		t.Fatal(err)
 	}
+	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingConnectionID = int(connectionID)
+	s.cfg.JoinedRecordingProtocolGeneration = 1
+	s.cfg.JoinedRecordingBatchID = batchID
 	var singleHourID string
 	var singleStreamDayID int64
 	if err := pool.QueryRow(ctx, `SELECT h.hour_id,h.stream_day_id FROM recording_joined_hours h
@@ -753,6 +757,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	t.Run("single-canary publication claim is database-fenced", func(t *testing.T) {
 		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
 		s.cfg.JoinedRecordingCanaryHourIDs = singleHourID
+		if err := s.cfg.ValidateJoined(); err != nil {
+			t.Fatalf("single-canary test configuration invalid: %v (batch=%q hour=%q)", err, s.cfg.JoinedRecordingBatchID, singleHourID)
+		}
 		workScope, err := s.joinedWorkScopeIdentity()
 		if err != nil {
 			t.Fatal(err)
@@ -812,10 +819,6 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		}
 	})
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
-	s.cfg.JoinedRecordingProtocolVersion = 1
-	s.cfg.JoinedRecordingConnectionID = int(connectionID)
-	s.cfg.JoinedRecordingProtocolGeneration = 1
-	s.cfg.JoinedRecordingBatchID = batchID
 	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(batchID, canaryGapHourID)
 	recordingID, batchRecordingID := sourceLedger.recordingID, sourceLedger.batchRecordingID
 	var sources []joinedrecording.SourceClip
