@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -117,8 +118,8 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	canaryIDs, err := s.cfg.JoinedCanaryHourIDs()
-	if err != nil || workScope != "canary" || len(canaryIDs) != 3 {
-		util.WriteError(w, http.StatusConflict, "joined containment requires the exact canary scope")
+	if err != nil || !config.IsJoinedCanaryWorkScope(workScope) {
+		util.WriteError(w, http.StatusConflict, "joined containment requires an exact canary scope")
 		return
 	}
 

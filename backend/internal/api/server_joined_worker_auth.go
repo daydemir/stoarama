@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
@@ -140,7 +141,7 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 			    AND a.scope_kind=$2 AND a.scope_id=$3))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID).Scan(&allowed)
 		return err == nil && allowed
 	}
-	if scope != "canary" {
+	if !config.IsJoinedCanaryWorkScope(scope) {
 		return false
 	}
 	hours := s.joinedCanaryHourIDs()

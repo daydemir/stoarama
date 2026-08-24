@@ -13,9 +13,14 @@ import (
 const JoinedProtocolVersion = 1
 
 const (
-	WorkScopeCanary      = "canary"
-	WorkScopeFrozenBatch = "frozen_batch"
+	WorkScopeCanary       = "canary"
+	WorkScopeSingleCanary = "canary_single"
+	WorkScopeFrozenBatch  = "frozen_batch"
 )
+
+func IsCanaryWorkScope(scope string) bool {
+	return scope == WorkScopeCanary || scope == WorkScopeSingleCanary
+}
 
 // WorkScopeIdentity is the exact rollout authority shared by worker, API, and
 // signed claim tokens. Canary order is intentional and covered by the digest.
@@ -27,7 +32,7 @@ type WorkScopeIdentity struct {
 
 func NewWorkScopeIdentity(batchID, workScope string, canaryHourIDs []string) (WorkScopeIdentity, error) {
 	identity := WorkScopeIdentity{WorkScope: workScope, CanaryHourIDs: slices.Clone(canaryHourIDs)}
-	if workScope == WorkScopeCanary {
+	if IsCanaryWorkScope(workScope) {
 		identity.CanaryHourIDsSHA256 = canaryHourIDsSHA256(identity.CanaryHourIDs)
 	}
 	if err := identity.Validate(batchID); err != nil {
@@ -41,8 +46,12 @@ func (s WorkScopeIdentity) Validate(batchID string) error {
 		return fmt.Errorf("invalid joined work scope batch")
 	}
 	switch s.WorkScope {
-	case WorkScopeCanary:
-		if len(s.CanaryHourIDs) != 3 || !lowerHex64(s.CanaryHourIDsSHA256) ||
+	case WorkScopeCanary, WorkScopeSingleCanary:
+		wantCount := 3
+		if s.WorkScope == WorkScopeSingleCanary {
+			wantCount = 1
+		}
+		if len(s.CanaryHourIDs) != wantCount || !lowerHex64(s.CanaryHourIDsSHA256) ||
 			s.CanaryHourIDsSHA256 != canaryHourIDsSHA256(s.CanaryHourIDs) {
 			return fmt.Errorf("invalid joined canary work scope")
 		}

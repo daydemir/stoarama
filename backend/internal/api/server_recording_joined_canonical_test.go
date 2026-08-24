@@ -743,6 +743,75 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		Scan(&canarySourceHourID); err != nil {
 		t.Fatal(err)
 	}
+	var singleHourID string
+	var singleStreamDayID int64
+	if err := pool.QueryRow(ctx, `SELECT h.hour_id,h.stream_day_id FROM recording_joined_hours h
+		WHERE h.source_clip_count>0 AND h.stream_day_id<>$1 ORDER BY h.priority_ordinal,h.id LIMIT 1`, sourceLedger.streamDayID).
+		Scan(&singleHourID, &singleStreamDayID); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("single-canary publication claim is database-fenced", func(t *testing.T) {
+		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
+		s.cfg.JoinedRecordingCanaryHourIDs = singleHourID
+		workScope, err := s.joinedWorkScopeIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bootstrapBody, _ := json.Marshal(joinedrecording.WorkerBootstrapRequest{ProtocolVersion: 1,
+			BatchID: batchID, WorkScopeIdentity: workScope})
+		bootstrapReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", bytes.NewReader(bootstrapBody))
+		bootstrapReq.Header.Set("Authorization", "Bearer "+s.cfg.JoinedWorkerBootstrapToken)
+		bootstrapRec := httptest.NewRecorder()
+		s.requireJoinedWorkerBootstrapAuth(http.HandlerFunc(s.handleJoinedToken)).ServeHTTP(bootstrapRec, bootstrapReq)
+		var bootstrap joinedrecording.WorkerBootstrapResponse
+		if bootstrapRec.Code != http.StatusOK || json.Unmarshal(bootstrapRec.Body.Bytes(), &bootstrap) != nil {
+			t.Fatalf("single-canary bootstrap status=%d body=%s", bootstrapRec.Code, bootstrapRec.Body.String())
+		}
+		claimBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "single-worker"})
+		claimReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
+		claimReq.Header.Set("Authorization", "Bearer "+bootstrap.ClaimToken)
+		claimRec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(claimRec, claimReq)
+		var ledgerClaim joinedrecording.PublicationClaimResponse
+		if claimRec.Code != http.StatusOK || json.Unmarshal(claimRec.Body.Bytes(), &ledgerClaim) != nil || ledgerClaim.Ledger == nil {
+			t.Fatalf("single-canary ledger claim status=%d body=%s", claimRec.Code, claimRec.Body.String())
+		}
+		var expectedLedgerScope, expectedLedgerObject string
+		if err := pool.QueryRow(ctx, `SELECT scope_id,object_key FROM recording_joined_artifacts
+			WHERE stream_day_id=$1 AND artifact_kind='allocation_ledger'`, singleStreamDayID).Scan(&expectedLedgerScope, &expectedLedgerObject); err != nil {
+			t.Fatal(err)
+		}
+		if ledgerClaim.Ledger.ScopeID != expectedLedgerScope {
+			t.Fatalf("single-canary claimed ledger scope=%q want=%q", ledgerClaim.Ledger.ScopeID, expectedLedgerScope)
+		}
+		s.joinedOutputStorage = joinedOutputStoreStub{head: r2.ObjectHead{ETag: "single-ledger-etag", SizeBytes: ledgerClaim.Ledger.ExpectedSize}}
+		finalizeBody, _ := json.Marshal(joinedrecording.FinalizeLedgerRequest{ProtocolVersion: 1, Published: joinedrecording.PublishedLedger{
+			ArtifactID: ledgerClaim.Ledger.ArtifactID, ObjectKey: expectedLedgerObject, ETag: "single-ledger-etag",
+			SizeBytes: ledgerClaim.Ledger.ExpectedSize, SHA256: ledgerClaim.Ledger.ExpectedSHA256}})
+		finalizeReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/ledger/finalize", bytes.NewReader(finalizeBody))
+		finalizeReq.Header.Set("Authorization", "Bearer "+ledgerClaim.Ledger.OperationToken)
+		finalizeRec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFinalizeLedger)).ServeHTTP(finalizeRec, finalizeReq)
+		if finalizeRec.Code != http.StatusNoContent {
+			t.Fatalf("single-canary ledger finalize status=%d body=%s", finalizeRec.Code, finalizeRec.Body.String())
+		}
+		hourReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
+		hourReq.Header.Set("Authorization", "Bearer "+bootstrap.ClaimToken)
+		hourRec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(hourRec, hourReq)
+		var hourClaim joinedrecording.PublicationClaimResponse
+		if hourRec.Code != http.StatusOK || json.Unmarshal(hourRec.Body.Bytes(), &hourClaim) != nil || hourClaim.Hour == nil || hourClaim.Hour.HourID != singleHourID {
+			t.Fatalf("single-canary hour claim status=%d body=%s", hourRec.Code, hourRec.Body.String())
+		}
+		foreignClaimReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
+		foreignClaimReq.Header.Set("Authorization", "Bearer "+bootstrap.ClaimToken)
+		foreignClaimRec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedPublicationClaim)).ServeHTTP(foreignClaimRec, foreignClaimReq)
+		if foreignClaimRec.Code != http.StatusNoContent {
+			t.Fatalf("single-canary exposed a foreign publication after its selected hour: status=%d body=%s", foreignClaimRec.Code, foreignClaimRec.Body.String())
+		}
+	})
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
 	s.cfg.JoinedRecordingProtocolVersion = 1
 	s.cfg.JoinedRecordingConnectionID = int(connectionID)
 	s.cfg.JoinedRecordingProtocolGeneration = 1
