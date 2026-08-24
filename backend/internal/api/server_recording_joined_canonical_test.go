@@ -750,7 +750,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	var singleHourID string
 	var singleStreamDayID int64
 	if err := pool.QueryRow(ctx, `SELECT h.hour_id,h.stream_day_id FROM recording_joined_hours h
-		WHERE h.stream_day_id<>$1 ORDER BY h.priority_ordinal,h.id LIMIT 1`, sourceLedger.streamDayID).
+		WHERE h.stream_day_id>$1 ORDER BY h.priority_ordinal,h.id LIMIT 1`, ledgers[12].streamDayID).
 		Scan(&singleHourID, &singleStreamDayID); err != nil {
 		t.Fatal(err)
 	}
@@ -967,7 +967,6 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	lateConn.Release()
 	freezeConn.Release()
-	t.Run("single-canary publication claim is database-fenced", singleCanaryTest)
 	ledgerArtifactID, ledgerRelative, ledgerObject := ledgers[0].artifactID, ledgers[0].relativePath, ledgers[0].objectKey
 	ledgerBytes, ledgerArtifactSHA := ledgers[0].bytes, ledgers[0].sha
 
@@ -1945,6 +1944,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if finalizeIndexRecorder.Code != http.StatusNoContent {
 		t.Fatalf("batch-index finalize status=%d body=%s", finalizeIndexRecorder.Code, finalizeIndexRecorder.Body.String())
 	}
+	t.Run("single-canary publication claim is database-fenced", singleCanaryTest)
 	t.Log("JOINED_CANONICAL_LIFECYCLE_EXECUTED")
 }
 
