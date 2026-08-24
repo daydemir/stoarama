@@ -746,7 +746,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	var singleHourID string
 	var singleStreamDayID int64
 	if err := pool.QueryRow(ctx, `SELECT h.hour_id,h.stream_day_id FROM recording_joined_hours h
-		WHERE h.source_clip_count>0 AND h.stream_day_id<>$1 ORDER BY h.priority_ordinal,h.id LIMIT 1`, sourceLedger.streamDayID).
+		WHERE h.stream_day_id<>$1 ORDER BY h.priority_ordinal,h.id LIMIT 1`, sourceLedger.streamDayID).
 		Scan(&singleHourID, &singleStreamDayID); err != nil {
 		t.Fatal(err)
 	}
