@@ -32,6 +32,9 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 		if !sameCanonical([]MediaToolEvidence{actualTool}, []MediaToolEvidence{claim.MediaTool}) {
 			return fmt.Errorf("installed media tool differs from frozen claim")
 		}
+		if err := EnsureScratchHeadroom(scratchRoot, claim.Sources); err != nil {
+			return err
+		}
 		sourceCapability := func(callCtx context.Context, source SourceClip, operation string) (SourceReadCapability, error) {
 			if err := callCtx.Err(); err != nil {
 				return SourceReadCapability{}, err

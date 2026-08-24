@@ -40,6 +40,9 @@ func rebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRo
 		if err != nil || !sameCanonical([]MediaToolEvidence{actualTool}, []MediaToolEvidence{claim.Plan.MediaTool}) {
 			return fmt.Errorf("installed media tool differs from sealed hour")
 		}
+		if err := EnsureScratchHeadroom(scratchRoot, claim.Plan.Sources); err != nil {
+			return err
+		}
 		sourceOnly := sourceOnlyClips(claim.Plan.Sources)
 		preflight := PreflightHourClaim{ProtocolVersion: JoinedProtocolVersion, HourID: claim.HourID,
 			LeaseID: claim.LeaseID, OperationToken: currentClaim.OperationToken, LeaseExpires: currentClaim.LeaseExpires,
