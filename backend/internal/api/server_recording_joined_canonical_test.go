@@ -754,7 +754,12 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		Scan(&singleHourID, &singleStreamDayID); err != nil {
 		t.Fatal(err)
 	}
-	t.Run("single-canary publication claim is database-fenced", func(t *testing.T) {
+	singleCanaryTest := func(t *testing.T) {
+		originalSingleScope, originalSingleIDs := s.cfg.JoinedRecordingWorkScope, s.cfg.JoinedRecordingCanaryHourIDs
+		defer func() {
+			s.cfg.JoinedRecordingWorkScope = originalSingleScope
+			s.cfg.JoinedRecordingCanaryHourIDs = originalSingleIDs
+		}()
 		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
 		s.cfg.JoinedRecordingCanaryHourIDs = singleHourID
 		if err := s.cfg.ValidateJoined(); err != nil {
@@ -817,8 +822,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		if foreignClaimRec.Code != http.StatusNoContent {
 			t.Fatalf("single-canary exposed a foreign publication after its selected hour: status=%d body=%s", foreignClaimRec.Code, foreignClaimRec.Body.String())
 		}
-	})
-	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
+	}
 	s.cfg.JoinedRecordingCanaryHourIDs = joinedCanaryScopeForTest(batchID, canaryGapHourID)
 	recordingID, batchRecordingID := sourceLedger.recordingID, sourceLedger.batchRecordingID
 	var sources []joinedrecording.SourceClip
@@ -963,6 +967,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	lateConn.Release()
 	freezeConn.Release()
+	t.Run("single-canary publication claim is database-fenced", singleCanaryTest)
 	ledgerArtifactID, ledgerRelative, ledgerObject := ledgers[0].artifactID, ledgers[0].relativePath, ledgers[0].objectKey
 	ledgerBytes, ledgerArtifactSHA := ledgers[0].bytes, ledgers[0].sha
 
