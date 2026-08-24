@@ -301,13 +301,14 @@ func publishHourPart(ctx context.Context, client CapabilityHTTPClient, claim Wor
 	if err != nil {
 		return PublishedOutput{}, err
 	}
+	// The HTTP transport owns and closes request bodies passed to Do. Keep a
+	// defensive close for clients that do not, but do not treat a second close
+	// as a failed publication: net/http may already have closed this file after
+	// the PUT completed successfully.
+	defer func() { _ = f.Close() }()
 	observation, putErr := putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, "video/mp4", size, sha, capability, f)
-	closeErr := f.Close()
 	if putErr != nil {
 		return PublishedOutput{}, putErr
-	}
-	if closeErr != nil {
-		return PublishedOutput{}, closeErr
 	}
 	readCapability, err := resolveRead(ctx, claim, artifactID)
 	if err != nil {
