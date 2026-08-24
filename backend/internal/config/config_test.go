@@ -380,6 +380,16 @@ func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
 	if scope, err := (Config{JoinedRecordingCanaryHourIDs: joinedCanaryScope(batch)}).JoinedWorkScope(); err != nil || scope != JoinedWorkScopeDisabled {
 		t.Fatalf("disabled scope was affected by inert canary IDs scope=%q err=%v", scope, err)
 	}
+	single := canary
+	single.JoinedRecordingWorkScope = JoinedWorkScopeSingleCanary
+	single.JoinedRecordingCanaryHourIDs = strings.Split(canary.JoinedRecordingCanaryHourIDs, ",")[0]
+	if scope, err := single.JoinedWorkScope(); err != nil || scope != JoinedWorkScopeSingleCanary {
+		t.Fatalf("single-canary scope=%q err=%v", scope, err)
+	}
+	single.JoinedRecordingCanaryHourIDs = canary.JoinedRecordingCanaryHourIDs
+	if _, err := single.JoinedWorkScope(); err == nil {
+		t.Fatal("single-canary scope accepted more than one hour")
+	}
 }
 
 func validJoinedAPIConfigForTest(batch, hour string) Config {

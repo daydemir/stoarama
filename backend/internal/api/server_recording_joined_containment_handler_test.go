@@ -54,4 +54,10 @@ func TestJoinedContainmentHandlerRejectsUnsafeRequestsBeforeDatabase(t *testing.
 			}
 		})
 	}
+	single := &Server{cfg: base.cfg}
+	single.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
+	single.cfg.JoinedRecordingCanaryHourIDs = strings.Split(base.cfg.JoinedRecordingCanaryHourIDs, ",")[0]
+	if got := call(single, "/api/v1/recording/joined/containment?batch_id="+batchID); got != http.StatusServiceUnavailable {
+		t.Fatalf("single-canary scope was rejected before database access: status=%d", got)
+	}
 }

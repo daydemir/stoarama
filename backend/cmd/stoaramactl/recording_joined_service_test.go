@@ -607,6 +607,37 @@ func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
 	}
 }
 
+func TestJoinedWorkerStatusBindsExactSingleCanaryScope(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
+	cfg.JoinedRecordingCanaryHourIDs = strings.Split(cfg.JoinedRecordingCanaryHourIDs, ",")[0]
+	hours, err := cfg.JoinedCanaryHourIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := joinedWorkerStatus{ProtocolVersion: joinedrecording.JoinedProtocolVersion, Enabled: true,
+		BatchID: cfg.JoinedRecordingBatchID, WorkScope: config.JoinedWorkScopeSingleCanary, CanaryHourIDs: hours}
+	if err := validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, status); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*joinedWorkerStatus){
+		"scope":      func(s *joinedWorkerStatus) { s.WorkScope = config.JoinedWorkScopeCanary },
+		"extra hour": func(s *joinedWorkerStatus) { s.CanaryHourIDs = append(s.CanaryHourIDs, "extra") },
+		"wrong hour": func(s *joinedWorkerStatus) {
+			s.CanaryHourIDs[0] = strings.Replace(s.CanaryHourIDs[0], "hour-01", "hour-02", 1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := status
+			bad.CanaryHourIDs = append([]string(nil), status.CanaryHourIDs...)
+			mutate(&bad)
+			if validateJoinedWorkerStatus(cfg, cfg.JoinedRecordingBatchID, bad) == nil {
+				t.Fatal("mismatched single-canary worker status accepted")
+			}
+		})
+	}
+}
+
 func TestJoinedWorkerStatusBindsFrozenBatchScopeWithoutCanaryHours(t *testing.T) {
 	cfg := validJoinedWorkerConfig()
 	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch

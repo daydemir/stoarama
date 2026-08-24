@@ -588,10 +588,15 @@ func (c Config) ValidateJoinedRecording() error {
 }
 
 const (
-	JoinedWorkScopeDisabled    = "disabled"
-	JoinedWorkScopeCanary      = "canary"
-	JoinedWorkScopeFrozenBatch = "frozen_batch"
+	JoinedWorkScopeDisabled     = "disabled"
+	JoinedWorkScopeCanary       = "canary"
+	JoinedWorkScopeSingleCanary = "canary_single"
+	JoinedWorkScopeFrozenBatch  = "frozen_batch"
 )
+
+func IsJoinedCanaryWorkScope(scope string) bool {
+	return scope == JoinedWorkScopeCanary || scope == JoinedWorkScopeSingleCanary
+}
 
 // JoinedWorkScope validates the explicit rollout authority shared by API and
 // worker. Automatic rolling has no scope value and remains unavailable.
@@ -603,9 +608,9 @@ func (c Config) JoinedWorkScope() (string, error) {
 		if c.JoinedRecordingControlPlaneEnabled || c.JoinedRecordingEnabled {
 			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=disabled requires joined recording to be disabled")
 		}
-	case JoinedWorkScopeCanary:
+	case JoinedWorkScopeCanary, JoinedWorkScopeSingleCanary:
 		if !c.JoinedRecordingControlPlaneEnabled && !c.JoinedRecordingEnabled {
-			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=canary requires an enabled joined API or worker")
+			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=%s requires an enabled joined API or worker", scope)
 		}
 		if _, err := c.JoinedCanaryHourIDs(); err != nil {
 			return "", err
@@ -618,7 +623,7 @@ func (c Config) JoinedWorkScope() (string, error) {
 			return "", fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must be empty for frozen_batch scope")
 		}
 	default:
-		return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE must be disabled, canary, or frozen_batch")
+		return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE must be disabled, canary, canary_single, or frozen_batch")
 	}
 	return scope, nil
 }
@@ -633,8 +638,12 @@ func (c Config) JoinedCanaryHourIDs() ([]string, error) {
 	prefix := c.JoinedRecordingBatchID + "__recording-"
 	pattern := regexp.MustCompile(`^[1-9][0-9]*__date-([0-9]{4}-[0-9]{2}-[0-9]{2})__hour-(0[1-9]|1[0-2])__generation-[1-9][0-9]*$`)
 	items := strings.Split(raw, ",")
-	if len(items) != 3 {
-		return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exactly three canonical hour IDs")
+	wantCount := 3
+	if c.JoinedRecordingWorkScope == JoinedWorkScopeSingleCanary {
+		wantCount = 1
+	}
+	if len(items) != wantCount {
+		return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exactly %d canonical hour ID(s)", wantCount)
 	}
 	hours := make([]string, 0, len(items))
 	seen := make(map[string]struct{}, len(items))

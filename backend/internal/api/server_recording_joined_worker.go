@@ -56,7 +56,7 @@ func (s *Server) joinedWorkScopeIdentity() (joinedrecording.WorkScopeIdentity, e
 		return joinedrecording.WorkScopeIdentity{}, err
 	}
 	var hours []string
-	if scope == joinedrecording.WorkScopeCanary {
+	if joinedrecording.IsCanaryWorkScope(scope) {
 		hours, err = s.cfg.JoinedCanaryHourIDs()
 		if err != nil {
 			return joinedrecording.WorkScopeIdentity{}, err

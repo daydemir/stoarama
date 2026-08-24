@@ -77,6 +77,15 @@ func TestWorkScopeIdentityBindsExactCanaryAndFrozenBatch(t *testing.T) {
 			t.Fatalf("unsafe work scope %q accepted", scope)
 		}
 	}
+	single, err := NewWorkScopeIdentity(batchID, WorkScopeSingleCanary, hours[:1])
+	if err != nil || single.CanaryHourIDsSHA256 == "" {
+		t.Fatalf("single-canary=%+v err=%v", single, err)
+	}
+	for _, candidate := range [][]string{nil, hours[:2]} {
+		if _, err := NewWorkScopeIdentity(batchID, WorkScopeSingleCanary, candidate); err == nil {
+			t.Fatalf("single-canary accepted %d hours", len(candidate))
+		}
+	}
 }
 
 func TestGapOnlyHourSkipsPreflightAndUsesPublicationClaim(t *testing.T) {

@@ -571,7 +571,7 @@ func validateJoinedWorkerStatus(cfg config.Config, batchID string, status joined
 	workScope, scopeErr := cfg.JoinedWorkScope()
 	var localHours []string
 	var err error
-	if workScope == config.JoinedWorkScopeCanary {
+	if config.IsJoinedCanaryWorkScope(workScope) {
 		localHours, err = cfg.JoinedCanaryHourIDs()
 	}
 	if err != nil || scopeErr != nil || !status.Enabled || status.ProtocolVersion != joinedrecording.JoinedProtocolVersion ||
@@ -589,7 +589,7 @@ func joinedConfiguredWorkScope(cfg config.Config) (joinedrecording.WorkScopeIden
 		return joinedrecording.WorkScopeIdentity{}, err
 	}
 	var hours []string
-	if scope == config.JoinedWorkScopeCanary {
+	if config.IsJoinedCanaryWorkScope(scope) {
 		hours, err = cfg.JoinedCanaryHourIDs()
 		if err != nil {
 			return joinedrecording.WorkScopeIdentity{}, err
