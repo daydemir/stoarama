@@ -51,6 +51,7 @@ type joinedContainmentArtifactSample struct {
 	ID                    int64      `json:"id"`
 	ArtifactKind          string     `json:"artifact_kind"`
 	ScopeID               string     `json:"scope_id"`
+	HourID                string     `json:"hour_id,omitempty"`
 	StreamDayID           *int64     `json:"stream_day_id,omitempty"`
 	HourRecordID          *int64     `json:"hour_record_id,omitempty"`
 	PublicationState      string     `json:"publication_state"`
@@ -74,6 +75,9 @@ type joinedContainmentResponse struct {
 	OutsideScopeMediaCount                  int64                             `json:"outside_scope_media_count"`
 	OutsideScopePublishedSampleTruncated    bool                              `json:"outside_scope_published_sample_truncated"`
 	OutsideScopeSample                      []joinedContainmentArtifactSample `json:"outside_scope_sample"`
+	InScopeMediaCount                       int64                             `json:"in_scope_media_count"`
+	InScopeMediaSampleTruncated             bool                              `json:"in_scope_media_sample_truncated"`
+	InScopeMediaSample                      []joinedContainmentArtifactSample `json:"in_scope_media_sample"`
 }
 
 // joinedContainmentAllowed reuses the diagnostic's process-local brake. This
@@ -144,6 +148,7 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		Hours:              make([]joinedContainmentHour, 0, len(canaryIDs)),
 		ArtifactStates:     make([]joinedContainmentArtifactState, 0),
 		OutsideScopeSample: make([]joinedContainmentArtifactSample, 0),
+		InScopeMediaSample: make([]joinedContainmentArtifactSample, 0),
 	}
 	var batchRecordID int64
 	if err := tx.QueryRow(ctx, `SELECT b.id,b.state,b.generation,c.joined_protocol_version
@@ -253,7 +258,7 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 	}
 
 	sampleRows, err := tx.Query(ctx, `
-		SELECT a.id,a.artifact_kind,a.scope_id,a.stream_day_id,a.hour_record_id,COALESCE(a.publication_state,''),
+		SELECT a.id,a.artifact_kind,a.scope_id,COALESCE(h.hour_id,''),a.stream_day_id,a.hour_record_id,COALESCE(a.publication_state,''),
 		       a.publication_lease_expires_at,a.published_at
 		FROM recording_joined_artifacts a
 		LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
@@ -267,7 +272,7 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 	}
 	for sampleRows.Next() {
 		var sample joinedContainmentArtifactSample
-		if err := sampleRows.Scan(&sample.ID, &sample.ArtifactKind, &sample.ScopeID, &sample.StreamDayID,
+		if err := sampleRows.Scan(&sample.ID, &sample.ArtifactKind, &sample.ScopeID, &sample.HourID, &sample.StreamDayID,
 			&sample.HourRecordID, &sample.PublicationState,
 			&sample.PublicationLeaseUntil, &sample.PublishedAt); err != nil {
 			sampleRows.Close()
@@ -283,6 +288,41 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 	}
 	sampleRows.Close()
 	response.OutsideScopePublishedSampleTruncated = response.OutsideScopePublishedOrPublishingCount > int64(len(response.OutsideScopeSample))
+
+	mediaRows, err := tx.Query(ctx, `
+		SELECT a.id,a.artifact_kind,a.scope_id,COALESCE(h.hour_id,''),a.stream_day_id,a.hour_record_id,
+		       COALESCE(a.publication_state,''),a.publication_lease_expires_at,a.published_at,
+		       count(*) OVER ()
+		FROM recording_joined_artifacts a
+		JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		WHERE a.batch_id=$1 AND a.batch_record_id=$2 AND a.artifact_kind='media'
+		  AND h.hour_id=ANY($3::text[])
+		ORDER BY a.id
+		LIMIT $4`, batchIDs[0], batchRecordID, canaryIDs, joinedContainmentArtifactSampleLimit)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "read joined in-scope media sample failed")
+		return
+	}
+	var mediaTotal int64
+	for mediaRows.Next() {
+		var sample joinedContainmentArtifactSample
+		if err := mediaRows.Scan(&sample.ID, &sample.ArtifactKind, &sample.ScopeID, &sample.HourID,
+			&sample.StreamDayID, &sample.HourRecordID, &sample.PublicationState,
+			&sample.PublicationLeaseUntil, &sample.PublishedAt, &mediaTotal); err != nil {
+			mediaRows.Close()
+			util.WriteError(w, http.StatusInternalServerError, "scan joined in-scope media sample failed")
+			return
+		}
+		response.InScopeMediaSample = append(response.InScopeMediaSample, sample)
+	}
+	if err := mediaRows.Err(); err != nil {
+		mediaRows.Close()
+		util.WriteError(w, http.StatusInternalServerError, "iterate joined in-scope media sample failed")
+		return
+	}
+	mediaRows.Close()
+	response.InScopeMediaCount = mediaTotal
+	response.InScopeMediaSampleTruncated = mediaTotal > int64(len(response.InScopeMediaSample))
 	if err := tx.Commit(ctx); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "finish joined containment read failed")
 		return
