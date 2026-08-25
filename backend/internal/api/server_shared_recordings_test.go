@@ -224,6 +224,87 @@ func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
 	}
 }
 
+func TestRecordingFutureWindowsRespectScheduleBoundaries(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status) VALUES(48,'schedule@example.test','Schedule','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(2,48,'Schedule storage','https://example.test','auto','clips','access',''::bytea,'verified');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,cron_expr,status,cron_timezone,
+			daily_window_start,daily_window_end,active_weekdays,end_at)
+		VALUES(48,2,'scheduled windows','https://example.test/live.m3u8','* * * * *','active','UTC',
+			'12:00'::time,'11:00'::time,127,NULL)
+		RETURNING id
+	`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+
+	status, windows, err := s.recordingFutureWindowsForAccount(ctx, 48, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status[id] != "active" || len(windows[id]) != 14 {
+		t.Fatalf("active overnight runway status=%q windows=%d, want 14", status[id], len(windows[id]))
+	}
+	for i := 1; i < len(windows[id]); i++ {
+		if delta := windows[id][i].Sub(windows[id][i-1]); delta != 24*time.Hour {
+			t.Fatalf("overnight windows are not consecutive at %d: %s", i, delta)
+		}
+	}
+
+	targetWeekday := windows[id][0].AddDate(0, 0, 2).Weekday()
+	isoDay := int(targetWeekday)
+	if isoDay == 0 {
+		isoDay = 7
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET active_weekdays=$2,end_at=NULL WHERE id=$1`, id, 1<<(isoDay-1)); err != nil {
+		t.Fatal(err)
+	}
+	_, weekdayWindows, err := s.recordingFutureWindowsForAccount(ctx, 48, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(weekdayWindows[id]) == 0 || len(weekdayWindows[id]) > 14 {
+		t.Fatalf("weekday-filtered windows=%d, want 1..14", len(weekdayWindows[id]))
+	}
+	for _, start := range weekdayWindows[id] {
+		if start.Weekday() != targetWeekday {
+			t.Fatalf("weekday filter returned %s, want %s", start.Weekday(), targetWeekday)
+		}
+	}
+
+	endAt := windows[id][0].Add(48 * time.Hour)
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET active_weekdays=127,end_at=$2 WHERE id=$1`, id, endAt); err != nil {
+		t.Fatal(err)
+	}
+	_, truncated, err := s.recordingFutureWindowsForAccount(ctx, 48, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(truncated[id]) != 2 {
+		t.Fatalf("end_at-truncated windows=%d, want 2", len(truncated[id]))
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='paused' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	pausedStatus, pausedWindows, err := s.recordingFutureWindowsForAccount(ctx, 48, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pausedStatus[id] != "paused" || len(pausedWindows[id]) != 0 {
+		t.Fatalf("paused runway status=%q windows=%d", pausedStatus[id], len(pausedWindows[id]))
+	}
+}
+
 func TestSharedRecordingsPageDisabledWithoutConfiguration(t *testing.T) {
 	s := &Server{cfg: config.Config{}, recordingsHTML: []byte("secret page")}
 	rec := httptest.NewRecorder()

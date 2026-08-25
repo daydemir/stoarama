@@ -344,7 +344,9 @@ func classifyBest14(days []recordingDailyGrade, status string, remainingWindows 
 func classifyBest14Scheduled(days []recordingDailyGrade, status string, futureWindows []time.Time) recordingBest14Rating {
 	best := best14Grades(days)
 	if len(best) < 14 && status == "active" {
-		best = trailingScoredDayRun(days)
+		if trailing := trailingScoredDayRun(days); len(trailing) > 0 {
+			best = trailing
+		}
 	}
 	completed := len(best)
 	rating := gradeRunRating(best)
@@ -415,6 +417,52 @@ func compactHealthDuration(seconds float64) string {
 	return (time.Duration(seconds * float64(time.Second))).Round(time.Second).String()
 }
 
+func (s *Server) recordingFutureWindowsForAccount(ctx context.Context, accountID int64, recordingIDs []int64) (map[int64]string, map[int64][]time.Time, error) {
+	status := map[int64]string{}
+	futureWindows := map[int64][]time.Time{}
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.id,r.status,f.window_start_at
+		FROM recordings r
+		LEFT JOIN LATERAL (
+			SELECT ((d::date + r.daily_window_start) AT TIME ZONE r.cron_timezone) AS window_start_at
+			FROM generate_series(
+				(now() AT TIME ZONE r.cron_timezone)::date - 1,
+				LEAST(
+					COALESCE((r.end_at AT TIME ZONE r.cron_timezone)::date, (now() AT TIME ZONE r.cron_timezone)::date + 90),
+					(now() AT TIME ZONE r.cron_timezone)::date + 90
+				), interval '1 day') d
+			WHERE r.status = 'active'
+			  AND (r.active_weekdays & (1 << (extract(isodow FROM d)::int-1))) <> 0
+			  AND ((d::date + r.daily_window_end + CASE WHEN r.daily_window_end <= r.daily_window_start THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE r.cron_timezone) > now()
+			  AND (r.end_at IS NULL OR ((d::date + r.daily_window_end + CASE WHEN r.daily_window_end <= r.daily_window_start THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE r.cron_timezone) <= r.end_at)
+			ORDER BY d
+			LIMIT 14
+		) f ON true
+		WHERE r.account_id=$1 AND r.id=ANY($2::bigint[])
+		ORDER BY r.id,f.window_start_at
+	`, accountID, recordingIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var state string
+		var futureStart *time.Time
+		if err := rows.Scan(&id, &state, &futureStart); err != nil {
+			return nil, nil, err
+		}
+		status[id] = state
+		if futureStart != nil {
+			futureWindows[id] = append(futureWindows[id], *futureStart)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return status, futureWindows, nil
+}
+
 func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountID int64, recordingIDs []int64) (map[int64]recordingTimelineHealth, error) {
 	out := make(map[int64]recordingTimelineHealth, len(recordingIDs))
 	if accountID <= 0 || len(recordingIDs) == 0 {
@@ -450,50 +498,14 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	futureWindows := map[int64][]time.Time{}
-	status := map[int64]string{}
-	metaRows, err := s.pool.Query(ctx, `
-		SELECT r.id,r.status,f.window_start_at
-		FROM recordings r
-		LEFT JOIN LATERAL (
-			SELECT ((d::date + r.daily_window_start) AT TIME ZONE r.cron_timezone) AS window_start_at
-			FROM generate_series(
-				(now() AT TIME ZONE r.cron_timezone)::date - 1,
-				LEAST(
-					COALESCE((r.end_at AT TIME ZONE r.cron_timezone)::date, (now() AT TIME ZONE r.cron_timezone)::date + 90),
-					(now() AT TIME ZONE r.cron_timezone)::date + 90
-				), interval '1 day') d
-			WHERE r.status = 'active'
-			  AND (r.active_weekdays & (1 << (extract(isodow FROM d)::int-1))) <> 0
-			  AND ((d::date + r.daily_window_end + CASE WHEN r.daily_window_end <= r.daily_window_start THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE r.cron_timezone) > now()
-			  AND (r.end_at IS NULL OR ((d::date + r.daily_window_end + CASE WHEN r.daily_window_end <= r.daily_window_start THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE r.cron_timezone) <= r.end_at)
-			ORDER BY d
-			LIMIT 14
-		) f ON true
-		WHERE r.account_id=$1 AND r.id=ANY($2::bigint[])
-		ORDER BY r.id,f.window_start_at
-	`, accountID, recordingIDs)
+	status, futureWindows, err := s.recordingFutureWindowsForAccount(ctx, accountID, recordingIDs)
 	if err != nil {
 		return nil, err
 	}
-	defer metaRows.Close()
-	for metaRows.Next() {
-		var id int64
-		var state string
-		var futureStart *time.Time
-		if err := metaRows.Scan(&id, &state, &futureStart); err != nil {
-			return nil, err
-		}
-		status[id] = state
-		if futureStart != nil {
-			futureWindows[id] = append(futureWindows[id], *futureStart)
-		}
+	for id := range status {
 		if _, ok := out[id]; !ok {
 			out[id] = recordingTimelineHealth{}
 		}
-	}
-	if err := metaRows.Err(); err != nil {
-		return nil, err
 	}
 	gradeRows, err := s.pool.Query(ctx, `
 		SELECT h.recording_id,h.window_start_at,h.window_end_at,h.expected_seconds,h.coverage_pct,

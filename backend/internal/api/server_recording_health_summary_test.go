@@ -129,6 +129,13 @@ func TestBest14CannotBridgeUnknownOrMissingCalendarDay(t *testing.T) {
 	}
 }
 
+func TestActiveLatestUnknownPreservesPriorScoredCount(t *testing.T) {
+	got := classifyBest14(dailyGrades("ABC?"), "active", 14)
+	if got.Completed != 3 || got.Rating != "INSUFFICIENT" {
+		t.Fatalf("latest unknown discarded prior scored run: %+v", got)
+	}
+}
+
 func TestRollOffPotentialCannotBridgeUnknownDay(t *testing.T) {
 	grades := dailyGrades("AAAAFCCCCCC?CCCCCC")
 	got := classifyBest14(grades, "active", 1)
