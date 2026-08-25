@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1018,6 +1019,8 @@ type joinedConnectionStatusResponse struct {
 	ClientVersion                   string     `json:"client_version,omitempty"`
 	ClientPhase                     string     `json:"client_phase,omitempty"`
 	ClientPreviousExit              string     `json:"client_previous_exit,omitempty"`
+	ClientErrorClass                string     `json:"client_error_class,omitempty"`
+	ClientErrorSHA256               string     `json:"client_error_sha256,omitempty"`
 	ClientErrorAt                   *time.Time `json:"client_error_at,omitempty"`
 	ClientErrorPresent              bool       `json:"client_error_present"`
 }
@@ -1029,6 +1032,25 @@ func boundedJoinedDiagnosticText(value string) string {
 		runes = runes[:128]
 	}
 	return string(runes)
+}
+
+func joinedClientErrorClass(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "joined delivery:") {
+		return "joined_delivery"
+	}
+	return "nas_pull"
+}
+
+func joinedClientErrorSHA256(value string) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum)
 }
 
 // joinedConnectionStatusAllowed rate-limits the authenticated diagnostic to
@@ -1072,19 +1094,19 @@ func (s *Server) handleJoinedConnectionStatus(w http.ResponseWriter, r *http.Req
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var (
-		observedID                                     int64
-		observedProtocol, pollInterval                 int
-		lastSeen, clientErrorAt                        *time.Time
-		clientVersion, clientPhase, clientPreviousExit string
+		observedID                                                  int64
+		observedProtocol, pollInterval                              int
+		lastSeen, clientErrorAt                                     *time.Time
+		clientVersion, clientPhase, clientPreviousExit, clientError string
 	)
 	err := s.pool.QueryRow(ctx, `SELECT c.id,c.joined_protocol_version,c.last_seen_at,c.poll_interval_sec,
-		client_version,client_phase,client_previous_exit,client_last_error_at
+		client_version,client_phase,client_previous_exit,client_last_error,client_last_error_at
 		FROM connections c
 		WHERE c.id=$1 AND c.kind='nas_pull' AND EXISTS (
 			SELECT 1 FROM recording_joined_batches b WHERE b.batch_id=$2 AND b.connection_id=c.id
 		)`, connectionID, batchIDs[0]).Scan(
 		&observedID, &observedProtocol, &lastSeen, &pollInterval,
-		&clientVersion, &clientPhase, &clientPreviousExit, &clientErrorAt)
+		&clientVersion, &clientPhase, &clientPreviousExit, &clientError, &clientErrorAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "joined connection target not found")
 		return
@@ -1118,6 +1140,7 @@ func (s *Server) handleJoinedConnectionStatus(w http.ResponseWriter, r *http.Req
 		HeartbeatAgeSeconds: ageSeconds, HeartbeatStale: stale,
 		PollIntervalSeconds: pollInterval, ClientVersion: boundedJoinedDiagnosticText(clientVersion),
 		ClientPhase: boundedJoinedDiagnosticText(clientPhase), ClientPreviousExit: boundedJoinedDiagnosticText(clientPreviousExit),
-		ClientErrorAt: clientErrorAt, ClientErrorPresent: clientErrorAt != nil,
+		ClientErrorClass: joinedClientErrorClass(clientError), ClientErrorSHA256: joinedClientErrorSHA256(clientError),
+		ClientErrorAt: clientErrorAt, ClientErrorPresent: clientError != "" || clientErrorAt != nil,
 	})
 }
