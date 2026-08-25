@@ -395,6 +395,44 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	}
 }
 
+func TestRecordingsListFiltersCompletedAndPotentialBest14ScoresSeparately(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`id="qualityFilter"`,
+		`<option value="great_plus">Great+ completed</option>`,
+		`<option value="good_plus">Good+ completed</option>`,
+		`<option value="fine_plus">Fine+ completed</option>`,
+		`<option value="great_potential">Great+ potential</option>`,
+		`<option value="good_potential">Good+ potential</option>`,
+		`<option value="fine_potential">Fine+ potential</option>`,
+		`const BEST14_COMPLETED_TIERS = {`,
+		`great_plus: ['GREAT'],`,
+		`good_plus: ['GREAT', 'VERY_GOOD', 'GOOD'],`,
+		`fine_plus: ['GREAT', 'VERY_GOOD', 'GOOD', 'FINE'],`,
+		`if (Number(rating.completed_days || 0) < 14) return '';`,
+		`if (String(rating.qualifier || '').trim() !== '') return '';`,
+		`if (String(rating.rating || '').toUpperCase() !== 'INSUFFICIENT') return '';`,
+		`if (Number(rating.completed_days || 0) >= 14) return '';`,
+		`qualifier.endsWith('_POTENTIAL')`,
+		`all.filter((rec) => matchesStatusFilter(rec) && matchesQualityFilter(rec))`,
+		`state.qualityFilter = els.qualityFilter.value;`,
+		`syncQualityFilterQuery();`,
+		`Completed tiers require 14 consecutive scored recording days.`,
+		`Great+ allows only A, B, and C days.`,
+		`Good+ allows no F days and at most two E days; D days are allowed.`,
+		`Fine+ allows any mix with no F days.`,
+		`Potential uses the same grade pattern before day 14 and is not a completed tier.`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings quality filter missing %q", marker)
+		}
+	}
+}
+
 func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {

@@ -408,6 +408,21 @@
     /* In the floating price rail the primary action fills the panel width. */
     .composer-side .composer-summary { margin-bottom: 14px; }
     .composer-side .button-row > * { width: 100%; min-width: 0; }
+    .recording-list-filters {
+      display: flex;
+      align-items: end;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .recording-list-filters .seg { flex: 1 1 100%; }
+    .recording-list-filter-field { width: min(260px, 100%); margin: 0; }
+    .score-help { align-self: center; max-width: 560px; color: var(--muted); font-size: 12px; }
+    .score-help > summary { color: var(--accent); cursor: pointer; font-weight: 500; }
+    .score-help > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+    .score-help-copy { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); line-height: 1.5; }
+    .score-help-copy p { margin: 0 0 6px; }
+    .score-help-copy p:last-child { margin-bottom: 0; }
     .recordings-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
     .recordings-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
@@ -589,18 +604,49 @@
         <p class="empty-hero-sub">Set up a recording of any public HLS or HTTPS stream and choose how often it saves a clip. Clips are kept in storage we manage for you, or delivered to your own NAS. You can browse, download, or delete your clips anytime. Pricing is $0.05 for each hour a recording saves at least one clip. You are never charged for an hour nothing was recorded.</p>
       </div>
 
-      <!-- Status filter (client-side over the loaded list; hidden in empty state).
-           Pagination is deferred, so this narrows the already-loaded recordings. -->
-      <div id="statusFilter" class="seg hidden" style="margin-bottom:14px;">
-        <button type="button" class="on" data-statusfilter="all">All</button>
-        <button type="button" data-statusfilter="active">Active</button>
-        <button type="button" data-statusfilter="scheduled">Scheduled</button>
-        <button type="button" data-statusfilter="paused">Paused</button>
-        <button type="button" data-statusfilter="completed">Completed</button>
-      </div>
-      <div id="recordingSortWrap" class="field hidden" style="max-width:260px;margin-bottom:14px;">
-        <label for="recordingSort">Sort recordings</label>
-        <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Best 14-day rating</option></select>
+      <!-- Client-side filters over the loaded list. Completed score tiers and
+           under-14-day potential states stay separate. -->
+      <div id="recordingListFilters" class="recording-list-filters hidden">
+        <div id="statusFilter" class="seg">
+          <button type="button" class="on" data-statusfilter="all">All</button>
+          <button type="button" data-statusfilter="active">Active</button>
+          <button type="button" data-statusfilter="scheduled">Scheduled</button>
+          <button type="button" data-statusfilter="paused">Paused</button>
+          <button type="button" data-statusfilter="completed">Completed</button>
+        </div>
+        <div class="field recording-list-filter-field">
+          <label for="qualityFilter">14-day score</label>
+          <select id="qualityFilter">
+            <option value="all">All scores</option>
+            <optgroup label="Completed tiers">
+              <option value="great_plus">Great+ completed</option>
+              <option value="good_plus">Good+ completed</option>
+              <option value="fine_plus">Fine+ completed</option>
+              <option value="questionable">Questionable completed</option>
+              <option value="bad">Bad completed</option>
+            </optgroup>
+            <optgroup label="Under 14 days">
+              <option value="great_potential">Great+ potential</option>
+              <option value="good_potential">Good+ potential</option>
+              <option value="fine_potential">Fine+ potential</option>
+              <option value="questionable_potential">Questionable potential</option>
+              <option value="bad_potential">Bad potential</option>
+              <option value="insufficient">Insufficient or no runway</option>
+            </optgroup>
+          </select>
+        </div>
+        <div id="recordingSortWrap" class="field recording-list-filter-field">
+          <label for="recordingSort">Sort recordings</label>
+          <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Best 14-day rating</option></select>
+        </div>
+        <details class="score-help">
+          <summary>How 14-day scores work</summary>
+          <div class="score-help-copy">
+            <p>Completed tiers require 14 consecutive scored recording days. A skipped or unmeasured day breaks the run.</p>
+            <p>Great+ allows only A, B, and C days. Good+ allows no F days and at most two E days; D days are allowed. Fine+ allows any mix with no F days. The + filters include every better tier.</p>
+            <p>Questionable means one F day. Bad means more than one F day. Potential uses the same grade pattern before day 14 and is not a completed tier.</p>
+          </div>
+        </details>
       </div>
 
       <!-- Recording cards -->
@@ -1005,7 +1051,9 @@
       heroCopy: document.getElementById('heroCopy'),
       clipPage: document.getElementById('clipPage'),
       cards: document.getElementById('cards'),
+      recordingListFilters: document.getElementById('recordingListFilters'),
       statusFilter: document.getElementById('statusFilter'),
+      qualityFilter: document.getElementById('qualityFilter'),
       recordingSortWrap: document.getElementById('recordingSortWrap'),
       recordingSort: document.getElementById('recordingSort'),
       newRecRow: document.getElementById('newRecRow'),
@@ -1137,6 +1185,23 @@
     const authParams = new URLSearchParams(window.location.search);
     const authCompleted = String(authParams.get('auth') || '').trim().toLowerCase() === 'complete';
     const billingReturn = String(authParams.get('billing') || '').trim().toLowerCase();
+    const QUALITY_FILTER_KEYS = new Set([
+      'all', 'great_plus', 'good_plus', 'fine_plus', 'questionable', 'bad',
+      'great_potential', 'good_potential', 'fine_potential',
+      'questionable_potential', 'bad_potential', 'insufficient',
+    ]);
+
+    function qualityFilterFromQuery() {
+      const value = String(authParams.get('quality') || 'all').trim().toLowerCase();
+      return QUALITY_FILTER_KEYS.has(value) ? value : 'all';
+    }
+
+    function syncQualityFilterQuery() {
+      const url = new URL(window.location.href);
+      if (state.qualityFilter === 'all') url.searchParams.delete('quality');
+      else url.searchParams.set('quality', state.qualityFilter);
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    }
 
     const CATALOG_STASH_KEY = 'recCatalogStreamId';
     function stashCatalogStreamId(id) {
@@ -1163,6 +1228,7 @@
       // Client-side status filter over the loaded recordings list: 'all' (default),
       // 'active', 'scheduled', 'paused', or 'completed'.
       statusFilter: 'all',
+      qualityFilter: qualityFilterFromQuery(),
       recordingSort: 'newest',
       destinations: [],
       schedPreset: 'hourly',
@@ -2950,6 +3016,58 @@
       return f === 'all' || recordingFilterKey(rec) === f;
     }
 
+    const BEST14_COMPLETED_TIERS = {
+      great_plus: ['GREAT'],
+      good_plus: ['GREAT', 'VERY_GOOD', 'GOOD'],
+      fine_plus: ['GREAT', 'VERY_GOOD', 'GOOD', 'FINE'],
+    };
+    const BEST14_POTENTIAL_TIERS = {
+      great_potential: ['GREAT_POTENTIAL'],
+      good_potential: ['GREAT_POTENTIAL', 'VERY_GOOD_POTENTIAL', 'GOOD_POTENTIAL'],
+      fine_potential: ['GREAT_POTENTIAL', 'VERY_GOOD_POTENTIAL', 'GOOD_POTENTIAL', 'FINE_POTENTIAL'],
+    };
+
+    function recordingBest14(rec) {
+      const timeline = rec && rec.timeline_health;
+      const rating = timeline && timeline.best_14_rating;
+      return rating && typeof rating === 'object' ? rating : null;
+    }
+
+    // A completed tier is valid only after the API has scored all 14 days. Potential
+    // qualifiers remain insufficient and never pass a completed-tier filter.
+    function completedBest14Rating(rec) {
+      const rating = recordingBest14(rec);
+      if (!rating || String(rating.rating || '').toUpperCase() === 'INSUFFICIENT') return '';
+      if (Number(rating.completed_days || 0) < 14) return '';
+      if (String(rating.qualifier || '').trim() !== '') return '';
+      return String(rating.rating || '').toUpperCase();
+    }
+
+    function potentialBest14Qualifier(rec) {
+      const rating = recordingBest14(rec);
+      if (!rating) return '';
+      if (String(rating.rating || '').toUpperCase() !== 'INSUFFICIENT') return '';
+      if (Number(rating.completed_days || 0) >= 14) return '';
+      const qualifier = String(rating.qualifier || '').toUpperCase();
+      return qualifier.endsWith('_POTENTIAL') ? qualifier : '';
+    }
+
+    function matchesQualityFilter(rec) {
+      const filter = state.qualityFilter || 'all';
+      if (filter === 'all') return true;
+      const completed = completedBest14Rating(rec);
+      if (BEST14_COMPLETED_TIERS[filter]) return BEST14_COMPLETED_TIERS[filter].includes(completed);
+      if (filter === 'questionable' || filter === 'bad') return completed === filter.toUpperCase();
+      const potential = potentialBest14Qualifier(rec);
+      if (BEST14_POTENTIAL_TIERS[filter]) return BEST14_POTENTIAL_TIERS[filter].includes(potential);
+      if (filter === 'questionable_potential' || filter === 'bad_potential') return potential === filter.toUpperCase();
+      if (filter === 'insufficient') {
+        const rating = recordingBest14(rec);
+        return !rating || (String(rating.rating || '').toUpperCase() === 'INSUFFICIENT' && !potential);
+      }
+      return true;
+    }
+
     // ---- Relay capture state (honest copy shared by list card + detail) ----
     // The single source of truth for what a relay recording is actually doing. It
     // NEVER implies "no computer connected" when has_relay_online is true; instead it
@@ -3288,15 +3406,15 @@
       els.heroCopy.classList.toggle('hidden', !empty);
       els.newRecRow.classList.toggle('hidden', sharedReadOnly);
       els.cards.classList.toggle('hidden', empty);
-      els.statusFilter.classList.toggle('hidden', empty);
-      els.recordingSortWrap.classList.toggle('hidden', empty);
+      els.recordingListFilters.classList.toggle('hidden', empty);
       if (empty) {
         els.cards.innerHTML = '';
         return;
       }
       renderStatusFilter();
-      // Client-side status filter over the loaded list (pagination deferred).
-      const items = all.filter(matchesStatusFilter);
+      els.qualityFilter.value = state.qualityFilter;
+      // Client-side status and score filters over the loaded list (pagination deferred).
+      const items = all.filter((rec) => matchesStatusFilter(rec) && matchesQualityFilter(rec));
       if (state.recordingSort === 'best14') items.sort((a, b) => {
         const left = best14Sort(a), right = best14Sort(b);
         return left[0] - right[0] || left[1] - right[1] || Number(b.id) - Number(a.id);
@@ -4692,7 +4810,7 @@
     function focusComposerView() {
       els.heroCopy.classList.add('hidden');
       els.cards.classList.add('hidden');
-      els.statusFilter.classList.add('hidden');
+      els.recordingListFilters.classList.add('hidden');
       els.newRecRow.classList.add('hidden');
     }
 
@@ -5234,6 +5352,11 @@
       state.recordingSort = els.recordingSort.value;
       renderCards();
     });
+    els.qualityFilter.addEventListener('change', () => {
+      state.qualityFilter = els.qualityFilter.value;
+      syncQualityFilterQuery();
+      renderCards();
+    });
     els.selectStreamsBtn.addEventListener('click', () => window.location.assign('/streams'));
     els.bulkCancelBtn.addEventListener('click', async () => {
       const ids = [...state.selectedRecordings];
@@ -5483,7 +5606,7 @@
           els.cardBanner.classList.add('hidden');
           els.heroCopy.classList.add('hidden');
           els.cards.classList.add('hidden');
-          els.statusFilter.classList.add('hidden');
+          els.recordingListFilters.classList.add('hidden');
           els.newRecRow.classList.add('hidden');
           els.composer.classList.add('hidden');
           els.clipPage.classList.remove('hidden');
