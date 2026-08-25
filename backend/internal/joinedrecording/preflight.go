@@ -109,6 +109,9 @@ func freezeDownloadedAudioForPreflight(ctx context.Context, sources []SourceClip
 	for i := range sources {
 		source := sourceOnlyClips([]SourceClip{sources[i]})[0]
 		local := locals[i]
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("freeze source ordinal=%d clip_id=%d: %w", i+1, source.ClipID, err)
+		}
 		if source.ClipID != local.ClipID || verifyLocalIdentity(local) != nil {
 			return nil, nil, nil, nil, fmt.Errorf("downloaded source identity differs")
 		}
@@ -119,6 +122,9 @@ func freezeDownloadedAudioForPreflight(ctx context.Context, sources []SourceClip
 		local.SourceClaimSHA256 = claimSHA
 		_, _, audio, probeErr := probeMediaMetadata(ctx, local.Path)
 		if probeErr == nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return nil, nil, nil, nil, fmt.Errorf("freeze source ordinal=%d clip_id=%d: %w", i+1, source.ClipID, contextErr)
+			}
 			source.AudioContract, local.AudioContract = audio, audio
 			includedSources, includedLocals = append(includedSources, source), append(includedLocals, local)
 			continue
@@ -126,13 +132,19 @@ func freezeDownloadedAudioForPreflight(ctx context.Context, sources []SourceClip
 		firstErr := deterministicEvidenceFailure(ctx, "corrupt_source_media", probeErr)
 		var first *deterministicMediaError
 		if !errors.As(firstErr, &first) {
-			return nil, nil, nil, nil, firstErr
+			if contextErr := ctx.Err(); contextErr != nil {
+				firstErr = contextErr
+			}
+			return nil, nil, nil, nil, fmt.Errorf("freeze source ordinal=%d clip_id=%d: %w", i+1, source.ClipID, firstErr)
 		}
 		_, _, _, repeatProbeErr := probeMediaMetadata(ctx, local.Path)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, nil, nil, nil, fmt.Errorf("repeat freeze source ordinal=%d clip_id=%d: %w", i+1, source.ClipID, contextErr)
+		}
 		repeatErr := deterministicEvidenceFailure(ctx, "corrupt_source_media", repeatProbeErr)
 		var repeated *deterministicMediaError
 		if repeatProbeErr == nil || !errors.As(repeatErr, &repeated) || first.code != repeated.code || first.evidenceSHA256 != repeated.evidenceSHA256 {
-			return nil, nil, nil, nil, fmt.Errorf("source media probe failure was not repeatable")
+			return nil, nil, nil, nil, fmt.Errorf("source media probe failure was not repeatable ordinal=%d clip_id=%d", i+1, source.ClipID)
 		}
 		quarantinedSources = append(quarantinedSources, source)
 		quarantines = append(quarantines, QuarantinedBuild{Source: local, Evidence: maximalityEvidence([]LocalSource{local}, first, 2, mediaToolIdentity)})

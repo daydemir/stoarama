@@ -645,7 +645,7 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 		if err := joinedPublicationWithinScope(s.cfg, publication); err != nil {
 			return false, err
 		}
-		return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, func(taskCtx context.Context) error {
+		return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, "publish_claim", func(taskCtx context.Context) error {
 			return s.processClaim(taskCtx, publication, req.ScratchRoot)
 		})
 	}
@@ -656,7 +656,7 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 	if !joinedHourWithinScope(s.cfg, preflight.HourID) {
 		return false, errors.New("joined preflight claim is outside configured work scope")
 	}
-	return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, func(taskCtx context.Context) error {
+	return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, "preflight_and_publish", func(taskCtx context.Context) error {
 		return s.processPreflight(taskCtx, preflight, req.ScratchRoot)
 	})
 }
@@ -714,13 +714,21 @@ func joinedPublicationWithinScope(cfg config.Config, response joinedrecording.Pu
 	return errors.New("joined publication claim is outside configured canary scope")
 }
 
-func runJoinedWorkerTask(ctx context.Context, limit time.Duration, work func(context.Context) error) error {
-	if limit <= 0 || work == nil {
+func runJoinedWorkerTask(ctx context.Context, limit time.Duration, stage string, work func(context.Context) error) error {
+	if limit <= 0 || strings.TrimSpace(stage) == "" || work == nil {
 		return errors.New("joined worker task limit is required")
 	}
+	startedAt := time.Now()
 	taskCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	return work(taskCtx)
+	err := work(taskCtx)
+	if err != nil && errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("joined worker task deadline exceeded stage=%s elapsed=%s limit=%s: %w", stage, time.Since(startedAt).Round(time.Millisecond), limit, context.DeadlineExceeded)
+	}
+	// A nil result means the task completed its finalize call. Preserve that
+	// committed success if the cooperative deadline becomes visible at the
+	// same boundary; restarting it would create a false retry.
+	return err
 }
 
 func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, claim joinedrecording.PreflightHourClaim, scratchRoot string) error {
