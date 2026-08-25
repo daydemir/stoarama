@@ -426,15 +426,17 @@ func TestRecordingsListFiltersCompletedAndPotentialBest14ScoresSeparately(t *tes
 		`Array.isArray(rating.filter_keys)`,
 		`rating.tier_sort_rank`,
 		`Completed tiers require 14 consecutive scored recording days.`,
-		`Great+ allows only A, B, and C days.`,
-		`Good+ allows no F days and at most two E days; D days are allowed.`,
-		`Fine+ allows any mix with no F days.`,
-		`Potential uses the same grade pattern before day 14 and is not a completed tier.`,
+		`Great+ contains only A, B, and C days.`,
+		`Good+ has no F days and at most two E days; D days are allowed.`,
+		`Fine+ has no F days.`,
+		`A future roll-off potential already has a completed score`,
+		`const explicit = String(rating.potential_rating || '').toUpperCase();`,
+		`potentialKind === 'FUTURE_ROLL_OFF'`,
 		`const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };`,
 		`const tierRank = completed && Number.isFinite(apiTierRank) ? apiTierRank : (BEST14_COMPLETED_SORT_RANK[completed] ?? 5);`,
 		`return [tierRank, detailRank, -completedDays];`,
 		`left[0] - right[0] || left[1] - right[1] || left[2] - right[2] || Number(b.id) - Number(a.id)`,
-		`Sorting puts completed Great+ first, then Good+, Fine+, Questionable, and Bad. Potential and insufficient recordings follow.`,
+		`Sorting uses the current completed score: Great+ first, then Good+, Fine+, Questionable, and Bad. Potential does not replace the current score.`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings quality filter missing %q", marker)
@@ -455,6 +457,7 @@ func TestRecordingsQualityFilterContractUsesCompletedAndPotentialFixtures(t *tes
 		{name: "fine completed", rating: recordingBest14Rating{Rating: "FINE", Completed: 14}, keys: []string{"fine_plus"}, rank: 2},
 		{name: "questionable completed", rating: recordingBest14Rating{Rating: "QUESTIONABLE", Completed: 14}, keys: []string{"questionable"}, rank: 3},
 		{name: "bad completed", rating: recordingBest14Rating{Rating: "BAD", Completed: 14}, keys: []string{"bad"}, rank: 4},
+		{name: "questionable with great roll-off", rating: recordingBest14Rating{Rating: "QUESTIONABLE", Completed: 14, PotentialRating: "GREAT", PotentialKind: "FUTURE_ROLL_OFF", PotentialDays: 1}, keys: []string{"questionable", "great_potential", "good_potential", "fine_potential"}, rank: 3},
 		{name: "great potential", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "GREAT_POTENTIAL", Completed: 8}, keys: []string{"great_potential", "good_potential", "fine_potential"}, rank: 5},
 		{name: "good potential", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "GOOD_POTENTIAL", Completed: 8}, keys: []string{"good_potential", "fine_potential"}, rank: 5},
 		{name: "fine potential", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "FINE_POTENTIAL", Completed: 8}, keys: []string{"fine_potential"}, rank: 5},
@@ -480,6 +483,67 @@ func TestRecordingsQualityFilterContractUsesCompletedAndPotentialFixtures(t *tes
 	potential := classifyBest14(dailyGrades("AABCDE"), "active", 8)
 	if !reflect.DeepEqual(potential.FilterKeys, []string{"good_potential", "fine_potential"}) || potential.TierSortRank != 5 {
 		t.Fatalf("classified potential contract=%+v", potential)
+	}
+}
+
+func TestRecordingsPageShowsProgressiveLoadingAndRecoverableErrors(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`id="pageLoading" class="page-loading" role="status" aria-live="polite"`,
+		`id="recordingsLoading" class="recordings-loading hidden" role="status" aria-live="polite"`,
+		`id="recordingsLoadError" class="recordings-load-error hidden" role="alert"`,
+		`id="recordingsRetryBtn"`,
+		`id="cards" class="cards" aria-busy="false"`,
+		`function beginRecordingsLoad()`,
+		`els.cards.setAttribute('aria-busy', 'true');`,
+		`function failRecordingsLoad(error)`,
+		`els.recordingsRetryBtn.addEventListener('click', () => refreshRecordings());`,
+		`const supportingLoads = [loadBilling(), refreshDestinations(), loadConnections(), loadRelays()];`,
+		`await Promise.allSettled([refreshRecordings(), ...supportingLoads]);`,
+		`if (!sharedReadOnly) await loadRelays();`,
+	} {
+		if marker == `if (!sharedReadOnly) await loadRelays();` {
+			if strings.Contains(page, marker) {
+				t.Fatalf("recordings list still blocks on relay load")
+			}
+			continue
+		}
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings progressive loading missing %q", marker)
+		}
+	}
+}
+
+func TestRecordingsPageExplainsDailyGradesPotentialsAndFilterCounts(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`<summary>Daily grades and 14-day scores</summary>`,
+		`It is not the percentage of clip files that uploaded or dropped.`,
+		`At least 99% coverage`,
+		`At least 95% coverage`,
+		`At least 90% coverage`,
+		`At least 80% usable coverage`,
+		`less than 80% of the scheduled time`,
+		`No usable completed media`,
+		`missing calendar day breaks the run`,
+		`An under-14 potential has enough scheduled runway`,
+		`clean A, B, or C days can move an older low grade`,
+		`id="scoreFilterResult"`,
+		`function renderScoreFilterResult(count)`,
+		`parts.push(String(selected.textContent || '').trim());`,
+		`renderScoreFilterResult(items.length);`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings score guide/count missing %q", marker)
+		}
 	}
 }
 
