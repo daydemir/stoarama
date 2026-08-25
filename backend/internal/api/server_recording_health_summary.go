@@ -31,10 +31,12 @@ type recordingTimelineHealth struct {
 }
 
 type recordingBest14Rating struct {
-	Rating    string `json:"rating"`
-	Qualifier string `json:"qualifier,omitempty"`
-	Completed int    `json:"completed_days"`
-	SortRank  int    `json:"sort_rank"`
+	Rating       string   `json:"rating"`
+	Qualifier    string   `json:"qualifier,omitempty"`
+	Completed    int      `json:"completed_days"`
+	SortRank     int      `json:"sort_rank"`
+	FilterKeys   []string `json:"filter_keys"`
+	TierSortRank int      `json:"tier_sort_rank"`
 }
 
 type recordingDailyGrade struct {
@@ -135,12 +137,70 @@ func ratingRank(rating string) int {
 	return map[string]int{"GREAT": 0, "VERY_GOOD": 1, "GOOD": 2, "FINE": 3, "QUESTIONABLE": 4, "BAD": 5, "UNKNOWN": 6}[rating]
 }
 
+func best14FilterKeys(rating recordingBest14Rating) []string {
+	if rating.Rating != "INSUFFICIENT" && rating.Completed >= 14 && rating.Qualifier == "" {
+		switch rating.Rating {
+		case "GREAT":
+			return []string{"great_plus", "good_plus", "fine_plus"}
+		case "VERY_GOOD", "GOOD":
+			return []string{"good_plus", "fine_plus"}
+		case "FINE":
+			return []string{"fine_plus"}
+		case "QUESTIONABLE":
+			return []string{"questionable"}
+		case "BAD":
+			return []string{"bad"}
+		}
+	}
+	if rating.Rating == "INSUFFICIENT" && rating.Completed < 14 {
+		switch rating.Qualifier {
+		case "GREAT_POTENTIAL":
+			return []string{"great_potential", "good_potential", "fine_potential"}
+		case "VERY_GOOD_POTENTIAL", "GOOD_POTENTIAL":
+			return []string{"good_potential", "fine_potential"}
+		case "FINE_POTENTIAL":
+			return []string{"fine_potential"}
+		case "QUESTIONABLE_POTENTIAL":
+			return []string{"questionable_potential"}
+		case "BAD_POTENTIAL":
+			return []string{"bad_potential"}
+		}
+	}
+	return []string{"insufficient"}
+}
+
+func best14TierSortRank(rating recordingBest14Rating) int {
+	if rating.Rating == "INSUFFICIENT" || rating.Completed < 14 || rating.Qualifier != "" {
+		return 5
+	}
+	switch rating.Rating {
+	case "GREAT":
+		return 0
+	case "VERY_GOOD", "GOOD":
+		return 1
+	case "FINE":
+		return 2
+	case "QUESTIONABLE":
+		return 3
+	case "BAD":
+		return 4
+	default:
+		return 5
+	}
+}
+
+func finalizeBest14Rating(rating recordingBest14Rating) recordingBest14Rating {
+	rating.FilterKeys = best14FilterKeys(rating)
+	rating.TierSortRank = best14TierSortRank(rating)
+	return rating
+}
+
 func classifyBest14(days []recordingDailyGrade, status string, remainingWindows int) recordingBest14Rating {
 	best := best14Grades(days)
 	completed := len(best)
 	rating := gradeRunRating(best)
 	if completed >= 14 {
-		return recordingBest14Rating{Rating: rating, Completed: completed, SortRank: ratingRank(rating)}
+		return finalizeBest14Rating(recordingBest14Rating{Rating: rating, Completed: completed, SortRank: ratingRank(rating)})
 	}
 	out := recordingBest14Rating{Rating: "INSUFFICIENT", Completed: completed, SortRank: 60}
 	if status != "active" {
@@ -153,7 +213,7 @@ func classifyBest14(days []recordingDailyGrade, status string, remainingWindows 
 		out.Qualifier = rating + "_POTENTIAL"
 		out.SortRank = 10 + ratingRank(rating)
 	}
-	return out
+	return finalizeBest14Rating(out)
 }
 
 func classifyRecordingTimelineHealth(h *recordingTimelineHealth) {

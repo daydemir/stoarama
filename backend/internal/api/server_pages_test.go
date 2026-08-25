@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -381,7 +382,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`dailyGradesHTML(timeline.daily_grades, timezone)`,
 		`A–C good · D degraded · E poor · F no usable media · ? not yet measurable`,
 		`daily-grade ${grade.toLowerCase()}`,
-		`<option value="best14">Best 14-day rating</option>`,
+		`<option value="best14">Completed 14-day score</option>`,
 		`best14RatingHTML(best14)`,
 		`Insufficient`,
 		`state.recordingSort === 'best14'`,
@@ -392,6 +393,93 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings list health-column layout missing %q", marker)
 		}
+	}
+}
+
+func TestRecordingsListFiltersCompletedAndPotentialBest14ScoresSeparately(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`id="qualityFilter"`,
+		`<option value="great_plus">Great+ completed</option>`,
+		`<option value="good_plus">Good+ completed</option>`,
+		`<option value="fine_plus">Fine+ completed</option>`,
+		`<option value="great_potential">Great+ potential</option>`,
+		`<option value="good_potential">Good+ potential</option>`,
+		`<option value="fine_potential">Fine+ potential</option>`,
+		`const BEST14_COMPLETED_TIERS = {`,
+		`great_plus: ['GREAT'],`,
+		`good_plus: ['GREAT', 'VERY_GOOD', 'GOOD'],`,
+		`fine_plus: ['GREAT', 'VERY_GOOD', 'GOOD', 'FINE'],`,
+		`if (Number(rating.completed_days || 0) < 14) return '';`,
+		`if (String(rating.qualifier || '').trim() !== '') return '';`,
+		`if (String(rating.rating || '').toUpperCase() !== 'INSUFFICIENT') return '';`,
+		`if (Number(rating.completed_days || 0) >= 14) return '';`,
+		`qualifier.endsWith('_POTENTIAL')`,
+		`all.filter((rec) => matchesStatusFilter(rec) && matchesQualityFilter(rec))`,
+		`state.qualityFilter = els.qualityFilter.value;`,
+		`syncQualityFilterQuery();`,
+		`if (state.qualityFilter === 'all') syncQualityFilterQuery();`,
+		`Array.isArray(rating.filter_keys)`,
+		`rating.tier_sort_rank`,
+		`Completed tiers require 14 consecutive scored recording days.`,
+		`Great+ allows only A, B, and C days.`,
+		`Good+ allows no F days and at most two E days; D days are allowed.`,
+		`Fine+ allows any mix with no F days.`,
+		`Potential uses the same grade pattern before day 14 and is not a completed tier.`,
+		`const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };`,
+		`const tierRank = completed && Number.isFinite(apiTierRank) ? apiTierRank : (BEST14_COMPLETED_SORT_RANK[completed] ?? 5);`,
+		`return [tierRank, detailRank, -completedDays];`,
+		`left[0] - right[0] || left[1] - right[1] || left[2] - right[2] || Number(b.id) - Number(a.id)`,
+		`Sorting puts completed Great+ first, then Good+, Fine+, Questionable, and Bad. Potential and insufficient recordings follow.`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings quality filter missing %q", marker)
+		}
+	}
+}
+
+func TestRecordingsQualityFilterContractUsesCompletedAndPotentialFixtures(t *testing.T) {
+	tests := []struct {
+		name   string
+		rating recordingBest14Rating
+		keys   []string
+		rank   int
+	}{
+		{name: "great completed", rating: recordingBest14Rating{Rating: "GREAT", Completed: 14}, keys: []string{"great_plus", "good_plus", "fine_plus"}, rank: 0},
+		{name: "very good completed", rating: recordingBest14Rating{Rating: "VERY_GOOD", Completed: 14}, keys: []string{"good_plus", "fine_plus"}, rank: 1},
+		{name: "good completed", rating: recordingBest14Rating{Rating: "GOOD", Completed: 14}, keys: []string{"good_plus", "fine_plus"}, rank: 1},
+		{name: "fine completed", rating: recordingBest14Rating{Rating: "FINE", Completed: 14}, keys: []string{"fine_plus"}, rank: 2},
+		{name: "questionable completed", rating: recordingBest14Rating{Rating: "QUESTIONABLE", Completed: 14}, keys: []string{"questionable"}, rank: 3},
+		{name: "bad completed", rating: recordingBest14Rating{Rating: "BAD", Completed: 14}, keys: []string{"bad"}, rank: 4},
+		{name: "great potential", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "GREAT_POTENTIAL", Completed: 8}, keys: []string{"great_potential", "good_potential", "fine_potential"}, rank: 5},
+		{name: "good potential", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "GOOD_POTENTIAL", Completed: 8}, keys: []string{"good_potential", "fine_potential"}, rank: 5},
+		{name: "fine potential", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "FINE_POTENTIAL", Completed: 8}, keys: []string{"fine_potential"}, rank: 5},
+		{name: "short runway", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "SHORT_RUNWAY", Completed: 8}, keys: []string{"insufficient"}, rank: 5},
+		{name: "malformed completed tier under 14 days", rating: recordingBest14Rating{Rating: "FINE", Completed: 13}, keys: []string{"insufficient"}, rank: 5},
+		{name: "malformed potential at 14 days", rating: recordingBest14Rating{Rating: "INSUFFICIENT", Qualifier: "FINE_POTENTIAL", Completed: 14}, keys: []string{"insufficient"}, rank: 5},
+		{name: "malformed completed qualifier", rating: recordingBest14Rating{Rating: "GREAT", Qualifier: "GREAT_POTENTIAL", Completed: 14}, keys: []string{"insufficient"}, rank: 5},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := best14FilterKeys(tc.rating); !reflect.DeepEqual(got, tc.keys) {
+				t.Fatalf("filter keys=%v want=%v", got, tc.keys)
+			}
+			if got := best14TierSortRank(tc.rating); got != tc.rank {
+				t.Fatalf("tier sort rank=%d want=%d", got, tc.rank)
+			}
+		})
+	}
+	completed := classifyBest14(dailyGrades("AAABBBCCCAAABB"), "completed", 0)
+	if !reflect.DeepEqual(completed.FilterKeys, []string{"great_plus", "good_plus", "fine_plus"}) || completed.TierSortRank != 0 {
+		t.Fatalf("classified completed contract=%+v", completed)
+	}
+	potential := classifyBest14(dailyGrades("AABCDE"), "active", 8)
+	if !reflect.DeepEqual(potential.FilterKeys, []string{"good_potential", "fine_potential"}) || potential.TierSortRank != 5 {
+		t.Fatalf("classified potential contract=%+v", potential)
 	}
 }
 
