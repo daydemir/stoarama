@@ -1,6 +1,7 @@
 package api
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -92,7 +93,7 @@ func TestClassifyBest14(t *testing.T) {
 		{"live bad potential", "ABCFF", "active", "INSUFFICIENT", "BAD_POTENTIAL", 9, 5},
 		{"short runway", "ABCC", "active", "INSUFFICIENT", "SHORT_RUNWAY", 9, 4},
 		{"paused is ended", "ABCC", "paused", "INSUFFICIENT", "ENDED", 20, 4},
-		{"unknown excluded", "ABC?D", "active", "INSUFFICIENT", "VERY_GOOD_POTENTIAL", 10, 4},
+		{"unknown breaks streak", "ABC?D", "active", "INSUFFICIENT", "VERY_GOOD_POTENTIAL", 13, 1},
 		{"no completed days", "?", "active", "INSUFFICIENT", "UNKNOWN_POTENTIAL", 14, 0},
 	}
 	for _, tc := range tests {
@@ -109,6 +110,74 @@ func TestBest14ChoosesFewestFThenEThenDThenC(t *testing.T) {
 	got := best14Grades(dailyGrades("FEEEEEEEEEEEEEABBBBBBBBBBBBB"))
 	if score := gradeRunScore(got); score != [5]int{0, 0, 0, 0, -1} {
 		t.Fatalf("best score=%v grades=%v", score, got)
+	}
+}
+
+func TestBest14CannotBridgeUnknownOrMissingCalendarDay(t *testing.T) {
+	unknown := dailyGrades("AAAAAAA?AAAAAAA")
+	if got := best14Grades(unknown); len(got) != 7 {
+		t.Fatalf("unknown bridged into %d-day run, want 7", len(got))
+	}
+
+	missing := dailyGrades("AAAAAAAAAAAAAA")
+	missing[7].WindowStartAt = missing[7].WindowStartAt.AddDate(0, 0, 1)
+	for i := 8; i < len(missing); i++ {
+		missing[i].WindowStartAt = missing[i].WindowStartAt.AddDate(0, 0, 1)
+	}
+	if got := best14Grades(missing); len(got) != 7 {
+		t.Fatalf("calendar gap bridged into %d-day run, want 7", len(got))
+	}
+}
+
+func TestRollOffPotentialCannotBridgeUnknownDay(t *testing.T) {
+	grades := dailyGrades("AAAAFCCCCCC?CCCCCC")
+	got := classifyBest14(grades, "active", 1)
+	if got.Completed >= 14 || got.PotentialKind == "FUTURE_ROLL_OFF" {
+		t.Fatalf("unknown day produced false completed roll-off path: %+v", got)
+	}
+}
+
+func TestScheduledPotentialCannotBridgeFutureCalendarGap(t *testing.T) {
+	grades := dailyGrades("CCCCCCCCCCCCC")
+	last := grades[len(grades)-1].WindowStartAt
+	got := classifyBest14Scheduled(grades, "active", []time.Time{last.AddDate(0, 0, 2)})
+	if got.Qualifier != "SHORT_RUNWAY" || got.PotentialRating != "" {
+		t.Fatalf("future calendar gap produced false potential: %+v", got)
+	}
+}
+
+func TestCompletedQuestionableExposesCleanDayRollOffToGreat(t *testing.T) {
+	// Recording 417's shape: every existing 14-day window still contains the F;
+	// one more clean day creates a clean trailing 14.
+	got := classifyBest14(dailyGrades("AAABFBBBAAAAAAAABB"), "active", 1)
+	if got.Rating != "QUESTIONABLE" || got.Completed != 14 {
+		t.Fatalf("current rating=%+v, want completed Questionable", got)
+	}
+	if got.PotentialRating != "GREAT" || got.PotentialKind != "FUTURE_ROLL_OFF" || got.PotentialDays != 1 {
+		t.Fatalf("roll-off potential=%+v, want Great in one clean day", got)
+	}
+	want := []string{"questionable", "great_potential", "good_potential", "fine_potential"}
+	if !reflect.DeepEqual(got.FilterKeys, want) {
+		t.Fatalf("filter keys=%v want=%v", got.FilterKeys, want)
+	}
+}
+
+func TestCompletedPotentialRequiresActiveScheduledRunway(t *testing.T) {
+	grades := dailyGrades("AAABFBBBAAAAAAAABB")
+	for _, tc := range []struct {
+		name, status string
+		runway       int
+	}{
+		{name: "completed", status: "completed", runway: 5},
+		{name: "paused", status: "paused", runway: 5},
+		{name: "no runway", status: "active", runway: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyBest14(grades, tc.status, tc.runway)
+			if got.PotentialRating != "" || got.PotentialKind != "" || got.PotentialDays != 0 {
+				t.Fatalf("unexpected potential %+v", got)
+			}
+		})
 	}
 }
 

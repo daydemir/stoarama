@@ -31,12 +31,15 @@ type recordingTimelineHealth struct {
 }
 
 type recordingBest14Rating struct {
-	Rating       string   `json:"rating"`
-	Qualifier    string   `json:"qualifier,omitempty"`
-	Completed    int      `json:"completed_days"`
-	SortRank     int      `json:"sort_rank"`
-	FilterKeys   []string `json:"filter_keys"`
-	TierSortRank int      `json:"tier_sort_rank"`
+	Rating          string   `json:"rating"`
+	Qualifier       string   `json:"qualifier,omitempty"`
+	Completed       int      `json:"completed_days"`
+	SortRank        int      `json:"sort_rank"`
+	FilterKeys      []string `json:"filter_keys"`
+	TierSortRank    int      `json:"tier_sort_rank"`
+	PotentialRating string   `json:"potential_rating,omitempty"`
+	PotentialKind   string   `json:"potential_kind,omitempty"`
+	PotentialDays   int      `json:"potential_days,omitempty"`
 }
 
 type recordingDailyGrade struct {
@@ -104,22 +107,65 @@ func gradeRunScore(grades []recordingDailyGrade) [5]int {
 	return [5]int{counts["F"], counts["E"], counts["D"], counts["C"], -counts["A"]}
 }
 
-func best14Grades(days []recordingDailyGrade) []recordingDailyGrade {
-	known := make([]recordingDailyGrade, 0, len(days))
+func consecutiveRecordingDays(previous, next recordingDailyGrade) bool {
+	if previous.WindowStartAt.IsZero() || next.WindowStartAt.IsZero() {
+		return false
+	}
+	delta := next.WindowStartAt.Sub(previous.WindowStartAt)
+	// Daily windows can be 23 or 25 hours apart across daylight-saving changes.
+	return delta >= 20*time.Hour && delta <= 28*time.Hour
+}
+
+func scoredDayRuns(days []recordingDailyGrade) [][]recordingDailyGrade {
+	runs := make([][]recordingDailyGrade, 0, 1)
+	current := make([]recordingDailyGrade, 0, len(days))
+	flush := func() {
+		if len(current) > 0 {
+			runs = append(runs, current)
+			current = nil
+		}
+	}
 	for _, day := range days {
-		if day.Grade != "UNKNOWN" {
-			known = append(known, day)
+		if day.Grade == "UNKNOWN" {
+			flush()
+			continue
+		}
+		if len(current) > 0 && !consecutiveRecordingDays(current[len(current)-1], day) {
+			flush()
+		}
+		current = append(current, day)
+	}
+	flush()
+	return runs
+}
+
+func trailingScoredDayRun(days []recordingDailyGrade) []recordingDailyGrade {
+	runs := scoredDayRuns(days)
+	if len(runs) == 0 || len(days) == 0 || days[len(days)-1].Grade == "UNKNOWN" {
+		return nil
+	}
+	last := runs[len(runs)-1]
+	if last[len(last)-1].WindowStartAt.Equal(days[len(days)-1].WindowStartAt) {
+		return last
+	}
+	return nil
+}
+
+func best14Grades(days []recordingDailyGrade) []recordingDailyGrade {
+	var best, longest []recordingDailyGrade
+	for _, run := range scoredDayRuns(days) {
+		if len(run) >= len(longest) {
+			longest = run
+		}
+		for i := 0; i+14 <= len(run); i++ {
+			candidate := run[i : i+14]
+			if len(best) == 0 || scoreLess(gradeRunScore(candidate), gradeRunScore(best)) {
+				best = candidate
+			}
 		}
 	}
-	if len(known) < 14 {
-		return known
-	}
-	best := known[:14]
-	for i := 1; i+14 <= len(known); i++ {
-		candidate := known[i : i+14]
-		if scoreLess(gradeRunScore(candidate), gradeRunScore(best)) {
-			best = candidate
-		}
+	if len(best) == 0 {
+		return longest
 	}
 	return best
 }
@@ -138,35 +184,65 @@ func ratingRank(rating string) int {
 }
 
 func best14FilterKeys(rating recordingBest14Rating) []string {
+	keys := make([]string, 0, 6)
+	add := func(values ...string) {
+		for _, value := range values {
+			found := false
+			for _, existing := range keys {
+				if existing == value {
+					found = true
+					break
+				}
+			}
+			if !found {
+				keys = append(keys, value)
+			}
+		}
+	}
 	if rating.Rating != "INSUFFICIENT" && rating.Completed >= 14 && rating.Qualifier == "" {
 		switch rating.Rating {
 		case "GREAT":
-			return []string{"great_plus", "good_plus", "fine_plus"}
+			add("great_plus", "good_plus", "fine_plus")
 		case "VERY_GOOD", "GOOD":
-			return []string{"good_plus", "fine_plus"}
+			add("good_plus", "fine_plus")
 		case "FINE":
-			return []string{"fine_plus"}
+			add("fine_plus")
 		case "QUESTIONABLE":
-			return []string{"questionable"}
+			add("questionable")
 		case "BAD":
-			return []string{"bad"}
+			add("bad")
 		}
 	}
 	if rating.Rating == "INSUFFICIENT" && rating.Completed < 14 {
 		switch rating.Qualifier {
 		case "GREAT_POTENTIAL":
-			return []string{"great_potential", "good_potential", "fine_potential"}
+			add("great_potential", "good_potential", "fine_potential")
 		case "VERY_GOOD_POTENTIAL", "GOOD_POTENTIAL":
-			return []string{"good_potential", "fine_potential"}
+			add("good_potential", "fine_potential")
 		case "FINE_POTENTIAL":
-			return []string{"fine_potential"}
+			add("fine_potential")
 		case "QUESTIONABLE_POTENTIAL":
-			return []string{"questionable_potential"}
+			add("questionable_potential")
 		case "BAD_POTENTIAL":
-			return []string{"bad_potential"}
+			add("bad_potential")
 		}
 	}
-	return []string{"insufficient"}
+	switch rating.PotentialRating {
+	case "GREAT":
+		add("great_potential", "good_potential", "fine_potential")
+	case "VERY_GOOD", "GOOD":
+		add("good_potential", "fine_potential")
+	case "FINE":
+		add("fine_potential")
+	case "QUESTIONABLE":
+		add("questionable_potential")
+	case "BAD":
+		add("bad_potential")
+	}
+	if len(keys) == 0 {
+		return []string{"insufficient"}
+	}
+	return keys
 }
 
 func best14TierSortRank(rating recordingBest14Rating) int {
@@ -195,23 +271,110 @@ func finalizeBest14Rating(rating recordingBest14Rating) recordingBest14Rating {
 	return rating
 }
 
+// best14RollOffPotential returns the highest tier a completed recording can
+// reach on its actual scheduled future windows when those windows earn clean
+// A/B/C days. C is the weakest clean day, so a returned path does not depend on
+// assuming perfect A days. Calendar gaps still break the run.
+func best14RollOffPotential(days []recordingDailyGrade, futureWindows []time.Time) (string, int) {
+	currentWindow := best14Grades(days)
+	if len(currentWindow) < 14 || len(futureWindows) == 0 {
+		return "", 0
+	}
+	current := gradeRunRating(currentWindow)
+	best, daysToBest := current, 0
+	candidate := append([]recordingDailyGrade(nil), days...)
+	if len(futureWindows) > 14 {
+		futureWindows = futureWindows[:14]
+	}
+	for added, start := range futureWindows {
+		candidate = append(candidate, recordingDailyGrade{WindowStartAt: start, Grade: "C"})
+		next := gradeRunRating(best14Grades(candidate))
+		if ratingRank(next) < ratingRank(best) {
+			best, daysToBest = next, added+1
+		}
+		if best == "GREAT" {
+			break
+		}
+	}
+	if ratingRank(best) >= ratingRank(current) {
+		return "", 0
+	}
+	return best, daysToBest
+}
+
+func best14FuturePotential(days []recordingDailyGrade, futureWindows []time.Time) (string, int) {
+	best, daysToBest := "", 0
+	candidate := append([]recordingDailyGrade(nil), days...)
+	if len(futureWindows) > 14 {
+		futureWindows = futureWindows[:14]
+	}
+	for added, start := range futureWindows {
+		candidate = append(candidate, recordingDailyGrade{WindowStartAt: start, Grade: "C"})
+		window := best14Grades(candidate)
+		if len(window) < 14 {
+			continue
+		}
+		next := gradeRunRating(window)
+		if best == "" || ratingRank(next) < ratingRank(best) {
+			best, daysToBest = next, added+1
+		}
+	}
+	return best, daysToBest
+}
+
+func contiguousFutureWindows(days []recordingDailyGrade, count int) []time.Time {
+	if count <= 0 {
+		return nil
+	}
+	start := time.Unix(0, 0).UTC()
+	if len(days) > 0 && !days[len(days)-1].WindowStartAt.IsZero() {
+		start = days[len(days)-1].WindowStartAt
+	}
+	out := make([]time.Time, count)
+	for i := range out {
+		out[i] = start.AddDate(0, 0, i+1)
+	}
+	return out
+}
+
 func classifyBest14(days []recordingDailyGrade, status string, remainingWindows int) recordingBest14Rating {
+	return classifyBest14Scheduled(days, status, contiguousFutureWindows(days, remainingWindows))
+}
+
+func classifyBest14Scheduled(days []recordingDailyGrade, status string, futureWindows []time.Time) recordingBest14Rating {
 	best := best14Grades(days)
+	if len(best) < 14 && status == "active" {
+		best = trailingScoredDayRun(days)
+	}
 	completed := len(best)
 	rating := gradeRunRating(best)
 	if completed >= 14 {
-		return finalizeBest14Rating(recordingBest14Rating{Rating: rating, Completed: completed, SortRank: ratingRank(rating)})
+		out := recordingBest14Rating{Rating: rating, Completed: completed, SortRank: ratingRank(rating)}
+		if status == "active" {
+			out.PotentialRating, out.PotentialDays = best14RollOffPotential(days, futureWindows)
+			if out.PotentialRating != "" {
+				out.PotentialKind = "FUTURE_ROLL_OFF"
+			}
+		}
+		return finalizeBest14Rating(out)
 	}
 	out := recordingBest14Rating{Rating: "INSUFFICIENT", Completed: completed, SortRank: 60}
 	if status != "active" {
 		out.Qualifier = "ENDED"
 		out.SortRank = 80
-	} else if completed+remainingWindows < 14 {
-		out.Qualifier = "SHORT_RUNWAY"
-		out.SortRank = 70
+	} else if completed == 0 {
+		out.Qualifier = "UNKNOWN_POTENTIAL"
+		out.SortRank = 10 + ratingRank("UNKNOWN")
 	} else {
-		out.Qualifier = rating + "_POTENTIAL"
-		out.SortRank = 10 + ratingRank(rating)
+		out.PotentialRating, out.PotentialDays = best14FuturePotential(days, futureWindows)
+		if out.PotentialRating == "" {
+			out.Qualifier = "SHORT_RUNWAY"
+			out.SortRank = 70
+		} else {
+			out.Qualifier = out.PotentialRating + "_POTENTIAL"
+			out.SortRank = 10 + ratingRank(out.PotentialRating)
+			out.PotentialKind = "UNDER_14_RUNWAY"
+		}
 	}
 	return finalizeBest14Rating(out)
 }
@@ -287,20 +450,28 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	remaining := map[int64]int{}
+	futureWindows := map[int64][]time.Time{}
 	status := map[int64]string{}
 	metaRows, err := s.pool.Query(ctx, `
-		SELECT r.id,r.status,
-		CASE WHEN r.status <> 'active' THEN 0 WHEN r.end_at IS NULL THEN 14 ELSE (
-			SELECT count(*) FROM generate_series(
+		SELECT r.id,r.status,f.window_start_at
+		FROM recordings r
+		LEFT JOIN LATERAL (
+			SELECT ((d::date + r.daily_window_start) AT TIME ZONE r.cron_timezone) AS window_start_at
+			FROM generate_series(
 				(now() AT TIME ZONE r.cron_timezone)::date - 1,
-				(r.end_at AT TIME ZONE r.cron_timezone)::date,
-				interval '1 day') d
-			WHERE (r.active_weekdays & (1 << (extract(isodow FROM d)::int-1))) <> 0
-			  AND ((d::date + r.daily_window_end) AT TIME ZONE r.cron_timezone) > now()
-			  AND ((d::date + r.daily_window_end) AT TIME ZONE r.cron_timezone) <= r.end_at
-		) END
-		FROM recordings r WHERE r.account_id=$1 AND r.id=ANY($2::bigint[])
+				LEAST(
+					COALESCE((r.end_at AT TIME ZONE r.cron_timezone)::date, (now() AT TIME ZONE r.cron_timezone)::date + 90),
+					(now() AT TIME ZONE r.cron_timezone)::date + 90
+				), interval '1 day') d
+			WHERE r.status = 'active'
+			  AND (r.active_weekdays & (1 << (extract(isodow FROM d)::int-1))) <> 0
+			  AND ((d::date + r.daily_window_end + CASE WHEN r.daily_window_end <= r.daily_window_start THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE r.cron_timezone) > now()
+			  AND (r.end_at IS NULL OR ((d::date + r.daily_window_end + CASE WHEN r.daily_window_end <= r.daily_window_start THEN interval '1 day' ELSE interval '0' END) AT TIME ZONE r.cron_timezone) <= r.end_at)
+			ORDER BY d
+			LIMIT 14
+		) f ON true
+		WHERE r.account_id=$1 AND r.id=ANY($2::bigint[])
+		ORDER BY r.id,f.window_start_at
 	`, accountID, recordingIDs)
 	if err != nil {
 		return nil, err
@@ -309,11 +480,14 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 	for metaRows.Next() {
 		var id int64
 		var state string
-		var runway int
-		if err := metaRows.Scan(&id, &state, &runway); err != nil {
+		var futureStart *time.Time
+		if err := metaRows.Scan(&id, &state, &futureStart); err != nil {
 			return nil, err
 		}
-		status[id], remaining[id] = state, runway
+		status[id] = state
+		if futureStart != nil {
+			futureWindows[id] = append(futureWindows[id], *futureStart)
+		}
 		if _, ok := out[id]; !ok {
 			out[id] = recordingTimelineHealth{}
 		}
@@ -360,7 +534,7 @@ func (s *Server) recordingTimelineHealthForAccount(ctx context.Context, accountI
 		return nil, err
 	}
 	for id, h := range out {
-		h.Best14Rating = classifyBest14(h.DailyGrades, status[id], remaining[id])
+		h.Best14Rating = classifyBest14Scheduled(h.DailyGrades, status[id], futureWindows[id])
 		out[id] = h
 	}
 	return out, nil

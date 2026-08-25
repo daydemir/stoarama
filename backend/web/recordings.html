@@ -226,6 +226,7 @@
     .best14-rating.good, .best14-rating.fine { color: var(--warn); }
     .best14-rating.questionable, .best14-rating.bad { color: var(--err); }
     .best14-rating.insufficient { color: var(--muted); }
+    .best14-potential { margin: 1px 0 4px; color: var(--accent); font: 500 10px/1.35 var(--mono); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
     .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
     .health-strip-cell[data-health-tooltip] { cursor: help; }
@@ -417,12 +418,43 @@
     }
     .recording-list-filters .seg { flex: 1 1 100%; }
     .recording-list-filter-field { width: min(260px, 100%); margin: 0; }
-    .score-help { align-self: center; max-width: 560px; color: var(--muted); font-size: 12px; }
-    .score-help > summary { color: var(--accent); cursor: pointer; font-weight: 500; }
+    .score-help { flex: 1 1 100%; color: var(--muted); font-size: 12px; }
+    .score-help > summary { width: fit-content; color: var(--accent); cursor: pointer; font-weight: 600; }
     .score-help > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
-    .score-help-copy { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); line-height: 1.5; }
-    .score-help-copy p { margin: 0 0 6px; }
+    .score-help-copy { max-width: 760px; margin-top: 10px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel2); line-height: 1.5; }
+    .score-help-copy h3 { margin: 16px 0 7px; color: var(--text); font-size: 13px; }
+    .score-help-copy h3:first-child { margin-top: 0; }
+    .score-help-copy p { margin: 0 0 8px; }
     .score-help-copy p:last-child { margin-bottom: 0; }
+    .score-grade-key { display: grid; grid-template-columns: max-content 1fr; gap: 7px 10px; margin: 0; }
+    .score-grade-key dt, .score-grade-key dd { margin: 0; }
+    .score-grade-key dt { display: flex; align-items: flex-start; gap: 7px; color: var(--text); font-weight: 600; }
+    .score-grade-key dd { color: var(--muted); }
+    .score-grade-swatch { flex: 0 0 auto; display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 5px; color: #fff; font: 600 10px/1 var(--mono); }
+    .score-grade-swatch.a { background: #15803d; }
+    .score-grade-swatch.b { background: #16a34a; }
+    .score-grade-swatch.c { background: #4ade80; color: #052e16; }
+    .score-grade-swatch.d { background: #eab308; color: #422006; }
+    .score-grade-swatch.e { background: #f97316; }
+    .score-grade-swatch.f { background: #b91c1c; }
+    .score-grade-swatch.unknown { background: var(--muted); color: var(--bg); }
+    .score-filter-result { min-height: 20px; margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+    .page-loading { display: flex; align-items: center; gap: 10px; min-height: 68px; color: var(--muted); }
+    .loading-spinner { flex: 0 0 auto; width: 18px; height: 18px; border: 2px solid color-mix(in srgb, var(--accent) 24%, var(--border)); border-top-color: var(--accent); border-radius: 50%; animation: loading-spin 700ms linear infinite; }
+    .recordings-loading { margin: 2px 0 16px; }
+    .recordings-loading-head, .recordings-load-notice { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; }
+    .recordings-loading-head { margin-bottom: 12px; }
+    .recordings-load-notice { min-height: 32px; margin-bottom: 8px; }
+    .recordings-skeleton { overflow: hidden; border: 1px solid var(--border); border-radius: 12px; }
+    .recordings-skeleton-row { display: grid; grid-template-columns: 38px 1.5fr 1.1fr 1.35fr 0.9fr 0.7fr 0.7fr 90px; gap: 10px; min-height: 58px; padding: 11px 10px; border-bottom: 1px solid var(--border); }
+    .recordings-skeleton-row:last-child { border-bottom: 0; }
+    .skeleton-line { align-self: center; height: 10px; border-radius: 999px; background: color-mix(in srgb, var(--muted) 18%, transparent); animation: loading-pulse 1.4s ease-in-out infinite; }
+    .skeleton-line.short { width: 52%; }
+    .recordings-load-error { margin: 0 0 16px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border)); border-radius: 12px; color: var(--text); }
+    .recordings-load-error p { margin: 0 0 10px; color: var(--muted); }
+    .recordings-load-error button { width: auto; min-width: 0; min-height: 34px; padding: 6px 12px; }
+    @keyframes loading-spin { to { transform: rotate(360deg); } }
+    @keyframes loading-pulse { 50% { opacity: 0.45; } }
     .recordings-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
     .recordings-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
@@ -478,6 +510,8 @@
       }
     }
     @media (max-width: 1039px) {
+      .recordings-skeleton-row { grid-template-columns: 24px 1.4fr 1fr; }
+      .recordings-skeleton-row .skeleton-line:nth-child(n+4) { display: none; }
       .recordings-table-wrap { overflow: visible; border: 0; border-radius: 0; }
       .recordings-table thead { display: block; margin-bottom: 8px; }
       .recordings-table thead tr { display: block; }
@@ -512,6 +546,8 @@
       .recordings-table tbody { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
+      .score-grade-key { grid-template-columns: 1fr; gap: 3px; }
+      .score-grade-key dd { margin: 0 0 7px 27px; }
       .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
       .grid-2 { grid-template-columns: 1fr; }
       .batch-stream-table { min-width: 620px; }
@@ -542,6 +578,9 @@
       .clip-table-clips .clip-row-actions { justify-content: flex-start; flex-wrap: wrap; margin-top: 6px; }
       .clip-table-clips .clip-xfer-cell { padding-left: 12px !important; padding-right: 12px !important; }
     }
+    @media (prefers-reduced-motion: reduce) {
+      .loading-spinner, .skeleton-line { animation: none; }
+    }
   </style>
 <!--SHELL_HEAD-->
 </head>
@@ -550,6 +589,10 @@
     <!--SHELL_TOPBAR-->
 
     <div class="rec-content">
+    <div id="pageLoading" class="page-loading" role="status" aria-live="polite">
+      <span class="loading-spinner" aria-hidden="true"></span>
+      <span>Opening recordings…</span>
+    </div>
     <!-- Signed-out: single sign-in-link panel -->
     <div id="signedOut" class="panel hidden">
       <div class="eyebrow">Sign in</div>
@@ -625,7 +668,7 @@
               <option value="questionable">Questionable completed</option>
               <option value="bad">Bad completed</option>
             </optgroup>
-            <optgroup label="Under 14 days">
+            <optgroup label="Potential paths">
               <option value="great_potential">Great+ potential</option>
               <option value="good_potential">Good+ potential</option>
               <option value="fine_potential">Fine+ potential</option>
@@ -639,19 +682,48 @@
           <label for="recordingSort">Sort recordings</label>
           <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Completed 14-day score</option></select>
         </div>
-        <details class="score-help">
-          <summary>How 14-day scores work</summary>
+        <details id="scoreHelp" class="score-help">
+          <summary>Daily grades and 14-day scores</summary>
           <div class="score-help-copy">
-            <p>Completed tiers require 14 consecutive scored recording days. A skipped or unmeasured day breaks the run.</p>
-            <p>Great+ allows only A, B, and C days. Good+ allows no F days and at most two E days; D days are allowed. Fine+ allows any mix with no F days. The + filters include every better tier.</p>
-            <p>Questionable means one F day. Bad means more than one F day. Potential uses the same grade pattern before day 14 and is not a completed tier.</p>
-            <p>Sorting puts completed Great+ first, then Good+, Fine+, Questionable, and Bad. Potential and insufficient recordings follow.</p>
+            <h3>One grade for each recording day</h3>
+            <p>Coverage is the share of scheduled recording time backed by usable media. It is not the percentage of clip files that uploaded or dropped.</p>
+            <dl class="score-grade-key">
+              <dt><span class="score-grade-swatch a">A</span>A</dt><dd>At least 99% coverage, no overlap, and no gap longer than 2 minutes.</dd>
+              <dt><span class="score-grade-swatch b">B</span>B</dt><dd>At least 95% coverage, no overlap, a largest gap of 15 minutes or less, at most one gap over 5 minutes, and at most six gaps over 30 seconds.</dd>
+              <dt><span class="score-grade-swatch c">C</span>C</dt><dd>At least 90% coverage, no overlap, a largest gap of 30 minutes or less, and at most two gaps over 5 minutes.</dd>
+              <dt><span class="score-grade-swatch d">D</span>D</dt><dd>At least 80% usable coverage, but the day missed an A, B, or C limit because of gaps, overlap, or another timeline failure.</dd>
+              <dt><span class="score-grade-swatch e">E</span>E</dt><dd>Some usable media, but less than 80% of the scheduled time was covered.</dd>
+              <dt><span class="score-grade-swatch f">F</span>F</dt><dd>No usable completed media: zero coverage or no completed clips.</dd>
+              <dt><span class="score-grade-swatch unknown">?</span>Not measured</dt><dd>The day is still pending, or its timeline metrics are missing, stale, or inconsistent.</dd>
+            </dl>
+            <h3>The best rolling 14-day score</h3>
+            <p>Completed tiers require 14 consecutive scored recording days. A skipped, unmeasured, or missing calendar day breaks the run. Great+ contains only A, B, and C days. Good+ has no F days and at most two E days; D days are allowed. Fine+ has no F days. The + filters include every better completed tier.</p>
+            <p>Questionable has one F day. Bad has more than one F day. When several 14-day windows exist, Stoarama chooses the one with the fewest F days, then the fewest E, D, and C days.</p>
+            <h3>What "potential" means</h3>
+            <p>An under-14 potential has enough scheduled runway to reach 14 scored days if its remaining days preserve the shown tier. A future roll-off potential already has a completed score, but clean A, B, or C days can move an older low grade out of the rolling 14-day window and reach a higher tier. The row states how many clean days that path needs.</p>
+            <p>Insufficient means the recording has fewer than 14 scored days and has ended, lacks enough scheduled runway, or has no reliable grade pattern yet. Potential is a path, not a completed result.</p>
+            <p>Sorting uses the current completed score: Great+ first, then Good+, Fine+, Questionable, and Bad. Potential does not replace the current score.</p>
           </div>
         </details>
       </div>
 
+      <div id="scoreFilterResult" class="score-filter-result hidden" role="status" aria-live="polite"></div>
+      <div id="recordingsLoading" class="recordings-loading hidden" role="status" aria-live="polite">
+        <div class="recordings-loading-head"><span class="loading-spinner" aria-hidden="true"></span><span>Loading recordings and daily scores…</span></div>
+        <div class="recordings-skeleton" aria-hidden="true">
+          <div class="recordings-skeleton-row"><span class="skeleton-line short"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span></div>
+          <div class="recordings-skeleton-row"><span class="skeleton-line short"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span></div>
+          <div class="recordings-skeleton-row"><span class="skeleton-line short"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span></div>
+        </div>
+      </div>
+      <div id="recordingsLoadNotice" class="recordings-load-notice hidden" role="status" aria-live="polite"></div>
+      <div id="recordingsLoadError" class="recordings-load-error hidden" role="alert">
+        <p id="recordingsLoadErrorText">Recordings could not be loaded.</p>
+        <button id="recordingsRetryBtn" class="secondary" type="button">Try loading again</button>
+      </div>
+
       <!-- Recording cards -->
-      <div id="cards" class="cards"></div>
+      <div id="cards" class="cards" aria-busy="false"></div>
 
       <!-- Creation-route composer -->
       <section id="composer" class="panel hidden">
@@ -678,7 +750,7 @@
           <div id="catalogStreamLoc" class="preview muted"></div>
           <div class="preview mono" style="margin-top:6px;">Stream ID: <span id="catalogStreamIdVal"></span></div>
           <div class="hint">Clip paths follow the File naming section below and are visible once the recording is created.</div>
-          <img id="catalogFramePreview" class="video-preview hidden" alt="recent frame" />
+          <img id="catalogFramePreview" class="video-preview hidden" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="recent frame" />
         </div>
         <input type="hidden" id="recStreamID" value="" />
 
@@ -1042,6 +1114,7 @@
     function recordingAPIPath(suffix = '') { return recordingsBasePath + suffix; }
 
     const els = {
+      pageLoading: document.getElementById('pageLoading'),
       signedOut: document.getElementById('signedOut'),
       signedIn: document.getElementById('signedIn'),
       requestStatus: document.getElementById('requestStatus'),
@@ -1057,6 +1130,12 @@
       qualityFilter: document.getElementById('qualityFilter'),
       recordingSortWrap: document.getElementById('recordingSortWrap'),
       recordingSort: document.getElementById('recordingSort'),
+      scoreFilterResult: document.getElementById('scoreFilterResult'),
+      recordingsLoading: document.getElementById('recordingsLoading'),
+      recordingsLoadNotice: document.getElementById('recordingsLoadNotice'),
+      recordingsLoadError: document.getElementById('recordingsLoadError'),
+      recordingsLoadErrorText: document.getElementById('recordingsLoadErrorText'),
+      recordingsRetryBtn: document.getElementById('recordingsRetryBtn'),
       newRecRow: document.getElementById('newRecRow'),
       newRecBtn: document.getElementById('newRecBtn'),
       recordingsCsvBtn: document.getElementById('recordingsCsvBtn'),
@@ -1233,6 +1312,8 @@
       statusFilter: 'all',
       qualityFilter: qualityFilterFromQuery(),
       recordingSort: 'newest',
+      recordingsLoaded: false,
+      recordingsLoading: false,
       destinations: [],
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
@@ -1314,6 +1395,41 @@
     }
 
     function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
+
+    let recordingsLoadToken = 0;
+    function beginRecordingsLoad() {
+      state.recordingsLoading = true;
+      els.cards.setAttribute('aria-busy', 'true');
+      els.recordingsLoadError.classList.add('hidden');
+      if (state.recordingsLoaded) {
+        els.recordingsLoading.classList.add('hidden');
+        els.recordingsLoadNotice.innerHTML = '<span class="loading-spinner" aria-hidden="true"></span><span>Refreshing recordings…</span>';
+        els.recordingsLoadNotice.classList.remove('hidden');
+      } else {
+        els.recordingsLoadNotice.classList.add('hidden');
+        els.recordingsLoading.classList.remove('hidden');
+        els.cards.classList.add('hidden');
+        els.recordingListFilters.classList.add('hidden');
+        els.scoreFilterResult.classList.add('hidden');
+      }
+    }
+
+    function finishRecordingsLoad() {
+      state.recordingsLoading = false;
+      els.cards.setAttribute('aria-busy', 'false');
+      els.recordingsLoading.classList.add('hidden');
+      els.recordingsLoadNotice.classList.add('hidden');
+      els.recordingsLoadError.classList.add('hidden');
+    }
+
+    function failRecordingsLoad(error) {
+      finishRecordingsLoad();
+      const message = String(error && (error.message || error) || 'Unknown error');
+      els.recordingsLoadErrorText.textContent = state.recordingsLoaded
+        ? `The latest recording data could not be loaded. The existing list is still shown. ${message}`
+        : `Recordings could not be loaded. ${message}`;
+      els.recordingsLoadError.classList.remove('hidden');
+    }
 
     function browserTimezone() {
       try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) { return 'UTC'; }
@@ -2750,6 +2866,7 @@
       } catch (_) {
         state.relays = [];
       }
+      if (state.recordingsLoaded && !state.recordingsLoading) renderCards();
     }
 
     function scheduleStreamProbe() {
@@ -3048,10 +3165,12 @@
       return String(rating.rating || '').toUpperCase();
     }
 
-    /** Return an under-14-day potential qualifier, excluding malformed completed data. */
+    /** Return the reachable potential tier for an under-14 runway or future roll-off. */
     function potentialBest14Qualifier(rec) {
       const rating = recordingBest14(rec);
       if (!rating) return '';
+      const explicit = String(rating.potential_rating || '').toUpperCase();
+      if (explicit) return `${explicit}_POTENTIAL`;
       if (String(rating.rating || '').toUpperCase() !== 'INSUFFICIENT') return '';
       if (Number(rating.completed_days || 0) >= 14) return '';
       const qualifier = String(rating.qualifier || '').toUpperCase();
@@ -3341,10 +3460,19 @@
       const labels = { GREAT: 'Great', VERY_GOOD: 'Very good', GOOD: 'Good', FINE: 'Fine', QUESTIONABLE: 'Questionable', BAD: 'Bad', UNKNOWN: 'Unknown' };
       let text = labels[rating] || 'Insufficient';
       if (rating === 'INSUFFICIENT') {
-        if (qualifier.endsWith('_POTENTIAL')) text += ` — ${labels[qualifier.slice(0, -10)] || 'Unknown'} potential (${completed}/14)`;
-        else text += qualifier === 'SHORT_RUNWAY' ? ` — short runway (${completed}/14)` : ` — ended (${completed}/14)`;
+        if (qualifier.endsWith('_POTENTIAL')) text += ` · ${labels[qualifier.slice(0, -10)] || 'Unknown'} potential (${completed}/14)`;
+        else text += qualifier === 'SHORT_RUNWAY' ? ` · short runway (${completed}/14)` : ` · ended (${completed}/14)`;
       }
-      return `<div class="best14-rating ${rating.toLowerCase()}" aria-label="Best 14-day rating: ${escapeHTML(text)}">${escapeHTML(text)}</div>`;
+      const potential = String(value.potential_rating || '').toUpperCase();
+      const potentialKind = String(value.potential_kind || '').toUpperCase();
+      const potentialDays = Number(value.potential_days || 0);
+      let potentialHTML = '';
+      if (rating !== 'INSUFFICIENT' && potential && potentialKind === 'FUTURE_ROLL_OFF') {
+        const dayLabel = potentialDays === 1 ? 'day' : 'days';
+        const potentialText = `${labels[potential] || potential} potential in ${potentialDays} clean ${dayLabel}`;
+        potentialHTML = `<div class="best14-potential" aria-label="${escapeHTML(potentialText)}">${escapeHTML(potentialText)}</div>`;
+      }
+      return `<div class="best14-rating ${rating.toLowerCase()}" aria-label="Best 14-day rating: ${escapeHTML(text)}">${escapeHTML(text)}</div>${potentialHTML}`;
     }
 
     const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };
@@ -3414,6 +3542,20 @@
       els.relayBanner.classList.remove('hidden');
     }
 
+    function renderScoreFilterResult(count) {
+      const amount = Number(count || 0);
+      const parts = [`${amount} recording${amount === 1 ? '' : 's'}`];
+      const statusLabels = { active: 'Active', scheduled: 'Scheduled', paused: 'Paused', completed: 'Completed' };
+      const status = String(state.statusFilter || 'all');
+      if (statusLabels[status]) parts.push(statusLabels[status]);
+      if (state.qualityFilter !== 'all') {
+        const selected = els.qualityFilter.options[els.qualityFilter.selectedIndex];
+        if (selected) parts.push(String(selected.textContent || '').trim());
+      }
+      els.scoreFilterResult.textContent = parts.join(' · ');
+      els.scoreFilterResult.classList.remove('hidden');
+    }
+
     function renderCards() {
       hideHealthTooltip();
       if (sharedReadOnly) els.relayBanner.classList.add('hidden'); else renderFleetSummary();
@@ -3425,6 +3567,7 @@
       els.recordingListFilters.classList.toggle('hidden', empty);
       if (empty) {
         els.cards.innerHTML = '';
+        els.scoreFilterResult.classList.add('hidden');
         return;
       }
       renderStatusFilter();
@@ -3435,6 +3578,7 @@
         const left = best14Sort(a), right = best14Sort(b);
         return left[0] - right[0] || left[1] - right[1] || left[2] - right[2] || Number(b.id) - Number(a.id);
       });
+      renderScoreFilterResult(items.length);
       if (items.length === 0) {
         els.cards.innerHTML = `<div class="clip-summary">No recordings match this filter.</div>`;
         return;
@@ -4776,8 +4920,11 @@
     }
 
     async function refreshRecordings() {
+      const requestToken = ++recordingsLoadToken;
+      beginRecordingsLoad();
       try {
         const payload = await fetchJSON(recordingAPIPath());
+        if (requestToken !== recordingsLoadToken) return false;
         state.recordings = Array.isArray(payload.items) ? payload.items : (Array.isArray(payload.recordings) ? payload.recordings : []);
         const present = new Set(state.recordings.map((rec) => Number(rec.id)));
         state.selectedRecordings = new Set([...state.selectedRecordings].filter((id) => present.has(id)));
@@ -4787,15 +4934,17 @@
         state.fleetRelayTotal = Number(payload.fleet_relay_total || 0);
         state.fleetRelayLiveLeases = Number(payload.fleet_relay_live_leases || 0);
         state.fleetRelayAvailableSlots = Number(payload.fleet_relay_available_slots || 0);
-        // Refresh the relay snapshot alongside recordings so the banner + cards read a
-        // consistent fleet view. Best-effort; a cloud-only account gets an empty list.
-        if (!sharedReadOnly) await loadRelays();
+        // The list can render from this response. Relay-node detail loads in parallel
+        // and rerenders only the small fleet-dependent parts when it arrives.
         if (!sharedReadOnly) renderLedger();
+        state.recordingsLoaded = true;
+        finishRecordingsLoad();
         renderCards();
+        return true;
       } catch (err) {
-        // Keep the surface usable; surface the error near the ledger area.
-        els.ledger.classList.remove('hidden');
-        els.ledger.innerHTML = `<span style="color:var(--err)">${escapeHTML(String(err.message || err))}</span>`;
+        if (requestToken !== recordingsLoadToken) return false;
+        failRecordingsLoad(err);
+        return false;
       }
     }
 
@@ -5354,6 +5503,7 @@
     els.recSharedDest.addEventListener('change', () => { applyStorageChoiceUI(); renderCostEstimate(); refreshStartEnabled(); });
     els.connectAnotherBtn.addEventListener('click', () => openConnectForm('Connect another bucket'));
     els.newRecBtn.addEventListener('click', () => window.location.assign('/recordings/new'));
+    els.recordingsRetryBtn.addEventListener('click', () => refreshRecordings());
     // Status filter: delegate clicks off the chips (static markup), set the active
     // filter, and re-render the loaded list. Client-side only; no refetch.
     els.statusFilter.addEventListener('click', (ev) => {
@@ -5606,13 +5756,9 @@
         } else {
           state.account = await fetchAccountWithRetry();
         }
+        els.pageLoading.classList.add('hidden');
         els.signedOut.classList.add('hidden');
         els.signedIn.classList.remove('hidden');
-        if (!sharedReadOnly) {
-          await loadBilling();
-          await refreshDestinations();
-          await loadConnections();
-        }
         const recId = clipPageRecId();
         if (recId) {
           // Dedicated clip-management page: hide the list/composer chrome and render
@@ -5626,7 +5772,8 @@
           els.newRecRow.classList.add('hidden');
           els.composer.classList.add('hidden');
           els.clipPage.classList.remove('hidden');
-          await loadClipPage(0);
+          const supportingLoads = sharedReadOnly ? [] : [loadBilling(), refreshDestinations(), loadConnections(), loadRelays()];
+          await Promise.all([loadClipPage(0), Promise.allSettled(supportingLoads)]);
           return;
         }
         if (sharedReadOnly) {
@@ -5634,14 +5781,23 @@
           els.cardBanner.classList.add('hidden');
           els.composer.classList.add('hidden');
           await refreshRecordings();
-        } else {
-          await handleBillingReturn();
-        }
-        if (!sharedReadOnly && newRecordingRoute()) {
-          await renderNewRecordingRoute();
           return;
         }
+
+        // These account sections do not gate one another. Start them together so a
+        // slow billing response cannot hold the recordings list or composer blank.
+        const supportingLoads = [loadBilling(), refreshDestinations(), loadConnections(), loadRelays()];
+        if (newRecordingRoute()) {
+          await Promise.all([renderNewRecordingRoute(), Promise.allSettled(supportingLoads)]);
+          return;
+        }
+        if (billingReturn) {
+          await Promise.all([handleBillingReturn(), Promise.allSettled(supportingLoads)]);
+          return;
+        }
+        await Promise.allSettled([refreshRecordings(), ...supportingLoads]);
       } catch (err) {
+        els.pageLoading.classList.add('hidden');
         els.signedIn.classList.add('hidden');
         if (sharedReadOnly) {
           els.signedOut.classList.add('hidden');
