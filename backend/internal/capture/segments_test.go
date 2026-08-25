@@ -1228,7 +1228,7 @@ func TestAppendGooglevideoHLSRecoveryInputArgs(t *testing.T) {
 				t.Fatalf("recovery option presence=%t want=%t: %v", got, tt.want, args)
 			}
 			if got {
-				requireArgPair(t, args, "-m3u8_hold_counters", "3")
+				requireArgPair(t, args, "-m3u8_hold_counters", "4")
 			}
 		})
 	}
@@ -1241,7 +1241,7 @@ func TestGooglevideoHLSRecoveryOptionIsInputScoped(t *testing.T) {
 	if recovery < 0 || input < 0 || recovery > input {
 		t.Fatalf("Googlevideo HLS recovery option must be input-scoped before -i: %v", args)
 	}
-	requireArgPair(t, args, "-m3u8_hold_counters", "3")
+	requireArgPair(t, args, "-m3u8_hold_counters", "4")
 	if slices.Contains(buildFFmpegContinuousArgs("https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, "", nil), "-m3u8_hold_counters") {
 		t.Fatal("non-Google HLS input received Googlevideo recovery option")
 	}

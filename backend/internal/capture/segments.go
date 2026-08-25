@@ -875,10 +875,10 @@ func appendGooglevideoHLSRecoveryInputArgs(args []string, sourceURL, pinHost str
 	}
 	// Googlevideo rotates signed media URLs. When a child fragment expires,
 	// FFmpeg's HLS demuxer skips it and can otherwise poll the unchanged playlist
-	// until our 30-second watchdog fires. Three counts tolerate one unchanged
-	// reload after reaching the live edge while returning an expired manifest to
-	// the worker's fresh resolver within about 1.5 target durations.
-	return append(args, "-m3u8_hold_counters", "3")
+	// until our 30-second watchdog fires. Four counts tolerate normal publication
+	// just beyond one target duration while returning an expired manifest to the
+	// worker's fresh resolver within about two target durations.
+	return append(args, "-m3u8_hold_counters", "4")
 }
 
 func isGooglevideoURL(sourceURL string) bool {

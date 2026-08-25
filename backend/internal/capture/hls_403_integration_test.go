@@ -58,11 +58,65 @@ func TestContinuousHLSExpiredFragmentFailsFast(t *testing.T) {
 	if captureCtx.Err() == context.DeadlineExceeded {
 		t.Fatalf("FFmpeg held an unchanged HLS playlist past 4s after an expired fragment; requests=%d stderr=%s", forbiddenRequests.Load(), strings.TrimSpace(string(output)))
 	}
-	if elapsed > 3*time.Second {
+	if elapsed > 3500*time.Millisecond {
 		t.Fatalf("expired HLS fragment took %s to fail; requests=%d", elapsed, forbiddenRequests.Load())
 	}
 	if forbiddenRequests.Load() != 1 {
 		t.Fatalf("expired HLS fragment requests=%d want=1", forbiddenRequests.Load())
+	}
+}
+
+func TestContinuousGooglevideoHLSSurvivesSustainedHealthyPublication(t *testing.T) {
+	ffmpeg, err := exec.LookPath(ffmpegBin())
+	if err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	temp := t.TempDir()
+	segment := generateHLSFixtureSegment(t, ffmpeg, temp)
+
+	started := time.Now()
+	var highestSegmentRequested atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n")
+			published := 1 + int(time.Since(started)/(1100*time.Millisecond))
+			for i := 0; i < published; i++ {
+				fmt.Fprintf(w, "#EXTINF:1,\n/segment-%d.ts\n", i)
+			}
+			return
+		}
+		var index int64
+		if _, err := fmt.Sscanf(r.URL.Path, "/segment-%d.ts", &index); err == nil {
+			for {
+				prior := highestSegmentRequested.Load()
+				if index <= prior || highestSegmentRequested.CompareAndSwap(prior, index) {
+					break
+				}
+			}
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write(segment)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer captureCancel()
+	args := []string{"-nostdin", "-loglevel", "error"}
+	args = appendGooglevideoHLSRecoveryInputArgs(args, "https://manifest.googlevideo.com/live.m3u8", "")
+	args = append(args,
+		"-i", server.URL+"/live.m3u8",
+		"-map", "0:v:0", "-c", "copy", "-f", "null", "-",
+	)
+	cmd := exec.CommandContext(captureCtx, ffmpeg, args...)
+	output, runErr := cmd.CombinedOutput()
+	if captureCtx.Err() != context.DeadlineExceeded {
+		t.Fatalf("FFmpeg exited during a healthy advancing playlist; elapsed=%s highest_segment=%d err=%v stderr=%s", time.Since(started), highestSegmentRequested.Load(), runErr, strings.TrimSpace(string(output)))
+	}
+	if highestSegmentRequested.Load() < 2 {
+		t.Fatalf("healthy advancing playlist reached only segment %d", highestSegmentRequested.Load())
 	}
 }
 
