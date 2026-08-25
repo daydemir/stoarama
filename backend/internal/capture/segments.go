@@ -792,6 +792,7 @@ func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string,
 	}
 	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, true, 10, pinHost, inputHeaders)
 	args = appendHLSLiveEdgeInputArgs(args, sourceURL)
+	args = appendGooglevideoHLSRecoveryInputArgs(args, sourceURL, pinHost)
 	args = append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", sourceURL,
@@ -865,9 +866,32 @@ func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
 	if !isHLSInputURL(sourceURL) {
 		return args
 	}
-	return append(args,
-		"-live_start_index", "-1",
-	)
+	return append(args, "-live_start_index", "-1")
+}
+
+func appendGooglevideoHLSRecoveryInputArgs(args []string, sourceURL, pinHost string) []string {
+	if !isHLSInputURL(sourceURL) || (!isGooglevideoURL(sourceURL) && !isGooglevideoHost(pinHost)) {
+		return args
+	}
+	// Googlevideo rotates signed media URLs. When a child fragment expires,
+	// FFmpeg's HLS demuxer skips it and can otherwise poll the unchanged playlist
+	// until our 30-second watchdog fires. Three counts tolerate one unchanged
+	// reload after reaching the live edge while returning an expired manifest to
+	// the worker's fresh resolver within about 1.5 target durations.
+	return append(args, "-m3u8_hold_counters", "3")
+}
+
+func isGooglevideoURL(sourceURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(sourceURL))
+	if err != nil {
+		return false
+	}
+	return isGooglevideoHost(u.Hostname())
+}
+
+func isGooglevideoHost(rawHost string) bool {
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rawHost), "."))
+	return host == "googlevideo.com" || strings.HasSuffix(host, ".googlevideo.com")
 }
 
 func isHLSManifestURL(sourceURL string) bool {
