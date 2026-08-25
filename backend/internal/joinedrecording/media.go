@@ -650,9 +650,16 @@ func copyAndVerifySingleton(ctx context.Context, source LocalSource, scratchDir 
 
 func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath string) (Verification, error) {
 	expectedAccumulator := newMediaAccumulator()
-	for _, source := range sources {
+	for sourceIndex, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return Verification{}, fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, err)
+		}
 		if err := probeMediaInto(ctx, source.Path, expectedAccumulator, source.AudioContract, true); err != nil {
-			return Verification{}, deterministicEvidenceFailure(ctx, "corrupt_source_media", fmt.Errorf("probe source: %w", err))
+			if contextErr := ctx.Err(); contextErr != nil {
+				return Verification{}, fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, contextErr)
+			}
+			classified := deterministicEvidenceFailure(ctx, "corrupt_source_media", err)
+			return Verification{}, fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, classified)
 		}
 	}
 	expected := expectedAccumulator.fingerprint()

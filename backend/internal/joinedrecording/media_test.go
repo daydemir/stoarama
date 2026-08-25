@@ -113,6 +113,42 @@ func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	}
 }
 
+func TestVerifyJoinedMediaAttributesSourceProbeFailure(t *testing.T) {
+	dir := t.TempDir()
+	output := makeMediaClip(t, dir, "output.mp4", 440, false)
+	output.ClipID = 1
+	badPath := filepath.Join(dir, "bad.mp4")
+	if err := os.WriteFile(badPath, []byte("not media"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	size, sha, err := localIdentity(badPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := LocalSource{ClipID: 928, Path: badPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	_, err = VerifyJoinedMedia(context.Background(), []LocalSource{bad}, output.Path)
+	if err == nil || !strings.Contains(err.Error(), "probe source ordinal=1 clip_id=928") {
+		t.Fatalf("source probe failure was not attributed: %v", err)
+	}
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "corrupt_source_media" {
+		t.Fatalf("source attribution changed deterministic classification: %v", err)
+	}
+}
+
+func TestFreezeDownloadedAudioAttributesCancellation(t *testing.T) {
+	dir := t.TempDir()
+	local := makeMediaClip(t, dir, "source.mp4", 440, false)
+	local.ClipID = 928
+	source := testSource(928, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _, _, err := freezeDownloadedAudioForPreflight(ctx, []SourceClip{source}, []LocalSource{local}, strings.Repeat("f", 64))
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "freeze source ordinal=1 clip_id=928") {
+		t.Fatalf("freeze cancellation was not attributed: %v", err)
+	}
+}
+
 func TestBuildLargestPassingPrefixRejectsAACPrimingTotalChange(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, true)

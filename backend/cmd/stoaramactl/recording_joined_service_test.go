@@ -567,14 +567,27 @@ func TestJoinedWorkerRejectsMalformedReclaimedHourBeforeStorage(t *testing.T) {
 
 func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 	started := make(chan struct{})
-	err := runJoinedWorkerTask(context.Background(), time.Millisecond, func(ctx context.Context) error {
+	err := runJoinedWorkerTask(context.Background(), time.Millisecond, "preflight_and_publish", func(ctx context.Context) error {
 		close(started)
 		<-ctx.Done()
-		return ctx.Err()
+		return errors.New("media parser raced the deadline")
 	})
 	<-started
-	if !errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "joined worker task deadline exceeded stage=preflight_and_publish") {
 		t.Fatalf("task deadline err=%v", err)
+	}
+}
+
+func TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline(t *testing.T) {
+	finalized := false
+	err := runJoinedWorkerTask(context.Background(), time.Millisecond, "publish_claim", func(ctx context.Context) error {
+		// The worker contract permits nil only after its finalize call commits.
+		finalized = true
+		<-ctx.Done()
+		return nil
+	})
+	if err != nil || !finalized {
+		t.Fatalf("completed task was changed into a deadline failure: %v", err)
 	}
 }
 
