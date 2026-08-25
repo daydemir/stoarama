@@ -1192,11 +1192,13 @@
       'questionable_potential', 'bad_potential', 'insufficient',
     ]);
 
+    /** Return a supported quality filter from the URL, or the default filter. */
     function qualityFilterFromQuery() {
       const value = String(authParams.get('quality') || 'all').trim().toLowerCase();
       return QUALITY_FILTER_KEYS.has(value) ? value : 'all';
     }
 
+    /** Keep the shareable URL aligned with the active quality filter. */
     function syncQualityFilterQuery() {
       const url = new URL(window.location.href);
       if (state.qualityFilter === 'all') url.searchParams.delete('quality');
@@ -1287,6 +1289,7 @@
       batchSubmitting: false,
       selectedRecordings: new Set(),
     };
+    if (state.qualityFilter === 'all') syncQualityFilterQuery();
 
     async function fetchJSON(path, opts = {}) {
       const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -3028,6 +3031,7 @@
       fine_potential: ['GREAT_POTENTIAL', 'VERY_GOOD_POTENTIAL', 'GOOD_POTENTIAL', 'FINE_POTENTIAL'],
     };
 
+    /** Read the API's Best-14 rating object from a recording row. */
     function recordingBest14(rec) {
       const timeline = rec && rec.timeline_health;
       const rating = timeline && timeline.best_14_rating;
@@ -3044,6 +3048,7 @@
       return String(rating.rating || '').toUpperCase();
     }
 
+    /** Return an under-14-day potential qualifier, excluding malformed completed data. */
     function potentialBest14Qualifier(rec) {
       const rating = recordingBest14(rec);
       if (!rating) return '';
@@ -3053,9 +3058,13 @@
       return qualifier.endsWith('_POTENTIAL') ? qualifier : '';
     }
 
+    /** Match one recording against the selected completed or potential score filter. */
     function matchesQualityFilter(rec) {
       const filter = state.qualityFilter || 'all';
       if (filter === 'all') return true;
+      const rating = recordingBest14(rec);
+      const filterKeys = rating && Array.isArray(rating.filter_keys) ? rating.filter_keys : [];
+      if (filterKeys.length) return filterKeys.includes(filter);
       const completed = completedBest14Rating(rec);
       if (BEST14_COMPLETED_TIERS[filter]) return BEST14_COMPLETED_TIERS[filter].includes(completed);
       if (filter === 'questionable' || filter === 'bad') return completed === filter.toUpperCase();
@@ -3063,7 +3072,6 @@
       if (BEST14_POTENTIAL_TIERS[filter]) return BEST14_POTENTIAL_TIERS[filter].includes(potential);
       if (filter === 'questionable_potential' || filter === 'bad_potential') return potential === filter.toUpperCase();
       if (filter === 'insufficient') {
-        const rating = recordingBest14(rec);
         return !rating || (String(rating.rating || '').toUpperCase() === 'INSUFFICIENT' && !potential);
       }
       return true;
@@ -3341,10 +3349,12 @@
 
     const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };
 
+    /** Return deterministic completed-tier, detail, and day-count sort keys. */
     function best14Sort(rec) {
       const rating = recordingBest14(rec);
       const completed = completedBest14Rating(rec);
-      const tierRank = BEST14_COMPLETED_SORT_RANK[completed] ?? 5;
+      const apiTierRank = Number(rating && rating.tier_sort_rank);
+      const tierRank = completed && Number.isFinite(apiTierRank) ? apiTierRank : (BEST14_COMPLETED_SORT_RANK[completed] ?? 5);
       const detailRank = rating && Number.isFinite(Number(rating.sort_rank)) ? Number(rating.sort_rank) : 99;
       const completedDays = Number(rating && rating.completed_days || 0);
       return [tierRank, detailRank, -completedDays];
