@@ -637,7 +637,7 @@
         </div>
         <div id="recordingSortWrap" class="field recording-list-filter-field">
           <label for="recordingSort">Sort recordings</label>
-          <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Best 14-day rating</option></select>
+          <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Completed 14-day score</option></select>
         </div>
         <details class="score-help">
           <summary>How 14-day scores work</summary>
@@ -645,6 +645,7 @@
             <p>Completed tiers require 14 consecutive scored recording days. A skipped or unmeasured day breaks the run.</p>
             <p>Great+ allows only A, B, and C days. Good+ allows no F days and at most two E days; D days are allowed. Fine+ allows any mix with no F days. The + filters include every better tier.</p>
             <p>Questionable means one F day. Bad means more than one F day. Potential uses the same grade pattern before day 14 and is not a completed tier.</p>
+            <p>Sorting puts completed Great+ first, then Good+, Fine+, Questionable, and Bad. Potential and insufficient recordings follow.</p>
           </div>
         </details>
       </div>
@@ -3338,10 +3339,15 @@
       return `<div class="best14-rating ${rating.toLowerCase()}" aria-label="Best 14-day rating: ${escapeHTML(text)}">${escapeHTML(text)}</div>`;
     }
 
+    const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };
+
     function best14Sort(rec) {
-      const rating = rec.timeline_health && rec.timeline_health.best_14_rating;
-      const rank = rating && Number.isFinite(Number(rating.sort_rank)) ? Number(rating.sort_rank) : 99;
-      return [rank, -Number(rating && rating.completed_days || 0)];
+      const rating = recordingBest14(rec);
+      const completed = completedBest14Rating(rec);
+      const tierRank = BEST14_COMPLETED_SORT_RANK[completed] ?? 5;
+      const detailRank = rating && Number.isFinite(Number(rating.sort_rank)) ? Number(rating.sort_rank) : 99;
+      const completedDays = Number(rating && rating.completed_days || 0);
+      return [tierRank, detailRank, -completedDays];
     }
 
     function dailyGradesCardHTML(rec) {
@@ -3417,7 +3423,7 @@
       const items = all.filter((rec) => matchesStatusFilter(rec) && matchesQualityFilter(rec));
       if (state.recordingSort === 'best14') items.sort((a, b) => {
         const left = best14Sort(a), right = best14Sort(b);
-        return left[0] - right[0] || left[1] - right[1] || Number(b.id) - Number(a.id);
+        return left[0] - right[0] || left[1] - right[1] || left[2] - right[2] || Number(b.id) - Number(a.id);
       });
       if (items.length === 0) {
         els.cards.innerHTML = `<div class="clip-summary">No recordings match this filter.</div>`;

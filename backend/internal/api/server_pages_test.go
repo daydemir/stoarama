@@ -381,7 +381,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`dailyGradesHTML(timeline.daily_grades, timezone)`,
 		`A–C good · D degraded · E poor · F no usable media · ? not yet measurable`,
 		`daily-grade ${grade.toLowerCase()}`,
-		`<option value="best14">Best 14-day rating</option>`,
+		`<option value="best14">Completed 14-day score</option>`,
 		`best14RatingHTML(best14)`,
 		`Insufficient`,
 		`state.recordingSort === 'best14'`,
@@ -426,6 +426,11 @@ func TestRecordingsListFiltersCompletedAndPotentialBest14ScoresSeparately(t *tes
 		`Good+ allows no F days and at most two E days; D days are allowed.`,
 		`Fine+ allows any mix with no F days.`,
 		`Potential uses the same grade pattern before day 14 and is not a completed tier.`,
+		`const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };`,
+		`const tierRank = BEST14_COMPLETED_SORT_RANK[completed] ?? 5;`,
+		`return [tierRank, detailRank, -completedDays];`,
+		`left[0] - right[0] || left[1] - right[1] || left[2] - right[2] || Number(b.id) - Number(a.id)`,
+		`Sorting puts completed Great+ first, then Good+, Fine+, Questionable, and Bad. Potential and insufficient recordings follow.`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings quality filter missing %q", marker)
