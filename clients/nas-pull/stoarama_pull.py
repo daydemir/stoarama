@@ -941,6 +941,7 @@ class Runtime:
         self.joined_protocol_version = 0
         self.joined_protocol_generation = 0
         self.joined_delivery = None
+        self.joined_raw_priority_polled_at = 0.0
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -2684,6 +2685,7 @@ def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     digest = hashlib.sha256()
     size = 0
+    raw_poll_size = 0
     started = time.monotonic()
     try:
         before = os.fstat(descriptor)
@@ -2697,6 +2699,10 @@ def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
                 break
             size += len(chunk)
             digest.update(chunk)
+            if size - raw_poll_size >= JOINED_HASH_BYTES_PER_SEC:
+                if poll_raw_pending(cfg, runtime):
+                    raise JoinedDownloadYield("joined hashing yielded to raw delivery")
+                raw_poll_size = size
             throttle_joined_io(started, size, JOINED_HASH_BYTES_PER_SEC, stop_event)
         after = os.fstat(descriptor)
         path_after = joined_entry_stat(directory_fd, name)
@@ -2708,6 +2714,16 @@ def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
     finally:
         os.close(descriptor)
     return size, digest.hexdigest(), after
+
+
+def joined_raw_priority_checkpoint(cfg, runtime):
+    now = time.monotonic()
+    with runtime.lock:
+        if now - runtime.joined_raw_priority_polled_at < 1.0:
+            return
+        runtime.joined_raw_priority_polled_at = now
+    if poll_raw_pending(cfg, runtime):
+        raise JoinedDownloadYield("joined validation yielded to raw delivery")
 
 
 def verify_joined_entry(cfg, runtime, directory_fd, name, expected_bytes, expected_sha, stop_event):
@@ -4155,6 +4171,7 @@ def read_joined_manifest(cfg, runtime, directory_fd, name, expected_sha, item, s
 
 
 def read_joined_json_path(cfg, runtime, batch_id, relative_path, expected_size, expected_sha, stop_event):
+    joined_raw_priority_checkpoint(cfg, runtime)
     holder = {"batch_id": batch_id, "relative_path": relative_path}
     directory_fd = open_joined_output_dir(cfg, holder, create=False)
     try:
@@ -4249,6 +4266,7 @@ def validate_hour_ledger_binding(cfg, runtime, item, manifest, stop_event):
 
 
 def verify_joined_relative_file(cfg, runtime, batch_id, relative_path, size_bytes, sha256, stop_event):
+    joined_raw_priority_checkpoint(cfg, runtime)
     holder = {"batch_id": batch_id, "relative_path": relative_path}
     directory_fd = open_joined_output_dir(cfg, holder, create=False)
     try:
@@ -4702,6 +4720,8 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
 
 
 def download_joined_item(cfg, runtime, item, stop_event):
+    if poll_raw_pending(cfg, runtime):
+        raise JoinedDownloadYield("joined delivery yielded to raw delivery")
     ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
     validate_media_manifest_binding(cfg, runtime, item, stop_event)
     directory_fd = open_joined_output_dir(cfg, item)
@@ -4733,6 +4753,8 @@ def download_joined_item(cfg, runtime, item, stop_event):
         while part_size < item["size_bytes"]:
             if not runtime.joined_protocol_enabled() or stop_event.is_set():
                 raise JoinedDownloadYield("joined download stopped at a range boundary")
+            if poll_raw_pending(cfg, runtime):
+                raise JoinedDownloadYield("joined delivery yielded to raw delivery")
             try:
                 current_prepared = prepare_joined_download(cfg, item)
             except ExistingFileMismatch:
@@ -4749,6 +4771,8 @@ def download_joined_item(cfg, runtime, item, stop_event):
             part_size = end + 1
         if not runtime.joined_protocol_enabled():
             raise JoinedDownloadYield("joined protocol was disabled")
+        if poll_raw_pending(cfg, runtime):
+            raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         try:
             verify_joined_entry(
                 cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
@@ -4756,7 +4780,11 @@ def download_joined_item(cfg, runtime, item, stop_event):
         except ExistingFileMismatch:
             truncate_joined_part(directory_fd, part_name)
             raise RuntimeError("joined download checksum mismatch; partial restarted")
+        if poll_raw_pending(cfg, runtime):
+            raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
+        if poll_raw_pending(cfg, runtime):
+            raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         def publish_final():
             os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
             os.fsync(directory_fd)
