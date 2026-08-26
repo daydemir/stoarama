@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -822,6 +823,31 @@ func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 	<-started
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "joined worker task deadline exceeded stage=preflight_and_publish") {
 		t.Fatalf("task deadline err=%v", err)
+	}
+}
+
+func TestBoundedMediaDeadlineUsesWorkerTaskClassification(t *testing.T) {
+	ffprobe := strings.TrimSpace(os.Getenv("FFPROBE_BIN"))
+	if ffprobe == "" {
+		ffprobe = "ffprobe"
+	}
+	if _, err := exec.LookPath(ffprobe); err != nil {
+		t.Skip("ffprobe unavailable")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ffmpeg-blocked")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", fake)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, err := joinedrecording.InspectMediaToolEvidence(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded media deadline err=%v", err)
+	}
+	if class, reason := joinedFailureClassification(err); class != "transient" || reason != "worker_task_deadline" {
+		t.Fatalf("classification=%s/%s err=%v", class, reason, err)
 	}
 }
 

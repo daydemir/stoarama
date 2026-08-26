@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
@@ -96,22 +97,23 @@ func InspectMediaToolEvidence(ctx context.Context) (MediaToolEvidence, error) {
 }
 
 func mediaToolVersion(ctx context.Context, binary string) (string, error) {
-	cmd := exec.CommandContext(ctx, binary, "-version")
+	process := newBoundedMediaProcess(ctx, binary, "-version")
+	cmd := process.cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", err
 	}
 	var stderr limitedOutput
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	if err := process.Start(); err != nil {
 		return "", err
 	}
 	out, readErr := io.ReadAll(io.LimitReader(stdout, mediaCommandOutputLimit+1))
 	tooLarge := len(out) > mediaCommandOutputLimit
-	if tooLarge && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	if tooLarge || readErr != nil {
+		_ = process.Kill()
 	}
-	waitErr := cmd.Wait()
+	waitErr := process.Wait()
 	if readErr != nil {
 		return "", fmt.Errorf("read media tool version: %w", readErr)
 	}
@@ -119,8 +121,11 @@ func mediaToolVersion(ctx context.Context, binary string) (string, error) {
 		return "", fmt.Errorf("media tool version exceeds bounded output")
 	}
 	line := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
-	if waitErr != nil || line == "" {
-		return "", fmt.Errorf("read media tool version: %v (%s)", waitErr, stderr.String())
+	if waitErr != nil {
+		return "", fmt.Errorf("read media tool version: %w (%s)", waitErr, stderr.String())
+	}
+	if line == "" {
+		return "", fmt.Errorf("read media tool version: empty output (%s)", stderr.String())
 	}
 	return line, nil
 }
@@ -343,10 +348,28 @@ func BuildLargestPassingPrefix(ctx context.Context, sources []LocalSource, scrat
 			return BuiltOutput{}, err
 		}
 	}
+	return buildLargestPassingPrefix(ctx, sources, scratchDir, mediaToolIdentity, buildIsolatedAttempt)
+}
+
+type isolatedBuildAttempt func(context.Context, []LocalSource, string) (BuiltOutput, error)
+type mediaCandidateBudget func(string, int) time.Duration
+
+func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
+	if kind == "full" || kind == "full_repeat" {
+		return 25 * time.Minute
+	}
+	budget := 2*time.Minute + time.Duration(sourceCount)*25*time.Second
+	if budget > 25*time.Minute {
+		return 25 * time.Minute
+	}
+	return budget
+}
+
+func buildLargestPassingPrefix(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt) (BuiltOutput, error) {
 	var lastErr error
 	evidence := []MaximalityEvidence{}
 	for n := len(sources); n >= 1; n-- {
-		built, err := buildIsolatedAttempt(ctx, sources[:n], scratchDir)
+		built, err := attempt(ctx, sources[:n], scratchDir)
 		if err == nil {
 			built.SplitEvidence = append([]MaximalityEvidence(nil), evidence...)
 			return built, nil
@@ -360,7 +383,7 @@ func BuildLargestPassingPrefix(ctx context.Context, sources []LocalSource, scrat
 			lastErr = err
 			continue
 		}
-		_, repeatErr := buildIsolatedAttempt(ctx, sources[:n], scratchDir)
+		_, repeatErr := attempt(ctx, sources[:n], scratchDir)
 		if repeatErr == nil {
 			return BuiltOutput{}, fmt.Errorf("candidate failure was not repeatable; retry preflight unchanged")
 		}
@@ -421,29 +444,229 @@ func maximalityEvidence(sources []LocalSource, failure *deterministicMediaError,
 }
 
 func buildAllPassingParts(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string) ([]BuiltOutput, []QuarantinedBuild, error) {
+	if len(sources) == 0 || strings.TrimSpace(scratchDir) == "" || !lowerHex64(mediaToolIdentity) {
+		return nil, nil, fmt.Errorf("bounded sources, scratch, and pinned media tool identity are required")
+	}
+	if err := os.MkdirAll(scratchDir, 0700); err != nil {
+		return nil, nil, fmt.Errorf("create scratch: %w", err)
+	}
+	for _, source := range sources {
+		if err := verifyLocalIdentity(source); err != nil {
+			return nil, nil, err
+		}
+	}
+	return buildAllPassingPartsWithAttempt(ctx, sources, scratchDir, mediaToolIdentity, buildIsolatedAttempt)
+}
+
+var errMediaSplitNotIsolated = errors.New("media split could not be isolated")
+
+// buildAllPassingPartsWithAttempt keeps preflight work linear in source media.
+// Adjacent pairs only locate possible seams. The exact segment plus its next
+// source must fail identically in two fresh attempts before that split is
+// accepted. Any unexplained or changing failure aborts the whole provisional
+// plan without returning partial outputs.
+func buildAllPassingPartsWithAttempt(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt) (parts []BuiltOutput, quarantines []QuarantinedBuild, err error) {
+	return buildAllPassingPartsWithPolicy(ctx, sources, scratchDir, mediaToolIdentity, attempt, defaultMediaCandidateBudget)
+}
+
+func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, budget mediaCandidateBudget) (parts []BuiltOutput, quarantines []QuarantinedBuild, err error) {
+	if len(sources) == 0 {
+		return nil, nil, fmt.Errorf("bounded sources are required")
+	}
+	attempts := 0
+	maxAttempts := 6*len(sources) + 2
+	run := func(kind string, candidate []LocalSource) (BuiltOutput, error) {
+		attempts++
+		if attempts > maxAttempts {
+			return BuiltOutput{}, fmt.Errorf("%w: attempt budget exceeded", errMediaSplitNotIsolated)
+		}
+		attemptCtx := ctx
+		cancel := func() {}
+		if duration := budget(kind, len(candidate)); duration > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, duration)
+		}
+		defer cancel()
+		started := time.Now()
+		built, err := attempt(attemptCtx, candidate, scratchDir)
+		emitStageTiming(ctx, "media_candidate_"+kind, time.Since(started), err)
+		return built, err
+	}
+	ownedParts := make([]BuiltOutput, 0)
+	cleanupParts := func() {
+		for _, part := range ownedParts {
+			discardIsolatedBuild(part, scratchDir)
+		}
+		ownedParts = nil
+	}
+	defer func() {
+		if err != nil {
+			cleanupParts()
+		}
+	}()
+
+	full, firstErr := run("full", sources)
+	if firstErr == nil {
+		return []BuiltOutput{full}, nil, nil
+	}
+	firstFailure, ok := deterministicBuildFailure(firstErr)
+	if !ok {
+		if !errors.Is(firstErr, context.DeadlineExceeded) || ctx.Err() != nil {
+			return nil, nil, firstErr
+		}
+	} else if firstFailure.code == "output_exceeds_put_cap" {
+		timedAttempt := func(attemptCtx context.Context, candidate []LocalSource, attemptScratch string) (BuiltOutput, error) {
+			started := time.Now()
+			candidateCtx, cancel := context.WithTimeout(attemptCtx, budget("size", len(candidate)))
+			defer cancel()
+			built, err := attempt(candidateCtx, candidate, attemptScratch)
+			emitStageTiming(ctx, "media_candidate_size", time.Since(started), err)
+			return built, err
+		}
+		return buildSizeBoundParts(ctx, sources, scratchDir, mediaToolIdentity, timedAttempt)
+	} else {
+		if repeatedBuild, repeatFailure, repeatErr := repeatMatchingFailure(run, "full_repeat", sources, firstFailure); repeatErr != nil {
+			return nil, nil, repeatErr
+		} else if repeatFailure == nil {
+			discardIsolatedBuild(repeatedBuild, scratchDir)
+			return nil, nil, fmt.Errorf("%w: full candidate failure was not repeatable", errMediaSplitNotIsolated)
+		}
+	}
+
+	boundaries := make([]int, 0)
+	for i := 0; i+1 < len(sources); i++ {
+		pair := sources[i : i+2]
+		built, pairErr := run("pair", pair)
+		if pairErr == nil {
+			discardIsolatedBuild(built, scratchDir)
+			continue
+		}
+		pairFailure, deterministic := deterministicBuildFailure(pairErr)
+		if !deterministic || pairFailure.code == "output_exceeds_put_cap" {
+			return nil, nil, pairErr
+		}
+		if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "pair_repeat", pair, pairFailure); repeatErr != nil {
+			return nil, nil, repeatErr
+		} else if repeated == nil {
+			discardIsolatedBuild(repeatedBuild, scratchDir)
+			return nil, nil, fmt.Errorf("%w: adjacent failure changed across repeats", errMediaSplitNotIsolated)
+		}
+		boundaries = append(boundaries, i+1)
+	}
+	if len(boundaries) == 0 {
+		return nil, nil, fmt.Errorf("%w: full failure has no adjacent locator", errMediaSplitNotIsolated)
+	}
+
+	ends := append(append([]int(nil), boundaries...), len(sources))
+	start := 0
+	for _, end := range ends {
+		segment := sources[start:end]
+		built, segmentErr := run("segment", segment)
+		if segmentErr != nil {
+			failure, deterministic := deterministicBuildFailure(segmentErr)
+			if len(segment) != 1 || !deterministic || failure.code == "output_exceeds_put_cap" {
+				return nil, nil, errors.Join(errMediaSplitNotIsolated, fmt.Errorf("isolated segment failed: %w", segmentErr))
+			}
+			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "singleton_repeat", segment, failure); repeatErr != nil {
+				return nil, nil, repeatErr
+			} else if repeated == nil {
+				discardIsolatedBuild(repeatedBuild, scratchDir)
+				return nil, nil, fmt.Errorf("%w: singleton failure changed across repeats", errMediaSplitNotIsolated)
+			}
+			quarantines = append(quarantines, QuarantinedBuild{Source: segment[0], Evidence: maximalityEvidence(segment, failure, 2, mediaToolIdentity)})
+			start = end
+			continue
+		}
+		parts = append(parts, built)
+		ownedParts = append(ownedParts, built)
+		if end < len(sources) {
+			extension := sources[start : end+1]
+			extensionBuild, extensionErr := run("extension", extension)
+			extensionFailure, deterministic := deterministicBuildFailure(extensionErr)
+			if extensionErr == nil || !deterministic || extensionFailure.code == "output_exceeds_put_cap" {
+				if extensionErr == nil {
+					discardIsolatedBuild(extensionBuild, scratchDir)
+					return nil, nil, fmt.Errorf("%w: exact boundary extension unexpectedly passed", errMediaSplitNotIsolated)
+				}
+				return nil, nil, errors.Join(errMediaSplitNotIsolated, fmt.Errorf("exact boundary extension did not fail deterministically: %w", extensionErr))
+			}
+			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "extension_repeat", extension, extensionFailure); repeatErr != nil {
+				return nil, nil, repeatErr
+			} else if repeated == nil {
+				discardIsolatedBuild(repeatedBuild, scratchDir)
+				return nil, nil, fmt.Errorf("%w: boundary extension changed across repeats", errMediaSplitNotIsolated)
+			}
+			parts[len(parts)-1].SplitEvidence = []MaximalityEvidence{maximalityEvidence(extension, extensionFailure, 2, mediaToolIdentity)}
+		}
+		start = end
+	}
+	if start != len(sources) {
+		return nil, nil, fmt.Errorf("%w: source accounting incomplete", errMediaSplitNotIsolated)
+	}
+	return parts, quarantines, nil
+}
+
+func deterministicBuildFailure(err error) (*deterministicMediaError, bool) {
+	var failure *deterministicMediaError
+	ok := errors.As(err, &failure)
+	return failure, ok
+}
+
+func repeatMatchingFailure(run func(string, []LocalSource) (BuiltOutput, error), kind string, sources []LocalSource, first *deterministicMediaError) (BuiltOutput, *deterministicMediaError, error) {
+	built, err := run(kind, sources)
+	if err == nil {
+		return built, nil, nil
+	}
+	second, ok := deterministicBuildFailure(err)
+	if !ok {
+		return BuiltOutput{}, nil, err
+	}
+	if first.code != second.code || first.evidenceSHA256 != second.evidenceSHA256 {
+		return BuiltOutput{}, nil, fmt.Errorf("%w: deterministic failure changed across repeats", errMediaSplitNotIsolated)
+	}
+	return BuiltOutput{}, second, nil
+}
+
+func buildSizeBoundParts(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt) ([]BuiltOutput, []QuarantinedBuild, error) {
 	remaining := sources
 	parts := make([]BuiltOutput, 0, 1)
 	quarantines := []QuarantinedBuild{}
 	for len(remaining) > 0 {
-		part, err := BuildLargestPassingPrefix(ctx, remaining, scratchDir, mediaToolIdentity)
+		part, err := buildLargestPassingPrefix(ctx, remaining, scratchDir, mediaToolIdentity, attempt)
 		if err != nil {
 			var failure *deterministicMediaError
 			if !errors.As(err, &failure) || failure.code == "output_exceeds_put_cap" {
+				for _, provisional := range parts {
+					discardIsolatedBuild(provisional, scratchDir)
+				}
 				return nil, nil, err
 			}
-			// BuildLargestPassingPrefix already proved this irreducible source in
-			// two fresh isolated attempts before it can reach this branch.
 			quarantines = append(quarantines, QuarantinedBuild{Source: remaining[0], Evidence: maximalityEvidence(remaining[:1], failure, 2, mediaToolIdentity)})
 			remaining = remaining[1:]
 			continue
 		}
 		if part.SourceCount <= 0 || part.SourceCount > len(remaining) {
-			return nil, nil, fmt.Errorf("preflight part made no bounded progress")
+			for _, provisional := range parts {
+				discardIsolatedBuild(provisional, scratchDir)
+			}
+			discardIsolatedBuild(part, scratchDir)
+			return nil, nil, fmt.Errorf("size-bounded preflight part made no bounded progress")
 		}
 		parts = append(parts, part)
 		remaining = remaining[part.SourceCount:]
 	}
 	return parts, quarantines, nil
+}
+
+func discardIsolatedBuild(built BuiltOutput, scratchDir string) {
+	if strings.TrimSpace(built.Path) == "" {
+		return
+	}
+	attemptDir := filepath.Dir(built.Path)
+	rel, err := filepath.Rel(scratchDir, attemptDir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) || !strings.HasPrefix(filepath.Base(attemptDir), "attempt-") {
+		return
+	}
+	_ = os.RemoveAll(attemptDir)
 }
 
 func PreflightHour(ctx context.Context, draft HourDraft, locals []LocalSource, scratchDir, mediaToolIdentity string) (HourPreflight, error) {
@@ -584,8 +807,7 @@ func buildAndVerify(ctx context.Context, sources []LocalSource, scratchDir strin
 			_ = os.Remove(outputPath)
 		}
 	}()
-	cmd := exec.CommandContext(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", manifestPath, "-copyts", "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", outputPath)
-	if err := runBounded(cmd); err != nil {
+	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", manifestPath, "-copyts", "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", outputPath); err != nil {
 		return BuiltOutput{}, deterministicCommandFailure(ctx, "source_media_incompatible", fmt.Errorf("stream-copy join: %w", err))
 	}
 	verification, err := VerifyJoinedMedia(ctx, sources, outputPath)
@@ -623,7 +845,7 @@ func copyAndVerifySingleton(ctx context.Context, source LocalSource, scratchDir 
 			_ = os.Remove(outputPath)
 		}
 	}()
-	written, copyErr := io.Copy(out, in)
+	written, copyErr := copyWithContext(ctx, out, in)
 	if copyErr != nil {
 		return BuiltOutput{}, copyErr
 	}
@@ -675,8 +897,7 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 	verification.DecodedFrameTotalsStatus = "passed"
 	verification.DecodedAudioTotalsStatus = "passed"
 	verification.OutputTimestampStatus = "passed"
-	decode := exec.CommandContext(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", outputPath, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-")
-	if err := runBounded(decode); err != nil {
+	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", outputPath, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"); err != nil {
 		classified := deterministicCommandFailure(ctx, "strict_decode_failure", err)
 		if classified == err {
 			return verification, fmt.Errorf("strict joined decode infrastructure: %w", err)
@@ -810,22 +1031,26 @@ func probeMediaInto(ctx context.Context, mediaPath string, accumulator *mediaAcc
 		}
 	}
 	accumulator.duration += duration
-	cmd := exec.CommandContext(ctx, ffprobeBinary(), "-v", "error", "-err_detect", "explode", "-show_packets", "-show_frames", "-show_data_hash", "sha256", "-show_entries", "packet=stream_index,pts,dts,duration,data_hash:frame=stream_index,media_type,best_effort_timestamp,nb_samples", "-of", "compact=p=1:nk=0", mediaPath)
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-err_detect", "explode", "-show_packets", "-show_frames", "-show_data_hash", "sha256", "-show_entries", "packet=stream_index,pts,dts,duration,data_hash:frame=stream_index,media_type,best_effort_timestamp,nb_samples", "-of", "compact=p=1:nk=0", mediaPath)
+	cmd := process.cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
 	var stderr limitedOutput
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	if err := process.Start(); err != nil {
 		return err
 	}
 	timestampStatus := "monotonic"
 	if enforceAudioContract {
 		timestampStatus = "source_clips_independent"
 	}
-	consumeErr := consumeCompactEvidence(stdout, indexType, accumulator, timestampStatus)
-	waitErr := cmd.Wait()
+	consumeErr := consumeCompactEvidenceContext(ctx, stdout, indexType, accumulator, timestampStatus)
+	if consumeErr != nil {
+		_ = process.Kill()
+	}
+	waitErr := process.Wait()
 	if consumeErr != nil {
 		return consumeErr
 	}
@@ -841,22 +1066,23 @@ func probeMediaInto(ctx context.Context, mediaPath string, accumulator *mediaAcc
 }
 
 func probeMediaMetadata(ctx context.Context, mediaPath string) (float64, map[int]probedStream, *AudioSequenceContract, error) {
-	cmd := exec.CommandContext(ctx, ffprobeBinary(), "-v", "error", "-show_streams", "-show_format", "-show_entries", "format=duration:stream=index,codec_type,codec_name,sample_rate,channels,channel_layout,initial_padding,codec_delay,trailing_padding,start_pts,start_time,duration_ts,duration,time_base", "-of", "json", mediaPath)
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-show_streams", "-show_format", "-show_entries", "format=duration:stream=index,codec_type,codec_name,sample_rate,channels,channel_layout,initial_padding,codec_delay,trailing_padding,start_pts,start_time,duration_ts,duration,time_base", "-of", "json", mediaPath)
+	cmd := process.cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	var stderr limitedOutput
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	if err := process.Start(); err != nil {
 		return 0, nil, nil, err
 	}
 	out, readErr := io.ReadAll(io.LimitReader(stdout, mediaCommandOutputLimit+1))
 	tooLarge := len(out) > mediaCommandOutputLimit
-	if tooLarge && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	if tooLarge || readErr != nil {
+		_ = process.Kill()
 	}
-	waitErr := cmd.Wait()
+	waitErr := process.Wait()
 	if readErr != nil {
 		return 0, nil, nil, readErr
 	}
@@ -956,14 +1182,15 @@ func sameAudioFormat(a, b AudioSequenceContract) bool {
 }
 
 func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64, error) {
-	cmd := exec.CommandContext(ctx, ffprobeBinary(), "-v", "error", "-select_streams", "a:0", "-show_packets", "-show_entries", "packet=side_data_list", "-of", "compact=p=1:nk=0", mediaPath)
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-select_streams", "a:0", "-show_packets", "-show_entries", "packet=side_data_list", "-of", "compact=p=1:nk=0", mediaPath)
+	cmd := process.cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, 0, err
 	}
 	var stderr limitedOutput
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	if err := process.Start(); err != nil {
 		return 0, 0, err
 	}
 	var skip, discard int64
@@ -971,6 +1198,11 @@ func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			_ = process.Kill()
+			_ = process.Wait()
+			return 0, 0, err
+		}
 		for _, field := range strings.Split(scanner.Text(), "|") {
 			key, value, ok := strings.Cut(field, "=")
 			if !ok {
@@ -994,9 +1226,11 @@ func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		_ = process.Kill()
+		_ = process.Wait()
 		return 0, 0, err
 	}
-	if err := cmd.Wait(); err != nil {
+	if err := process.Wait(); err != nil {
 		return 0, 0, fmt.Errorf("ffprobe audio trim: %w (%s)", err, stderr.String())
 	}
 	if parseErr != nil {
@@ -1006,18 +1240,22 @@ func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64
 }
 
 func hashEffectiveAudio(ctx context.Context, mediaPath string, accumulator *mediaAccumulator) error {
-	cmd := exec.CommandContext(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", mediaPath, "-map", "0:a:0", "-vn", "-sn", "-dn", "-acodec", "pcm_s32le", "-f", "s32le", "-")
+	process := newBoundedMediaProcess(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", mediaPath, "-map", "0:a:0", "-vn", "-sn", "-dn", "-acodec", "pcm_s32le", "-f", "s32le", "-")
+	cmd := process.cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
 	var stderr limitedOutput
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	if err := process.Start(); err != nil {
 		return err
 	}
-	n, copyErr := io.Copy(accumulator.effectiveAudio, stdout)
-	waitErr := cmd.Wait()
+	n, copyErr := copyWithContext(ctx, accumulator.effectiveAudio, stdout)
+	if copyErr != nil {
+		_ = process.Kill()
+	}
+	waitErr := process.Wait()
 	if copyErr != nil {
 		return fmt.Errorf("hash effective decoded audio: %w", copyErr)
 	}
@@ -1032,6 +1270,10 @@ func hashEffectiveAudio(ctx context.Context, mediaPath string, accumulator *medi
 }
 
 func consumeCompactEvidence(reader io.Reader, indexType map[int]probedStream, accumulator *mediaAccumulator, timestampStatus string) error {
+	return consumeCompactEvidenceContext(context.Background(), reader, indexType, accumulator, timestampStatus)
+}
+
+func consumeCompactEvidenceContext(ctx context.Context, reader io.Reader, indexType map[int]probedStream, accumulator *mediaAccumulator, timestampStatus string) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	localFrameSeen := map[string]bool{}
@@ -1041,6 +1283,9 @@ func consumeCompactEvidence(reader io.Reader, indexType map[int]probedStream, ac
 	localFirstDTSSeconds := map[string]*big.Rat{}
 	localTimelineBase := map[string]*big.Rat{}
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		line := scanner.Text()
 		fields := strings.Split(line, "|")
 		if len(fields) < 2 {
@@ -1141,6 +1386,33 @@ func consumeCompactEvidence(reader io.Reader, indexType map[int]probedStream, ac
 	return nil
 }
 
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buffer := make([]byte, 128<<10)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			count, writeErr := dst.Write(buffer[:n])
+			written += int64(count)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if count != n {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
+}
+
 func parseTimeBase(raw string) (int64, int64, error) {
 	numeratorRaw, denominatorRaw, ok := strings.Cut(raw, "/")
 	if !ok {
@@ -1216,10 +1488,15 @@ type boundedCommandError struct {
 func (e *boundedCommandError) Error() string { return fmt.Sprintf("%v (%s)", e.cause, e.output) }
 func (e *boundedCommandError) Unwrap() error { return e.cause }
 
-func runBounded(cmd *exec.Cmd) error {
+func runBounded(ctx context.Context, name string, args ...string) error {
+	process := newBoundedMediaProcess(ctx, name, args...)
+	cmd := process.cmd
 	var output limitedOutput
 	cmd.Stdout, cmd.Stderr = &output, &output
-	if err := cmd.Run(); err != nil {
+	if err := process.Start(); err != nil {
+		return &boundedCommandError{cause: err, output: output.String()}
+	}
+	if err := process.Wait(); err != nil {
 		return &boundedCommandError{cause: err, output: output.String()}
 	}
 	return nil
