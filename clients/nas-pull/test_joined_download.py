@@ -809,6 +809,45 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertFalse(final.exists())
             self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
 
+    def test_raw_pending_yields_before_joined_storage_or_dependency_work(self):
+        item = pull.valid_joined_item(self.media_item())
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            with mock.patch.object(pull, "poll_raw_pending", return_value=True) as pending, \
+                 mock.patch.object(pull, "ensure_joined_dependency_ack") as dependency, \
+                 mock.patch.object(pull, "open_joined_output_dir") as storage, \
+                 self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
+                pull.download_joined_item(cfg, runtime, item, threading.Event())
+            pending.assert_called_once_with(cfg, runtime)
+            dependency.assert_not_called()
+            storage.assert_not_called()
+
+    def test_raw_arrival_yields_after_one_durable_joined_range(self):
+        content = b"abcdef"
+        raw_item = self.media_item(content)
+        item = pull.valid_joined_item(raw_item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            self.install_manifest(cfg, item)
+            ranges = []
+            def open_range(request, **_kwargs):
+                start, end = map(int, dict(request.header_items())["Range"].removeprefix("bytes=").split("-"))
+                ranges.append((start, end))
+                return RangeResponse(content[start:end + 1], start, end, len(content))
+            with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), \
+                 mock.patch.object(pull, "poll_raw_pending", side_effect=[False, False, True]), \
+                 mock.patch.object(pull, "storage_status", return_value=self.storage()), \
+                 mock.patch.object(pull, "request_json", return_value=self.prepared(raw_item)), \
+                 mock.patch.object(pull, "open_joined_url", side_effect=open_range), \
+                 self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
+                pull.download_joined_item(cfg, runtime, item, threading.Event())
+            self.assertEqual(ranges, [(0, 2)])
+            final = pull.joined_output_path(cfg, item)
+            self.assertFalse(final.exists())
+            self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
+
     def test_downgrade_after_download_stops_before_ack(self):
         raw_item = self.media_item()
         with tempfile.TemporaryDirectory() as raw:
@@ -1055,7 +1094,9 @@ class JoinedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = self.runtime(cfg)
-            with self.assertRaises(pull.ExistingFileMismatch): pull.download_joined_item(cfg, runtime, item, threading.Event())
+            with mock.patch.object(pull, "poll_raw_pending", return_value=False), \
+                 self.assertRaises(pull.ExistingFileMismatch):
+                pull.download_joined_item(cfg, runtime, item, threading.Event())
             path = self.install_manifest(cfg, item); path.write_bytes(self.manifest_bytes({**item, "size_bytes": 7}))
             altered = {**item, "hour_manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(
@@ -1082,6 +1123,41 @@ class JoinedDownloadTests(unittest.TestCase):
                     pull.hash_joined_entry(cfg, runtime, directory_fd, part, stop)
                 poll.assert_not_called(); self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 6)
             finally: os.close(directory_fd)
+
+    def test_hash_yields_to_raw_delivery_at_a_bounded_read_boundary(self):
+        content, item = b"abcdef", pull.valid_joined_item(self.media_item())
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            directory_fd, _, part, marker = self.names(cfg, item)
+            try:
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                    pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, self.marker(item), threading.Event())
+                descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd)
+                os.write(descriptor, content)
+                os.close(descriptor)
+                with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), mock.patch.object(
+                    pull, "JOINED_HASH_BYTES_PER_SEC", 3
+                ), mock.patch.object(pull, "poll_raw_pending", return_value=True) as pending, \
+                     self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
+                    pull.hash_joined_entry(cfg, runtime, directory_fd, part, threading.Event())
+                pending.assert_called_once_with(cfg, runtime)
+                self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, len(content))
+            finally:
+                os.close(directory_fd)
+
+    def test_small_file_validation_shares_a_one_second_raw_priority_cadence(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            with mock.patch.object(pull.time, "monotonic", side_effect=[10.0, 10.5, 11.0]), mock.patch.object(
+                pull, "poll_raw_pending", side_effect=[False, True]
+            ) as pending:
+                pull.joined_raw_priority_checkpoint(cfg, runtime)
+                pull.joined_raw_priority_checkpoint(cfg, runtime)
+                with self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
+                    pull.joined_raw_priority_checkpoint(cfg, runtime)
+            self.assertEqual(pending.call_count, 2)
 
     def test_unknown_partial_and_hardlink_are_never_modified(self):
         item = pull.valid_joined_item(self.media_item())
