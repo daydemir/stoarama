@@ -68,6 +68,17 @@ func TestJoinedAPIClientOmitsMalformedOrOversizedServerError(t *testing.T) {
 	}
 }
 
+func TestJoinedTaskFailureDiagnosticSelectsOnlyStructuredAPIErrors(t *testing.T) {
+	want := `joined API /seal returned status 409 error="canonical plan differs"`
+	structured := joinedAPIStatusError("/seal", http.StatusConflict, strings.NewReader(`{"error":"canonical plan differs"}`))
+	if got := joinedTaskFailureDiagnostic(fmt.Errorf("preflight: %w", structured)); got != want {
+		t.Fatalf("structured diagnostic differs: %q", got)
+	}
+	if got := joinedTaskFailureDiagnostic(errors.New("request-body-secret-sentinel")); got != "" {
+		t.Fatalf("arbitrary task error was exposed: %q", got)
+	}
+}
+
 func TestJoinedClaimAdmissionOperatorContract(t *testing.T) {
 	const (
 		batch = "tier1-generation-1"
