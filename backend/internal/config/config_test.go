@@ -356,6 +356,10 @@ func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
 	frozen := canary
 	frozen.JoinedRecordingWorkScope = JoinedWorkScopeFrozenBatch
 	frozen.JoinedRecordingCanaryHourIDs = ""
+	if frozen.ValidateJoined() == nil {
+		t.Fatal("frozen-batch API accepted no active-task cap")
+	}
+	frozen.JoinedRecordingMaxActiveTasks = 2
 	if scope, err := frozen.JoinedWorkScope(); err != nil || scope != JoinedWorkScopeFrozenBatch {
 		t.Fatalf("frozen scope=%q err=%v", scope, err)
 	}

@@ -694,6 +694,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	defer fixture.cleanup()
 	s, pool := fixture.s, fixture.pool
 	s.cfg.JoinedRecordingControlPlaneEnabled = true
+	// This lifecycle deliberately leaves several claims active while it exercises
+	// later publication stages. Capacity limits have dedicated transactional tests.
+	s.cfg.JoinedRecordingMaxActiveTasks = 64
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
 	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	s.cfg.R2Endpoint = "https://output.example.test"
@@ -731,6 +734,10 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if len(ledgers) != 462 || sourceLedger == nil || gapAtomicLedger == nil || insertFinalChild == nil {
 		t.Fatalf("canonical materialization ledgers=%d source=%v gap=%v final=%v", len(ledgers), sourceLedger != nil,
 			gapAtomicLedger != nil, insertFinalChild != nil)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_joined_admission_controls
+		SET claims_paused=FALSE,updated_at=clock_timestamp() WHERE batch_record_id=$1`, batchRecordID); err != nil {
+		t.Fatalf("explicitly resume joined claims for canonical lifecycle fixture: %v", err)
 	}
 	var canaryGapHourID, canarySourceHourID string
 	if err := pool.QueryRow(ctx, `SELECT hour_id FROM recording_joined_hours
@@ -1738,7 +1745,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	s.cfg.JoinedRecordingCanaryHourIDs = ""
 	frozenClaimToken := mintJoinedClaimForTest(t, s, batchID)
 	frozenPublicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1,
-		BatchID: batchID, WorkerID: "frozen-batch-worker"})
+		BatchID: batchID, WorkerID: "frozen-batch-worker", ScratchAvailableBytes: 1 << 62, TaskBudgetBytes: 1 << 62})
 	frozenPublicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim",
 		bytes.NewReader(frozenPublicationBody))
 	frozenPublicationRequest.Header.Set("Authorization", "Bearer "+frozenClaimToken)
@@ -1918,7 +1925,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("batch-index retry status=%d body=%s", retryIndex.Code, retryIndex.Body.String())
 	}
 	indexClaimToken := mintJoinedClaimForTest(t, s, batchID)
-	publicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1, BatchID: batchID, WorkerID: "index-worker"})
+	publicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1, BatchID: batchID,
+		WorkerID: "index-worker", ScratchAvailableBytes: 1 << 62, TaskBudgetBytes: 1 << 62})
 	publicationRequest := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(publicationBody))
 	publicationRequest.Header.Set("Authorization", "Bearer "+indexClaimToken)
 	publicationRecorder := httptest.NewRecorder()

@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +44,39 @@ type remoteJoinedOperatorService struct {
 	processClaim     func(context.Context, joinedrecording.PublicationClaimResponse, string) error
 	processPreflight func(context.Context, joinedrecording.PreflightHourClaim, string) error
 }
+
+type joinedOperationTracker struct {
+	mu      sync.RWMutex
+	leaseID string
+	token   string
+	expires time.Time
+}
+
+func newJoinedOperationTracker(leaseID, token string, expires time.Time) *joinedOperationTracker {
+	return &joinedOperationTracker{leaseID: leaseID, token: token, expires: expires}
+}
+
+func (t *joinedOperationTracker) replace(leaseID, token string, expires time.Time) {
+	t.mu.Lock()
+	t.leaseID, t.token, t.expires = leaseID, token, expires
+	t.mu.Unlock()
+}
+
+func (t *joinedOperationTracker) accept(credentials joinedrecording.OperationCredentials) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if credentials.LeaseID == t.leaseID && !credentials.ExpiresAt.Before(t.expires) {
+		t.token, t.expires = credentials.OperationToken, credentials.ExpiresAt
+	}
+}
+
+func (t *joinedOperationTracker) get() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.token
+}
+
+type joinedOperationTrackerContextKey struct{}
 
 type joinedAdminBatchStatusStreamDay struct {
 	RecordingID       int64  `json:"recording_id"`
@@ -542,6 +577,40 @@ func (s *remoteJoinedOperatorService) Status(ctx context.Context, req joinedStat
 	return status, nil
 }
 
+func (s *remoteJoinedOperatorService) ClaimAdmissionStatus(ctx context.Context, batchID string) (joinedrecording.ClaimAdmissionStatus, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return joinedrecording.ClaimAdmissionStatus{}, err
+	}
+	var status joinedrecording.ClaimAdmissionStatus
+	path := "/api/v1/recording/joined/admission?batch_id=" + url.QueryEscape(batchID)
+	if err := s.api.getJSON(ctx, path, token, &status); err != nil {
+		return status, err
+	}
+	if err := status.Validate(); err != nil || status.BatchID != batchID {
+		return status, errors.New("joined claim admission status differs")
+	}
+	return status, nil
+}
+
+func (s *remoteJoinedOperatorService) SetClaimAdmission(ctx context.Context, req joinedrecording.ClaimAdmissionRequest) (joinedrecording.ClaimAdmissionStatus, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return joinedrecording.ClaimAdmissionStatus{}, err
+	}
+	if err := req.Validate(); err != nil {
+		return joinedrecording.ClaimAdmissionStatus{}, err
+	}
+	var status joinedrecording.ClaimAdmissionStatus
+	if err := s.api.putJSON(ctx, "/api/v1/recording/joined/admission", token, req, &status); err != nil {
+		return status, err
+	}
+	if err := status.Validate(); err != nil || status.BatchID != req.BatchID || status.ClaimsPaused != req.ClaimsPaused {
+		return status, errors.New("joined claim admission update differs")
+	}
+	return status, nil
+}
+
 func (s *remoteJoinedOperatorService) CheckWorkerStartup(ctx context.Context, req joinedWorkerRequest) error {
 	if err := os.MkdirAll(req.ScratchRoot, 0o700); err != nil {
 		return fmt.Errorf("create joined scratch root: %w", err)
@@ -565,7 +634,32 @@ func (s *remoteJoinedOperatorService) CheckWorkerStartup(ctx context.Context, re
 	if !ok || validateJoinedWorkerStatus(s.cfg, req.BatchID, values) != nil {
 		return fmt.Errorf("joined backend is not enabled")
 	}
+	removed, err := s.cleanupInactiveScratch(ctx, req)
+	if err != nil {
+		return fmt.Errorf("cleanup inactive joined scratch: %w", err)
+	}
+	if len(removed) > 0 {
+		log.Printf("joined worker removed inactive scratch directories count=%d", len(removed))
+	}
 	return nil
+}
+
+func (s *remoteJoinedOperatorService) cleanupInactiveScratch(ctx context.Context, req joinedWorkerRequest) ([]string, error) {
+	return joinedrecording.CleanupInactiveLeaseScratch(ctx, req.ScratchRoot, func(callCtx context.Context, leaseIDs []string) (map[string]bool, error) {
+		response, err := s.api.leaseStatus(callCtx, s.api.bootstrapToken, joinedrecording.LeaseStatusRequest{
+			ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+			BatchID:         req.BatchID,
+			LeaseIDs:        leaseIDs,
+		})
+		if err != nil {
+			return nil, err
+		}
+		proof := make(map[string]bool, len(response.Leases))
+		for _, lease := range response.Leases {
+			proof[lease.LeaseID] = !lease.Active
+		}
+		return proof, nil
+	})
 }
 
 func validateJoinedWorkerStatus(cfg config.Config, batchID string, status joinedWorkerStatus) error {
@@ -600,13 +694,26 @@ func joinedConfiguredWorkScope(cfg config.Config) (joinedrecording.WorkScopeIden
 }
 
 func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedWorkerRequest) error {
+	return runJoinedWorkerLoop(ctx, s.idlePoll, func(admissionCtx, taskCtx context.Context) (bool, error) {
+		return s.runWorkerOnceWithTaskContext(admissionCtx, taskCtx, req)
+	})
+}
+
+// runJoinedWorkerLoop separates claim admission from work already admitted.
+// Canceling admission stops the next bootstrap or claim immediately, while a
+// claimed task keeps its lease heartbeat and gets its existing hard deadline.
+func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce func(context.Context, context.Context) (bool, error)) error {
+	if idlePoll <= 0 || runOnce == nil {
+		return errors.New("joined worker loop configuration is required")
+	}
+	taskBase := context.WithoutCancel(ctx)
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		worked, err := s.runWorkerOnce(ctx, req)
+		worked, err := runOnce(ctx, taskBase)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil && !worked {
 				return nil
 			}
 			return err
@@ -614,7 +721,7 @@ func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedW
 		if worked {
 			continue
 		}
-		timer := time.NewTimer(s.idlePoll)
+		timer := time.NewTimer(idlePoll)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -627,18 +734,33 @@ func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedW
 }
 
 func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joinedWorkerRequest) (bool, error) {
+	return s.runWorkerOnceWithTaskContext(ctx, ctx, req)
+}
+
+func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx, taskCtx context.Context, req joinedWorkerRequest) (bool, error) {
 	workScope, err := joinedConfiguredWorkScope(s.cfg)
 	if err != nil {
 		return false, err
 	}
 	bootstrapRequest := joinedrecording.WorkerBootstrapRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
 		BatchID: req.BatchID, WorkScopeIdentity: workScope}
-	bootstrap, ok, err := s.api.bootstrap(ctx, bootstrapRequest)
+	bootstrap, ok, err := s.api.bootstrap(admissionCtx, bootstrapRequest)
 	if err != nil || !ok {
 		return false, err
 	}
 	claimRequest := joinedrecording.WorkClaimRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: req.BatchID, WorkerID: req.WorkerID}
-	publication, ok, err := s.api.claimPublication(ctx, bootstrap.ClaimToken, claimRequest)
+	if workScope.WorkScope == joinedrecording.WorkScopeFrozenBatch {
+		budget, err := joinedrecording.AvailableScratchBudget(req.ScratchRoot)
+		if err != nil {
+			return false, fmt.Errorf("measure joined scratch admission budget: %w", err)
+		}
+		claimRequest.ScratchAvailableBytes = budget
+		claimRequest.TaskBudgetBytes = budget
+	}
+	// Cancellation can race after either claim API commits a lease but before
+	// this client receives it. No local task starts in that case. The unseen
+	// fenced lease expires and becomes reclaimable through the normal path.
+	publication, ok, err := s.api.claimPublication(admissionCtx, bootstrap.ClaimToken, claimRequest)
 	if err != nil {
 		return false, err
 	}
@@ -646,20 +768,82 @@ func (s *remoteJoinedOperatorService) runWorkerOnce(ctx context.Context, req joi
 		if err := joinedPublicationWithinScope(s.cfg, publication); err != nil {
 			return false, err
 		}
-		return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, "publish_claim", func(taskCtx context.Context) error {
-			return s.processClaim(taskCtx, publication, req.ScratchRoot)
+		kind, id, token := joinedPublicationFailureIdentity(publication)
+		leaseID, expires := joinedPublicationLeaseIdentity(publication)
+		tracker := newJoinedOperationTracker(leaseID, token, expires)
+		taskErr := runJoinedWorkerTask(taskCtx, joinedWorkerTaskLimit, "publish_claim", func(workCtx context.Context) error {
+			workCtx = context.WithValue(workCtx, joinedOperationTrackerContextKey{}, tracker)
+			return s.processClaim(workCtx, publication, req.ScratchRoot)
 		})
+		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
-	preflight, ok, err := s.api.claimPreflight(ctx, bootstrap.ClaimToken, claimRequest)
+	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
 	if err != nil || !ok {
 		return false, err
 	}
 	if !joinedHourWithinScope(s.cfg, preflight.HourID) {
 		return false, errors.New("joined preflight claim is outside configured work scope")
 	}
-	return true, runJoinedWorkerTask(ctx, joinedWorkerTaskLimit, "preflight_and_publish", func(taskCtx context.Context) error {
-		return s.processPreflight(taskCtx, preflight, req.ScratchRoot)
+	tracker := newJoinedOperationTracker(preflight.LeaseID, preflight.OperationToken, preflight.LeaseExpires)
+	taskErr := runJoinedWorkerTask(taskCtx, joinedWorkerTaskLimit, "preflight_and_publish", func(workCtx context.Context) error {
+		workCtx = context.WithValue(workCtx, joinedOperationTrackerContextKey{}, tracker)
+		return s.processPreflight(workCtx, preflight, req.ScratchRoot)
 	})
+	return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), "hour", preflight.HourID, taskErr)
+}
+
+func joinedPublicationFailureIdentity(response joinedrecording.PublicationClaimResponse) (kind, id, token string) {
+	switch response.Kind {
+	case "ledger":
+		return "ledger", response.Ledger.ScopeID, response.Ledger.OperationToken
+	case "hour":
+		return "hour", response.Hour.HourID, response.Hour.OperationToken
+	case "batch_index":
+		return "batch_index", response.BatchIndex.ScopeID, response.BatchIndex.OperationToken
+	default:
+		return "", "", ""
+	}
+}
+
+func joinedPublicationLeaseIdentity(response joinedrecording.PublicationClaimResponse) (string, time.Time) {
+	switch response.Kind {
+	case "ledger":
+		return response.Ledger.LeaseID, response.Ledger.LeaseExpires
+	case "hour":
+		return response.Hour.LeaseID, response.Hour.LeaseExpires
+	case "batch_index":
+		return response.BatchIndex.LeaseID, response.BatchIndex.LeaseExpires
+	default:
+		return "", time.Time{}
+	}
+}
+
+func joinedFailureClassification(err error) (class, reason string) {
+	if errors.Is(err, syscall.ENOSPC) || strings.Contains(strings.ToLower(err.Error()), "scratch") {
+		return "resource", "scratch_resource_exhausted"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "transient", "worker_task_deadline"
+	}
+	return "transient", "worker_task_failed"
+}
+
+func (s *remoteJoinedOperatorService) reportJoinedTaskFailure(taskCtx context.Context, token, kind, id string, taskErr error) error {
+	if taskErr == nil {
+		return nil
+	}
+	class, reason := joinedFailureClassification(taskErr)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(taskCtx), 30*time.Second)
+	defer cancel()
+	_, reportErr := s.api.reportFailure(reportCtx, token, joinedrecording.WorkFailureRequest{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion, ScopeKind: kind, ScopeID: id,
+		FailureClass: class, ReasonCode: reason,
+	})
+	if reportErr != nil {
+		return errors.Join(taskErr, fmt.Errorf("report joined task failure: %w", reportErr))
+	}
+	log.Printf("joined worker task failure recorded scope_kind=%s scope_id=%s class=%s reason=%s", kind, id, class, reason)
+	return nil
 }
 
 func joinedHourWithinScope(cfg config.Config, hourID string) bool {
@@ -745,6 +929,11 @@ func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, c
 		sealed, err := s.api.sealHour(callCtx, current.OperationToken, request)
 		if err == nil && sealed.HourID != current.HourID {
 			err = fmt.Errorf("sealed joined hour differs from preflight claim")
+		}
+		if err == nil {
+			if tracker, ok := callCtx.Value(joinedOperationTrackerContextKey{}).(*joinedOperationTracker); ok {
+				tracker.replace(sealed.LeaseID, sealed.OperationToken, sealed.LeaseExpires)
+			}
 		}
 		return sealed, err
 	}
@@ -833,7 +1022,11 @@ func (s *remoteJoinedOperatorService) scopeHeartbeat(kind, id string) joinedreco
 		if err != nil {
 			return joinedrecording.OperationCredentials{}, err
 		}
-		return joinedrecording.OperationCredentials{LeaseID: response.LeaseID, OperationToken: response.OperationToken, ExpiresAt: response.ExpiresAt}, nil
+		credentials := joinedrecording.OperationCredentials{LeaseID: response.LeaseID, OperationToken: response.OperationToken, ExpiresAt: response.ExpiresAt}
+		if tracker, ok := ctx.Value(joinedOperationTrackerContextKey{}).(*joinedOperationTracker); ok {
+			tracker.accept(credentials)
+		}
+		return credentials, nil
 	}
 }
 
@@ -907,6 +1100,41 @@ func (c *joinedAPIClient) claimPreflight(ctx context.Context, token string, requ
 		}
 	}
 	return response, ok, err
+}
+
+func (c *joinedAPIClient) reportFailure(ctx context.Context, token string, request joinedrecording.WorkFailureRequest) (joinedrecording.WorkFailureResponse, error) {
+	var response joinedrecording.WorkFailureResponse
+	if err := request.Validate(); err != nil {
+		return response, err
+	}
+	if err := c.postJSON(ctx, "/api/v1/recording/joined/failure", token, request, &response); err != nil {
+		return response, err
+	}
+	if response.ProtocolVersion != joinedrecording.JoinedProtocolVersion || response.AttemptCount < 1 ||
+		(response.State != "retry" && response.State != "terminal") ||
+		(response.State == "retry") != (response.NextAttemptAt != nil) {
+		return response, errors.New("invalid joined failure response")
+	}
+	return response, nil
+}
+
+func (c *joinedAPIClient) leaseStatus(ctx context.Context, token string, request joinedrecording.LeaseStatusRequest) (joinedrecording.LeaseStatusResponse, error) {
+	var response joinedrecording.LeaseStatusResponse
+	if err := request.Validate(); err != nil {
+		return response, err
+	}
+	if err := c.postJSON(ctx, "/api/v1/recording/joined/leases/status", token, request, &response); err != nil {
+		return response, err
+	}
+	if response.ProtocolVersion != joinedrecording.JoinedProtocolVersion || len(response.Leases) != len(request.LeaseIDs) {
+		return response, errors.New("invalid joined lease status response")
+	}
+	for i := range response.Leases {
+		if response.Leases[i].LeaseID != request.LeaseIDs[i] || (response.Leases[i].Active && response.Leases[i].ExpiresAt == nil) {
+			return response, errors.New("joined lease status response differs")
+		}
+	}
+	return response, nil
 }
 
 func (c *joinedAPIClient) heartbeat(ctx context.Context, token string, request joinedrecording.HeartbeatRequest) (joinedrecording.HeartbeatResponse, error) {
@@ -1000,6 +1228,33 @@ func (c *joinedAPIClient) postJSON(ctx context.Context, path, token string, requ
 		return fmt.Errorf("joined API %s unexpectedly returned no content", path)
 	}
 	return err
+}
+
+func (c *joinedAPIClient) putJSON(ctx context.Context, path, token string, payload, response any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode joined API request")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("construct joined API request")
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	httpResponse, err := c.httpClient.Do(request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("execute joined API %s", path)
+	}
+	defer httpResponse.Body.Close()
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, joinedAPIResponseLimit))
+		return fmt.Errorf("joined API %s returned status %d", path, httpResponse.StatusCode)
+	}
+	return decodeJoinedAPIResponse(httpResponse.Body, response)
 }
 
 func (c *joinedAPIClient) postNoContent(ctx context.Context, path, token string, request any) error {

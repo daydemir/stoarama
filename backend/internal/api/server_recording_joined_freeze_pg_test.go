@@ -32,6 +32,8 @@ var joinedMigrationNames = []string{
 	"0141_joined_tier1_checkpointed_dry_run.sql",
 	"0142_joined_stream_day_neighbor_authority.sql",
 	"0143_joined_final_validation_checkpoints.sql",
+	"0144_joined_rollout_admission_failures.sql",
+	"0145_joined_claim_admission_control.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {

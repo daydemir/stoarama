@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +23,51 @@ import (
 func TestJoinedAPIClientRejectsMalformedBaseURL(t *testing.T) {
 	if _, err := newJoinedAPIClient("https://%", "", nil); err == nil {
 		t.Fatal("malformed APP_BASE_URL was accepted")
+	}
+}
+
+func TestJoinedClaimAdmissionOperatorContract(t *testing.T) {
+	const (
+		batch = "tier1-generation-1"
+		op    = "joined-tier1-operator-token-at-least-32-bytes"
+	)
+	updated := time.Now().UTC().Truncate(time.Second)
+	requests := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+op {
+			t.Fatalf("operator authorization differs")
+		}
+		requests <- r.Method + " " + r.URL.RequestURI()
+		paused := false
+		if r.Method == http.MethodPut {
+			var req joinedrecording.ClaimAdmissionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BatchID != batch || !req.ClaimsPaused {
+				t.Fatalf("bad admission request: %+v err=%v", req, err)
+			}
+			paused = true
+		}
+		_ = json.NewEncoder(w).Encode(joinedrecording.ClaimAdmissionStatus{ProtocolVersion: 1, BatchID: batch,
+			ClaimsPaused: paused, ActiveHourLeases: 1, ActiveLeaseCount: 1, UpdatedAt: updated})
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api, operatorToken: op}
+	if _, err := service.ClaimAdmissionStatus(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SetClaimAdmission(context.Background(), joinedrecording.ClaimAdmissionRequest{
+		ProtocolVersion: 1, BatchID: batch, ClaimsPaused: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-requests; got != "GET /api/v1/recording/joined/admission?batch_id="+batch {
+		t.Fatal(got)
+	}
+	if got := <-requests; got != "PUT /api/v1/recording/joined/admission" {
+		t.Fatal(got)
 	}
 }
 
@@ -81,6 +130,102 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 	}
 }
 
+func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
+	t.Parallel()
+	cfg := validJoinedWorkerConfig()
+	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	cfg.JoinedRecordingCanaryHourIDs = ""
+	root := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const claimToken = "claim-token-kept-secret-value"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/recording/joined/token":
+			var request joinedrecording.WorkerBootstrapRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			writeJoinedTestJSON(t, w, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: 1,
+				BatchID: cfg.JoinedRecordingBatchID, ClaimToken: claimToken, ExpiresAt: time.Now().Add(time.Hour), WorkScopeIdentity: request.WorkScopeIdentity})
+		case "/api/v1/recording/joined/publication/claim", "/api/v1/recording/joined/claim":
+			var request joinedrecording.WorkClaimRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Validate() != nil ||
+				request.ScratchAvailableBytes <= 0 || request.TaskBudgetBytes != request.ScratchAvailableBytes {
+				t.Errorf("unsafe broad claim request: %+v err=%v", request, err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "bootstrap-token-kept-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{cfg: cfg, api: api}
+	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{
+		BatchID: cfg.JoinedRecordingBatchID, WorkerID: "worker-1", ScratchRoot: root})
+	if err != nil || worked {
+		t.Fatalf("broad claim worked=%v err=%v", worked, err)
+	}
+}
+
+func TestJoinedFailureReportingUsesStableClassAndFencedEndpoint(t *testing.T) {
+	t.Parallel()
+	if class, reason := joinedFailureClassification(syscall.ENOSPC); class != "resource" || reason != "scratch_resource_exhausted" {
+		t.Fatalf("disk failure class=%q reason=%q", class, reason)
+	}
+	if class, reason := joinedFailureClassification(context.DeadlineExceeded); class != "transient" || reason != "worker_task_deadline" {
+		t.Fatalf("deadline class=%q reason=%q", class, reason)
+	}
+	const token = "operation-token-kept-secret-value"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/recording/joined/failure" || r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("failure request path=%q authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		var request joinedrecording.WorkFailureRequest
+		if json.NewDecoder(r.Body).Decode(&request) != nil || request.Validate() != nil || request.ReasonCode != "worker_task_failed" {
+			t.Errorf("failure request=%+v", request)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		next := time.Now().UTC().Add(time.Minute)
+		writeJoinedTestJSON(t, w, joinedrecording.WorkFailureResponse{ProtocolVersion: 1, State: "retry", AttemptCount: 1, NextAttemptAt: &next})
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "bootstrap-token-kept-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api}
+	err = service.reportJoinedTaskFailure(context.Background(), token, "hour", "hour-1", errors.New("decoder failed"))
+	if err != nil {
+		t.Fatalf("recorded task failure stopped worker: %v", err)
+	}
+}
+
+func TestJoinedOperationTrackerRejectsForeignOrRegressedHeartbeat(t *testing.T) {
+	now := time.Now().UTC()
+	tracker := newJoinedOperationTracker(strings.Repeat("a", 43), "valid-current-token-value", now.Add(5*time.Minute))
+	tracker.accept(joinedrecording.OperationCredentials{LeaseID: strings.Repeat("b", 43), OperationToken: "foreign-token-value", ExpiresAt: now.Add(10 * time.Minute)})
+	if got := tracker.get(); got != "valid-current-token-value" {
+		t.Fatalf("foreign lease poisoned failure fence: %q", got)
+	}
+	tracker.accept(joinedrecording.OperationCredentials{LeaseID: strings.Repeat("a", 43), OperationToken: "regressed-token-value", ExpiresAt: now.Add(time.Minute)})
+	if got := tracker.get(); got != "valid-current-token-value" {
+		t.Fatalf("regressed expiry poisoned failure fence: %q", got)
+	}
+	tracker.accept(joinedrecording.OperationCredentials{LeaseID: strings.Repeat("a", 43), OperationToken: "renewed-token-value", ExpiresAt: now.Add(10 * time.Minute)})
+	if got := tracker.get(); got != "renewed-token-value" {
+		t.Fatalf("valid renewal was not tracked: %q", got)
+	}
+}
+
 func TestJoinedWorkerIdleCancellationStopsCleanly(t *testing.T) {
 	t.Parallel()
 	requested := make(chan struct{}, 1)
@@ -110,6 +255,108 @@ func TestJoinedWorkerIdleCancellationStopsCleanly(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("cancelled idle worker: %v", err)
+	}
+}
+
+func TestJoinedWorkerDrainStopsClaimsAndLetsAdmittedTaskFinish(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	var calls atomic.Int32
+	go func() {
+		done <- runJoinedWorkerLoop(ctx, time.Hour, func(admissionCtx, taskCtx context.Context) (bool, error) {
+			if calls.Add(1) != 1 {
+				return false, errors.New("draining worker admitted another claim")
+			}
+			if admissionCtx != ctx {
+				return false, errors.New("claim admission did not use the signal context")
+			}
+			close(started)
+			select {
+			case <-taskCtx.Done():
+				return false, errors.New("admitted task was canceled during drain")
+			case <-release:
+				return true, nil
+			}
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		t.Fatalf("worker stopped before admitted task completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("drained worker: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("claim calls=%d want 1", got)
+	}
+}
+
+func TestJoinedWorkerDrainPreservesAdmittedTaskFailure(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	want := errors.New("admitted task failed")
+	err := runJoinedWorkerLoop(ctx, time.Hour, func(context.Context, context.Context) (bool, error) {
+		cancel()
+		return true, want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("drain hid admitted task failure: %v", err)
+	}
+}
+
+func TestJoinedWorkerScratchCleanupUsesBootstrapScopedLeaseProof(t *testing.T) {
+	t.Parallel()
+	cfg := validJoinedWorkerConfig()
+	inactive := strings.Repeat("I", 43)
+	active := strings.Repeat("A", 43)
+	root := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, leaseID := range []string{inactive, active} {
+		if err := os.Mkdir(filepath.Join(root, leaseID), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const bootstrapToken = "scratch-proof-bootstrap-token-kept-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/recording/joined/leases/status":
+			if r.Header.Get("Authorization") != "Bearer "+bootstrapToken {
+				t.Errorf("lease proof auth=%q", r.Header.Get("Authorization"))
+			}
+			var request joinedrecording.LeaseStatusRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Validate() != nil || !slices.Equal(request.LeaseIDs, []string{active, inactive}) {
+				t.Errorf("invalid lease proof request: %+v err=%v", request, err)
+			}
+			expires := time.Now().Add(time.Hour)
+			writeJoinedTestJSON(t, w, joinedrecording.LeaseStatusResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				Leases: []joinedrecording.LeaseStatus{{LeaseID: active, Active: true, ExpiresAt: &expires}, {LeaseID: inactive}}})
+		default:
+			t.Errorf("unexpected scratch cleanup path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, bootstrapToken, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{cfg: cfg, api: api}
+	removed, err := service.cleanupInactiveScratch(context.Background(), joinedWorkerRequest{
+		BatchID: cfg.JoinedRecordingBatchID, WorkerID: "worker-1", ScratchRoot: root})
+	if err != nil || !slices.Equal(removed, []string{inactive}) {
+		t.Fatalf("scratch cleanup removed=%v err=%v", removed, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, active)); err != nil {
+		t.Fatalf("active scratch was removed: %v", err)
 	}
 }
 

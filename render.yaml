@@ -158,6 +158,8 @@ services:
         value: "0"
       - key: JOINED_RECORDING_PROTOCOL_GENERATION
         value: "0"
+      - key: JOINED_RECORDING_MAX_ACTIVE_TASKS
+        value: "2"
       - key: STOARAMA_JOINED_WORK_SCOPE
         value: disabled
       - key: JOINED_RECORDING_BATCH_ID

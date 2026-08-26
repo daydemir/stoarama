@@ -80,6 +80,7 @@ func TestJoinedBootstrapAndClaimScopeDriftFailBeforeDatabaseMutation(t *testing.
 	claim := mintJoinedClaimForTest(t, s, batchID)
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	s.cfg.JoinedRecordingMaxActiveTasks = 2
 	for _, tc := range []struct {
 		path    string
 		handler http.HandlerFunc
@@ -362,6 +363,7 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 		{name: "heartbeat", path: "/api/v1/recording/joined/heartbeat", body: `{"scope_kind":"hour","scope_id":"hour-test"}`, handler: s.handleJoinedHeartbeat},
 		{name: "source capability", path: "/api/v1/recording/joined/capabilities/source", body: `{"hour_id":"hour-test","clip_id":1}`, handler: s.handleJoinedSourceCapability},
 		{name: "artifact capability", path: "/api/v1/recording/joined/capabilities/artifact", body: `{"scope_kind":"hour","scope_id":"hour-test","artifact_id":1,"operation":"put"}`, handler: s.handleJoinedArtifactCapability},
+		{name: "failure", path: "/api/v1/recording/joined/failure", body: `{"protocol_version":1,"scope_kind":"hour","scope_id":"hour-test","failure_class":"transient","reason_code":"network_timeout"}`, handler: s.handleJoinedFailure},
 	} {
 		t.Run("disabled "+tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
