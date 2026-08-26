@@ -27,6 +27,7 @@ const (
 	joinedWorkerIdlePoll   = 2 * time.Second
 	joinedWorkerTaskLimit  = 2 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
+	joinedAPIErrorLimit    = 4 << 10
 )
 
 type joinedAPIClient struct {
@@ -1364,8 +1365,7 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		return false, nil
 	}
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, joinedAPIResponseLimit))
-		return false, fmt.Errorf("joined API %s returned status %d", path, httpResponse.StatusCode)
+		return false, joinedAPIStatusError(path, httpResponse.StatusCode, httpResponse.Body)
 	}
 	if response == nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, joinedAPIResponseLimit))
@@ -1375,6 +1375,22 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		return false, fmt.Errorf("decode joined API %s response: %w", path, err)
 	}
 	return true, nil
+}
+
+func joinedAPIStatusError(path string, status int, body io.Reader) error {
+	raw, err := io.ReadAll(io.LimitReader(body, joinedAPIErrorLimit+1))
+	if err != nil || len(raw) > joinedAPIErrorLimit {
+		return fmt.Errorf("joined API %s returned status %d", path, status)
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&payload) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(payload.Error) == "" {
+		return fmt.Errorf("joined API %s returned status %d", path, status)
+	}
+	return fmt.Errorf("joined API %s returned status %d error=%q", path, status, payload.Error)
 }
 
 func (c *joinedAPIClient) getJSON(ctx context.Context, path, token string, response any) error {

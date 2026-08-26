@@ -27,6 +27,47 @@ func TestJoinedAPIClientRejectsMalformedBaseURL(t *testing.T) {
 	}
 }
 
+func TestJoinedAPIClientIncludesBoundedStructuredServerError(t *testing.T) {
+	const operationToken = "operation-token-secret-sentinel"
+	const requestSecret = "request-body-secret-sentinel"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+operationToken {
+			t.Error("operation authorization differs")
+			return
+		}
+		var payload struct {
+			Secret string `json:"secret"`
+		}
+		if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Secret != requestSecret {
+			t.Error("request payload differs")
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"worker media partition differs from canonical plan"}`))
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = api.postJSON(context.Background(), "/seal", operationToken, struct {
+		Secret string `json:"secret"`
+	}{requestSecret}, &struct{}{})
+	want := `joined API /seal returned status 409 error="worker media partition differs from canonical plan"`
+	if err == nil || err.Error() != want || strings.Contains(err.Error(), operationToken) || strings.Contains(err.Error(), requestSecret) {
+		t.Fatalf("structured server error was not surfaced safely: %v", err)
+	}
+}
+
+func TestJoinedAPIClientOmitsMalformedOrOversizedServerError(t *testing.T) {
+	for _, body := range []string{`not-json`, `{"error":"` + strings.Repeat("x", joinedAPIErrorLimit) + `"}`} {
+		err := joinedAPIStatusError("/seal", http.StatusConflict, strings.NewReader(body))
+		if err == nil || err.Error() != "joined API /seal returned status 409" {
+			t.Fatalf("untrusted response was included: %v", err)
+		}
+	}
+}
+
 func TestJoinedClaimAdmissionOperatorContract(t *testing.T) {
 	const (
 		batch = "tier1-generation-1"
