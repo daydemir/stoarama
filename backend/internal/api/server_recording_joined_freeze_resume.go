@@ -81,7 +81,8 @@ func (s *Server) joinedTier1FreezeProgress(ctx context.Context, batchID string) 
 		COALESCE((SELECT min(br.priority_ordinal) FROM recording_joined_batch_recordings br
 		 LEFT JOIN recording_joined_snapshot_chunks c ON c.batch_recording_id=br.id
 		 WHERE br.batch_record_id=b.id AND c.id IS NULL),0)
-		FROM recording_joined_batches b WHERE b.batch_id=$1`, batchID).
+		FROM recording_joined_batches b WHERE b.batch_id=$1 AND b.connection_id=$2`, batchID,
+		s.cfg.JoinedRecordingConnectionID).
 		Scan(&progress.State, &progress.CompletedRecordings, &progress.ExpectedRecordings,
 			&progress.CompletedStreamDays, &progress.ExpectedStreamDays, &next)
 	if err != nil {
@@ -99,15 +100,11 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 	var batchRecordID int64
 	var requestBytes []byte
 	var requestSHA, state string
-	var protocol int
-	err := tx.QueryRow(ctx, `SELECT b.id,b.freeze_request_bytes,b.freeze_request_sha256,b.state,c.joined_protocol_version
+	err := tx.QueryRow(ctx, `SELECT b.id,b.freeze_request_bytes,b.freeze_request_sha256,b.state
 		FROM recording_joined_batches b JOIN connections c ON c.id=b.connection_id
-		WHERE b.batch_id=$1 FOR UPDATE OF b,c`, req.BatchID).
-		Scan(&batchRecordID, &requestBytes, &requestSHA, &state, &protocol)
+		WHERE b.batch_id=$1 AND c.id=$2 FOR UPDATE OF b,c`, req.BatchID, s.cfg.JoinedRecordingConnectionID).
+		Scan(&batchRecordID, &requestBytes, &requestSHA, &state)
 	if err == nil {
-		if protocol != joinedrecording.JoinedProtocolVersion {
-			return plan, 0, "", false, errors.New("Tier-1 connection protocol is disabled")
-		}
 		if requestSHA != req.ExpectedRequestSHA256 {
 			return plan, 0, "", false, errors.New("Tier-1 batch key already has different immutable evidence")
 		}
@@ -125,17 +122,25 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 	}
 
 	var liveAccountID int64
-	var liveProtocol int
 	var liveQualificationStatus, liveQualificationVersion, liveCohortSHA, liveWindowsSHA string
 	var liveQualificationFrozenAt time.Time
-	if err := tx.QueryRow(ctx, `SELECT run.final_plan_bytes,run.final_plan_sha256,c.account_id,c.joined_protocol_version,
+	var checkpointConnectionID int64
+	if err := tx.QueryRow(ctx, `SELECT connection_id FROM recording_joined_dry_runs
+		WHERE batch_id=$1 AND generation=$2 FOR SHARE`, req.BatchID, req.Generation).Scan(&checkpointConnectionID); err != nil {
+		return plan, 0, "", false, errors.New("ready checkpointed Tier-1 dry-run plan not found")
+	}
+	if checkpointConnectionID != int64(s.cfg.JoinedRecordingConnectionID) {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 connection differs")
+	}
+	if err := tx.QueryRow(ctx, `SELECT run.final_plan_bytes,run.final_plan_sha256,c.account_id,
 		q.status,q.definition_version,q.cohort_sha256,q.windows_sha256,q.frozen_at
 		FROM recording_joined_dry_runs run
-		JOIN connections c ON c.id=run.connection_id
+		JOIN connections c ON c.id=run.connection_id AND c.account_id=run.account_id
 		JOIN recording_qualification_runs q ON q.id=run.qualification_run_id AND q.account_id=run.account_id
 		WHERE run.batch_id=$1 AND run.generation=$2 AND run.state='ready' AND run.final_plan_sha256=$3
-		FOR SHARE OF run,c,q`, req.BatchID, req.Generation, req.ExpectedRequestSHA256).
-		Scan(&requestBytes, &requestSHA, &liveAccountID, &liveProtocol, &liveQualificationStatus,
+		  AND run.connection_id=$4
+		FOR SHARE OF run,c,q`, req.BatchID, req.Generation, req.ExpectedRequestSHA256, s.cfg.JoinedRecordingConnectionID).
+		Scan(&requestBytes, &requestSHA, &liveAccountID, &liveQualificationStatus,
 			&liveQualificationVersion, &liveCohortSHA, &liveWindowsSHA, &liveQualificationFrozenAt); err != nil {
 		return plan, 0, "", false, errors.New("ready checkpointed Tier-1 dry-run plan not found")
 	}
@@ -144,7 +149,8 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 		return plan, 0, "", false, errors.New("checkpointed Tier-1 dry-run plan differs")
 	}
 	plan.RequestSHA256 = requestSHA
-	if liveAccountID != plan.AccountID || liveProtocol != joinedrecording.JoinedProtocolVersion || liveQualificationStatus != "active" ||
+	if liveAccountID != plan.AccountID || plan.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) ||
+		liveQualificationStatus != "active" ||
 		liveQualificationVersion != plan.SelectionAuthority.QualificationRuleVersion ||
 		liveCohortSHA != plan.SelectionAuthority.QualificationCohortSHA256 ||
 		liveWindowsSHA != plan.SelectionAuthority.QualificationWindowsSHA256 ||

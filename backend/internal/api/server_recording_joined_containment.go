@@ -171,10 +171,6 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusConflict, "joined batch generation identity is invalid")
 		return
 	}
-	if response.ConnectionProtocolVersion != s.cfg.JoinedRecordingProtocolVersion {
-		util.WriteError(w, http.StatusConflict, "joined connection protocol is not ready")
-		return
-	}
 	if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&response.DatabaseNow); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined database clock failed")
 		return
@@ -185,10 +181,9 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		       h.claimed_by IS NOT NULL,h.heartbeat_at
 		FROM recording_joined_hours h
 		JOIN recording_joined_batches b ON b.id=h.batch_record_id AND b.batch_id=$1 AND b.connection_id=$2
-		JOIN connections c ON c.id=h.connection_id AND c.id=$2 AND c.joined_protocol_version=$4
+		JOIN connections c ON c.id=h.connection_id AND c.id=$2
 		WHERE h.batch_id=$1 AND h.batch_record_id=b.id AND h.hour_id=ANY($3::text[])
-		ORDER BY array_position($3::text[],h.hour_id)`, batchIDs[0], s.cfg.JoinedRecordingConnectionID, canaryIDs,
-		s.cfg.JoinedRecordingProtocolVersion)
+		ORDER BY array_position($3::text[],h.hour_id)`, batchIDs[0], s.cfg.JoinedRecordingConnectionID, canaryIDs)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined canary hours failed")
 		return

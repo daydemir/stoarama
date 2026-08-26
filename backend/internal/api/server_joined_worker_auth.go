@@ -134,11 +134,12 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 		}
 		var allowed bool
 		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_batches b
-			JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
+			JOIN connections c ON c.id=b.connection_id AND c.id=$4
 			WHERE b.batch_id=$1 AND (($2='hour' AND EXISTS(SELECT 1 FROM recording_joined_hours h
 			  WHERE h.batch_record_id=b.id AND h.hour_id=$3)) OR ($2<>'hour' AND EXISTS(
 			  SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
-			    AND a.scope_kind=$2 AND a.scope_id=$3))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID).Scan(&allowed)
+			    AND a.scope_kind=$2 AND a.scope_id=$3))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID,
+			s.cfg.JoinedRecordingConnectionID).Scan(&allowed)
 		return err == nil && allowed
 	}
 	if !config.IsJoinedCanaryWorkScope(scope) {
@@ -147,12 +148,20 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 	hours := s.joinedCanaryHourIDs()
 	switch claims.SubjectKind {
 	case joinedauth.SubjectHour:
-		for _, hourID := range hours {
-			if claims.SubjectID == hourID {
-				return true
+		if s.pool == nil {
+			for _, hourID := range hours {
+				if claims.SubjectID == hourID {
+					return true
+				}
 			}
+			return false
 		}
-		return false
+		var allowed bool
+		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_hours h
+			JOIN recording_joined_batches b ON b.id=h.batch_record_id AND b.connection_id=$4
+			WHERE h.batch_id=$1 AND h.hour_id=$2 AND h.hour_id=ANY($3::text[]))`, claims.BatchID,
+			claims.SubjectID, hours, s.cfg.JoinedRecordingConnectionID).Scan(&allowed)
+		return err == nil && allowed
 	case joinedauth.SubjectLedger:
 		if s.pool == nil {
 			return false
@@ -160,8 +169,10 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 		var allowed bool
 		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_artifacts a
 			JOIN recording_joined_hours h ON h.stream_day_id=a.stream_day_id
+			JOIN recording_joined_batches b ON b.id=a.batch_record_id AND b.connection_id=$4
 			WHERE a.batch_id=$1 AND a.artifact_kind='allocation_ledger' AND a.scope_id=$2
-			  AND h.hour_id=ANY($3::text[]))`, claims.BatchID, claims.SubjectID, hours).Scan(&allowed)
+			  AND h.hour_id=ANY($3::text[]))`, claims.BatchID, claims.SubjectID, hours,
+			s.cfg.JoinedRecordingConnectionID).Scan(&allowed)
 		return err == nil && allowed
 	case joinedauth.SubjectBatchIndex:
 		return false

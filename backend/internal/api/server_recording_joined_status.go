@@ -43,6 +43,10 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, "one valid batch_id is required")
 		return
 	}
+	if batchIDs[0] != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusNotFound, "joined batch not found")
+		return
+	}
 
 	rows, err := s.pool.Query(r.Context(), `SELECT b.batch_id,b.state,b.frozen_denominator_sha256,
 		b.freeze_started_at,b.frozen_at,b.expected_stream_days,b.expected_scheduled_hours,
@@ -51,9 +55,9 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 		FROM recording_joined_batches b
 		JOIN recording_joined_batch_recordings br ON br.batch_record_id=b.id
 		JOIN recording_joined_stream_days d ON d.batch_record_id=b.id AND d.batch_recording_id=br.id
-		WHERE b.batch_id=$1 AND b.state<>'snapshotting'
+		WHERE b.batch_id=$1 AND b.connection_id=$3 AND b.state<>'snapshotting'
 		ORDER BY br.priority_ordinal,d.date_ordinal
-		LIMIT $2`, batchIDs[0], joinedAdminBatchStatusStreamDays+1)
+		LIMIT $2`, batchIDs[0], joinedAdminBatchStatusStreamDays+1, s.cfg.JoinedRecordingConnectionID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load joined batch status: %v", err))
 		return

@@ -45,7 +45,7 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	claim, ledger, ledgerArtifactID, hourRecordID, workerID, err := loadJoinedSealFacts(r.Context(), tx, claims.BatchID,
-		req.HourID, preflightToken)
+		req.HourID, preflightToken, s.cfg.JoinedRecordingConnectionID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "joined preflight lease is stale or foreign")
 		return
@@ -60,7 +60,8 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("build canonical joined hour: %v", err))
 		return
 	}
-	mediaIDs, err := insertJoinedMediaArtifacts(r.Context(), tx, hourRecordID, claim, plan, req, preflightToken)
+	mediaIDs, err := insertJoinedMediaArtifacts(r.Context(), tx, hourRecordID, claim, plan, req, preflightToken,
+		s.cfg.JoinedRecordingConnectionID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, fmt.Sprintf("seal joined media identities: %v", err))
 		return
@@ -87,8 +88,9 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 	err = tx.QueryRow(r.Context(), `UPDATE recording_joined_hours SET state='sealed',claim_token=NULL,claimed_by=NULL,
 		lease_expires_at=NULL,heartbeat_at=NULL,source_only_sha256=$3,canonical_plan=$4,manifest_bytes=$5,
 		manifest_sha256=$6,sealed_at=now() WHERE id=$1 AND state='leased' AND claim_token=$2 AND lease_expires_at>now()
-		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.joined_protocol_version=1)
-		RETURNING id`, hourRecordID, preflightToken, req.SourceClaimSHA256, planJSON, manifestBytes, manifestSHA).Scan(&sealedID)
+		  AND connection_id=$7
+		RETURNING id`, hourRecordID, preflightToken, req.SourceClaimSHA256, planJSON, manifestBytes, manifestSHA,
+		s.cfg.JoinedRecordingConnectionID).Scan(&sealedID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "joined hour seal lease changed")
 		return
@@ -146,7 +148,7 @@ func joinedOutputAuthority(raw string) (string, error) {
 	return parsed.Host, nil
 }
 
-func loadJoinedSealFacts(ctx context.Context, tx pgx.Tx, batchID, hourID string, token uuid.UUID) (
+func loadJoinedSealFacts(ctx context.Context, tx pgx.Tx, batchID, hourID string, token uuid.UUID, connectionID int) (
 	joinedrecording.PreflightHourClaim, joinedrecording.StreamDayAllocation, int64, int64, string, error) {
 	var claim joinedrecording.PreflightHourClaim
 	var ledger joinedrecording.StreamDayAllocation
@@ -160,9 +162,10 @@ func loadJoinedSealFacts(ctx context.Context, tx pgx.Tx, batchID, hourID string,
 		JOIN recording_joined_batch_recordings br ON br.batch_record_id=b.id AND br.recording_id=h.recording_id
 		JOIN recording_joined_stream_days d ON d.id=h.stream_day_id
 		JOIN recording_joined_artifacts ledger ON ledger.stream_day_id=d.id AND ledger.artifact_kind='allocation_ledger'
-		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=h.connection_id
 		WHERE h.hour_id=$1 AND h.batch_id=$2 AND b.state='frozen' AND h.state='leased' AND h.claim_token=$3 AND h.lease_expires_at>now()
-		  AND ledger.publication_state='published' FOR UPDATE OF h,c`, hourID, batchID, token).Scan(&hourRecordID,
+		  AND c.id=$4
+		  AND ledger.publication_state='published' FOR UPDATE OF h,c`, hourID, batchID, token, connectionID).Scan(&hourRecordID,
 		&claim.BatchID, &claim.Generation, &claim.RecordingID, &claim.Timezone, &claim.LocalDate, &claim.LocalHour,
 		&claim.FolderName, &metadataJSON, &claim.AllocationLedgerSHA, &qualificationJSON, &mediaToolJSON,
 		&claim.SourceClaimSHA256, &ledgerJSON, &ledgerArtifactID, &workerID)
@@ -270,7 +273,7 @@ func buildJoinedSealedPlan(claim joinedrecording.PreflightHourClaim, req joinedr
 }
 
 func insertJoinedMediaArtifacts(ctx context.Context, tx pgx.Tx, hourRecordID int64, claim joinedrecording.PreflightHourClaim,
-	plan joinedrecording.BatchPlan, req joinedrecording.SealHourRequest, token uuid.UUID) ([]int64, error) {
+	plan joinedrecording.BatchPlan, req joinedrecording.SealHourRequest, token uuid.UUID, connectionID int) ([]int64, error) {
 	sourceIDs := map[int64]int64{}
 	rows, err := tx.Query(ctx, `SELECT clip_id,id FROM recording_joined_sources WHERE hour_record_id=$1`, hourRecordID)
 	if err != nil {
@@ -291,9 +294,9 @@ func insertJoinedMediaArtifacts(ctx context.Context, tx pgx.Tx, hourRecordID int
 			scope_kind,scope_id,stream_day_id,hour_record_id,artifact_kind,ordinal,relative_path,object_key,content_type,
 			content_id,expected_size_bytes,expected_sha256)
 			SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,'media',$2,$3,$4,
-			  'video/mp4',$5,$6,$7 FROM recording_joined_hours WHERE id=$1 AND state='leased' AND claim_token=$8
+			  'video/mp4',$5,$6,$7 FROM recording_joined_hours WHERE id=$1 AND state='leased' AND claim_token=$8 AND connection_id=$9
 			RETURNING id`, hourRecordID, output.Ordinal, output.RelativePath, output.ObjectKey, output.ContentID,
-			output.ExpectedSize, output.ExpectedSHA, token).Scan(&mediaIDs[i])
+			output.ExpectedSize, output.ExpectedSHA, token, connectionID).Scan(&mediaIDs[i])
 		if err != nil {
 			return nil, err
 		}
@@ -330,10 +333,11 @@ func insertJoinedMediaArtifacts(ctx context.Context, tx pgx.Tx, hourRecordID int
 	return mediaIDs, nil
 }
 
-func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID int64, scope joinedrecording.WorkScopeIdentity) error {
+func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID int64, scope joinedrecording.WorkScopeIdentity,
+	connectionID int) error {
 	var batchID string
 	if err := tx.QueryRow(ctx, `SELECT batch_id FROM recording_joined_artifacts
-		WHERE id=$1 AND artifact_kind='allocation_ledger'`, ledgerArtifactID).Scan(&batchID); err != nil {
+		WHERE id=$1 AND artifact_kind='allocation_ledger' AND connection_id=$2`, ledgerArtifactID, connectionID).Scan(&batchID); err != nil {
 		return err
 	}
 	if err := scope.Validate(batchID); err != nil {
@@ -351,11 +355,11 @@ func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID i
 		FROM recording_joined_artifacts ledger JOIN recording_joined_stream_days d ON d.id=ledger.stream_day_id
 		JOIN recording_joined_hours h ON h.stream_day_id=d.id JOIN recording_joined_batches b ON b.id=h.batch_record_id
 		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
-		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=h.connection_id
 		WHERE ledger.id=$1 AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
-		  AND b.state='frozen' AND h.state='pending' AND h.source_clip_count=0
+		  AND b.state='frozen' AND h.state='pending' AND h.source_clip_count=0 AND c.id=$4
 		  AND ($2::boolean OR h.hour_id=ANY($3::text[])) ORDER BY h.delivery_hour
-		FOR UPDATE OF h,c`, ledgerArtifactID, allGapHours, scope.CanaryHourIDs)
+		FOR UPDATE OF h,c`, ledgerArtifactID, allGapHours, scope.CanaryHourIDs, connectionID)
 	if err != nil {
 		return err
 	}
@@ -406,8 +410,8 @@ func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID i
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE recording_joined_hours SET state='sealed',source_only_sha256=$2,
-			canonical_plan=$3,manifest_bytes=$4,manifest_sha256=$5,sealed_at=now() WHERE id=$1 AND state='pending'`,
-			hour.recordID, plan.SourceClaimSHA256, planJSON, manifestBytes, manifestSHA); err != nil {
+			canonical_plan=$3,manifest_bytes=$4,manifest_sha256=$5,sealed_at=now() WHERE id=$1 AND state='pending' AND connection_id=$6`,
+			hour.recordID, plan.SourceClaimSHA256, planJSON, manifestBytes, manifestSHA, connectionID); err != nil {
 			return err
 		}
 		relativePath := "coverage/hours/" + plan.HourID + ".json"
@@ -415,8 +419,8 @@ func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID i
 			scope_kind,scope_id,stream_day_id,hour_record_id,artifact_kind,ordinal,relative_path,object_key,content_type,
 			expected_size_bytes,expected_sha256,canonical_bytes,publication_state)
 			SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,'hour_manifest',1,
-			  $2,$3,'application/json',$4,$5,$6,'sealed' FROM recording_joined_hours WHERE id=$1`, hour.recordID,
-			relativePath, "joined/"+plan.BatchID+"/"+relativePath, len(manifestBytes), manifestSHA, manifestBytes); err != nil {
+			  $2,$3,'application/json',$4,$5,$6,'sealed' FROM recording_joined_hours WHERE id=$1 AND connection_id=$7`, hour.recordID,
+			relativePath, "joined/"+plan.BatchID+"/"+relativePath, len(manifestBytes), manifestSHA, manifestBytes, connectionID); err != nil {
 			return err
 		}
 	}

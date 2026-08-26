@@ -556,6 +556,7 @@ func TestConnectionHeartbeatJoinedProtocolTracksCurrentClientCapability(t *testi
 
 func TestDesiredJoinedProtocolIsExactAndFailClosed(t *testing.T) {
 	base := validRemoteJoinedProtocolConfig(42, 9)
+	base.JoinedRecordingNASDeliveryEnabled = true
 	for _, tc := range []struct {
 		name                        string
 		cfg                         config.Config
@@ -563,6 +564,7 @@ func TestDesiredJoinedProtocolIsExactAndFailClosed(t *testing.T) {
 		wantVersion, wantGeneration int
 	}{
 		{"exact enabled", base, 42, 1, 9},
+		{"NAS delivery disabled", validRemoteJoinedProtocolConfig(42, 9), 42, 0, 9},
 		{"mismatch", base, 41, 0, 0},
 		{"missing target", config.Config{}, 42, 0, 0},
 		{"invalid joined control config", config.Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1, JoinedRecordingConnectionID: 42, JoinedRecordingProtocolGeneration: 9}, 42, 0, 9},
@@ -596,6 +598,7 @@ func TestPullJoinedConnectionIDRejectsStaleObservedProtocol(t *testing.T) {
 		t.Fatalf("stale database protocol survived desired downgrade: %v", err)
 	}
 	s.cfg = validRemoteJoinedProtocolConfig(int(connectionID), 3)
+	s.cfg.JoinedRecordingNASDeliveryEnabled = true
 	if got, err := s.pullJoinedConnectionID(ctx, pool, principal, false); err != nil || got != connectionID {
 		t.Fatalf("current exact protocol connection=%d err=%v", got, err)
 	}

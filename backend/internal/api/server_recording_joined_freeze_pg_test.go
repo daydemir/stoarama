@@ -24,6 +24,17 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
+func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var superuser bool
+	if err := pool.QueryRow(context.Background(), `SELECT rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&superuser); err != nil {
+		t.Fatalf("check PostgreSQL fixture authority: %v", err)
+	}
+	if !superuser {
+		t.Skip("persisted-corruption fixture requires a disposable PostgreSQL superuser")
+	}
+}
+
 var joinedMigrationNames = []string{
 	"0137_recording_joined_outputs.sql",
 	"0138_joined_historical_qualification_authority.sql",
@@ -241,6 +252,8 @@ func newJoinedHistoricalTier1FixtureWithCheckpoint(t *testing.T, email string, s
 	}
 	s.cfg.JoinedRecordingControlPlaneEnabled = true
 	s.cfg.JoinedRecordingProtocolVersion = 1
+	s.cfg.JoinedRecordingConnectionID = int(connectionID)
+	s.cfg.JoinedRecordingProtocolGeneration = 1
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
 	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
@@ -597,8 +610,8 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
-	if replay, _ := call(req); replay.Code != http.StatusConflict {
-		t.Fatalf("protocol-zero apply replay status=%d body=%s", replay.Code, replay.Body.String())
+	if replay, _ := call(req); replay.Code != http.StatusOK {
+		t.Fatalf("protocol-zero cloud apply replay status=%d", replay.Code)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
@@ -731,6 +744,7 @@ func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testi
 	abandonedReq := req
 	abandonedReq.Generation = 2
 	abandonedReq.BatchID = strings.TrimSuffix(req.BatchID, "-generation-1") + "-generation-2"
+	fixture.s.cfg.JoinedRecordingBatchID = abandonedReq.BatchID
 	abandoned, err := fixture.s.startJoinedTier1DryRun(ctx, abandonedReq)
 	if err != nil {
 		t.Fatal(err)
@@ -742,6 +756,7 @@ func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testi
 	if _, err := fixture.s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{RunID: abandoned.RunID, PriorityOrdinal: 1}); err == nil {
 		t.Fatal("invalidated dry-run resumed")
 	}
+	fixture.s.cfg.JoinedRecordingBatchID = req.BatchID
 	if _, err := fixture.pool.Exec(ctx, `UPDATE recording_clips SET purged_at=clock_timestamp() WHERE id=$1`, fixture.clipID); err == nil {
 		t.Fatal("invalidated dry-run released retention authority")
 	}
@@ -751,6 +766,60 @@ func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testi
 	}
 	if progress.State != "building" || progress.CompletedRecordings != 0 || progress.NextPriorityOrdinal == nil || *progress.NextPriorityOrdinal != 1 {
 		t.Fatalf("start progress=%+v", progress)
+	}
+	var foreignConnectionID int64
+	var foreignAPIKeyID int64
+	_, foreignAccountID := seedUserOrg(t, fixture.pool, "foreign-dry-run@example.test", true)
+	if err := fixture.pool.QueryRow(ctx, `INSERT INTO account_api_keys(account_id,key_prefix,secret_hash,label,scopes)
+		VALUES($1,'sir_foreign_dry_run','foreign-dry-run-key','Foreign dry-run',ARRAY['stoarama.pull']) RETURNING id`,
+		foreignAccountID).Scan(&foreignAPIKeyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,label,api_key_id,joined_protocol_version)
+		VALUES($1,'nas_pull','foreign joined authority',$2,0) RETURNING id`, foreignAccountID,
+		foreignAPIKeyID).Scan(&foreignConnectionID); err != nil {
+		t.Fatal(err)
+	}
+	foreignReq := req
+	foreignReq.ConnectionID = foreignConnectionID
+	var runsBefore, runsAfter int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_dry_runs`).Scan(&runsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.s.startJoinedTier1DryRun(ctx, foreignReq); err == nil {
+		t.Fatal("foreign connection started a Tier-1 dry-run")
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_dry_runs`).Scan(&runsAfter); err != nil || runsAfter != runsBefore {
+		t.Fatalf("foreign dry-run start mutated rows before=%d after=%d err=%v", runsBefore, runsAfter, err)
+	}
+	var abandonedState string
+	var abandonedCompleted int
+	var abandonedInvalidatedAt time.Time
+	if err := fixture.pool.QueryRow(ctx, `SELECT state,completed_recordings,invalidated_at FROM recording_joined_dry_runs WHERE id=$1`,
+		abandoned.RunID).Scan(&abandonedState, &abandonedCompleted, &abandonedInvalidatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.s.stepJoinedTier1DryRun(ctx, joinedTier1DryRunStepRequest{RunID: abandoned.RunID, PriorityOrdinal: 1}); err == nil {
+		t.Fatal("foreign dry-run UUID advanced")
+	}
+	if _, err := fixture.s.joinedTier1DryRunStatus(ctx, abandoned.RunID); err == nil {
+		t.Fatal("foreign dry-run UUID status was disclosed")
+	}
+	invalidateBody, _ := json.Marshal(map[string]string{"run_id": abandoned.RunID})
+	invalidateReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/recording/joined/freeze-tier1/dry-run/invalidate",
+		bytes.NewReader(invalidateBody))
+	invalidateRec := httptest.NewRecorder()
+	fixture.s.handleAdminJoinedFreezeTier1DryRunInvalidate(invalidateRec, invalidateReq)
+	var stateAfterForeign string
+	var completedAfterForeign int
+	var invalidatedAfterForeign time.Time
+	if err := fixture.pool.QueryRow(ctx, `SELECT state,completed_recordings,invalidated_at FROM recording_joined_dry_runs WHERE id=$1`,
+		abandoned.RunID).Scan(&stateAfterForeign, &completedAfterForeign, &invalidatedAfterForeign); err != nil ||
+		invalidateRec.Code != http.StatusConflict || stateAfterForeign != abandonedState || completedAfterForeign != abandonedCompleted ||
+		!invalidatedAfterForeign.Equal(abandonedInvalidatedAt) {
+		t.Fatalf("foreign invalidate status=%d state=%q/%q completed=%d/%d timestamp=%s/%s err=%v", invalidateRec.Code,
+			stateAfterForeign, abandonedState, completedAfterForeign, abandonedCompleted, invalidatedAfterForeign,
+			abandonedInvalidatedAt, err)
 	}
 	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, fixture.connectionID); err != nil {
 		t.Fatal(err)
@@ -875,6 +944,88 @@ func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testi
 	}
 	apply := req
 	apply.Apply, apply.ExpectedRequestSHA256 = true, *progress.RequestSHA256
+	var persistedForeignRunID int64
+	requireJoinedTestReplicationRole(t, fixture.pool)
+	foreignQualificationTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignQualificationTx.Exec(ctx, `SET LOCAL session_replication_role='replica'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreignQualificationTx.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,
+		definition_jsonb,definition_sha256,cohort_sha256,windows_sha256,target_recording_count,target_window_count,
+		required_good_or_great,max_acceptable,window_sequence_start_at,qualification_due_at,status,created_at,frozen_at)
+		SELECT $1,definition_version,definition_jsonb,definition_sha256,cohort_sha256,windows_sha256,target_recording_count,
+		target_window_count,required_good_or_great,max_acceptable,window_sequence_start_at,qualification_due_at,status,
+		created_at,frozen_at FROM recording_qualification_runs WHERE id=$2 RETURNING id`, foreignAccountID,
+		fixture.runID).Scan(&persistedForeignRunID); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreignQualificationTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var snapshotsBeforeForeign int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_source_snapshots`).Scan(&snapshotsBeforeForeign); err != nil {
+		t.Fatal(err)
+	}
+	foreignRunTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignRunTx.Exec(ctx, `SET LOCAL session_replication_role='replica'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignRunTx.Exec(ctx, `DELETE FROM recording_joined_dry_run_recordings WHERE dry_run_id=$1`, progress.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignRunTx.Exec(ctx, `DELETE FROM recording_joined_dry_run_scopes WHERE dry_run_id=$1`, progress.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignRunTx.Exec(ctx, `DELETE FROM recording_joined_dry_runs WHERE id=$1`, progress.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignRunTx.Exec(ctx, `INSERT INTO recording_joined_dry_runs(account_id,connection_id,batch_id,generation,
+		qualification_run_id,input_bytes,input_sha256,skeleton_bytes,skeleton_sha256,state,completed_recordings,
+		final_plan_bytes,final_plan_sha256,ready_at) VALUES($1,$2,$3,$4,$5,$6,$7,$6,$7,'ready',33,$6,$7,clock_timestamp())`,
+		foreignAccountID, foreignConnectionID, apply.BatchID, apply.Generation,
+		persistedForeignRunID, finalBytes, apply.ExpectedRequestSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreignRunTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	foreignApply, _ := fixture.call(apply)
+	var foreignApplyBatches, snapshotsAfterForeign int
+	if err := fixture.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM recording_joined_batches WHERE batch_id=$1),
+		(SELECT count(*) FROM recording_joined_source_snapshots)`, apply.BatchID).
+		Scan(&foreignApplyBatches, &snapshotsAfterForeign); err != nil || foreignApply.Code != http.StatusConflict ||
+		foreignApplyBatches != 0 || snapshotsAfterForeign != snapshotsBeforeForeign {
+		t.Fatalf("persisted foreign ready checkpoint apply status=%d body=%s batches=%d snapshots=%d err=%v",
+			foreignApply.Code, foreignApply.Body.String(), foreignApplyBatches, snapshotsAfterForeign-snapshotsBeforeForeign, err)
+	}
+	restoreRunTx, err := fixture.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreRunTx.Exec(ctx, `SET LOCAL session_replication_role='replica'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreRunTx.Exec(ctx, `DELETE FROM recording_joined_dry_runs WHERE batch_id=$1 AND generation=$2`,
+		apply.BatchID, apply.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreRunTx.Exec(ctx, `INSERT INTO recording_joined_dry_runs(account_id,connection_id,batch_id,generation,
+		qualification_run_id,input_bytes,input_sha256,skeleton_bytes,skeleton_sha256,state,completed_recordings,
+		final_plan_bytes,final_plan_sha256,ready_at) VALUES($1,$2,$3,$4,$5,$6,$7,$6,$7,'ready',33,$6,$7,clock_timestamp())`,
+		fixture.accountID, fixture.connectionID, apply.BatchID, apply.Generation, fixture.runID, finalBytes,
+		apply.ExpectedRequestSHA256); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreRunTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, fixture.connectionID); err != nil {
 		t.Fatal(err)
 	}

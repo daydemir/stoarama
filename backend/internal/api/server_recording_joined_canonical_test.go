@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -77,6 +79,36 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 	if err != nil {
 		t.Fatalf("start final-validation checkpoint: %v", err)
 	}
+	var validationRunsBefore, validationRunsAfter int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_final_validation_runs`).Scan(&validationRunsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.s.startJoinedFinalValidation(ctx, joinedFinalValidationStartRequest{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: "foreign-generation-1",
+		ExpectedFrozenDenominatorSHA256: fixture.plan.FrozenDenominatorSHA256,
+	}); err == nil {
+		t.Fatal("foreign batch started final validation")
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_final_validation_runs`).Scan(&validationRunsAfter); err != nil ||
+		validationRunsAfter != validationRunsBefore {
+		t.Fatalf("foreign final-validation start mutated rows before=%d after=%d err=%v", validationRunsBefore, validationRunsAfter, err)
+	}
+	configuredBatch := fixture.s.cfg.JoinedRecordingBatchID
+	fixture.s.cfg.JoinedRecordingBatchID = "foreign-generation-1"
+	if _, err := fixture.s.stepJoinedFinalValidation(ctx, joinedFinalValidationStepRequest{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion, RunID: validation.RunID, Ordinal: 1,
+	}); err == nil {
+		t.Fatal("foreign final-validation run UUID advanced")
+	}
+	if _, err := fixture.s.joinedFinalValidationStatus(ctx, validation.RunID); err == nil {
+		t.Fatal("foreign final-validation run UUID status was disclosed")
+	}
+	fixture.s.cfg.JoinedRecordingBatchID = configuredBatch
+	var completedScopes int
+	if err := fixture.pool.QueryRow(ctx, `SELECT completed_scopes FROM recording_joined_final_validation_runs WHERE id=$1`,
+		validation.RunID).Scan(&completedScopes); err != nil || completedScopes != 0 {
+		t.Fatalf("foreign final-validation run mutated completed_scopes=%d err=%v", completedScopes, err)
+	}
 	for validation.State != "ready" {
 		if validation.NextOrdinal == nil {
 			t.Fatalf("final-validation checkpoint stalled: %+v", validation)
@@ -133,12 +165,6 @@ func TestJoinedFinalFreezeRecomputesFrozenDenominatorAndIsAdminOnly(t *testing.T
 		t.Fatalf("failed final freeze leaked state=%s started=%v err=%v", state, freezeStarted, err)
 	}
 	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, fixture.connectionID); err != nil {
-		t.Fatal(err)
-	}
-	if response := call(freezeRequest, true, ""); response.Code != http.StatusConflict {
-		t.Fatalf("protocol-0 final freeze status=%d body=%s", response.Code, response.Body.String())
-	}
-	if _, err := fixture.pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, fixture.connectionID); err != nil {
 		t.Fatal(err)
 	}
 	lockTx, err := fixture.pool.Begin(ctx)
@@ -974,6 +1000,13 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	}
 	lateConn.Release()
 	freezeConn.Release()
+	// The NAS heartbeat observes protocol 0 while cloud joining proceeds. Cloud
+	// authority comes from the configured batch, connection, scope, and worker
+	// credentials, not from the independent NAS delivery switch.
+	s.cfg.JoinedRecordingNASDeliveryEnabled = false
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	t.Run("single-canary publication claim is database-fenced", singleCanaryTest)
 	ledgerArtifactID, ledgerRelative, ledgerObject := ledgers[0].artifactID, ledgers[0].relativePath, ledgers[0].objectKey
 	ledgerBytes, ledgerArtifactSHA := ledgers[0].bytes, ledgers[0].sha
@@ -1158,6 +1191,68 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("exact dependency ledger finalize status=%d body=%s", sourceLedgerFinalizeRec.Code, sourceLedgerFinalizeRec.Body.String())
 	}
 	principal := accountPrincipal{AccountID: accountID, APIKeyID: &apiKeyID, KeyScopes: []string{accountScopePull}}
+	disabledFeedReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/joined", nil)
+	disabledFeedReq = disabledFeedReq.WithContext(context.WithValue(disabledFeedReq.Context(), accountPrincipalContextKey, principal))
+	disabledFeedRec := httptest.NewRecorder()
+	s.handleAccountJoined(disabledFeedRec, disabledFeedReq)
+	if disabledFeedRec.Code != http.StatusOK || disabledFeedRec.Body.String() != "{\"item\":null}\n" {
+		t.Fatalf("disabled NAS feed status=%d body=%s", disabledFeedRec.Code, disabledFeedRec.Body.String())
+	}
+	disabledDownloadReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/joined/output/download", nil)
+	disabledDownloadRoute := chi.NewRouteContext()
+	disabledDownloadRoute.URLParams.Add("joinedId", fmt.Sprint(ledgerArtifactID))
+	disabledDownloadReq = disabledDownloadReq.WithContext(context.WithValue(
+		context.WithValue(disabledDownloadReq.Context(), accountPrincipalContextKey, principal), chi.RouteCtxKey, disabledDownloadRoute))
+	disabledDownloadRec := httptest.NewRecorder()
+	s.handleAccountJoinedDownload(disabledDownloadRec, disabledDownloadReq)
+	if disabledDownloadRec.Code != http.StatusNotFound {
+		t.Fatalf("disabled NAS download status=%d body=%s", disabledDownloadRec.Code, disabledDownloadRec.Body.String())
+	}
+	disabledAckBody, _ := json.Marshal(joinedAckRequest{ArtifactID: ledgerArtifactID, RelativePath: ledgerRelative,
+		SizeBytes: int64(len(ledgerBytes)), SHA256: ledgerArtifactSHA})
+	disabledAckReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/joined/ack", bytes.NewReader(disabledAckBody))
+	disabledAckReq = disabledAckReq.WithContext(context.WithValue(disabledAckReq.Context(), accountPrincipalContextKey, principal))
+	disabledAckRec := httptest.NewRecorder()
+	s.handleAccountJoinedAck(disabledAckRec, disabledAckReq)
+	if disabledAckRec.Code != http.StatusNotFound {
+		t.Fatalf("disabled NAS ACK status=%d body=%s", disabledAckRec.Code, disabledAckRec.Body.String())
+	}
+	var disabledAckCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_artifact_acks WHERE artifact_id=$1`, ledgerArtifactID).Scan(&disabledAckCount); err != nil || disabledAckCount != 0 {
+		t.Fatalf("disabled NAS ACK mutated rows=%d err=%v", disabledAckCount, err)
+	}
+	s.cfg.JoinedRecordingNASDeliveryEnabled = true
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	configuredBatchID := s.cfg.JoinedRecordingBatchID
+	s.cfg.JoinedRecordingBatchID = configuredBatchID + "-foreign"
+	foreignBatchFeedReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/joined", nil)
+	foreignBatchFeedReq = foreignBatchFeedReq.WithContext(context.WithValue(foreignBatchFeedReq.Context(), accountPrincipalContextKey, principal))
+	foreignBatchFeedRec := httptest.NewRecorder()
+	s.handleAccountJoined(foreignBatchFeedRec, foreignBatchFeedReq)
+	foreignBatchDownloadReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/joined/output/download", nil)
+	foreignBatchDownloadRoute := chi.NewRouteContext()
+	foreignBatchDownloadRoute.URLParams.Add("joinedId", fmt.Sprint(ledgerArtifactID))
+	foreignBatchDownloadReq = foreignBatchDownloadReq.WithContext(context.WithValue(
+		context.WithValue(foreignBatchDownloadReq.Context(), accountPrincipalContextKey, principal), chi.RouteCtxKey,
+		foreignBatchDownloadRoute))
+	foreignBatchDownloadRec := httptest.NewRecorder()
+	s.handleAccountJoinedDownload(foreignBatchDownloadRec, foreignBatchDownloadReq)
+	foreignBatchAckReq := httptest.NewRequest(http.MethodPost, "/api/v1/account/joined/ack", bytes.NewReader(disabledAckBody))
+	foreignBatchAckReq = foreignBatchAckReq.WithContext(context.WithValue(foreignBatchAckReq.Context(), accountPrincipalContextKey, principal))
+	foreignBatchAckRec := httptest.NewRecorder()
+	s.handleAccountJoinedAck(foreignBatchAckRec, foreignBatchAckReq)
+	var foreignBatchAckCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_artifact_acks WHERE artifact_id=$1`, ledgerArtifactID).
+		Scan(&foreignBatchAckCount); err != nil || foreignBatchFeedRec.Code != http.StatusOK ||
+		foreignBatchFeedRec.Body.String() != "{\"item\":null}\n" || foreignBatchDownloadRec.Code != http.StatusNotFound ||
+		foreignBatchAckRec.Code != http.StatusNotFound || foreignBatchAckCount != 0 {
+		t.Fatalf("foreign-batch NAS leaked or mutated feed=%d/%s download=%d ack=%d rows=%d err=%v",
+			foreignBatchFeedRec.Code, foreignBatchFeedRec.Body.String(), foreignBatchDownloadRec.Code,
+			foreignBatchAckRec.Code, foreignBatchAckCount, err)
+	}
+	s.cfg.JoinedRecordingBatchID = configuredBatchID
 	feedReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/joined", nil)
 	feedReq = feedReq.WithContext(context.WithValue(feedReq.Context(), accountPrincipalContextKey, principal))
 	feedRec := httptest.NewRecorder()
@@ -1430,6 +1525,236 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		sourceClaim.HourID).Scan(&sourceClaimTokenBeforeFailure); err != nil {
 		t.Fatal(err)
 	}
+	var publicationArtifactID int64
+	var publicationToken string
+	var publicationLeaseExpires time.Time
+	var publicationAttempt int
+	if err := pool.QueryRow(ctx, `SELECT id,publication_token::text,publication_lease_expires_at,publication_attempt_count
+		FROM recording_joined_artifacts WHERE batch_record_id=$1 AND publication_state='publishing'
+		AND publication_lease_expires_at>now() ORDER BY id LIMIT 1`, batchRecordID).Scan(&publicationArtifactID,
+		&publicationToken, &publicationLeaseExpires, &publicationAttempt); err != nil {
+		t.Fatalf("active publication fixture is required: %v", err)
+	}
+	verifiedSourceClaims, err := joinedauth.Verify(s.cfg.JoinedWorkerSigningKey, sourceClaim.OperationToken, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("verify source operation fixture: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_worker_failures
+		(batch_record_id,hour_record_id,batch_id,scope_kind,scope_id,claim_token,attempt_count,
+		 failure_class,reason_code,disposition,retry_at)
+		SELECT h.batch_record_id,h.id,h.batch_id,'hour',h.hour_id,h.claim_token,h.attempt_count,
+		 'transient','worker_task_deadline','retry',$2
+		FROM recording_joined_hours h WHERE h.hour_id=$1`, sourceClaim.HourID, sourceClaim.LeaseExpires.Add(time.Minute)); err != nil {
+		t.Fatalf("seed persisted failure collision: %v", err)
+	}
+	configuredConnectionForForeignLease := s.cfg.JoinedRecordingConnectionID
+	foreignConfigRestored := false
+	defer func() {
+		if !foreignConfigRestored {
+			s.cfg.JoinedRecordingConnectionID = configuredConnectionForForeignLease
+		}
+	}()
+	s.cfg.JoinedRecordingConnectionID = int(foreignConnectionID)
+	leaseStatusBody, _ := json.Marshal(joinedrecording.LeaseStatusRequest{ProtocolVersion: 1, BatchID: batchID,
+		LeaseIDs: []string{joinedauth.LeaseID(uuid.MustParse(sourceClaimTokenBeforeFailure)),
+			joinedauth.LeaseID(uuid.MustParse(publicationToken))}})
+	leaseStatusReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/leases/status", bytes.NewReader(leaseStatusBody))
+	leaseStatusRec := httptest.NewRecorder()
+	s.handleJoinedLeaseStatus(leaseStatusRec, leaseStatusReq)
+	var leaseStatus joinedrecording.LeaseStatusResponse
+	if leaseStatusRec.Code != http.StatusOK || json.Unmarshal(leaseStatusRec.Body.Bytes(), &leaseStatus) != nil ||
+		len(leaseStatus.Leases) != 2 || leaseStatus.Leases[0].Active || leaseStatus.Leases[1].Active {
+		t.Fatalf("foreign lease status disclosed active leases status=%d body=%s", leaseStatusRec.Code, leaseStatusRec.Body.String())
+	}
+	joinedStatusReq := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/status?batch_id="+url.QueryEscape(batchID), nil)
+	joinedStatusRec := httptest.NewRecorder()
+	s.handleJoinedStatus(joinedStatusRec, joinedStatusReq)
+	if joinedStatusRec.Code != http.StatusNotFound {
+		t.Fatalf("foreign joined status=%d body=%s", joinedStatusRec.Code, joinedStatusRec.Body.String())
+	}
+	foreignMutationSnapshot := func() (string, string) {
+		var hours, artifacts string
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(id,state,attempt_count,claim_token,
+			claimed_by,lease_expires_at,heartbeat_at,next_attempt_at,failure_reason_code,updated_at) ORDER BY id),'[]')::text
+			FROM recording_joined_hours WHERE batch_id=$1`, batchID).Scan(&hours); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(id,publication_state,
+			publication_attempt_count,publication_token,publication_claimed_by,publication_lease_expires_at,
+			publication_heartbeat_at,publication_next_attempt_at,finalized_token,etag,version_id,published_at,
+			failure_reason_code,updated_at) ORDER BY id),'[]')::text FROM recording_joined_artifacts WHERE batch_id=$1`,
+			batchID).Scan(&artifacts); err != nil {
+			t.Fatal(err)
+		}
+		return hours, artifacts
+	}
+	foreignMutationHoursBefore, foreignMutationArtifactsBefore := foreignMutationSnapshot()
+	foreignStoreCalls := []string{}
+	s.joinedOutputStorage = joinedOutputStoreStub{headKeys: &foreignStoreCalls}
+	foreignOperationCases := []struct {
+		path    string
+		token   string
+		handler http.HandlerFunc
+	}{
+		{"/api/v1/recording/joined/capabilities/source", sourceClaim.OperationToken, s.handleJoinedSourceCapability},
+		{"/api/v1/recording/joined/heartbeat", sourceClaim.OperationToken, s.handleJoinedHeartbeat},
+		{"/api/v1/recording/joined/seal/hour", sourceClaim.OperationToken, s.handleJoinedSealHour},
+		{"/api/v1/recording/joined/publication/ledger/finalize", publication.Ledger.OperationToken, s.handleJoinedFinalizeLedger},
+		{"/api/v1/recording/joined/capabilities/artifact", publication.Ledger.OperationToken, s.handleJoinedArtifactCapability},
+	}
+	for _, tc := range foreignOperationCases {
+		req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader([]byte(`{}`)))
+		req.Header.Set("Authorization", "Bearer "+tc.token)
+		rec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(tc.handler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("foreign operation path=%s status=%d body=%s", tc.path, rec.Code, rec.Body.String())
+		}
+	}
+	foreignClaimCases := []struct {
+		path    string
+		body    []byte
+		handler http.HandlerFunc
+	}{
+		{"/api/v1/recording/joined/claim", sourceClaimBody, s.handleJoinedClaim},
+		{"/api/v1/recording/joined/publication/claim", claimBody, s.handleJoinedPublicationClaim},
+	}
+	for _, tc := range foreignClaimCases {
+		req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer "+claimToken)
+		rec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(tc.handler).ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent && rec.Code < http.StatusBadRequest {
+			t.Fatalf("foreign claim path=%s status=%d body=%s", tc.path, rec.Code, rec.Body.String())
+		}
+	}
+	foreignMutationHoursAfter, foreignMutationArtifactsAfter := foreignMutationSnapshot()
+	if foreignMutationHoursAfter != foreignMutationHoursBefore || foreignMutationArtifactsAfter != foreignMutationArtifactsBefore ||
+		len(foreignStoreCalls) != 0 {
+		t.Fatalf("foreign signed routes mutated hours=%v/%v artifacts=%v/%v store_calls=%v",
+			foreignMutationHoursAfter, foreignMutationHoursBefore, foreignMutationArtifactsAfter,
+			foreignMutationArtifactsBefore, foreignStoreCalls)
+	}
+	s.joinedOutputStorage = joinedOutputStoreStub{head: r2.ObjectHead{ETag: "source-ledger-etag", SizeBytes: int64(len(sourceLedger.bytes))}}
+	var foreignFailureCountBefore int
+	var foreignFailureCreatedBefore time.Time
+	if err := pool.QueryRow(ctx, `SELECT count(*),max(created_at) FROM recording_joined_worker_failures WHERE claim_token=$1`,
+		uuid.MustParse(sourceClaimTokenBeforeFailure)).Scan(&foreignFailureCountBefore, &foreignFailureCreatedBefore); err != nil {
+		t.Fatal(err)
+	}
+	foreignFailureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "hour",
+		ScopeID: sourceClaim.HourID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
+	foreignFailureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure",
+		bytes.NewReader(foreignFailureBody))
+	foreignFailureReq = foreignFailureReq.WithContext(context.WithValue(foreignFailureReq.Context(),
+		joinedWorkerClaimsContextKey{}, verifiedSourceClaims))
+	foreignFailureRec := httptest.NewRecorder()
+	s.handleJoinedFailure(foreignFailureRec, foreignFailureReq)
+	var foreignFailureCountAfter int
+	var foreignFailureCreatedAfter time.Time
+	if err := pool.QueryRow(ctx, `SELECT count(*),max(created_at) FROM recording_joined_worker_failures WHERE claim_token=$1`,
+		uuid.MustParse(sourceClaimTokenBeforeFailure)).Scan(&foreignFailureCountAfter, &foreignFailureCreatedAfter); err != nil ||
+		foreignFailureRec.Code != http.StatusConflict || foreignFailureCountAfter != foreignFailureCountBefore ||
+		!foreignFailureCreatedAfter.Equal(foreignFailureCreatedBefore) {
+		t.Fatalf("foreign failure collision disclosed or mutated status=%d body=%s count=%d/%d created=%s/%s err=%v",
+			foreignFailureRec.Code, foreignFailureRec.Body.String(), foreignFailureCountAfter, foreignFailureCountBefore,
+			foreignFailureCreatedAfter, foreignFailureCreatedBefore, err)
+	}
+	var hourLeaseExpires time.Time
+	var hourAttempt int
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at,attempt_count FROM recording_joined_hours WHERE hour_id=$1`,
+		sourceClaim.HourID).Scan(&hourLeaseExpires, &hourAttempt); err != nil {
+		t.Fatal(err)
+	}
+	requireJoinedTestReplicationRole(t, pool)
+	leasesRestored := false
+	defer func() {
+		if leasesRestored {
+			return
+		}
+		tx, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Errorf("begin emergency lease fixture restore: %v", err)
+			return
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if _, err := tx.Exec(context.Background(), `SET LOCAL session_replication_role='replica'`); err != nil {
+			t.Errorf("enable emergency lease fixture restore: %v", err)
+			return
+		}
+		if _, err := tx.Exec(context.Background(), `UPDATE recording_joined_hours SET lease_expires_at=$2,attempt_count=$3 WHERE hour_id=$1`,
+			sourceClaim.HourID, hourLeaseExpires, hourAttempt); err != nil {
+			t.Errorf("restore emergency hour lease fixture: %v", err)
+			return
+		}
+		if _, err := tx.Exec(context.Background(), `UPDATE recording_joined_artifacts SET publication_lease_expires_at=$2,
+			publication_attempt_count=$3 WHERE id=$1`, publicationArtifactID, publicationLeaseExpires, publicationAttempt); err != nil {
+			t.Errorf("restore emergency publication lease fixture: %v", err)
+			return
+		}
+		if err := tx.Commit(context.Background()); err != nil {
+			t.Errorf("commit emergency lease fixture restore: %v", err)
+		}
+	}()
+	foreignExpiryTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignExpiryTx.Exec(ctx, `SET LOCAL session_replication_role='replica'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignExpiryTx.Exec(ctx, `UPDATE recording_joined_hours SET lease_expires_at=now()-interval '1 second',attempt_count=$2
+		WHERE hour_id=$1`, sourceClaim.HourID, joinedMaxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreignExpiryTx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_lease_expires_at=now()-interval '1 second',
+		publication_attempt_count=$2 WHERE id=$1`, publicationArtifactID, joinedMaxAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if err := foreignExpiryTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var failuresBeforeForeignReconcile int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_worker_failures`).Scan(&failuresBeforeForeignReconcile); err != nil {
+		t.Fatal(err)
+	}
+	s.joinedAttemptReconcileAt = time.Time{}
+	reconcileBody, _ := json.Marshal(joinedAttemptReconcileRequest{BatchID: batchID})
+	reconcileReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/maintenance/reconcile-expired",
+		bytes.NewReader(reconcileBody))
+	reconcileRec := httptest.NewRecorder()
+	s.handleJoinedReconcileExpiredAttempts(reconcileRec, reconcileReq)
+	var hourStateAfter, publicationStateAfter string
+	var failuresAfterForeignReconcile int
+	if err := pool.QueryRow(ctx, `SELECT h.state,a.publication_state,(SELECT count(*) FROM recording_joined_worker_failures)
+		FROM recording_joined_hours h CROSS JOIN recording_joined_artifacts a WHERE h.hour_id=$1 AND a.id=$2`,
+		sourceClaim.HourID, publicationArtifactID).Scan(&hourStateAfter, &publicationStateAfter,
+		&failuresAfterForeignReconcile); err != nil || reconcileRec.Code != http.StatusOK || hourStateAfter != "leased" ||
+		publicationStateAfter != "publishing" || failuresAfterForeignReconcile != failuresBeforeForeignReconcile {
+		t.Fatalf("foreign reconcile status=%d hour=%s publication=%s failures=%d/%d err=%v", reconcileRec.Code,
+			hourStateAfter, publicationStateAfter, failuresAfterForeignReconcile, failuresBeforeForeignReconcile, err)
+	}
+	s.cfg.JoinedRecordingConnectionID = configuredConnectionForForeignLease
+	foreignConfigRestored = true
+	restoreLeaseTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreLeaseTx.Exec(ctx, `SET LOCAL session_replication_role='replica'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreLeaseTx.Exec(ctx, `UPDATE recording_joined_hours SET lease_expires_at=$2,attempt_count=$3 WHERE hour_id=$1`,
+		sourceClaim.HourID, hourLeaseExpires, hourAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoreLeaseTx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_lease_expires_at=$2,
+		publication_attempt_count=$3 WHERE id=$1`, publicationArtifactID, publicationLeaseExpires, publicationAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreLeaseTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	leasesRestored = true
 	failureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "hour",
 		ScopeID: sourceClaim.HourID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
 	failureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure", bytes.NewReader(failureBody))
@@ -1586,11 +1911,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if err := protocolTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-protocolResult; err == nil {
-		t.Fatal("source capability survived a concurrent protocol downgrade")
-	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
-		t.Fatal(err)
+	if err := <-protocolResult; err != nil {
+		t.Fatalf("source capability failed after independent NAS protocol downgrade: %v", err)
 	}
 	mediaSHA := strings.Repeat("3", 64)
 	sealRequest := joinedrecording.SealHourRequest{ProtocolVersion: 1, HourID: sourceClaim.HourID,
@@ -1658,6 +1980,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		if rec.Code != http.StatusNoContent {
 			t.Fatalf("source hour finalize attempt=%d status=%d body=%s", attempt, rec.Code, rec.Body.String())
 		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
 	}
 	ackArtifact := func(ack joinedAckRequest) *httptest.ResponseRecorder {
 		body, _ := json.Marshal(ack)
@@ -1820,6 +2145,67 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("batch-index seal accepted generic service auth status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
+	var artifactsBeforeForeign, refsBeforeForeign int
+	var stateBeforeForeign string
+	var pausedBeforeForeign bool
+	var admissionUpdatedBeforeForeign time.Time
+	if err := pool.QueryRow(ctx, `SELECT b.state,c.claims_paused,c.updated_at,
+		(SELECT count(*) FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id),
+		(SELECT count(*) FROM recording_joined_batch_index_refs r WHERE r.batch_record_id=b.id)
+		FROM recording_joined_batches b JOIN recording_joined_admission_controls c ON c.batch_record_id=b.id
+		WHERE b.id=$1`, batchRecordID).Scan(&stateBeforeForeign, &pausedBeforeForeign, &admissionUpdatedBeforeForeign,
+		&artifactsBeforeForeign, &refsBeforeForeign); err != nil {
+		t.Fatal(err)
+	}
+	configuredConnectionID := s.cfg.JoinedRecordingConnectionID
+	foreignBatchConfigRestored := false
+	defer func() {
+		if !foreignBatchConfigRestored {
+			s.cfg.JoinedRecordingConnectionID = configuredConnectionID
+		}
+	}()
+	s.cfg.JoinedRecordingConnectionID = int(foreignConnectionID)
+	if rec := sealIndex(joinedSealBatchIndexRequest{ProtocolVersion: 1, BatchID: batchID}); rec.Code != http.StatusConflict {
+		t.Fatalf("foreign batch-index preview status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := sealIndex(joinedSealBatchIndexRequest{ProtocolVersion: 1, BatchID: batchID, Apply: true,
+		ExpectedSHA256: strings.Repeat("a", 64)}); rec.Code != http.StatusConflict {
+		t.Fatalf("foreign batch-index apply status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	foreignAdmissionStatusReq := httptest.NewRequest(http.MethodGet,
+		"/api/v1/recording/joined/admission?batch_id="+url.QueryEscape(batchID), nil)
+	foreignAdmissionStatusRec := httptest.NewRecorder()
+	s.handleJoinedAdmissionStatus(foreignAdmissionStatusRec, foreignAdmissionStatusReq)
+	if foreignAdmissionStatusRec.Code != http.StatusConflict {
+		t.Fatalf("foreign admission status=%d body=%s", foreignAdmissionStatusRec.Code, foreignAdmissionStatusRec.Body.String())
+	}
+	foreignAdmissionBody, _ := json.Marshal(joinedrecording.ClaimAdmissionRequest{ProtocolVersion: 1, BatchID: batchID,
+		ClaimsPaused: !pausedBeforeForeign})
+	foreignAdmissionSetReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/admission",
+		bytes.NewReader(foreignAdmissionBody))
+	foreignAdmissionSetRec := httptest.NewRecorder()
+	s.handleJoinedAdmissionSet(foreignAdmissionSetRec, foreignAdmissionSetReq)
+	if foreignAdmissionSetRec.Code != http.StatusConflict {
+		t.Fatalf("foreign admission set=%d body=%s", foreignAdmissionSetRec.Code, foreignAdmissionSetRec.Body.String())
+	}
+	s.cfg.JoinedRecordingConnectionID = configuredConnectionID
+	foreignBatchConfigRestored = true
+	var artifactsAfterForeign, refsAfterForeign int
+	var stateAfterForeign string
+	var pausedAfterForeign bool
+	var admissionUpdatedAfterForeign time.Time
+	if err := pool.QueryRow(ctx, `SELECT b.state,c.claims_paused,c.updated_at,
+		(SELECT count(*) FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id),
+		(SELECT count(*) FROM recording_joined_batch_index_refs r WHERE r.batch_record_id=b.id)
+		FROM recording_joined_batches b JOIN recording_joined_admission_controls c ON c.batch_record_id=b.id
+		WHERE b.id=$1`, batchRecordID).Scan(&stateAfterForeign, &pausedAfterForeign, &admissionUpdatedAfterForeign,
+		&artifactsAfterForeign, &refsAfterForeign); err != nil || stateAfterForeign != stateBeforeForeign ||
+		pausedAfterForeign != pausedBeforeForeign || !admissionUpdatedAfterForeign.Equal(admissionUpdatedBeforeForeign) ||
+		artifactsAfterForeign != artifactsBeforeForeign || refsAfterForeign != refsBeforeForeign {
+		t.Fatalf("foreign authority mutated batch state=%s/%s paused=%v/%v updated=%s/%s artifacts=%d/%d refs=%d/%d err=%v",
+			stateAfterForeign, stateBeforeForeign, pausedAfterForeign, pausedBeforeForeign, admissionUpdatedAfterForeign,
+			admissionUpdatedBeforeForeign, artifactsAfterForeign, artifactsBeforeForeign, refsAfterForeign, refsBeforeForeign, err)
+	}
 	previewStarted := time.Now()
 	preview := sealIndex(previewRequest)
 	assertIndexDuration("preview", previewStarted)
@@ -1862,45 +2248,6 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 			partialReferences, err)
 	}
 	if err := indexBlockerTx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	protocolBlockerTx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := protocolBlockerTx.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
-		_ = protocolBlockerTx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	protocolBlockedStarted := time.Now()
-	protocolBlocked := sealIndex(applyIndex)
-	protocolBlockedElapsed := time.Since(protocolBlockedStarted)
-	if protocolBlocked.Code != http.StatusConflict || protocolBlockedElapsed >= 20*time.Second {
-		_ = protocolBlockerTx.Rollback(ctx)
-		t.Fatalf("protocol-blocked batch-index apply status=%d elapsed=%s body=%s", protocolBlocked.Code,
-			protocolBlockedElapsed, protocolBlocked.Body.String())
-	}
-	var protocolBlockedState string
-	if err := protocolBlockerTx.QueryRow(ctx, `SELECT state FROM recording_joined_batches WHERE id=$1`, batchRecordID).
-		Scan(&protocolBlockedState); err != nil || protocolBlockedState != "frozen" {
-		_ = protocolBlockerTx.Rollback(ctx)
-		t.Fatalf("protocol-blocked batch-index state=%s err=%v", protocolBlockedState, err)
-	}
-	if err := protocolBlockerTx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	protocolRejected := sealIndex(applyIndex)
-	if protocolRejected.Code != http.StatusConflict {
-		t.Fatalf("protocol-v0 batch-index apply status=%d body=%s", protocolRejected.Code, protocolRejected.Body.String())
-	}
-	var protocolIndexes, protocolReferences int
-	if err := pool.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM recording_joined_artifacts WHERE batch_record_id=$1 AND artifact_kind='batch_index'),
-		(SELECT count(*) FROM recording_joined_batch_index_refs WHERE batch_record_id=$1)`, batchRecordID).
-		Scan(&protocolIndexes, &protocolReferences); err != nil || protocolIndexes != 0 || protocolReferences != 0 {
-		t.Fatalf("protocol-v0 batch-index apply leaked indexes=%d refs=%d err=%v", protocolIndexes, protocolReferences, err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	type applyResult struct {
@@ -2072,7 +2419,7 @@ func publishJoinedCanonicalRemainderForIndex(t *testing.T, fixture joinedHistori
 			_ = tx.Rollback(ctx)
 			t.Fatal(err)
 		}
-		if err := sealJoinedGapOnlyHoursTx(ctx, tx, id, frozenScope); err != nil {
+		if err := sealJoinedGapOnlyHoursTx(ctx, tx, id, frozenScope, int(fixture.connectionID)); err != nil {
 			_ = tx.Rollback(ctx)
 			t.Fatal(err)
 		}

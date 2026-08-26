@@ -140,6 +140,7 @@ type Config struct {
 	// before constructing any database, media, or storage client while disabled.
 	// Render instance count is the only production concurrency control.
 	JoinedRecordingControlPlaneEnabled bool
+	JoinedRecordingNASDeliveryEnabled  bool
 	JoinedRecordingEnabled             bool
 	JoinedRecordingProtocolVersion     int
 	JoinedRecordingConnectionID        int
@@ -280,6 +281,7 @@ func Load() (Config, error) {
 		RecordingFrozenHLSQuiescenceAllowlist: strEnv("RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST", ""),
 		RelayUploadWorkers:                    RelayUploadWorkersFromEnv(),
 		JoinedRecordingControlPlaneEnabled:    boolEnv("JOINED_RECORDING_CONTROL_PLANE_ENABLED", false),
+		JoinedRecordingNASDeliveryEnabled:     boolEnv("JOINED_RECORDING_NAS_DELIVERY_ENABLED", false),
 		JoinedRecordingEnabled:                boolEnv("JOINED_RECORDING_ENABLED", false),
 		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
 		JoinedRecordingConnectionID:           intEnv("JOINED_RECORDING_CONNECTION_ID", 0),
@@ -450,6 +452,9 @@ func (c Config) ValidateJoined() error {
 		if c.JoinedRecordingWorkScope == JoinedWorkScopeFrozenBatch && (c.JoinedRecordingMaxActiveTasks < 1 || c.JoinedRecordingMaxActiveTasks > 64) {
 			return fmt.Errorf("JOINED_RECORDING_MAX_ACTIVE_TASKS must be between 1 and 64 for frozen-batch work")
 		}
+	}
+	if c.JoinedRecordingNASDeliveryEnabled && !c.JoinedRecordingControlPlaneEnabled {
+		return fmt.Errorf("JOINED_RECORDING_NAS_DELIVERY_ENABLED requires JOINED_RECORDING_CONTROL_PLANE_ENABLED=true")
 	}
 	return nil
 }

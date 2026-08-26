@@ -64,6 +64,10 @@ func (s *Server) handleAdminJoinedFinalFreeze(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusConflict, "joined final-freeze batch differs")
+		return
+	}
 	response, err := s.finalFreezeJoinedBatch(r.Context(), req)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
@@ -73,6 +77,9 @@ func (s *Server) handleAdminJoinedFinalFreeze(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFreezeRequest) (joinedFinalFreezeResponse, error) {
+	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+		return joinedFinalFreezeResponse{}, errors.New("joined final-freeze batch differs")
+	}
 	ctx, cancel := context.WithTimeout(ctx, joinedFinalFreezeOperationTimeout)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -95,9 +102,10 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		q.definition_version,b.qualification_cohort_sha256,b.qualification_windows_sha256,
 		b.selected_qualification_windows_sha256
 		FROM recording_joined_batches b
-		JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=b.connection_id
 		JOIN recording_qualification_runs q ON q.id=b.qualification_run_id AND q.account_id=b.account_id AND q.status='active'
-		WHERE b.batch_id=$1 FOR UPDATE OF b FOR SHARE OF q`, req.BatchID).Scan(&batchRecordID, &connectionID, &response.State,
+		WHERE b.batch_id=$1 AND b.connection_id=$2 FOR UPDATE OF b FOR SHARE OF q`, req.BatchID,
+		s.cfg.JoinedRecordingConnectionID).Scan(&batchRecordID, &connectionID, &response.State,
 		&frozenAt, &freezeStartedAt, &response.FrozenDenominatorSHA256, &response.RecordingCount,
 		&response.StreamDayCount, &response.ScheduledHourCount, &authority.SelectionBasis,
 		&authority.OrderedRecordingIDSHA256, &authority.Cutoff, &authority.QualificationRunID,
@@ -149,11 +157,10 @@ func (s *Server) finalFreezeJoinedBatch(ctx context.Context, req joinedFinalFree
 		len(days) != response.StreamDayCount || response.ScheduledHourCount != response.StreamDayCount*12 {
 		return response, errors.New("joined final-freeze evidence differs")
 	}
-	var protocolVersion int
-	if err := tx.QueryRow(ctx, `SELECT joined_protocol_version FROM connections WHERE id=$1
-		AND joined_protocol_version=1 FOR SHARE`, connectionID).Scan(&protocolVersion); err != nil ||
-		protocolVersion != joinedrecording.JoinedProtocolVersion {
-		return response, errors.New("joined connection protocol changed before final freeze")
+	var lockedConnectionID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM connections WHERE id=$1
+		FOR SHARE`, connectionID).Scan(&lockedConnectionID); err != nil || lockedConnectionID != connectionID {
+		return response, errors.New("joined connection changed before final freeze")
 	}
 	if err := tx.QueryRow(ctx, `UPDATE recording_joined_batches SET state='frozen',frozen_at=clock_timestamp()
 		WHERE id=$1 AND state='building' AND freeze_started_at IS NOT NULL RETURNING frozen_at`, batchRecordID).

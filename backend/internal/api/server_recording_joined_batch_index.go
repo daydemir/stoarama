@@ -95,7 +95,8 @@ func (s *Server) sealJoinedBatchIndex(ctx context.Context, request joinedSealBat
 		return joinedSealBatchIndexResponse{}, err
 	}
 
-	canonical, state, existingID, err := loadJoinedCanonicalBatchIndex(ctx, tx, request.BatchID, request.Apply)
+	canonical, state, existingID, err := loadJoinedCanonicalBatchIndex(ctx, tx, request.BatchID,
+		s.cfg.JoinedRecordingConnectionID, request.Apply)
 	if err != nil {
 		return joinedSealBatchIndexResponse{}, err
 	}
@@ -160,7 +161,8 @@ func (s *Server) sealJoinedBatchIndex(ctx context.Context, request joinedSealBat
 	}
 	command, err := tx.Exec(ctx, `UPDATE recording_joined_batches SET state='index_sealed',index_artifact_id=$2,index_sealed_at=clock_timestamp()
 		WHERE id=$1 AND state='frozen' AND frozen_at IS NOT NULL AND EXISTS(SELECT 1 FROM connections c
-		WHERE c.id=recording_joined_batches.connection_id AND c.joined_protocol_version=1)`, canonical.BatchRecordID, response.ArtifactID)
+		WHERE c.id=recording_joined_batches.connection_id AND c.id=$3)`, canonical.BatchRecordID,
+		response.ArtifactID, s.cfg.JoinedRecordingConnectionID)
 	if err != nil || command.RowsAffected() != 1 {
 		return response, errors.New("joined batch changed before index seal")
 	}
@@ -177,7 +179,7 @@ func configureJoinedBatchIndexTransaction(ctx context.Context, tx pgx.Tx) error 
 	return err
 }
 
-func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID string, lock bool) (joinedCanonicalIndex, string, int64, error) {
+func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID string, connectionID int, lock bool) (joinedCanonicalIndex, string, int64, error) {
 	var canonical joinedCanonicalIndex
 	var state string
 	var indexArtifactID *int64
@@ -190,13 +192,13 @@ func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID strin
 		b.expected_source_clips,b.expected_source_bytes,b.policy_version,b.media_tool,b.selection_basis,
 		b.ordered_recording_ids_sha256,b.eligibility_cutoff,b.qualification_run_id,b.qualification_frozen_at,
 		q.definition_version,b.qualification_cohort_sha256,b.qualification_windows_sha256,b.selected_qualification_windows_sha256
-		FROM recording_joined_batches b JOIN connections c ON c.id=b.connection_id AND c.joined_protocol_version=1
+		FROM recording_joined_batches b JOIN connections c ON c.id=b.connection_id
 		JOIN recording_qualification_runs q ON q.id=b.qualification_run_id AND q.account_id=b.account_id
-		WHERE b.batch_id=$1`
+		WHERE b.batch_id=$1 AND c.id=$2`
 	if lock {
 		query += ` FOR UPDATE OF b FOR SHARE OF c,q`
 	}
-	err := tx.QueryRow(ctx, query, batchID).Scan(&canonical.BatchRecordID, &canonical.AccountID, &canonical.ConnectionID,
+	err := tx.QueryRow(ctx, query, batchID, connectionID).Scan(&canonical.BatchRecordID, &canonical.AccountID, &canonical.ConnectionID,
 		&state, &indexArtifactID, &canonical.Index.Generation, &canonical.Index.FrozenAt, &canonical.Index.FrozenDenominatorSHA256,
 		&expectedRecordings, &expectedLedgers, &expectedHours, &sourceCount64, &sourceBytes, &canonical.Index.PolicyVersion,
 		&mediaToolJSON, &authority.SelectionBasis, &authority.OrderedRecordingIDSHA256, &authority.Cutoff,

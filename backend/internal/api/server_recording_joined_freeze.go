@@ -157,6 +157,10 @@ func (s *Server) handleAdminJoinedFreezeTier1(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) || req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusConflict, "Tier-1 connection differs from configured cloud authority")
+		return
+	}
 	if !req.Apply {
 		plan, _, err := s.buildJoinedTier1FreezePlan(r.Context(), s.pool, req)
 		if err != nil {
@@ -180,6 +184,9 @@ func (s *Server) handleAdminJoinedFreezeTier1(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) buildJoinedTier1FreezePlan(ctx context.Context, q joinedTier1FreezeQuerier, req joinedTier1FreezeRequest) (joinedTier1FreezePlan, []byte, error) {
+	if req.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) || req.BatchID != s.cfg.JoinedRecordingBatchID {
+		return joinedTier1FreezePlan{}, nil, errors.New("Tier-1 freeze authority differs")
+	}
 	tool, err := joinedrecording.InspectMediaToolEvidence(ctx)
 	if err != nil {
 		return joinedTier1FreezePlan{}, nil, fmt.Errorf("inspect joined media tool: %w", err)
@@ -202,7 +209,7 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 	plan.ExpectedScheduledHours = plan.ExpectedStreamDays * 12
 	if err := q.QueryRow(ctx, `SELECT c.account_id,q.definition_version,q.cohort_sha256,q.windows_sha256,q.frozen_at
 		FROM connections c JOIN recording_qualification_runs q ON q.id=$2 AND q.account_id=c.account_id
-		WHERE c.id=$1 AND c.joined_protocol_version=1 AND q.status='active'`, req.ConnectionID, req.QualificationRunID).
+		WHERE c.id=$1 AND q.status='active'`, req.ConnectionID, req.QualificationRunID).
 		Scan(&plan.AccountID, &plan.SelectionAuthority.QualificationRuleVersion,
 			&plan.SelectionAuthority.QualificationCohortSHA256, &plan.SelectionAuthority.QualificationWindowsSHA256,
 			&plan.SelectionAuthority.QualificationRunFrozenAt); err != nil {
@@ -633,14 +640,11 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 	}
 	var existingBytes []byte
 	var existingSHA string
-	var existingProtocol int
-	err = tx.QueryRow(ctx, `SELECT b.freeze_request_bytes,b.freeze_request_sha256,c.joined_protocol_version
+	err = tx.QueryRow(ctx, `SELECT b.freeze_request_bytes,b.freeze_request_sha256
 		FROM recording_joined_batches b JOIN connections c ON c.id=b.connection_id
-		WHERE b.batch_id=$1 FOR SHARE OF b,c`, req.BatchID).Scan(&existingBytes, &existingSHA, &existingProtocol)
+		WHERE b.batch_id=$1 AND c.id=$2 FOR SHARE OF b,c`, req.BatchID,
+		s.cfg.JoinedRecordingConnectionID).Scan(&existingBytes, &existingSHA)
 	if err == nil {
-		if existingProtocol != joinedrecording.JoinedProtocolVersion {
-			return joinedTier1FreezePlan{}, false, errors.New("Tier-1 connection protocol is disabled")
-		}
 		if existingSHA != req.ExpectedRequestSHA256 {
 			return joinedTier1FreezePlan{}, false, errors.New("Tier-1 batch key already has different immutable evidence")
 		}

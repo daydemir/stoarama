@@ -61,6 +61,10 @@ func (s *Server) handleAdminJoinedFreezeTier1DryRunStart(w http.ResponseWriter, 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) || req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusConflict, "Tier-1 dry-run authority differs")
+		return
+	}
 	progress, err := s.startJoinedTier1DryRun(r.Context(), req)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
@@ -70,6 +74,9 @@ func (s *Server) handleAdminJoinedFreezeTier1DryRunStart(w http.ResponseWriter, 
 }
 
 func (s *Server) startJoinedTier1DryRun(ctx context.Context, req joinedTier1FreezeRequest) (joinedTier1DryRunProgress, error) {
+	if req.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) || req.BatchID != s.cfg.JoinedRecordingBatchID {
+		return joinedTier1DryRunProgress{}, errors.New("Tier-1 dry-run authority differs")
+	}
 	inputBytes, err := json.Marshal(req)
 	if err != nil {
 		return joinedTier1DryRunProgress{}, err
@@ -91,7 +98,8 @@ func (s *Server) startJoinedTier1DryRun(ctx context.Context, req joinedTier1Free
 	}
 	var existingRunID, existingInputSHA string
 	err = tx.QueryRow(ctx, `SELECT id::text,input_sha256 FROM recording_joined_dry_runs
-		WHERE batch_id=$1 AND generation=$2 FOR SHARE`, req.BatchID, req.Generation).Scan(&existingRunID, &existingInputSHA)
+		WHERE batch_id=$1 AND generation=$2 AND connection_id=$3 FOR SHARE`, req.BatchID, req.Generation,
+		s.cfg.JoinedRecordingConnectionID).Scan(&existingRunID, &existingInputSHA)
 	if err == nil {
 		if existingInputSHA != inputSHA {
 			return joinedTier1DryRunProgress{}, errors.New("Tier-1 dry-run key already has different immutable input")
@@ -227,7 +235,8 @@ func (s *Server) stepJoinedTier1DryRun(ctx context.Context, req joinedTier1DryRu
 	var state string
 	var completed int
 	if err := tx.QueryRow(ctx, `SELECT skeleton_bytes,state,completed_recordings FROM recording_joined_dry_runs
-		WHERE id=$1 FOR UPDATE`, req.RunID).Scan(&skeletonBytes, &state, &completed); err != nil {
+		WHERE id=$1 AND connection_id=$2 AND batch_id=$3 FOR UPDATE`, req.RunID,
+		s.cfg.JoinedRecordingConnectionID, s.cfg.JoinedRecordingBatchID).Scan(&skeletonBytes, &state, &completed); err != nil {
 		return joinedTier1DryRunProgress{}, err
 	}
 	if state == "ready" {
@@ -432,8 +441,13 @@ func (s *Server) handleAdminJoinedFreezeTier1DryRunStatus(w http.ResponseWriter,
 			util.WriteError(w, http.StatusBadRequest, "invalid Tier-1 dry-run key")
 			return
 		}
-		if err := s.pool.QueryRow(r.Context(), `SELECT id::text FROM recording_joined_dry_runs WHERE batch_id=$1 AND generation=$2`,
-			batchID, generation).Scan(&runID); err != nil {
+		if batchID != s.cfg.JoinedRecordingBatchID {
+			util.WriteError(w, http.StatusNotFound, "Tier-1 dry-run not found")
+			return
+		}
+		if err := s.pool.QueryRow(r.Context(), `SELECT id::text FROM recording_joined_dry_runs
+			WHERE batch_id=$1 AND generation=$2 AND connection_id=$3`, batchID, generation,
+			s.cfg.JoinedRecordingConnectionID).Scan(&runID); err != nil {
 			util.WriteError(w, http.StatusNotFound, "Tier-1 dry-run not found")
 			return
 		}
@@ -466,7 +480,8 @@ func (s *Server) handleAdminJoinedFreezeTier1DryRunInvalidate(w http.ResponseWri
 		return
 	}
 	command, err := s.pool.Exec(r.Context(), `UPDATE recording_joined_dry_runs SET state='invalidated',invalidated_at=clock_timestamp()
-		WHERE id=$1 AND state='building'`, req.RunID)
+		WHERE id=$1 AND state='building' AND connection_id=$2 AND batch_id=$3`, req.RunID,
+		s.cfg.JoinedRecordingConnectionID, s.cfg.JoinedRecordingBatchID)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
 		return
@@ -486,7 +501,9 @@ func (s *Server) handleAdminJoinedFreezeTier1DryRunInvalidate(w http.ResponseWri
 func (s *Server) joinedTier1DryRunStatus(ctx context.Context, runID string) (joinedTier1DryRunProgress, error) {
 	var p joinedTier1DryRunProgress
 	var sha *string
-	if err := s.pool.QueryRow(ctx, `SELECT id::text,state,completed_recordings,final_plan_sha256 FROM recording_joined_dry_runs WHERE id=$1`, runID).
+	if err := s.pool.QueryRow(ctx, `SELECT id::text,state,completed_recordings,final_plan_sha256
+		FROM recording_joined_dry_runs WHERE id=$1 AND connection_id=$2 AND batch_id=$3`, runID,
+		s.cfg.JoinedRecordingConnectionID, s.cfg.JoinedRecordingBatchID).
 		Scan(&p.RunID, &p.State, &p.CompletedRecordings, &sha); err != nil {
 		return p, err
 	}

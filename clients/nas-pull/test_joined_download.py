@@ -926,12 +926,17 @@ class JoinedDownloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = self.runtime(cfg)
-            with self.assertRaises(pull.ExistingFileMismatch):
-                pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
-            ledger_path = self.install_ledger(cfg, gap=True)
-            ledger_path.write_bytes(ledger_path.read_bytes() + b"x")
-            with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaises(pull.ExistingFileMismatch):
-                pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
+            with mock.patch.object(pull.time, "monotonic", return_value=10.0), \
+                 mock.patch.object(pull, "poll_raw_pending", return_value=False) as raw_pending, \
+                 mock.patch.object(pull, "request_json", side_effect=AssertionError("raw API escaped test")) as network:
+                with self.assertRaises(pull.ExistingFileMismatch):
+                    pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
+                ledger_path = self.install_ledger(cfg, gap=True)
+                ledger_path.write_bytes(ledger_path.read_bytes() + b"x")
+                with self.assertRaises(pull.ExistingFileMismatch):
+                    pull.validate_hour_ledger_binding(cfg, runtime, item, manifest, threading.Event())
+            raw_pending.assert_called_once_with(cfg, runtime)
+            network.assert_not_called()
 
     def test_final_index_proves_each_day_union_and_exact_media_without_scanning(self):
         ledger = self.ledger_payload()
