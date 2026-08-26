@@ -322,7 +322,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		WHERE h.batch_id=$1 AND ($3 OR h.hour_id=ANY($2::text[]))
 		  AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
 		  AND h.source_clip_count>0 AND h.attempt_count<$5
-		  AND h.source_bytes<=GREATEST(($4-$6)/2,-1)
+		  AND h.source_bytes<=GREATEST(($4::bigint-$6::bigint)/2,-1::bigint)
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.hour_record_id=h.id
 		    AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		  AND ((h.state='pending' AND h.next_attempt_at<=now()) OR (h.state='leased' AND h.lease_expires_at<=now()))
@@ -483,7 +483,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		JOIN recording_joined_batches b ON b.id=a.batch_record_id
 		WHERE a.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND a.artifact_kind<>'media'
 		  AND a.publication_attempt_count<$5
-		  AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT h.source_bytes FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0)<=GREATEST(($4-$6)/2,-1))
+		  AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT h.source_bytes FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0)<=GREATEST(($4::bigint-$6::bigint)/2,-1::bigint))
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.artifact_id=a.id
 		    AND f.attempt_count=a.publication_attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		  AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
@@ -502,6 +502,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if err != nil {
+		log.Printf("joined publication claim selection failed batch_id=%s worker_id=%s: %v", claims.BatchID, workerID, err)
 		util.WriteError(w, http.StatusInternalServerError, "select joined publication claim")
 		return
 	}
