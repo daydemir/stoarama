@@ -172,9 +172,12 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	if scratch.publicationLeaseID != claim.LeaseID {
 		return PublishedHour{}, fmt.Errorf("scratch is not bound to current publication lease")
 	}
+	publishStarted := time.Now()
 	_, manifestJSON, manifestSHA, err := BuildHourManifest(HourManifestInput{Plan: claim.Plan, Allocation: claim.Allocation, AllocationLedger: claim.AllocationLedger, MediaArtifactIDs: claim.MediaArtifactIDs, Built: built, QuarantineEvidence: quarantine})
 	if err != nil || int64(len(manifestJSON)) != claim.HourManifestExpectedSize || manifestSHA != claim.HourManifestExpectedSHA {
-		return PublishedHour{}, fmt.Errorf("sealed hour manifest identity changed before publication")
+		err = fmt.Errorf("sealed hour manifest identity changed before publication")
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+		return PublishedHour{}, err
 	}
 	type identity struct {
 		size int64
@@ -184,11 +187,15 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	for i := range built {
 		output := claim.Plan.Outputs[i]
 		if built[i].SourceCount != len(output.Sources) || built[i].Verification.Status != "passed" || !SafeScratchOutput(built[i].Path, scratchDir) {
-			return PublishedHour{}, fmt.Errorf("hour part %d is not a verified scratch artifact", i+1)
+			err = fmt.Errorf("hour part %d is not a verified scratch artifact", i+1)
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+			return PublishedHour{}, err
 		}
 		size, sha, identityErr := localIdentity(built[i].Path)
 		if identityErr != nil || size != built[i].SizeBytes || sha != built[i].SHA256 || size != output.ExpectedSize || sha != output.ExpectedSHA || size > r2.MaxConditionalPutBytes {
-			return PublishedHour{}, fmt.Errorf("hour part %d changed before publication", i+1)
+			err = fmt.Errorf("hour part %d changed before publication", i+1)
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+			return PublishedHour{}, err
 		}
 		identities[i] = identity{size: size, sha: sha}
 	}
@@ -196,34 +203,44 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	for i := range built {
 		create, resolveErr := resolveCreate(ctx, claim, claim.MediaArtifactIDs[i])
 		if resolveErr != nil {
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), resolveErr)
 			return PublishedHour{}, fmt.Errorf("resolve exact media create capability: %w", resolveErr)
 		}
 		output, publishErr := publishHourPart(ctx, client, claim, create, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i], built[i], identities[i].size, identities[i].sha, resolveRead)
 		if publishErr != nil {
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), publishErr)
 			return PublishedHour{}, publishErr
 		}
 		published.Outputs = append(published.Outputs, output)
 	}
 	manifestCreate, err := resolveCreate(ctx, claim, claim.HourManifestArtifactID)
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest create capability: %w", err)
 	}
 	_, err = putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, "application/json", int64(len(manifestJSON)), manifestSHA, manifestCreate, bytes.NewReader(manifestJSON))
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, err
 	}
 	manifestRead, err := resolveRead(ctx, claim, claim.HourManifestArtifactID)
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest reread capability")
 	}
 	manifestHead, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, int64(len(manifestJSON)), manifestSHA, manifestRead.ETag, manifestRead.VersionID, manifestRead)
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, err
 	}
 	published.HourManifestETag, published.HourManifestVersionID, published.HourManifestSizeBytes, published.HourManifestSHA256 = manifestHead.ETag, manifestHead.VersionID, int64(len(manifestJSON)), manifestSHA
+	emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), nil)
+	finalizeStarted := time.Now()
 	if err := finalize(ctx, claim, published); err != nil {
+		emitStageTiming(ctx, "finalize", time.Since(finalizeStarted), err)
 		return PublishedHour{}, fmt.Errorf("immutable joined hour verified but fenced database reconciliation remains pending: %w", err)
 	}
+	emitStageTiming(ctx, "finalize", time.Since(finalizeStarted), nil)
 	if filepath.Base(scratchDir) != claim.LeaseID || filepath.Clean(scratchDir) != scratchDir {
 		return PublishedHour{}, fmt.Errorf("refusing cleanup outside current lease scratch")
 	}

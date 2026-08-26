@@ -591,6 +591,19 @@ func TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline(t *testing.T) {
 	}
 }
 
+func TestJoinedStageTimingLogHasOnlyBoundedFields(t *testing.T) {
+	got := joinedStageTimingLog("batch__recording-413__hour-02", joinedrecording.StageTimingEvent{Stage: "download", ElapsedMS: 1234, Outcome: "ok"})
+	want := "joined worker stage timing hour_id=batch__recording-413__hour-02 stage=download elapsed_ms=1234 outcome=ok"
+	if got != want {
+		t.Fatalf("timing log=%q want=%q", got, want)
+	}
+	for _, forbidden := range []string{"https://", "X-Amz-", "token", "object_key"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("timing log contains forbidden field %q: %q", forbidden, got)
+		}
+	}
+}
+
 func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
 	cfg := validJoinedWorkerConfig()
 	hours, err := cfg.JoinedCanaryHourIDs()

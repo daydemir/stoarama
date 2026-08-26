@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -732,6 +733,7 @@ func runJoinedWorkerTask(ctx context.Context, limit time.Duration, stage string,
 }
 
 func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, claim joinedrecording.PreflightHourClaim, scratchRoot string) error {
+	ctx = withJoinedStageTiming(ctx, claim.HourID)
 	heartbeat := s.hourHeartbeat(claim.HourID)
 	resolveSource := func(callCtx context.Context, current joinedrecording.PreflightHourClaim, source joinedrecording.SourceClip, operation string) (joinedrecording.SourceReadCapability, error) {
 		return s.api.sourceCapability(callCtx, current.OperationToken, joinedrecording.SourceCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, HourID: current.HourID, ClipID: source.ClipID, Operation: operation})
@@ -757,6 +759,16 @@ func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, c
 	return nil
 }
 
+func joinedStageTimingLog(hourID string, event joinedrecording.StageTimingEvent) string {
+	return fmt.Sprintf("joined worker stage timing hour_id=%s stage=%s elapsed_ms=%d outcome=%s", hourID, event.Stage, event.ElapsedMS, event.Outcome)
+}
+
+func withJoinedStageTiming(ctx context.Context, hourID string) context.Context {
+	return joinedrecording.WithStageTimingObserver(ctx, func(event joinedrecording.StageTimingEvent) {
+		log.Print(joinedStageTimingLog(hourID, event))
+	})
+}
+
 func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response joinedrecording.PublicationClaimResponse, scratchRoot string) error {
 	switch response.Kind {
 	case "ledger":
@@ -774,6 +786,7 @@ func (s *remoteJoinedOperatorService) publishClaim(ctx context.Context, response
 		return err
 	case "hour":
 		claim := *response.Hour
+		ctx = withJoinedStageTiming(ctx, claim.HourID)
 		var scratch joinedrecording.SealedHourScratch
 		var err error
 		if claim.Plan.GapOnly {
