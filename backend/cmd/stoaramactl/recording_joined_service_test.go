@@ -72,6 +72,38 @@ func TestJoinedClaimAdmissionOperatorContract(t *testing.T) {
 	}
 }
 
+func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
+	const (
+		batch = "tier1-generation-1"
+		op    = "joined-tier1-operator-token-at-least-32-bytes"
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.RequestURI() != "/api/v1/recording/joined/delivery-status?batch_id="+batch+"&artifact_id=429" {
+			t.Fatalf("request=%s %s", r.Method, r.URL.RequestURI())
+		}
+		if r.Header.Get("Authorization") != "Bearer "+op {
+			t.Fatal("operator authorization differs")
+		}
+		writeJoinedTestJSON(t, w, joinedDeliveryStatus{BatchID: batch, ArtifactID: 429,
+			ArtifactKind: "media", HourID: "hour-429", RelativePath: "joined/hour-429.mp4",
+			ExpectedSizeBytes: 12, ExpectedSHA256: strings.Repeat("a", 64), PublicationState: "published",
+			Acknowledged: true, IdentityMatches: true, ConnectionID: 47, ConnectionProtocol: 1})
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api, operatorToken: op}
+	result, err := service.DeliveryStatus(context.Background(), joinedDeliveryStatusRequest{BatchID: batch, ArtifactID: 429})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.(joinedDeliveryStatus).Acknowledged {
+		t.Fatalf("result=%v", result)
+	}
+}
+
 func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 	t.Parallel()
 	const (

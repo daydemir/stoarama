@@ -105,6 +105,11 @@ type joinedStatusRequest struct {
 	BatchID string `json:"batch_id"`
 }
 
+type joinedDeliveryStatusRequest struct {
+	BatchID    string `json:"batch_id"`
+	ArtifactID int64  `json:"artifact_id"`
+}
+
 type joinedAdmissionRequest struct {
 	BatchID string
 	Action  string
@@ -128,6 +133,7 @@ type joinedOperatorService interface {
 	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
 	RunWorker(context.Context, joinedWorkerRequest) error
 	Status(context.Context, joinedStatusRequest) (any, error)
+	DeliveryStatus(context.Context, joinedDeliveryStatusRequest) (any, error)
 }
 
 type joinedOperatorFactory func(context.Context, config.Config) (joinedOperatorService, error)
@@ -176,7 +182,7 @@ func waitForJoinedWorkerShutdown(ctx context.Context) {
 
 func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []string, factory joinedOperatorFactory) (any, error) {
 	if len(args) == 0 {
-		return nil, errors.New("expected import-tier1-historical, freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, seal-batch-index, worker run, or status")
+		return nil, errors.New("expected import-tier1-historical, freeze-tier1, seal-stream-day, seal-remaining-days, final-freeze, seal-batch-index, worker run, status, or delivery-status")
 	}
 
 	switch args[0] {
@@ -370,6 +376,16 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 			return nil, err
 		}
 		return service.Status(ctx, req)
+	case "delivery-status":
+		req, err := parseJoinedDeliveryStatus(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.DeliveryStatus(ctx, req)
 	default:
 		return nil, fmt.Errorf("unknown subcommand %q", args[0])
 	}
@@ -640,6 +656,23 @@ func parseJoinedStatus(cfg config.Config, args []string) (joinedStatusRequest, e
 		return req, err
 	}
 	return req, validateJoinedBatchID(req.BatchID)
+}
+
+func parseJoinedDeliveryStatus(cfg config.Config, args []string) (joinedDeliveryStatusRequest, error) {
+	req := joinedDeliveryStatusRequest{BatchID: cfg.JoinedRecordingBatchID}
+	flags := newJoinedFlagSet("recording-joined delivery-status")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	flags.Int64Var(&req.ArtifactID, "artifact-id", 0, "joined artifact identifier")
+	if err := parseJoinedFlags(flags, args); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if req.ArtifactID <= 0 {
+		return req, errors.New("--artifact-id must be a positive integer")
+	}
+	return req, nil
 }
 
 func newJoinedFlagSet(name string) *flag.FlagSet {

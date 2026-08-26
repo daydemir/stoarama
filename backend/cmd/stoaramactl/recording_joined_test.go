@@ -69,6 +69,7 @@ type fakeJoinedOperator struct {
 	indexReq        joinedSealBatchIndexRequest
 	workerReq       joinedWorkerRequest
 	statusReq       joinedStatusRequest
+	deliveryReq     joinedDeliveryStatusRequest
 	startupReq      joinedWorkerRequest
 	startupErr      error
 	workerRuns      int
@@ -158,6 +159,11 @@ func (f *fakeJoinedOperator) CheckWorkerStartup(_ context.Context, req joinedWor
 func (f *fakeJoinedOperator) Status(_ context.Context, req joinedStatusRequest) (any, error) {
 	f.statusReq = req
 	return map[string]any{"status": "running"}, nil
+}
+
+func (f *fakeJoinedOperator) DeliveryStatus(_ context.Context, req joinedDeliveryStatusRequest) (any, error) {
+	f.deliveryReq = req
+	return map[string]any{"acknowledged": true}, nil
 }
 
 func (f *fakeJoinedOperator) ClaimAdmissionStatus(_ context.Context, _ string) (joinedrecording.ClaimAdmissionStatus, error) {
@@ -542,5 +548,36 @@ func TestJoinedWorkerRejectsLocalConcurrencyFlag(t *testing.T) {
 	_, err := runRecordingJoinedWith(context.Background(), cfg, []string{"worker", "run", "--concurrency", "8"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestJoinedDeliveryStatusDispatchesExactArtifact(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	fake := &fakeJoinedOperator{}
+	result, err := runRecordingJoinedWith(context.Background(), cfg, []string{
+		"delivery-status", "--batch-id", cfg.JoinedRecordingBatchID, "--artifact-id", "429",
+	}, func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.deliveryReq != (joinedDeliveryStatusRequest{BatchID: cfg.JoinedRecordingBatchID, ArtifactID: 429}) {
+		t.Fatalf("delivery status request=%+v", fake.deliveryReq)
+	}
+	if got := result.(map[string]any)["acknowledged"]; got != true {
+		t.Fatalf("acknowledged=%v", got)
+	}
+}
+
+func TestJoinedDeliveryStatusRejectsMissingOrInvalidArtifact(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	for _, args := range [][]string{
+		{"delivery-status"},
+		{"delivery-status", "--artifact-id", "0"},
+		{"delivery-status", "--artifact-id", "-1"},
+		{"delivery-status", "--artifact-id", "1", "extra"},
+	} {
+		if _, err := runRecordingJoinedWith(context.Background(), cfg, args, nil); err == nil {
+			t.Fatalf("args=%v accepted", args)
+		}
 	}
 }
