@@ -2753,8 +2753,9 @@ def valid_joined_timestamp(value, label):
     if fraction.endswith("0"):
         raise ValueError("joined manifest has noncanonical %s" % label)
     normalized = value.replace("Z", "+00:00")
-    if match.group(1) and len(match.group(1)) > 6:
-        normalized = normalized.replace("." + match.group(1), "." + match.group(1)[:6], 1)
+    if match.group(1):
+        microseconds = match.group(1)[:6].ljust(6, "0")
+        normalized = normalized.replace("." + match.group(1), "." + microseconds, 1)
     try:
         parsed = datetime.datetime.fromisoformat(normalized)
     except ValueError as exc:
@@ -3071,7 +3072,7 @@ def valid_source(source, recording_id, source_only=False, location=None, local_d
         raise ValueError("joined source recording identity conflicts")
     positive_joined_int(source["recording_job_id"], "recording_job_id")
     positive_joined_int(source["storage_destination_id"], "storage_destination_id")
-    if source["provider"] != "r2" or source["region"] != "auto" or not isinstance(source["bucket"], str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", source["bucket"]) is None:
+    if source["provider"] not in ("r2", "r2_managed") or source["region"] != "auto" or not isinstance(source["bucket"], str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", source["bucket"]) is None:
         raise ValueError("joined source storage identity is invalid")
     endpoint = source["endpoint"]
     if not isinstance(endpoint, str) or SOURCE_ENDPOINT_V1.fullmatch(endpoint) is None:
