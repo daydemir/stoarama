@@ -588,6 +588,43 @@ func TestPreflightQuarantinesIrreducibleCorruptSourceAndContinues(t *testing.T) 
 	}
 }
 
+func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "one.mp4", 440, false)
+	bad := makeMediaClip(t, dir, "bad.mp4", 660, false)
+	third := makeMediaClip(t, dir, "three.mp4", 880, false)
+	first.ClipID, bad.ClipID, third.ClipID = 1, 2, 3
+	if err := os.Truncate(bad.Path, 128); err != nil {
+		t.Fatal(err)
+	}
+	bad.SizeBytes, bad.SHA256, _ = localIdentity(bad.Path)
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	clips := []SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute)), testSource(3, start.Add(2*time.Minute))}
+	draft := HourDraft{LocalDate: "2026-05-04", LocalHour: 1, Parts: []OutputPlan{
+		{Hour: 1, Sources: clips[0:1]},
+		{Hour: 1, Sources: clips[1:2]},
+		{Hour: 1, Sources: clips[2:3]},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := PreflightHour(ctx, draft, []LocalSource{first, bad, third}, dir, strings.Repeat("f", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, built := range result.Built {
+		defer os.Remove(built.Path)
+	}
+	if len(result.Built) != 2 || result.Built[0].SourceCount != 1 || result.Built[1].SourceCount != 1 {
+		t.Fatalf("built parts differ: %+v", result.Built)
+	}
+	if len(result.Quarantined) != 1 || result.Quarantined[0].ClipID != 2 || len(result.Quarantines) != 1 || result.Quarantines[0].Evidence.RepeatCount != 2 {
+		t.Fatalf("quarantine accounting differs: %+v", result)
+	}
+	if len(result.Sources) != 2 || result.Sources[0].ClipID != 1 || result.Sources[1].ClipID != 3 || result.Sources[1].SeamToPrevious.Reason != "source_quarantined" {
+		t.Fatalf("surviving source accounting differs: %+v", result.Sources)
+	}
+}
+
 func TestSingletonIsExactByteCopy(t *testing.T) {
 	dir := t.TempDir()
 	source := makeMediaClip(t, dir, "one.mp4", 440, false)
