@@ -103,7 +103,7 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 		QualificationRuleVersion: joinedrecording.Tier1HistoricalQualificationVersion,
 		Members:                  make([]joinedHistoricalQualificationMember, 0, len(req.RecordingJobs)),
 	}
-	if err := q.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1 AND joined_protocol_version=1`,
+	if err := q.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1`,
 		req.ConnectionID).Scan(&plan.AccountID); err != nil {
 		return plan, errors.New("Tier-1 connection differs")
 	}
@@ -249,6 +249,10 @@ func (s *Server) handleAdminJoinedHistoricalQualification(w http.ResponseWriter,
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) || req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusConflict, "Tier-1 connection differs from configured cloud authority")
+		return
+	}
 	if !req.Apply {
 		plan, err := buildJoinedHistoricalQualificationPlan(r.Context(), s.pool, req)
 		if err != nil {
@@ -275,7 +279,7 @@ func (s *Server) applyJoinedHistoricalQualification(ctx context.Context, req joi
 	}
 	defer tx.Rollback(ctx)
 	var accountID int64
-	if err := tx.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1 AND joined_protocol_version=1`,
+	if err := tx.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1`,
 		req.ConnectionID).Scan(&accountID); err != nil {
 		return joinedHistoricalQualificationPlan{}, 0, time.Time{}, false, errors.New("Tier-1 connection differs")
 	}
@@ -310,7 +314,7 @@ func (s *Server) applyJoinedHistoricalQualification(ctx context.Context, req joi
 			return existingPlan, 0, time.Time{}, false, errors.New("a different active qualification authority already exists")
 		}
 		if err := tx.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1 AND account_id=$2
-			AND joined_protocol_version=1 FOR SHARE`, req.ConnectionID, accountID).Scan(&accountID); err != nil {
+			FOR SHARE`, req.ConnectionID, accountID).Scan(&accountID); err != nil {
 			return existingPlan, 0, time.Time{}, false, errors.New("Tier-1 connection changed during historical replay")
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -378,7 +382,7 @@ func (s *Server) applyJoinedHistoricalQualification(ctx context.Context, req joi
 		return plan, 0, time.Time{}, false, err
 	}
 	if err := tx.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1 AND account_id=$2
-		AND joined_protocol_version=1 FOR SHARE`, req.ConnectionID, accountID).Scan(&accountID); err != nil {
+		FOR SHARE`, req.ConnectionID, accountID).Scan(&accountID); err != nil {
 		return plan, 0, time.Time{}, false, errors.New("Tier-1 connection changed during historical import")
 	}
 	if err := tx.Commit(ctx); err != nil {

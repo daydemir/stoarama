@@ -75,8 +75,9 @@ func TestJoinedConnectionStatusIsAuthenticatedReadOnlyAndScoped(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.ConnectionID != connectionID || got.ExpectedProtocolVersion != 1 || got.ExpectedProtocolGeneration != 1 ||
-		got.ServerDesiredProtocolVersion != 1 || got.ServerDesiredProtocolGeneration != 1 ||
+	if got.ConnectionID != connectionID || !got.ControlPlaneEnabled || got.NASDeliveryEnabled ||
+		got.ExpectedProtocolVersion != 1 || got.ExpectedProtocolGeneration != 1 ||
+		got.ServerDesiredProtocolVersion != 0 || got.ServerDesiredProtocolGeneration != 1 ||
 		got.ObservedProtocolVersion != 0 || got.HeartbeatStale || got.ClientVersion != "pull-test" || got.ClientPhase != "degraded" ||
 		!got.ClientErrorPresent || got.ClientErrorAt == nil || !got.ClientErrorAt.Equal(errorAt) ||
 		got.ClientErrorClass != "nas_pull" || got.ClientErrorSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(clientError))) {

@@ -17,8 +17,10 @@ import (
 // while heartbeat, seal, upload, and finalize never consult this control.
 func (s *Server) joinedClaimAdmissionAllowed(ctx context.Context, tx pgx.Tx, batchID string) (bool, error) {
 	var paused bool
-	err := tx.QueryRow(ctx, `SELECT claims_paused FROM recording_joined_admission_controls
-		WHERE batch_id=$1 FOR SHARE`, batchID).Scan(&paused)
+	err := tx.QueryRow(ctx, `SELECT c.claims_paused FROM recording_joined_admission_controls c
+		JOIN recording_joined_batches b ON b.id=c.batch_record_id
+		WHERE c.batch_id=$1 AND b.connection_id=$2 FOR SHARE OF c,b`, batchID,
+		s.cfg.JoinedRecordingConnectionID).Scan(&paused)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -31,6 +33,10 @@ func (s *Server) handleJoinedAdmissionStatus(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	if batchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusNotFound, "joined admission control is unavailable")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -39,7 +45,7 @@ func (s *Server) handleJoinedAdmissionStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	status, err := joinedAdmissionStatus(ctx, tx, batchID)
+	status, err := s.joinedAdmissionStatus(ctx, tx, batchID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "joined admission control is unavailable")
 		return
@@ -78,9 +84,10 @@ func (s *Server) handleJoinedAdmissionSet(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var updatedAt time.Time
-	err = tx.QueryRow(ctx, `UPDATE recording_joined_admission_controls
-		SET claims_paused=$2,updated_at=clock_timestamp() WHERE batch_id=$1 RETURNING updated_at`,
-		req.BatchID, req.ClaimsPaused).Scan(&updatedAt)
+	err = tx.QueryRow(ctx, `UPDATE recording_joined_admission_controls c
+		SET claims_paused=$2,updated_at=clock_timestamp() FROM recording_joined_batches b
+		WHERE c.batch_id=$1 AND b.id=c.batch_record_id AND b.connection_id=$3 RETURNING c.updated_at`,
+		req.BatchID, req.ClaimsPaused, s.cfg.JoinedRecordingConnectionID).Scan(&updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "joined admission control is unavailable")
 		return
@@ -89,7 +96,7 @@ func (s *Server) handleJoinedAdmissionSet(w http.ResponseWriter, r *http.Request
 		util.WriteError(w, http.StatusInternalServerError, "update joined admission control")
 		return
 	}
-	status, err := joinedAdmissionStatus(ctx, tx, req.BatchID)
+	status, err := s.joinedAdmissionStatus(ctx, tx, req.BatchID)
 	if err != nil || !status.UpdatedAt.Equal(updatedAt) || status.ClaimsPaused != req.ClaimsPaused || status.Validate() != nil {
 		util.WriteError(w, http.StatusInternalServerError, "verify joined admission update")
 		return
@@ -110,14 +117,15 @@ func joinedAdmissionBatchID(w http.ResponseWriter, r *http.Request) (string, boo
 	return values[0], true
 }
 
-func joinedAdmissionStatus(ctx context.Context, tx pgx.Tx, batchID string) (joinedrecording.ClaimAdmissionStatus, error) {
+func (s *Server) joinedAdmissionStatus(ctx context.Context, tx pgx.Tx, batchID string) (joinedrecording.ClaimAdmissionStatus, error) {
 	status := joinedrecording.ClaimAdmissionStatus{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: batchID}
 	err := tx.QueryRow(ctx, `SELECT c.claims_paused,c.updated_at,
 		(SELECT count(*) FROM recording_joined_hours h WHERE h.batch_record_id=c.batch_record_id
 		 AND h.state='leased' AND h.lease_expires_at>now()),
 		(SELECT count(*) FROM recording_joined_artifacts a WHERE a.batch_record_id=c.batch_record_id
 		 AND a.publication_state='publishing' AND a.publication_lease_expires_at>now())
-		FROM recording_joined_admission_controls c WHERE c.batch_id=$1`, batchID).Scan(
+		FROM recording_joined_admission_controls c JOIN recording_joined_batches b ON b.id=c.batch_record_id
+		WHERE c.batch_id=$1 AND b.connection_id=$2`, batchID, s.cfg.JoinedRecordingConnectionID).Scan(
 		&status.ClaimsPaused, &status.UpdatedAt, &status.ActiveHourLeases, &status.ActivePublicationLeases)
 	status.ActiveLeaseCount = status.ActiveHourLeases + status.ActivePublicationLeases
 	return status, err

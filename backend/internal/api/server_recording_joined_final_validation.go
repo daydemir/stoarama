@@ -63,6 +63,10 @@ func (s *Server) handleAdminJoinedFinalValidationStart(w http.ResponseWriter, r 
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusConflict, "joined final-validation batch differs")
+		return
+	}
 	progress, err := s.startJoinedFinalValidation(r.Context(), req)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
@@ -72,6 +76,9 @@ func (s *Server) handleAdminJoinedFinalValidationStart(w http.ResponseWriter, r 
 }
 
 func (s *Server) startJoinedFinalValidation(ctx context.Context, req joinedFinalValidationStartRequest) (joinedFinalValidationProgress, error) {
+	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+		return joinedFinalValidationProgress{}, errors.New("joined final-validation batch differs")
+	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -88,7 +95,8 @@ func (s *Server) startJoinedFinalValidation(ctx context.Context, req joinedFinal
 	var expectedDays int
 	var denominator string
 	if err := tx.QueryRow(ctx, `SELECT id,generation,state,expected_stream_days,frozen_denominator_sha256
-		FROM recording_joined_batches WHERE batch_id=$1 FOR UPDATE`, req.BatchID).
+		FROM recording_joined_batches WHERE batch_id=$1 AND connection_id=$2 FOR UPDATE`, req.BatchID,
+		s.cfg.JoinedRecordingConnectionID).
 		Scan(&batchRecordID, &generation, &state, &expectedDays, &denominator); err != nil {
 		return joinedFinalValidationProgress{}, fmt.Errorf("lock joined batch for final validation: %w", err)
 	}
@@ -176,7 +184,10 @@ func (s *Server) stepJoinedFinalValidation(ctx context.Context, req joinedFinalV
 		return joinedFinalValidationProgress{}, err
 	}
 	var state string
-	if err := tx.QueryRow(ctx, `SELECT state FROM recording_joined_final_validation_runs WHERE id=$1 FOR UPDATE`, req.RunID).Scan(&state); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT r.state FROM recording_joined_final_validation_runs r
+		JOIN recording_joined_batches b ON b.id=r.batch_record_id
+		WHERE r.id=$1 AND r.batch_id=$2 AND b.connection_id=$3 FOR UPDATE OF r`, req.RunID,
+		s.cfg.JoinedRecordingBatchID, s.cfg.JoinedRecordingConnectionID).Scan(&state); err != nil {
 		return joinedFinalValidationProgress{}, err
 	}
 	if state == "ready" {
@@ -263,9 +274,11 @@ func (s *Server) joinedFinalValidationStatus(ctx context.Context, runID string) 
 	var next *int
 	var receiptSet *string
 	var completedAt *time.Time
-	if err := s.pool.QueryRow(ctx, `SELECT id::text,batch_id,generation,state,validator_version,
-		expected_denominator_sha256,completed_scopes,expected_stream_days,receipt_set_sha256,completed_at
-		FROM recording_joined_final_validation_runs WHERE id=$1`, runID).
+	if err := s.pool.QueryRow(ctx, `SELECT r.id::text,r.batch_id,r.generation,r.state,r.validator_version,
+		r.expected_denominator_sha256,r.completed_scopes,r.expected_stream_days,r.receipt_set_sha256,r.completed_at
+		FROM recording_joined_final_validation_runs r JOIN recording_joined_batches b ON b.id=r.batch_record_id
+		WHERE r.id=$1 AND r.batch_id=$2 AND b.connection_id=$3`, runID, s.cfg.JoinedRecordingBatchID,
+		s.cfg.JoinedRecordingConnectionID).
 		Scan(&p.RunID, &p.BatchID, &p.Generation, &p.State, &p.ValidatorVersion, &p.ExpectedDenominatorSHA256,
 			&p.CompletedScopes, &p.ExpectedScopes, &receiptSet, &completedAt); err != nil {
 		return p, err

@@ -172,6 +172,7 @@ func TestRenderJoinedWorkScopeShipsDisabled(t *testing.T) {
 func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	for _, key := range []string{
 		"JOINED_RECORDING_CONTROL_PLANE_ENABLED",
+		"JOINED_RECORDING_NAS_DELIVERY_ENABLED",
 		"JOINED_RECORDING_ENABLED",
 		"JOINED_RECORDING_PROTOCOL_VERSION",
 		"JOINED_RECORDING_CONNECTION_ID",
@@ -197,7 +198,7 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.JoinedRecordingControlPlaneEnabled || cfg.JoinedRecordingEnabled || cfg.JoinedRecordingRollingEnabled || cfg.JoinedRecordingProtocolVersion != 0 {
+	if cfg.JoinedRecordingControlPlaneEnabled || cfg.JoinedRecordingNASDeliveryEnabled || cfg.JoinedRecordingEnabled || cfg.JoinedRecordingRollingEnabled || cfg.JoinedRecordingProtocolVersion != 0 {
 		t.Fatalf("joined worker unexpectedly enabled: %+v", cfg)
 	}
 	if cfg.JoinedRecordingConnectionID != 0 || cfg.JoinedRecordingProtocolGeneration != 0 {
@@ -211,6 +212,18 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 	}
 	if err := cfg.ValidateJoinedRecording(); err != nil {
 		t.Fatalf("disabled validation: %v", err)
+	}
+}
+
+func TestJoinedNASDeliveryRequiresReadyControlPlane(t *testing.T) {
+	cfg := validJoinedAPIConfigForTest("tier1-2026-08", joinedCanaryScope("tier1-2026-08"))
+	cfg.JoinedRecordingNASDeliveryEnabled = true
+	if err := cfg.ValidateJoined(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.JoinedRecordingControlPlaneEnabled = false
+	if err := cfg.ValidateJoined(); err == nil {
+		t.Fatal("NAS joined delivery enabled without control plane")
 	}
 }
 
@@ -483,6 +496,7 @@ func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
 	}
 	for _, required := range []string{
 		"key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"false\"",
+		"key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"false\"",
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
 		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"0\"",
 		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"0\"",
@@ -497,6 +511,9 @@ func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
 	}
 	if strings.Contains(section, "key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"true\"") {
 		t.Fatal("joined API control plane was enabled in source configuration")
+	}
+	if strings.Contains(section, "key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"true\"") {
+		t.Fatal("joined NAS delivery was enabled in source configuration")
 	}
 	if strings.Contains(section, "STOARAMA_JOINED_OPERATOR_TOKEN") {
 		t.Fatal("joined operator credential must not be deployed to the API")

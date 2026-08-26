@@ -192,7 +192,7 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 	}
 	var head joinedFeedHeadDiagnostic
 	err = tx.QueryRow(ctx, `SELECT a.id,a.batch_id,h.hour_id,a.artifact_kind,a.ordinal,a.expected_size_bytes,a.expected_sha256 `+
-		joinedFeedHeadFromWhere, response.ConnectionID).Scan(&head.ArtifactID, &head.BatchID, &head.HourID, &head.Kind,
+		joinedFeedHeadFromWhere, response.ConnectionID, s.cfg.JoinedRecordingBatchID).Scan(&head.ArtifactID, &head.BatchID, &head.HourID, &head.Kind,
 		&head.Ordinal, &head.ExpectedSizeBytes, &head.ExpectedSHA256)
 	if err == nil {
 		response.FeedHead = &head

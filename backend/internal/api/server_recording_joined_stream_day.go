@@ -154,6 +154,10 @@ func (s *Server) handleAdminJoinedSealStreamDay(w http.ResponseWriter, r *http.R
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.BatchID != s.cfg.JoinedRecordingBatchID {
+		util.WriteError(w, http.StatusConflict, "joined stream-day batch differs")
+		return
+	}
 	if response, ok, err := s.loadSealedJoinedStreamDay(r.Context(), req); err != nil {
 		util.WriteError(w, http.StatusConflict, err.Error())
 		return
@@ -230,10 +234,11 @@ func (s *Server) loadSealedJoinedStreamDay(ctx context.Context, req joinedSealSt
 		d.head_manifest_sha256,d.ledger_sha256,d.ledger_artifact_sha256,d.seal_request_sha256,a.id,
 		d.source_clip_count,d.source_bytes
 		FROM recording_joined_stream_days d JOIN recording_joined_batches b ON b.id=d.batch_record_id
-		JOIN connections c ON c.id=d.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=d.connection_id
 		JOIN recording_joined_artifacts a ON a.stream_day_id=d.id AND a.artifact_kind='allocation_ledger'
 		WHERE d.batch_id=$1 AND d.recording_id=$2 AND d.local_date=$3::date AND d.state='sealed'
-		  AND b.state='building' AND b.freeze_started_at IS NULL`, req.BatchID, req.RecordingID, req.LocalDate).Scan(
+		  AND b.state='building' AND b.freeze_started_at IS NULL AND c.id=$4`, req.BatchID, req.RecordingID,
+		req.LocalDate, s.cfg.JoinedRecordingConnectionID).Scan(
 		&response.BatchID, &response.RecordingID, &response.LocalDate, &response.SourceSnapshotSHA,
 		&response.HeadManifestSHA, &response.LedgerSHA, &response.LedgerArtifactSHA, &response.SealRequestSHA,
 		&response.LedgerArtifactID, &response.SourceCount, &response.SourceBytes)
@@ -255,9 +260,10 @@ func (s *Server) loadPendingJoinedStreamDay(ctx context.Context, req joinedSealS
 		d.scheduled_start_at,d.scheduled_end_at,br.qualification,d.source_snapshot_sha256
 		FROM recording_joined_stream_days d JOIN recording_joined_batches b ON b.id=d.batch_record_id
 		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
-		JOIN connections c ON c.id=d.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=d.connection_id
 		WHERE d.batch_id=$1 AND d.recording_id=$2 AND d.local_date=$3::date AND d.state='pending'
-		  AND b.state='building' AND b.freeze_started_at IS NULL`, req.BatchID, req.RecordingID, req.LocalDate).Scan(
+		  AND b.state='building' AND b.freeze_started_at IS NULL AND c.id=$4`, req.BatchID, req.RecordingID,
+		req.LocalDate, s.cfg.JoinedRecordingConnectionID).Scan(
 		&plan.BatchRecordID, &plan.BatchRecordingID, &plan.StreamDayID, &plan.AccountID, &plan.ConnectionID,
 		&plan.RecordingID, &plan.RecordingJobID, &plan.BatchID, &plan.LocalDate, &plan.Timezone, &plan.FolderName,
 		&plan.Generation, &plan.DateOrdinal, &plan.PriorityOrdinal, &plan.ScheduledStart, &plan.ScheduledEnd,
@@ -499,6 +505,9 @@ func (s *Server) headJoinedStreamDaySourceAttempt(ctx context.Context, store joi
 
 func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDayRequest, loaded joinedStreamDayPlan,
 	observations []joinedStreamDayHeadObservation) (joinedSealStreamDayResponse, error) {
+	if req.BatchID != s.cfg.JoinedRecordingBatchID || loaded.ConnectionID != int64(s.cfg.JoinedRecordingConnectionID) {
+		return joinedSealStreamDayResponse{}, errors.New("joined stream-day authority differs")
+	}
 	if len(observations) != len(loaded.Sources) {
 		return joinedSealStreamDayResponse{}, errors.New("joined stream-day HEAD count differs")
 	}
@@ -554,7 +563,7 @@ func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDa
 		return joinedSealStreamDayResponse{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	current, state, err := loadJoinedStreamDayForSeal(ctx, tx, req)
+	current, state, err := loadJoinedStreamDayForSeal(ctx, tx, req, s.cfg.JoinedRecordingConnectionID)
 	if err != nil {
 		return joinedSealStreamDayResponse{}, err
 	}
@@ -588,7 +597,8 @@ func (s *Server) sealJoinedStreamDay(ctx context.Context, req joinedSealStreamDa
 	return response, nil
 }
 
-func loadJoinedStreamDayForSeal(ctx context.Context, tx pgx.Tx, req joinedSealStreamDayRequest) (joinedStreamDayPlan, string, error) {
+func loadJoinedStreamDayForSeal(ctx context.Context, tx pgx.Tx, req joinedSealStreamDayRequest,
+	connectionID int) (joinedStreamDayPlan, string, error) {
 	var plan joinedStreamDayPlan
 	var qualification []byte
 	var state string
@@ -598,9 +608,9 @@ func loadJoinedStreamDayForSeal(ctx context.Context, tx pgx.Tx, req joinedSealSt
 		FROM recording_joined_stream_days d JOIN recording_joined_batches b ON b.id=d.batch_record_id
 		JOIN recording_joined_batch_recordings br ON br.id=d.batch_recording_id
 		JOIN connections c ON c.id=d.connection_id
-		WHERE d.batch_id=$1 AND d.recording_id=$2 AND d.local_date=$3::date
-		  AND b.state='building' AND b.freeze_started_at IS NULL AND c.joined_protocol_version=1
-		FOR UPDATE OF d,b,c FOR SHARE OF br`, req.BatchID, req.RecordingID, req.LocalDate).Scan(
+		WHERE d.batch_id=$1 AND d.recording_id=$2 AND d.local_date=$3::date AND c.id=$4
+		  AND b.state='building' AND b.freeze_started_at IS NULL
+		FOR UPDATE OF d,b,c FOR SHARE OF br`, req.BatchID, req.RecordingID, req.LocalDate, connectionID).Scan(
 		&plan.BatchRecordID, &plan.BatchRecordingID, &plan.StreamDayID, &plan.AccountID, &plan.ConnectionID,
 		&plan.RecordingID, &plan.RecordingJobID, &plan.BatchID, &plan.LocalDate, &plan.Timezone, &plan.FolderName,
 		&plan.Generation, &plan.DateOrdinal, &plan.PriorityOrdinal, &plan.ScheduledStart, &plan.ScheduledEnd,

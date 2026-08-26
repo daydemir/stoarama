@@ -50,7 +50,7 @@ const joinedFeedHeadFromWhere = `
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
 		LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id AND own_ack.connection_id=a.connection_id
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
-		WHERE a.connection_id=$1 AND own_ack.artifact_id IS NULL
+		WHERE a.connection_id=$1 AND a.batch_id=$2 AND own_ack.artifact_id IS NULL
 		  AND ((a.artifact_kind<>'media' AND a.publication_state='published')
 		    OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
 		  AND (a.artifact_kind='allocation_ledger'
@@ -145,7 +145,7 @@ func (s *Server) handleAccountJoined(w http.ResponseWriter, r *http.Request) {
 		SELECT a.id,a.connection_id,a.batch_id,h.hour_id,a.artifact_kind,a.content_type,a.relative_path,a.expected_size_bytes,a.expected_sha256,
 		       manifest.id,manifest.relative_path,manifest.expected_sha256,
 		       ledger.id,ledger.relative_path,ledger.expected_sha256
-		`+joinedFeedHeadFromWhere+` FOR SHARE OF a`, connectionID).Scan(
+		`+joinedFeedHeadFromWhere+` FOR SHARE OF a`, connectionID, s.cfg.JoinedRecordingBatchID).Scan(
 		&item.ArtifactID, &item.ConnectionID, &item.BatchID, &item.HourID, &item.Kind, &item.ContentType, &item.RelativePath,
 		&item.SizeBytes, &item.SHA256, &item.HourManifestID, &item.HourManifestRelativePath, &item.HourManifestSHA256,
 		&item.LedgerArtifactID, &item.LedgerRelativePath, &item.LedgerSHA256)
@@ -198,7 +198,7 @@ func (s *Server) handleAccountJoinedDownload(w http.ResponseWriter, r *http.Requ
 		LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
-		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3
+		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3 AND a.batch_id=$4
 		  AND ((a.artifact_kind<>'media' AND a.publication_state='published') OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
 		  AND (a.artifact_kind='allocation_ledger'
 		    OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
@@ -207,7 +207,8 @@ func (s *Server) handleAccountJoinedDownload(w http.ResponseWriter, r *http.Requ
 		      WHERE ack.artifact_id=manifest.id AND ack.connection_id=a.connection_id))
 		    OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
 		      LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
-		      WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index' AND ack.artifact_id IS NULL)))`, outputID, connectionID, principal.AccountID).Scan(
+		      WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index' AND ack.artifact_id IS NULL)))`,
+		outputID, connectionID, principal.AccountID, s.cfg.JoinedRecordingBatchID).Scan(
 		&objectKey, &etag, &versionID, &sizeBytes, &sha256, &contentType)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "joined output not found")
@@ -265,7 +266,7 @@ func (s *Server) revalidateAccountJoinedDownload(ctx context.Context, principal 
 		LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
-		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3
+		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3 AND a.batch_id=$9
 		  AND (a.object_key,a.etag,a.version_id,a.expected_size_bytes,a.expected_sha256)=($4,$5,$6,$7,$8)
 		  AND ((a.artifact_kind<>'media' AND a.publication_state='published') OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
 		  AND (a.artifact_kind='allocation_ledger'
@@ -276,7 +277,8 @@ func (s *Server) revalidateAccountJoinedDownload(ctx context.Context, principal 
 		    OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
 		      LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
 		      WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index' AND ack.artifact_id IS NULL)))
-		FOR SHARE OF a`, outputID, connectionID, principal.AccountID, objectKey, etag, versionID, sizeBytes, sha256).Scan(&ok)
+		FOR SHARE OF a`, outputID, connectionID, principal.AccountID, objectKey, etag, versionID, sizeBytes, sha256,
+		s.cfg.JoinedRecordingBatchID).Scan(&ok)
 	if err != nil {
 		return err
 	}
@@ -344,7 +346,7 @@ func (s *Server) handleAccountJoinedAck(w http.ResponseWriter, r *http.Request) 
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
 		LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=a.id AND ack.connection_id=a.connection_id
 		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
-		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3
+		WHERE a.id=$1 AND a.connection_id=$2 AND a.account_id=$3 AND a.batch_id=$4
 		  AND ((a.artifact_kind<>'media' AND a.publication_state='published') OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
 		  AND (a.artifact_kind='allocation_ledger'
 		    OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks dep
@@ -354,7 +356,7 @@ func (s *Server) handleAccountJoinedAck(w http.ResponseWriter, r *http.Request) 
 		    OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
 		      LEFT JOIN recording_joined_artifact_acks dep ON dep.artifact_id=prior.id AND dep.connection_id=prior.connection_id
 		      WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index' AND dep.artifact_id IS NULL)))
-		FOR SHARE OF a`, req.ArtifactID, connectionID, principal.AccountID).Scan(
+		FOR SHARE OF a`, req.ArtifactID, connectionID, principal.AccountID, s.cfg.JoinedRecordingBatchID).Scan(
 		&relativePath, &sizeBytes, &sha256, &verifiedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "joined output not found")
@@ -404,8 +406,8 @@ func (s *Server) revalidateJoinedSourceCapability(ctx context.Context, hourID, b
 	var ok int
 	err = tx.QueryRow(ctx, `
 		SELECT c.id FROM connections c JOIN recording_joined_hours h ON h.connection_id=c.id
-		WHERE h.hour_id=$1 AND h.batch_id=$2 AND c.joined_protocol_version=1
-		FOR SHARE OF c`, hourID, batchID).Scan(&ok)
+		WHERE h.hour_id=$1 AND h.batch_id=$2 AND c.id=$3
+		FOR SHARE OF c`, hourID, batchID, s.cfg.JoinedRecordingConnectionID).Scan(&ok)
 	if err != nil {
 		return err
 	}
@@ -443,7 +445,7 @@ func (s *Server) revalidateJoinedArtifactCapability(ctx context.Context, scopeKi
 	defer func() { _ = tx.Rollback(ctx) }()
 	var ok int
 	err = tx.QueryRow(ctx, `SELECT c.id FROM connections c JOIN recording_joined_batches b ON b.connection_id=c.id
-		WHERE b.batch_id=$1 AND c.joined_protocol_version=1 FOR SHARE OF c`, batchID).Scan(&ok)
+		WHERE b.batch_id=$1 AND c.id=$2 FOR SHARE OF c`, batchID, s.cfg.JoinedRecordingConnectionID).Scan(&ok)
 	if err != nil {
 		return err
 	}
@@ -564,14 +566,14 @@ func (s *Server) handleJoinedSourceCapability(w http.ResponseWriter, r *http.Req
 		JOIN recording_joined_batches b ON b.id=h.batch_record_id AND b.batch_id=h.batch_id
 		  AND b.source_endpoint=src.endpoint
 		LEFT JOIN recording_joined_artifacts root ON root.hour_record_id=h.id AND root.artifact_kind='hour_manifest'
-		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=h.connection_id AND c.id=$5
 		JOIN storage_destinations sd ON sd.id=src.storage_destination_id AND sd.provider=src.provider
 		  AND sd.endpoint=src.endpoint AND sd.region=src.region AND sd.bucket=src.bucket
 		WHERE h.hour_id=$1 AND src.clip_id=$2 AND h.batch_id=$4
 		  AND ((h.state='leased' AND h.claim_token=$3 AND h.lease_expires_at>now())
 		    OR (h.state='sealed' AND root.publication_state='publishing' AND root.publication_token=$3
 		      AND root.publication_lease_expires_at>now()))
-		  AND h.failure_reason_code=''`, req.HourID, req.ClipID, token, claims.BatchID).Scan(
+		  AND h.failure_reason_code=''`, req.HourID, req.ClipID, token, claims.BatchID, s.cfg.JoinedRecordingConnectionID).Scan(
 		&d.objectKey, &d.sizeBytes, &d.region, &d.bucket, &d.endpoint, &d.accessKeyID, &d.secretEnc,
 		&provider, &etag, &versionID, &sha256, &leaseExpires, &leaseState, &databaseNow)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -693,10 +695,10 @@ func (s *Server) handleJoinedArtifactCapability(w http.ResponseWriter, r *http.R
 		FROM recording_joined_artifacts target
 		JOIN recording_joined_artifacts root ON root.batch_record_id=target.batch_record_id
 		  AND root.scope_kind=target.scope_kind AND root.scope_id=target.scope_id AND root.artifact_kind<>'media'
-		JOIN connections c ON c.id=target.connection_id AND c.joined_protocol_version=1
+		JOIN connections c ON c.id=target.connection_id AND c.id=$6
 		WHERE target.id=$1 AND target.scope_id=$2 AND target.scope_kind=$5 AND root.publication_state='publishing'
 		  AND root.publication_token=$3 AND root.publication_lease_expires_at>now() AND target.batch_id=$4`,
-		req.ArtifactID, req.ScopeID, token, claims.BatchID, req.ScopeKind).Scan(
+		req.ArtifactID, req.ScopeID, token, claims.BatchID, req.ScopeKind, s.cfg.JoinedRecordingConnectionID).Scan(
 		&objectKey, &contentType, &expectedSize, &expectedSHA, &leaseExpires, &databaseNow)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "joined artifact capability lease is stale or foreign")

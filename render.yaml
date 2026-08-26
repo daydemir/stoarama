@@ -152,6 +152,8 @@ services:
       # isolated worker backend signing or storage credentials.
       - key: JOINED_RECORDING_CONTROL_PLANE_ENABLED
         value: "false"
+      - key: JOINED_RECORDING_NAS_DELIVERY_ENABLED
+        value: "false"
       - key: JOINED_RECORDING_PROTOCOL_VERSION
         value: "0"
       - key: JOINED_RECORDING_CONNECTION_ID

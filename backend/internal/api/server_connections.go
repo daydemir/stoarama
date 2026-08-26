@@ -651,7 +651,8 @@ func desiredJoinedProtocol(cfg config.Config, connectionID int64) (int, int) {
 		(cfg.JoinedRecordingProtocolVersion != 0 && cfg.JoinedRecordingProtocolVersion != 1) {
 		return 0, 0
 	}
-	if cfg.JoinedRecordingControlPlaneEnabled && cfg.JoinedRecordingProtocolVersion == 1 && cfg.ValidateJoined() == nil {
+	if cfg.JoinedRecordingNASDeliveryEnabled && cfg.JoinedRecordingControlPlaneEnabled &&
+		cfg.JoinedRecordingProtocolVersion == 1 && cfg.ValidateJoined() == nil {
 		return 1, cfg.JoinedRecordingProtocolGeneration
 	}
 	return 0, cfg.JoinedRecordingProtocolGeneration
