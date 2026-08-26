@@ -241,8 +241,8 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 		return PublishedHour{}, fmt.Errorf("immutable joined hour verified but fenced database reconciliation remains pending: %w", err)
 	}
 	emitStageTiming(ctx, "finalize", time.Since(finalizeStarted), nil)
-	if filepath.Base(scratchDir) != claim.LeaseID || filepath.Clean(scratchDir) != scratchDir {
-		return PublishedHour{}, fmt.Errorf("refusing cleanup outside current lease scratch")
+	if filepath.Base(scratchDir) != scratch.verified.OriginLeaseID || filepath.Clean(scratchDir) != scratchDir {
+		return PublishedHour{}, fmt.Errorf("refusing cleanup outside verified origin lease scratch")
 	}
 	for _, output := range built {
 		if !SafeScratchOutput(output.Path, scratchDir) {
