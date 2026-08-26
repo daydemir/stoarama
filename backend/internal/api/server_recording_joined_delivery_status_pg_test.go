@@ -47,8 +47,15 @@ func joinedDeliveryStatusTestPool(t *testing.T) (*pgxpool.Pool, func()) {
 		t.Fatal(err)
 	}
 	_, err = pool.Exec(ctx, `
-		CREATE TABLE connections(id bigint PRIMARY KEY,kind text NOT NULL DEFAULT 'nas_pull',joined_protocol_version integer NOT NULL,
-		 joined_last_attempt_artifact_id bigint,joined_last_blocker text NOT NULL DEFAULT '',joined_last_attempt_at timestamptz,joined_retry_at timestamptz);
+		CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint NOT NULL DEFAULT 1,kind text NOT NULL DEFAULT 'nas_pull',joined_protocol_version integer NOT NULL,
+		 joined_last_attempt_artifact_id bigint,joined_last_blocker text NOT NULL DEFAULT '',joined_last_attempt_at timestamptz,joined_retry_at timestamptz,
+		 last_cursor_id bigint NOT NULL DEFAULT 0,clips_pulled bigint NOT NULL DEFAULT 0,bytes_pulled bigint NOT NULL DEFAULT 0,
+		 client_last_success_at timestamptz,nas_batch_completed_at timestamptz,nas_batch_clips integer NOT NULL DEFAULT 0,
+		 nas_batch_bytes bigint NOT NULL DEFAULT 0,nas_batch_failures integer NOT NULL DEFAULT 0,
+		 joined_files_pulled bigint NOT NULL DEFAULT 0,joined_bytes_pulled bigint NOT NULL DEFAULT 0);
+		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,delivery text NOT NULL);
+		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,size_bytes bigint NOT NULL,
+		 created_at timestamptz NOT NULL,purged_at timestamptz,released_at timestamptz);
 		CREATE TABLE recording_joined_batches(id bigint PRIMARY KEY,batch_id text NOT NULL,connection_id bigint NOT NULL);
 		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,hour_id text NOT NULL,priority_ordinal integer NOT NULL);
 		CREATE TABLE recording_joined_artifacts(
@@ -84,7 +91,10 @@ func TestJoinedDeliveryStatusReadsExactAppendOnlyAckWithoutWriting(t *testing.T)
 		query string
 		args  []any
 	}{
-		{query: `INSERT INTO connections(id,joined_protocol_version) VALUES(13,1)`},
+		{query: `INSERT INTO connections(id,joined_protocol_version,last_cursor_id,clips_pulled,bytes_pulled,
+		 client_last_success_at,nas_batch_completed_at,nas_batch_clips,nas_batch_bytes,nas_batch_failures,joined_files_pulled,joined_bytes_pulled)
+		 VALUES(13,1,100,90,9000,now(),now(),4,400,0,7,700)`},
+		{query: `INSERT INTO recordings VALUES(1,1,'nas_pull'); INSERT INTO recording_clips VALUES(101,1,250,now()-interval '10 minutes',NULL,NULL)`},
 		{query: `INSERT INTO recording_joined_batches VALUES(1,$1,13),(2,'foreign-generation-1',13)`, args: []any{batchID}},
 		{query: `INSERT INTO recording_joined_hours VALUES(101,1,$1,1),(102,1,$2,2),(103,2,$1,1)`, args: []any{hourID, outsideHourID}},
 		{query: `INSERT INTO recording_joined_artifacts(id,batch_record_id,connection_id,batch_id,stream_day_id,hour_record_id,artifact_kind,relative_path,expected_size_bytes,expected_sha256,publication_state,published_at) VALUES
@@ -137,7 +147,10 @@ func TestJoinedDeliveryStatusReadsExactAppendOnlyAckWithoutWriting(t *testing.T)
 	if status.Acknowledged || status.IdentityMatches || status.HourID != hourID || status.FeedHead == nil ||
 		status.FeedHead.ArtifactID != 480 || status.FeedHead.BatchID != "foreign-generation-1" ||
 		status.LastAttemptArtifactID == nil || *status.LastAttemptArtifactID != 480 || !status.TelemetryMatchesHead ||
-		status.LastAttemptBlockerClass != "present" || status.LastAttemptBlockerSHA256 == "" {
+		status.LastAttemptBlockerClass != "present" || status.LastAttemptBlockerSHA256 == "" ||
+		status.RawDelivery.LastCursorID != 100 || status.RawDelivery.ClipsPulled != 90 ||
+		status.RawDelivery.PendingClips != 1 || status.RawDelivery.PendingBytes != 250 ||
+		status.RawDelivery.JoinedFilesPulled != 7 || status.RawDelivery.JoinedBytesPulled != 700 {
 		t.Fatalf("unacked=%+v", status)
 	}
 	if strings.Contains(unacked.Body.String(), "download_error") {

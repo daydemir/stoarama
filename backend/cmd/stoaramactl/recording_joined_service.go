@@ -109,31 +109,32 @@ type joinedWorkerStatus struct {
 }
 
 type joinedDeliveryStatus struct {
-	BatchID                  string                `json:"batch_id"`
-	ArtifactID               int64                 `json:"artifact_id"`
-	ArtifactKind             string                `json:"artifact_kind"`
-	HourID                   string                `json:"hour_id"`
-	RelativePath             string                `json:"relative_path"`
-	ExpectedSizeBytes        int64                 `json:"expected_size_bytes"`
-	ExpectedSHA256           string                `json:"expected_sha256"`
-	PublicationState         string                `json:"publication_state"`
-	PublishedAt              *time.Time            `json:"published_at,omitempty"`
-	Acknowledged             bool                  `json:"acknowledged"`
-	VerifiedAt               *time.Time            `json:"verified_at,omitempty"`
-	AcknowledgedPath         string                `json:"acknowledged_relative_path,omitempty"`
-	AcknowledgedSize         *int64                `json:"acknowledged_size_bytes,omitempty"`
-	AcknowledgedSHA256       string                `json:"acknowledged_sha256,omitempty"`
-	IdentityMatches          bool                  `json:"identity_matches"`
-	ConnectionID             int64                 `json:"connection_id"`
-	ConnectionProtocol       int                   `json:"connection_protocol_version"`
-	ObservedAt               time.Time             `json:"observed_at"`
-	FeedHead                 *joinedFeedHeadStatus `json:"feed_head,omitempty"`
-	LastAttemptArtifactID    *int64                `json:"last_attempt_artifact_id,omitempty"`
-	LastAttemptBlockerClass  string                `json:"last_attempt_blocker_class,omitempty"`
-	LastAttemptBlockerSHA256 string                `json:"last_attempt_blocker_sha256,omitempty"`
-	LastAttemptAt            *time.Time            `json:"last_attempt_at,omitempty"`
-	RetryAt                  *time.Time            `json:"retry_at,omitempty"`
-	TelemetryMatchesHead     bool                  `json:"telemetry_matches_head"`
+	BatchID                  string                  `json:"batch_id"`
+	ArtifactID               int64                   `json:"artifact_id"`
+	ArtifactKind             string                  `json:"artifact_kind"`
+	HourID                   string                  `json:"hour_id"`
+	RelativePath             string                  `json:"relative_path"`
+	ExpectedSizeBytes        int64                   `json:"expected_size_bytes"`
+	ExpectedSHA256           string                  `json:"expected_sha256"`
+	PublicationState         string                  `json:"publication_state"`
+	PublishedAt              *time.Time              `json:"published_at,omitempty"`
+	Acknowledged             bool                    `json:"acknowledged"`
+	VerifiedAt               *time.Time              `json:"verified_at,omitempty"`
+	AcknowledgedPath         string                  `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize         *int64                  `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256       string                  `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches          bool                    `json:"identity_matches"`
+	ConnectionID             int64                   `json:"connection_id"`
+	ConnectionProtocol       int                     `json:"connection_protocol_version"`
+	ObservedAt               time.Time               `json:"observed_at"`
+	FeedHead                 *joinedFeedHeadStatus   `json:"feed_head,omitempty"`
+	LastAttemptArtifactID    *int64                  `json:"last_attempt_artifact_id,omitempty"`
+	LastAttemptBlockerClass  string                  `json:"last_attempt_blocker_class,omitempty"`
+	LastAttemptBlockerSHA256 string                  `json:"last_attempt_blocker_sha256,omitempty"`
+	LastAttemptAt            *time.Time              `json:"last_attempt_at,omitempty"`
+	RetryAt                  *time.Time              `json:"retry_at,omitempty"`
+	TelemetryMatchesHead     bool                    `json:"telemetry_matches_head"`
+	RawDelivery              joinedRawDeliveryStatus `json:"raw_delivery"`
 }
 
 type joinedFeedHeadStatus struct {
@@ -144,6 +145,22 @@ type joinedFeedHeadStatus struct {
 	Ordinal           int     `json:"ordinal"`
 	ExpectedSizeBytes int64   `json:"expected_size_bytes"`
 	ExpectedSHA256    string  `json:"expected_sha256"`
+}
+
+type joinedRawDeliveryStatus struct {
+	LastCursorID        int64      `json:"last_cursor_id"`
+	ClipsPulled         int64      `json:"clips_pulled"`
+	BytesPulled         int64      `json:"bytes_pulled"`
+	ClientLastSuccessAt *time.Time `json:"client_last_success_at,omitempty"`
+	NASBatchCompletedAt *time.Time `json:"nas_batch_completed_at,omitempty"`
+	NASBatchClips       int        `json:"nas_batch_clips"`
+	NASBatchBytes       int64      `json:"nas_batch_bytes"`
+	NASBatchFailures    int        `json:"nas_batch_failures"`
+	PendingClips        int64      `json:"pending_clips"`
+	PendingBytes        int64      `json:"pending_bytes"`
+	OldestPendingAt     *time.Time `json:"oldest_pending_at,omitempty"`
+	JoinedFilesPulled   int64      `json:"joined_files_pulled"`
+	JoinedBytesPulled   int64      `json:"joined_bytes_pulled"`
 }
 
 type joinedSealStreamDayReceipt struct {

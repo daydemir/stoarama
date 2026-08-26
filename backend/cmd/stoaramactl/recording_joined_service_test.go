@@ -83,6 +83,9 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 	headHour := "older-hour-1"
 	lastAttemptID := int64(401)
 	blockerSHA := strings.Repeat("b", 64)
+	lastSuccess := observed.Add(-2 * time.Minute)
+	batchCompleted := observed.Add(-3 * time.Minute)
+	oldestPending := observed.Add(-4 * time.Minute)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.RequestURI() != "/api/v1/recording/joined/delivery-status?batch_id="+batch+"&artifact_id=429" {
 			t.Fatalf("request=%s %s", r.Method, r.URL.RequestURI())
@@ -97,7 +100,11 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 			ObservedAt: observed, FeedHead: &joinedFeedHeadStatus{ArtifactID: 401, BatchID: "older-generation-1",
 				HourID: &headHour, Kind: "media", Ordinal: 2, ExpectedSizeBytes: 99, ExpectedSHA256: strings.Repeat("c", 64)},
 			LastAttemptArtifactID: &lastAttemptID, LastAttemptBlockerClass: "present",
-			LastAttemptBlockerSHA256: blockerSHA, LastAttemptAt: &attempted, RetryAt: &retry, TelemetryMatchesHead: true})
+			LastAttemptBlockerSHA256: blockerSHA, LastAttemptAt: &attempted, RetryAt: &retry, TelemetryMatchesHead: true,
+			RawDelivery: joinedRawDeliveryStatus{LastCursorID: 100, ClipsPulled: 90, BytesPulled: 9000,
+				ClientLastSuccessAt: &lastSuccess, NASBatchCompletedAt: &batchCompleted, NASBatchClips: 4,
+				NASBatchBytes: 400, PendingClips: 3, PendingBytes: 300, OldestPendingAt: &oldestPending,
+				JoinedFilesPulled: 7, JoinedBytesPulled: 700}})
 	}))
 	defer server.Close()
 	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
@@ -115,7 +122,11 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 		got.LastAttemptArtifactID == nil || *got.LastAttemptArtifactID != lastAttemptID ||
 		got.LastAttemptBlockerClass != "present" || got.LastAttemptBlockerSHA256 != blockerSHA ||
 		got.LastAttemptAt == nil || !got.LastAttemptAt.Equal(attempted) || got.RetryAt == nil || !got.RetryAt.Equal(retry) ||
-		!got.TelemetryMatchesHead {
+		!got.TelemetryMatchesHead || got.RawDelivery.LastCursorID != 100 || got.RawDelivery.ClipsPulled != 90 ||
+		got.RawDelivery.PendingClips != 3 || got.RawDelivery.PendingBytes != 300 ||
+		got.RawDelivery.ClientLastSuccessAt == nil || !got.RawDelivery.ClientLastSuccessAt.Equal(lastSuccess) ||
+		got.RawDelivery.OldestPendingAt == nil || !got.RawDelivery.OldestPendingAt.Equal(oldestPending) ||
+		got.RawDelivery.JoinedFilesPulled != 7 || got.RawDelivery.JoinedBytesPulled != 700 {
 		t.Fatalf("result=%+v", got)
 	}
 }

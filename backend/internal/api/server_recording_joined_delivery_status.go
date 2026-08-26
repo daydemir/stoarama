@@ -17,31 +17,32 @@ import (
 const joinedDeliveryStatusInterval = time.Second
 
 type joinedDeliveryStatusResponse struct {
-	BatchID                  string                    `json:"batch_id"`
-	ArtifactID               int64                     `json:"artifact_id"`
-	ArtifactKind             string                    `json:"artifact_kind"`
-	HourID                   string                    `json:"hour_id"`
-	RelativePath             string                    `json:"relative_path"`
-	ExpectedSizeBytes        int64                     `json:"expected_size_bytes"`
-	ExpectedSHA256           string                    `json:"expected_sha256"`
-	PublicationState         string                    `json:"publication_state"`
-	PublishedAt              *time.Time                `json:"published_at,omitempty"`
-	Acknowledged             bool                      `json:"acknowledged"`
-	VerifiedAt               *time.Time                `json:"verified_at,omitempty"`
-	AcknowledgedPath         string                    `json:"acknowledged_relative_path,omitempty"`
-	AcknowledgedSize         *int64                    `json:"acknowledged_size_bytes,omitempty"`
-	AcknowledgedSHA256       string                    `json:"acknowledged_sha256,omitempty"`
-	IdentityMatches          bool                      `json:"identity_matches"`
-	ConnectionID             int64                     `json:"connection_id"`
-	ConnectionProtocol       int                       `json:"connection_protocol_version"`
-	ObservedAt               time.Time                 `json:"observed_at"`
-	FeedHead                 *joinedFeedHeadDiagnostic `json:"feed_head,omitempty"`
-	LastAttemptArtifactID    *int64                    `json:"last_attempt_artifact_id,omitempty"`
-	LastAttemptBlockerClass  string                    `json:"last_attempt_blocker_class,omitempty"`
-	LastAttemptBlockerSHA256 string                    `json:"last_attempt_blocker_sha256,omitempty"`
-	LastAttemptAt            *time.Time                `json:"last_attempt_at,omitempty"`
-	RetryAt                  *time.Time                `json:"retry_at,omitempty"`
-	TelemetryMatchesHead     bool                      `json:"telemetry_matches_head"`
+	BatchID                  string                      `json:"batch_id"`
+	ArtifactID               int64                       `json:"artifact_id"`
+	ArtifactKind             string                      `json:"artifact_kind"`
+	HourID                   string                      `json:"hour_id"`
+	RelativePath             string                      `json:"relative_path"`
+	ExpectedSizeBytes        int64                       `json:"expected_size_bytes"`
+	ExpectedSHA256           string                      `json:"expected_sha256"`
+	PublicationState         string                      `json:"publication_state"`
+	PublishedAt              *time.Time                  `json:"published_at,omitempty"`
+	Acknowledged             bool                        `json:"acknowledged"`
+	VerifiedAt               *time.Time                  `json:"verified_at,omitempty"`
+	AcknowledgedPath         string                      `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize         *int64                      `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256       string                      `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches          bool                        `json:"identity_matches"`
+	ConnectionID             int64                       `json:"connection_id"`
+	ConnectionProtocol       int                         `json:"connection_protocol_version"`
+	ObservedAt               time.Time                   `json:"observed_at"`
+	FeedHead                 *joinedFeedHeadDiagnostic   `json:"feed_head,omitempty"`
+	LastAttemptArtifactID    *int64                      `json:"last_attempt_artifact_id,omitempty"`
+	LastAttemptBlockerClass  string                      `json:"last_attempt_blocker_class,omitempty"`
+	LastAttemptBlockerSHA256 string                      `json:"last_attempt_blocker_sha256,omitempty"`
+	LastAttemptAt            *time.Time                  `json:"last_attempt_at,omitempty"`
+	RetryAt                  *time.Time                  `json:"retry_at,omitempty"`
+	TelemetryMatchesHead     bool                        `json:"telemetry_matches_head"`
+	RawDelivery              joinedRawDeliveryDiagnostic `json:"raw_delivery"`
 }
 
 type joinedFeedHeadDiagnostic struct {
@@ -52,6 +53,22 @@ type joinedFeedHeadDiagnostic struct {
 	Ordinal           int     `json:"ordinal"`
 	ExpectedSizeBytes int64   `json:"expected_size_bytes"`
 	ExpectedSHA256    string  `json:"expected_sha256"`
+}
+
+type joinedRawDeliveryDiagnostic struct {
+	LastCursorID        int64      `json:"last_cursor_id"`
+	ClipsPulled         int64      `json:"clips_pulled"`
+	BytesPulled         int64      `json:"bytes_pulled"`
+	ClientLastSuccessAt *time.Time `json:"client_last_success_at,omitempty"`
+	NASBatchCompletedAt *time.Time `json:"nas_batch_completed_at,omitempty"`
+	NASBatchClips       int        `json:"nas_batch_clips"`
+	NASBatchBytes       int64      `json:"nas_batch_bytes"`
+	NASBatchFailures    int        `json:"nas_batch_failures"`
+	PendingClips        int64      `json:"pending_clips"`
+	PendingBytes        int64      `json:"pending_bytes"`
+	OldestPendingAt     *time.Time `json:"oldest_pending_at,omitempty"`
+	JoinedFilesPulled   int64      `json:"joined_files_pulled"`
+	JoinedBytesPulled   int64      `json:"joined_bytes_pulled"`
 }
 
 func joinedAttemptBlockerClass(value string) string {
@@ -184,9 +201,19 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var blocker string
-	err = tx.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at
-		FROM connections WHERE id=$1 AND kind='nas_pull'`, response.ConnectionID).Scan(
-		&response.LastAttemptArtifactID, &blocker, &response.LastAttemptAt, &response.RetryAt)
+	err = tx.QueryRow(ctx, `SELECT conn.joined_last_attempt_artifact_id,conn.joined_last_blocker,
+		conn.joined_last_attempt_at,conn.joined_retry_at,conn.last_cursor_id,conn.clips_pulled,conn.bytes_pulled,
+		conn.client_last_success_at,conn.nas_batch_completed_at,conn.nas_batch_clips,conn.nas_batch_bytes,
+		conn.nas_batch_failures,pending.clips,pending.bytes,pending.oldest_at,
+		conn.joined_files_pulled,conn.joined_bytes_pulled
+		FROM connections conn `+connectionPendingLateralSQL+`
+		WHERE conn.id=$1 AND conn.kind='nas_pull'`, response.ConnectionID).Scan(
+		&response.LastAttemptArtifactID, &blocker, &response.LastAttemptAt, &response.RetryAt,
+		&response.RawDelivery.LastCursorID, &response.RawDelivery.ClipsPulled, &response.RawDelivery.BytesPulled,
+		&response.RawDelivery.ClientLastSuccessAt, &response.RawDelivery.NASBatchCompletedAt,
+		&response.RawDelivery.NASBatchClips, &response.RawDelivery.NASBatchBytes, &response.RawDelivery.NASBatchFailures,
+		&response.RawDelivery.PendingClips, &response.RawDelivery.PendingBytes, &response.RawDelivery.OldestPendingAt,
+		&response.RawDelivery.JoinedFilesPulled, &response.RawDelivery.JoinedBytesPulled)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined delivery telemetry failed")
 		return
