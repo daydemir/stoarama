@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,37 @@ func bindTestScratch(t *testing.T, claim WorkerClaim, built []BuiltOutput, quara
 
 func noHeartbeat(_ context.Context, _ string) (OperationCredentials, error) {
 	return OperationCredentials{}, errors.New("unexpected heartbeat")
+}
+
+func TestPublishClaimedHourTimesEarlyLocalVerificationFailure(t *testing.T) {
+	req := testRequest([]SourceClip{testSource(1, time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC))})
+	req.Sources = nil
+	ledger, err := testLedger(req, "2026-05-04")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AllocationLedgerSHA = ledger.LedgerSHA256
+	plan, err := BuildGapOnlyHourPlan(req, "2026-05-04", 2, "no_source_clips")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := sealedClaim(t, 7, plan, nil, nil)
+	sealedScratch, err := BindReclaimedGapOnlyHourScratch(claim, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealedScratch.verified.Quarantine = []QuarantineEvidence{{}}
+	var events []StageTimingEvent
+	ctx := WithStageTimingObserver(context.Background(), func(event StageTimingEvent) { events = append(events, event) })
+	_, err = publishClaimedHour(ctx, &memoryCapabilityClient{objects: map[string][]byte{}}, claim, sealedScratch, testCreateResolver(), func(context.Context, WorkerClaim, int64) (ObjectReadCapability, error) {
+		return ObjectReadCapability{}, errors.New("unexpected read")
+	}, func(context.Context, WorkerClaim, PublishedHour) error { return errors.New("unexpected finalize") })
+	if err == nil || len(events) != 1 || events[0].Stage != "upload_verify" || events[0].Outcome != "error" {
+		t.Fatalf("early verification timing events=%+v err=%v", events, err)
+	}
+	if !reflect.DeepEqual(events[0], StageTimingEvent{Stage: "upload_verify", ElapsedMS: events[0].ElapsedMS, Outcome: "error"}) {
+		t.Fatalf("unexpected timing fields: %+v", events[0])
+	}
 }
 
 func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *testing.T) {

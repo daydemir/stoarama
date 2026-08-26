@@ -172,9 +172,12 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	if scratch.publicationLeaseID != claim.LeaseID {
 		return PublishedHour{}, fmt.Errorf("scratch is not bound to current publication lease")
 	}
+	publishStarted := time.Now()
 	_, manifestJSON, manifestSHA, err := BuildHourManifest(HourManifestInput{Plan: claim.Plan, Allocation: claim.Allocation, AllocationLedger: claim.AllocationLedger, MediaArtifactIDs: claim.MediaArtifactIDs, Built: built, QuarantineEvidence: quarantine})
 	if err != nil || int64(len(manifestJSON)) != claim.HourManifestExpectedSize || manifestSHA != claim.HourManifestExpectedSHA {
-		return PublishedHour{}, fmt.Errorf("sealed hour manifest identity changed before publication")
+		err = fmt.Errorf("sealed hour manifest identity changed before publication")
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+		return PublishedHour{}, err
 	}
 	type identity struct {
 		size int64
@@ -184,16 +187,19 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	for i := range built {
 		output := claim.Plan.Outputs[i]
 		if built[i].SourceCount != len(output.Sources) || built[i].Verification.Status != "passed" || !SafeScratchOutput(built[i].Path, scratchDir) {
-			return PublishedHour{}, fmt.Errorf("hour part %d is not a verified scratch artifact", i+1)
+			err = fmt.Errorf("hour part %d is not a verified scratch artifact", i+1)
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+			return PublishedHour{}, err
 		}
 		size, sha, identityErr := localIdentity(built[i].Path)
 		if identityErr != nil || size != built[i].SizeBytes || sha != built[i].SHA256 || size != output.ExpectedSize || sha != output.ExpectedSHA || size > r2.MaxConditionalPutBytes {
-			return PublishedHour{}, fmt.Errorf("hour part %d changed before publication", i+1)
+			err = fmt.Errorf("hour part %d changed before publication", i+1)
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+			return PublishedHour{}, err
 		}
 		identities[i] = identity{size: size, sha: sha}
 	}
 	published := PublishedHour{HourID: claim.HourID, RecordingID: claim.Plan.RecordingID, LocalDate: claim.Plan.LocalDate, LocalHour: claim.Plan.LocalHour, Outputs: make([]PublishedOutput, 0, len(built)), HourManifestObjectKey: claim.Plan.CoverageObjectKey}
-	publishStarted := time.Now()
 	for i := range built {
 		create, resolveErr := resolveCreate(ctx, claim, claim.MediaArtifactIDs[i])
 		if resolveErr != nil {

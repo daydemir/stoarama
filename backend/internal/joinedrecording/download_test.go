@@ -19,9 +19,20 @@ import (
 )
 
 type downloadFenceClient struct {
-	source   SourceClip
-	body     []byte
-	failHead bool
+	source        SourceClip
+	body          []byte
+	failHead      bool
+	cancelOnClose context.CancelFunc
+}
+
+type testCancelOnCloseBody struct {
+	*bytes.Reader
+	cancel context.CancelFunc
+}
+
+func (b *testCancelOnCloseBody) Close() error {
+	b.cancel()
+	return nil
 }
 
 type concurrentDownloadClient struct {
@@ -124,9 +135,34 @@ func (c *downloadFenceClient) Do(request *http.Request) (*http.Response, error) 
 			c.source.Object.ETag, c.source.Object.VersionID), nil
 	}
 	response := capabilityResponse(http.StatusOK, c.body, c.source.Object.ETag, c.source.Object.VersionID)
+	if c.cancelOnClose != nil {
+		response.Body = &testCancelOnCloseBody{Reader: bytes.NewReader(c.body), cancel: c.cancelOnClose}
+	}
 	response.ContentLength = c.source.Object.SizeBytes
 	response.Header.Set("Content-Length", strconv.FormatInt(c.source.Object.SizeBytes, 10))
 	return response, nil
+}
+
+func TestDownloadClaimSourcesDoesNotPublishAfterCancellationBeforeLink(t *testing.T) {
+	claim, source, body := downloadClaimFixture(t)
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &downloadFenceClient{source: source, body: body, cancelOnClose: cancel}
+	_, _, err := downloadClaimSources(ctx, claim, root, client, testSourceAuthority, downloadCapability(source))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("download cancellation=%v", err)
+	}
+	directory, dirErr := claim.ScratchDir(root)
+	if dirErr != nil {
+		t.Fatal(dirErr)
+	}
+	finalPath := filepath.Join(directory, "clip-1.mp4")
+	if _, statErr := os.Stat(finalPath); !os.IsNotExist(statErr) {
+		t.Fatalf("canceled download published final source: %v", statErr)
+	}
+	if _, statErr := os.Stat(finalPath + ".part"); !os.IsNotExist(statErr) {
+		t.Fatalf("canceled download left partial source: %v", statErr)
+	}
 }
 
 func downloadClaimFixture(t *testing.T) (PreflightHourClaim, SourceClip, []byte) {

@@ -103,6 +103,10 @@ func downloadClaimSource(ctx context.Context, source SourceClip, scratchDir stri
 		}
 		return LocalSource{}, fmt.Errorf("exact download verification failed")
 	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(partPath)
+		return LocalSource{}, err
+	}
 	if err := os.Link(partPath, finalPath); err != nil {
 		_ = os.Remove(partPath)
 		return LocalSource{}, fmt.Errorf("publish source scratch without overwrite: %w", err)
