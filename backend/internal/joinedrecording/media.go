@@ -530,6 +530,9 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 			discardIsolatedBuild(repeatedBuild, scratchDir)
 			return nil, nil, fmt.Errorf("%w: full candidate failure was not repeatable", errMediaSplitNotIsolated)
 		}
+		if len(sources) == 1 {
+			return nil, []QuarantinedBuild{{Source: sources[0], Evidence: maximalityEvidence(sources, firstFailure, 2, mediaToolIdentity)}}, nil
+		}
 	}
 
 	boundaries := make([]int, 0)
@@ -679,6 +682,7 @@ func PreflightHour(ctx context.Context, draft HourDraft, locals []LocalSource, s
 	}
 	result := HourPreflight{}
 	used := map[int64]bool{}
+	var previousQuarantined *SourceClip
 	for _, candidate := range draft.Parts {
 		candidateLocals := make([]LocalSource, len(candidate.Sources))
 		for i, source := range candidate.Sources {
@@ -704,19 +708,19 @@ func PreflightHour(ctx context.Context, draft HourDraft, locals []LocalSource, s
 		}
 		offset := 0
 		partIndex := 0
-		previousWasQuarantine := false
 		for offset < len(candidate.Sources) {
 			if quarantine, ok := quarantineIDs[candidate.Sources[offset].ClipID]; ok {
 				result.Quarantined = append(result.Quarantined, candidate.Sources[offset])
 				result.Quarantines = append(result.Quarantines, quarantine)
+				quarantined := candidate.Sources[offset]
+				previousQuarantined = &quarantined
 				offset++
-				previousWasQuarantine = true
 				continue
 			}
 			built := parts[partIndex]
 			partSources := append([]SourceClip(nil), candidate.Sources[offset:offset+built.SourceCount]...)
-			if previousWasQuarantine {
-				partSources[0].SeamToPrevious = SeamEvidence{Verdict: "incompatible", Reason: "source_quarantined", SignedGapNanoseconds: partSources[0].StartUTC.Sub(candidate.Sources[offset-1].EndUTC).Nanoseconds()}
+			if previousQuarantined != nil {
+				partSources[0].SeamToPrevious = SeamEvidence{Verdict: "incompatible", Reason: "source_quarantined", SignedGapNanoseconds: partSources[0].StartUTC.Sub(previousQuarantined.EndUTC).Nanoseconds()}
 			} else if partIndex > 0 {
 				reason := "deterministic_media_split"
 				if evidence := result.Built[len(result.Built)-1].SplitEvidence; len(evidence) > 0 {
@@ -732,7 +736,7 @@ func PreflightHour(ctx context.Context, draft HourDraft, locals []LocalSource, s
 			result.Built = append(result.Built, built)
 			offset += built.SourceCount
 			partIndex++
-			previousWasQuarantine = false
+			previousQuarantined = nil
 		}
 		if offset != len(candidate.Sources) || partIndex != len(parts) {
 			return HourPreflight{}, fmt.Errorf("candidate run was not fully accounted")
