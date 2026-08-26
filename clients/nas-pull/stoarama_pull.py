@@ -47,7 +47,13 @@ ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 JOINED_ROOT = "joined"
 JOINED_PROTOCOL_VERSION = 1
-JOINED_RANGE_BYTES = 64 * 1024 * 1024
+JOINED_BACKGROUND_MIN_GENERATION = 4
+JOINED_RANGE_BYTES = 8 * 1024 * 1024
+JOINED_DOWNLOAD_BYTES_PER_SEC = 8 * 1024 * 1024
+JOINED_HASH_BYTES_PER_SEC = 32 * 1024 * 1024
+# Preserve one worst-case raw-download wave before admitting lower-priority
+# joined bytes: 32 workers x 60 seconds x the server's 8 MiB/s upload cap.
+JOINED_RAW_HEADROOM_BYTES = MAX_DOWNLOAD_WORKERS * 60 * 8 * 1024 * 1024
 JOINED_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
 JOINED_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 
@@ -934,6 +940,7 @@ class Runtime:
         # negotiate again; no manifest, environment, or progress file enables it.
         self.joined_protocol_version = 0
         self.joined_protocol_generation = 0
+        self.joined_delivery = None
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1022,6 +1029,13 @@ class Runtime:
         with self.lock:
             return self.joined_protocol_version == JOINED_PROTOCOL_VERSION
 
+    def joined_background_enabled(self):
+        with self.lock:
+            return (
+                self.joined_protocol_version == JOINED_PROTOCOL_VERSION
+                and self.joined_protocol_generation >= JOINED_BACKGROUND_MIN_GENERATION
+            )
+
     def apply_joined_protocol_response(self, response):
         version = response.get("joined_protocol_version") if isinstance(response, dict) else None
         generation = response.get("joined_protocol_generation") if isinstance(response, dict) else None
@@ -1054,6 +1068,37 @@ class Runtime:
             if self.joined_protocol_version != JOINED_PROTOCOL_VERSION:
                 return False
             operation()
+            return True
+
+    def set_joined_delivery_error(self, artifact_id, blocker, retry_sec):
+        attempted = datetime.datetime.now(datetime.timezone.utc)
+        retry = attempted + datetime.timedelta(seconds=retry_sec)
+        with self.lock:
+            self.joined_delivery = {
+                "artifact_id": artifact_id,
+                "blocker": blocker,
+                "attempted_at": attempted.isoformat().replace("+00:00", "Z"),
+                "retry_at": retry.isoformat().replace("+00:00", "Z"),
+            }
+
+    def clear_joined_delivery_error(self):
+        with self.lock:
+            self.joined_delivery = None
+
+    def reserve_joined_storage(self, cfg, storage, expected_bytes):
+        """Reserve one joined range only when it cannot consume raw headroom."""
+        available = bool(storage.get("available"))
+        free_bytes = int(storage.get("free_bytes", 0)) if available else 0
+        expected_bytes = max(0, int(expected_bytes))
+        with self.lock:
+            usable_free = free_bytes - self.capacity_reserved_bytes - expected_bytes
+            threshold = (
+                cfg.min_free_bytes + JOINED_RAW_HEADROOM_BYTES
+                + (CAPACITY_RESUME_HYSTERESIS_BYTES if self.capacity_blocked else 0)
+            )
+            if not available or usable_free < threshold:
+                return False
+            self.capacity_reserved_bytes += expected_bytes
             return True
 
     def reserve_storage(self, cfg, storage, expected_bytes=0):
@@ -1101,12 +1146,15 @@ class Runtime:
             }
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
+            joined_delivery = self.joined_delivery.copy() if self.joined_delivery is not None else None
         if outage:
             payload["last_outage"] = outage
         if storage is not None and storage_age <= STORAGE_TELEMETRY_MAX_AGE_SEC:
             payload["storage"] = storage
         elif self.storage is not None:
             payload["storage"] = {"available": False}
+        if joined_delivery is not None and payload["joined_protocol_version"] == JOINED_PROTOCOL_VERSION:
+            payload["joined_delivery"] = joined_delivery
         if self.inventory is not None:
             inventory = self.inventory.summary()
             if inventory is not None:
@@ -1185,6 +1233,17 @@ def require_storage_capacity(cfg, runtime, expected_bytes=0):
             detail = "NAS free-space check unavailable"
         runtime.set_phase(Phase.BLOCKED)
         raise RuntimeError(detail)
+
+
+def require_joined_storage_capacity(cfg, runtime, expected_bytes):
+    """Fail joined admission without changing raw capacity or process phase."""
+    try:
+        storage = storage_status(cfg)
+    except Exception:
+        storage = {"available": False}
+    runtime.set_storage(storage)
+    if not runtime.reserve_joined_storage(cfg, storage, expected_bytes):
+        raise JoinedDownloadYield("joined storage yielded to raw reserve")
 
 
 def prepare_clip_with_capacity(cfg, runtime, clip):
@@ -2625,18 +2684,20 @@ def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     digest = hashlib.sha256()
     size = 0
+    started = time.monotonic()
     try:
         before = os.fstat(descriptor)
         if not stat_module.S_ISREG(before.st_mode):
             raise ExistingFileMismatch("joined entry is not a regular file")
         while True:
-            if stop_event.is_set() or poll_raw_pending(cfg, runtime):
-                raise JoinedDownloadYield("joined hashing yielded to raw clip delivery")
+            if stop_event.is_set():
+                raise JoinedDownloadYield("joined hashing stopped at a read boundary")
             chunk = os.read(descriptor, JOINED_RANGE_BYTES)
             if not chunk:
                 break
             size += len(chunk)
             digest.update(chunk)
+            throttle_joined_io(started, size, JOINED_HASH_BYTES_PER_SEC, stop_event)
         after = os.fstat(descriptor)
         path_after = joined_entry_stat(directory_fd, name)
         if (
@@ -4058,18 +4119,20 @@ def read_joined_content(cfg, runtime, directory_fd, name, limit, stop_event):
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     content = bytearray()
     digest = hashlib.sha256()
+    started = time.monotonic()
     try:
         before = os.fstat(descriptor)
         if not stat_module.S_ISREG(before.st_mode) or before.st_nlink not in (1, 2):
             raise ExistingFileMismatch("joined hour manifest has an unknown hardlink")
         while True:
-            if stop_event.is_set() or poll_raw_pending(cfg, runtime):
-                raise JoinedDownloadYield("joined manifest validation yielded to raw clip delivery")
+            if stop_event.is_set():
+                raise JoinedDownloadYield("joined manifest validation stopped at a read boundary")
             chunk = os.read(descriptor, min(JOINED_RANGE_BYTES, limit + 1 - len(content)))
             if not chunk:
                 break
             content.extend(chunk)
             digest.update(chunk)
+            throttle_joined_io(started, len(content), JOINED_HASH_BYTES_PER_SEC, stop_event)
             if len(content) > limit:
                 raise ValueError("joined JSON artifact is too large")
         after = os.fstat(descriptor)
@@ -4519,7 +4582,13 @@ def validate_joined_download_renewal(first, current):
         raise ExistingFileMismatch("joined prepared object identity changed")
 
 
-def append_joined_range(prepared, directory_fd, part_name, item, start, end):
+def throttle_joined_io(started, transferred, bytes_per_sec, stop_event):
+    delay = (float(transferred) / bytes_per_sec) - (time.monotonic() - started)
+    if delay > 0 and stop_event.wait(delay):
+        raise JoinedDownloadYield("joined I/O stopped at a bounded chunk")
+
+
+def append_joined_range(prepared, directory_fd, part_name, item, start, end, stop_event):
     headers = {
         "User-Agent": USER_AGENT,
         "Range": "bytes=%d-%d" % (start, end),
@@ -4558,6 +4627,7 @@ def append_joined_range(prepared, directory_fd, part_name, item, start, end):
         flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(part_name, flags, dir_fd=directory_fd)
         written = 0
+        started = time.monotonic()
         try:
             opened = os.fstat(descriptor)
             if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or opened.st_size != start:
@@ -4571,6 +4641,7 @@ def append_joined_range(prepared, directory_fd, part_name, item, start, end):
                 while offset < len(block):
                     offset += os.write(descriptor, block[offset:])
                 written += len(block)
+                throttle_joined_io(started, written, JOINED_DOWNLOAD_BYTES_PER_SEC, stop_event)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -4658,41 +4729,41 @@ def download_joined_item(cfg, runtime, item, stop_event):
         if part_size > item["size_bytes"]:
             truncate_joined_part(directory_fd, part_name)
             part_size = 0
-        remaining = item["size_bytes"] - part_size
-        require_storage_capacity(cfg, runtime, remaining)
-        try:
-            while part_size < item["size_bytes"]:
-                if not runtime.joined_protocol_enabled() or stop_event.is_set() or poll_raw_pending(cfg, runtime):
-                    raise JoinedDownloadYield("joined download yielded to raw clips")
-                try:
-                    current_prepared = prepare_joined_download(cfg, item)
-                except ExistingFileMismatch:
-                    truncate_joined_part(directory_fd, part_name)
-                    raise
-                validate_joined_download_renewal(prepared, current_prepared)
-                end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
-                append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end)
-                part_size = end + 1
-            if not runtime.joined_protocol_enabled():
-                raise JoinedDownloadYield("joined protocol was disabled")
+        while part_size < item["size_bytes"]:
+            if not runtime.joined_protocol_enabled() or stop_event.is_set():
+                raise JoinedDownloadYield("joined download stopped at a range boundary")
             try:
-                verify_joined_entry(
-                    cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
-                )
+                current_prepared = prepare_joined_download(cfg, item)
             except ExistingFileMismatch:
                 truncate_joined_part(directory_fd, part_name)
-                raise RuntimeError("joined download checksum mismatch; partial restarted")
-            validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
-            def publish_final():
-                os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-                os.fsync(directory_fd)
-            if not runtime.run_joined_completion(publish_final):
-                raise JoinedDownloadYield("joined protocol was disabled")
-            if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
-                raise RuntimeError("joined publication disappeared")
-            return True
-        finally:
-            runtime.release_storage_reservation(remaining)
+                raise
+            validate_joined_download_renewal(prepared, current_prepared)
+            end = min(item["size_bytes"], part_size + JOINED_RANGE_BYTES) - 1
+            range_bytes = end - part_size + 1
+            require_joined_storage_capacity(cfg, runtime, range_bytes)
+            try:
+                append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end, stop_event)
+            finally:
+                runtime.release_storage_reservation(range_bytes)
+            part_size = end + 1
+        if not runtime.joined_protocol_enabled():
+            raise JoinedDownloadYield("joined protocol was disabled")
+        try:
+            verify_joined_entry(
+                cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
+            )
+        except ExistingFileMismatch:
+            truncate_joined_part(directory_fd, part_name)
+            raise RuntimeError("joined download checksum mismatch; partial restarted")
+        validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
+        def publish_final():
+            os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+            os.fsync(directory_fd)
+        if not runtime.run_joined_completion(publish_final):
+            raise JoinedDownloadYield("joined protocol was disabled")
+        if not complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+            raise RuntimeError("joined publication disappeared")
+        return True
     finally:
         os.close(directory_fd)
 
@@ -4789,7 +4860,7 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
             raise JoinedDownloadYield("joined protocol was disabled")
 
 
-def drain_joined(cfg, runtime, stop_event):
+def drain_joined(cfg, runtime, stop_event, report_phase=True):
     if not runtime.joined_protocol_enabled() or cfg.dry_run:
         return False
     page = request_json(cfg, "GET", "/account/joined")
@@ -4801,18 +4872,55 @@ def drain_joined(cfg, runtime, stop_event):
     if raw_item is None:
         return False
     item = valid_joined_item(raw_item)
-    runtime.set_phase(Phase.DRAINING)
+    if report_phase:
+        runtime.set_phase(Phase.DRAINING)
     try:
         downloaded = download_joined_item(cfg, runtime, item, stop_event)
         ack_joined_item(cfg, runtime, item)
-    except JoinedDownloadYield:
-        log("INFO", "joined artifact_id=%d yielded to raw clip delivery" % item["id"])
-        return True
+    except JoinedDownloadYield as exc:
+        if "storage" in str(exc):
+            runtime.set_joined_delivery_error(item["id"], "storage_guard", min(getattr(cfg, "poll_interval_sec", 60), 10))
+        log("INFO", "joined artifact_id=%d stopped at a safe boundary" % item["id"])
+        return False
+    except Exception as exc:
+        runtime.set_joined_delivery_error(
+            item["id"], classify_joined_delivery_error(exc), min(getattr(cfg, "poll_interval_sec", 60), 10),
+        )
+        raise
+    runtime.clear_joined_delivery_error()
     log(
         "INFO", "joined artifact_id=%d bytes=%d saved=%s%s"
         % (item["id"], item["size_bytes"], joined_output_path(cfg, item), "" if downloaded else " existing"),
     )
     return True
+
+
+def classify_joined_delivery_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return "http_error"
+    if isinstance(exc, ExistingFileMismatch):
+        return "path_conflict"
+    if isinstance(exc, OSError):
+        return "io_error"
+    if "checksum mismatch" in str(exc):
+        return "hash_mismatch"
+    return "download_failed"
+
+
+def joined_loop(cfg, runtime, stop_event):
+    """Drain one joined artifact at a time without blocking the raw cursor loop."""
+    while not stop_event.is_set():
+        if not runtime.joined_background_enabled():
+            stop_event.wait(min(cfg.poll_interval_sec, 10))
+            continue
+        try:
+            progress = drain_joined(cfg, runtime, stop_event, report_phase=False)
+        except Exception as exc:
+            log("WARN", "joined delivery deferred: %s" % exc)
+            stop_event.wait(min(cfg.poll_interval_sec, 10))
+            continue
+        if not progress:
+            stop_event.wait(min(cfg.poll_interval_sec, 10))
 
 
 def release_clip(cfg, recording_id, clip_id):
@@ -5093,14 +5201,17 @@ def stage_update(cfg):
     return version
 
 
-def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready):
+def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready, joined_stop_event=None):
     while not stop_event.is_set():
         try:
             if stage_update(cfg):
                 # Staging is harmless, but process replacement is not. Ask the
                 # background inventory scan to stop at a durable checkpoint;
-                # the delivery loop remains live while it winds down.
+                # both delivery loops remain live while their active page or
+                # joined range reaches a durable boundary.
                 inventory_stop_event.set()
+                if joined_stop_event is not None:
+                    joined_stop_event.set()
                 update_ready.set()
                 return
         except Exception as exc:
@@ -5129,12 +5240,13 @@ def exec_candidate(cfg, runtime):
         raise SelfUpdateExecError("failed to activate staged NAS client") from exc
 
 
-def update_can_exec(update_ready, inventory_worker, stop_event=None):
+def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_worker=None):
     """Process replacement is safe only between delivery pages and scans."""
     return (
         update_ready.is_set()
         and (stop_event is None or not stop_event.is_set())
         and not inventory_worker.is_alive()
+        and (joined_worker is None or not joined_worker.is_alive())
     )
 
 
@@ -5146,11 +5258,13 @@ def run(cfg):
     mark_runtime(cfg, runtime)
     stop_event = threading.Event()
     inventory_stop_event = threading.Event()
+    joined_stop_event = threading.Event()
     update_ready = threading.Event()
 
     def stop(_signum, _frame):
         stop_event.set()
         inventory_stop_event.set()
+        joined_stop_event.set()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -5160,7 +5274,7 @@ def run(cfg):
     storage_probe.start()
     updater = threading.Thread(
         target=update_loop,
-        args=(cfg, runtime, stop_event, inventory_stop_event, update_ready),
+        args=(cfg, runtime, stop_event, inventory_stop_event, update_ready, joined_stop_event),
         daemon=True,
     )
     updater.start()
@@ -5168,19 +5282,29 @@ def run(cfg):
         target=inventory_loop, args=(cfg, inventory, inventory_stop_event), daemon=True,
     )
     inventory_worker.start()
+    joined_worker = threading.Thread(
+        target=joined_loop, args=(cfg, runtime, joined_stop_event), daemon=True,
+    )
+    joined_worker.start()
     self_update_failed = False
     try:
         while not stop_event.is_set():
             # No delivery page is active at this boundary. A staged candidate
             # may replace the process even when storage/list work is failing,
             # provided the inventory thread has reached its stop checkpoint.
-            if update_can_exec(update_ready, inventory_worker, stop_event):
+            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker):
                 runtime.set_phase(Phase.UPDATING)
                 exec_candidate(cfg, runtime)
             if not heartbeat.is_alive():
                 log("WARN", "heartbeat thread dead; restarting")
                 heartbeat = threading.Thread(target=heartbeat_loop, args=(cfg, runtime, stop_event), daemon=True)
                 heartbeat.start()
+            if not joined_worker.is_alive() and not joined_stop_event.is_set():
+                log("WARN", "joined delivery thread dead; restarting")
+                joined_worker = threading.Thread(
+                    target=joined_loop, args=(cfg, runtime, joined_stop_event), daemon=True,
+                )
+                joined_worker.start()
             try:
                 check_storage(cfg)
                 require_storage_capacity(cfg, runtime)
@@ -5200,20 +5324,11 @@ def run(cfg):
                     # not resurrect the previous client indefinitely.
                     mark_runtime(cfg, runtime, "healthy")
                     runtime.stable_marked = True
-                if update_can_exec(update_ready, inventory_worker, stop_event):
+                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
                 if not progress and not stop_event.is_set():
-                    try:
-                        joined_progress = drain_joined(cfg, runtime, stop_event)
-                    except Exception as exc:
-                        runtime.set_error("joined delivery: %s" % exc)
-                        log("WARN", "joined delivery deferred: %s" % exc)
-                        stop_event.wait(min(cfg.poll_interval_sec, 10))
-                        continue
-                    if joined_progress:
-                        continue
                     try:
                         certified = maybe_run_native_stitch(cfg, runtime, inventory, stop_event)
                     except Exception as exc:
@@ -5233,16 +5348,25 @@ def run(cfg):
     finally:
         stop_event.set()
         inventory_stop_event.set()
+        joined_stop_event.set()
         heartbeat.join(timeout=HEARTBEAT_TIMEOUT_SEC + 1)
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
-        if not self_update_failed:
+        joined_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
+        joined_stuck = joined_worker.is_alive()
+        if joined_stuck:
+            log("ERROR", "joined delivery worker did not stop; process must exit unclean")
+            mark_runtime(cfg, runtime, PreviousExit.UNCLEAN_PROCESS.value)
+        elif not self_update_failed:
             mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
         if inventory_worker.is_alive():
             log("WARN", "inventory worker still running at shutdown; leaving database open")
-        else:
+        elif not joined_stuck:
             inventory.close()
-        lock_handle.close()
+        if not joined_stuck:
+            lock_handle.close()
+        else:
+            raise RuntimeError("joined delivery worker did not stop")
     return 0
 
 

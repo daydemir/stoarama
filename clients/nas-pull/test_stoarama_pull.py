@@ -1585,11 +1585,13 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             runtime = pull.Runtime(cfg)
             stop_event = threading.Event()
             inventory_stop_event = threading.Event()
+            joined_stop_event = threading.Event()
             ready = threading.Event()
             with mock.patch.object(pull, "stage_update", return_value="new-version") as stage:
-                pull.update_loop(cfg, runtime, stop_event, inventory_stop_event, ready)
+                pull.update_loop(cfg, runtime, stop_event, inventory_stop_event, ready, joined_stop_event)
             stage.assert_called_once_with(cfg)
             self.assertTrue(inventory_stop_event.is_set())
+            self.assertTrue(joined_stop_event.is_set())
             self.assertTrue(ready.is_set())
             self.assertEqual(runtime.phase, pull.Phase.STARTING)
 
@@ -1618,6 +1620,27 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             inventory_release.set()
             inventory_worker.join(timeout=1)
 
+    def test_update_exec_waits_for_joined_range_boundary(self):
+        ready = threading.Event()
+        ready.set()
+        joined_release = threading.Event()
+
+        def joined_work():
+            joined_release.wait()
+
+        joined_worker = threading.Thread(target=joined_work)
+        joined_worker.start()
+        stopped_inventory = mock.Mock()
+        stopped_inventory.is_alive.return_value = False
+        try:
+            self.assertFalse(pull.update_can_exec(ready, stopped_inventory, joined_worker=joined_worker))
+            joined_release.set()
+            joined_worker.join(timeout=1)
+            self.assertTrue(pull.update_can_exec(ready, stopped_inventory, joined_worker=joined_worker))
+        finally:
+            joined_release.set()
+            joined_worker.join(timeout=1)
+
     def test_update_exec_failure_is_terminal_and_bounded(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1628,6 +1651,25 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 pull.exec_candidate(cfg, runtime)
             mark.assert_called_once_with(cfg, runtime, pull.PreviousExit.SELF_UPDATE.value)
             self.assertNotIn("secret-bearing", str(caught.exception))
+
+    def test_joined_background_stays_dormant_before_activation_generation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            runtime.apply_joined_protocol_response({
+                "ok": True, "joined_delivery_accepted": True,
+                "joined_protocol_version": 1,
+                "joined_protocol_generation": pull.JOINED_BACKGROUND_MIN_GENERATION - 1,
+            })
+
+            class OneWaitStop:
+                def __init__(self): self.stopped = False
+                def is_set(self): return self.stopped
+                def wait(self, _timeout): self.stopped = True; return True
+
+            with mock.patch.object(pull, "drain_joined") as drain:
+                pull.joined_loop(cfg, runtime, OneWaitStop())
+            drain.assert_not_called()
 
     def test_inventory_dirty_sync_stops_between_batches_and_preserves_unsent_rows(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1667,7 +1709,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 def __init__(self, target, args=(), **_kwargs):
                     self.target = target
                     self.args = args
-                    self.alive = target is not pull.inventory_loop
+                    self.alive = target not in (pull.inventory_loop, pull.joined_loop)
 
                 def start(self):
                     if self.target is pull.update_loop:
@@ -1743,6 +1785,208 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ), mock.patch.object(pull, "exec_candidate") as activate:
                 self.assertEqual(pull.run(cfg), 0)
             activate.assert_not_called()
+
+    def test_run_does_not_starve_joined_ledger_behind_endless_healthy_raw_pages(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.validate = mock.Mock()
+            fake_inventory = mock.Mock()
+            fake_lock = mock.Mock()
+            handlers = []
+            events = []
+            allow_joined_ack = threading.Event()
+            joined_acked = threading.Event()
+            real_thread = threading.Thread
+            real_runtime = pull.Runtime
+            joined_threads = []
+
+            class FakeThread:
+                background_targets = {
+                    pull.heartbeat_loop, pull.storage_probe_loop, pull.update_loop, pull.inventory_loop,
+                }
+
+                def __init__(self, target, args=(), **kwargs):
+                    self.target = target
+                    self.args = args
+                    self.worker = None
+                    self.alive = True
+                    self.kwargs = kwargs
+                    if target is pull.joined_loop:
+                        joined_threads.append(self)
+
+                def start(self):
+                    if self.target not in self.background_targets:
+                        self.worker = real_thread(target=self.target, args=self.args, daemon=True)
+                        self.worker.start()
+
+                def is_alive(self):
+                    return self.worker.is_alive() if self.worker is not None else self.alive
+
+                def join(self, timeout=None):
+                    self.alive = False
+                    if self.worker is not None:
+                        self.worker.join(timeout)
+
+            def runtime_factory(config, inventory=None):
+                runtime = real_runtime(config, inventory)
+                runtime.apply_joined_protocol_response({
+                    "ok": True, "joined_delivery_accepted": True,
+                    "joined_protocol_version": 1,
+                    "joined_protocol_generation": pull.JOINED_BACKGROUND_MIN_GENERATION,
+                })
+                return runtime
+
+            def remember_handler(_signal_number, handler):
+                handlers.append(handler)
+
+            def endless_raw(*_args, **_kwargs):
+                page = 1 + sum(event.startswith("raw_page_") for event in events)
+                events.append("raw_page_%d" % page)
+                if page == 1:
+                    allow_joined_ack.set()
+                    joined_acked.wait(1)
+                if (joined_acked.is_set() and page >= 2) or page >= 4:
+                    handlers[0](None, None)
+                return True
+
+            def download_and_ack_ledger(*_args, **_kwargs):
+                events.append("ledger_downloaded")
+                if not allow_joined_ack.wait(1):
+                    self.fail("joined ledger ran before the first raw page could complete")
+                events.append("ledger_acked")
+                joined_acked.set()
+                return True
+
+            with mock.patch.object(pull, "acquire_lock", return_value=fake_lock), mock.patch.object(
+                pull, "Inventory", return_value=fake_inventory
+            ), mock.patch.object(pull, "Runtime", side_effect=runtime_factory), mock.patch.object(
+                pull.threading, "Thread", FakeThread
+            ), mock.patch.object(pull.signal, "signal", side_effect=remember_handler), mock.patch.object(
+                pull, "mark_runtime"
+            ), mock.patch.object(pull, "check_storage"), mock.patch.object(
+                pull, "require_storage_capacity"
+            ), mock.patch.object(pull, "drain_page", side_effect=endless_raw), mock.patch.object(
+                pull, "drain_joined", side_effect=download_and_ack_ledger
+            ), mock.patch.object(pull, "maybe_run_native_stitch", return_value=False):
+                self.assertEqual(pull.run(cfg), 0)
+
+            self.assertTrue(joined_acked.is_set(), events)
+            self.assertEqual(len(joined_threads), 1)
+            ack_index = events.index("ledger_acked")
+            self.assertTrue(any(event.startswith("raw_page_") for event in events[:ack_index]), events)
+            self.assertTrue(any(event.startswith("raw_page_") for event in events[ack_index + 1:]), events)
+
+    def test_joined_failure_does_not_stop_raw_pages(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.validate = mock.Mock()
+            fake_inventory = mock.Mock()
+            fake_lock = mock.Mock()
+            handlers = []
+            raw_pages = []
+            joined_failed = threading.Event()
+            real_thread = threading.Thread
+            real_runtime = pull.Runtime
+
+            class FakeThread:
+                background_targets = {
+                    pull.heartbeat_loop, pull.storage_probe_loop, pull.update_loop, pull.inventory_loop,
+                }
+                def __init__(self, target, args=(), **_kwargs):
+                    self.target, self.args, self.worker, self.alive = target, args, None, True
+                def start(self):
+                    if self.target not in self.background_targets:
+                        self.worker = real_thread(target=self.target, args=self.args, daemon=True)
+                        self.worker.start()
+                def is_alive(self):
+                    return self.worker.is_alive() if self.worker is not None else self.alive
+                def join(self, timeout=None):
+                    self.alive = False
+                    if self.worker is not None:
+                        self.worker.join(timeout)
+
+            def runtime_factory(config, inventory=None):
+                runtime = real_runtime(config, inventory)
+                runtime.apply_joined_protocol_response({
+                    "ok": True, "joined_delivery_accepted": True,
+                    "joined_protocol_version": 1,
+                    "joined_protocol_generation": pull.JOINED_BACKGROUND_MIN_GENERATION,
+                })
+                return runtime
+
+            def remember_handler(_signal_number, handler):
+                handlers.append(handler)
+
+            def raw_page(*_args, **_kwargs):
+                raw_pages.append(len(raw_pages) + 1)
+                if len(raw_pages) == 1:
+                    self.assertTrue(joined_failed.wait(1))
+                if len(raw_pages) == 2:
+                    handlers[0](None, None)
+                return True
+
+            def joined_failure(*_args, **_kwargs):
+                joined_failed.set()
+                raise RuntimeError("typed joined failure")
+
+            with mock.patch.object(pull, "acquire_lock", return_value=fake_lock), mock.patch.object(
+                pull, "Inventory", return_value=fake_inventory
+            ), mock.patch.object(pull, "Runtime", side_effect=runtime_factory), mock.patch.object(
+                pull.threading, "Thread", FakeThread
+            ), mock.patch.object(pull.signal, "signal", side_effect=remember_handler), mock.patch.object(
+                pull, "mark_runtime"
+            ), mock.patch.object(pull, "check_storage"), mock.patch.object(
+                pull, "require_storage_capacity"
+            ), mock.patch.object(pull, "drain_page", side_effect=raw_page), mock.patch.object(
+                pull, "drain_joined", side_effect=joined_failure
+            ):
+                self.assertEqual(pull.run(cfg), 0)
+
+            self.assertEqual(raw_pages, [1, 2])
+            self.assertTrue(joined_failed.is_set())
+
+    def test_stuck_joined_worker_never_marks_clean_or_releases_process_lock(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            cfg.validate = mock.Mock()
+            fake_inventory = mock.Mock()
+            fake_lock = mock.Mock()
+            handlers = []
+
+            class FakeThread:
+                def __init__(self, target, args=(), **_kwargs):
+                    self.target = target
+                    self.args = args
+                    self.alive = target is pull.joined_loop
+                def start(self): pass
+                def is_alive(self): return self.alive
+                def join(self, timeout=None): del timeout
+
+            def remember_handler(_signal_number, handler):
+                handlers.append(handler)
+
+            def stop_raw(*_args, **_kwargs):
+                handlers[0](None, None)
+                return False
+
+            with mock.patch.object(pull, "acquire_lock", return_value=fake_lock), mock.patch.object(
+                pull, "Inventory", return_value=fake_inventory
+            ), mock.patch.object(pull.threading, "Thread", FakeThread), mock.patch.object(
+                pull.signal, "signal", side_effect=remember_handler
+            ), mock.patch.object(pull, "mark_runtime") as mark, mock.patch.object(
+                pull, "check_storage"
+            ), mock.patch.object(pull, "require_storage_capacity"), mock.patch.object(
+                pull, "drain_page", side_effect=stop_raw
+            ), self.assertRaisesRegex(RuntimeError, "joined delivery worker did not stop"):
+                pull.run(cfg)
+
+            self.assertIn(
+                mock.call(cfg, mock.ANY, pull.PreviousExit.UNCLEAN_PROCESS.value),
+                mark.call_args_list,
+            )
+            self.assertNotIn(mock.call(cfg, mock.ANY, pull.PreviousExit.CLEAN.value), mark.call_args_list)
+            fake_lock.close.assert_not_called()
+            fake_inventory.close.assert_not_called()
 
     def test_inventory_hash_cancellation_commits_progress_without_completing_scan(self):
         with tempfile.TemporaryDirectory() as raw:
