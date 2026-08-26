@@ -154,10 +154,8 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 	built := BuiltOutput{SizeBytes: int64(len(media)), SHA256: hex.EncodeToString(mediaSum[:]), SourceCount: 1, Verification: passingVerification()}
 	claim := sealedClaim(t, 7, plan, []BuiltOutput{built}, nil)
 	root := t.TempDir()
-	scratch, err := claim.ScratchDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	originLeaseID := strings.Repeat("O", 43)
+	scratch := filepath.Join(root, originLeaseID)
 	if err := os.MkdirAll(scratch, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +175,12 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 		t.Fatal(err)
 	}
 	built.Path, built.SizeBytes, built.SHA256 = mediaPath, size, sha
-	sealedScratch := bindTestScratch(t, claim, []BuiltOutput{built}, nil, scratch)
+	sealedScratch, err := bindSealedHourScratch(verifiedHourScratch{HourID: claim.HourID,
+		SourceClaimSHA256: claim.Plan.SourceClaimSHA256, OriginLeaseID: originLeaseID,
+		Directory: scratch, Built: []BuiltOutput{built}}, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
 	client := &memoryCapabilityClient{objects: map[string][]byte{}}
 	if _, err := PublishClaimedHourRenewing(context.Background(), client, testSourceAuthority, claim, sealedScratch, noHeartbeat, testCreateResolver(), testReadResolver(client), func(context.Context, WorkerClaim, PublishedHour) error { return errors.New("database unavailable") }); err == nil {
 		t.Fatal("database orphan was reported as finalized")
@@ -200,7 +203,7 @@ func TestPublishClaimedHourReconcilesImmutableOrphanAndCleansOnlyScratch(t *test
 		t.Fatalf("orphan not reconciled: %+v", published)
 	}
 	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
-		t.Fatal("finalized current-lease scratch tree was not removed")
+		t.Fatal("finalized origin-lease scratch tree was not removed")
 	}
 	if data, err := os.ReadFile(outside); err != nil || string(data) != "keep" {
 		t.Fatalf("cleanup changed data outside current lease scratch: %q err=%v", data, err)
