@@ -44,3 +44,20 @@ func TestJoinedFailureBackoffIsStableCappedAndExhausts(t *testing.T) {
 		t.Fatalf("deterministic failure state=%q retry=%s", state, retry)
 	}
 }
+
+func TestJoinedFailureBackoffStartsAfterLiveLease(t *testing.T) {
+	now := time.Date(2026, 8, 26, 7, 0, 0, 500_000_000, time.UTC)
+	leaseExpires := now.Add(5 * time.Minute).Truncate(time.Second)
+	token := uuid.MustParse("35d99714-2469-4e3b-bdca-31749b42f261")
+	state, retry := joinedFailureDispositionAfterLease("transient", 1, token, leaseExpires, now)
+	if state != "retry" || !retry.After(leaseExpires) {
+		t.Fatalf("live lease retry state=%q retry=%s lease_expires=%s", state, retry, leaseExpires)
+	}
+	if retry.Sub(leaseExpires) < 10*time.Second || retry.Sub(leaseExpires) > 20*time.Second {
+		t.Fatalf("live lease retry lost bounded backoff: %s", retry.Sub(leaseExpires))
+	}
+	state, retry = joinedFailureDispositionAfterLease("deterministic", 1, token, leaseExpires, now)
+	if state != "terminal" || !retry.IsZero() {
+		t.Fatalf("terminal failure gained retry state=%q retry=%s", state, retry)
+	}
+}

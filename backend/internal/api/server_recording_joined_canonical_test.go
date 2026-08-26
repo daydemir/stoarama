@@ -1425,6 +1425,27 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if sourceClaimRec.Code != http.StatusOK || json.Unmarshal(sourceClaimRec.Body.Bytes(), &sourceClaim) != nil || len(sourceClaim.Sources) != 1 {
 		t.Fatalf("source claim status=%d body=%s expected=%+v", sourceClaimRec.Code, sourceClaimRec.Body.String(), sources)
 	}
+	failureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "hour",
+		ScopeID: sourceClaim.HourID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
+	failureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure", bytes.NewReader(failureBody))
+	failureReq.Header.Set("Authorization", "Bearer "+sourceClaim.OperationToken)
+	failureRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFailure)).ServeHTTP(failureRec, failureReq)
+	var failure joinedrecording.WorkFailureResponse
+	if failureRec.Code != http.StatusOK || json.Unmarshal(failureRec.Body.Bytes(), &failure) != nil ||
+		failure.State != "retry" || failure.NextAttemptAt == nil {
+		t.Fatalf("source failure status=%d body=%s", failureRec.Code, failureRec.Body.String())
+	}
+	var failedState string
+	var failedClaimToken string
+	if err := pool.QueryRow(ctx, `SELECT state,claim_token::text FROM recording_joined_hours WHERE hour_id=$1`,
+		sourceClaim.HourID).Scan(&failedState, &failedClaimToken); err != nil {
+		t.Fatal(err)
+	}
+	if failedState != "leased" || failedClaimToken == "" || !failure.NextAttemptAt.After(sourceClaim.LeaseExpires) {
+		t.Fatalf("retry can become eligible before lease expiry state=%s token_present=%t next=%s lease_expires=%s",
+			failedState, failedClaimToken != "", failure.NextAttemptAt, sourceClaim.LeaseExpires)
+	}
 	sourceCapability := func() *httptest.ResponseRecorder {
 		t.Helper()
 		body, _ := json.Marshal(joinedrecording.SourceCapabilityRequest{ProtocolVersion: 1, HourID: sourceClaim.HourID,
@@ -1937,6 +1958,28 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if publicationRecorder.Code != http.StatusOK || json.Unmarshal(publicationRecorder.Body.Bytes(), &indexClaim) != nil ||
 		indexClaim.Kind != "batch_index" || indexClaim.BatchIndex == nil || indexClaim.BatchIndex.ArtifactID != indexReceipt.ArtifactID {
 		t.Fatalf("batch-index claim status=%d body=%s", publicationRecorder.Code, publicationRecorder.Body.String())
+	}
+	indexFailureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "batch_index",
+		ScopeID: indexClaim.BatchIndex.ScopeID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
+	indexFailureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure", bytes.NewReader(indexFailureBody))
+	indexFailureReq.Header.Set("Authorization", "Bearer "+indexClaim.BatchIndex.OperationToken)
+	indexFailureRec := httptest.NewRecorder()
+	s.requireJoinedWorkerAuth(http.HandlerFunc(s.handleJoinedFailure)).ServeHTTP(indexFailureRec, indexFailureReq)
+	var indexFailure joinedrecording.WorkFailureResponse
+	if indexFailureRec.Code != http.StatusOK || json.Unmarshal(indexFailureRec.Body.Bytes(), &indexFailure) != nil ||
+		indexFailure.State != "retry" || indexFailure.NextAttemptAt == nil ||
+		!indexFailure.NextAttemptAt.After(indexClaim.BatchIndex.LeaseExpires) {
+		t.Fatalf("batch-index failure status=%d body=%s lease_expires=%s", indexFailureRec.Code,
+			indexFailureRec.Body.String(), indexClaim.BatchIndex.LeaseExpires)
+	}
+	var failedIndexState string
+	var failedIndexToken string
+	if err := pool.QueryRow(ctx, `SELECT publication_state,publication_token::text FROM recording_joined_artifacts WHERE id=$1`,
+		indexClaim.BatchIndex.ArtifactID).Scan(&failedIndexState, &failedIndexToken); err != nil {
+		t.Fatal(err)
+	}
+	if failedIndexState != "publishing" || failedIndexToken == "" {
+		t.Fatalf("publication retry lost fence state=%s token_present=%t", failedIndexState, failedIndexToken != "")
 	}
 	s.joinedOutputStorage = joinedOutputStoreStub{heads: map[string]r2.ObjectHead{
 		indexReceipt.ObjectKey: {ETag: "index-etag", SizeBytes: indexReceipt.SizeBytes},
