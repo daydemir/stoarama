@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 type PreflightSourceCapability func(context.Context, PreflightHourClaim, SourceClip, string) (SourceReadCapability, error)
@@ -49,24 +50,31 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 			}
 			return capability, err
 		}
+		stageStarted := time.Now()
 		locals, scratchDir, err := downloadClaimSources(workCtx, claim, scratchRoot, client, storageAuthority, sourceCapability)
+		emitStageTiming(workCtx, "download", time.Since(stageStarted), err)
 		if err != nil {
 			return err
 		}
+		stageStarted = time.Now()
 		includedSources, frozenLocals, initialQuarantined, initialQuarantines, err := freezeDownloadedAudioForPreflight(workCtx, claim.Sources, locals, claim.MediaTool.IdentitySHA256)
+		emitStageTiming(workCtx, "freeze", time.Since(stageStarted), err)
 		if err != nil {
 			return err
 		}
 		includedSources, initialQuarantined = deriveClaimedHourSeams(claim.Sources, includedSources, initialQuarantined)
 		request := PlanRequest{BatchID: claim.BatchID, Generation: claim.Generation, RecordingID: claim.RecordingID, Timezone: claim.Timezone, LocalDate: claim.LocalDate, DeliveryHour: claim.LocalHour, FolderName: claim.FolderName, Metadata: claim.Metadata, Qualification: claim.Qualification, AllocationLedgerSHA: claim.AllocationLedgerSHA, MediaTool: claim.MediaTool, Sources: includedSources, QuarantinedSources: initialQuarantined}
+		stageStarted = time.Now()
 		preflight := HourPreflight{}
 		if len(includedSources) > 0 {
 			draft, discoverErr := DiscoverHourPlan(request)
 			if discoverErr != nil {
+				emitStageTiming(workCtx, "build_verify", time.Since(stageStarted), discoverErr)
 				return discoverErr
 			}
 			preflight, err = PreflightHour(workCtx, draft, frozenLocals, scratchDir, claim.MediaTool.IdentitySHA256)
 			if err != nil {
+				emitStageTiming(workCtx, "build_verify", time.Since(stageStarted), err)
 				return err
 			}
 		}
@@ -85,15 +93,21 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 			plan, err = BuildPlan(request)
 		}
 		if err != nil {
+			emitStageTiming(workCtx, "build_verify", time.Since(stageStarted), err)
 			return err
 		}
 		quarantine := quarantineEvidenceFromBuilds(append(initialQuarantines, preflight.Quarantines...))
 		sealRequest := sealHourRequest(claim, plan, preflight.Built, quarantine)
+		emitStageTiming(workCtx, "build_verify", time.Since(stageStarted), nil)
+		stageStarted = time.Now()
 		currentClaim, err := fresh()
 		if err != nil || workCtx.Err() != nil {
-			return fmt.Errorf("preflight lease ended before seal")
+			err = fmt.Errorf("preflight lease ended before seal")
+			emitStageTiming(workCtx, "seal", time.Since(stageStarted), err)
+			return err
 		}
 		sealed, err = seal(workCtx, currentClaim, sealRequest)
+		emitStageTiming(workCtx, "seal", time.Since(stageStarted), err)
 		if err != nil {
 			return err
 		}

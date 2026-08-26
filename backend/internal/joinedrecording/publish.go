@@ -193,37 +193,48 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 		identities[i] = identity{size: size, sha: sha}
 	}
 	published := PublishedHour{HourID: claim.HourID, RecordingID: claim.Plan.RecordingID, LocalDate: claim.Plan.LocalDate, LocalHour: claim.Plan.LocalHour, Outputs: make([]PublishedOutput, 0, len(built)), HourManifestObjectKey: claim.Plan.CoverageObjectKey}
+	publishStarted := time.Now()
 	for i := range built {
 		create, resolveErr := resolveCreate(ctx, claim, claim.MediaArtifactIDs[i])
 		if resolveErr != nil {
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), resolveErr)
 			return PublishedHour{}, fmt.Errorf("resolve exact media create capability: %w", resolveErr)
 		}
 		output, publishErr := publishHourPart(ctx, client, claim, create, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i], built[i], identities[i].size, identities[i].sha, resolveRead)
 		if publishErr != nil {
+			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), publishErr)
 			return PublishedHour{}, publishErr
 		}
 		published.Outputs = append(published.Outputs, output)
 	}
 	manifestCreate, err := resolveCreate(ctx, claim, claim.HourManifestArtifactID)
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest create capability: %w", err)
 	}
 	_, err = putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, "application/json", int64(len(manifestJSON)), manifestSHA, manifestCreate, bytes.NewReader(manifestJSON))
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, err
 	}
 	manifestRead, err := resolveRead(ctx, claim, claim.HourManifestArtifactID)
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest reread capability")
 	}
 	manifestHead, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, int64(len(manifestJSON)), manifestSHA, manifestRead.ETag, manifestRead.VersionID, manifestRead)
 	if err != nil {
+		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, err
 	}
 	published.HourManifestETag, published.HourManifestVersionID, published.HourManifestSizeBytes, published.HourManifestSHA256 = manifestHead.ETag, manifestHead.VersionID, int64(len(manifestJSON)), manifestSHA
+	emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), nil)
+	finalizeStarted := time.Now()
 	if err := finalize(ctx, claim, published); err != nil {
+		emitStageTiming(ctx, "finalize", time.Since(finalizeStarted), err)
 		return PublishedHour{}, fmt.Errorf("immutable joined hour verified but fenced database reconciliation remains pending: %w", err)
 	}
+	emitStageTiming(ctx, "finalize", time.Since(finalizeStarted), nil)
 	if filepath.Base(scratchDir) != claim.LeaseID || filepath.Clean(scratchDir) != scratchDir {
 		return PublishedHour{}, fmt.Errorf("refusing cleanup outside current lease scratch")
 	}
