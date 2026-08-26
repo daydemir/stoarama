@@ -32,13 +32,15 @@ func TestJoinedAPIClientIncludesBoundedStructuredServerError(t *testing.T) {
 	const requestSecret = "request-body-secret-sentinel"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+operationToken {
-			t.Fatal("operation authorization differs")
+			t.Error("operation authorization differs")
+			return
 		}
 		var payload struct {
 			Secret string `json:"secret"`
 		}
 		if json.NewDecoder(r.Body).Decode(&payload) != nil || payload.Secret != requestSecret {
-			t.Fatal("request payload differs")
+			t.Error("request payload differs")
+			return
 		}
 		w.WriteHeader(http.StatusConflict)
 		_, _ = w.Write([]byte(`{"error":"worker media partition differs from canonical plan"}`))
