@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -113,6 +114,331 @@ func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	}
 }
 
+func TestBuildAllPassingPartsHasLinearCandidateWork(t *testing.T) {
+	const sourceCount = 60
+	sources := make([]LocalSource, sourceCount)
+	for i := range sources {
+		sources[i] = LocalSource{ClipID: int64(i + 1), SourceClaimSHA256: strings.Repeat("a", 64)}
+	}
+	totalSourcesBuilt := 0
+	attempts := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		attempts++
+		totalSourcesBuilt += len(candidate)
+		if len(candidate) == 1 {
+			return BuiltOutput{SourceCount: 1}, nil
+		}
+		return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+			CandidateCount int `json:"candidate_count"`
+		}{len(candidate)}, errors.New("repeatable adjacent seam failure"))
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != sourceCount || len(quarantines) != 0 {
+		t.Fatalf("parts=%d quarantines=%d want=%d/0", len(parts), len(quarantines), sourceCount)
+	}
+	if totalSourcesBuilt > sourceCount*12 {
+		t.Fatalf("candidate work is superlinear: attempts=%d total_sources_built=%d limit=%d", attempts, totalSourcesBuilt, sourceCount*12)
+	}
+}
+
+func TestBuildAllPassingPartsUsesExactBoundaryProof(t *testing.T) {
+	sources := makeSyntheticLocalSources(6)
+	calls := make([][]int64, 0)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		calls = append(calls, clipIDs(candidate))
+		if containsAdjacentClipIDs(candidate, 3, 4) {
+			return BuiltOutput{}, seamFailure(3, 4)
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 || parts[0].SourceCount != 3 || parts[1].SourceCount != 3 || len(quarantines) != 0 {
+		t.Fatalf("parts=%+v quarantines=%+v", parts, quarantines)
+	}
+	if len(parts[0].SplitEvidence) != 1 || parts[0].SplitEvidence[0].RepeatCount != 2 || !equalInt64s(parts[0].SplitEvidence[0].CandidateClipIDs, []int64{1, 2, 3, 4}) || len(parts[1].SplitEvidence) != 0 {
+		t.Fatalf("boundary evidence=%+v", parts)
+	}
+	if countSpan(calls, []int64{1, 2, 3, 4}) != 2 {
+		t.Fatalf("exact boundary extension was not proved twice: calls=%v", calls)
+	}
+}
+
+func TestBuildAllPassingPartsRejectsUnexplainedNonlocalFailure(t *testing.T) {
+	sources := makeSyntheticLocalSources(5)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) >= 3 {
+			return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("three-way-only mismatch"))
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, errMediaSplitNotIsolated) || len(parts) != 0 || len(quarantines) != 0 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsLocalizesAfterFullCandidateDeadline(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	parentCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		ids := clipIDs(candidate)
+		if equalInt64s(ids, []int64{1, 2, 3, 4}) {
+			<-ctx.Done()
+			return BuiltOutput{}, ctx.Err()
+		}
+		if containsAdjacentClipIDs(candidate, 2, 3) {
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	budget := func(kind string, _ int) time.Duration {
+		if kind == "full" {
+			return 10 * time.Millisecond
+		}
+		return 100 * time.Millisecond
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithPolicy(parentCtx, sources, t.TempDir(), strings.Repeat("f", 64), attempt, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentCtx.Err() != nil || len(parts) != 2 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || len(parts[0].SplitEvidence) != 1 || len(quarantines) != 0 {
+		t.Fatalf("parent_err=%v parts=%+v quarantines=%+v", parentCtx.Err(), parts, quarantines)
+	}
+}
+
+func TestBuildAllPassingPartsRejectsPairLocatorWithoutExactExtensionFailureAndCleansScratch(t *testing.T) {
+	sources := makeSyntheticLocalSources(6)
+	scratch := t.TempDir()
+	attempt := func(_ context.Context, candidate []LocalSource, scratchDir string) (BuiltOutput, error) {
+		ids := clipIDs(candidate)
+		if equalInt64s(ids, []int64{1, 2, 3, 4, 5, 6}) || equalInt64s(ids, []int64{3, 4}) {
+			return BuiltOutput{}, seamFailure(3, 4)
+		}
+		dir, err := os.MkdirTemp(scratchDir, "attempt-")
+		if err != nil {
+			return BuiltOutput{}, err
+		}
+		path := filepath.Join(dir, "joined.mp4")
+		if err := os.WriteFile(path, []byte(fmt.Sprint(ids)), 0600); err != nil {
+			return BuiltOutput{}, err
+		}
+		return BuiltOutput{Path: path, SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, scratch, strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, errMediaSplitNotIsolated) || len(parts) != 0 || len(quarantines) != 0 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+	entries, readErr := os.ReadDir(scratch)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		leaks := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			payload, _ := os.ReadFile(filepath.Join(scratch, entry.Name(), "joined.mp4"))
+			leaks = append(leaks, entry.Name()+":"+string(payload))
+		}
+		t.Fatalf("provisional scratch leaked: %v", leaks)
+	}
+}
+
+func TestBuildAllPassingPartsPreservesRepeatedSingletonQuarantine(t *testing.T) {
+	sources := makeSyntheticLocalSources(5)
+	calls := make([][]int64, 0)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		calls = append(calls, clipIDs(candidate))
+		for _, source := range candidate {
+			if source.ClipID == 3 {
+				return BuiltOutput{}, deterministicFailure("corrupt_source_media", struct {
+					ClipID int64 `json:"clip_id"`
+				}{3}, errors.New("corrupt source"))
+			}
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || len(quarantines) != 1 || quarantines[0].Source.ClipID != 3 || quarantines[0].Evidence.RepeatCount != 2 {
+		t.Fatalf("parts=%+v quarantines=%+v", parts, quarantines)
+	}
+	if countSpan(calls, []int64{3}) != 2 {
+		t.Fatalf("singleton corruption was not proved twice: calls=%v", calls)
+	}
+}
+
+func TestBuildAllPassingPartsRejectsChangingPairAndBoundaryProofs(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		changing  []int64
+		pairFails []int64
+	}{
+		{name: "pair repeat", changing: []int64{2, 3}, pairFails: []int64{2, 3}},
+		{name: "boundary repeat", changing: []int64{1, 2, 3}, pairFails: []int64{2, 3}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sources := makeSyntheticLocalSources(5)
+			changingCalls := 0
+			attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+				ids := clipIDs(candidate)
+				if equalInt64s(ids, []int64{1, 2, 3, 4, 5}) {
+					return BuiltOutput{}, seamFailure(2, 3)
+				}
+				if equalInt64s(ids, test.changing) {
+					changingCalls++
+					return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+						Version int `json:"version"`
+					}{changingCalls}, errors.New("changing failure"))
+				}
+				if equalInt64s(ids, test.pairFails) {
+					return BuiltOutput{}, seamFailure(2, 3)
+				}
+				return BuiltOutput{SourceCount: len(candidate)}, nil
+			}
+
+			parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+			if !errors.Is(err, errMediaSplitNotIsolated) || len(parts) != 0 || len(quarantines) != 0 {
+				t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+			}
+		})
+	}
+}
+
+func TestBuildAllPassingPartsPropagatesInfrastructureFailureWithoutPartialPlan(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		ids := clipIDs(candidate)
+		if equalInt64s(ids, []int64{1, 2, 3, 4}) {
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		if equalInt64s(ids, []int64{1, 2}) {
+			return BuiltOutput{}, syscall.ENOSPC
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, syscall.ENOSPC) || len(parts) != 0 || len(quarantines) != 0 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsPreservesOutputCapPartition(t *testing.T) {
+	sources := makeSyntheticLocalSources(5)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) > 3 {
+			return BuiltOutput{}, deterministicFailure("output_exceeds_put_cap", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("bounded output cap"))
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 3 || parts[1].SourceCount != 2 {
+		t.Fatalf("parts=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsOutputCapKeepsLargeWorkloadAndQuarantine(t *testing.T) {
+	sources := makeSyntheticLocalSources(60)
+	attempts := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		attempts++
+		if len(candidate) > 3 {
+			return BuiltOutput{}, deterministicFailure("output_exceeds_put_cap", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("bounded output cap"))
+		}
+		for _, source := range candidate {
+			if source.ClipID == 10 {
+				return BuiltOutput{}, deterministicFailure("corrupt_source_media", struct {
+					ClipID int64 `json:"clip_id"`
+				}{10}, errors.New("corrupt source"))
+			}
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 20 || len(quarantines) != 1 || quarantines[0].Source.ClipID != 10 {
+		t.Fatalf("parts=%d quarantines=%+v attempts=%d err=%v", len(parts), quarantines, attempts, err)
+	}
+	if attempts <= 6*len(sources)+2 {
+		t.Fatalf("fixture did not exceed the non-cap attempt budget: attempts=%d", attempts)
+	}
+}
+
+func makeSyntheticLocalSources(count int) []LocalSource {
+	sources := make([]LocalSource, count)
+	for i := range sources {
+		sources[i] = LocalSource{ClipID: int64(i + 1), SourceClaimSHA256: strings.Repeat("a", 64)}
+	}
+	return sources
+}
+
+func clipIDs(sources []LocalSource) []int64 {
+	ids := make([]int64, len(sources))
+	for i := range sources {
+		ids[i] = sources[i].ClipID
+	}
+	return ids
+}
+
+func containsAdjacentClipIDs(sources []LocalSource, left, right int64) bool {
+	for i := 0; i+1 < len(sources); i++ {
+		if sources[i].ClipID == left && sources[i+1].ClipID == right {
+			return true
+		}
+	}
+	return false
+}
+
+func seamFailure(left, right int64) error {
+	return deterministicFailure("media_sequence_mismatch", struct {
+		Left  int64 `json:"left"`
+		Right int64 `json:"right"`
+	}{left, right}, errors.New("repeatable adjacent seam failure"))
+}
+
+func equalInt64s(left, right []int64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func countSpan(calls [][]int64, want []int64) int {
+	count := 0
+	for _, call := range calls {
+		if equalInt64s(call, want) {
+			count++
+		}
+	}
+	return count
+}
+
 func TestVerifyJoinedMediaAttributesSourceProbeFailure(t *testing.T) {
 	dir := t.TempDir()
 	output := makeMediaClip(t, dir, "output.mp4", 440, false)
@@ -182,6 +508,37 @@ func TestBuildAllPassingPartsContinuesAfterAACSeamSplit(t *testing.T) {
 	}
 	if len(parts) != 2 || parts[0].SourceCount != 1 || parts[1].SourceCount != 1 {
 		t.Fatalf("AAC split did not account for every source: %+v", parts)
+	}
+}
+
+func TestBuildAllPassingPartsVerifiesMultipleAACSeams(t *testing.T) {
+	dir := t.TempDir()
+	sources := make([]LocalSource, 4)
+	for i := range sources {
+		sources[i] = makeMediaClip(t, dir, fmt.Sprintf("audio-%d.mp4", i+1), 440+i*110, true)
+		sources[i].ClipID = int64(i + 1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	parts, quarantines, err := buildAllPassingParts(ctx, sources, dir, strings.Repeat("f", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		for _, part := range parts {
+			discardIsolatedBuild(part, dir)
+		}
+	}()
+	if len(parts) != 4 || len(quarantines) != 0 {
+		t.Fatalf("parts=%d quarantines=%d", len(parts), len(quarantines))
+	}
+	for i, part := range parts {
+		if part.SourceCount != 1 || part.Verification.Status != "passed" {
+			t.Fatalf("part[%d]=%+v", i, part)
+		}
+		if i+1 < len(parts) && (len(part.SplitEvidence) != 1 || part.SplitEvidence[0].RepeatCount != 2) {
+			t.Fatalf("part[%d] boundary evidence=%+v", i, part.SplitEvidence)
+		}
 	}
 }
 

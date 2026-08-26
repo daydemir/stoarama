@@ -825,6 +825,24 @@ func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 	}
 }
 
+func TestBoundedMediaDeadlineUsesWorkerTaskClassification(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ffmpeg-blocked")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", fake)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, err := joinedrecording.InspectMediaToolEvidence(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded media deadline err=%v", err)
+	}
+	if class, reason := joinedFailureClassification(err); class != "transient" || reason != "worker_task_deadline" {
+		t.Fatalf("classification=%s/%s err=%v", class, reason, err)
+	}
+}
+
 func TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline(t *testing.T) {
 	finalized := false
 	err := runJoinedWorkerTask(context.Background(), time.Millisecond, "publish_claim", func(ctx context.Context) error {
