@@ -455,10 +455,17 @@ class JoinedDownloadTests(unittest.TestCase):
 
     def test_source_identity_and_nanosecond_parity_with_cloud(self):
         source = self.golden("allocation_ledger_v1.golden.json")["sources"][0]
+        managed = json.loads(json.dumps(source))
+        managed["provider"] = "r2_managed"
+        self.assertEqual(pull.valid_source(managed, managed["recording_id"], source_only=True), managed["clip_id"])
+        managed["end_utc"] = "2026-05-04T08:01:00.04Z"
+        self.assertEqual(pull.valid_source(managed, managed["recording_id"], source_only=True), managed["clip_id"])
         for label, mutate in (
             ("canonical HTTPS", lambda value: value.update(endpoint="https://cap.test/?secret=value")),
             ("unsafe", lambda value: value["object"].update(key="raw/../escape.mp4")),
             ("ETag", lambda value: value["object"].update(etag='W/"weak"')),
+            ("storage identity", lambda value: value.update(provider=" r2_managed")),
+            ("storage identity", lambda value: value.update(provider="s3")),
         ):
             changed = json.loads(json.dumps(source))
             mutate(changed)
