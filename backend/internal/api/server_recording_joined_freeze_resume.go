@@ -124,6 +124,14 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 	var liveAccountID int64
 	var liveQualificationStatus, liveQualificationVersion, liveCohortSHA, liveWindowsSHA string
 	var liveQualificationFrozenAt time.Time
+	var checkpointConnectionID int64
+	if err := tx.QueryRow(ctx, `SELECT connection_id FROM recording_joined_dry_runs
+		WHERE batch_id=$1 AND generation=$2 FOR SHARE`, req.BatchID, req.Generation).Scan(&checkpointConnectionID); err != nil {
+		return plan, 0, "", false, errors.New("ready checkpointed Tier-1 dry-run plan not found")
+	}
+	if checkpointConnectionID != int64(s.cfg.JoinedRecordingConnectionID) {
+		return plan, 0, "", false, errors.New("checkpointed Tier-1 connection differs")
+	}
 	if err := tx.QueryRow(ctx, `SELECT run.final_plan_bytes,run.final_plan_sha256,c.account_id,
 		q.status,q.definition_version,q.cohort_sha256,q.windows_sha256,q.frozen_at
 		FROM recording_joined_dry_runs run

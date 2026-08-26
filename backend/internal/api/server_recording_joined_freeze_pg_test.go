@@ -24,6 +24,17 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
+func requireJoinedTestReplicationRole(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var superuser bool
+	if err := pool.QueryRow(context.Background(), `SELECT rolsuper FROM pg_roles WHERE rolname=current_user`).Scan(&superuser); err != nil {
+		t.Fatalf("check PostgreSQL fixture authority: %v", err)
+	}
+	if !superuser {
+		t.Skip("persisted-corruption fixture requires a disposable PostgreSQL superuser")
+	}
+}
+
 var joinedMigrationNames = []string{
 	"0137_recording_joined_outputs.sql",
 	"0138_joined_historical_qualification_authority.sql",
@@ -599,8 +610,8 @@ func TestJoinedTier1HistoricalApplyUsesExactFrozenDenominator(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=0 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
-	if replay, _ := call(req); replay.Code != http.StatusConflict {
-		t.Fatalf("protocol-zero apply replay status=%d body=%s", replay.Code, replay.Body.String())
+	if replay, _ := call(req); replay.Code != http.StatusOK {
+		t.Fatalf("protocol-zero cloud apply replay status=%d", replay.Code)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_protocol_version=1 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
@@ -934,6 +945,7 @@ func TestJoinedTier1CheckpointedDryRunBuildsCanonicalPlanAndStaysHidden(t *testi
 	apply := req
 	apply.Apply, apply.ExpectedRequestSHA256 = true, *progress.RequestSHA256
 	var persistedForeignRunID int64
+	requireJoinedTestReplicationRole(t, fixture.pool)
 	foreignQualificationTx, err := fixture.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)

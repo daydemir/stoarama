@@ -1548,6 +1548,12 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("seed persisted failure collision: %v", err)
 	}
 	configuredConnectionForForeignLease := s.cfg.JoinedRecordingConnectionID
+	foreignConfigRestored := false
+	defer func() {
+		if !foreignConfigRestored {
+			s.cfg.JoinedRecordingConnectionID = configuredConnectionForForeignLease
+		}
+	}()
 	s.cfg.JoinedRecordingConnectionID = int(foreignConnectionID)
 	leaseStatusBody, _ := json.Marshal(joinedrecording.LeaseStatusRequest{ProtocolVersion: 1, BatchID: batchID,
 		LeaseIDs: []string{joinedauth.LeaseID(uuid.MustParse(sourceClaimTokenBeforeFailure)),
@@ -1660,6 +1666,36 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		sourceClaim.HourID).Scan(&hourLeaseExpires, &hourAttempt); err != nil {
 		t.Fatal(err)
 	}
+	requireJoinedTestReplicationRole(t, pool)
+	leasesRestored := false
+	defer func() {
+		if leasesRestored {
+			return
+		}
+		tx, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Errorf("begin emergency lease fixture restore: %v", err)
+			return
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		if _, err := tx.Exec(context.Background(), `SET LOCAL session_replication_role='replica'`); err != nil {
+			t.Errorf("enable emergency lease fixture restore: %v", err)
+			return
+		}
+		if _, err := tx.Exec(context.Background(), `UPDATE recording_joined_hours SET lease_expires_at=$2,attempt_count=$3 WHERE hour_id=$1`,
+			sourceClaim.HourID, hourLeaseExpires, hourAttempt); err != nil {
+			t.Errorf("restore emergency hour lease fixture: %v", err)
+			return
+		}
+		if _, err := tx.Exec(context.Background(), `UPDATE recording_joined_artifacts SET publication_lease_expires_at=$2,
+			publication_attempt_count=$3 WHERE id=$1`, publicationArtifactID, publicationLeaseExpires, publicationAttempt); err != nil {
+			t.Errorf("restore emergency publication lease fixture: %v", err)
+			return
+		}
+		if err := tx.Commit(context.Background()); err != nil {
+			t.Errorf("commit emergency lease fixture restore: %v", err)
+		}
+	}()
 	foreignExpiryTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1699,6 +1735,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 			hourStateAfter, publicationStateAfter, failuresAfterForeignReconcile, failuresBeforeForeignReconcile, err)
 	}
 	s.cfg.JoinedRecordingConnectionID = configuredConnectionForForeignLease
+	foreignConfigRestored = true
 	restoreLeaseTx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1717,6 +1754,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if err := restoreLeaseTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
+	leasesRestored = true
 	failureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "hour",
 		ScopeID: sourceClaim.HourID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
 	failureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure", bytes.NewReader(failureBody))
@@ -2120,6 +2158,12 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatal(err)
 	}
 	configuredConnectionID := s.cfg.JoinedRecordingConnectionID
+	foreignBatchConfigRestored := false
+	defer func() {
+		if !foreignBatchConfigRestored {
+			s.cfg.JoinedRecordingConnectionID = configuredConnectionID
+		}
+	}()
 	s.cfg.JoinedRecordingConnectionID = int(foreignConnectionID)
 	if rec := sealIndex(joinedSealBatchIndexRequest{ProtocolVersion: 1, BatchID: batchID}); rec.Code != http.StatusConflict {
 		t.Fatalf("foreign batch-index preview status=%d body=%s", rec.Code, rec.Body.String())
@@ -2145,6 +2189,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("foreign admission set=%d body=%s", foreignAdmissionSetRec.Code, foreignAdmissionSetRec.Body.String())
 	}
 	s.cfg.JoinedRecordingConnectionID = configuredConnectionID
+	foreignBatchConfigRestored = true
 	var artifactsAfterForeign, refsAfterForeign int
 	var stateAfterForeign string
 	var pausedAfterForeign bool

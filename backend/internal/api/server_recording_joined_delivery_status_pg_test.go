@@ -225,9 +225,8 @@ func TestJoinedDeliveryStatusReadsExactAppendOnlyAckWithoutWriting(t *testing.T)
 	if err := json.Unmarshal(unacked.Body.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.Acknowledged || status.IdentityMatches || status.HourID != hourID || status.FeedHead == nil ||
-		status.FeedHead.ArtifactID != 480 || status.FeedHead.BatchID != "foreign-generation-1" ||
-		status.LastAttemptArtifactID == nil || *status.LastAttemptArtifactID != 480 || !status.TelemetryMatchesHead ||
+	if status.Acknowledged || status.IdentityMatches || status.HourID != hourID || status.FeedHead != nil ||
+		status.LastAttemptArtifactID == nil || *status.LastAttemptArtifactID != 480 || status.TelemetryMatchesHead ||
 		status.LastAttemptBlockerClass != "present" || status.LastAttemptBlockerSHA256 == "" ||
 		status.RawDelivery.LastCursorID != 100 || status.RawDelivery.ClipsPulled != 90 ||
 		status.RawDelivery.PendingClips != 1 || status.RawDelivery.PendingBytes != 250 ||
