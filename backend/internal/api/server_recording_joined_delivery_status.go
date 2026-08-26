@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,23 +17,49 @@ import (
 const joinedDeliveryStatusInterval = time.Second
 
 type joinedDeliveryStatusResponse struct {
-	BatchID            string     `json:"batch_id"`
-	ArtifactID         int64      `json:"artifact_id"`
-	ArtifactKind       string     `json:"artifact_kind"`
-	HourID             string     `json:"hour_id"`
-	RelativePath       string     `json:"relative_path"`
-	ExpectedSizeBytes  int64      `json:"expected_size_bytes"`
-	ExpectedSHA256     string     `json:"expected_sha256"`
-	PublicationState   string     `json:"publication_state"`
-	PublishedAt        *time.Time `json:"published_at,omitempty"`
-	Acknowledged       bool       `json:"acknowledged"`
-	VerifiedAt         *time.Time `json:"verified_at,omitempty"`
-	AcknowledgedPath   string     `json:"acknowledged_relative_path,omitempty"`
-	AcknowledgedSize   *int64     `json:"acknowledged_size_bytes,omitempty"`
-	AcknowledgedSHA256 string     `json:"acknowledged_sha256,omitempty"`
-	IdentityMatches    bool       `json:"identity_matches"`
-	ConnectionID       int64      `json:"connection_id"`
-	ConnectionProtocol int        `json:"connection_protocol_version"`
+	BatchID                  string                    `json:"batch_id"`
+	ArtifactID               int64                     `json:"artifact_id"`
+	ArtifactKind             string                    `json:"artifact_kind"`
+	HourID                   string                    `json:"hour_id"`
+	RelativePath             string                    `json:"relative_path"`
+	ExpectedSizeBytes        int64                     `json:"expected_size_bytes"`
+	ExpectedSHA256           string                    `json:"expected_sha256"`
+	PublicationState         string                    `json:"publication_state"`
+	PublishedAt              *time.Time                `json:"published_at,omitempty"`
+	Acknowledged             bool                      `json:"acknowledged"`
+	VerifiedAt               *time.Time                `json:"verified_at,omitempty"`
+	AcknowledgedPath         string                    `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize         *int64                    `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256       string                    `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches          bool                      `json:"identity_matches"`
+	ConnectionID             int64                     `json:"connection_id"`
+	ConnectionProtocol       int                       `json:"connection_protocol_version"`
+	ObservedAt               time.Time                 `json:"observed_at"`
+	FeedHead                 *joinedFeedHeadDiagnostic `json:"feed_head,omitempty"`
+	LastAttemptArtifactID    *int64                    `json:"last_attempt_artifact_id,omitempty"`
+	LastAttemptBlockerClass  string                    `json:"last_attempt_blocker_class,omitempty"`
+	LastAttemptBlockerSHA256 string                    `json:"last_attempt_blocker_sha256,omitempty"`
+	LastAttemptAt            *time.Time                `json:"last_attempt_at,omitempty"`
+	RetryAt                  *time.Time                `json:"retry_at,omitempty"`
+	TelemetryMatchesHead     bool                      `json:"telemetry_matches_head"`
+}
+
+type joinedFeedHeadDiagnostic struct {
+	ArtifactID        int64   `json:"artifact_id"`
+	BatchID           string  `json:"batch_id"`
+	HourID            *string `json:"hour_id,omitempty"`
+	Kind              string  `json:"kind"`
+	Ordinal           int     `json:"ordinal"`
+	ExpectedSizeBytes int64   `json:"expected_size_bytes"`
+	ExpectedSHA256    string  `json:"expected_sha256"`
+}
+
+func joinedAttemptBlockerClass(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return "present"
 }
 
 func (s *Server) joinedDeliveryStatusAllowed(now time.Time) bool {
@@ -103,7 +130,7 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	response := joinedDeliveryStatusResponse{BatchID: batchValues[0], ArtifactID: artifactID}
+	response := joinedDeliveryStatusResponse{BatchID: batchValues[0], ArtifactID: artifactID, ObservedAt: time.Now().UTC()}
 	var acknowledgedPath, acknowledgedSHA *string
 	var acknowledgedSize *int64
 	err = tx.QueryRow(ctx, `
@@ -146,6 +173,28 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusConflict, "joined delivery identity is invalid")
 		return
 	}
+	var head joinedFeedHeadDiagnostic
+	err = tx.QueryRow(ctx, `SELECT a.id,a.batch_id,h.hour_id,a.artifact_kind,a.ordinal,a.expected_size_bytes,a.expected_sha256 `+
+		joinedFeedHeadFromWhere, response.ConnectionID).Scan(&head.ArtifactID, &head.BatchID, &head.HourID, &head.Kind,
+		&head.Ordinal, &head.ExpectedSizeBytes, &head.ExpectedSHA256)
+	if err == nil {
+		response.FeedHead = &head
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		util.WriteError(w, http.StatusInternalServerError, "read joined feed head failed")
+		return
+	}
+	var blocker string
+	err = tx.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at
+		FROM connections WHERE id=$1 AND kind='nas_pull'`, response.ConnectionID).Scan(
+		&response.LastAttemptArtifactID, &blocker, &response.LastAttemptAt, &response.RetryAt)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "read joined delivery telemetry failed")
+		return
+	}
+	response.LastAttemptBlockerClass = joinedAttemptBlockerClass(blocker)
+	response.LastAttemptBlockerSHA256 = joinedClientErrorSHA256(blocker)
+	response.TelemetryMatchesHead = response.FeedHead != nil && response.LastAttemptArtifactID != nil &&
+		*response.LastAttemptArtifactID == response.FeedHead.ArtifactID
 	if err := tx.Commit(ctx); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "finish joined delivery status read failed")
 		return

@@ -38,6 +38,34 @@ type joinedArtifactItem struct {
 	LedgerSHA256             *string `json:"ledger_sha256"`
 }
 
+// joinedFeedHeadFromWhere is shared by the NAS feed and the read-only
+// connection diagnostic. Keep the eligibility predicate and ordering in one
+// place so an operator sees the same head item the NAS sees.
+const joinedFeedHeadFromWhere = `
+		FROM recording_joined_artifacts a
+		LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		LEFT JOIN recording_joined_artifacts manifest ON a.artifact_kind='media'
+		  AND manifest.hour_record_id=a.hour_record_id AND manifest.artifact_kind='hour_manifest'
+		LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
+		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
+		LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id AND own_ack.connection_id=a.connection_id
+		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
+		WHERE a.connection_id=$1 AND own_ack.artifact_id IS NULL
+		  AND ((a.artifact_kind<>'media' AND a.publication_state='published')
+		    OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
+		  AND (a.artifact_kind='allocation_ledger'
+		    OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
+		      WHERE ack.artifact_id=ledger.id AND ack.connection_id=a.connection_id))
+		    OR (a.artifact_kind='media' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
+		      WHERE ack.artifact_id=manifest.id AND ack.connection_id=a.connection_id))
+		    OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
+		      LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
+		      WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index' AND ack.artifact_id IS NULL)))
+		ORDER BY a.batch_record_id,h.priority_ordinal NULLS LAST,
+		  CASE a.artifact_kind WHEN 'allocation_ledger' THEN 0 WHEN 'hour_manifest' THEN 1 WHEN 'media' THEN 2 ELSE 3 END,
+		  a.ordinal,a.id
+		LIMIT 1`
+
 type joinedOutputObjectStore interface {
 	Head(context.Context, string) (r2.ObjectHead, error)
 	PresignPutCreateOnlyRequest(context.Context, string, string, int64, string, time.Duration) (r2.PresignedRequest, error)
@@ -117,29 +145,7 @@ func (s *Server) handleAccountJoined(w http.ResponseWriter, r *http.Request) {
 		SELECT a.id,a.connection_id,a.batch_id,h.hour_id,a.artifact_kind,a.content_type,a.relative_path,a.expected_size_bytes,a.expected_sha256,
 		       manifest.id,manifest.relative_path,manifest.expected_sha256,
 		       ledger.id,ledger.relative_path,ledger.expected_sha256
-		FROM recording_joined_artifacts a
-		LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
-		LEFT JOIN recording_joined_artifacts manifest ON a.artifact_kind='media'
-		  AND manifest.hour_record_id=a.hour_record_id AND manifest.artifact_kind='hour_manifest'
-		LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
-		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
-		LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id AND own_ack.connection_id=a.connection_id
-		JOIN connections c ON c.id=a.connection_id AND c.joined_protocol_version=1
-		WHERE a.connection_id=$1 AND own_ack.artifact_id IS NULL
-		  AND ((a.artifact_kind<>'media' AND a.publication_state='published')
-		    OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
-		  AND (a.artifact_kind='allocation_ledger'
-		    OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
-		      WHERE ack.artifact_id=ledger.id AND ack.connection_id=a.connection_id))
-		    OR (a.artifact_kind='media' AND EXISTS(SELECT 1 FROM recording_joined_artifact_acks ack
-		      WHERE ack.artifact_id=manifest.id AND ack.connection_id=a.connection_id))
-		    OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts prior
-		      LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
-		      WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index' AND ack.artifact_id IS NULL)))
-		ORDER BY a.batch_record_id,h.priority_ordinal NULLS LAST,
-		  CASE a.artifact_kind WHEN 'allocation_ledger' THEN 0 WHEN 'hour_manifest' THEN 1 WHEN 'media' THEN 2 ELSE 3 END,
-		  a.ordinal,a.id
-		LIMIT 1 FOR SHARE OF a`, connectionID).Scan(
+		`+joinedFeedHeadFromWhere+` FOR SHARE OF a`, connectionID).Scan(
 		&item.ArtifactID, &item.ConnectionID, &item.BatchID, &item.HourID, &item.Kind, &item.ContentType, &item.RelativePath,
 		&item.SizeBytes, &item.SHA256, &item.HourManifestID, &item.HourManifestRelativePath, &item.HourManifestSHA256,
 		&item.LedgerArtifactID, &item.LedgerRelativePath, &item.LedgerSHA256)

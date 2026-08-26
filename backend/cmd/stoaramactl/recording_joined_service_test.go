@@ -77,6 +77,12 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 		batch = "tier1-generation-1"
 		op    = "joined-tier1-operator-token-at-least-32-bytes"
 	)
+	observed := time.Now().UTC().Truncate(time.Second)
+	attempted := observed.Add(-time.Minute)
+	retry := observed.Add(time.Minute)
+	headHour := "older-hour-1"
+	lastAttemptID := int64(401)
+	blockerSHA := strings.Repeat("b", 64)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.RequestURI() != "/api/v1/recording/joined/delivery-status?batch_id="+batch+"&artifact_id=429" {
 			t.Fatalf("request=%s %s", r.Method, r.URL.RequestURI())
@@ -87,7 +93,11 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 		writeJoinedTestJSON(t, w, joinedDeliveryStatus{BatchID: batch, ArtifactID: 429,
 			ArtifactKind: "media", HourID: "hour-429", RelativePath: "joined/hour-429.mp4",
 			ExpectedSizeBytes: 12, ExpectedSHA256: strings.Repeat("a", 64), PublicationState: "published",
-			Acknowledged: true, IdentityMatches: true, ConnectionID: 47, ConnectionProtocol: 1})
+			Acknowledged: true, IdentityMatches: true, ConnectionID: 47, ConnectionProtocol: 1,
+			ObservedAt: observed, FeedHead: &joinedFeedHeadStatus{ArtifactID: 401, BatchID: "older-generation-1",
+				HourID: &headHour, Kind: "media", Ordinal: 2, ExpectedSizeBytes: 99, ExpectedSHA256: strings.Repeat("c", 64)},
+			LastAttemptArtifactID: &lastAttemptID, LastAttemptBlockerClass: "present",
+			LastAttemptBlockerSHA256: blockerSHA, LastAttemptAt: &attempted, RetryAt: &retry, TelemetryMatchesHead: true})
 	}))
 	defer server.Close()
 	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
@@ -99,8 +109,14 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.(joinedDeliveryStatus).Acknowledged {
-		t.Fatalf("result=%v", result)
+	got := result.(joinedDeliveryStatus)
+	if !got.Acknowledged || !got.ObservedAt.Equal(observed) || got.FeedHead == nil || got.FeedHead.ArtifactID != 401 ||
+		got.FeedHead.BatchID != "older-generation-1" || got.FeedHead.HourID == nil || *got.FeedHead.HourID != headHour ||
+		got.LastAttemptArtifactID == nil || *got.LastAttemptArtifactID != lastAttemptID ||
+		got.LastAttemptBlockerClass != "present" || got.LastAttemptBlockerSHA256 != blockerSHA ||
+		got.LastAttemptAt == nil || !got.LastAttemptAt.Equal(attempted) || got.RetryAt == nil || !got.RetryAt.Equal(retry) ||
+		!got.TelemetryMatchesHead {
+		t.Fatalf("result=%+v", got)
 	}
 }
 

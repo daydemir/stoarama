@@ -109,23 +109,41 @@ type joinedWorkerStatus struct {
 }
 
 type joinedDeliveryStatus struct {
-	BatchID            string     `json:"batch_id"`
-	ArtifactID         int64      `json:"artifact_id"`
-	ArtifactKind       string     `json:"artifact_kind"`
-	HourID             string     `json:"hour_id"`
-	RelativePath       string     `json:"relative_path"`
-	ExpectedSizeBytes  int64      `json:"expected_size_bytes"`
-	ExpectedSHA256     string     `json:"expected_sha256"`
-	PublicationState   string     `json:"publication_state"`
-	PublishedAt        *time.Time `json:"published_at,omitempty"`
-	Acknowledged       bool       `json:"acknowledged"`
-	VerifiedAt         *time.Time `json:"verified_at,omitempty"`
-	AcknowledgedPath   string     `json:"acknowledged_relative_path,omitempty"`
-	AcknowledgedSize   *int64     `json:"acknowledged_size_bytes,omitempty"`
-	AcknowledgedSHA256 string     `json:"acknowledged_sha256,omitempty"`
-	IdentityMatches    bool       `json:"identity_matches"`
-	ConnectionID       int64      `json:"connection_id"`
-	ConnectionProtocol int        `json:"connection_protocol_version"`
+	BatchID                  string                `json:"batch_id"`
+	ArtifactID               int64                 `json:"artifact_id"`
+	ArtifactKind             string                `json:"artifact_kind"`
+	HourID                   string                `json:"hour_id"`
+	RelativePath             string                `json:"relative_path"`
+	ExpectedSizeBytes        int64                 `json:"expected_size_bytes"`
+	ExpectedSHA256           string                `json:"expected_sha256"`
+	PublicationState         string                `json:"publication_state"`
+	PublishedAt              *time.Time            `json:"published_at,omitempty"`
+	Acknowledged             bool                  `json:"acknowledged"`
+	VerifiedAt               *time.Time            `json:"verified_at,omitempty"`
+	AcknowledgedPath         string                `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize         *int64                `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256       string                `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches          bool                  `json:"identity_matches"`
+	ConnectionID             int64                 `json:"connection_id"`
+	ConnectionProtocol       int                   `json:"connection_protocol_version"`
+	ObservedAt               time.Time             `json:"observed_at"`
+	FeedHead                 *joinedFeedHeadStatus `json:"feed_head,omitempty"`
+	LastAttemptArtifactID    *int64                `json:"last_attempt_artifact_id,omitempty"`
+	LastAttemptBlockerClass  string                `json:"last_attempt_blocker_class,omitempty"`
+	LastAttemptBlockerSHA256 string                `json:"last_attempt_blocker_sha256,omitempty"`
+	LastAttemptAt            *time.Time            `json:"last_attempt_at,omitempty"`
+	RetryAt                  *time.Time            `json:"retry_at,omitempty"`
+	TelemetryMatchesHead     bool                  `json:"telemetry_matches_head"`
+}
+
+type joinedFeedHeadStatus struct {
+	ArtifactID        int64   `json:"artifact_id"`
+	BatchID           string  `json:"batch_id"`
+	HourID            *string `json:"hour_id,omitempty"`
+	Kind              string  `json:"kind"`
+	Ordinal           int     `json:"ordinal"`
+	ExpectedSizeBytes int64   `json:"expected_size_bytes"`
+	ExpectedSHA256    string  `json:"expected_sha256"`
 }
 
 type joinedSealStreamDayReceipt struct {
