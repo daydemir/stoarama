@@ -71,6 +71,8 @@ type Server struct {
 	joinedConnectionStatusAt time.Time
 	joinedContainmentMu      sync.Mutex
 	joinedContainmentAt      time.Time
+	joinedDeliveryStatusMu   sync.Mutex
+	joinedDeliveryStatusAt   time.Time
 	joinedAttemptReconcileMu sync.Mutex
 	joinedAttemptReconcileAt time.Time
 }
@@ -571,6 +573,7 @@ func (s *Server) router() http.Handler {
 		api.Group(func(joinedOperator chi.Router) {
 			joinedOperator.Use(s.requireJoinedOperatorAuth)
 			joinedOperator.Get("/recording/joined/containment", s.handleJoinedContainment)
+			joinedOperator.Get("/recording/joined/delivery-status", s.handleJoinedDeliveryStatus)
 			joinedOperator.Post("/recording/joined/maintenance/reconcile-expired", s.handleJoinedReconcileExpiredAttempts)
 			joinedOperator.Get("/recording/joined/admission", s.handleJoinedAdmissionStatus)
 			joinedOperator.Put("/recording/joined/admission", s.handleJoinedAdmissionSet)

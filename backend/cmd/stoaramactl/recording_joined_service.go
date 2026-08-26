@@ -108,6 +108,26 @@ type joinedWorkerStatus struct {
 	Hours           map[string]int64 `json:"hours"`
 }
 
+type joinedDeliveryStatus struct {
+	BatchID            string     `json:"batch_id"`
+	ArtifactID         int64      `json:"artifact_id"`
+	ArtifactKind       string     `json:"artifact_kind"`
+	HourID             string     `json:"hour_id"`
+	RelativePath       string     `json:"relative_path"`
+	ExpectedSizeBytes  int64      `json:"expected_size_bytes"`
+	ExpectedSHA256     string     `json:"expected_sha256"`
+	PublicationState   string     `json:"publication_state"`
+	PublishedAt        *time.Time `json:"published_at,omitempty"`
+	Acknowledged       bool       `json:"acknowledged"`
+	VerifiedAt         *time.Time `json:"verified_at,omitempty"`
+	AcknowledgedPath   string     `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize   *int64     `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256 string     `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches    bool       `json:"identity_matches"`
+	ConnectionID       int64      `json:"connection_id"`
+	ConnectionProtocol int        `json:"connection_protocol_version"`
+}
+
 type joinedSealStreamDayReceipt struct {
 	ProtocolVersion   int    `json:"protocol_version"`
 	BatchID           string `json:"batch_id"`
@@ -573,6 +593,23 @@ func (s *remoteJoinedOperatorService) Status(ctx context.Context, req joinedStat
 	path := "/api/v1/recording/joined/status?batch_id=" + url.QueryEscape(req.BatchID)
 	if err := s.api.getJSON(ctx, path, s.api.bootstrapToken, &status); err != nil {
 		return nil, err
+	}
+	return status, nil
+}
+
+func (s *remoteJoinedOperatorService) DeliveryStatus(ctx context.Context, req joinedDeliveryStatusRequest) (any, error) {
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return nil, err
+	}
+	var status joinedDeliveryStatus
+	path := "/api/v1/recording/joined/delivery-status?batch_id=" + url.QueryEscape(req.BatchID) +
+		"&artifact_id=" + url.QueryEscape(fmt.Sprint(req.ArtifactID))
+	if err := s.api.getJSON(ctx, path, token, &status); err != nil {
+		return nil, err
+	}
+	if status.BatchID != req.BatchID || status.ArtifactID != req.ArtifactID {
+		return nil, errors.New("joined delivery status identity differs")
 	}
 	return status, nil
 }
