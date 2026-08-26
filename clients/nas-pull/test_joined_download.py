@@ -239,6 +239,26 @@ class JoinedDownloadTests(unittest.TestCase):
                  "hour_manifest_relative_path": None, "hour_manifest_sha256": None}
         self.assertEqual(pull.valid_joined_item(batch)["kind"], "batch_index")
 
+    def test_joined_capacity_preserves_one_full_raw_worker_wave(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            runtime.capacity_blocked = False
+            joined_bytes = pull.JOINED_RANGE_BYTES
+            storage = {
+                "available": True,
+                "total_bytes": cfg.min_free_bytes + pull.JOINED_RAW_HEADROOM_BYTES + joined_bytes,
+                "free_bytes": cfg.min_free_bytes + pull.JOINED_RAW_HEADROOM_BYTES + joined_bytes,
+            }
+            self.assertTrue(runtime.reserve_joined_storage(cfg, storage, joined_bytes))
+            self.assertTrue(runtime.reserve_storage(cfg, storage, pull.JOINED_RAW_HEADROOM_BYTES))
+            runtime.release_storage_reservation(pull.JOINED_RAW_HEADROOM_BYTES + joined_bytes)
+            self.assertEqual(runtime.capacity_reserved_bytes, 0)
+
+            storage["free_bytes"] -= 1
+            self.assertFalse(runtime.reserve_joined_storage(cfg, storage, joined_bytes))
+            self.assertTrue(runtime.reserve_storage(cfg, storage, pull.JOINED_RAW_HEADROOM_BYTES - 1))
+
     def test_protocol_v1_shared_golden(self):
         fixture = json.loads(PROTOCOL_GOLDEN.read_text())
         self.assertEqual(set(fixture), {"feed_responses", "prepare_response"})
@@ -258,6 +278,52 @@ class JoinedDownloadTests(unittest.TestCase):
             prepared = pull.prepare_joined_download(SimpleNamespace(origin="https://stoarama.test"), media)
         self.assertEqual(prepared["url_authority"], "joined.example.test")
         self.assertEqual(prepared["url_path"], "/objects/%s.mp4" % media["sha256"])
+
+    def test_background_delivery_requires_separate_generation_activation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            runtime.apply_joined_protocol_response(self.protocol_response(
+                1, pull.JOINED_BACKGROUND_MIN_GENERATION - 1,
+            ))
+            self.assertTrue(runtime.joined_protocol_enabled())
+            self.assertFalse(runtime.joined_background_enabled())
+            runtime.apply_joined_protocol_response(self.protocol_response(
+                1, pull.JOINED_BACKGROUND_MIN_GENERATION,
+            ))
+            self.assertTrue(runtime.joined_background_enabled())
+
+    def test_joined_failure_heartbeat_is_typed_and_opaque(self):
+        raw_item = self.media_item()
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            with mock.patch.object(pull, "request_json", return_value={"item": raw_item}), mock.patch.object(
+                pull, "download_joined_item", side_effect=RuntimeError("secret path and signed URL")
+            ), self.assertRaisesRegex(RuntimeError, "secret path"):
+                pull.drain_joined(cfg, runtime, threading.Event())
+            joined = runtime.heartbeat_payload(None)["joined_delivery"]
+            self.assertEqual(joined["artifact_id"], raw_item["artifact_id"])
+            self.assertEqual(joined["blocker"], "download_failed")
+            self.assertNotIn("secret", json.dumps(joined))
+
+    def test_joined_io_throttle_uses_cumulative_rate_and_is_stoppable(self):
+        stop = mock.Mock()
+        stop.wait.return_value = False
+        with mock.patch.object(pull.time, "monotonic", return_value=10.25):
+            pull.throttle_joined_io(10.0, 8 * 1024 * 1024, 8 * 1024 * 1024, stop)
+        stop.wait.assert_called_once_with(0.75)
+
+        stop.reset_mock()
+        with mock.patch.object(pull.time, "monotonic", return_value=11.5):
+            pull.throttle_joined_io(10.0, 8 * 1024 * 1024, 8 * 1024 * 1024, stop)
+        stop.wait.assert_not_called()
+
+        stop.wait.return_value = True
+        with mock.patch.object(pull.time, "monotonic", return_value=10.0), self.assertRaises(
+            pull.JoinedDownloadYield
+        ):
+            pull.throttle_joined_io(10.0, 8 * 1024 * 1024, 8 * 1024 * 1024, stop)
 
     def test_cloud_canonical_goldens_and_strict_nested_decoders(self):
         expected = {
@@ -752,7 +818,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 return True
             with mock.patch.object(pull, "request_json", side_effect=api), \
                  mock.patch.object(pull, "download_joined_item", side_effect=download):
-                self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
+                self.assertFalse(pull.drain_joined(cfg, runtime, threading.Event()))
             self.assertEqual(paths, ["/account/joined"])
 
     def test_gap_only_hour_manifest_downloads_and_exact_acks(self):
@@ -990,7 +1056,7 @@ class JoinedDownloadTests(unittest.TestCase):
             ), self.assertRaisesRegex(pull.ExistingFileMismatch, "wrong dependency ACK identity"):
                 pull.download_joined_item(cfg, runtime, altered, threading.Event())
 
-    def test_hash_is_bounded_cancellable_and_yields_to_raw(self):
+    def test_hash_is_bounded_and_cancellable_without_polling_raw_feed(self):
         content, item = b"abcdef", pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1000,9 +1066,14 @@ class JoinedDownloadTests(unittest.TestCase):
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False):
                     pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, self.marker(item), threading.Event())
                 descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd); os.write(descriptor, content); os.close(descriptor)
-                with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), mock.patch.object(pull, "poll_raw_pending", side_effect=[False, True]) as poll, self.assertRaises(pull.JoinedDownloadYield):
-                    pull.hash_joined_entry(cfg, runtime, directory_fd, part, threading.Event())
-                self.assertEqual(poll.call_count, 2); self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 6)
+                stop = threading.Event()
+                def stop_after_chunk(*_args):
+                    stop.set()
+                with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), mock.patch.object(
+                    pull, "throttle_joined_io", side_effect=stop_after_chunk
+                ), mock.patch.object(pull, "poll_raw_pending") as poll, self.assertRaises(pull.JoinedDownloadYield):
+                    pull.hash_joined_entry(cfg, runtime, directory_fd, part, stop)
+                poll.assert_not_called(); self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 6)
             finally: os.close(directory_fd)
 
     def test_unknown_partial_and_hardlink_are_never_modified(self):
@@ -1125,12 +1196,12 @@ class JoinedDownloadTests(unittest.TestCase):
                 response = RangeResponse(b"abcdef", 0, 5, 6); response.status = 200
                 descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd); os.write(descriptor, b"abc"); os.close(descriptor)
                 with mock.patch.object(pull, "open_joined_url", return_value=response), self.assertRaisesRegex(RuntimeError, "ignored range"):
-                    pull.append_joined_range(prepared, directory_fd, part, item, 0, 2)
+                    pull.append_joined_range(prepared, directory_fd, part, item, 0, 2, threading.Event())
                 self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 0)
                 descriptor = os.open(part, os.O_WRONLY, dir_fd=directory_fd); os.write(descriptor, b"abc"); os.close(descriptor)
                 changed = RangeResponse(b"def", 3, 5, 6, etag="etag-2")
                 with mock.patch.object(pull, "open_joined_url", return_value=changed), self.assertRaisesRegex(pull.ExistingFileMismatch, "identity drifted"):
-                    pull.append_joined_range(prepared, directory_fd, part, item, 3, 5)
+                    pull.append_joined_range(prepared, directory_fd, part, item, 3, 5, threading.Event())
                 self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 0)
             finally: os.close(directory_fd)
 
