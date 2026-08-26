@@ -599,7 +599,7 @@ func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t
 	}
 	bad.SizeBytes, bad.SHA256, _ = localIdentity(bad.Path)
 	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
-	clips := []SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute)), testSource(3, start.Add(2*time.Minute))}
+	clips := []SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute)), testSource(3, start.Add(2*time.Minute+3*time.Second))}
 	draft := HourDraft{LocalDate: "2026-05-04", LocalHour: 1, Parts: []OutputPlan{
 		{Hour: 1, Sources: clips[0:1]},
 		{Hour: 1, Sources: clips[1:2]},
@@ -620,7 +620,7 @@ func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t
 	if len(result.Quarantined) != 1 || result.Quarantined[0].ClipID != 2 || len(result.Quarantines) != 1 || result.Quarantines[0].Evidence.RepeatCount != 2 {
 		t.Fatalf("quarantine accounting differs: %+v", result)
 	}
-	if len(result.Sources) != 2 || result.Sources[0].ClipID != 1 || result.Sources[1].ClipID != 3 || result.Sources[1].SeamToPrevious.Reason != "source_quarantined" {
+	if len(result.Sources) != 2 || result.Sources[0].ClipID != 1 || result.Sources[1].ClipID != 3 || result.Sources[1].SeamToPrevious.Reason != "source_quarantined" || result.Sources[1].SeamToPrevious.SignedGapNanoseconds != int64(3*time.Second) {
 		t.Fatalf("surviving source accounting differs: %+v", result.Sources)
 	}
 }
