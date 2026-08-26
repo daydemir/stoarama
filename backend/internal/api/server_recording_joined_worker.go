@@ -64,6 +64,20 @@ func joinedFailureDisposition(class string, attempt int, token uuid.UUID, now ti
 	return "retry", now.Add(delay)
 }
 
+func joinedFailureDispositionAfterLease(class string, attempt int, token uuid.UUID, leaseExpires, now time.Time) (string, time.Time) {
+	disposition, retry := joinedFailureDisposition(class, attempt, token, now)
+	if disposition != "retry" {
+		return disposition, retry
+	}
+	// A retry row fences the existing lease rather than releasing it. Start
+	// the backoff after that lease expires so the same high-priority task
+	// cannot be reclaimed immediately ahead of untouched work.
+	if leaseExpires.After(now) {
+		retry = leaseExpires.Add(retry.Sub(now))
+	}
+	return disposition, retry.UTC().Truncate(time.Second)
+}
+
 func (s *Server) joinedClaimSlotAvailable(ctx context.Context, tx pgx.Tx, batchID string) (bool, error) {
 	cap := s.cfg.JoinedRecordingMaxActiveTasks
 	if cap == 0 && !s.joinedFrozenBatchScope() {
@@ -660,15 +674,18 @@ func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var batchRecordID, targetID int64
+	var leaseExpires time.Time
 	if claims.Operation == joinedauth.OperationPreflight && req.ScopeKind == joinedauth.SubjectHour {
-		err = tx.QueryRow(r.Context(), `SELECT batch_record_id,id,attempt_count FROM recording_joined_hours
+		err = tx.QueryRow(r.Context(), `SELECT batch_record_id,id,attempt_count,lease_expires_at FROM recording_joined_hours
 			WHERE batch_id=$1 AND hour_id=$2 AND state='leased' AND claim_token=$3 AND lease_expires_at>now()
-			FOR UPDATE`, claims.BatchID, req.ScopeID, claimToken).Scan(&batchRecordID, &targetID, &attempt)
+			FOR UPDATE`, claims.BatchID, req.ScopeID, claimToken).Scan(&batchRecordID, &targetID, &attempt, &leaseExpires)
 	} else if claims.Operation == joinedauth.OperationPublish {
-		err = tx.QueryRow(r.Context(), `SELECT batch_record_id,id,publication_attempt_count FROM recording_joined_artifacts
+		err = tx.QueryRow(r.Context(), `SELECT batch_record_id,id,publication_attempt_count,publication_lease_expires_at
+			FROM recording_joined_artifacts
 			WHERE batch_id=$1 AND scope_kind=$2 AND scope_id=$3 AND artifact_kind<>'media'
 			  AND publication_state='publishing' AND publication_token=$4 AND publication_lease_expires_at>now()
-			FOR UPDATE`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken).Scan(&batchRecordID, &targetID, &attempt)
+			FOR UPDATE`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken).
+			Scan(&batchRecordID, &targetID, &attempt, &leaseExpires)
 	} else {
 		err = pgx.ErrNoRows
 	}
@@ -676,9 +693,8 @@ func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusConflict, "joined failure lease is stale or foreign")
 		return
 	}
-	disposition, retry := joinedFailureDisposition(req.FailureClass, attempt, claimToken, time.Now().UTC())
+	disposition, retry := joinedFailureDispositionAfterLease(req.FailureClass, attempt, claimToken, leaseExpires, time.Now().UTC())
 	if disposition == "retry" {
-		retry = retry.UTC().Truncate(time.Second)
 		retryAt = &retry
 	}
 	var hourID, artifactID any
