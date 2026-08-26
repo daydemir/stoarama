@@ -1,3 +1,6 @@
+ALTER TABLE recording_joined_batches
+  ADD CONSTRAINT recording_joined_batches_id_batch_id_unique UNIQUE(id,batch_id);
+
 CREATE TABLE recording_joined_admission_controls (
   batch_record_id BIGINT PRIMARY KEY,
   batch_id TEXT NOT NULL UNIQUE,
