@@ -607,6 +607,7 @@ func validRemoteJoinedProtocolConfig(connectionID, generation int) config.Config
 		JoinedRecordingProtocolVersion:     1,
 		JoinedRecordingConnectionID:        connectionID,
 		JoinedRecordingProtocolGeneration:  generation,
+		JoinedRecordingMaxActiveTasks:      2,
 		JoinedRecordingWorkScope:           config.JoinedWorkScopeFrozenBatch,
 		JoinedRecordingBatchID:             "tier1-2026-08",
 		JoinedWorkerBootstrapToken:         "joined-bootstrap-credential-32bytes",

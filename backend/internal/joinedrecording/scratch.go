@@ -8,6 +8,28 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// AvailableScratchBudget reports the bytes a new broad-rollout task may claim.
+// It leaves the fixed scratch margin unallocated before admission. The task's
+// own source/output requirement retains the same margin as a second guard.
+func AvailableScratchBudget(root string) (int64, error) {
+	if err := validatePrivateScratchRoot(root); err != nil {
+		return 0, err
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(root, &stat); err != nil {
+		return 0, fmt.Errorf("read joined scratch headroom: %w", err)
+	}
+	available := stat.Bavail * uint64(stat.Bsize)
+	if available <= ScratchSafetyMarginBytes {
+		return 0, &ScratchHeadroomError{Available: available, Required: ScratchSafetyMarginBytes + 1}
+	}
+	budget := available - ScratchSafetyMarginBytes
+	if budget > math.MaxInt64 {
+		budget = math.MaxInt64
+	}
+	return int64(budget), nil
+}
+
 // ScratchSafetyMarginBytes leaves room for filesystem metadata, ffmpeg
 // temporary files, and the final verification pass. It is deliberately large
 // because a failed space check must stop before any source download begins.

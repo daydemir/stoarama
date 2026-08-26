@@ -105,6 +105,12 @@ type joinedStatusRequest struct {
 	BatchID string `json:"batch_id"`
 }
 
+type joinedAdmissionRequest struct {
+	BatchID string
+	Action  string
+	Timeout time.Duration
+}
+
 // joinedOperatorService is the narrow boundary between operator parsing and
 // the joined-recording lifecycle. The integration supplies its DB/media/API
 // implementation without teaching the CLI about those clients.
@@ -117,6 +123,8 @@ type joinedOperatorService interface {
 	FinalValidation(context.Context, joinedFinalFreezeRequest) (any, error)
 	FinalFreeze(context.Context, joinedFinalFreezeRequest) (any, error)
 	SealBatchIndex(context.Context, joinedSealBatchIndexRequest) (any, error)
+	ClaimAdmissionStatus(context.Context, string) (joinedrecording.ClaimAdmissionStatus, error)
+	SetClaimAdmission(context.Context, joinedrecording.ClaimAdmissionRequest) (joinedrecording.ClaimAdmissionStatus, error)
 	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
 	RunWorker(context.Context, joinedWorkerRequest) error
 	Status(context.Context, joinedStatusRequest) (any, error)
@@ -125,16 +133,30 @@ type joinedOperatorService interface {
 type joinedOperatorFactory func(context.Context, config.Config) (joinedOperatorService, error)
 
 func runRecordingJoined(ctx context.Context, cfg config.Config, args []string) {
-	result, err := runRecordingJoinedWith(ctx, cfg, args, newJoinedOperatorService)
+	result, err := runRecordingJoinedCommand(ctx, cfg, args, newJoinedOperatorService)
 	if err != nil {
 		log.Fatalf("recording-joined: %v", err)
 	}
 	if result != nil {
 		printJSON(result)
 	}
+}
+
+func runRecordingJoinedCommand(ctx context.Context, cfg config.Config, args []string, factory joinedOperatorFactory) (any, error) {
+	signalAware := len(args) >= 2 && ((args[0] == "worker" && args[1] == "run") || (args[0] == "admission" && args[1] == "drain"))
+	if signalAware {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
+	result, err := runRecordingJoinedWith(ctx, cfg, args, factory)
+	if err != nil {
+		return nil, err
+	}
 	if joinedWorkerIsDisabled(result) {
 		waitForJoinedWorkerShutdown(ctx)
 	}
+	return result, nil
 }
 
 func newJoinedOperatorService(_ context.Context, cfg config.Config) (joinedOperatorService, error) {
@@ -158,6 +180,50 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 	}
 
 	switch args[0] {
+	case "admission":
+		req, err := parseJoinedAdmission(cfg, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		switch req.Action {
+		case "status":
+			return service.ClaimAdmissionStatus(ctx, req.BatchID)
+		case "pause", "resume":
+			return service.SetClaimAdmission(ctx, joinedrecording.ClaimAdmissionRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				BatchID: req.BatchID, ClaimsPaused: req.Action == "pause"})
+		case "drain":
+			status, err := service.SetClaimAdmission(ctx, joinedrecording.ClaimAdmissionRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				BatchID: req.BatchID, ClaimsPaused: true})
+			if err != nil || status.ActiveLeaseCount == 0 {
+				return status, err
+			}
+			deadlineCtx, cancel := context.WithTimeout(ctx, req.Timeout)
+			defer cancel()
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-deadlineCtx.Done():
+					return nil, fmt.Errorf("joined admission remains paused with %d active leases: %w", status.ActiveLeaseCount, deadlineCtx.Err())
+				case <-ticker.C:
+					status, err = service.ClaimAdmissionStatus(deadlineCtx, req.BatchID)
+					if err != nil {
+						return nil, err
+					}
+					if !status.ClaimsPaused {
+						return nil, errors.New("joined claim admission resumed before drain completed")
+					}
+					if status.ActiveLeaseCount == 0 {
+						return status, nil
+					}
+				}
+			}
+		}
+		return nil, errors.New("invalid joined admission action")
 	case "import-tier1-historical":
 		if err := requireJoinedActiveProtocol(cfg); err != nil {
 			return nil, err
@@ -307,6 +373,34 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 	default:
 		return nil, fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+func parseJoinedAdmission(cfg config.Config, args []string) (joinedAdmissionRequest, error) {
+	req := joinedAdmissionRequest{BatchID: cfg.JoinedRecordingBatchID, Timeout: joinedWorkerTaskLimit}
+	if len(args) == 0 {
+		return req, errors.New("expected admission status, pause, resume, or drain")
+	}
+	req.Action = args[0]
+	if req.Action != "status" && req.Action != "pause" && req.Action != "resume" && req.Action != "drain" {
+		return req, fmt.Errorf("unknown admission action %q", req.Action)
+	}
+	flags := newJoinedFlagSet("recording-joined admission " + req.Action)
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "immutable batch identifier")
+	timeoutSec := int(req.Timeout / time.Second)
+	if req.Action == "drain" {
+		flags.IntVar(&timeoutSec, "timeout-sec", timeoutSec, "maximum seconds to wait for zero active leases")
+	}
+	if err := parseJoinedFlags(flags, args[1:]); err != nil {
+		return req, err
+	}
+	if err := validateJoinedBatchID(req.BatchID); err != nil {
+		return req, err
+	}
+	if timeoutSec < 1 || timeoutSec > int(joinedWorkerTaskLimit/time.Second) {
+		return req, fmt.Errorf("--timeout-sec must be between 1 and %d", int(joinedWorkerTaskLimit/time.Second))
+	}
+	req.Timeout = time.Duration(timeoutSec) * time.Second
+	return req, nil
 }
 
 func parseJoinedImportHistoricalQualification(cfg config.Config, args []string) (joinedImportHistoricalQualificationRequest, error) {

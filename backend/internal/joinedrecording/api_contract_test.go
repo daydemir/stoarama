@@ -35,6 +35,67 @@ func TestJoinedLifecycleRequestWireContracts(t *testing.T) {
 	}
 }
 
+func TestBroadClaimRequiresACompleteCapacityPair(t *testing.T) {
+	base := WorkClaimRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", WorkerID: "worker-1"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("legacy bounded claim: %v", err)
+	}
+	base.ScratchAvailableBytes = 2 << 30
+	if err := base.Validate(); err == nil {
+		t.Fatal("claim accepted half of a capacity report")
+	}
+	base.TaskBudgetBytes = 1536 << 20
+	if err := base.Validate(); err != nil {
+		t.Fatalf("complete capacity report: %v", err)
+	}
+	want := int64(2*537405614 + 256<<20)
+	if got, err := RequiredScratchBudgetBytes(537405614); err != nil || got != want {
+		t.Fatalf("required scratch=%d want=%d err=%v", got, want, err)
+	}
+}
+
+func TestFailureAndLeaseStatusContractsRejectUnboundedInput(t *testing.T) {
+	failure := WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "hour", ScopeID: "hour-1", FailureClass: "resource", ReasonCode: "scratch_exhausted"}
+	if err := failure.Validate(); err != nil {
+		t.Fatalf("valid failure: %v", err)
+	}
+	for _, class := range []string{"", "fatal", "RESOURCE"} {
+		failure.FailureClass = class
+		if failure.Validate() == nil {
+			t.Fatalf("accepted failure class %q", class)
+		}
+	}
+	lease := LeaseStatusRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", LeaseIDs: []string{strings.Repeat("l", 43)}}
+	if err := lease.Validate(); err != nil {
+		t.Fatalf("valid lease proof: %v", err)
+	}
+	lease.LeaseIDs = append(lease.LeaseIDs, lease.LeaseIDs[0])
+	if lease.Validate() == nil {
+		t.Fatal("accepted duplicate lease proof request")
+	}
+}
+
+func TestClaimAdmissionContract(t *testing.T) {
+	req := ClaimAdmissionRequest{ProtocolVersion: JoinedProtocolVersion, BatchID: "tier1-generation-1", ClaimsPaused: true}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	}
+	bad := req
+	bad.BatchID = "BAD"
+	if err := bad.Validate(); err == nil {
+		t.Fatal("invalid request accepted")
+	}
+	status := ClaimAdmissionStatus{ProtocolVersion: JoinedProtocolVersion, BatchID: req.BatchID, ClaimsPaused: true,
+		ActiveHourLeases: 2, ActivePublicationLeases: 1, ActiveLeaseCount: 3, UpdatedAt: time.Now().UTC()}
+	if err := status.Validate(); err != nil {
+		t.Fatalf("valid status rejected: %v", err)
+	}
+	status.ActiveLeaseCount = 2
+	if err := status.Validate(); err == nil {
+		t.Fatal("inconsistent active lease total accepted")
+	}
+}
+
 func TestWorkScopeIdentityBindsExactCanaryAndFrozenBatch(t *testing.T) {
 	const batchID = "tier1-generation-1"
 	hours := []string{

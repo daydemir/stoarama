@@ -144,6 +144,7 @@ type Config struct {
 	JoinedRecordingProtocolVersion     int
 	JoinedRecordingConnectionID        int
 	JoinedRecordingProtocolGeneration  int
+	JoinedRecordingMaxActiveTasks      int
 	JoinedRecordingRollingEnabled      bool
 	JoinedRecordingWorkScope           string
 	JoinedRecordingBatchID             string
@@ -283,6 +284,7 @@ func Load() (Config, error) {
 		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
 		JoinedRecordingConnectionID:           intEnv("JOINED_RECORDING_CONNECTION_ID", 0),
 		JoinedRecordingProtocolGeneration:     intEnv("JOINED_RECORDING_PROTOCOL_GENERATION", 0),
+		JoinedRecordingMaxActiveTasks:         intEnv("JOINED_RECORDING_MAX_ACTIVE_TASKS", 0),
 		JoinedRecordingRollingEnabled:         boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
 		JoinedRecordingWorkScope:              strings.TrimSpace(strEnv("STOARAMA_JOINED_WORK_SCOPE", "disabled")),
 		JoinedRecordingBatchID:                strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
@@ -444,6 +446,9 @@ func (c Config) ValidateJoined() error {
 		}
 		if !validJoinedRecordingBatchID(c.JoinedRecordingBatchID) {
 			return fmt.Errorf("JOINED_RECORDING_BATCH_ID must be a lowercase letters/numbers/hyphens identifier")
+		}
+		if c.JoinedRecordingWorkScope == JoinedWorkScopeFrozenBatch && (c.JoinedRecordingMaxActiveTasks < 1 || c.JoinedRecordingMaxActiveTasks > 64) {
+			return fmt.Errorf("JOINED_RECORDING_MAX_ACTIVE_TASKS must be between 1 and 64 for frozen-batch work")
 		}
 	}
 	return nil

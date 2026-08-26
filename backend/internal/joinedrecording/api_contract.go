@@ -99,9 +99,70 @@ type WorkerBootstrapResponse struct {
 }
 
 type WorkClaimRequest struct {
+	ProtocolVersion       int    `json:"protocol_version"`
+	BatchID               string `json:"batch_id"`
+	WorkerID              string `json:"worker_id"`
+	ScratchAvailableBytes int64  `json:"scratch_available_bytes,omitempty"`
+	TaskBudgetBytes       int64  `json:"task_budget_bytes,omitempty"`
+}
+
+// ClaimAdmissionRequest changes only admission of future joined claims. It
+// does not revoke operation tokens or alter already-leased work.
+type ClaimAdmissionRequest struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	BatchID         string `json:"batch_id"`
-	WorkerID        string `json:"worker_id"`
+	ClaimsPaused    bool   `json:"claims_paused"`
+}
+
+type ClaimAdmissionStatus struct {
+	ProtocolVersion         int       `json:"protocol_version"`
+	BatchID                 string    `json:"batch_id"`
+	ClaimsPaused            bool      `json:"claims_paused"`
+	ActiveHourLeases        int64     `json:"active_hour_leases"`
+	ActivePublicationLeases int64     `json:"active_publication_leases"`
+	ActiveLeaseCount        int64     `json:"active_lease_count"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+const JoinedScratchFixedBytes int64 = 256 << 20
+
+func RequiredScratchBudgetBytes(sourceBytes int64) (int64, error) {
+	if sourceBytes < 0 || sourceBytes > (1<<62)-JoinedScratchFixedBytes/2 {
+		return 0, fmt.Errorf("invalid joined source byte count")
+	}
+	return sourceBytes*2 + JoinedScratchFixedBytes, nil
+}
+
+type WorkFailureRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	ScopeKind       string `json:"scope_kind"`
+	ScopeID         string `json:"scope_id"`
+	FailureClass    string `json:"failure_class"`
+	ReasonCode      string `json:"reason_code"`
+}
+
+type WorkFailureResponse struct {
+	ProtocolVersion int        `json:"protocol_version"`
+	State           string     `json:"state"`
+	AttemptCount    int        `json:"attempt_count"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at,omitempty"`
+}
+
+type LeaseStatusRequest struct {
+	ProtocolVersion int      `json:"protocol_version"`
+	BatchID         string   `json:"batch_id"`
+	LeaseIDs        []string `json:"lease_ids"`
+}
+
+type LeaseStatus struct {
+	LeaseID   string     `json:"lease_id"`
+	Active    bool       `json:"active"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+type LeaseStatusResponse struct {
+	ProtocolVersion int           `json:"protocol_version"`
+	Leases          []LeaseStatus `json:"leases"`
 }
 
 type HeartbeatRequest struct {
@@ -203,10 +264,63 @@ func (r WorkerBootstrapResponse) Validate(now time.Time) error {
 }
 
 func (r WorkClaimRequest) Validate() error {
-	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || !validWorkerID(r.WorkerID) {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || !validWorkerID(r.WorkerID) ||
+		r.ScratchAvailableBytes < 0 || r.TaskBudgetBytes < 0 ||
+		((r.ScratchAvailableBytes == 0) != (r.TaskBudgetBytes == 0)) {
 		return fmt.Errorf("invalid joined work claim request")
 	}
 	return nil
+}
+
+func (r ClaimAdmissionRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) {
+		return fmt.Errorf("invalid joined claim admission request")
+	}
+	return nil
+}
+
+func (s ClaimAdmissionStatus) Validate() error {
+	if s.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(s.BatchID) || s.UpdatedAt.IsZero() ||
+		s.ActiveHourLeases < 0 || s.ActivePublicationLeases < 0 ||
+		s.ActiveLeaseCount != s.ActiveHourLeases+s.ActivePublicationLeases {
+		return fmt.Errorf("invalid joined claim admission status")
+	}
+	return nil
+}
+
+func (r WorkFailureRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !validScope(r.ScopeKind, r.ScopeID) ||
+		(r.FailureClass != "transient" && r.FailureClass != "resource" && r.FailureClass != "deterministic") ||
+		!safeReasonCode(r.ReasonCode) {
+		return fmt.Errorf("invalid joined work failure request")
+	}
+	return nil
+}
+
+func (r LeaseStatusRequest) Validate() error {
+	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) || len(r.LeaseIDs) == 0 || len(r.LeaseIDs) > 256 {
+		return fmt.Errorf("invalid joined lease status request")
+	}
+	seen := make(map[string]bool, len(r.LeaseIDs))
+	for _, raw := range r.LeaseIDs {
+		if !validLeaseID(raw) || seen[raw] {
+			return fmt.Errorf("invalid joined lease status request")
+		}
+		seen[raw] = true
+	}
+	return nil
+}
+
+func safeReasonCode(value string) bool {
+	if value == "" || len(value) > 80 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, c := range value[1:] {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func (r HeartbeatRequest) Validate() error {

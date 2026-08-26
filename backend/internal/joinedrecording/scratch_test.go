@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestRequiredScratchBytesReservesSourcesOutputAndMargin(t *testing.T) {
@@ -70,6 +72,26 @@ func TestEnsureScratchHeadroomRejectsSymlinkRoot(t *testing.T) {
 	}
 	if err := EnsureScratchHeadroom(link, []SourceClip{{ClipID: 1, Object: ObjectIdentity{SizeBytes: 1}}}); err == nil {
 		t.Fatal("symlink scratch root was accepted")
+	}
+}
+
+func TestAvailableScratchBudgetLeavesFixedReserve(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(root, &stat); err != nil {
+		t.Fatal(err)
+	}
+	available := stat.Bavail * uint64(stat.Bsize)
+	got, err := AvailableScratchBudget(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := available - ScratchSafetyMarginBytes
+	if uint64(got) != want {
+		t.Fatalf("scratch budget=%d want %d", got, want)
 	}
 }
 

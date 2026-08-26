@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
@@ -67,6 +72,10 @@ type fakeJoinedOperator struct {
 	startupReq      joinedWorkerRequest
 	startupErr      error
 	workerRuns      int
+	runWorker       func(context.Context, joinedWorkerRequest) error
+	admissionStatus joinedrecording.ClaimAdmissionStatus
+	admissionReads  []joinedrecording.ClaimAdmissionStatus
+	admissionSets   []joinedrecording.ClaimAdmissionRequest
 }
 
 func (f *fakeJoinedOperator) ImportHistoricalQualification(_ context.Context,
@@ -132,9 +141,12 @@ func (f *fakeJoinedOperator) SealBatchIndex(_ context.Context, req joinedSealBat
 	return map[string]any{"sha256": req.ExpectedSHA256}, nil
 }
 
-func (f *fakeJoinedOperator) RunWorker(_ context.Context, req joinedWorkerRequest) error {
+func (f *fakeJoinedOperator) RunWorker(ctx context.Context, req joinedWorkerRequest) error {
 	f.workerReq = req
 	f.workerRuns++
+	if f.runWorker != nil {
+		return f.runWorker(ctx, req)
+	}
 	return nil
 }
 
@@ -146,6 +158,20 @@ func (f *fakeJoinedOperator) CheckWorkerStartup(_ context.Context, req joinedWor
 func (f *fakeJoinedOperator) Status(_ context.Context, req joinedStatusRequest) (any, error) {
 	f.statusReq = req
 	return map[string]any{"status": "running"}, nil
+}
+
+func (f *fakeJoinedOperator) ClaimAdmissionStatus(_ context.Context, _ string) (joinedrecording.ClaimAdmissionStatus, error) {
+	if len(f.admissionReads) > 0 {
+		status := f.admissionReads[0]
+		f.admissionReads = f.admissionReads[1:]
+		return status, nil
+	}
+	return f.admissionStatus, nil
+}
+
+func (f *fakeJoinedOperator) SetClaimAdmission(_ context.Context, req joinedrecording.ClaimAdmissionRequest) (joinedrecording.ClaimAdmissionStatus, error) {
+	f.admissionSets = append(f.admissionSets, req)
+	return f.admissionStatus, nil
 }
 
 func TestJoinedWorkerDisabledBeforeFactory(t *testing.T) {
@@ -178,6 +204,89 @@ func TestJoinedWorkerDisabledIdleIsCancellable(t *testing.T) {
 	}()
 	cancel()
 	<-done
+}
+
+func TestJoinedWorkerEnabledProcessHandlesSIGTERM(t *testing.T) {
+	if os.Getenv("STOARAMA_TEST_JOINED_SIGTERM_HELPER") == "1" {
+		readyPath := os.Getenv("STOARAMA_TEST_JOINED_SIGTERM_READY")
+		fake := &fakeJoinedOperator{runWorker: func(ctx context.Context, _ joinedWorkerRequest) error {
+			if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			fmt.Println("enabled-worker-admission-canceled")
+			return nil
+		}}
+		_, err := runRecordingJoinedCommand(context.Background(), validJoinedWorkerConfig(), []string{"worker", "run"},
+			func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil })
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
+
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestJoinedWorkerEnabledProcessHandlesSIGTERM$")
+	cmd.Env = append(os.Environ(), "STOARAMA_TEST_JOINED_SIGTERM_HELPER=1", "STOARAMA_TEST_JOINED_SIGTERM_READY="+readyPath)
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("enabled worker did not start: %s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil || !strings.Contains(output.String(), "enabled-worker-admission-canceled") {
+			t.Fatalf("SIGTERM result err=%v output=%q", err, output.String())
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("enabled worker ignored SIGTERM")
+	}
+}
+
+func TestJoinedAdmissionDrainPausesBeforeZeroLeaseGate(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	fake := &fakeJoinedOperator{admissionStatus: joinedrecording.ClaimAdmissionStatus{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: cfg.JoinedRecordingBatchID,
+		ClaimsPaused: true, ActiveLeaseCount: 0, UpdatedAt: time.Now(),
+	}}
+	result, err := runRecordingJoinedWith(context.Background(), cfg, []string{"admission", "drain", "--timeout-sec", "30"},
+		func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil })
+	status, ok := result.(joinedrecording.ClaimAdmissionStatus)
+	if err != nil || !ok || !status.ClaimsPaused || status.ActiveLeaseCount != 0 || len(fake.admissionSets) != 1 || !fake.admissionSets[0].ClaimsPaused {
+		t.Fatalf("admission drain result=%+v sets=%+v err=%v", result, fake.admissionSets, err)
+	}
+}
+
+func TestJoinedAdmissionParsingIsBounded(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	if req, err := parseJoinedAdmission(cfg, []string{"drain", "--timeout-sec", "60"}); err != nil || req.Action != "drain" || req.Timeout != time.Minute {
+		t.Fatalf("parse drain req=%+v err=%v", req, err)
+	}
+	for _, args := range [][]string{{"drain", "--timeout-sec", "0"}, {"drain", "--timeout-sec", "7201"}, {"unknown"}} {
+		if _, err := parseJoinedAdmission(cfg, args); err == nil {
+			t.Fatalf("unsafe admission args accepted: %v", args)
+		}
+	}
 }
 
 func TestJoinedWorkerParsesFixedWorkerEnvelope(t *testing.T) {

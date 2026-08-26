@@ -200,6 +200,7 @@ func usage() {
 	  stoaramactl recording-joined final-freeze --batch-id ID --expected-frozen-denominator-sha256 HASH [--apply]
 	  stoaramactl recording-joined seal-batch-index --batch-id ID --expected-sha256 HASH [--apply]
 	  stoaramactl recording-joined worker run [--batch-id ID --worker-id ID --scratch-root ABS]
+	  stoaramactl recording-joined admission (status|pause|resume|drain) [--batch-id ID] [--timeout-sec 7200]
 	  stoaramactl recording-joined status --batch-id ID
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]

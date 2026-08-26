@@ -71,6 +71,8 @@ type Server struct {
 	joinedConnectionStatusAt time.Time
 	joinedContainmentMu      sync.Mutex
 	joinedContainmentAt      time.Time
+	joinedAttemptReconcileMu sync.Mutex
+	joinedAttemptReconcileAt time.Time
 }
 
 const accountSessionCookie = "stoarama_session"
@@ -550,6 +552,7 @@ func (s *Server) router() http.Handler {
 			joinedWorker.Use(s.requireJoinedWorkerAuth)
 			joinedWorker.Post("/recording/joined/claim", s.handleJoinedClaim)
 			joinedWorker.Post("/recording/joined/publication/claim", s.handleJoinedPublicationClaim)
+			joinedWorker.Post("/recording/joined/failure", s.handleJoinedFailure)
 			joinedWorker.Post("/recording/joined/heartbeat", s.handleJoinedHeartbeat)
 			joinedWorker.Post("/recording/joined/capabilities/source", s.handleJoinedSourceCapability)
 			joinedWorker.Post("/recording/joined/capabilities/artifact", s.handleJoinedArtifactCapability)
@@ -563,10 +566,14 @@ func (s *Server) router() http.Handler {
 			joinedBootstrap.Post("/recording/joined/token", s.handleJoinedToken)
 			joinedBootstrap.Get("/recording/joined/status", s.handleJoinedStatus)
 			joinedBootstrap.Get("/recording/joined/connection-status", s.handleJoinedConnectionStatus)
+			joinedBootstrap.Post("/recording/joined/leases/status", s.handleJoinedLeaseStatus)
 		})
 		api.Group(func(joinedOperator chi.Router) {
 			joinedOperator.Use(s.requireJoinedOperatorAuth)
 			joinedOperator.Get("/recording/joined/containment", s.handleJoinedContainment)
+			joinedOperator.Post("/recording/joined/maintenance/reconcile-expired", s.handleJoinedReconcileExpiredAttempts)
+			joinedOperator.Get("/recording/joined/admission", s.handleJoinedAdmissionStatus)
+			joinedOperator.Put("/recording/joined/admission", s.handleJoinedAdmissionSet)
 		})
 
 		api.Group(func(service chi.Router) {
