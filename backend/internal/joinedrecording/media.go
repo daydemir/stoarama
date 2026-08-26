@@ -663,7 +663,7 @@ func discardIsolatedBuild(built BuiltOutput, scratchDir string) {
 	}
 	attemptDir := filepath.Dir(built.Path)
 	rel, err := filepath.Rel(scratchDir, attemptDir)
-	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) || !strings.HasPrefix(filepath.Base(attemptDir), "attempt-") {
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) || !strings.HasPrefix(filepath.Base(attemptDir), "attempt-") {
 		return
 	}
 	_ = os.RemoveAll(attemptDir)

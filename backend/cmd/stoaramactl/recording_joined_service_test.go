@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -826,6 +827,13 @@ func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 }
 
 func TestBoundedMediaDeadlineUsesWorkerTaskClassification(t *testing.T) {
+	ffprobe := strings.TrimSpace(os.Getenv("FFPROBE_BIN"))
+	if ffprobe == "" {
+		ffprobe = "ffprobe"
+	}
+	if _, err := exec.LookPath(ffprobe); err != nil {
+		t.Skip("ffprobe unavailable")
+	}
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "ffmpeg-blocked")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"), 0700); err != nil {

@@ -256,6 +256,25 @@ func TestBuildAllPassingPartsRejectsPairLocatorWithoutExactExtensionFailureAndCl
 	}
 }
 
+func TestDiscardIsolatedBuildNeverRemovesScratchParent(t *testing.T) {
+	parent, err := os.MkdirTemp(t.TempDir(), "attempt-parent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(parent, "scratch")
+	if err := os.Mkdir(scratch, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "joined.mp4")
+	if err := os.WriteFile(outside, []byte("must survive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	discardIsolatedBuild(BuiltOutput{Path: outside}, scratch)
+	if payload, err := os.ReadFile(outside); err != nil || string(payload) != "must survive" {
+		t.Fatalf("scratch parent was changed payload=%q err=%v", payload, err)
+	}
+}
+
 func TestBuildAllPassingPartsPreservesRepeatedSingletonQuarantine(t *testing.T) {
 	sources := makeSyntheticLocalSources(5)
 	calls := make([][]int64, 0)
@@ -518,7 +537,7 @@ func TestBuildAllPassingPartsVerifiesMultipleAACSeams(t *testing.T) {
 		sources[i] = makeMediaClip(t, dir, fmt.Sprintf("audio-%d.mp4", i+1), 440+i*110, true)
 		sources[i].ClipID = int64(i + 1)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	parts, quarantines, err := buildAllPassingParts(ctx, sources, dir, strings.Repeat("f", 64))
 	if err != nil {

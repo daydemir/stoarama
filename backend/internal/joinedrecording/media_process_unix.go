@@ -25,6 +25,7 @@ type boundedMediaProcess struct {
 	waitOnce  sync.Once
 	waitErr   error
 	reaped    atomic.Bool
+	lifecycle sync.Mutex
 
 	mu        sync.Mutex
 	cancelErr error
@@ -62,8 +63,10 @@ func (p *boundedMediaProcess) Wait() error {
 	}
 	p.waitOnce.Do(func() {
 		commandErr := p.cmd.Wait()
+		p.lifecycle.Lock()
 		p.reaped.Store(true)
 		close(p.exited)
+		p.lifecycle.Unlock()
 		<-p.watchDone
 
 		p.mu.Lock()
@@ -102,6 +105,8 @@ func (p *boundedMediaProcess) watchCancellation() {
 }
 
 func (p *boundedMediaProcess) signalOwnedProcessGroup(signal syscall.Signal) error {
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
 	if p.reaped.Load() {
 		return nil
 	}

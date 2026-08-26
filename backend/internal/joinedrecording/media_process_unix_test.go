@@ -35,6 +35,7 @@ func TestBoundedMediaProcessHelper(t *testing.T) {
 		}
 		grandchild := exec.Command(os.Args[0], "-test.run=^TestBoundedMediaProcessHelper$")
 		grandchild.Env = replaceMediaProcessTestEnv(os.Environ(), mediaProcessHelperMode, "stubborn-grandchild")
+		grandchild.Env = replaceMediaProcessTestEnv(grandchild.Env, mediaProcessReadyFile, "")
 		grandchild.Stdout, grandchild.Stderr = os.Stdout, os.Stderr
 		if err := grandchild.Start(); err != nil {
 			os.Exit(71)
