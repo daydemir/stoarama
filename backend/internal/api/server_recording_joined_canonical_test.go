@@ -732,6 +732,10 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("canonical materialization ledgers=%d source=%v gap=%v final=%v", len(ledgers), sourceLedger != nil,
 			gapAtomicLedger != nil, insertFinalChild != nil)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_joined_admission_controls
+		SET claims_paused=FALSE,updated_at=clock_timestamp() WHERE batch_record_id=$1`, batchRecordID); err != nil {
+		t.Fatalf("explicitly resume joined claims for canonical lifecycle fixture: %v", err)
+	}
 	var canaryGapHourID, canarySourceHourID string
 	if err := pool.QueryRow(ctx, `SELECT hour_id FROM recording_joined_hours
 		WHERE stream_day_id=$1 AND source_clip_count=0 ORDER BY delivery_hour LIMIT 1`, ledgers[0].streamDayID).
