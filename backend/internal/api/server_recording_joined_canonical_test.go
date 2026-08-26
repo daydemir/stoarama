@@ -1425,6 +1425,11 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if sourceClaimRec.Code != http.StatusOK || json.Unmarshal(sourceClaimRec.Body.Bytes(), &sourceClaim) != nil || len(sourceClaim.Sources) != 1 {
 		t.Fatalf("source claim status=%d body=%s expected=%+v", sourceClaimRec.Code, sourceClaimRec.Body.String(), sources)
 	}
+	var sourceClaimTokenBeforeFailure string
+	if err := pool.QueryRow(ctx, `SELECT claim_token::text FROM recording_joined_hours WHERE hour_id=$1`,
+		sourceClaim.HourID).Scan(&sourceClaimTokenBeforeFailure); err != nil {
+		t.Fatal(err)
+	}
 	failureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "hour",
 		ScopeID: sourceClaim.HourID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
 	failureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure", bytes.NewReader(failureBody))
@@ -1442,7 +1447,8 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		sourceClaim.HourID).Scan(&failedState, &failedClaimToken); err != nil {
 		t.Fatal(err)
 	}
-	if failedState != "leased" || failedClaimToken == "" || !failure.NextAttemptAt.After(sourceClaim.LeaseExpires) {
+	if failedState != "leased" || failedClaimToken != sourceClaimTokenBeforeFailure ||
+		!failure.NextAttemptAt.After(sourceClaim.LeaseExpires) {
 		t.Fatalf("retry can become eligible before lease expiry state=%s token_present=%t next=%s lease_expires=%s",
 			failedState, failedClaimToken != "", failure.NextAttemptAt, sourceClaim.LeaseExpires)
 	}
@@ -1959,6 +1965,11 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		indexClaim.Kind != "batch_index" || indexClaim.BatchIndex == nil || indexClaim.BatchIndex.ArtifactID != indexReceipt.ArtifactID {
 		t.Fatalf("batch-index claim status=%d body=%s", publicationRecorder.Code, publicationRecorder.Body.String())
 	}
+	var indexClaimTokenBeforeFailure string
+	if err := pool.QueryRow(ctx, `SELECT publication_token::text FROM recording_joined_artifacts WHERE id=$1`,
+		indexClaim.BatchIndex.ArtifactID).Scan(&indexClaimTokenBeforeFailure); err != nil {
+		t.Fatal(err)
+	}
 	indexFailureBody, _ := json.Marshal(joinedrecording.WorkFailureRequest{ProtocolVersion: 1, ScopeKind: "batch_index",
 		ScopeID: indexClaim.BatchIndex.ScopeID, FailureClass: "transient", ReasonCode: "worker_task_deadline"})
 	indexFailureReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/failure", bytes.NewReader(indexFailureBody))
@@ -1978,7 +1989,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		indexClaim.BatchIndex.ArtifactID).Scan(&failedIndexState, &failedIndexToken); err != nil {
 		t.Fatal(err)
 	}
-	if failedIndexState != "publishing" || failedIndexToken == "" {
+	if failedIndexState != "publishing" || failedIndexToken != indexClaimTokenBeforeFailure {
 		t.Fatalf("publication retry lost fence state=%s token_present=%t", failedIndexState, failedIndexToken != "")
 	}
 	s.joinedOutputStorage = joinedOutputStoreStub{heads: map[string]r2.ObjectHead{
