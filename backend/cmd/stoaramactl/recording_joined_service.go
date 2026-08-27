@@ -934,6 +934,15 @@ func (s *remoteJoinedOperatorService) reportJoinedTaskFailure(taskCtx context.Co
 }
 
 func joinedTaskFailureDiagnostic(err error) string {
+	var storageErr *joinedrecording.StorageCapabilityError
+	if errors.As(err, &storageErr) {
+		diagnostic := storageErr.Error()
+		var responseErr *joinedAPIResponseError
+		if errors.As(err, &responseErr) {
+			diagnostic += fmt.Sprintf(" api_status=%d", responseErr.status)
+		}
+		return diagnostic
+	}
 	var responseErr *joinedAPIResponseError
 	if errors.As(err, &responseErr) {
 		return responseErr.Error()
