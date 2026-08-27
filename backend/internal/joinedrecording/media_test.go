@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -649,6 +650,10 @@ func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t
 	seal := sealHourRequest(claim, plan, result.Built, quarantineEvidenceFromBuilds(result.Quarantines))
 	if err := seal.Validate(plan.RecordingID, plan.MediaTool.IdentitySHA256); err != nil {
 		t.Fatalf("preflight quarantine must satisfy the seal contract: %v", err)
+	}
+	seal.Quarantine[0].NormalizedFacts = json.RawMessage(`{"category":"tampered"}`)
+	if err := seal.Validate(plan.RecordingID, plan.MediaTool.IdentitySHA256); err == nil {
+		t.Fatal("tampered quarantine facts passed strict digest validation")
 	}
 }
 
