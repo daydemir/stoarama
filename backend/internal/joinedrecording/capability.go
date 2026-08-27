@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,76 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
+
+// StorageCapabilityError reports only the immutable artifact coordinate and
+// transport status needed to diagnose a failed publication. Cause remains
+// available to errors.Is/errors.As, but Error deliberately never renders it.
+type StorageCapabilityError struct {
+	Operation         string
+	Reason            string
+	StatusCode        int
+	ArtifactID        int64
+	Ordinal           int
+	RequestID         StorageRequestIDEvidence
+	ExtendedRequestID StorageRequestIDEvidence
+	RayID             StorageRequestIDEvidence
+	Cause             error
+}
+
+type StorageRequestIDEvidence struct {
+	SHA256 string
+	Length int
+}
+
+func (e *StorageCapabilityError) Error() string {
+	if e == nil {
+		return "storage capability failed"
+	}
+	operation := e.Operation
+	if operation != "put" && operation != "reread_capability" && operation != "reread" {
+		operation = "unknown"
+	}
+	status := e.StatusCode
+	if status < 0 || status > 599 {
+		status = 0
+	}
+	reason := e.Reason
+	if reason != "capability" && reason != "transport" && reason != "status" && reason != "identity" && reason != "hash" {
+		reason = "unknown"
+	}
+	message := fmt.Sprintf("storage capability operation=%s reason=%s status=%d artifact_id=%d ordinal=%d",
+		operation, reason, status, e.ArtifactID, e.Ordinal)
+	if e.RequestID.valid() {
+		message += fmt.Sprintf(" request_id_sha256=%s request_id_length=%d", e.RequestID.SHA256, e.RequestID.Length)
+	}
+	if e.ExtendedRequestID.valid() {
+		message += fmt.Sprintf(" extended_request_id_sha256=%s extended_request_id_length=%d",
+			e.ExtendedRequestID.SHA256, e.ExtendedRequestID.Length)
+	}
+	if e.RayID.valid() {
+		message += fmt.Sprintf(" ray_id_sha256=%s ray_id_length=%d", e.RayID.SHA256, e.RayID.Length)
+	}
+	return message
+}
+
+func (e *StorageCapabilityError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e StorageRequestIDEvidence) valid() bool {
+	return e.Length > 0 && lowerHex64(e.SHA256)
+}
+
+func storageRequestIDEvidence(raw string) StorageRequestIDEvidence {
+	if raw == "" {
+		return StorageRequestIDEvidence{}
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return StorageRequestIDEvidence{SHA256: hex.EncodeToString(sum[:]), Length: len(raw)}
+}
 
 const SourceEndpointV1Pattern = `^https://[0-9a-f]{32}\.r2\.cloudflarestorage\.com$`
 
@@ -207,37 +278,55 @@ func openExactCapability(ctx context.Context, client CapabilityHTTPClient, autho
 
 func putCreateOnlyCapability(ctx context.Context, client CapabilityHTTPClient, authority, bucket string, artifactID int64, key, contentType string, size int64, sha string, capability ObjectCreateCapability, body io.Reader) (putObservation, error) {
 	if client == nil || capability.Validate(artifactID, bucket, key, contentType, size, sha, authority, time.Now().UTC()) != nil {
-		return putObservation{}, fmt.Errorf("exact create capability is required")
+		return putObservation{}, &StorageCapabilityError{Operation: "put", Reason: "capability", ArtifactID: artifactID,
+			Cause: errors.New("exact create capability is required")}
 	}
 	response, err := capabilityRequest(ctx, client, capability.Request, capability.ExpiresAt, body, size)
 	if err != nil {
-		return putObservation{}, err
+		return putObservation{}, &StorageCapabilityError{Operation: "put", Reason: "transport", ArtifactID: artifactID, Cause: err}
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 	response.Body.Close()
 	created := response.StatusCode >= 200 && response.StatusCode < 300
 	if !created && response.StatusCode != http.StatusPreconditionFailed {
-		return putObservation{}, fmt.Errorf("create-only storage PUT failed with status %d", response.StatusCode)
+		return putObservation{}, &StorageCapabilityError{Operation: "put", Reason: "status", StatusCode: response.StatusCode,
+			ArtifactID: artifactID, RequestID: storageRequestIDEvidence(response.Header.Get("x-amz-request-id")),
+			ExtendedRequestID: storageRequestIDEvidence(response.Header.Get("x-amz-id-2")),
+			RayID:             storageRequestIDEvidence(response.Header.Get("cf-ray"))}
 	}
 	return putObservation{Created: created, ETag: responseETag(response.Header.Get("ETag")), VersionID: response.Header.Get("x-amz-version-id")}, nil
 }
 
 func reconcileExactCapability(ctx context.Context, client CapabilityHTTPClient, authority, bucket string, artifactID int64, key string, size int64, sha, etag, versionID string, capability ObjectReadCapability) (r2.ObjectHead, error) {
 	if client == nil || capability.Validate(artifactID, bucket, key, size, sha, etag, versionID, authority, time.Now().UTC()) != nil {
-		return r2.ObjectHead{}, fmt.Errorf("exact read capability is required")
+		return r2.ObjectHead{}, &StorageCapabilityError{Operation: "reread", Reason: "capability", ArtifactID: artifactID,
+			Cause: errors.New("exact read capability is required")}
 	}
 	response, err := capabilityRequest(ctx, client, capability.Request, capability.ExpiresAt, nil, 0)
 	if err != nil {
-		return r2.ObjectHead{}, err
+		return r2.ObjectHead{}, &StorageCapabilityError{Operation: "reread", Reason: "transport", ArtifactID: artifactID, Cause: err}
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || responseSize(response) != capability.SizeBytes || responseETag(response.Header.Get("ETag")) != capability.ETag || (capability.VersionID != "" && response.Header.Get("x-amz-version-id") != capability.VersionID) {
-		return r2.ObjectHead{}, fmt.Errorf("exact GET identity differs")
+	requestID := storageRequestIDEvidence(response.Header.Get("x-amz-request-id"))
+	extendedRequestID := storageRequestIDEvidence(response.Header.Get("x-amz-id-2"))
+	rayID := storageRequestIDEvidence(response.Header.Get("cf-ray"))
+	if response.StatusCode != http.StatusOK {
+		return r2.ObjectHead{}, &StorageCapabilityError{Operation: "reread", Reason: "status", StatusCode: response.StatusCode,
+			ArtifactID: artifactID, RequestID: requestID, ExtendedRequestID: extendedRequestID, RayID: rayID}
+	}
+	if responseSize(response) != capability.SizeBytes || responseETag(response.Header.Get("ETag")) != capability.ETag || (capability.VersionID != "" && response.Header.Get("x-amz-version-id") != capability.VersionID) {
+		return r2.ObjectHead{}, &StorageCapabilityError{Operation: "reread", Reason: "identity", StatusCode: response.StatusCode,
+			ArtifactID: artifactID, RequestID: requestID, ExtendedRequestID: extendedRequestID, RayID: rayID}
 	}
 	hash := sha256.New()
 	n, err := io.Copy(hash, io.LimitReader(response.Body, capability.SizeBytes+1))
-	if err != nil || n != capability.SizeBytes || subtle.ConstantTimeCompare(hash.Sum(nil), mustDecodeHex(capability.SHA256)) != 1 {
-		return r2.ObjectHead{}, fmt.Errorf("full reread hash differs")
+	if err != nil {
+		return r2.ObjectHead{}, &StorageCapabilityError{Operation: "reread", Reason: "transport", StatusCode: response.StatusCode,
+			ArtifactID: artifactID, RequestID: requestID, ExtendedRequestID: extendedRequestID, RayID: rayID, Cause: err}
+	}
+	if n != capability.SizeBytes || subtle.ConstantTimeCompare(hash.Sum(nil), mustDecodeHex(capability.SHA256)) != 1 {
+		return r2.ObjectHead{}, &StorageCapabilityError{Operation: "reread", Reason: "hash", StatusCode: response.StatusCode,
+			ArtifactID: artifactID, RequestID: requestID, ExtendedRequestID: extendedRequestID, RayID: rayID}
 	}
 	return r2.ObjectHead{ETag: capability.ETag, VersionID: capability.VersionID, SizeBytes: capability.SizeBytes}, nil
 }

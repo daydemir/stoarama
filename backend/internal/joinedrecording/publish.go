@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,15 +326,29 @@ func publishHourPart(ctx context.Context, client CapabilityHTTPClient, claim Wor
 	defer func() { _ = f.Close() }()
 	observation, putErr := putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, "video/mp4", size, sha, capability, f)
 	if putErr != nil {
+		var diagnostic *StorageCapabilityError
+		if errors.As(putErr, &diagnostic) {
+			withOrdinal := *diagnostic
+			withOrdinal.Ordinal = output.Ordinal
+			return PublishedOutput{}, &withOrdinal
+		}
 		return PublishedOutput{}, putErr
 	}
 	readCapability, err := resolveRead(ctx, claim, artifactID)
 	if err != nil {
-		return PublishedOutput{}, fmt.Errorf("resolve exact media reread capability")
+		return PublishedOutput{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "capability", ArtifactID: artifactID,
+			Ordinal: output.Ordinal, Cause: err}
 	}
 	head, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, size, sha, readCapability.ETag, readCapability.VersionID, readCapability)
 	if err != nil {
-		return PublishedOutput{}, err
+		var diagnostic *StorageCapabilityError
+		if errors.As(err, &diagnostic) {
+			withOrdinal := *diagnostic
+			withOrdinal.Ordinal = output.Ordinal
+			return PublishedOutput{}, &withOrdinal
+		}
+		return PublishedOutput{}, &StorageCapabilityError{Operation: "reread", ArtifactID: artifactID,
+			Ordinal: output.Ordinal, Cause: err}
 	}
 	return PublishedOutput{ArtifactID: artifactID, ObjectKey: output.ObjectKey, ETag: head.ETag, VersionID: head.VersionID, SizeBytes: size, SHA256: sha, Created: observation.Created}, nil
 }

@@ -116,6 +116,35 @@ func TestJoinedTaskFailureDiagnosticSelectsOnlyStructuredAPIErrors(t *testing.T)
 	}
 }
 
+func TestJoinedTaskFailureDiagnosticDistinguishesSafeUploadSteps(t *testing.T) {
+	put := &joinedrecording.StorageCapabilityError{Operation: "put", Reason: "status", StatusCode: http.StatusTooManyRequests,
+		ArtifactID: 646, Ordinal: 29,
+		RequestID:         joinedrecording.StorageRequestIDEvidence{SHA256: strings.Repeat("a", 64), Length: 10},
+		ExtendedRequestID: joinedrecording.StorageRequestIDEvidence{SHA256: strings.Repeat("b", 64), Length: 11},
+		RayID:             joinedrecording.StorageRequestIDEvidence{SHA256: strings.Repeat("c", 64), Length: 12},
+		Cause:             errors.New("url-query-header-checksum-token-secret")}
+	wantPut := "storage capability operation=put reason=status status=429 artifact_id=646 ordinal=29 request_id_sha256=" + strings.Repeat("a", 64) +
+		" request_id_length=10 extended_request_id_sha256=" + strings.Repeat("b", 64) +
+		" extended_request_id_length=11 ray_id_sha256=" + strings.Repeat("c", 64) + " ray_id_length=12"
+	if got := joinedTaskFailureDiagnostic(put); got != wantPut {
+		t.Fatalf("put diagnostic=%q want=%q", got, wantPut)
+	}
+	put.Operation = "put-token-secret"
+	put.Reason = "reason-token-secret"
+	put.StatusCode = 900
+	put.RequestID = joinedrecording.StorageRequestIDEvidence{SHA256: "request-header-secret", Length: 99}
+	if got := joinedTaskFailureDiagnostic(put); got != "storage capability operation=unknown reason=unknown status=0 artifact_id=646 ordinal=29 extended_request_id_sha256="+strings.Repeat("b", 64)+" extended_request_id_length=11 ray_id_sha256="+strings.Repeat("c", 64)+" ray_id_length=12" {
+		t.Fatalf("unsafe typed fields reached diagnostic: %q", got)
+	}
+	conflict := joinedAPIStatusError("/api/v1/recording/joined/capabilities/artifact", http.StatusConflict,
+		strings.NewReader(`{"error":"response-body-secret-sentinel"}`))
+	reread := &joinedrecording.StorageCapabilityError{Operation: "reread_capability", Reason: "capability", ArtifactID: 646, Ordinal: 29, Cause: conflict}
+	wantReread := "storage capability operation=reread_capability reason=capability status=0 artifact_id=646 ordinal=29 api_status=409"
+	if got := joinedTaskFailureDiagnostic(reread); got != wantReread || strings.Contains(got, "secret") {
+		t.Fatalf("reread diagnostic=%q want=%q", got, wantReread)
+	}
+}
+
 func TestJoinedClaimAdmissionOperatorContract(t *testing.T) {
 	const (
 		batch = "tier1-generation-1"
