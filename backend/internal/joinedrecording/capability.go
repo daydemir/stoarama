@@ -28,6 +28,7 @@ type StorageCapabilityError struct {
 	StatusCode        int
 	ArtifactID        int64
 	Ordinal           int
+	Attempts          int
 	RequestID         StorageRequestIDEvidence
 	ExtendedRequestID StorageRequestIDEvidence
 	RayID             StorageRequestIDEvidence
@@ -57,6 +58,9 @@ func (e *StorageCapabilityError) Error() string {
 	}
 	message := fmt.Sprintf("storage capability operation=%s reason=%s status=%d artifact_id=%d ordinal=%d",
 		operation, reason, status, e.ArtifactID, e.Ordinal)
+	if e.Attempts > 0 && e.Attempts <= len(putRetryDelays)+1 {
+		message += fmt.Sprintf(" attempts=%d", e.Attempts)
+	}
 	if e.RequestID.valid() {
 		message += fmt.Sprintf(" request_id_sha256=%s request_id_length=%d", e.RequestID.SHA256, e.RequestID.Length)
 	}

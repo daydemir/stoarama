@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -163,6 +164,10 @@ func (c WorkerClaim) ScratchDir(root string) (string, error) {
 // then its precomputed canonical hour manifest. The callback must atomically
 // finalize the exact unexpired publication token.
 func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, scratch SealedHourScratch, resolveCreate CreateCapabilityResolver, resolveRead ReadCapabilityResolver, finalize FinalizeHour) (PublishedHour, error) {
+	return publishClaimedHourWithDeadline(ctx, client, claim, scratch, resolveCreate, resolveRead, finalize, func() time.Time { return claim.LeaseExpires })
+}
+
+func publishClaimedHourWithDeadline(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, scratch SealedHourScratch, resolveCreate CreateCapabilityResolver, resolveRead ReadCapabilityResolver, finalize FinalizeHour, leaseExpires func() time.Time) (PublishedHour, error) {
 	built, quarantine, scratchDir := scratch.verified.Built, scratch.verified.Quarantine, scratch.verified.Directory
 	if client == nil || resolveCreate == nil || resolveRead == nil || finalize == nil {
 		return PublishedHour{}, fmt.Errorf("capability client and fenced finalizer are required")
@@ -202,24 +207,18 @@ func publishClaimedHour(ctx context.Context, client CapabilityHTTPClient, claim 
 	}
 	published := PublishedHour{HourID: claim.HourID, RecordingID: claim.Plan.RecordingID, LocalDate: claim.Plan.LocalDate, LocalHour: claim.Plan.LocalHour, Outputs: make([]PublishedOutput, 0, len(built)), HourManifestObjectKey: claim.Plan.CoverageObjectKey}
 	for i := range built {
-		create, resolveErr := resolveCreate(ctx, claim, claim.MediaArtifactIDs[i])
-		if resolveErr != nil {
-			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), resolveErr)
-			return PublishedHour{}, fmt.Errorf("resolve exact media create capability: %w", resolveErr)
-		}
-		output, publishErr := publishHourPart(ctx, client, claim, create, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i], built[i], identities[i].size, identities[i].sha, resolveRead)
+		output, publishErr := publishHourPart(ctx, client, claim, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i], built[i], identities[i].size, identities[i].sha, resolveCreate, resolveRead, leaseExpires)
 		if publishErr != nil {
 			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), publishErr)
 			return PublishedHour{}, publishErr
 		}
 		published.Outputs = append(published.Outputs, output)
 	}
-	manifestCreate, err := resolveCreate(ctx, claim, claim.HourManifestArtifactID)
-	if err != nil {
-		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
-		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest create capability: %w", err)
-	}
-	_, err = putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, "application/json", int64(len(manifestJSON)), manifestSHA, manifestCreate, bytes.NewReader(manifestJSON))
+	_, err = putCreateOnlyWithRetry(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, "application/json", int64(len(manifestJSON)), manifestSHA, leaseExpires, claim.LeaseID,
+		func(callCtx context.Context) (ObjectCreateCapability, error) {
+			return resolveCreate(callCtx, claim, claim.HourManifestArtifactID)
+		},
+		func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(manifestJSON)), nil }, defaultPutRetryPolicy())
 	if err != nil {
 		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
 		return PublishedHour{}, err
@@ -308,23 +307,18 @@ func publishClaimedHourRenewing(ctx context.Context, client CapabilityHTTPClient
 			return finalize(callCtx, currentClaim, output)
 		}
 		var err error
-		published, err = publishClaimedHour(workCtx, client, claim, scratch, create, read, finish)
+		published, err = publishClaimedHourWithDeadline(workCtx, client, claim, scratch, create, read, finish, func() time.Time { return current().ExpiresAt })
 		return err
 	})
 	return published, err
 }
 
-func publishHourPart(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, capability ObjectCreateCapability, artifactID int64, output OutputPlan, built BuiltOutput, size int64, sha string, resolveRead ReadCapabilityResolver) (PublishedOutput, error) {
-	f, err := os.Open(built.Path)
-	if err != nil {
-		return PublishedOutput{}, err
-	}
-	// The HTTP transport owns and closes request bodies passed to Do. Keep a
-	// defensive close for clients that do not, but do not treat a second close
-	// as a failed publication: net/http may already have closed this file after
-	// the PUT completed successfully.
-	defer func() { _ = f.Close() }()
-	observation, putErr := putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, "video/mp4", size, sha, capability, f)
+func publishHourPart(ctx context.Context, client CapabilityHTTPClient, claim WorkerClaim, artifactID int64, output OutputPlan, built BuiltOutput, size int64, sha string, resolveCreate CreateCapabilityResolver, resolveRead ReadCapabilityResolver, leaseExpires func() time.Time) (PublishedOutput, error) {
+	observation, putErr := putCreateOnlyWithRetry(ctx, client, claim.StorageAuthority, claim.StorageBucket, artifactID, output.ObjectKey, "video/mp4", size, sha, leaseExpires, claim.LeaseID,
+		func(callCtx context.Context) (ObjectCreateCapability, error) {
+			return resolveCreate(callCtx, claim, artifactID)
+		},
+		func() (io.ReadCloser, error) { return os.Open(built.Path) }, defaultPutRetryPolicy())
 	if putErr != nil {
 		var diagnostic *StorageCapabilityError
 		if errors.As(putErr, &diagnostic) {
