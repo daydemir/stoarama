@@ -97,6 +97,31 @@ func TestClaimAdmissionContract(t *testing.T) {
 	}
 }
 
+func TestClaimAdmissionOneShotContract(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	req := ClaimAdmissionRequest{ProtocolVersion: JoinedProtocolVersion, BatchID: "tier1-generation-1",
+		ClaimsPaused: true, ExpectedActiveClaimsSHA256: digest, MaxNewClaims: 1}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("valid one-shot request rejected: %v", err)
+	}
+	for _, mutate := range []func(*ClaimAdmissionRequest){
+		func(r *ClaimAdmissionRequest) { r.ClaimsPaused = false },
+		func(r *ClaimAdmissionRequest) { r.MaxNewClaims = 2 },
+		func(r *ClaimAdmissionRequest) { r.ExpectedActiveClaimsSHA256 = "" },
+	} {
+		bad := req
+		mutate(&bad)
+		if err := bad.Validate(); err == nil {
+			t.Fatalf("invalid one-shot request accepted: %+v", bad)
+		}
+	}
+	status := ClaimAdmissionStatus{ProtocolVersion: JoinedProtocolVersion, BatchID: req.BatchID, ClaimsPaused: true,
+		ActiveLeaseCount: 0, ActiveClaimsSHA256: digest, UpdatedAt: time.Now().UTC()}
+	if err := status.Validate(); err != nil {
+		t.Fatalf("valid digest status rejected: %v", err)
+	}
+}
+
 func TestWorkScopeIdentityBindsExactCanaryAndFrozenBatch(t *testing.T) {
 	const batchID = "tier1-generation-1"
 	hours := []string{

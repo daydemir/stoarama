@@ -132,9 +132,11 @@ type WorkClaimRequest struct {
 // ClaimAdmissionRequest changes only admission of future joined claims. It
 // does not revoke operation tokens or alter already-leased work.
 type ClaimAdmissionRequest struct {
-	ProtocolVersion int    `json:"protocol_version"`
-	BatchID         string `json:"batch_id"`
-	ClaimsPaused    bool   `json:"claims_paused"`
+	ProtocolVersion            int    `json:"protocol_version"`
+	BatchID                    string `json:"batch_id"`
+	ClaimsPaused               bool   `json:"claims_paused"`
+	ExpectedActiveClaimsSHA256 string `json:"expected_active_claims_sha256,omitempty"`
+	MaxNewClaims               int    `json:"max_new_claims,omitempty"`
 }
 
 type ClaimAdmissionStatus struct {
@@ -144,6 +146,8 @@ type ClaimAdmissionStatus struct {
 	ActiveHourLeases        int64     `json:"active_hour_leases"`
 	ActivePublicationLeases int64     `json:"active_publication_leases"`
 	ActiveLeaseCount        int64     `json:"active_lease_count"`
+	ActiveClaimsSHA256      string    `json:"active_claims_sha256,omitempty"`
+	OneShotClaimsRemaining  int       `json:"one_shot_claims_remaining,omitempty"`
 	UpdatedAt               time.Time `json:"updated_at"`
 }
 
@@ -299,13 +303,19 @@ func (r ClaimAdmissionRequest) Validate() error {
 	if r.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(r.BatchID) {
 		return fmt.Errorf("invalid joined claim admission request")
 	}
+	oneShot := r.ExpectedActiveClaimsSHA256 != "" || r.MaxNewClaims != 0
+	if oneShot && (!r.ClaimsPaused || r.MaxNewClaims != 1 || !lowerHex64(r.ExpectedActiveClaimsSHA256)) {
+		return fmt.Errorf("invalid joined one-shot claim admission request")
+	}
 	return nil
 }
 
 func (s ClaimAdmissionStatus) Validate() error {
 	if s.ProtocolVersion != JoinedProtocolVersion || !safeBatchID.MatchString(s.BatchID) || s.UpdatedAt.IsZero() ||
 		s.ActiveHourLeases < 0 || s.ActivePublicationLeases < 0 ||
-		s.ActiveLeaseCount != s.ActiveHourLeases+s.ActivePublicationLeases {
+		s.ActiveLeaseCount != s.ActiveHourLeases+s.ActivePublicationLeases ||
+		(s.ActiveClaimsSHA256 != "" && !lowerHex64(s.ActiveClaimsSHA256)) ||
+		s.OneShotClaimsRemaining < 0 || s.OneShotClaimsRemaining > 1 {
 		return fmt.Errorf("invalid joined claim admission status")
 	}
 	return nil

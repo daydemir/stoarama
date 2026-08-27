@@ -199,6 +199,7 @@ func TestJoinedExactFiftyScopeClaimsOnlyListedWork(t *testing.T) {
 	close(start)
 	wg.Wait()
 	close(results)
+	var activePublication joinedrecording.PublicationClaimResponse
 	for got := range results {
 		if got.code != http.StatusOK {
 			t.Fatalf("concurrent %s status=%d body=%s", got.kind, got.code, got.body)
@@ -214,11 +215,75 @@ func TestJoinedExactFiftyScopeClaimsOnlyListedWork(t *testing.T) {
 				!joinedLedgerTouchesAllowlist(claim.Ledger.Ledger, allowlist) {
 				t.Fatalf("publication escaped allowlist: %s", got.body)
 			}
+			activePublication = claim
 		}
 	}
 	joinedFiftyPreflightClaim(t, s, req.BatchID, claimToken, "third-worker", http.StatusNoContent)
 	if claim := joinedFiftyPublicationClaimStatus(t, s, req.BatchID, claimToken, http.StatusNoContent); claim.Kind != "" {
 		t.Fatalf("third publication claim=%+v", claim)
+	}
+
+	// Arm a permit against both active identities, then finish one of them.
+	// The next claim transaction must observe the changed identity set, consume
+	// no work, and atomically return admission to paused.
+	if _, err := pool.Exec(ctx, `UPDATE recording_joined_admission_controls SET claims_paused=TRUE,
+		one_shot_expected_active_claims_sha256=NULL,one_shot_claims_remaining=0,updated_at=clock_timestamp()
+		WHERE batch_record_id=$1`, batchRecordID); err != nil {
+		t.Fatal(err)
+	}
+	statusTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := s.joinedAdmissionStatus(ctx, statusTx, req.BatchID)
+	_ = statusTx.Rollback(ctx)
+	if err != nil || status.ActiveLeaseCount != 2 || status.ActiveClaimsSHA256 == "" {
+		t.Fatalf("active identity status=%+v err=%v", status, err)
+	}
+	oneShotBody, _ := json.Marshal(joinedrecording.ClaimAdmissionRequest{ProtocolVersion: 1, BatchID: req.BatchID,
+		ClaimsPaused: true, ExpectedActiveClaimsSHA256: status.ActiveClaimsSHA256, MaxNewClaims: 1})
+	oneShotReq := httptest.NewRequest(http.MethodPut, "/api/v1/recording/joined/admission", bytes.NewReader(oneShotBody))
+	oneShotRec := httptest.NewRecorder()
+	s.handleJoinedAdmissionSet(oneShotRec, oneShotReq)
+	if oneShotRec.Code != http.StatusOK {
+		t.Fatalf("arm one-shot status=%d body=%s", oneShotRec.Code, oneShotRec.Body.String())
+	}
+	var legacyPaused bool
+	if err := pool.QueryRow(ctx, `SELECT claims_paused FROM recording_joined_admission_controls
+		WHERE batch_record_id=$1`, batchRecordID).Scan(&legacyPaused); err != nil || !legacyPaused {
+		t.Fatalf("legacy admission bit did not remain paused: paused=%v err=%v", legacyPaused, err)
+	}
+	joinedFiftyFinalizeLedger(t, s, activePublication)
+	joinedFiftyPreflightClaim(t, s, req.BatchID, claimToken, "raced-worker", http.StatusNoContent)
+	statusTx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err = s.joinedAdmissionStatus(ctx, statusTx, req.BatchID)
+	_ = statusTx.Rollback(ctx)
+	if err != nil || !status.ClaimsPaused || status.OneShotClaimsRemaining != 0 || status.ActiveLeaseCount != 1 {
+		t.Fatalf("raced terminal fence status=%+v err=%v", status, err)
+	}
+
+	oneShotBody, _ = json.Marshal(joinedrecording.ClaimAdmissionRequest{ProtocolVersion: 1, BatchID: req.BatchID,
+		ClaimsPaused: true, ExpectedActiveClaimsSHA256: status.ActiveClaimsSHA256, MaxNewClaims: 1})
+	oneShotReq = httptest.NewRequest(http.MethodPut, "/api/v1/recording/joined/admission", bytes.NewReader(oneShotBody))
+	oneShotRec = httptest.NewRecorder()
+	s.handleJoinedAdmissionSet(oneShotRec, oneShotReq)
+	if oneShotRec.Code != http.StatusOK {
+		t.Fatalf("rearm one-shot status=%d body=%s", oneShotRec.Code, oneShotRec.Body.String())
+	}
+	if claim := joinedFiftyPublicationClaimStatus(t, s, req.BatchID, claimToken, http.StatusOK); claim.Kind == "" {
+		t.Fatal("one-shot publication claim was empty")
+	}
+	statusTx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err = s.joinedAdmissionStatus(ctx, statusTx, req.BatchID)
+	_ = statusTx.Rollback(ctx)
+	if err != nil || !status.ClaimsPaused || status.OneShotClaimsRemaining != 0 || status.ActiveLeaseCount != 2 {
+		t.Fatalf("one-shot consume status=%+v err=%v", status, err)
 	}
 	var excludedHourAttempt, excludedManifestAttempt int
 	if err := pool.QueryRow(ctx, `SELECT h.attempt_count,a.publication_attempt_count FROM recording_joined_hours h
