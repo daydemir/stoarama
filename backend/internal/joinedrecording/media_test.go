@@ -607,7 +607,8 @@ func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	result, err := PreflightHour(ctx, draft, []LocalSource{first, bad, third}, dir, strings.Repeat("f", 64))
+	mediaToolIdentity := testRequest(clips).MediaTool.IdentitySHA256
+	result, err := PreflightHour(ctx, draft, []LocalSource{first, bad, third}, dir, mediaToolIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,6 +623,32 @@ func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t
 	}
 	if len(result.Sources) != 2 || result.Sources[0].ClipID != 1 || result.Sources[1].ClipID != 3 || result.Sources[1].SeamToPrevious.Reason != "source_quarantined" || result.Sources[1].SeamToPrevious.SignedGapNanoseconds != int64(3*time.Second) {
 		t.Fatalf("surviving source accounting differs: %+v", result.Sources)
+	}
+	req := testRequest(result.Sources)
+	req.QuarantinedSources = result.Quarantined
+	req.BuiltArtifacts = make([]BuiltArtifactIdentity, len(result.Built))
+	for i, built := range result.Built {
+		req.BuiltArtifacts[i] = BuiltArtifactIdentity{SizeBytes: built.SizeBytes, SHA256: built.SHA256, MediaToolIdentity: req.MediaTool.IdentitySHA256}
+	}
+	ledgerSources, err := mergeAccountedSources(req.Sources, req.QuarantinedSources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledgerReq := req
+	ledgerReq.Sources, ledgerReq.QuarantinedSources = ledgerSources, nil
+	ledger, err := testLedger(ledgerReq, req.LocalDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AllocationLedgerSHA = ledger.LedgerSHA256
+	plan, err := BuildPlan(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := PreflightHourClaim{HourID: plan.HourID}
+	seal := sealHourRequest(claim, plan, result.Built, quarantineEvidenceFromBuilds(result.Quarantines))
+	if err := seal.Validate(plan.RecordingID, plan.MediaTool.IdentitySHA256); err != nil {
+		t.Fatalf("preflight quarantine must satisfy the seal contract: %v", err)
 	}
 }
 
