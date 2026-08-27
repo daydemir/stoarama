@@ -5,13 +5,230 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+type partFailureCapabilityClient struct {
+	*memoryCapabilityClient
+	failingKey string
+	status     int
+	puts       map[string]int
+}
+
+type partRereadFailureCapabilityClient struct {
+	*memoryCapabilityClient
+	failingKey string
+	mode       string
+	puts       map[string]int
+}
+
+func (*partRereadFailureCapabilityClient) joinedRedirectSafe() {}
+
+func (c *partRereadFailureCapabilityClient) Do(request *http.Request) (*http.Response, error) {
+	key := request.URL.Query().Get("key")
+	if request.Method == http.MethodPut {
+		c.puts[key]++
+	}
+	if request.Method != http.MethodGet || key != c.failingKey {
+		return c.memoryCapabilityClient.Do(request)
+	}
+	if c.mode == "transport" {
+		return nil, errors.New("transport-url-token-secret")
+	}
+	body := c.objects[key]
+	var response *http.Response
+	switch c.mode {
+	case "status":
+		response = capabilityResponse(http.StatusServiceUnavailable, []byte("response-body-secret"), "", "")
+	case "identity":
+		response = capabilityResponse(http.StatusOK, body, "wrong-etag", "version")
+	case "hash":
+		mutated := append([]byte(nil), body...)
+		mutated[0] ^= 0xff
+		response = capabilityResponse(http.StatusOK, mutated, objectETag(body), "version")
+	default:
+		return nil, errors.New("unknown reread test mode")
+	}
+	response.Header.Set("x-amz-request-id", "request-id-secret-token=abc")
+	response.Header.Set("x-amz-id-2", "extended-secret/bearer+value=")
+	response.Header.Set("cf-ray", "ray-secret?query=credential")
+	return response, nil
+}
+
+func (*partFailureCapabilityClient) joinedRedirectSafe() {}
+
+func (c *partFailureCapabilityClient) Do(request *http.Request) (*http.Response, error) {
+	key := request.URL.Query().Get("key")
+	if request.Method == http.MethodPut {
+		c.puts[key]++
+		if key == c.failingKey {
+			response := capabilityResponse(c.status, []byte("response-body-secret-sentinel"), "", "")
+			response.Header.Set("x-amz-request-id", "request-id-secret-token=abc")
+			response.Header.Set("x-amz-id-2", "extended-secret/bearer+value=")
+			response.Header.Set("cf-ray", "ray-secret?query=credential")
+			response.Header.Set("x-unsafe", "header-secret-sentinel")
+			return response, nil
+		}
+	}
+	return c.memoryCapabilityClient.Do(request)
+}
+
+func thirtyPartPublicationFixture(t *testing.T) (WorkerClaim, SealedHourScratch, []BuiltOutput, map[string][]byte) {
+	t.Helper()
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	sources := make([]SourceClip, 30)
+	artifacts := make([]BuiltArtifactIdentity, 30)
+	media := make(map[string][]byte, 30)
+	for i := range sources {
+		sources[i] = testSource(int64(i+1), start.Add(time.Duration(i)*2*time.Minute))
+		if i > 0 {
+			sources[i].SeamToPrevious = SeamEvidence{Verdict: "gap", Reason: "missing_capture_sequence", SignedGapNanoseconds: int64(time.Minute)}
+		}
+		body := []byte("verified-media-part-" + strconv.Itoa(i+1))
+		sum := sha256.Sum256(body)
+		artifacts[i] = BuiltArtifactIdentity{SizeBytes: int64(len(body)), SHA256: hex.EncodeToString(sum[:])}
+		media[artifacts[i].SHA256] = body
+	}
+	req := testRequest(sources)
+	ledger, err := testLedger(req, req.LocalDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AllocationLedgerSHA = ledger.LedgerSHA256
+	for i := range artifacts {
+		artifacts[i].MediaToolIdentity = req.MediaTool.IdentitySHA256
+	}
+	req.BuiltArtifacts = artifacts
+	plan, err := BuildPlan(req)
+	if err != nil || len(plan.Outputs) != 30 {
+		t.Fatalf("build 30-part plan outputs=%d err=%v", len(plan.Outputs), err)
+	}
+	built := make([]BuiltOutput, 30)
+	directory := filepath.Join(t.TempDir(), strings.Repeat("L", 43))
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := range built {
+		body := media[plan.Outputs[i].ExpectedSHA]
+		path := filepath.Join(directory, "part-"+strconv.Itoa(i+1)+".mp4")
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		built[i] = BuiltOutput{Path: path, SizeBytes: int64(len(body)), SHA256: plan.Outputs[i].ExpectedSHA,
+			SourceCount: 1, Verification: passingVerification()}
+	}
+	claim := sealedClaim(t, 7, plan, built, nil)
+	return claim, bindTestScratch(t, claim, built, nil, directory), built, media
+}
+
+func TestPublishClaimedHourReportsSafePart29PutFailure(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			claim, scratch, _, media := thirtyPartPublicationFixture(t)
+			objects := map[string][]byte{}
+			for i := 0; i < 28; i += 2 {
+				objects[claim.Plan.Outputs[i].ObjectKey] = append([]byte(nil), media[claim.Plan.Outputs[i].ExpectedSHA]...)
+			}
+			client := &partFailureCapabilityClient{memoryCapabilityClient: &memoryCapabilityClient{objects: objects},
+				failingKey: claim.Plan.Outputs[28].ObjectKey, status: status, puts: map[string]int{}}
+			finalized := false
+			_, err := publishClaimedHour(context.Background(), client, claim, scratch, testCreateResolver(), testReadResolver(client.memoryCapabilityClient), func(context.Context, WorkerClaim, PublishedHour) error {
+				finalized = true
+				return nil
+			})
+			var diagnostic *StorageCapabilityError
+			if !errors.As(err, &diagnostic) || diagnostic.Operation != "put" || diagnostic.Reason != "status" || diagnostic.StatusCode != status ||
+				diagnostic.ArtifactID != claim.MediaArtifactIDs[28] || diagnostic.Ordinal != 29 ||
+				diagnostic.RequestID != (StorageRequestIDEvidence{SHA256: "f416bbd10bf2fc79f29cd10cde04b6ad722a9ad2543a3b302786783de84318ef", Length: 27}) ||
+				diagnostic.ExtendedRequestID != (StorageRequestIDEvidence{SHA256: "223fd63859a8806048c89f92fe526f63b7780c6c710ae52dfece3eafc4c7dc78", Length: 29}) ||
+				diagnostic.RayID != (StorageRequestIDEvidence{SHA256: "27e586c18e5fcae586df216614036f5962499068f6205891c9073c0da5457121", Length: 27}) {
+				t.Fatalf("part29 diagnostic=%+v err=%v", diagnostic, err)
+			}
+			if finalized || client.puts[claim.Plan.Outputs[29].ObjectKey] != 0 {
+				t.Fatalf("publication advanced after part29 finalized=%v part30_puts=%d", finalized, client.puts[claim.Plan.Outputs[29].ObjectKey])
+			}
+			for _, forbidden := range []string{"response-body-secret-sentinel", "header-secret-sentinel", "request-id-secret", "extended-secret", "ray-secret", claim.OperationToken, claim.Plan.Outputs[28].ExpectedSHA, "https://"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("unsafe diagnostic %q contains %q", err, forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestPublishClaimedHourPreservesPart29ReadCapabilityConflict(t *testing.T) {
+	claim, scratch, _, _ := thirtyPartPublicationFixture(t)
+	client := &memoryCapabilityClient{objects: map[string][]byte{}}
+	conflict := errors.New("read-capability-conflict-sentinel")
+	finalized := false
+	_, err := publishClaimedHour(context.Background(), client, claim, scratch, testCreateResolver(), func(ctx context.Context, got WorkerClaim, artifactID int64) (ObjectReadCapability, error) {
+		if artifactID == claim.MediaArtifactIDs[28] {
+			return ObjectReadCapability{}, conflict
+		}
+		return testReadResolver(client)(ctx, got, artifactID)
+	}, func(context.Context, WorkerClaim, PublishedHour) error {
+		finalized = true
+		return nil
+	})
+	var diagnostic *StorageCapabilityError
+	if !errors.Is(err, conflict) || !errors.As(err, &diagnostic) || diagnostic.Operation != "reread_capability" || diagnostic.Reason != "capability" ||
+		diagnostic.ArtifactID != claim.MediaArtifactIDs[28] || diagnostic.Ordinal != 29 || finalized {
+		t.Fatalf("read conflict diagnostic=%+v finalized=%v err=%v", diagnostic, finalized, err)
+	}
+}
+
+func TestPublishClaimedHourReportsSafePart29RereadFailures(t *testing.T) {
+	for _, tc := range []struct {
+		mode   string
+		status int
+	}{
+		{mode: "transport"},
+		{mode: "status", status: http.StatusServiceUnavailable},
+		{mode: "identity", status: http.StatusOK},
+		{mode: "hash", status: http.StatusOK},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			claim, scratch, _, _ := thirtyPartPublicationFixture(t)
+			memory := &memoryCapabilityClient{objects: map[string][]byte{}}
+			client := &partRereadFailureCapabilityClient{memoryCapabilityClient: memory,
+				failingKey: claim.Plan.Outputs[28].ObjectKey, mode: tc.mode, puts: map[string]int{}}
+			finalized := false
+			_, err := publishClaimedHour(context.Background(), client, claim, scratch, testCreateResolver(), testReadResolver(memory), func(context.Context, WorkerClaim, PublishedHour) error {
+				finalized = true
+				return nil
+			})
+			var diagnostic *StorageCapabilityError
+			if !errors.As(err, &diagnostic) || diagnostic.Operation != "reread" || diagnostic.Reason != tc.mode ||
+				diagnostic.StatusCode != tc.status || diagnostic.ArtifactID != claim.MediaArtifactIDs[28] || diagnostic.Ordinal != 29 {
+				t.Fatalf("part29 %s diagnostic=%+v err=%v", tc.mode, diagnostic, err)
+			}
+			if _, created := memory.objects[claim.Plan.Outputs[28].ObjectKey]; !created || finalized ||
+				client.puts[claim.Plan.Outputs[29].ObjectKey] != 0 {
+				t.Fatalf("reread %s advanced incorrectly created29=%v finalized=%v part30_puts=%d",
+					tc.mode, created, finalized, client.puts[claim.Plan.Outputs[29].ObjectKey])
+			}
+			for _, forbidden := range []string{"transport-url-token-secret", "response-body-secret", "request-id-secret", "extended-secret", "ray-secret", claim.OperationToken, claim.Plan.Outputs[28].ExpectedSHA, "https://"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("unsafe reread diagnostic %q contains %q", err, forbidden)
+				}
+			}
+			if tc.mode == "transport" {
+				if diagnostic.RequestID != (StorageRequestIDEvidence{}) || diagnostic.ExtendedRequestID != (StorageRequestIDEvidence{}) || diagnostic.RayID != (StorageRequestIDEvidence{}) {
+					t.Fatalf("transport failure invented request IDs: %+v", diagnostic)
+				}
+			} else if diagnostic.RequestID.SHA256 != "f416bbd10bf2fc79f29cd10cde04b6ad722a9ad2543a3b302786783de84318ef" || diagnostic.RequestID.Length != 27 {
+				t.Fatalf("request ID evidence differs: %+v", diagnostic.RequestID)
+			}
+		})
+	}
+}
 
 func oneOutputPlan(t *testing.T, artifact ...BuiltArtifactIdentity) BatchPlan {
 	t.Helper()
