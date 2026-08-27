@@ -48,6 +48,9 @@ func (*joinedAPITransportError) Error() string   { return "joined API transport 
 func (e *joinedAPITransportError) Unwrap() error { return e.cause }
 
 func (e *joinedAPIResponseError) Error() string {
+	if strings.TrimSpace(e.message) == "" {
+		return fmt.Sprintf("joined API %s returned status %d", e.path, e.status)
+	}
 	return fmt.Sprintf("joined API %s returned status %d error=%q", e.path, e.status, e.message)
 }
 
@@ -1171,6 +1174,10 @@ func joinedCreateCapabilityError(err error, artifactID int64) error {
 		diagnostic.Reason, diagnostic.StatusCode = "status", responseErr.status
 	} else if errors.As(err, &transportErr) {
 		diagnostic.Reason = "transport"
+	} else if !errors.Is(err, context.Canceled) {
+		// A capability failure without an HTTP status is ambiguous transport.
+		// The bounded retry loop resolves a fresh capability before retrying.
+		diagnostic.Reason = "transport"
 	}
 	return diagnostic
 }
@@ -1191,6 +1198,8 @@ func joinedReadCapabilityError(err error, artifactID int64) error {
 	if errors.As(err, &responseErr) {
 		diagnostic.Reason, diagnostic.StatusCode = "status", responseErr.status
 	} else if errors.As(err, &transportErr) {
+		diagnostic.Reason = "transport"
+	} else if !errors.Is(err, context.Canceled) {
 		diagnostic.Reason = "transport"
 	}
 	return diagnostic
@@ -1471,7 +1480,7 @@ func marshalJoinedAPIRequest(payload any) ([]byte, error) {
 func joinedAPIStatusError(path string, status int, body io.Reader) error {
 	raw, err := io.ReadAll(io.LimitReader(body, joinedAPIErrorLimit+1))
 	if err != nil || len(raw) > joinedAPIErrorLimit {
-		return fmt.Errorf("joined API %s returned status %d", path, status)
+		return &joinedAPIResponseError{path: path, status: status}
 	}
 	var payload struct {
 		Error string `json:"error"`
@@ -1479,7 +1488,7 @@ func joinedAPIStatusError(path string, status int, body io.Reader) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&payload) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(payload.Error) == "" {
-		return fmt.Errorf("joined API %s returned status %d", path, status)
+		return &joinedAPIResponseError{path: path, status: status}
 	}
 	return &joinedAPIResponseError{path: path, status: status, message: payload.Error}
 }

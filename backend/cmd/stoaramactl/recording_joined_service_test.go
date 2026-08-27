@@ -97,10 +97,14 @@ func TestJoinedAPIClientIncludesBoundedStructuredServerError(t *testing.T) {
 }
 
 func TestJoinedAPIClientOmitsMalformedOrOversizedServerError(t *testing.T) {
-	for _, body := range []string{`not-json`, `{"error":"` + strings.Repeat("x", joinedAPIErrorLimit) + `"}`} {
-		err := joinedAPIStatusError("/seal", http.StatusConflict, strings.NewReader(body))
-		if err == nil || err.Error() != "joined API /seal returned status 409" {
-			t.Fatalf("untrusted response was included: %v", err)
+	for _, status := range []int{http.StatusBadRequest, http.StatusBadGateway} {
+		for _, body := range []string{"", `not-json`, `{"error":"` + strings.Repeat("x", joinedAPIErrorLimit) + `"}`} {
+			err := joinedAPIStatusError("/seal", status, strings.NewReader(body))
+			var responseErr *joinedAPIResponseError
+			want := fmt.Sprintf("joined API /seal returned status %d", status)
+			if err == nil || err.Error() != want || !errors.As(err, &responseErr) || responseErr.status != status {
+				t.Fatalf("untrusted response was included: %v", err)
+			}
 		}
 	}
 }
@@ -1071,8 +1075,11 @@ func TestJoinedCreateCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) 
 		err          error
 	}{
 		{"transport", "transport", 0, &joinedAPITransportError{cause: errors.New("signed URL must not escape")}},
+		{"context timeout", "transport", 0, context.DeadlineExceeded},
+		{"caller cancellation", "capability", 0, context.Canceled},
 		{"retryable status", "status", http.StatusServiceUnavailable, &joinedAPIResponseError{path: "/secret", status: http.StatusServiceUnavailable, message: "raw body"}},
-		{"deterministic", "capability", 0, errors.New("raw capability error")},
+		{"deterministic status", "status", http.StatusBadRequest, &joinedAPIResponseError{path: "/secret", status: http.StatusBadRequest, message: "raw body"}},
+		{"unknown without status", "transport", 0, errors.New("raw capability error")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1090,11 +1097,24 @@ func TestJoinedCreateCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) 
 }
 
 func TestJoinedReadCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) {
-	var diagnostic *joinedrecording.StorageCapabilityError
-	err := joinedReadCapabilityError(&joinedAPITransportError{cause: errors.New("https://signed.example/?token=secret")}, 646)
-	if !errors.As(err, &diagnostic) || diagnostic.Operation != "reread_capability" || diagnostic.Reason != "transport" ||
-		diagnostic.ArtifactID != 646 || strings.Contains(diagnostic.Error(), "signed.example") || strings.Contains(diagnostic.Error(), "secret") {
-		t.Fatalf("unsafe read capability diagnostic: %+v rendered=%q", diagnostic, diagnostic.Error())
+	for _, tc := range []struct {
+		name, reason string
+		err          error
+	}{
+		{"wrapped transport", "transport", &joinedAPITransportError{cause: errors.New("https://signed.example/?token=secret")}},
+		{"context timeout", "transport", context.DeadlineExceeded},
+		{"unknown without status", "transport", errors.New("secret raw read error")},
+		{"caller cancellation", "capability", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var diagnostic *joinedrecording.StorageCapabilityError
+			err := joinedReadCapabilityError(tc.err, 646)
+			if !errors.As(err, &diagnostic) || diagnostic.Operation != "reread_capability" || diagnostic.Reason != tc.reason ||
+				diagnostic.ArtifactID != 646 || strings.Contains(diagnostic.Error(), "signed.example") ||
+				strings.Contains(diagnostic.Error(), "secret") {
+				t.Fatalf("unsafe read capability diagnostic: %+v rendered=%q", diagnostic, diagnostic.Error())
+			}
+		})
 	}
 }
 
