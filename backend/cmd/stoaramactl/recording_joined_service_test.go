@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,42 @@ import (
 func TestJoinedAPIClientRejectsMalformedBaseURL(t *testing.T) {
 	if _, err := newJoinedAPIClient("https://%", "", nil); err == nil {
 		t.Fatal("malformed APP_BASE_URL was accepted")
+	}
+}
+
+func TestJoinedAPIRequestPreservesCanonicalRawEvidence(t *testing.T) {
+	for name, facts := range map[string]json.RawMessage{
+		"html placeholders":    json.RawMessage(`{"category":"invalid_media_data","normalized_fact":"<address>&<scratch-file>"}`),
+		"producer field order": json.RawMessage(`{"status":"failed","packet_payload_order_status":"passed","decoded_frame_totals_status":"failed","source_fingerprint":{"duration_seconds":1},"output_fingerprint":{"duration_seconds":2}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload := struct {
+				Facts json.RawMessage `json:"facts"`
+			}{Facts: facts}
+			ordinary, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := marshalJoinedAPIRequest(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.HasSuffix(body, []byte("\n")) {
+				t.Fatal("joined request retained encoder newline")
+			}
+			if name == "html placeholders" && (!bytes.Contains(ordinary, []byte(`\u003caddress\u003e`)) || !bytes.Contains(body, []byte(`<address>&<scratch-file>`))) {
+				t.Fatalf("fixture did not isolate HTML escaping: ordinary=%s joined=%s", ordinary, body)
+			}
+			var received struct {
+				Facts json.RawMessage `json:"facts"`
+			}
+			if err := json.Unmarshal(body, &received); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(received.Facts, facts) {
+				t.Fatalf("canonical evidence changed across joined request: got=%s want=%s", received.Facts, facts)
+			}
+		})
 	}
 }
 

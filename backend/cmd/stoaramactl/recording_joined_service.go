@@ -1326,7 +1326,7 @@ func (c *joinedAPIClient) postJSON(ctx context.Context, path, token string, requ
 }
 
 func (c *joinedAPIClient) putJSON(ctx context.Context, path, token string, payload, response any) error {
-	body, err := json.Marshal(payload)
+	body, err := marshalJoinedAPIRequest(payload)
 	if err != nil {
 		return fmt.Errorf("encode joined API request")
 	}
@@ -1364,7 +1364,7 @@ func (c *joinedAPIClient) postNoContent(ctx context.Context, path, token string,
 }
 
 func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token string, payload, response any) (bool, error) {
-	body, err := json.Marshal(payload)
+	body, err := marshalJoinedAPIRequest(payload)
 	if err != nil {
 		return false, fmt.Errorf("encode joined API request")
 	}
@@ -1397,6 +1397,16 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		return false, fmt.Errorf("decode joined API %s response: %w", path, err)
 	}
 	return true, nil
+}
+
+func marshalJoinedAPIRequest(payload any) ([]byte, error) {
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(payload); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(body.Bytes(), []byte("\n")), nil
 }
 
 func joinedAPIStatusError(path string, status int, body io.Reader) error {
