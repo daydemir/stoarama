@@ -27,7 +27,10 @@ const (
 	joinedWorkerIdlePoll   = 2 * time.Second
 	joinedWorkerTaskLimit  = 2 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
-	joinedAPIErrorLimit    = 4 << 10
+	// Sealed-hour claims repeat canonical source, plan, manifest, and proof data.
+	// Thirty-part hours can legitimately exceed the ordinary API response cap.
+	joinedLargeHourAPIResponseLimit = 2 << 20
+	joinedAPIErrorLimit             = 4 << 10
 )
 
 type joinedAPIClient struct {
@@ -1461,7 +1464,7 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, joinedAPIResponseLimit))
 		return true, nil
 	}
-	if err := decodeJoinedAPIResponse(httpResponse.Body, response); err != nil {
+	if err := decodeJoinedAPIResponseWithLimit(httpResponse.Body, response, joinedAPIResponseLimitForPath(path)); err != nil {
 		return false, fmt.Errorf("decode joined API %s response: %w", path, err)
 	}
 	return true, nil
@@ -1516,8 +1519,21 @@ func (c *joinedAPIClient) getJSON(ctx context.Context, path, token string, respo
 }
 
 func decodeJoinedAPIResponse(body io.Reader, response any) error {
-	raw, err := io.ReadAll(io.LimitReader(body, joinedAPIResponseLimit+1))
-	if err != nil || len(raw) > joinedAPIResponseLimit {
+	return decodeJoinedAPIResponseWithLimit(body, response, joinedAPIResponseLimit)
+}
+
+func joinedAPIResponseLimitForPath(path string) int64 {
+	switch path {
+	case "/api/v1/recording/joined/hour/seal", "/api/v1/recording/joined/publication/claim":
+		return joinedLargeHourAPIResponseLimit
+	default:
+		return joinedAPIResponseLimit
+	}
+}
+
+func decodeJoinedAPIResponseWithLimit(body io.Reader, response any, limit int64) error {
+	raw, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil || int64(len(raw)) > limit {
 		return fmt.Errorf("joined API response exceeds limit")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
