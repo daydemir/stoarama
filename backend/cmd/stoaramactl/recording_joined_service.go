@@ -36,6 +36,16 @@ type joinedAPIClient struct {
 	httpClient     *http.Client
 }
 
+type joinedAPIResponseError struct {
+	path    string
+	status  int
+	message string
+}
+
+func (e *joinedAPIResponseError) Error() string {
+	return fmt.Sprintf("joined API %s returned status %d error=%q", e.path, e.status, e.message)
+}
+
 type remoteJoinedOperatorService struct {
 	cfg              config.Config
 	api              *joinedAPIClient
@@ -915,8 +925,20 @@ func (s *remoteJoinedOperatorService) reportJoinedTaskFailure(taskCtx context.Co
 	if reportErr != nil {
 		return errors.Join(taskErr, fmt.Errorf("report joined task failure: %w", reportErr))
 	}
-	log.Printf("joined worker task failure recorded scope_kind=%s scope_id=%s class=%s reason=%s", kind, id, class, reason)
+	if diagnostic := joinedTaskFailureDiagnostic(taskErr); diagnostic != "" {
+		log.Printf("joined worker task failure recorded scope_kind=%s scope_id=%s class=%s reason=%s diagnostic=%q", kind, id, class, reason, diagnostic)
+	} else {
+		log.Printf("joined worker task failure recorded scope_kind=%s scope_id=%s class=%s reason=%s", kind, id, class, reason)
+	}
 	return nil
+}
+
+func joinedTaskFailureDiagnostic(err error) string {
+	var responseErr *joinedAPIResponseError
+	if errors.As(err, &responseErr) {
+		return responseErr.Error()
+	}
+	return ""
 }
 
 func joinedHourWithinScope(cfg config.Config, hourID string) bool {
@@ -1390,7 +1412,7 @@ func joinedAPIStatusError(path string, status int, body io.Reader) error {
 	if decoder.Decode(&payload) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(payload.Error) == "" {
 		return fmt.Errorf("joined API %s returned status %d", path, status)
 	}
-	return fmt.Errorf("joined API %s returned status %d error=%q", path, status, payload.Error)
+	return &joinedAPIResponseError{path: path, status: status, message: payload.Error}
 }
 
 func (c *joinedAPIClient) getJSON(ctx context.Context, path, token string, response any) error {
