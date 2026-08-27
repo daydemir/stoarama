@@ -50,9 +50,8 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusConflict, "joined preflight lease is stale or foreign")
 		return
 	}
-	if err := req.Validate(claim.RecordingID, claim.MediaTool.IdentitySHA256); err != nil ||
-		req.SourceClaimSHA256 != claim.SourceClaimSHA256 || !sameFrozenJoinedSources(claim.Sources, req.AccountedSources) {
-		util.WriteError(w, http.StatusConflict, "joined hour seal source identity differs")
+	if err := validateJoinedSealSourceIdentity(claim, req); err != nil {
+		util.WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
 	plan, built, err := buildJoinedSealedPlan(claim, req)
@@ -137,6 +136,19 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, response)
+}
+
+func validateJoinedSealSourceIdentity(claim joinedrecording.PreflightHourClaim, req joinedrecording.SealHourRequest) error {
+	if err := req.Validate(claim.RecordingID, claim.MediaTool.IdentitySHA256); err != nil {
+		return fmt.Errorf("validate joined hour seal request: %w", err)
+	}
+	if req.SourceClaimSHA256 != claim.SourceClaimSHA256 {
+		return errors.New("joined hour seal source claim differs")
+	}
+	if !sameFrozenJoinedSources(claim.Sources, req.AccountedSources) {
+		return errors.New("joined hour seal frozen sources differ")
+	}
+	return nil
 }
 
 func joinedOutputAuthority(raw string) (string, error) {
