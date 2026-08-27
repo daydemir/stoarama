@@ -1130,6 +1130,32 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		Scan(&sealedGapHourID); err != nil || sealedGapHourID != canaryGapHourID {
 		t.Fatalf("server sealed gap hour=%q want=%q err=%v", sealedGapHourID, canaryGapHourID, err)
 	}
+	canaryScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canaryScopeSHA, err := canaryScope.SHA256(batchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenScope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenScopeSHA, err := frozenScope.SHA256(batchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matchingAuthorizations, frozenAuthorizations int
+	if err := pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE ga.work_scope_identity_sha256=$2 AND ga.authorization_source='server_seal'),
+		count(*) FILTER (WHERE ga.work_scope_identity_sha256=$3)
+		FROM recording_joined_gap_only_scope_authorizations ga
+		JOIN recording_joined_artifacts a ON a.id=ga.artifact_id
+		WHERE a.stream_day_id=$1`, ledgers[0].streamDayID, canaryScopeSHA, frozenScopeSHA).Scan(
+		&matchingAuthorizations, &frozenAuthorizations); err != nil || matchingAuthorizations != 1 || frozenAuthorizations != 0 {
+		t.Fatalf("gap scope authorizations matching=%d frozen=%d err=%v", matchingAuthorizations, frozenAuthorizations, err)
+	}
 	var pendingForeignGaps int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_hours
 		WHERE stream_day_id=$1 AND state='pending' AND source_clip_count=0 AND hour_id<>$2`, ledgers[0].streamDayID, canaryGapHourID).

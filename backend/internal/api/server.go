@@ -577,6 +577,7 @@ func (s *Server) router() http.Handler {
 			joinedOperator.Post("/recording/joined/maintenance/reconcile-expired", s.handleJoinedReconcileExpiredAttempts)
 			joinedOperator.Get("/recording/joined/admission", s.handleJoinedAdmissionStatus)
 			joinedOperator.Put("/recording/joined/admission", s.handleJoinedAdmissionSet)
+			joinedOperator.Put("/recording/joined/gap-only/frozen-authorization", s.handleJoinedGapOnlyFrozenAuthorization)
 		})
 
 		api.Group(func(service chi.Router) {

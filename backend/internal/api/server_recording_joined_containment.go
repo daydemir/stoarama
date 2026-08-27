@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -78,6 +79,9 @@ type joinedContainmentResponse struct {
 	InScopeMediaCount                       int64                             `json:"in_scope_media_count"`
 	InScopeMediaSampleTruncated             bool                              `json:"in_scope_media_sample_truncated"`
 	InScopeMediaSample                      []joinedContainmentArtifactSample `json:"in_scope_media_sample"`
+	UnauthorizedGapOnlyCount                int64                             `json:"unauthorized_gap_only_count"`
+	UnauthorizedGapOnlyArtifactIDs          []int64                           `json:"unauthorized_gap_only_artifact_ids"`
+	UnauthorizedGapOnlySampleTruncated      bool                              `json:"unauthorized_gap_only_sample_truncated"`
 }
 
 // joinedContainmentAllowed reuses the diagnostic's process-local brake. This
@@ -141,14 +145,25 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 	}
 
 	response := joinedContainmentResponse{
-		ProtocolVersion:    s.cfg.JoinedRecordingProtocolVersion,
-		BatchID:            batchIDs[0],
-		WorkScope:          workScope,
-		CanaryHourIDs:      append([]string(nil), canaryIDs...),
-		Hours:              make([]joinedContainmentHour, 0, len(canaryIDs)),
-		ArtifactStates:     make([]joinedContainmentArtifactState, 0),
-		OutsideScopeSample: make([]joinedContainmentArtifactSample, 0),
-		InScopeMediaSample: make([]joinedContainmentArtifactSample, 0),
+		ProtocolVersion:                s.cfg.JoinedRecordingProtocolVersion,
+		BatchID:                        batchIDs[0],
+		WorkScope:                      workScope,
+		CanaryHourIDs:                  append([]string(nil), canaryIDs...),
+		Hours:                          make([]joinedContainmentHour, 0, len(canaryIDs)),
+		ArtifactStates:                 make([]joinedContainmentArtifactState, 0),
+		OutsideScopeSample:             make([]joinedContainmentArtifactSample, 0),
+		InScopeMediaSample:             make([]joinedContainmentArtifactSample, 0),
+		UnauthorizedGapOnlyArtifactIDs: make([]int64, 0),
+	}
+	scopeIdentity, err := joinedrecording.NewWorkScopeIdentity(batchIDs[0], workScope, canaryIDs)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "joined containment scope differs")
+		return
+	}
+	scopeSHA, err := scopeIdentity.SHA256(batchIDs[0])
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "joined containment scope differs")
+		return
 	}
 	var batchRecordID int64
 	if err := tx.QueryRow(ctx, `SELECT b.id,b.state,b.generation,c.joined_protocol_version
@@ -175,6 +190,47 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		util.WriteError(w, http.StatusInternalServerError, "read joined database clock failed")
 		return
 	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM recording_joined_artifacts a
+		JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		WHERE a.batch_record_id=$1 AND a.artifact_kind='hour_manifest' AND h.source_clip_count=0
+		  AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		    WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$3
+		      AND ga.work_scope_identity_sha256=$2 AND (($3='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		        OR ($3 IN ('canary','canary_single') AND ga.authorization_source='server_seal')))`,
+		batchRecordID, scopeSHA, workScope).Scan(&response.UnauthorizedGapOnlyCount); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "read unauthorized joined gap-only artifacts failed")
+		return
+	}
+	unauthorizedRows, err := tx.Query(ctx, `SELECT a.id FROM recording_joined_artifacts a
+		JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		WHERE a.batch_record_id=$1 AND a.artifact_kind='hour_manifest' AND h.source_clip_count=0
+		  AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		    WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$3
+		      AND ga.work_scope_identity_sha256=$2 AND (($3='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		        OR ($3 IN ('canary','canary_single') AND ga.authorization_source='server_seal')))
+		ORDER BY a.id LIMIT $4`, batchRecordID, scopeSHA, workScope, joinedContainmentArtifactSampleLimit)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "read unauthorized joined gap-only sample failed")
+		return
+	}
+	for unauthorizedRows.Next() {
+		var id int64
+		if err := unauthorizedRows.Scan(&id); err != nil {
+			unauthorizedRows.Close()
+			util.WriteError(w, http.StatusInternalServerError, "scan unauthorized joined gap-only sample failed")
+			return
+		}
+		response.UnauthorizedGapOnlyArtifactIDs = append(response.UnauthorizedGapOnlyArtifactIDs, id)
+	}
+	if err := unauthorizedRows.Err(); err != nil {
+		unauthorizedRows.Close()
+		util.WriteError(w, http.StatusInternalServerError, "read unauthorized joined gap-only sample failed")
+		return
+	}
+	unauthorizedRows.Close()
+	response.UnauthorizedGapOnlySampleTruncated = response.UnauthorizedGapOnlyCount > int64(len(response.UnauthorizedGapOnlyArtifactIDs))
 	rows, err := tx.Query(ctx, `
 		SELECT h.hour_id,h.recording_id,h.state,h.attempt_count,h.source_clip_count,h.source_bytes,
 		       h.lease_expires_at,COALESCE(h.lease_expires_at<=now(),false),COALESCE(h.lease_expires_at>now(),false),
