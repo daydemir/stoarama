@@ -198,6 +198,18 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 		switch req.Action {
 		case "status":
 			return service.ClaimAdmissionStatus(ctx, req.BatchID)
+		case "refill-one":
+			status, err := service.ClaimAdmissionStatus(ctx, req.BatchID)
+			if err != nil {
+				return nil, err
+			}
+			if !status.ClaimsPaused || status.OneShotClaimsRemaining != 0 || status.ActiveClaimsSHA256 == "" {
+				return nil, errors.New("joined one-shot refill requires paused admission and an exact active-claim digest")
+			}
+			return service.SetClaimAdmission(ctx, joinedrecording.ClaimAdmissionRequest{
+				ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: req.BatchID, ClaimsPaused: true,
+				ExpectedActiveClaimsSHA256: status.ActiveClaimsSHA256, MaxNewClaims: 1,
+			})
 		case "pause", "resume":
 			return service.SetClaimAdmission(ctx, joinedrecording.ClaimAdmissionRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
 				BatchID: req.BatchID, ClaimsPaused: req.Action == "pause"})
@@ -394,10 +406,10 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 func parseJoinedAdmission(cfg config.Config, args []string) (joinedAdmissionRequest, error) {
 	req := joinedAdmissionRequest{BatchID: cfg.JoinedRecordingBatchID, Timeout: joinedWorkerTaskLimit}
 	if len(args) == 0 {
-		return req, errors.New("expected admission status, pause, resume, or drain")
+		return req, errors.New("expected admission status, pause, resume, refill-one, or drain")
 	}
 	req.Action = args[0]
-	if req.Action != "status" && req.Action != "pause" && req.Action != "resume" && req.Action != "drain" {
+	if req.Action != "status" && req.Action != "pause" && req.Action != "resume" && req.Action != "refill-one" && req.Action != "drain" {
 		return req, fmt.Errorf("unknown admission action %q", req.Action)
 	}
 	flags := newJoinedFlagSet("recording-joined admission " + req.Action)

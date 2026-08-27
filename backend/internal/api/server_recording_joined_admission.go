@@ -2,8 +2,13 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,18 +18,103 @@ import (
 )
 
 // joinedClaimAdmissionAllowed is called inside each claim transaction. The
-// shared row lock makes a completed pause linearizable with claim commits,
-// while heartbeat, seal, upload, and finalize never consult this control.
-func (s *Server) joinedClaimAdmissionAllowed(ctx context.Context, tx pgx.Tx, batchID string) (bool, error) {
+// exclusive control-row lock serializes claim admission. One-shot admission
+// also locks every expected active task until the new claim commits, so a
+// terminal transition cannot substitute another task under the same count.
+func (s *Server) joinedClaimAdmissionAllowed(ctx context.Context, tx pgx.Tx, batchID string) (bool, bool, bool, error) {
 	var paused bool
-	err := tx.QueryRow(ctx, `SELECT c.claims_paused FROM recording_joined_admission_controls c
+	var expected *string
+	var remaining int
+	err := tx.QueryRow(ctx, `SELECT c.claims_paused,c.one_shot_expected_active_claims_sha256,c.one_shot_claims_remaining
+		FROM recording_joined_admission_controls c
 		JOIN recording_joined_batches b ON b.id=c.batch_record_id
-		WHERE c.batch_id=$1 AND b.connection_id=$2 FOR SHARE OF c,b`, batchID,
-		s.cfg.JoinedRecordingConnectionID).Scan(&paused)
+		WHERE c.batch_id=$1 AND b.connection_id=$2 FOR UPDATE OF c`, batchID,
+		s.cfg.JoinedRecordingConnectionID).Scan(&paused, &expected, &remaining)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return false, false, false, nil
 	}
-	return !paused, err
+	if err != nil {
+		return false, false, false, err
+	}
+	if remaining == 0 {
+		return !paused, false, false, nil
+	}
+	_, _, digest, err := joinedActiveClaims(ctx, tx, batchID, true)
+	if err != nil {
+		return false, false, false, err
+	}
+	if expected == nil || digest != *expected {
+		_, err = tx.Exec(ctx, `UPDATE recording_joined_admission_controls SET claims_paused=TRUE,
+			one_shot_expected_active_claims_sha256=NULL,one_shot_claims_remaining=0,updated_at=clock_timestamp()
+			WHERE batch_id=$1`, batchID)
+		return false, false, true, err
+	}
+	return true, true, false, nil
+}
+
+func joinedActiveClaims(ctx context.Context, tx pgx.Tx, batchID string, lock bool) (int64, int64, string, error) {
+	suffix := ""
+	if lock {
+		suffix = " FOR UPDATE"
+	}
+	rows, err := tx.Query(ctx, `SELECT id,claim_token::text FROM recording_joined_hours
+		WHERE batch_id=$1 AND state='leased' AND lease_expires_at>now()`+suffix, batchID)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	var identities []string
+	var hours, publications int64
+	for rows.Next() {
+		var id int64
+		var token string
+		if err := rows.Scan(&id, &token); err != nil {
+			rows.Close()
+			return 0, 0, "", err
+		}
+		identities = append(identities, fmt.Sprintf("hour:%d:%s", id, token))
+		hours++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, "", err
+	}
+	rows.Close()
+	rows, err = tx.Query(ctx, `SELECT id,publication_token::text FROM recording_joined_artifacts
+		WHERE batch_id=$1 AND publication_state='publishing' AND publication_lease_expires_at>now()`+suffix, batchID)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	for rows.Next() {
+		var id int64
+		var token string
+		if err := rows.Scan(&id, &token); err != nil {
+			rows.Close()
+			return 0, 0, "", err
+		}
+		identities = append(identities, fmt.Sprintf("publication:%d:%s", id, token))
+		publications++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, "", err
+	}
+	rows.Close()
+	sort.Strings(identities)
+	sum := sha256.Sum256([]byte(strings.Join(identities, "\n")))
+	return hours, publications, hex.EncodeToString(sum[:]), nil
+}
+
+func consumeJoinedOneShotClaim(ctx context.Context, tx pgx.Tx, batchID string) error {
+	tag, err := tx.Exec(ctx, `UPDATE recording_joined_admission_controls SET
+		one_shot_expected_active_claims_sha256=NULL,one_shot_claims_remaining=0,updated_at=clock_timestamp()
+		WHERE batch_id=$1 AND claims_paused=TRUE AND one_shot_claims_remaining=1`, batchID)
+	if err != nil {
+		return fmt.Errorf("consume joined one-shot claim: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("consume joined one-shot claim: rows=%d", tag.RowsAffected())
+	}
+	return nil
 }
 
 func (s *Server) handleJoinedAdmissionStatus(w http.ResponseWriter, r *http.Request) {
@@ -84,10 +174,25 @@ func (s *Server) handleJoinedAdmissionSet(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var updatedAt time.Time
+	if req.MaxNewClaims == 1 {
+		var paused bool
+		if err := tx.QueryRow(ctx, `SELECT claims_paused FROM recording_joined_admission_controls
+			WHERE batch_id=$1 FOR UPDATE`, req.BatchID).Scan(&paused); err != nil || !paused {
+			util.WriteError(w, http.StatusConflict, "joined one-shot admission requires paused claims")
+			return
+		}
+		_, _, digest, digestErr := joinedActiveClaims(ctx, tx, req.BatchID, true)
+		if digestErr != nil || digest != req.ExpectedActiveClaimsSHA256 {
+			util.WriteError(w, http.StatusConflict, "joined active claim identity differs")
+			return
+		}
+	}
 	err = tx.QueryRow(ctx, `UPDATE recording_joined_admission_controls c
-		SET claims_paused=$2,updated_at=clock_timestamp() FROM recording_joined_batches b
+		SET claims_paused=$2,one_shot_expected_active_claims_sha256=$4,
+			one_shot_claims_remaining=$5,updated_at=clock_timestamp() FROM recording_joined_batches b
 		WHERE c.batch_id=$1 AND b.id=c.batch_record_id AND b.connection_id=$3 RETURNING c.updated_at`,
-		req.BatchID, req.ClaimsPaused, s.cfg.JoinedRecordingConnectionID).Scan(&updatedAt)
+		req.BatchID, req.ClaimsPaused, s.cfg.JoinedRecordingConnectionID,
+		nullIfEmpty(req.ExpectedActiveClaimsSHA256), req.MaxNewClaims).Scan(&updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusConflict, "joined admission control is unavailable")
 		return
@@ -97,7 +202,8 @@ func (s *Server) handleJoinedAdmissionSet(w http.ResponseWriter, r *http.Request
 		return
 	}
 	status, err := s.joinedAdmissionStatus(ctx, tx, req.BatchID)
-	if err != nil || !status.UpdatedAt.Equal(updatedAt) || status.ClaimsPaused != req.ClaimsPaused || status.Validate() != nil {
+	if err != nil || !status.UpdatedAt.Equal(updatedAt) || status.ClaimsPaused != req.ClaimsPaused ||
+		status.OneShotClaimsRemaining != req.MaxNewClaims || status.Validate() != nil {
 		util.WriteError(w, http.StatusInternalServerError, "verify joined admission update")
 		return
 	}
@@ -119,14 +225,21 @@ func joinedAdmissionBatchID(w http.ResponseWriter, r *http.Request) (string, boo
 
 func (s *Server) joinedAdmissionStatus(ctx context.Context, tx pgx.Tx, batchID string) (joinedrecording.ClaimAdmissionStatus, error) {
 	status := joinedrecording.ClaimAdmissionStatus{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: batchID}
-	err := tx.QueryRow(ctx, `SELECT c.claims_paused,c.updated_at,
-		(SELECT count(*) FROM recording_joined_hours h WHERE h.batch_record_id=c.batch_record_id
-		 AND h.state='leased' AND h.lease_expires_at>now()),
-		(SELECT count(*) FROM recording_joined_artifacts a WHERE a.batch_record_id=c.batch_record_id
-		 AND a.publication_state='publishing' AND a.publication_lease_expires_at>now())
+	err := tx.QueryRow(ctx, `SELECT c.claims_paused,c.updated_at,c.one_shot_claims_remaining
 		FROM recording_joined_admission_controls c JOIN recording_joined_batches b ON b.id=c.batch_record_id
 		WHERE c.batch_id=$1 AND b.connection_id=$2`, batchID, s.cfg.JoinedRecordingConnectionID).Scan(
-		&status.ClaimsPaused, &status.UpdatedAt, &status.ActiveHourLeases, &status.ActivePublicationLeases)
+		&status.ClaimsPaused, &status.UpdatedAt, &status.OneShotClaimsRemaining)
+	if err != nil {
+		return status, err
+	}
+	status.ActiveHourLeases, status.ActivePublicationLeases, status.ActiveClaimsSHA256, err = joinedActiveClaims(ctx, tx, batchID, false)
 	status.ActiveLeaseCount = status.ActiveHourLeases + status.ActivePublicationLeases
 	return status, err
+}
+
+func nullIfEmpty(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }

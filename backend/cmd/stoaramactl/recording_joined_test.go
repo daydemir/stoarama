@@ -283,6 +283,24 @@ func TestJoinedAdmissionDrainPausesBeforeZeroLeaseGate(t *testing.T) {
 	}
 }
 
+func TestJoinedAdmissionRefillOneBindsCurrentActiveClaims(t *testing.T) {
+	cfg := validJoinedWorkerConfig()
+	digest := strings.Repeat("a", 64)
+	fake := &fakeJoinedOperator{admissionStatus: joinedrecording.ClaimAdmissionStatus{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: cfg.JoinedRecordingBatchID,
+		ClaimsPaused: true, ActiveLeaseCount: 1, ActiveHourLeases: 1, ActiveClaimsSHA256: digest, UpdatedAt: time.Now(),
+	}}
+	_, err := runRecordingJoinedWith(context.Background(), cfg, []string{"admission", "refill-one"},
+		func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil })
+	if err != nil || len(fake.admissionSets) != 1 {
+		t.Fatalf("refill-one sets=%+v err=%v", fake.admissionSets, err)
+	}
+	got := fake.admissionSets[0]
+	if !got.ClaimsPaused || got.MaxNewClaims != 1 || got.ExpectedActiveClaimsSHA256 != digest {
+		t.Fatalf("refill-one request=%+v", got)
+	}
+}
+
 func TestJoinedAdmissionParsingIsBounded(t *testing.T) {
 	cfg := validJoinedWorkerConfig()
 	if req, err := parseJoinedAdmission(cfg, []string{"drain", "--timeout-sec", "60"}); err != nil || req.Action != "drain" || req.Timeout != time.Minute {

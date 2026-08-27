@@ -47,6 +47,7 @@ var joinedMigrationNames = []string{
 	"0145_joined_claim_admission_control.sql",
 	"0146_joined_gap_only_scope_authorizations.sql",
 	"0147_joined_allowlist_50_scope.sql",
+	"0148_joined_one_shot_admission.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
