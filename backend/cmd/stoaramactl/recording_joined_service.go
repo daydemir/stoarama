@@ -1176,7 +1176,24 @@ func joinedCreateCapabilityError(err error, artifactID int64) error {
 }
 
 func (s *remoteJoinedOperatorService) artifactReadCapability(ctx context.Context, kind, id string, artifactID int64, token string) (joinedrecording.ObjectReadCapability, error) {
-	return s.api.artifactReadCapability(ctx, token, joinedrecording.ArtifactCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, ScopeKind: kind, ScopeID: id, ArtifactID: artifactID, Operation: "read"})
+	capability, err := s.api.artifactReadCapability(ctx, token, joinedrecording.ArtifactCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, ScopeKind: kind, ScopeID: id, ArtifactID: artifactID, Operation: "read"})
+	if err == nil {
+		return capability, nil
+	}
+	return joinedrecording.ObjectReadCapability{}, joinedReadCapabilityError(err, artifactID)
+}
+
+func joinedReadCapabilityError(err error, artifactID int64) error {
+	diagnostic := &joinedrecording.StorageCapabilityError{Operation: "reread_capability", Reason: "capability",
+		ArtifactID: artifactID, Cause: err}
+	var responseErr *joinedAPIResponseError
+	var transportErr *joinedAPITransportError
+	if errors.As(err, &responseErr) {
+		diagnostic.Reason, diagnostic.StatusCode = "status", responseErr.status
+	} else if errors.As(err, &transportErr) {
+		diagnostic.Reason = "transport"
+	}
+	return diagnostic
 }
 
 func (s *remoteJoinedOperatorService) hourCreateCapability(ctx context.Context, claim joinedrecording.WorkerClaim, artifactID int64) (joinedrecording.ObjectCreateCapability, error) {

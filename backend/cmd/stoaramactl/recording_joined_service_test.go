@@ -1089,6 +1089,15 @@ func TestJoinedCreateCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) 
 	}
 }
 
+func TestJoinedReadCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) {
+	var diagnostic *joinedrecording.StorageCapabilityError
+	err := joinedReadCapabilityError(&joinedAPITransportError{cause: errors.New("https://signed.example/?token=secret")}, 646)
+	if !errors.As(err, &diagnostic) || diagnostic.Operation != "reread_capability" || diagnostic.Reason != "transport" ||
+		diagnostic.ArtifactID != 646 || strings.Contains(diagnostic.Error(), "signed.example") || strings.Contains(diagnostic.Error(), "secret") {
+		t.Fatalf("unsafe read capability diagnostic: %+v rendered=%q", diagnostic, diagnostic.Error())
+	}
+}
+
 func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
 	cfg := validJoinedWorkerConfig()
 	hours, err := cfg.JoinedCanaryHourIDs()

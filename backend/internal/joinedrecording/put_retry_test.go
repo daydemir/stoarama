@@ -238,6 +238,37 @@ func TestCreateOnlyPutCapabilityResolutionExhaustionPreservesAttempts(t *testing
 	}
 }
 
+func TestReadCapabilityResolutionRetriesTransientFailure(t *testing.T) {
+	capability := ObjectReadCapability{ArtifactID: 646}
+	resolves, waits := 0, 0
+	got, err := resolveReadCapabilityWithRetry(context.Background(), 646, func() time.Time { return time.Now().Add(time.Minute) },
+		"lease-12345678", func(context.Context) (ObjectReadCapability, error) {
+			resolves++
+			if resolves == 1 {
+				return ObjectReadCapability{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "transport",
+					ArtifactID: 646, Cause: context.DeadlineExceeded}
+			}
+			return capability, nil
+		}, putRetryPolicy{wait: func(context.Context, time.Duration) error { waits++; return nil }, now: time.Now})
+	if err != nil || got.ArtifactID != 646 || resolves != 2 || waits != 1 {
+		t.Fatalf("got=%+v err=%v resolves=%d waits=%d", got, err, resolves, waits)
+	}
+}
+
+func TestReadCapabilityResolutionDoesNotRetryDeterministicFailure(t *testing.T) {
+	resolves := 0
+	_, err := resolveReadCapabilityWithRetry(context.Background(), 646, func() time.Time { return time.Now().Add(time.Minute) },
+		"lease-12345678", func(context.Context) (ObjectReadCapability, error) {
+			resolves++
+			return ObjectReadCapability{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "status",
+				StatusCode: http.StatusConflict, ArtifactID: 646}
+		}, putRetryPolicy{wait: func(context.Context, time.Duration) error { t.Fatal("unexpected retry wait"); return nil }, now: time.Now})
+	var diagnostic *StorageCapabilityError
+	if !errors.As(err, &diagnostic) || diagnostic.StatusCode != http.StatusConflict || diagnostic.Attempts != 1 || resolves != 1 {
+		t.Fatalf("diagnostic=%+v resolves=%d err=%v", diagnostic, resolves, err)
+	}
+}
+
 func boolInt(value bool) int {
 	if value {
 		return 1

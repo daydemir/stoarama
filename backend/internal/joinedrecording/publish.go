@@ -223,7 +223,10 @@ func publishClaimedHourWithDeadline(ctx context.Context, client CapabilityHTTPCl
 		emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailureManifestUpload, claim.HourManifestArtifactID, 0)
 		return PublishedHour{}, err
 	}
-	manifestRead, err := resolveRead(ctx, claim, claim.HourManifestArtifactID)
+	manifestRead, err := resolveReadCapabilityWithRetry(ctx, claim.HourManifestArtifactID, leaseExpires, claim.LeaseID,
+		func(callCtx context.Context) (ObjectReadCapability, error) {
+			return resolveRead(callCtx, claim, claim.HourManifestArtifactID)
+		}, defaultPutRetryPolicy())
 	if err != nil {
 		emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailureManifestCapability, claim.HourManifestArtifactID, 0)
 		return PublishedHour{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "capability",
@@ -329,8 +332,17 @@ func publishHourPart(ctx context.Context, client CapabilityHTTPClient, claim Wor
 		}
 		return PublishedOutput{}, putErr
 	}
-	readCapability, err := resolveRead(ctx, claim, artifactID)
+	readCapability, err := resolveReadCapabilityWithRetry(ctx, artifactID, leaseExpires, claim.LeaseID,
+		func(callCtx context.Context) (ObjectReadCapability, error) {
+			return resolveRead(callCtx, claim, artifactID)
+		}, defaultPutRetryPolicy())
 	if err != nil {
+		var diagnostic *StorageCapabilityError
+		if errors.As(err, &diagnostic) {
+			withOrdinal := *diagnostic
+			withOrdinal.Ordinal = output.Ordinal
+			return PublishedOutput{}, &withOrdinal
+		}
 		return PublishedOutput{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "capability", ArtifactID: artifactID,
 			Ordinal: output.Ordinal, Cause: err}
 	}
