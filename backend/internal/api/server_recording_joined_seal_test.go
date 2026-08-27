@@ -1,12 +1,48 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 )
+
+func TestJoinedWorkerResponsePreservesCanonicalEvidenceBytes(t *testing.T) {
+	for name, facts := range map[string]json.RawMessage{
+		"html placeholders":    json.RawMessage(`{"category":"invalid_media_data","normalized_fact":"<address>&<scratch-file>"}`),
+		"producer field order": json.RawMessage(`{"status":"failed","packet_payload_order_status":"passed","decoded_frame_totals_status":"failed","source_fingerprint":{"duration_seconds":1},"output_fingerprint":{"duration_seconds":2}}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writeJoinedWorkerJSON(recorder, http.StatusOK, struct {
+				Facts json.RawMessage `json:"facts"`
+			}{Facts: facts})
+			if recorder.Code != http.StatusOK || recorder.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("response metadata differs: code=%d content_type=%q", recorder.Code, recorder.Header().Get("Content-Type"))
+			}
+			if name == "html placeholders" && !bytes.Contains(recorder.Body.Bytes(), []byte(`<address>&<scratch-file>`)) {
+				t.Fatalf("canonical placeholders changed: %s", recorder.Body.Bytes())
+			}
+			if name == "html placeholders" && (bytes.Contains(recorder.Body.Bytes(), []byte(`\u003c`)) || bytes.Contains(recorder.Body.Bytes(), []byte(`\u003e`)) || bytes.Contains(recorder.Body.Bytes(), []byte(`\u0026`))) {
+				t.Fatalf("canonical placeholders were HTML escaped: %s", recorder.Body.Bytes())
+			}
+			var received struct {
+				Facts json.RawMessage `json:"facts"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &received); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(received.Facts, facts) {
+				t.Fatalf("canonical evidence changed across response: got=%s want=%s", received.Facts, facts)
+			}
+		})
+	}
+}
 
 func TestValidateJoinedSealSourceIdentityReportsExactBoundary(t *testing.T) {
 	start := time.Date(2026, time.August, 15, 8, 0, 0, 0, time.UTC)

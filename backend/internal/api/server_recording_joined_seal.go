@@ -135,7 +135,7 @@ func (s *Server) handleJoinedSealHour(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusConflict, "commit joined hour seal")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, response)
+	writeJoinedWorkerJSON(w, http.StatusOK, response)
 }
 
 func validateJoinedSealSourceIdentity(claim joinedrecording.PreflightHourClaim, req joinedrecording.SealHourRequest) error {
