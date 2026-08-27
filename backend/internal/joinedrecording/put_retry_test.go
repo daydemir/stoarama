@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -183,6 +184,7 @@ func TestCreateOnlyPutRetriesOnlyTransientCapabilityResolution(t *testing.T) {
 		wantErr   bool
 	}{
 		{"transport then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "transport", Cause: context.DeadlineExceeded}}, 2, false},
+		{"caller canceled transport", []*StorageCapabilityError{{Operation: "create_capability", Reason: "transport", Cause: context.Canceled}}, 1, true},
 		{"408 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 408}}, 2, false},
 		{"425 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 425}}, 2, false},
 		{"429 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 429}}, 2, false},
@@ -235,6 +237,44 @@ func TestCreateOnlyPutCapabilityResolutionExhaustionPreservesAttempts(t *testing
 	if !errors.As(err, &diagnostic) || diagnostic.Attempts != len(putRetryDelays)+1 || diagnostic.ArtifactID != 646 ||
 		resolves != len(putRetryDelays)+1 || waits != len(putRetryDelays) || opens != 0 {
 		t.Fatalf("diagnostic=%+v resolves=%d waits=%d opens=%d err=%v", diagnostic, resolves, waits, opens, err)
+	}
+}
+
+func TestCapabilityResolutionStopsWhenCallerContextEnds(t *testing.T) {
+	for _, operation := range []string{"create", "read"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			resolves, waits := 0, 0
+			if operation == "create" {
+				_, err := putCreateOnlyWithRetry(ctx, &memoryCapabilityClient{objects: map[string][]byte{}}, testSourceAuthority,
+					"recordings", 646, "joined/test.mp4", "video/mp4", 1, strings.Repeat("a", 64),
+					func() time.Time { return time.Now().Add(time.Minute) }, "lease-12345678",
+					func(context.Context) (ObjectCreateCapability, error) {
+						resolves++
+						cancel()
+						return ObjectCreateCapability{}, &StorageCapabilityError{Operation: "create_capability", Reason: "transport",
+							ArtifactID: 646, Cause: context.DeadlineExceeded}
+					}, func() (io.ReadCloser, error) { t.Fatal("unexpected body open"); return nil, nil },
+					putRetryPolicy{wait: func(context.Context, time.Duration) error { waits++; return nil }, now: time.Now})
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("create error=%v", err)
+				}
+			} else {
+				_, err := resolveReadCapabilityWithRetry(ctx, 646, func() time.Time { return time.Now().Add(time.Minute) },
+					"lease-12345678", func(context.Context) (ObjectReadCapability, error) {
+						resolves++
+						cancel()
+						return ObjectReadCapability{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "transport",
+							ArtifactID: 646, Cause: context.DeadlineExceeded}
+					}, putRetryPolicy{wait: func(context.Context, time.Duration) error { waits++; return nil }, now: time.Now})
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("read error=%v", err)
+				}
+			}
+			if resolves != 1 || waits != 0 {
+				t.Fatalf("resolves=%d waits=%d", resolves, waits)
+			}
+		})
 	}
 }
 
