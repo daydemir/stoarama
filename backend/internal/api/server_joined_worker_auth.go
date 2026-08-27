@@ -164,7 +164,7 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 			            AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
 			            AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
 			            AND ga.work_scope_identity_sha256=$5
-			            AND ga.authorization_source IN ('server_seal','operator_frozen'))))))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID,
+			            AND ga.authorization_source IN ('server_seal','operator_frozen'))))))))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID,
 			s.cfg.JoinedRecordingConnectionID, scopeSHA, identity.WorkScope).Scan(&allowed)
 		return err == nil && allowed
 	}
@@ -192,7 +192,7 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 			      AND ga.batch_record_id=root.batch_record_id AND ga.batch_id=root.batch_id
 			      AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
 			      AND ga.work_scope=$6 AND ga.work_scope_identity_sha256=$5
-			      AND ga.authorization_source='server_seal'))`, claims.BatchID,
+			      AND ga.authorization_source='server_seal')))`, claims.BatchID,
 			claims.SubjectID, hours, s.cfg.JoinedRecordingConnectionID, scopeSHA, identity.WorkScope).Scan(&allowed)
 		return err == nil && allowed
 	case joinedauth.SubjectLedger:

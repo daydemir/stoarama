@@ -828,7 +828,7 @@ func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {
 			      AND ga.work_scope=$7 AND ga.work_scope_identity_sha256=$6
 			      AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
 			        OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
-			FOR UPDATE`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken, s.cfg.JoinedRecordingConnectionID,
+			FOR UPDATE OF a`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken, s.cfg.JoinedRecordingConnectionID,
 			workScopeSHA, workScopeName).
 			Scan(&batchRecordID, &targetID, &attempt, &leaseExpires)
 	} else {
