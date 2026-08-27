@@ -109,6 +109,95 @@ func TestJoinedAPIClientOmitsMalformedOrOversizedServerError(t *testing.T) {
 	}
 }
 
+func TestJoinedAPIClientAcceptsBoundedLargeHourResponses(t *testing.T) {
+	claim := joinedrecording.WorkerClaim{
+		ProtocolVersion:  joinedrecording.JoinedProtocolVersion,
+		MediaArtifactIDs: make([]int64, 30),
+	}
+	claim.Plan.Outputs = make([]joinedrecording.OutputPlan, 30)
+	for i := range claim.MediaArtifactIDs {
+		claim.MediaArtifactIDs[i] = int64(i + 1)
+		// Source identities and verification evidence dominate real multi-part
+		// claims. Keep the fixture in the production schema while crossing 1 MiB.
+		claim.Plan.Outputs[i].Sources = []joinedrecording.SourceClip{{Endpoint: strings.Repeat("a", 40<<10)}}
+	}
+	sealBody, err := json.Marshal(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationBody, err := json.Marshal(joinedrecording.PublicationClaimResponse{
+		ProtocolVersion: joinedrecording.JoinedProtocolVersion, Kind: "hour", Hour: &claim,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sealBody) <= joinedAPIResponseLimit || len(publicationBody) <= joinedAPIResponseLimit {
+		t.Fatalf("fixtures do not exceed default response limit: seal=%d publication=%d", len(sealBody), len(publicationBody))
+	}
+
+	for _, tc := range []struct {
+		path string
+		body []byte
+		new  func() any
+		ids  func(any) []int64
+	}{
+		{"/api/v1/recording/joined/hour/seal", sealBody, func() any { return &joinedrecording.WorkerClaim{} }, func(v any) []int64 { return v.(*joinedrecording.WorkerClaim).MediaArtifactIDs }},
+		{"/api/v1/recording/joined/publication/claim", publicationBody, func() any { return &joinedrecording.PublicationClaimResponse{} }, func(v any) []int64 { return v.(*joinedrecording.PublicationClaimResponse).Hour.MediaArtifactIDs }},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(tc.body)
+			}))
+			defer server.Close()
+			api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := tc.new()
+			if err := api.postJSON(context.Background(), tc.path, "operation-token", struct{}{}, got); err != nil {
+				t.Fatal(err)
+			}
+			ids := tc.ids(got)
+			if len(ids) != 30 || ids[29] != 30 {
+				t.Fatalf("decoded media artifact IDs differ: %+v", ids)
+			}
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(sealBody) }))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ordinary joinedrecording.WorkerClaim
+	if err := api.postJSON(context.Background(), "/api/v1/recording/joined/heartbeat", "operation-token", struct{}{}, &ordinary); err == nil || !strings.Contains(err.Error(), "response exceeds limit") {
+		t.Fatalf("ordinary endpoint lost default response limit: %v", err)
+	}
+}
+
+func TestJoinedAPIClientRejectsOversizedHourResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"proof":"%s"}`, strings.Repeat("a", joinedLargeHourAPIResponseLimit))
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "joined-worker-bootstrap-token-at-least-32-bytes", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Proof string `json:"proof"`
+	}
+	for _, path := range []string{"/api/v1/recording/joined/hour/seal", "/api/v1/recording/joined/publication/claim"} {
+		err = api.postJSON(context.Background(), path, "operation-token", struct{}{}, &got)
+		if err == nil || !strings.Contains(err.Error(), "response exceeds limit") {
+			t.Fatalf("oversized %s response was accepted: %v", path, err)
+		}
+	}
+}
+
 func TestJoinedTaskFailureDiagnosticSelectsOnlyStructuredAPIErrors(t *testing.T) {
 	want := `joined API /seal returned status 409 error="canonical plan differs"`
 	structured := joinedAPIStatusError("/seal", http.StatusConflict, strings.NewReader(`{"error":"canonical plan differs"}`))
