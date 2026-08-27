@@ -489,6 +489,41 @@ func TestJoinedOperationTokenIsFencedByCurrentExactSingleCanaryScope(t *testing.
 	}
 }
 
+func TestJoinedOperationTokenIsFencedByExactFiftyHourAllowlist(t *testing.T) {
+	const batch = "tier1-fifty-2026-08"
+	hours := make([]string, 50)
+	for i := range hours {
+		hours[i] = fmt.Sprintf("%s__recording-%d__date-2026-08-20__hour-01__generation-1", batch, i+1)
+	}
+	cfg := config.Config{JoinedRecordingControlPlaneEnabled: true, JoinedRecordingProtocolVersion: 1,
+		JoinedRecordingBatchID: batch, JoinedRecordingCanaryHourIDs: strings.Join(hours, ","),
+		JoinedRecordingWorkScope: config.JoinedWorkScopeAllowlist50, JoinedRecordingMaxActiveTasks: 2,
+		JoinedWorkerBootstrapToken: "joined-bootstrap-credential-32bytes",
+		JoinedWorkerSigningKey:     "joined-signing-credential-32-bytes"}
+	s := &Server{cfg: cfg, joinedCredentialCheck: func(context.Context) error { return nil }}
+	call := func(hourID string) int {
+		token, err := joinedauth.MintOperation(cfg.JoinedWorkerSigningKey, batch, joinedauth.SubjectHour, hourID,
+			uuid.New(), joinedauth.OperationPublish, time.Now().Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/heartbeat", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		s.requireJoinedWorkerAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })).ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for _, inside := range []string{hours[0], hours[49]} {
+		if status := call(inside); status != http.StatusNoContent {
+			t.Fatalf("allowlisted operation %s status=%d", inside, status)
+		}
+	}
+	outside := batch + "__recording-51__date-2026-08-20__hour-01__generation-1"
+	if status := call(outside); status != http.StatusUnauthorized {
+		t.Fatalf("excluded allowlist operation status=%d", status)
+	}
+}
+
 func TestJoinedStorageAuthorityRequiresExactHTTPSRoot(t *testing.T) {
 	t.Parallel()
 	for _, raw := range []string{

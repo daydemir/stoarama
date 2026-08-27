@@ -197,7 +197,7 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		    WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
 		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$3
 		      AND ga.work_scope_identity_sha256=$2 AND (($3='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($3 IN ('canary','canary_single') AND ga.authorization_source='server_seal')))`,
+		        OR ($3 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal')))`,
 		batchRecordID, scopeSHA, workScope).Scan(&response.UnauthorizedGapOnlyCount); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read unauthorized joined gap-only artifacts failed")
 		return
@@ -209,7 +209,7 @@ func (s *Server) handleJoinedContainment(w http.ResponseWriter, r *http.Request)
 		    WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
 		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$3
 		      AND ga.work_scope_identity_sha256=$2 AND (($3='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($3 IN ('canary','canary_single') AND ga.authorization_source='server_seal')))
+		        OR ($3 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal')))
 		ORDER BY a.id LIMIT $4`, batchRecordID, scopeSHA, workScope, joinedContainmentArtifactSampleLimit)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read unauthorized joined gap-only sample failed")

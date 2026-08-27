@@ -209,7 +209,7 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 			        AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id AND ga.hour_record_id=a.hour_record_id
 			        AND ga.hour_id=a.scope_id AND ga.work_scope=$7 AND ga.work_scope_identity_sha256=$6
 			        AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-			          OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+			          OR ($7 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 			    AND (($3 AND (a.artifact_kind<>'hour_manifest' OR EXISTS(SELECT 1 FROM recording_joined_artifacts published_ledger
 		          WHERE published_ledger.stream_day_id=a.stream_day_id AND published_ledger.artifact_kind='allocation_ledger'
 		            AND published_ledger.publication_state='published'))) OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
@@ -300,7 +300,7 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		         AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$7
 		         AND ga.work_scope_identity_sha256=$6
 		         AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		           OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		           OR ($7 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 		   AND ($4 OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		     WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($3::text[])))
 		     OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
@@ -332,7 +332,7 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		         AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$7
 		         AND ga.work_scope_identity_sha256=$6
 		         AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		           OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		           OR ($7 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 		   AND ($4 OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		     WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($3::text[])))
 		     OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
@@ -604,7 +604,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		      AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id AND ga.hour_record_id=a.hour_record_id
 		      AND ga.hour_id=a.scope_id AND ga.work_scope=$9 AND ga.work_scope_identity_sha256=$8
 		      AND (($9='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($9 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		        OR ($9 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 		  AND (($3 AND (a.artifact_kind<>'hour_manifest' OR ledger.publication_state='published')) OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		      WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
 		    OR (a.artifact_kind='hour_manifest' AND ledger.publication_state='published'
@@ -827,7 +827,7 @@ func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {
 			      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
 			      AND ga.work_scope=$7 AND ga.work_scope_identity_sha256=$6
 			      AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-			        OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+			        OR ($7 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 			FOR UPDATE OF a`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken, s.cfg.JoinedRecordingConnectionID,
 			workScopeSHA, workScopeName).
 			Scan(&batchRecordID, &targetID, &attempt, &leaseExpires)
@@ -1287,7 +1287,7 @@ func (s *Server) validateJoinedHourFinalizeIdentity(ctx context.Context, publish
 		      AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
 		      AND ga.work_scope=$6 AND ga.work_scope_identity_sha256=$5
 		      AND (($6='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($6 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		        OR ($6 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 
 		FOR SHARE OF root,h,c`, claims.BatchID, published.HourID, lease, s.cfg.JoinedRecordingConnectionID, currentScopeSHA,
 		currentScope.WorkScope).Scan(
@@ -1372,7 +1372,7 @@ func (s *Server) finalizeJoinedHour(ctx context.Context, published joinedrecordi
 		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
 		      AND ga.work_scope=$5 AND ga.work_scope_identity_sha256=$4
 		      AND (($5='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($5 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		        OR ($5 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 		FOR UPDATE OF a,c`, published.HourID, claims.BatchID, s.cfg.JoinedRecordingConnectionID, currentScopeSHA,
 		currentScope.WorkScope).Scan(&manifestID, &state, &manifestKey, &manifestSize,
 		&manifestSHA, &currentETag, &currentVersion, &finalized, &recordingID, &localDate, &localHour)
@@ -1540,7 +1540,7 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		        AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
 		        AND ga.work_scope=$8 AND ga.work_scope_identity_sha256=$7
 		        AND (($8='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		          OR ($8 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		          OR ($8 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 		  RETURNING a.publication_lease_expires_at`, req.ScopeKind, req.ScopeID, token, joinedLeaseDuration.String(),
 			claims.BatchID, s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScopeName).Scan(&leaseExpires)
 	} else {
