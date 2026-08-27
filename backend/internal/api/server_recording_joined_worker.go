@@ -388,12 +388,18 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	admissionAllowed, err := s.joinedClaimAdmissionAllowed(r.Context(), tx, claims.BatchID)
+	admissionAllowed, oneShotClaim, admissionChanged, err := s.joinedClaimAdmissionAllowed(r.Context(), tx, claims.BatchID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined claim admission")
 		return
 	}
 	if !admissionAllowed {
+		if admissionChanged {
+			if err := tx.Commit(r.Context()); err != nil {
+				util.WriteError(w, http.StatusConflict, "commit joined admission fence")
+				return
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -503,6 +509,12 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("validate canonical joined claim: %v", err))
 		return
 	}
+	if oneShotClaim {
+		if err := consumeJoinedOneShotClaim(r.Context(), tx, claims.BatchID); err != nil {
+			util.WriteError(w, http.StatusConflict, "consume joined one-shot claim")
+			return
+		}
+	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit joined claim: %v", err))
 		return
@@ -560,12 +572,18 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	admissionAllowed, err := s.joinedClaimAdmissionAllowed(r.Context(), tx, claims.BatchID)
+	admissionAllowed, oneShotClaim, admissionChanged, err := s.joinedClaimAdmissionAllowed(r.Context(), tx, claims.BatchID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined publication claim admission")
 		return
 	}
 	if !admissionAllowed {
+		if admissionChanged {
+			if err := tx.Commit(r.Context()); err != nil {
+				util.WriteError(w, http.StatusConflict, "commit joined admission fence")
+				return
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -724,6 +742,12 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	if err := response.Validate(time.Now().UTC()); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("validate joined publication claim: %v", err))
 		return
+	}
+	if oneShotClaim {
+		if err := consumeJoinedOneShotClaim(r.Context(), tx, claims.BatchID); err != nil {
+			util.WriteError(w, http.StatusConflict, "consume joined one-shot claim")
+			return
+		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		util.WriteError(w, http.StatusConflict, "commit joined publication claim")
