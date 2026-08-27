@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -47,6 +48,10 @@ func (c LedgerPublicationClaim) Validate(now time.Time) ([]byte, string, error) 
 // PublishAllocationLedger uses an independent renewable publication lease;
 // hour preflight can start only after its exact ledger artifact is published.
 func publishAllocationLedger(ctx context.Context, client CapabilityHTTPClient, claim LedgerPublicationClaim, resolveCreate LedgerCreateCapabilityResolver, resolveRead LedgerReadCapabilityResolver, finalize FinalizeLedger) (PublishedLedger, error) {
+	return publishAllocationLedgerWithDeadline(ctx, client, claim, resolveCreate, resolveRead, finalize, func() time.Time { return claim.LeaseExpires })
+}
+
+func publishAllocationLedgerWithDeadline(ctx context.Context, client CapabilityHTTPClient, claim LedgerPublicationClaim, resolveCreate LedgerCreateCapabilityResolver, resolveRead LedgerReadCapabilityResolver, finalize FinalizeLedger, leaseExpires func() time.Time) (PublishedLedger, error) {
 	if client == nil || resolveCreate == nil || resolveRead == nil || finalize == nil {
 		return PublishedLedger{}, fmt.Errorf("capability client and fenced ledger finalizer are required")
 	}
@@ -54,11 +59,9 @@ func publishAllocationLedger(ctx context.Context, client CapabilityHTTPClient, c
 	if err != nil {
 		return PublishedLedger{}, err
 	}
-	create, err := resolveCreate(ctx, claim)
-	if err != nil {
-		return PublishedLedger{}, fmt.Errorf("resolve exact allocation-ledger create capability: %w", err)
-	}
-	_, err = putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.ArtifactID, objectKey, "application/json", claim.ExpectedSize, claim.ExpectedSHA256, create, bytes.NewReader(canonical))
+	_, err = putCreateOnlyWithRetry(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.ArtifactID, objectKey, "application/json", claim.ExpectedSize, claim.ExpectedSHA256, leaseExpires, claim.LeaseID,
+		func(callCtx context.Context) (ObjectCreateCapability, error) { return resolveCreate(callCtx, claim) },
+		func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(canonical)), nil }, defaultPutRetryPolicy())
 	if err != nil {
 		return PublishedLedger{}, err
 	}
@@ -132,7 +135,7 @@ func publishAllocationLedgerRenewing(ctx context.Context, client CapabilityHTTPC
 			return finalize(callCtx, currentClaim, output)
 		}
 		var err error
-		published, err = publishAllocationLedger(workCtx, client, claim, create, read, finish)
+		published, err = publishAllocationLedgerWithDeadline(workCtx, client, claim, create, read, finish, func() time.Time { return current().ExpiresAt })
 		return err
 	})
 	return published, err

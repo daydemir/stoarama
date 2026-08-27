@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -52,15 +53,17 @@ func (c BatchIndexPublicationClaim) WithOperation(credentials OperationCredentia
 }
 
 func publishBatchIndex(ctx context.Context, client CapabilityHTTPClient, claim BatchIndexPublicationClaim, resolveCreate BatchIndexCreateCapabilityResolver, resolveRead BatchIndexReadCapabilityResolver, finalize FinalizeBatchIndex) (PublishedBatchIndex, error) {
+	return publishBatchIndexWithDeadline(ctx, client, claim, resolveCreate, resolveRead, finalize, func() time.Time { return claim.LeaseExpires })
+}
+
+func publishBatchIndexWithDeadline(ctx context.Context, client CapabilityHTTPClient, claim BatchIndexPublicationClaim, resolveCreate BatchIndexCreateCapabilityResolver, resolveRead BatchIndexReadCapabilityResolver, finalize FinalizeBatchIndex, leaseExpires func() time.Time) (PublishedBatchIndex, error) {
 	canonical, objectKey, err := claim.Validate(time.Now().UTC())
 	if client == nil || resolveCreate == nil || resolveRead == nil || finalize == nil || err != nil {
 		return PublishedBatchIndex{}, fmt.Errorf("valid capability client and fenced batch-index claim are required")
 	}
-	create, err := resolveCreate(ctx, claim)
-	if err != nil {
-		return PublishedBatchIndex{}, err
-	}
-	if _, err = putCreateOnlyCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.ArtifactID, objectKey, "application/json", claim.ExpectedSize, claim.ExpectedSHA256, create, bytes.NewReader(canonical)); err != nil {
+	if _, err = putCreateOnlyWithRetry(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.ArtifactID, objectKey, "application/json", claim.ExpectedSize, claim.ExpectedSHA256, leaseExpires, claim.LeaseID,
+		func(callCtx context.Context) (ObjectCreateCapability, error) { return resolveCreate(callCtx, claim) },
+		func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(canonical)), nil }, defaultPutRetryPolicy()); err != nil {
 		return PublishedBatchIndex{}, err
 	}
 	read, err := resolveRead(ctx, claim)
@@ -125,7 +128,7 @@ func publishBatchIndexRenewing(ctx context.Context, client CapabilityHTTPClient,
 			return finalize(callCtx, currentClaim, output)
 		}
 		var err error
-		published, err = publishBatchIndex(workCtx, client, claim, create, read, finish)
+		published, err = publishBatchIndexWithDeadline(workCtx, client, claim, create, read, finish, func() time.Time { return current().ExpiresAt })
 		return err
 	})
 	return published, err
