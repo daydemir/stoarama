@@ -630,7 +630,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusConflict, "commit joined publication claim")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, response)
+	writeJoinedWorkerJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {

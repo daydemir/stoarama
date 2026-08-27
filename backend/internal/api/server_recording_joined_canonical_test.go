@@ -1160,6 +1160,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		exactHour.Hour == nil || exactHour.Hour.HourID != canaryGapHourID {
 		t.Fatalf("exact canary hour claim status=%d body=%s", exactHourRec.Code, exactHourRec.Body.String())
 	}
+	if err := exactHour.Validate(time.Now().UTC()); err != nil {
+		t.Fatalf("decoded publication claim differs: %v", err)
+	}
 	noForeignReq := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/publication/claim", bytes.NewReader(claimBody))
 	noForeignReq.Header.Set("Authorization", "Bearer "+claimToken)
 	noForeignRec := httptest.NewRecorder()
@@ -1928,6 +1931,9 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 	if sealRec.Code != http.StatusOK || json.Unmarshal(sealRec.Body.Bytes(), &sealed) != nil ||
 		len(sealed.MediaArtifactIDs) != 1 || sealed.HourManifestArtifactID <= 0 {
 		t.Fatalf("source seal status=%d body=%s", sealRec.Code, sealRec.Body.String())
+	}
+	if err := sealed.Validate(time.Now().UTC()); err != nil {
+		t.Fatalf("decoded source seal claim differs: %v", err)
 	}
 	var mediaRows, mediaSourceRows, dispositionRows, manifestRows int
 	if err := pool.QueryRow(ctx, `SELECT
