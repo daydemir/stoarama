@@ -616,8 +616,26 @@ func validateQuarantineEvidence(e QuarantineEvidence, toolIdentity, expectedSour
 		RepeatCount       int    `json:"repeat_count"`
 	}{e.SourceClaimSHA256, e.ReasonCode, e.FailureSHA256, e.PolicyVersion, e.MediaToolIdentity, e.AttemptCount}
 	evidenceSHA, _, proofErr := stitchcert.CanonicalSHA(proof)
-	if err != nil || proofErr != nil || !reasonCode.MatchString(e.ReasonCode) || len(e.SourceClipIDs) == 0 || e.SourceClaimSHA256 != expectedSourceClaim || e.PolicyVersion != PlanPolicyVersion || len(canonicalFacts) == 0 || failureSHA != e.FailureSHA256 || evidenceSHA != e.EvidenceSHA256 || e.AttemptCount != 2 || e.MediaToolIdentity != toolIdentity {
-		return fmt.Errorf("invalid quarantine evidence")
+	if err != nil || len(canonicalFacts) == 0 || failureSHA != e.FailureSHA256 {
+		return fmt.Errorf("invalid quarantine failure facts")
+	}
+	if proofErr != nil || evidenceSHA != e.EvidenceSHA256 {
+		return fmt.Errorf("invalid quarantine proof digest")
+	}
+	if !reasonCode.MatchString(e.ReasonCode) || len(e.SourceClipIDs) == 0 {
+		return fmt.Errorf("invalid quarantine reason or source set")
+	}
+	if e.SourceClaimSHA256 != expectedSourceClaim {
+		return fmt.Errorf("invalid quarantine source claim")
+	}
+	if e.PolicyVersion != PlanPolicyVersion {
+		return fmt.Errorf("invalid quarantine policy version")
+	}
+	if e.AttemptCount != 2 {
+		return fmt.Errorf("invalid quarantine attempt count")
+	}
+	if e.MediaToolIdentity != toolIdentity {
+		return fmt.Errorf("invalid quarantine media tool identity")
 	}
 	return nil
 }

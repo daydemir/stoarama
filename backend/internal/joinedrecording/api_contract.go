@@ -389,8 +389,11 @@ func (r SealHourRequest) Validate(recordingID int64, toolIdentity string) error 
 	for _, evidence := range r.Quarantine {
 		quarantineSources, sourceErr := sourceSubsetByIDs(r.AccountedSources, evidence.SourceClipIDs)
 		expectedClaim, claimErr := candidateSourceClaimSHA(quarantineSources)
-		if sourceErr != nil || claimErr != nil || validateQuarantineEvidence(evidence, toolIdentity, expectedClaim) != nil {
+		if sourceErr != nil || claimErr != nil {
 			return fmt.Errorf("joined hour seal quarantine differs")
+		}
+		if evidenceErr := validateQuarantineEvidence(evidence, toolIdentity, expectedClaim); evidenceErr != nil {
+			return fmt.Errorf("joined hour seal quarantine differs: %w", evidenceErr)
 		}
 		for _, clipID := range evidence.SourceClipIDs {
 			if !accounted[clipID] || disposed[clipID] {
