@@ -529,7 +529,7 @@ func (s *Server) revalidateJoinedArtifactCapability(ctx context.Context, scopeKi
 		      AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
 		      AND ga.work_scope=$7 AND ga.work_scope_identity_sha256=$6
 		      AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		        OR ($7 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))
 		FOR SHARE OF target,root`, artifactID, scopeKind, scopeID, batchID, lease, workScopeSHA, workScope.WorkScope).Scan(&ok)
 	if err != nil {
 		return err
@@ -801,7 +801,7 @@ func (s *Server) handleJoinedArtifactCapability(w http.ResponseWriter, r *http.R
 		      AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
 		      AND ga.work_scope=$8 AND ga.work_scope_identity_sha256=$7
 		      AND (($8='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
-		        OR ($8 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))`,
+		        OR ($8 IN ('canary','canary_single','allowlist_50') AND ga.authorization_source='server_seal'))))`,
 		req.ArtifactID, req.ScopeID, token, claims.BatchID, req.ScopeKind, s.cfg.JoinedRecordingConnectionID, workScopeSHA,
 		workScope.WorkScope).Scan(
 		&objectKey, &contentType, &expectedSize, &expectedSHA, &leaseExpires, &databaseNow)

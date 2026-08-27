@@ -452,6 +452,9 @@ func (c Config) ValidateJoined() error {
 		if c.JoinedRecordingWorkScope == JoinedWorkScopeFrozenBatch && (c.JoinedRecordingMaxActiveTasks < 1 || c.JoinedRecordingMaxActiveTasks > 64) {
 			return fmt.Errorf("JOINED_RECORDING_MAX_ACTIVE_TASKS must be between 1 and 64 for frozen-batch work")
 		}
+		if c.JoinedRecordingWorkScope == JoinedWorkScopeAllowlist50 && c.JoinedRecordingMaxActiveTasks != 2 {
+			return fmt.Errorf("JOINED_RECORDING_MAX_ACTIVE_TASKS must be exactly 2 for allowlist_50 work")
+		}
 	}
 	if c.JoinedRecordingNASDeliveryEnabled && !c.JoinedRecordingControlPlaneEnabled {
 		return fmt.Errorf("JOINED_RECORDING_NAS_DELIVERY_ENABLED requires JOINED_RECORDING_CONTROL_PLANE_ENABLED=true")
@@ -601,11 +604,12 @@ const (
 	JoinedWorkScopeDisabled     = "disabled"
 	JoinedWorkScopeCanary       = "canary"
 	JoinedWorkScopeSingleCanary = "canary_single"
+	JoinedWorkScopeAllowlist50  = "allowlist_50"
 	JoinedWorkScopeFrozenBatch  = "frozen_batch"
 )
 
 func IsJoinedCanaryWorkScope(scope string) bool {
-	return scope == JoinedWorkScopeCanary || scope == JoinedWorkScopeSingleCanary
+	return scope == JoinedWorkScopeCanary || scope == JoinedWorkScopeSingleCanary || scope == JoinedWorkScopeAllowlist50
 }
 
 // JoinedWorkScope validates the explicit rollout authority shared by API and
@@ -618,7 +622,7 @@ func (c Config) JoinedWorkScope() (string, error) {
 		if c.JoinedRecordingControlPlaneEnabled || c.JoinedRecordingEnabled {
 			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=disabled requires joined recording to be disabled")
 		}
-	case JoinedWorkScopeCanary, JoinedWorkScopeSingleCanary:
+	case JoinedWorkScopeCanary, JoinedWorkScopeSingleCanary, JoinedWorkScopeAllowlist50:
 		if !c.JoinedRecordingControlPlaneEnabled && !c.JoinedRecordingEnabled {
 			return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE=%s requires an enabled joined API or worker", scope)
 		}
@@ -633,7 +637,7 @@ func (c Config) JoinedWorkScope() (string, error) {
 			return "", fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must be empty for frozen_batch scope")
 		}
 	default:
-		return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE must be disabled, canary, canary_single, or frozen_batch")
+		return "", fmt.Errorf("STOARAMA_JOINED_WORK_SCOPE must be disabled, canary, canary_single, allowlist_50, or frozen_batch")
 	}
 	return scope, nil
 }
@@ -651,6 +655,8 @@ func (c Config) JoinedCanaryHourIDs() ([]string, error) {
 	wantCount := 3
 	if c.JoinedRecordingWorkScope == JoinedWorkScopeSingleCanary {
 		wantCount = 1
+	} else if c.JoinedRecordingWorkScope == JoinedWorkScopeAllowlist50 {
+		wantCount = 50
 	}
 	if len(items) != wantCount {
 		return nil, fmt.Errorf("JOINED_RECORDING_CANARY_HOUR_IDS must contain exactly %d canonical hour ID(s)", wantCount)

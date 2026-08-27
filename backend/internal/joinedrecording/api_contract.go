@@ -17,11 +17,12 @@ const JoinedProtocolVersion = 1
 const (
 	WorkScopeCanary       = "canary"
 	WorkScopeSingleCanary = "canary_single"
+	WorkScopeAllowlist50  = "allowlist_50"
 	WorkScopeFrozenBatch  = "frozen_batch"
 )
 
 func IsCanaryWorkScope(scope string) bool {
-	return scope == WorkScopeCanary || scope == WorkScopeSingleCanary
+	return scope == WorkScopeCanary || scope == WorkScopeSingleCanary || scope == WorkScopeAllowlist50
 }
 
 // WorkScopeIdentity is the exact rollout authority shared by worker, API, and
@@ -48,10 +49,12 @@ func (s WorkScopeIdentity) Validate(batchID string) error {
 		return fmt.Errorf("invalid joined work scope batch")
 	}
 	switch s.WorkScope {
-	case WorkScopeCanary, WorkScopeSingleCanary:
+	case WorkScopeCanary, WorkScopeSingleCanary, WorkScopeAllowlist50:
 		wantCount := 3
 		if s.WorkScope == WorkScopeSingleCanary {
 			wantCount = 1
+		} else if s.WorkScope == WorkScopeAllowlist50 {
+			wantCount = 50
 		}
 		if len(s.CanaryHourIDs) != wantCount || !lowerHex64(s.CanaryHourIDsSHA256) ||
 			s.CanaryHourIDsSHA256 != canaryHourIDsSHA256(s.CanaryHourIDs) {

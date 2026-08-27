@@ -28,22 +28,31 @@ const (
 )
 
 type Claims struct {
-	Version     int    `json:"v"`
-	Audience    string `json:"aud"`
-	ExpiresAt   int64  `json:"exp"`
-	Kind        string `json:"kind"`
-	BatchID     string `json:"batch_id"`
-	SubjectKind string `json:"subject_kind,omitempty"`
-	SubjectID   string `json:"subject_id,omitempty"`
-	LeaseToken  string `json:"lease_token,omitempty"`
-	Operation   string `json:"operation,omitempty"`
-	joinedrecording.WorkScopeIdentity
+	Version                 int    `json:"v"`
+	Audience                string `json:"aud"`
+	ExpiresAt               int64  `json:"exp"`
+	Kind                    string `json:"kind"`
+	BatchID                 string `json:"batch_id"`
+	SubjectKind             string `json:"subject_kind,omitempty"`
+	SubjectID               string `json:"subject_id,omitempty"`
+	LeaseToken              string `json:"lease_token,omitempty"`
+	Operation               string `json:"operation,omitempty"`
+	WorkScope               string `json:"work_scope,omitempty"`
+	WorkScopeIdentitySHA256 string `json:"work_scope_identity_sha256,omitempty"`
+	// CanaryHourIDs fields are decode-only compatibility for claim tokens
+	// minted before compact scope digests. New tokens always omit them.
+	CanaryHourIDs       []string `json:"canary_hour_ids,omitempty"`
+	CanaryHourIDsSHA256 string   `json:"canary_hour_ids_sha256,omitempty"`
 }
 
 func MintClaim(signingKey, batchID string, workScope joinedrecording.WorkScopeIdentity, expiresAt time.Time) (string, error) {
+	scopeSHA, err := workScope.SHA256(batchID)
+	if err != nil {
+		return "", errors.New("invalid joined claim token scope")
+	}
 	claims := Claims{Version: 1, Audience: Audience, ExpiresAt: expiresAt.UTC().Unix(), Kind: KindClaim,
-		BatchID: batchID, WorkScopeIdentity: workScope}
-	if !validCommon(signingKey, claims, expiresAt) || workScope.Validate(batchID) != nil {
+		BatchID: batchID, WorkScope: workScope.WorkScope, WorkScopeIdentitySHA256: scopeSHA}
+	if !validCommon(signingKey, claims, expiresAt) {
 		return "", errors.New("invalid joined claim token scope")
 	}
 	return mint(signingKey, claims)
@@ -89,20 +98,53 @@ func Verify(signingKey, token string, now time.Time) (Claims, error) {
 	switch claims.Kind {
 	case KindClaim:
 		if claims.SubjectKind != "" || claims.SubjectID != "" || claims.LeaseToken != "" || claims.Operation != "" ||
-			claims.WorkScopeIdentity.Validate(claims.BatchID) != nil {
+			!validClaimScope(claims.WorkScope) || !normalizeClaimScope(&claims) {
 			return Claims{}, errors.New("invalid joined claim token")
 		}
 	case KindOperation:
 		if claims.SubjectID == "" || len(claims.SubjectID) > 256 || uuid.Validate(claims.LeaseToken) != nil ||
 			(claims.SubjectKind != SubjectHour && claims.SubjectKind != SubjectLedger && claims.SubjectKind != SubjectBatchIndex) ||
 			(claims.Operation != OperationPreflight && claims.Operation != OperationPublish) || claims.WorkScope != "" ||
-			len(claims.CanaryHourIDs) != 0 || claims.CanaryHourIDsSHA256 != "" {
+			claims.WorkScopeIdentitySHA256 != "" || len(claims.CanaryHourIDs) != 0 || claims.CanaryHourIDsSHA256 != "" {
 			return Claims{}, errors.New("invalid joined operation token")
 		}
 	default:
 		return Claims{}, errors.New("invalid joined token kind")
 	}
 	return claims, nil
+}
+
+func normalizeClaimScope(claims *Claims) bool {
+	if validLowerHex64(claims.WorkScopeIdentitySHA256) {
+		return len(claims.CanaryHourIDs) == 0 && claims.CanaryHourIDsSHA256 == ""
+	}
+	legacy := joinedrecording.WorkScopeIdentity{WorkScope: claims.WorkScope, CanaryHourIDs: claims.CanaryHourIDs,
+		CanaryHourIDsSHA256: claims.CanaryHourIDsSHA256}
+	sha, err := legacy.SHA256(claims.BatchID)
+	if err != nil {
+		return false
+	}
+	claims.WorkScopeIdentitySHA256 = sha
+	claims.CanaryHourIDs = nil
+	claims.CanaryHourIDsSHA256 = ""
+	return true
+}
+
+func validClaimScope(scope string) bool {
+	return scope == joinedrecording.WorkScopeCanary || scope == joinedrecording.WorkScopeSingleCanary ||
+		scope == joinedrecording.WorkScopeAllowlist50 || scope == joinedrecording.WorkScopeFrozenBatch
+}
+
+func validLowerHex64(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func signature(key, payload string) string {

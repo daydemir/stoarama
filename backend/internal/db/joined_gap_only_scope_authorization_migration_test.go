@@ -56,6 +56,13 @@ func TestJoinedGapOnlyScopeAuthorizationMigrationLifecycle(t *testing.T) {
 	if _, err = conn.Exec(ctx, string(raw)); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
+	raw, err = os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0147_joined_allowlist_50_scope.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(ctx, string(raw)); err != nil {
+		t.Fatalf("apply allowlist migration: %v", err)
+	}
 	var count int
 	if err = conn.QueryRow(ctx, `SELECT count(*) FROM recording_joined_gap_only_scope_authorizations`).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("migration backfilled legacy authorization count=%d err=%v", count, err)
@@ -85,6 +92,24 @@ func TestJoinedGapOnlyScopeAuthorizationMigrationLifecycle(t *testing.T) {
 		 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','server_seal',$1,'hours/1.json','joined/hours/1.json',21,
 		 '1a5f3ed7f0b7cc8d9f7f28f50f94a2e33ec8c5d45441b0ec8868889b3dc08225',$1,'joined-gap-authorization-v1','sealed')`, canaryDigest, canaryBytes); err == nil {
 		t.Fatal("out-of-scope canary hour authorization succeeded")
+	}
+	allowlistHours := make([]string, 49)
+	allowlistHours[0] = "hour-1"
+	for i := 1; i < len(allowlistHours); i++ {
+		allowlistHours[i] = fmt.Sprintf("hour-%d", i+1)
+	}
+	allowlistBytes := []byte(fmt.Sprintf(`{"work_scope":"allowlist_50","canary_hour_ids":["%s"],"canary_hour_ids_sha256":"%s"}`,
+		strings.Join(allowlistHours, `","`), strings.Repeat("a", 64)))
+	allowlistDigest := fmt.Sprintf("%x", sha256.Sum256(allowlistBytes))
+	if _, err = conn.Exec(ctx, `INSERT INTO recording_joined_gap_only_scope_authorizations
+		(artifact_id,batch_record_id,batch_id,hour_record_id,hour_id,work_scope,work_scope_identity_sha256,work_scope_identity_bytes,
+		 canary_hour_ids_sha256,authorization_source,request_sha256,relative_path,object_key,expected_size_bytes,expected_sha256,
+		 review_evidence_sha256,verification_policy_version,verified_publication_state)
+		 VALUES(20,1,'batch-generation-1',10,'hour-1','allowlist_50',$1,$2,
+		 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','server_seal',$1,'hours/1.json','joined/hours/1.json',21,
+		 '1a5f3ed7f0b7cc8d9f7f28f50f94a2e33ec8c5d45441b0ec8868889b3dc08225',$1,'joined-gap-authorization-v1','sealed')`,
+		allowlistDigest, allowlistBytes); err == nil {
+		t.Fatal("allowlist_50 authorization accepted 49 hours")
 	}
 	if _, err = conn.Exec(ctx, `INSERT INTO recording_joined_gap_only_scope_authorizations
 		(artifact_id,batch_record_id,batch_id,hour_record_id,hour_id,work_scope,work_scope_identity_sha256,work_scope_identity_bytes,

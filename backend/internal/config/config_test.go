@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -407,6 +408,39 @@ func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
 	if _, err := single.JoinedWorkScope(); err == nil {
 		t.Fatal("single-canary scope accepted more than one hour")
 	}
+	allowlist := canary
+	allowlist.JoinedRecordingWorkScope = JoinedWorkScopeAllowlist50
+	allowlist.JoinedRecordingCanaryHourIDs = joinedAllowlistHours(batch, 50)
+	allowlist.JoinedRecordingMaxActiveTasks = 2
+	if scope, err := allowlist.JoinedWorkScope(); err != nil || scope != JoinedWorkScopeAllowlist50 || allowlist.ValidateJoined() != nil {
+		t.Fatalf("allowlist scope=%q err=%v", scope, err)
+	}
+	for _, count := range []int{49, 51} {
+		candidate := allowlist
+		candidate.JoinedRecordingCanaryHourIDs = joinedAllowlistHours(batch, count)
+		if candidate.ValidateJoined() == nil {
+			t.Fatalf("allowlist accepted %d hours", count)
+		}
+	}
+	duplicate := allowlist
+	duplicateHours := strings.Split(duplicate.JoinedRecordingCanaryHourIDs, ",")
+	duplicateHours[49] = duplicateHours[0]
+	duplicate.JoinedRecordingCanaryHourIDs = strings.Join(duplicateHours, ",")
+	if duplicate.ValidateJoined() == nil {
+		t.Fatal("allowlist accepted a duplicate canonical hour")
+	}
+	allowlist.JoinedRecordingMaxActiveTasks = 1
+	if allowlist.ValidateJoined() == nil {
+		t.Fatal("allowlist accepted a non-two-worker active-task cap")
+	}
+}
+
+func joinedAllowlistHours(batch string, count int) string {
+	hours := make([]string, count)
+	for i := range hours {
+		hours[i] = batch + "__recording-" + strconv.Itoa(i+1) + "__date-2026-08-01__hour-01__generation-1"
+	}
+	return strings.Join(hours, ",")
 }
 
 func validJoinedAPIConfigForTest(batch, hour string) Config {

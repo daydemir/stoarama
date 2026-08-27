@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +147,24 @@ func TestWorkScopeIdentityBindsExactCanaryAndFrozenBatch(t *testing.T) {
 		if _, err := NewWorkScopeIdentity(batchID, WorkScopeSingleCanary, candidate); err == nil {
 			t.Fatalf("single-canary accepted %d hours", len(candidate))
 		}
+	}
+	allowlistHours := make([]string, 50)
+	for i := range allowlistHours {
+		allowlistHours[i] = fmt.Sprintf("%s__recording-%d__date-2026-08-01__hour-01__generation-1", batchID, i+1)
+	}
+	allowlist, err := NewWorkScopeIdentity(batchID, WorkScopeAllowlist50, allowlistHours)
+	if err != nil || !allowlist.Equal(allowlist) || allowlist.CanaryHourIDsSHA256 == "" {
+		t.Fatalf("allowlist=%+v err=%v", allowlist, err)
+	}
+	for _, candidate := range [][]string{allowlistHours[:49], append(append([]string(nil), allowlistHours...), allowlistHours[0])} {
+		if _, err := NewWorkScopeIdentity(batchID, WorkScopeAllowlist50, candidate); err == nil {
+			t.Fatalf("allowlist accepted %d hours", len(candidate))
+		}
+	}
+	duplicate := append([]string(nil), allowlistHours...)
+	duplicate[49] = duplicate[0]
+	if _, err := NewWorkScopeIdentity(batchID, WorkScopeAllowlist50, duplicate); err == nil {
+		t.Fatal("allowlist accepted a duplicate hour")
 	}
 }
 
