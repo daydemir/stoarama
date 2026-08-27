@@ -556,7 +556,63 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		boundaries = append(boundaries, i+1)
 	}
 	if len(boundaries) == 0 {
-		return nil, nil, fmt.Errorf("%w: full failure has no adjacent locator", errMediaSplitNotIsolated)
+		if firstFailure == nil {
+			return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr)
+		}
+		remaining := sources
+		failedExtension := firstFailure
+		for len(remaining) > 1 {
+			found := false
+			for end := len(remaining) - 1; end > 0; end-- {
+				candidate := remaining[:end]
+				built, candidateErr := run("prefix", candidate)
+				if candidateErr == nil {
+					built.SplitEvidence = []MaximalityEvidence{maximalityEvidence(remaining[:end+1], failedExtension, 2, mediaToolIdentity)}
+					parts = append(parts, built)
+					ownedParts = append(ownedParts, built)
+					remaining = remaining[end:]
+					found = true
+					break
+				}
+				failure, deterministic := deterministicBuildFailure(candidateErr)
+				if !deterministic || failure.code == "output_exceeds_put_cap" {
+					return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr, candidateErr)
+				}
+				if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "prefix_repeat", candidate, failure); repeatErr != nil {
+					return nil, nil, errors.Join(firstErr, repeatErr)
+				} else if repeated == nil {
+					discardIsolatedBuild(repeatedBuild, scratchDir)
+					return nil, nil, errors.Join(firstErr, fmt.Errorf("%w: prefix failure changed across repeats", errMediaSplitNotIsolated))
+				}
+				failedExtension = failure
+			}
+			if !found {
+				return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr)
+			}
+
+			built, remainingErr := run("remaining", remaining)
+			if remainingErr == nil {
+				parts = append(parts, built)
+				ownedParts = append(ownedParts, built)
+				return parts, nil, nil
+			}
+			failure, deterministic := deterministicBuildFailure(remainingErr)
+			if !deterministic || failure.code == "output_exceeds_put_cap" {
+				return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr, remainingErr)
+			}
+			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "remaining_repeat", remaining, failure); repeatErr != nil {
+				return nil, nil, errors.Join(firstErr, repeatErr)
+			} else if repeated == nil {
+				discardIsolatedBuild(repeatedBuild, scratchDir)
+				return nil, nil, errors.Join(firstErr, fmt.Errorf("%w: remaining failure changed across repeats", errMediaSplitNotIsolated))
+			}
+			if len(remaining) == 1 {
+				quarantines = append(quarantines, QuarantinedBuild{Source: remaining[0], Evidence: maximalityEvidence(remaining, failure, 2, mediaToolIdentity)})
+				return parts, quarantines, nil
+			}
+			failedExtension = failure
+		}
+		return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr)
 	}
 
 	ends := append(append([]int(nil), boundaries...), len(sources))

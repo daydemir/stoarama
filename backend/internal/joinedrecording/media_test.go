@@ -172,7 +172,7 @@ func TestBuildAllPassingPartsUsesExactBoundaryProof(t *testing.T) {
 	}
 }
 
-func TestBuildAllPassingPartsRejectsUnexplainedNonlocalFailure(t *testing.T) {
+func TestBuildAllPassingPartsUsesMaximalPrefixesForThresholdFailure(t *testing.T) {
 	sources := makeSyntheticLocalSources(5)
 	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
 		if len(candidate) >= 3 {
@@ -184,8 +184,42 @@ func TestBuildAllPassingPartsRejectsUnexplainedNonlocalFailure(t *testing.T) {
 	}
 
 	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
-	if !errors.Is(err, errMediaSplitNotIsolated) || len(parts) != 0 || len(quarantines) != 0 {
+	if err != nil || len(parts) != 3 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || parts[2].SourceCount != 1 || len(quarantines) != 0 {
 		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+	if !equalInt64s(parts[0].SplitEvidence[0].CandidateClipIDs, []int64{1, 2, 3}) ||
+		!equalInt64s(parts[1].SplitEvidence[0].CandidateClipIDs, []int64{3, 4, 5}) || len(parts[2].SplitEvidence) != 0 {
+		t.Fatalf("threshold maximality evidence differs: %+v", parts)
+	}
+}
+
+func TestBuildAllPassingPartsUsesMaximalPassingPrefixForNonlocalFailure(t *testing.T) {
+	sources := makeSyntheticLocalSources(32)
+	calls := make([][]int64, 0)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		calls = append(calls, clipIDs(candidate))
+		if len(candidate) == len(sources) {
+			return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("repeatable nonlocal mismatch"))
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 || parts[0].SourceCount != 31 || parts[1].SourceCount != 1 || len(quarantines) != 0 {
+		t.Fatalf("parts=%+v quarantines=%+v", parts, quarantines)
+	}
+	if len(parts[0].SplitEvidence) != 1 || parts[0].SplitEvidence[0].RepeatCount != 2 ||
+		parts[0].SplitEvidence[0].ReasonCode != "media_sequence_mismatch" ||
+		!equalInt64s(parts[0].SplitEvidence[0].CandidateClipIDs, clipIDs(sources)) || len(parts[1].SplitEvidence) != 0 {
+		t.Fatalf("maximal prefix evidence=%+v", parts)
+	}
+	if countSpan(calls, clipIDs(sources)) != 2 || countSpan(calls, clipIDs(sources[:31])) != 1 || countSpan(calls, clipIDs(sources[31:])) != 1 {
+		t.Fatalf("candidates were not independently and minimally proved: %v", calls)
 	}
 }
 
