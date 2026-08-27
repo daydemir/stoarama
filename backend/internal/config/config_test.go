@@ -422,6 +422,13 @@ func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
 			t.Fatalf("allowlist accepted %d hours", count)
 		}
 	}
+	duplicate := allowlist
+	duplicateHours := strings.Split(duplicate.JoinedRecordingCanaryHourIDs, ",")
+	duplicateHours[49] = duplicateHours[0]
+	duplicate.JoinedRecordingCanaryHourIDs = strings.Join(duplicateHours, ",")
+	if duplicate.ValidateJoined() == nil {
+		t.Fatal("allowlist accepted a duplicate canonical hour")
+	}
 	allowlist.JoinedRecordingMaxActiveTasks = 1
 	if allowlist.ValidateJoined() == nil {
 		t.Fatal("allowlist accepted a non-two-worker active-task cap")

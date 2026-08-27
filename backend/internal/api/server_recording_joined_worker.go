@@ -145,7 +145,11 @@ func (s *Server) joinedWorkScopeIdentity() (joinedrecording.WorkScopeIdentity, e
 
 func (s *Server) joinedClaimMatchesCurrentScope(claims joinedauth.Claims) bool {
 	current, err := s.joinedWorkScopeIdentity()
-	return err == nil && claims.BatchID == s.cfg.JoinedRecordingBatchID && claims.WorkScopeIdentity.Equal(current)
+	if err != nil || claims.BatchID != s.cfg.JoinedRecordingBatchID || claims.WorkScope != current.WorkScope {
+		return false
+	}
+	currentSHA, err := current.SHA256(claims.BatchID)
+	return err == nil && claims.WorkScopeIdentitySHA256 == currentSHA
 }
 
 func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {

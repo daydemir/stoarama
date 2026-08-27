@@ -161,6 +161,11 @@ func TestWorkScopeIdentityBindsExactCanaryAndFrozenBatch(t *testing.T) {
 			t.Fatalf("allowlist accepted %d hours", len(candidate))
 		}
 	}
+	duplicate := append([]string(nil), allowlistHours...)
+	duplicate[49] = duplicate[0]
+	if _, err := NewWorkScopeIdentity(batchID, WorkScopeAllowlist50, duplicate); err == nil {
+		t.Fatal("allowlist accepted a duplicate hour")
+	}
 }
 
 func TestGapOnlyHourSkipsPreflightAndUsesPublicationClaim(t *testing.T) {

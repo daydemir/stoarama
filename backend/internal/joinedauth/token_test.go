@@ -3,6 +3,7 @@ package joinedauth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func TestJoinedWorkerTokenScopeAndExpiry(t *testing.T) {
 	}
 	claimScope, err := Verify("signing-key", claimToken, now)
 	if err != nil || claimScope.Kind != KindClaim || claimScope.BatchID != "batch-test" || claimScope.SubjectID != "" ||
-		!claimScope.WorkScopeIdentity.Equal(testClaimWorkScope(t, "batch-test")) {
+		claimScope.WorkScope != joinedrecording.WorkScopeFrozenBatch || !validLowerHex64(claimScope.WorkScopeIdentitySHA256) {
 		t.Fatalf("claim scope=%+v err=%v", claimScope, err)
 	}
 	claim := uuid.New()
@@ -96,8 +97,12 @@ func TestJoinedClaimTokenBindsExactCanaryIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := Verify("signing-key", token, now)
-	if err != nil || !got.WorkScopeIdentity.Equal(scope) {
+	wantSHA, shaErr := scope.SHA256(batchID)
+	if err != nil || shaErr != nil || got.WorkScope != scope.WorkScope || got.WorkScopeIdentitySHA256 != wantSHA {
 		t.Fatalf("claims=%+v err=%v", got, err)
+	}
+	if len(token) >= 1024 {
+		t.Fatalf("three-hour claim token length=%d", len(token))
 	}
 	parts := strings.Split(token, ".")
 	payload, _ := base64.RawURLEncoding.DecodeString(parts[0])
@@ -105,14 +110,77 @@ func TestJoinedClaimTokenBindsExactCanaryIdentity(t *testing.T) {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		t.Fatal(err)
 	}
-	claims.CanaryHourIDsSHA256 = strings.Repeat("0", 64)
+	claims.WorkScopeIdentitySHA256 = strings.Repeat("0", 64)
 	payload, _ = json.Marshal(claims)
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
-	if _, err := Verify("signing-key", encoded+"."+signature("signing-key", encoded), now); err == nil {
-		t.Fatal("validly signed canary digest drift was accepted")
+	if drifted, err := Verify("signing-key", encoded+"."+signature("signing-key", encoded), now); err != nil ||
+		drifted.WorkScopeIdentitySHA256 == wantSHA {
+		t.Fatal("signed digest claim did not retain its exact drift for server comparison")
 	}
 	if _, err := MintClaim("signing-key", batchID, joinedrecording.WorkScopeIdentity{WorkScope: "rolling"}, now.Add(time.Minute)); err == nil {
 		t.Fatal("rolling claim authority was minted")
+	}
+}
+
+func TestJoinedFiftyHourClaimTokenIsHeaderSafeAndDigestBound(t *testing.T) {
+	batchID := strings.Repeat("a", 63)
+	hours := make([]string, 50)
+	for i := range hours {
+		hours[i] = fmt.Sprintf("%s__recording-%d__date-2026-08-20__hour-01__generation-1", batchID, i+1)
+	}
+	scope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeAllowlist50, hours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(2_000_000_000, 0).UTC()
+	token, err := MintClaim("signing-key", batchID, scope, now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Verify("signing-key", token, now)
+	wantSHA, shaErr := scope.SHA256(batchID)
+	if err != nil || shaErr != nil || got.WorkScope != joinedrecording.WorkScopeAllowlist50 ||
+		got.WorkScopeIdentitySHA256 != wantSHA {
+		t.Fatalf("claims=%+v err=%v sha_err=%v", got, err, shaErr)
+	}
+	if len(token) >= 1024 {
+		t.Fatalf("fifty-hour claim token length=%d, want below 1024", len(token))
+	}
+	changed := append([]string(nil), hours...)
+	changed[49] = batchID + "__recording-51__date-2026-08-20__hour-01__generation-1"
+	drifted, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeAllowlist50, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedSHA, err := drifted.SHA256(batchID)
+	if err != nil || driftedSHA == got.WorkScopeIdentitySHA256 {
+		t.Fatal("changed fiftieth hour retained claim authority")
+	}
+}
+
+func TestJoinedClaimVerificationNormalizesPreDigestToken(t *testing.T) {
+	const batchID = "tier1-generation-1"
+	hours := []string{
+		batchID + "__recording-1__date-2026-08-01__hour-01__generation-1",
+		batchID + "__recording-2__date-2026-08-01__hour-02__generation-1",
+		batchID + "__recording-3__date-2026-08-01__hour-03__generation-1",
+	}
+	scope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeCanary, hours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(2_000_000_000, 0).UTC()
+	legacy, err := mint("signing-key", Claims{Version: 1, Audience: Audience, ExpiresAt: now.Add(time.Minute).Unix(),
+		Kind: KindClaim, BatchID: batchID, WorkScope: scope.WorkScope, CanaryHourIDs: scope.CanaryHourIDs,
+		CanaryHourIDsSHA256: scope.CanaryHourIDsSHA256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Verify("signing-key", legacy, now)
+	wantSHA, shaErr := scope.SHA256(batchID)
+	if err != nil || shaErr != nil || got.WorkScopeIdentitySHA256 != wantSHA || len(got.CanaryHourIDs) != 0 ||
+		got.CanaryHourIDsSHA256 != "" {
+		t.Fatalf("normalized claims=%+v err=%v sha_err=%v", got, err, shaErr)
 	}
 }
 
