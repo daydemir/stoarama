@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -156,6 +157,16 @@ type joinedOutputStoreStub struct {
 	extraGetExpirySec int
 	extraPutExpirySec int
 	headKeys          *[]string
+	headErr           error
+	body              []byte
+	openErr           error
+}
+
+func (s joinedOutputStoreStub) OpenExact(_ context.Context, _ string, _, _ string) (io.ReadCloser, error) {
+	if s.openErr != nil {
+		return nil, s.openErr
+	}
+	return io.NopCloser(bytes.NewReader(s.body)), nil
 }
 
 func (s joinedOutputStoreStub) Head(_ context.Context, key string) (r2.ObjectHead, error) {
@@ -164,6 +175,9 @@ func (s joinedOutputStoreStub) Head(_ context.Context, key string) (r2.ObjectHea
 	}
 	if head, ok := s.heads[key]; ok {
 		return head, nil
+	}
+	if s.headErr != nil {
+		return r2.ObjectHead{}, s.headErr
 	}
 	return s.head, nil
 }

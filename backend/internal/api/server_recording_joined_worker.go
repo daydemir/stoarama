@@ -169,6 +169,11 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 	}
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
+	workScopeSHA, err := workScope.SHA256(req.BatchID)
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+		return
+	}
 	var availableBatchID string
 	err = s.pool.QueryRow(r.Context(), `
 		SELECT b.batch_id FROM recording_joined_batches b
@@ -188,7 +193,24 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		      AND f.attempt_count=a.publication_attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		    AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
 		      OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
-		    AND (($3 AND (a.artifact_kind<>'hour_manifest' OR EXISTS(SELECT 1 FROM recording_joined_artifacts published_ledger
+			    AND (a.artifact_kind<>'batch_index' OR ($7='frozen_batch' AND NOT EXISTS(SELECT 1
+			      FROM recording_joined_batch_index_refs ref
+			      JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+			      JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+			      WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+			        AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+			          WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+			            AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+			            AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+			            AND ga.work_scope_identity_sha256=$6
+			            AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+			    AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT source_clip_count FROM recording_joined_hours WHERE id=a.hour_record_id),0)>0
+			      OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
+			        AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id AND ga.hour_record_id=a.hour_record_id
+			        AND ga.hour_id=a.scope_id AND ga.work_scope=$7 AND ga.work_scope_identity_sha256=$6
+			        AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+			          OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+			    AND (($3 AND (a.artifact_kind<>'hour_manifest' OR EXISTS(SELECT 1 FROM recording_joined_artifacts published_ledger
 		          WHERE published_ledger.stream_day_id=a.stream_day_id AND published_ledger.artifact_kind='allocation_ledger'
 		            AND published_ledger.publication_state='published'))) OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		          WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
@@ -197,7 +219,7 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		        AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=a.stream_day_id
 		          AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published')))))
 		LIMIT 1`, req.BatchID, canaryHours, frozenBatch, joinedMaxAttempts,
-		s.cfg.JoinedRecordingConnectionID).Scan(&availableBatchID)
+		s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScope.WorkScope).Scan(&availableBatchID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -217,6 +239,14 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID string, canaryHours []string, frozenBatch bool) (int64, int64, error) {
+	workScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		return 0, 0, err
+	}
+	workScopeSHA, err := workScope.SHA256(batchID)
+	if err != nil {
+		return 0, 0, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, 0, err
@@ -253,12 +283,31 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		   'transient','worker_lease_expired','terminal' FROM recording_joined_artifacts a
 		 WHERE a.batch_id=$1 AND a.artifact_kind<>'media' AND a.publication_state='publishing'
 		   AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=a.batch_record_id AND b.connection_id=$5)
+		   AND (a.artifact_kind<>'batch_index' OR ($7='frozen_batch' AND NOT EXISTS(SELECT 1
+		     FROM recording_joined_batch_index_refs ref
+		     JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+		     JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+		     WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+		       AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		         WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+		           AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+		           AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+		           AND ga.work_scope_identity_sha256=$6
+		           AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+		   AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT source_clip_count FROM recording_joined_hours
+		     WHERE id=a.hour_record_id),0)>0 OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		       WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		         AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$7
+		         AND ga.work_scope_identity_sha256=$6
+		         AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		           OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
 		   AND ($4 OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		     WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($3::text[])))
 		     OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		       WHERE allowed.id=a.hour_record_id AND allowed.hour_id=ANY($3::text[]))))
 		   AND a.publication_lease_expires_at<=now() AND a.publication_attempt_count>= $2
-		 ON CONFLICT DO NOTHING`, batchID, joinedMaxAttempts, canaryHours, frozenBatch, s.cfg.JoinedRecordingConnectionID); err != nil {
+		 ON CONFLICT DO NOTHING`, batchID, joinedMaxAttempts, canaryHours, frozenBatch, s.cfg.JoinedRecordingConnectionID,
+		workScopeSHA, workScope.WorkScope); err != nil {
 		return 0, 0, err
 	}
 	artifacts, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts a SET publication_state='terminal_failed',
@@ -266,6 +315,24 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		 publication_heartbeat_at=NULL,failure_reason_code='worker_lease_expired'
 		 WHERE a.batch_id=$1 AND a.artifact_kind<>'media' AND a.publication_state='publishing'
 		   AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=a.batch_record_id AND b.connection_id=$5)
+		   AND (a.artifact_kind<>'batch_index' OR ($7='frozen_batch' AND NOT EXISTS(SELECT 1
+		     FROM recording_joined_batch_index_refs ref
+		     JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+		     JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+		     WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+		       AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		         WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+		           AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+		           AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+		           AND ga.work_scope_identity_sha256=$6
+		           AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+		   AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT source_clip_count FROM recording_joined_hours
+		     WHERE id=a.hour_record_id),0)>0 OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		       WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		         AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope=$7
+		         AND ga.work_scope_identity_sha256=$6
+		         AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		           OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
 		   AND ($4 OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		     WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($3::text[])))
 		     OR (a.artifact_kind='hour_manifest' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
@@ -274,7 +341,7 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		   AND EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.artifact_id=a.id
 		     AND f.claim_token=a.publication_token AND f.attempt_count=a.publication_attempt_count
 		     AND f.disposition='terminal' AND f.reason_code='worker_lease_expired')`, batchID, joinedMaxAttempts, canaryHours,
-		frozenBatch, s.cfg.JoinedRecordingConnectionID)
+		frozenBatch, s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScope.WorkScope)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -458,6 +525,16 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	}
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
+	currentScope, scopeErr := s.joinedWorkScopeIdentity()
+	if scopeErr != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+		return
+	}
+	currentScopeSHA, scopeErr := currentScope.SHA256(req.BatchID)
+	if scopeErr != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+		return
+	}
 	claims, ok := joinedWorkerClaimsFromContext(r.Context())
 	if !ok || claims.Kind != joinedauth.KindClaim || claims.BatchID != req.BatchID || !s.joinedClaimMatchesCurrentScope(claims) {
 		util.WriteError(w, http.StatusForbidden, "joined claim token scope differs")
@@ -511,6 +588,23 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		    AND f.attempt_count=a.publication_attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		  AND ((a.publication_state='sealed' AND a.publication_next_attempt_at<=now())
 		    OR (a.publication_state='publishing' AND a.publication_lease_expires_at<=now()))
+		  AND (a.artifact_kind<>'batch_index' OR ($9='frozen_batch' AND NOT EXISTS(SELECT 1
+		    FROM recording_joined_batch_index_refs ref
+		    JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+		    JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+		    WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+		      AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		        WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+		          AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+		          AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+		          AND ga.work_scope_identity_sha256=$8
+		          AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+		  AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT source_clip_count FROM recording_joined_hours WHERE id=a.hour_record_id),0)>0
+		    OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
+		      AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id AND ga.hour_record_id=a.hour_record_id
+		      AND ga.hour_id=a.scope_id AND ga.work_scope=$9 AND ga.work_scope_identity_sha256=$8
+		      AND (($9='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		        OR ($9 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
 		  AND (($3 AND (a.artifact_kind<>'hour_manifest' OR ledger.publication_state='published')) OR (a.artifact_kind='allocation_ledger' AND EXISTS(SELECT 1 FROM recording_joined_hours allowed
 		      WHERE allowed.stream_day_id=a.stream_day_id AND allowed.hour_id=ANY($2::text[])))
 		    OR (a.artifact_kind='hour_manifest' AND ledger.publication_state='published'
@@ -519,7 +613,8 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		ORDER BY CASE a.artifact_kind WHEN 'allocation_ledger' THEN 0 WHEN 'hour_manifest' THEN 1 ELSE 2 END,
 		  COALESCE((SELECT h.priority_ordinal FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0),a.id
 		FOR UPDATE OF a SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch, capacityBytes,
-		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes, s.cfg.JoinedRecordingConnectionID).Scan(&artifactID, &selectedKind)
+		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes, s.cfg.JoinedRecordingConnectionID, currentScopeSHA,
+		currentScope.WorkScope).Scan(&artifactID, &selectedKind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -655,6 +750,20 @@ func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusForbidden, "joined failure lease differs")
 		return
 	}
+	var workScopeSHA, workScopeName string
+	if claims.Operation == joinedauth.OperationPublish {
+		workScope, scopeErr := s.joinedWorkScopeIdentity()
+		if scopeErr != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+			return
+		}
+		workScopeSHA, scopeErr = workScope.SHA256(claims.BatchID)
+		if scopeErr != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+			return
+		}
+		workScopeName = workScope.WorkScope
+	}
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "begin joined failure report")
@@ -695,12 +804,32 @@ func (s *Server) handleJoinedFailure(w http.ResponseWriter, r *http.Request) {
 			  AND connection_id=$4
 			FOR UPDATE`, claims.BatchID, req.ScopeID, claimToken, s.cfg.JoinedRecordingConnectionID).Scan(&batchRecordID, &targetID, &attempt, &leaseExpires)
 	} else if claims.Operation == joinedauth.OperationPublish {
-		err = tx.QueryRow(r.Context(), `SELECT batch_record_id,id,publication_attempt_count,publication_lease_expires_at
-			FROM recording_joined_artifacts
-			WHERE batch_id=$1 AND scope_kind=$2 AND scope_id=$3 AND artifact_kind<>'media'
-			  AND publication_state='publishing' AND publication_token=$4 AND publication_lease_expires_at>now()
-			  AND connection_id=$5
-			FOR UPDATE`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken, s.cfg.JoinedRecordingConnectionID).
+		// Bind the live scope before accepting a stale publication token.
+		err = tx.QueryRow(r.Context(), `SELECT a.batch_record_id,a.id,a.publication_attempt_count,a.publication_lease_expires_at
+			FROM recording_joined_artifacts a LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
+			WHERE a.batch_id=$1 AND a.scope_kind=$2 AND a.scope_id=$3 AND a.artifact_kind<>'media'
+			  AND a.publication_state='publishing' AND a.publication_token=$4 AND a.publication_lease_expires_at>now()
+			  AND a.connection_id=$5
+			  AND (a.artifact_kind<>'batch_index' OR ($7='frozen_batch' AND NOT EXISTS(SELECT 1
+			    FROM recording_joined_batch_index_refs ref
+			    JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+			    JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+			    WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+			      AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+			        WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+			          AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+			          AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+			          AND ga.work_scope_identity_sha256=$6
+			          AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+			  AND (a.artifact_kind<>'hour_manifest' OR h.source_clip_count>0 OR EXISTS(SELECT 1
+			    FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
+			      AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+			      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
+			      AND ga.work_scope=$7 AND ga.work_scope_identity_sha256=$6
+			      AND (($7='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+			        OR ($7 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+			FOR UPDATE OF a`, claims.BatchID, req.ScopeKind, req.ScopeID, claimToken, s.cfg.JoinedRecordingConnectionID,
+			workScopeSHA, workScopeName).
 			Scan(&batchRecordID, &targetID, &attempt, &leaseExpires)
 	} else {
 		err = pgx.ErrNoRows
@@ -920,13 +1049,33 @@ func (s *Server) validateJoinedRootFinalizeIdentity(ctx context.Context, scopeKi
 	if err != nil {
 		return errors.New("joined publication lease differs")
 	}
+	currentScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		return errors.New("joined work scope is unavailable")
+	}
+	currentScopeSHA, err := currentScope.SHA256(claims.BatchID)
+	if err != nil {
+		return errors.New("joined work scope is unavailable")
+	}
 	var valid bool
 	err = s.pool.QueryRow(ctx, `SELECT a.scope_id=$4 AND a.object_key=$5 AND a.expected_size_bytes=$6 AND a.expected_sha256=$7
 		AND ((a.publication_state='publishing' AND a.publication_token=$8 AND a.publication_lease_expires_at>now())
 		  OR (a.publication_state='published' AND a.finalized_token=$8))
 		FROM recording_joined_artifacts a JOIN connections c ON c.id=a.connection_id
-		WHERE a.id=$1 AND a.artifact_kind<>'media' AND a.scope_kind=$2 AND a.batch_id=$3 AND c.id=$9 FOR SHARE OF a,c`, artifactID, scopeKind,
-		claims.BatchID, claims.SubjectID, objectKey, sizeBytes, sha256, lease, s.cfg.JoinedRecordingConnectionID).Scan(&valid)
+		WHERE a.id=$1 AND a.artifact_kind<>'media' AND a.scope_kind=$2 AND a.batch_id=$3 AND c.id=$9
+		  AND (a.artifact_kind<>'batch_index' OR ($11='frozen_batch' AND NOT EXISTS(SELECT 1
+		    FROM recording_joined_batch_index_refs ref
+		    JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+		    JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+		    WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+		      AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		        WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+		          AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+		          AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+		          AND ga.work_scope_identity_sha256=$10
+		          AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+		FOR SHARE OF a,c`, artifactID, scopeKind, claims.BatchID, claims.SubjectID, objectKey, sizeBytes, sha256, lease,
+		s.cfg.JoinedRecordingConnectionID, currentScopeSHA, currentScope.WorkScope).Scan(&valid)
 	if err != nil || !valid {
 		return errors.New("joined publication identity differs")
 	}
@@ -1113,6 +1262,14 @@ func (s *Server) validateJoinedHourFinalizeIdentity(ctx context.Context, publish
 	if err != nil {
 		return errors.New("joined hour publication lease differs")
 	}
+	currentScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		return errors.New("joined work scope is unavailable")
+	}
+	currentScopeSHA, err := currentScope.SHA256(claims.BatchID)
+	if err != nil {
+		return errors.New("joined work scope is unavailable")
+	}
 	var manifestID int64
 	var key, sha, localDate string
 	var size, recordingID int64
@@ -1124,8 +1281,17 @@ func (s *Server) validateJoinedHourFinalizeIdentity(ctx context.Context, publish
 		 OR (root.publication_state='published' AND root.finalized_token=$3))
 		FROM recording_joined_artifacts root JOIN recording_joined_hours h ON h.id=root.hour_record_id
 		JOIN connections c ON c.id=root.connection_id
-		WHERE root.batch_id=$1 AND root.scope_id=$2 AND root.artifact_kind='hour_manifest' AND c.id=$4 FOR SHARE OF root,h,c`, claims.BatchID,
-		published.HourID, lease, s.cfg.JoinedRecordingConnectionID).Scan(&manifestID, &key, &size, &sha, &recordingID, &localDate, &localHour, &valid)
+		WHERE root.batch_id=$1 AND root.scope_id=$2 AND root.artifact_kind='hour_manifest' AND c.id=$4
+		  AND (h.source_clip_count>0 OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		    WHERE ga.artifact_id=root.id AND ga.batch_record_id=root.batch_record_id AND ga.batch_id=root.batch_id
+		      AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
+		      AND ga.work_scope=$6 AND ga.work_scope_identity_sha256=$5
+		      AND (($6='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		        OR ($6 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+
+		FOR SHARE OF root,h,c`, claims.BatchID, published.HourID, lease, s.cfg.JoinedRecordingConnectionID, currentScopeSHA,
+		currentScope.WorkScope).Scan(
+		&manifestID, &key, &size, &sha, &recordingID, &localDate, &localHour, &valid)
 	if err != nil || !valid || key != published.HourManifestObjectKey || size != published.HourManifestSizeBytes ||
 		sha != published.HourManifestSHA256 || recordingID != published.RecordingID || localDate != published.LocalDate ||
 		localHour != published.LocalHour {
@@ -1177,6 +1343,14 @@ func (s *Server) finalizeJoinedHour(ctx context.Context, published joinedrecordi
 	if err != nil {
 		return errors.New("joined hour publication lease differs")
 	}
+	currentScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		return errors.New("joined work scope is unavailable")
+	}
+	currentScopeSHA, err := currentScope.SHA256(claims.BatchID)
+	if err != nil {
+		return errors.New("joined work scope is unavailable")
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1193,7 +1367,14 @@ func (s *Server) finalizeJoinedHour(ctx context.Context, published joinedrecordi
 		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id
 		JOIN connections c ON c.id=a.connection_id
 		WHERE a.scope_kind='hour' AND a.scope_id=$1 AND a.batch_id=$2 AND a.artifact_kind='hour_manifest' AND c.id=$3
-		FOR UPDATE OF a,c`, published.HourID, claims.BatchID, s.cfg.JoinedRecordingConnectionID).Scan(&manifestID, &state, &manifestKey, &manifestSize,
+		  AND (h.source_clip_count>0 OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		    WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
+		      AND ga.work_scope=$5 AND ga.work_scope_identity_sha256=$4
+		      AND (($5='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		        OR ($5 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		FOR UPDATE OF a,c`, published.HourID, claims.BatchID, s.cfg.JoinedRecordingConnectionID, currentScopeSHA,
+		currentScope.WorkScope).Scan(&manifestID, &state, &manifestKey, &manifestSize,
 		&manifestSHA, &currentETag, &currentVersion, &finalized, &recordingID, &localDate, &localHour)
 	if err != nil || manifestKey != published.HourManifestObjectKey || manifestSize != published.HourManifestSizeBytes ||
 		manifestSHA != published.HourManifestSHA256 || recordingID != published.RecordingID || localDate != published.LocalDate ||
@@ -1291,6 +1472,20 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		util.WriteError(w, http.StatusBadRequest, "invalid joined heartbeat lease")
 		return
 	}
+	var workScopeSHA, workScopeName string
+	if claims.Operation == joinedauth.OperationPublish {
+		workScope, scopeErr := s.joinedWorkScopeIdentity()
+		if scopeErr != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+			return
+		}
+		workScopeSHA, scopeErr = workScope.SHA256(claims.BatchID)
+		if scopeErr != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
+			return
+		}
+		workScopeName = workScope.WorkScope
+	}
 	tx, err := s.pool.Begin(r.Context())
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("begin joined heartbeat: %v", err))
@@ -1322,12 +1517,32 @@ func (s *Server) handleJoinedHeartbeat(w http.ResponseWriter, r *http.Request) {
 		    AND connection_id=$5
 		  RETURNING lease_expires_at`, req.ScopeID, token, joinedLeaseDuration.String(), claims.BatchID, s.cfg.JoinedRecordingConnectionID).Scan(&leaseExpires)
 	} else if claims.Operation == joinedauth.OperationPublish {
-		err = tx.QueryRow(r.Context(), `UPDATE recording_joined_artifacts SET
-		  publication_lease_expires_at=GREATEST(publication_lease_expires_at+interval '1 second',date_trunc('second',now()+$4::interval)),publication_heartbeat_at=now()
-		  WHERE scope_kind=$1 AND scope_id=$2 AND batch_id=$5 AND artifact_kind<>'media'
-		    AND publication_state='publishing' AND publication_token=$3 AND publication_lease_expires_at>now()
-		    AND connection_id=$6
-		  RETURNING publication_lease_expires_at`, req.ScopeKind, req.ScopeID, token, joinedLeaseDuration.String(), claims.BatchID, s.cfg.JoinedRecordingConnectionID).Scan(&leaseExpires)
+		err = tx.QueryRow(r.Context(), `UPDATE recording_joined_artifacts a SET
+		  publication_lease_expires_at=GREATEST(a.publication_lease_expires_at+interval '1 second',date_trunc('second',now()+$4::interval)),publication_heartbeat_at=now()
+		  WHERE a.scope_kind=$1 AND a.scope_id=$2 AND a.batch_id=$5 AND a.artifact_kind<>'media'
+		    AND a.publication_state='publishing' AND a.publication_token=$3 AND a.publication_lease_expires_at>now()
+		    AND a.connection_id=$6
+		    AND (a.artifact_kind<>'batch_index' OR ($8='frozen_batch' AND NOT EXISTS(SELECT 1
+		      FROM recording_joined_batch_index_refs ref
+		      JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+		      JOIN recording_joined_hours gap_hour ON gap_hour.id=target.hour_record_id
+		      WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND gap_hour.source_clip_count=0
+		        AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		          WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+		            AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+		            AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+		            AND ga.work_scope_identity_sha256=$7
+		            AND ga.authorization_source IN ('server_seal','operator_frozen')))))
+		    AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT source_clip_count FROM recording_joined_hours
+		      WHERE id=a.hour_record_id),0)>0 OR EXISTS(SELECT 1
+		      FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
+		        AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		        AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
+		        AND ga.work_scope=$8 AND ga.work_scope_identity_sha256=$7
+		        AND (($8='frozen_batch' AND ga.authorization_source IN ('server_seal','operator_frozen'))
+		          OR ($8 IN ('canary','canary_single') AND ga.authorization_source='server_seal'))))
+		  RETURNING a.publication_lease_expires_at`, req.ScopeKind, req.ScopeID, token, joinedLeaseDuration.String(),
+			claims.BatchID, s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScopeName).Scan(&leaseExpires)
 	} else {
 		err = pgx.ErrNoRows
 	}

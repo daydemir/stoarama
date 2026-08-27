@@ -834,6 +834,15 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	var frozenScopeSHA string
+	if req.JoinedDelivery != nil {
+		var err error
+		frozenScopeSHA, err = joinedFrozenScopeSHA(s.cfg.JoinedRecordingBatchID)
+		if err != nil {
+			util.WriteError(w, http.StatusServiceUnavailable, "joined delivery scope is unavailable")
+			return
+		}
+	}
 	var outageClass string
 	var outageStartedAt, outageRecoveredAt *time.Time
 	var outageFailureCount int
@@ -967,6 +976,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 			  joined_last_attempt_at=$4,joined_retry_at=$5
 			WHERE c.id=$1 AND c.joined_protocol_version=1 AND EXISTS(
 			  SELECT 1 FROM recording_joined_artifacts a
+			  LEFT JOIN recording_joined_hours h ON h.id=a.hour_record_id
 			  LEFT JOIN recording_joined_artifacts manifest ON a.artifact_kind='media'
 			    AND manifest.hour_record_id=a.hour_record_id AND manifest.artifact_kind='hour_manifest'
 			  LEFT JOIN recording_joined_artifacts ledger ON a.artifact_kind='hour_manifest'
@@ -974,6 +984,12 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 			  LEFT JOIN recording_joined_artifact_acks own_ack ON own_ack.artifact_id=a.id
 			    AND own_ack.connection_id=a.connection_id
 			  WHERE a.id=$2 AND a.connection_id=c.id AND own_ack.artifact_id IS NULL
+			    AND (a.artifact_kind<>'hour_manifest' OR h.source_clip_count>0 OR EXISTS(SELECT 1
+			      FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=a.id
+			        AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+			        AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id
+			        AND ga.work_scope='frozen_batch' AND ga.work_scope_identity_sha256=$6
+			        AND ga.authorization_source IN ('server_seal','operator_frozen')))
 			    AND ((a.artifact_kind<>'media' AND a.publication_state='published')
 			      OR (a.artifact_kind='media' AND a.published_at IS NOT NULL))
 			    AND (a.artifact_kind='allocation_ledger'
@@ -985,7 +1001,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 			        LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=prior.id AND ack.connection_id=prior.connection_id
 			        WHERE prior.batch_record_id=a.batch_record_id AND prior.artifact_kind<>'batch_index'
 			          AND ack.artifact_id IS NULL))))`,
-			connectionID, joined.ArtifactID, joined.Blocker, joined.AttemptedAt, joined.RetryAt)
+			connectionID, joined.ArtifactID, joined.Blocker, joined.AttemptedAt, joined.RetryAt, frozenScopeSHA)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("record joined delivery telemetry: %v", err))
 			return

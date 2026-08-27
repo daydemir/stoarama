@@ -14,6 +14,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/joinedauth"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
+	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -427,12 +428,46 @@ func sealJoinedGapOnlyHoursTx(ctx context.Context, tx pgx.Tx, ledgerArtifactID i
 			return err
 		}
 		relativePath := "coverage/hours/" + plan.HourID + ".json"
-		if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,batch_id,
+		var artifactID int64
+		if err := tx.QueryRow(ctx, `INSERT INTO recording_joined_artifacts(batch_record_id,account_id,connection_id,batch_id,
 			scope_kind,scope_id,stream_day_id,hour_record_id,artifact_kind,ordinal,relative_path,object_key,content_type,
 			expected_size_bytes,expected_sha256,canonical_bytes,publication_state)
 			SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,'hour_manifest',1,
-			  $2,$3,'application/json',$4,$5,$6,'sealed' FROM recording_joined_hours WHERE id=$1 AND connection_id=$7`, hour.recordID,
-			relativePath, "joined/"+plan.BatchID+"/"+relativePath, len(manifestBytes), manifestSHA, manifestBytes, connectionID); err != nil {
+			  $2,$3,'application/json',$4,$5,$6,'sealed' FROM recording_joined_hours WHERE id=$1 AND connection_id=$7
+			RETURNING id`, hour.recordID, relativePath, "joined/"+plan.BatchID+"/"+relativePath, len(manifestBytes), manifestSHA,
+			manifestBytes, connectionID).Scan(&artifactID); err != nil {
+			return err
+		}
+		scopeSHA, scopeBytes, err := scope.Canonical(plan.BatchID)
+		if err != nil {
+			return err
+		}
+		authSource := "server_seal"
+		authIdentity := struct {
+			ArtifactID           int64  `json:"artifact_id"`
+			BatchID              string `json:"batch_id"`
+			HourID               string `json:"hour_id"`
+			ExpectedSize         int    `json:"expected_size_bytes"`
+			ExpectedSHA          string `json:"expected_sha256"`
+			WorkScopeIdentitySHA string `json:"work_scope_identity_sha256"`
+			AuthorizationSource  string `json:"authorization_source"`
+		}{artifactID, plan.BatchID, plan.HourID, len(manifestBytes), manifestSHA, scopeSHA, authSource}
+		requestSHA, _, err := stitchcert.CanonicalSHA(authIdentity)
+		if err != nil {
+			return err
+		}
+		var canarySHA any
+		if joinedrecording.IsCanaryWorkScope(scope.WorkScope) {
+			canarySHA = scope.CanaryHourIDsSHA256
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO recording_joined_gap_only_scope_authorizations
+			(artifact_id,batch_record_id,batch_id,hour_record_id,hour_id,work_scope,work_scope_identity_sha256,work_scope_identity_bytes,
+			 canary_hour_ids_sha256,authorization_source,request_sha256,relative_path,object_key,expected_size_bytes,expected_sha256,
+			 review_evidence_sha256,verification_policy_version,verified_publication_state)
+			SELECT $1,a.batch_record_id,a.batch_id,a.hour_record_id,a.scope_id,$2,$3,$4,$5,$6,$7,
+			 a.relative_path,a.object_key,a.expected_size_bytes,a.expected_sha256,$7,'joined-gap-authorization-v1','sealed'
+			FROM recording_joined_artifacts a WHERE a.id=$1`, artifactID, scope.WorkScope, scopeSHA, scopeBytes, canarySHA,
+			authSource, requestSHA); err != nil {
 			return err
 		}
 	}

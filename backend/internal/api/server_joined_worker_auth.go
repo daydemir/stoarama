@@ -128,6 +128,14 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 	if err != nil {
 		return false
 	}
+	identity, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		return false
+	}
+	scopeSHA, err := identity.SHA256(claims.BatchID)
+	if err != nil {
+		return false
+	}
 	if scope == "frozen_batch" {
 		if s.pool == nil {
 			return false
@@ -136,10 +144,28 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_batches b
 			JOIN connections c ON c.id=b.connection_id AND c.id=$4
 			WHERE b.batch_id=$1 AND (($2='hour' AND EXISTS(SELECT 1 FROM recording_joined_hours h
-			  WHERE h.batch_record_id=b.id AND h.hour_id=$3)) OR ($2<>'hour' AND EXISTS(
+			  LEFT JOIN recording_joined_artifacts root ON root.hour_record_id=h.id AND root.artifact_kind='hour_manifest'
+			  WHERE h.batch_record_id=b.id AND h.hour_id=$3
+			    AND (root.id IS NULL OR h.source_clip_count>0 OR EXISTS(SELECT 1
+			      FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=root.id
+			        AND ga.batch_record_id=root.batch_record_id AND ga.batch_id=root.batch_id
+			        AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
+			        AND ga.work_scope=$6 AND ga.work_scope_identity_sha256=$5
+			        AND ga.authorization_source IN ('server_seal','operator_frozen')))) OR ($2<>'hour' AND EXISTS(
 			  SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
-			    AND a.scope_kind=$2 AND a.scope_id=$3))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID,
-			s.cfg.JoinedRecordingConnectionID).Scan(&allowed)
+			    AND a.scope_kind=$2 AND a.scope_id=$3
+			    AND ($2<>'batch_index' OR (a.artifact_kind='batch_index' AND NOT EXISTS(SELECT 1
+			      FROM recording_joined_batch_index_refs ref
+			      JOIN recording_joined_artifacts target ON target.id=ref.referenced_artifact_id
+			      JOIN recording_joined_hours h ON h.id=target.hour_record_id
+			      WHERE ref.index_artifact_id=a.id AND ref.reference_kind='hour_manifest' AND h.source_clip_count=0
+			        AND NOT EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+			          WHERE ga.artifact_id=target.id AND ga.batch_record_id=target.batch_record_id
+			            AND ga.batch_id=target.batch_id AND ga.hour_record_id=target.hour_record_id
+			            AND ga.hour_id=target.scope_id AND ga.work_scope='frozen_batch'
+			            AND ga.work_scope_identity_sha256=$5
+			            AND ga.authorization_source IN ('server_seal','operator_frozen'))))))))))`, claims.BatchID, claims.SubjectKind, claims.SubjectID,
+			s.cfg.JoinedRecordingConnectionID, scopeSHA, identity.WorkScope).Scan(&allowed)
 		return err == nil && allowed
 	}
 	if !config.IsJoinedCanaryWorkScope(scope) {
@@ -159,8 +185,15 @@ func (s *Server) joinedOperationWithinScope(ctx context.Context, claims joinedau
 		var allowed bool
 		err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_hours h
 			JOIN recording_joined_batches b ON b.id=h.batch_record_id AND b.connection_id=$4
-			WHERE h.batch_id=$1 AND h.hour_id=$2 AND h.hour_id=ANY($3::text[]))`, claims.BatchID,
-			claims.SubjectID, hours, s.cfg.JoinedRecordingConnectionID).Scan(&allowed)
+			LEFT JOIN recording_joined_artifacts root ON root.hour_record_id=h.id AND root.artifact_kind='hour_manifest'
+			WHERE h.batch_id=$1 AND h.hour_id=$2 AND h.hour_id=ANY($3::text[])
+			  AND (root.id IS NULL OR h.source_clip_count>0 OR EXISTS(SELECT 1
+			    FROM recording_joined_gap_only_scope_authorizations ga WHERE ga.artifact_id=root.id
+			      AND ga.batch_record_id=root.batch_record_id AND ga.batch_id=root.batch_id
+			      AND ga.hour_record_id=root.hour_record_id AND ga.hour_id=root.scope_id
+			      AND ga.work_scope=$6 AND ga.work_scope_identity_sha256=$5
+			      AND ga.authorization_source='server_seal')))`, claims.BatchID,
+			claims.SubjectID, hours, s.cfg.JoinedRecordingConnectionID, scopeSHA, identity.WorkScope).Scan(&allowed)
 		return err == nil && allowed
 	case joinedauth.SubjectLedger:
 		if s.pool == nil {

@@ -181,6 +181,14 @@ func configureJoinedBatchIndexTransaction(ctx context.Context, tx pgx.Tx) error 
 
 func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID string, connectionID int, lock bool) (joinedCanonicalIndex, string, int64, error) {
 	var canonical joinedCanonicalIndex
+	frozenScope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		return canonical, "", 0, err
+	}
+	frozenScopeSHA, err := frozenScope.SHA256(batchID)
+	if err != nil {
+		return canonical, "", 0, err
+	}
 	var state string
 	var indexArtifactID *int64
 	var mediaToolJSON []byte
@@ -198,7 +206,7 @@ func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID strin
 	if lock {
 		query += ` FOR UPDATE OF b FOR SHARE OF c,q`
 	}
-	err := tx.QueryRow(ctx, query, batchID, connectionID).Scan(&canonical.BatchRecordID, &canonical.AccountID, &canonical.ConnectionID,
+	err = tx.QueryRow(ctx, query, batchID, connectionID).Scan(&canonical.BatchRecordID, &canonical.AccountID, &canonical.ConnectionID,
 		&state, &indexArtifactID, &canonical.Index.Generation, &canonical.Index.FrozenAt, &canonical.Index.FrozenDenominatorSHA256,
 		&expectedRecordings, &expectedLedgers, &expectedHours, &sourceCount64, &sourceBytes, &canonical.Index.PolicyVersion,
 		&mediaToolJSON, &authority.SelectionBasis, &authority.OrderedRecordingIDSHA256, &authority.Cutoff,
@@ -245,7 +253,7 @@ func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID strin
 	}
 	var hourByID map[int64]joinedrecording.HourManifest
 	canonical.Index.Hours, hourByID, canonical.Index.FinalMediaCount, err = loadJoinedHourReferences(ctx, tx,
-		canonical.BatchRecordID, expectedHours)
+		canonical.BatchRecordID, expectedHours, frozenScopeSHA)
 	if err != nil {
 		return canonical, state, 0, err
 	}
@@ -429,13 +437,17 @@ func loadJoinedLedgerReferences(ctx context.Context, tx pgx.Tx, batchRecordID in
 	return refs, ledgers, nil
 }
 
-func loadJoinedHourReferences(ctx context.Context, tx pgx.Tx, batchRecordID int64, expected int) (
+func loadJoinedHourReferences(ctx context.Context, tx pgx.Tx, batchRecordID int64, expected int, frozenScopeSHA string) (
 	[]joinedrecording.BatchIndexHour, map[int64]joinedrecording.HourManifest, int, error) {
 	rows, err := tx.Query(ctx, `SELECT a.id,a.hour_record_id,a.canonical_bytes,a.relative_path,a.object_key,
 		a.expected_size_bytes,a.expected_sha256,h.priority_ordinal
 		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.state='sealed'
 		WHERE a.batch_record_id=$1 AND a.artifact_kind='hour_manifest' AND a.publication_state='published'
-		ORDER BY h.priority_ordinal`, batchRecordID)
+		  AND (h.source_clip_count>0 OR EXISTS(SELECT 1 FROM recording_joined_gap_only_scope_authorizations ga
+		    WHERE ga.artifact_id=a.id AND ga.batch_record_id=a.batch_record_id AND ga.batch_id=a.batch_id
+		      AND ga.hour_record_id=a.hour_record_id AND ga.hour_id=a.scope_id AND ga.work_scope='frozen_batch'
+		      AND ga.authorization_source IN ('server_seal','operator_frozen') AND ga.work_scope_identity_sha256=$2))
+		ORDER BY h.priority_ordinal`, batchRecordID, frozenScopeSHA)
 	if err != nil {
 		return nil, nil, 0, err
 	}

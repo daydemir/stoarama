@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 )
 
 const JoinedProtocolVersion = 1
@@ -76,6 +78,24 @@ func (s WorkScopeIdentity) Validate(batchID string) error {
 func (s WorkScopeIdentity) Equal(other WorkScopeIdentity) bool {
 	return s.WorkScope == other.WorkScope && s.CanaryHourIDsSHA256 == other.CanaryHourIDsSHA256 &&
 		slices.Equal(s.CanaryHourIDs, other.CanaryHourIDs)
+}
+
+// SHA256 binds the exact validated rollout scope used to authorize work.
+func (s WorkScopeIdentity) SHA256(batchID string) (string, error) {
+	digest, _, err := s.Canonical(batchID)
+	return digest, err
+}
+
+// Canonical returns the exact bytes and digest persisted by scope authorization.
+func (s WorkScopeIdentity) Canonical(batchID string) (string, []byte, error) {
+	if err := s.Validate(batchID); err != nil {
+		return "", nil, err
+	}
+	digest, canonical, err := stitchcert.CanonicalSHA(s)
+	if err != nil {
+		return "", nil, fmt.Errorf("canonical joined work scope: %w", err)
+	}
+	return digest, canonical, nil
 }
 
 func canaryHourIDsSHA256(hourIDs []string) string {

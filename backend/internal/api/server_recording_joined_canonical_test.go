@@ -1130,6 +1130,32 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		Scan(&sealedGapHourID); err != nil || sealedGapHourID != canaryGapHourID {
 		t.Fatalf("server sealed gap hour=%q want=%q err=%v", sealedGapHourID, canaryGapHourID, err)
 	}
+	canaryScope, err := s.joinedWorkScopeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canaryScopeSHA, err := canaryScope.SHA256(batchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenScope, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenScopeSHA, err := frozenScope.SHA256(batchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matchingAuthorizations, frozenAuthorizations int
+	if err := pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE ga.work_scope_identity_sha256=$2 AND ga.authorization_source='server_seal'),
+		count(*) FILTER (WHERE ga.work_scope_identity_sha256=$3)
+		FROM recording_joined_gap_only_scope_authorizations ga
+		JOIN recording_joined_artifacts a ON a.id=ga.artifact_id
+		WHERE a.stream_day_id=$1`, ledgers[0].streamDayID, canaryScopeSHA, frozenScopeSHA).Scan(
+		&matchingAuthorizations, &frozenAuthorizations); err != nil || matchingAuthorizations != 1 || frozenAuthorizations != 0 {
+		t.Fatalf("gap scope authorizations matching=%d frozen=%d err=%v", matchingAuthorizations, frozenAuthorizations, err)
+	}
 	var pendingForeignGaps int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_joined_hours
 		WHERE stream_day_id=$1 AND state='pending' AND source_clip_count=0 AND hour_id<>$2`, ledgers[0].streamDayID, canaryGapHourID).
@@ -2116,6 +2142,33 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("frozen-batch ledger claim status=%d body=%s", frozenPublicationRecorder.Code, frozenPublicationRecorder.Body.String())
 	}
 	publishJoinedCanonicalRemainderForIndex(t, fixture, batchRecordID)
+	// The canonical lifecycle predates explicit frozen-scope ratification. Give
+	// its already-verified gap manifests the exact frozen authorization that the
+	// operator endpoint is exercised for separately in the gap-fence PG test.
+	frozenIdentity, err := joinedrecording.NewWorkScopeIdentity(batchID, joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenScopeSHA, frozenScopeBytes, err := frozenIdentity.Canonical(batchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_gap_only_scope_authorizations
+		(artifact_id,batch_record_id,batch_id,hour_record_id,hour_id,work_scope,work_scope_identity_sha256,
+		 work_scope_identity_bytes,authorization_source,request_sha256,relative_path,object_key,expected_size_bytes,
+		 expected_sha256,review_evidence_sha256,incident_id,verification_policy_version,verified_publication_state,
+		 verified_etag,verified_version_id)
+		SELECT a.id,a.batch_record_id,a.batch_id,a.hour_record_id,a.scope_id,'frozen_batch',$2,$3,'operator_frozen',
+		 encode(sha256(convert_to('canonical-test-request:'||a.id::text,'UTF8')),'hex'),a.relative_path,a.object_key,
+		 a.expected_size_bytes,a.expected_sha256,
+		 encode(sha256(convert_to('canonical-test-review:'||a.id::text,'UTF8')),'hex'),
+		 'canonical-lifecycle-test','joined-gap-authorization-v1',a.publication_state,a.etag,a.version_id
+		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id
+		WHERE a.batch_record_id=$1 AND a.artifact_kind='hour_manifest' AND a.publication_state='published'
+		  AND h.source_clip_count=0
+		ON CONFLICT (artifact_id,work_scope_identity_sha256) DO NOTHING`, batchRecordID, frozenScopeSHA, frozenScopeBytes); err != nil {
+		t.Fatalf("authorize canonical frozen gap fixtures: %v", err)
+	}
 	var missingHourID, missingState string
 	var missingPriority int64
 	if err := pool.QueryRow(ctx, `SELECT h.hour_id,h.state,h.priority_ordinal FROM recording_joined_hours h
@@ -2318,6 +2371,36 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		indexClaim.Kind != "batch_index" || indexClaim.BatchIndex == nil || indexClaim.BatchIndex.ArtifactID != indexReceipt.ArtifactID {
 		t.Fatalf("batch-index claim status=%d body=%s", publicationRecorder.Code, publicationRecorder.Body.String())
 	}
+	// This comprehensive test deliberately holds database locks long enough to
+	// approach the production publication lease. Refresh the fixture lease here
+	// so the following failure-path assertion tests authorization, not wall time.
+	refreshedIndexLease := uuid.New()
+	refreshedIndexExpiry := time.Now().UTC().Add(5 * time.Minute)
+	refreshIndexTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := refreshIndexTx.Exec(ctx, `SET LOCAL session_replication_role='replica'`); err != nil {
+		_ = refreshIndexTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err := refreshIndexTx.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_token=$2,
+		publication_lease_expires_at=$3,publication_heartbeat_at=clock_timestamp() WHERE id=$1`,
+		indexClaim.BatchIndex.ArtifactID, refreshedIndexLease, refreshedIndexExpiry); err != nil {
+		_ = refreshIndexTx.Rollback(ctx)
+		t.Fatalf("refresh batch-index test lease: %v", err)
+	}
+	if err := refreshIndexTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	refreshedIndexOperation, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, batchID,
+		joinedauth.SubjectBatchIndex, indexClaim.BatchIndex.ScopeID, refreshedIndexLease,
+		joinedauth.OperationPublish, refreshedIndexExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexClaim.BatchIndex.OperationToken = refreshedIndexOperation
+	indexClaim.BatchIndex.LeaseExpires = refreshedIndexExpiry
 	var indexClaimTokenBeforeFailure string
 	if err := pool.QueryRow(ctx, `SELECT publication_token::text FROM recording_joined_artifacts WHERE id=$1`,
 		indexClaim.BatchIndex.ArtifactID).Scan(&indexClaimTokenBeforeFailure); err != nil {

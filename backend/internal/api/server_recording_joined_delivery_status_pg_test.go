@@ -58,15 +58,21 @@ func joinedDeliveryStatusTestPool(t *testing.T) (*pgxpool.Pool, func()) {
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,size_bytes bigint NOT NULL,
 		 created_at timestamptz NOT NULL,purged_at timestamptz,released_at timestamptz);
 		CREATE TABLE recording_joined_batches(id bigint PRIMARY KEY,batch_id text NOT NULL,connection_id bigint NOT NULL);
-		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,hour_id text NOT NULL,priority_ordinal integer NOT NULL);
+		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,hour_id text NOT NULL,
+		 priority_ordinal integer NOT NULL,source_clip_count integer NOT NULL DEFAULT 1);
 		CREATE TABLE recording_joined_artifacts(
 		 id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,account_id bigint NOT NULL DEFAULT 1,connection_id bigint NOT NULL,batch_id text NOT NULL,
+		 scope_id text NOT NULL DEFAULT '',
 		 stream_day_id bigint,hour_record_id bigint,artifact_kind text NOT NULL,ordinal integer NOT NULL DEFAULT 1,relative_path text NOT NULL,expected_size_bytes bigint NOT NULL,
 		 expected_sha256 text NOT NULL,content_type text NOT NULL DEFAULT 'application/json',object_key text NOT NULL DEFAULT '',etag text NOT NULL DEFAULT '',
 		 version_id text NOT NULL DEFAULT '',publication_state text,published_at timestamptz);
 		CREATE TABLE recording_joined_artifact_acks(
 		 artifact_id bigint NOT NULL,connection_id bigint NOT NULL,relative_path text NOT NULL,size_bytes bigint NOT NULL,
-		 sha256 text NOT NULL,verified_at timestamptz NOT NULL,PRIMARY KEY(artifact_id,connection_id));`)
+		 sha256 text NOT NULL,verified_at timestamptz NOT NULL,PRIMARY KEY(artifact_id,connection_id));
+		CREATE TABLE recording_joined_gap_only_scope_authorizations(
+		 artifact_id bigint NOT NULL,batch_record_id bigint NOT NULL,batch_id text NOT NULL,hour_record_id bigint NOT NULL,
+		 hour_id text NOT NULL,work_scope text NOT NULL,work_scope_identity_sha256 text NOT NULL,
+		 authorization_source text NOT NULL,PRIMARY KEY(artifact_id,work_scope_identity_sha256));`)
 	if err != nil {
 		pool.Close()
 		_, _ = admin.Exec(ctx, `DROP SCHEMA IF EXISTS `+pgx.Identifier{schema}.Sanitize()+` CASCADE`)
