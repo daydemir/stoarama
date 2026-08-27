@@ -223,6 +223,37 @@ func TestBuildAllPassingPartsUsesMaximalPassingPrefixForNonlocalFailure(t *testi
 	}
 }
 
+func TestBuildAllPassingPartsDescendsAfterRepeatedPrefixFailure(t *testing.T) {
+	sources := makeSyntheticLocalSources(32)
+	calls := make([][]int64, 0)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		calls = append(calls, clipIDs(candidate))
+		if len(candidate) >= 31 {
+			return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("repeatable nonlocal mismatch"))
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 || parts[0].SourceCount != 30 || parts[1].SourceCount != 2 || len(quarantines) != 0 {
+		t.Fatalf("parts=%+v quarantines=%+v", parts, quarantines)
+	}
+	if len(parts[0].SplitEvidence) != 1 || parts[0].SplitEvidence[0].RepeatCount != 2 ||
+		parts[0].SplitEvidence[0].ReasonCode != "media_sequence_mismatch" ||
+		!equalInt64s(parts[0].SplitEvidence[0].CandidateClipIDs, clipIDs(sources[:31])) || len(parts[1].SplitEvidence) != 0 {
+		t.Fatalf("maximal prefix evidence=%+v", parts)
+	}
+	if countSpan(calls, clipIDs(sources)) != 2 || countSpan(calls, clipIDs(sources[:31])) != 2 ||
+		countSpan(calls, clipIDs(sources[:30])) != 1 || countSpan(calls, clipIDs(sources[30:])) != 2 || len(calls) != 37 {
+		t.Fatalf("descending candidates were not independently and minimally proved: %v", calls)
+	}
+}
+
 func TestBuildAllPassingPartsLocalizesAfterFullCandidateDeadline(t *testing.T) {
 	sources := makeSyntheticLocalSources(4)
 	parentCtx, cancel := context.WithTimeout(context.Background(), time.Second)
