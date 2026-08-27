@@ -29,3 +29,26 @@ func TestNilStageTimingObserverLeavesContextUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUploadVerifyFailureStagesAreClosedAndBounded(t *testing.T) {
+	stages := []UploadVerifyFailureStage{
+		UploadVerifyFailureManifestIdentity, UploadVerifyFailurePartScratch, UploadVerifyFailurePartLocalIdentity,
+		UploadVerifyFailurePartUpload, UploadVerifyFailureManifestUpload, UploadVerifyFailureManifestCapability,
+		UploadVerifyFailureManifestReconcile,
+	}
+	for _, stage := range stages {
+		if !stage.Valid() {
+			t.Fatalf("declared stage %q is invalid", stage)
+		}
+	}
+	if UploadVerifyFailureStage("signed-url-secret").Valid() {
+		t.Fatal("arbitrary diagnostic stage was accepted")
+	}
+	var got StageTimingEvent
+	ctx := WithStageTimingObserver(context.Background(), func(event StageTimingEvent) { got = event })
+	emitUploadVerifyFailure(ctx, time.Now().Add(-time.Millisecond), UploadVerifyFailurePartUpload, 646, 29)
+	if got.Stage != "upload_verify" || got.Outcome != "error" || got.FailureStage != UploadVerifyFailurePartUpload ||
+		got.ArtifactID != 646 || got.ArtifactOrdinal != 29 {
+		t.Fatalf("bounded diagnostic differs: %+v", got)
+	}
+}

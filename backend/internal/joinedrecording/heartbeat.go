@@ -2,6 +2,7 @@ package joinedrecording
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -91,6 +92,9 @@ func runWithHeartbeat(ctx context.Context, initial OperationCredentials, interva
 	<-done
 	select {
 	case err := <-heartbeatErr:
+		if workErr != nil && !errors.Is(workErr, context.Canceled) {
+			return errors.Join(workErr, err)
+		}
 		return err
 	default:
 		return workErr

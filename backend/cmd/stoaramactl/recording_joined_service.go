@@ -42,6 +42,11 @@ type joinedAPIResponseError struct {
 	message string
 }
 
+type joinedAPITransportError struct{ cause error }
+
+func (*joinedAPITransportError) Error() string   { return "joined API transport failed" }
+func (e *joinedAPITransportError) Unwrap() error { return e.cause }
+
 func (e *joinedAPIResponseError) Error() string {
 	return fmt.Sprintf("joined API %s returned status %d error=%q", e.path, e.status, e.message)
 }
@@ -1053,7 +1058,18 @@ func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, c
 }
 
 func joinedStageTimingLog(hourID string, event joinedrecording.StageTimingEvent) string {
-	return fmt.Sprintf("joined worker stage timing hour_id=%s stage=%s elapsed_ms=%d outcome=%s", hourID, event.Stage, event.ElapsedMS, event.Outcome)
+	base := fmt.Sprintf("joined worker stage timing hour_id=%s stage=%s elapsed_ms=%d outcome=%s", hourID, event.Stage, event.ElapsedMS, event.Outcome)
+	if event.Stage != "upload_verify" || event.Outcome != "error" || !event.FailureStage.Valid() {
+		return base
+	}
+	artifactID, ordinal := event.ArtifactID, event.ArtifactOrdinal
+	if artifactID < 0 {
+		artifactID = 0
+	}
+	if ordinal < 0 {
+		ordinal = 0
+	}
+	return fmt.Sprintf("%s failure_stage=%s artifact_id=%d artifact_ordinal=%d", base, event.FailureStage, artifactID, ordinal)
 }
 
 func withJoinedStageTiming(ctx context.Context, hourID string) context.Context {
@@ -1139,7 +1155,24 @@ func (s *remoteJoinedOperatorService) hourHeartbeat(hourID string) joinedrecordi
 }
 
 func (s *remoteJoinedOperatorService) artifactCreateCapability(ctx context.Context, kind, id string, artifactID int64, token string) (joinedrecording.ObjectCreateCapability, error) {
-	return s.api.artifactCreateCapability(ctx, token, joinedrecording.ArtifactCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, ScopeKind: kind, ScopeID: id, ArtifactID: artifactID, Operation: "put"})
+	capability, err := s.api.artifactCreateCapability(ctx, token, joinedrecording.ArtifactCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, ScopeKind: kind, ScopeID: id, ArtifactID: artifactID, Operation: "put"})
+	if err == nil {
+		return capability, nil
+	}
+	return joinedrecording.ObjectCreateCapability{}, joinedCreateCapabilityError(err, artifactID)
+}
+
+func joinedCreateCapabilityError(err error, artifactID int64) error {
+	diagnostic := &joinedrecording.StorageCapabilityError{Operation: "create_capability", Reason: "capability",
+		ArtifactID: artifactID, Cause: err}
+	var responseErr *joinedAPIResponseError
+	var transportErr *joinedAPITransportError
+	if errors.As(err, &responseErr) {
+		diagnostic.Reason, diagnostic.StatusCode = "status", responseErr.status
+	} else if errors.As(err, &transportErr) {
+		diagnostic.Reason = "transport"
+	}
+	return diagnostic
 }
 
 func (s *remoteJoinedOperatorService) artifactReadCapability(ctx context.Context, kind, id string, artifactID int64, token string) (joinedrecording.ObjectReadCapability, error) {
@@ -1389,7 +1422,7 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		return false, fmt.Errorf("execute joined API %s", path)
+		return false, &joinedAPITransportError{cause: err}
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode == http.StatusNoContent {

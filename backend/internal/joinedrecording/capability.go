@@ -45,7 +45,7 @@ func (e *StorageCapabilityError) Error() string {
 		return "storage capability failed"
 	}
 	operation := e.Operation
-	if operation != "put" && operation != "reread_capability" && operation != "reread" {
+	if operation != "put" && operation != "create_capability" && operation != "reread_capability" && operation != "reread" {
 		operation = "unknown"
 	}
 	status := e.StatusCode

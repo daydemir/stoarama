@@ -182,7 +182,7 @@ func publishClaimedHourWithDeadline(ctx context.Context, client CapabilityHTTPCl
 	_, manifestJSON, manifestSHA, err := BuildHourManifest(HourManifestInput{Plan: claim.Plan, Allocation: claim.Allocation, AllocationLedger: claim.AllocationLedger, MediaArtifactIDs: claim.MediaArtifactIDs, Built: built, QuarantineEvidence: quarantine})
 	if err != nil || int64(len(manifestJSON)) != claim.HourManifestExpectedSize || manifestSHA != claim.HourManifestExpectedSHA {
 		err = fmt.Errorf("sealed hour manifest identity changed before publication")
-		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+		emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailureManifestIdentity, claim.HourManifestArtifactID, 0)
 		return PublishedHour{}, err
 	}
 	type identity struct {
@@ -194,13 +194,13 @@ func publishClaimedHourWithDeadline(ctx context.Context, client CapabilityHTTPCl
 		output := claim.Plan.Outputs[i]
 		if built[i].SourceCount != len(output.Sources) || built[i].Verification.Status != "passed" || !SafeScratchOutput(built[i].Path, scratchDir) {
 			err = fmt.Errorf("hour part %d is not a verified scratch artifact", i+1)
-			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+			emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailurePartScratch, claim.MediaArtifactIDs[i], output.Ordinal)
 			return PublishedHour{}, err
 		}
 		size, sha, identityErr := localIdentity(built[i].Path)
 		if identityErr != nil || size != built[i].SizeBytes || sha != built[i].SHA256 || size != output.ExpectedSize || sha != output.ExpectedSHA || size > r2.MaxConditionalPutBytes {
 			err = fmt.Errorf("hour part %d changed before publication", i+1)
-			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+			emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailurePartLocalIdentity, claim.MediaArtifactIDs[i], output.Ordinal)
 			return PublishedHour{}, err
 		}
 		identities[i] = identity{size: size, sha: sha}
@@ -209,7 +209,7 @@ func publishClaimedHourWithDeadline(ctx context.Context, client CapabilityHTTPCl
 	for i := range built {
 		output, publishErr := publishHourPart(ctx, client, claim, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i], built[i], identities[i].size, identities[i].sha, resolveCreate, resolveRead, leaseExpires)
 		if publishErr != nil {
-			emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), publishErr)
+			emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailurePartUpload, claim.MediaArtifactIDs[i], claim.Plan.Outputs[i].Ordinal)
 			return PublishedHour{}, publishErr
 		}
 		published.Outputs = append(published.Outputs, output)
@@ -220,17 +220,18 @@ func publishClaimedHourWithDeadline(ctx context.Context, client CapabilityHTTPCl
 		},
 		func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(manifestJSON)), nil }, defaultPutRetryPolicy())
 	if err != nil {
-		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+		emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailureManifestUpload, claim.HourManifestArtifactID, 0)
 		return PublishedHour{}, err
 	}
 	manifestRead, err := resolveRead(ctx, claim, claim.HourManifestArtifactID)
 	if err != nil {
-		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
-		return PublishedHour{}, fmt.Errorf("resolve exact hour-manifest reread capability")
+		emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailureManifestCapability, claim.HourManifestArtifactID, 0)
+		return PublishedHour{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "capability",
+			ArtifactID: claim.HourManifestArtifactID, Cause: err}
 	}
 	manifestHead, err := reconcileExactCapability(ctx, client, claim.StorageAuthority, claim.StorageBucket, claim.HourManifestArtifactID, claim.Plan.CoverageObjectKey, int64(len(manifestJSON)), manifestSHA, manifestRead.ETag, manifestRead.VersionID, manifestRead)
 	if err != nil {
-		emitStageTiming(ctx, "upload_verify", time.Since(publishStarted), err)
+		emitUploadVerifyFailure(ctx, publishStarted, UploadVerifyFailureManifestReconcile, claim.HourManifestArtifactID, 0)
 		return PublishedHour{}, err
 	}
 	published.HourManifestETag, published.HourManifestVersionID, published.HourManifestSizeBytes, published.HourManifestSHA256 = manifestHead.ETag, manifestHead.VersionID, int64(len(manifestJSON)), manifestSHA

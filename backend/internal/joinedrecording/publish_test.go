@@ -359,7 +359,8 @@ func TestPublishClaimedHourTimesEarlyLocalVerificationFailure(t *testing.T) {
 	if err == nil || len(events) != 1 || events[0].Stage != "upload_verify" || events[0].Outcome != "error" {
 		t.Fatalf("early verification timing events=%+v err=%v", events, err)
 	}
-	if !reflect.DeepEqual(events[0], StageTimingEvent{Stage: "upload_verify", ElapsedMS: events[0].ElapsedMS, Outcome: "error"}) {
+	if !reflect.DeepEqual(events[0], StageTimingEvent{Stage: "upload_verify", ElapsedMS: events[0].ElapsedMS, Outcome: "error",
+		FailureStage: UploadVerifyFailureManifestIdentity, ArtifactID: claim.HourManifestArtifactID}) {
 		t.Fatalf("unexpected timing fields: %+v", events[0])
 	}
 }

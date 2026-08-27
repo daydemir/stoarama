@@ -1054,6 +1054,41 @@ func TestJoinedStageTimingLogHasOnlyBoundedFields(t *testing.T) {
 	}
 }
 
+func TestJoinedStageTimingLogIncludesOnlyBoundedUploadVerifyDiagnostic(t *testing.T) {
+	event := joinedrecording.StageTimingEvent{Stage: "upload_verify", ElapsedMS: 1234, Outcome: "error",
+		FailureStage: joinedrecording.UploadVerifyFailurePartUpload, ArtifactID: 646, ArtifactOrdinal: 29}
+	got := joinedStageTimingLog("batch__recording-413__hour-02", event)
+	want := "joined worker stage timing hour_id=batch__recording-413__hour-02 stage=upload_verify elapsed_ms=1234 outcome=error failure_stage=part_upload artifact_id=646 artifact_ordinal=29"
+	if got != want {
+		t.Fatalf("diagnostic log=%q want=%q", got, want)
+	}
+}
+
+func TestJoinedCreateCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) {
+	tests := []struct {
+		name, reason string
+		status       int
+		err          error
+	}{
+		{"transport", "transport", 0, &joinedAPITransportError{cause: errors.New("signed URL must not escape")}},
+		{"retryable status", "status", http.StatusServiceUnavailable, &joinedAPIResponseError{path: "/secret", status: http.StatusServiceUnavailable, message: "raw body"}},
+		{"deterministic", "capability", 0, errors.New("raw capability error")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *joinedrecording.StorageCapabilityError
+			if !errors.As(joinedCreateCapabilityError(tt.err, 646), &got) || got.Operation != "create_capability" ||
+				got.Reason != tt.reason || got.StatusCode != tt.status || got.ArtifactID != 646 {
+				t.Fatalf("classification=%+v", got)
+			}
+			rendered := got.Error()
+			if strings.Contains(rendered, "secret") || strings.Contains(rendered, "raw body") || strings.Contains(rendered, "raw capability") {
+				t.Fatalf("diagnostic leaked cause: %q", rendered)
+			}
+		})
+	}
+}
+
 func TestJoinedWorkerStatusBindsExactBatchAndCanaryScope(t *testing.T) {
 	cfg := validJoinedWorkerConfig()
 	hours, err := cfg.JoinedCanaryHourIDs()
