@@ -58,7 +58,18 @@ func putCreateOnlyWithRetry(ctx context.Context, client CapabilityHTTPClient, au
 		}
 		capability, err := resolve(ctx)
 		if err != nil {
-			return putObservation{}, err
+			err = putErrorWithAttempts(err, attempt)
+			if attempt > len(putRetryDelays) || !retryableCreateOnlyPut(err) {
+				return putObservation{}, err
+			}
+			delay := jitteredPutRetryDelay(putRetryDelays[attempt-1], leaseID, artifactID, attempt)
+			if leaseExpires == nil || !leaseExpires().After(policy.now().Add(delay+putRetrySafetyMargin)) {
+				return putObservation{}, err
+			}
+			if err := policy.wait(ctx, delay); err != nil {
+				return putObservation{}, err
+			}
+			continue
 		}
 		body, err := openBody()
 		if err != nil {
@@ -87,11 +98,11 @@ func putCreateOnlyWithRetry(ctx context.Context, client CapabilityHTTPClient, au
 }
 
 func retryableCreateOnlyPut(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	var storageErr *StorageCapabilityError
+	if !errors.As(err, &storageErr) || (storageErr.Operation != "put" && storageErr.Operation != "create_capability" && storageErr.Operation != "reread_capability") {
 		return false
 	}
-	var storageErr *StorageCapabilityError
-	if !errors.As(err, &storageErr) || storageErr.Operation != "put" {
+	if storageErr.Operation == "put" && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		return false
 	}
 	if storageErr.Reason == "transport" {
@@ -101,6 +112,35 @@ func retryableCreateOnlyPut(err error) bool {
 		return false
 	}
 	return storageErr.StatusCode == http.StatusRequestTimeout || storageErr.StatusCode == http.StatusTooEarly || storageErr.StatusCode == http.StatusTooManyRequests || storageErr.StatusCode >= 500 && storageErr.StatusCode <= 599
+}
+
+func resolveReadCapabilityWithRetry(ctx context.Context, artifactID int64, leaseExpires func() time.Time, leaseID string,
+	resolve func(context.Context) (ObjectReadCapability, error), policy putRetryPolicy) (ObjectReadCapability, error) {
+	policy = policy.normalized()
+	for attempt := 1; attempt <= len(putRetryDelays)+1; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return ObjectReadCapability{}, err
+		}
+		if leaseExpires == nil || !leaseExpires().After(policy.now()) {
+			return ObjectReadCapability{}, context.DeadlineExceeded
+		}
+		capability, err := resolve(ctx)
+		if err == nil {
+			return capability, nil
+		}
+		err = putErrorWithAttempts(err, attempt)
+		if attempt > len(putRetryDelays) || !retryableCreateOnlyPut(err) {
+			return ObjectReadCapability{}, err
+		}
+		delay := jitteredPutRetryDelay(putRetryDelays[attempt-1], leaseID, artifactID, attempt)
+		if !leaseExpires().After(policy.now().Add(delay + putRetrySafetyMargin)) {
+			return ObjectReadCapability{}, err
+		}
+		if err := policy.wait(ctx, delay); err != nil {
+			return ObjectReadCapability{}, err
+		}
+	}
+	panic("unreachable")
 }
 
 func putErrorWithAttempts(err error, attempts int) error {

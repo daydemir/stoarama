@@ -171,6 +171,25 @@ func TestHeartbeatCancellationPreventsFinalize(t *testing.T) {
 	}
 }
 
+func TestHeartbeatFailureDoesNotMaskWorkFailure(t *testing.T) {
+	now := time.Now().UTC()
+	initial := OperationCredentials{LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("a", 32),
+		ExpiresAt: now.Add(time.Second)}
+	ticks := make(chan time.Time, 1)
+	workFailure := errors.New("bounded upload failure")
+	heartbeatFailure := errors.New("heartbeat unavailable")
+	err := runWithHeartbeat(context.Background(), initial, time.Second, func(context.Context, string) (OperationCredentials, error) {
+		return OperationCredentials{}, heartbeatFailure
+	}, func(ctx context.Context, _ func() OperationCredentials) error {
+		ticks <- now
+		<-ctx.Done()
+		return workFailure
+	}, func() time.Time { return now }, ticks)
+	if !errors.Is(err, workFailure) || !errors.Is(err, heartbeatFailure) {
+		t.Fatalf("work or heartbeat failure was masked: %v", err)
+	}
+}
+
 func TestOperationRefreshRejectsExpiredLowerAndForeignCredentials(t *testing.T) {
 	now := time.Now().UTC()
 	leaseID := strings.Repeat("L", 43)

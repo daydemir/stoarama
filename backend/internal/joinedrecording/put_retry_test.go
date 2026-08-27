@@ -175,6 +175,107 @@ func TestCreateOnlyPutRetryMatrix(t *testing.T) {
 	}
 }
 
+func TestCreateOnlyPutRetriesOnlyTransientCapabilityResolution(t *testing.T) {
+	tests := []struct {
+		name      string
+		failures  []*StorageCapabilityError
+		wantCalls int
+		wantErr   bool
+	}{
+		{"transport then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "transport", Cause: context.DeadlineExceeded}}, 2, false},
+		{"408 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 408}}, 2, false},
+		{"425 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 425}}, 2, false},
+		{"429 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 429}}, 2, false},
+		{"503 then success", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 503}}, 2, false},
+		{"deterministic capability", []*StorageCapabilityError{{Operation: "create_capability", Reason: "capability"}}, 1, true},
+		{"deterministic 400", []*StorageCapabilityError{{Operation: "create_capability", Reason: "status", StatusCode: 400}}, 1, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte("artifact")
+			capability := createCapability(7, "recordings", "joined/test.mp4", "video/mp4", body)
+			client := &scriptedPutClient{memoryCapabilityClient: &memoryCapabilityClient{objects: map[string][]byte{}}, statuses: []int{200}}
+			resolves, opens, waits := 0, 0, 0
+			_, err := putCreateOnlyWithRetry(context.Background(), client, testSourceAuthority, "recordings", 7,
+				"joined/test.mp4", "video/mp4", int64(len(body)), hashBytes(body), func() time.Time { return time.Now().Add(time.Minute) },
+				"lease-12345678", func(context.Context) (ObjectCreateCapability, error) {
+					resolves++
+					if resolves <= len(tt.failures) {
+						failure := *tt.failures[resolves-1]
+						failure.ArtifactID = 7
+						return ObjectCreateCapability{}, &failure
+					}
+					return distinctCreateCapability(t, capability, resolves), nil
+				}, func() (io.ReadCloser, error) {
+					opens++
+					return io.NopCloser(bytes.NewReader(body)), nil
+				}, putRetryPolicy{wait: func(context.Context, time.Duration) error { waits++; return nil }, now: time.Now})
+			if (err != nil) != tt.wantErr || resolves != tt.wantCalls || waits != tt.wantCalls-1 ||
+				opens != boolInt(!tt.wantErr) || client.putCalls != boolInt(!tt.wantErr) {
+				t.Fatalf("err=%v resolves=%d waits=%d opens=%d puts=%d", err, resolves, waits, opens, client.putCalls)
+			}
+		})
+	}
+}
+
+func TestCreateOnlyPutCapabilityResolutionExhaustionPreservesAttempts(t *testing.T) {
+	body := []byte("artifact")
+	resolves, waits, opens := 0, 0, 0
+	_, err := putCreateOnlyWithRetry(context.Background(), &memoryCapabilityClient{objects: map[string][]byte{}},
+		testSourceAuthority, "recordings", 646, "joined/test.mp4", "video/mp4", int64(len(body)), hashBytes(body),
+		func() time.Time { return time.Now().Add(time.Minute) }, "lease-12345678", func(context.Context) (ObjectCreateCapability, error) {
+			resolves++
+			return ObjectCreateCapability{}, &StorageCapabilityError{Operation: "create_capability", Reason: "transport",
+				ArtifactID: 646, Cause: context.DeadlineExceeded}
+		}, func() (io.ReadCloser, error) {
+			opens++
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}, putRetryPolicy{wait: func(context.Context, time.Duration) error { waits++; return nil }, now: time.Now})
+	var diagnostic *StorageCapabilityError
+	if !errors.As(err, &diagnostic) || diagnostic.Attempts != len(putRetryDelays)+1 || diagnostic.ArtifactID != 646 ||
+		resolves != len(putRetryDelays)+1 || waits != len(putRetryDelays) || opens != 0 {
+		t.Fatalf("diagnostic=%+v resolves=%d waits=%d opens=%d err=%v", diagnostic, resolves, waits, opens, err)
+	}
+}
+
+func TestReadCapabilityResolutionRetriesTransientFailure(t *testing.T) {
+	capability := ObjectReadCapability{ArtifactID: 646}
+	resolves, waits := 0, 0
+	got, err := resolveReadCapabilityWithRetry(context.Background(), 646, func() time.Time { return time.Now().Add(time.Minute) },
+		"lease-12345678", func(context.Context) (ObjectReadCapability, error) {
+			resolves++
+			if resolves == 1 {
+				return ObjectReadCapability{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "transport",
+					ArtifactID: 646, Cause: context.DeadlineExceeded}
+			}
+			return capability, nil
+		}, putRetryPolicy{wait: func(context.Context, time.Duration) error { waits++; return nil }, now: time.Now})
+	if err != nil || got.ArtifactID != 646 || resolves != 2 || waits != 1 {
+		t.Fatalf("got=%+v err=%v resolves=%d waits=%d", got, err, resolves, waits)
+	}
+}
+
+func TestReadCapabilityResolutionDoesNotRetryDeterministicFailure(t *testing.T) {
+	resolves := 0
+	_, err := resolveReadCapabilityWithRetry(context.Background(), 646, func() time.Time { return time.Now().Add(time.Minute) },
+		"lease-12345678", func(context.Context) (ObjectReadCapability, error) {
+			resolves++
+			return ObjectReadCapability{}, &StorageCapabilityError{Operation: "reread_capability", Reason: "status",
+				StatusCode: http.StatusConflict, ArtifactID: 646}
+		}, putRetryPolicy{wait: func(context.Context, time.Duration) error { t.Fatal("unexpected retry wait"); return nil }, now: time.Now})
+	var diagnostic *StorageCapabilityError
+	if !errors.As(err, &diagnostic) || diagnostic.StatusCode != http.StatusConflict || diagnostic.Attempts != 1 || resolves != 1 {
+		t.Fatalf("diagnostic=%+v resolves=%d err=%v", diagnostic, resolves, err)
+	}
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 func TestCreateOnlyPutDoesNotWaitPastLease(t *testing.T) {
 	body := []byte("artifact")
 	capability := createCapability(7, "recordings", "joined/test.mp4", "video/mp4", body)
