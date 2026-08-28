@@ -465,7 +465,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		Scan(&item.HourID, &item.LeaseExpires)
 	if err != nil {
 		writeJoinedDBError(w, http.StatusConflict, "claim joined hour", "hour_claim", "lease_update",
-			claims.BatchID, workerID, hourRecordID, err)
+			claims.BatchID, workerID, "hour", hourRecordID, err)
 		return
 	}
 	err = tx.QueryRow(r.Context(), `
@@ -529,7 +529,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	if oneShotClaim {
 		if err := consumeJoinedOneShotClaim(r.Context(), tx, claims.BatchID); err != nil {
 			writeJoinedDBError(w, http.StatusConflict, "consume joined one-shot claim", "hour_claim", "consume_one_shot",
-				claims.BatchID, workerID, hourRecordID, err)
+				claims.BatchID, workerID, "hour", hourRecordID, err)
 			return
 		}
 	}
@@ -667,13 +667,13 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	}
 	if err != nil {
 		writeJoinedDBError(w, http.StatusInternalServerError, "select joined publication claim", "publication_claim", "select",
-			claims.BatchID, workerID, 0, err)
+			claims.BatchID, workerID, "none", 0, err)
 		return
 	}
 	if selectedKind == "batch_index" {
 		if buildErr := configureJoinedBatchIndexTransaction(r.Context(), tx); buildErr != nil {
 			writeJoinedDBError(w, http.StatusConflict, "configure joined batch-index evidence transaction", "publication_claim",
-				"configure_batch_index", claims.BatchID, workerID, artifactID, buildErr)
+				"configure_batch_index", claims.BatchID, workerID, "artifact", artifactID, buildErr)
 			return
 		}
 		canonical, state, existingID, buildErr := loadJoinedCanonicalBatchIndex(r.Context(), tx, claims.BatchID,
@@ -689,7 +689,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		s.cfg.JoinedRecordingConnectionID).
 		Scan(&lockedConnection); err != nil {
 		writeJoinedDBError(w, http.StatusConflict, "joined publication protocol changed", "publication_claim",
-			"lock_connection", claims.BatchID, workerID, artifactID, err)
+			"lock_connection", claims.BatchID, workerID, "artifact", artifactID, err)
 		return
 	}
 	leaseToken := uuid.New()
@@ -706,7 +706,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		excludedPublicationArtifactIDs).Scan(&kind, &scopeID, &leaseExpires)
 	if err != nil {
 		writeJoinedDBError(w, http.StatusConflict, "claim joined publication", "publication_claim", "lease_update",
-			claims.BatchID, workerID, artifactID, err)
+			claims.BatchID, workerID, "artifact", artifactID, err)
 		return
 	}
 	operationToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, claims.BatchID,
@@ -775,13 +775,13 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	if oneShotClaim {
 		if err := consumeJoinedOneShotClaim(r.Context(), tx, claims.BatchID); err != nil {
 			writeJoinedDBError(w, http.StatusConflict, "consume joined one-shot claim", "publication_claim", "consume_one_shot",
-				claims.BatchID, workerID, artifactID, err)
+				claims.BatchID, workerID, "artifact", artifactID, err)
 			return
 		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		writeJoinedDBError(w, http.StatusConflict, "commit joined publication claim", "publication_claim", "commit",
-			claims.BatchID, workerID, artifactID, err)
+			claims.BatchID, workerID, "artifact", artifactID, err)
 		return
 	}
 	writeJoinedWorkerJSON(w, http.StatusOK, response)
