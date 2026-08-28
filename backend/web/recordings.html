@@ -1372,6 +1372,7 @@
     }
 
     // Mutable view state.
+    const RECORDING_ENRICHMENT_BATCH_SIZE = 12;
     const state = {
       account: null,
       billingEnabled: true,
@@ -5204,15 +5205,29 @@
 	  if (state.recordingEnrichmentLoading) return;
 	  state.recordingEnrichmentLoading = true;
 	  try {
-	    const payload = await fetchJSON(recordingAPIPath('/enrichment'));
-	    if (requestToken !== recordingsLoadToken) return;
-	    mergeRecordingMetricItems(payload.items);
-	    state.recordingEnrichmentLoaded = true;
-	    state.recordingEnrichmentError = false;
-	    renderCards();
+	    const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);
+	    if (ids.length === 0) {
+	      state.recordingEnrichmentLoaded = true;
+	      state.recordingEnrichmentError = false;
+	      renderCards();
+	      return;
+	    }
+	    for (let offset = 0; offset < ids.length; offset += RECORDING_ENRICHMENT_BATCH_SIZE) {
+	      if (requestToken !== recordingsLoadToken) return;
+	      const batch = ids.slice(offset, offset + RECORDING_ENRICHMENT_BATCH_SIZE);
+	      const params = new URLSearchParams();
+	      params.set('recording_ids', batch.join(','));
+	      const payload = await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`));
+	      if (requestToken !== recordingsLoadToken) return;
+	      mergeRecordingMetricItems(payload.items);
+	      state.recordingEnrichmentError = false;
+	      state.recordingEnrichmentLoaded = offset + batch.length >= ids.length;
+	      renderCards();
+	    }
 	  } catch (_) {
 	    if (requestToken !== recordingsLoadToken) return;
 	    state.recordingEnrichmentError = true;
+	    renderCards();
 	  } finally {
 	    if (requestToken === recordingsLoadToken) state.recordingEnrichmentLoading = false;
 	  }

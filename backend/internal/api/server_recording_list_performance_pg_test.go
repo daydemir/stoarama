@@ -150,3 +150,110 @@ func TestRecordingMetricEndpointTimeoutsCoverScopeLookup(t *testing.T) {
 		})
 	}
 }
+
+func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status)
+		VALUES(47,'batch-metrics@example.test','Batch metrics','admin','active');
+		INSERT INTO accounts(id,email,name,role,status)
+		VALUES(99,'foreign-batch@example.test','Foreign batch','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(1,47,'Batch storage','https://example.test','auto','clips','access',''::bytea,'verified');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(2,99,'Foreign batch storage','https://example.test','auto','foreign-clips','access',''::bytea,'verified');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
+		SELECT 700+g,47,1,'Batch recording '||g,'https://example.test/'||g||'.m3u8','completed',
+		       now()-interval '1 day','sampled',
+		       CASE WHEN g < 12 THEN '* * * * *' ELSE 'invalid cron outside requested batch' END,
+		       'UTC',60
+		FROM generate_series(0,103) AS g;
+		UPDATE recordings SET status='canceled',cron_expr='* * * * *' WHERE id=803;
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
+		VALUES(900,99,2,'Foreign batch recording','https://example.test/foreign.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/v1/shared/mit-scl/recordings/enrichment?recording_ids=700,701,702,703,704,705,706,707,708,709,710,711", nil)
+	rec := httptest.NewRecorder()
+	s.handleSharedRecordingListEnrichment(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Items []recordingListEnrichmentItem `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 12 {
+		t.Fatalf("items=%d want 12", len(payload.Items))
+	}
+	for index, item := range payload.Items {
+		wantID := int64(700 + index)
+		if item.RecordingID != wantID {
+			t.Fatalf("item[%d].recording_id=%d want %d", index, item.RecordingID, wantID)
+		}
+	}
+
+	for _, test := range []struct {
+		name       string
+		path       string
+		shared     bool
+		wantStatus int
+		wantItems  int
+	}{
+		{
+			name:       "public rejects canceled recording",
+			path:       "/api/v1/shared/mit-scl/recordings/enrichment?recording_ids=700,803",
+			shared:     true,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "account rejects canceled recording",
+			path:       "/api/v1/account/recordings/enrichment?recording_ids=700,803",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "public rejects foreign recording",
+			path:       "/api/v1/shared/mit-scl/recordings/enrichment?recording_ids=700,900",
+			shared:     true,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "account rejects foreign recording",
+			path:       "/api/v1/account/recordings/enrichment?recording_ids=700,900",
+			wantStatus: http.StatusNotFound,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, test.path, nil)
+			response := httptest.NewRecorder()
+			if test.shared {
+				s.handleSharedRecordingListEnrichment(response, req)
+			} else {
+				s.handleAccountRecordingListEnrichment(response, withPrincipal(req, accountPrincipal{AccountID: 47}, ""))
+			}
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.wantStatus, response.Body.String())
+			}
+			if test.wantItems == 0 {
+				return
+			}
+			var got struct {
+				Items []recordingListEnrichmentItem `json:"items"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got.Items) != test.wantItems {
+				t.Fatalf("items=%d want=%d", len(got.Items), test.wantItems)
+			}
+		})
+	}
+}

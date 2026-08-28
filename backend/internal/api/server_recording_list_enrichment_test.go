@@ -2,11 +2,58 @@ package api
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestRequestedRecordingEnrichmentIDsArePositiveUniqueAndBounded(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		want    []int64
+		wantErr bool
+	}{
+		{name: "absent", query: "", want: nil},
+		{name: "ordered batch", query: "recording_ids=9,7,8", want: []int64{9, 7, 8}},
+		{name: "duplicate", query: "recording_ids=9,9", wantErr: true},
+		{name: "zero", query: "recording_ids=0", wantErr: true},
+		{name: "invalid", query: "recording_ids=9,nope", wantErr: true},
+		{name: "over limit", query: "recording_ids=1,2,3,4,5,6,7,8,9,10,11,12,13", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/recordings/enrichment?"+test.query, nil)
+			got, err := requestedRecordingEnrichmentIDs(req)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error=%v wantErr=%t", err, test.wantErr)
+			}
+			if test.wantErr {
+				return
+			}
+			if len(got) != len(test.want) {
+				t.Fatalf("ids=%v want %v", got, test.want)
+			}
+			for index := range got {
+				if got[index] != test.want[index] {
+					t.Fatalf("ids=%v want %v", got, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestRecordingEnrichmentRejectsCombinedSingleAndBatchScopes(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/recordings/enrichment?recording_id=9&recording_ids=9", nil)
+	rec := httptest.NewRecorder()
+	(&Server{}).handleSharedRecordingListEnrichment(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
 
 func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 	var cache recordingMetricCache[int64]

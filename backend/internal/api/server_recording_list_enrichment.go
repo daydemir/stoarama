@@ -23,6 +23,7 @@ const (
 	recordingHealthPageCacheTTL    = 30 * time.Second
 	recordingMetricFailureTTL      = 5 * time.Second
 	recordingMetricConcurrency     = 2
+	recordingEnrichmentBatchSize   = 12
 )
 
 type recordingMetricCacheKey struct {
@@ -78,6 +79,31 @@ func requestedRecordingMetricID(r *http.Request) (int64, error) {
 		return 0, errors.New("recording_id must be a positive integer")
 	}
 	return id, nil
+}
+
+func requestedRecordingEnrichmentIDs(r *http.Request) ([]int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("recording_ids"))
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) > recordingEnrichmentBatchSize {
+		return nil, errors.New("recording_ids supports at most 12 IDs")
+	}
+	ids := make([]int64, 0, len(parts))
+	seen := make(map[int64]struct{}, len(parts))
+	for _, part := range parts {
+		id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+		if err != nil || id <= 0 {
+			return nil, errors.New("recording_ids must contain positive integers")
+		}
+		if _, ok := seen[id]; ok {
+			return nil, errors.New("recording_ids must not contain duplicates")
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 func recordingMetricScopeSignature(ids []int64) string {
@@ -226,6 +252,42 @@ func (s *Server) recordingMetricScopeIDs(ctx context.Context, accountID, recordi
 	return ids, nil
 }
 
+func (s *Server) recordingMetricSelectedIDs(ctx context.Context, accountID int64, requestedIDs []int64, shared bool) ([]int64, error) {
+	if len(requestedIDs) == 0 || len(requestedIDs) > recordingEnrichmentBatchSize {
+		return nil, errors.New("recording enrichment batch size is invalid")
+	}
+	status := `r.status<>'canceled'`
+	if shared {
+		status = `r.status IN ('active','paused','completed')`
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.id
+		FROM unnest($2::bigint[]) WITH ORDINALITY AS requested(id, ordinal)
+		JOIN recordings r ON r.id=requested.id
+		WHERE r.account_id=$1 AND `+status+`
+		ORDER BY requested.ordinal
+	`, accountID, requestedIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, len(requestedIDs))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) != len(requestedIDs) {
+		return nil, pgx.ErrNoRows
+	}
+	return ids, nil
+}
+
 func writeRecordingMetricError(w http.ResponseWriter, err error, label string) {
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "recording not found")
@@ -258,9 +320,23 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	selectedIDs, err := requestedRecordingEnrichmentIDs(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if recordingID > 0 && len(selectedIDs) > 0 {
+		util.WriteError(w, http.StatusBadRequest, "recording_id and recording_ids cannot be combined")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), recordingListEnrichmentTimeout)
 	defer cancel()
-	ids, err := s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
+	var ids []int64
+	if len(selectedIDs) > 0 {
+		ids, err = s.recordingMetricSelectedIDs(ctx, accountID, selectedIDs, shared)
+	} else {
+		ids, err = s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
+	}
 	if err != nil {
 		writeRecordingMetricError(w, err, "load recording metrics")
 		return
