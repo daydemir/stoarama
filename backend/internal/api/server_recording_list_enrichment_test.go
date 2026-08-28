@@ -49,7 +49,7 @@ func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			value, err := loadRecordingMetricCached(context.Background(), &cache, sameKey, time.Minute, time.Second, slots, loader(47))
+			value, err := loadRecordingMetricCached(context.Background(), &cache, sameKey, time.Minute, time.Minute, time.Second, slots, loader(47))
 			results <- result{value: value, err: err}
 		}()
 	}
@@ -63,7 +63,7 @@ func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		value, err := loadRecordingMetricCached(context.Background(), &cache, foreignKey, time.Minute, time.Second, slots, loader(99))
+		value, err := loadRecordingMetricCached(context.Background(), &cache, foreignKey, time.Minute, time.Minute, time.Second, slots, loader(99))
 		results <- result{value: value, err: err}
 	}()
 	<-loaderStarted
@@ -71,7 +71,7 @@ func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		value, err := loadRecordingMetricCached(context.Background(), &cache, thirdKey, time.Minute, time.Second, slots, loader(701))
+		value, err := loadRecordingMetricCached(context.Background(), &cache, thirdKey, time.Minute, time.Minute, time.Second, slots, loader(701))
 		results <- result{value: value, err: err}
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -108,7 +108,7 @@ func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 		t.Fatalf("total loader calls=%d want 3", got)
 	}
 
-	value, err := loadRecordingMetricCached(context.Background(), &cache, sameKey, time.Minute, time.Second, slots, loader(-1))
+	value, err := loadRecordingMetricCached(context.Background(), &cache, sameKey, time.Minute, time.Minute, time.Second, slots, loader(-1))
 	if err != nil || value != 47 || calls.Load() != 3 {
 		t.Fatalf("cached reload value=%d err=%v calls=%d", value, err, calls.Load())
 	}
@@ -121,7 +121,7 @@ func TestRecordingMetricCacheTimeoutIncludesAdmissionWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	called := false
-	_, err := loadRecordingMetricCached(ctx, &cache, recordingMetricCacheKey{AccountID: 47, Scope: "700"}, time.Minute, time.Second, slots, func(context.Context) (int, error) {
+	_, err := loadRecordingMetricCached(ctx, &cache, recordingMetricCacheKey{AccountID: 47, Scope: "700"}, time.Minute, time.Minute, time.Second, slots, func(context.Context) (int, error) {
 		called = true
 		return 1, nil
 	})
@@ -132,11 +132,61 @@ func TestRecordingMetricCacheTimeoutIncludesAdmissionWait(t *testing.T) {
 		t.Fatal("loader ran without metric admission")
 	}
 	<-slots
-	_, err = loadRecordingMetricCached(context.Background(), &cache, recordingMetricCacheKey{AccountID: 47, Scope: "700"}, time.Minute, time.Second, slots, func(context.Context) (int, error) {
+	_, err = loadRecordingMetricCached(context.Background(), &cache, recordingMetricCacheKey{AccountID: 47, Scope: "700"}, time.Minute, time.Minute, time.Second, slots, func(context.Context) (int, error) {
 		called = true
 		return 1, nil
 	})
 	if err != context.DeadlineExceeded || called {
 		t.Fatalf("brief failure cache error=%v loader_called=%t", err, called)
+	}
+}
+
+func TestRecordingMetricFlightSurvivesLeaderDisconnect(t *testing.T) {
+	var cache recordingMetricCache[int]
+	slots := make(chan struct{}, 1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	loader := func(ctx context.Context) (int, error) {
+		calls.Add(1)
+		close(started)
+		select {
+		case <-release:
+			return 47, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	key := recordingMetricCacheKey{AccountID: 47, Shared: true, Scope: "700"}
+	type result struct {
+		value int
+		err   error
+	}
+	leaderResult := make(chan result, 1)
+	leaderCtx, cancelLeader := context.WithTimeout(context.Background(), time.Second)
+	go func() {
+		value, err := loadRecordingMetricCached(leaderCtx, &cache, key, time.Second, time.Minute, time.Second, slots, loader)
+		leaderResult <- result{value: value, err: err}
+	}()
+	<-started
+	followerResult := make(chan result, 1)
+	go func() {
+		value, err := loadRecordingMetricCached(context.Background(), &cache, key, time.Second, time.Minute, time.Second, slots, loader)
+		followerResult <- result{value: value, err: err}
+	}()
+	cancelLeader()
+	if got := <-leaderResult; got.err != context.Canceled {
+		t.Fatalf("leader error=%v want canceled", got.err)
+	}
+	close(release)
+	if got := <-followerResult; got.err != nil || got.value != 47 {
+		t.Fatalf("follower value=%d err=%v", got.value, got.err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("shared loader calls=%d want 1", got)
+	}
+	value, err := loadRecordingMetricCached(context.Background(), &cache, key, time.Second, time.Minute, time.Second, slots, loader)
+	if err != nil || value != 47 || calls.Load() != 1 {
+		t.Fatalf("cached value=%d err=%v calls=%d", value, err, calls.Load())
 	}
 }

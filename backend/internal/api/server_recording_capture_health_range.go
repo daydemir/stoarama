@@ -99,7 +99,7 @@ func (s *Server) writeRecordingCaptureHealth(w http.ResponseWriter, r *http.Requ
 	ctx, cancel := context.WithTimeout(r.Context(), captureHealthPageTimeout)
 	defer cancel()
 	key := recordingCaptureHealthCacheKey(r, accountID, recordingID, shared)
-	page, err := loadRecordingMetricCached(ctx, &s.recordingHealthPageCache, key, recordingHealthPageCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingCaptureHealthPage, error) {
+	page, err := loadRecordingMetricCached(ctx, &s.recordingHealthPageCache, key, captureHealthPageTimeout, recordingHealthPageCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingCaptureHealthPage, error) {
 		return s.recordingCaptureHealthPage(r.Clone(loadCtx), accountID, recordingID)
 	})
 	if err != nil {

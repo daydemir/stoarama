@@ -101,10 +101,10 @@ func (s *Server) recordingMetricWorkSlots() chan struct{} {
 }
 
 // loadRecordingMetricCached collapses identical requests and admits at most two
-// expensive recording-metric loaders per API instance. The caller's context
-// covers cache waiting, admission waiting, and the database work itself.
-func loadRecordingMetricCached[T any](ctx context.Context, cache *recordingMetricCache[T], key recordingMetricCacheKey, successTTL, failureTTL time.Duration, slots chan struct{}, loader func(context.Context) (T, error)) (T, error) {
-	var zero T
+// expensive recording-metric loaders per API instance. Each caller can stop
+// waiting independently, while the shared flight keeps the initiating request's
+// absolute endpoint deadline and cannot be canceled by one disconnected client.
+func loadRecordingMetricCached[T any](ctx context.Context, cache *recordingMetricCache[T], key recordingMetricCacheKey, loadBudget, successTTL, failureTTL time.Duration, slots chan struct{}, loader func(context.Context) (T, error)) (T, error) {
 	now := time.Now()
 	cache.Mu.Lock()
 	if entry, ok := cache.Entries[key]; ok && now.Before(entry.ExpiresAt) {
@@ -113,12 +113,7 @@ func loadRecordingMetricCached[T any](ctx context.Context, cache *recordingMetri
 	}
 	if flight, ok := cache.Flights[key]; ok {
 		cache.Mu.Unlock()
-		select {
-		case <-flight.Done:
-			return flight.Value, flight.Err
-		case <-ctx.Done():
-			return zero, ctx.Err()
-		}
+		return waitForRecordingMetricFlight(ctx, flight)
 	}
 	if cache.Entries == nil {
 		cache.Entries = make(map[recordingMetricCacheKey]recordingMetricCacheEntry[T])
@@ -134,12 +129,44 @@ func loadRecordingMetricCached[T any](ctx context.Context, cache *recordingMetri
 	flight := &recordingMetricFlight[T]{Done: make(chan struct{})}
 	cache.Flights[key] = flight
 	cache.Mu.Unlock()
+	loadCtx, cancel := detachedRecordingMetricContext(ctx, loadBudget)
+	go runRecordingMetricFlight(loadCtx, cancel, cache, key, flight, successTTL, failureTTL, slots, loader)
+	return waitForRecordingMetricFlight(ctx, flight)
+}
 
+func waitForRecordingMetricFlight[T any](ctx context.Context, flight *recordingMetricFlight[T]) (T, error) {
+	var zero T
+	select {
+	case <-flight.Done:
+		return flight.Value, flight.Err
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	}
+}
+
+func detachedRecordingMetricContext(ctx context.Context, loadBudget time.Duration) (context.Context, context.CancelFunc) {
+	parent := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(parent, deadline)
+	}
+	return context.WithTimeout(parent, loadBudget)
+}
+
+func runRecordingMetricFlight[T any](ctx context.Context, cancel context.CancelFunc, cache *recordingMetricCache[T], key recordingMetricCacheKey, flight *recordingMetricFlight[T], successTTL, failureTTL time.Duration, slots chan struct{}, loader func(context.Context) (T, error)) {
+	defer cancel()
 	var value T
 	var err error
 	select {
 	case slots <- struct{}{}:
-		value, err = loader(ctx)
+		ctxErr := ctx.Err()
+		if deadline, ok := ctx.Deadline(); ctxErr == nil && ok && !time.Now().Before(deadline) {
+			ctxErr = context.DeadlineExceeded
+		}
+		if ctxErr != nil {
+			err = ctxErr
+		} else {
+			value, err = loader(ctx)
+		}
 		<-slots
 	case <-ctx.Done():
 		err = ctx.Err()
@@ -161,7 +188,6 @@ func loadRecordingMetricCached[T any](ctx context.Context, cache *recordingMetri
 	}
 	close(flight.Done)
 	cache.Mu.Unlock()
-	return value, err
 }
 
 func (s *Server) recordingMetricScopeIDs(ctx context.Context, accountID, recordingID int64, shared bool) ([]int64, error) {
@@ -240,7 +266,7 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		return
 	}
 	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: recordingMetricScopeSignature(ids)}
-	result, err := loadRecordingMetricCached(ctx, &s.recordingEnrichmentCache, key, recordingEnrichmentCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingListEnrichmentResult, error) {
+	result, err := loadRecordingMetricCached(ctx, &s.recordingEnrichmentCache, key, recordingListEnrichmentTimeout, recordingEnrichmentCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingListEnrichmentResult, error) {
 		bins, loadErr := s.recordingHealthBinsForAccount(loadCtx, accountID, ids)
 		if loadErr != nil {
 			return recordingListEnrichmentResult{}, loadErr
@@ -302,7 +328,7 @@ func (s *Server) handleRecordingJoinedProgress(w http.ResponseWriter, r *http.Re
 		return
 	}
 	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: recordingMetricScopeSignature(ids)}
-	progress, err := loadRecordingMetricCached(ctx, &s.recordingProgressCache, key, recordingProgressCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (map[int64]recordingJoinedProgress, error) {
+	progress, err := loadRecordingMetricCached(ctx, &s.recordingProgressCache, key, recordingJoinedProgressTimeout, recordingProgressCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (map[int64]recordingJoinedProgress, error) {
 		return s.recordingJoinedProgressForAccount(loadCtx, accountID, ids)
 	})
 	if err != nil {
