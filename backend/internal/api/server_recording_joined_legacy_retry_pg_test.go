@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 )
@@ -192,7 +193,15 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 		t.Fatalf("exact remediation claim=%q want=%q", remediated.HourID, hourID)
 	}
 	var attempts int
-	if err := pool.QueryRow(ctx, `SELECT attempt_count FROM recording_joined_hours WHERE hour_id=$1`, hourID).Scan(&attempts); err != nil || attempts != 2 {
-		t.Fatalf("remediation attempt_count=%d want=2 err=%v", attempts, err)
+	var claimedBy, claimToken string
+	var leaseExpires time.Time
+	if err := pool.QueryRow(ctx, `SELECT attempt_count,claimed_by,claim_token::text,lease_expires_at
+		FROM recording_joined_hours WHERE hour_id=$1`, hourID).Scan(&attempts, &claimedBy, &claimToken, &leaseExpires); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || claimedBy != "exact-remediation-worker" ||
+		claimToken == "00000000-0000-0000-0000-000000000099" || claimToken == "" || !leaseExpires.After(time.Now()) {
+		t.Fatalf("remediation lease attempts=%d claimed_by=%q token_replaced=%v future_expiry=%v",
+			attempts, claimedBy, claimToken != "00000000-0000-0000-0000-000000000099", leaseExpires.After(time.Now()))
 	}
 }
