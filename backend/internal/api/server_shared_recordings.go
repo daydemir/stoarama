@@ -55,11 +55,11 @@ type sharedRecording struct {
 	RelayNodeName     *string                     `json:"relay_node_name"`
 	HasRelayOnline    bool                        `json:"has_relay_online"`
 	HasRelayAssigned  bool                        `json:"has_relay_assigned"`
-	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins,omitempty"`
-	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health,omitempty"`
-	JoinedReadyMS     int64                       `json:"joined_ready_ms,omitempty"`
-	SourceDurationMS  int64                       `json:"source_duration_ms,omitempty"`
-	JoinedPercent     *int                        `json:"joined_percent,omitempty"`
+	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins"`
+	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health"`
+	JoinedReadyMS     int64                       `json:"joined_ready_ms"`
+	SourceDurationMS  int64                       `json:"source_duration_ms"`
+	JoinedPercent     *int                        `json:"joined_percent"`
 }
 
 type sharedRecordingsLimiter struct {
@@ -432,6 +432,7 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 		if err != nil {
 			return nil, err
 		}
+		item.CaptureHealthBins = []recordingHealthBin{}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {

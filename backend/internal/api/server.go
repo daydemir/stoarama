@@ -75,6 +75,10 @@ type Server struct {
 	joinedDeliveryStatusAt   time.Time
 	joinedAttemptReconcileMu sync.Mutex
 	joinedAttemptReconcileAt time.Time
+	recordingMetricSlotsMu   sync.Mutex
+	recordingMetricSlots     chan struct{}
+	recordingEnrichmentCache recordingMetricCache[recordingListEnrichmentResult]
+	recordingProgressCache   recordingMetricCache[map[int64]recordingJoinedProgress]
 }
 
 const accountSessionCookie = "stoarama_session"

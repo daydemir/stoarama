@@ -605,7 +605,8 @@ func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 		`data-health-page="older"`,
 		`data-health-page="newer"`,
 		`loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))`,
-		`clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');`,
+		`const page = await fetchRecordingCaptureHealth(recId, '');`,
+		`void loadRecordingDetailCaptureHealth(recId);`,
 		`Array.from({ length: 24 }, () => [])`,
 		`hours.map((bins, hour) => ({ bin: captureHealthDisplayBin(bins), hour }))`,
 		`if (bins.length === 1) return bins[0];`,
@@ -730,9 +731,15 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 		"recordingAPIPath('/enrichment')",
 		"recordingAPIPath(`/joined-progress${sortQuery}`)",
 		"Joined coverage is loading",
+		"void loadRecordingDetailCaptureHealth(recId);",
+		"clipPageState.joinedPayload = payload;",
+		"renderClipPageWithJoined();",
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing lazy-metric marker %q", marker)
 		}
+	}
+	if strings.Contains(page, "clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');") {
+		t.Fatal("recording detail still waits for capture health before loading joined files")
 	}
 }

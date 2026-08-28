@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -45,12 +44,14 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		name    string
 		handler http.HandlerFunc
 		path    string
+		rowsKey string
 		setup   func(*http.Request) *http.Request
 	}{
 		{
 			name:    "authenticated",
 			handler: s.handleAccountRecordingsList,
 			path:    "/api/v1/account/recordings",
+			rowsKey: "items",
 			setup: func(req *http.Request) *http.Request {
 				return withPrincipal(req, accountPrincipal{AccountID: 47}, "")
 			},
@@ -59,6 +60,7 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 			name:    "public",
 			handler: s.handleSharedRecordingsList,
 			path:    "/api/v1/shared/mit-scl/recordings",
+			rowsKey: "recordings",
 			setup:   func(req *http.Request) *http.Request { return req },
 		},
 	}
@@ -76,14 +78,27 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
-			var payload map[string]any
+			var payload map[string]json.RawMessage
 			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 				t.Fatal(err)
 			}
-			encoded := rec.Body.String()
-			for _, forbidden := range []string{`"capture_health_bins"`, `"timeline_health"`, `"joined_percent"`} {
-				if contains := json.Valid(rec.Body.Bytes()) && strings.Contains(encoded, forbidden); contains {
-					t.Fatalf("baseline response included lazy field %s: %s", forbidden, encoded)
+			var items []map[string]json.RawMessage
+			if err := json.Unmarshal(payload[tc.rowsKey], &items); err != nil {
+				t.Fatalf("decode %s: %v", tc.rowsKey, err)
+			}
+			if len(items) != 1 {
+				t.Fatalf("%s rows=%d want 1", tc.rowsKey, len(items))
+			}
+			want := map[string]string{
+				"capture_health_bins": "[]",
+				"timeline_health":     "null",
+				"source_duration_ms":  "0",
+				"joined_ready_ms":     "0",
+				"joined_percent":      "null",
+			}
+			for field, expected := range want {
+				if got, ok := items[0][field]; !ok || string(got) != expected {
+					t.Fatalf("baseline compatibility field %s=%s present=%t want %s", field, got, ok, expected)
 				}
 			}
 		})

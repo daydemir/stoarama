@@ -3977,7 +3977,7 @@
     // ---- Dedicated clip-management page (/recordings/{id}) ----
 
     const CLIP_PAGE_SIZE = 100;
-    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null, captureHealth: null, joinedFolderPath: '' };
+    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null, captureHealth: null, joinedFolderPath: '', joinedPayload: null };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
     // switch the view into the dedicated clip page.
@@ -4009,13 +4009,10 @@
         }
         const rec = clipPageState.rec;
         clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
-        try {
-          clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');
-        } catch (err) {
-          clipPageState.captureHealth = { error: String(err.message || err) };
-        }
+		clipPageState.captureHealth = null;
         renderClipPage();
 		void loadRecordingDetailEnrichment(recId);
+		void loadRecordingDetailCaptureHealth(recId);
       }
       const body = root.querySelector('#clipListBody');
       if (body) body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
@@ -4030,6 +4027,7 @@
       }
       clipPageState.total = Number(payload.total || 0);
       clipPageState.joinedFolderPath = String(payload.folder_path || recordingAPIPath(`/${encodeURIComponent(recId)}/joined/folder`));
+	  clipPageState.joinedPayload = payload;
       renderClipPage();
       renderJoinedList(payload);
       clipPageState.loading = false;
@@ -4041,10 +4039,27 @@
 	    const item = Array.isArray(payload.items) ? payload.items[0] : null;
 	    if (!item || Number(item.recording_id) !== Number(clipPageState.recId) || !clipPageState.rec) return;
 	    Object.assign(clipPageState.rec, item);
-	    renderClipPage();
+	    renderClipPageWithJoined();
 	  } catch (_) {
 	    // Timeline enrichment is supplementary; joined media browsing stays usable.
 	  }
+	}
+
+	async function loadRecordingDetailCaptureHealth(recId) {
+	  try {
+	    const page = await fetchRecordingCaptureHealth(recId, '');
+	    if (Number(recId) !== Number(clipPageState.recId)) return;
+	    clipPageState.captureHealth = page;
+	  } catch (err) {
+	    if (Number(recId) !== Number(clipPageState.recId)) return;
+	    clipPageState.captureHealth = { error: String(err.message || err) };
+	  }
+	  renderClipPageWithJoined();
+	}
+
+	function renderClipPageWithJoined() {
+	  renderClipPage();
+	  if (clipPageState.joinedPayload) renderJoinedList(clipPageState.joinedPayload);
 	}
 
     // Reload the recording JSON after a schedule/storage/billing edit, then re-render
@@ -4057,13 +4072,10 @@
         return;
       }
       clipPageState.recName = String((clipPageState.rec.stream_name || clipPageState.rec.name) || `Recording #${clipPageState.recId}`);
-      try {
-        clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, '');
-      } catch (err) {
-        clipPageState.captureHealth = { error: String(err.message || err) };
-      }
+	  clipPageState.captureHealth = null;
       renderClipPage();
 	  void loadRecordingDetailEnrichment(clipPageState.recId);
+	  void loadRecordingDetailCaptureHealth(clipPageState.recId);
       await loadClipPage(clipPageState.page);
     }
 

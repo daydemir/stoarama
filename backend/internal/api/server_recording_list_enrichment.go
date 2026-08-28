@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -17,12 +18,46 @@ import (
 const (
 	recordingListEnrichmentTimeout = 5 * time.Second
 	recordingJoinedProgressTimeout = 8 * time.Second
+	recordingEnrichmentCacheTTL    = 30 * time.Second
+	recordingProgressCacheTTL      = 60 * time.Second
+	recordingMetricFailureTTL      = 5 * time.Second
+	recordingMetricConcurrency     = 2
 )
+
+type recordingMetricCacheKey struct {
+	AccountID   int64
+	RecordingID int64
+	Shared      bool
+	Scope       string
+}
+
+type recordingMetricCacheEntry[T any] struct {
+	Value     T
+	Err       error
+	ExpiresAt time.Time
+}
+
+type recordingMetricFlight[T any] struct {
+	Done  chan struct{}
+	Value T
+	Err   error
+}
+
+type recordingMetricCache[T any] struct {
+	Mu      sync.Mutex
+	Entries map[recordingMetricCacheKey]recordingMetricCacheEntry[T]
+	Flights map[recordingMetricCacheKey]*recordingMetricFlight[T]
+}
+
+type recordingListEnrichmentResult struct {
+	Bins     map[int64][]recordingHealthBin
+	Timeline map[int64]recordingTimelineHealth
+}
 
 type recordingListEnrichmentItem struct {
 	RecordingID       int64                    `json:"recording_id"`
-	CaptureHealthBins []recordingHealthBin     `json:"capture_health_bins,omitempty"`
-	TimelineHealth    *recordingTimelineHealth `json:"timeline_health,omitempty"`
+	CaptureHealthBins []recordingHealthBin     `json:"capture_health_bins"`
+	TimelineHealth    *recordingTimelineHealth `json:"timeline_health"`
 }
 
 type recordingJoinedProgressItem struct {
@@ -42,6 +77,90 @@ func requestedRecordingMetricID(r *http.Request) (int64, error) {
 		return 0, errors.New("recording_id must be a positive integer")
 	}
 	return id, nil
+}
+
+func recordingMetricScopeSignature(ids []int64) string {
+	var scope strings.Builder
+	for i, id := range ids {
+		if i > 0 {
+			scope.WriteByte(',')
+		}
+		scope.WriteString(strconv.FormatInt(id, 10))
+	}
+	return scope.String()
+}
+
+func (s *Server) recordingMetricWorkSlots() chan struct{} {
+	s.recordingMetricSlotsMu.Lock()
+	defer s.recordingMetricSlotsMu.Unlock()
+	if s.recordingMetricSlots == nil {
+		s.recordingMetricSlots = make(chan struct{}, recordingMetricConcurrency)
+	}
+	return s.recordingMetricSlots
+}
+
+// loadRecordingMetricCached collapses identical requests and admits at most two
+// expensive recording-metric loaders per API instance. The caller's context
+// covers cache waiting, admission waiting, and the database work itself.
+func loadRecordingMetricCached[T any](ctx context.Context, cache *recordingMetricCache[T], key recordingMetricCacheKey, successTTL, failureTTL time.Duration, slots chan struct{}, loader func(context.Context) (T, error)) (T, error) {
+	var zero T
+	now := time.Now()
+	cache.Mu.Lock()
+	if entry, ok := cache.Entries[key]; ok && now.Before(entry.ExpiresAt) {
+		cache.Mu.Unlock()
+		return entry.Value, entry.Err
+	}
+	if flight, ok := cache.Flights[key]; ok {
+		cache.Mu.Unlock()
+		select {
+		case <-flight.Done:
+			return flight.Value, flight.Err
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		}
+	}
+	if cache.Entries == nil {
+		cache.Entries = make(map[recordingMetricCacheKey]recordingMetricCacheEntry[T])
+	}
+	if cache.Flights == nil {
+		cache.Flights = make(map[recordingMetricCacheKey]*recordingMetricFlight[T])
+	}
+	for staleKey, entry := range cache.Entries {
+		if !now.Before(entry.ExpiresAt) {
+			delete(cache.Entries, staleKey)
+		}
+	}
+	flight := &recordingMetricFlight[T]{Done: make(chan struct{})}
+	cache.Flights[key] = flight
+	cache.Mu.Unlock()
+
+	var value T
+	var err error
+	select {
+	case slots <- struct{}{}:
+		value, err = loader(ctx)
+		<-slots
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+
+	cache.Mu.Lock()
+	flight.Value = value
+	flight.Err = err
+	delete(cache.Flights, key)
+	ttl := successTTL
+	if err != nil {
+		ttl = failureTTL
+	}
+	// A caller disconnect should not make a healthy metric key fail for every
+	// other browser. Deadlines and database failures are briefly cached to stop
+	// retry herds.
+	if ttl > 0 && !errors.Is(err, context.Canceled) {
+		cache.Entries[key] = recordingMetricCacheEntry[T]{Value: value, Err: err, ExpiresAt: time.Now().Add(ttl)}
+	}
+	close(flight.Done)
+	cache.Mu.Unlock()
+	return value, err
 }
 
 func (s *Server) recordingMetricScopeIDs(ctx context.Context, accountID, recordingID int64, shared bool) ([]int64, error) {
@@ -112,29 +231,41 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ids, err := s.recordingMetricScopeIDs(r.Context(), accountID, recordingID, shared)
+	ctx, cancel := context.WithTimeout(r.Context(), recordingListEnrichmentTimeout)
+	defer cancel()
+	ids, err := s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
 	if err != nil {
 		writeRecordingMetricError(w, err, "load recording metrics")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), recordingListEnrichmentTimeout)
-	defer cancel()
-	bins, err := s.recordingHealthBinsForAccount(ctx, accountID, ids)
+	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: recordingMetricScopeSignature(ids)}
+	result, err := loadRecordingMetricCached(ctx, &s.recordingEnrichmentCache, key, recordingEnrichmentCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingListEnrichmentResult, error) {
+		bins, loadErr := s.recordingHealthBinsForAccount(loadCtx, accountID, ids)
+		if loadErr != nil {
+			return recordingListEnrichmentResult{}, loadErr
+		}
+		if loadErr := s.populateRecordingListJoinedProgressBins(loadCtx, accountID, ids, bins); loadErr != nil {
+			return recordingListEnrichmentResult{}, loadErr
+		}
+		timeline, loadErr := s.recordingTimelineHealthForAccount(loadCtx, accountID, ids)
+		if loadErr != nil {
+			return recordingListEnrichmentResult{}, loadErr
+		}
+		return recordingListEnrichmentResult{Bins: bins, Timeline: timeline}, nil
+	})
 	if err != nil {
 		log.Printf("recording list enrichment failed account_id=%d: %v", accountID, err)
 		writeRecordingMetricError(w, err, "load recording metrics")
 		return
 	}
-	timeline, err := s.recordingTimelineHealthForAccount(ctx, accountID, ids)
-	if err != nil {
-		log.Printf("recording list timeline enrichment failed account_id=%d: %v", accountID, err)
-		writeRecordingMetricError(w, err, "load recording metrics")
-		return
-	}
 	items := make([]recordingListEnrichmentItem, 0, len(ids))
 	for _, id := range ids {
-		item := recordingListEnrichmentItem{RecordingID: id, CaptureHealthBins: bins[id]}
-		if health, ok := timeline[id]; ok {
+		bins := result.Bins[id]
+		if bins == nil {
+			bins = []recordingHealthBin{}
+		}
+		item := recordingListEnrichmentItem{RecordingID: id, CaptureHealthBins: bins}
+		if health, ok := result.Timeline[id]; ok {
 			item.TimelineHealth = &health
 		}
 		items = append(items, item)
@@ -162,14 +293,17 @@ func (s *Server) handleRecordingJoinedProgress(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ids, err := s.recordingMetricScopeIDs(r.Context(), accountID, recordingID, shared)
+	ctx, cancel := context.WithTimeout(r.Context(), recordingJoinedProgressTimeout)
+	defer cancel()
+	ids, err := s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
 	if err != nil {
 		writeRecordingMetricError(w, err, "load joined progress")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), recordingJoinedProgressTimeout)
-	defer cancel()
-	progress, err := s.recordingJoinedProgressForAccount(ctx, accountID, ids)
+	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: recordingMetricScopeSignature(ids)}
+	progress, err := loadRecordingMetricCached(ctx, &s.recordingProgressCache, key, recordingProgressCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (map[int64]recordingJoinedProgress, error) {
+		return s.recordingJoinedProgressForAccount(loadCtx, accountID, ids)
+	})
 	if err != nil {
 		log.Printf("recording joined progress failed account_id=%d: %v", accountID, err)
 		writeRecordingMetricError(w, err, "load joined progress")
@@ -192,4 +326,39 @@ func (s *Server) handleRecordingJoinedProgress(w http.ResponseWriter, r *http.Re
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
 	util.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) populateRecordingListJoinedProgressBins(ctx context.Context, accountID int64, recordingIDs []int64, bins map[int64][]recordingHealthBin) error {
+	type binRef struct {
+		recordingID int64
+		index       int
+	}
+	refs := make([]binRef, 0, len(recordingIDs)*recentHealthBinCount)
+	binRecordingIDs := make([]int64, 0, cap(refs))
+	starts := make([]time.Time, 0, cap(refs))
+	ends := make([]time.Time, 0, cap(refs))
+	for _, recordingID := range recordingIDs {
+		for index, bin := range bins[recordingID] {
+			refs = append(refs, binRef{recordingID: recordingID, index: index})
+			binRecordingIDs = append(binRecordingIDs, recordingID)
+			starts = append(starts, bin.Start)
+			ends = append(ends, bin.End)
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	progress, err := s.recordingJoinedProgressForBins(ctx, accountID, binRecordingIDs, starts, ends)
+	if err != nil {
+		return err
+	}
+	if len(progress) != len(refs) {
+		return errors.New("joined health bin count mismatch")
+	}
+	for index, ref := range refs {
+		bin := &bins[ref.recordingID][ref.index]
+		bin.SourceDurationMS = progress[index].SourceDurationMS
+		bin.JoinedReadyMS = progress[index].JoinedReadyMS
+	}
+	return nil
 }

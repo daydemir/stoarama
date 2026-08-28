@@ -155,6 +155,27 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 			t.Fatalf("list joined bin %d=%+v want %+v", i, listBins[i], want)
 		}
 	}
+	lazyBins := map[int64][]recordingHealthBin{
+		20: {{Start: time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC), End: time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)}},
+		30: {
+			{Start: starts[0], End: ends[0]},
+			{Start: starts[1], End: ends[1]},
+		},
+	}
+	if err := s.populateRecordingListJoinedProgressBins(context.Background(), 47, []int64{20, 30}, lazyBins); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range wantBins {
+		var got recordingHealthBin
+		if i == 0 {
+			got = lazyBins[20][0]
+		} else {
+			got = lazyBins[30][i-1]
+		}
+		if got.SourceDurationMS != want.SourceDurationMS || got.JoinedReadyMS != want.JoinedReadyMS {
+			t.Fatalf("lazy heatmap joined bin %d=%+v want %+v", i, got, want)
+		}
+	}
 }
 
 func TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation(t *testing.T) {
