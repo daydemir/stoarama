@@ -65,12 +65,41 @@ func (s *Server) recordingJoinedPageRoot(principal accountPrincipal) string {
 	return "/recordings"
 }
 
+const recordingJoinedPublishedArtifactScopeSQL = `
+	FROM recording_joined_artifacts a
+	JOIN recording_joined_hours h
+	  ON h.id=a.hour_record_id
+	 AND h.batch_record_id=a.batch_record_id
+	 AND h.account_id=a.account_id
+	 AND h.state='sealed'
+	JOIN recordings rec
+	  ON rec.id=h.recording_id
+	 AND rec.account_id=h.account_id
+	 AND rec.status IN ('active','paused','completed')
+	WHERE rec.id=$1
+	  AND rec.account_id=$2
+	  AND a.published_at IS NOT NULL
+	  AND a.etag IS NOT NULL AND a.etag<>''
+	  AND a.version_id IS NOT NULL
+	  AND (a.artifact_kind='media' OR a.publication_state='published')
+	  AND EXISTS (
+	    SELECT 1 FROM recording_joined_artifacts manifest
+	    WHERE manifest.hour_record_id=h.id
+	      AND manifest.batch_record_id=h.batch_record_id
+	      AND manifest.account_id=h.account_id
+	      AND manifest.artifact_kind='hour_manifest'
+	      AND manifest.publication_state='published'
+	      AND manifest.published_at IS NOT NULL
+	      AND manifest.etag IS NOT NULL AND manifest.etag<>''
+	      AND manifest.version_id IS NOT NULL
+	  )`
+
 // recordingJoinedFiles lists only artifacts from an account-owned, sealed hour
 // whose immutable identity and published hour manifest are complete.
 func (s *Server) recordingJoinedFiles(ctx context.Context, principal accountPrincipal, recordingID int64, kinds []string, limit, offset int) (recordingJoinedList, error) {
 	var recordingExists bool
 	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-		SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND status<>'canceled'
+		SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND status IN ('active','paused','completed')
 	)`, recordingID, principal.AccountID).Scan(&recordingExists); err != nil {
 		return recordingJoinedList{}, err
 	}
@@ -78,35 +107,8 @@ func (s *Server) recordingJoinedFiles(ctx context.Context, principal accountPrin
 		return recordingJoinedList{}, pgx.ErrNoRows
 	}
 
-	const publishedScope = `
-		FROM recording_joined_artifacts a
-		JOIN recording_joined_hours h
-		  ON h.id=a.hour_record_id
-		 AND h.batch_record_id=a.batch_record_id
-		 AND h.account_id=a.account_id
-		 AND h.state='sealed'
-		JOIN recordings rec
-		  ON rec.id=h.recording_id
-		 AND rec.account_id=h.account_id
-		 AND rec.status<>'canceled'
-		WHERE rec.id=$1
-		  AND rec.account_id=$2
-		  AND a.artifact_kind=ANY($3::text[])
-		  AND a.published_at IS NOT NULL
-		  AND a.etag IS NOT NULL AND a.etag<>''
-		  AND a.version_id IS NOT NULL
-		  AND (a.artifact_kind='media' OR a.publication_state='published')
-		  AND EXISTS (
-		    SELECT 1 FROM recording_joined_artifacts manifest
-		    WHERE manifest.hour_record_id=h.id
-		      AND manifest.batch_record_id=h.batch_record_id
-		      AND manifest.account_id=h.account_id
-		      AND manifest.artifact_kind='hour_manifest'
-		      AND manifest.publication_state='published'
-		      AND manifest.published_at IS NOT NULL
-		      AND manifest.etag IS NOT NULL AND manifest.etag<>''
-		      AND manifest.version_id IS NOT NULL
-		  )`
+	publishedScope := recordingJoinedPublishedArtifactScopeSQL + `
+		AND a.artifact_kind=ANY($3::text[])`
 
 	var total int64
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) `+publishedScope, recordingID, principal.AccountID, kinds).Scan(&total); err != nil {
@@ -263,17 +265,21 @@ type joinedByteRange struct {
 	end   int64
 }
 
-// parseJoinedByteRange accepts one RFC 7233 byte range and rejects multipart or
-// unsatisfiable requests.
+// parseJoinedByteRange accepts one RFC 7233 byte range. Unsupported units and
+// multipart forms are ignored; malformed or unsatisfiable byte ranges fail.
 func parseJoinedByteRange(raw string, size int64) (*joinedByteRange, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
 	}
-	if size <= 0 || !strings.HasPrefix(raw, "bytes=") || strings.Contains(raw, ",") {
+	unit, value, found := strings.Cut(raw, "=")
+	if !found || !strings.EqualFold(strings.TrimSpace(unit), "bytes") || strings.Contains(value, ",") {
+		return nil, nil
+	}
+	if size <= 0 {
 		return nil, errors.New("invalid byte range")
 	}
-	parts := strings.Split(strings.TrimPrefix(raw, "bytes="), "-")
+	parts := strings.Split(strings.TrimSpace(value), "-")
 	if len(parts) != 2 {
 		return nil, errors.New("invalid byte range")
 	}
@@ -352,34 +358,9 @@ func (s *Server) handleAccountRecordingJoinedDownload(w http.ResponseWriter, r *
 	var objectKey, etag, versionID, contentType, sha256, relativePath string
 	var sizeBytes int64
 	err := s.pool.QueryRow(r.Context(), `SELECT a.object_key,a.etag,a.version_id,a.content_type,
-		a.expected_size_bytes,a.expected_sha256,a.relative_path
-		FROM recording_joined_artifacts a
-		JOIN recording_joined_hours h
-		  ON h.id=a.hour_record_id
-		 AND h.batch_record_id=a.batch_record_id
-		 AND h.account_id=a.account_id
-		 AND h.state='sealed'
-		JOIN recordings rec
-		  ON rec.id=h.recording_id
-		 AND rec.account_id=h.account_id
-		 AND rec.status<>'canceled'
-		WHERE rec.id=$1 AND rec.account_id=$2 AND a.id=$3
-		  AND a.artifact_kind IN ('hour_manifest','media')
-		  AND a.published_at IS NOT NULL
-		  AND a.etag IS NOT NULL AND a.etag<>''
-		  AND a.version_id IS NOT NULL
-		  AND (a.artifact_kind='media' OR a.publication_state='published')
-		  AND EXISTS (
-		    SELECT 1 FROM recording_joined_artifacts manifest
-		    WHERE manifest.hour_record_id=h.id
-		      AND manifest.batch_record_id=h.batch_record_id
-		      AND manifest.account_id=h.account_id
-		      AND manifest.artifact_kind='hour_manifest'
-		      AND manifest.publication_state='published'
-		      AND manifest.published_at IS NOT NULL
-		      AND manifest.etag IS NOT NULL AND manifest.etag<>''
-		      AND manifest.version_id IS NOT NULL
-		  )`, recordingID, principal.AccountID, artifactID).Scan(
+		a.expected_size_bytes,a.expected_sha256,a.relative_path `+recordingJoinedPublishedArtifactScopeSQL+`
+		  AND a.id=$3
+		  AND a.artifact_kind IN ('hour_manifest','media')`, recordingID, principal.AccountID, artifactID).Scan(
 		&objectKey, &etag, &versionID, &contentType, &sizeBytes, &sha256, &relativePath)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "joined recording file not found")
@@ -397,22 +378,10 @@ func (s *Server) handleAccountRecordingJoinedDownload(w http.ResponseWriter, r *
 	}
 	var stillCurrent bool
 	err = s.pool.QueryRow(r.Context(), `SELECT EXISTS(
-		SELECT 1 FROM recording_joined_artifacts a
-		JOIN recording_joined_hours h
-		  ON h.id=a.hour_record_id AND h.batch_record_id=a.batch_record_id AND h.account_id=a.account_id AND h.state='sealed'
-		JOIN recordings rec ON rec.id=h.recording_id AND rec.account_id=h.account_id AND rec.status<>'canceled'
-		WHERE rec.id=$1 AND rec.account_id=$2 AND a.id=$3
-		  AND a.object_key=$4 AND a.etag=$5 AND a.version_id=$6
+		SELECT 1 `+recordingJoinedPublishedArtifactScopeSQL+`
+		  AND a.id=$3 AND a.object_key=$4 AND a.etag=$5 AND a.version_id=$6
 		  AND a.expected_size_bytes=$7 AND a.expected_sha256=$8 AND a.content_type=$9
-		  AND a.artifact_kind IN ('hour_manifest','media') AND a.published_at IS NOT NULL
-		  AND (a.artifact_kind='media' OR a.publication_state='published')
-		  AND EXISTS (
-		    SELECT 1 FROM recording_joined_artifacts manifest
-		    WHERE manifest.hour_record_id=h.id AND manifest.batch_record_id=h.batch_record_id
-		      AND manifest.account_id=h.account_id AND manifest.artifact_kind='hour_manifest'
-		      AND manifest.publication_state='published' AND manifest.published_at IS NOT NULL
-		      AND manifest.etag IS NOT NULL AND manifest.etag<>'' AND manifest.version_id IS NOT NULL
-		  )
+		  AND a.artifact_kind IN ('hour_manifest','media')
 	)`, recordingID, principal.AccountID, artifactID, objectKey, etag, versionID,
 		sizeBytes, sha256, contentType).Scan(&stillCurrent)
 	if err != nil || !stillCurrent {

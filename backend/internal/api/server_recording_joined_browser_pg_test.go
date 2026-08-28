@@ -127,12 +127,30 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 	bins := make([]recordingHealthBin, 2)
 	starts := []time.Time{time.Date(2026, 5, 4, 8, 59, 0, 0, time.UTC), time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)}
 	ends := []time.Time{starts[1], starts[1].Add(time.Minute)}
-	if err := s.populateRecordingJoinedProgressBins(context.Background(), 30, starts, ends, bins); err != nil {
+	if err := s.populateRecordingJoinedProgressBins(context.Background(), 47, 30, starts, ends, bins); err != nil {
 		t.Fatal(err)
 	}
 	for i, bin := range bins {
 		if bin.SourceDurationMS != 30_000 || bin.JoinedReadyMS != 30_000 {
 			t.Fatalf("boundary bin %d=%+v want 30000/30000", i, bin)
+		}
+	}
+	listBins, err := s.recordingJoinedProgressForBins(context.Background(), 47,
+		[]int64{20, 30, 30},
+		[]time.Time{time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC), starts[0], starts[1]},
+		[]time.Time{time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC), ends[0], ends[1]},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBins := []recordingJoinedBinProgress{
+		{SourceDurationMS: 180_000, JoinedReadyMS: 120_000},
+		{SourceDurationMS: 30_000, JoinedReadyMS: 30_000},
+		{SourceDurationMS: 30_000, JoinedReadyMS: 30_000},
+	}
+	for i, want := range wantBins {
+		if listBins[i] != want {
+			t.Fatalf("list joined bin %d=%+v want %+v", i, listBins[i], want)
 		}
 	}
 }
@@ -320,6 +338,11 @@ func (s *joinedBrowserRangeStore) OpenExactRange(_ context.Context, key, etag, v
 	return io.NopCloser(bytes.NewReader(s.body[start : end+1])), nil
 }
 
+func (s *joinedBrowserRangeStore) OpenExact(_ context.Context, key, etag, versionID string) (io.ReadCloser, error) {
+	s.objectKey, s.etag, s.versionID, s.start, s.end = key, etag, versionID, 0, int64(len(s.body)-1)
+	return io.NopCloser(bytes.NewReader(s.body)), nil
+}
+
 func TestRecordingJoinedDownloadSupportsUnversionedExactRange(t *testing.T) {
 	pool := joinedBrowserTestPool(t)
 	seedJoinedBrowserTestData(t, pool)
@@ -343,6 +366,15 @@ func TestRecordingJoinedDownloadSupportsUnversionedExactRange(t *testing.T) {
 	}
 	if store.objectKey != "joined/private/media-1.mp4" || store.etag != "media-1" || store.versionID != "" || store.start != 2 || store.end != 5 {
 		t.Fatalf("exact range call key=%q etag=%q version=%q range=%d-%d", store.objectKey, store.etag, store.versionID, store.start, store.end)
+	}
+	for _, unsupported := range []string{"items=2-5", "bytes=2-3,5-6"} {
+		fullRequest := req.Clone(req.Context())
+		fullRequest.Header.Set("Range", unsupported)
+		full := httptest.NewRecorder()
+		s.handleAccountRecordingJoinedDownload(full, fullRequest)
+		if full.Code != http.StatusOK || full.Body.String() != "0123456789" || full.Header().Get("Content-Range") != "" {
+			t.Fatalf("unsupported range %q status=%d content-range=%q body=%q", unsupported, full.Code, full.Header().Get("Content-Range"), full.Body.String())
+		}
 	}
 
 	store.head.ETag = "changed"

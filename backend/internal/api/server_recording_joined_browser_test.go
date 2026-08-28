@@ -51,8 +51,9 @@ func TestParseJoinedByteRange(t *testing.T) {
 		{raw: "bytes=-10", wantStart: 90, wantEnd: 99},
 		{raw: "bytes=95-200", wantStart: 95, wantEnd: 99},
 		{raw: "bytes=100-", wantError: true},
-		{raw: "bytes=1-2,4-5", wantError: true},
-		{raw: "items=0-9", wantError: true},
+		{raw: "bytes=bad", wantError: true},
+		{raw: "bytes=1-2,4-5", wantAbsent: true},
+		{raw: "items=0-9", wantAbsent: true},
 	} {
 		got, err := parseJoinedByteRange(test.raw, 100)
 		if (err != nil) != test.wantError {

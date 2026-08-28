@@ -161,7 +161,7 @@ func TestSharedRecordingDTOExcludesSensitiveFields(t *testing.T) {
 	}
 }
 
-func TestSharedRecordingsExposeAllNonCanceledStatuses(t *testing.T) {
+func TestSharedRecordingsExposeOnlyAllowlistedStatuses(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -207,7 +207,7 @@ func TestSharedRecordingsExposeAllNonCanceledStatuses(t *testing.T) {
 		seen[recording.Status] = true
 	}
 	if !seen["active"] || !seen["paused"] || !seen["completed"] || seen["canceled"] {
-		t.Fatalf("visible statuses=%v, want all non-canceled statuses", seen)
+		t.Fatalf("visible statuses=%v, want active, paused, and completed only", seen)
 	}
 
 	for _, status := range []string{"active", "paused", "completed", "canceled"} {

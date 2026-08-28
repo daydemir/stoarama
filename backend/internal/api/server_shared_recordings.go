@@ -26,7 +26,7 @@ const (
 	sharedRecordingsMaxFailures        = 5
 	sharedRecordingsMaxClients         = 4096
 	sharedRecordingsListLimit          = 500
-	sharedRecordingsVisibleStatusesSQL = "rec.status <> 'canceled'"
+	sharedRecordingsVisibleStatusesSQL = "rec.status IN ('active','paused','completed')"
 )
 
 type sharedRecording struct {

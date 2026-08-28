@@ -144,7 +144,7 @@ func TestOpenExactSendsConditionalGenerationIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	if _, err := io.ReadAll(body); err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestOpenExactRangeSendsConditionalGenerationAndByteRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	if ifMatch != `"abc123"` || version != "version-7" || byteRange != "bytes=10-19" {
 		t.Fatalf("If-Match=%q versionId=%q Range=%q", ifMatch, version, byteRange)
 	}
@@ -190,6 +190,9 @@ func TestOpenExactMethodsRejectMissingIdentityAndInvalidRange(t *testing.T) {
 	}
 	if _, err := client.OpenExactRange(context.Background(), "clip.mp4", "abc123", "", 10, 9); err == nil {
 		t.Fatal("OpenExactRange allowed an invalid range")
+	}
+	if _, err := client.OpenExactRange(context.Background(), "clip.mp4", "", "", 0, 9); err == nil {
+		t.Fatal("OpenExactRange allowed an empty ETag")
 	}
 }
 

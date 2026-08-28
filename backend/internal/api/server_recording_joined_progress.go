@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -14,12 +15,7 @@ type recordingJoinedProgress struct {
 	Percent          *int  `json:"joined_percent"`
 }
 
-const recordingJoinedReadyClipsSQL = `WITH candidate_sources AS MATERIALIZED (
-	SELECT id,clip_id,hour_record_id,batch_record_id,account_id,recording_id
-	FROM recording_joined_sources
-	WHERE account_id=$1 AND recording_id=ANY($2::bigint[])
-)
-	SELECT DISTINCT src.clip_id
+const recordingJoinedReadyFromCandidateSourcesSQL = `SELECT DISTINCT src.clip_id
 	FROM candidate_sources src
 	JOIN recording_joined_hours h
 	  ON h.id=src.hour_record_id
@@ -49,6 +45,13 @@ const recordingJoinedReadyClipsSQL = `WITH candidate_sources AS MATERIALIZED (
 	      AND manifest.etag IS NOT NULL AND manifest.etag<>''
 	      AND manifest.version_id IS NOT NULL
 	  )`
+
+const recordingJoinedReadyClipsSQL = `WITH candidate_sources AS MATERIALIZED (
+	SELECT id,clip_id,hour_record_id,batch_record_id,account_id,recording_id
+	FROM recording_joined_sources
+	WHERE account_id=$1 AND recording_id=ANY($2::bigint[])
+)
+` + recordingJoinedReadyFromCandidateSourcesSQL
 
 const recordingJoinedProgressSQL = `WITH requested AS (
 	SELECT DISTINCT id AS recording_id
@@ -96,7 +99,8 @@ func (s *Server) recordingJoinedProgressForAccount(ctx context.Context, accountI
 			return nil, err
 		}
 		if progress.JoinedReadyMS > progress.SourceDurationMS {
-			return nil, fmt.Errorf("recording %d joined duration %d exceeds source duration %d", recordingID, progress.JoinedReadyMS, progress.SourceDurationMS)
+			log.Printf("recording joined progress omitted recording_id=%d ready_ms=%d source_ms=%d", recordingID, progress.JoinedReadyMS, progress.SourceDurationMS)
+			continue
 		}
 		if progress.SourceDurationMS > 0 {
 			percent := int(progress.JoinedReadyMS * 100 / progress.SourceDurationMS)
@@ -178,77 +182,79 @@ func sortSharedRecordingsByJoinedProgress(items []sharedRecording, direction int
 	})
 }
 
+type recordingJoinedBinProgress struct {
+	SourceDurationMS int64
+	JoinedReadyMS    int64
+}
+
 const recordingJoinedProgressBinsSQL = `WITH bins AS (
-	SELECT bin_start,bin_end,ordinality
-	FROM unnest($2::timestamptz[],$3::timestamptz[]) WITH ORDINALITY b(bin_start,bin_end,ordinality)
-), clips AS (
-	SELECT id,clip_start_at,clip_end_at
-	FROM recording_clips
-	WHERE recording_id=$1 AND purged_at IS NULL
-), ready AS (
-	SELECT DISTINCT src.clip_id
-	FROM recording_joined_sources src
-	JOIN recording_joined_hours h
-	  ON h.id=src.hour_record_id
-	 AND h.recording_id=src.recording_id
-	 AND h.account_id=src.account_id
-	 AND h.batch_record_id=src.batch_record_id
-	 AND h.state='sealed'
-	JOIN recording_joined_media_sources ms ON ms.source_id=src.id
-	JOIN recording_joined_artifacts media
-	  ON media.id=ms.artifact_id
-	 AND media.hour_record_id=h.id
-	 AND media.batch_record_id=h.batch_record_id
-	 AND media.account_id=h.account_id
-	 AND media.artifact_kind='media'
-	 AND media.published_at IS NOT NULL
-	 AND media.etag IS NOT NULL AND media.etag<>''
-	 AND media.version_id IS NOT NULL
-	WHERE src.recording_id=$1
-	  AND EXISTS (
-	    SELECT 1 FROM recording_joined_artifacts manifest
-	    WHERE manifest.hour_record_id=h.id
-	      AND manifest.batch_record_id=h.batch_record_id
-	      AND manifest.account_id=h.account_id
-	      AND manifest.artifact_kind='hour_manifest'
-	      AND manifest.publication_state='published'
-	      AND manifest.published_at IS NOT NULL
-	      AND manifest.etag IS NOT NULL AND manifest.etag<>''
-	      AND manifest.version_id IS NOT NULL
-	  )
-)
+	SELECT recording_id,bin_start,bin_end,ordinality
+	FROM unnest($1::bigint[],$2::timestamptz[],$3::timestamptz[])
+		WITH ORDINALITY b(recording_id,bin_start,bin_end,ordinality)
+), candidate_sources AS MATERIALIZED (
+	SELECT id,clip_id,hour_record_id,batch_record_id,account_id,recording_id
+	FROM recording_joined_sources
+	WHERE account_id=$4 AND recording_id=ANY($1::bigint[])
+), ready AS (` + recordingJoinedReadyFromCandidateSourcesSQL + `)
 SELECT b.ordinality,
 	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000),0)::bigint,
 	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000)
 		FILTER (WHERE ready.clip_id IS NOT NULL),0)::bigint
 FROM bins b
-LEFT JOIN clips c ON c.clip_start_at<b.bin_end AND c.clip_end_at>b.bin_start
+LEFT JOIN recording_clips c ON c.recording_id=b.recording_id AND c.purged_at IS NULL
+	AND c.clip_start_at<b.bin_end AND c.clip_end_at>b.bin_start
 LEFT JOIN ready ON ready.clip_id=c.id
 GROUP BY b.ordinality
 ORDER BY b.ordinality`
 
-func (s *Server) populateRecordingJoinedProgressBins(ctx context.Context, recordingID int64, starts, ends []time.Time, bins []recordingHealthBin) error {
-	rows, err := s.pool.Query(ctx, recordingJoinedProgressBinsSQL, recordingID, starts, ends)
+func (s *Server) recordingJoinedProgressForBins(ctx context.Context, accountID int64, recordingIDs []int64, starts, ends []time.Time) ([]recordingJoinedBinProgress, error) {
+	if accountID <= 0 || len(recordingIDs) != len(starts) || len(starts) != len(ends) {
+		return nil, fmt.Errorf("invalid joined health bin scope")
+	}
+	out := make([]recordingJoinedBinProgress, len(starts))
+	if len(starts) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, recordingJoinedProgressBinsSQL, recordingIDs, starts, ends, accountID)
 	if err != nil {
-		return fmt.Errorf("count joined source duration: %w", err)
+		return nil, fmt.Errorf("count joined source duration: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var ordinal, sourceMS, readyMS int64
 		if err := rows.Scan(&ordinal, &sourceMS, &readyMS); err != nil {
-			return fmt.Errorf("scan joined source duration: %w", err)
+			return nil, fmt.Errorf("scan joined source duration: %w", err)
 		}
-		if ordinal < 1 || ordinal > int64(len(bins)) {
-			return fmt.Errorf("joined health bin ordinal %d out of range", ordinal)
+		if ordinal < 1 || ordinal > int64(len(out)) {
+			return nil, fmt.Errorf("joined health bin ordinal %d out of range", ordinal)
 		}
 		if readyMS > sourceMS {
-			return fmt.Errorf("joined health bin %d ready duration %d exceeds source duration %d", ordinal, readyMS, sourceMS)
+			log.Printf("recording joined health bin omitted ordinal=%d ready_ms=%d source_ms=%d", ordinal, readyMS, sourceMS)
+			continue
 		}
-		bins[ordinal-1].SourceDurationMS = sourceMS
-		bins[ordinal-1].JoinedReadyMS = readyMS
+		out[ordinal-1] = recordingJoinedBinProgress{SourceDurationMS: sourceMS, JoinedReadyMS: readyMS}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("count joined source duration: %w", err)
+		return nil, fmt.Errorf("count joined source duration: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Server) populateRecordingJoinedProgressBins(ctx context.Context, accountID, recordingID int64, starts, ends []time.Time, bins []recordingHealthBin) error {
+	recordingIDs := make([]int64, len(starts))
+	for i := range recordingIDs {
+		recordingIDs[i] = recordingID
+	}
+	progress, err := s.recordingJoinedProgressForBins(ctx, accountID, recordingIDs, starts, ends)
+	if err != nil {
+		return err
+	}
+	if len(progress) != len(bins) {
+		return fmt.Errorf("joined health bins=%d want %d", len(progress), len(bins))
+	}
+	for i := range bins {
+		bins[i].SourceDurationMS = progress[i].SourceDurationMS
+		bins[i].JoinedReadyMS = progress[i].JoinedReadyMS
 	}
 	return nil
 }
