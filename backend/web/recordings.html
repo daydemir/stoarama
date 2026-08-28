@@ -285,7 +285,7 @@
     }
     .best14-potential.great, .best14-potential.good, .best14-potential.fine { color: var(--quality-potential-fg); border-color: var(--quality-potential-border); background: var(--quality-potential-bg); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
-    .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
+    .health-strip-cell { position: relative; flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
     .health-strip-cell[data-health-tooltip] { cursor: help; }
     .health-strip-bar { width: 100%; min-height: 2px; border-radius: 2px; background: var(--muted); }
     .health-strip-bar.healthy { background: var(--ok); }
@@ -3514,7 +3514,7 @@
       let action = !sharedReadOnly && status === 'active'
         ? `<details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-pause="${id}">Pause recording…</button></div></details>`
         : (!sharedReadOnly && status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
-      action += `<a class="btn-link secondary" href="${recordingsPagePath}/${id}">View joined</a>`;
+      action += `<a class="btn-link secondary" href="${recordingsPagePath}/${id}">View recording</a>`;
       const localTime = localTimeLabel(timezone);
       const ends = instantInTimezone(rec.end_at, timezone);
       return `<tr class="${extraClass}" data-card="${id}">
@@ -4180,9 +4180,16 @@
         const health = String(bin.health || '');
         const start = instantInTimezone(bin.start, timezone) || '';
         const end = instantInTimezone(bin.end, timezone) || '';
-        const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;
+        const sourceMS = Number(bin.source_duration_ms || 0);
+        const joinedAvailable = sourceMS > 0;
+        const joinedPercent = joinedAvailable ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : null;
+        const joinedMarker = joinedPercent === 100
+          ? '<span class="health-joined-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
+          : (joinedPercent > 0 ? `<span class="health-joined-marker" aria-hidden="true">${joinedPercent}</span>` : '');
+        const joinedLabel = joinedAvailable ? ` · Joined: ${joinedPercent}%` : ' · Joined: unavailable';
+        const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}${joinedLabel}`;
         latestTitle = title;
-        cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
+        cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span>${joinedMarker}</span>`);
       }
       return `<div class="health-strip" role="img" aria-label="Capture health over recording time" aria-describedby="healthTooltip" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
     }
@@ -4271,12 +4278,14 @@
             const percent = expected > 0 ? Math.round(captured / expected * 1000) / 10 : 0;
             const health = String(bin.health || '');
             const sourceMS = Number(bin.source_duration_ms || 0);
-            const joinedPercent = sourceMS > 0 ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : 0;
+            const joinedAvailable = sourceMS > 0;
+            const joinedPercent = joinedAvailable ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : null;
             const joinedMarker = joinedPercent === 100
               ? '<span class="health-joined-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
               : (joinedPercent > 0 ? `<span class="health-joined-marker" aria-hidden="true">${joinedPercent}</span>` : '');
             const zone = bin.localZone ? ` ${bin.localZone}` : '';
-            const title = `${date} ${String(hour).padStart(2, '0')}:00${zone} · Capture health: ${percent}% of expected clips captured (${captured}/${expected}) · Joined: ${joinedPercent}%`;
+            const joinedLabel = joinedAvailable ? `Joined: ${joinedPercent}%` : 'Joined: unavailable';
+            const title = `${date} ${String(hour).padStart(2, '0')}:00${zone} · Capture health: ${percent}% of expected clips captured (${captured}/${expected}) · ${joinedLabel}`;
             return `<button type="button" class="health-heatmap-cell ${health}" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}">${joinedMarker}</button>`;
           }).join('')}
         </div>`;
@@ -4445,7 +4454,7 @@
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <div class="recording-head-actions">
-            <a class="btn-link secondary" href="${escapeHTML(folderPath)}">Browse joined recordings</a>
+            <a class="btn-link secondary" href="${escapeHTML(folderPath)}">Joined clips</a>
             <a class="btn-link secondary" href="${recordingsPagePath}">Back to recordings</a>
           </div>
         </div>`;

@@ -340,7 +340,7 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	}
 	page := string(body)
 	for _, marker := range []string{
-		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;",
+		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}${joinedLabel}`;",
 		`data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"`,
 		`data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0"`,
 		`aria-describedby="healthTooltip"`,
@@ -711,9 +711,70 @@ func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"health-joined-marker", "Joined: ${joinedPercent}%", "source_duration_ms", "joined_ready_ms", "<svg viewBox=\"0 0 10 10\""} {
+	for _, marker := range []string{
+		"health-joined-marker",
+		"const joinedAvailable = sourceMS > 0;",
+		"Joined: ${joinedPercent}%",
+		"Joined: unavailable",
+		"source_duration_ms",
+		"joined_ready_ms",
+		"<svg viewBox=\"0 0 10 10\"",
+	} {
 		if !strings.Contains(string(body), marker) {
 			t.Fatalf("recordings html missing joined-progress marker %q", marker)
+		}
+	}
+}
+
+func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`<option value="joined_desc">Joined: highest first</option>`,
+		`<option value="joined_asc">Joined: lowest first</option>`,
+		`const direction = state.recordingSort === 'joined_asc' ? 1 : -1;`,
+		`if (left.available !== right.available) return left.available ? -1 : 1;`,
+		`if (left.available && left.percent !== right.percent) return direction * (left.percent - right.percent);`,
+		`if (!(sourceMS > 0) || rawPercent === null || rawPercent === undefined`,
+		`return { available: false, percent: null, sourceMS: 0, readyMS: 0 };`,
+		`available: true,`,
+		`>${joined.percent}%</div>`,
+		`Joined coverage is temporarily unavailable`,
+		`Joined coverage unavailable: no usable recorded footage`,
+		`mergeRecordingMetricItems(payload.items);`,
+		`state.joinedProgressLoaded = true;`,
+		`renderCards();`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing joined sort/state marker %q", marker)
+		}
+	}
+	refreshStart := strings.Index(page, "async function refreshJoinedProgress(requestToken)")
+	if refreshStart < 0 {
+		t.Fatal("joined progress refresh function not found")
+	}
+	refreshEnd := strings.Index(page[refreshStart:], "// ---- Composer open/close ----")
+	if refreshEnd < 0 {
+		t.Fatal("joined progress refresh function end not found")
+	}
+	refresh := page[refreshStart : refreshStart+refreshEnd]
+	mergeAt := strings.Index(refresh, "mergeRecordingMetricItems(payload.items);")
+	loadedAt := strings.Index(refresh, "state.joinedProgressLoaded = true;")
+	renderAt := strings.Index(refresh, "renderCards();")
+	if mergeAt < 0 || loadedAt < mergeAt || renderAt < loadedAt {
+		t.Fatalf("joined lazy values do not rerender in order: merge=%d loaded=%d render=%d", mergeAt, loadedAt, renderAt)
+	}
+	for _, stale := range []string{">View joined<", ">Browse joined recordings<"} {
+		if strings.Contains(page, stale) {
+			t.Fatalf("recordings html still contains stale action copy %q", stale)
+		}
+	}
+	for _, label := range []string{">View recording<", ">Joined clips<"} {
+		if !strings.Contains(page, label) {
+			t.Fatalf("recordings html missing exact action copy %q", label)
 		}
 	}
 }
