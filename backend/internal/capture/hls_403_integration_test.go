@@ -2,6 +2,7 @@ package capture
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -63,6 +64,75 @@ func TestContinuousHLSExpiredFragmentFailsFast(t *testing.T) {
 	}
 	if forbiddenRequests.Load() != 1 {
 		t.Fatalf("expired HLS fragment requests=%d want=1", forbiddenRequests.Load())
+	}
+}
+
+// TestContinuousGooglevideoHLSAdvancingManifestExpiredFragments replays the
+// production shape that the stale-playlist counter cannot catch: the manifest
+// sequence keeps advancing, but its signed child fragments have already expired.
+// FFmpeg logs each 403 and remains alive while producing no media, so the relay
+// must return to the worker's fresh resolver without waiting for the watchdog.
+func TestContinuousGooglevideoHLSAdvancingManifestExpiredFragments(t *testing.T) {
+	ffmpeg, err := exec.LookPath(ffmpegBin())
+	if err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+
+	temp := t.TempDir()
+	segment := generateHLSFixtureSegment(t, ffmpeg, temp)
+
+	var playlistRequests atomic.Int64
+	var forbiddenRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/live.m3u8":
+			sequence := playlistRequests.Add(1) - 1
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n", sequence)
+			if sequence == 0 {
+				fmt.Fprint(w, "#EXTINF:1,\n/segment.ts\n")
+				return
+			}
+			fmt.Fprintf(w, "#EXTINF:1,\n/expired-%d.ts\n", sequence)
+		case r.URL.Path == "/segment.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write(segment)
+		case strings.HasPrefix(r.URL.Path, "/expired-"):
+			forbiddenRequests.Add(1)
+			http.Error(w, "expired", http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer captureCancel()
+	started := time.Now()
+	err = captureContinuousWithHeaders(
+		captureCtx,
+		server.URL+"/live.m3u8",
+		time.Second,
+		"manifest.googlevideo.com",
+		nil,
+		temp,
+		func(Segment) error { return nil },
+		"",
+		10*time.Second,
+		10*time.Second,
+	)
+	elapsed := time.Since(started)
+	if captureCtx.Err() == context.DeadlineExceeded {
+		t.Fatalf("capture held advancing manifest with expired fragments past 4s; playlists=%d forbidden=%d", playlistRequests.Load(), forbiddenRequests.Load())
+	}
+	if !errors.Is(err, ErrContinuousExpiredGooglevideoFragment) {
+		t.Fatalf("capture error=%v, want expired Googlevideo HLS fragment", err)
+	}
+	if elapsed > 3500*time.Millisecond {
+		t.Fatalf("advancing manifest with expired fragments took %s to reconnect", elapsed)
+	}
+	if forbiddenRequests.Load() == 0 {
+		t.Fatal("fixture never served an expired fragment")
 	}
 }
 
