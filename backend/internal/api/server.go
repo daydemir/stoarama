@@ -79,6 +79,7 @@ type Server struct {
 	recordingMetricSlots     chan struct{}
 	recordingEnrichmentCache recordingMetricCache[recordingListEnrichmentResult]
 	recordingProgressCache   recordingMetricCache[map[int64]recordingJoinedProgress]
+	recordingHealthPageCache recordingMetricCache[recordingCaptureHealthPage]
 }
 
 const accountSessionCookie = "stoarama_session"

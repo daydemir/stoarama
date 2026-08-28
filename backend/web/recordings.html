@@ -3977,7 +3977,11 @@
     // ---- Dedicated clip-management page (/recordings/{id}) ----
 
     const CLIP_PAGE_SIZE = 100;
-    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null, captureHealth: null, joinedFolderPath: '', joinedPayload: null };
+    const clipPageState = {
+      recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null,
+      captureHealth: null, joinedFolderPath: '', joinedPayload: null,
+      joinedPayloadKey: '', joinedLoadToken: 0, joinedStatus: 'idle', joinedError: '',
+    };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
     // switch the view into the dedicated clip page.
@@ -3993,8 +3997,15 @@
       const recId = clipPageState.recId;
       const root = els.clipPage;
       const firstLoad = !clipPageState.rec;
-      clipPageState.page = Math.max(0, Number(page) || 0);
+	  const requestedPage = Math.max(0, Number(page) || 0);
+	  const joinedKey = `${recId}:${requestedPage}`;
+	  const loadToken = ++clipPageState.joinedLoadToken;
+	  clipPageState.page = requestedPage;
       clipPageState.loading = true;
+	  clipPageState.joinedPayload = null;
+	  clipPageState.joinedPayloadKey = joinedKey;
+	  clipPageState.joinedStatus = 'loading';
+	  clipPageState.joinedError = '';
       // Load the full recording once (schedule + storage + stream id). It drives the
       // detail cards and the pause/resume/delete actions; the clips list refetches per
       // page but the recording does not.
@@ -4003,14 +4014,16 @@
         try {
           clipPageState.rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));
         } catch (err) {
+		  if (loadToken !== clipPageState.joinedLoadToken) return;
           root.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
           clipPageState.loading = false;
           return;
         }
+		if (loadToken !== clipPageState.joinedLoadToken) return;
         const rec = clipPageState.rec;
         clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
 		clipPageState.captureHealth = null;
-        renderClipPage();
+		renderClipPageWithJoined();
 		void loadRecordingDetailEnrichment(recId);
 		void loadRecordingDetailCaptureHealth(recId);
       }
@@ -4018,18 +4031,22 @@
       if (body) body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
       let payload;
       try {
-        const offset = clipPageState.page * CLIP_PAGE_SIZE;
+		const offset = requestedPage * CLIP_PAGE_SIZE;
         payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined?limit=${CLIP_PAGE_SIZE}&offset=${offset}`));
       } catch (err) {
-        if (body) body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+		if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
+		clipPageState.joinedStatus = 'error';
+		clipPageState.joinedError = String(err.message || err);
+		renderClipPageWithJoined();
         clipPageState.loading = false;
         return;
       }
+	  if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
       clipPageState.total = Number(payload.total || 0);
       clipPageState.joinedFolderPath = String(payload.folder_path || recordingAPIPath(`/${encodeURIComponent(recId)}/joined/folder`));
 	  clipPageState.joinedPayload = payload;
-      renderClipPage();
-      renderJoinedList(payload);
+	  clipPageState.joinedStatus = 'ready';
+	  renderClipPageWithJoined();
       clipPageState.loading = false;
     }
 
@@ -4059,7 +4076,19 @@
 
 	function renderClipPageWithJoined() {
 	  renderClipPage();
-	  if (clipPageState.joinedPayload) renderJoinedList(clipPageState.joinedPayload);
+	  const joinedKey = `${clipPageState.recId}:${clipPageState.page}`;
+	  if (clipPageState.joinedPayload && clipPageState.joinedPayloadKey === joinedKey) {
+		renderJoinedList(clipPageState.joinedPayload);
+		return;
+	  }
+	  if (clipPageState.joinedPayloadKey !== joinedKey) return;
+	  const body = els.clipPage.querySelector('#clipListBody');
+	  if (!body) return;
+	  if (clipPageState.joinedStatus === 'loading') {
+		body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
+	  } else if (clipPageState.joinedStatus === 'error') {
+		body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(clipPageState.joinedError)}</div>`;
+	  }
 	}
 
     // Reload the recording JSON after a schedule/storage/billing edit, then re-render
@@ -4319,8 +4348,7 @@
       const anchorDate = direction === 'newer' && candidateDate > localToday ? localToday : candidateDate;
       try {
         clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, anchorDate);
-        renderClipPage();
-        await loadClipPage(clipPageState.page);
+		renderClipPageWithJoined();
       } catch (err) {
         window.alert(String(err.message || err));
       }

@@ -20,6 +20,7 @@ const (
 	recordingJoinedProgressTimeout = 8 * time.Second
 	recordingEnrichmentCacheTTL    = 30 * time.Second
 	recordingProgressCacheTTL      = 60 * time.Second
+	recordingHealthPageCacheTTL    = 30 * time.Second
 	recordingMetricFailureTTL      = 5 * time.Second
 	recordingMetricConcurrency     = 2
 )

@@ -386,7 +386,7 @@ func (s *Server) handleSharedRecordingCaptureHealth(w http.ResponseWriter, r *ht
 	if !ok {
 		return
 	}
-	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id)
+	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id, true)
 }
 
 func (s *Server) sharedRecordingPrincipalRequest(r *http.Request) *http.Request {

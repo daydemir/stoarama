@@ -743,3 +743,41 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 		t.Fatal("recording detail still waits for capture health before loading joined files")
 	}
 }
+
+func TestRecordingDetailJoinedPayloadIsBoundToActiveAsyncLoad(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"const loadToken = ++clipPageState.joinedLoadToken;",
+		"clipPageState.joinedPayload = null;",
+		"clipPageState.joinedPayloadKey = joinedKey;",
+		"loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey",
+		"clipPageState.joinedPayloadKey === joinedKey",
+		"clipPageState.joinedStatus = 'error';",
+		"renderClipPageWithJoined();",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording detail missing async joined identity fence %q", marker)
+		}
+	}
+	clearAt := strings.Index(page, "clipPageState.joinedPayload = null;")
+	fetchAt := strings.Index(page, "payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined")
+	if clearAt < 0 || fetchAt < 0 || clearAt > fetchAt {
+		t.Fatalf("joined payload is not cleared before the next page fetch: clear=%d fetch=%d", clearAt, fetchAt)
+	}
+	pageHealthStart := strings.Index(page, "async function loadRecordingCaptureHealthPage(direction)")
+	if pageHealthStart < 0 {
+		t.Fatal("capture-health pagination function not found")
+	}
+	pageHealthEnd := strings.Index(page[pageHealthStart:], "// The storage card")
+	if pageHealthEnd < 0 {
+		t.Fatal("capture-health pagination function not found")
+	}
+	pageHealthSource := page[pageHealthStart : pageHealthStart+pageHealthEnd]
+	if strings.Contains(pageHealthSource, "await loadClipPage(clipPageState.page);") {
+		t.Fatal("capture-health pagination still refetches joined media and reopens the stale-payload race")
+	}
+}
