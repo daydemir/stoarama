@@ -369,7 +369,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
-		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th><th>Joined</th><th>Schedule</th>`,
+		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th>${joinedSortHeaderHTML()}<th>Schedule</th>`,
 		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
 		`const captureHealthHTML = captureHealth === 'unavailable'`,
@@ -747,6 +747,12 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		`mergeRecordingMetricItems(payload.items);`,
 		`state.joinedProgressLoaded = true;`,
 		`renderCards();`,
+		`data-sortjoined`,
+		`aria-sort="${ariaSort}"`,
+		`state.recordingSort = next;`,
+		`els.recordingSort.value = next;`,
+		`Joined, highest first`,
+		`Joined, lowest first`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing joined sort/state marker %q", marker)
@@ -776,6 +782,37 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
 		}
+	}
+}
+
+func TestRecordingJoinedDetailFailureOffersAnInPlaceRetry(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`Joined recordings could not be loaded.`,
+		`data-joinedretry`,
+		`loadClipPage(clipPageState.page)`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing joined detail recovery marker %q", marker)
+		}
+	}
+}
+
+func TestRecordingJoinedDetailFormatsNonemptyPublishedFilesWithDefinedHelper(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	if strings.Contains(page, `fmtBytes(`) {
+		t.Fatal("joined detail calls undefined fmtBytes helper")
+	}
+	if !strings.Contains(page, `formatBytes(Number(file.size_bytes || 0))`) {
+		t.Fatal("joined detail does not format a published file with the defined formatBytes helper")
 	}
 }
 
