@@ -919,6 +919,157 @@ while :; do sleep .1; done
 	}
 }
 
+func TestContinuousExpiredGooglevideoPipelinesNextFreshResolution(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, time.Now().Add(time.Minute).Format(time.RFC3339Nano))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, HeartbeatSec: 1, CaptureTempDir: t.TempDir(), UploadWorkers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.heartbeatInt = 5 * time.Millisecond
+	worker.leaseSafetyMargin = time.Millisecond
+	worker.reconnectDelay = func(int64, int) time.Duration { return time.Hour }
+
+	thirdResolved := make(chan struct{})
+	var resolves atomic.Int64
+	worker.resolveCaptureInput = func(ctx context.Context, _, _, _ string) (string, bool, string, error) {
+		switch call := resolves.Add(1); call {
+		case 1:
+			return "https://192.0.2.1/first.m3u8", false, "headers-a", nil
+		case 2:
+			return "https://192.0.2.2/second.m3u8", false, "headers-b", nil
+		case 3:
+			close(thirdResolved)
+			return "https://192.0.2.3/third.m3u8", false, "headers-c", nil
+		default:
+			<-ctx.Done()
+			return "", false, "", ctx.Err()
+		}
+	}
+	type captureCall struct {
+		url, headers string
+	}
+	captures := make(chan captureCall, 3)
+	var captureCount atomic.Int64
+	worker.continuousCapture = func(ctx context.Context, sourceURL string, _ time.Duration, _ string, _ *int, _ string, _ func(capture.Segment) error, headers string) error {
+		captures <- captureCall{url: sourceURL, headers: headers}
+		switch captureCount.Add(1) {
+		case 1:
+			return capture.ErrContinuousExpiredGooglevideoFragment
+		case 2:
+			select {
+			case <-thirdResolved:
+				return capture.ErrContinuousExpiredGooglevideoFragment
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		default:
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	windowEnd := time.Now().Add(time.Minute)
+	go func() {
+		defer close(done)
+		worker.processContinuousJob(jobCtx, recordingapi.RecordingJob{
+			JobID: 451, RecordingID: 451,
+			SourceURL: "https://www.youtube.com/watch?v=test", SourcePageURL: "https://www.youtube.com/watch?v=test",
+			ClipDurationSec: 60, LeaseExpiresAt: time.Now().Add(time.Minute), LeaseToken: "lease",
+			Kind: "continuous_window", WindowEndAt: &windowEnd,
+		})
+	}()
+
+	want := []captureCall{
+		{url: "https://192.0.2.1/first.m3u8", headers: "headers-a"},
+		{url: "https://192.0.2.2/second.m3u8", headers: "headers-b"},
+		{url: "https://192.0.2.3/third.m3u8", headers: "headers-c"},
+	}
+	for i, expected := range want {
+		select {
+		case got := <-captures:
+			if got != expected {
+				t.Fatalf("capture %d=%+v want %+v", i+1, got, expected)
+			}
+		case <-time.After(750 * time.Millisecond):
+			t.Fatalf("capture %d did not start; resolver calls=%d", i+1, resolves.Load())
+		}
+	}
+	cancelJob()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuous job did not stop after cancellation")
+	}
+	if got := resolves.Load(); got < 3 || got > 4 {
+		t.Fatalf("resolver calls=%d want three captures plus at most one in-flight prefetch", got)
+	}
+}
+
+func TestContinuousResolutionPrefetchRejectsUnsafeOrStaleResults(t *testing.T) {
+	now := time.Date(2026, time.August, 28, 19, 0, 0, 0, time.UTC)
+	currentResolvedAt := now.Add(-time.Minute)
+	for _, tc := range []struct {
+		name    string
+		input   continuousResolvedInput
+		current string
+		want    bool
+	}{
+		{name: "fresh distinct public", input: continuousResolvedInput{url: "https://192.0.2.2/fresh.m3u8", completedAt: now.Add(-time.Second)}, current: "https://192.0.2.1/current.m3u8", want: true},
+		{name: "same url", input: continuousResolvedInput{url: "https://192.0.2.1/current.m3u8", completedAt: now.Add(-time.Second)}, current: "https://192.0.2.1/current.m3u8"},
+		{name: "stale", input: continuousResolvedInput{url: "https://192.0.2.2/stale.m3u8", completedAt: now.Add(-continuousResolutionPrefetchMaxAge - time.Nanosecond)}, current: "https://192.0.2.1/current.m3u8"},
+		{name: "predates current", input: continuousResolvedInput{url: "https://192.0.2.2/old.m3u8", completedAt: currentResolvedAt.Add(-time.Nanosecond)}, current: "https://192.0.2.1/current.m3u8"},
+		{name: "future clock", input: continuousResolvedInput{url: "https://192.0.2.2/future.m3u8", completedAt: now.Add(time.Second)}, current: "https://192.0.2.1/current.m3u8"},
+		{name: "image", input: continuousResolvedInput{url: "https://192.0.2.2/frame.jpg", isImage: true, completedAt: now.Add(-time.Second)}, current: "https://192.0.2.1/current.m3u8"},
+		{name: "resolver error", input: continuousResolvedInput{completedAt: now.Add(-time.Second), err: errors.New("resolve failed")}, current: "https://192.0.2.1/current.m3u8"},
+		{name: "private target", input: continuousResolvedInput{url: "http://127.0.0.1/private.m3u8", completedAt: now.Add(-time.Second)}, current: "https://192.0.2.1/current.m3u8"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			done := make(chan struct{})
+			close(done)
+			prefetch := &continuousResolutionPrefetch{cancel: func() {}, done: done, input: tc.input}
+			got, ok := prefetch.consume(now, tc.current, currentResolvedAt)
+			if ok != tc.want {
+				t.Fatalf("consume ok=%v want %v input=%+v", ok, tc.want, tc.input)
+			}
+			if ok && got.url != tc.input.url {
+				t.Fatalf("consumed url=%q want %q", got.url, tc.input.url)
+			}
+		})
+	}
+}
+
+func TestContinuousResolutionPrefetchCancelsAndJoinsUnfinishedResolver(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	prefetch := &continuousResolutionPrefetch{cancel: cancel, done: done}
+	go func() {
+		<-ctx.Done()
+		close(done)
+	}()
+	if _, ok := prefetch.consume(time.Now(), "https://192.0.2.1/current.m3u8", time.Now().Add(-time.Second)); ok {
+		t.Fatal("unfinished canceled prefetch was consumed")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("consume returned before canceled resolver joined")
+	}
+}
+
 func TestRetryableTransportError(t *testing.T) {
 	tests := []struct {
 		err  error
