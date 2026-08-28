@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -25,7 +26,7 @@ const (
 	sharedRecordingsMaxFailures        = 5
 	sharedRecordingsMaxClients         = 4096
 	sharedRecordingsListLimit          = 500
-	sharedRecordingsVisibleStatusesSQL = "rec.status IN ('active','paused')"
+	sharedRecordingsVisibleStatusesSQL = "rec.status IN ('active','paused','completed')"
 )
 
 type sharedRecording struct {
@@ -54,8 +55,11 @@ type sharedRecording struct {
 	RelayNodeName     *string                     `json:"relay_node_name"`
 	HasRelayOnline    bool                        `json:"has_relay_online"`
 	HasRelayAssigned  bool                        `json:"has_relay_assigned"`
-	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins,omitempty"`
-	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health,omitempty"`
+	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins"`
+	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health"`
+	JoinedReadyMS     int64                       `json:"joined_ready_ms"`
+	SourceDurationMS  int64                       `json:"source_duration_ms"`
+	JoinedPercent     *int                        `json:"joined_percent"`
 }
 
 type sharedRecordingsLimiter struct {
@@ -382,7 +386,24 @@ func (s *Server) handleSharedRecordingCaptureHealth(w http.ResponseWriter, r *ht
 	if !ok {
 		return
 	}
-	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id)
+	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id, true)
+}
+
+func (s *Server) sharedRecordingPrincipalRequest(r *http.Request) *http.Request {
+	ctx := context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: s.cfg.SharedRecordingsAccountID, AuthType: "shared"})
+	return r.WithContext(ctx)
+}
+
+func (s *Server) handleSharedRecordingJoinedList(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedList(w, s.sharedRecordingPrincipalRequest(r))
+}
+
+func (s *Server) handleSharedRecordingJoinedDownload(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedDownload(w, s.sharedRecordingPrincipalRequest(r))
+}
+
+func (s *Server) handleSharedRecordingJoinedFolder(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedFolder(w, s.sharedRecordingPrincipalRequest(r))
 }
 
 func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sharedRecording, error) {
@@ -402,7 +423,6 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	}
 	defer rows.Close()
 	items := []sharedRecording{}
-	ids := []int64{}
 	for rows.Next() {
 		raw, err := scanRecordingListRow(rows, s.billing != nil)
 		if err != nil {
@@ -412,8 +432,8 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 		if err != nil {
 			return nil, err
 		}
+		item.CaptureHealthBins = []recordingHealthBin{}
 		items = append(items, item)
-		ids = append(ids, item.ID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -421,20 +441,8 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	if recordingID > 0 && len(items) == 0 {
 		return items, nil
 	}
-	bins, err := s.recordingHealthBinsForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
-	if err != nil {
-		return nil, err
-	}
-	timeline, err := s.recordingTimelineHealthForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
-	if err != nil {
-		return nil, err
-	}
-	for i := range items {
-		items[i].CaptureHealthBins = bins[items[i].ID]
-		if health, ok := timeline[items[i].ID]; ok {
-			items[i].TimelineHealth = &health
-		}
-	}
+	// The shared page uses the same fast baseline as the authenticated page.
+	// Slow health and joined aggregates load through separate scoped endpoints.
 	return items, nil
 }
 

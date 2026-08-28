@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -372,27 +373,77 @@ func TestContinuousNoProgressExpired(t *testing.T) {
 	}
 }
 
-func TestContinuousMediaLagExpired(t *testing.T) {
-	now := time.Date(2026, time.August, 9, 2, 0, 0, 0, time.UTC)
+func TestContinuousMediaLagDriftExpired(t *testing.T) {
 	timeout := 15 * time.Minute
 	for _, tc := range []struct {
-		name     string
-		mediaEnd time.Time
-		now      time.Time
-		timeout  time.Duration
-		want     bool
+		name       string
+		bestLag    time.Duration
+		currentLag time.Duration
+		timeout    time.Duration
+		want       bool
 	}{
-		{name: "within bound", mediaEnd: now.Add(-timeout + time.Nanosecond), now: now, timeout: timeout},
-		{name: "at bound", mediaEnd: now.Add(-timeout), now: now, timeout: timeout, want: true},
-		{name: "well behind despite progress", mediaEnd: now.Add(-48 * time.Minute), now: now, timeout: timeout, want: true},
-		{name: "disabled", mediaEnd: now.Add(-time.Hour), now: now, timeout: 0},
-		{name: "unknown media end", now: now, timeout: timeout},
+		{name: "stable offset", bestLag: 20 * time.Minute, currentLag: 20 * time.Minute, timeout: timeout},
+		{name: "within bound", bestLag: 20 * time.Minute, currentLag: 35*time.Minute - time.Nanosecond, timeout: timeout},
+		{name: "at bound", bestLag: 20 * time.Minute, currentLag: 35 * time.Minute, timeout: timeout, want: true},
+		{name: "caught up", bestLag: 20 * time.Minute, currentLag: 5 * time.Minute, timeout: timeout},
+		{name: "disabled", bestLag: 20 * time.Minute, currentLag: time.Hour, timeout: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := continuousMediaLagExpired(tc.mediaEnd, tc.now, tc.timeout); got != tc.want {
-				t.Fatalf("continuousMediaLagExpired()=%v want %v", got, tc.want)
+			if got := continuousMediaLagDriftExpired(tc.bestLag, tc.currentLag, tc.timeout); got != tc.want {
+				t.Fatalf("continuousMediaLagDriftExpired()=%v want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestContinuousMediaLagFenceAllowsStableSourceOffsetAndStopsGrowingDrift(t *testing.T) {
+	started := time.Date(2026, time.August, 28, 4, 0, 0, 0, time.UTC)
+	const sourceOffset = 20 * time.Minute
+	var fence continuousMediaLagFence
+	var aborts atomic.Int64
+	abort := func() { aborts.Add(1) }
+
+	// TOPIS-style streams can advance at wall-clock speed while their media
+	// timeline carries a stable offset. That offset is not delivery drift and
+	// must not make the worker surrender an otherwise gapless capture.
+	var sequence int64
+	for elapsed := time.Duration(0); elapsed <= 30*time.Minute; elapsed += time.Minute {
+		sequence++
+		fence.observe(sequence, started.Add(elapsed-sourceOffset), started.Add(elapsed), 15*time.Minute, abort)
+	}
+	if fence.lagged() || aborts.Load() != 0 {
+		t.Fatalf("stable source offset tripped lag fence: lagged=%v aborts=%d", fence.lagged(), aborts.Load())
+	}
+
+	// If delivery subsequently falls a full timeout farther behind the best
+	// observed offset, the existing safety behavior still stops capture once.
+	fence.observe(sequence+1, started.Add(31*time.Minute-sourceOffset), started.Add(46*time.Minute), 15*time.Minute, abort)
+	fence.observe(sequence+2, started.Add(32*time.Minute-sourceOffset), started.Add(48*time.Minute), 15*time.Minute, abort)
+	if !fence.lagged() || aborts.Load() != 1 {
+		t.Fatalf("growing delivery drift did not trip once: lagged=%v aborts=%d", fence.lagged(), aborts.Load())
+	}
+}
+
+func TestContinuousMediaLagFenceIgnoresOutOfOrderDeliveryWorkers(t *testing.T) {
+	started := time.Date(2026, time.August, 28, 4, 0, 0, 0, time.UTC)
+	var fence continuousMediaLagFence
+	var aborts atomic.Int64
+	abort := func() { aborts.Add(1) }
+
+	// A concurrent worker reaches sequence 2 first and establishes the source's
+	// stable offset. Sequence 1 is observed much later; its scheduling delay must
+	// not be mistaken for media drift.
+	fence.observe(2, started.Add(-5*time.Minute), started.Add(15*time.Minute), 15*time.Minute, abort)
+	fence.observe(1, started.Add(-20*time.Minute), started.Add(15*time.Minute), 15*time.Minute, abort)
+	if fence.lagged() || aborts.Load() != 0 {
+		t.Fatalf("out-of-order worker tripped lag fence: lagged=%v aborts=%d", fence.lagged(), aborts.Load())
+	}
+
+	// Sequence numbers persist across reconnect attempts. A newer segment that is
+	// genuinely another 15 minutes behind still trips the lease-scoped fence.
+	fence.observe(3, started.Add(10*time.Minute), started.Add(45*time.Minute), 15*time.Minute, abort)
+	if !fence.lagged() || aborts.Load() != 1 {
+		t.Fatalf("newer drift was not detected after reconnect: lagged=%v aborts=%d", fence.lagged(), aborts.Load())
 	}
 }
 
@@ -487,11 +538,11 @@ func TestUpdateDrainStopsStalledContinuousCapture(t *testing.T) {
 func TestContinuousMediaLagStopsCaptureThenDrainsBeforeSurrender(t *testing.T) {
 	now := time.Date(2026, time.August, 9, 2, 0, 0, 0, time.UTC)
 	var delivered atomic.Int64
-	var lagged atomic.Bool
+	var fence continuousMediaLagFence
 	var aborted atomic.Int64
-	pool := startSegmentDeliveryPool(2, func() {}, func(seg capture.Segment) error {
-		observeContinuousMediaLag(seg.EndAt, now, 15*time.Minute, &lagged, func() { aborted.Add(1) })
-		delivered.Add(1)
+	pool := startSegmentDeliveryPool(1, func() {}, func(seg capture.Segment) error {
+		sequence := delivered.Add(1)
+		fence.observe(seg.CaptureSequence, seg.EndAt, now.Add(time.Duration(sequence-1)*4*time.Minute), 15*time.Minute, func() { aborted.Add(1) })
 		return nil
 	})
 	for sequence := int64(1); sequence <= 5; sequence++ {
@@ -500,16 +551,17 @@ func TestContinuousMediaLagStopsCaptureThenDrainsBeforeSurrender(t *testing.T) {
 		}
 	}
 	result := pool.close()
-	if result.err != nil || result.pending != 0 || delivered.Load() != 5 || !lagged.Load() || aborted.Load() != 1 {
-		t.Fatalf("drain result=%+v delivered=%d lagged=%v aborts=%d, want five acknowledged and one stop", result, delivered.Load(), lagged.Load(), aborted.Load())
+	if result.err != nil || result.pending != 0 || delivered.Load() != 5 || !fence.lagged() || aborted.Load() != 1 {
+		t.Fatalf("drain result=%+v delivered=%d lagged=%v aborts=%d, want five acknowledged and one stop", result, delivered.Load(), fence.lagged(), aborted.Load())
 	}
-	if !continuousMediaLagCanSurrender(lagged.Load(), result.err, false) {
+	if !continuousMediaLagCanSurrender(fence.lagged(), result.err, false) {
 		t.Fatal("fully drained lagged capture did not surrender")
 	}
 
-	var failedLagged atomic.Bool
+	var failedFence continuousMediaLagFence
+	failedFence.observe(1, now.Add(-48*time.Minute), now, 15*time.Minute, func() {})
+	failedFence.observe(2, now.Add(-48*time.Minute), now.Add(15*time.Minute), 15*time.Minute, func() {})
 	failedPool := startSegmentDeliveryPool(1, func() {}, func(seg capture.Segment) error {
-		observeContinuousMediaLag(seg.EndAt, now, 15*time.Minute, &failedLagged, func() {})
 		return errSegmentDeliveryExhausted
 	})
 	if err := failedPool.Submit(capture.Segment{CaptureSequence: 1, EndAt: now.Add(-48 * time.Minute)}); err != nil {
@@ -517,10 +569,10 @@ func TestContinuousMediaLagStopsCaptureThenDrainsBeforeSurrender(t *testing.T) {
 	}
 	failed := failedPool.close()
 	joined := joinSegmentDeliveryError(context.Canceled, failed.err)
-	if continuousMediaLagCanSurrender(failedLagged.Load(), failed.err, false) {
+	if continuousMediaLagCanSurrender(failedFence.lagged(), failed.err, false) {
 		t.Fatal("lagged capture surrendered with an unacknowledged segment")
 	}
-	if shouldCleanupContinuousAttempt(failed.pending > 0, joined, failedLagged.Load()) {
+	if shouldCleanupContinuousAttempt(failed.pending > 0, joined, failedFence.lagged()) {
 		t.Fatal("lagged capture deleted its unacknowledged spool")
 	}
 }
@@ -877,6 +929,10 @@ func TestRetryableTransportError(t *testing.T) {
 		{err: &apihttp.StatusError{Code: 403}, want: false},
 		{err: &net.DNSError{Err: "temporary", IsTemporary: true}, want: true},
 		{err: &net.DNSError{Err: "permanent"}, want: false},
+		// R2 PUT failures reach the worker as a write syscall error. ECONNRESET is
+		// transient even though os.SyscallError itself does not implement
+		// net.Error, and aborting the capture here creates an avoidable media gap.
+		{err: fmt.Errorf("upload file failed: %w", &os.SyscallError{Syscall: "write", Err: syscall.ECONNRESET}), want: true},
 		{err: context.DeadlineExceeded, want: true},
 	}
 	for _, tc := range tests {

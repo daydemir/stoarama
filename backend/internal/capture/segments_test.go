@@ -1167,6 +1167,48 @@ func TestContinuousProgressTimeoutBoundsHLSReconnect(t *testing.T) {
 	}
 }
 
+func TestContinuousStderrObserverDetectsGooglevideoForbiddenAcrossWrites(t *testing.T) {
+	observer := newContinuousStderrObserver(true)
+	for _, chunk := range []string{"[https] HTTP err", "or 403 Forbid", "den\n"} {
+		if _, err := observer.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-observer.expiredGooglevideo:
+	default:
+		t.Fatal("observer did not signal expired Googlevideo fragment")
+	}
+}
+
+func TestContinuousStderrObserverIgnoresUnwatchedForbidden(t *testing.T) {
+	observer := newContinuousStderrObserver(false)
+	if _, err := observer.Write([]byte("HTTP error 403 Forbidden")); err != nil {
+		t.Fatal(err)
+	}
+	if observer.expiredGooglevideo != nil {
+		t.Fatal("unwatched stderr installed a Googlevideo fragment observer")
+	}
+}
+
+func TestContinuousFFmpegLogLevelObservesOnlyGooglevideoHLSWarnings(t *testing.T) {
+	tests := []struct {
+		name, sourceURL, pinHost, want string
+	}{
+		{name: "Googlevideo manifest", sourceURL: "https://manifest.googlevideo.com/live.m3u8", want: "warning"},
+		{name: "pinned Googlevideo manifest", sourceURL: "https://203.0.113.10/live.m3u8", pinHost: "manifest.googlevideo.com", want: "warning"},
+		{name: "unrelated HLS", sourceURL: "https://example.com/live.m3u8", want: "error"},
+		{name: "Googlevideo MP4", sourceURL: "https://rr1.googlevideo.com/live.mp4", want: "error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := continuousFFmpegLogLevel(tt.sourceURL, tt.pinHost); got != tt.want {
+				t.Fatalf("log level=%q want=%q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildFFmpegContinuousArgsDoesNotSendHLSOptionToHTTPVideo(t *testing.T) {
 	args := buildFFmpegContinuousArgs("https://example.com/live.mp4?token=secret", "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil)
 	for _, option := range []string{"-reconnect_at_eof", "-live_start_index"} {

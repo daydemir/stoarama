@@ -463,7 +463,6 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	}
 	defer rows.Close()
 	items := make([]map[string]any, 0, 8)
-	recordingIDs := make([]int64, 0, 8)
 	for rows.Next() {
 		item, err := scanRecordingListRow(rows, s.billing != nil)
 		if err != nil {
@@ -471,24 +470,16 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		items = append(items, item)
-		recordingIDs = append(recordingIDs, item["id"].(int64))
 	}
 	if err := rows.Err(); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("iterate recordings: %v", err))
 		return
 	}
 	rows.Close()
-	captureHealthBins, err := s.recordingHealthBinsForAccount(r.Context(), principal.AccountID, recordingIDs)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording capture health: %v", err))
-		return
-	}
-	timelineHealth, err := s.recordingTimelineHealthForAccount(r.Context(), principal.AccountID, recordingIDs)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording timeline health: %v", err))
-		return
-	}
-	attachRecordingListHealth(items, captureHealthBins, timelineHealth)
+	// Keep the first list response on the baseline recording-row query. Capture
+	// heatmaps, timeline grades, and joined coverage are loaded independently so
+	// their aggregate scans can never hold the page open.
+	attachRecordingListMetricPlaceholders(items)
 	// Fleet relay aggregate: total nodes, online nodes (heartbeat within 120s), live
 	// leases across all relay nodes, available slots across ONLINE relays, and the
 	// existing fleet_relay_warning (kept for rollout compatibility).
@@ -539,6 +530,16 @@ func attachRecordingListHealth(items []map[string]any, capture map[int64][]recor
 		if health, ok := timeline[id]; ok {
 			item["timeline_health"] = health
 		}
+	}
+}
+
+func attachRecordingListMetricPlaceholders(items []map[string]any) {
+	for _, item := range items {
+		item["capture_health_bins"] = []recordingHealthBin{}
+		item["timeline_health"] = nil
+		item["source_duration_ms"] = int64(0)
+		item["joined_ready_ms"] = int64(0)
+		item["joined_percent"] = nil
 	}
 }
 
@@ -1372,6 +1373,7 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	attachRecordingListMetricPlaceholders([]map[string]any{item})
 	util.WriteJSON(w, http.StatusOK, item)
 }
 
@@ -1392,6 +1394,7 @@ func (s *Server) writeRecordingJSON(w http.ResponseWriter, r *http.Request, id, 
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	attachRecordingListMetricPlaceholders([]map[string]any{item})
 	util.WriteJSON(w, http.StatusOK, item)
 }
 

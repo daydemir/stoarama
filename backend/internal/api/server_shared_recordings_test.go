@@ -161,7 +161,7 @@ func TestSharedRecordingDTOExcludesSensitiveFields(t *testing.T) {
 	}
 }
 
-func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
+func TestSharedRecordingsExposeOnlyAllowlistedStatuses(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -177,8 +177,8 @@ func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
 	for _, status := range []string{"active", "paused", "completed", "canceled"} {
 		var id int64
 		if err := pool.QueryRow(ctx, `
-			INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,cron_expr,status)
-			VALUES(47,1,$1,'https://example.test/live.m3u8','* * * * *',$2)
+			INSERT INTO recordings(account_id,storage_destination_id,name,stream_url,cron_expr,status,paused_at)
+			VALUES(47,1,$1,'https://example.test/live.m3u8','* * * * *',$2,CASE WHEN $2='paused' THEN now() ELSE NULL END)
 			RETURNING id
 		`, status+" recording", status).Scan(&id); err != nil {
 			t.Fatalf("insert %s recording: %v", status, err)
@@ -199,15 +199,15 @@ func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
 	if err := json.Unmarshal(list.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Recordings) != 2 {
-		t.Fatalf("list returned %d recordings, want active+paused only: %s", len(payload.Recordings), list.Body.String())
+	if len(payload.Recordings) != 3 {
+		t.Fatalf("list returned %d recordings, want active+paused+completed: %s", len(payload.Recordings), list.Body.String())
 	}
 	seen := map[string]bool{}
 	for _, recording := range payload.Recordings {
 		seen[recording.Status] = true
 	}
-	if !seen["active"] || !seen["paused"] || seen["completed"] || seen["canceled"] {
-		t.Fatalf("visible statuses=%v, want active and paused only", seen)
+	if !seen["active"] || !seen["paused"] || !seen["completed"] || seen["canceled"] {
+		t.Fatalf("visible statuses=%v, want active, paused, and completed only", seen)
 	}
 
 	for _, status := range []string{"active", "paused", "completed", "canceled"} {
@@ -215,7 +215,7 @@ func TestSharedRecordingsExposeOnlyActiveAndPaused(t *testing.T) {
 		path := "/api/v1/shared/mit-scl/recordings/" + strconv.FormatInt(ids[status], 10)
 		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
 		want := http.StatusOK
-		if status == "completed" || status == "canceled" {
+		if status == "canceled" {
 			want = http.StatusNotFound
 		}
 		if response.Code != want {
@@ -491,13 +491,22 @@ func TestSharedRecordingsPageHasAccessibleHeatmap(t *testing.T) {
 		`const sharedReadOnly = Boolean(sharedRouteMatch);`,
 		`function recordingAPIPath`,
 		`sharedReadOnly ? '' :`,
-		`/clips?limit=`,
-		`data-clipdownload`,
+		`/joined?limit=`,
+		`Joined clips`,
+		`View recording`,
+		`Joined: highest first`,
+		`function joinedCoverage`,
+		`renderJoinedList(payload)`,
 		`Array.from({ length: 24 }, () => [])`,
 		`timeZoneName: 'short'`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("shared recordings page missing %q", marker)
+		}
+	}
+	for _, forbidden := range []string{`/clips?limit=${CLIP_PAGE_SIZE}`, `joinedFilesCardHTML()`} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("dedicated recording browser still contains raw/parallel browser marker %q", forbidden)
 		}
 	}
 }

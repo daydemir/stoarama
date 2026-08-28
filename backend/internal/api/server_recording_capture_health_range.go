@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -13,7 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const captureHealthPageDays = 90
+const (
+	captureHealthPageDays    = 90
+	captureHealthPageTimeout = 8 * time.Second
+)
 
 type captureHealthRequestError struct {
 	message string
@@ -81,11 +85,23 @@ func (s *Server) handleAccountRecordingCaptureHealth(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
-	s.writeRecordingCaptureHealth(w, r, principal.AccountID, id)
+	s.writeRecordingCaptureHealth(w, r, principal.AccountID, id, false)
 }
 
-func (s *Server) writeRecordingCaptureHealth(w http.ResponseWriter, r *http.Request, accountID, recordingID int64) {
-	page, err := s.recordingCaptureHealthPage(r, accountID, recordingID)
+func recordingCaptureHealthCacheKey(r *http.Request, accountID, recordingID int64, shared bool) recordingMetricCacheKey {
+	return recordingMetricCacheKey{
+		AccountID: accountID, RecordingID: recordingID, Shared: shared,
+		Scope: strings.TrimSpace(r.URL.Query().Get("from")) + "|" + strings.TrimSpace(r.URL.Query().Get("to")),
+	}
+}
+
+func (s *Server) writeRecordingCaptureHealth(w http.ResponseWriter, r *http.Request, accountID, recordingID int64, shared bool) {
+	ctx, cancel := context.WithTimeout(r.Context(), captureHealthPageTimeout)
+	defer cancel()
+	key := recordingCaptureHealthCacheKey(r, accountID, recordingID, shared)
+	page, err := loadRecordingMetricCached(ctx, &s.recordingHealthPageCache, key, captureHealthPageTimeout, recordingHealthPageCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingCaptureHealthPage, error) {
+		return s.recordingCaptureHealthPage(r.Clone(loadCtx), accountID, recordingID)
+	})
 	if err != nil {
 		var requestError captureHealthRequestError
 		switch {
@@ -93,12 +109,16 @@ func (s *Server) writeRecordingCaptureHealth(w http.ResponseWriter, r *http.Requ
 			util.WriteError(w, http.StatusNotFound, "recording not found")
 		case errors.As(err, &requestError):
 			util.WriteError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, context.DeadlineExceeded):
+			w.Header().Set("Retry-After", "10")
+			util.WriteError(w, http.StatusServiceUnavailable, "capture health temporarily unavailable")
 		default:
 			log.Printf("recording capture health failed account_id=%d recording_id=%d: %v", accountID, recordingID, err)
 			util.WriteError(w, http.StatusInternalServerError, "compute recording capture health")
 		}
 		return
 	}
+	w.Header().Set("Cache-Control", "private, no-store")
 	util.WriteJSON(w, http.StatusOK, page)
 }
 
@@ -191,6 +211,9 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 		}
 		if err := rows.Err(); err != nil {
 			return recordingCaptureHealthPage{}, fmt.Errorf("count captured clips: %w", err)
+		}
+		if err := s.populateRecordingJoinedProgressBins(r.Context(), accountID, recordingID, starts, ends, bins); err != nil {
+			return recordingCaptureHealthPage{}, err
 		}
 	}
 	for i := range bins {

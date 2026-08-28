@@ -1,11 +1,44 @@
 package api
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 )
+
+func TestCaptureHealthPageUsesBoundedMetricAdmission(t *testing.T) {
+	slots := make(chan struct{}, recordingMetricConcurrency)
+	for range recordingMetricConcurrency {
+		slots <- struct{}{}
+	}
+	s := &Server{recordingMetricSlots: slots}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/700/capture-health?from=2026-05-01&to=2026-05-31", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	started := time.Now()
+	s.writeRecordingCaptureHealth(rec, req, 47, 700, false)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("capture health admission ignored request deadline: %s", elapsed)
+	}
+	if rec.Header().Get("Retry-After") != "10" {
+		t.Fatalf("retry-after=%q", rec.Header().Get("Retry-After"))
+	}
+
+	authKey := recordingCaptureHealthCacheKey(req, 47, 700, false)
+	publicKey := recordingCaptureHealthCacheKey(req, 47, 700, true)
+	otherRange := recordingCaptureHealthCacheKey(httptest.NewRequest(http.MethodGet, "/?from=2026-04-01&to=2026-04-30", nil), 47, 700, false)
+	if authKey == publicKey || authKey == otherRange {
+		t.Fatalf("capture health cache keys are not scope-isolated: auth=%+v public=%+v range=%+v", authKey, publicKey, otherRange)
+	}
+}
 
 func TestRecordingCoverageWindow(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)

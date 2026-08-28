@@ -115,6 +115,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run '^TestJoinedDeliveryStatusReadsExactAppendOnlyAckWithoutWriting$' -count=1 -v
+      - name: Test joined recording browser provenance, isolation, and query plan
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^(TestRecordingJoinedProgressUsesExactPublishedMediaProvenance|TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes|TestRecordingJoinedBrowserAuthPublicParityAndIsolation|TestRecordingJoinedDownloadSupportsUnversionedExactRange|TestJoinedBrowserIndexMigrationIsTransactionalAndRejectsWrongPrecreate|TestJoinedFolderIsSameOriginScopedAndRedacted|TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials)$' -count=1 -v
       # The continuous-window revive rules decide whether a 12-hour window resumes
       # after a failure or stays forfeited, and every test covering them is
       # DB-backed, so they all skipped in CI until this step named them.
