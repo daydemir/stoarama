@@ -104,3 +104,49 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		})
 	}
 }
+
+func TestRecordingMetricEndpointTimeoutsCoverScopeLookup(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	locker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Release()
+	tx, err := locker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE recordings IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		path    string
+		handler http.HandlerFunc
+	}{
+		{name: "enrichment", path: "/api/v1/account/recordings/enrichment", handler: s.handleAccountRecordingListEnrichment},
+		{name: "joined progress", path: "/api/v1/account/recordings/joined-progress", handler: s.handleAccountRecordingJoinedProgress},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requestCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			req := withPrincipal(httptest.NewRequest(http.MethodGet, tc.path, nil).WithContext(requestCtx), accountPrincipal{AccountID: 47}, "")
+			rec := httptest.NewRecorder()
+			started := time.Now()
+			tc.handler(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if rec.Header().Get("Retry-After") != "10" {
+				t.Fatalf("retry-after=%q", rec.Header().Get("Retry-After"))
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("scope lookup exceeded request deadline: %s", elapsed)
+			}
+		})
+	}
+}
