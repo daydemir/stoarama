@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/apihttp"
@@ -1296,6 +1297,13 @@ func retryableTransportError(ctx context.Context, err error) bool {
 		return false
 	}
 	if errors.Is(err, errReplaySegmentDelivery) {
+		return true
+	}
+	// A failed R2 PUT can surface the socket reset as os.SyscallError ->
+	// syscall.ECONNRESET without a net.Error wrapper. Treat that exact transport
+	// condition like other temporary network failures so the preserved segment is
+	// retried instead of aborting capture and creating a media gap.
+	if errors.Is(err, syscall.ECONNRESET) {
 		return true
 	}
 	var statusErr *apihttp.StatusError

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -877,6 +878,10 @@ func TestRetryableTransportError(t *testing.T) {
 		{err: &apihttp.StatusError{Code: 403}, want: false},
 		{err: &net.DNSError{Err: "temporary", IsTemporary: true}, want: true},
 		{err: &net.DNSError{Err: "permanent"}, want: false},
+		// R2 PUT failures reach the worker as a write syscall error. ECONNRESET is
+		// transient even though os.SyscallError itself does not implement
+		// net.Error, and aborting the capture here creates an avoidable media gap.
+		{err: fmt.Errorf("upload file failed: %w", &os.SyscallError{Syscall: "write", Err: syscall.ECONNRESET}), want: true},
 		{err: context.DeadlineExceeded, want: true},
 	}
 	for _, tc := range tests {
