@@ -369,7 +369,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
-		`<th>Recording</th><th>Status / Last 12 hours</th><th>Timeline health</th><th>Schedule</th>`,
+		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th><th>Schedule</th>`,
 		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
 		`const captureHealthHTML = captureHealth === 'unavailable'`,
@@ -393,6 +393,48 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings list health-column layout missing %q", marker)
 		}
+	}
+}
+
+func TestRecordingsQualityTiersAreFirstClassVisualStatuses(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatalf("load recordings html: %v", err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`--quality-great-bg: #14532d;`,
+		`.best14-rating.great { color: var(--quality-great-fg); background: var(--quality-great-bg); }`,
+		`.best14-rating.good { color: var(--quality-good-fg); background: var(--quality-good-bg); }`,
+		`.best14-rating.fine { color: var(--quality-fine-fg); background: var(--quality-fine-bg); }`,
+		`<div class="quality-section-label">Best 14-day score</div>`,
+		`<div class="quality-daily"><div class="quality-section-label">Daily grades</div>`,
+		`if (rating === 'GREAT') return 'Great+';`,
+		`if (rating === 'VERY_GOOD' || rating === 'GOOD') return 'Good+';`,
+		`if (rating === 'FINE') return 'Fine+';`,
+		`Completed scores use 14 consecutive scored recording days; a missing or unmeasured day breaks the run.`,
+		`Daily badges grade individual recording days.`,
+		`class="best14-rating ${tierClass}" data-health-tooltip=`,
+		`tabindex="0" aria-describedby="healthTooltip"`,
+		`<span class="best14-rating great"><span class="best14-rating-name">Great+</span></span>`,
+		`<span class="best14-rating good"><span class="best14-rating-name">Good+</span></span>`,
+		`<span class="best14-rating fine"><span class="best14-rating-name">Fine+</span></span>`,
+		`<span class="detail-card-title">Recording quality</span>`,
+		`const best14 = timeline && timeline.best_14_rating`,
+		`<div><div class="quality-section-label" style="margin-bottom:6px;">Best 14-day score</div>${best14RatingHTML(best14)}</div>`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings aggregate quality presentation missing %q", marker)
+		}
+	}
+
+	aggregate := strings.Index(page, `<div class="quality-section-label">Best 14-day score</div>`)
+	if aggregate < 0 {
+		t.Fatal("recordings row is missing the aggregate score label")
+	}
+	daily := strings.Index(page[aggregate:], `<div class="quality-daily"><div class="quality-section-label">Daily grades</div>`)
+	if daily < 0 {
+		t.Fatal("recordings row does not place the aggregate score before daily grades")
 	}
 }
 
