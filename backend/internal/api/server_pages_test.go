@@ -369,7 +369,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
-		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th><th>Joined</th><th>Schedule</th>`,
+		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th>${joinedSortHeaderHTML()}<th>Schedule</th>`,
 		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
 		`const captureHealthHTML = captureHealth === 'unavailable'`,
@@ -747,6 +747,12 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		`mergeRecordingMetricItems(payload.items);`,
 		`state.joinedProgressLoaded = true;`,
 		`renderCards();`,
+		`data-sortjoined`,
+		`aria-sort="${ariaSort}"`,
+		`state.recordingSort = next;`,
+		`els.recordingSort.value = next;`,
+		`Joined, highest first`,
+		`Joined, lowest first`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing joined sort/state marker %q", marker)
@@ -776,6 +782,66 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
 		}
+	}
+}
+
+func TestRecordingJoinedDetailFailureOffersAnInPlaceRetry(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	renderStart := strings.Index(page, "function renderClipPageWithJoined()")
+	if renderStart < 0 {
+		t.Fatal("joined detail render function start not found")
+	}
+	renderEnd := strings.Index(page[renderStart:], "async function reloadClipPageRecording()")
+	if renderEnd < 0 {
+		t.Fatal("joined detail render function boundaries not found")
+	}
+	render := page[renderStart : renderStart+renderEnd]
+	for _, marker := range []string{
+		`Joined recordings could not be loaded.`,
+		`data-joinedretry`,
+		`wireClipPageNav(body);`,
+	} {
+		if !strings.Contains(render, marker) {
+			t.Fatalf("joined detail error branch missing recovery marker %q", marker)
+		}
+	}
+	errorAt := strings.Index(render, `clipPageState.joinedStatus === 'error'`)
+	buttonAt := strings.Index(render, `data-joinedretry`)
+	wireAt := strings.Index(render, `wireClipPageNav(body);`)
+	if errorAt < 0 || buttonAt < errorAt || wireAt < buttonAt {
+		t.Fatalf("joined error recovery is not rendered then wired in order: error=%d button=%d wire=%d", errorAt, buttonAt, wireAt)
+	}
+
+	wireStart := strings.Index(page, "function wireClipPageNav(root)")
+	if wireStart < 0 {
+		t.Fatal("joined detail navigation function start not found")
+	}
+	wireEnd := strings.Index(page[wireStart:], "async function downloadClipPageZip")
+	if wireEnd < 0 {
+		t.Fatal("joined detail navigation function boundaries not found")
+	}
+	wiring := page[wireStart : wireStart+wireEnd]
+	const exactRetryListener = `if (retry) retry.addEventListener('click', () => loadClipPage(clipPageState.page));`
+	if !strings.Contains(wiring, exactRetryListener) {
+		t.Fatalf("joined retry button is not wired to reload the current page: %q", exactRetryListener)
+	}
+}
+
+func TestRecordingJoinedDetailFormatsNonemptyPublishedFilesWithDefinedHelper(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	if strings.Contains(page, `fmtBytes(`) {
+		t.Fatal("joined detail calls undefined fmtBytes helper")
+	}
+	if !strings.Contains(page, `formatBytes(Number(file.size_bytes || 0))`) {
+		t.Fatal("joined detail does not format a published file with the defined formatBytes helper")
 	}
 }
 
