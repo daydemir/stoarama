@@ -285,7 +285,7 @@
     }
     .best14-potential.great, .best14-potential.good, .best14-potential.fine { color: var(--quality-potential-fg); border-color: var(--quality-potential-border); background: var(--quality-potential-bg); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
-    .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
+    .health-strip-cell { position: relative; flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
     .health-strip-cell[data-health-tooltip] { cursor: help; }
     .health-strip-bar { width: 100%; min-height: 2px; border-radius: 2px; background: var(--muted); }
     .health-strip-bar.healthy { background: var(--ok); }
@@ -1386,6 +1386,12 @@
       recordingSort: 'newest',
       recordingsLoaded: false,
       recordingsLoading: false,
+	  recordingEnrichmentLoaded: false,
+	  recordingEnrichmentLoading: false,
+	  recordingEnrichmentError: false,
+	  joinedProgressLoaded: false,
+	  joinedProgressLoading: false,
+	  joinedProgressError: false,
       destinations: [],
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
@@ -3489,9 +3495,13 @@
       const capture = rec.capture_via === 'relay'
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       const joined = joinedCoverage(rec);
-      const joinedHTML = joined.available
+      const joinedHTML = !state.joinedProgressLoaded && !state.joinedProgressError
+	    ? `<div class="cell-main" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading...</div>`
+	    : joined.available
         ? `<div class="cell-main" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
-        : `<div class="cell-main" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
+	    : state.joinedProgressError
+	      ? `<div class="cell-main" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
+          : `<div class="cell-main" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
       let storage = sharedReadOnly ? '&mdash;' : (rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage'));
       if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
       let warning = '';
@@ -3504,7 +3514,7 @@
       let action = !sharedReadOnly && status === 'active'
         ? `<details class="action-menu"><summary aria-label="Recording actions">⋯</summary><div class="action-menu-pop"><button type="button" class="danger" data-pause="${id}">Pause recording…</button></div></details>`
         : (!sharedReadOnly && status === 'paused' ? `<button type="button" class="secondary" data-resume="${id}">Resume</button>` : '');
-      action += `<a class="btn-link secondary" href="${recordingsPagePath}/${id}">View joined</a>`;
+      action += `<a class="btn-link secondary" href="${recordingsPagePath}/${id}">View recording</a>`;
       const localTime = localTimeLabel(timezone);
       const ends = instantInTimezone(rec.end_at, timezone);
       return `<tr class="${extraClass}" data-card="${id}">
@@ -3967,7 +3977,11 @@
     // ---- Dedicated clip-management page (/recordings/{id}) ----
 
     const CLIP_PAGE_SIZE = 100;
-    const clipPageState = { recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null, captureHealth: null, joinedFolderPath: '' };
+    const clipPageState = {
+      recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null,
+      captureHealth: null, joinedFolderPath: '', joinedPayload: null,
+      joinedPayloadKey: '', joinedLoadToken: 0, joinedStatus: 'idle', joinedError: '',
+    };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
     // switch the view into the dedicated clip page.
@@ -3983,8 +3997,15 @@
       const recId = clipPageState.recId;
       const root = els.clipPage;
       const firstLoad = !clipPageState.rec;
-      clipPageState.page = Math.max(0, Number(page) || 0);
+	  const requestedPage = Math.max(0, Number(page) || 0);
+	  const joinedKey = `${recId}:${requestedPage}`;
+	  const loadToken = ++clipPageState.joinedLoadToken;
+	  clipPageState.page = requestedPage;
       clipPageState.loading = true;
+	  clipPageState.joinedPayload = null;
+	  clipPageState.joinedPayloadKey = joinedKey;
+	  clipPageState.joinedStatus = 'loading';
+	  clipPageState.joinedError = '';
       // Load the full recording once (schedule + storage + stream id). It drives the
       // detail cards and the pause/resume/delete actions; the clips list refetches per
       // page but the recording does not.
@@ -3993,36 +4014,82 @@
         try {
           clipPageState.rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));
         } catch (err) {
+		  if (loadToken !== clipPageState.joinedLoadToken) return;
           root.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
           clipPageState.loading = false;
           return;
         }
+		if (loadToken !== clipPageState.joinedLoadToken) return;
         const rec = clipPageState.rec;
         clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
-        try {
-          clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');
-        } catch (err) {
-          clipPageState.captureHealth = { error: String(err.message || err) };
-        }
-        renderClipPage();
+		clipPageState.captureHealth = null;
+		renderClipPageWithJoined();
+		void loadRecordingDetailEnrichment(recId);
+		void loadRecordingDetailCaptureHealth(recId);
       }
       const body = root.querySelector('#clipListBody');
       if (body) body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
       let payload;
       try {
-        const offset = clipPageState.page * CLIP_PAGE_SIZE;
+		const offset = requestedPage * CLIP_PAGE_SIZE;
         payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined?limit=${CLIP_PAGE_SIZE}&offset=${offset}`));
       } catch (err) {
-        if (body) body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
+		if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
+		clipPageState.joinedStatus = 'error';
+		clipPageState.joinedError = String(err.message || err);
+		renderClipPageWithJoined();
         clipPageState.loading = false;
         return;
       }
+	  if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
       clipPageState.total = Number(payload.total || 0);
       clipPageState.joinedFolderPath = String(payload.folder_path || recordingAPIPath(`/${encodeURIComponent(recId)}/joined/folder`));
-      renderClipPage();
-      renderJoinedList(payload);
+	  clipPageState.joinedPayload = payload;
+	  clipPageState.joinedStatus = 'ready';
+	  renderClipPageWithJoined();
       clipPageState.loading = false;
     }
+
+	async function loadRecordingDetailEnrichment(recId) {
+	  try {
+	    const payload = await fetchJSON(recordingAPIPath(`/enrichment?recording_id=${encodeURIComponent(recId)}`));
+	    const item = Array.isArray(payload.items) ? payload.items[0] : null;
+	    if (!item || Number(item.recording_id) !== Number(clipPageState.recId) || !clipPageState.rec) return;
+	    Object.assign(clipPageState.rec, item);
+	    renderClipPageWithJoined();
+	  } catch (_) {
+	    // Timeline enrichment is supplementary; joined media browsing stays usable.
+	  }
+	}
+
+	async function loadRecordingDetailCaptureHealth(recId) {
+	  try {
+	    const page = await fetchRecordingCaptureHealth(recId, '');
+	    if (Number(recId) !== Number(clipPageState.recId)) return;
+	    clipPageState.captureHealth = page;
+	  } catch (err) {
+	    if (Number(recId) !== Number(clipPageState.recId)) return;
+	    clipPageState.captureHealth = { error: String(err.message || err) };
+	  }
+	  renderClipPageWithJoined();
+	}
+
+	function renderClipPageWithJoined() {
+	  renderClipPage();
+	  const joinedKey = `${clipPageState.recId}:${clipPageState.page}`;
+	  if (clipPageState.joinedPayload && clipPageState.joinedPayloadKey === joinedKey) {
+		renderJoinedList(clipPageState.joinedPayload);
+		return;
+	  }
+	  if (clipPageState.joinedPayloadKey !== joinedKey) return;
+	  const body = els.clipPage.querySelector('#clipListBody');
+	  if (!body) return;
+	  if (clipPageState.joinedStatus === 'loading') {
+		body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
+	  } else if (clipPageState.joinedStatus === 'error') {
+		body.innerHTML = `<div class="clip-summary" style="color:var(--err)">${escapeHTML(clipPageState.joinedError)}</div>`;
+	  }
+	}
 
     // Reload the recording JSON after a schedule/storage/billing edit, then re-render
     // the whole detail view (cards + current clip page). Keeps one source of truth.
@@ -4034,12 +4101,10 @@
         return;
       }
       clipPageState.recName = String((clipPageState.rec.stream_name || clipPageState.rec.name) || `Recording #${clipPageState.recId}`);
-      try {
-        clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, '');
-      } catch (err) {
-        clipPageState.captureHealth = { error: String(err.message || err) };
-      }
+	  clipPageState.captureHealth = null;
       renderClipPage();
+	  void loadRecordingDetailEnrichment(clipPageState.recId);
+	  void loadRecordingDetailCaptureHealth(clipPageState.recId);
       await loadClipPage(clipPageState.page);
     }
 
@@ -4115,9 +4180,16 @@
         const health = String(bin.health || '');
         const start = instantInTimezone(bin.start, timezone) || '';
         const end = instantInTimezone(bin.end, timezone) || '';
-        const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;
+        const sourceMS = Number(bin.source_duration_ms || 0);
+        const joinedAvailable = sourceMS > 0;
+        const joinedPercent = joinedAvailable ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : null;
+        const joinedMarker = joinedPercent === 100
+          ? '<span class="health-joined-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
+          : (joinedPercent > 0 ? `<span class="health-joined-marker" aria-hidden="true">${joinedPercent}</span>` : '');
+        const joinedLabel = joinedAvailable ? ` · Joined: ${joinedPercent}%` : ' · Joined: unavailable';
+        const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}${joinedLabel}`;
         latestTitle = title;
-        cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span></span>`);
+        cells.push(`<span class="health-strip-cell" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"><span class="health-strip-bar ${escapeHTML(health)}" style="height:${Math.max(3, Math.min(100, percent))}%"></span>${joinedMarker}</span>`);
       }
       return `<div class="health-strip" role="img" aria-label="Capture health over recording time" aria-describedby="healthTooltip" data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0">${cells.join('')}</div>`;
     }
@@ -4206,12 +4278,14 @@
             const percent = expected > 0 ? Math.round(captured / expected * 1000) / 10 : 0;
             const health = String(bin.health || '');
             const sourceMS = Number(bin.source_duration_ms || 0);
-            const joinedPercent = sourceMS > 0 ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : 0;
+            const joinedAvailable = sourceMS > 0;
+            const joinedPercent = joinedAvailable ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : null;
             const joinedMarker = joinedPercent === 100
               ? '<span class="health-joined-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
               : (joinedPercent > 0 ? `<span class="health-joined-marker" aria-hidden="true">${joinedPercent}</span>` : '');
             const zone = bin.localZone ? ` ${bin.localZone}` : '';
-            const title = `${date} ${String(hour).padStart(2, '0')}:00${zone} · Capture health: ${percent}% of expected clips captured (${captured}/${expected}) · Joined: ${joinedPercent}%`;
+            const joinedLabel = joinedAvailable ? `Joined: ${joinedPercent}%` : 'Joined: unavailable';
+            const title = `${date} ${String(hour).padStart(2, '0')}:00${zone} · Capture health: ${percent}% of expected clips captured (${captured}/${expected}) · ${joinedLabel}`;
             return `<button type="button" class="health-heatmap-cell ${health}" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}">${joinedMarker}</button>`;
           }).join('')}
         </div>`;
@@ -4283,8 +4357,7 @@
       const anchorDate = direction === 'newer' && candidateDate > localToday ? localToday : candidateDate;
       try {
         clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, anchorDate);
-        renderClipPage();
-        await loadClipPage(clipPageState.page);
+		renderClipPageWithJoined();
       } catch (err) {
         window.alert(String(err.message || err));
       }
@@ -4381,7 +4454,7 @@
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <div class="recording-head-actions">
-            <a class="btn-link secondary" href="${escapeHTML(folderPath)}">Browse joined recordings</a>
+            <a class="btn-link secondary" href="${escapeHTML(folderPath)}">Joined clips</a>
             <a class="btn-link secondary" href="${recordingsPagePath}">Back to recordings</a>
           </div>
         </div>`;
@@ -5086,11 +5159,15 @@
       const requestToken = ++recordingsLoadToken;
       beginRecordingsLoad();
       try {
-        const sortQuery = state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc'
-          ? `?sort=${encodeURIComponent(state.recordingSort)}` : '';
-        const payload = await fetchJSON(recordingAPIPath(sortQuery));
+        const payload = await fetchJSON(recordingAPIPath());
         if (requestToken !== recordingsLoadToken) return false;
         state.recordings = Array.isArray(payload.items) ? payload.items : (Array.isArray(payload.recordings) ? payload.recordings : []);
+		state.recordingEnrichmentLoaded = false;
+		state.recordingEnrichmentLoading = false;
+		state.recordingEnrichmentError = false;
+		state.joinedProgressLoaded = false;
+		state.joinedProgressLoading = false;
+		state.joinedProgressError = false;
         const present = new Set(state.recordings.map((rec) => Number(rec.id)));
         state.selectedRecordings = new Set([...state.selectedRecordings].filter((id) => present.has(id)));
         updateBulkCancelButton();
@@ -5105,6 +5182,8 @@
         state.recordingsLoaded = true;
         finishRecordingsLoad();
         renderCards();
+		void refreshRecordingEnrichment(requestToken);
+		void refreshJoinedProgress(requestToken);
         return true;
       } catch (err) {
         if (requestToken !== recordingsLoadToken) return false;
@@ -5112,6 +5191,53 @@
         return false;
       }
     }
+
+	function mergeRecordingMetricItems(items) {
+	  const byID = new Map(state.recordings.map((rec) => [Number(rec.id), rec]));
+	  for (const item of Array.isArray(items) ? items : []) {
+	    const rec = byID.get(Number(item.recording_id));
+	    if (rec) Object.assign(rec, item);
+	  }
+	}
+
+	async function refreshRecordingEnrichment(requestToken) {
+	  if (state.recordingEnrichmentLoading) return;
+	  state.recordingEnrichmentLoading = true;
+	  try {
+	    const payload = await fetchJSON(recordingAPIPath('/enrichment'));
+	    if (requestToken !== recordingsLoadToken) return;
+	    mergeRecordingMetricItems(payload.items);
+	    state.recordingEnrichmentLoaded = true;
+	    state.recordingEnrichmentError = false;
+	    renderCards();
+	  } catch (_) {
+	    if (requestToken !== recordingsLoadToken) return;
+	    state.recordingEnrichmentError = true;
+	  } finally {
+	    if (requestToken === recordingsLoadToken) state.recordingEnrichmentLoading = false;
+	  }
+	}
+
+	async function refreshJoinedProgress(requestToken) {
+	  if (state.joinedProgressLoading) return;
+	  state.joinedProgressLoading = true;
+	  try {
+	    const sortQuery = state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc'
+	      ? `?sort=${encodeURIComponent(state.recordingSort)}` : '';
+	    const payload = await fetchJSON(recordingAPIPath(`/joined-progress${sortQuery}`));
+	    if (requestToken !== recordingsLoadToken) return;
+	    mergeRecordingMetricItems(payload.items);
+	    state.joinedProgressLoaded = true;
+	    state.joinedProgressError = false;
+	    renderCards();
+	  } catch (_) {
+	    if (requestToken !== recordingsLoadToken) return;
+	    state.joinedProgressError = true;
+	    renderCards();
+	  } finally {
+	    if (requestToken === recordingsLoadToken) state.joinedProgressLoading = false;
+	  }
+	}
 
     // ---- Composer open/close ----
 
@@ -5682,7 +5808,9 @@
     els.recordingSort.addEventListener('change', () => {
       state.recordingSort = els.recordingSort.value;
       renderCards();
-      if (state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc') void refreshRecordings();
+	  if ((state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc') && !state.joinedProgressLoaded) {
+	    void refreshJoinedProgress(recordingsLoadToken);
+	  }
     });
     els.qualityFilter.addEventListener('change', () => {
       state.qualityFilter = els.qualityFilter.value;

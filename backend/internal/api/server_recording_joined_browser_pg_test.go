@@ -3,12 +3,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -56,7 +58,7 @@ func joinedBrowserTestPool(t *testing.T) *pgxpool.Pool {
 		admin.Close()
 	})
 	if _, err := pool.Exec(ctx, `
-		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,status text NOT NULL);
+		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,status text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,clip_start_at timestamptz NOT NULL,clip_end_at timestamptz NOT NULL,purged_at timestamptz);
 		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,state text NOT NULL,hour_id text NOT NULL,local_date date NOT NULL,delivery_hour integer NOT NULL,scheduled_start_at timestamptz NOT NULL,scheduled_end_at timestamptz NOT NULL);
 		CREATE TABLE recording_joined_sources(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,clip_id bigint NOT NULL);
@@ -73,7 +75,7 @@ func seedJoinedBrowserTestData(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO recordings VALUES (10,47,'completed'),(20,47,'completed'),(30,47,'completed'),(40,47,'completed'),(50,99,'completed');
+		INSERT INTO recordings(id,account_id,status) VALUES (10,47,'completed'),(20,47,'completed'),(30,47,'completed'),(40,47,'completed'),(50,99,'completed');
 		INSERT INTO recording_clips VALUES
 			(101,10,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z',NULL),
 			(102,20,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z',NULL),
@@ -153,6 +155,79 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 			t.Fatalf("list joined bin %d=%+v want %+v", i, listBins[i], want)
 		}
 	}
+	lazyBins := map[int64][]recordingHealthBin{
+		20: {{Start: time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC), End: time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)}},
+		30: {
+			{Start: starts[0], End: ends[0]},
+			{Start: starts[1], End: ends[1]},
+		},
+	}
+	if err := s.populateRecordingListJoinedProgressBins(context.Background(), 47, []int64{20, 30}, lazyBins); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range wantBins {
+		var got recordingHealthBin
+		if i == 0 {
+			got = lazyBins[20][0]
+		} else {
+			got = lazyBins[30][i-1]
+		}
+		if got.SourceDurationMS != want.SourceDurationMS || got.JoinedReadyMS != want.JoinedReadyMS {
+			t.Fatalf("lazy heatmap joined bin %d=%+v want %+v", i, got, want)
+		}
+	}
+}
+
+func TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	seedJoinedBrowserTestData(t, pool)
+	s := &Server{pool: pool, cfg: config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}}
+
+	type response struct {
+		Items []recordingJoinedProgressItem `json:"items"`
+	}
+	call := func(t *testing.T, shared bool, path string) response {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if !shared {
+			req = withPrincipal(req, accountPrincipal{AccountID: 47}, "")
+		}
+		rec := httptest.NewRecorder()
+		if shared {
+			s.router().ServeHTTP(rec, req)
+		} else {
+			s.handleAccountRecordingJoinedProgress(rec, req)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var payload response
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	auth := call(t, false, "/api/v1/account/recordings/joined-progress?sort=joined_desc")
+	shared := call(t, true, "/api/v1/shared/mit-scl/recordings/joined-progress?sort=joined_desc")
+	if !reflect.DeepEqual(auth, shared) {
+		t.Fatalf("auth/public mismatch:\nauth=%+v\npublic=%+v", auth, shared)
+	}
+	wantOrder := []int64{30, 20, 10, 40}
+	if len(auth.Items) != len(wantOrder) {
+		t.Fatalf("items=%d want=%d: %+v", len(auth.Items), len(wantOrder), auth.Items)
+	}
+	for i, item := range auth.Items {
+		if item.RecordingID != wantOrder[i] || item.RecordingID == 50 {
+			t.Fatalf("item[%d]=%+v want recording %d and no foreign recording", i, item, wantOrder[i])
+		}
+	}
+
+	foreign := httptest.NewRecorder()
+	s.router().ServeHTTP(foreign, httptest.NewRequest(http.MethodGet,
+		"/api/v1/shared/mit-scl/recordings/joined-progress?recording_id=50", nil))
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign status=%d want=404 body=%s", foreign.Code, foreign.Body.String())
+	}
 }
 
 func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
@@ -173,7 +248,7 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		CREATE INDEX idx_recording_clips_recording_started ON recording_clips(recording_id,clip_start_at DESC);
-		INSERT INTO recordings VALUES (60,47,'completed');
+		INSERT INTO recordings(id,account_id,status) VALUES (60,47,'completed');
 		INSERT INTO recording_joined_hours VALUES
 			(205,3,47,60,'sealed','same-account-noise','2026-05-04',4,'2026-05-04 11:00:00Z','2026-05-04 12:00:00Z');
 		INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at)

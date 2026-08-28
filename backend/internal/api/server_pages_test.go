@@ -340,7 +340,7 @@ func TestRecordingHealthBinSourceAssignsCapturedPercentageTooltip(t *testing.T) 
 	}
 	page := string(body)
 	for _, marker := range []string{
-		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}`;",
+		"const title = `${Math.round(percent * 10) / 10}% of expected clips captured (${captured}/${expected}) · ${start} to ${end}${joinedLabel}`;",
 		`data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}"`,
 		`data-health-tooltip="${escapeHTML(latestTitle)}" tabindex="0"`,
 		`aria-describedby="healthTooltip"`,
@@ -605,7 +605,8 @@ func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 		`data-health-page="older"`,
 		`data-health-page="newer"`,
 		`loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))`,
-		`clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');`,
+		`const page = await fetchRecordingCaptureHealth(recId, '');`,
+		`void loadRecordingDetailCaptureHealth(recId);`,
 		`Array.from({ length: 24 }, () => [])`,
 		`hours.map((bins, hour) => ({ bin: captureHealthDisplayBin(bins), hour }))`,
 		`if (bins.length === 1) return bins[0];`,
@@ -710,9 +711,134 @@ func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"health-joined-marker", "Joined: ${joinedPercent}%", "source_duration_ms", "joined_ready_ms", "<svg viewBox=\"0 0 10 10\""} {
+	for _, marker := range []string{
+		"health-joined-marker",
+		"const joinedAvailable = sourceMS > 0;",
+		"Joined: ${joinedPercent}%",
+		"Joined: unavailable",
+		"source_duration_ms",
+		"joined_ready_ms",
+		"<svg viewBox=\"0 0 10 10\"",
+	} {
 		if !strings.Contains(string(body), marker) {
 			t.Fatalf("recordings html missing joined-progress marker %q", marker)
 		}
+	}
+}
+
+func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`<option value="joined_desc">Joined: highest first</option>`,
+		`<option value="joined_asc">Joined: lowest first</option>`,
+		`const direction = state.recordingSort === 'joined_asc' ? 1 : -1;`,
+		`if (left.available !== right.available) return left.available ? -1 : 1;`,
+		`if (left.available && left.percent !== right.percent) return direction * (left.percent - right.percent);`,
+		`if (!(sourceMS > 0) || rawPercent === null || rawPercent === undefined`,
+		`return { available: false, percent: null, sourceMS: 0, readyMS: 0 };`,
+		`available: true,`,
+		`>${joined.percent}%</div>`,
+		`Joined coverage is temporarily unavailable`,
+		`Joined coverage unavailable: no usable recorded footage`,
+		`mergeRecordingMetricItems(payload.items);`,
+		`state.joinedProgressLoaded = true;`,
+		`renderCards();`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing joined sort/state marker %q", marker)
+		}
+	}
+	refreshStart := strings.Index(page, "async function refreshJoinedProgress(requestToken)")
+	if refreshStart < 0 {
+		t.Fatal("joined progress refresh function not found")
+	}
+	refreshEnd := strings.Index(page[refreshStart:], "// ---- Composer open/close ----")
+	if refreshEnd < 0 {
+		t.Fatal("joined progress refresh function end not found")
+	}
+	refresh := page[refreshStart : refreshStart+refreshEnd]
+	mergeAt := strings.Index(refresh, "mergeRecordingMetricItems(payload.items);")
+	loadedAt := strings.Index(refresh, "state.joinedProgressLoaded = true;")
+	renderAt := strings.Index(refresh, "renderCards();")
+	if mergeAt < 0 || loadedAt < mergeAt || renderAt < loadedAt {
+		t.Fatalf("joined lazy values do not rerender in order: merge=%d loaded=%d render=%d", mergeAt, loadedAt, renderAt)
+	}
+	for _, stale := range []string{">View joined<", ">Browse joined recordings<"} {
+		if strings.Contains(page, stale) {
+			t.Fatalf("recordings html still contains stale action copy %q", stale)
+		}
+	}
+	for _, label := range []string{">View recording<", ">Joined clips<"} {
+		if !strings.Contains(page, label) {
+			t.Fatalf("recordings html missing exact action copy %q", label)
+		}
+	}
+}
+
+func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"const payload = await fetchJSON(recordingAPIPath());",
+		"void refreshRecordingEnrichment(requestToken);",
+		"void refreshJoinedProgress(requestToken);",
+		"recordingAPIPath('/enrichment')",
+		"recordingAPIPath(`/joined-progress${sortQuery}`)",
+		"Joined coverage is loading",
+		"void loadRecordingDetailCaptureHealth(recId);",
+		"clipPageState.joinedPayload = payload;",
+		"renderClipPageWithJoined();",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing lazy-metric marker %q", marker)
+		}
+	}
+	if strings.Contains(page, "clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');") {
+		t.Fatal("recording detail still waits for capture health before loading joined files")
+	}
+}
+
+func TestRecordingDetailJoinedPayloadIsBoundToActiveAsyncLoad(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"const loadToken = ++clipPageState.joinedLoadToken;",
+		"clipPageState.joinedPayload = null;",
+		"clipPageState.joinedPayloadKey = joinedKey;",
+		"loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey",
+		"clipPageState.joinedPayloadKey === joinedKey",
+		"clipPageState.joinedStatus = 'error';",
+		"renderClipPageWithJoined();",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording detail missing async joined identity fence %q", marker)
+		}
+	}
+	clearAt := strings.Index(page, "clipPageState.joinedPayload = null;")
+	fetchAt := strings.Index(page, "payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined")
+	if clearAt < 0 || fetchAt < 0 || clearAt > fetchAt {
+		t.Fatalf("joined payload is not cleared before the next page fetch: clear=%d fetch=%d", clearAt, fetchAt)
+	}
+	pageHealthStart := strings.Index(page, "async function loadRecordingCaptureHealthPage(direction)")
+	if pageHealthStart < 0 {
+		t.Fatal("capture-health pagination function not found")
+	}
+	pageHealthEnd := strings.Index(page[pageHealthStart:], "// The storage card")
+	if pageHealthEnd < 0 {
+		t.Fatal("capture-health pagination function not found")
+	}
+	pageHealthSource := page[pageHealthStart : pageHealthStart+pageHealthEnd]
+	if strings.Contains(pageHealthSource, "await loadClipPage(clipPageState.page);") {
+		t.Fatal("capture-health pagination still refetches joined media and reopens the stale-payload race")
 	}
 }

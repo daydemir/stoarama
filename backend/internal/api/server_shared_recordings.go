@@ -55,8 +55,8 @@ type sharedRecording struct {
 	RelayNodeName     *string                     `json:"relay_node_name"`
 	HasRelayOnline    bool                        `json:"has_relay_online"`
 	HasRelayAssigned  bool                        `json:"has_relay_assigned"`
-	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins,omitempty"`
-	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health,omitempty"`
+	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins"`
+	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health"`
 	JoinedReadyMS     int64                       `json:"joined_ready_ms"`
 	SourceDurationMS  int64                       `json:"source_duration_ms"`
 	JoinedPercent     *int                        `json:"joined_percent"`
@@ -386,7 +386,7 @@ func (s *Server) handleSharedRecordingCaptureHealth(w http.ResponseWriter, r *ht
 	if !ok {
 		return
 	}
-	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id)
+	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id, true)
 }
 
 func (s *Server) sharedRecordingPrincipalRequest(r *http.Request) *http.Request {
@@ -423,7 +423,6 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	}
 	defer rows.Close()
 	items := []sharedRecording{}
-	ids := []int64{}
 	for rows.Next() {
 		raw, err := scanRecordingListRow(rows, s.billing != nil)
 		if err != nil {
@@ -433,8 +432,8 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 		if err != nil {
 			return nil, err
 		}
+		item.CaptureHealthBins = []recordingHealthBin{}
 		items = append(items, item)
-		ids = append(ids, item.ID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -442,30 +441,8 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	if recordingID > 0 && len(items) == 0 {
 		return items, nil
 	}
-	bins, err := s.recordingHealthBinsForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
-	if err != nil {
-		return nil, err
-	}
-	timeline, err := s.recordingTimelineHealthForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
-	if err != nil {
-		return nil, err
-	}
-	joinedProgress, err := s.recordingJoinedProgressForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
-	if err != nil {
-		return nil, err
-	}
-	for i := range items {
-		items[i].CaptureHealthBins = bins[items[i].ID]
-		if health, ok := timeline[items[i].ID]; ok {
-			items[i].TimelineHealth = &health
-		}
-		if progress, ok := joinedProgress[items[i].ID]; ok {
-			items[i].JoinedReadyMS = progress.JoinedReadyMS
-			items[i].SourceDurationMS = progress.SourceDurationMS
-			items[i].JoinedPercent = progress.Percent
-		}
-	}
-	sortSharedRecordingsByJoinedProgress(items, recordingJoinedSortDirection(r.URL.Query().Get("sort")))
+	// The shared page uses the same fast baseline as the authenticated page.
+	// Slow health and joined aggregates load through separate scoped endpoints.
 	return items, nil
 }
 
