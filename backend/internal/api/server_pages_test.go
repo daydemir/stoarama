@@ -878,7 +878,7 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 	}
 	page := string(body)
 	for _, marker := range []string{
-		"const RECORDING_ENRICHMENT_BATCH_SIZE = 12;",
+		"const RECORDING_ENRICHMENT_BATCH_SIZE = 1;",
 		"const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);",
 		"offset < ids.length; offset += RECORDING_ENRICHMENT_BATCH_SIZE",
 		"const batch = ids.slice(offset, offset + RECORDING_ENRICHMENT_BATCH_SIZE);",
@@ -900,9 +900,16 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 		t.Fatal("recording enrichment refresh function end not found")
 	}
 	refresh := page[refreshStart : refreshStart+refreshEnd]
+	if got := strings.Count(refresh, "await fetchJSON("); got != 1 {
+		t.Fatalf("recording enrichment has %d fetch sites; want one awaited request inside the loop", got)
+	}
+	if strings.Contains(refresh, "Promise.all") {
+		t.Fatal("recording enrichment must not fan out concurrent browser requests")
+	}
 	fetchAt := strings.Index(refresh, "await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`))")
 	mergeAt := -1
 	renderAt := -1
+	catchAt := strings.Index(refresh, "} catch (_)")
 	if fetchAt >= 0 {
 		if relative := strings.Index(refresh[fetchAt:], "mergeRecordingMetricItems(payload.items);"); relative >= 0 {
 			mergeAt = fetchAt + relative
@@ -913,8 +920,8 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 			renderAt = mergeAt + relative
 		}
 	}
-	if fetchAt < 0 || mergeAt < fetchAt || renderAt < mergeAt {
-		t.Fatalf("enrichment batch does not fetch, merge, then render in order: fetch=%d merge=%d render=%d", fetchAt, mergeAt, renderAt)
+	if fetchAt < 0 || mergeAt < fetchAt || renderAt < mergeAt || catchAt < renderAt {
+		t.Fatalf("enrichment batch does not await, merge, render incrementally, then stop on failure: fetch=%d merge=%d render=%d catch=%d", fetchAt, mergeAt, renderAt, catchAt)
 	}
 }
 
