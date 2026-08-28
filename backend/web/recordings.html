@@ -3518,6 +3518,7 @@
       }).join('')}</div>`;
     }
 
+    /** Map the API's detailed rating to the completed tier shown to users. */
     function best14TierLabel(rating) {
       if (rating === 'GREAT') return 'Great+';
       if (rating === 'VERY_GOOD' || rating === 'GOOD') return 'Good+';
@@ -3527,6 +3528,7 @@
       return 'Insufficient';
     }
 
+    /** Map the API's detailed rating to its accessible visual treatment. */
     function best14TierClass(rating) {
       if (rating === 'GREAT') return 'great';
       if (rating === 'VERY_GOOD' || rating === 'GOOD') return 'good';
@@ -3536,6 +3538,7 @@
       return 'insufficient';
     }
 
+    /** Explain the rule met by a completed 14-day rating. */
     function best14RuleText(rating) {
       if (rating === 'GREAT') return 'Only A, B, and C days.';
       if (rating === 'VERY_GOOD') return 'No F or E days. D days are allowed.';
@@ -3566,13 +3569,17 @@
       const potentialKind = String(value.potential_kind || '').toUpperCase();
       const potentialDays = Number(value.potential_days || 0);
       let potentialHTML = '';
-      if (rating === 'INSUFFICIENT' && qualifier.endsWith('_POTENTIAL')) {
+      if (rating === 'INSUFFICIENT' && qualifier === 'UNKNOWN_POTENTIAL') {
+        const pendingText = 'Awaiting scored days';
+        const pendingTooltip = 'Awaiting the first scored recording day. This is not a completed score or a potential tier yet.';
+        potentialHTML = `<div class="best14-potential" data-health-tooltip="${escapeHTML(pendingTooltip)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(pendingTooltip)}">${escapeHTML(pendingText)}</div>`;
+      } else if (rating === 'INSUFFICIENT' && qualifier.endsWith('_POTENTIAL')) {
         const potentialRating = qualifier.slice(0, -10);
         const potentialText = `${best14TierLabel(potentialRating)} potential · ${completed}/14 days`;
         const potentialTooltip = `${potentialText}. Potential is not a completed score.`;
         potentialHTML = `<div class="best14-potential ${best14TierClass(potentialRating)}" data-health-tooltip="${escapeHTML(potentialTooltip)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(potentialTooltip)}">${escapeHTML(potentialText)}</div>`;
       } else if (rating === 'INSUFFICIENT') {
-        const stateText = qualifier === 'SHORT_RUNWAY' ? 'Short runway' : 'Ended without a completed tier';
+        const stateText = qualifier === 'SHORT_RUNWAY' ? 'Short runway' : (qualifier === 'ENDED' ? 'Ended without a completed tier' : 'Pending');
         potentialHTML = `<div class="best14-potential" aria-label="${escapeHTML(stateText)}">${escapeHTML(stateText)}</div>`;
       } else if (potential && potentialKind === 'FUTURE_ROLL_OFF') {
         const dayLabel = potentialDays === 1 ? 'day' : 'days';
