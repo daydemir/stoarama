@@ -18,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | reconcile-upload-intents | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -38,6 +38,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if args[0] == "repair-source" {
 		runRecordingSourceRepair(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "reconcile-upload-intents" {
+		runRecordingUploadIntentReconcile(ctx, cfg, args[1:])
 		return
 	}
 	if args[0] == "authoritative-frame" {
@@ -75,6 +79,35 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	default:
 		log.Fatalf("unknown recordings naming subcommand: %s", args[1])
 	}
+}
+
+func runRecordingUploadIntentReconcile(ctx context.Context, cfg config.Config, args []string) {
+	fs := flag.NewFlagSet("recordings reconcile-upload-intents", flag.ExitOnError)
+	accountID := fs.Int64("account-id", 0, "exact account id")
+	idsRaw := fs.String("recording-ids", "", "comma-separated exact recording ids (maximum 50)")
+	expiresBeforeRaw := fs.String("expires-before", "", "inclusive RFC3339 expiry cutoff")
+	apply := fs.Bool("apply", false, "expire the exact reviewed plan")
+	expected := fs.String("expected-plan-sha256", "", "exact hash returned by the dry run")
+	reason := fs.String("reason", "", "audited operator reason")
+	backendAPIURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	apiToken := fs.String("api-token", cfg.APIToken, "admin API token")
+	_ = fs.Parse(args)
+	if *accountID <= 0 || strings.TrimSpace(*idsRaw) == "" {
+		log.Fatal("--account-id and --recording-ids are required")
+	}
+	expiresBefore, err := time.Parse(time.RFC3339, strings.TrimSpace(*expiresBeforeRaw))
+	if err != nil {
+		log.Fatal("--expires-before must be RFC3339")
+	}
+	if *apply && (len(strings.TrimSpace(*expected)) != 64 || strings.TrimSpace(*reason) == "") {
+		log.Fatal("--apply requires --expected-plan-sha256 and --reason")
+	}
+	payload := map[string]any{
+		"account_id": *accountID, "recording_ids": parseQualificationIDs(*idsRaw),
+		"expires_before": expiresBefore.UTC(), "apply": *apply,
+		"expected_plan_sha256": strings.ToLower(strings.TrimSpace(*expected)), "reason": strings.TrimSpace(*reason),
+	}
+	printJSON(mustAPIRequest(ctx, http.MethodPost, strings.TrimSpace(*backendAPIURL), strings.TrimSpace(*apiToken), "/api/v1/recording/upload-intents/reconcile-expired", payload))
 }
 
 func runRecordingClipAuthoritativeFrame(ctx context.Context, cfg config.Config, args []string) {
