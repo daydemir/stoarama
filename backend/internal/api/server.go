@@ -251,6 +251,8 @@ func (s *Server) router() http.Handler {
 			shared.Group(func(read chi.Router) {
 				read.Use(s.requireSharedRecordingsAuth)
 				read.Get("/recordings", s.handleSharedRecordingsList)
+				read.Get("/recordings/enrichment", s.handleSharedRecordingListEnrichment)
+				read.Get("/recordings/joined-progress", s.handleSharedRecordingJoinedProgress)
 				read.Get("/recordings/{id}", s.handleSharedRecordingGet)
 				read.Get("/recordings/{id}/capture-health", s.handleSharedRecordingCaptureHealth)
 				read.Get("/recordings/{id}/joined", s.handleSharedRecordingJoinedList)
@@ -282,6 +284,8 @@ func (s *Server) router() http.Handler {
 			account.Post("/storage-destinations", s.handleAccountStorageDestinationsCreate)
 			account.Delete("/storage-destinations/{id}", s.handleAccountStorageDestinationDelete)
 			account.Get("/recordings", s.handleAccountRecordingsList)
+			account.Get("/recordings/enrichment", s.handleAccountRecordingListEnrichment)
+			account.Get("/recordings/joined-progress", s.handleAccountRecordingJoinedProgress)
 			account.Get("/recordings/qualification", s.handleAccountRecordingQualification)
 			account.Get("/recordings/streak-priority", s.handleAccountRecordingStreakPriority)
 			account.Get("/recordings/campaign-tracks", s.handleAccountRecordingCampaignTracks)

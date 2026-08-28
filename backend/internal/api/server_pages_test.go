@@ -716,3 +716,23 @@ func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
 		}
 	}
 }
+
+func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"const payload = await fetchJSON(recordingAPIPath());",
+		"void refreshRecordingEnrichment(requestToken);",
+		"void refreshJoinedProgress(requestToken);",
+		"recordingAPIPath('/enrichment')",
+		"recordingAPIPath(`/joined-progress${sortQuery}`)",
+		"Joined coverage is loading",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing lazy-metric marker %q", marker)
+		}
+	}
+}

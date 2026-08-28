@@ -1386,6 +1386,12 @@
       recordingSort: 'newest',
       recordingsLoaded: false,
       recordingsLoading: false,
+	  recordingEnrichmentLoaded: false,
+	  recordingEnrichmentLoading: false,
+	  recordingEnrichmentError: false,
+	  joinedProgressLoaded: false,
+	  joinedProgressLoading: false,
+	  joinedProgressError: false,
       destinations: [],
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
@@ -3489,9 +3495,13 @@
       const capture = rec.capture_via === 'relay'
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       const joined = joinedCoverage(rec);
-      const joinedHTML = joined.available
+      const joinedHTML = !state.joinedProgressLoaded && !state.joinedProgressError
+	    ? `<div class="cell-main" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading...</div>`
+	    : joined.available
         ? `<div class="cell-main" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
-        : `<div class="cell-main" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
+	    : state.joinedProgressError
+	      ? `<div class="cell-main" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
+          : `<div class="cell-main" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
       let storage = sharedReadOnly ? '&mdash;' : (rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage'));
       if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
       let warning = '';
@@ -4005,6 +4015,7 @@
           clipPageState.captureHealth = { error: String(err.message || err) };
         }
         renderClipPage();
+		void loadRecordingDetailEnrichment(recId);
       }
       const body = root.querySelector('#clipListBody');
       if (body) body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
@@ -4024,6 +4035,18 @@
       clipPageState.loading = false;
     }
 
+	async function loadRecordingDetailEnrichment(recId) {
+	  try {
+	    const payload = await fetchJSON(recordingAPIPath(`/enrichment?recording_id=${encodeURIComponent(recId)}`));
+	    const item = Array.isArray(payload.items) ? payload.items[0] : null;
+	    if (!item || Number(item.recording_id) !== Number(clipPageState.recId) || !clipPageState.rec) return;
+	    Object.assign(clipPageState.rec, item);
+	    renderClipPage();
+	  } catch (_) {
+	    // Timeline enrichment is supplementary; joined media browsing stays usable.
+	  }
+	}
+
     // Reload the recording JSON after a schedule/storage/billing edit, then re-render
     // the whole detail view (cards + current clip page). Keeps one source of truth.
     async function reloadClipPageRecording() {
@@ -4040,6 +4063,7 @@
         clipPageState.captureHealth = { error: String(err.message || err) };
       }
       renderClipPage();
+	  void loadRecordingDetailEnrichment(clipPageState.recId);
       await loadClipPage(clipPageState.page);
     }
 
@@ -5086,11 +5110,15 @@
       const requestToken = ++recordingsLoadToken;
       beginRecordingsLoad();
       try {
-        const sortQuery = state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc'
-          ? `?sort=${encodeURIComponent(state.recordingSort)}` : '';
-        const payload = await fetchJSON(recordingAPIPath(sortQuery));
+        const payload = await fetchJSON(recordingAPIPath());
         if (requestToken !== recordingsLoadToken) return false;
         state.recordings = Array.isArray(payload.items) ? payload.items : (Array.isArray(payload.recordings) ? payload.recordings : []);
+		state.recordingEnrichmentLoaded = false;
+		state.recordingEnrichmentLoading = false;
+		state.recordingEnrichmentError = false;
+		state.joinedProgressLoaded = false;
+		state.joinedProgressLoading = false;
+		state.joinedProgressError = false;
         const present = new Set(state.recordings.map((rec) => Number(rec.id)));
         state.selectedRecordings = new Set([...state.selectedRecordings].filter((id) => present.has(id)));
         updateBulkCancelButton();
@@ -5105,6 +5133,8 @@
         state.recordingsLoaded = true;
         finishRecordingsLoad();
         renderCards();
+		void refreshRecordingEnrichment(requestToken);
+		void refreshJoinedProgress(requestToken);
         return true;
       } catch (err) {
         if (requestToken !== recordingsLoadToken) return false;
@@ -5112,6 +5142,53 @@
         return false;
       }
     }
+
+	function mergeRecordingMetricItems(items) {
+	  const byID = new Map(state.recordings.map((rec) => [Number(rec.id), rec]));
+	  for (const item of Array.isArray(items) ? items : []) {
+	    const rec = byID.get(Number(item.recording_id));
+	    if (rec) Object.assign(rec, item);
+	  }
+	}
+
+	async function refreshRecordingEnrichment(requestToken) {
+	  if (state.recordingEnrichmentLoading) return;
+	  state.recordingEnrichmentLoading = true;
+	  try {
+	    const payload = await fetchJSON(recordingAPIPath('/enrichment'));
+	    if (requestToken !== recordingsLoadToken) return;
+	    mergeRecordingMetricItems(payload.items);
+	    state.recordingEnrichmentLoaded = true;
+	    state.recordingEnrichmentError = false;
+	    renderCards();
+	  } catch (_) {
+	    if (requestToken !== recordingsLoadToken) return;
+	    state.recordingEnrichmentError = true;
+	  } finally {
+	    if (requestToken === recordingsLoadToken) state.recordingEnrichmentLoading = false;
+	  }
+	}
+
+	async function refreshJoinedProgress(requestToken) {
+	  if (state.joinedProgressLoading) return;
+	  state.joinedProgressLoading = true;
+	  try {
+	    const sortQuery = state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc'
+	      ? `?sort=${encodeURIComponent(state.recordingSort)}` : '';
+	    const payload = await fetchJSON(recordingAPIPath(`/joined-progress${sortQuery}`));
+	    if (requestToken !== recordingsLoadToken) return;
+	    mergeRecordingMetricItems(payload.items);
+	    state.joinedProgressLoaded = true;
+	    state.joinedProgressError = false;
+	    renderCards();
+	  } catch (_) {
+	    if (requestToken !== recordingsLoadToken) return;
+	    state.joinedProgressError = true;
+	    renderCards();
+	  } finally {
+	    if (requestToken === recordingsLoadToken) state.joinedProgressLoading = false;
+	  }
+	}
 
     // ---- Composer open/close ----
 
@@ -5682,7 +5759,9 @@
     els.recordingSort.addEventListener('change', () => {
       state.recordingSort = els.recordingSort.value;
       renderCards();
-      if (state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc') void refreshRecordings();
+	  if ((state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc') && !state.joinedProgressLoaded) {
+	    void refreshJoinedProgress(recordingsLoadToken);
+	  }
     });
     els.qualityFilter.addEventListener('change', () => {
       state.qualityFilter = els.qualityFilter.value;

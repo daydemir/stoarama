@@ -15,24 +15,23 @@ type recordingJoinedProgress struct {
 	Percent          *int  `json:"joined_percent"`
 }
 
-const recordingJoinedReadyFromCandidateSourcesSQL = `SELECT DISTINCT src.clip_id
-	FROM candidate_sources src
-	JOIN recording_joined_hours h
-	  ON h.id=src.hour_record_id
-	 AND h.recording_id=src.recording_id
-	 AND h.account_id=src.account_id
-	 AND h.batch_record_id=src.batch_record_id
-	 AND h.state='sealed'
-	JOIN recording_joined_media_sources ms ON ms.source_id=src.id
+const recordingJoinedReadyFromCandidateHoursSQL = `SELECT DISTINCT src.clip_id
+	FROM candidate_hours h
 	JOIN recording_joined_artifacts media
-	  ON media.id=ms.artifact_id
-	 AND media.hour_record_id=h.id
+	  ON media.hour_record_id=h.id
 	 AND media.batch_record_id=h.batch_record_id
 	 AND media.account_id=h.account_id
 	 AND media.artifact_kind='media'
 	 AND media.published_at IS NOT NULL
 	 AND media.etag IS NOT NULL AND media.etag<>''
 	 AND media.version_id IS NOT NULL
+	JOIN recording_joined_media_sources ms ON ms.artifact_id=media.id
+	JOIN recording_joined_sources src
+	  ON src.id=ms.source_id
+	 AND src.hour_record_id=h.id
+	 AND src.recording_id=h.recording_id
+	 AND src.account_id=h.account_id
+	 AND src.batch_record_id=h.batch_record_id
 	WHERE EXISTS (
 	    SELECT 1
 	    FROM recording_joined_artifacts manifest
@@ -46,12 +45,12 @@ const recordingJoinedReadyFromCandidateSourcesSQL = `SELECT DISTINCT src.clip_id
 	      AND manifest.version_id IS NOT NULL
 	  )`
 
-const recordingJoinedReadyClipsSQL = `WITH candidate_sources AS MATERIALIZED (
-	SELECT id,clip_id,hour_record_id,batch_record_id,account_id,recording_id
-	FROM recording_joined_sources
-	WHERE account_id=$1 AND recording_id=ANY($2::bigint[])
+const recordingJoinedReadyClipsSQL = `WITH candidate_hours AS MATERIALIZED (
+	SELECT id,batch_record_id,account_id,recording_id
+	FROM recording_joined_hours
+	WHERE account_id=$1 AND recording_id=ANY($2::bigint[]) AND state='sealed'
 )
-` + recordingJoinedReadyFromCandidateSourcesSQL
+` + recordingJoinedReadyFromCandidateHoursSQL
 
 const recordingJoinedProgressSQL = `WITH requested AS (
 	SELECT DISTINCT id AS recording_id
@@ -191,11 +190,11 @@ const recordingJoinedProgressBinsSQL = `WITH bins AS (
 	SELECT recording_id,bin_start,bin_end,ordinality
 	FROM unnest($1::bigint[],$2::timestamptz[],$3::timestamptz[])
 		WITH ORDINALITY b(recording_id,bin_start,bin_end,ordinality)
-), candidate_sources AS MATERIALIZED (
-	SELECT id,clip_id,hour_record_id,batch_record_id,account_id,recording_id
-	FROM recording_joined_sources
-	WHERE account_id=$4 AND recording_id=ANY($1::bigint[])
-), ready AS (` + recordingJoinedReadyFromCandidateSourcesSQL + `)
+), candidate_hours AS MATERIALIZED (
+	SELECT id,batch_record_id,account_id,recording_id
+	FROM recording_joined_hours
+	WHERE account_id=$4 AND recording_id=ANY($1::bigint[]) AND state='sealed'
+), ready AS (` + recordingJoinedReadyFromCandidateHoursSQL + `)
 SELECT b.ordinality,
 	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000),0)::bigint,
 	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000)

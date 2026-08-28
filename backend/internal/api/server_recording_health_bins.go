@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"fmt"
-	"log"
 	"slices"
 	"time"
 
@@ -246,17 +245,6 @@ func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID in
 		return nil, err
 	}
 	countRows.Close()
-	joinedProgress, err := s.recordingJoinedProgressForBins(ctx, accountID, binRecordingIDs, binStarts, binEnds)
-	if err != nil {
-		log.Printf("recording list joined health bins omitted account_id=%d: %v", accountID, err)
-	} else {
-		for i, progress := range joinedProgress {
-			ref := refs[i]
-			out[ref.recordingID][ref.index].SourceDurationMS = progress.SourceDurationMS
-			out[ref.recordingID][ref.index].JoinedReadyMS = progress.JoinedReadyMS
-		}
-	}
-
 	for id, bins := range out {
 		for i := range bins {
 			bins[i].Health = recordingCaptureHealth("active", bins[i].Captured, bins[i].Expected)
