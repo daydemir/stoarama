@@ -789,7 +789,7 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 		"const payload = await fetchJSON(recordingAPIPath());",
 		"void refreshRecordingEnrichment(requestToken);",
 		"void refreshJoinedProgress(requestToken);",
-		"recordingAPIPath('/enrichment')",
+		"recordingAPIPath(`/enrichment?${params.toString()}`)",
 		"recordingAPIPath(`/joined-progress${sortQuery}`)",
 		"Joined coverage is loading",
 		"void loadRecordingDetailCaptureHealth(recId);",
@@ -802,6 +802,53 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 	}
 	if strings.Contains(page, "clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');") {
 		t.Fatal("recording detail still waits for capture health before loading joined files")
+	}
+}
+
+func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"const RECORDING_ENRICHMENT_BATCH_SIZE = 12;",
+		"const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);",
+		"offset < ids.length; offset += RECORDING_ENRICHMENT_BATCH_SIZE",
+		"const batch = ids.slice(offset, offset + RECORDING_ENRICHMENT_BATCH_SIZE);",
+		"params.set('recording_ids', batch.join(','));",
+		"await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`))",
+		"mergeRecordingMetricItems(payload.items);",
+		"renderCards();",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing progressive enrichment marker %q", marker)
+		}
+	}
+	refreshStart := strings.Index(page, "async function refreshRecordingEnrichment(requestToken)")
+	if refreshStart < 0 {
+		t.Fatal("recording enrichment refresh function not found")
+	}
+	refreshEnd := strings.Index(page[refreshStart:], "async function refreshJoinedProgress(requestToken)")
+	if refreshEnd < 0 {
+		t.Fatal("recording enrichment refresh function end not found")
+	}
+	refresh := page[refreshStart : refreshStart+refreshEnd]
+	fetchAt := strings.Index(refresh, "await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`))")
+	mergeAt := -1
+	renderAt := -1
+	if fetchAt >= 0 {
+		if relative := strings.Index(refresh[fetchAt:], "mergeRecordingMetricItems(payload.items);"); relative >= 0 {
+			mergeAt = fetchAt + relative
+		}
+	}
+	if mergeAt >= 0 {
+		if relative := strings.Index(refresh[mergeAt:], "renderCards();"); relative >= 0 {
+			renderAt = mergeAt + relative
+		}
+	}
+	if fetchAt < 0 || mergeAt < fetchAt || renderAt < mergeAt {
+		t.Fatalf("enrichment batch does not fetch, merge, then render in order: fetch=%d merge=%d render=%d", fetchAt, mergeAt, renderAt)
 	}
 }
 
