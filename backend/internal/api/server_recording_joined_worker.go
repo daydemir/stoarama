@@ -412,6 +412,8 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// Broad frozen-batch admission never retries persisted legacy work. An
+	// operator must isolate that exact hour under canary_single instead.
 	var hourRecordID int64
 	err = tx.QueryRow(r.Context(), `
 		SELECT h.id FROM recording_joined_hours h
@@ -421,6 +423,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		WHERE h.batch_id=$1 AND ($3 OR h.hour_id=ANY($2::text[]))
 		  AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
 		  AND h.source_clip_count>0 AND h.attempt_count<$5
+		  AND (NOT $3 OR (h.state='pending' AND h.attempt_count=0))
 		  AND h.source_bytes<=GREATEST(($4::bigint-$6::bigint)/2,-1::bigint)
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.hour_record_id=h.id
 		    AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
@@ -443,6 +446,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		UPDATE recording_joined_hours SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
 		  lease_expires_at=date_trunc('second',now()+$4::interval),heartbeat_at=now()
 		WHERE id=$1 AND batch_id=$5 AND ($7 OR hour_id=ANY($6::text[]))
+		  AND (NOT $7 OR (state='pending' AND attempt_count=0))
 		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.id=$8)
 		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID,
 		canaryHours, frozenBatch, s.cfg.JoinedRecordingConnectionID).
