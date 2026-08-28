@@ -62,10 +62,11 @@ type Config struct {
 	// this long without a successfully ingested segment. The server then hands the
 	// job to another worker; zero disables the safeguard.
 	ContinuousNoProgressTimeout time.Duration
-	// ContinuousMaxMediaLag makes a worker surrender a continuous job when a
-	// finalized segment's media timestamp trails wall time by this much. This
-	// catches a delivery queue that is making slow progress but can never return to
-	// real time; zero disables the safeguard.
+	// ContinuousMaxMediaLag makes a worker surrender a continuous job when the
+	// finalized media timeline falls this much farther behind wall time than the
+	// best offset observed by this lease. Calibrating the source's stable offset
+	// catches delivery drift without rejecting intentionally delayed live feeds;
+	// zero disables the safeguard.
 	ContinuousMaxMediaLag time.Duration
 	// FrozenHLSQuiescenceAllowlist is a comma-separated list of exact
 	// "worker-id/recording-id" pairs. Empty is structurally disabled. The policy
@@ -615,6 +616,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	// cancel) just like a fixed delay.
 	failures := 0
 	var frozenHLSState frozenHLSJobState
+	var mediaLagFence continuousMediaLagFence
 	backoff := func(delay time.Duration) {
 		select {
 		case <-windowCtx.Done():
@@ -704,14 +706,13 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// jobCtx, so uploads already in flight keep their full retry budget (and the
 		// post-window grace) while the pool is drained.
 		attemptCtx, abortAttempt := context.WithCancel(windowCtx)
-		var mediaLagged atomic.Bool
 		pool := startSegmentDeliveryPool(w.cfg.UploadWorkers, abortAttempt, func(seg capture.Segment) error {
 			// Measure age when an upload worker actually reaches the descriptor, not
 			// when capture enqueues it. Submit is intentionally nonblocking, so only
 			// this point can detect a queue that is falling behind real time. Stopping
 			// capture is control flow only: this segment and the rest of the accepted
 			// spool still drain normally on jobCtx.
-			observeContinuousMediaLag(seg.EndAt, time.Now(), w.cfg.ContinuousMaxMediaLag, &mediaLagged, abortAttempt)
+			mediaLagFence.observe(seg.CaptureSequence, seg.EndAt, time.Now(), w.cfg.ContinuousMaxMediaLag, abortAttempt)
 			return deliverSegment(resolved, seg)
 		}, func(depth int) { w.cfg.RelayDiagnostics.DeliveryQueue(job.JobID, depth) })
 		var diskPressure atomic.Bool
@@ -776,7 +777,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if delivery.submitted > 0 {
 			segmentDeliveryPending = delivery.pending > 0
 		}
-		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr, mediaLagged.Load()) {
+		if shouldCleanupContinuousAttempt(segmentDeliveryPending, captureErr, mediaLagFence.lagged()) {
 			if removeErr := os.RemoveAll(outDir); removeErr != nil {
 				w.cfg.RelayDiagnostics.Error(job.JobID, "temp_cleanup_failed", removeErr)
 			}
@@ -792,8 +793,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, err)
 			return
 		}
-		if continuousMediaLagCanSurrender(mediaLagged.Load(), delivery.err, windowClosed) {
-			err := fmt.Errorf("continuous media timeline fell behind by at least %s", w.cfg.ContinuousMaxMediaLag)
+		if continuousMediaLagCanSurrender(mediaLagFence.lagged(), delivery.err, windowClosed) {
+			err := fmt.Errorf("continuous media timeline drift grew by at least %s", w.cfg.ContinuousMaxMediaLag)
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
 			return
 		}
@@ -1128,8 +1129,16 @@ func continuousNoProgressExpired(lastProgressAt, now time.Time, timeout time.Dur
 	return timeout > 0 && !now.Before(lastProgressAt.Add(timeout))
 }
 
-func continuousMediaLagExpired(mediaEnd, now time.Time, timeout time.Duration) bool {
-	return timeout > 0 && !mediaEnd.IsZero() && !now.Before(mediaEnd.Add(timeout))
+type continuousMediaLagFence struct {
+	mu              sync.Mutex
+	initialized     bool
+	highestSequence int64
+	bestLag         time.Duration
+	drifted         atomic.Bool
+}
+
+func continuousMediaLagDriftExpired(bestLag, currentLag, timeout time.Duration) bool {
+	return timeout > 0 && currentLag-bestLag >= timeout
 }
 
 // recordingCaptureTargetFPS is deliberately nil even for jobs created by an
@@ -1137,10 +1146,33 @@ func continuousMediaLagExpired(mediaEnd, now time.Time, timeout time.Duration) b
 // branch; recording footage must always use source/native stream-copy.
 func recordingCaptureTargetFPS(_ *int) *int { return nil }
 
-func observeContinuousMediaLag(mediaEnd, now time.Time, timeout time.Duration, lagged *atomic.Bool, abort context.CancelFunc) {
-	if continuousMediaLagExpired(mediaEnd, now, timeout) && lagged.CompareAndSwap(false, true) {
+func (f *continuousMediaLagFence) observe(sequence int64, mediaEnd, now time.Time, timeout time.Duration, abort context.CancelFunc) {
+	if sequence <= 0 || timeout <= 0 || mediaEnd.IsZero() || f.drifted.Load() {
+		return
+	}
+	currentLag := now.Sub(mediaEnd)
+	f.mu.Lock()
+	// Delivery workers consume one FIFO but execute concurrently. A later segment
+	// can reach this observer before an earlier worker is scheduled; never let the
+	// older sample masquerade as newly accumulated drift.
+	if f.initialized && sequence <= f.highestSequence {
+		f.mu.Unlock()
+		return
+	}
+	f.highestSequence = sequence
+	if !f.initialized || currentLag < f.bestLag {
+		f.bestLag = currentLag
+		f.initialized = true
+	}
+	drifted := continuousMediaLagDriftExpired(f.bestLag, currentLag, timeout)
+	f.mu.Unlock()
+	if drifted && f.drifted.CompareAndSwap(false, true) {
 		abort()
 	}
+}
+
+func (f *continuousMediaLagFence) lagged() bool {
+	return f != nil && f.drifted.Load()
 }
 
 func continuousMediaLagCanSurrender(lagged bool, deliveryErr error, windowClosed bool) bool {
