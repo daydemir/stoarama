@@ -791,14 +791,43 @@ func TestRecordingJoinedDetailFailureOffersAnInPlaceRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	page := string(body)
+	renderStart := strings.Index(page, "function renderClipPageWithJoined()")
+	if renderStart < 0 {
+		t.Fatal("joined detail render function start not found")
+	}
+	renderEnd := strings.Index(page[renderStart:], "async function reloadClipPageRecording()")
+	if renderEnd < 0 {
+		t.Fatal("joined detail render function boundaries not found")
+	}
+	render := page[renderStart : renderStart+renderEnd]
 	for _, marker := range []string{
 		`Joined recordings could not be loaded.`,
 		`data-joinedretry`,
-		`loadClipPage(clipPageState.page)`,
+		`wireClipPageNav(body);`,
 	} {
-		if !strings.Contains(page, marker) {
-			t.Fatalf("recordings html missing joined detail recovery marker %q", marker)
+		if !strings.Contains(render, marker) {
+			t.Fatalf("joined detail error branch missing recovery marker %q", marker)
 		}
+	}
+	errorAt := strings.Index(render, `clipPageState.joinedStatus === 'error'`)
+	buttonAt := strings.Index(render, `data-joinedretry`)
+	wireAt := strings.Index(render, `wireClipPageNav(body);`)
+	if errorAt < 0 || buttonAt < errorAt || wireAt < buttonAt {
+		t.Fatalf("joined error recovery is not rendered then wired in order: error=%d button=%d wire=%d", errorAt, buttonAt, wireAt)
+	}
+
+	wireStart := strings.Index(page, "function wireClipPageNav(root)")
+	if wireStart < 0 {
+		t.Fatal("joined detail navigation function start not found")
+	}
+	wireEnd := strings.Index(page[wireStart:], "async function downloadClipPageZip")
+	if wireEnd < 0 {
+		t.Fatal("joined detail navigation function boundaries not found")
+	}
+	wiring := page[wireStart : wireStart+wireEnd]
+	const exactRetryListener = `if (retry) retry.addEventListener('click', () => loadClipPage(clipPageState.page));`
+	if !strings.Contains(wiring, exactRetryListener) {
+		t.Fatalf("joined retry button is not wired to reload the current page: %q", exactRetryListener)
 	}
 }
 
