@@ -253,6 +253,8 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings", s.handleSharedRecordingsList)
 				read.Get("/recordings/{id}", s.handleSharedRecordingGet)
 				read.Get("/recordings/{id}/capture-health", s.handleSharedRecordingCaptureHealth)
+				read.Get("/recordings/{id}/joined", s.handleSharedRecordingJoinedList)
+				read.Get("/recordings/{id}/joined/{joinedId}/download", s.handleSharedRecordingJoinedDownload)
 				read.Get("/recordings/{id}/clips", s.handleSharedRecordingClips)
 				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
 			})

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
@@ -38,6 +39,8 @@ func (s *Server) handleAccountRecordingJoinedList(w http.ResponseWriter, r *http
 		JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.recording_id=$1
 		JOIN recordings rec ON rec.id=h.recording_id AND rec.account_id=$2
 		WHERE a.account_id=$2 AND a.batch_record_id=h.batch_record_id AND a.artifact_kind IN ('hour_manifest','media')
+		AND h.state='sealed' AND EXISTS(SELECT 1 FROM recording_joined_artifacts manifest WHERE manifest.hour_record_id=h.id
+		  AND manifest.artifact_kind='hour_manifest' AND manifest.publication_state='published' AND manifest.published_at IS NOT NULL)
 		AND ((a.artifact_kind='media' AND a.published_at IS NOT NULL) OR (a.artifact_kind='hour_manifest' AND a.publication_state='published'))
 		ORDER BY h.local_date,h.delivery_hour,a.ordinal,a.id`, recordingID, principal.AccountID)
 	if err != nil {
@@ -53,6 +56,9 @@ func (s *Server) handleAccountRecordingJoinedList(w http.ResponseWriter, r *http
 			return
 		}
 		file.DownloadPath = fmt.Sprintf("/api/v1/account/recordings/%d/joined/%d/download", recordingID, file.ArtifactID)
+		if strings.Contains(r.URL.Path, "/api/v1/shared/") {
+			file.DownloadPath = fmt.Sprintf("/api/v1/shared/%s/recordings/%d/joined/%d/download", s.cfg.SharedRecordingsSlug, recordingID, file.ArtifactID)
+		}
 		files = append(files, file)
 	}
 	if err := rows.Err(); err != nil {
@@ -89,6 +95,8 @@ func (s *Server) handleAccountRecordingJoinedDownload(w http.ResponseWriter, r *
 		FROM recording_joined_artifacts a JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.recording_id=$1
 		JOIN recordings rec ON rec.id=h.recording_id AND rec.account_id=$2 WHERE a.id=$3 AND a.account_id=$2
 		AND a.batch_record_id=h.batch_record_id AND a.artifact_kind IN ('hour_manifest','media')
+		AND h.state='sealed' AND EXISTS(SELECT 1 FROM recording_joined_artifacts manifest WHERE manifest.hour_record_id=h.id
+		  AND manifest.artifact_kind='hour_manifest' AND manifest.publication_state='published' AND manifest.published_at IS NOT NULL)
 		AND ((a.artifact_kind='media' AND a.published_at IS NOT NULL) OR (a.artifact_kind='hour_manifest' AND a.publication_state='published'))`, recordingID, principal.AccountID, artifactID).Scan(&objectKey, &etag, &versionID, &contentType, &sizeBytes, &sha256)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "joined recording file not found")
@@ -110,6 +118,8 @@ func (s *Server) handleAccountRecordingJoinedDownload(w http.ResponseWriter, r *
 		JOIN recordings rec ON rec.id=h.recording_id AND rec.account_id=$2
 		WHERE a.id=$3 AND a.account_id=$2 AND a.object_key=$4 AND a.etag=$5 AND a.version_id=$6
 		AND a.expected_size_bytes=$7 AND a.batch_record_id=h.batch_record_id
+		AND h.state='sealed' AND EXISTS(SELECT 1 FROM recording_joined_artifacts manifest WHERE manifest.hour_record_id=h.id
+		  AND manifest.artifact_kind='hour_manifest' AND manifest.publication_state='published' AND manifest.published_at IS NOT NULL)
 		AND a.artifact_kind IN ('hour_manifest','media')
 		AND ((a.artifact_kind='media' AND a.published_at IS NOT NULL) OR (a.artifact_kind='hour_manifest' AND a.publication_state='published')))`,
 		recordingID, principal.AccountID, artifactID, objectKey, etag, versionID, sizeBytes).Scan(&stillCurrent)

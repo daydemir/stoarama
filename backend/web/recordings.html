@@ -3849,7 +3849,7 @@
           clipPageState.captureHealth = { error: String(err.message || err) };
         }
         try {
-          const joined = await fetchJSON(`/api/v1/account/recordings/${encodeURIComponent(recId)}/joined`);
+          const joined = await fetchJSON(`${apiBase()}/recordings/${encodeURIComponent(recId)}/joined`);
           clipPageState.joinedFiles = Array.isArray(joined.files) ? joined.files : [];
         } catch (err) {
           clipPageState.joinedFiles = { error: String(err.message || err) };
@@ -4176,7 +4176,7 @@
         <div class="stack">${value.map((file) => `<div class="detail-rows" style="grid-template-columns:1fr auto;align-items:center;border-top:1px solid var(--border);padding-top:10px;">
           <div><div class="cell-main">${escapeHTML(file.hour_id || file.relative_path)}</div><div class="hint">${escapeHTML(file.kind === 'media' ? 'Video' : 'Manifest')} · ${fmtBytes(Number(file.size_bytes || 0))}</div></div>
           <a class="btn-link secondary" href="${escapeHTML(file.download_path)}" target="_blank" rel="noopener noreferrer" style="width:auto;min-width:74px;min-height:34px;padding:6px 12px;">${file.kind === 'media' ? 'View' : 'Open'}</a>
-        </div>`).join('')}</div><div class="hint" style="margin-top:12px;">Links expire automatically and are available only to members of this organization.</div></div>`;
+        </div>`).join('')}</div><div class="hint" style="margin-top:12px;">Each view is authorized when opened and stops if the stored object identity has changed.</div></div>`;
     }
 
     function streamCardHTML(rec) {
@@ -4252,7 +4252,7 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + (sharedReadOnly ? '' : streamCardHTML(rec)) + captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec) + relayRoutingCardHTML(rec) + (sharedReadOnly ? '' : storageCardHTML(rec) + joinedFilesCardHTML())
+      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + (sharedReadOnly ? '' : streamCardHTML(rec)) + captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec) + relayRoutingCardHTML(rec) + (sharedReadOnly ? joinedFilesCardHTML() : storageCardHTML(rec) + joinedFilesCardHTML())
         + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Clips</div></div></div><div id="clipListBody"></div>`;
       wireDetailActions(root);
       if (!sharedReadOnly) mountRecordingLivePlayer(rec);

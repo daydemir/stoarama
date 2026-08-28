@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -383,6 +384,19 @@ func (s *Server) handleSharedRecordingCaptureHealth(w http.ResponseWriter, r *ht
 		return
 	}
 	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id)
+}
+
+func (s *Server) sharedRecordingPrincipalRequest(r *http.Request) *http.Request {
+	ctx := context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: s.cfg.SharedRecordingsAccountID, AuthType: "shared"})
+	return r.WithContext(ctx)
+}
+
+func (s *Server) handleSharedRecordingJoinedList(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedList(w, s.sharedRecordingPrincipalRequest(r))
+}
+
+func (s *Server) handleSharedRecordingJoinedDownload(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedDownload(w, s.sharedRecordingPrincipalRequest(r))
 }
 
 func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sharedRecording, error) {
