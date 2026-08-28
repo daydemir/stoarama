@@ -48,6 +48,32 @@ const recordingJoinedReadyClipsSQL = `
 	      AND manifest.version_id IS NOT NULL
 	  )`
 
+const recordingJoinedProgressSQL = `WITH requested AS (
+	SELECT DISTINCT id AS recording_id
+	FROM recordings
+	WHERE account_id=$1 AND status<>'canceled' AND id=ANY($2::bigint[])
+), ready_clip_ids AS (` + recordingJoinedReadyClipsSQL + `), source AS (
+	SELECT c.recording_id,
+		COALESCE(sum(EXTRACT(epoch FROM (c.clip_end_at-c.clip_start_at))*1000),0)::bigint AS duration_ms
+	FROM recording_clips c
+	JOIN requested req ON req.recording_id=c.recording_id
+	WHERE c.purged_at IS NULL AND c.recording_id=ANY($2::bigint[])
+	GROUP BY c.recording_id
+), ready AS (
+	SELECT c.recording_id,
+		COALESCE(sum(EXTRACT(epoch FROM (c.clip_end_at-c.clip_start_at))*1000),0)::bigint AS duration_ms
+	FROM recording_clips c
+	JOIN requested req ON req.recording_id=c.recording_id
+	JOIN ready_clip_ids ready_clip ON ready_clip.clip_id=c.id
+	WHERE c.purged_at IS NULL AND c.recording_id=ANY($2::bigint[])
+	GROUP BY c.recording_id
+)
+SELECT req.recording_id,COALESCE(source.duration_ms,0),COALESCE(ready.duration_ms,0)
+FROM requested req
+LEFT JOIN source ON source.recording_id=req.recording_id
+LEFT JOIN ready ON ready.recording_id=req.recording_id
+ORDER BY req.recording_id`
+
 // recordingJoinedProgressForAccount returns duration-based joined coverage for
 // the requested account-owned recordings. A mapped source counts only when its
 // specific media artifact and containing hour manifest are both published.
@@ -56,31 +82,7 @@ func (s *Server) recordingJoinedProgressForAccount(ctx context.Context, accountI
 	if accountID <= 0 || len(recordingIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.pool.Query(ctx, `WITH requested AS (
-		SELECT DISTINCT id AS recording_id
-		FROM recordings
-		WHERE account_id=$1 AND status<>'canceled' AND id=ANY($2::bigint[])
-	), ready_clip_ids AS (`+recordingJoinedReadyClipsSQL+`), source AS (
-		SELECT c.recording_id,
-			COALESCE(sum(EXTRACT(epoch FROM (c.clip_end_at-c.clip_start_at))*1000),0)::bigint AS duration_ms
-		FROM recording_clips c
-		JOIN requested req ON req.recording_id=c.recording_id
-		WHERE c.purged_at IS NULL
-		GROUP BY c.recording_id
-	), ready AS (
-		SELECT c.recording_id,
-			COALESCE(sum(EXTRACT(epoch FROM (c.clip_end_at-c.clip_start_at))*1000),0)::bigint AS duration_ms
-		FROM recording_clips c
-		JOIN requested req ON req.recording_id=c.recording_id
-		JOIN ready_clip_ids ready_clip ON ready_clip.clip_id=c.id
-		WHERE c.purged_at IS NULL
-		GROUP BY c.recording_id
-	)
-	SELECT req.recording_id,COALESCE(source.duration_ms,0),COALESCE(ready.duration_ms,0)
-	FROM requested req
-	LEFT JOIN source ON source.recording_id=req.recording_id
-	LEFT JOIN ready ON ready.recording_id=req.recording_id
-	ORDER BY req.recording_id`, accountID, recordingIDs)
+	rows, err := s.pool.Query(ctx, recordingJoinedProgressSQL, accountID, recordingIDs)
 	if err != nil {
 		return nil, err
 	}

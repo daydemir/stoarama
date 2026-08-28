@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -131,6 +133,61 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 		if bin.SourceDurationMS != 30_000 || bin.JoinedReadyMS != 30_000 {
 			t.Fatalf("boundary bin %d=%+v want 30000/30000", i, bin)
 		}
+	}
+}
+
+func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	seedJoinedBrowserTestData(t, pool)
+	ctx := context.Background()
+	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0149_joined_recording_browser_indexes.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE INDEX idx_recording_clips_recording_started ON recording_clips(recording_id,clip_start_at DESC);
+		INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at)
+		SELECT 1000000+value,50,'2026-05-04 08:00:00Z'::timestamptz+value*interval '1 second','2026-05-04 08:00:01Z'::timestamptz+value*interval '1 second'
+		FROM generate_series(1,50000) value;
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id)
+		SELECT 1000000+value,204,2,99,50,1000000+value FROM generate_series(1,50000) value;
+		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
+		SELECT 1000000+value,204,2,99,'media',NULL,now(),'noise-'||value,'','video/mp4','noise/'||value||'.mp4',10,repeat('9',64),'joined/noise/'||value||'.mp4',value
+		FROM generate_series(1,50000) value;
+		ANALYZE recordings; ANALYZE recording_clips; ANALYZE recording_joined_hours;
+		ANALYZE recording_joined_sources; ANALYZE recording_joined_artifacts; ANALYZE recording_joined_media_sources;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING,FORMAT TEXT) "+recordingJoinedProgressSQL, int64(47), []int64{10, 20, 30, 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	planLines := []string{}
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		planLines = append(planLines, line)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(planLines, "\n")
+	t.Logf("joined progress EXPLAIN ANALYZE (%s):\n%s", time.Since(started).Round(time.Millisecond), plan)
+	for _, index := range []string{"idx_recording_clips_recording_started", "recording_joined_artifacts_published_hour_idx"} {
+		if !strings.Contains(plan, index) {
+			t.Fatalf("plan did not use %s:\n%s", index, plan)
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("indexed joined progress EXPLAIN took %s", elapsed)
 	}
 }
 
@@ -259,6 +316,46 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 	for _, forbidden := range []string{"joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("folder leaked %q", forbidden)
+		}
+	}
+}
+
+func TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	seedJoinedBrowserTestData(t, pool)
+	store := &joinedBrowserRangeStore{
+		joinedOutputStoreStub: joinedOutputStoreStub{head: r2.ObjectHead{ETag: "media-1", SizeBytes: 10}},
+		body:                  []byte("0123456789"),
+	}
+	s := &Server{pool: pool, joinedOutputStorage: store, cfg: config.Config{
+		SharedRecordingsAccountID: 47,
+		SharedRecordingsSlug:      "mit-scl",
+		SharedRecordingsPublic:    true,
+	}}
+	router := s.router()
+	for _, test := range []struct {
+		path, rangeHeader string
+		wantCode          int
+		wantBody          string
+	}{
+		{path: "/api/v1/shared/mit-scl/recordings/20/joined", wantCode: http.StatusOK, wantBody: `"total":2`},
+		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder", wantCode: http.StatusOK, wantBody: "private R2 folder"},
+		{path: "/api/v1/shared/mit-scl/recordings/20/joined/302/download?disposition=inline", rangeHeader: "bytes=2-5", wantCode: http.StatusPartialContent, wantBody: "2345"},
+		{path: "/api/v1/shared/mit-scl/recordings/50/joined", wantCode: http.StatusNotFound, wantBody: "recording not found"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, test.path, nil)
+		if test.rangeHeader != "" {
+			req.Header.Set("Range", test.rangeHeader)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) {
+			t.Fatalf("path=%s status=%d body=%s", test.path, response.Code, response.Body.String())
+		}
+		for _, forbidden := range []string{"joined/private/", "cloudflarestorage.com", "access_key", "secret_access"} {
+			if strings.Contains(response.Body.String(), forbidden) {
+				t.Fatalf("path=%s leaked %q", test.path, forbidden)
+			}
 		}
 	}
 }
