@@ -21,6 +21,19 @@
       --ok: #22c55e;
       --warn: #f59e0b;
       --err: #ef4444;
+      --quality-great-bg: #14532d;
+      --quality-great-fg: #f0fdf4;
+      --quality-good-bg: #15803d;
+      --quality-good-fg: #f0fdf4;
+      --quality-fine-bg: #4ade80;
+      --quality-fine-fg: #052e16;
+      --quality-questionable-bg: #9a3412;
+      --quality-questionable-fg: #fff7ed;
+      --quality-bad-bg: #991b1b;
+      --quality-bad-fg: #fef2f2;
+      --quality-potential-bg: color-mix(in srgb, #4ade80 10%, transparent);
+      --quality-potential-border: #166534;
+      --quality-potential-fg: #86efac;
       --mono: "IBM Plex Mono", monospace;
       --sans: "IBM Plex Sans", system-ui, sans-serif;
     }
@@ -36,6 +49,9 @@
         --ok: #16a34a;
         --warn: #d97706;
         --err: #dc2626;
+        --quality-potential-bg: #f0fdf4;
+        --quality-potential-border: #86efac;
+        --quality-potential-fg: #166534;
       }
     }
     * { box-sizing: border-box; }
@@ -215,21 +231,59 @@
     .capture-health.warning { color: var(--warn); }
     .capture-health.critical { color: var(--err); }
     .capture-health.not_expected, .capture-health.unavailable { color: var(--muted); }
-    .daily-grades { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+    .recording-quality { display: grid; gap: 7px; }
+    .quality-section-label {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 600;
+      line-height: 1.2;
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+    .quality-daily { display: grid; gap: 4px; padding-top: 7px; border-top: 1px solid var(--border); }
+    .daily-grades { display: flex; flex-wrap: wrap; gap: 4px; }
     .daily-grade { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 5px; color: #fff; font: 600 11px/1 var(--mono); }
-    .daily-grade.a { background: #15803d; }
-    .daily-grade.b { background: #16a34a; }
+    .daily-grade.a { background: #14532d; }
+    .daily-grade.b { background: #15803d; }
     .daily-grade.c { background: #4ade80; color: #052e16; }
     .daily-grade.d { background: #eab308; color: #422006; }
-    .daily-grade.e { background: #f97316; }
+    .daily-grade.e { background: #c2410c; }
     .daily-grade.f { background: #b91c1c; }
     .daily-grade.unknown { background: var(--muted); color: var(--bg); }
-    .best14-rating { display: inline-block; margin: 0 0 4px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; font: 600 10px/1.2 var(--mono); }
-    .best14-rating.great, .best14-rating.very_good { color: var(--ok); }
-    .best14-rating.good, .best14-rating.fine { color: var(--warn); }
-    .best14-rating.questionable, .best14-rating.bad { color: var(--err); }
-    .best14-rating.insufficient { color: var(--muted); }
-    .best14-potential { margin: 1px 0 4px; color: var(--accent); font: 500 10px/1.35 var(--mono); }
+    .best14-rating {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 8px;
+      width: fit-content;
+      min-height: 34px;
+      padding: 7px 9px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      color: var(--text);
+      background: var(--panel2);
+      font-family: var(--mono);
+      cursor: help;
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.14);
+    }
+    .best14-rating:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+    .best14-rating-name { font-size: 13px; font-weight: 600; line-height: 1; }
+    .best14-rating-detail { font-size: 9px; font-weight: 500; line-height: 1.2; opacity: 0.82; white-space: nowrap; }
+    .best14-rating.great { color: var(--quality-great-fg); background: var(--quality-great-bg); }
+    .best14-rating.good { color: var(--quality-good-fg); background: var(--quality-good-bg); }
+    .best14-rating.fine { color: var(--quality-fine-fg); background: var(--quality-fine-bg); }
+    .best14-rating.questionable { color: var(--quality-questionable-fg); background: var(--quality-questionable-bg); }
+    .best14-rating.bad { color: var(--quality-bad-fg); background: var(--quality-bad-bg); }
+    .best14-rating.insufficient { color: var(--muted); border-color: var(--border); background: var(--panel2); box-shadow: none; }
+    .best14-potential {
+      width: fit-content;
+      padding: 3px 7px;
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+      border-radius: 6px;
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 8%, transparent);
+      font: 500 10px/1.35 var(--mono);
+    }
+    .best14-potential.great, .best14-potential.good, .best14-potential.fine { color: var(--quality-potential-fg); border-color: var(--quality-potential-border); background: var(--quality-potential-bg); }
     .health-strip { display: flex; align-items: end; gap: 2px; height: 20px; margin-top: 5px; }
     .health-strip-cell { flex: 1 1 0; min-width: 3px; max-width: 12px; height: 100%; display: flex; align-items: end; border-radius: 2px; background: color-mix(in srgb, var(--muted) 12%, transparent); overflow: hidden; }
     .health-strip-cell[data-health-tooltip] { cursor: help; }
@@ -437,13 +491,17 @@
     .score-grade-key dt { display: flex; align-items: flex-start; gap: 7px; color: var(--text); font-weight: 600; }
     .score-grade-key dd { color: var(--muted); }
     .score-grade-swatch { flex: 0 0 auto; display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 5px; color: #fff; font: 600 10px/1 var(--mono); }
-    .score-grade-swatch.a { background: #15803d; }
-    .score-grade-swatch.b { background: #16a34a; }
+    .score-grade-swatch.a { background: #14532d; }
+    .score-grade-swatch.b { background: #15803d; }
     .score-grade-swatch.c { background: #4ade80; color: #052e16; }
     .score-grade-swatch.d { background: #eab308; color: #422006; }
-    .score-grade-swatch.e { background: #f97316; }
+    .score-grade-swatch.e { background: #c2410c; }
     .score-grade-swatch.f { background: #b91c1c; }
     .score-grade-swatch.unknown { background: var(--muted); color: var(--bg); }
+    .score-tier-key { display: flex; flex-wrap: wrap; gap: 8px; margin: 9px 0 10px; }
+    .score-tier-key .best14-rating { min-height: 30px; padding: 6px 8px; cursor: default; box-shadow: none; }
+    .recording-quality-detail { display: grid; gap: 14px; }
+    .recording-quality-detail .quality-daily { padding-top: 12px; }
     .score-filter-result { min-height: 20px; margin: 0 0 10px; color: var(--muted); font-size: 12px; }
     .page-loading { display: flex; align-items: center; gap: 10px; min-height: 68px; color: var(--muted); }
     .loading-spinner { flex: 0 0 auto; width: 18px; height: 18px; border: 2px solid color-mix(in srgb, var(--accent) 24%, var(--border)); border-top-color: var(--accent); border-radius: 50%; animation: loading-spin 700ms linear infinite; }
@@ -542,7 +600,7 @@
       .recordings-table td:nth-child(2), .recordings-table td:nth-child(3), .recordings-table td:nth-child(4), .recordings-table td:nth-child(9) { grid-column: 1 / -1; }
       .recordings-table td:nth-child(2)::before { content: "Recording"; }
       .recordings-table td:nth-child(3)::before { content: "Status / Last 12 hours"; }
-      .recordings-table td:nth-child(4)::before { content: "Timeline health"; }
+      .recordings-table td:nth-child(4)::before { content: "Recording quality"; }
       .recordings-table td:nth-child(5)::before { content: "Joined"; }
       .recordings-table td:nth-child(6)::before { content: "Schedule"; }
       .recordings-table td:nth-child(7)::before { content: "Clip / Capture"; }
@@ -706,6 +764,11 @@
               <dt><span class="score-grade-swatch unknown">?</span>Not measured</dt><dd>The day is still pending, or its timeline metrics are missing, stale, or inconsistent.</dd>
             </dl>
             <h3>The best rolling 14-day score</h3>
+            <div class="score-tier-key" aria-label="Completed 14-day score tiers">
+              <span class="best14-rating great"><span class="best14-rating-name">Great+</span></span>
+              <span class="best14-rating good"><span class="best14-rating-name">Good+</span></span>
+              <span class="best14-rating fine"><span class="best14-rating-name">Fine+</span></span>
+            </div>
             <p>Completed tiers require 14 consecutive scored recording days. A skipped, unmeasured, or missing calendar day breaks the run. Great+ contains only A, B, and C days. Good+ has no F days and at most two E days; D days are allowed. Fine+ has no F days. The + filters include every better completed tier.</p>
             <p>Questionable has one F day. Bad has more than one F day. When several 14-day windows exist, Stoarama chooses the one with the fewest F days, then the fewest E, D, and C days.</p>
             <h3>What "potential" means</h3>
@@ -3404,13 +3467,16 @@
 	    ? Number(timeline.lifetime_coverage_pct) : null;
 	  const stitchLabels = { continuous: 'continuous timeline · native layout compatible', gapped: 'gapped timeline', overlap: 'overlapping timeline', layout_changed: 'native layout changed', unknown: 'not checked yet' };
 	  const timelineHealthHTML = timeline
-	    ? `${best14RatingHTML(best14)}<div class="capture-health ${escapeHTML(timelineGrade)}">${recentCoverage == null ? 'Awaiting a completed window' : `${recentCoverage.toFixed(2)}% recent coverage`}</div>
+	    ? `<div class="recording-quality">
+	       <div class="quality-section-label">Best 14-day score</div>
+	       ${best14RatingHTML(best14)}
+	       <div class="capture-health ${escapeHTML(timelineGrade)}">${recentCoverage == null ? 'Awaiting a completed window' : `${recentCoverage.toFixed(2)}% recent coverage`}</div>
 	       <div class="cell-sub">${escapeHTML(stitchLabels[String(timeline.stitchability || 'unknown')] || String(timeline.stitchability || 'unknown'))} · ${escapeHTML(String(timeline.diagnosis || ''))}</div>
 	       ${recentCoverage == null ? '' : `<div class="cell-sub">Largest gap ${escapeHTML(formatDuration(Number(timeline.recent_largest_gap_seconds || 0) * 1000))} · overlaps ${Number(timeline.recent_overlap_count || 0)} · layout changes ${Number(timeline.recent_layout_change_count || 0)}</div>`}
 	       ${lifetimeCoverage == null ? '' : `<div class="cell-sub">Whole period ${lifetimeCoverage.toFixed(2)}% · ${Number(timeline.lifetime_window_count || 0)} completed window(s)${timeline.lifetime_complete === true ? '' : ' · historical check in progress'}</div>`}
-	       ${dailyGradesHTML(timeline.daily_grades, timezone)}
-	       `
-	    : '';
+	       <div class="quality-daily"><div class="quality-section-label">Daily grades</div>${dailyGradesHTML(timeline.daily_grades, timezone)}</div>
+	       </div>`
+	    : `<div class="recording-quality"><div class="quality-section-label">Best 14-day score</div>${best14RatingHTML(null)}<div class="capture-health unavailable">Timeline check pending</div></div>`;
 	  const captureHealthHTML = captureHealth === 'unavailable'
 	      ? `<div class="capture-health unavailable">Capture health unavailable</div><div class="cell-sub">${lastHTML}</div>`
 	    : healthBins.length
@@ -3483,27 +3549,76 @@
       }).join('')}</div>`;
     }
 
+    /** Map the API's detailed rating to the completed tier shown to users. */
+    function best14TierLabel(rating) {
+      if (rating === 'GREAT') return 'Great+';
+      if (rating === 'VERY_GOOD' || rating === 'GOOD') return 'Good+';
+      if (rating === 'FINE') return 'Fine+';
+      if (rating === 'QUESTIONABLE') return 'Questionable';
+      if (rating === 'BAD') return 'Bad';
+      return 'Insufficient';
+    }
+
+    /** Map the API's detailed rating to its accessible visual treatment. */
+    function best14TierClass(rating) {
+      if (rating === 'GREAT') return 'great';
+      if (rating === 'VERY_GOOD' || rating === 'GOOD') return 'good';
+      if (rating === 'FINE') return 'fine';
+      if (rating === 'QUESTIONABLE') return 'questionable';
+      if (rating === 'BAD') return 'bad';
+      return 'insufficient';
+    }
+
+    /** Explain the rule met by a completed 14-day rating. */
+    function best14RuleText(rating) {
+      if (rating === 'GREAT') return 'Only A, B, and C days.';
+      if (rating === 'VERY_GOOD') return 'No F or E days. D days are allowed.';
+      if (rating === 'GOOD') return 'No F days and at most two E days. D days are allowed.';
+      if (rating === 'FINE') return 'No F days.';
+      if (rating === 'QUESTIONABLE') return 'The window has one F day.';
+      if (rating === 'BAD') return 'The window has more than one F day.';
+      return '';
+    }
+
     function best14RatingHTML(value) {
-      if (!value) return '';
+      if (!value) {
+        const pending = '14-day score pending. Daily badges grade individual recording days.';
+        return `<span class="best14-rating insufficient" data-health-tooltip="${escapeHTML(pending)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(pending)}"><span class="best14-rating-name">Pending</span><span class="best14-rating-detail">14-day score</span></span>`;
+      }
       const rating = String(value.rating || 'INSUFFICIENT').toUpperCase();
       const qualifier = String(value.qualifier || '').toUpperCase();
       const completed = Number(value.completed_days || 0);
-      const labels = { GREAT: 'Great', VERY_GOOD: 'Very good', GOOD: 'Good', FINE: 'Fine', QUESTIONABLE: 'Questionable', BAD: 'Bad', UNKNOWN: 'Unknown' };
-      let text = labels[rating] || 'Insufficient';
-      if (rating === 'INSUFFICIENT') {
-        if (qualifier.endsWith('_POTENTIAL')) text += ` · ${labels[qualifier.slice(0, -10)] || 'Unknown'} potential (${completed}/14)`;
-        else text += qualifier === 'SHORT_RUNWAY' ? ` · short runway (${completed}/14)` : ` · ended (${completed}/14)`;
-      }
+      const label = best14TierLabel(rating);
+      const tierClass = best14TierClass(rating);
+      const detail = rating === 'INSUFFICIENT' ? `${completed}/14 days` : '14-day score';
+      const baseRule = 'Completed scores use 14 consecutive scored recording days; a missing or unmeasured day breaks the run.';
+      let tooltip = `${label} 14-day score. ${baseRule}`;
+      if (rating === 'INSUFFICIENT') tooltip = `Insufficient: ${completed}/14 consecutive scored days.`;
+      else tooltip += ` ${best14RuleText(rating)}`;
+      tooltip += ' Daily badges grade individual recording days.';
       const potential = String(value.potential_rating || '').toUpperCase();
       const potentialKind = String(value.potential_kind || '').toUpperCase();
       const potentialDays = Number(value.potential_days || 0);
       let potentialHTML = '';
-      if (rating !== 'INSUFFICIENT' && potential && potentialKind === 'FUTURE_ROLL_OFF') {
+      if (rating === 'INSUFFICIENT' && qualifier === 'UNKNOWN_POTENTIAL') {
+        const pendingText = 'Awaiting scored days';
+        const pendingTooltip = 'Awaiting the first scored recording day. This is not a completed score or a potential tier yet.';
+        potentialHTML = `<div class="best14-potential" data-health-tooltip="${escapeHTML(pendingTooltip)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(pendingTooltip)}">${escapeHTML(pendingText)}</div>`;
+      } else if (rating === 'INSUFFICIENT' && qualifier.endsWith('_POTENTIAL')) {
+        const potentialRating = qualifier.slice(0, -10);
+        const potentialText = `${best14TierLabel(potentialRating)} potential · ${completed}/14 days`;
+        const potentialTooltip = `${potentialText}. Potential is not a completed score.`;
+        potentialHTML = `<div class="best14-potential ${best14TierClass(potentialRating)}" data-health-tooltip="${escapeHTML(potentialTooltip)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(potentialTooltip)}">${escapeHTML(potentialText)}</div>`;
+      } else if (rating === 'INSUFFICIENT') {
+        const stateText = qualifier === 'SHORT_RUNWAY' ? 'Short runway' : (qualifier === 'ENDED' ? 'Ended without a completed tier' : 'Pending');
+        potentialHTML = `<div class="best14-potential" aria-label="${escapeHTML(stateText)}">${escapeHTML(stateText)}</div>`;
+      } else if (potential && potentialKind === 'FUTURE_ROLL_OFF') {
         const dayLabel = potentialDays === 1 ? 'day' : 'days';
-        const potentialText = `${labels[potential] || potential} potential in ${potentialDays} clean ${dayLabel}`;
-        potentialHTML = `<div class="best14-potential" aria-label="${escapeHTML(potentialText)}">${escapeHTML(potentialText)}</div>`;
+        const potentialText = `${best14TierLabel(potential)} potential in ${potentialDays} clean ${dayLabel}`;
+        const potentialTooltip = `${potentialText}. Potential is not a completed score.`;
+        potentialHTML = `<div class="best14-potential ${best14TierClass(potential)}" data-health-tooltip="${escapeHTML(potentialTooltip)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(potentialTooltip)}">${escapeHTML(potentialText)}</div>`;
       }
-      return `<div class="best14-rating ${rating.toLowerCase()}" aria-label="Best 14-day rating: ${escapeHTML(text)}">${escapeHTML(text)}</div>${potentialHTML}`;
+      return `<span class="best14-rating ${tierClass}" data-health-tooltip="${escapeHTML(tooltip)}" tabindex="0" aria-describedby="healthTooltip" aria-label="${escapeHTML(tooltip)}"><span class="best14-rating-name">${escapeHTML(label)}</span><span class="best14-rating-detail">${escapeHTML(detail)}</span></span>${potentialHTML}`;
     }
 
     const BEST14_COMPLETED_SORT_RANK = { GREAT: 0, VERY_GOOD: 1, GOOD: 1, FINE: 2, QUESTIONABLE: 3, BAD: 4 };
@@ -3521,13 +3636,17 @@
 
     function dailyGradesCardHTML(rec) {
       const timeline = rec.timeline_health && typeof rec.timeline_health === 'object' ? rec.timeline_health : null;
-      return `<div class="detail-card"><div class="detail-card-head"><span class="detail-card-title">Daily recording grades</span></div>
-        <div class="hint">A–C good · D degraded · E poor · F no usable media · ? not yet measurable</div>
-        ${dailyGradesHTML(timeline && timeline.daily_grades, String(rec.cron_timezone || 'UTC'))}</div>`;
+      const best14 = timeline && timeline.best_14_rating && typeof timeline.best_14_rating === 'object' ? timeline.best_14_rating : null;
+      return `<div class="detail-card"><div class="detail-card-head"><span class="detail-card-title">Recording quality</span></div>
+        <div class="recording-quality-detail">
+          <div><div class="quality-section-label" style="margin-bottom:6px;">Best 14-day score</div>${best14RatingHTML(best14)}</div>
+          <div class="quality-daily"><div class="quality-section-label">Daily grades</div><div class="hint" style="margin-top:0;">A–C good · D degraded · E poor · F no usable media · ? not yet measurable</div>
+          ${dailyGradesHTML(timeline && timeline.daily_grades, String(rec.cron_timezone || 'UTC'))}</div>
+        </div></div>`;
     }
 
     function recordingsTableHTML(rows) {
-      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th>${sharedReadOnly ? '' : '<input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span>'}</th><th>Recording</th><th>Status / Last 12 hours</th><th>Timeline health</th><th>Joined</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
+      return `<div class="recordings-table-wrap"><table class="recordings-table"><thead><tr><th>${sharedReadOnly ? '' : '<input type="checkbox" data-selectvisible aria-label="Select visible recordings"><span class="select-visible-label">Select visible</span>'}</th><th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th><th>Joined</th><th>Schedule</th><th>Clip / Capture</th><th>Storage</th><th>Actions</th></tr></thead>${rows}</table></div>`;
     }
 
     // Update the status-filter chips: keep each chip's label with a live count and
