@@ -55,6 +55,12 @@ type recordingUploadIntentReconcilePlan struct {
 	Candidates    []recordingUploadIntentReconcileCandidate `json:"candidates"`
 }
 
+type recordingUploadIntentJobFence struct {
+	RecordingID int64
+	Status      string
+	Attempt     int
+}
+
 func normalizeRecordingIDs(ids []int64) ([]int64, error) {
 	if len(ids) == 0 || len(ids) > 50 {
 		return nil, errors.New("recording_ids must contain 1 to 50 ids")
@@ -126,43 +132,91 @@ func (s *Server) handleAdminRecordingUploadIntentReconcile(w http.ResponseWriter
 		util.WriteError(w, http.StatusInternalServerError, "bound recording upload-intent reconciliation")
 		return
 	}
-	rows, err := tx.Query(r.Context(), `
-		SELECT ui.id::text,ui.recording_id,ui.recording_job_id,ui.expires_at,
-		       j.status,j.attempt_count
-		FROM recording_upload_intents ui
-		JOIN recording_jobs j ON j.id=ui.recording_job_id
-		JOIN recordings rec ON rec.id=ui.recording_id AND rec.id=j.recording_id
+	// Lock the bounded account-scoped job set first. The upload-intent ledger has
+	// an index on recording_job_id but no recording_id/expiry index, so beginning
+	// with that ledger can degrade into a fleet-wide scan. Splitting the lock and
+	// lookup retains the same generation fence while forcing the second query
+	// through the existing per-job index.
+	jobRows, err := tx.Query(r.Context(), `
+		SELECT j.id,j.recording_id,j.status,j.attempt_count
+		FROM recording_jobs j
+		JOIN recordings rec ON rec.id=j.recording_id
 		WHERE rec.account_id=$1
-		  AND ui.recording_id=ANY($2::bigint[])
-		  AND ui.status='pending'
-		  AND ui.expires_at<=$3
-		  AND ui.expires_at<=now()-$4::interval
+		  AND j.recording_id=ANY($2::bigint[])
 		  AND NOT (j.status='leased' AND j.lease_expires_at>now())
-		ORDER BY ui.recording_id,ui.recording_job_id,ui.expires_at,ui.id
-		FOR UPDATE OF ui,j
-	`, req.AccountID, ids, cutoff, recordingUploadIntentReconcileSafetyMargin.String())
+		ORDER BY j.id
+		FOR UPDATE OF j
+	`, req.AccountID, ids)
 	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "load expired recording upload intents")
+		log.Printf("recording upload-intent reconciliation lock jobs account=%d err=%v", req.AccountID, err)
+		util.WriteError(w, http.StatusInternalServerError, "lock recording upload-intent jobs")
 		return
 	}
-	candidates := make([]recordingUploadIntentReconcileCandidate, 0)
-	for rows.Next() {
-		var candidate recordingUploadIntentReconcileCandidate
-		if err = rows.Scan(&candidate.IntentID, &candidate.RecordingID, &candidate.JobID,
-			&candidate.ExpiresAt, &candidate.JobStatus, &candidate.JobAttempt); err != nil {
-			rows.Close()
-			util.WriteError(w, http.StatusInternalServerError, "scan expired recording upload intents")
+	jobIDs := make([]int64, 0)
+	jobFences := make(map[int64]recordingUploadIntentJobFence)
+	for jobRows.Next() {
+		var jobID int64
+		var fence recordingUploadIntentJobFence
+		if err = jobRows.Scan(&jobID, &fence.RecordingID, &fence.Status, &fence.Attempt); err != nil {
+			jobRows.Close()
+			util.WriteError(w, http.StatusInternalServerError, "scan recording upload-intent jobs")
 			return
 		}
-		candidate.ExpiresAt = candidate.ExpiresAt.UTC()
-		candidates = append(candidates, candidate)
+		jobIDs = append(jobIDs, jobID)
+		jobFences[jobID] = fence
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		util.WriteError(w, http.StatusInternalServerError, "iterate expired recording upload intents")
+	if err = jobRows.Err(); err != nil {
+		jobRows.Close()
+		log.Printf("recording upload-intent reconciliation iterate jobs account=%d err=%v", req.AccountID, err)
+		util.WriteError(w, http.StatusInternalServerError, "iterate recording upload-intent jobs")
 		return
 	}
-	rows.Close()
+	jobRows.Close()
+
+	candidates := make([]recordingUploadIntentReconcileCandidate, 0)
+	if len(jobIDs) > 0 {
+		rows, queryErr := tx.Query(r.Context(), `
+			SELECT ui.id::text,ui.recording_id,ui.recording_job_id,ui.expires_at
+			FROM recording_upload_intents ui
+			WHERE ui.recording_job_id=ANY($1::bigint[])
+			  AND ui.status='pending'
+			  AND ui.expires_at<=$2
+			  AND ui.expires_at<=now()-$3::interval
+			ORDER BY ui.recording_id,ui.recording_job_id,ui.expires_at,ui.id
+			FOR UPDATE OF ui
+		`, jobIDs, cutoff, recordingUploadIntentReconcileSafetyMargin.String())
+		if queryErr != nil {
+			log.Printf("recording upload-intent reconciliation load intents account=%d jobs=%d err=%v", req.AccountID, len(jobIDs), queryErr)
+			util.WriteError(w, http.StatusInternalServerError, "load expired recording upload intents")
+			return
+		}
+		for rows.Next() {
+			var candidate recordingUploadIntentReconcileCandidate
+			if err = rows.Scan(&candidate.IntentID, &candidate.RecordingID, &candidate.JobID,
+				&candidate.ExpiresAt); err != nil {
+				rows.Close()
+				util.WriteError(w, http.StatusInternalServerError, "scan expired recording upload intents")
+				return
+			}
+			fence, ok := jobFences[candidate.JobID]
+			if !ok || fence.RecordingID != candidate.RecordingID {
+				rows.Close()
+				util.WriteError(w, http.StatusConflict, "recording upload-intent ownership changed")
+				return
+			}
+			candidate.JobStatus = fence.Status
+			candidate.JobAttempt = fence.Attempt
+			candidate.ExpiresAt = candidate.ExpiresAt.UTC()
+			candidates = append(candidates, candidate)
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			log.Printf("recording upload-intent reconciliation iterate intents account=%d jobs=%d err=%v", req.AccountID, len(jobIDs), err)
+			util.WriteError(w, http.StatusInternalServerError, "iterate expired recording upload intents")
+			return
+		}
+		rows.Close()
+	}
 	plan := recordingUploadIntentReconcilePlan{Version: 1, AccountID: req.AccountID, RecordingIDs: ids, ExpiresBefore: cutoff, Candidates: candidates}
 	planSHA, err := recordingUploadIntentPlanSHA(plan)
 	if err != nil {
