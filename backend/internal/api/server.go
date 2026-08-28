@@ -304,6 +304,8 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Get("/recordings/{id}/capture-health", s.handleAccountRecordingCaptureHealth)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
+			account.Get("/recordings/{id}/joined", s.handleAccountRecordingJoinedList)
+			account.Get("/recordings/{id}/joined/{joinedId}/download", s.handleAccountRecordingJoinedDownload)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
 			account.Get("/recordings/{id}/stitch-certification", s.handleAccountNativeStitchGet)
 			account.Get("/recordings/{id}/clips/{clipId}/download", s.handleAccountRecordingClipDownload)

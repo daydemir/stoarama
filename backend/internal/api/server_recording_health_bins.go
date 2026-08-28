@@ -17,11 +17,13 @@ const (
 )
 
 type recordingHealthBin struct {
-	Start    time.Time                   `json:"start"`
-	End      time.Time                   `json:"end"`
-	Captured int64                       `json:"captured"`
-	Expected int64                       `json:"expected"`
-	Health   recordingCaptureHealthState `json:"health"`
+	Start            time.Time                   `json:"start"`
+	End              time.Time                   `json:"end"`
+	Captured         int64                       `json:"captured"`
+	Expected         int64                       `json:"expected"`
+	Health           recordingCaptureHealthState `json:"health"`
+	JoinedReadyMS    int64                       `json:"joined_ready_ms"`
+	SourceDurationMS int64                       `json:"source_duration_ms"`
 }
 
 type recordingHealthSpec struct {

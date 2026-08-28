@@ -659,3 +659,15 @@ func TestHandleKoreaAppDefaultsToCaptureTypes(t *testing.T) {
 		t.Fatalf("location should not include legacy recordable param: %q", location)
 	}
 }
+
+func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"health-joined-marker", "Joined: ${joinedPercent}%", "source_duration_ms", "joined_ready_ms", "<svg viewBox=\"0 0 10 10\""} {
+		if !strings.Contains(string(body), marker) {
+			t.Fatalf("recordings html missing joined-progress marker %q", marker)
+		}
+	}
+}

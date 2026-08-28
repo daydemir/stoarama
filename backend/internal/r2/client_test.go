@@ -32,6 +32,27 @@ func TestPresignGetExactBindsConditionalGenerationIdentity(t *testing.T) {
 	}
 }
 
+func TestPresignGetVersionIsBrowserOpenableAndGenerationBound(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := client.PresignGetVersion(context.Background(), "clip.mp4", "version-7", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustURL(t, raw)
+	if u.Query().Get("versionId") != "version-7" {
+		t.Fatalf("versionId=%q", u.Query().Get("versionId"))
+	}
+	if strings.Contains(u.Query().Get("X-Amz-SignedHeaders"), "if-match") {
+		t.Fatalf("browser capability unexpectedly requires If-Match: %q", u.Query().Get("X-Amz-SignedHeaders"))
+	}
+	if _, err := client.PresignGetVersion(context.Background(), "clip.mp4", "", time.Minute); err == nil {
+		t.Fatal("missing version id was accepted")
+	}
+}
+
 func TestPresignedExactCapabilitiesBindMethodAuthorityKeyAndHeaders(t *testing.T) {
 	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
 	if err != nil {
