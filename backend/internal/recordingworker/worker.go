@@ -104,7 +104,6 @@ type Worker struct {
 	frozenHLSSafetyInterval time.Duration
 	frozenHLSWait           func(context.Context, time.Duration) error
 	frozenHLSProofSpan      func(time.Duration) time.Duration
-	resolveCaptureInput     continuousResolveFunc
 	continuousCapture       continuousCaptureFunc
 }
 
@@ -172,7 +171,6 @@ func NewWorker(cfg Config) (*Worker, error) {
 		frozenHLSPollMax:        30 * time.Second,
 		frozenHLSForceCapture:   frozenHLSForcedCaptureMax,
 		frozenHLSSafetyInterval: time.Second,
-		resolveCaptureInput:     capture.ResolveCaptureInputWithHeaders,
 	}, nil
 }
 
@@ -619,12 +617,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	failures := 0
 	var frozenHLSState frozenHLSJobState
 	var mediaLagFence continuousMediaLagFence
-	resolveCaptureInput := w.resolveCaptureInput
-	if resolveCaptureInput == nil {
-		resolveCaptureInput = capture.ResolveCaptureInputWithHeaders
-	}
-	var preparedInput *continuousResolvedInput
-	prefetchEnabled := false
 	backoff := func(delay time.Duration) {
 		select {
 		case <-windowCtx.Done():
@@ -636,38 +628,27 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			break
 		}
 
-		var resolved, inputHeaders string
-		var isImage bool
-		var currentResolvedAt time.Time
-		if preparedInput != nil {
-			resolved, isImage, inputHeaders, currentResolvedAt = preparedInput.url, preparedInput.isImage, preparedInput.headers, preparedInput.completedAt
-			preparedInput = nil
-			w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_prefetched_source")
-		} else {
-			// Resolve a fresh source on every ordinary reconnect. After one typed
-			// Googlevideo expiry proves the affected path, the next distinct resolve
-			// may already be prepared in parallel with capture.
-			w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_resolving")
-			resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
-			var err error
-			resolved, isImage, inputHeaders, err = resolveCaptureInput(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
-			resolveCancel()
-			currentResolvedAt = time.Now()
-			if err != nil {
-				if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
-					break
-				}
-				w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
-				failures++
-				delay := w.nextReconnectDelay(job.JobID, failures)
-				log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
-					job.JobID, job.RecordingID, attempt, err, delay)
-				if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
-					return
-				}
-				backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
-				continue
+		// Re-resolve EVERY attempt so expiring tokens are refreshed on reconnect.
+		// A transient resolve error backs off and retries rather than failing the
+		// job mid-window.
+		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_resolving")
+		resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
+		resolved, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
+		resolveCancel()
+		if err != nil {
+			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+				break
 			}
+			w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
+			failures++
+			delay := w.nextReconnectDelay(job.JobID, failures)
+			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
+				job.JobID, job.RecordingID, attempt, err, delay)
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
+				return
+			}
+			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+			continue
 		}
 		if isImage {
 			err := fmt.Errorf("image sources are not supported by the recorder")
@@ -782,10 +763,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if captureContinuous == nil {
 			captureContinuous = continuousCaptureForJob(job)
 		}
-		var resolutionPrefetch *continuousResolutionPrefetch
-		if prefetchEnabled {
-			resolutionPrefetch = startContinuousResolutionPrefetch(windowCtx, resolveCaptureInput, job)
-		}
 		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
@@ -807,25 +784,21 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		}
 
 		if errors.Is(captureErr, errDiskPressure) {
-			resolutionPrefetch.discard()
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderDiskPressure, errDiskPressure)
 			return
 		}
 		windowClosed := continuousShouldStop(canceled(), windowCtx.Err() != nil)
 		if continuousSelfUpdateCanSurrender(w.cfg.DrainForUpdate != nil && w.cfg.DrainForUpdate.Load(), delivery.err, windowClosed) {
-			resolutionPrefetch.discard()
 			err := fmt.Errorf("relay is draining for a verified self-update")
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderSelfUpdate, err)
 			return
 		}
 		if continuousMediaLagCanSurrender(mediaLagFence.lagged(), delivery.err, windowClosed) {
-			resolutionPrefetch.discard()
 			err := fmt.Errorf("continuous media timeline drift grew by at least %s", w.cfg.ContinuousMaxMediaLag)
 			w.surrenderContinuousJobForReason(ctx, cancel, job, recordingapi.SurrenderNoProgress, err)
 			return
 		}
 		if continuousDeliveryFailureShouldFail(captureErr, windowClosed) {
-			resolutionPrefetch.discard()
 			w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", captureErr)
 			w.fail(ctx, job.JobID, job.LeaseToken, captureErr)
 			return
@@ -835,25 +808,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// no-output episode must earn a fresh three-observation classification.
 			frozenHLSState = frozenHLSJobState{}
 		}
-		if errors.Is(captureErr, capture.ErrContinuousExpiredGooglevideoFragment) && !windowClosed {
-			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), captureErr) {
-				resolutionPrefetch.discard()
-				return
-			}
-			failures = 0
-			if next, ok := resolutionPrefetch.consume(time.Now(), resolved, currentResolvedAt); ok {
-				preparedInput = &next
-				w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_prefetch_ready")
-				log.Printf("recording worker job=%d recording=%d Googlevideo fragment expired; using distinct prefetched source",
-					job.JobID, job.RecordingID)
-			} else {
-				log.Printf("recording worker job=%d recording=%d Googlevideo fragment expired; resolving fresh source",
-					job.JobID, job.RecordingID)
-			}
-			prefetchEnabled = true
-			continue
-		}
-		resolutionPrefetch.discard()
 		if frozenHLSCanObserve(windowClosed, delivery.err, segmentDeliveryPending, captureErr) {
 			ffmpegExitAt := time.Now()
 			forcedLaunchDeadline := ffmpegExitAt.Add(min(w.frozenHLSForceCapture, frozenHLSForcedCaptureMax))
@@ -938,73 +892,6 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 }
 
 type continuousCaptureFunc func(context.Context, string, time.Duration, string, *int, string, func(capture.Segment) error, string) error
-
-type continuousResolveFunc func(context.Context, string, string, string) (string, bool, string, error)
-
-const continuousResolutionPrefetchMaxAge = 90 * time.Second
-
-type continuousResolvedInput struct {
-	url         string
-	isImage     bool
-	headers     string
-	completedAt time.Time
-	err         error
-}
-
-type continuousResolutionPrefetch struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	input  continuousResolvedInput
-}
-
-func startContinuousResolutionPrefetch(parent context.Context, resolve continuousResolveFunc, job recordingapi.RecordingJob) *continuousResolutionPrefetch {
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
-	prefetch := &continuousResolutionPrefetch{cancel: cancel, done: make(chan struct{})}
-	go func() {
-		defer close(prefetch.done)
-		defer cancel()
-		prefetch.input.url, prefetch.input.isImage, prefetch.input.headers, prefetch.input.err = resolve(
-			ctx, job.StreamProvider, job.SourceURL, job.SourcePageURL,
-		)
-		prefetch.input.completedAt = time.Now()
-	}()
-	return prefetch
-}
-
-func (p *continuousResolutionPrefetch) consume(now time.Time, currentURL string, currentResolvedAt time.Time) (continuousResolvedInput, bool) {
-	if p == nil {
-		return continuousResolvedInput{}, false
-	}
-	select {
-	case <-p.done:
-	default:
-		// The speculative resolver did not finish during capture. Cancel and join it
-		// before the ordinary synchronous path starts, so one job never runs two
-		// yt-dlp processes concurrently.
-		p.cancel()
-		<-p.done
-		return continuousResolvedInput{}, false
-	}
-	p.cancel()
-	input := p.input
-	age := now.Sub(input.completedAt)
-	if input.err != nil || input.isImage || input.url == "" || input.url == currentURL ||
-		input.completedAt.Before(currentResolvedAt) || age < 0 || age > continuousResolutionPrefetchMaxAge {
-		return continuousResolvedInput{}, false
-	}
-	if _, err := netguard.ValidatePublicURL(input.url); err != nil {
-		return continuousResolvedInput{}, false
-	}
-	return input, true
-}
-
-func (p *continuousResolutionPrefetch) discard() {
-	if p == nil {
-		return
-	}
-	p.cancel()
-	<-p.done
-}
 
 func continuousCaptureForJob(job recordingapi.RecordingJob) continuousCaptureFunc {
 	if job.TimestampContractSupported {
