@@ -606,15 +606,16 @@ func TestPullJoinedConnectionIDRejectsStaleObservedProtocol(t *testing.T) {
 
 func validRemoteJoinedProtocolConfig(connectionID, generation int) config.Config {
 	return config.Config{
-		JoinedRecordingControlPlaneEnabled: true,
-		JoinedRecordingProtocolVersion:     1,
-		JoinedRecordingConnectionID:        connectionID,
-		JoinedRecordingProtocolGeneration:  generation,
-		JoinedRecordingMaxActiveTasks:      2,
-		JoinedRecordingWorkScope:           config.JoinedWorkScopeFrozenBatch,
-		JoinedRecordingBatchID:             "tier1-2026-08",
-		JoinedWorkerBootstrapToken:         "joined-bootstrap-credential-32bytes",
-		JoinedWorkerSigningKey:             "joined-signing-credential-32-bytes",
+		JoinedRecordingControlPlaneEnabled:                  true,
+		JoinedRecordingProtocolVersion:                      1,
+		JoinedRecordingConnectionID:                         connectionID,
+		JoinedRecordingProtocolGeneration:                   generation,
+		JoinedRecordingMaxActiveTasks:                       2,
+		JoinedRecordingWorkScope:                            config.JoinedWorkScopeFrozenBatch,
+		JoinedRecordingBatchID:                              "tier1-2026-08",
+		JoinedRecordingFrozenExcludedPublicationArtifactIDs: joinedFrozenPublicationDenyForTest,
+		JoinedWorkerBootstrapToken:                          "joined-bootstrap-credential-32bytes",
+		JoinedWorkerSigningKey:                              "joined-signing-credential-32-bytes",
 	}
 }
 

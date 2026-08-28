@@ -1049,6 +1049,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		beforeHours, beforeArtifacts := snapshot()
 		canaryIDs := s.cfg.JoinedRecordingCanaryHourIDs
 		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+		s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 		s.cfg.JoinedRecordingCanaryHourIDs = ""
 		defer func() {
 			s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeCanary
@@ -2126,6 +2127,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatal("source-bearing hour bypassed its worker lease")
 	}
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 	s.cfg.JoinedRecordingCanaryHourIDs = ""
 	frozenClaimToken := mintJoinedClaimForTest(t, s, batchID)
 	frozenPublicationBody, _ := json.Marshal(joinedrecording.PublicationClaimRequest{ProtocolVersion: 1,

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -139,24 +140,25 @@ type Config struct {
 	// Joined recording generation is ship-dark. The isolated worker must return
 	// before constructing any database, media, or storage client while disabled.
 	// Render instance count is the only production concurrency control.
-	JoinedRecordingControlPlaneEnabled bool
-	JoinedRecordingNASDeliveryEnabled  bool
-	JoinedRecordingEnabled             bool
-	JoinedRecordingProtocolVersion     int
-	JoinedRecordingConnectionID        int
-	JoinedRecordingProtocolGeneration  int
-	JoinedRecordingMaxActiveTasks      int
-	JoinedRecordingRollingEnabled      bool
-	JoinedRecordingWorkScope           string
-	JoinedRecordingBatchID             string
-	JoinedRecordingCanaryHourIDs       string
-	JoinedRecordingScratchRoot         string
-	JoinedRecordingStorageAuthority    string
-	JoinedRecordingFFmpegArchiveURL    string
-	JoinedRecordingFFmpegArchiveSHA256 string
-	JoinedRecordingFFmpegSHA256        string
-	JoinedRecordingFFprobeSHA256       string
-	JoinedRecordingWorkerToken         string
+	JoinedRecordingControlPlaneEnabled                  bool
+	JoinedRecordingNASDeliveryEnabled                   bool
+	JoinedRecordingEnabled                              bool
+	JoinedRecordingProtocolVersion                      int
+	JoinedRecordingConnectionID                         int
+	JoinedRecordingProtocolGeneration                   int
+	JoinedRecordingMaxActiveTasks                       int
+	JoinedRecordingRollingEnabled                       bool
+	JoinedRecordingWorkScope                            string
+	JoinedRecordingBatchID                              string
+	JoinedRecordingCanaryHourIDs                        string
+	JoinedRecordingFrozenExcludedPublicationArtifactIDs string
+	JoinedRecordingScratchRoot                          string
+	JoinedRecordingStorageAuthority                     string
+	JoinedRecordingFFmpegArchiveURL                     string
+	JoinedRecordingFFmpegArchiveSHA256                  string
+	JoinedRecordingFFmpegSHA256                         string
+	JoinedRecordingFFprobeSHA256                        string
+	JoinedRecordingWorkerToken                          string
 
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
 	// control service alongside the scheduler). Empty/disabled by default.
@@ -275,29 +277,30 @@ func Load() (Config, error) {
 		StripeGBMonthMeterID: strings.TrimSpace(os.Getenv("STRIPE_GB_MONTH_METER_ID")),
 		StripeLivemode:       boolEnv("STRIPE_LIVEMODE", false),
 
-		RecordingWorkerConcurrency:            intEnv("RECORDING_WORKER_CONCURRENCY", 1),
-		RecordingWorkerHeartbeatSec:           intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
-		RecordingWorkerPollSec:                intEnv("RECORDING_WORKER_POLL_SEC", 5),
-		RecordingFrozenHLSQuiescenceAllowlist: strEnv("RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST", ""),
-		RelayUploadWorkers:                    RelayUploadWorkersFromEnv(),
-		JoinedRecordingControlPlaneEnabled:    boolEnv("JOINED_RECORDING_CONTROL_PLANE_ENABLED", false),
-		JoinedRecordingNASDeliveryEnabled:     boolEnv("JOINED_RECORDING_NAS_DELIVERY_ENABLED", false),
-		JoinedRecordingEnabled:                boolEnv("JOINED_RECORDING_ENABLED", false),
-		JoinedRecordingProtocolVersion:        intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
-		JoinedRecordingConnectionID:           intEnv("JOINED_RECORDING_CONNECTION_ID", 0),
-		JoinedRecordingProtocolGeneration:     intEnv("JOINED_RECORDING_PROTOCOL_GENERATION", 0),
-		JoinedRecordingMaxActiveTasks:         intEnv("JOINED_RECORDING_MAX_ACTIVE_TASKS", 0),
-		JoinedRecordingRollingEnabled:         boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
-		JoinedRecordingWorkScope:              strings.TrimSpace(strEnv("STOARAMA_JOINED_WORK_SCOPE", "disabled")),
-		JoinedRecordingBatchID:                strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
-		JoinedRecordingCanaryHourIDs:          strings.TrimSpace(os.Getenv("JOINED_RECORDING_CANARY_HOUR_IDS")),
-		JoinedRecordingScratchRoot:            strEnv("JOINED_RECORDING_SCRATCH_ROOT", "/tmp/stoarama-joined"),
-		JoinedRecordingStorageAuthority:       strings.TrimSpace(os.Getenv("JOINED_RECORDING_STORAGE_AUTHORITY")),
-		JoinedRecordingFFmpegArchiveURL:       strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_URL")),
-		JoinedRecordingFFmpegArchiveSHA256:    strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256")),
-		JoinedRecordingFFmpegSHA256:           strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_BINARY_SHA256")),
-		JoinedRecordingFFprobeSHA256:          strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFPROBE_BINARY_SHA256")),
-		JoinedRecordingWorkerToken:            strings.TrimSpace(os.Getenv("STOARAMA_JOINED_WORKER_TOKEN")),
+		RecordingWorkerConcurrency:                          intEnv("RECORDING_WORKER_CONCURRENCY", 1),
+		RecordingWorkerHeartbeatSec:                         intEnv("RECORDING_WORKER_HEARTBEAT_SEC", 15),
+		RecordingWorkerPollSec:                              intEnv("RECORDING_WORKER_POLL_SEC", 5),
+		RecordingFrozenHLSQuiescenceAllowlist:               strEnv("RECORDING_FROZEN_HLS_QUIESCENCE_ALLOWLIST", ""),
+		RelayUploadWorkers:                                  RelayUploadWorkersFromEnv(),
+		JoinedRecordingControlPlaneEnabled:                  boolEnv("JOINED_RECORDING_CONTROL_PLANE_ENABLED", false),
+		JoinedRecordingNASDeliveryEnabled:                   boolEnv("JOINED_RECORDING_NAS_DELIVERY_ENABLED", false),
+		JoinedRecordingEnabled:                              boolEnv("JOINED_RECORDING_ENABLED", false),
+		JoinedRecordingProtocolVersion:                      intEnv("JOINED_RECORDING_PROTOCOL_VERSION", 0),
+		JoinedRecordingConnectionID:                         intEnv("JOINED_RECORDING_CONNECTION_ID", 0),
+		JoinedRecordingProtocolGeneration:                   intEnv("JOINED_RECORDING_PROTOCOL_GENERATION", 0),
+		JoinedRecordingMaxActiveTasks:                       intEnv("JOINED_RECORDING_MAX_ACTIVE_TASKS", 0),
+		JoinedRecordingRollingEnabled:                       boolEnv("JOINED_RECORDING_ROLLING_ENABLED", false),
+		JoinedRecordingWorkScope:                            strings.TrimSpace(strEnv("STOARAMA_JOINED_WORK_SCOPE", "disabled")),
+		JoinedRecordingBatchID:                              strings.TrimSpace(os.Getenv("JOINED_RECORDING_BATCH_ID")),
+		JoinedRecordingCanaryHourIDs:                        strings.TrimSpace(os.Getenv("JOINED_RECORDING_CANARY_HOUR_IDS")),
+		JoinedRecordingFrozenExcludedPublicationArtifactIDs: strings.TrimSpace(os.Getenv("JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS")),
+		JoinedRecordingScratchRoot:                          strEnv("JOINED_RECORDING_SCRATCH_ROOT", "/tmp/stoarama-joined"),
+		JoinedRecordingStorageAuthority:                     strings.TrimSpace(os.Getenv("JOINED_RECORDING_STORAGE_AUTHORITY")),
+		JoinedRecordingFFmpegArchiveURL:                     strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_URL")),
+		JoinedRecordingFFmpegArchiveSHA256:                  strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256")),
+		JoinedRecordingFFmpegSHA256:                         strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFMPEG_BINARY_SHA256")),
+		JoinedRecordingFFprobeSHA256:                        strings.TrimSpace(os.Getenv("JOINED_RECORDING_FFPROBE_BINARY_SHA256")),
+		JoinedRecordingWorkerToken:                          strings.TrimSpace(os.Getenv("STOARAMA_JOINED_WORKER_TOKEN")),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
@@ -452,6 +455,11 @@ func (c Config) ValidateJoined() error {
 		if c.JoinedRecordingWorkScope == JoinedWorkScopeFrozenBatch && (c.JoinedRecordingMaxActiveTasks < 1 || c.JoinedRecordingMaxActiveTasks > 64) {
 			return fmt.Errorf("JOINED_RECORDING_MAX_ACTIVE_TASKS must be between 1 and 64 for frozen-batch work")
 		}
+		if c.JoinedRecordingWorkScope == JoinedWorkScopeFrozenBatch {
+			if _, err := c.JoinedFrozenExcludedPublicationArtifactIDs(); err != nil {
+				return err
+			}
+		}
 		if c.JoinedRecordingWorkScope == JoinedWorkScopeAllowlist50 && c.JoinedRecordingMaxActiveTasks != 2 {
 			return fmt.Errorf("JOINED_RECORDING_MAX_ACTIVE_TASKS must be exactly 2 for allowlist_50 work")
 		}
@@ -460,6 +468,36 @@ func (c Config) ValidateJoined() error {
 		return fmt.Errorf("JOINED_RECORDING_NAS_DELIVERY_ENABLED requires JOINED_RECORDING_CONTROL_PLANE_ENABLED=true")
 	}
 	return nil
+}
+
+// JoinedFrozenExcludedPublicationArtifactIDs returns the exact legacy deny
+// set required before broad frozen-batch publication can start. Other scopes
+// do not use this field.
+func (c Config) JoinedFrozenExcludedPublicationArtifactIDs() ([]int64, error) {
+	if strings.TrimSpace(c.JoinedRecordingWorkScope) != JoinedWorkScopeFrozenBatch {
+		return nil, nil
+	}
+	raw := strings.TrimSpace(c.JoinedRecordingFrozenExcludedPublicationArtifactIDs)
+	items := strings.Split(raw, ",")
+	if raw == "" || len(items) != 3 {
+		return nil, fmt.Errorf("JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS must be exactly 468,469,470 for frozen-batch work")
+	}
+	ids := make([]int64, 0, len(items))
+	seen := make(map[int64]bool, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		id, err := strconv.ParseInt(item, 10, 64)
+		if err != nil || id <= 0 || seen[id] {
+			return nil, fmt.Errorf("JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS must be exactly 468,469,470 for frozen-batch work")
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []int64{468, 469, 470}) {
+		return nil, fmt.Errorf("JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS must be exactly 468,469,470 for frozen-batch work")
+	}
+	return ids, nil
 }
 
 // StripeBillingEnabled reports whether the complete billing configuration is

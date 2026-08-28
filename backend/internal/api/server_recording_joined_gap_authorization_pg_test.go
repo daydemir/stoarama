@@ -164,6 +164,7 @@ func TestJoinedLegacyGapOnlyAuthorizationFence(t *testing.T) {
 		joinedGapBootstrapNoWork(t, s, req.BatchID)
 		joinedGapPublicationClaim(t, s, req.BatchID, mintJoinedClaimForTest(t, s, req.BatchID), http.StatusNoContent)
 		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+		s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 		s.cfg.JoinedRecordingCanaryHourIDs = ""
 		frozenSHA, err := joinedFrozenScopeSHA(req.BatchID)
 		if err != nil {
@@ -182,6 +183,7 @@ func TestJoinedLegacyGapOnlyAuthorizationFence(t *testing.T) {
 
 	t.Run("operator route rejects foreign credentials and unsafe gates", func(t *testing.T) {
 		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+		s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 		authReq := joinedGapAuthorizationRequest(legacy, req.BatchID, gapHourID)
 		s.joinedOutputStorage = joinedOutputStoreStub{headErr: &smithy.GenericAPIError{Code: "NoSuchKey", Message: "missing"}}
 		for name, token := range map[string]string{
@@ -417,6 +419,7 @@ func TestJoinedLegacyGapOnlyAuthorizationFence(t *testing.T) {
 			t.Fatalf("failed seal residue state=%s artifacts=%d authorizations=%d err=%v", state, artifacts, authorizations, err)
 		}
 		s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+		s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 		s.cfg.JoinedRecordingCanaryHourIDs = ""
 	})
 

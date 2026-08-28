@@ -40,6 +40,8 @@ services:
         sync: false
       - key: JOINED_RECORDING_CANARY_HOUR_IDS
         sync: false
+      - key: JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS
+        sync: false
       - key: JOINED_RECORDING_SCRATCH_ROOT
         value: /tmp/stoarama-joined
       - key: JOINED_RECORDING_STORAGE_AUTHORITY
@@ -167,6 +169,8 @@ services:
       - key: JOINED_RECORDING_BATCH_ID
         sync: false
       - key: JOINED_RECORDING_CANARY_HOUR_IDS
+        sync: false
+      - key: JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS
         sync: false
       - key: JOINED_WORKER_BOOTSTRAP_TOKEN
         sync: false

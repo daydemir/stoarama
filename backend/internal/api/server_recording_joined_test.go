@@ -22,6 +22,8 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
+const joinedFrozenPublicationDenyForTest = "468,469,470"
+
 func joinedCanaryScopeForTest(batch string, included ...string) string {
 	hours := append([]string(nil), included...)
 	for i := 1; len(hours) < 3; i++ {
@@ -80,6 +82,7 @@ func TestJoinedBootstrapAndClaimScopeDriftFailBeforeDatabaseMutation(t *testing.
 	}
 	claim := mintJoinedClaimForTest(t, s, batchID)
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 	s.cfg.JoinedRecordingCanaryHourIDs = ""
 	s.cfg.JoinedRecordingMaxActiveTasks = 2
 	for _, tc := range []struct {
