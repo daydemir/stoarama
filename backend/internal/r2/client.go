@@ -390,6 +390,9 @@ func (c *Client) HeadExact(ctx context.Context, key, etag, versionID string) (Ob
 // race even when versioning is unavailable.
 func (c *Client) OpenExact(ctx context.Context, key, etag, versionID string) (io.ReadCloser, error) {
 	clean := cleanETag(etag)
+	if clean == "" {
+		return nil, errors.New("open exact: etag is required")
+	}
 	in := &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + clean + `"`)}
 	if strings.TrimSpace(versionID) != "" {
 		in.VersionId = aws.String(strings.TrimSpace(versionID))
@@ -397,6 +400,32 @@ func (c *Client) OpenExact(ctx context.Context, key, etag, versionID string) (io
 	out, err := c.s3.GetObject(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("open exact object %s: %w", key, err)
+	}
+	return out.Body, nil
+}
+
+// OpenExactRange returns one byte range from the exact object generation
+// observed by Head. The inclusive bounds are validated before the request.
+func (c *Client) OpenExactRange(ctx context.Context, key, etag, versionID string, start, end int64) (io.ReadCloser, error) {
+	clean := cleanETag(etag)
+	if clean == "" {
+		return nil, errors.New("open exact range: etag is required")
+	}
+	if start < 0 || end < start {
+		return nil, errors.New("open exact range: invalid byte range")
+	}
+	in := &s3.GetObjectInput{
+		Bucket:  aws.String(c.bucket),
+		Key:     aws.String(key),
+		IfMatch: aws.String(`"` + clean + `"`),
+		Range:   aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+	}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.s3.GetObject(ctx, in)
+	if err != nil {
+		return nil, fmt.Errorf("open exact object range %s: %w", key, err)
 	}
 	return out.Body, nil
 }

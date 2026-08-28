@@ -488,7 +488,14 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording timeline health: %v", err))
 		return
 	}
+	joinedProgress, err := s.recordingJoinedProgressForAccount(r.Context(), principal.AccountID, recordingIDs)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording joined progress: %v", err))
+		return
+	}
 	attachRecordingListHealth(items, captureHealthBins, timelineHealth)
+	attachRecordingJoinedProgress(items, joinedProgress)
+	sortRecordingMapsByJoinedProgress(items, joinedProgress, recordingJoinedSortDirection(r.URL.Query().Get("sort")))
 	// Fleet relay aggregate: total nodes, online nodes (heartbeat within 120s), live
 	// leases across all relay nodes, available slots across ONLINE relays, and the
 	// existing fleet_relay_warning (kept for rollout compatibility).
@@ -1372,6 +1379,12 @@ func (s *Server) handleAccountRecordingGet(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	progress, err := s.recordingJoinedProgressForAccount(r.Context(), principal.AccountID, []int64{id})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording joined progress: %v", err))
+		return
+	}
+	attachRecordingJoinedProgress([]map[string]any{item}, progress)
 	util.WriteJSON(w, http.StatusOK, item)
 }
 
@@ -1392,6 +1405,12 @@ func (s *Server) writeRecordingJSON(w http.ResponseWriter, r *http.Request, id, 
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording: %v", err))
 		return
 	}
+	progress, err := s.recordingJoinedProgressForAccount(r.Context(), accountID, []int64{id})
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load recording joined progress: %v", err))
+		return
+	}
+	attachRecordingJoinedProgress([]map[string]any{item}, progress)
 	util.WriteJSON(w, http.StatusOK, item)
 }
 

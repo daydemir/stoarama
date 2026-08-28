@@ -156,6 +156,43 @@ func TestOpenExactSendsConditionalGenerationIdentity(t *testing.T) {
 	}
 }
 
+func TestOpenExactRangeSendsConditionalGenerationAndByteRange(t *testing.T) {
+	var ifMatch, version, byteRange string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ifMatch = r.Header.Get("If-Match")
+		byteRange = r.Header.Get("Range")
+		version = r.URL.Query().Get("versionId")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "clip")
+	}))
+	defer server.Close()
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := client.OpenExactRange(context.Background(), "clip.mp4", `"abc123"`, "version-7", 10, 19)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if ifMatch != `"abc123"` || version != "version-7" || byteRange != "bytes=10-19" {
+		t.Fatalf("If-Match=%q versionId=%q Range=%q", ifMatch, version, byteRange)
+	}
+}
+
+func TestOpenExactMethodsRejectMissingIdentityAndInvalidRange(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.OpenExact(context.Background(), "clip.mp4", "", ""); err == nil {
+		t.Fatal("OpenExact allowed an empty ETag")
+	}
+	if _, err := client.OpenExactRange(context.Background(), "clip.mp4", "abc123", "", 10, 9); err == nil {
+		t.Fatal("OpenExactRange allowed an invalid range")
+	}
+}
+
 func TestPutReaderIfAbsentVerifiedCreatesAndRereadsExactObject(t *testing.T) {
 	body := []byte("joined-media")
 	sum := sha256.Sum256(body)

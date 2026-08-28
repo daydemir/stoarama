@@ -369,7 +369,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
-		`<th>Recording</th><th>Status / Last 12 hours</th><th>Timeline health</th><th>Schedule</th>`,
+		`<th>Recording</th><th>Status / Last 12 hours</th><th>Timeline health</th><th>Joined</th><th>Schedule</th>`,
 		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
 		`const captureHealthHTML = captureHealth === 'unavailable'`,

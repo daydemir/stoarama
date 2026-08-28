@@ -192,40 +192,8 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 		if err := rows.Err(); err != nil {
 			return recordingCaptureHealthPage{}, fmt.Errorf("count captured clips: %w", err)
 		}
-		progressRows, err := s.pool.Query(r.Context(), `WITH bins AS (
-			SELECT bin_start,bin_end,ordinality FROM unnest($2::timestamptz[],$3::timestamptz[]) WITH ORDINALITY b(bin_start,bin_end,ordinality)
-		), clips AS (
-			SELECT id,clip_start_at,clip_end_at FROM recording_clips WHERE recording_id=$1 AND purged_at IS NULL
-		), ready AS (
-			SELECT DISTINCT src.clip_id FROM recording_joined_sources src
-			JOIN recording_joined_media_sources ms ON ms.source_id=src.id
-			JOIN recording_joined_artifacts a ON a.id=ms.artifact_id AND a.artifact_kind='media'
-			  AND a.publication_state='published' AND a.published_at IS NOT NULL
-			JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.id=src.hour_record_id AND h.recording_id=$1 AND h.state='sealed'
-			JOIN recording_joined_artifacts manifest ON manifest.hour_record_id=h.id AND manifest.artifact_kind='hour_manifest'
-			  AND manifest.publication_state='published' AND manifest.published_at IS NOT NULL
-		)
-		SELECT b.ordinality,
-			COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000),0)::bigint,
-			COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000) FILTER (WHERE ready.clip_id IS NOT NULL),0)::bigint
-		FROM bins b LEFT JOIN clips c ON c.clip_start_at<b.bin_end AND c.clip_end_at>b.bin_start
-		LEFT JOIN ready ON ready.clip_id=c.id GROUP BY b.ordinality ORDER BY b.ordinality`, recordingID, starts, ends)
-		if err != nil {
-			return recordingCaptureHealthPage{}, fmt.Errorf("count joined source duration: %w", err)
-		}
-		defer progressRows.Close()
-		for progressRows.Next() {
-			var ordinal, sourceMS, readyMS int64
-			if err := progressRows.Scan(&ordinal, &sourceMS, &readyMS); err != nil {
-				return recordingCaptureHealthPage{}, fmt.Errorf("scan joined source duration: %w", err)
-			}
-			if ordinal < 1 || ordinal > int64(len(bins)) {
-				return recordingCaptureHealthPage{}, fmt.Errorf("joined health bin ordinal %d out of range", ordinal)
-			}
-			bins[ordinal-1].SourceDurationMS, bins[ordinal-1].JoinedReadyMS = sourceMS, readyMS
-		}
-		if err := progressRows.Err(); err != nil {
-			return recordingCaptureHealthPage{}, fmt.Errorf("count joined source duration: %w", err)
+		if err := s.populateRecordingJoinedProgressBins(r.Context(), recordingID, starts, ends, bins); err != nil {
+			return recordingCaptureHealthPage{}, err
 		}
 	}
 	for i := range bins {
