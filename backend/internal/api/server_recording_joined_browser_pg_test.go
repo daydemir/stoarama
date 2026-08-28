@@ -178,6 +178,138 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 	}
 }
 
+func TestRecordingJoinedBinProgressRejectsUnpublishedMismatchedAndPurgedSources(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	seedJoinedBrowserTestData(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips VALUES
+			(107,40,'2026-05-04 08:10:00Z','2026-05-04 08:11:00Z',NULL),
+			(108,40,'2026-05-04 08:11:00Z','2026-05-04 08:12:00Z',NULL),
+			(109,40,'2026-05-04 08:12:00Z','2026-05-04 08:13:00Z',now());
+		INSERT INTO recording_joined_hours VALUES
+			(205,1,47,40,'sealed','missing-manifest','2026-05-04',4,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z'),
+			(206,1,47,40,'sealed','unpublished-media','2026-05-04',5,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z'),
+			(207,1,47,40,'sealed','purged-source','2026-05-04',6,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z');
+		INSERT INTO recording_joined_sources VALUES
+			(407,205,1,47,40,107),(408,206,1,47,40,108),(409,207,1,47,40,109);
+		INSERT INTO recording_joined_artifacts VALUES
+			(310,205,1,47,'media',NULL,now(),'media-no-manifest','','video/mp4','missing-manifest.mp4',10,repeat('4',64),'joined/private/missing-manifest.mp4',1),
+			(311,206,1,47,'hour_manifest','published',now(),'manifest-unpublished-media','','application/json','unpublished-media.json',10,repeat('5',64),'joined/private/unpublished-media.json',1),
+			(312,206,1,47,'media',NULL,NULL,'media-unpublished','','video/mp4','unpublished-media.mp4',10,repeat('6',64),'joined/private/unpublished-media.mp4',1),
+			(313,207,1,47,'hour_manifest','published',now(),'manifest-purged','','application/json','purged.json',10,repeat('7',64),'joined/private/purged.json',1),
+			(314,207,1,47,'media',NULL,now(),'media-purged','','video/mp4','purged.mp4',10,repeat('8',64),'joined/private/purged.mp4',1);
+		INSERT INTO recording_joined_media_sources VALUES
+			(310,407,1),(312,408,1),(314,409,1),(314,407,2);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	progress, err := (&Server{pool: pool}).recordingJoinedProgressForBins(ctx, 47, []int64{40}, []time.Time{start}, []time.Time{start.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != 1 || progress[0].SourceDurationMS != 120_000 || progress[0].JoinedReadyMS != 0 {
+		t.Fatalf("joined bin=%+v want source=120000 ready=0", progress)
+	}
+}
+
+func TestRecordingJoinedBinProgressSingleHighVolumeRecordingIsBounded(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	ctx := context.Background()
+	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0149_joined_recording_browser_indexes.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE INDEX idx_recording_clips_recording_started ON recording_clips(recording_id,clip_start_at DESC);
+		INSERT INTO recordings(id,account_id,status) VALUES (70,47,'completed');
+		INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at)
+		SELECT 2000000+value,70,'2026-05-01 00:00:00Z'::timestamptz+value*interval '2 minutes','2026-05-01 00:00:00Z'::timestamptz+value*interval '2 minutes'+interval '1 minute'
+		FROM generate_series(1,15000) value;
+		INSERT INTO recording_joined_hours VALUES
+			(270,7,47,70,'sealed','eligible','2026-05-21',1,'2026-05-20 00:00:00Z','2026-05-22 00:00:00Z'),
+			(271,7,47,70,'pending','historical','2026-05-01',2,'2026-05-01 00:00:00Z','2026-05-20 00:00:00Z');
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id)
+		SELECT 3000000+value,CASE WHEN value>14400 THEN 270 ELSE 271 END,7,47,70,2000000+value
+		FROM generate_series(1,15000) value;
+		INSERT INTO recording_joined_artifacts VALUES
+			(370,270,7,47,'hour_manifest','published',now(),'manifest-70','','application/json','manifest.json',10,repeat('a',64),'joined/70/manifest.json',1),
+			(371,270,7,47,'media',NULL,now(),'media-70','','video/mp4','media.mp4',10,repeat('b',64),'joined/70/media.mp4',1);
+		INSERT INTO recording_joined_media_sources(artifact_id,source_id,ordinal)
+		SELECT 371,3000000+value,value-14400 FROM generate_series(14401,15000) value;
+		ANALYZE recordings; ANALYZE recording_clips; ANALYZE recording_joined_hours;
+		ANALYZE recording_joined_sources; ANALYZE recording_joined_artifacts; ANALYZE recording_joined_media_sources;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	windowEnd := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC).Add(15001 * 2 * time.Minute)
+	starts, ends, recordingIDs := make([]time.Time, 12), make([]time.Time, 12), make([]int64, 12)
+	for i := range starts {
+		starts[i] = windowEnd.Add(time.Duration(i-12) * 2 * time.Hour)
+		ends[i] = starts[i].Add(2 * time.Hour)
+		recordingIDs[i] = 70
+	}
+	started := time.Now()
+	progress, err := (&Server{pool: pool}).recordingJoinedProgressForBins(ctx, 47, recordingIDs, starts, ends)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sourceMS, readyMS int64
+	for _, bin := range progress {
+		sourceMS += bin.SourceDurationMS
+		readyMS += bin.JoinedReadyMS
+	}
+	if sourceMS != 43_200_000 || readyMS != 36_000_000 {
+		t.Fatalf("source_ms=%d ready_ms=%d want 43200000/36000000", sourceMS, readyMS)
+	}
+	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING OFF,FORMAT JSON) "+recordingJoinedProgressBinsSQL, recordingIDs, starts, ends, int64(47))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var raw []byte
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("joined-bin plan returned no rows")
+	}
+	if err := rows.Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var document []map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	visits := joinedBinPlanRelationVisits(document[0]["Plan"].(map[string]any), "recording_clips")
+	t.Logf("single-recording joined bins elapsed=%s recording_clips_visits=%d", time.Since(started), visits)
+	if visits > 17_000 {
+		t.Fatalf("single-recording joined bins visited %d recording_clips rows; want one bounded historical pass", visits)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("single-recording joined bins took %s", elapsed)
+	}
+}
+
+func joinedBinPlanRelationVisits(plan map[string]any, relation string) int64 {
+	var total float64
+	if plan["Relation Name"] == relation {
+		rows, _ := plan["Actual Rows"].(float64)
+		loops, _ := plan["Actual Loops"].(float64)
+		removed, _ := plan["Rows Removed by Filter"].(float64)
+		total += (rows + removed) * loops
+	}
+	children, _ := plan["Plans"].([]any)
+	for _, child := range children {
+		total += float64(joinedBinPlanRelationVisits(child.(map[string]any), relation))
+	}
+	return int64(total)
+}
+
 func TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation(t *testing.T) {
 	pool := joinedBrowserTestPool(t)
 	seedJoinedBrowserTestData(t, pool)

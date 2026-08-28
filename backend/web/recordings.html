@@ -1388,7 +1388,10 @@
     }
 
     // Mutable view state.
-    const RECORDING_ENRICHMENT_BATCH_SIZE = 12;
+    // High-volume completed recordings can have more than 10,000 source clips.
+    // One recording per request keeps each exact interval query inside its fixed
+    // deadline and prevents a large cohort from occupying both metric work slots.
+    const RECORDING_ENRICHMENT_BATCH_SIZE = 1;
     const state = {
       account: null,
       billingEnabled: true,
