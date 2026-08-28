@@ -81,6 +81,17 @@ func requestedRecordingMetricID(r *http.Request) (int64, error) {
 	return id, nil
 }
 
+func requestedRecordingTimelineOnly(r *http.Request) (bool, error) {
+	values, ok := r.URL.Query()["timeline_only"]
+	if !ok {
+		return false, nil
+	}
+	if len(values) != 1 || strings.TrimSpace(values[0]) != "1" {
+		return false, errors.New("timeline_only must equal 1")
+	}
+	return true, nil
+}
+
 func requestedRecordingEnrichmentIDs(r *http.Request) ([]int64, error) {
 	raw := strings.TrimSpace(r.URL.Query().Get("recording_ids"))
 	if raw == "" {
@@ -325,8 +336,17 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	timelineOnly, err := requestedRecordingTimelineOnly(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if recordingID > 0 && len(selectedIDs) > 0 {
 		util.WriteError(w, http.StatusBadRequest, "recording_id and recording_ids cannot be combined")
+		return
+	}
+	if timelineOnly && recordingID <= 0 {
+		util.WriteError(w, http.StatusBadRequest, "timeline_only requires recording_id")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), recordingListEnrichmentTimeout)
@@ -341,8 +361,16 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		writeRecordingMetricError(w, err, "load recording metrics")
 		return
 	}
-	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: recordingMetricScopeSignature(ids)}
+	scope := recordingMetricScopeSignature(ids)
+	if timelineOnly {
+		scope = "timeline|" + scope
+	}
+	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: scope}
 	result, err := loadRecordingMetricCached(ctx, &s.recordingEnrichmentCache, key, recordingListEnrichmentTimeout, recordingEnrichmentCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingListEnrichmentResult, error) {
+		if timelineOnly {
+			timeline, loadErr := s.recordingTimelineHealthForAccount(loadCtx, accountID, ids)
+			return recordingListEnrichmentResult{Bins: map[int64][]recordingHealthBin{}, Timeline: timeline}, loadErr
+		}
 		bins, loadErr := s.recordingHealthBinsForAccount(loadCtx, accountID, ids)
 		if loadErr != nil {
 			return recordingListEnrichmentResult{}, loadErr

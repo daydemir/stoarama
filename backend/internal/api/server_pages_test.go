@@ -871,6 +871,20 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 	}
 }
 
+func TestRecordingDetailLoadsTimelineWithoutDuplicateClipMetrics(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	if !strings.Contains(page, `/enrichment?recording_id=${encodeURIComponent(recId)}&timeline_only=1`) {
+		t.Fatal("recording detail does not request timeline-only enrichment")
+	}
+	if !strings.Contains(page, `clipPageState.rec.timeline_health = item.timeline_health || null`) {
+		t.Fatal("recording detail does not restrict timeline-only response merging to timeline health")
+	}
+}
+
 func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
