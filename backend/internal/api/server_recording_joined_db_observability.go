@@ -32,3 +32,18 @@ func writeJoinedDBError(w http.ResponseWriter, status int, publicMessage, operat
 	log.Print(joinedDBErrorLogLine(operation, stage, batchID, workerID, subjectKind, subjectID, err))
 	util.WriteError(w, status, publicMessage)
 }
+
+func writeJoinedHourDBError(w http.ResponseWriter, status int, publicMessage, operation, stage, batchID, workerID string,
+	hourRecordID int64, err error) {
+	writeJoinedDBError(w, status, publicMessage, operation, stage, batchID, workerID, "hour", hourRecordID, err)
+}
+
+func writeJoinedArtifactDBError(w http.ResponseWriter, status int, publicMessage, operation, stage, batchID, workerID string,
+	artifactID int64, err error) {
+	writeJoinedDBError(w, status, publicMessage, operation, stage, batchID, workerID, "artifact", artifactID, err)
+}
+
+func writeJoinedUnscopedDBError(w http.ResponseWriter, status int, publicMessage, operation, stage, batchID, workerID string,
+	err error) {
+	writeJoinedDBError(w, status, publicMessage, operation, stage, batchID, workerID, "none", 0, err)
+}

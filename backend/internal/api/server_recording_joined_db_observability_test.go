@@ -42,8 +42,8 @@ func TestJoinedDBErrorObservabilityIsSanitizedAndFailClosed(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	const workerID = "postgres://worker:secret@database.example/private"
-	writeJoinedDBError(recorder, http.StatusConflict, "claim joined publication", "publication_claim", "lease_update",
-		"tier1-2026-08", workerID, "artifact", 471, err)
+	writeJoinedArtifactDBError(recorder, http.StatusConflict, "claim joined publication", "publication_claim", "lease_update",
+		"tier1-2026-08", workerID, 471, err)
 
 	const wantLog = "joined_db_error operation=\"publication_claim\" stage=\"lease_update\" sqlstate=\"40001\" " +
 		"sqlstate_class=\"40\" batch_id=\"tier1-2026-08\" " +
@@ -65,6 +65,32 @@ func TestJoinedDBErrorObservabilityIsSanitizedAndFailClosed(t *testing.T) {
 	}
 	if recorder.Code != http.StatusConflict || recorder.Body.String() != "{\"error\":\"claim joined publication\"}\n" {
 		t.Fatalf("fail-closed response status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestJoinedHourDBErrorWrapperLabelsHourRecordID(t *testing.T) {
+	var logs bytes.Buffer
+	oldOutput, oldFlags, oldPrefix := log.Writer(), log.Flags(), log.Prefix()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(oldOutput)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+
+	recorder := httptest.NewRecorder()
+	writeJoinedHourDBError(recorder, http.StatusConflict, "claim joined hour", "hour_claim", "lease_update",
+		"tier1-2026-08", "worker-safe", 27, &pgconn.PgError{Code: "55P03", Message: "secret lock detail"})
+	line := logs.String()
+	if !strings.Contains(line, `sqlstate="55P03" sqlstate_class="55"`) ||
+		!strings.Contains(line, `subject_kind="hour" subject_id=27`) ||
+		strings.Contains(line, "artifact_id=") || strings.Contains(line, "secret lock detail") {
+		t.Fatalf("hour wrapper emitted mislabeled or unsafe log: %q", line)
+	}
+	if recorder.Code != http.StatusConflict || recorder.Body.String() != "{\"error\":\"claim joined hour\"}\n" {
+		t.Fatalf("hour fail-closed response status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
