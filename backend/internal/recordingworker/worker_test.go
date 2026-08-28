@@ -383,8 +383,10 @@ func TestContinuousMediaLagDriftExpired(t *testing.T) {
 		want       bool
 	}{
 		{name: "stable offset", bestLag: 20 * time.Minute, currentLag: 20 * time.Minute, timeout: timeout},
-		{name: "within bound", bestLag: 20 * time.Minute, currentLag: 35*time.Minute - time.Nanosecond, timeout: timeout},
+		{name: "outside timestamp tolerance", bestLag: 20 * time.Minute, currentLag: 35*time.Minute - continuousMediaLagBoundaryTolerance - time.Nanosecond, timeout: timeout},
+		{name: "at timestamp tolerance", bestLag: 20 * time.Minute, currentLag: 35*time.Minute - continuousMediaLagBoundaryTolerance, timeout: timeout, want: true},
 		{name: "at bound", bestLag: 20 * time.Minute, currentLag: 35 * time.Minute, timeout: timeout, want: true},
+		{name: "short timeout has exact boundary", currentLag: 9*time.Second + time.Nanosecond, timeout: 10 * time.Second},
 		{name: "caught up", bestLag: 20 * time.Minute, currentLag: 5 * time.Minute, timeout: timeout},
 		{name: "disabled", bestLag: 20 * time.Minute, currentLag: time.Hour, timeout: 0},
 	} {
@@ -421,6 +423,24 @@ func TestContinuousMediaLagFenceAllowsStableSourceOffsetAndStopsGrowingDrift(t *
 	fence.observe(sequence+2, started.Add(32*time.Minute-sourceOffset), started.Add(48*time.Minute), 15*time.Minute, abort)
 	if !fence.lagged() || aborts.Load() != 1 {
 		t.Fatalf("growing delivery drift did not trip once: lagged=%v aborts=%d", fence.lagged(), aborts.Load())
+	}
+}
+
+func TestContinuousMediaLagFenceStopsDriftAtTimestampTolerance(t *testing.T) {
+	started := time.Date(2026, time.August, 28, 23, 0, 0, 0, time.UTC)
+	const timeout = 15 * time.Minute
+	var fence continuousMediaLagFence
+	var aborts atomic.Int64
+	abort := func() { aborts.Add(1) }
+
+	// The first accepted segment establishes the source's stable offset. A live
+	// source can then settle just under the exact timeout because its media clock
+	// and the worker's wall clock are sampled at different segment boundaries.
+	fence.observe(1, started.Add(-4*time.Minute), started, timeout, abort)
+	fence.observe(2, started.Add(11*time.Minute+500*time.Millisecond), started.Add(30*time.Minute), timeout, abort)
+
+	if !fence.lagged() || aborts.Load() != 1 {
+		t.Fatalf("near-boundary drift did not trip once: lagged=%v aborts=%d", fence.lagged(), aborts.Load())
 	}
 }
 

@@ -1137,8 +1137,21 @@ type continuousMediaLagFence struct {
 	drifted         atomic.Bool
 }
 
+const continuousMediaLagBoundaryTolerance = 5 * time.Second
+
 func continuousMediaLagDriftExpired(bestLag, currentLag, timeout time.Duration) bool {
-	return timeout > 0 && currentLag-bestLag >= timeout
+	if timeout <= 0 {
+		return false
+	}
+	threshold := timeout
+	// Media timestamps and the worker's wall clock are sampled at different
+	// segment boundaries. Treat drift within a few seconds of a long safety
+	// limit as expired, or a source can settle forever at 14m59.x against a 15m
+	// fence while the health monitor correctly reports it stale.
+	if timeout > 2*continuousMediaLagBoundaryTolerance {
+		threshold -= continuousMediaLagBoundaryTolerance
+	}
+	return currentLag-bestLag >= threshold
 }
 
 // recordingCaptureTargetFPS is deliberately nil even for jobs created by an
