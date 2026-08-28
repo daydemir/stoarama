@@ -464,7 +464,8 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		canaryHours, frozenBatch, s.cfg.JoinedRecordingConnectionID).
 		Scan(&item.HourID, &item.LeaseExpires)
 	if err != nil {
-		util.WriteError(w, http.StatusConflict, fmt.Sprintf("claim joined hour: %v", err))
+		writeJoinedHourDBError(w, http.StatusConflict, "claim joined hour", "hour_claim", "lease_update",
+			claims.BatchID, workerID, hourRecordID, err)
 		return
 	}
 	err = tx.QueryRow(r.Context(), `
@@ -527,7 +528,8 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	if oneShotClaim {
 		if err := consumeJoinedOneShotClaim(r.Context(), tx, claims.BatchID); err != nil {
-			util.WriteError(w, http.StatusConflict, "consume joined one-shot claim")
+			writeJoinedHourDBError(w, http.StatusConflict, "consume joined one-shot claim", "hour_claim", "consume_one_shot",
+				claims.BatchID, workerID, hourRecordID, err)
 			return
 		}
 	}
@@ -664,13 +666,14 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if err != nil {
-		log.Printf("joined publication claim selection failed batch_id=%s worker_id=%s: %v", claims.BatchID, workerID, err)
-		util.WriteError(w, http.StatusInternalServerError, "select joined publication claim")
+		writeJoinedUnscopedDBError(w, http.StatusInternalServerError, "select joined publication claim", "publication_claim", "select",
+			claims.BatchID, workerID, err)
 		return
 	}
 	if selectedKind == "batch_index" {
 		if buildErr := configureJoinedBatchIndexTransaction(r.Context(), tx); buildErr != nil {
-			util.WriteError(w, http.StatusConflict, "configure joined batch-index evidence transaction")
+			writeJoinedArtifactDBError(w, http.StatusConflict, "configure joined batch-index evidence transaction", "publication_claim",
+				"configure_batch_index", claims.BatchID, workerID, artifactID, buildErr)
 			return
 		}
 		canonical, state, existingID, buildErr := loadJoinedCanonicalBatchIndex(r.Context(), tx, claims.BatchID,
@@ -685,7 +688,8 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		ON c.id=a.connection_id AND c.id=$2 WHERE a.id=$1 FOR SHARE OF c`, artifactID,
 		s.cfg.JoinedRecordingConnectionID).
 		Scan(&lockedConnection); err != nil {
-		util.WriteError(w, http.StatusConflict, "joined publication protocol changed")
+		writeJoinedArtifactDBError(w, http.StatusConflict, "joined publication protocol changed", "publication_claim",
+			"lock_connection", claims.BatchID, workerID, artifactID, err)
 		return
 	}
 	leaseToken := uuid.New()
@@ -701,7 +705,8 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		joinedLeaseDuration.String(), claims.BatchID, s.cfg.JoinedRecordingConnectionID, frozenBatch,
 		excludedPublicationArtifactIDs).Scan(&kind, &scopeID, &leaseExpires)
 	if err != nil {
-		util.WriteError(w, http.StatusConflict, "claim joined publication")
+		writeJoinedArtifactDBError(w, http.StatusConflict, "claim joined publication", "publication_claim", "lease_update",
+			claims.BatchID, workerID, artifactID, err)
 		return
 	}
 	operationToken, err := joinedauth.MintOperation(s.cfg.JoinedWorkerSigningKey, claims.BatchID,
@@ -769,12 +774,14 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	}
 	if oneShotClaim {
 		if err := consumeJoinedOneShotClaim(r.Context(), tx, claims.BatchID); err != nil {
-			util.WriteError(w, http.StatusConflict, "consume joined one-shot claim")
+			writeJoinedArtifactDBError(w, http.StatusConflict, "consume joined one-shot claim", "publication_claim", "consume_one_shot",
+				claims.BatchID, workerID, artifactID, err)
 			return
 		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {
-		util.WriteError(w, http.StatusConflict, "commit joined publication claim")
+		writeJoinedArtifactDBError(w, http.StatusConflict, "commit joined publication claim", "publication_claim", "commit",
+			claims.BatchID, workerID, artifactID, err)
 		return
 	}
 	writeJoinedWorkerJSON(w, http.StatusOK, response)
