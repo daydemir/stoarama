@@ -25,6 +25,7 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	s.cfg.JoinedRecordingControlPlaneEnabled = true
 	s.cfg.JoinedRecordingProtocolVersion = 1
 	s.cfg.JoinedRecordingMaxActiveTasks = 2
+	s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
 	s.cfg.JoinedWorkerBootstrapToken = "joined-bootstrap-credential-32bytes"
 	s.cfg.JoinedWorkerSigningKey = "joined-signing-credential-32-bytes"
 	s.cfg.R2Endpoint, s.cfg.R2Bucket, s.cfg.R2Region = "https://output.example.test", "joined-output", "auto"
@@ -40,7 +41,36 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT id FROM recording_joined_batches WHERE batch_id=$1`, req.BatchID).Scan(&batchRecordID); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, insertFinalChild := materializeJoinedCanonicalBatch(t, fixture, batchRecordID)
+	ledgers, sourceLedger, _, insertFinalChild := materializeJoinedCanonicalBatch(t, fixture, batchRecordID)
+	if sourceLedger == nil {
+		t.Fatal("source ledger fixture is required")
+	}
+	legacyArtifactIDs := []int64{468, 469, 470, 471}
+	legacyLedgerIndexes := make([]int, 0, len(legacyArtifactIDs))
+	for i := range ledgers {
+		if ledgers[i].streamDayID != sourceLedger.streamDayID {
+			legacyLedgerIndexes = append(legacyLedgerIndexes, i)
+			if len(legacyLedgerIndexes) == len(legacyArtifactIDs) {
+				break
+			}
+		}
+	}
+	if len(legacyLedgerIndexes) != len(legacyArtifactIDs) {
+		t.Fatal("legacy publication fixtures are required")
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	for i, ledgerIndex := range legacyLedgerIndexes {
+		if _, err := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET id=$2 WHERE id=$1`,
+			ledgers[ledgerIndex].artifactID, legacyArtifactIDs[i]); err != nil {
+			t.Fatal(err)
+		}
+		ledgers[ledgerIndex].artifactID = legacyArtifactIDs[i]
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +117,145 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT hour_id FROM recording_joined_hours WHERE batch_record_id=$1
 		AND source_clip_count>0 ORDER BY priority_ordinal,id LIMIT 1`, batchRecordID).Scan(&hourID); err != nil {
 		t.Fatal(err)
+	}
+
+	// Leave only the three legacy artifacts and one clean artifact immediately
+	// due under frozen_batch. The source ledger is held for the hour test below.
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, publishErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',
+		finalized_token='00000000-0000-0000-0000-000000000077',etag='fixture-published',version_id='',published_at=now()
+		WHERE batch_record_id=$1 AND artifact_kind='allocation_ledger' AND NOT (id=ANY($2::bigint[]))
+		  AND stream_day_id<>$3`, batchRecordID, legacyArtifactIDs, sourceLedger.streamDayID)
+	_, sourceDelayErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_next_attempt_at=now()+interval '1 hour'
+		WHERE batch_record_id=$1 AND artifact_kind IN ('allocation_ledger','batch_index')
+		  AND (stream_day_id=$2 OR artifact_kind='batch_index' OR id=471)`, batchRecordID, sourceLedger.streamDayID)
+	_, enableArtifactErr := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`)
+	if publishErr != nil {
+		t.Fatal(publishErr)
+	}
+	if sourceDelayErr != nil {
+		t.Fatal(sourceDelayErr)
+	}
+	if enableArtifactErr != nil {
+		t.Fatal(enableArtifactErr)
+	}
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	joinedGapBootstrapNoWork(t, s, req.BatchID)
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, cleanDueErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_next_attempt_at=now()-interval '1 minute'
+		WHERE id=471`)
+	_, liveFenceErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='publishing',
+		publication_attempt_count=1,publication_token='00000000-0000-0000-0000-000000000070',
+		publication_claimed_by='live-fenced-worker',publication_lease_expires_at=now()+interval '5 minutes',
+		publication_heartbeat_at=now() WHERE id=470`)
+	_, enableArtifactErr = pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`)
+	if cleanDueErr != nil {
+		t.Fatal(cleanDueErr)
+	}
+	if liveFenceErr != nil {
+		t.Fatal(liveFenceErr)
+	}
+	if enableArtifactErr != nil {
+		t.Fatal(enableArtifactErr)
+	}
+	publicationToken := joinedGapBootstrapToken(t, s, req.BatchID)
+	s.cfg.JoinedRecordingMaxActiveTasks = 1
+	if claim := joinedFiftyPublicationClaimStatus(t, s, req.BatchID, publicationToken, http.StatusNoContent); claim.Kind != "" {
+		t.Fatalf("live fenced lease escaped global cap: %+v", claim)
+	}
+	s.cfg.JoinedRecordingMaxActiveTasks = 2
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, resetLiveErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='sealed',
+		publication_attempt_count=0,publication_token=NULL,publication_claimed_by=NULL,
+		publication_lease_expires_at=NULL,publication_heartbeat_at=NULL WHERE id=470`)
+	_, enableArtifactErr = pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`)
+	if resetLiveErr != nil {
+		t.Fatal(resetLiveErr)
+	}
+	if enableArtifactErr != nil {
+		t.Fatal(enableArtifactErr)
+	}
+	cleanPublication := joinedFiftyPublicationClaim(t, s, req.BatchID, publicationToken)
+	if cleanPublication.Ledger == nil || cleanPublication.Ledger.ArtifactID != 471 {
+		t.Fatalf("frozen publication claim artifact=%+v want clean artifact 471", cleanPublication)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, cleanPublishedErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='published',
+		finalized_token=publication_token,publication_token=NULL,publication_claimed_by=NULL,
+		publication_lease_expires_at=NULL,publication_heartbeat_at=NULL,etag='fixture-published',version_id='',published_at=now()
+		WHERE id=471`)
+	_, expiredFenceErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_state='publishing',
+		publication_attempt_count=8,publication_token='00000000-0000-0000-0000-000000000069',
+		publication_claimed_by='expired-fenced-worker',publication_lease_expires_at=now()-interval '1 minute',
+		publication_heartbeat_at=now()-interval '2 minutes' WHERE id=469`)
+	_, enableArtifactErr = pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`)
+	if cleanPublishedErr != nil {
+		t.Fatal(cleanPublishedErr)
+	}
+	if expiredFenceErr != nil {
+		t.Fatal(expiredFenceErr)
+	}
+	if enableArtifactErr != nil {
+		t.Fatal(enableArtifactErr)
+	}
+	if hours, artifacts, err := s.recordJoinedExpiredAttemptEvidence(ctx, req.BatchID, nil, true); err != nil || hours != 0 || artifacts != 0 {
+		t.Fatalf("frozen expired maintenance hours=%d artifacts=%d err=%v", hours, artifacts, err)
+	}
+	var expiredState string
+	var expiredAttempts, expiredFailures int
+	if err := pool.QueryRow(ctx, `SELECT publication_state,publication_attempt_count,
+		(SELECT count(*) FROM recording_joined_worker_failures WHERE artifact_id=469)
+		FROM recording_joined_artifacts WHERE id=469`).Scan(&expiredState, &expiredAttempts, &expiredFailures); err != nil ||
+		expiredState != "publishing" || expiredAttempts != 8 || expiredFailures != 0 {
+		t.Fatalf("expired fenced artifact mutated state=%s attempts=%d failures=%d err=%v",
+			expiredState, expiredAttempts, expiredFailures, err)
+	}
+	if claim := joinedFiftyPublicationClaimStatus(t, s, req.BatchID, publicationToken, http.StatusNoContent); claim.Kind != "" {
+		t.Fatalf("frozen publication escaped legacy fence: %+v", claim)
+	}
+	var legacyUnchanged, legacyAttempts int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE publication_state='sealed'),
+		COALESCE(sum(publication_attempt_count),0) FROM recording_joined_artifacts WHERE id=ANY($1::bigint[])`,
+		[]int64{468, 470}).Scan(&legacyUnchanged, &legacyAttempts); err != nil || legacyUnchanged != 2 || legacyAttempts != 0 {
+		t.Fatalf("legacy publication artifacts mutated sealed=%d attempts=%d err=%v", legacyUnchanged, legacyAttempts, err)
+	}
+
+	// Exact canary scope remains the explicit remediation authority.
+	var legacyHourID string
+	if err := pool.QueryRow(ctx, `SELECT h.hour_id FROM recording_joined_artifacts a
+		JOIN recording_joined_hours h ON h.stream_day_id=a.stream_day_id WHERE a.id=468
+		ORDER BY h.delivery_hour LIMIT 1`).Scan(&legacyHourID); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
+	s.cfg.JoinedRecordingCanaryHourIDs = legacyHourID
+	legacyToken := joinedGapBootstrapToken(t, s, req.BatchID)
+	legacyClaim := joinedFiftyPublicationClaim(t, s, req.BatchID, legacyToken)
+	if legacyClaim.Ledger == nil || legacyClaim.Ledger.ArtifactID != 468 {
+		t.Fatalf("canary remediation artifact=%+v want 468", legacyClaim)
+	}
+	joinedFiftyFinalizeLedger(t, s, legacyClaim)
+
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, sourceDueErr := pool.Exec(ctx, `UPDATE recording_joined_artifacts SET publication_next_attempt_at=now()-interval '1 minute'
+		WHERE batch_record_id=$1 AND artifact_kind='allocation_ledger' AND stream_day_id=$2`, batchRecordID, sourceLedger.streamDayID)
+	_, enableArtifactErr = pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_update_guard`)
+	if sourceDueErr != nil {
+		t.Fatal(sourceDueErr)
+	}
+	if enableArtifactErr != nil {
+		t.Fatal(enableArtifactErr)
 	}
 
 	// Publish the source hour's allocation ledger through the worker API.

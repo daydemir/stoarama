@@ -173,6 +173,11 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 	}
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
+	excludedPublicationArtifactIDs, err := s.cfg.JoinedFrozenExcludedPublicationArtifactIDs()
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	workScopeSHA, err := workScope.SHA256(req.BatchID)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
@@ -192,6 +197,7 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		    AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=h.stream_day_id
 		      AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'))
 		  OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
+		    AND (NOT $3 OR NOT (a.id=ANY($8::bigint[])))
 		    AND a.publication_attempt_count<$4
 		    AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.artifact_id=a.id
 		      AND f.attempt_count=a.publication_attempt_count AND f.disposition='retry' AND f.retry_at>now())
@@ -223,7 +229,7 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		        AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=a.stream_day_id
 		          AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published')))))
 		LIMIT 1`, req.BatchID, canaryHours, frozenBatch, joinedMaxAttempts,
-		s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScope.WorkScope).Scan(&availableBatchID)
+		s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScope.WorkScope, excludedPublicationArtifactIDs).Scan(&availableBatchID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -243,6 +249,10 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID string, canaryHours []string, frozenBatch bool) (int64, int64, error) {
+	excludedPublicationArtifactIDs, err := s.cfg.JoinedFrozenExcludedPublicationArtifactIDs()
+	if err != nil {
+		return 0, 0, err
+	}
 	workScope, err := s.joinedWorkScopeIdentity()
 	if err != nil {
 		return 0, 0, err
@@ -286,6 +296,7 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		 SELECT a.batch_record_id,a.id,a.batch_id,a.scope_kind,a.scope_id,a.publication_token,a.publication_attempt_count,
 		   'transient','worker_lease_expired','terminal' FROM recording_joined_artifacts a
 		 WHERE a.batch_id=$1 AND a.artifact_kind<>'media' AND a.publication_state='publishing'
+		   AND (NOT $4 OR NOT (a.id=ANY($8::bigint[])))
 		   AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=a.batch_record_id AND b.connection_id=$5)
 		   AND (a.artifact_kind<>'batch_index' OR ($7='frozen_batch' AND NOT EXISTS(SELECT 1
 		     FROM recording_joined_batch_index_refs ref
@@ -311,13 +322,14 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		       WHERE allowed.id=a.hour_record_id AND allowed.hour_id=ANY($3::text[]))))
 		   AND a.publication_lease_expires_at<=now() AND a.publication_attempt_count>= $2
 		 ON CONFLICT DO NOTHING`, batchID, joinedMaxAttempts, canaryHours, frozenBatch, s.cfg.JoinedRecordingConnectionID,
-		workScopeSHA, workScope.WorkScope); err != nil {
+		workScopeSHA, workScope.WorkScope, excludedPublicationArtifactIDs); err != nil {
 		return 0, 0, err
 	}
 	artifacts, err := tx.Exec(ctx, `UPDATE recording_joined_artifacts a SET publication_state='terminal_failed',
 		 publication_token=NULL,publication_claimed_by=NULL,publication_lease_expires_at=NULL,
 		 publication_heartbeat_at=NULL,failure_reason_code='worker_lease_expired'
 		 WHERE a.batch_id=$1 AND a.artifact_kind<>'media' AND a.publication_state='publishing'
+		   AND (NOT $4 OR NOT (a.id=ANY($8::bigint[])))
 		   AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=a.batch_record_id AND b.connection_id=$5)
 		   AND (a.artifact_kind<>'batch_index' OR ($7='frozen_batch' AND NOT EXISTS(SELECT 1
 		     FROM recording_joined_batch_index_refs ref
@@ -345,7 +357,7 @@ func (s *Server) recordJoinedExpiredAttemptEvidence(ctx context.Context, batchID
 		   AND EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.artifact_id=a.id
 		     AND f.claim_token=a.publication_token AND f.attempt_count=a.publication_attempt_count
 		     AND f.disposition='terminal' AND f.reason_code='worker_lease_expired')`, batchID, joinedMaxAttempts, canaryHours,
-		frozenBatch, s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScope.WorkScope)
+		frozenBatch, s.cfg.JoinedRecordingConnectionID, workScopeSHA, workScope.WorkScope, excludedPublicationArtifactIDs)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -545,6 +557,11 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 	}
 	canaryHours := s.joinedCanaryHourIDs()
 	frozenBatch := s.joinedFrozenBatchScope()
+	excludedPublicationArtifactIDs, err := s.cfg.JoinedFrozenExcludedPublicationArtifactIDs()
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	currentScope, scopeErr := s.joinedWorkScopeIdentity()
 	if scopeErr != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
@@ -608,6 +625,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		  AND ledger.stream_day_id=a.stream_day_id AND ledger.artifact_kind='allocation_ledger'
 		JOIN recording_joined_batches b ON b.id=a.batch_record_id
 		WHERE a.batch_id=$1 AND b.state IN ('frozen','index_sealed') AND a.artifact_kind<>'media'
+		  AND (NOT $3 OR NOT (a.id=ANY($10::bigint[])))
 		  AND a.publication_attempt_count<$5
 		  AND (a.artifact_kind<>'hour_manifest' OR COALESCE((SELECT h.source_bytes FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0)<=GREATEST(($4::bigint-$6::bigint)/2,-1::bigint))
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.artifact_id=a.id
@@ -640,7 +658,7 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		  COALESCE((SELECT h.priority_ordinal FROM recording_joined_hours h WHERE h.id=a.hour_record_id),0),a.id
 		FOR UPDATE OF a SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch, capacityBytes,
 		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes, s.cfg.JoinedRecordingConnectionID, currentScopeSHA,
-		currentScope.WorkScope).Scan(&artifactID, &selectedKind)
+		currentScope.WorkScope, excludedPublicationArtifactIDs).Scan(&artifactID, &selectedKind)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -678,8 +696,10 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		publication_lease_expires_at=date_trunc('second',now()+$4::interval),publication_heartbeat_at=now()
 		WHERE id=$1 AND batch_id=$5 AND EXISTS(SELECT 1 FROM connections c
 		  WHERE c.id=recording_joined_artifacts.connection_id AND c.id=$6)
+		  AND (NOT $7 OR NOT (id=ANY($8::bigint[])))
 		RETURNING artifact_kind,scope_id,publication_lease_expires_at`, artifactID, leaseToken, workerID,
-		joinedLeaseDuration.String(), claims.BatchID, s.cfg.JoinedRecordingConnectionID).Scan(&kind, &scopeID, &leaseExpires)
+		joinedLeaseDuration.String(), claims.BatchID, s.cfg.JoinedRecordingConnectionID, frozenBatch,
+		excludedPublicationArtifactIDs).Scan(&kind, &scopeID, &leaseExpires)
 	if err != nil {
 		util.WriteError(w, http.StatusConflict, "claim joined publication")
 		return

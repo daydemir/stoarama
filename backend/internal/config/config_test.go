@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -374,8 +375,29 @@ func TestJoinedWorkScopeIsExplicitAndBounded(t *testing.T) {
 		t.Fatal("frozen-batch API accepted no active-task cap")
 	}
 	frozen.JoinedRecordingMaxActiveTasks = 2
+	frozen.JoinedRecordingFrozenExcludedPublicationArtifactIDs = "470,468,469"
 	if scope, err := frozen.JoinedWorkScope(); err != nil || scope != JoinedWorkScopeFrozenBatch {
 		t.Fatalf("frozen scope=%q err=%v", scope, err)
+	}
+	if ids, err := frozen.JoinedFrozenExcludedPublicationArtifactIDs(); err != nil || !slices.Equal(ids, []int64{468, 469, 470}) {
+		t.Fatalf("frozen publication deny set=%v err=%v", ids, err)
+	}
+	for name, raw := range map[string]string{
+		"missing": "", "partial": "468,469", "extra": "468,469,470,471", "duplicate": "468,469,469",
+		"zero": "0,468,469", "negative": "-1,468,469", "overflow": "468,469,9223372036854775808",
+		"junk": "468,469,nope", "wrong": "468,469,471",
+	} {
+		t.Run("frozen publication deny "+name, func(t *testing.T) {
+			candidate := frozen
+			candidate.JoinedRecordingFrozenExcludedPublicationArtifactIDs = raw
+			if err := candidate.ValidateJoined(); err == nil {
+				t.Fatalf("invalid frozen publication deny set %q accepted", raw)
+			}
+		})
+	}
+	canary.JoinedRecordingFrozenExcludedPublicationArtifactIDs = "junk"
+	if err := canary.ValidateJoined(); err != nil {
+		t.Fatalf("non-frozen scope used publication deny set: %v", err)
 	}
 	for name, edit := range map[string]func(*Config){
 		"implicit enabled": func(c *Config) { c.JoinedRecordingWorkScope = "" },
