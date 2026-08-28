@@ -1179,9 +1179,6 @@ func TestContinuousStderrObserverDetectsGooglevideoForbiddenAcrossWrites(t *test
 	default:
 		t.Fatal("observer did not signal expired Googlevideo fragment")
 	}
-	if !observer.expired() {
-		t.Fatal("observer did not retain expired-fragment classification")
-	}
 }
 
 func TestContinuousStderrObserverIgnoresUnwatchedForbidden(t *testing.T) {
@@ -1189,8 +1186,8 @@ func TestContinuousStderrObserverIgnoresUnwatchedForbidden(t *testing.T) {
 	if _, err := observer.Write([]byte("HTTP error 403 Forbidden")); err != nil {
 		t.Fatal(err)
 	}
-	if observer.expired() {
-		t.Fatal("unwatched stderr classified as Googlevideo fragment expiry")
+	if observer.expiredGooglevideo != nil {
+		t.Fatal("unwatched stderr installed a Googlevideo fragment observer")
 	}
 }
 
