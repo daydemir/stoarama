@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -147,16 +148,26 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	// A deployment after an operator's concurrent precreate takes this path.
+	// Reapplying must validate and accept each exact existing index.
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("validate precreated joined browser indexes: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		CREATE INDEX idx_recording_clips_recording_started ON recording_clips(recording_id,clip_start_at DESC);
+		INSERT INTO recordings VALUES (60,47,'completed');
+		INSERT INTO recording_joined_hours VALUES
+			(205,3,47,60,'sealed','same-account-noise','2026-05-04',4,'2026-05-04 11:00:00Z','2026-05-04 12:00:00Z');
 		INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at)
-		SELECT 1000000+value,50,'2026-05-04 08:00:00Z'::timestamptz+value*interval '1 second','2026-05-04 08:00:01Z'::timestamptz+value*interval '1 second'
+		SELECT 1000000+value,60,'2026-05-04 08:00:00Z'::timestamptz+value*interval '1 second','2026-05-04 08:00:01Z'::timestamptz+value*interval '1 second'
 		FROM generate_series(1,50000) value;
 		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id)
-		SELECT 1000000+value,204,2,99,50,1000000+value FROM generate_series(1,50000) value;
+		SELECT 1000000+value,205,3,47,60,1000000+value FROM generate_series(1,50000) value;
 		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
-		SELECT 1000000+value,204,2,99,'media',NULL,now(),'noise-'||value,'','video/mp4','noise/'||value||'.mp4',10,repeat('9',64),'joined/noise/'||value||'.mp4',value
+		SELECT 1000000+value,205,3,47,'media',NULL,now(),'noise-'||value,'','video/mp4','noise/'||value||'.mp4',10,repeat('9',64),'joined/noise/'||value||'.mp4',value
 		FROM generate_series(1,50000) value;
+		INSERT INTO recording_joined_media_sources(artifact_id,source_id,ordinal)
+		SELECT 1000000+value,1000000+value,1 FROM generate_series(1,50000) value;
 		ANALYZE recordings; ANALYZE recording_clips; ANALYZE recording_joined_hours;
 		ANALYZE recording_joined_sources; ANALYZE recording_joined_artifacts; ANALYZE recording_joined_media_sources;
 	`); err != nil {
@@ -181,13 +192,57 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 	}
 	plan := strings.Join(planLines, "\n")
 	t.Logf("joined progress EXPLAIN ANALYZE (%s):\n%s", time.Since(started).Round(time.Millisecond), plan)
-	for _, index := range []string{"idx_recording_clips_recording_started", "recording_joined_artifacts_published_hour_idx"} {
+	for _, index := range []string{"idx_recording_clips_recording_started", "recording_joined_sources_account_recording_idx", "recording_joined_media_sources_source_artifact_idx", "recording_joined_artifacts_published_hour_idx"} {
 		if !strings.Contains(plan, index) {
 			t.Fatalf("plan did not use %s:\n%s", index, plan)
 		}
 	}
+	bufferMatch := regexp.MustCompile(`Buffers: shared hit=([0-9]+)`).FindStringSubmatch(plan)
+	if len(bufferMatch) != 2 {
+		t.Fatalf("plan did not report shared buffers:\n%s", plan)
+	}
+	sharedHits, err := strconv.Atoi(bufferMatch[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sharedHits > 1000 {
+		t.Fatalf("joined progress touched %d shared buffers; want at most 1000:\n%s", sharedHits, plan)
+	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("indexed joined progress EXPLAIN took %s", elapsed)
+	}
+}
+
+func TestJoinedBrowserIndexMigrationIsTransactionalAndRejectsWrongPrecreate(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	ctx := context.Background()
+	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "infra", "sql", "migrations", "0149_joined_recording_browser_indexes.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("apply migration inside runner transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1`); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("migration closed its owning transaction: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE INDEX recording_joined_sources_account_recording_idx
+		ON recording_joined_sources(clip_id)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err == nil || !strings.Contains(err.Error(), "not the valid exact joined-browser source index") {
+		t.Fatalf("wrong precreated index error=%v", err)
 	}
 }
 

@@ -14,9 +14,13 @@ type recordingJoinedProgress struct {
 	Percent          *int  `json:"joined_percent"`
 }
 
-const recordingJoinedReadyClipsSQL = `
+const recordingJoinedReadyClipsSQL = `WITH candidate_sources AS MATERIALIZED (
+	SELECT id,clip_id,hour_record_id,batch_record_id,account_id,recording_id
+	FROM recording_joined_sources
+	WHERE account_id=$1 AND recording_id=ANY($2::bigint[])
+)
 	SELECT DISTINCT src.clip_id
-	FROM recording_joined_sources src
+	FROM candidate_sources src
 	JOIN recording_joined_hours h
 	  ON h.id=src.hour_record_id
 	 AND h.recording_id=src.recording_id
@@ -33,9 +37,7 @@ const recordingJoinedReadyClipsSQL = `
 	 AND media.published_at IS NOT NULL
 	 AND media.etag IS NOT NULL AND media.etag<>''
 	 AND media.version_id IS NOT NULL
-	WHERE src.account_id=$1
-	  AND src.recording_id=ANY($2::bigint[])
-	  AND EXISTS (
+	WHERE EXISTS (
 	    SELECT 1
 	    FROM recording_joined_artifacts manifest
 	    WHERE manifest.hour_record_id=h.id
