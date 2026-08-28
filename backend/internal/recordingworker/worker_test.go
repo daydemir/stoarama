@@ -868,6 +868,87 @@ while :; do sleep .1; done
 	}
 }
 
+func TestContinuousExpiredGooglevideoRetriesSameManifestOnceBeforeResolve(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, time.Now().Add(time.Minute).Format(time.RFC3339Nano))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := NewWorker(Config{Client: client, HeartbeatSec: 1, CaptureTempDir: t.TempDir(), UploadWorkers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.heartbeatInt = 5 * time.Millisecond
+	worker.leaseSafetyMargin = time.Millisecond
+	worker.reconnectDelay = func(int64, int) time.Duration { return time.Hour }
+
+	var resolves atomic.Int64
+	worker.resolveCaptureInput = func(context.Context, string, string, string) (string, bool, string, error) {
+		if resolves.Add(1) == 1 {
+			return "https://192.0.2.1/first.m3u8", false, "first-headers", nil
+		}
+		return "https://192.0.2.2/fresh.m3u8", false, "fresh-headers", nil
+	}
+	type captureCall struct {
+		url, headers string
+	}
+	captures := make(chan captureCall, 3)
+	var captureCount atomic.Int64
+	worker.continuousCapture = func(ctx context.Context, sourceURL string, _ time.Duration, _ string, _ *int, _ string, _ func(capture.Segment) error, headers string) error {
+		captures <- captureCall{url: sourceURL, headers: headers}
+		if captureCount.Add(1) <= 2 {
+			return capture.ErrContinuousExpiredGooglevideoFragment
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	windowEnd := time.Now().Add(time.Minute)
+	go func() {
+		defer close(done)
+		worker.processContinuousJob(jobCtx, recordingapi.RecordingJob{
+			JobID: 450, RecordingID: 450, SourceURL: "https://192.0.2.10/watch",
+			ClipDurationSec: 60, LeaseExpiresAt: time.Now().Add(time.Minute), LeaseToken: "lease",
+			Kind: "continuous_window", WindowEndAt: &windowEnd,
+		})
+	}()
+
+	want := []captureCall{
+		{url: "https://192.0.2.1/first.m3u8", headers: "first-headers"},
+		{url: "https://192.0.2.1/first.m3u8", headers: "first-headers"},
+		{url: "https://192.0.2.2/fresh.m3u8", headers: "fresh-headers"},
+	}
+	for i, expected := range want {
+		select {
+		case got := <-captures:
+			if got != expected {
+				t.Fatalf("capture %d=%+v want %+v", i+1, got, expected)
+			}
+		case <-time.After(750 * time.Millisecond):
+			t.Fatalf("capture %d did not start without generic backoff; resolves=%d", i+1, resolves.Load())
+		}
+	}
+	cancelJob()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuous job did not stop after cancellation")
+	}
+	if resolves.Load() != 2 {
+		t.Fatalf("resolver calls=%d want 2", resolves.Load())
+	}
+}
+
 func TestRetryableTransportError(t *testing.T) {
 	tests := []struct {
 		err  error

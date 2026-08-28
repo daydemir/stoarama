@@ -103,6 +103,7 @@ type Worker struct {
 	frozenHLSSafetyInterval time.Duration
 	frozenHLSWait           func(context.Context, time.Duration) error
 	frozenHLSProofSpan      func(time.Duration) time.Duration
+	resolveCaptureInput     continuousResolveFunc
 	continuousCapture       continuousCaptureFunc
 }
 
@@ -170,6 +171,7 @@ func NewWorker(cfg Config) (*Worker, error) {
 		frozenHLSPollMax:        30 * time.Second,
 		frozenHLSForceCapture:   frozenHLSForcedCaptureMax,
 		frozenHLSSafetyInterval: time.Second,
+		resolveCaptureInput:     capture.ResolveCaptureInputWithHeaders,
 	}, nil
 }
 
@@ -469,10 +471,11 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		defer windowCancel()
 	}
 
-	// The source URL is re-resolved every supervisor attempt; deliverSegment records
-	// the URL that produced the segment it is ingesting, and takes it as a parameter
-	// so each attempt's delivery pool closes over an immutable copy rather than a
-	// variable the job goroutine rewrites on reconnect.
+	// The source URL is re-resolved every ordinary supervisor attempt. One bounded
+	// Googlevideo 403 retry may reopen the same validated manifest first.
+	// deliverSegment records the URL that produced the segment it is ingesting, and
+	// takes it as a parameter so each attempt's delivery pool closes over an
+	// immutable copy rather than a variable the job goroutine rewrites on reconnect.
 	//
 	// CONCURRENCY: CaptureContinuous no longer performs delivery inline. It still
 	// calls the pool's Submit synchronously and in order, but reserve -> PUT ->
@@ -621,32 +624,50 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		case <-time.After(delay):
 		}
 	}
+	var resolved, inputHeaders string
+	var isImage bool
+	reuseResolved := false
+	sameManifestRetried := false
 	for attempt := 1; ; attempt++ {
 		if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 			break
 		}
 
-		// Re-resolve EVERY attempt so expiring tokens are refreshed on reconnect.
-		// A transient resolve error backs off and retries rather than failing the
-		// job mid-window.
-		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_resolving")
-		resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
-		resolved, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
-		resolveCancel()
-		if err != nil {
-			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
-				break
+		if reuseResolved {
+			// An advancing Googlevideo manifest can contain one expired child URL
+			// while its next live edge is already usable. Reopen this validated URL
+			// once before paying the 11-29 second yt-dlp resolve cost.
+			reuseResolved = false
+			w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_same_manifest_retry")
+		} else {
+			// Resolve a fresh source on every ordinary reconnect. The sole exception
+			// is the bounded Googlevideo retry above; a second typed expiry returns
+			// here immediately.
+			w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_resolving")
+			resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
+			resolveCaptureInput := w.resolveCaptureInput
+			if resolveCaptureInput == nil {
+				resolveCaptureInput = capture.ResolveCaptureInputWithHeaders
 			}
-			w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
-			failures++
-			delay := w.nextReconnectDelay(job.JobID, failures)
-			log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
-				job.JobID, job.RecordingID, attempt, err, delay)
-			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
-				return
+			resolvedNext, imageNext, headersNext, err := resolveCaptureInput(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
+			resolveCancel()
+			if err != nil {
+				if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
+					break
+				}
+				w.cfg.RelayDiagnostics.Error(job.JobID, "resolve_retry", err)
+				failures++
+				delay := w.nextReconnectDelay(job.JobID, failures)
+				log.Printf("recording worker job=%d recording=%d continuous resolve failed (attempt %d): %v; retrying in %s",
+					job.JobID, job.RecordingID, attempt, err, delay)
+				if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), err) {
+					return
+				}
+				backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
+				continue
 			}
-			backoff(continuousReconnectDelay(progress.last(), time.Now(), w.cfg.ContinuousNoProgressTimeout, delay))
-			continue
+			resolved, isImage, inputHeaders = resolvedNext, imageNext, headersNext
+			sameManifestRetried = false
 		}
 		if isImage {
 			err := fmt.Errorf("image sources are not supported by the recorder")
@@ -854,6 +875,23 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			}
 			break
 		}
+		if errors.Is(captureErr, capture.ErrContinuousExpiredGooglevideoFragment) {
+			if w.surrenderContinuousJob(ctx, cancel, job, progress.last(), captureErr) {
+				return
+			}
+			failures = 0
+			if !sameManifestRetried {
+				sameManifestRetried = true
+				reuseResolved = true
+				log.Printf("recording worker job=%d recording=%d Googlevideo fragment expired; retrying current manifest without backoff",
+					job.JobID, job.RecordingID)
+			} else {
+				sameManifestRetried = false
+				log.Printf("recording worker job=%d recording=%d current Googlevideo manifest remained expired; resolving fresh source without backoff",
+					job.JobID, job.RecordingID)
+			}
+			continue
+		}
 		// Premature exit (clean end-of-stream or a hard ffmpeg error) with the window
 		// still open: back off and reconnect. An attempt that ingested at least one
 		// clip was a healthy connection that later dropped, so reset the backoff.
@@ -891,6 +929,8 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 }
 
 type continuousCaptureFunc func(context.Context, string, time.Duration, string, *int, string, func(capture.Segment) error, string) error
+
+type continuousResolveFunc func(context.Context, string, string, string) (string, bool, string, error)
 
 func continuousCaptureForJob(job recordingapi.RecordingJob) continuousCaptureFunc {
 	if job.TimestampContractSupported {

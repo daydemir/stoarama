@@ -229,6 +229,98 @@ func TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart(t *tes
 	}
 }
 
+func TestContinuousGooglevideoHLSSameManifestReopenFindsFreshLiveEdge(t *testing.T) {
+	ffmpeg, err := exec.LookPath(ffmpegBin())
+	if err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	temp := t.TempDir()
+	segments := generateHLSFixtureSegments(t, ffmpeg, temp, 6)
+
+	var recovered atomic.Bool
+	var stalePlaylistRequests atomic.Int64
+	var forbiddenRequests atomic.Int64
+	var healthySegmentRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/live.m3u8" {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			if recovered.Load() {
+				fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n")
+				for i := 1; i <= 4; i++ {
+					fmt.Fprintf(w, "#EXTINF:1,\n/healthy-%d.ts\n", i)
+				}
+				fmt.Fprint(w, "#EXT-X-ENDLIST\n")
+				return
+			}
+			sequence := stalePlaylistRequests.Add(1) - 1
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n", sequence)
+			if sequence == 0 {
+				fmt.Fprint(w, "#EXTINF:1,\n/initial.ts\n")
+				return
+			}
+			fmt.Fprintf(w, "#EXTINF:1,\n/expired-%d.ts\n", sequence)
+			return
+		}
+		switch {
+		case r.URL.Path == "/initial.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write(segments[0])
+		case strings.HasPrefix(r.URL.Path, "/expired-"):
+			forbiddenRequests.Add(1)
+			http.Error(w, "expired", http.StatusForbidden)
+		case strings.HasPrefix(r.URL.Path, "/healthy-"):
+			var index int
+			if _, err := fmt.Sscanf(r.URL.Path, "/healthy-%d.ts", &index); err != nil || index >= len(segments) {
+				http.NotFound(w, r)
+				return
+			}
+			healthySegmentRequests.Add(1)
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write(segments[index])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	firstOut := filepath.Join(temp, "first")
+	if err := os.Mkdir(firstOut, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 4*time.Second)
+	firstErr := captureContinuousWithHeaders(
+		firstCtx, server.URL+"/live.m3u8", time.Second, "manifest.googlevideo.com", nil,
+		firstOut, func(Segment) error { return nil }, "", 10*time.Second, 10*time.Second,
+	)
+	cancelFirst()
+	if !errors.Is(firstErr, ErrContinuousExpiredGooglevideoFragment) || forbiddenRequests.Load() < 1 {
+		t.Fatalf("first capture error=%v forbidden=%d, want an expired fragment", firstErr, forbiddenRequests.Load())
+	}
+
+	recovered.Store(true)
+	secondOut := filepath.Join(temp, "second")
+	if err := os.Mkdir(secondOut, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var delivered atomic.Int64
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 6*time.Second)
+	secondErr := captureContinuousWithHeaders(
+		secondCtx, server.URL+"/live.m3u8", time.Second, "manifest.googlevideo.com", nil,
+		secondOut, func(seg Segment) error {
+			delivered.Add(1)
+			RemoveSegmentFile(seg)
+			return nil
+		}, "", 10*time.Second, 10*time.Second,
+	)
+	cancelSecond()
+	if secondErr != nil {
+		t.Fatalf("same manifest URL did not recover on reopen: %v", secondErr)
+	}
+	if healthySegmentRequests.Load() < 4 || delivered.Load() < 1 {
+		t.Fatalf("same-manifest reopen healthy requests=%d delivered=%d", healthySegmentRequests.Load(), delivered.Load())
+	}
+}
+
 func TestContinuousGooglevideoHLSSurvivesSustainedHealthyPublication(t *testing.T) {
 	ffmpeg, err := exec.LookPath(ffmpegBin())
 	if err != nil {
