@@ -4175,7 +4175,7 @@
       return `<div class="detail-card"><div class="detail-card-head"><span class="detail-card-title">Joined files</span><span class="muted">${value.length} file${value.length === 1 ? '' : 's'}</span></div>
         <div class="stack">${value.map((file) => `<div class="detail-rows" style="grid-template-columns:1fr auto;align-items:center;border-top:1px solid var(--border);padding-top:10px;">
           <div><div class="cell-main">${escapeHTML(file.hour_id || file.relative_path)}</div><div class="hint">${escapeHTML(file.kind === 'media' ? 'Video' : 'Manifest')} · ${fmtBytes(Number(file.size_bytes || 0))}</div></div>
-          <button type="button" class="secondary" data-joined-open="${escapeHTML(file.download_path)}" style="width:auto;min-width:74px;min-height:34px;padding:6px 12px;">${file.kind === 'media' ? 'View' : 'Open'}</button>
+          <a class="btn-link secondary" href="${escapeHTML(file.download_path)}" target="_blank" rel="noopener noreferrer" style="width:auto;min-width:74px;min-height:34px;padding:6px 12px;">${file.kind === 'media' ? 'View' : 'Open'}</a>
         </div>`).join('')}</div><div class="hint" style="margin-top:12px;">Links expire automatically and are available only to members of this organization.</div></div>`;
     }
 
@@ -4271,17 +4271,6 @@
       if (routingBtn) routingBtn.addEventListener('click', () => openRelayRoutingEdit());
       root.querySelectorAll('button[data-health-page]').forEach((button) =>
         button.addEventListener('click', () => loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))));
-      root.querySelectorAll('button[data-joined-open]').forEach((button) => button.addEventListener('click', async () => {
-        button.disabled = true;
-        try {
-          const result = await fetchJSON(button.getAttribute('data-joined-open'));
-          window.open(result.url, '_blank', 'noopener,noreferrer');
-        } catch (err) {
-          window.alert(String(err.message || err));
-        } finally {
-          button.disabled = false;
-        }
-      }));
     }
 
     async function openRelayRoutingEdit() {

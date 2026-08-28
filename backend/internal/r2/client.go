@@ -132,22 +132,6 @@ func (c *Client) PresignGetExact(ctx context.Context, key, etag, versionID strin
 	return out.URL, nil
 }
 
-// PresignGetVersion returns a browser-openable capability for one immutable
-// object generation. Unlike PresignGetExact, it requires no request headers.
-func (c *Client) PresignGetVersion(ctx context.Context, key, versionID string, ttl time.Duration) (string, error) {
-	versionID = strings.TrimSpace(versionID)
-	if versionID == "" {
-		return "", errors.New("presign version get: version id is required")
-	}
-	out, err := c.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(c.bucket), Key: aws.String(key), VersionId: aws.String(versionID),
-	}, s3.WithPresignExpires(ttl))
-	if err != nil {
-		return "", fmt.Errorf("presign version get %s: %w", key, err)
-	}
-	return out.URL, nil
-}
-
 func (c *Client) PresignGetExactRequest(ctx context.Context, key, etag, versionID string, ttl time.Duration) (PresignedRequest, error) {
 	clean := cleanETag(etag)
 	if clean == "" {

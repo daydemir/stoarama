@@ -198,9 +198,12 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 			SELECT id,clip_start_at,clip_end_at FROM recording_clips WHERE recording_id=$1 AND purged_at IS NULL
 		), ready AS (
 			SELECT DISTINCT src.clip_id FROM recording_joined_sources src
-			JOIN recording_joined_hours h ON h.id=src.hour_record_id AND h.recording_id=$1 AND h.state='sealed'
-			JOIN recording_joined_artifacts a ON a.hour_record_id=h.id AND a.artifact_kind='media'
+			JOIN recording_joined_media_sources ms ON ms.source_id=src.id
+			JOIN recording_joined_artifacts a ON a.id=ms.artifact_id AND a.artifact_kind='media'
 			  AND a.publication_state='published' AND a.published_at IS NOT NULL
+			JOIN recording_joined_hours h ON h.id=a.hour_record_id AND h.id=src.hour_record_id AND h.recording_id=$1 AND h.state='sealed'
+			JOIN recording_joined_artifacts manifest ON manifest.hour_record_id=h.id AND manifest.artifact_kind='hour_manifest'
+			  AND manifest.publication_state='published' AND manifest.published_at IS NOT NULL
 		)
 		SELECT b.ordinality,
 			COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000),0)::bigint,

@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -93,22 +94,14 @@ func (s *Server) handleAccountRecordingJoinedDownload(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusNotFound, "joined recording file not found")
 		return
 	}
-	if err != nil || s.r2 == nil {
+	store := s.joinedOutputStore()
+	if err != nil || store == nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "joined recording file is unavailable")
 		return
 	}
-	head, err := s.r2.Head(r.Context(), objectKey)
+	head, err := store.Head(r.Context(), objectKey)
 	if err != nil || head.SizeBytes != sizeBytes || head.ETag != etag || head.VersionID != versionID {
 		util.WriteError(w, http.StatusConflict, "joined recording file identity changed")
-		return
-	}
-	ttl := s.cfg.R2SignGetTTL
-	if ttl <= 0 || ttl > time.Hour {
-		ttl = time.Hour
-	}
-	signedURL, err := s.r2.PresignGetVersion(r.Context(), objectKey, versionID, ttl)
-	if err != nil {
-		util.WriteError(w, http.StatusInternalServerError, "sign joined recording file")
 		return
 	}
 	var stillCurrent bool
@@ -124,5 +117,17 @@ func (s *Server) handleAccountRecordingJoinedDownload(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusConflict, "joined recording file changed while signing")
 		return
 	}
-	util.WriteJSON(w, http.StatusOK, map[string]any{"url": signedURL, "content_type": contentType, "size_bytes": sizeBytes, "sha256": sha256, "expires_in_sec": int(ttl.Seconds())})
+	body, err := store.OpenExact(r.Context(), objectKey, etag, versionID)
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "joined recording file identity changed")
+		return
+	}
+	defer body.Close()
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", sizeBytes))
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if _, err := io.Copy(w, io.LimitReader(body, sizeBytes+1)); err != nil {
+		return
+	}
 }
