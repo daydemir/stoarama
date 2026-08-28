@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -21,8 +22,9 @@ func joinedDBErrorCode(err error) (string, string) {
 
 func joinedDBErrorLogLine(operation, stage, batchID, workerID string, artifactID int64, err error) string {
 	sqlstate, class := joinedDBErrorCode(err)
-	return fmt.Sprintf("joined_db_error operation=%q stage=%q sqlstate=%q sqlstate_class=%q batch_id=%q worker_id=%q artifact_id=%d",
-		operation, stage, sqlstate, class, batchID, workerID, artifactID)
+	workerIDHash := sha256.Sum256([]byte(workerID))
+	return fmt.Sprintf("joined_db_error operation=%q stage=%q sqlstate=%q sqlstate_class=%q batch_id=%q worker_id_sha256=%x artifact_id=%d",
+		operation, stage, sqlstate, class, batchID, workerIDHash, artifactID)
 }
 
 func writeJoinedDBError(w http.ResponseWriter, status int, publicMessage, operation, stage, batchID, workerID string,

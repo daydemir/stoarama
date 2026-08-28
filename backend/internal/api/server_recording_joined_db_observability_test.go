@@ -41,11 +41,13 @@ func TestJoinedDBErrorObservabilityIsSanitizedAndFailClosed(t *testing.T) {
 	})
 
 	recorder := httptest.NewRecorder()
+	const workerID = "postgres://worker:secret@database.example/private"
 	writeJoinedDBError(recorder, http.StatusConflict, "claim joined publication", "publication_claim", "lease_update",
-		"tier1-2026-08", "worker-safe", 471, err)
+		"tier1-2026-08", workerID, 471, err)
 
 	const wantLog = "joined_db_error operation=\"publication_claim\" stage=\"lease_update\" sqlstate=\"40001\" " +
-		"sqlstate_class=\"40\" batch_id=\"tier1-2026-08\" worker_id=\"worker-safe\" artifact_id=471\n"
+		"sqlstate_class=\"40\" batch_id=\"tier1-2026-08\" " +
+		"worker_id_sha256=95483bbce8a471fcf63557429398a8f9dfe87cb81552339d011934df0e122a17 artifact_id=471\n"
 	if got := logs.String(); got != wantLog {
 		t.Fatalf("sanitized log=%q want=%q", got, wantLog)
 	}
@@ -53,6 +55,9 @@ func TestJoinedDBErrorObservabilityIsSanitizedAndFailClosed(t *testing.T) {
 		if strings.Contains(logs.String(), secret) || strings.Contains(recorder.Body.String(), secret) {
 			t.Fatalf("database detail escaped redaction: %q", secret)
 		}
+	}
+	if strings.Contains(logs.String(), workerID) {
+		t.Fatalf("worker correlation value escaped hashing: %q", logs.String())
 	}
 	if recorder.Code != http.StatusConflict || recorder.Body.String() != "{\"error\":\"claim joined publication\"}\n" {
 		t.Fatalf("fail-closed response status=%d body=%q", recorder.Code, recorder.Body.String())
