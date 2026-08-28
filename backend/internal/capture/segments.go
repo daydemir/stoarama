@@ -59,7 +59,6 @@ type continuousStderrObserver struct {
 	buffer             bytes.Buffer
 	expiredGooglevideo chan struct{}
 	tail               string
-	detected           bool
 }
 
 func newContinuousStderrObserver(watchGooglevideo bool) *continuousStderrObserver {
@@ -72,14 +71,20 @@ func newContinuousStderrObserver(watchGooglevideo bool) *continuousStderrObserve
 
 func (o *continuousStderrObserver) Write(p []byte) (int, error) {
 	n, err := o.buffer.Write(p)
-	if o.expiredGooglevideo == nil || o.detected {
+	if o.expiredGooglevideo == nil {
 		return n, err
 	}
 	const maxTail = 64
 	text := strings.ToLower(o.tail + string(p))
 	if strings.Contains(text, "403") && strings.Contains(text, "forbidden") {
-		o.detected = true
-		o.expiredGooglevideo <- struct{}{}
+		select {
+		case o.expiredGooglevideo <- struct{}{}:
+		default:
+		}
+		// Do not let the matched text combine with a later unrelated write or
+		// suppress a later, distinct 403 after capture progress resumes.
+		o.tail = ""
+		return n, err
 	}
 	if len(text) > maxTail {
 		o.tail = text[len(text)-maxTail:]
@@ -89,7 +94,6 @@ func (o *continuousStderrObserver) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (o *continuousStderrObserver) expired() bool  { return o.detected }
 func (o *continuousStderrObserver) String() string { return o.buffer.String() }
 
 const (
@@ -114,6 +118,10 @@ const (
 	// second to close the current trailer, then kill it so fresh resolution is not
 	// delayed by the ordinary twenty-second shutdown allowance.
 	continuousExpiredFragmentShutdownGrace = time.Second
+	// A child-fragment 403 can be transient while FFmpeg continues to consume the
+	// advancing manifest. Confirm that output stayed still before replacing the
+	// process and its resolved manifest.
+	continuousExpiredFragmentConfirmationWindow = 5 * time.Second
 )
 
 type Segment struct {
@@ -448,8 +456,23 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 	lastProgressAt := startedAt
 	lastOutputSizes := map[string]int64{}
 	var sawProgress bool
+	var expiredFragmentTimer *time.Timer
+	var expiredFragmentConfirmation <-chan time.Time
+	var expiredFragmentBaseline map[string]int64
+	stopExpiredFragmentTimer := func() {
+		if expiredFragmentTimer != nil && !expiredFragmentTimer.Stop() {
+			select {
+			case <-expiredFragmentTimer.C:
+			default:
+			}
+		}
+		expiredFragmentTimer = nil
+		expiredFragmentConfirmation = nil
+		expiredFragmentBaseline = nil
+	}
 	ticker := time.NewTicker(ContinuousSegmentPollInterval)
 	defer ticker.Stop()
+	defer stopExpiredFragmentTimer()
 
 	// stopFFmpeg sends SIGINT for a clean trailer, then waits a bounded grace for
 	// the process to exit (falling back to Kill so we never hang on a wedged child).
@@ -496,17 +519,54 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		}
 		return nil
 	}
+	returnExpiredFragment := func() error {
+		stopFFmpeg(continuousExpiredFragmentShutdownGrace)
+		finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
+		sweepErr := sweepFinal(finalizeCtx, true)
+		cancelFinalize()
+		if sweepErr != nil {
+			return errors.Join(ErrContinuousExpiredGooglevideoFragment, sweepErr)
+		}
+		return ErrContinuousExpiredGooglevideoFragment
+	}
 
 	for {
 		select {
 		case <-stderr.expiredGooglevideo:
-			stopFFmpeg(continuousExpiredFragmentShutdownGrace)
-			finalizeCtx, cancelFinalize := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancelFinalize()
-			if sweepErr := sweepFinal(finalizeCtx, true); sweepErr != nil {
-				return errors.Join(ErrContinuousExpiredGooglevideoFragment, sweepErr)
+			if expiredFragmentTimer != nil {
+				outputSizes, err := continuousOutputSizes(outDir)
+				if err != nil {
+					stopFFmpeg(continuousShutdownGrace)
+					return err
+				}
+				if !continuousOutputAdvanced(expiredFragmentBaseline, outputSizes) {
+					return returnExpiredFragment()
+				}
+				stopExpiredFragmentTimer()
+				expiredFragmentBaseline = outputSizes
+				expiredFragmentTimer = time.NewTimer(continuousExpiredFragmentConfirmationWindow)
+				expiredFragmentConfirmation = expiredFragmentTimer.C
+				continue
 			}
-			return ErrContinuousExpiredGooglevideoFragment
+			var err error
+			expiredFragmentBaseline, err = continuousOutputSizes(outDir)
+			if err != nil {
+				stopFFmpeg(continuousShutdownGrace)
+				return err
+			}
+			expiredFragmentTimer = time.NewTimer(continuousExpiredFragmentConfirmationWindow)
+			expiredFragmentConfirmation = expiredFragmentTimer.C
+		case <-expiredFragmentConfirmation:
+			outputSizes, err := continuousOutputSizes(outDir)
+			if err != nil {
+				stopFFmpeg(continuousShutdownGrace)
+				return err
+			}
+			if continuousOutputAdvanced(expiredFragmentBaseline, outputSizes) {
+				stopExpiredFragmentTimer()
+				continue
+			}
+			return returnExpiredFragment()
 		case <-ctx.Done():
 			stopFFmpeg(continuousShutdownGrace)
 			// Final sweep: the last open segment now has a clean trailer.
@@ -519,8 +579,16 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		case err := <-waitErr:
 			// ffmpeg exited on its own (stream ended or a hard error). Sweep whatever
 			// finalized segments remain, then surface the error if it was non-clean.
+			expiredWithoutRecovery := len(stderr.expiredGooglevideo) > 0
+			if expiredFragmentTimer != nil {
+				outputSizes, sizeErr := continuousOutputSizes(outDir)
+				if sizeErr != nil {
+					return errors.Join(fmt.Errorf("inspect continuous output after ffmpeg exit: %w", sizeErr), sweepFinal(ctx, true))
+				}
+				expiredWithoutRecovery = !continuousOutputAdvanced(expiredFragmentBaseline, outputSizes)
+			}
 			sweepErr := sweepFinal(ctx, true)
-			if stderr.expired() {
+			if err != nil && expiredWithoutRecovery {
 				return errors.Join(ErrContinuousExpiredGooglevideoFragment, sweepErr)
 			}
 			if err != nil {
@@ -540,6 +608,9 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 			if continuousOutputAdvanced(lastOutputSizes, outputSizes) {
 				lastProgressAt = now
 				sawProgress = true
+			}
+			if expiredFragmentTimer != nil && continuousOutputAdvanced(expiredFragmentBaseline, outputSizes) {
+				stopExpiredFragmentTimer()
 			}
 			lastOutputSizes = outputSizes
 			if err := continuousWatchdogError(now, startedAt, lastProgressAt, sawProgress, startupTimeout, progressTimeout); err != nil {
