@@ -369,7 +369,7 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
-		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th><th>Schedule</th>`,
+		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th><th>Joined</th><th>Schedule</th>`,
 		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
 		`const captureHealthHTML = captureHealth === 'unavailable'`,
@@ -702,5 +702,17 @@ func TestHandleKoreaAppDefaultsToCaptureTypes(t *testing.T) {
 	}
 	if strings.Contains(location, "recordable") {
 		t.Fatalf("location should not include legacy recordable param: %q", location)
+	}
+}
+
+func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"health-joined-marker", "Joined: ${joinedPercent}%", "source_duration_ms", "joined_ready_ms", "<svg viewBox=\"0 0 10 10\""} {
+		if !strings.Contains(string(body), marker) {
+			t.Fatalf("recordings html missing joined-progress marker %q", marker)
+		}
 	}
 }

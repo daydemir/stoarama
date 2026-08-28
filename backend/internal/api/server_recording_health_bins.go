@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"log"
 	"slices"
 	"time"
 
@@ -17,11 +18,13 @@ const (
 )
 
 type recordingHealthBin struct {
-	Start    time.Time                   `json:"start"`
-	End      time.Time                   `json:"end"`
-	Captured int64                       `json:"captured"`
-	Expected int64                       `json:"expected"`
-	Health   recordingCaptureHealthState `json:"health"`
+	Start            time.Time                   `json:"start"`
+	End              time.Time                   `json:"end"`
+	Captured         int64                       `json:"captured"`
+	Expected         int64                       `json:"expected"`
+	Health           recordingCaptureHealthState `json:"health"`
+	JoinedReadyMS    int64                       `json:"joined_ready_ms"`
+	SourceDurationMS int64                       `json:"source_duration_ms"`
 }
 
 type recordingHealthSpec struct {
@@ -243,6 +246,16 @@ func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID in
 		return nil, err
 	}
 	countRows.Close()
+	joinedProgress, err := s.recordingJoinedProgressForBins(ctx, accountID, binRecordingIDs, binStarts, binEnds)
+	if err != nil {
+		log.Printf("recording list joined health bins omitted account_id=%d: %v", accountID, err)
+	} else {
+		for i, progress := range joinedProgress {
+			ref := refs[i]
+			out[ref.recordingID][ref.index].SourceDurationMS = progress.SourceDurationMS
+			out[ref.recordingID][ref.index].JoinedReadyMS = progress.JoinedReadyMS
+		}
+	}
 
 	for id, bins := range out {
 		for i := range bins {

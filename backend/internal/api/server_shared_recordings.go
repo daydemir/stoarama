@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -25,7 +26,7 @@ const (
 	sharedRecordingsMaxFailures        = 5
 	sharedRecordingsMaxClients         = 4096
 	sharedRecordingsListLimit          = 500
-	sharedRecordingsVisibleStatusesSQL = "rec.status IN ('active','paused')"
+	sharedRecordingsVisibleStatusesSQL = "rec.status IN ('active','paused','completed')"
 )
 
 type sharedRecording struct {
@@ -56,6 +57,9 @@ type sharedRecording struct {
 	HasRelayAssigned  bool                        `json:"has_relay_assigned"`
 	CaptureHealthBins []recordingHealthBin        `json:"capture_health_bins,omitempty"`
 	TimelineHealth    *recordingTimelineHealth    `json:"timeline_health,omitempty"`
+	JoinedReadyMS     int64                       `json:"joined_ready_ms"`
+	SourceDurationMS  int64                       `json:"source_duration_ms"`
+	JoinedPercent     *int                        `json:"joined_percent"`
 }
 
 type sharedRecordingsLimiter struct {
@@ -385,6 +389,23 @@ func (s *Server) handleSharedRecordingCaptureHealth(w http.ResponseWriter, r *ht
 	s.writeRecordingCaptureHealth(w, r, s.cfg.SharedRecordingsAccountID, id)
 }
 
+func (s *Server) sharedRecordingPrincipalRequest(r *http.Request) *http.Request {
+	ctx := context.WithValue(r.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: s.cfg.SharedRecordingsAccountID, AuthType: "shared"})
+	return r.WithContext(ctx)
+}
+
+func (s *Server) handleSharedRecordingJoinedList(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedList(w, s.sharedRecordingPrincipalRequest(r))
+}
+
+func (s *Server) handleSharedRecordingJoinedDownload(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedDownload(w, s.sharedRecordingPrincipalRequest(r))
+}
+
+func (s *Server) handleSharedRecordingJoinedFolder(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountRecordingJoinedFolder(w, s.sharedRecordingPrincipalRequest(r))
+}
+
 func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sharedRecording, error) {
 	query := recordingListSelectSQL + `
 		WHERE rec.account_id=$1 AND ` + sharedRecordingsVisibleStatusesSQL
@@ -429,12 +450,22 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	if err != nil {
 		return nil, err
 	}
+	joinedProgress, err := s.recordingJoinedProgressForAccount(r.Context(), s.cfg.SharedRecordingsAccountID, ids)
+	if err != nil {
+		return nil, err
+	}
 	for i := range items {
 		items[i].CaptureHealthBins = bins[items[i].ID]
 		if health, ok := timeline[items[i].ID]; ok {
 			items[i].TimelineHealth = &health
 		}
+		if progress, ok := joinedProgress[items[i].ID]; ok {
+			items[i].JoinedReadyMS = progress.JoinedReadyMS
+			items[i].SourceDurationMS = progress.SourceDurationMS
+			items[i].JoinedPercent = progress.Percent
+		}
 	}
+	sortSharedRecordingsByJoinedProgress(items, recordingJoinedSortDirection(r.URL.Query().Get("sort")))
 	return items, nil
 }
 

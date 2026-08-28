@@ -192,6 +192,9 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 		if err := rows.Err(); err != nil {
 			return recordingCaptureHealthPage{}, fmt.Errorf("count captured clips: %w", err)
 		}
+		if err := s.populateRecordingJoinedProgressBins(r.Context(), accountID, recordingID, starts, ends, bins); err != nil {
+			return recordingCaptureHealthPage{}, err
+		}
 	}
 	for i := range bins {
 		bins[i].Health = recordingCaptureHealth("active", bins[i].Captured, bins[i].Expected)
