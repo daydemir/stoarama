@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -20,7 +21,7 @@ import (
 const (
 	recordingJoinedBrowserDefaultLimit = 100
 	recordingJoinedBrowserMaxLimit     = 500
-	recordingJoinedFolderPageSize      = 250
+	recordingJoinedFolderMaxFiles      = 5000
 )
 
 type recordingJoinedFile struct {
@@ -182,22 +183,38 @@ func (s *Server) handleAccountRecordingJoinedList(w http.ResponseWriter, r *http
 type joinedFolderPage struct {
 	RecordingID int64
 	BackPath    string
-	Files       []recordingJoinedFile
+	Crumbs      []joinedFolderCrumb
+	Folders     []joinedFolderEntry
+	Files       []joinedFolderFile
 	Total       int64
-	First       int64
-	Last        int64
-	Previous    string
-	Next        string
+}
+
+type joinedFolderCrumb struct {
+	Name    string
+	Path    string
+	Current bool
+}
+
+type joinedFolderEntry struct {
+	Name  string
+	Count int
+	Path  string
+}
+
+type joinedFolderFile struct {
+	Name         string
+	DownloadPath string
+	LocalDate    string
+	Size         string
 }
 
 var joinedFolderTemplate = template.Must(template.New("joined-folder").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Joined recordings</title><style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,sans-serif;background:#101114;color:#f3f4f6}body{max-width:1080px;margin:0 auto;padding:24px}a{color:#9bc5ff}a:focus-visible{outline:2px solid #9bc5ff;outline-offset:3px}.head{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.button{display:inline-flex;align-items:center;min-height:36px;padding:0 14px;border:1px solid #586174;border-radius:8px;text-decoration:none}.note{color:#aeb5c2;font-size:14px;line-height:1.5}.list{margin:20px 0;border-top:1px solid #30343d}.file{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;padding:12px 0;border-bottom:1px solid #30343d}.path{overflow-wrap:anywhere}.meta{color:#aeb5c2;font-size:13px;margin-top:4px}.actions{display:flex;gap:8px;align-items:center}.pager{display:flex;gap:12px;align-items:center;justify-content:flex-end;flex-wrap:wrap}@media(max-width:640px){body{padding:16px}.file{grid-template-columns:1fr}.actions{justify-content:flex-start}}
-</style></head><body><div class="head"><div><a href="{{.BackPath}}">Back to recording</a><h1>Joined recordings</h1></div><div>{{.First}}-{{.Last}} of {{.Total}}</div></div>
-<p class="note">This view lists the published joined files in Stoarama's private R2 folder. Each file is read through an account-scoped, ETag-bound Stoarama URL. The bucket and its credentials remain private.</p>
-<div class="list">{{range .Files}}<div class="file"><div><div class="path">{{.RelativePath}}</div><div class="meta">{{.Kind}} · {{.SizeBytes}} bytes · {{.LocalDate}} · hour {{printf "%02d" .DeliveryHour}}</div></div><div class="actions"><a class="button" href="{{.DownloadPath}}?disposition=inline" target="_blank" rel="noopener noreferrer">Open</a><a class="button" href="{{.DownloadPath}}?disposition=attachment">Download</a></div></div>{{else}}<p class="note">No joined files are published yet.</p>{{end}}</div>
-<nav class="pager" aria-label="Joined folder pages">{{if .Previous}}<a class="button" href="{{.Previous}}">Previous</a>{{end}}{{if .Next}}<a class="button" href="{{.Next}}">Next</a>{{end}}</nav></body></html>`))
+<title>Joined clips</title><style>
+:root{color-scheme:dark;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0f13;color:#f3f5f8}*{box-sizing:border-box}body{max-width:1120px;margin:0 auto;padding:32px 24px 56px}a{color:#a8ceff}a:focus-visible{outline:2px solid #8bbcff;outline-offset:3px}.back{display:inline-flex;margin-bottom:22px;color:#aeb8c7;font-size:14px;text-decoration:none}.back:hover{color:#f3f5f8}.head{display:flex;gap:24px;align-items:end;justify-content:space-between;margin-bottom:24px}.head h1{margin:0 0 7px;font-size:clamp(26px,4vw,38px);line-height:1.12;letter-spacing:-.025em}.note{max-width:70ch;margin:0;color:#aeb8c7;font-size:14px;line-height:1.55}.count{flex:0 0 auto;color:#aeb8c7;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}.browser{overflow:hidden;border:1px solid #303744;border-radius:14px;background:#15191f;box-shadow:0 12px 32px rgba(0,0,0,.22)}.crumbs{display:flex;align-items:center;gap:7px;min-height:48px;padding:8px 14px;overflow-x:auto;border-bottom:1px solid #303744;white-space:nowrap}.crumbs a,.crumbs span{font-size:14px}.crumbs span{color:#f3f5f8;font-weight:650}.sep{color:#667085}.entry{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;min-height:64px;padding:11px 14px;border-bottom:1px solid #292f39}.entry:last-child{border-bottom:0}.folder{display:flex;align-items:center;gap:12px;min-width:0;color:#f3f5f8;font-weight:650;text-decoration:none}.folder:hover .name{text-decoration:underline;text-underline-offset:3px}.folder-icon{position:relative;flex:0 0 auto;width:24px;height:17px;border-radius:4px;background:#5e9de7}.folder-icon:before{content:"";position:absolute;top:-5px;left:2px;width:10px;height:6px;border-radius:4px 4px 0 0;background:inherit}.name{min-width:0;overflow-wrap:anywhere}.meta{margin-top:5px;color:#aeb8c7;font-size:13px;line-height:1.45}.actions{display:flex;gap:8px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:7px 13px;border:1px solid #4d596b;border-radius:8px;color:#dceaff;text-decoration:none}.button:hover{border-color:#78aeea;background:#202a36}.empty{padding:28px 18px;color:#aeb8c7;text-align:center}@media(max-width:640px){body{padding:20px 14px 40px}.head{align-items:start;flex-direction:column;gap:8px}.entry{grid-template-columns:1fr;gap:10px;padding:14px}.actions{justify-content:flex-start}.button{min-height:44px;flex:1}.count{white-space:normal}}
+</style></head><body><a class="back" href="{{.BackPath}}">← Back to recording</a><header class="head"><div><h1>Joined clips</h1><p class="note">Browse the published continuous clips for this recording. Separate files mark a detected gap or incompatible source layout.</p></div><div class="count">{{.Total}} clip{{if ne .Total 1}}s{{end}}</div></header>
+<main class="browser"><nav class="crumbs" aria-label="Joined clip folders">{{range $index, $crumb := .Crumbs}}{{if $index}}<span class="sep" aria-hidden="true">/</span>{{end}}{{if $crumb.Current}}<span aria-current="page">{{$crumb.Name}}</span>{{else}}<a href="{{$crumb.Path}}">{{$crumb.Name}}</a>{{end}}{{end}}</nav>
+<div>{{range .Folders}}<div class="entry"><a class="folder" href="{{.Path}}"><span class="folder-icon" aria-hidden="true"></span><span class="name">{{.Name}}</span></a><span class="meta">{{.Count}} clip{{if ne .Count 1}}s{{end}}</span></div>{{end}}{{range .Files}}<div class="entry"><div><div class="name">{{.Name}}</div><div class="meta">{{.LocalDate}} · {{.Size}}</div></div><div class="actions"><a class="button" href="{{.DownloadPath}}?disposition=inline" target="_blank" rel="noopener noreferrer">View</a><a class="button" href="{{.DownloadPath}}?disposition=attachment">Download</a></div></div>{{end}}{{if and (not .Folders) (not .Files)}}<div class="empty">No joined clips are published in this folder yet.</div>{{end}}</div></main></body></html>`))
 
 // handleAccountRecordingJoinedFolder renders a same-origin folder view for
 // people who do not have R2 access. It uses the same account/cohort scope as the
@@ -212,10 +229,13 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 	if !ok {
 		return
 	}
-	pageNumber := parseIntQuery(r, "page", 1, 1, 1<<20)
-	offset := (pageNumber - 1) * recordingJoinedFolderPageSize
+	activePath, ok := parseJoinedFolderPath(r.URL.Query().Get("folder"))
+	if !ok {
+		util.WriteError(w, http.StatusBadRequest, "invalid joined folder")
+		return
+	}
 	result, err := s.recordingJoinedFiles(r.Context(), principal, recordingID,
-		[]string{"hour_manifest", "media"}, recordingJoinedFolderPageSize, offset)
+		[]string{"media"}, recordingJoinedBrowserMaxLimit, 0)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "recording not found")
 		return
@@ -224,19 +244,28 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 		util.WriteError(w, http.StatusInternalServerError, "list joined recording folder")
 		return
 	}
-	pagePath := result.FolderPath
-	previous, next := "", ""
-	if pageNumber > 1 {
-		previous = pagePath + "?page=" + strconv.Itoa(pageNumber-1)
+	if result.Total > recordingJoinedFolderMaxFiles {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined folder is too large to browse")
+		return
 	}
-	if int64(offset+len(result.Files)) < result.Total {
-		next = pagePath + "?page=" + strconv.Itoa(pageNumber+1)
+	for offset := len(result.Files); int64(offset) < result.Total; offset += recordingJoinedBrowserMaxLimit {
+		next, nextErr := s.recordingJoinedFiles(r.Context(), principal, recordingID,
+			[]string{"media"}, recordingJoinedBrowserMaxLimit, offset)
+		if nextErr != nil {
+			util.WriteError(w, http.StatusInternalServerError, "list joined recording folder")
+			return
+		}
+		if len(next.Files) == 0 {
+			break
+		}
+		result.Files = append(result.Files, next.Files...)
 	}
-	first, last := int64(0), int64(0)
-	if len(result.Files) > 0 {
-		first = int64(offset + 1)
-		last = int64(offset + len(result.Files))
+	folders, files, found := joinedFolderEntries(result.FolderPath, result.Files, activePath)
+	if !found {
+		util.WriteError(w, http.StatusNotFound, "joined folder not found")
+		return
 	}
+	crumbs := joinedFolderCrumbs(result.FolderPath, activePath)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; media-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -245,15 +274,118 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 	if err := joinedFolderTemplate.Execute(w, joinedFolderPage{
 		RecordingID: recordingID,
 		BackPath:    fmt.Sprintf("%s/%d", s.recordingJoinedPageRoot(principal), recordingID),
-		Files:       result.Files,
+		Crumbs:      crumbs,
+		Folders:     folders,
+		Files:       files,
 		Total:       result.Total,
-		First:       first,
-		Last:        last,
-		Previous:    previous,
-		Next:        next,
 	}); err != nil {
 		return
 	}
+}
+
+var joinedFolderMonths = map[string]bool{
+	"January": true, "February": true, "March": true, "April": true,
+	"May": true, "June": true, "July": true, "August": true,
+	"September": true, "October": true, "November": true, "December": true,
+}
+
+func parseJoinedFolderPath(raw string) ([]string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, true
+	}
+	if len(raw) > 128 {
+		return nil, false
+	}
+	parts := strings.Split(raw, "/")
+	if len(parts) > 2 {
+		return nil, false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.ContainsAny(part, "\\\x00\r\n") {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+func joinedFolderFileParts(relativePath string) []string {
+	parts := strings.FieldsFunc(strings.TrimSpace(relativePath), func(r rune) bool { return r == '/' || r == '\\' })
+	for i, part := range parts {
+		if joinedFolderMonths[part] {
+			return parts[i:]
+		}
+	}
+	return parts
+}
+
+func joinedFolderPath(root string, parts []string) string {
+	if len(parts) == 0 {
+		return root
+	}
+	return root + "?folder=" + url.QueryEscape(strings.Join(parts, "/"))
+}
+
+func joinedFolderCrumbs(root string, active []string) []joinedFolderCrumb {
+	crumbs := []joinedFolderCrumb{{Name: "Joined clips", Path: root, Current: len(active) == 0}}
+	for i, name := range active {
+		crumbs = append(crumbs, joinedFolderCrumb{
+			Name: name, Path: joinedFolderPath(root, active[:i+1]), Current: i == len(active)-1,
+		})
+	}
+	return crumbs
+}
+
+func joinedFolderEntries(root string, source []recordingJoinedFile, active []string) ([]joinedFolderEntry, []joinedFolderFile, bool) {
+	folderIndex := make(map[string]int)
+	folders := make([]joinedFolderEntry, 0)
+	files := make([]joinedFolderFile, 0)
+	matched := len(active) == 0
+	for _, file := range source {
+		parts := joinedFolderFileParts(file.RelativePath)
+		if len(parts) == 0 || len(parts) <= len(active) {
+			continue
+		}
+		matches := true
+		for i, want := range active {
+			if parts[i] != want {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		matched = true
+		if len(parts) > len(active)+1 {
+			name := parts[len(active)]
+			if index, exists := folderIndex[name]; exists {
+				folders[index].Count++
+			} else {
+				folderIndex[name] = len(folders)
+				folders = append(folders, joinedFolderEntry{Name: name, Count: 1, Path: joinedFolderPath(root, append(append([]string{}, active...), name))})
+			}
+			continue
+		}
+		files = append(files, joinedFolderFile{
+			Name: parts[len(parts)-1], DownloadPath: file.DownloadPath, LocalDate: file.LocalDate,
+			Size: joinedFolderSize(file.SizeBytes),
+		})
+	}
+	return folders, files, matched
+}
+
+func joinedFolderSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	}
+	if bytes < 1024*1024*1024 {
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+	}
+	return fmt.Sprintf("%.1f GB", float64(bytes)/(1024*1024*1024))
 }
 
 type joinedOutputRangeStore interface {

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -34,6 +35,47 @@ func TestRecordingJoinedBrowserRequiresAccountPrincipal(t *testing.T) {
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
 		})
+	}
+}
+
+func TestJoinedFolderEntriesDrillMonthWeekdayAndExposeOnlyLeafFiles(t *testing.T) {
+	from := time.Date(2026, time.August, 6, 8, 0, 0, 0, time.UTC)
+	source := []recordingJoinedFile{
+		{RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", DownloadPath: "/joined/1", LocalDate: "2026-08-06", ScheduledFrom: from, ScheduledTo: from.Add(time.Hour), SizeBytes: 1024},
+		{RelativePath: "377_Europe_Poland_Luban/August/Thursday/b.mp4", DownloadPath: "/joined/2", LocalDate: "2026-08-06", ScheduledFrom: from.Add(time.Hour), ScheduledTo: from.Add(2 * time.Hour), SizeBytes: 2 * 1024 * 1024},
+		{RelativePath: "377_Europe_Poland_Luban/August/Friday/c.mp4", DownloadPath: "/joined/3", LocalDate: "2026-08-07", ScheduledFrom: from, ScheduledTo: from.Add(30 * time.Minute), SizeBytes: 3 * 1024 * 1024},
+	}
+	root := "/api/v1/shared/mit-scl/recordings/377/joined/folder"
+	folders, files, found := joinedFolderEntries(root, source, nil)
+	if !found || len(folders) != 1 || folders[0].Name != "August" || folders[0].Count != 3 || len(files) != 0 {
+		t.Fatalf("root folders=%+v files=%+v found=%v", folders, files, found)
+	}
+	folders, files, found = joinedFolderEntries(root, source, []string{"August"})
+	if !found || len(folders) != 2 || folders[0].Name != "Thursday" || folders[0].Count != 2 || len(files) != 0 {
+		t.Fatalf("month folders=%+v files=%+v found=%v", folders, files, found)
+	}
+	folders, files, found = joinedFolderEntries(root, source, []string{"August", "Thursday"})
+	if !found || len(folders) != 0 || len(files) != 2 || files[0].Name != "a.mp4" || files[0].DownloadPath != "/joined/1" {
+		t.Fatalf("weekday folders=%+v files=%+v found=%v", folders, files, found)
+	}
+	if files[0].Size != "1.0 KB" {
+		t.Fatalf("leaf metadata=%+v", files[0])
+	}
+	if _, _, found = joinedFolderEntries(root, source, []string{"September"}); found {
+		t.Fatal("missing folder reported as found")
+	}
+}
+
+func TestParseJoinedFolderPathRejectsTraversalAndExtraDepth(t *testing.T) {
+	for _, raw := range []string{"", "August", "August/Thursday"} {
+		if _, ok := parseJoinedFolderPath(raw); !ok {
+			t.Fatalf("valid path %q rejected", raw)
+		}
+	}
+	for _, raw := range []string{"..", "August/../Thursday", "August/Thursday/file.mp4", "August\\Thursday", "August\nThursday"} {
+		if _, ok := parseJoinedFolderPath(raw); ok {
+			t.Fatalf("invalid path %q accepted", raw)
+		}
 	}
 }
 
