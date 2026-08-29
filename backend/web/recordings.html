@@ -4017,7 +4017,8 @@
     const clipPageState = {
       recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null,
       captureHealth: null, joinedFolderPath: '', joinedPayload: null,
-      joinedPayloadKey: '', joinedLoadToken: 0, joinedStatus: 'idle', joinedError: '',
+      captureHealthLoadToken: 0, joinedPayloadKey: '', joinedLoadToken: 0,
+      joinedStatus: 'idle', joinedError: '',
     };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
@@ -4099,14 +4100,32 @@
 	  }
 	}
 
-	async function loadRecordingDetailCaptureHealth(recId) {
+	async function loadRecordingDetailCaptureHealth(recId, toDate = '') {
+	  const loadToken = ++clipPageState.captureHealthLoadToken;
 	  try {
-	    const page = await fetchRecordingCaptureHealth(recId, '');
-	    if (Number(recId) !== Number(clipPageState.recId)) return;
-	    clipPageState.captureHealth = page;
+	    const page = await fetchRecordingCaptureHealth(recId, toDate, 'base');
+	    if (loadToken !== clipPageState.captureHealthLoadToken || Number(recId) !== Number(clipPageState.recId)) return;
+	    clipPageState.captureHealth = { ...page, joined_status: 'loading' };
+	    renderClipPageWithJoined();
+	    void loadRecordingDetailJoinedHealth(recId, page, loadToken);
 	  } catch (err) {
-	    if (Number(recId) !== Number(clipPageState.recId)) return;
+	    if (loadToken !== clipPageState.captureHealthLoadToken || Number(recId) !== Number(clipPageState.recId)) return;
 	    clipPageState.captureHealth = { error: String(err.message || err) };
+	    renderClipPageWithJoined();
+	  }
+	}
+
+	async function loadRecordingDetailJoinedHealth(recId, page, loadToken) {
+	  const pageKey = captureHealthPageKey(page);
+	  try {
+	    const joinedPage = await fetchRecordingCaptureHealth(recId, page.to, 'joined', page.from);
+	    if (loadToken !== clipPageState.captureHealthLoadToken || Number(recId) !== Number(clipPageState.recId)) return;
+	    if (captureHealthPageKey(clipPageState.captureHealth) !== pageKey) return;
+	    clipPageState.captureHealth = { ...mergeCaptureHealthJoined(clipPageState.captureHealth, joinedPage), joined_status: 'ready' };
+	  } catch (_) {
+	    if (loadToken !== clipPageState.captureHealthLoadToken || Number(recId) !== Number(clipPageState.recId)) return;
+	    if (captureHealthPageKey(clipPageState.captureHealth) !== pageKey) return;
+	    clipPageState.captureHealth = markCaptureHealthJoinedUnavailable(clipPageState.captureHealth);
 	  }
 	  renderClipPageWithJoined();
 	}
@@ -4271,9 +4290,44 @@
     window.addEventListener('scroll', hideHealthTooltip, true);
     window.addEventListener('resize', hideHealthTooltip);
 
-    async function fetchRecordingCaptureHealth(recordingID, toDate) {
-      const query = toDate ? `?to=${encodeURIComponent(toDate)}` : '';
+    async function fetchRecordingCaptureHealth(recordingID, toDate, metrics = 'full', fromDate = '') {
+      const params = new URLSearchParams();
+      if (toDate) params.set('to', toDate);
+      if (fromDate) params.set('from', fromDate);
+      params.set('metrics', metrics);
+      const query = `?${params.toString()}`;
       return fetchJSON(recordingAPIPath(`/${encodeURIComponent(recordingID)}/capture-health${query}`));
+    }
+
+    function captureHealthPageKey(page) {
+      if (!page || page.error) return '';
+      return `${Number(page.recording_id || 0)}|${String(page.from || '')}|${String(page.to || '')}`;
+    }
+
+    function mergeCaptureHealthJoined(basePage, joinedPage) {
+      if (captureHealthPageKey(basePage) === '' || captureHealthPageKey(basePage) !== captureHealthPageKey(joinedPage)) {
+        throw new Error('joined capture health page does not match captured bins');
+      }
+      const joinedBins = new Map((Array.isArray(joinedPage.bins) ? joinedPage.bins : [])
+        .map((bin) => [`${String(bin.start || '')}|${String(bin.end || '')}`, bin]));
+      const baseBins = Array.isArray(basePage.bins) ? basePage.bins : [];
+      if (joinedBins.size !== baseBins.length) {
+        throw new Error('joined capture health bins do not match captured bins');
+      }
+      const bins = baseBins.map((bin) => {
+        const match = joinedBins.get(`${String(bin.start || '')}|${String(bin.end || '')}`);
+        if (!match) throw new Error('joined capture health bin is missing');
+        return {
+          ...bin,
+          source_duration_ms: Number(match.source_duration_ms || 0),
+          joined_ready_ms: Number(match.joined_ready_ms || 0),
+        };
+      });
+      return { ...basePage, joined_included: true, bins };
+    }
+
+    function markCaptureHealthJoinedUnavailable(page) {
+      return { ...page, joined_status: 'error' };
     }
 
     function captureHealthLocalParts(value, timezone) {
@@ -4284,6 +4338,16 @@
       });
       formatter.formatToParts(new Date(value)).forEach((part) => { parts[part.type] = part.value; });
       return { date: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour), zone: parts.timeZoneName || '' };
+    }
+
+    function captureHealthJoinedLabel(bin, page) {
+      const status = String((page && page.joined_status) || '');
+      if (status === 'loading') return 'Joined: loading';
+      if (status === 'error') return 'Joined: temporarily unavailable';
+      const sourceMS = Number((bin && bin.source_duration_ms) || 0);
+      if (sourceMS <= 0) return 'Joined: unavailable';
+      const joinedPercent = Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100));
+      return `Joined: ${joinedPercent}%`;
     }
 
     function captureHealthDateRange(from, to) {
@@ -4316,13 +4380,14 @@
             const percent = expected > 0 ? Math.round(captured / expected * 1000) / 10 : 0;
             const health = String(bin.health || '');
             const sourceMS = Number(bin.source_duration_ms || 0);
-            const joinedAvailable = sourceMS > 0;
+            const joinedStatus = String(page.joined_status || '');
+            const joinedAvailable = joinedStatus !== 'loading' && joinedStatus !== 'error' && sourceMS > 0;
             const joinedPercent = joinedAvailable ? Math.min(100, Math.floor(Number(bin.joined_ready_ms || 0) / sourceMS * 100)) : null;
             const joinedMarker = joinedPercent === 100
               ? '<span class="health-joined-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>'
               : (joinedPercent > 0 ? `<span class="health-joined-marker" aria-hidden="true">${joinedPercent}</span>` : '');
             const zone = bin.localZone ? ` ${bin.localZone}` : '';
-            const joinedLabel = joinedAvailable ? `Joined: ${joinedPercent}%` : 'Joined: unavailable';
+            const joinedLabel = captureHealthJoinedLabel(bin, page);
             const title = `${date} ${String(hour).padStart(2, '0')}:00${zone} · Capture health: ${percent}% of expected clips captured (${captured}/${expected}) · ${joinedLabel}`;
             return `<button type="button" class="health-heatmap-cell ${health}" data-health-tooltip="${escapeHTML(title)}" aria-label="${escapeHTML(title)}">${joinedMarker}</button>`;
           }).join('')}
@@ -4362,6 +4427,12 @@
       }), { captured: 0, expected: 0, joined_ready_ms: 0, source_duration_ms: 0 });
       const percent = totals.expected > 0 ? Math.round(totals.captured / totals.expected * 1000) / 10 : 0;
       const joinedPercent = totals.source_duration_ms > 0 ? Math.min(100, Math.floor(totals.joined_ready_ms / totals.source_duration_ms * 100)) : 0;
+      const joinedStatus = String(page.joined_status || (page.joined_included ? 'ready' : ''));
+      const joinedStatusHTML = joinedStatus === 'loading'
+        ? '<div class="hint" role="status" aria-live="polite">Joined coverage is loading.</div>'
+        : (joinedStatus === 'error'
+            ? '<div class="hint" role="status" aria-live="polite" style="color:var(--warn)">Joined coverage is temporarily unavailable. Captured clips remain shown. <button type="button" class="secondary" data-health-joined-retry style="width:auto;min-width:0;min-height:28px;padding:4px 10px;margin-left:6px;">Try again</button></div>'
+            : '');
       return `
         <div class="detail-card">
           <div class="detail-card-head">
@@ -4373,6 +4444,7 @@
           </div>
           <div class="cell-main">${percent}% · ${totals.captured}/${totals.expected} clips${totals.source_duration_ms > 0 ? ` · ${joinedPercent}% joined` : ''}</div>
           <div class="hint">${escapeHTML(page.from)} through ${escapeHTML(page.to)} in ${escapeHTML(page.timezone)}. Hover or focus an hour for details.</div>
+          ${joinedStatusHTML}
           <div class="health-heatmap" aria-label="Hourly capture health by local date">${captureHealthHeatmap(page)}</div>
           <div class="health-legend">
             <span><i style="background:var(--ok)"></i>98% or better</span>
@@ -4393,12 +4465,7 @@
       const candidateDate = candidate.toISOString().slice(0, 10);
       const localToday = captureHealthLocalParts(new Date().toISOString(), page.timezone).date;
       const anchorDate = direction === 'newer' && candidateDate > localToday ? localToday : candidateDate;
-      try {
-        clipPageState.captureHealth = await fetchRecordingCaptureHealth(clipPageState.recId, anchorDate);
-		renderClipPageWithJoined();
-      } catch (err) {
-        window.alert(String(err.message || err));
-      }
+      void loadRecordingDetailCaptureHealth(clipPageState.recId, anchorDate);
     }
 
     // The storage card: stream id where applicable, current delivery, retention tier.
@@ -4474,6 +4541,19 @@
       return row + err;
     }
 
+    function renderDetailCardSafely(label, render) {
+      try {
+        return render();
+      } catch (err) {
+        console.error(`Unable to render ${label}`, err);
+        return `<div class="detail-card" role="status"><div class="detail-card-head"><span class="detail-card-title">${escapeHTML(label)}</span></div><div class="hint">This detail is temporarily unavailable.</div></div>`;
+      }
+    }
+
+    function renderRecordingDetailBody(prefix, cardRenderers, joinedBrowser) {
+      return prefix + cardRenderers.map(([label, render]) => renderDetailCardSafely(label, render)).join('') + joinedBrowser;
+    }
+
     // Render the whole detail view: header, schedule card, storage card, recording
     // actions, and an empty #clipListBody the clip pages render into.
     function renderClipPage() {
@@ -4507,10 +4587,29 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      root.innerHTML = header + blocked + relayBanner + recActionsCardHTML(rec) + (sharedReadOnly ? '' : streamCardHTML(rec)) + captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec) + relayRoutingCardHTML(rec) + (sharedReadOnly ? '' : storageCardHTML(rec))
-        + `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Joined recordings</div><div class="hint">Published continuous parts are shown here. Separate parts indicate a detected gap or incompatible source layout.</div></div></div><div id="clipListBody"></div>`;
-      wireDetailActions(root);
-      if (!sharedReadOnly) mountRecordingLivePlayer(rec);
+      const joinedBrowser = `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Joined recordings</div><div class="hint">Published continuous parts are shown here. Separate parts indicate a detected gap or incompatible source layout.</div></div></div><div id="clipListBody"></div>`;
+      const cardRenderers = [
+        ['Recording actions', () => recActionsCardHTML(rec)],
+        ['Live stream', () => sharedReadOnly ? '' : streamCardHTML(rec)],
+        ['Capture health', () => captureHealthCardHTML()],
+        ['Daily recording quality', () => dailyGradesCardHTML(rec)],
+        ['Schedule', () => scheduleCardHTML(rec)],
+        ['Relay routing', () => relayRoutingCardHTML(rec)],
+        ['Storage', () => sharedReadOnly ? '' : storageCardHTML(rec)],
+      ];
+      root.innerHTML = renderRecordingDetailBody(header + blocked + relayBanner, cardRenderers, joinedBrowser);
+      try {
+        wireDetailActions(root);
+      } catch (err) {
+        console.error('Unable to wire recording details', err);
+      }
+      if (!sharedReadOnly) {
+        try {
+          mountRecordingLivePlayer(rec);
+        } catch (err) {
+          console.error('Unable to mount recording preview', err);
+        }
+      }
     }
 
     function wireDetailActions(root) {
@@ -4526,6 +4625,15 @@
       if (routingBtn) routingBtn.addEventListener('click', () => openRelayRoutingEdit());
       root.querySelectorAll('button[data-health-page]').forEach((button) =>
         button.addEventListener('click', () => loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))));
+      const joinedRetry = root.querySelector('button[data-health-joined-retry]');
+      if (joinedRetry) joinedRetry.addEventListener('click', () => {
+        const page = clipPageState.captureHealth;
+        if (!page || page.error) return;
+        const loadToken = clipPageState.captureHealthLoadToken;
+        clipPageState.captureHealth = { ...page, joined_status: 'loading' };
+        renderClipPageWithJoined();
+        void loadRecordingDetailJoinedHealth(clipPageState.recId, page, loadToken);
+      });
     }
 
     async function openRelayRoutingEdit() {

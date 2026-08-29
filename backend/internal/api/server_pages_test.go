@@ -387,7 +387,9 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 		`Insufficient`,
 		`state.recordingSort === 'best14'`,
 		`Number.isFinite(Number(rating.sort_rank)) ? Number(rating.sort_rank) : 99`,
-		`captureHealthCardHTML() + dailyGradesCardHTML(rec) + scheduleCardHTML(rec)`,
+		`['Capture health', () => captureHealthCardHTML()]`,
+		`['Daily recording quality', () => dailyGradesCardHTML(rec)]`,
+		`['Schedule', () => scheduleCardHTML(rec)]`,
 		`data-health-tooltip="${escapeHTML(title)}" tabindex="0" aria-describedby="healthTooltip"`,
 	} {
 		if !strings.Contains(page, marker) {
@@ -600,12 +602,18 @@ func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`/capture-health${query}`,
+		`fetchRecordingCaptureHealth(recId, toDate, 'base')`,
+		`fetchRecordingCaptureHealth(recId, page.to, 'joined', page.from)`,
+		`mergeCaptureHealthJoined(clipPageState.captureHealth, joinedPage)`,
+		`Joined coverage is loading.`,
+		`Joined coverage is temporarily unavailable. Captured clips remain shown.`,
+		`role="status" aria-live="polite"`,
+		`function captureHealthJoinedLabel(bin, page)`,
 		`class="health-heatmap-cell ${health}" data-health-tooltip="${escapeHTML(title)}"`,
 		`aria-label="Hourly capture health by local date"`,
 		`data-health-page="older"`,
 		`data-health-page="newer"`,
 		`loadRecordingCaptureHealthPage(button.getAttribute('data-health-page'))`,
-		`const page = await fetchRecordingCaptureHealth(recId, '');`,
 		`void loadRecordingDetailCaptureHealth(recId);`,
 		`Array.from({ length: 24 }, () => [])`,
 		`hours.map((bins, hour) => ({ bin: captureHealthDisplayBin(bins), hour }))`,
@@ -617,6 +625,26 @@ func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording detail heatmap source missing %q", marker)
+		}
+	}
+}
+
+func TestRecordingDetailCardFailureCannotRemoveJoinedBrowser(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`function renderDetailCardSafely(label, render)`,
+		`function renderRecordingDetailBody(prefix, cardRenderers, joinedBrowser)`,
+		`renderDetailCardSafely(label, render)`,
+		`role="status"`,
+		`This detail is temporarily unavailable.`,
+		`id="clipListBody"`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording detail resilience source missing %q", marker)
 		}
 	}
 }

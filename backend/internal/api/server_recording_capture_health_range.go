@@ -25,14 +25,45 @@ type captureHealthRequestError struct {
 
 func (e captureHealthRequestError) Error() string { return e.message }
 
+type captureHealthMetrics string
+
+const (
+	captureHealthMetricsFull   captureHealthMetrics = "full"
+	captureHealthMetricsBase   captureHealthMetrics = "base"
+	captureHealthMetricsJoined captureHealthMetrics = "joined"
+)
+
+func parseCaptureHealthMetrics(raw string) (captureHealthMetrics, error) {
+	switch strings.TrimSpace(raw) {
+	case "", string(captureHealthMetricsFull):
+		return captureHealthMetricsFull, nil
+	case string(captureHealthMetricsBase):
+		return captureHealthMetricsBase, nil
+	case string(captureHealthMetricsJoined):
+		return captureHealthMetricsJoined, nil
+	default:
+		return "", captureHealthRequestError{message: "invalid metrics; expected base, joined, or full"}
+	}
+}
+
+func (m captureHealthMetrics) includesCapture() bool {
+	return m == captureHealthMetricsBase || m == captureHealthMetricsFull
+}
+
+func (m captureHealthMetrics) includesJoined() bool {
+	return m == captureHealthMetricsJoined || m == captureHealthMetricsFull
+}
+
 type recordingCaptureHealthPage struct {
-	RecordingID int64                `json:"recording_id"`
-	Timezone    string               `json:"timezone"`
-	From        string               `json:"from"`
-	To          string               `json:"to"`
-	HasOlder    bool                 `json:"has_older"`
-	HasNewer    bool                 `json:"has_newer"`
-	Bins        []recordingHealthBin `json:"bins"`
+	RecordingID     int64                `json:"recording_id"`
+	Timezone        string               `json:"timezone"`
+	From            string               `json:"from"`
+	To              string               `json:"to"`
+	HasOlder        bool                 `json:"has_older"`
+	HasNewer        bool                 `json:"has_newer"`
+	CaptureIncluded bool                 `json:"capture_included"`
+	JoinedIncluded  bool                 `json:"joined_included"`
+	Bins            []recordingHealthBin `json:"bins"`
 }
 
 type captureHealthRange struct {
@@ -88,19 +119,28 @@ func (s *Server) handleAccountRecordingCaptureHealth(w http.ResponseWriter, r *h
 	s.writeRecordingCaptureHealth(w, r, principal.AccountID, id, false)
 }
 
-func recordingCaptureHealthCacheKey(r *http.Request, accountID, recordingID int64, shared bool) recordingMetricCacheKey {
+func recordingCaptureHealthCacheKey(r *http.Request, accountID, recordingID int64, shared bool, metrics captureHealthMetrics) recordingMetricCacheKey {
 	return recordingMetricCacheKey{
 		AccountID: accountID, RecordingID: recordingID, Shared: shared,
-		Scope: strings.TrimSpace(r.URL.Query().Get("from")) + "|" + strings.TrimSpace(r.URL.Query().Get("to")),
+		Scope: string(metrics) + "|" + strings.TrimSpace(r.URL.Query().Get("from")) + "|" + strings.TrimSpace(r.URL.Query().Get("to")),
 	}
 }
 
 func (s *Server) writeRecordingCaptureHealth(w http.ResponseWriter, r *http.Request, accountID, recordingID int64, shared bool) {
+	metrics, err := parseCaptureHealthMetrics(r.URL.Query().Get("metrics"))
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), captureHealthPageTimeout)
 	defer cancel()
-	key := recordingCaptureHealthCacheKey(r, accountID, recordingID, shared)
-	page, err := loadRecordingMetricCached(ctx, &s.recordingHealthPageCache, key, captureHealthPageTimeout, recordingHealthPageCacheTTL, recordingMetricFailureTTL, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingCaptureHealthPage, error) {
-		return s.recordingCaptureHealthPage(r.Clone(loadCtx), accountID, recordingID)
+	key := recordingCaptureHealthCacheKey(r, accountID, recordingID, shared, metrics)
+	var classSlots chan struct{}
+	if metrics.includesJoined() {
+		classSlots = s.recordingMetricHeavyWorkSlots()
+	}
+	page, err := loadRecordingMetricCachedWithClass(ctx, &s.recordingHealthPageCache, key, captureHealthPageTimeout, recordingHealthPageCacheTTL, recordingMetricFailureTTL, classSlots, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingCaptureHealthPage, error) {
+		return s.recordingCaptureHealthPage(r.Clone(loadCtx), accountID, recordingID, metrics)
 	})
 	if err != nil {
 		var requestError captureHealthRequestError
@@ -122,7 +162,7 @@ func (s *Server) writeRecordingCaptureHealth(w http.ResponseWriter, r *http.Requ
 	util.WriteJSON(w, http.StatusOK, page)
 }
 
-func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordingID int64) (recordingCaptureHealthPage, error) {
+func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordingID int64, metrics captureHealthMetrics) (recordingCaptureHealthPage, error) {
 	var spec recordingHealthSpec
 	err := s.pool.QueryRow(r.Context(), `
 		SELECT id, mode, COALESCE(cron_expr,''), cron_timezone,
@@ -187,7 +227,7 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 	for i := range bins {
 		starts[i], ends[i] = bins[i].Start, bins[i].End
 	}
-	if len(bins) > 0 {
+	if len(bins) > 0 && metrics.includesCapture() {
 		rows, err := s.pool.Query(r.Context(), `
 			SELECT b.ordinality, COUNT(c.id)::bigint
 			FROM unnest($2::timestamptz[], $3::timestamptz[]) WITH ORDINALITY AS b(bin_start, bin_end, ordinality)
@@ -212,21 +252,27 @@ func (s *Server) recordingCaptureHealthPage(r *http.Request, accountID, recordin
 		if err := rows.Err(); err != nil {
 			return recordingCaptureHealthPage{}, fmt.Errorf("count captured clips: %w", err)
 		}
+	}
+	if len(bins) > 0 && metrics.includesJoined() {
 		if err := s.populateRecordingJoinedProgressBins(r.Context(), accountID, recordingID, starts, ends, bins); err != nil {
 			return recordingCaptureHealthPage{}, err
 		}
 	}
-	for i := range bins {
-		bins[i].Health = recordingCaptureHealth("active", bins[i].Captured, bins[i].Expected)
+	if metrics.includesCapture() {
+		for i := range bins {
+			bins[i].Health = recordingCaptureHealth("active", bins[i].Captured, bins[i].Expected)
+		}
 	}
 	return recordingCaptureHealthPage{
-		RecordingID: recordingID,
-		Timezone:    spec.Timezone,
-		From:        from.Format("2006-01-02"),
-		To:          toDate.Format("2006-01-02"),
-		HasOlder:    from.After(time.Date(coverageStart.In(location).Year(), coverageStart.In(location).Month(), coverageStart.In(location).Day(), 0, 0, 0, 0, location)),
-		HasNewer:    to.Before(lastHistoryDay.AddDate(0, 0, 1)),
-		Bins:        bins,
+		RecordingID:     recordingID,
+		Timezone:        spec.Timezone,
+		From:            from.Format("2006-01-02"),
+		To:              toDate.Format("2006-01-02"),
+		HasOlder:        from.After(time.Date(coverageStart.In(location).Year(), coverageStart.In(location).Month(), coverageStart.In(location).Day(), 0, 0, 0, 0, location)),
+		HasNewer:        to.Before(lastHistoryDay.AddDate(0, 0, 1)),
+		CaptureIncluded: metrics.includesCapture(),
+		JoinedIncluded:  metrics.includesJoined(),
+		Bins:            bins,
 	}, nil
 }
 

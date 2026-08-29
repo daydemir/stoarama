@@ -32,11 +32,38 @@ func TestCaptureHealthPageUsesBoundedMetricAdmission(t *testing.T) {
 		t.Fatalf("retry-after=%q", rec.Header().Get("Retry-After"))
 	}
 
-	authKey := recordingCaptureHealthCacheKey(req, 47, 700, false)
-	publicKey := recordingCaptureHealthCacheKey(req, 47, 700, true)
-	otherRange := recordingCaptureHealthCacheKey(httptest.NewRequest(http.MethodGet, "/?from=2026-04-01&to=2026-04-30", nil), 47, 700, false)
+	authKey := recordingCaptureHealthCacheKey(req, 47, 700, false, captureHealthMetricsFull)
+	publicKey := recordingCaptureHealthCacheKey(req, 47, 700, true, captureHealthMetricsFull)
+	otherRange := recordingCaptureHealthCacheKey(httptest.NewRequest(http.MethodGet, "/?from=2026-04-01&to=2026-04-30", nil), 47, 700, false, captureHealthMetricsFull)
 	if authKey == publicKey || authKey == otherRange {
 		t.Fatalf("capture health cache keys are not scope-isolated: auth=%+v public=%+v range=%+v", authKey, publicKey, otherRange)
+	}
+	baseKey := recordingCaptureHealthCacheKey(req, 47, 700, false, captureHealthMetricsBase)
+	joinedKey := recordingCaptureHealthCacheKey(req, 47, 700, false, captureHealthMetricsJoined)
+	if authKey == baseKey || authKey == joinedKey || baseKey == joinedKey {
+		t.Fatalf("capture health cache keys are not metric-shape isolated: full=%+v base=%+v joined=%+v", authKey, baseKey, joinedKey)
+	}
+}
+
+func TestCaptureHealthMetricsRejectsUnknownShape(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want captureHealthMetrics
+		ok   bool
+	}{
+		{raw: "", want: captureHealthMetricsFull, ok: true},
+		{raw: "full", want: captureHealthMetricsFull, ok: true},
+		{raw: "base", want: captureHealthMetricsBase, ok: true},
+		{raw: "joined", want: captureHealthMetricsJoined, ok: true},
+		{raw: "all-the-tables", ok: false},
+	} {
+		got, err := parseCaptureHealthMetrics(test.raw)
+		if test.ok && (err != nil || got != test.want) {
+			t.Fatalf("parse %q = %q, %v; want %q", test.raw, got, err, test.want)
+		}
+		if !test.ok && err == nil {
+			t.Fatalf("parse %q unexpectedly succeeded as %q", test.raw, got)
+		}
 	}
 }
 
