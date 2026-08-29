@@ -173,6 +173,7 @@ type TrackFingerprint struct {
 type MediaFingerprint struct {
 	DurationSeconds      float64                      `json:"duration_seconds"`
 	Tracks               map[string]*TrackFingerprint `json:"tracks"`
+	DecodedVideoSHA256   string                       `json:"decoded_video_sha256,omitempty"`
 	AudioContracts       []AudioSequenceContract      `json:"audio_sequence_contracts,omitempty"`
 	EffectiveAudioBytes  int64                        `json:"effective_audio_bytes,omitempty"`
 	EffectiveAudioFrames int64                        `json:"effective_audio_sample_frames,omitempty"`
@@ -180,14 +181,16 @@ type MediaFingerprint struct {
 }
 
 type Verification struct {
-	Status                   string           `json:"status"`
-	PacketPayloadOrderStatus string           `json:"packet_payload_order_status"`
-	DecodedFrameTotalsStatus string           `json:"decoded_frame_totals_status"`
-	DecodedAudioTotalsStatus string           `json:"decoded_audio_totals_status"`
-	OutputTimestampStatus    string           `json:"output_timestamp_status"`
-	StrictDecodeStatus       string           `json:"strict_decode_status"`
-	SourceFingerprint        MediaFingerprint `json:"source_fingerprint"`
-	OutputFingerprint        MediaFingerprint `json:"output_fingerprint"`
+	Status                     string           `json:"status"`
+	AcceptanceMode             string           `json:"acceptance_mode,omitempty"`
+	PacketPayloadOrderStatus   string           `json:"packet_payload_order_status"`
+	DecodedFrameSequenceStatus string           `json:"decoded_frame_sequence_status,omitempty"`
+	DecodedFrameTotalsStatus   string           `json:"decoded_frame_totals_status"`
+	DecodedAudioTotalsStatus   string           `json:"decoded_audio_totals_status"`
+	OutputTimestampStatus      string           `json:"output_timestamp_status"`
+	StrictDecodeStatus         string           `json:"strict_decode_status"`
+	SourceFingerprint          MediaFingerprint `json:"source_fingerprint"`
+	OutputFingerprint          MediaFingerprint `json:"output_fingerprint"`
 }
 
 type BuiltOutput struct {
@@ -950,8 +953,15 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 		return Verification{}, deterministicEvidenceFailure(ctx, "joined_output_probe_failure", fmt.Errorf("probe joined output: %w", err))
 	}
 	verification := Verification{Status: "failed", SourceFingerprint: expected, OutputFingerprint: actual}
-	if err := compareFingerprints(expected, actual); err != nil {
-		return verification, deterministicFailure("media_sequence_mismatch", verification, err)
+	if strictErr := compareFingerprints(expected, actual); strictErr != nil {
+		decodedVideoSHA, relaxedErr := compareDecodedEquivalent(ctx, sources, outputPath, expected, actual)
+		if relaxedErr != nil {
+			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%v", strictErr, relaxedErr))
+		}
+		verification.AcceptanceMode = "decoded_frame_equivalent"
+		verification.DecodedFrameSequenceStatus = "passed"
+		verification.SourceFingerprint.DecodedVideoSHA256 = decodedVideoSHA
+		verification.OutputFingerprint.DecodedVideoSHA256 = decodedVideoSHA
 	}
 	verification.PacketPayloadOrderStatus = "passed"
 	verification.DecodedFrameTotalsStatus = "passed"
@@ -967,6 +977,96 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 	verification.StrictDecodeStatus = "passed"
 	verification.Status = "passed"
 	return verification, nil
+}
+
+func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, outputPath string, expected, actual MediaFingerprint) (string, error) {
+	if len(expected.Tracks) != len(actual.Tracks) || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
+		return "", fmt.Errorf("joined duration or stream cardinality mismatch")
+	}
+	for mediaType, want := range expected.Tracks {
+		got := actual.Tracks[mediaType]
+		if got == nil || want.TimestampStatus != "source_clips_independent" || got.TimestampStatus != "monotonic" || want.DecodedFrames <= 0 || want.DecodedFrames != got.DecodedFrames || (mediaType == "audio" && want.DecodedSamples != got.DecodedSamples) {
+			return "", fmt.Errorf("joined %s decoded totals or timeline mismatch", mediaType)
+		}
+	}
+	if expected.EffectiveAudioBytes != actual.EffectiveAudioBytes || expected.EffectiveAudioFrames != actual.EffectiveAudioFrames || expected.EffectiveAudioSHA256 != actual.EffectiveAudioSHA256 {
+		return "", fmt.Errorf("joined effective decoded audio sequence mismatch")
+	}
+	if len(expected.AudioContracts) > 0 && (len(actual.AudioContracts) != 1 || !sameAudioFormat(expected.AudioContracts[0], actual.AudioContracts[0])) {
+		return "", fmt.Errorf("joined effective audio format mismatch")
+	}
+	sourcePaths := make([]string, len(sources))
+	for i := range sources {
+		sourcePaths[i] = sources[i].Path
+	}
+	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, sourcePaths)
+	if err != nil {
+		return "", fmt.Errorf("decode source frame sequence: %w", err)
+	}
+	gotFrames, gotSHA, err := decodedVideoSequenceIdentity(ctx, []string{outputPath})
+	if err != nil {
+		return "", fmt.Errorf("decode joined frame sequence: %w", err)
+	}
+	if wantFrames <= 0 || wantFrames != gotFrames || wantSHA != gotSHA {
+		return "", fmt.Errorf("joined decoded video frame sequence mismatch")
+	}
+	return wantSHA, nil
+}
+
+func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int64, string, error) {
+	sequence := sha256.New()
+	var frames int64
+	for _, mediaPath := range mediaPaths {
+		process := newBoundedMediaProcess(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", mediaPath, "-map", "0:v:0", "-an", "-sn", "-dn", "-f", "framemd5", "-hash", "sha256", "-")
+		stdout, err := process.cmd.StdoutPipe()
+		if err != nil {
+			return 0, "", err
+		}
+		var stderr limitedOutput
+		process.cmd.Stderr = &stderr
+		if err := process.Start(); err != nil {
+			return 0, "", err
+		}
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4096), 1<<20)
+		for scanner.Scan() {
+			if err := ctx.Err(); err != nil {
+				_ = process.Kill()
+				_ = process.Wait()
+				return 0, "", err
+			}
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			fields := strings.Split(line, ",")
+			if len(fields) != 6 {
+				_ = process.Kill()
+				_ = process.Wait()
+				return 0, "", fmt.Errorf("invalid framemd5 evidence")
+			}
+			duration := strings.TrimSpace(fields[3])
+			size := strings.TrimSpace(fields[4])
+			frameSHA := strings.ToLower(strings.TrimSpace(fields[5]))
+			if _, err := strconv.ParseInt(duration, 10, 64); err != nil {
+				return 0, "", fmt.Errorf("invalid decoded frame duration")
+			}
+			if _, err := strconv.ParseInt(size, 10, 64); err != nil || !lowerHex64(frameSHA) {
+				return 0, "", fmt.Errorf("invalid decoded frame identity")
+			}
+			_, _ = fmt.Fprintf(sequence, "%s|%s|%s\n", duration, size, frameSHA)
+			frames++
+		}
+		if err := scanner.Err(); err != nil {
+			_ = process.Kill()
+			_ = process.Wait()
+			return 0, "", err
+		}
+		if err := process.Wait(); err != nil {
+			return 0, "", fmt.Errorf("framemd5 decode: %w (%s)", err, stderr.String())
+		}
+	}
+	return frames, hex.EncodeToString(sequence.Sum(nil)), nil
 }
 
 func compareFingerprints(expected, actual MediaFingerprint) error {

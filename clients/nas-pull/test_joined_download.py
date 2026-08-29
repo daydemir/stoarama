@@ -686,6 +686,25 @@ class JoinedDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source order"):
             pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(manifest)))
 
+    def test_decoded_equivalent_verification_binds_frame_sequence(self):
+        verification = self.golden("hour_manifest_v1.golden.json")["media"][0]["verification"]
+        verification["acceptance_mode"] = "decoded_frame_equivalent"
+        verification["decoded_frame_sequence_status"] = "passed"
+        for fingerprint in (verification["source_fingerprint"], verification["output_fingerprint"]):
+            fingerprint["decoded_video_sha256"] = "d" * 64
+        verification["output_fingerprint"]["tracks"]["video"]["packet_chain_sha256"] = "e" * 64
+        order = (
+            "status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status",
+            "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status",
+            "strict_decode_status", "source_fingerprint", "output_fingerprint",
+        )
+        verification = {key: verification[key] for key in order}
+        pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+
+        verification["output_fingerprint"]["decoded_video_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "decoded video sequence"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+
     def test_audio_codec_and_quarantine_reason_are_exactly_bound(self):
         verification = self.golden("hour_manifest_v1.golden.json")["media"][0]["verification"]
         def audio_track(video):
