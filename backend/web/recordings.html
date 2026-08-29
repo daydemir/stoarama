@@ -478,6 +478,7 @@
     }
     .recording-list-filters .seg { flex: 1 1 100%; }
     .recording-list-filter-field { width: min(260px, 100%); margin: 0; }
+    .recording-search-field { flex: 1 1 280px; min-width: min(280px, 100%); }
     .score-help { flex: 1 1 100%; color: var(--muted); font-size: 12px; }
     .score-help > summary { width: fit-content; color: var(--accent); cursor: pointer; font-weight: 600; }
     .score-help > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
@@ -519,6 +520,55 @@
     .recordings-load-error button { width: auto; min-width: 0; min-height: 34px; padding: 6px 12px; }
     @keyframes loading-spin { to { transform: rotate(360deg); } }
     @keyframes loading-pulse { 50% { opacity: 0.45; } }
+    .recording-browser-layout { min-width: 0; }
+    .recording-browser-main { min-width: 0; }
+    .folder-rail {
+      display: none;
+      width: 260px;
+      min-width: 0;
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      position: sticky;
+      top: 16px;
+      align-self: start;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel2);
+    }
+    .folder-rail-title { margin: 0 0 9px; color: var(--text); font-size: 13px; font-weight: 650; }
+    .folder-browser-mobile { margin: 0 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); }
+    .folder-browser-mobile > summary { padding: 10px 12px; color: var(--text); cursor: pointer; font-size: 13px; font-weight: 650; }
+    .folder-browser-mobile > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+    .folder-browser-mobile-body { max-height: min(62vh, 520px); overflow: auto; padding: 0 10px 10px; }
+    .recording-folder-nav ul { margin: 0; padding: 0; list-style: none; }
+    .folder-node-row { display: grid; grid-template-columns: 24px minmax(0, 1fr); align-items: start; padding-left: var(--folder-indent); }
+    .folder-toggle, .folder-toggle-spacer { width: 24px; min-width: 24px; min-height: 34px; padding: 0; border: 0; display: inline-grid; place-items: center; color: var(--muted); background: transparent; }
+    .folder-toggle:hover { color: var(--text); background: transparent; }
+    .folder-toggle:focus-visible, .folder-select:focus-visible, .folder-breadcrumbs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .folder-select {
+      display: grid;
+      width: 100%;
+      min-width: 0;
+      min-height: 34px;
+      padding: 5px 7px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+    }
+    .folder-select:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+    .folder-select.selected { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); }
+    .folder-select.folder-all { margin-bottom: 4px; }
+    .folder-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
+    .folder-metric { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 10px/1.3 var(--mono); }
+    .folder-breadcrumbs { min-height: 28px; margin: 0 0 8px; overflow-x: auto; }
+    .folder-breadcrumbs ol { display: flex; align-items: center; min-width: max-content; margin: 0; padding: 0; list-style: none; }
+    .folder-breadcrumbs li { display: inline-flex; align-items: center; color: var(--muted); font-size: 12px; }
+    .folder-breadcrumbs li + li::before { content: "/"; padding: 0 4px; color: var(--border-strong, var(--muted)); }
+    .folder-breadcrumbs button { width: auto; min-width: 0; min-height: 28px; padding: 3px 5px; border: 0; color: var(--accent); background: transparent; font-size: 12px; }
+    .folder-breadcrumbs [aria-current="page"] { color: var(--text); font-weight: 650; }
     .recordings-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
     .recordings-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
@@ -585,12 +635,19 @@
         width: 1120px;
         margin-inline: calc((880px - 1120px) / 2);
       }
-      #cards:not(.hidden) {
+      .recording-browser-layout:not(.hidden) {
         width: min(1320px, calc(100vw - 40px));
         margin-inline: calc((880px - min(1320px, calc(100vw - 40px))) / 2);
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 16px;
       }
+      .folder-rail { display: block; }
+      .folder-browser-mobile { display: none; }
     }
     @media (max-width: 1039px) {
+      .recording-browser-layout { display: block; }
+      .folder-browser-mobile { display: block; }
       .recordings-skeleton-row { grid-template-columns: 24px 1.4fr 1fr; }
       .recordings-skeleton-row .skeleton-line:nth-child(n+4) { display: none; }
       .recordings-table-wrap { overflow: visible; border: 0; border-radius: 0; }
@@ -611,17 +668,10 @@
         border-radius: 12px;
       }
       .recordings-table td { min-width: 0; padding: 0; border: 0; }
-      .recordings-table td::before { display: block; margin-bottom: 2px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
-      .recordings-table td:nth-child(1) { position: absolute; top: 14px; left: 14px; width: auto; }
-      .recordings-table td:nth-child(2), .recordings-table td:nth-child(3), .recordings-table td:nth-child(4), .recordings-table td:nth-child(9) { grid-column: 1 / -1; }
-      .recordings-table td:nth-child(2)::before { content: "Recording"; }
-      .recordings-table td:nth-child(3)::before { content: "Status / Last 12 hours"; }
-      .recordings-table td:nth-child(4)::before { content: "Recording quality"; }
-      .recordings-table td:nth-child(5)::before { content: "Joined"; }
-      .recordings-table td:nth-child(6)::before { content: "Schedule"; }
-      .recordings-table td:nth-child(7)::before { content: "Clip / Capture"; }
-	  .recordings-table td:nth-child(8)::before { content: "Storage"; }
-      .recordings-table td:nth-child(9)::before { content: "Actions"; }
+      .recordings-table td::before { content: attr(data-label); display: block; margin-bottom: 2px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+      .recordings-table td.recording-select-cell { position: absolute; top: 14px; left: 14px; width: auto; }
+      .recordings-table td.recording-select-cell::before { display: none; }
+      .recordings-table td.recording-cell-wide { grid-column: 1 / -1; }
       .recordings-table .row-actions { flex-wrap: wrap; }
     }
     @media (max-width: 800px) {
@@ -761,9 +811,13 @@
             </optgroup>
           </select>
         </div>
+        <div class="field recording-list-filter-field recording-search-field">
+          <label for="recordingSearch">Search recordings</label>
+          <input id="recordingSearch" type="search" placeholder="Name, location, folder, or ID" autocomplete="off" />
+        </div>
         <div id="recordingSortWrap" class="field recording-list-filter-field">
           <label for="recordingSort">Sort recordings</label>
-          <select id="recordingSort"><option value="newest">Newest first</option><option value="best14">Completed 14-day score</option><option value="joined_desc">Joined: highest first</option><option value="joined_asc">Joined: lowest first</option></select>
+          <select id="recordingSort"><option value="joined_desc">Joined: highest first</option><option value="joined_asc">Joined: lowest first</option><option value="newest">Newest first</option><option value="best14">Completed 14-day score</option></select>
         </div>
         <details id="scoreHelp" class="score-help">
           <summary>Daily grades and 14-day scores</summary>
@@ -795,6 +849,17 @@
         </details>
       </div>
 
+      <details id="folderBrowserMobile" class="folder-browser-mobile hidden">
+        <summary>Browse folders</summary>
+        <div id="folderNavMobile" class="folder-browser-mobile-body"></div>
+      </details>
+      <div id="recordingBrowserLayout" class="recording-browser-layout hidden">
+        <aside id="folderRail" class="folder-rail" aria-label="Browse recording folders">
+          <h2 class="folder-rail-title">Folders</h2>
+          <div id="folderNavRail"></div>
+        </aside>
+        <section class="recording-browser-main" aria-label="Recordings in selected folder">
+      <nav id="folderBreadcrumbs" class="folder-breadcrumbs" aria-label="Selected folder"></nav>
       <div id="scoreFilterResult" class="score-filter-result hidden" role="status" aria-live="polite"></div>
       <div id="recordingsLoading" class="recordings-loading hidden" role="status" aria-live="polite">
         <div class="recordings-loading-head"><span class="loading-spinner" aria-hidden="true"></span><span>Loading recordings and daily scores…</span></div>
@@ -812,6 +877,8 @@
 
       <!-- Recording cards -->
       <div id="cards" class="cards" aria-busy="false"></div>
+        </section>
+      </div>
 
       <!-- Creation-route composer -->
       <section id="composer" class="panel hidden">
@@ -1216,8 +1283,14 @@
       recordingListFilters: document.getElementById('recordingListFilters'),
       statusFilter: document.getElementById('statusFilter'),
       qualityFilter: document.getElementById('qualityFilter'),
+      recordingSearch: document.getElementById('recordingSearch'),
       recordingSortWrap: document.getElementById('recordingSortWrap'),
       recordingSort: document.getElementById('recordingSort'),
+      recordingBrowserLayout: document.getElementById('recordingBrowserLayout'),
+      folderBrowserMobile: document.getElementById('folderBrowserMobile'),
+      folderNavMobile: document.getElementById('folderNavMobile'),
+      folderNavRail: document.getElementById('folderNavRail'),
+      folderBreadcrumbs: document.getElementById('folderBreadcrumbs'),
       scoreFilterResult: document.getElementById('scoreFilterResult'),
       recordingsLoading: document.getElementById('recordingsLoading'),
       recordingsLoadNotice: document.getElementById('recordingsLoadNotice'),
@@ -1403,7 +1476,11 @@
       // 'active', 'scheduled', 'paused', or 'completed'.
       statusFilter: 'all',
       qualityFilter: qualityFilterFromQuery(),
-      recordingSort: 'newest',
+      recordingSearch: '',
+      recordingSort: recordingSortFromSearch(window.location.search),
+      selectedFolderKey: folderSelectionFromSearch(window.location.search),
+      openFolderKeys: new Set(),
+	  folderNavigationSignature: '',
       recordingsLoaded: false,
       recordingsLoading: false,
 	  recordingEnrichmentLoaded: false,
@@ -1469,6 +1546,7 @@
       selectedRecordings: new Set(),
     };
     if (state.qualityFilter === 'all') syncQualityFilterQuery();
+	els.recordingSort.value = state.recordingSort;
 
     async function fetchJSON(path, opts = {}) {
       const method = String((opts && opts.method) || 'GET').toUpperCase();
@@ -1504,6 +1582,8 @@
         els.recordingsLoadNotice.innerHTML = '<span class="loading-spinner" aria-hidden="true"></span><span>Refreshing recordings…</span>';
         els.recordingsLoadNotice.classList.remove('hidden');
       } else {
+		els.recordingBrowserLayout.classList.remove('hidden');
+		els.folderBrowserMobile.classList.add('hidden');
         els.recordingsLoadNotice.classList.add('hidden');
         els.recordingsLoading.classList.remove('hidden');
         els.cards.classList.add('hidden');
@@ -3438,6 +3518,267 @@
       return { tone: 'wait', text: 'Starting shortly on <b>your computer</b>.' };
     }
 
+    const RECORDING_FOLDER_LEVELS = ['continent', 'country', 'city', 'plaza', 'recording'];
+    const OTHER_RECORDINGS_LABEL = 'Other recordings';
+
+    function recordingFolderValue(raw) {
+      const value = String(raw || '').trim();
+      return value
+        ? { label: value, keyPart: `value:${value}` }
+        : { label: OTHER_RECORDINGS_LABEL, keyPart: 'missing' };
+    }
+
+    function recordingFolderSegments(rec) {
+      const naming = rec && rec.naming && typeof rec.naming === 'object' ? rec.naming : {};
+      const metadata = naming.metadata && typeof naming.metadata === 'object' ? naming.metadata : {};
+      const values = [metadata.continent, metadata.country, metadata.city, metadata.plaza_name];
+      const path = [];
+      const segments = values.map((value, index) => {
+        const normalized = recordingFolderValue(value);
+        const kind = RECORDING_FOLDER_LEVELS[index];
+        if (kind === 'plaza' && normalized.keyPart !== 'missing') {
+          const plazaID = String(metadata.plaza_id || '').trim();
+          normalized.keyPart = JSON.stringify(['plaza', plazaID || 'missing-id', normalized.label]);
+          if (plazaID) normalized.label = `${plazaID} · ${normalized.label}`;
+        }
+        path.push([kind, normalized.keyPart]);
+        return { kind, ...normalized, nodeKey: JSON.stringify(['folder-v1', ...path]) };
+      });
+      const id = Number(rec && rec.id);
+      const recordingLabel = String(rec && (rec.stream_name || rec.name) || (id > 0 ? `Recording #${id}` : 'Recording')).trim();
+      const recordingPart = id > 0 ? `id:${id}` : `name:${recordingLabel}`;
+      path.push(['recording', recordingPart]);
+      segments.push({
+        kind: 'recording', label: recordingLabel, keyPart: recordingPart,
+        nodeKey: JSON.stringify(['folder-v1', ...path]),
+      });
+      return segments;
+    }
+
+    function newRecordingFolderNode(kind, label, key, parentKey, depth) {
+      return {
+        kind, label, key, parentKey, depth,
+        count: 0, sourceMS: 0, readyMS: 0,
+        recordingIDs: new Set(), children: [], childrenByKey: new Map(),
+      };
+    }
+
+    function addRecordingFolderMetric(node, rec) {
+      const id = Number(rec && rec.id);
+      if (id > 0) node.recordingIDs.add(id);
+      node.count += 1;
+      const sourceMS = Number(rec && rec.source_duration_ms);
+      const readyMS = Number(rec && rec.joined_ready_ms);
+      if (sourceMS > 0) {
+        node.sourceMS += sourceMS;
+        node.readyMS += Math.max(0, Math.min(sourceMS, Number.isFinite(readyMS) ? readyMS : 0));
+      }
+    }
+
+    function buildRecordingFolderTree(recordings) {
+      const root = newRecordingFolderNode('all', 'All recordings', 'all', null, 0);
+      const byKey = new Map([[root.key, root]]);
+      for (const rec of Array.isArray(recordings) ? recordings : []) {
+        addRecordingFolderMetric(root, rec);
+        let parent = root;
+        for (const segment of recordingFolderSegments(rec)) {
+          let node = parent.childrenByKey.get(segment.nodeKey);
+          if (!node) {
+            node = newRecordingFolderNode(segment.kind, segment.label, segment.nodeKey, parent.key, parent.depth + 1);
+            parent.childrenByKey.set(node.key, node);
+            parent.children.push(node);
+            byKey.set(node.key, node);
+          }
+          addRecordingFolderMetric(node, rec);
+          parent = node;
+        }
+      }
+      const sortChildren = (node) => {
+        node.children.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base', numeric: true }) || a.key.localeCompare(b.key));
+        for (const child of node.children) sortChildren(child);
+      };
+      sortChildren(root);
+      root.byKey = byKey;
+      return root;
+    }
+
+    function recordingFolderTreeSignature(tree, selectedKey, openKeys, joinedLoaded, joinedError) {
+      const nodes = tree && tree.byKey instanceof Map
+        ? [...tree.byKey.values()].map((node) => [node.key, node.label, node.count, node.sourceMS, node.readyMS]).sort((a, b) => a[0].localeCompare(b[0]))
+        : [];
+      const open = openKeys instanceof Set ? [...openKeys].sort() : [];
+      return JSON.stringify([selectedKey || 'all', open, joinedLoaded === true, joinedError === true, nodes]);
+    }
+
+    function folderNodeByKey(tree, key) {
+      if (!tree || !(tree.byKey instanceof Map)) return null;
+      return tree.byKey.get(String(key || '')) || null;
+    }
+
+    function recordingMatchesFolder(rec, node) {
+      if (!node || node.kind === 'all') return true;
+      return node.recordingIDs.has(Number(rec && rec.id));
+    }
+
+    function recordingMatchesSearch(rec, rawQuery) {
+      const words = String(rawQuery || '').trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      if (!words.length) return true;
+      const naming = rec && rec.naming && typeof rec.naming === 'object' ? rec.naming : {};
+      const metadata = naming.metadata && typeof naming.metadata === 'object' ? naming.metadata : {};
+      const haystack = [
+        rec && rec.id, rec && rec.name, rec && rec.stream_name, rec && rec.stream_location,
+        naming.folder_name, metadata.plaza_id, metadata.continent, metadata.country,
+        metadata.city, metadata.plaza_name,
+      ].map((value) => String(value || '').toLocaleLowerCase()).join(' ');
+      return words.every((word) => haystack.includes(word));
+    }
+
+    function recordingSortFromSearch(search) {
+      const value = new URLSearchParams(String(search || '')).get('sort') || '';
+      return ['newest', 'best14', 'joined_desc', 'joined_asc'].includes(value) ? value : 'joined_desc';
+    }
+
+    function folderSelectionFromSearch(search) {
+      return new URLSearchParams(String(search || '')).get('folder') || 'all';
+    }
+
+    function recordingsListURL(currentHref, selectedFolderKey, sort) {
+      const url = new URL(String(currentHref || ''), 'https://stoarama.invalid');
+      if (selectedFolderKey && selectedFolderKey !== 'all') url.searchParams.set('folder', selectedFolderKey);
+      else url.searchParams.delete('folder');
+      if (['newest', 'best14', 'joined_desc', 'joined_asc'].includes(sort)) url.searchParams.set('sort', sort);
+      else url.searchParams.delete('sort');
+      return `${url.pathname}${url.search}${url.hash}`;
+    }
+
+    function sortRecordingItems(items, sort) {
+      const output = [...items];
+      if (sort === 'joined_desc' || sort === 'joined_asc') {
+        const direction = sort === 'joined_asc' ? 1 : -1;
+        output.sort((a, b) => {
+          const left = joinedCoverage(a), right = joinedCoverage(b);
+          if (left.available !== right.available) return left.available ? -1 : 1;
+          if (left.available && left.percent !== right.percent) return direction * (left.percent - right.percent);
+          return Number(b.id) - Number(a.id);
+        });
+      } else if (sort === 'newest') {
+        output.sort((a, b) => Number(b.id) - Number(a.id));
+      }
+      return output;
+    }
+
+    function folderMetricText(node, joinedLoaded, joinedError) {
+      const count = Number(node && node.count || 0);
+      const countLabel = `${count} recording${count === 1 ? '' : 's'}`;
+      if (joinedError) return `${countLabel} · Joined temporarily unavailable`;
+      if (!joinedLoaded) return `${countLabel} · Joined loading`;
+      const sourceMS = Number(node && node.sourceMS || 0);
+      if (!(sourceMS > 0)) return `${countLabel} · Joined unavailable`;
+      const readyMS = Math.max(0, Number(node && node.readyMS || 0));
+      return `${countLabel} · ${Math.max(0, Math.min(100, Math.trunc(readyMS / sourceMS * 100)))}% joined`;
+    }
+
+    function folderNavigatorHTML(tree, view, instance) {
+      if (!tree) return '';
+      const selectedKey = String(view && view.selectedKey || 'all');
+      const openKeys = view && view.openKeys instanceof Set ? view.openKeys : new Set();
+      const idState = { value: 0 };
+      const selectButton = (node, levelClass = '') => {
+        const current = node.key === selectedKey ? ' aria-current="page"' : '';
+        return `<button type="button" class="folder-select ${levelClass}${current ? ' selected' : ''}" data-folder-select="${escapeHTML(node.key)}"${current}><span class="folder-label">${escapeHTML(node.label)}</span><span class="folder-metric">${escapeHTML(folderMetricText(node, view.joinedLoaded, view.joinedError))}</span></button>`;
+      };
+      const renderNode = (node) => {
+        const hasChildren = node.children.length > 0;
+        const open = hasChildren && openKeys.has(node.key);
+        const childID = `folder-${instance}-${idState.value++}`;
+        const toggle = hasChildren
+          ? `<button type="button" class="folder-toggle" data-folder-toggle="${escapeHTML(node.key)}" aria-expanded="${open}" aria-controls="${childID}" aria-label="${open ? 'Collapse' : 'Expand'} ${escapeHTML(node.label)}"><span aria-hidden="true">${open ? '&#9662;' : '&#9656;'}</span></button>`
+          : '<span class="folder-toggle-spacer" aria-hidden="true"></span>';
+        const children = hasChildren
+          ? `<ul id="${childID}" class="folder-children"${open ? '' : ' hidden'}>${node.children.map(renderNode).join('')}</ul>`
+          : '';
+        return `<li><div class="folder-node-row" style="--folder-indent:${Math.max(0, node.depth - 1) * 12}px">${toggle}${selectButton(node)}</div>${children}</li>`;
+      };
+      return `<nav class="recording-folder-nav" aria-label="Recording folders">${selectButton(tree, 'folder-all')}<ul class="folder-root">${tree.children.map(renderNode).join('')}</ul></nav>`;
+    }
+
+    function recordingFolderAncestors(tree, node) {
+      const ancestors = [];
+      let current = node;
+      while (current) {
+        ancestors.push(current);
+        current = current.parentKey ? folderNodeByKey(tree, current.parentKey) : null;
+      }
+      return ancestors.reverse();
+    }
+
+    function syncRecordingListQuery() {
+      window.history.replaceState({}, '', recordingsListURL(window.location.href, state.selectedFolderKey, state.recordingSort));
+    }
+
+    function validSelectedFolder(tree) {
+      let selected = folderNodeByKey(tree, state.selectedFolderKey);
+      if (!selected) {
+        state.selectedFolderKey = 'all';
+        selected = tree;
+        syncRecordingListQuery();
+      }
+      const ancestors = recordingFolderAncestors(tree, selected);
+      for (const ancestor of ancestors.slice(0, -1)) {
+        if (ancestor.kind !== 'all' && ancestor.children.length) state.openFolderKeys.add(ancestor.key);
+      }
+      return selected;
+    }
+
+    function folderBreadcrumbsHTML(tree, selected) {
+      const crumbs = recordingFolderAncestors(tree, selected);
+      return `<ol>${crumbs.map((node, index) => {
+        const current = index === crumbs.length - 1 ? ' aria-current="page"' : '';
+        return `<li><button type="button" data-folder-select="${escapeHTML(node.key)}"${current}>${escapeHTML(node.label)}</button></li>`;
+      }).join('')}</ol>`;
+    }
+
+    function renderFolderNavigation(tree, selected) {
+      const view = {
+        selectedKey: selected.key,
+        openKeys: state.openFolderKeys,
+        joinedLoaded: state.joinedProgressLoaded,
+        joinedError: state.joinedProgressError,
+      };
+	  const signature = recordingFolderTreeSignature(tree, selected.key, state.openFolderKeys, view.joinedLoaded, view.joinedError);
+	  if (signature === state.folderNavigationSignature) return;
+	  state.folderNavigationSignature = signature;
+      els.folderNavRail.innerHTML = folderNavigatorHTML(tree, view, 'rail');
+      els.folderNavMobile.innerHTML = folderNavigatorHTML(tree, view, 'mobile');
+      els.folderBreadcrumbs.innerHTML = folderBreadcrumbsHTML(tree, selected);
+      wireFolderNavigation(tree);
+    }
+
+    function wireFolderNavigation(tree) {
+      for (const container of [els.folderNavRail, els.folderNavMobile]) {
+        container.querySelectorAll('button[data-folder-toggle]').forEach((button) => button.addEventListener('click', () => {
+          const key = button.getAttribute('data-folder-toggle');
+          if (state.openFolderKeys.has(key)) state.openFolderKeys.delete(key);
+          else state.openFolderKeys.add(key);
+          renderFolderNavigation(tree, validSelectedFolder(tree));
+        }));
+      }
+      for (const container of [els.folderNavRail, els.folderNavMobile, els.folderBreadcrumbs]) {
+        container.querySelectorAll('button[data-folder-select]').forEach((button) => button.addEventListener('click', () => {
+          const selected = folderNodeByKey(tree, button.getAttribute('data-folder-select'));
+          if (!selected) return;
+          state.selectedFolderKey = selected.key;
+          const ancestors = recordingFolderAncestors(tree, selected);
+          for (const ancestor of ancestors.slice(0, -1)) {
+            if (ancestor.kind !== 'all' && ancestor.children.length) state.openFolderKeys.add(ancestor.key);
+          }
+          syncRecordingListQuery();
+          els.folderBrowserMobile.open = false;
+          renderCards();
+        }));
+      }
+    }
+
     // Schedule-row label for relay recordings (the Capture row in the schedule card).
     // Mirrors the S1-S9 ordering so both surfaces stay in sync via _relayCtx.
     function relayScheduleRowText(rec) {
@@ -3538,15 +3879,15 @@
       const localTime = localTimeLabel(timezone);
       const ends = instantInTimezone(rec.end_at, timezone);
       return `<tr class="${extraClass}" data-card="${id}">
-        <td>${sharedReadOnly ? '' : `<input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}>`}</td>
-        <td><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
-		<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
-		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>
-        <td>${joinedHTML}</td>
-        <td><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
-        <td><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
-		<td><div class="cell-main">${storage}</div></td>
-        <td><div class="row-actions">${action}</div></td>
+        <td class="recording-select-cell" data-label="">${sharedReadOnly ? '' : `<input type="checkbox" data-recordingselect="${id}" aria-label="Select recording #${id}"${state.selectedRecordings.has(id) ? ' checked' : ''}>`}</td>
+        <td class="recording-cell-wide" data-label="Recording"><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
+		<td class="recording-cell-wide" data-label="Status / Last 12 hours"><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
+		<td class="recording-cell-wide" data-label="Recording quality">${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>
+        <td data-label="Joined">${joinedHTML}</td>
+        <td data-label="Schedule"><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
+        <td data-label="Clip / Capture"><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
+		<td data-label="Storage"><div class="cell-main">${storage}</div></td>
+        <td class="recording-cell-wide" data-label="Actions"><div class="row-actions">${action}</div></td>
       </tr>`;
     }
 
@@ -3741,6 +4082,8 @@
         const selected = els.qualityFilter.options[els.qualityFilter.selectedIndex];
         if (selected) parts.push(String(selected.textContent || '').trim());
       }
+	  if (state.selectedFolderKey !== 'all') parts.push('Selected folder');
+	  if (state.recordingSearch) parts.push(`Search: ${state.recordingSearch}`);
       els.scoreFilterResult.textContent = parts.join(' · ');
       els.scoreFilterResult.classList.remove('hidden');
     }
@@ -3750,31 +4093,38 @@
       if (sharedReadOnly) els.relayBanner.classList.add('hidden'); else renderFleetSummary();
       const all = state.recordings;
       const empty = all.length === 0;
+	  const folderTree = buildRecordingFolderTree(all);
+	  const selectedFolder = validSelectedFolder(folderTree);
       els.heroCopy.classList.toggle('hidden', !empty);
       els.newRecRow.classList.toggle('hidden', sharedReadOnly);
       els.cards.classList.toggle('hidden', empty);
       els.recordingListFilters.classList.toggle('hidden', empty);
+	  els.recordingBrowserLayout.classList.toggle('hidden', empty);
+	  els.folderBrowserMobile.classList.toggle('hidden', empty);
       if (empty) {
         els.cards.innerHTML = '';
+		state.folderNavigationSignature = '';
+		els.folderNavRail.innerHTML = '';
+		els.folderNavMobile.innerHTML = '';
+		els.folderBreadcrumbs.innerHTML = '';
         els.scoreFilterResult.classList.add('hidden');
         return;
       }
+	  renderFolderNavigation(folderTree, selectedFolder);
       renderStatusFilter();
       els.qualityFilter.value = state.qualityFilter;
-      // Client-side status and score filters over the loaded list (pagination deferred).
-      const items = all.filter((rec) => matchesStatusFilter(rec) && matchesQualityFilter(rec));
+	  els.recordingSort.value = state.recordingSort;
+      // Folder and search narrow the same loaded rows before the existing status,
+      // score, and global sort rules. No selection adds a backend request.
+      let items = all.filter((rec) => recordingMatchesFolder(rec, selectedFolder)
+		&& recordingMatchesSearch(rec, state.recordingSearch)
+		&& matchesStatusFilter(rec) && matchesQualityFilter(rec));
       if (state.recordingSort === 'best14') items.sort((a, b) => {
         const left = best14Sort(a), right = best14Sort(b);
         return left[0] - right[0] || left[1] - right[1] || left[2] - right[2] || Number(b.id) - Number(a.id);
       });
       if (state.recordingSort === 'joined_desc' || state.recordingSort === 'joined_asc') {
-        const direction = state.recordingSort === 'joined_asc' ? 1 : -1;
-        items.sort((a, b) => {
-          const left = joinedCoverage(a), right = joinedCoverage(b);
-          if (left.available !== right.available) return left.available ? -1 : 1;
-          if (left.available && left.percent !== right.percent) return direction * (left.percent - right.percent);
-          return Number(b.id) - Number(a.id);
-        });
+		items = sortRecordingItems(items, state.recordingSort);
       }
       renderScoreFilterResult(items.length);
       if (items.length === 0) {
@@ -3807,6 +4157,7 @@
           const next = state.recordingSort === 'joined_desc' ? 'joined_asc' : 'joined_desc';
           state.recordingSort = next;
           els.recordingSort.value = next;
+		  syncRecordingListQuery();
           renderCards();
           if (!state.joinedProgressLoaded && !state.joinedProgressLoading) void refreshJoinedProgress(recordingsLoadToken);
         }));
@@ -5969,10 +6320,15 @@
     });
     els.recordingSort.addEventListener('change', () => {
       state.recordingSort = els.recordingSort.value;
+	  syncRecordingListQuery();
       renderCards();
 	  if ((state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc') && !state.joinedProgressLoaded) {
 	    void refreshJoinedProgress(recordingsLoadToken);
 	  }
+    });
+    els.recordingSearch.addEventListener('input', () => {
+      state.recordingSearch = String(els.recordingSearch.value || '').trim();
+      renderCards();
     });
     els.qualityFilter.addEventListener('change', () => {
       state.qualityFilter = els.qualityFilter.value;

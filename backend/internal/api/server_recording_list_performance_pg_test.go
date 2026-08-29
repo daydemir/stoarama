@@ -19,8 +19,11 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		INSERT INTO accounts(id,email,name,role,status) VALUES(47,'metrics@example.test','Metrics','admin','active');
 		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
 		VALUES(1,47,'Metrics storage','https://example.test','auto','clips','access',''::bytea,'verified');
-		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
-		VALUES(700,47,1,'Metric-independent list','https://example.test/live.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60);
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec,
+			naming_profile,folder_name,naming_metadata_jsonb)
+		VALUES(700,47,1,'Metric-independent list','https://example.test/live.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60,
+			'plaza_hourly_v1','08_Europe_Poland_Swidnik_Plac_Konstytucji',
+			'{"plaza_id":"08","continent":"Europe","country":"Poland","city":"Swidnik","plaza_name":"Plac Konstytucji"}'::jsonb);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -100,6 +103,16 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 				if got, ok := items[0][field]; !ok || string(got) != expected {
 					t.Fatalf("baseline compatibility field %s=%s present=%t want %s", field, got, ok, expected)
 				}
+			}
+			var naming struct {
+				Profile    string `json:"profile"`
+				FolderName string `json:"folder_name"`
+			}
+			if err := json.Unmarshal(items[0]["naming"], &naming); err != nil {
+				t.Fatalf("decode baseline naming: %v body=%s", err, items[0]["naming"])
+			}
+			if naming.Profile != "plaza_hourly_v1" || naming.FolderName != "08_Europe_Poland_Swidnik_Plac_Konstytucji" {
+				t.Fatalf("baseline naming=%+v", naming)
 			}
 		})
 	}
