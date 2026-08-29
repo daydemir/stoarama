@@ -347,6 +347,30 @@
     .clip-row-actions button.secondary, .clip-row-actions a.secondary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
     .clip-row-actions button.secondary:hover, .clip-row-actions a.secondary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
     .joined-path { max-width: 390px; overflow-wrap: anywhere; white-space: normal !important; color: var(--text); }
+    .joined-browser { overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--panel2) 58%, transparent); }
+    .joined-browser-bar { display: flex; align-items: center; gap: 6px; min-height: 44px; padding: 7px 10px; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: thin; }
+    .joined-crumb { width: auto; min-width: 0; min-height: 30px; padding: 4px 8px; border-color: transparent; color: var(--accent); white-space: nowrap; }
+    .joined-crumb[aria-current="page"] { color: var(--text); cursor: default; }
+    .joined-crumb-sep { flex: 0 0 auto; color: var(--muted); }
+    .joined-browser-list { display: grid; }
+    .joined-folder-row, .joined-file-row { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 12px; min-height: 48px; padding: 7px 10px; border-bottom: 1px solid color-mix(in srgb, var(--border) 65%, transparent); }
+    .joined-folder-row:last-child, .joined-file-row:last-child { border-bottom: 0; }
+    .joined-folder-button { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; min-height: 34px; padding: 3px 4px; border: 0; border-radius: 6px; background: transparent; text-align: left; }
+    .joined-folder-button:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+    .joined-folder-icon { position: relative; flex: 0 0 auto; width: 20px; height: 14px; border-radius: 3px; background: color-mix(in srgb, var(--accent) 68%, var(--panel)); }
+    .joined-folder-icon::before { content: ""; position: absolute; left: 2px; top: -4px; width: 8px; height: 5px; border-radius: 3px 3px 0 0; background: inherit; }
+    .joined-entry-name { min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+    .joined-entry-meta { color: var(--muted); font: 11px/1.4 var(--mono); white-space: nowrap; }
+    .joined-file-main { min-width: 0; padding-left: 34px; }
+    .joined-file-actions { display: flex; gap: 6px; justify-content: flex-end; }
+    .joined-file-actions a { min-height: 32px; padding: 5px 10px; }
+    .joined-browser-empty { padding: 16px; color: var(--muted); }
+    @media (max-width: 640px) {
+      .joined-file-row { grid-template-columns: 1fr; gap: 7px; padding: 10px; }
+      .joined-file-main { padding-left: 0; }
+      .joined-file-actions { justify-content: flex-start; }
+      .joined-file-actions a { min-height: 40px; }
+    }
     details.action-menu { position: relative; display: inline-block; }
     details.action-menu > summary { list-style: none; width: 30px; height: 28px; display: grid; place-items: center; border: 1px solid var(--muted); border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1; }
     details.action-menu > summary::-webkit-details-marker { display: none; }
@@ -4364,12 +4388,12 @@
 
     // ---- Dedicated clip-management page (/recordings/{id}) ----
 
-    const CLIP_PAGE_SIZE = 100;
+    const CLIP_PAGE_SIZE = 500;
     const clipPageState = {
       recId: 0, page: 0, total: 0, recName: '', loading: false, rec: null,
       captureHealth: null, joinedFolderPath: '', joinedPayload: null,
       captureHealthLoadToken: 0, joinedPayloadKey: '', joinedLoadToken: 0,
-      joinedStatus: 'idle', joinedError: '',
+      joinedStatus: 'idle', joinedError: '', joinedBrowsePath: [],
     };
 
     // The recording id when the URL is /recordings/{id}, else 0. Used at boot to
@@ -4377,6 +4401,18 @@
     function clipPageRecId() {
       const m = sharedReadOnly ? sharedRouteMatch : /^\/recordings\/(\d+)\/?$/.exec(window.location.pathname || '');
       return m ? Number(sharedReadOnly ? m[2] : m[1]) : 0;
+    }
+
+    async function fetchAllJoinedPages(fetchPage, initial) {
+      const files = Array.isArray(initial.files) ? initial.files.slice() : [];
+      const total = Number(initial.total || files.length);
+      for (let nextOffset = files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE) {
+        const next = await fetchPage(nextOffset);
+        const nextFiles = Array.isArray(next.files) ? next.files : [];
+        files.push(...nextFiles);
+        if (nextFiles.length === 0) break;
+      }
+      return { ...initial, files, total };
     }
 
     // Render the recording detail view with only immutable, published joined media.
@@ -4420,8 +4456,13 @@
       if (body) body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
       let payload;
       try {
-		const offset = requestedPage * CLIP_PAGE_SIZE;
+		const offset = 0;
         payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined?limit=${CLIP_PAGE_SIZE}&offset=${offset}`));
+		payload = await fetchAllJoinedPages(async (nextOffset) => {
+		  const next = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined?limit=${CLIP_PAGE_SIZE}&offset=${nextOffset}`));
+		  if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return { files: [] };
+		  return next;
+		}, payload);
       } catch (err) {
 		if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
 		clipPageState.joinedStatus = 'error';
@@ -4431,7 +4472,8 @@
         return;
       }
 	  if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
-      clipPageState.total = Number(payload.total || 0);
+	  clipPageState.total = Number(payload.total || 0);
+	  clipPageState.joinedBrowsePath = [];
       clipPageState.joinedFolderPath = String(payload.folder_path || recordingAPIPath(`/${encodeURIComponent(recId)}/joined/folder`));
 	  clipPageState.joinedPayload = payload;
 	  clipPageState.joinedStatus = 'ready';
@@ -4938,7 +4980,7 @@
         relayBanner = relayStateHTML(relayCaptureState(rec), true);
       }
       teardownDetailPlayer();
-      const joinedBrowser = `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Joined recordings</div><div class="hint">Published continuous parts are shown here. Separate parts indicate a detected gap or incompatible source layout.</div></div></div><div id="clipListBody"></div>`;
+      const joinedBrowser = `<div class="clip-page-head" style="margin:18px 0 6px;"><div><div class="eyebrow">Joined recordings</div><div class="hint">Browse published continuous parts by folder. Separate files indicate a detected gap or incompatible source layout.</div></div></div><div id="clipListBody"></div>`;
       const cardRenderers = [
         ['Recording actions', () => recActionsCardHTML(rec)],
         ['Live stream', () => sharedReadOnly ? '' : streamCardHTML(rec)],
@@ -5278,12 +5320,7 @@
       if (!body) return;
       const items = Array.isArray(payload.files) ? payload.files : [];
       const total = clipPageState.total;
-      const pageCount = Math.max(1, Math.ceil(total / CLIP_PAGE_SIZE));
-      const page = clipPageState.page;
-      const first = total === 0 ? 0 : page * CLIP_PAGE_SIZE + 1;
-      const last = page * CLIP_PAGE_SIZE + items.length;
-
-      const summary = `<div class="clip-summary" style="margin:0 0 10px;"><b>${total}</b> joined part${total === 1 ? '' : 's'} published${total > 0 ? ` &middot; showing ${first}-${last}` : ''}</div>`;
+      const summary = `<div class="clip-summary" style="margin:0 0 10px;"><b>${total}</b> joined part${total === 1 ? '' : 's'} published</div>`;
 
       if (items.length === 0) {
         body.innerHTML = summary + `<div class="clip-summary">No joined recordings are published yet.</div>`;
@@ -5291,22 +5328,55 @@
         return;
       }
 
-      const rows = items.map((file) => {
+      const activePath = Array.isArray(clipPageState.joinedBrowsePath) ? clipPageState.joinedBrowsePath : [];
+      const { folders, files } = joinedFolderView(items, activePath);
+      const folderRows = folders.map(({ name, count }) => `<div class="joined-folder-row">
+        <button type="button" class="joined-folder-button" data-joinedfolder="${escapeHTML(name)}">
+          <span class="joined-folder-icon" aria-hidden="true"></span>
+          <span class="joined-entry-name">${escapeHTML(name)}</span>
+        </button>
+        <span class="joined-entry-meta">${count} file${count === 1 ? '' : 's'}</span>
+      </div>`).join('');
+      const fileRows = files.map(({ file, parts }) => {
         const start = new Date(file.scheduled_start_at);
         const end = new Date(file.scheduled_end_at);
         const durationMS = Number.isFinite(start.getTime()) && Number.isFinite(end.getTime()) ? Math.max(0, end - start) : 0;
         const downloadPath = String(file.download_path || '');
-        return `<tr>
-          <td class="joined-path">${escapeHTML(String(file.relative_path || file.hour_id || 'Joined recording'))}</td>
-          <td>${escapeHTML(String(file.local_date || ''))} · hour ${String(Number(file.delivery_hour || 0)).padStart(2, '0')}</td>
-          <td class="num">${escapeHTML(formatDuration(durationMS))}</td>
-          <td class="num">${escapeHTML(formatBytes(Number(file.size_bytes || 0)))}</td>
-          <td><div class="clip-row-actions"><a class="btn-link secondary" href="${escapeHTML(downloadPath)}?disposition=inline" target="_blank" rel="noopener noreferrer">View</a><a class="btn-link secondary" href="${escapeHTML(downloadPath)}?disposition=attachment">Download</a></div></td>
-        </tr>`;
+        const name = parts[parts.length - 1] || String(file.hour_id || 'Joined recording');
+        return `<div class="joined-file-row">
+          <div class="joined-file-main"><div class="joined-entry-name">${escapeHTML(name)}</div><div class="joined-entry-meta">${escapeHTML(String(file.local_date || ''))} · ${escapeHTML(formatDuration(durationMS))} · ${escapeHTML(formatBytes(Number(file.size_bytes || 0)))}</div></div>
+          <div class="joined-file-actions"><a class="btn-link secondary" href="${escapeHTML(downloadPath)}?disposition=inline" target="_blank" rel="noopener noreferrer">View</a><a class="btn-link secondary" href="${escapeHTML(downloadPath)}?disposition=attachment">Download</a></div>
+        </div>`;
       }).join('');
-
-      body.innerHTML = summary + `<table class="clip-table clip-table-clips"><thead><tr><th>Joined file</th><th>Delivery hour</th><th class="num">Span</th><th class="num">Size</th><th aria-label="Actions"></th></tr></thead><tbody>${rows}</tbody></table>` + clipPagerHTML(page, pageCount);
+      const crumbs = ['Joined clips', ...activePath].map((name, index) => {
+        const current = index === activePath.length;
+        return `${index ? '<span class="joined-crumb-sep" aria-hidden="true">/</span>' : ''}<button type="button" class="joined-crumb" data-joinedcrumb="${index}"${current ? ' aria-current="page" disabled' : ''}>${escapeHTML(name)}</button>`;
+      }).join('');
+      const entries = folderRows + fileRows || '<div class="joined-browser-empty">This folder is empty.</div>';
+      body.innerHTML = summary + `<div class="joined-browser"><nav class="joined-browser-bar" aria-label="Joined clip folders">${crumbs}</nav><div class="joined-browser-list">${entries}</div></div>`;
       wireClipPageNav(body);
+    }
+
+    function joinedFolderView(items, activePath) {
+      const monthNames = new Set(['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']);
+      const normalized = items.map((file) => {
+        const rawParts = String(file.relative_path || '').split('/').filter(Boolean);
+        const monthIndex = rawParts.findIndex((part) => monthNames.has(part));
+        const parts = monthIndex >= 0 ? rawParts.slice(monthIndex) : rawParts;
+        return { file, parts };
+      });
+      const visible = normalized.filter(({ parts }) => activePath.every((part, index) => parts[index] === part));
+      const folders = new Map();
+      const files = [];
+      visible.forEach((entry) => {
+        if (entry.parts.length > activePath.length + 1) {
+          const name = entry.parts[activePath.length];
+          folders.set(name, (folders.get(name) || 0) + 1);
+        } else {
+          files.push(entry);
+        }
+      });
+      return { folders: [...folders.entries()].map(([name, count]) => ({ name, count })), files };
     }
 
     function clipPagerHTML(page, pageCount) {
@@ -5327,6 +5397,16 @@
           if (clipPageState.loading) return;
           const dir = b.getAttribute('data-clippage');
           loadClipPage(dir === 'prev' ? clipPageState.page - 1 : clipPageState.page + 1);
+        }));
+      root.querySelectorAll('button[data-joinedfolder]').forEach((button) =>
+        button.addEventListener('click', () => {
+          clipPageState.joinedBrowsePath = [...clipPageState.joinedBrowsePath, button.getAttribute('data-joinedfolder')];
+          renderJoinedList(clipPageState.joinedPayload);
+        }));
+      root.querySelectorAll('button[data-joinedcrumb]').forEach((button) =>
+        button.addEventListener('click', () => {
+          clipPageState.joinedBrowsePath = clipPageState.joinedBrowsePath.slice(0, Number(button.getAttribute('data-joinedcrumb')));
+          renderJoinedList(clipPageState.joinedPayload);
         }));
     }
 
