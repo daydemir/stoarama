@@ -944,6 +944,33 @@ func TestRecordingJoinedDetailFormatsNonemptyPublishedFilesWithDefinedHelper(t *
 	}
 }
 
+func TestRecordingJoinedDetailUsesFolderBrowserAndLoadsEveryPublishedPart(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`class="joined-browser"`,
+		`aria-label="Joined clip folders"`,
+		`data-joinedfolder=`,
+		`data-joinedcrumb=`,
+		`monthNames.has(part)`,
+		`parts = monthIndex >= 0 ? rawParts.slice(monthIndex) : rawParts`,
+		`for (let nextOffset = offset + files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE)`,
+		`files.push(...nextFiles)`,
+		`>View</a>`,
+		`>Download</a>`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording joined folder browser missing %q", marker)
+		}
+	}
+	if strings.Contains(page, `<th>Joined file</th>`) {
+		t.Fatal("recording joined detail still renders the flat joined-files table")
+	}
+}
+
 func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
