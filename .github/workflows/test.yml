@@ -119,6 +119,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run '^(TestRecordingJoinedProgressUsesExactPublishedMediaProvenance|TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes|TestRecordingJoinedBrowserAuthPublicParityAndIsolation|TestRecordingJoinedDownloadSupportsUnversionedExactRange|TestJoinedBrowserIndexMigrationIsTransactionalAndRejectsWrongPrecreate|TestJoinedFolderIsSameOriginScopedAndRedacted|TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials)$' -count=1 -v
+      - name: Test recording folder API parity and baseline independence
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^(TestSharedRecordingsExposeTypedNamingWithAuthenticatedParity|TestRecordingListBaselineDoesNotWaitForMetricTables)$' -count=1 -v
       - name: Test capture-health joined-metric isolation
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

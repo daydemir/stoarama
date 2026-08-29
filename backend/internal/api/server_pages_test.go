@@ -370,8 +370,8 @@ func TestRecordingsListRendersPersistedTimelineHealth(t *testing.T) {
 	for _, marker := range []string{
 		`rec.timeline_health && typeof rec.timeline_health === 'object'`,
 		`<th>Recording</th><th>Status / Last 12 hours</th><th>Recording quality</th>${joinedSortHeaderHTML()}<th>Schedule</th>`,
-		`<td><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
-		<td>${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
+		`<td class="recording-cell-wide" data-label="Status / Last 12 hours"><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
+		<td class="recording-cell-wide" data-label="Recording quality">${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>`,
 		`const captureHealthHTML = captureHealth === 'unavailable'`,
 		"? `${captureHealthGraph(healthBins, timezone)}<div class=\"cell-sub\">Last 12 scheduled hours",
 		`recent coverage`,
@@ -466,7 +466,9 @@ func TestRecordingsListFiltersCompletedAndPotentialBest14ScoresSeparately(t *tes
 		`if (String(rating.rating || '').toUpperCase() !== 'INSUFFICIENT') return '';`,
 		`if (Number(rating.completed_days || 0) >= 14) return '';`,
 		`qualifier.endsWith('_POTENTIAL')`,
-		`all.filter((rec) => matchesStatusFilter(rec) && matchesQualityFilter(rec))`,
+		`let items = all.filter((rec) => recordingMatchesFolder(rec, selectedFolder)`,
+		`&& recordingMatchesSearch(rec, state.recordingSearch)`,
+		`&& matchesStatusFilter(rec) && matchesQualityFilter(rec));`,
 		`state.qualityFilter = els.qualityFilter.value;`,
 		`syncQualityFilterQuery();`,
 		`if (state.qualityFilter === 'all') syncQualityFilterQuery();`,
@@ -763,7 +765,7 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 	for _, marker := range []string{
 		`<option value="joined_desc">Joined: highest first</option>`,
 		`<option value="joined_asc">Joined: lowest first</option>`,
-		`const direction = state.recordingSort === 'joined_asc' ? 1 : -1;`,
+		`const direction = sort === 'joined_asc' ? 1 : -1;`,
 		`if (left.available !== right.available) return left.available ? -1 : 1;`,
 		`if (left.available && left.percent !== right.percent) return direction * (left.percent - right.percent);`,
 		`if (!(sourceMS > 0) || rawPercent === null || rawPercent === undefined`,
@@ -809,6 +811,75 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 	for _, label := range []string{">View recording<", ">Joined clips<"} {
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
+		}
+	}
+}
+
+func TestRecordingFolderNavigatorIsSharedResponsiveAndComposesWithListControls(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`<label for="recordingSearch">Search recordings</label>`,
+		`<input id="recordingSearch" type="search"`,
+		`<details id="folderBrowserMobile" class="folder-browser-mobile hidden">`,
+		`<summary>Browse folders</summary>`,
+		`<aside id="folderRail" class="folder-rail" aria-label="Browse recording folders">`,
+		`<nav id="folderBreadcrumbs" class="folder-breadcrumbs" aria-label="Selected folder">`,
+		`id="recordingBrowserLayout" class="recording-browser-layout hidden"`,
+		`selectedFolderKey: folderSelectionFromSearch(window.location.search),`,
+		`openFolderKeys: new Set(),`,
+		`recordingSearch: '',`,
+		`recordingSort: recordingSortFromSearch(window.location.search),`,
+		`const folderTree = buildRecordingFolderTree(all);`,
+		`recordingMatchesFolder(rec, selectedFolder)`,
+		`recordingMatchesSearch(rec, state.recordingSearch)`,
+		`window.history.replaceState({}, '', recordingsListURL(window.location.href, state.selectedFolderKey, state.recordingSort));`,
+		`data-label="Recording"`,
+		`data-label="Status / Last 12 hours"`,
+		`data-label="Recording quality"`,
+		`data-label="Joined"`,
+		`data-label="Schedule"`,
+		`data-label="Clip / Capture"`,
+		`data-label="Storage"`,
+		`data-label="Actions"`,
+		`.recordings-table td::before { content: attr(data-label);`,
+		`@media (min-width: 1040px)`,
+		`@media (max-width: 1039px)`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recording folder navigator missing %q", marker)
+		}
+	}
+	if strings.Contains(page, `.recordings-table td:nth-child(5)::before`) || strings.Contains(page, `.recordings-table td:nth-child(9)::before`) {
+		t.Fatal("mobile recording labels still depend on fragile nine-column nth-child positions")
+	}
+	if strings.Contains(page, `role="tree"`) {
+		t.Fatal("folder navigator claims ARIA tree semantics without implementing its keyboard contract")
+	}
+}
+
+func TestRecordingListDefaultsToJoinedDescendingWithoutBlockingBaseline(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`<option value="joined_desc">Joined: highest first</option>`,
+		`return ['newest', 'best14', 'joined_desc', 'joined_asc'].includes(value) ? value : 'joined_desc';`,
+		`recordingSort: recordingSortFromSearch(window.location.search),`,
+		`els.recordingSort.value = state.recordingSort;`,
+		`if (left.available !== right.available) return left.available ? -1 : 1;`,
+		`finishRecordingsLoad();
+        renderCards();
+		void refreshRecordingEnrichment(requestToken);
+		void refreshJoinedProgress(requestToken);`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings default joined sort missing %q", marker)
 		}
 	}
 }

@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
+	"github.com/go-chi/chi/v5"
 )
 
 func testSharedRecordingsSigningKey() string {
@@ -142,6 +144,15 @@ func TestSharedRecordingDTOExcludesSensitiveFields(t *testing.T) {
 		"start_at": time.Now(), "captured_clip_count": 9, "expected_clip_count": 10,
 		"capture_health": "warning", "source_kind": "hls", "capture_via": "cloud",
 		"has_relay_online": false, "has_relay_assigned": false,
+		"naming": map[string]any{
+			"profile":     "plaza_hourly_v1",
+			"folder_name": "08_Europe_Poland_Swidnik_Plac_Konstytucji",
+			"metadata": map[string]any{
+				"plaza_id": "08", "continent": "Europe", "country": "Poland",
+				"city": "Swidnik", "plaza_name": "Plac Konstytucji",
+				"private_note": "must not cross the public DTO",
+			},
+		},
 		"stream_url":             "https://secret.example/playlist.m3u8",
 		"storage_destination_id": 55, "storage_destination_name": "private NAS",
 	}
@@ -158,6 +169,22 @@ func TestSharedRecordingDTOExcludesSensitiveFields(t *testing.T) {
 		if strings.Contains(encoded, forbidden) {
 			t.Fatalf("shared DTO leaked %q: %s", forbidden, encoded)
 		}
+	}
+	for _, allowed := range []string{
+		`"profile":"plaza_hourly_v1"`,
+		`"folder_name":"08_Europe_Poland_Swidnik_Plac_Konstytucji"`,
+		`"plaza_id":"08"`,
+		`"continent":"Europe"`,
+		`"country":"Poland"`,
+		`"city":"Swidnik"`,
+		`"plaza_name":"Plac Konstytucji"`,
+	} {
+		if !strings.Contains(encoded, allowed) {
+			t.Fatalf("shared DTO omitted allowlisted naming field %q: %s", allowed, encoded)
+		}
+	}
+	if strings.Contains(encoded, "private_note") {
+		t.Fatalf("shared DTO leaked non-allowlisted naming metadata: %s", encoded)
 	}
 }
 
@@ -222,6 +249,115 @@ func TestSharedRecordingsExposeOnlyAllowlistedStatuses(t *testing.T) {
 			t.Fatalf("%s detail status=%d want=%d body=%s", status, response.Code, want, response.Body.String())
 		}
 	}
+}
+
+func TestSharedRecordingsExposeTypedNamingWithAuthenticatedParity(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status) VALUES
+			(47,'mit-folder@example.test','MIT folders','admin','active'),
+			(99,'foreign-folder@example.test','Foreign folders','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status) VALUES
+			(1,47,'MIT storage','https://example.test','auto','clips','access',''::bytea,'verified'),
+			(2,99,'Foreign storage','https://example.test','auto','clips','access',''::bytea,'verified');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,cron_expr,naming_profile,folder_name,naming_metadata_jsonb) VALUES
+			(701,47,1,'Swidnik plaza','https://example.test/mit.m3u8','completed','0 * * * *','plaza_hourly_v1',
+			 '08_Europe_Poland_Swidnik_Plac_Konstytucji',
+			 '{"plaza_id":"08","continent":"Europe","country":"Poland","city":"Swidnik","plaza_name":"Plac Konstytucji","private_note":"never public"}'::jsonb),
+			(702,99,2,'Foreign plaza','https://example.test/foreign.m3u8','completed','0 * * * *','plaza_hourly_v1',
+			 '99_Europe_Poland_Foreign_Private',
+			 '{"plaza_id":"99","continent":"Europe","country":"Poland","city":"Foreign","plaza_name":"Private"}'::jsonb),
+			(703,47,1,'Canceled plaza','https://example.test/canceled.m3u8','canceled','0 * * * *','plaza_hourly_v1',
+			 '09_Europe_Poland_Canceled_Private',
+			 '{"plaza_id":"09","continent":"Europe","country":"Poland","city":"Canceled","plaza_name":"Private"}'::jsonb);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
+
+	type listPayload struct {
+		Items      []map[string]json.RawMessage `json:"items"`
+		Recordings []map[string]json.RawMessage `json:"recordings"`
+	}
+	call := func(handler http.HandlerFunc, req *http.Request) []map[string]json.RawMessage {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "private_note") || strings.Contains(rec.Body.String(), "Foreign plaza") || strings.Contains(rec.Body.String(), "Canceled plaza") {
+			t.Fatalf("recording naming response crossed its allowlist or cohort: %s", rec.Body.String())
+		}
+		var payload listPayload
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Items) > 0 {
+			return payload.Items
+		}
+		return payload.Recordings
+	}
+	authReq := withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings", nil), accountPrincipal{AccountID: 47}, "")
+	authItems := call(s.handleAccountRecordingsList, authReq)
+	sharedItems := call(s.handleSharedRecordingsList, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings", nil))
+	if len(authItems) != 1 || len(sharedItems) != 1 {
+		t.Fatalf("auth rows=%d shared rows=%d, want one owner-visible recording", len(authItems), len(sharedItems))
+	}
+
+	type namingPayload struct {
+		Profile    string                   `json:"profile"`
+		FolderName string                   `json:"folder_name"`
+		Metadata   recordingnaming.Metadata `json:"metadata"`
+	}
+	decodeNaming := func(item map[string]json.RawMessage) namingPayload {
+		t.Helper()
+		var naming namingPayload
+		if err := json.Unmarshal(item["naming"], &naming); err != nil {
+			t.Fatalf("decode naming: %v body=%s", err, item["naming"])
+		}
+		return naming
+	}
+	authNaming, sharedNaming := decodeNaming(authItems[0]), decodeNaming(sharedItems[0])
+	if authNaming != sharedNaming {
+		t.Fatalf("auth naming=%+v shared naming=%+v", authNaming, sharedNaming)
+	}
+	if sharedNaming.Profile != "plaza_hourly_v1" || sharedNaming.FolderName != "08_Europe_Poland_Swidnik_Plac_Konstytucji" ||
+		sharedNaming.Metadata != (recordingnaming.Metadata{PlazaID: "08", Continent: "Europe", Country: "Poland", City: "Swidnik", PlazaName: "Plac Konstytucji"}) {
+		t.Fatalf("unexpected shared naming: %+v", sharedNaming)
+	}
+
+	detail := func(handler http.HandlerFunc, req *http.Request, id int64, wantStatus int) map[string]json.RawMessage {
+		t.Helper()
+		route := chi.NewRouteContext()
+		route.URLParams.Add("id", strconv.FormatInt(id, 10))
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		if rec.Code != wantStatus {
+			t.Fatalf("recording %d status=%d want=%d body=%s", id, rec.Code, wantStatus, rec.Body.String())
+		}
+		if wantStatus != http.StatusOK {
+			return nil
+		}
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &item); err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	authDetailReq := withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/701", nil), accountPrincipal{AccountID: 47}, "")
+	sharedDetailReq := httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/701", nil)
+	if got := decodeNaming(detail(s.handleAccountRecordingGet, authDetailReq, 701, http.StatusOK)); got != authNaming {
+		t.Fatalf("auth detail naming=%+v want=%+v", got, authNaming)
+	}
+	if got := decodeNaming(detail(s.handleSharedRecordingGet, sharedDetailReq, 701, http.StatusOK)); got != sharedNaming {
+		t.Fatalf("shared detail naming=%+v want=%+v", got, sharedNaming)
+	}
+	detail(s.handleSharedRecordingGet, httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/702", nil), 702, http.StatusNotFound)
 }
 
 func TestRecordingFutureWindowsRespectScheduleBoundaries(t *testing.T) {
