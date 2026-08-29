@@ -146,7 +146,6 @@ func TestRecordingCaptureHealthBaseRetainsAdmissionUnderJoinedSaturation(t *test
 
 	joinedDone := make(chan int, 2)
 	for _, shared := range []bool{false, true} {
-		shared := shared
 		go func() {
 			requestCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
