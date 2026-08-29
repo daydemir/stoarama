@@ -596,20 +596,33 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 	pool := joinedBrowserTestPool(t)
 	seedJoinedBrowserTestData(t, pool)
 	s := &Server{pool: pool}
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/20/joined/folder", nil)
-	route := chi.NewRouteContext()
-	route.URLParams.Add("id", strconv.FormatInt(20, 10))
-	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, route)
-	ctx = context.WithValue(ctx, accountPrincipalContextKey, accountPrincipal{AccountID: 47, AuthType: "session"})
-	req = req.WithContext(ctx)
-	response := httptest.NewRecorder()
-	s.handleAccountRecordingJoinedFolder(response, req)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "May/Monday/hour_01_part_01_0800-0801.mp4") {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-	}
-	for _, forbidden := range []string{"joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
-		if strings.Contains(response.Body.String(), forbidden) {
-			t.Fatalf("folder leaked %q", forbidden)
+	for _, test := range []struct {
+		path string
+		want []string
+	}{
+		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"May", "folder=May", "2 clips"}},
+		{path: "/api/v1/account/recordings/20/joined/folder?folder=May", want: []string{"Monday", "folder=May%2FMonday"}},
+		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", ">View</a>", ">Download</a>"}},
+	} {
+		req := httptest.NewRequest(http.MethodGet, test.path, nil)
+		route := chi.NewRouteContext()
+		route.URLParams.Add("id", strconv.FormatInt(20, 10))
+		ctx := context.WithValue(req.Context(), chi.RouteCtxKey, route)
+		ctx = context.WithValue(ctx, accountPrincipalContextKey, accountPrincipal{AccountID: 47, AuthType: "session"})
+		response := httptest.NewRecorder()
+		s.handleAccountRecordingJoinedFolder(response, req.WithContext(ctx))
+		if response.Code != http.StatusOK {
+			t.Fatalf("path=%s status=%d body=%s", test.path, response.Code, response.Body.String())
+		}
+		for _, want := range test.want {
+			if !strings.Contains(response.Body.String(), want) {
+				t.Fatalf("path=%s missing %q body=%s", test.path, want, response.Body.String())
+			}
+		}
+		for _, forbidden := range []string{"joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
+			if strings.Contains(response.Body.String(), forbidden) {
+				t.Fatalf("folder leaked %q", forbidden)
+			}
 		}
 	}
 }
@@ -633,7 +646,7 @@ func TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials(t *testing.T) {
 		wantBody          string
 	}{
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined", wantCode: http.StatusOK, wantBody: `"total":2`},
-		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder", wantCode: http.StatusOK, wantBody: "private R2 folder"},
+		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder", wantCode: http.StatusOK, wantBody: "Joined clips"},
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined/302/download?disposition=inline", rangeHeader: "bytes=2-5", wantCode: http.StatusPartialContent, wantBody: "2345"},
 		{path: "/api/v1/shared/mit-scl/recordings/50/joined", wantCode: http.StatusNotFound, wantBody: "recording not found"},
 	} {

@@ -466,8 +466,7 @@ func TestRecordingsListFiltersCompletedAndPotentialBest14ScoresSeparately(t *tes
 		`if (String(rating.rating || '').toUpperCase() !== 'INSUFFICIENT') return '';`,
 		`if (Number(rating.completed_days || 0) >= 14) return '';`,
 		`qualifier.endsWith('_POTENTIAL')`,
-		`let items = all.filter((rec) => recordingMatchesFolder(rec, selectedFolder)`,
-		`&& recordingMatchesSearch(rec, state.recordingSearch)`,
+		`let items = all.filter((rec) => recordingMatchesSearch(rec, state.recordingSearch)`,
 		`&& matchesStatusFilter(rec) && matchesQualityFilter(rec));`,
 		`state.qualityFilter = els.qualityFilter.value;`,
 		`syncQualityFilterQuery();`,
@@ -631,7 +630,7 @@ func TestRecordingDetailUsesPagedHourlyCaptureHealthHeatmap(t *testing.T) {
 	}
 }
 
-func TestRecordingDetailCardFailureCannotRemoveJoinedBrowser(t *testing.T) {
+func TestRecordingDetailCardFailureCannotRemoveJoinedFolderLink(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
 		t.Fatal(err)
@@ -639,11 +638,11 @@ func TestRecordingDetailCardFailureCannotRemoveJoinedBrowser(t *testing.T) {
 	page := string(body)
 	for _, marker := range []string{
 		`function renderDetailCardSafely(label, render)`,
-		`function renderRecordingDetailBody(prefix, cardRenderers, joinedBrowser)`,
+		`function renderRecordingDetailBody(prefix, cardRenderers)`,
 		`renderDetailCardSafely(label, render)`,
 		`role="status"`,
 		`This detail is temporarily unavailable.`,
-		`id="clipListBody"`,
+		`class="btn-link primary joined-folder-cta"`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording detail resilience source missing %q", marker)
@@ -808,14 +807,14 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 			t.Fatalf("recordings html still contains stale action copy %q", stale)
 		}
 	}
-	for _, label := range []string{">View recording<", ">Joined clips<"} {
+	for _, label := range []string{">View recording<", ">Browse joined folder<"} {
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
 		}
 	}
 }
 
-func TestRecordingFolderNavigatorIsSharedResponsiveAndComposesWithListControls(t *testing.T) {
+func TestRecordingListHasNoAccountWideFolderNavigator(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
 		t.Fatal(err)
@@ -824,19 +823,10 @@ func TestRecordingFolderNavigatorIsSharedResponsiveAndComposesWithListControls(t
 	for _, marker := range []string{
 		`<label for="recordingSearch">Search recordings</label>`,
 		`<input id="recordingSearch" type="search"`,
-		`<details id="folderBrowserMobile" class="folder-browser-mobile hidden">`,
-		`<summary>Browse folders</summary>`,
-		`<aside id="folderRail" class="folder-rail" aria-label="Browse recording folders">`,
-		`<nav id="folderBreadcrumbs" class="folder-breadcrumbs" aria-label="Selected folder">`,
-		`id="recordingBrowserLayout" class="recording-browser-layout hidden"`,
-		`selectedFolderKey: folderSelectionFromSearch(window.location.search),`,
-		`openFolderKeys: new Set(),`,
 		`recordingSearch: '',`,
 		`recordingSort: recordingSortFromSearch(window.location.search),`,
-		`const folderTree = buildRecordingFolderTree(all);`,
-		`recordingMatchesFolder(rec, selectedFolder)`,
 		`recordingMatchesSearch(rec, state.recordingSearch)`,
-		`window.history.replaceState({}, '', recordingsListURL(window.location.href, state.selectedFolderKey, state.recordingSort));`,
+		`window.history.replaceState({}, '', recordingsListURL(window.location.href, state.recordingSort));`,
 		`data-label="Recording"`,
 		`data-label="Status / Last 12 hours"`,
 		`data-label="Recording quality"`,
@@ -850,7 +840,12 @@ func TestRecordingFolderNavigatorIsSharedResponsiveAndComposesWithListControls(t
 		`@media (max-width: 1039px)`,
 	} {
 		if !strings.Contains(page, marker) {
-			t.Fatalf("recording folder navigator missing %q", marker)
+			t.Fatalf("recording list missing %q", marker)
+		}
+	}
+	for _, removed := range []string{"folderBrowserMobile", "folderNavRail", "folderBreadcrumbs", "recordingMatchesFolder", "buildRecordingFolderTree"} {
+		if strings.Contains(page, removed) {
+			t.Fatalf("recording list still contains removed folder navigator marker %q", removed)
 		}
 	}
 	if strings.Contains(page, `.recordings-table td:nth-child(5)::before`) || strings.Contains(page, `.recordings-table td:nth-child(9)::before`) {
@@ -884,90 +879,25 @@ func TestRecordingListDefaultsToJoinedDescendingWithoutBlockingBaseline(t *testi
 	}
 }
 
-func TestRecordingJoinedDetailFailureOffersAnInPlaceRetry(t *testing.T) {
-	body, err := loadHTMLPage("recordings.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	page := string(body)
-	renderStart := strings.Index(page, "function renderClipPageWithJoined()")
-	if renderStart < 0 {
-		t.Fatal("joined detail render function start not found")
-	}
-	renderEnd := strings.Index(page[renderStart:], "async function reloadClipPageRecording()")
-	if renderEnd < 0 {
-		t.Fatal("joined detail render function boundaries not found")
-	}
-	render := page[renderStart : renderStart+renderEnd]
-	for _, marker := range []string{
-		`Joined recordings could not be loaded.`,
-		`data-joinedretry`,
-		`wireClipPageNav(body);`,
-	} {
-		if !strings.Contains(render, marker) {
-			t.Fatalf("joined detail error branch missing recovery marker %q", marker)
-		}
-	}
-	errorAt := strings.Index(render, `clipPageState.joinedStatus === 'error'`)
-	buttonAt := strings.Index(render, `data-joinedretry`)
-	wireAt := strings.Index(render, `wireClipPageNav(body);`)
-	if errorAt < 0 || buttonAt < errorAt || wireAt < buttonAt {
-		t.Fatalf("joined error recovery is not rendered then wired in order: error=%d button=%d wire=%d", errorAt, buttonAt, wireAt)
-	}
-
-	wireStart := strings.Index(page, "function wireClipPageNav(root)")
-	if wireStart < 0 {
-		t.Fatal("joined detail navigation function start not found")
-	}
-	wireEnd := strings.Index(page[wireStart:], "async function downloadClipPageZip")
-	if wireEnd < 0 {
-		t.Fatal("joined detail navigation function boundaries not found")
-	}
-	wiring := page[wireStart : wireStart+wireEnd]
-	const exactRetryListener = `if (retry) retry.addEventListener('click', () => loadClipPage(clipPageState.page));`
-	if !strings.Contains(wiring, exactRetryListener) {
-		t.Fatalf("joined retry button is not wired to reload the current page: %q", exactRetryListener)
-	}
-}
-
-func TestRecordingJoinedDetailFormatsNonemptyPublishedFilesWithDefinedHelper(t *testing.T) {
-	body, err := loadHTMLPage("recordings.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	page := string(body)
-	if strings.Contains(page, `fmtBytes(`) {
-		t.Fatal("joined detail calls undefined fmtBytes helper")
-	}
-	if !strings.Contains(page, `formatBytes(Number(file.size_bytes || 0))`) {
-		t.Fatal("joined detail does not format a published file with the defined formatBytes helper")
-	}
-}
-
-func TestRecordingJoinedDetailUsesFolderBrowserAndLoadsEveryPublishedPart(t *testing.T) {
+func TestRecordingDetailLinksToDedicatedJoinedFolderWithoutEagerJoinedFetch(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
 		t.Fatal(err)
 	}
 	page := string(body)
 	for _, marker := range []string{
-		`class="joined-browser"`,
-		`aria-label="Joined clip folders"`,
-		`data-joinedfolder=`,
-		`data-joinedcrumb=`,
-		`monthNames.has(part)`,
-		`parts = monthIndex >= 0 ? rawParts.slice(monthIndex) : rawParts`,
-		`for (let nextOffset = files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE)`,
-		`files.push(...nextFiles)`,
-		`>View</a>`,
-		`>Download</a>`,
+		`const folderPath = recordingAPIPath(`,
+		`class="btn-link primary joined-folder-cta"`,
+		`>Browse joined folder</a>`,
 	} {
 		if !strings.Contains(page, marker) {
-			t.Fatalf("recording joined folder browser missing %q", marker)
+			t.Fatalf("recording detail missing dedicated joined folder link %q", marker)
 		}
 	}
-	if strings.Contains(page, `<th>Joined file</th>`) {
-		t.Fatal("recording joined detail still renders the flat joined-files table")
+	for _, removed := range []string{"renderJoinedList", "joinedFolderView", `/joined?limit=`, `id="clipListBody"`} {
+		if strings.Contains(page, removed) {
+			t.Fatalf("recording detail still contains embedded joined browser marker %q", removed)
+		}
 	}
 }
 
@@ -985,8 +915,7 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 		"recordingAPIPath(`/joined-progress${sortQuery}`)",
 		"Joined coverage is loading",
 		"void loadRecordingDetailCaptureHealth(recId);",
-		"clipPageState.joinedPayload = payload;",
-		"renderClipPageWithJoined();",
+		"renderClipPage();",
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing lazy-metric marker %q", marker)
@@ -1065,29 +994,31 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 	}
 }
 
-func TestRecordingDetailJoinedPayloadIsBoundToActiveAsyncLoad(t *testing.T) {
+func TestRecordingDetailMetadataLoadIsBoundToActiveRequest(t *testing.T) {
 	body, err := loadHTMLPage("recordings.html")
 	if err != nil {
 		t.Fatal(err)
 	}
 	page := string(body)
 	for _, marker := range []string{
-		"const loadToken = ++clipPageState.joinedLoadToken;",
-		"clipPageState.joinedPayload = null;",
-		"clipPageState.joinedPayloadKey = joinedKey;",
-		"loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey",
-		"clipPageState.joinedPayloadKey === joinedKey",
-		"clipPageState.joinedStatus = 'error';",
-		"renderClipPageWithJoined();",
+		"const loadToken = ++clipPageState.detailLoadToken;",
+		"if (loadToken !== clipPageState.detailLoadToken) return;",
+		"rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));",
+		"clipPageState.rec = rec;",
+		"renderClipPage();",
 	} {
 		if !strings.Contains(page, marker) {
-			t.Fatalf("recording detail missing async joined identity fence %q", marker)
+			t.Fatalf("recording detail missing metadata identity fence %q", marker)
 		}
 	}
-	clearAt := strings.Index(page, "clipPageState.joinedPayload = null;")
-	fetchAt := strings.Index(page, "payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined")
-	if clearAt < 0 || fetchAt < 0 || clearAt > fetchAt {
-		t.Fatalf("joined payload is not cleared before the next page fetch: clear=%d fetch=%d", clearAt, fetchAt)
+	if strings.Contains(page, "clipPageState.joinedPayload") || strings.Contains(page, "/joined?limit=") {
+		t.Fatal("recording detail still fetches the embedded joined payload")
+	}
+	fetchAt := strings.Index(page, "rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));")
+	guardAt := strings.Index(page[fetchAt:], "if (loadToken !== clipPageState.detailLoadToken) return;")
+	assignAt := strings.Index(page[fetchAt:], "clipPageState.rec = rec;")
+	if fetchAt < 0 || guardAt < 0 || assignAt < 0 || guardAt > assignAt {
+		t.Fatalf("recording metadata commits before its active-request guard: fetch=%d guard=%d assign=%d", fetchAt, guardAt, assignAt)
 	}
 	pageHealthStart := strings.Index(page, "async function loadRecordingCaptureHealthPage(direction)")
 	if pageHealthStart < 0 {
@@ -1098,7 +1029,7 @@ func TestRecordingDetailJoinedPayloadIsBoundToActiveAsyncLoad(t *testing.T) {
 		t.Fatal("capture-health pagination function not found")
 	}
 	pageHealthSource := page[pageHealthStart : pageHealthStart+pageHealthEnd]
-	if strings.Contains(pageHealthSource, "await loadClipPage(clipPageState.page);") {
-		t.Fatal("capture-health pagination still refetches joined media and reopens the stale-payload race")
+	if strings.Contains(pageHealthSource, "await loadClipPage(") {
+		t.Fatal("capture-health pagination refetches recording metadata")
 	}
 }
