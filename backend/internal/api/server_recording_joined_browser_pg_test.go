@@ -600,7 +600,7 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 		path string
 		want []string
 	}{
-		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"May", "folder=May", "1 clip"}},
+		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"May", "folder=May", "2 clips"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May", want: []string{"Monday", "folder=May%2FMonday"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", ">View</a>", ">Download</a>"}},
 	} {
