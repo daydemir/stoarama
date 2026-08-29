@@ -4085,8 +4085,9 @@
       const loadToken = ++clipPageState.detailLoadToken;
       clipPageState.loading = true;
       if (firstLoad) root.innerHTML = `<div class="clip-summary">Loading recording...</div>`;
+      let rec;
       try {
-        clipPageState.rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));
+		rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));
       } catch (err) {
         if (loadToken !== clipPageState.detailLoadToken) return;
         root.innerHTML = `<div class="clip-summary" role="alert" style="color:var(--err)">${escapeHTML(String(err.message || err))}</div>`;
@@ -4094,7 +4095,7 @@
         return;
       }
       if (loadToken !== clipPageState.detailLoadToken) return;
-      const rec = clipPageState.rec;
+	  clipPageState.rec = rec;
       clipPageState.recName = String((rec && (rec.stream_name || rec.name)) || `Recording #${recId}`);
       if (firstLoad) clipPageState.captureHealth = null;
       renderClipPage();

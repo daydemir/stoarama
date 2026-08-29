@@ -1003,7 +1003,8 @@ func TestRecordingDetailMetadataLoadIsBoundToActiveRequest(t *testing.T) {
 	for _, marker := range []string{
 		"const loadToken = ++clipPageState.detailLoadToken;",
 		"if (loadToken !== clipPageState.detailLoadToken) return;",
-		"clipPageState.rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));",
+		"rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));",
+		"clipPageState.rec = rec;",
 		"renderClipPage();",
 	} {
 		if !strings.Contains(page, marker) {
@@ -1012,6 +1013,12 @@ func TestRecordingDetailMetadataLoadIsBoundToActiveRequest(t *testing.T) {
 	}
 	if strings.Contains(page, "clipPageState.joinedPayload") || strings.Contains(page, "/joined?limit=") {
 		t.Fatal("recording detail still fetches the embedded joined payload")
+	}
+	fetchAt := strings.Index(page, "rec = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}`));")
+	guardAt := strings.Index(page[fetchAt:], "if (loadToken !== clipPageState.detailLoadToken) return;")
+	assignAt := strings.Index(page[fetchAt:], "clipPageState.rec = rec;")
+	if fetchAt < 0 || guardAt < 0 || assignAt < 0 || guardAt > assignAt {
+		t.Fatalf("recording metadata commits before its active-request guard: fetch=%d guard=%d assign=%d", fetchAt, guardAt, assignAt)
 	}
 	pageHealthStart := strings.Index(page, "async function loadRecordingCaptureHealthPage(direction)")
 	if pageHealthStart < 0 {
