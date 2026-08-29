@@ -4403,6 +4403,18 @@
       return m ? Number(sharedReadOnly ? m[2] : m[1]) : 0;
     }
 
+    async function fetchAllJoinedPages(fetchPage, initial) {
+      const files = Array.isArray(initial.files) ? initial.files.slice() : [];
+      const total = Number(initial.total || files.length);
+      for (let nextOffset = files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE) {
+        const next = await fetchPage(nextOffset);
+        const nextFiles = Array.isArray(next.files) ? next.files : [];
+        files.push(...nextFiles);
+        if (nextFiles.length === 0) break;
+      }
+      return { ...initial, files, total };
+    }
+
     // Render the recording detail view with only immutable, published joined media.
     // Raw source clips remain preserved by the backend but are no longer exposed by
     // this browser.
@@ -4444,18 +4456,13 @@
       if (body) body.innerHTML = `<div class="clip-summary">Loading joined recordings...</div>`;
       let payload;
       try {
-		const offset = requestedPage * CLIP_PAGE_SIZE;
+		const offset = 0;
         payload = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined?limit=${CLIP_PAGE_SIZE}&offset=${offset}`));
-		const files = Array.isArray(payload.files) ? payload.files.slice() : [];
-		const total = Number(payload.total || files.length);
-		for (let nextOffset = offset + files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE) {
+		payload = await fetchAllJoinedPages(async (nextOffset) => {
 		  const next = await fetchJSON(recordingAPIPath(`/${encodeURIComponent(recId)}/joined?limit=${CLIP_PAGE_SIZE}&offset=${nextOffset}`));
-		  if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
-		  const nextFiles = Array.isArray(next.files) ? next.files : [];
-		  files.push(...nextFiles);
-		  if (nextFiles.length === 0) break;
-		}
-		payload = { ...payload, files, total };
+		  if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return { files: [] };
+		  return next;
+		}, payload);
       } catch (err) {
 		if (loadToken !== clipPageState.joinedLoadToken || joinedKey !== clipPageState.joinedPayloadKey) return;
 		clipPageState.joinedStatus = 'error';
@@ -5321,26 +5328,9 @@
         return;
       }
 
-      const monthNames = new Set(['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']);
-      const normalized = items.map((file) => {
-        const rawParts = String(file.relative_path || '').split('/').filter(Boolean);
-        const monthIndex = rawParts.findIndex((part) => monthNames.has(part));
-        const parts = monthIndex >= 0 ? rawParts.slice(monthIndex) : rawParts;
-        return { file, parts };
-      });
       const activePath = Array.isArray(clipPageState.joinedBrowsePath) ? clipPageState.joinedBrowsePath : [];
-      const visible = normalized.filter(({ parts }) => activePath.every((part, index) => parts[index] === part));
-      const folders = new Map();
-      const files = [];
-      visible.forEach((entry) => {
-        if (entry.parts.length > activePath.length + 1) {
-          const name = entry.parts[activePath.length];
-          folders.set(name, (folders.get(name) || 0) + 1);
-        } else {
-          files.push(entry);
-        }
-      });
-      const folderRows = [...folders.entries()].map(([name, count]) => `<div class="joined-folder-row">
+      const { folders, files } = joinedFolderView(items, activePath);
+      const folderRows = folders.map(({ name, count }) => `<div class="joined-folder-row">
         <button type="button" class="joined-folder-button" data-joinedfolder="${escapeHTML(name)}">
           <span class="joined-folder-icon" aria-hidden="true"></span>
           <span class="joined-entry-name">${escapeHTML(name)}</span>
@@ -5365,6 +5355,28 @@
       const entries = folderRows + fileRows || '<div class="joined-browser-empty">This folder is empty.</div>';
       body.innerHTML = summary + `<div class="joined-browser"><nav class="joined-browser-bar" aria-label="Joined clip folders">${crumbs}</nav><div class="joined-browser-list">${entries}</div></div>`;
       wireClipPageNav(body);
+    }
+
+    function joinedFolderView(items, activePath) {
+      const monthNames = new Set(['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']);
+      const normalized = items.map((file) => {
+        const rawParts = String(file.relative_path || '').split('/').filter(Boolean);
+        const monthIndex = rawParts.findIndex((part) => monthNames.has(part));
+        const parts = monthIndex >= 0 ? rawParts.slice(monthIndex) : rawParts;
+        return { file, parts };
+      });
+      const visible = normalized.filter(({ parts }) => activePath.every((part, index) => parts[index] === part));
+      const folders = new Map();
+      const files = [];
+      visible.forEach((entry) => {
+        if (entry.parts.length > activePath.length + 1) {
+          const name = entry.parts[activePath.length];
+          folders.set(name, (folders.get(name) || 0) + 1);
+        } else {
+          files.push(entry);
+        }
+      });
+      return { folders: [...folders.entries()].map(([name, count]) => ({ name, count })), files };
     }
 
     function clipPagerHTML(page, pageCount) {

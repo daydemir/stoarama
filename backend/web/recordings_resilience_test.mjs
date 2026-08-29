@@ -105,6 +105,64 @@ test('joined heatmap labels distinguish loading, failure, zero, and unavailable'
   assert.equal(captureHealthJoinedLabel({ source_duration_ms: 0, joined_ready_ms: 0 }, { joined_status: 'ready' }), 'Joined: unavailable');
 });
 
+test('joined file browser collects every paginated result exactly once', async () => {
+  const source = sourceBetween(
+    'async function fetchAllJoinedPages(fetchPage, initial)',
+    '// Render the recording detail view with only immutable, published joined media.',
+  );
+  const evaluate = new Function('CLIP_PAGE_SIZE', `${source}; return { fetchAllJoinedPages };`);
+  const { fetchAllJoinedPages } = evaluate(2);
+  const requestedOffsets = [];
+  const result = await fetchAllJoinedPages(async (offset) => {
+    requestedOffsets.push(offset);
+    return { files: [{ artifact_id: offset + 1 }, { artifact_id: offset + 2 }] };
+  }, { total: 6, files: [{ artifact_id: 1 }, { artifact_id: 2 }] });
+
+  assert.deepEqual(requestedOffsets, [2, 4]);
+  assert.deepEqual(result.files.map((file) => file.artifact_id), [1, 2, 3, 4, 5, 6]);
+  assert.equal(new Set(result.files.map((file) => file.artifact_id)).size, 6);
+});
+
+test('joined file browser drills through month and weekday to leaf actions', () => {
+  const source = sourceBetween(
+    'function renderJoinedList(payload)',
+    'function clipPagerHTML(page, pageCount)',
+  );
+  const body = { innerHTML: '' };
+  const root = { querySelector: (selector) => selector === '#clipListBody' ? body : null };
+  const clipPageState = { total: 3, joinedBrowsePath: [] };
+  const escapeHTML = (value) => String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+  const evaluate = new Function(
+    'els', 'clipPageState', 'escapeHTML', 'formatDuration', 'formatBytes', 'wireClipPageNav',
+    `${source}; return { renderJoinedList, joinedFolderView };`,
+  );
+  const { renderJoinedList, joinedFolderView } = evaluate(
+    { clipPage: root }, clipPageState, escapeHTML, (value) => `${value}ms`, (value) => `${value}B`, () => {},
+  );
+  const files = [
+    { artifact_id: 1, relative_path: 'plaza/August/Thursday/a.mp4', download_path: '/joined/1', size_bytes: 10, scheduled_start_at: '2026-08-06T08:00:00Z', scheduled_end_at: '2026-08-06T09:00:00Z' },
+    { artifact_id: 2, relative_path: 'plaza/August/Thursday/b.mp4', download_path: '/joined/2', size_bytes: 20, scheduled_start_at: '2026-08-06T09:00:00Z', scheduled_end_at: '2026-08-06T10:00:00Z' },
+    { artifact_id: 3, relative_path: 'plaza/August/Friday/c.mp4', download_path: '/joined/3', size_bytes: 30, scheduled_start_at: '2026-08-07T08:00:00Z', scheduled_end_at: '2026-08-07T09:00:00Z' },
+  ];
+
+  assert.deepEqual(joinedFolderView(files, []).folders, [{ name: 'August', count: 3 }]);
+  assert.deepEqual(joinedFolderView(files, ['August']).folders, [{ name: 'Thursday', count: 2 }, { name: 'Friday', count: 1 }]);
+  assert.deepEqual(joinedFolderView(files, ['August', 'Thursday']).files.map(({ file }) => file.artifact_id), [1, 2]);
+
+  clipPageState.joinedBrowsePath = ['August', 'Thursday'];
+  renderJoinedList({ files });
+  assert.match(body.innerHTML, /Joined clips[\s\S]*August[\s\S]*Thursday/);
+  assert.equal((body.innerHTML.match(/>View<\/a>/g) || []).length, 2);
+  assert.equal((body.innerHTML.match(/>Download<\/a>/g) || []).length, 2);
+  assert.match(body.innerHTML, /href="\/joined\/1\?disposition=inline"/);
+  assert.match(body.innerHTML, /href="\/joined\/2\?disposition=attachment"/);
+  assert.doesNotMatch(body.innerHTML, /c\.mp4/);
+});
+
 function folderFunctions() {
   const source = sourceBetween(
     'const RECORDING_FOLDER_LEVELS =',

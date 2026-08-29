@@ -957,7 +957,7 @@ func TestRecordingJoinedDetailUsesFolderBrowserAndLoadsEveryPublishedPart(t *tes
 		`data-joinedcrumb=`,
 		`monthNames.has(part)`,
 		`parts = monthIndex >= 0 ? rawParts.slice(monthIndex) : rawParts`,
-		`for (let nextOffset = offset + files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE)`,
+		`for (let nextOffset = files.length; nextOffset < total; nextOffset += CLIP_PAGE_SIZE)`,
 		`files.push(...nextFiles)`,
 		`>View</a>`,
 		`>Download</a>`,
