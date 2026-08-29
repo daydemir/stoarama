@@ -473,9 +473,79 @@ func buildAllPassingPartsWithAttempt(ctx context.Context, sources []LocalSource,
 }
 
 func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, budget mediaCandidateBudget) (parts []BuiltOutput, quarantines []QuarantinedBuild, err error) {
+	return buildAllPassingPartsWithPairProofReuse(ctx, sources, scratchDir, mediaToolIdentity, attempt, budget, true)
+}
+
+type exactPairFailureProof struct {
+	failure *deterministicMediaError
+}
+
+func cloneDeterministicMediaError(failure *deterministicMediaError) *deterministicMediaError {
+	if failure == nil {
+		return nil
+	}
+	return &deterministicMediaError{
+		code:           failure.code,
+		evidenceSHA256: failure.evidenceSHA256,
+		evidence:       append(json.RawMessage(nil), failure.evidence...),
+		err:            failure.err,
+	}
+}
+
+func exactPairFailureProofKey(sources []LocalSource, locatorPosition int, policyVersion, mediaToolIdentity string) (string, error) {
+	if len(sources) != 2 || locatorPosition < 0 || strings.TrimSpace(policyVersion) == "" || !lowerHex64(mediaToolIdentity) {
+		return "", fmt.Errorf("invalid exact pair proof identity")
+	}
+	type sourceIdentity struct {
+		ClipID            int64                  `json:"clip_id"`
+		SizeBytes         int64                  `json:"size_bytes"`
+		SHA256            string                 `json:"sha256"`
+		SourceClaimSHA256 string                 `json:"source_claim_sha256"`
+		AudioContract     *AudioSequenceContract `json:"audio_contract,omitempty"`
+	}
+	identity := struct {
+		PolicyVersion     string           `json:"policy_version"`
+		MediaToolIdentity string           `json:"media_tool_identity"`
+		LocatorPosition   int              `json:"locator_position"`
+		Sources           []sourceIdentity `json:"sources"`
+	}{PolicyVersion: policyVersion, MediaToolIdentity: mediaToolIdentity, LocatorPosition: locatorPosition, Sources: make([]sourceIdentity, len(sources))}
+	for i, source := range sources {
+		if source.ClipID <= 0 || source.SizeBytes <= 0 || !lowerHex64(source.SHA256) || !lowerHex64(source.SourceClaimSHA256) || (source.AudioContract != nil && validateAudioContract(*source.AudioContract) != nil) {
+			return "", fmt.Errorf("invalid exact pair source identity")
+		}
+		var audio *AudioSequenceContract
+		if source.AudioContract != nil {
+			copy := *source.AudioContract
+			audio = &copy
+		}
+		identity.Sources[i] = sourceIdentity{source.ClipID, source.SizeBytes, source.SHA256, source.SourceClaimSHA256, audio}
+	}
+	digest, _, err := stitchcert.CanonicalSHA(identity)
+	return digest, err
+}
+
+func reusableExactPairFailure(failure *deterministicMediaError) bool {
+	if failure == nil {
+		return false
+	}
+	switch failure.code {
+	case "source_media_incompatible", "joined_output_probe_failure", "media_sequence_mismatch", "strict_decode_failure":
+		return true
+	default:
+		return false
+	}
+}
+
+// buildAllPassingPartsWithPairProofReuse may reuse only the two matching
+// failures produced by the adjacent-pair locator. It never reuses a successful
+// build or a source-attributed failure. The later extension must identify the
+// same ordered pair at the same source position, and its exact files are
+// rehashed before the proof replaces two fresh failing extension attempts.
+func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, budget mediaCandidateBudget, reusePairProofs bool) (parts []BuiltOutput, quarantines []QuarantinedBuild, err error) {
 	if len(sources) == 0 {
 		return nil, nil, fmt.Errorf("bounded sources are required")
 	}
+	pairProofs := make(map[string]exactPairFailureProof)
 	attempts := 0
 	maxAttempts := 6*len(sources) + 2
 	run := func(kind string, candidate []LocalSource) (BuiltOutput, error) {
@@ -555,6 +625,12 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		} else if repeated == nil {
 			discardIsolatedBuild(repeatedBuild, scratchDir)
 			return nil, nil, fmt.Errorf("%w: adjacent failure changed across repeats", errMediaSplitNotIsolated)
+		}
+		if reusePairProofs && reusableExactPairFailure(pairFailure) {
+			key, keyErr := exactPairFailureProofKey(pair, i, PlanPolicyVersion, mediaToolIdentity)
+			if keyErr == nil {
+				pairProofs[key] = exactPairFailureProof{failure: cloneDeterministicMediaError(pairFailure)}
+			}
 		}
 		boundaries = append(boundaries, i+1)
 	}
@@ -642,6 +718,22 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		ownedParts = append(ownedParts, built)
 		if end < len(sources) {
 			extension := sources[start : end+1]
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			if reusePairProofs && len(extension) == 2 && ctx.Err() == nil {
+				key, keyErr := exactPairFailureProofKey(extension, start, PlanPolicyVersion, mediaToolIdentity)
+				proof, found := pairProofs[key]
+				if keyErr == nil && found && reusableExactPairFailure(proof.failure) && verifyLocalIdentity(extension[0]) == nil && verifyLocalIdentity(extension[1]) == nil {
+					if err := ctx.Err(); err != nil {
+						return nil, nil, err
+					}
+					parts[len(parts)-1].SplitEvidence = []MaximalityEvidence{maximalityEvidence(extension, cloneDeterministicMediaError(proof.failure), 2, mediaToolIdentity)}
+					emitStageTiming(ctx, "media_candidate_extension_pair_proof_reused", 0, nil)
+					start = end
+					continue
+				}
+			}
 			extensionBuild, extensionErr := run("extension", extension)
 			extensionFailure, deterministic := deterministicBuildFailure(extensionErr)
 			if extensionErr == nil || !deterministic || extensionFailure.code == "output_exceeds_put_cap" {
