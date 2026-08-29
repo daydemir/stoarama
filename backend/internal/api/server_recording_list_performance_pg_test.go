@@ -151,6 +151,82 @@ func TestRecordingMetricEndpointTimeoutsCoverScopeLookup(t *testing.T) {
 	}
 }
 
+func TestRecordingDetailTimelineEnrichmentDoesNotWaitForClipMetrics(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status) VALUES(47,'detail-metrics@example.test','Detail metrics','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(1,47,'Detail storage','https://example.test','auto','clips','access',''::bytea,'verified');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
+		VALUES(700,47,1,'High-volume detail','https://example.test/live.m3u8','completed',now()-interval '14 days','sampled','* * * * *','UTC',60);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
+
+	locker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Release()
+	tx, err := locker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE recording_clips, recording_joined_sources IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		path    string
+		shared  bool
+		handler http.HandlerFunc
+	}{
+		{name: "public", path: "/api/v1/shared/mit-scl/recordings/enrichment?recording_id=700&timeline_only=1", shared: true, handler: s.handleSharedRecordingListEnrichment},
+		{name: "authenticated", path: "/api/v1/account/recordings/enrichment?recording_id=700&timeline_only=1", handler: s.handleAccountRecordingListEnrichment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requestCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil).WithContext(requestCtx)
+			if !tc.shared {
+				req = withPrincipal(req, accountPrincipal{AccountID: 47}, "")
+			}
+			response := httptest.NewRecorder()
+			started := time.Now()
+			tc.handler(response, req)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if elapsed := time.Since(started); elapsed >= time.Second {
+				t.Fatalf("timeline-only detail enrichment waited for locked clip metrics: %s", elapsed)
+			}
+			var payload struct {
+				Items []recordingListEnrichmentItem `json:"items"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload.Items) != 1 || payload.Items[0].RecordingID != 700 || payload.Items[0].TimelineHealth == nil || len(payload.Items[0].CaptureHealthBins) != 0 {
+				t.Fatalf("unexpected timeline-only payload: %+v", payload.Items)
+			}
+		})
+	}
+
+	requestCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/enrichment?recording_id=700", nil).WithContext(requestCtx)
+	response := httptest.NewRecorder()
+	s.handleSharedRecordingListEnrichment(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("full enrichment status=%d body=%s; timeline-only cache leaked across metric shapes", response.Code, response.Body.String())
+	}
+}
+
 func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()
@@ -228,6 +304,28 @@ func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t
 		{
 			name:       "account rejects foreign recording",
 			path:       "/api/v1/account/recordings/enrichment?recording_ids=700,900",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "public timeline rejects canceled recording",
+			path:       "/api/v1/shared/mit-scl/recordings/enrichment?recording_id=803&timeline_only=1",
+			shared:     true,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "account timeline rejects canceled recording",
+			path:       "/api/v1/account/recordings/enrichment?recording_id=803&timeline_only=1",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "public timeline rejects foreign recording",
+			path:       "/api/v1/shared/mit-scl/recordings/enrichment?recording_id=900&timeline_only=1",
+			shared:     true,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "account timeline rejects foreign recording",
+			path:       "/api/v1/account/recordings/enrichment?recording_id=900&timeline_only=1",
 			wantStatus: http.StatusNotFound,
 		},
 	} {

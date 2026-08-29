@@ -55,6 +55,22 @@ func TestRecordingEnrichmentRejectsCombinedSingleAndBatchScopes(t *testing.T) {
 	}
 }
 
+func TestRecordingTimelineOnlyEnrichmentRequiresOneRecording(t *testing.T) {
+	for _, path := range []string{
+		"/recordings/enrichment?timeline_only=1",
+		"/recordings/enrichment?recording_ids=9&timeline_only=1",
+		"/recordings/enrichment?recording_id=9&timeline_only=true",
+		"/recordings/enrichment?recording_id=9&timeline_only=1&timeline_only=1",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		(&Server{}).handleSharedRecordingListEnrichment(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("path=%q status=%d want=%d body=%s", path, rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+	}
+}
+
 func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 	var cache recordingMetricCache[int64]
 	slots := make(chan struct{}, recordingMetricConcurrency)

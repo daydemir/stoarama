@@ -4089,10 +4089,10 @@
 
 	async function loadRecordingDetailEnrichment(recId) {
 	  try {
-	    const payload = await fetchJSON(recordingAPIPath(`/enrichment?recording_id=${encodeURIComponent(recId)}`));
+	    const payload = await fetchJSON(recordingAPIPath(`/enrichment?recording_id=${encodeURIComponent(recId)}&timeline_only=1`));
 	    const item = Array.isArray(payload.items) ? payload.items[0] : null;
 	    if (!item || Number(item.recording_id) !== Number(clipPageState.recId) || !clipPageState.rec) return;
-	    Object.assign(clipPageState.rec, item);
+	    clipPageState.rec.timeline_health = item.timeline_health || null;
 	    renderClipPageWithJoined();
 	  } catch (_) {
 	    // Timeline enrichment is supplementary; joined media browsing stays usable.
