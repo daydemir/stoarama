@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
@@ -60,6 +61,16 @@ type sharedRecording struct {
 	JoinedReadyMS     int64                       `json:"joined_ready_ms"`
 	SourceDurationMS  int64                       `json:"source_duration_ms"`
 	JoinedPercent     *int                        `json:"joined_percent"`
+	Naming            sharedRecordingNaming       `json:"naming"`
+}
+
+// sharedRecordingNaming is the public allowlist for recording folder data.
+// Keep this typed instead of forwarding the raw JSONB metadata so a future
+// private naming field cannot cross the shared-recordings boundary by accident.
+type sharedRecordingNaming struct {
+	Profile    string                   `json:"profile"`
+	FolderName string                   `json:"folder_name"`
+	Metadata   recordingnaming.Metadata `json:"metadata"`
 }
 
 type sharedRecordingsLimiter struct {
