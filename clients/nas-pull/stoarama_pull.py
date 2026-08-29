@@ -2835,8 +2835,11 @@ for _joined_order in (
     ("clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"),
     ("artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes", "sha256", "actual_start_utc", "actual_end_utc", "utc_offset_seconds", "media_tool_identity", "source_clip_ids", "verification", "maximality_evidence"),
     ("status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("duration_seconds", "tracks"),
+    ("duration_seconds", "tracks", "decoded_video_sha256"),
     ("duration_seconds", "tracks", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
+    ("duration_seconds", "tracks", "decoded_video_sha256", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
     ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "first_timestamp", "last_timestamp", "timestamp_status"),
     ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "decoded_samples", "first_timestamp", "last_timestamp", "timestamp_status"),
     ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"),
@@ -3732,9 +3735,13 @@ def valid_audio_contract(contract):
 
 def valid_media_fingerprint(fingerprint, output):
     base_fields = {"duration_seconds", "tracks"}
+    decoded_video_fields = {"decoded_video_sha256"}
     audio_fields = {"audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"}
-    if not isinstance(fingerprint, dict) or set(fingerprint) not in (base_fields, base_fields | audio_fields):
+    allowed = (base_fields, base_fields | decoded_video_fields, base_fields | audio_fields, base_fields | decoded_video_fields | audio_fields)
+    if not isinstance(fingerprint, dict) or set(fingerprint) not in allowed:
         raise ValueError("joined media fingerprint has invalid fields")
+    if "decoded_video_sha256" in fingerprint:
+        valid_sha256(fingerprint["decoded_video_sha256"], "decoded video")
     if (
         isinstance(fingerprint["duration_seconds"], bool)
         or not isinstance(fingerprint["duration_seconds"], (int, float))
@@ -3776,38 +3783,52 @@ def valid_media_fingerprint(fingerprint, output):
         if output and (track["timestamp_status"] != "monotonic" or track["decode_timeline_span_seconds"] != track["packet_duration_seconds"]):
             raise ValueError("joined output timestamps are not monotonic")
     if "audio" in tracks:
-        if set(fingerprint) != base_fields | audio_fields or not isinstance(fingerprint["audio_sequence_contracts"], list) or not fingerprint["audio_sequence_contracts"] or (output and len(fingerprint["audio_sequence_contracts"]) != 1):
+        expected_fields = base_fields | audio_fields | (decoded_video_fields if "decoded_video_sha256" in fingerprint else set())
+        if set(fingerprint) != expected_fields or not isinstance(fingerprint["audio_sequence_contracts"], list) or not fingerprint["audio_sequence_contracts"] or (output and len(fingerprint["audio_sequence_contracts"]) != 1):
             raise ValueError("joined audio fingerprint lacks contracts")
         for contract in fingerprint["audio_sequence_contracts"]:
             valid_audio_contract(contract)
         positive_joined_int(fingerprint["effective_audio_bytes"], "effective_audio_bytes")
         positive_joined_int(fingerprint["effective_audio_sample_frames"], "effective_audio_sample_frames")
         valid_sha256(fingerprint["effective_audio_sha256"], "effective audio")
-    elif set(fingerprint) != base_fields:
+    elif set(fingerprint) not in (base_fields, base_fields | decoded_video_fields):
         raise ValueError("joined audio evidence exists without an audio track")
 
 
 def valid_verification(verification):
-    fields = {
+    strict_fields = {
         "status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status",
         "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint",
     }
+    relaxed_fields = strict_fields | {"acceptance_mode", "decoded_frame_sequence_status"}
+    fields = set(verification) if isinstance(verification, dict) else set()
+    if fields not in (strict_fields, relaxed_fields):
+        raise ValueError("joined media verification has invalid fields")
     exact_joined_fields(verification, fields, "media verification")
     for key in fields - {"source_fingerprint", "output_fingerprint"}:
-        if verification[key] != "passed":
+        if key == "acceptance_mode":
+            if verification[key] != "decoded_frame_equivalent":
+                raise ValueError("joined media verification has invalid acceptance mode")
+        elif verification[key] != "passed":
             raise ValueError("joined media verification did not pass")
     valid_media_fingerprint(verification["source_fingerprint"], False)
     valid_media_fingerprint(verification["output_fingerprint"], True)
     expected, actual = verification["source_fingerprint"], verification["output_fingerprint"]
     if set(expected["tracks"]) != set(actual["tracks"]) or abs(actual["duration_seconds"] - expected["duration_seconds"]) > 2:
         raise ValueError("joined media fingerprint stream set conflicts")
+    relaxed = fields == relaxed_fields
+    if relaxed:
+        valid_sha256(expected.get("decoded_video_sha256"), "decoded video")
+        valid_sha256(actual.get("decoded_video_sha256"), "decoded video")
+        if expected["decoded_video_sha256"] != actual["decoded_video_sha256"]:
+            raise ValueError("joined decoded video sequence conflicts")
     for media_type, want in expected["tracks"].items():
         got = actual["tracks"][media_type]
-        comparable = (
+        comparable = (("decoded_frames",) if relaxed else (
             "packet_time_bases", "packet_duration_seconds", "first_packet_pts_seconds", "last_packet_pts_seconds",
             "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_count", "packet_chain_sha256",
             "packet_timing_sha256", "decoded_frames",
-        ) + (("decoded_samples",) if media_type == "audio" else ())
+        )) + (("decoded_samples",) if media_type == "audio" else ())
         if want["timestamp_status"] != "source_clips_independent" or any(want[key] != got[key] for key in comparable):
             raise ValueError("joined media fingerprint sequence conflicts")
     for key in ("effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"):

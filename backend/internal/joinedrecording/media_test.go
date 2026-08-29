@@ -90,6 +90,47 @@ func TestBuildLargestPassingPrefixPreservesPacketsFramesAndAudio(t *testing.T) {
 	}
 }
 
+func TestVerifyJoinedMediaAllowsDecodedEquivalentTimebaseNormalization(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "one.mp4", 440, false)
+	second := makeMediaClip(t, dir, "two.mp4", 880, false)
+	manifestPath := filepath.Join(dir, "concat.txt")
+	manifest := fmt.Sprintf("file '%s'\nfile '%s'\n", first.Path, second.Path)
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(dir, "normalized-timebase.mp4")
+	cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", manifestPath, "-map", "0:v:0", "-c", "copy", "-video_track_timescale", "90000", outputPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make normalized-timebase fixture: %v (%s)", err, output)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	verification, err := VerifyJoinedMedia(ctx, []LocalSource{first, second}, outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.Status != "passed" || verification.AcceptanceMode != "decoded_frame_equivalent" || verification.DecodedFrameSequenceStatus != "passed" || !lowerHex64(verification.SourceFingerprint.DecodedVideoSHA256) || verification.SourceFingerprint.DecodedVideoSHA256 != verification.OutputFingerprint.DecodedVideoSHA256 || verification.StrictDecodeStatus != "passed" {
+		t.Fatalf("normalized timebase was not accepted by decoded equivalence: %+v", verification)
+	}
+}
+
+func TestVerifyJoinedMediaRejectsChangedDecodedFrames(t *testing.T) {
+	dir := t.TempDir()
+	source := makeMediaClip(t, dir, "source.mp4", 440, false)
+	changedPath := filepath.Join(dir, "changed.mp4")
+	cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-i", source.Path, "-vf", "negate", "-c:v", "mpeg4", changedPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make changed-frame fixture: %v (%s)", err, output)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := VerifyJoinedMedia(ctx, []LocalSource{source}, changedPath)
+	if err == nil || !strings.Contains(err.Error(), "media_sequence_mismatch") || !strings.Contains(err.Error(), "decoded video frame sequence mismatch") {
+		t.Fatalf("changed decoded frames were not rejected: %v", err)
+	}
+}
+
 func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)
