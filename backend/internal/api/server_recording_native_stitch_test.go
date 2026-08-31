@@ -416,7 +416,7 @@ func TestNativeStitchCompletionRejectsForgedHistoricalSingleClipPass(t *testing.
 	ctx := context.Background()
 	for _, ddl := range []string{
 		`CREATE TABLE accounts(id bigint primary key)`, `INSERT INTO accounts VALUES(47)`,
-		`ALTER TABLE recording_clips ADD COLUMN capture_attempt_id uuid, ADD COLUMN timestamp_contract_version text, ADD COLUMN timestamp_contract jsonb, ADD COLUMN timestamp_contract_status text, ADD COLUMN timestamp_contract_reason text`,
+		`ALTER TABLE recording_clips ADD COLUMN IF NOT EXISTS capture_attempt_id uuid, ADD COLUMN IF NOT EXISTS timestamp_contract_version text, ADD COLUMN IF NOT EXISTS timestamp_contract jsonb, ADD COLUMN IF NOT EXISTS timestamp_contract_status text, ADD COLUMN IF NOT EXISTS timestamp_contract_reason text`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
