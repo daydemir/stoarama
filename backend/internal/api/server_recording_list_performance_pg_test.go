@@ -239,6 +239,17 @@ func TestRecordingDetailTimelineEnrichmentDoesNotWaitForClipMetrics(t *testing.T
 			if len(payload.Items) != 1 || payload.Items[0].RecordingID != 700 || payload.Items[0].TimelineHealth == nil || len(payload.Items[0].CaptureHealthBins) != 0 {
 				t.Fatalf("unexpected timeline-only payload: %+v", payload.Items)
 			}
+			var rawPayload struct {
+				Items []map[string]json.RawMessage `json:"items"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &rawPayload); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"captured_clip_count", "expected_clip_count", "capture_health"} {
+				if _, ok := rawPayload.Items[0][field]; ok {
+					t.Fatalf("timeline-only detail enrichment must omit %s", field)
+				}
+			}
 		})
 	}
 
@@ -272,8 +283,11 @@ func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t
 		       'UTC',60
 		FROM generate_series(0,103) AS g;
 		UPDATE recordings SET status='canceled',cron_expr='* * * * *' WHERE id=803;
+		UPDATE recordings SET status='active' WHERE id=700;
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
 		VALUES(900,99,2,'Foreign batch recording','https://example.test/foreign.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60);
+		INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at)
+		VALUES(700,1,now()-interval '1 minute',now());
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -300,6 +314,21 @@ func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t
 		if item.RecordingID != wantID {
 			t.Fatalf("item[%d].recording_id=%d want %d", index, item.RecordingID, wantID)
 		}
+	}
+	var enriched struct {
+		Items []struct {
+			RecordingID       int64                        `json:"recording_id"`
+			CapturedClipCount *int64                       `json:"captured_clip_count"`
+			ExpectedClipCount *int64                       `json:"expected_clip_count"`
+			CaptureHealth     *recordingCaptureHealthState `json:"capture_health"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &enriched); err != nil {
+		t.Fatal(err)
+	}
+	first := enriched.Items[0]
+	if first.RecordingID != 700 || first.CapturedClipCount == nil || *first.CapturedClipCount != 1 || first.ExpectedClipCount == nil || *first.ExpectedClipCount <= 1 || first.CaptureHealth == nil || *first.CaptureHealth != recordingCaptureHealthCritical {
+		t.Fatalf("recording list enrichment did not backfill capture metrics: %+v", first)
 	}
 
 	for _, test := range []struct {
