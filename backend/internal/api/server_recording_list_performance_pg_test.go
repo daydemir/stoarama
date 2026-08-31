@@ -21,7 +21,7 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		VALUES(1,47,'Metrics storage','https://example.test','auto','clips','access',''::bytea,'verified');
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec,
 			naming_profile,folder_name,naming_metadata_jsonb)
-		VALUES(700,47,1,'Metric-independent list','https://example.test/live.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60,
+		VALUES(700,47,1,'Metric-independent list','https://example.test/live.m3u8','active',now()-interval '1 day','sampled','* * * * *','UTC',60,
 			'plaza_hourly_v1','08_Europe_Poland_Swidnik_Plac_Konstytucji',
 			'{"plaza_id":"08","continent":"Europe","country":"Poland","city":"Swidnik","plaza_name":"Plac Konstytucji"}'::jsonb);
 	`); err != nil {
@@ -39,22 +39,24 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(ctx, `LOCK TABLE recording_joined_sources, recording_window_health IN ACCESS EXCLUSIVE MODE`); err != nil {
+	if _, err := tx.Exec(ctx, `LOCK TABLE recording_clips, recording_joined_sources, recording_window_health IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
 
 	requests := []struct {
-		name    string
-		handler http.HandlerFunc
-		path    string
-		rowsKey string
-		setup   func(*http.Request) *http.Request
+		name       string
+		handler    http.HandlerFunc
+		path       string
+		rowsKey    string
+		wantRecent bool
+		setup      func(*http.Request) *http.Request
 	}{
 		{
-			name:    "authenticated",
-			handler: s.handleAccountRecordingsList,
-			path:    "/api/v1/account/recordings",
-			rowsKey: "items",
+			name:       "authenticated",
+			handler:    s.handleAccountRecordingsList,
+			path:       "/api/v1/account/recordings",
+			rowsKey:    "items",
+			wantRecent: true,
 			setup: func(req *http.Request) *http.Request {
 				return withPrincipal(req, accountPrincipal{AccountID: 47}, "")
 			},
@@ -98,10 +100,20 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 				"source_duration_ms":  "0",
 				"joined_ready_ms":     "0",
 				"joined_percent":      "null",
+				"captured_clip_count": "0",
+				"expected_clip_count": "0",
+				"capture_health":      `"unavailable"`,
 			}
 			for field, expected := range want {
 				if got, ok := items[0][field]; !ok || string(got) != expected {
 					t.Fatalf("baseline compatibility field %s=%s present=%t want %s", field, got, ok, expected)
+				}
+			}
+			if tc.wantRecent {
+				// Authenticated lists retain the compatibility field, but its exact
+				// clip scan belongs to enrichment rather than the baseline response.
+				if got := string(items[0]["recent_clip_count"]); got != "0" {
+					t.Fatalf("baseline recent_clip_count=%s want placeholder 0", got)
 				}
 			}
 			var naming struct {
