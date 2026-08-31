@@ -2838,7 +2838,7 @@ for _joined_order in (
     ("status", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "acceptance_mode", "lossless_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
-    ("codec", "preset", "quantizer", "pixel_format", "frame_rate", "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order", "timeline_rule", "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256", "source_timeline_signature_sha256", "output_limit_bytes", "audio_status", "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256"),
+    ("codec", "preset", "quantizer", "pixel_format", "frame_rate", "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order", "timeline_rule", "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256", "decoded_frame_field_status", "decoded_frame_field_sha256", "source_timeline_signature_sha256", "output_limit_bytes", "audio_status", "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256"),
     ("duration_seconds", "tracks"),
     ("duration_seconds", "tracks", "decoded_video_sha256"),
     ("duration_seconds", "tracks", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
@@ -3866,6 +3866,7 @@ def valid_verification(verification):
             "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries",
             "chroma_location", "field_order",
             "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256",
+            "decoded_frame_field_status", "decoded_frame_field_sha256",
             "source_timeline_signature_sha256", "output_limit_bytes", "audio_status",
             "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256",
         }
@@ -3891,6 +3892,7 @@ def valid_verification(verification):
         if evidence["output_limit_bytes"] > JOINED_MAX_BYTES:
             raise ValueError("joined lossless normalization output limit conflicts")
         valid_sha256(evidence["decoded_frame_sequence_sha256"], "lossless decoded frame sequence")
+        valid_sha256(evidence["decoded_frame_field_sha256"], "lossless decoded frame field proof")
         valid_sha256(evidence["source_timeline_signature_sha256"], "lossless source timeline")
         valid_sha256(evidence["trigger_failure_sha256"], "lossless stream-copy failure")
         if not isinstance(evidence["trigger_failure_facts"], dict) or not evidence["trigger_failure_facts"] or joined_canonical_sha(evidence["trigger_failure_facts"]) != evidence["trigger_failure_sha256"]:
@@ -3916,6 +3918,10 @@ def valid_verification(verification):
                 evidence["output_decoded_frames"] != got_video["decoded_frames"] or
                 want_video["decoded_frames"] != got_video["decoded_frames"]):
             raise ValueError("joined lossless normalization frame evidence conflicts")
+        frame_field_payload = "all_frames_match_explicit_progressive_layout|%d\n" % evidence["source_decoded_frames"]
+        if (evidence["decoded_frame_field_status"] != "all_frames_match_explicit_progressive_layout" or
+                hashlib.sha256(frame_field_payload.encode("ascii")).hexdigest() != evidence["decoded_frame_field_sha256"]):
+            raise ValueError("joined lossless normalization decoded frame field evidence conflicts")
         for fingerprint in (expected, actual):
             valid_sha256(fingerprint.get("decoded_video_sha256"), "decoded video")
             if fingerprint["decoded_video_sha256"] != evidence["decoded_frame_sequence_sha256"]:

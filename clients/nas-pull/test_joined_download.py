@@ -734,6 +734,8 @@ class JoinedDownloadTests(unittest.TestCase):
             "source_decoded_frames": source_video["decoded_frames"],
             "output_decoded_frames": output_video["decoded_frames"],
             "decoded_frame_sequence_sha256": "d" * 64,
+            "decoded_frame_field_status": "all_frames_match_explicit_progressive_layout",
+            "decoded_frame_field_sha256": hashlib.sha256(("all_frames_match_explicit_progressive_layout|%d\n" % source_video["decoded_frames"]).encode("ascii")).hexdigest(),
             "source_timeline_signature_sha256": "e" * 64,
             "output_limit_bytes": 1024, "audio_status": "absent",
             "trigger_reason_code": "media_sequence_mismatch", "trigger_failure_facts": trigger_facts,
@@ -772,6 +774,11 @@ class JoinedDownloadTests(unittest.TestCase):
 
         verification["lossless_normalization"]["field_order"] = "unknown"
         with self.assertRaisesRegex(ValueError, "field order"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+        verification["lossless_normalization"]["field_order"] = "progressive"
+
+        verification["lossless_normalization"]["decoded_frame_field_sha256"] = "f" * 64
+        with self.assertRaisesRegex(ValueError, "frame field"):
             pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
 
     def test_audio_codec_and_quarantine_reason_are_exactly_bound(self):

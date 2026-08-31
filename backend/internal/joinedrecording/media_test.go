@@ -200,7 +200,7 @@ func TestBuildLosslessNativeTimelinePreservesEveryDecodedFrame(t *testing.T) {
 	if built.SourceCount != 2 || built.Verification.Status != "passed" || built.Verification.AcceptanceMode != "lossless_native_timeline_normalized" || evidence == nil {
 		t.Fatalf("lossless fallback evidence=%+v", built.Verification)
 	}
-	if evidence.Codec != "libx264" || evidence.Quantizer != 0 || evidence.SourceDecodedFrames != wantFrames || evidence.OutputDecodedFrames != wantFrames || evidence.DecodedFrameSequenceSHA256 != wantSHA || !lowerHex64(evidence.SourceTimelineSignatureSHA256) {
+	if evidence.Codec != "libx264" || evidence.Quantizer != 0 || evidence.SourceDecodedFrames != wantFrames || evidence.OutputDecodedFrames != wantFrames || evidence.DecodedFrameSequenceSHA256 != wantSHA || evidence.DecodedFrameFieldStatus != explicitProgressiveFrameStatus || evidence.DecodedFrameFieldSHA256 != progressiveFrameFieldSequenceSHA256(wantFrames) || !lowerHex64(evidence.SourceTimelineSignatureSHA256) {
 		t.Fatalf("lossless fallback evidence differs: %+v", evidence)
 	}
 	if built.Verification.PacketPayloadOrderStatus != "not_applicable_lossless_normalization" || validateLosslessNormalizationVerification(built.Verification) != nil {
@@ -213,6 +213,30 @@ func TestBuildLosslessNativeTimelinePreservesEveryDecodedFrame(t *testing.T) {
 	mutated.LosslessNormalization.OutputDecodedFrames--
 	if validateLosslessNormalizationVerification(mutated) == nil {
 		t.Fatal("lossless normalization accepted mismatched frame accounting")
+	}
+}
+
+func TestDecodedFrameFieldLineRequiresExplicitProgressiveDisplaySemantics(t *testing.T) {
+	layout := losslessVideoLayout{Width: 64, Height: 64, PixelFormat: "yuv420p", SampleAspectRatio: "1:1", ChromaLocation: "left"}
+	valid := "frame|width=64|height=64|pix_fmt=yuv420p|sample_aspect_ratio=1:1|interlaced_frame=0|top_field_first=0|repeat_pict=0|color_range=unknown|color_space=unknown|color_primaries=unknown|color_transfer=unknown|chroma_location=left|side_datum:side_data_type=H.26[45] User Data Unregistered SEI message"
+	if err := validateDecodedFrameFieldLine(valid, 2, 7, layout); err != nil {
+		t.Fatalf("explicit progressive frame rejected: %v", err)
+	}
+	for name, line := range map[string]string{
+		"interlaced": strings.Replace(valid, "interlaced_frame=0", "interlaced_frame=1", 1),
+		"top-field":  strings.Replace(valid, "top_field_first=0", "top_field_first=1", 1),
+		"repeat":     strings.Replace(valid, "repeat_pict=0", "repeat_pict=1", 1),
+		"sar":        strings.Replace(valid, "sample_aspect_ratio=1:1", "sample_aspect_ratio=2:1", 1),
+		"color":      strings.Replace(valid, "color_range=unknown", "color_range=tv", 1),
+		"missing":    strings.Replace(valid, "repeat_pict=0|", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var unsupported *unsupportedDecodedFrameField
+			err := validateDecodedFrameFieldLine(line, 2, 7, layout)
+			if !errors.As(err, &unsupported) || unsupported.SourceIndex != 2 || unsupported.FrameOrdinal != 7 {
+				t.Fatalf("frame semantics did not fail closed: %+v err=%v", unsupported, err)
+			}
+		})
 	}
 }
 
@@ -305,6 +329,57 @@ func TestBuildLosslessNativeTimelineRejectsInterlacedFieldOrder(t *testing.T) {
 	var deterministic *deterministicMediaError
 	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_field_order_unsupported" {
 		t.Fatalf("interlaced field order did not fail closed: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelineRejectsInterlacedFramesHiddenByProgressiveStreamMetadata(t *testing.T) {
+	dir := t.TempDir()
+	makeSegment := func(name string, interlaced bool) string {
+		mediaPath := filepath.Join(dir, name)
+		args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-c:v", "libx264", "-g", "10"}
+		if interlaced {
+			args = append(args, "-flags", "+ilme+ildct", "-x264-params", "tff=1")
+		} else {
+			args = append(args, "-field_order", "progressive")
+		}
+		args = append(args, mediaPath)
+		if output, err := exec.Command(ffmpegBinary(), args...).CombinedOutput(); err != nil {
+			t.Fatalf("make mixed-field fixture segment: %v (%s)", err, output)
+		}
+		return mediaPath
+	}
+	progressivePath := makeSegment("progressive.mp4", false)
+	interlacedPath := makeSegment("interlaced.mp4", true)
+	concatPath := filepath.Join(dir, "mixed.txt")
+	if err := os.WriteFile(concatPath, []byte(fmt.Sprintf("file '%s'\nfile '%s'\n", progressivePath, interlacedPath)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mixedPath := filepath.Join(dir, "mixed-progressive-metadata.mp4")
+	cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", concatPath, "-map", "0:v:0", "-c", "copy", "-field_order", "progressive", mixedPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make mixed-field fixture: %v (%s)", err, output)
+	}
+	makeSource := func(path string, clipID int64) LocalSource {
+		size, sha, err := localIdentity(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return LocalSource{ClipID: clipID, Path: path, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	}
+	mixed := makeSource(mixedPath, 1)
+	second := makeSource(makeSegment("second-progressive.mp4", false), 2)
+	sources := []LocalSource{mixed, second}
+	layout, _, err := probeLosslessVideoLayout(context.Background(), mixed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.FieldOrder != "progressive" {
+		t.Fatalf("fixture does not hide interlaced frames behind progressive stream metadata: %+v", layout)
+	}
+	_, err = buildLosslessNativeTimeline(context.Background(), sources, dir, testLosslessTrigger(t, sources))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_frame_fields_unsupported" {
+		t.Fatalf("hidden interlaced frame did not fail closed: %v", err)
 	}
 }
 

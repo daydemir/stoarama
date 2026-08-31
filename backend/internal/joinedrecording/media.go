@@ -215,6 +215,8 @@ type LosslessNormalizationEvidence struct {
 	SourceDecodedFrames           int64           `json:"source_decoded_frames"`
 	OutputDecodedFrames           int64           `json:"output_decoded_frames"`
 	DecodedFrameSequenceSHA256    string          `json:"decoded_frame_sequence_sha256"`
+	DecodedFrameFieldStatus       string          `json:"decoded_frame_field_status"`
+	DecodedFrameFieldSHA256       string          `json:"decoded_frame_field_sha256"`
 	SourceTimelineSignatureSHA256 string          `json:"source_timeline_signature_sha256"`
 	OutputLimitBytes              int64           `json:"output_limit_bytes"`
 	AudioStatus                   string          `json:"audio_status"`
@@ -1099,6 +1101,24 @@ type losslessVideoLayout struct {
 	FieldOrder        string
 }
 
+const explicitProgressiveFrameStatus = "all_frames_match_explicit_progressive_layout"
+
+type decodedFrameFieldProof struct {
+	Frames int64
+	SHA256 string
+}
+
+type unsupportedDecodedFrameField struct {
+	SourceIndex  int
+	FrameOrdinal int64
+	Field        string
+	Value        string
+}
+
+func (e *unsupportedDecodedFrameField) Error() string {
+	return fmt.Sprintf("decoded frame %d has unsupported %s=%s", e.FrameOrdinal, e.Field, e.Value)
+}
+
 func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scratchDir string, trigger *deterministicMediaError) (BuiltOutput, error) {
 	if len(sources) < 2 {
 		return BuiltOutput{}, fmt.Errorf("lossless normalization requires multiple sources")
@@ -1127,6 +1147,7 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 		FieldOrder        string `json:"field_order"`
 	}, len(sources))
 	var sourceBytes int64
+	sourcePaths := make([]string, len(sources))
 	for i, source := range sources {
 		layout, hasAudio, err := probeLosslessVideoLayout(ctx, source.Path)
 		if err != nil {
@@ -1155,6 +1176,7 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 			}{source.ClipID}, fmt.Errorf("source video layout or native frame rate changes within candidate"))
 		}
 		layouts[i] = layout
+		sourcePaths[i] = source.Path
 		timelineFacts[i] = struct {
 			ClipID            int64  `json:"clip_id"`
 			SourceClaimSHA256 string `json:"source_claim_sha256"`
@@ -1174,6 +1196,19 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 			return BuiltOutput{}, fmt.Errorf("lossless normalization source size overflows")
 		}
 		sourceBytes += source.SizeBytes
+	}
+	sourceFrameFields, err := decodedFrameFieldSequenceProof(ctx, sourcePaths, layouts[0])
+	if err != nil {
+		var unsupported *unsupportedDecodedFrameField
+		if errors.As(err, &unsupported) && unsupported.SourceIndex >= 0 && unsupported.SourceIndex < len(sources) {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_frame_fields_unsupported", struct {
+				ClipID       int64  `json:"clip_id"`
+				FrameOrdinal int64  `json:"frame_ordinal"`
+				Field        string `json:"field"`
+				Value        string `json:"value"`
+			}{sources[unsupported.SourceIndex].ClipID, unsupported.FrameOrdinal, unsupported.Field, unsupported.Value}, err)
+		}
+		return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_frame_field_probe_failure", err)
 	}
 
 	outputLimit := r2.MaxConditionalPutBytes
@@ -1243,7 +1278,19 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	}
 	sourceVideo, outputVideo := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
 	decodedSHA := verification.SourceFingerprint.DecodedVideoSHA256
-	if sourceVideo == nil || outputVideo == nil || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || !lowerHex64(decodedSHA) || decodedSHA != verification.OutputFingerprint.DecodedVideoSHA256 {
+	outputFrameFields, outputFieldErr := decodedFrameFieldSequenceProof(ctx, []string{outputPath}, layout)
+	if outputFieldErr != nil {
+		var unsupported *unsupportedDecodedFrameField
+		if errors.As(outputFieldErr, &unsupported) {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_output_frame_fields_invalid", struct {
+				FrameOrdinal int64  `json:"frame_ordinal"`
+				Field        string `json:"field"`
+				Value        string `json:"value"`
+			}{unsupported.FrameOrdinal, unsupported.Field, unsupported.Value}, outputFieldErr)
+		}
+		return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_output_frame_field_probe_failure", outputFieldErr)
+	}
+	if sourceVideo == nil || outputVideo == nil || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || sourceFrameFields.Frames != sourceVideo.DecodedFrames || outputFrameFields.Frames != outputVideo.DecodedFrames || sourceFrameFields.SHA256 != outputFrameFields.SHA256 || !lowerHex64(decodedSHA) || decodedSHA != verification.OutputFingerprint.DecodedVideoSHA256 {
 		return BuiltOutput{}, deterministicFailure("lossless_normalization_frame_mismatch", verification, fmt.Errorf("lossless decoded frame evidence differs"))
 	}
 	verification.AcceptanceMode = "lossless_native_timeline_normalized"
@@ -1265,6 +1312,8 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 		SourceDecodedFrames:           sourceVideo.DecodedFrames,
 		OutputDecodedFrames:           outputVideo.DecodedFrames,
 		DecodedFrameSequenceSHA256:    decodedSHA,
+		DecodedFrameFieldStatus:       explicitProgressiveFrameStatus,
+		DecodedFrameFieldSHA256:       sourceFrameFields.SHA256,
 		SourceTimelineSignatureSHA256: timelineSHA,
 		OutputLimitBytes:              outputLimit,
 		AudioStatus:                   "absent",
@@ -1367,7 +1416,7 @@ func validateLosslessNormalizationVerification(v Verification) error {
 	if v.AcceptanceMode != "lossless_native_timeline_normalized" || evidence == nil || v.Status != "passed" || v.PacketPayloadOrderStatus != "not_applicable_lossless_normalization" || v.DecodedFrameSequenceStatus != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" {
 		return fmt.Errorf("lossless normalization status evidence differs")
 	}
-	if evidence.Codec != "libx264" || evidence.Preset != "veryfast" || evidence.Quantizer != 0 || evidence.PixelFormat != "yuv420p" || evidence.AudioStatus != "absent" || evidence.TriggerReasonCode != "media_sequence_mismatch" || !lowerHex64(evidence.TriggerFailureSHA256) || !lowerHex64(evidence.DecodedFrameSequenceSHA256) || !lowerHex64(evidence.SourceTimelineSignatureSHA256) || evidence.OutputLimitBytes <= 0 || evidence.OutputLimitBytes > r2.MaxConditionalPutBytes {
+	if evidence.Codec != "libx264" || evidence.Preset != "veryfast" || evidence.Quantizer != 0 || evidence.PixelFormat != "yuv420p" || evidence.AudioStatus != "absent" || evidence.TriggerReasonCode != "media_sequence_mismatch" || !lowerHex64(evidence.TriggerFailureSHA256) || !lowerHex64(evidence.DecodedFrameSequenceSHA256) || evidence.DecodedFrameFieldStatus != explicitProgressiveFrameStatus || !lowerHex64(evidence.DecodedFrameFieldSHA256) || !lowerHex64(evidence.SourceTimelineSignatureSHA256) || evidence.OutputLimitBytes <= 0 || evidence.OutputLimitBytes > r2.MaxConditionalPutBytes {
 		return fmt.Errorf("lossless normalization codec evidence differs")
 	}
 	triggerSHA, triggerFacts, triggerErr := stitchcert.CanonicalSHA(evidence.TriggerFailureFacts)
@@ -1394,7 +1443,124 @@ func validateLosslessNormalizationVerification(v Verification) error {
 	if sourceVideo == nil || outputVideo == nil || sourceVideo.TimestampStatus != "source_clips_independent" || outputVideo.TimestampStatus != "monotonic" || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || evidence.SourceDecodedFrames != sourceVideo.DecodedFrames || evidence.OutputDecodedFrames != outputVideo.DecodedFrames || v.SourceFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 || v.OutputFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 {
 		return fmt.Errorf("lossless normalization decoded frame evidence differs")
 	}
+	if progressiveFrameFieldSequenceSHA256(evidence.SourceDecodedFrames) != evidence.DecodedFrameFieldSHA256 {
+		return fmt.Errorf("lossless normalization decoded frame field evidence differs")
+	}
 	return nil
+}
+
+func progressiveFrameFieldSequenceSHA256(frames int64) string {
+	payload := fmt.Sprintf("%s|%d\n", explicitProgressiveFrameStatus, frames)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func frameLayoutValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
+func validateDecodedFrameFieldLine(line string, sourceIndex int, frameOrdinal int64, layout losslessVideoLayout) error {
+	fields := strings.Split(strings.TrimSpace(line), "|")
+	values := make(map[string]string, 12)
+	seen := make(map[string]bool, len(fields)-1)
+	if len(fields) == 0 || fields[0] != "frame" {
+		return fmt.Errorf("invalid decoded frame field evidence")
+	}
+	for _, field := range fields[1:] {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok || seen[key] {
+			return fmt.Errorf("invalid decoded frame field evidence")
+		}
+		seen[key] = true
+		if strings.HasSuffix(key, ":side_data_type") {
+			switch value {
+			case "H.26[45] User Data Unregistered SEI message", "H.264 User Data Unregistered SEI message", "H.265 User Data Unregistered SEI message":
+				continue
+			}
+		}
+		switch key {
+		case "width", "height", "pix_fmt", "sample_aspect_ratio", "interlaced_frame", "top_field_first", "repeat_pict", "color_range", "color_space", "color_primaries", "color_transfer", "chroma_location":
+		default:
+			return fmt.Errorf("unsupported decoded frame side data")
+		}
+		values[key] = value
+	}
+	expected := map[string]string{
+		"width":               strconv.Itoa(layout.Width),
+		"height":              strconv.Itoa(layout.Height),
+		"pix_fmt":             layout.PixelFormat,
+		"sample_aspect_ratio": layout.SampleAspectRatio,
+		"interlaced_frame":    "0",
+		"top_field_first":     "0",
+		"repeat_pict":         "0",
+		"color_range":         frameLayoutValue(layout.ColorRange),
+		"color_space":         frameLayoutValue(layout.ColorSpace),
+		"color_primaries":     frameLayoutValue(layout.ColorPrimaries),
+		"color_transfer":      frameLayoutValue(layout.ColorTransfer),
+		"chroma_location":     frameLayoutValue(layout.ChromaLocation),
+	}
+	for _, key := range []string{"width", "height", "pix_fmt", "sample_aspect_ratio", "interlaced_frame", "top_field_first", "repeat_pict", "color_range", "color_space", "color_primaries", "color_transfer", "chroma_location"} {
+		if values[key] != expected[key] {
+			value := values[key]
+			if value == "" {
+				value = "missing"
+			}
+			return &unsupportedDecodedFrameField{SourceIndex: sourceIndex, FrameOrdinal: frameOrdinal, Field: key, Value: value}
+		}
+	}
+	return nil
+}
+
+func decodedFrameFieldSequenceProof(ctx context.Context, mediaPaths []string, layout losslessVideoLayout) (decodedFrameFieldProof, error) {
+	var frames int64
+	for sourceIndex, mediaPath := range mediaPaths {
+		process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-err_detect", "explode", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=width,height,pix_fmt,sample_aspect_ratio,interlaced_frame,top_field_first,repeat_pict,color_range,color_space,color_primaries,color_transfer,chroma_location", "-of", "compact=p=1:nk=0", mediaPath)
+		stdout, err := process.cmd.StdoutPipe()
+		if err != nil {
+			return decodedFrameFieldProof{}, err
+		}
+		var stderr limitedOutput
+		process.cmd.Stderr = &stderr
+		if err := process.Start(); err != nil {
+			return decodedFrameFieldProof{}, err
+		}
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4096), 1<<20)
+		var sourceFrames int64
+		for scanner.Scan() {
+			if err := ctx.Err(); err != nil {
+				_ = process.Kill()
+				_ = process.Wait()
+				return decodedFrameFieldProof{}, err
+			}
+			sourceFrames++
+			if err := validateDecodedFrameFieldLine(scanner.Text(), sourceIndex, sourceFrames, layout); err != nil {
+				_ = process.Kill()
+				_ = process.Wait()
+				return decodedFrameFieldProof{}, err
+			}
+			frames++
+		}
+		if err := scanner.Err(); err != nil {
+			_ = process.Kill()
+			_ = process.Wait()
+			return decodedFrameFieldProof{}, err
+		}
+		if err := process.Wait(); err != nil {
+			return decodedFrameFieldProof{}, fmt.Errorf("ffprobe decoded frame fields: %w (%s)", err, stderr.String())
+		}
+		if sourceFrames == 0 {
+			return decodedFrameFieldProof{}, fmt.Errorf("decoded frame field evidence is empty")
+		}
+	}
+	if frames == 0 {
+		return decodedFrameFieldProof{}, fmt.Errorf("decoded frame field evidence is empty")
+	}
+	return decodedFrameFieldProof{Frames: frames, SHA256: progressiveFrameFieldSequenceSHA256(frames)}, nil
 }
 
 func validateRejectedStreamCopyVerification(raw json.RawMessage, normalizedSource MediaFingerprint) error {
