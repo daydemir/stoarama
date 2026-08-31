@@ -74,6 +74,39 @@ func makeMediaClip(t *testing.T, dir, name string, tone int, audio bool) LocalSo
 	return local
 }
 
+func makeProgressiveLosslessSource(t *testing.T, dir, name string, tone int, audio bool) LocalSource {
+	t.Helper()
+	if _, err := exec.LookPath(ffmpegBinary()); err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	if _, err := exec.LookPath(ffprobeBinary()); err != nil {
+		t.Skip("ffprobe unavailable")
+	}
+	mediaPath := filepath.Join(dir, name)
+	args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1"}
+	if audio {
+		args = append(args, "-f", "lavfi", "-i", "sine=frequency="+strconv.Itoa(tone)+":sample_rate=48000:duration=1", "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest")
+	}
+	args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-field_order", "progressive", mediaPath)
+	cmd := exec.Command(ffmpegBinary(), args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make progressive lossless fixture: %v (%s)", err, output)
+	}
+	size, sha, err := localIdentity(mediaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := LocalSource{Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	if audio {
+		_, _, contract, err := probeMediaMetadata(context.Background(), mediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local.AudioContract = contract
+	}
+	return local
+}
+
 func TestBuildLargestPassingPrefixPreservesPacketsFramesAndAudio(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)
@@ -135,6 +168,338 @@ func TestVerifyJoinedMediaRejectsChangedDecodedFrames(t *testing.T) {
 	_, err := VerifyJoinedMedia(ctx, []LocalSource{source}, changedPath)
 	if err == nil || !strings.Contains(err.Error(), "media_sequence_mismatch") || !strings.Contains(err.Error(), "packet payload, decoded totals, or timeline mismatch") {
 		t.Fatalf("changed decoded frames were not rejected: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelinePreservesEveryDecodedFrame(t *testing.T) {
+	dir := t.TempDir()
+	first := makeProgressiveLosslessSource(t, dir, "lossless-one.mp4", 440, false)
+	second := makeProgressiveLosslessSource(t, dir, "lossless-two.mp4", 880, false)
+	first.ClipID, second.ClipID = 1, 2
+	sources := []LocalSource{first, second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, []string{first.Path, second.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, err := buildLosslessNativeTimeline(ctx, sources, dir, testLosslessTrigger(t, sources))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(built.Path)
+	gotFrames, gotSHA, err := decodedVideoSequenceIdentity(ctx, []string{built.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFrames != wantFrames || gotSHA != wantSHA {
+		t.Fatalf("lossless fallback changed decoded frame order: frames=%d/%d sha=%s/%s", gotFrames, wantFrames, gotSHA, wantSHA)
+	}
+	evidence := built.Verification.LosslessNormalization
+	if built.SourceCount != 2 || built.Verification.Status != "passed" || built.Verification.AcceptanceMode != "lossless_native_timeline_normalized" || evidence == nil {
+		t.Fatalf("lossless fallback evidence=%+v", built.Verification)
+	}
+	if evidence.Codec != "libx264" || evidence.Quantizer != 0 || evidence.SourceDecodedFrames != wantFrames || evidence.OutputDecodedFrames != wantFrames || evidence.DecodedFrameSequenceSHA256 != wantSHA || evidence.DecodedFrameFieldStatus != explicitProgressiveFrameStatus || evidence.DecodedFrameFieldSHA256 != progressiveFrameFieldSequenceSHA256(wantFrames) || !lowerHex64(evidence.SourceTimelineSignatureSHA256) {
+		t.Fatalf("lossless fallback evidence differs: %+v", evidence)
+	}
+	if built.Verification.PacketPayloadOrderStatus != "not_applicable_lossless_normalization" || validateLosslessNormalizationVerification(built.Verification) != nil {
+		t.Fatalf("lossless fallback verification contract differs: %+v", built.Verification)
+	}
+
+	mutated := built.Verification
+	copyEvidence := *mutated.LosslessNormalization
+	mutated.LosslessNormalization = &copyEvidence
+	mutated.LosslessNormalization.OutputDecodedFrames--
+	if validateLosslessNormalizationVerification(mutated) == nil {
+		t.Fatal("lossless normalization accepted mismatched frame accounting")
+	}
+}
+
+func TestDecodedFrameFieldLineRequiresExplicitProgressiveDisplaySemantics(t *testing.T) {
+	layout := losslessVideoLayout{Width: 64, Height: 64, PixelFormat: "yuv420p", SampleAspectRatio: "1:1", ChromaLocation: "left"}
+	valid := "frame|width=64|height=64|pix_fmt=yuv420p|sample_aspect_ratio=1:1|interlaced_frame=0|top_field_first=0|repeat_pict=0|color_range=unknown|color_space=unknown|color_primaries=unknown|color_transfer=unknown|chroma_location=left|side_datum:side_data_type=H.26[45] User Data Unregistered SEI message"
+	if err := validateDecodedFrameFieldLine(valid, 2, 7, layout); err != nil {
+		t.Fatalf("explicit progressive frame rejected: %v", err)
+	}
+	for name, line := range map[string]string{
+		"interlaced": strings.Replace(valid, "interlaced_frame=0", "interlaced_frame=1", 1),
+		"top-field":  strings.Replace(valid, "top_field_first=0", "top_field_first=1", 1),
+		"repeat":     strings.Replace(valid, "repeat_pict=0", "repeat_pict=1", 1),
+		"sar":        strings.Replace(valid, "sample_aspect_ratio=1:1", "sample_aspect_ratio=2:1", 1),
+		"color":      strings.Replace(valid, "color_range=unknown", "color_range=tv", 1),
+		"missing":    strings.Replace(valid, "repeat_pict=0|", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var unsupported *unsupportedDecodedFrameField
+			err := validateDecodedFrameFieldLine(line, 2, 7, layout)
+			if !errors.As(err, &unsupported) || unsupported.SourceIndex != 2 || unsupported.FrameOrdinal != 7 {
+				t.Fatalf("frame semantics did not fail closed: %+v err=%v", unsupported, err)
+			}
+		})
+	}
+}
+
+func TestBuildLosslessNativeTimelinePreservesDisplayMetadataAndRejectsChanges(t *testing.T) {
+	dir := t.TempDir()
+	makeSARClip := func(name, sar string, clipID int64) LocalSource {
+		mediaPath := filepath.Join(dir, name)
+		cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-vf", "setsar="+sar, "-c:v", "libx264", "-field_order", "progressive", mediaPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("make SAR fixture: %v (%s)", err, output)
+		}
+		size, sha, err := localIdentity(mediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return LocalSource{ClipID: clipID, Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	}
+	first := makeSARClip("sar-one.mp4", "2/1", 1)
+	second := makeSARClip("sar-two.mp4", "2/1", 2)
+	built, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger(t, []LocalSource{first, second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(built.Path)
+	sourceLayout, _, err := probeLosslessVideoLayout(context.Background(), first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputLayout, _, err := probeLosslessVideoLayout(context.Background(), built.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceLayout != outputLayout || built.Verification.LosslessNormalization.SampleAspectRatio != "2:1" {
+		t.Fatalf("display metadata changed: source=%+v output=%+v evidence=%+v", sourceLayout, outputLayout, built.Verification.LosslessNormalization)
+	}
+
+	changed := makeSARClip("sar-changed.mp4", "1/1", 3)
+	_, err = buildLosslessNativeTimeline(context.Background(), []LocalSource{first, changed}, dir, testLosslessTrigger(t, []LocalSource{first, changed}))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_layout_mismatch" {
+		t.Fatalf("display metadata change did not fail closed: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelineRejectsMissingFieldOrder(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "unknown-field-order-one.mp4", 440, false)
+	second := makeMediaClip(t, dir, "unknown-field-order-two.mp4", 880, false)
+	first.ClipID, second.ClipID = 1, 2
+	sources := []LocalSource{first, second}
+	layout, _, err := probeLosslessVideoLayout(context.Background(), first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.FieldOrder == "progressive" {
+		t.Fatalf("fixture unexpectedly reports explicit progressive field order: %+v", layout)
+	}
+	_, err = buildLosslessNativeTimeline(context.Background(), sources, dir, testLosslessTrigger(t, sources))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_field_order_unsupported" {
+		t.Fatalf("missing field order did not fail closed: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelineRejectsInterlacedFieldOrder(t *testing.T) {
+	dir := t.TempDir()
+	makeInterlaced := func(name string, clipID int64) LocalSource {
+		mediaPath := filepath.Join(dir, name)
+		cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-c:v", "libx264", "-flags", "+ilme+ildct", "-x264-params", "tff=1", mediaPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("make interlaced fixture: %v (%s)", err, output)
+		}
+		size, sha, err := localIdentity(mediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return LocalSource{ClipID: clipID, Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	}
+	first := makeInterlaced("interlaced-one.mp4", 1)
+	second := makeInterlaced("interlaced-two.mp4", 2)
+	sources := []LocalSource{first, second}
+	layout, _, err := probeLosslessVideoLayout(context.Background(), first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.FieldOrder == "" || layout.FieldOrder == "unknown" || layout.FieldOrder == "progressive" {
+		t.Fatalf("fixture did not expose an interlaced field order: %+v", layout)
+	}
+	_, err = buildLosslessNativeTimeline(context.Background(), sources, dir, testLosslessTrigger(t, sources))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_field_order_unsupported" {
+		t.Fatalf("interlaced field order did not fail closed: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelineRejectsInterlacedFramesHiddenByProgressiveStreamMetadata(t *testing.T) {
+	dir := t.TempDir()
+	makeSegment := func(name string, interlaced bool) string {
+		mediaPath := filepath.Join(dir, name)
+		args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-c:v", "libx264", "-g", "10"}
+		if interlaced {
+			args = append(args, "-flags", "+ilme+ildct", "-x264-params", "tff=1")
+		} else {
+			args = append(args, "-field_order", "progressive")
+		}
+		args = append(args, mediaPath)
+		if output, err := exec.Command(ffmpegBinary(), args...).CombinedOutput(); err != nil {
+			t.Fatalf("make mixed-field fixture segment: %v (%s)", err, output)
+		}
+		return mediaPath
+	}
+	progressivePath := makeSegment("progressive.mp4", false)
+	interlacedPath := makeSegment("interlaced.mp4", true)
+	concatPath := filepath.Join(dir, "mixed.txt")
+	if err := os.WriteFile(concatPath, []byte(fmt.Sprintf("file '%s'\nfile '%s'\n", progressivePath, interlacedPath)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mixedPath := filepath.Join(dir, "mixed-progressive-metadata.mp4")
+	cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", concatPath, "-map", "0:v:0", "-c", "copy", "-field_order", "progressive", mixedPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make mixed-field fixture: %v (%s)", err, output)
+	}
+	makeSource := func(path string, clipID int64) LocalSource {
+		size, sha, err := localIdentity(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return LocalSource{ClipID: clipID, Path: path, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	}
+	mixed := makeSource(mixedPath, 1)
+	second := makeSource(makeSegment("second-progressive.mp4", false), 2)
+	sources := []LocalSource{mixed, second}
+	layout, _, err := probeLosslessVideoLayout(context.Background(), mixed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.FieldOrder != "progressive" {
+		t.Fatalf("fixture does not hide interlaced frames behind progressive stream metadata: %+v", layout)
+	}
+	_, err = buildLosslessNativeTimeline(context.Background(), sources, dir, testLosslessTrigger(t, sources))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_frame_fields_unsupported" {
+		t.Fatalf("hidden interlaced frame did not fail closed: %v", err)
+	}
+}
+
+func TestBuildSealedOutputReproducesFrozenLosslessModeWhenFlagIsOff(t *testing.T) {
+	dir := t.TempDir()
+	first := makeProgressiveLosslessSource(t, dir, "sealed-lossless-one.mp4", 440, false)
+	second := makeProgressiveLosslessSource(t, dir, "sealed-lossless-two.mp4", 880, false)
+	first.ClipID, second.ClipID = 1, 2
+	sources := []LocalSource{first, second}
+	originalDir := filepath.Join(dir, "original")
+	rebuildDir := filepath.Join(dir, "rebuild")
+	if err := os.MkdirAll(originalDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original, err := buildLosslessNativeTimeline(context.Background(), sources, originalDir, testLosslessTrigger(t, sources))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(original.Path)
+
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	rebuilt, err := BuildSealedOutputForVerification(context.Background(), sources, rebuildDir, original.Verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(rebuilt.Path)
+	if rebuilt.SHA256 != original.SHA256 || rebuilt.SizeBytes != original.SizeBytes || !sameCanonical([]Verification{rebuilt.Verification}, []Verification{original.Verification}) {
+		t.Fatalf("sealed lossless rebuild drifted: original=%+v rebuilt=%+v", original, rebuilt)
+	}
+}
+
+func TestBuildWithLosslessFallbackRunsOnlyAfterSequenceMismatch(t *testing.T) {
+	sources := []LocalSource{{ClipID: 1}, {ClipID: 2}}
+	fastCalls, fallbackCalls := 0, 0
+	fast := func(context.Context, []LocalSource, string) (BuiltOutput, error) {
+		fastCalls++
+		return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct{}{}, errors.New("stream copy dropped a frame"))
+	}
+	fallback := func(_ context.Context, _ []LocalSource, _ string, trigger *deterministicMediaError) (BuiltOutput, error) {
+		fallbackCalls++
+		if trigger == nil || trigger.code != "media_sequence_mismatch" {
+			t.Fatal("lossless fallback trigger was not bound")
+		}
+		return BuiltOutput{SourceCount: 2, Verification: Verification{Status: "passed", AcceptanceMode: "lossless_native_timeline_normalized"}}, nil
+	}
+	built, err := buildWithLosslessFallback(context.Background(), sources, t.TempDir(), fast, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fastCalls != 1 || fallbackCalls != 1 || built.Verification.AcceptanceMode != "lossless_native_timeline_normalized" {
+		t.Fatalf("fallback policy differed: fast=%d fallback=%d built=%+v", fastCalls, fallbackCalls, built)
+	}
+
+	fast = func(context.Context, []LocalSource, string) (BuiltOutput, error) {
+		return BuiltOutput{}, deterministicFailure("corrupt_source_media", struct{}{}, errors.New("bad source"))
+	}
+	_, err = buildWithLosslessFallback(context.Background(), sources, t.TempDir(), fast, fallback)
+	if err == nil {
+		t.Fatal("non-sequence failure unexpectedly reached fallback")
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("fallback ran for unrelated failure: %d", fallbackCalls)
+	}
+}
+
+func TestLosslessNativeTimelineKeepsAudioOnStrictPath(t *testing.T) {
+	dir := t.TempDir()
+	first := makeProgressiveLosslessSource(t, dir, "audio-one.mp4", 440, true)
+	second := makeProgressiveLosslessSource(t, dir, "audio-two.mp4", 880, true)
+	first.ClipID, second.ClipID = 1, 2
+	_, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger(t, []LocalSource{first, second}))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_audio_unsupported" {
+		t.Fatalf("audio-bearing candidate did not fail closed: %v", err)
+	}
+}
+
+func testLosslessTrigger(t *testing.T, sources []LocalSource) *deterministicMediaError {
+	t.Helper()
+	if len(sources) < 2 {
+		t.Fatal("lossless trigger fixture requires multiple sources")
+	}
+	_, err := VerifyJoinedMedia(context.Background(), sources, sources[0].Path)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "media_sequence_mismatch" {
+		t.Fatalf("make rejected stream-copy evidence: %v", err)
+	}
+	return failure
+}
+
+func TestLosslessExpansionLimitUsesSingleExplicitProof(t *testing.T) {
+	sources := makeSyntheticLocalSources(2)
+	err := losslessOutputLimitFailure(700, 700)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "lossless_normalization_expansion_cap" {
+		t.Fatalf("lossless bounded output did not retain its explicit expansion-cap reason: %v", err)
+	}
+	tool := strings.Repeat("f", 64)
+	evidence := maximalityEvidence(sources, failure, 1, tool)
+	if err := validateMaximalityEvidence(evidence, tool, evidence.SourceClaimSHA256); err != nil {
+		t.Fatalf("single bounded output proof did not validate: %v", err)
+	}
+	evidence.RepeatCount = 2
+	if err := validateMaximalityEvidence(evidence, tool, evidence.SourceClaimSHA256); err == nil {
+		t.Fatal("output-cap proof accepted an unbound repeat count")
+	}
+}
+
+func TestLosslessNormalizationRequiresExplicitWorkerOptIn(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	if losslessNormalizationEnabled() {
+		t.Fatal("lossless normalization enabled by default")
+	}
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
+	if !losslessNormalizationEnabled() {
+		t.Fatal("explicit lossless normalization opt-in was ignored")
+	}
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "TRUE")
+	if losslessNormalizationEnabled() {
+		t.Fatal("ambiguous lossless normalization opt-in was accepted")
 	}
 }
 
@@ -673,19 +1038,108 @@ func TestBuildAllPassingPartsPropagatesInfrastructureFailureWithoutPartialPlan(t
 }
 
 func TestBuildAllPassingPartsPreservesOutputCapPartition(t *testing.T) {
+	for _, reason := range []string{"output_exceeds_put_cap", "lossless_normalization_expansion_cap"} {
+		t.Run(reason, func(t *testing.T) {
+			sources := makeSyntheticLocalSources(5)
+			attempts := 0
+			attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+				attempts++
+				if len(candidate) > 3 {
+					return BuiltOutput{}, deterministicFailure(reason, struct {
+						CandidateCount int `json:"candidate_count"`
+					}{len(candidate)}, errors.New("bounded output cap"))
+				}
+				return BuiltOutput{SourceCount: len(candidate)}, nil
+			}
+
+			parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+			if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 3 || parts[1].SourceCount != 2 || attempts > 8 {
+				t.Fatalf("parts=%+v quarantines=%+v attempts=%d err=%v", parts, quarantines, attempts, err)
+			}
+		})
+	}
+}
+
+func TestSizeBoundPartitionDoesNotAssumePerPrefixExpansionIsMonotonic(t *testing.T) {
 	sources := makeSyntheticLocalSources(5)
 	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
-		if len(candidate) > 3 {
-			return BuiltOutput{}, deterministicFailure("output_exceeds_put_cap", struct {
+		if candidate[0].ClipID == 1 && (len(candidate) == 5 || len(candidate) == 2) {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_expansion_cap", struct {
 				CandidateCount int `json:"candidate_count"`
-			}{len(candidate)}, errors.New("bounded output cap"))
+			}{len(candidate)}, errors.New("candidate-specific expansion cap"))
 		}
 		return BuiltOutput{SourceCount: len(candidate)}, nil
 	}
-
 	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
-	if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 3 || parts[1].SourceCount != 2 {
-		t.Fatalf("parts=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 4 || parts[1].SourceCount != 1 {
+		t.Fatalf("nonmonotonic expansion partition=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestLosslessScratchReservationCoversRetainedPartAndBoundaryExtension(t *testing.T) {
+	const sourceSize int64 = 100
+	sources := makeSyntheticLocalSources(3)
+	for i := range sources {
+		sources[i].SizeBytes = sourceSize
+		sources[i].SHA256 = strings.Repeat(string(rune('1'+i)), 64)
+	}
+	scratch := t.TempDir()
+	for i := range sources {
+		sources[i].Path = filepath.Join(scratch, fmt.Sprintf("source-%d.mp4", sources[i].ClipID))
+		if err := os.WriteFile(sources[i].Path, make([]byte, sourceSize), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var peakScratchBytes int64
+	attempt := func(_ context.Context, candidate []LocalSource, root string) (BuiltOutput, error) {
+		attemptDir, err := os.MkdirTemp(root, "attempt-")
+		if err != nil {
+			return BuiltOutput{}, err
+		}
+		outputPath := filepath.Join(attemptDir, "joined.mp4")
+		outputSize := int64(len(candidate)) * sourceSize * losslessNormalizationExpansionLimit
+		if err := os.WriteFile(outputPath, make([]byte, outputSize), 0o600); err != nil {
+			return BuiltOutput{}, err
+		}
+		var live int64
+		if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() {
+				return walkErr
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			live += info.Size()
+			return nil
+		}); err != nil {
+			return BuiltOutput{}, err
+		}
+		if live > peakScratchBytes {
+			peakScratchBytes = live
+		}
+		if containsAdjacentClipIDs(candidate, 2, 3) {
+			_ = os.RemoveAll(attemptDir)
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{Path: outputPath, SizeBytes: outputSize, SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, scratch, strings.Repeat("f", 64), attempt)
+	if err != nil || len(quarantines) != 0 || len(parts) != 2 {
+		t.Fatalf("overlap fixture parts=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	}
+	clips := make([]SourceClip, len(sources))
+	for i := range clips {
+		clips[i] = SourceClip{ClipID: sources[i].ClipID, Object: ObjectIdentity{SizeBytes: sourceSize}}
+	}
+	required, err := requiredScratchBytes(clips, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservedScratch := int64(required - ScratchSafetyMarginBytes)
+	oldSingleSetReserve := int64(len(sources)) * sourceSize * (1 + losslessNormalizationExpansionLimit)
+	if peakScratchBytes <= oldSingleSetReserve || reservedScratch < peakScratchBytes {
+		t.Fatalf("peak scratch=%d old reserve=%d new reserve=%d", peakScratchBytes, oldSingleSetReserve, reservedScratch)
 	}
 }
 
@@ -714,7 +1168,7 @@ func TestBuildAllPassingPartsOutputCapKeepsLargeWorkloadAndQuarantine(t *testing
 		t.Fatalf("parts=%d quarantines=%+v attempts=%d err=%v", len(parts), quarantines, attempts, err)
 	}
 	if attempts <= 6*len(sources)+2 {
-		t.Fatalf("fixture did not exceed the non-cap attempt budget: attempts=%d", attempts)
+		t.Fatalf("fixture did not exercise exhaustive longest-prefix proof: attempts=%d", attempts)
 	}
 }
 

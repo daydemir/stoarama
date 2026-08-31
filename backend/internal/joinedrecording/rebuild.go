@@ -40,7 +40,14 @@ func rebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRo
 		if err != nil || !sameCanonical([]MediaToolEvidence{actualTool}, []MediaToolEvidence{claim.Plan.MediaTool}) {
 			return fmt.Errorf("installed media tool differs from sealed hour")
 		}
-		if err := EnsureScratchHeadroom(scratchRoot, claim.Plan.Sources); err != nil {
+		requiresLosslessScratch := false
+		for _, media := range claim.HourManifest.Media {
+			if media.Verification.AcceptanceMode == "lossless_native_timeline_normalized" {
+				requiresLosslessScratch = true
+				break
+			}
+		}
+		if err := ensureScratchHeadroom(scratchRoot, claim.Plan.Sources, requiresLosslessScratch); err != nil {
 			return err
 		}
 		sourceOnly := sourceOnlyClips(claim.Plan.Sources)
@@ -82,11 +89,11 @@ func rebuildSealedHourRenewing(ctx context.Context, claim WorkerClaim, scratchRo
 				}
 				partSources[j] = local
 			}
-			part, err := BuildSealedOutput(workCtx, partSources, directory)
+			expected := claim.HourManifest.Media[i]
+			part, err := BuildSealedOutputForVerification(workCtx, partSources, directory, expected.Verification)
 			if err != nil {
 				return fmt.Errorf("rebuild sealed part %d: %w", i+1, err)
 			}
-			expected := claim.HourManifest.Media[i]
 			if part.SizeBytes != output.ExpectedSize || part.SHA256 != output.ExpectedSHA ||
 				part.SourceCount != len(output.Sources) || !sameCanonical([]Verification{part.Verification}, []Verification{expected.Verification}) {
 				return fmt.Errorf("rebuilt sealed part %d identity differs", i+1)

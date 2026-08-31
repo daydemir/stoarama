@@ -2835,7 +2835,10 @@ for _joined_order in (
     ("clip_id", "disposition", "media_artifact_id", "media_ordinal", "reason_code"),
     ("artifact_id", "ordinal", "part", "parts", "relative_path", "object_key", "content_id", "size_bytes", "sha256", "actual_start_utc", "actual_end_utc", "utc_offset_seconds", "media_tool_identity", "source_clip_ids", "verification", "maximality_evidence"),
     ("status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("status", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("status", "acceptance_mode", "lossless_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("codec", "preset", "quantizer", "pixel_format", "frame_rate", "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order", "timeline_rule", "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256", "decoded_frame_field_status", "decoded_frame_field_sha256", "source_timeline_signature_sha256", "output_limit_bytes", "audio_status", "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256"),
     ("duration_seconds", "tracks"),
     ("duration_seconds", "tracks", "decoded_video_sha256"),
     ("duration_seconds", "tracks", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
@@ -2857,7 +2860,7 @@ for _joined_order in (
     ("artifact_id", "recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count", "source_bytes", "scheduled_hour_ids"),
     ("hour_manifest_artifact_id", "hour_id", "recording_id", "local_date", "delivery_hour", "status", "relative_path", "object_key", "size_bytes", "sha256", "source_count", "source_bytes", "media_artifact_count"),
     ("previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"),
-    ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",),
+    ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",), ("output_bytes", "limit_bytes"),
     ("source_claim_sha256", "reason_code", "failure_sha256", "policy_version", "media_tool_identity", "repeat_count"),
     ("clip_id", "source_claim_sha256"),
     ("clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket", "object_key", "start_utc", "end_utc", "size_bytes", "ingest_sha256", "released_at"),
@@ -3795,20 +3798,54 @@ def valid_media_fingerprint(fingerprint, output):
         raise ValueError("joined audio evidence exists without an audio track")
 
 
+def rejected_video_stream_copy_equivalent(expected, actual, decoded):
+    if set(expected["tracks"]) != {"video"} or set(actual["tracks"]) != {"video"} or abs(actual["duration_seconds"] - expected["duration_seconds"]) > 2:
+        return False
+    want, got = expected["tracks"]["video"], actual["tracks"]["video"]
+    if want["timestamp_status"] != "source_clips_independent" or got["timestamp_status"] != "monotonic":
+        return False
+    if decoded:
+        return (
+            want["packet_count"] == got["packet_count"] and
+            want["packet_chain_sha256"] == got["packet_chain_sha256"] and
+            want["decoded_frames"] == got["decoded_frames"] and
+            expected.get("decoded_video_sha256") == actual.get("decoded_video_sha256")
+        )
+    return (
+        want["packet_time_bases"] == got["packet_time_bases"] and
+        want["packet_duration_seconds"] == got["packet_duration_seconds"] and
+        got["decode_timeline_span_seconds"] == got["packet_duration_seconds"] and
+        want["first_packet_pts_seconds"] == got["first_packet_pts_seconds"] and
+        want["last_packet_pts_seconds"] == got["last_packet_pts_seconds"] and
+        want["first_packet_dts_seconds"] == got["first_packet_dts_seconds"] and
+        want["last_packet_dts_seconds"] == got["last_packet_dts_seconds"] and
+        want["packet_count"] == got["packet_count"] and
+        want["packet_chain_sha256"] == got["packet_chain_sha256"] and
+        want["packet_timing_sha256"] == got["packet_timing_sha256"] and
+        want["decoded_frames"] == got["decoded_frames"]
+    )
+
+
 def valid_verification(verification):
     strict_fields = {
         "status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status",
         "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint",
     }
     relaxed_fields = strict_fields | {"acceptance_mode", "decoded_frame_sequence_status"}
+    normalized_fields = relaxed_fields | {"lossless_normalization"}
     fields = set(verification) if isinstance(verification, dict) else set()
-    if fields not in (strict_fields, relaxed_fields):
+    if fields not in (strict_fields, relaxed_fields, normalized_fields):
         raise ValueError("joined media verification has invalid fields")
     exact_joined_fields(verification, fields, "media verification")
-    for key in fields - {"source_fingerprint", "output_fingerprint"}:
+    normalized = fields == normalized_fields
+    for key in fields - {"source_fingerprint", "output_fingerprint", "lossless_normalization"}:
         if key == "acceptance_mode":
-            if verification[key] != "decoded_frame_equivalent":
+            want_mode = "lossless_native_timeline_normalized" if normalized else "decoded_frame_equivalent"
+            if verification[key] != want_mode:
                 raise ValueError("joined media verification has invalid acceptance mode")
+        elif key == "packet_payload_order_status" and normalized:
+            if verification[key] != "not_applicable_lossless_normalization":
+                raise ValueError("joined lossless normalization has invalid packet status")
         elif verification[key] != "passed":
             raise ValueError("joined media verification did not pass")
     valid_media_fingerprint(verification["source_fingerprint"], False)
@@ -3822,13 +3859,80 @@ def valid_verification(verification):
         valid_sha256(actual.get("decoded_video_sha256"), "decoded video")
         if expected["decoded_video_sha256"] != actual["decoded_video_sha256"]:
             raise ValueError("joined decoded video sequence conflicts")
+    if normalized:
+        evidence = verification["lossless_normalization"]
+        evidence_fields = {
+            "codec", "preset", "quantizer", "pixel_format", "frame_rate", "timeline_rule",
+            "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries",
+            "chroma_location", "field_order",
+            "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256",
+            "decoded_frame_field_status", "decoded_frame_field_sha256",
+            "source_timeline_signature_sha256", "output_limit_bytes", "audio_status",
+            "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256",
+        }
+        exact_joined_fields(evidence, evidence_fields, "lossless normalization")
+        if evidence["codec"] != "libx264" or evidence["preset"] != "veryfast" or evidence["quantizer"] != 0 or evidence["pixel_format"] != "yuv420p" or evidence["audio_status"] != "absent" or evidence["trigger_reason_code"] != "media_sequence_mismatch":
+            raise ValueError("joined lossless normalization codec evidence conflicts")
+        if not isinstance(evidence["frame_rate"], str) or re.fullmatch(r"[1-9][0-9]*(?:/[1-9][0-9]*)?", evidence["frame_rate"]) is None:
+            raise ValueError("joined lossless normalization frame rate conflicts")
+        if not isinstance(evidence["sample_aspect_ratio"], str) or re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", evidence["sample_aspect_ratio"]) is None:
+            raise ValueError("joined lossless normalization aspect ratio conflicts")
+        for display_field in ("color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order"):
+            if not isinstance(evidence[display_field], str) or len(evidence[display_field]) > 64:
+                raise ValueError("joined lossless normalization display metadata conflicts")
+        if evidence["field_order"] != "progressive":
+            raise ValueError("joined lossless normalization field order conflicts")
+        rate_parts = [int(value) for value in evidence["frame_rate"].split("/", 1)]
+        rate_num, rate_den = (rate_parts[0], 1) if len(rate_parts) == 1 else rate_parts
+        if evidence["timeline_rule"] != "settb=expr=%d/%d,setpts=N,setsar=%s" % (rate_den, rate_num, evidence["sample_aspect_ratio"].replace(":", "/")):
+            raise ValueError("joined lossless normalization timeline rule conflicts")
+        positive_joined_int(evidence["source_decoded_frames"], "source_decoded_frames")
+        positive_joined_int(evidence["output_decoded_frames"], "output_decoded_frames")
+        positive_joined_int(evidence["output_limit_bytes"], "output_limit_bytes")
+        if evidence["output_limit_bytes"] > JOINED_MAX_BYTES:
+            raise ValueError("joined lossless normalization output limit conflicts")
+        valid_sha256(evidence["decoded_frame_sequence_sha256"], "lossless decoded frame sequence")
+        valid_sha256(evidence["decoded_frame_field_sha256"], "lossless decoded frame field proof")
+        valid_sha256(evidence["source_timeline_signature_sha256"], "lossless source timeline")
+        valid_sha256(evidence["trigger_failure_sha256"], "lossless stream-copy failure")
+        if not isinstance(evidence["trigger_failure_facts"], dict) or not evidence["trigger_failure_facts"] or joined_canonical_sha(evidence["trigger_failure_facts"]) != evidence["trigger_failure_sha256"]:
+            raise ValueError("joined lossless normalization trigger evidence conflicts")
+        rejected = evidence["trigger_failure_facts"]
+        rejected_fields = strict_fields | {"decoded_frame_sequence_status"}
+        exact_joined_fields(rejected, rejected_fields, "rejected stream-copy verification")
+        if (rejected["status"] != "failed" or rejected["decoded_frame_sequence_status"] != "failed" or
+                any(rejected[key] != "" for key in rejected_fields - {"status", "decoded_frame_sequence_status", "source_fingerprint", "output_fingerprint"})):
+            raise ValueError("joined lossless normalization rejected stream-copy status conflicts")
+        valid_media_fingerprint(rejected["source_fingerprint"], False)
+        valid_media_fingerprint(rejected["output_fingerprint"], False)
+        valid_sha256(rejected["source_fingerprint"].get("decoded_video_sha256"), "rejected source decoded video")
+        valid_sha256(rejected["output_fingerprint"].get("decoded_video_sha256"), "rejected output decoded video")
+        if rejected["source_fingerprint"] != expected:
+            raise ValueError("joined lossless normalization rejected source fingerprint conflicts")
+        if rejected_video_stream_copy_equivalent(rejected["source_fingerprint"], rejected["output_fingerprint"], False) or rejected_video_stream_copy_equivalent(rejected["source_fingerprint"], rejected["output_fingerprint"], True):
+            raise ValueError("joined lossless normalization trigger did not reject both stream-copy modes")
+        if set(expected["tracks"]) != {"video"} or set(actual["tracks"]) != {"video"}:
+            raise ValueError("joined lossless normalization audio evidence conflicts")
+        want_video, got_video = expected["tracks"]["video"], actual["tracks"]["video"]
+        if (evidence["source_decoded_frames"] != want_video["decoded_frames"] or
+                evidence["output_decoded_frames"] != got_video["decoded_frames"] or
+                want_video["decoded_frames"] != got_video["decoded_frames"]):
+            raise ValueError("joined lossless normalization frame evidence conflicts")
+        frame_field_payload = "all_frames_match_explicit_progressive_layout|%d\n" % evidence["source_decoded_frames"]
+        if (evidence["decoded_frame_field_status"] != "all_frames_match_explicit_progressive_layout" or
+                hashlib.sha256(frame_field_payload.encode("ascii")).hexdigest() != evidence["decoded_frame_field_sha256"]):
+            raise ValueError("joined lossless normalization decoded frame field evidence conflicts")
+        for fingerprint in (expected, actual):
+            valid_sha256(fingerprint.get("decoded_video_sha256"), "decoded video")
+            if fingerprint["decoded_video_sha256"] != evidence["decoded_frame_sequence_sha256"]:
+                raise ValueError("joined lossless normalization decoded video sequence conflicts")
     for media_type, want in expected["tracks"].items():
         got = actual["tracks"][media_type]
-        comparable = (("packet_count", "packet_chain_sha256", "decoded_frames") if relaxed else (
+        comparable = (("decoded_frames",) if normalized else (("packet_count", "packet_chain_sha256", "decoded_frames") if relaxed else (
             "packet_time_bases", "packet_duration_seconds", "first_packet_pts_seconds", "last_packet_pts_seconds",
             "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_count", "packet_chain_sha256",
             "packet_timing_sha256", "decoded_frames",
-        )) + (("decoded_samples",) if media_type == "audio" else ())
+        ))) + (("decoded_samples",) if media_type == "audio" else ())
         if want["timestamp_status"] != "source_clips_independent" or any(want[key] != got[key] for key in comparable):
             raise ValueError("joined media fingerprint sequence conflicts")
     for key in ("effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"):
@@ -4044,6 +4148,8 @@ def valid_hour_manifest(payload, item=None):
                 raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
         valid_verification(media["verification"])
+        if media["verification"].get("acceptance_mode") == "lossless_native_timeline_normalized" and len(ids) < 2:
+            raise ValueError("joined lossless normalization requires multiple sources")
         source_fingerprint = media["verification"]["source_fingerprint"]
         audio_contracts = [source["audio_sequence_contract"] for source in run_sources if "audio_sequence_contract" in source]
         if (
@@ -4065,7 +4171,7 @@ def valid_hour_manifest(payload, item=None):
                 raise ValueError("joined maximality evidence conflicts")
             if joined_canonical_sha(evidence["normalized_failure_facts"]) != evidence["failure_sha256"]:
                 raise ValueError("joined maximality failure hash conflicts")
-            repeat_count = 1 if evidence["reason_code"] == "output_exceeds_put_cap" else 2
+            repeat_count = 1 if evidence["reason_code"] in {"output_exceeds_put_cap", "lossless_normalization_expansion_cap"} else 2
             proof = {
                 "source_claim_sha256": evidence["source_claim_sha256"], "reason_code": evidence["reason_code"],
                 "failure_sha256": evidence["failure_sha256"], "policy_version": evidence["policy_version"],

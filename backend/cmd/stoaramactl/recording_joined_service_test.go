@@ -402,7 +402,7 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 }
 
 func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
-	t.Parallel()
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
 	cfg := validJoinedWorkerConfig()
 	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	cfg.JoinedRecordingCanaryHourIDs = ""
@@ -423,7 +423,7 @@ func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
 		case "/api/v1/recording/joined/publication/claim", "/api/v1/recording/joined/claim":
 			var request joinedrecording.WorkClaimRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Validate() != nil ||
-				request.ScratchAvailableBytes <= 0 || request.TaskBudgetBytes != request.ScratchAvailableBytes {
+				request.ScratchAvailableBytes <= 0 || request.TaskBudgetBytes <= 0 || request.TaskBudgetBytes > request.ScratchAvailableBytes {
 				t.Errorf("unsafe broad claim request: %+v err=%v", request, err)
 			}
 			w.WriteHeader(http.StatusNoContent)

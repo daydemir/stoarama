@@ -11,7 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestRequiredScratchBytesReservesSourcesOutputAndMargin(t *testing.T) {
+func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
 	sources := []SourceClip{
 		{ClipID: 1, Object: ObjectIdentity{SizeBytes: 100}},
 		{ClipID: 2, Object: ObjectIdentity{SizeBytes: 250}},
@@ -20,8 +21,54 @@ func TestRequiredScratchBytesReservesSourcesOutputAndMargin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if want := uint64((1+losslessNormalizationScratchOutputMultiplier)*350) + ScratchSafetyMarginBytes; got != want {
+		t.Fatalf("required scratch=%d want %d", got, want)
+	}
+}
+
+func TestRequiredScratchBytesReservesAllRetainedLosslessParts(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
+	const sourceBytes int64 = 1 << 30
+	got, err := RequiredScratchBytes([]SourceClip{{ClipID: 1, Object: ObjectIdentity{SizeBytes: sourceBytes}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := uint64(sourceBytes*(1+losslessNormalizationScratchOutputMultiplier)) + ScratchSafetyMarginBytes
+	if got != want {
+		t.Fatalf("multipart lossless scratch=%d want %d", got, want)
+	}
+}
+
+func TestRequiredScratchBytesKeepsStreamCopyBudgetWithoutFallback(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	got, err := RequiredScratchBytes([]SourceClip{{ClipID: 1, Object: ObjectIdentity{SizeBytes: 350}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if want := uint64(2*350) + ScratchSafetyMarginBytes; got != want {
 		t.Fatalf("required scratch=%d want %d", got, want)
+	}
+}
+
+func TestWorkerTaskBudgetCannotAdmitMoreThanLosslessPreflightFits(t *testing.T) {
+	const available int64 = 2 << 30
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
+	taskBudget, err := WorkerTaskBudgetBytes(available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskBudget <= 0 || taskBudget >= available {
+		t.Fatalf("lossless task budget=%d available=%d", taskBudget, available)
+	}
+	maxSource := (taskBudget - JoinedScratchFixedBytes) / 2
+	if maxSource <= 0 || maxSource+maxSource*losslessNormalizationScratchOutputMultiplier > available {
+		t.Fatalf("server-admitted source=%d exceeds local lossless budget=%d", maxSource, available)
+	}
+
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	legacy, err := WorkerTaskBudgetBytes(available)
+	if err != nil || legacy != available {
+		t.Fatalf("disabled fallback changed admission: budget=%d err=%v", legacy, err)
 	}
 }
 
