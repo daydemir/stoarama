@@ -3826,7 +3826,7 @@ def rejected_video_stream_copy_equivalent(expected, actual, decoded):
     )
 
 
-def valid_verification(verification):
+def valid_verification(verification, media_size=None):
     strict_fields = {
         "status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status",
         "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint",
@@ -3891,6 +3891,8 @@ def valid_verification(verification):
         positive_joined_int(evidence["output_limit_bytes"], "output_limit_bytes")
         if evidence["output_limit_bytes"] > JOINED_MAX_BYTES:
             raise ValueError("joined lossless normalization output limit conflicts")
+        if media_size is not None and (isinstance(media_size, bool) or not isinstance(media_size, int) or media_size <= 0 or media_size >= evidence["output_limit_bytes"]):
+            raise ValueError("joined lossless normalization output limit conflicts with delivered media size")
         valid_sha256(evidence["decoded_frame_sequence_sha256"], "lossless decoded frame sequence")
         valid_sha256(evidence["decoded_frame_field_sha256"], "lossless decoded frame field proof")
         valid_sha256(evidence["source_timeline_signature_sha256"], "lossless source timeline")
@@ -4147,7 +4149,7 @@ def valid_hour_manifest(payload, item=None):
             if (previous["clip_id"], following["clip_id"]) in gap_pairs:
                 raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
-        valid_verification(media["verification"])
+        valid_verification(media["verification"], media["size_bytes"])
         if media["verification"].get("acceptance_mode") == "lossless_native_timeline_normalized" and len(ids) < 2:
             raise ValueError("joined lossless normalization requires multiple sources")
         source_fingerprint = media["verification"]["source_fingerprint"]

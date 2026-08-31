@@ -751,6 +751,60 @@ class JoinedDownloadTests(unittest.TestCase):
         verification = {key: verification[key] for key in order}
         pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
 
+        singleton_manifest = self.golden("hour_manifest_v1.golden.json")
+        singleton_manifest["media"][0]["verification"] = json.loads(json.dumps(verification))
+        with self.assertRaisesRegex(ValueError, "requires multiple sources"):
+            pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(singleton_manifest)))
+
+        bounded_manifest = self.golden("hour_manifest_mixed_v1.golden.json")
+        bounded_sources = bounded_manifest["sources"]
+        failure_facts = {"output_bytes": 700, "limit_bytes": 700}
+        failure_sha = pull.joined_canonical_sha(failure_facts)
+        source_sha = pull.candidate_source_claim_sha(bounded_sources)
+        maximality = {
+            "candidate_clip_ids": [source["clip_id"] for source in bounded_sources],
+            "reason_code": "lossless_normalization_expansion_cap",
+            "source_claim_sha256": source_sha,
+            "policy_version": bounded_manifest["policy_version"],
+            "evidence_sha256": "",
+            "normalized_failure_facts": failure_facts,
+            "failure_sha256": failure_sha,
+            "repeat_count": 1,
+            "media_tool_identity": bounded_manifest["media_tool"]["identity_sha256"],
+        }
+        maximality["evidence_sha256"] = pull.joined_canonical_sha({
+            "source_claim_sha256": source_sha,
+            "reason_code": maximality["reason_code"],
+            "failure_sha256": failure_sha,
+            "policy_version": maximality["policy_version"],
+            "media_tool_identity": maximality["media_tool_identity"],
+            "repeat_count": 1,
+        })
+        bounded_manifest["media"][0]["maximality_evidence"] = [maximality]
+        pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(bounded_manifest)))
+        maximality["repeat_count"] = 2
+        maximality["evidence_sha256"] = pull.joined_canonical_sha({
+            "source_claim_sha256": source_sha,
+            "reason_code": maximality["reason_code"],
+            "failure_sha256": failure_sha,
+            "policy_version": maximality["policy_version"],
+            "media_tool_identity": maximality["media_tool_identity"],
+            "repeat_count": 2,
+        })
+        with self.assertRaisesRegex(ValueError, "maximality evidence"):
+            pull.valid_hour_manifest(pull.decode_joined_json(pull.joined_canonical_bytes(bounded_manifest)))
+
+        with self.assertRaisesRegex(ValueError, "output limit"):
+            pull.valid_verification(
+                pull.decode_joined_json(pull.joined_canonical_bytes(verification)),
+                verification["lossless_normalization"]["output_limit_bytes"],
+            )
+
+        verification["packet_payload_order_status"] = "passed"
+        with self.assertRaisesRegex(ValueError, "packet status"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+        verification["packet_payload_order_status"] = "not_applicable_lossless_normalization"
+
         verification["lossless_normalization"]["trigger_failure_facts"] = {"category": "fabricated"}
         verification["lossless_normalization"]["trigger_failure_sha256"] = pull.joined_canonical_sha({"category": "fabricated"})
         with self.assertRaisesRegex(ValueError, "rejected stream-copy"):

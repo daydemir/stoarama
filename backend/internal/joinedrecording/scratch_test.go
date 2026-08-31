@@ -64,6 +64,10 @@ func TestWorkerTaskBudgetCannotAdmitMoreThanLosslessPreflightFits(t *testing.T) 
 	if maxSource <= 0 || maxSource+maxSource*losslessNormalizationScratchOutputMultiplier > available {
 		t.Fatalf("server-admitted source=%d exceeds local lossless budget=%d", maxSource, available)
 	}
+	nextSource := maxSource + 1
+	if nextSource+nextSource*losslessNormalizationScratchOutputMultiplier <= available {
+		t.Fatalf("lossless task budget was not maximal: next source=%d still fits available=%d", nextSource, available)
+	}
 
 	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
 	legacy, err := WorkerTaskBudgetBytes(available)

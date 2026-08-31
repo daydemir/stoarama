@@ -43,38 +43,15 @@ func (r *generatedEvidence) Read(p []byte) (int, error) {
 
 func makeMediaClip(t *testing.T, dir, name string, tone int, audio bool) LocalSource {
 	t.Helper()
-	if _, err := exec.LookPath(ffmpegBinary()); err != nil {
-		t.Skip("ffmpeg unavailable")
-	}
-	if _, err := exec.LookPath(ffprobeBinary()); err != nil {
-		t.Skip("ffprobe unavailable")
-	}
-	mediaPath := filepath.Join(dir, name)
-	args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1"}
-	if audio {
-		args = append(args, "-f", "lavfi", "-i", "sine=frequency="+strconv.Itoa(tone)+":sample_rate=48000:duration=1", "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest")
-	}
-	args = append(args, "-c:v", "mpeg4", "-g", "10", "-bf", "2", mediaPath)
-	cmd := exec.Command(ffmpegBinary(), args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("make fixture: %v (%s)", err, output)
-	}
-	size, sha, err := localIdentity(mediaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	local := LocalSource{Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
-	if audio {
-		_, _, contract, err := probeMediaMetadata(context.Background(), mediaPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		local.AudioContract = contract
-	}
-	return local
+	return makeVideoClip(t, dir, name, tone, audio, []string{"-c:v", "mpeg4", "-g", "10", "-bf", "2"})
 }
 
 func makeProgressiveLosslessSource(t *testing.T, dir, name string, tone int, audio bool) LocalSource {
+	t.Helper()
+	return makeVideoClip(t, dir, name, tone, audio, []string{"-c:v", "libx264", "-preset", "veryfast", "-field_order", "progressive"})
+}
+
+func makeVideoClip(t *testing.T, dir, name string, tone int, audio bool, videoArgs []string) LocalSource {
 	t.Helper()
 	if _, err := exec.LookPath(ffmpegBinary()); err != nil {
 		t.Skip("ffmpeg unavailable")
@@ -87,10 +64,11 @@ func makeProgressiveLosslessSource(t *testing.T, dir, name string, tone int, aud
 	if audio {
 		args = append(args, "-f", "lavfi", "-i", "sine=frequency="+strconv.Itoa(tone)+":sample_rate=48000:duration=1", "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest")
 	}
-	args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-field_order", "progressive", mediaPath)
+	args = append(args, videoArgs...)
+	args = append(args, mediaPath)
 	cmd := exec.Command(ffmpegBinary(), args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("make progressive lossless fixture: %v (%s)", err, output)
+		t.Fatalf("make fixture: %v (%s)", err, output)
 	}
 	size, sha, err := localIdentity(mediaPath)
 	if err != nil {
@@ -485,6 +463,29 @@ func TestLosslessExpansionLimitUsesSingleExplicitProof(t *testing.T) {
 	evidence.RepeatCount = 2
 	if err := validateMaximalityEvidence(evidence, tool, evidence.SourceClaimSHA256); err == nil {
 		t.Fatal("output-cap proof accepted an unbound repeat count")
+	}
+}
+
+func TestLosslessTruncatedOutputUsesExpansionCapBelowFFmpegFileLimit(t *testing.T) {
+	verification := Verification{
+		SourceFingerprint: MediaFingerprint{Tracks: map[string]*TrackFingerprint{
+			"video": {DecodedFrames: 900},
+		}},
+		OutputFingerprint: MediaFingerprint{Tracks: map[string]*TrackFingerprint{
+			"video": {DecodedFrames: 899},
+		}},
+	}
+	err := losslessTruncatedOutputFailure(verification, 699, 700)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "lossless_normalization_expansion_cap" {
+		t.Fatalf("ffmpeg -fs truncation below its byte limit was not routed to size partitioning: %v", err)
+	}
+	if err := losslessTruncatedOutputFailure(verification, 699, 0); err != nil {
+		t.Fatalf("invalid limit fabricated a bounded-output failure: %v", err)
+	}
+	verification.OutputFingerprint.Tracks["video"].DecodedFrames = 900
+	if err := losslessTruncatedOutputFailure(verification, 699, 700); err != nil {
+		t.Fatalf("complete output was misclassified as truncated: %v", err)
 	}
 }
 

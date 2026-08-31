@@ -1269,11 +1269,14 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	if err != nil {
 		return BuiltOutput{}, err
 	}
-	if size >= outputLimit {
-		return BuiltOutput{}, losslessOutputLimitFailure(size, outputLimit)
+	if err := losslessTruncatedOutputFailure(Verification{}, size, outputLimit); err != nil {
+		return BuiltOutput{}, err
 	}
 	verification, err := verifyLosslessNormalizedMedia(ctx, sources, outputPath, layout)
 	if err != nil {
+		if limitErr := losslessTruncatedOutputFailure(verification, size, outputLimit); limitErr != nil {
+			return BuiltOutput{}, limitErr
+		}
 		return BuiltOutput{}, deterministicFailure("lossless_normalization_verification_failure", verification, err)
 	}
 	sourceVideo, outputVideo := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
@@ -1334,6 +1337,25 @@ func losslessOutputLimitFailure(size, limit int64) error {
 		OutputBytes int64 `json:"output_bytes"`
 		LimitBytes  int64 `json:"limit_bytes"`
 	}{size, limit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
+}
+
+// ffmpeg's -fs stops before writing the packet that would cross the limit, so
+// a capped file can be slightly smaller than the configured byte ceiling. A
+// successful encode with fewer decoded frames than the verified source is the
+// fail-closed signal that the bounded output was truncated and must be routed
+// through size partitioning instead of media quarantine.
+func losslessTruncatedOutputFailure(verification Verification, size, limit int64) error {
+	if limit <= 0 {
+		return nil
+	}
+	if size >= limit {
+		return losslessOutputLimitFailure(size, limit)
+	}
+	want, got := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
+	if want != nil && got != nil && want.DecodedFrames > 0 && got.DecodedFrames > 0 && got.DecodedFrames < want.DecodedFrames {
+		return losslessOutputLimitFailure(size, limit)
+	}
+	return nil
 }
 
 func appendLosslessDisplayMetadata(args []string, layout losslessVideoLayout) []string {
