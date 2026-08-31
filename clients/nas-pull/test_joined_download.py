@@ -717,14 +717,19 @@ class JoinedDownloadTests(unittest.TestCase):
         for fingerprint in (verification["source_fingerprint"], verification["output_fingerprint"]):
             fingerprint["decoded_video_sha256"] = "d" * 64
         verification["acceptance_mode"] = "lossless_native_timeline_normalized"
+        trigger_facts = {"category": "stream_copy_changed_decoded_frames"}
         verification["lossless_normalization"] = {
             "codec": "libx264", "preset": "veryfast", "quantizer": 0, "pixel_format": "yuv420p",
-            "frame_rate": "10", "timeline_rule": "settb=expr=1/10,setpts=N",
+            "frame_rate": "10", "sample_aspect_ratio": "1:1", "color_range": "", "color_space": "",
+            "color_transfer": "", "color_primaries": "", "chroma_location": "left", "field_order": "",
+            "timeline_rule": "settb=expr=1/10,setpts=N,setsar=1/1",
             "source_decoded_frames": source_video["decoded_frames"],
             "output_decoded_frames": output_video["decoded_frames"],
             "decoded_frame_sequence_sha256": "d" * 64,
             "source_timeline_signature_sha256": "e" * 64,
             "output_limit_bytes": 1024, "audio_status": "absent",
+            "trigger_reason_code": "media_sequence_mismatch", "trigger_failure_facts": trigger_facts,
+            "trigger_failure_sha256": pull.joined_canonical_sha(trigger_facts),
         }
         verification["packet_payload_order_status"] = "not_applicable_lossless_normalization"
         verification["decoded_frame_sequence_status"] = "passed"
@@ -735,6 +740,11 @@ class JoinedDownloadTests(unittest.TestCase):
         )
         verification = {key: verification[key] for key in order}
         pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+
+        verification["lossless_normalization"]["trigger_failure_facts"]["category"] = "fabricated"
+        with self.assertRaisesRegex(ValueError, "trigger evidence"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+        verification["lossless_normalization"]["trigger_failure_facts"] = {"category": "stream_copy_changed_decoded_frames"}
 
         verification["lossless_normalization"]["output_decoded_frames"] += 1
         with self.assertRaisesRegex(ValueError, "frame evidence"):

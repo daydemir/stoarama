@@ -2837,7 +2837,7 @@ for _joined_order in (
     ("status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "acceptance_mode", "lossless_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
-    ("codec", "preset", "quantizer", "pixel_format", "frame_rate", "timeline_rule", "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256", "source_timeline_signature_sha256", "output_limit_bytes", "audio_status"),
+    ("codec", "preset", "quantizer", "pixel_format", "frame_rate", "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order", "timeline_rule", "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256", "source_timeline_signature_sha256", "output_limit_bytes", "audio_status", "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256"),
     ("duration_seconds", "tracks"),
     ("duration_seconds", "tracks", "decoded_video_sha256"),
     ("duration_seconds", "tracks", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
@@ -2859,7 +2859,7 @@ for _joined_order in (
     ("artifact_id", "recording_id", "local_date", "qualification_sha256", "frozen_source_sha256", "source_claim_sha256", "relative_path", "object_key", "size_bytes", "sha256", "ledger_sha256", "source_count", "source_bytes", "scheduled_hour_ids"),
     ("hour_manifest_artifact_id", "hour_id", "recording_id", "local_date", "delivery_hour", "status", "relative_path", "object_key", "size_bytes", "sha256", "source_count", "source_bytes", "media_artifact_count"),
     ("previous_clip_id", "next_clip_id", "at_utc", "signed_gap_nanoseconds", "reason"),
-    ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",),
+    ("category",), ("category", "exit_code", "normalized_fact"), ("source_bytes",), ("output_bytes",), ("output_bytes", "limit_bytes"),
     ("source_claim_sha256", "reason_code", "failure_sha256", "policy_version", "media_tool_identity", "repeat_count"),
     ("clip_id", "source_claim_sha256"),
     ("clip_id", "recording_id", "recording_job_id", "storage_destination_id", "provider", "endpoint", "region", "bucket", "object_key", "start_utc", "end_utc", "size_bytes", "ingest_sha256", "released_at"),
@@ -3834,17 +3834,25 @@ def valid_verification(verification):
         evidence = verification["lossless_normalization"]
         evidence_fields = {
             "codec", "preset", "quantizer", "pixel_format", "frame_rate", "timeline_rule",
+            "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries",
+            "chroma_location", "field_order",
             "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256",
             "source_timeline_signature_sha256", "output_limit_bytes", "audio_status",
+            "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256",
         }
         exact_joined_fields(evidence, evidence_fields, "lossless normalization")
-        if evidence["codec"] != "libx264" or evidence["preset"] != "veryfast" or evidence["quantizer"] != 0 or evidence["pixel_format"] != "yuv420p" or evidence["audio_status"] != "absent":
+        if evidence["codec"] != "libx264" or evidence["preset"] != "veryfast" or evidence["quantizer"] != 0 or evidence["pixel_format"] != "yuv420p" or evidence["audio_status"] != "absent" or evidence["trigger_reason_code"] != "media_sequence_mismatch":
             raise ValueError("joined lossless normalization codec evidence conflicts")
         if not isinstance(evidence["frame_rate"], str) or re.fullmatch(r"[1-9][0-9]*(?:/[1-9][0-9]*)?", evidence["frame_rate"]) is None:
             raise ValueError("joined lossless normalization frame rate conflicts")
+        if not isinstance(evidence["sample_aspect_ratio"], str) or re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", evidence["sample_aspect_ratio"]) is None:
+            raise ValueError("joined lossless normalization aspect ratio conflicts")
+        for display_field in ("color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order"):
+            if not isinstance(evidence[display_field], str) or len(evidence[display_field]) > 64:
+                raise ValueError("joined lossless normalization display metadata conflicts")
         rate_parts = [int(value) for value in evidence["frame_rate"].split("/", 1)]
         rate_num, rate_den = (rate_parts[0], 1) if len(rate_parts) == 1 else rate_parts
-        if evidence["timeline_rule"] != "settb=expr=%d/%d,setpts=N" % (rate_den, rate_num):
+        if evidence["timeline_rule"] != "settb=expr=%d/%d,setpts=N,setsar=%s" % (rate_den, rate_num, evidence["sample_aspect_ratio"].replace(":", "/")):
             raise ValueError("joined lossless normalization timeline rule conflicts")
         positive_joined_int(evidence["source_decoded_frames"], "source_decoded_frames")
         positive_joined_int(evidence["output_decoded_frames"], "output_decoded_frames")
@@ -3853,6 +3861,9 @@ def valid_verification(verification):
             raise ValueError("joined lossless normalization output limit conflicts")
         valid_sha256(evidence["decoded_frame_sequence_sha256"], "lossless decoded frame sequence")
         valid_sha256(evidence["source_timeline_signature_sha256"], "lossless source timeline")
+        valid_sha256(evidence["trigger_failure_sha256"], "lossless stream-copy failure")
+        if not isinstance(evidence["trigger_failure_facts"], dict) or not evidence["trigger_failure_facts"] or joined_canonical_sha(evidence["trigger_failure_facts"]) != evidence["trigger_failure_sha256"]:
+            raise ValueError("joined lossless normalization trigger evidence conflicts")
         if set(expected["tracks"]) != {"video"} or set(actual["tracks"]) != {"video"}:
             raise ValueError("joined lossless normalization audio evidence conflicts")
         want_video, got_video = expected["tracks"]["video"], actual["tracks"]["video"]
@@ -4086,6 +4097,8 @@ def valid_hour_manifest(payload, item=None):
                 raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
         valid_verification(media["verification"])
+        if media["verification"].get("acceptance_mode") == "lossless_native_timeline_normalized" and len(ids) < 2:
+            raise ValueError("joined lossless normalization requires multiple sources")
         source_fingerprint = media["verification"]["source_fingerprint"]
         audio_contracts = [source["audio_sequence_contract"] for source in run_sources if "audio_sequence_contract" in source]
         if (
@@ -4107,7 +4120,7 @@ def valid_hour_manifest(payload, item=None):
                 raise ValueError("joined maximality evidence conflicts")
             if joined_canonical_sha(evidence["normalized_failure_facts"]) != evidence["failure_sha256"]:
                 raise ValueError("joined maximality failure hash conflicts")
-            repeat_count = 1 if evidence["reason_code"] == "output_exceeds_put_cap" else 2
+            repeat_count = 1 if evidence["reason_code"] in {"output_exceeds_put_cap", "lossless_normalization_expansion_cap"} else 2
             proof = {
                 "source_claim_sha256": evidence["source_claim_sha256"], "reason_code": evidence["reason_code"],
                 "failure_sha256": evidence["failure_sha256"], "policy_version": evidence["policy_version"],

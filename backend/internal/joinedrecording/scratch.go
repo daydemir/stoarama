@@ -31,6 +31,50 @@ func AvailableScratchBudget(root string) (int64, error) {
 	return int64(budget), nil
 }
 
+// WorkerTaskBudgetBytes translates the worker's real free-space budget into
+// the legacy 2x admission model used by the claim API. With normalization
+// disabled it preserves the existing broad-rollout behavior exactly. With it
+// enabled, every source set admitted by the server also fits the local
+// source-plus-bounded-QP0-output preflight.
+func WorkerTaskBudgetBytes(available int64) (int64, error) {
+	if available <= 0 {
+		return 0, fmt.Errorf("joined scratch admission budget is invalid")
+	}
+	if !losslessNormalizationEnabled() {
+		return available, nil
+	}
+	fits := func(source int64) bool {
+		legacy, err := RequiredScratchBudgetBytes(source)
+		if err != nil || legacy > available {
+			return false
+		}
+		output := int64(r2.MaxConditionalPutBytes)
+		if source <= math.MaxInt64/losslessNormalizationExpansionLimit {
+			if expanded := source * losslessNormalizationExpansionLimit; expanded < output {
+				output = expanded
+			}
+		}
+		return source <= available-output
+	}
+	low, high := int64(0), available
+	for low < high {
+		mid := low + (high-low+1)/2
+		if fits(mid) {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	if low <= 0 {
+		return 0, &ScratchHeadroomError{Available: uint64(available), Required: uint64(JoinedScratchFixedBytes) + 8}
+	}
+	taskBudget, err := RequiredScratchBudgetBytes(low)
+	if err != nil || taskBudget > available {
+		return 0, fmt.Errorf("derive joined lossless scratch admission budget")
+	}
+	return taskBudget, nil
+}
+
 // ScratchSafetyMarginBytes leaves room for filesystem metadata, ffmpeg
 // temporary files, and the final verification pass. It is deliberately large
 // because a failed space check must stop before any source download begins.
@@ -50,6 +94,10 @@ func (e *ScratchHeadroomError) Error() string {
 // may expand compact source media by at most seven times and can never exceed
 // the single-object conditional PUT cap.
 func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
+	return requiredScratchBytes(sources, losslessNormalizationEnabled())
+}
+
+func requiredScratchBytes(sources []SourceClip, lossless bool) (uint64, error) {
 	var sourceBytes uint64
 	for _, source := range sources {
 		if source.Object.SizeBytes <= 0 {
@@ -62,7 +110,7 @@ func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 		sourceBytes += size
 	}
 	outputBytes := sourceBytes
-	if losslessNormalizationEnabled() {
+	if lossless {
 		outputBytes = uint64(r2.MaxConditionalPutBytes)
 		if sourceBytes <= math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
 			if expanded := sourceBytes * uint64(losslessNormalizationExpansionLimit); expanded < outputBytes {
@@ -86,7 +134,11 @@ func checkScratchHeadroom(available, required uint64) error {
 
 // EnsureScratchHeadroom fails closed before a worker downloads any source.
 func EnsureScratchHeadroom(root string, sources []SourceClip) error {
-	required, err := RequiredScratchBytes(sources)
+	return ensureScratchHeadroom(root, sources, losslessNormalizationEnabled())
+}
+
+func ensureScratchHeadroom(root string, sources []SourceClip, lossless bool) error {
+	required, err := requiredScratchBytes(sources, lossless)
 	if err != nil {
 		return err
 	}

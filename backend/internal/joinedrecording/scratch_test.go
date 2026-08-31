@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"golang.org/x/sys/unix"
 )
 
@@ -34,6 +35,28 @@ func TestRequiredScratchBytesKeepsStreamCopyBudgetWithoutFallback(t *testing.T) 
 	}
 	if want := uint64(2*350) + ScratchSafetyMarginBytes; got != want {
 		t.Fatalf("required scratch=%d want %d", got, want)
+	}
+}
+
+func TestWorkerTaskBudgetCannotAdmitMoreThanLosslessPreflightFits(t *testing.T) {
+	const available int64 = 2 << 30
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
+	taskBudget, err := WorkerTaskBudgetBytes(available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskBudget <= 0 || taskBudget >= available {
+		t.Fatalf("lossless task budget=%d available=%d", taskBudget, available)
+	}
+	maxSource := (taskBudget - JoinedScratchFixedBytes) / 2
+	if maxSource <= 0 || maxSource+min(maxSource*losslessNormalizationExpansionLimit, int64(r2.MaxConditionalPutBytes)) > available {
+		t.Fatalf("server-admitted source=%d exceeds local lossless budget=%d", maxSource, available)
+	}
+
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	legacy, err := WorkerTaskBudgetBytes(available)
+	if err != nil || legacy != available {
+		t.Fatalf("disabled fallback changed admission: budget=%d err=%v", legacy, err)
 	}
 }
 

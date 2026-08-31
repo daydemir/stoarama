@@ -204,7 +204,7 @@ func BuildHourManifest(input HourManifestInput) (HourManifest, []byte, string, e
 	included := map[int64]SourceDisposition{}
 	for i, output := range plan.Outputs {
 		artifactID, built := input.MediaArtifactIDs[i], input.Built[i]
-		if artifactID <= 0 || seenArtifactIDs[artifactID] || validatePassedVerification(built.Verification) != nil || built.SourceCount != len(output.Sources) || built.SizeBytes != output.ExpectedSize || built.SHA256 != output.ExpectedSHA {
+		if artifactID <= 0 || seenArtifactIDs[artifactID] || validatePassedVerification(built.Verification) != nil || (built.Verification.AcceptanceMode == "lossless_native_timeline_normalized" && len(output.Sources) < 2) || built.SourceCount != len(output.Sources) || built.SizeBytes != output.ExpectedSize || built.SHA256 != output.ExpectedSHA {
 			return HourManifest{}, nil, "", fmt.Errorf("hour media artifact %d differs from sealed plan", i+1)
 		}
 		seenArtifactIDs[artifactID] = true
@@ -342,7 +342,7 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 	lastMediaSourcePosition := -1
 	for i, media := range manifest.Media {
 		_, utcOffset := media.ActualStartUTC.In(loc).Zone()
-		if media.ArtifactID <= 0 || seenArtifacts[media.ArtifactID] || media.Ordinal != i+1 || media.Part != i+1 || media.Parts != len(manifest.Media) || media.ContentID != media.SHA256 || !lowerHex64(media.SHA256) || media.SizeBytes <= 0 || media.SizeBytes > r2.MaxConditionalPutBytes || media.ObjectKey != path.Join("joined", manifest.BatchID, "objects", media.ContentID+".mp4") || len(media.SourceClipIDs) == 0 || !media.ActualEndUTC.After(media.ActualStartUTC) || media.UTCOffsetSeconds != utcOffset || media.MediaToolIdentity != manifest.MediaTool.IdentitySHA256 || validatePassedVerification(media.Verification) != nil {
+		if media.ArtifactID <= 0 || seenArtifacts[media.ArtifactID] || media.Ordinal != i+1 || media.Part != i+1 || media.Parts != len(manifest.Media) || media.ContentID != media.SHA256 || !lowerHex64(media.SHA256) || media.SizeBytes <= 0 || media.SizeBytes > r2.MaxConditionalPutBytes || media.ObjectKey != path.Join("joined", manifest.BatchID, "objects", media.ContentID+".mp4") || len(media.SourceClipIDs) == 0 || (media.Verification.AcceptanceMode == "lossless_native_timeline_normalized" && len(media.SourceClipIDs) < 2) || !media.ActualEndUTC.After(media.ActualStartUTC) || media.UTCOffsetSeconds != utcOffset || media.MediaToolIdentity != manifest.MediaTool.IdentitySHA256 || validatePassedVerification(media.Verification) != nil {
 			return nil, "", fmt.Errorf("canonical hour manifest media differs")
 		}
 		firstPosition := sourcePositions[media.SourceClipIDs[0]]
@@ -586,7 +586,7 @@ func ValidateHourManifestLedgerBinding(manifest HourManifest, ledgerRef Allocati
 
 func validateMaximalityEvidence(e MaximalityEvidence, toolIdentity, expectedSourceClaim string) error {
 	minimumRepeats := 2
-	if e.ReasonCode == "output_exceeds_put_cap" {
+	if e.ReasonCode == "output_exceeds_put_cap" || e.ReasonCode == "lossless_normalization_expansion_cap" {
 		minimumRepeats = 1
 	}
 	failureSHA, canonicalFacts, err := stitchcert.CanonicalSHA(e.FailureFacts)

@@ -851,8 +851,12 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		if err != nil {
 			return false, fmt.Errorf("measure joined scratch admission budget: %w", err)
 		}
+		taskBudget, err := joinedrecording.WorkerTaskBudgetBytes(budget)
+		if err != nil {
+			return false, fmt.Errorf("derive joined scratch admission budget: %w", err)
+		}
 		claimRequest.ScratchAvailableBytes = budget
-		claimRequest.TaskBudgetBytes = budget
+		claimRequest.TaskBudgetBytes = taskBudget
 	}
 	// Cancellation can race after either claim API commits a lease but before
 	// this client receives it. No local task starts in that case. The unseen

@@ -831,7 +831,11 @@ func TestHourManifestAcceptsDecodedFrameEquivalentVerification(t *testing.T) {
 }
 
 func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing.T) {
-	plan := oneOutputPlan(t)
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	plan, err := buildTestPlan(testRequest([]SourceClip{testSource(1, start), testSource(2, start.Add(time.Minute))}))
+	if err != nil {
+		t.Fatal(err)
+	}
 	verification := passingVerification()
 	verification.AcceptanceMode = "lossless_native_timeline_normalized"
 	verification.PacketPayloadOrderStatus = "not_applicable_lossless_normalization"
@@ -839,14 +843,20 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 	verification.SourceFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
 	verification.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
 	frames := verification.SourceFingerprint.Tracks["video"].DecodedFrames
+	triggerSHA, triggerFacts, err := stitchcert.CanonicalSHA(struct {
+		Stage string `json:"stage"`
+	}{"stream_copy"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	verification.LosslessNormalization = &LosslessNormalizationEvidence{
 		Codec: "libx264", Preset: "veryfast", Quantizer: 0, PixelFormat: "yuv420p",
-		FrameRate: "10", TimelineRule: "settb=expr=1/10,setpts=N",
+		FrameRate: "10", SampleAspectRatio: "1:1", ChromaLocation: "left", TimelineRule: "settb=expr=1/10,setpts=N,setsar=1/1",
 		SourceDecodedFrames: frames, OutputDecodedFrames: frames,
 		DecodedFrameSequenceSHA256: strings.Repeat("d", 64), SourceTimelineSignatureSHA256: strings.Repeat("e", 64),
-		OutputLimitBytes: 1024, AudioStatus: "absent",
+		OutputLimitBytes: 1024, AudioStatus: "absent", TriggerReasonCode: "media_sequence_mismatch", TriggerFailureFacts: triggerFacts, TriggerFailureSHA256: triggerSHA,
 	}
-	built := []BuiltOutput{{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA, SourceCount: 1, Verification: verification}}
+	built := []BuiltOutput{{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA, SourceCount: 2, Verification: verification}}
 	allocation, ledger := testAllocation(plan)
 	manifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: []int64{88}, Built: built})
 	if err != nil {
@@ -859,6 +869,17 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 	mutated.Media[0].Verification.LosslessNormalization.OutputDecodedFrames--
 	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
 		t.Fatal("lossless normalization manifest accepted mismatched frame accounting")
+	}
+	mutated = cloneHourManifest(t, manifest)
+	mutated.Media[0].Verification.LosslessNormalization.TriggerFailureFacts = json.RawMessage(`{"stage":"fabricated"}`)
+	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+		t.Fatal("lossless normalization manifest accepted unbound stream-copy rejection facts")
+	}
+	singleton := oneOutputPlan(t)
+	singletonAllocation, singletonLedger := testAllocation(singleton)
+	built[0].SizeBytes, built[0].SHA256, built[0].SourceCount = singleton.Outputs[0].ExpectedSize, singleton.Outputs[0].ExpectedSHA, 1
+	if _, _, _, err := BuildHourManifest(HourManifestInput{Plan: singleton, Allocation: singletonAllocation, AllocationLedger: singletonLedger, MediaArtifactIDs: []int64{88}, Built: built}); err == nil {
+		t.Fatal("singleton falsely claimed lossless fallback activation")
 	}
 }
 
