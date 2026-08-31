@@ -51,12 +51,11 @@ func parseDeliveryMode(s string) (deliveryMode, error) {
 	}
 }
 
-// recordingListSelectSQL is the single SELECT + FROM/JOIN that feeds
-// scanRecordingListRow. Its column list and order MUST stay exactly aligned with
-// scanRecordingListRow's row.Scan; every consumer (the account list, the single
-// get, and the CSV export) appends only its own WHERE/ORDER BY so the three can
-// never drift out of sync again.
-const recordingListSelectSQL = `
+// The list response must not touch recording_clips. Its clip-derived fields are
+// placeholders until the bounded enrichment request fills them. Single-recording
+// reads and CSV exports retain the exact expressions. Both variants share the
+// surrounding SELECT so their column order stays aligned with scanRecordingListRow.
+const recordingListSelectPrefixSQL = `
 	SELECT
 		rec.id, rec.name, rec.stream_url, rec.storage_destination_id, sd.name,
 		rec.source_kind, COALESCE(rec.cron_expr,''), rec.cron_timezone, rec.clip_duration_sec, rec.target_fps,
@@ -64,6 +63,9 @@ const recordingListSelectSQL = `
 		rec.last_error_text, rec.last_error_at, rec.consecutive_failures,
 		COALESCE((SELECT b.has_payment_method FROM account_billing b
 		   WHERE b.account_id = rec.account_id), false) AS has_payment_method,
+`
+
+const recordingExactClipMetricsSQL = `
 		(SELECT count(*) FROM recording_clips c
 		   WHERE c.recording_id = rec.id AND c.clip_start_at > now() - interval '24 hours') AS recent_clip_count,
 		rec.paused_at,
@@ -82,6 +84,15 @@ const recordingListSelectSQL = `
 		       WHEN rec.status='paused' THEN rec.paused_at
 		       ELSE LEAST(now(), COALESCE(rec.end_at, now()))
 		     END) END AS captured_clip_count,
+`
+
+const recordingListClipMetricPlaceholdersSQL = `
+		0::bigint AS recent_clip_count,
+		rec.paused_at,
+		0::bigint AS captured_clip_count,
+`
+
+const recordingListSelectSuffixSQL = `
 		rec.completed_captured_clip_count, rec.completed_expected_clip_count,
 		rec.created_at, sd.managed,
 		rec.stream_id, st.name, st.location_text,
@@ -127,6 +138,9 @@ const recordingListSelectSQL = `
 	LEFT JOIN relay_groups preferred_group
 	  ON preferred_group.id=rec.preferred_relay_group_id
 	 AND preferred_group.account_id=rec.account_id`
+
+const recordingListSelectSQL = recordingListSelectPrefixSQL + recordingExactClipMetricsSQL + recordingListSelectSuffixSQL
+const recordingListBaselineSelectSQL = recordingListSelectPrefixSQL + recordingListClipMetricPlaceholdersSQL + recordingListSelectSuffixSQL
 
 // recordingProbeTimeout bounds the create-time ffmpeg reachability probe.
 const recordingProbeTimeout = 8 * time.Second
@@ -453,7 +467,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	rows, err := s.pool.Query(r.Context(), recordingListSelectSQL+`
+	rows, err := s.pool.Query(r.Context(), recordingListBaselineSelectSQL+`
 		WHERE rec.account_id=$1 AND rec.status <> 'canceled'
 		ORDER BY rec.created_at DESC, rec.id DESC
 	`, principal.AccountID)
@@ -464,7 +478,7 @@ func (s *Server) handleAccountRecordingsList(w http.ResponseWriter, r *http.Requ
 	defer rows.Close()
 	items := make([]map[string]any, 0, 8)
 	for rows.Next() {
-		item, err := scanRecordingListRow(rows, s.billing != nil)
+		item, err := scanRecordingListBaselineRow(rows, s.billing != nil)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("scan recording: %v", err))
 			return
@@ -2639,6 +2653,18 @@ func scanRecordingListRow(row pgx.Row, billingEnabled bool) (map[string]any, err
 		"has_relay_assigned": relayNodeName != nil,
 		"relay_node_name":    relayNodeName,
 	}, nil
+}
+
+func scanRecordingListBaselineRow(row pgx.Row, billingEnabled bool) (map[string]any, error) {
+	item, err := scanRecordingListRow(row, billingEnabled)
+	if err != nil {
+		return nil, err
+	}
+	item["recent_clip_count"] = int64(0)
+	item["captured_clip_count"] = int64(0)
+	item["expected_clip_count"] = int64(0)
+	item["capture_health"] = recordingCaptureHealthUnavailable
+	return item, nil
 }
 
 // checkRecordingScheduleCapacity rejects a prospective schedule whose forecast
