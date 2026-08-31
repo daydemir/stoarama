@@ -137,6 +137,7 @@ func TestJoinedWorkerBootstrapSHA256AllowlistFailsClosed(t *testing.T) {
 		JoinedWorkerBootstrapToken:  bootstrap,
 		JoinedWorkerBootstrapHashes: hex.EncodeToString(workerDigest[:]),
 		JoinedWorkerSigningKey:      signing,
+		JoinedOperatorToken:         "joined-operator-token-32-bytes-0001",
 	}
 	if err := valid.ValidateJoined(); err != nil {
 		t.Fatalf("valid joined worker digest allowlist: %v", err)
