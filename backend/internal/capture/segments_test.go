@@ -478,7 +478,7 @@ esac`
 			}
 			t.Setenv("FFPROBE_BIN", probe)
 			path := filepath.Join(dir, "seg-20260812-120000.mp4")
-			if err := os.WriteFile(path, []byte("valid-media"), 0o600); err != nil {
+			if err := os.WriteFile(path, syntheticMP4Bytes(true), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			seg, err := finalizeSegmentWithTimestampContract(context.Background(), path, time.Second, true)
@@ -488,7 +488,7 @@ esac`
 			if seg.TimestampContract != nil || seg.TimestampContractStatus != TimestampProbeUnknown || seg.TimestampContractReason != "missing_terminal_duration" {
 				t.Fatalf("ambiguous evidence was not UNKNOWN: %+v", seg)
 			}
-			if body, err := os.ReadFile(path); err != nil || string(body) != "valid-media" {
+			if body, err := os.ReadFile(path); err != nil || string(body) != string(syntheticMP4Bytes(true)) {
 				t.Fatalf("finalized media changed: body=%q err=%v", body, err)
 			}
 		})
@@ -508,7 +508,7 @@ printf '%s\n' '{"format":{"duration":"1.0"},"streams":[{"index":0,"codec_type":"
 	t.Setenv("FFPROBE_BIN", probe)
 	t.Setenv("PROBE_LOG", logPath)
 	path := filepath.Join(dir, "seg-20260807-120000.mp4")
-	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+	if err := os.WriteFile(path, syntheticMP4Bytes(true), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	legacy, err := finalizeSegment(context.Background(), path, time.Second)
@@ -556,7 +556,7 @@ esac`
 	}
 	t.Setenv("FFPROBE_BIN", probe)
 	path := filepath.Join(dir, "seg-20260807-120000.mp4")
-	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+	if err := os.WriteFile(path, syntheticMP4Bytes(true), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	seg, err := finalizeSegmentWithTimestampContract(context.Background(), path, time.Second, true)
@@ -566,6 +566,35 @@ esac`
 	if seg.TimestampContractStatus != TimestampProbeComplete || seg.TimestampContract == nil || !seg.AudioPresent {
 		t.Fatalf("segment lost authoritative audio evidence: %+v", seg)
 	}
+}
+
+func TestFinalizeSegmentRejectsUnreadableNonEmptyMP4(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\necho 'moov atom not found' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFPROBE_BIN", probe)
+	path := filepath.Join(dir, "seg-20260831-120000.mp4")
+	if err := os.WriteFile(path, syntheticMP4Bytes(false), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := finalizeSegment(context.Background(), path, time.Minute); err == nil {
+		t.Fatal("unreadable non-empty MP4 was accepted for delivery")
+	} else if !strings.Contains(err.Error(), "missing moov box") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func syntheticMP4Bytes(includeMoov bool) []byte {
+	box := func(kind string) []byte {
+		return append([]byte{0, 0, 0, 12}, append([]byte(kind), []byte{0, 0, 0, 0}...)...)
+	}
+	body := append(box("ftyp"), box("mdat")...)
+	if includeMoov {
+		body = append(body, box("moov")...)
+	}
+	return body
 }
 
 func TestContinuousWatchdogStartupAndProgressTimeouts(t *testing.T) {
@@ -820,7 +849,7 @@ func TestCaptureContinuousDoesNotRedeliverAfterCallbackFailure(t *testing.T) {
 	temp := t.TempDir()
 	installTimestampProbeFixture(t, temp)
 	ffmpeg := filepath.Join(temp, "ffmpeg")
-	script := "#!/bin/sh\nfor last do :; done\nout=${last%/*}\nprintf first > \"$out/seg-20260728-120000.mp4\"\nprintf second > \"$out/seg-20260728-120001.mp4\"\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.1; done\n"
+	script := "#!/bin/sh\nfor last do :; done\nout=${last%/*}\nprintf '\\000\\000\\000\\014ftyp\\000\\000\\000\\000\\000\\000\\000\\014mdat\\000\\000\\000\\000\\000\\000\\000\\014moov\\000\\000\\000\\000' > \"$out/seg-20260728-120000.mp4\"\nprintf '\\000\\000\\000\\014ftyp\\000\\000\\000\\000\\000\\000\\000\\014mdat\\000\\000\\000\\000\\000\\000\\000\\014moov\\000\\000\\000\\000' > \"$out/seg-20260728-120001.mp4\"\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.1; done\n"
 	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
@@ -866,8 +895,8 @@ case " $* " in
     exit 1
     ;;
 esac
-printf first > "$out/seg-20260807-120000.mp4"
-printf second > "$out/seg-20260807-120001.mp4"
+printf '\000\000\000\014ftyp\000\000\000\000\000\000\000\014mdat\000\000\000\000\000\000\000\014moov\000\000\000\000' > "$out/seg-20260807-120000.mp4"
+printf '\000\000\000\014ftyp\000\000\000\000\000\000\000\014mdat\000\000\000\000\000\000\000\014moov\000\000\000\000' > "$out/seg-20260807-120001.mp4"
 trap 'exit 0' INT TERM
 while :; do sleep 0.1; done
 `
