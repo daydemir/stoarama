@@ -61,7 +61,7 @@ func joinedBrowserTestPool(t *testing.T) *pgxpool.Pool {
 		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,status text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,clip_start_at timestamptz NOT NULL,clip_end_at timestamptz NOT NULL,purged_at timestamptz);
 		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,state text NOT NULL,hour_id text NOT NULL,local_date date NOT NULL,delivery_hour integer NOT NULL,scheduled_start_at timestamptz NOT NULL,scheduled_end_at timestamptz NOT NULL);
-		CREATE TABLE recording_joined_sources(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,clip_id bigint NOT NULL);
+		CREATE TABLE recording_joined_sources(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,clip_id bigint NOT NULL,start_at timestamptz NOT NULL DEFAULT '2026-05-04 08:00:00Z',end_at timestamptz NOT NULL DEFAULT '2026-05-04 08:01:00Z');
 		CREATE TABLE recording_joined_artifacts(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,artifact_kind text NOT NULL,publication_state text,published_at timestamptz,etag text,version_id text,content_type text NOT NULL,relative_path text NOT NULL,expected_size_bytes bigint NOT NULL,expected_sha256 text NOT NULL,object_key text NOT NULL,ordinal integer NOT NULL);
 		CREATE TABLE recording_joined_media_sources(artifact_id bigint NOT NULL,source_id bigint NOT NULL,ordinal integer NOT NULL,PRIMARY KEY(artifact_id,source_id));
 		CREATE TABLE recording_joined_hour_dispositions(hour_record_id bigint NOT NULL,source_id bigint NOT NULL,disposition text NOT NULL,PRIMARY KEY(hour_record_id,source_id));
@@ -175,6 +175,37 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 		if got.SourceDurationMS != want.SourceDurationMS || got.JoinedReadyMS != want.JoinedReadyMS {
 			t.Fatalf("lazy heatmap joined bin %d=%+v want %+v", i, got, want)
 		}
+	}
+}
+
+func TestRecordingJoinedProgressDoesNotReusePublishedOlderGeneration(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings(id,account_id,status) VALUES (60,47,'completed');
+		INSERT INTO recording_clips VALUES
+			(107,60,'2026-05-04 08:00:00Z','2026-05-04 08:02:00Z',NULL);
+		INSERT INTO recording_joined_hours VALUES
+			(205,1,47,60,'sealed','old-generation','2026-05-04',1,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z'),
+			(206,2,47,60,'pending','new-generation','2026-05-04',1,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z');
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id,start_at,end_at) VALUES
+			(407,205,1,47,60,107,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z'),
+			(408,206,2,47,60,107,'2026-05-04 08:00:00Z','2026-05-04 08:02:00Z');
+		INSERT INTO recording_joined_artifacts VALUES
+			(310,205,1,47,'hour_manifest','published',now(),'old-manifest','old-manifest-version','application/json','May/Monday/hour_01.json',10,repeat('4',64),'joined/private/old-manifest.json',1),
+			(311,205,1,47,'media','published',now(),'old-media','old-media-version','video/mp4','May/Monday/hour_01_part_01_0800-0801.mp4',10,repeat('5',64),'joined/private/old-media.mp4',1);
+		INSERT INTO recording_joined_media_sources VALUES (311,407,1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	progress, err := (&Server{pool: pool}).recordingJoinedProgressForAccount(ctx, 47, []int64{60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := progress[60]
+	if !ok || got.SourceDurationMS != 120_000 || got.JoinedReadyMS != 0 || got.Percent == nil || *got.Percent != 0 {
+		t.Fatalf("new frozen generation progress=%+v present=%t want source=120000 ready=0 percent=0", got, ok)
 	}
 }
 
@@ -399,7 +430,10 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING,FORMAT TEXT) "+recordingJoinedProgressSQL, int64(47), []int64{10, 20, 30, 40})
+	// Production requests every visible recording at once. Keep the large
+	// recording in scope so this catches a plan that only looks bounded when
+	// the noise belongs to an unrequested recording.
+	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING,FORMAT TEXT) "+recordingJoinedProgressSQL, int64(47), []int64{10, 20, 30, 40, 60})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,10 +451,13 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 	}
 	plan := strings.Join(planLines, "\n")
 	t.Logf("joined progress EXPLAIN ANALYZE (%s):\n%s", time.Since(started).Round(time.Millisecond), plan)
-	for _, index := range []string{"idx_recording_clips_recording_started", "recording_joined_sources_account_recording_idx", "recording_joined_media_sources_source_artifact_idx", "recording_joined_artifacts_published_hour_idx"} {
+	for _, index := range []string{"recording_joined_sources_account_recording_idx", "recording_joined_media_sources_source_artifact_idx", "recording_joined_artifacts_published_hour_idx"} {
 		if !strings.Contains(plan, index) {
 			t.Fatalf("plan did not use %s:\n%s", index, plan)
 		}
+	}
+	if strings.Contains(plan, "recording_clips") {
+		t.Fatalf("joined progress scanned mutable raw clips instead of the frozen source set:\n%s", plan)
 	}
 	bufferMatch := regexp.MustCompile(`Buffers: shared hit=([0-9]+)`).FindStringSubmatch(plan)
 	if len(bufferMatch) != 2 {
