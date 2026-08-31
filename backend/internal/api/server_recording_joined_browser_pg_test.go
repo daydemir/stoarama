@@ -61,7 +61,7 @@ func joinedBrowserTestPool(t *testing.T) *pgxpool.Pool {
 		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,status text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,clip_start_at timestamptz NOT NULL,clip_end_at timestamptz NOT NULL,purged_at timestamptz);
 		CREATE TABLE recording_joined_hours(id bigint PRIMARY KEY,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,state text NOT NULL,hour_id text NOT NULL,local_date date NOT NULL,delivery_hour integer NOT NULL,scheduled_start_at timestamptz NOT NULL,scheduled_end_at timestamptz NOT NULL);
-		CREATE TABLE recording_joined_sources(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,clip_id bigint NOT NULL);
+		CREATE TABLE recording_joined_sources(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,recording_id bigint NOT NULL,clip_id bigint NOT NULL,start_at timestamptz NOT NULL DEFAULT '2026-05-04 08:00:00Z',end_at timestamptz NOT NULL DEFAULT '2026-05-04 08:01:00Z');
 		CREATE TABLE recording_joined_artifacts(id bigint PRIMARY KEY,hour_record_id bigint NOT NULL,batch_record_id bigint NOT NULL,account_id bigint NOT NULL,artifact_kind text NOT NULL,publication_state text,published_at timestamptz,etag text,version_id text,content_type text NOT NULL,relative_path text NOT NULL,expected_size_bytes bigint NOT NULL,expected_sha256 text NOT NULL,object_key text NOT NULL,ordinal integer NOT NULL);
 		CREATE TABLE recording_joined_media_sources(artifact_id bigint NOT NULL,source_id bigint NOT NULL,ordinal integer NOT NULL,PRIMARY KEY(artifact_id,source_id));
 		CREATE TABLE recording_joined_hour_dispositions(hour_record_id bigint NOT NULL,source_id bigint NOT NULL,disposition text NOT NULL,PRIMARY KEY(hour_record_id,source_id));
@@ -420,10 +420,13 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 	}
 	plan := strings.Join(planLines, "\n")
 	t.Logf("joined progress EXPLAIN ANALYZE (%s):\n%s", time.Since(started).Round(time.Millisecond), plan)
-	for _, index := range []string{"idx_recording_clips_recording_started", "recording_joined_sources_account_recording_idx", "recording_joined_media_sources_source_artifact_idx", "recording_joined_artifacts_published_hour_idx"} {
+	for _, index := range []string{"recording_joined_sources_account_recording_idx", "recording_joined_media_sources_source_artifact_idx", "recording_joined_artifacts_published_hour_idx"} {
 		if !strings.Contains(plan, index) {
 			t.Fatalf("plan did not use %s:\n%s", index, plan)
 		}
+	}
+	if strings.Contains(plan, "recording_clips") {
+		t.Fatalf("joined progress scanned mutable raw clips instead of the frozen source set:\n%s", plan)
 	}
 	bufferMatch := regexp.MustCompile(`Buffers: shared hit=([0-9]+)`).FindStringSubmatch(plan)
 	if len(bufferMatch) != 2 {
