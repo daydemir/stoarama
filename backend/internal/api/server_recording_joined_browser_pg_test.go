@@ -399,7 +399,10 @@ func TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING,FORMAT TEXT) "+recordingJoinedProgressSQL, int64(47), []int64{10, 20, 30, 40})
+	// Production requests every visible recording at once. Keep the large
+	// recording in scope so this catches a plan that only looks bounded when
+	// the noise belongs to an unrequested recording.
+	rows, err := pool.Query(ctx, "EXPLAIN (ANALYZE,BUFFERS,TIMING,FORMAT TEXT) "+recordingJoinedProgressSQL, int64(47), []int64{10, 20, 30, 40, 60})
 	if err != nil {
 		t.Fatal(err)
 	}
