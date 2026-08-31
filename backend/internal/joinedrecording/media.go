@@ -401,7 +401,7 @@ func buildLargestPassingPrefix(ctx context.Context, sources []LocalSource, scrat
 		if !errors.As(err, &firstDeterministic) {
 			return BuiltOutput{}, err
 		}
-		if firstDeterministic.code == "output_exceeds_put_cap" {
+		if outputSizeFailure(firstDeterministic) {
 			evidence = append(evidence, maximalityEvidence(sources[:n], firstDeterministic, 1, mediaToolIdentity))
 			lastErr = err
 			continue
@@ -606,7 +606,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 		if !errors.Is(firstErr, context.DeadlineExceeded) || ctx.Err() != nil {
 			return nil, nil, firstErr
 		}
-	} else if firstFailure.code == "output_exceeds_put_cap" {
+	} else if outputSizeFailure(firstFailure) {
 		timedAttempt := func(attemptCtx context.Context, candidate []LocalSource, attemptScratch string) (BuiltOutput, error) {
 			started := time.Now()
 			candidateCtx, cancel := context.WithTimeout(attemptCtx, budget("size", len(candidate)))
@@ -637,7 +637,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 			continue
 		}
 		pairFailure, deterministic := deterministicBuildFailure(pairErr)
-		if !deterministic || pairFailure.code == "output_exceeds_put_cap" {
+		if !deterministic || outputSizeFailure(pairFailure) {
 			return nil, nil, pairErr
 		}
 		if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "pair_repeat", pair, pairFailure); repeatErr != nil {
@@ -674,7 +674,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 					break
 				}
 				failure, deterministic := deterministicBuildFailure(candidateErr)
-				if !deterministic || failure.code == "output_exceeds_put_cap" {
+				if !deterministic || outputSizeFailure(failure) {
 					return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr, candidateErr)
 				}
 				if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "prefix_repeat", candidate, failure); repeatErr != nil {
@@ -696,7 +696,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 				return parts, nil, nil
 			}
 			failure, deterministic := deterministicBuildFailure(remainingErr)
-			if !deterministic || failure.code == "output_exceeds_put_cap" {
+			if !deterministic || outputSizeFailure(failure) {
 				return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr, remainingErr)
 			}
 			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "remaining_repeat", remaining, failure); repeatErr != nil {
@@ -721,7 +721,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 		built, segmentErr := run("segment", segment)
 		if segmentErr != nil {
 			failure, deterministic := deterministicBuildFailure(segmentErr)
-			if len(segment) != 1 || !deterministic || failure.code == "output_exceeds_put_cap" {
+			if len(segment) != 1 || !deterministic || outputSizeFailure(failure) {
 				return nil, nil, errors.Join(errMediaSplitNotIsolated, fmt.Errorf("isolated segment failed: %w", segmentErr))
 			}
 			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "singleton_repeat", segment, failure); repeatErr != nil {
@@ -756,7 +756,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 			}
 			extensionBuild, extensionErr := run("extension", extension)
 			extensionFailure, deterministic := deterministicBuildFailure(extensionErr)
-			if extensionErr == nil || !deterministic || extensionFailure.code == "output_exceeds_put_cap" {
+			if extensionErr == nil || !deterministic || outputSizeFailure(extensionFailure) {
 				if extensionErr == nil {
 					discardIsolatedBuild(extensionBuild, scratchDir)
 					return nil, nil, fmt.Errorf("%w: exact boundary extension unexpectedly passed", errMediaSplitNotIsolated)
@@ -785,6 +785,10 @@ func deterministicBuildFailure(err error) (*deterministicMediaError, bool) {
 	return failure, ok
 }
 
+func outputSizeFailure(failure *deterministicMediaError) bool {
+	return failure != nil && (failure.code == "output_exceeds_put_cap" || failure.code == "lossless_normalization_expansion_cap")
+}
+
 func repeatMatchingFailure(run func(string, []LocalSource) (BuiltOutput, error), kind string, sources []LocalSource, first *deterministicMediaError) (BuiltOutput, *deterministicMediaError, error) {
 	built, err := run(kind, sources)
 	if err == nil {
@@ -808,7 +812,7 @@ func buildSizeBoundParts(ctx context.Context, sources []LocalSource, scratchDir,
 		part, err := buildLargestPassingPrefix(ctx, remaining, scratchDir, mediaToolIdentity, attempt)
 		if err != nil {
 			var failure *deterministicMediaError
-			if !errors.As(err, &failure) || failure.code == "output_exceeds_put_cap" {
+			if !errors.As(err, &failure) || outputSizeFailure(failure) {
 				for _, provisional := range parts {
 					discardIsolatedBuild(provisional, scratchDir)
 				}
@@ -937,10 +941,14 @@ func BuildSealedOutput(ctx context.Context, sources []LocalSource, scratchDir st
 }
 
 func buildAndVerify(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
-	if len(sources) == 1 {
+	if len(sources) == 1 || !losslessNormalizationEnabled() {
 		return buildStreamCopyAndVerify(ctx, sources, scratchDir)
 	}
 	return buildWithLosslessFallback(ctx, sources, scratchDir, buildStreamCopyAndVerify, buildLosslessNativeTimeline)
+}
+
+func losslessNormalizationEnabled() bool {
+	return os.Getenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED") == "true"
 }
 
 type mediaBuilder func(context.Context, []LocalSource, string) (BuiltOutput, error)
@@ -1133,6 +1141,9 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	layout := layouts[0]
 	timelineRule := fmt.Sprintf("settb=expr=%d/%d,setpts=N", layout.RateDen, layout.RateNum)
 	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-f", "concat", "-safe", "0", "-i", manifestPath, "-map", "0:v:0", "-an", "-vf", timelineRule, "-c:v", "libx264", "-preset", "veryfast", "-qp", "0", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-enc_time_base", fmt.Sprintf("%d:%d", layout.RateDen, layout.RateNum), "-movflags", "+faststart", "-fs", strconv.FormatInt(outputLimit, 10), outputPath); err != nil {
+		if info, statErr := os.Stat(outputPath); statErr == nil && reachedLosslessOutputLimit(info.Size(), outputLimit) {
+			return BuiltOutput{}, losslessOutputLimitFailure(info.Size(), outputLimit)
+		}
 		return BuiltOutput{}, deterministicCommandFailure(ctx, "lossless_normalization_encode_failure", err)
 	}
 	size, sha, err := localIdentity(outputPath)
@@ -1140,17 +1151,13 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 		return BuiltOutput{}, err
 	}
 	if size >= outputLimit {
-		code := "lossless_normalization_expansion_cap"
-		if outputLimit == r2.MaxConditionalPutBytes {
-			code = "output_exceeds_put_cap"
-		}
-		return BuiltOutput{}, deterministicFailure(code, struct {
-			OutputBytes int64 `json:"output_bytes"`
-			LimitBytes  int64 `json:"limit_bytes"`
-		}{size, outputLimit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
+		return BuiltOutput{}, losslessOutputLimitFailure(size, outputLimit)
 	}
 	verification, err := verifyLosslessNormalizedMedia(ctx, sources, outputPath)
 	if err != nil {
+		if reachedLosslessOutputLimit(size, outputLimit) {
+			return BuiltOutput{}, losslessOutputLimitFailure(size, outputLimit)
+		}
 		return BuiltOutput{}, deterministicFailure("lossless_normalization_verification_failure", verification, err)
 	}
 	sourceVideo, outputVideo := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
@@ -1176,6 +1183,21 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	}
 	keep = true
 	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
+}
+
+func reachedLosslessOutputLimit(size, limit int64) bool {
+	return size > 0 && limit > 0 && size >= limit-limit/20
+}
+
+func losslessOutputLimitFailure(size, limit int64) error {
+	code := "lossless_normalization_expansion_cap"
+	if limit == r2.MaxConditionalPutBytes {
+		code = "output_exceeds_put_cap"
+	}
+	return deterministicFailure(code, struct {
+		OutputBytes int64 `json:"output_bytes"`
+		LimitBytes  int64 `json:"limit_bytes"`
+	}{size, limit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
 }
 
 func verifyLosslessNormalizedMedia(ctx context.Context, sources []LocalSource, outputPath string) (Verification, error) {

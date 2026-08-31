@@ -12,6 +12,7 @@ import (
 )
 
 func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
 	sources := []SourceClip{
 		{ClipID: 1, Object: ObjectIdentity{SizeBytes: 100}},
 		{ClipID: 2, Object: ObjectIdentity{SizeBytes: 250}},
@@ -21,6 +22,17 @@ func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
 		t.Fatal(err)
 	}
 	if want := uint64(8*350) + ScratchSafetyMarginBytes; got != want {
+		t.Fatalf("required scratch=%d want %d", got, want)
+	}
+}
+
+func TestRequiredScratchBytesKeepsStreamCopyBudgetWithoutFallback(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	got, err := RequiredScratchBytes([]SourceClip{{ClipID: 1, Object: ObjectIdentity{SizeBytes: 350}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(2*350) + ScratchSafetyMarginBytes; got != want {
 		t.Fatalf("required scratch=%d want %d", got, want)
 	}
 }

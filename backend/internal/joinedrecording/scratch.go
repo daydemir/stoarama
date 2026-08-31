@@ -61,10 +61,13 @@ func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 		}
 		sourceBytes += size
 	}
-	outputBytes := uint64(r2.MaxConditionalPutBytes)
-	if sourceBytes <= math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
-		if expanded := sourceBytes * uint64(losslessNormalizationExpansionLimit); expanded < outputBytes {
-			outputBytes = expanded
+	outputBytes := sourceBytes
+	if losslessNormalizationEnabled() {
+		outputBytes = uint64(r2.MaxConditionalPutBytes)
+		if sourceBytes <= math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
+			if expanded := sourceBytes * uint64(losslessNormalizationExpansionLimit); expanded < outputBytes {
+				outputBytes = expanded
+			}
 		}
 	}
 	maxScratch := uint64(math.MaxInt64)

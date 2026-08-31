@@ -226,6 +226,27 @@ func TestLosslessNativeTimelineKeepsAudioOnStrictPath(t *testing.T) {
 	}
 }
 
+func TestReachedLosslessOutputLimitAccountsForMuxerSlack(t *testing.T) {
+	if !reachedLosslessOutputLimit(950, 1000) || !reachedLosslessOutputLimit(1000, 1000) || reachedLosslessOutputLimit(949, 1000) || reachedLosslessOutputLimit(1, 0) {
+		t.Fatal("lossless output limit threshold differs")
+	}
+}
+
+func TestLosslessNormalizationRequiresExplicitWorkerOptIn(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "")
+	if losslessNormalizationEnabled() {
+		t.Fatal("lossless normalization enabled by default")
+	}
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
+	if !losslessNormalizationEnabled() {
+		t.Fatal("explicit lossless normalization opt-in was ignored")
+	}
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "TRUE")
+	if losslessNormalizationEnabled() {
+		t.Fatal("ambiguous lossless normalization opt-in was accepted")
+	}
+}
+
 func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)
@@ -761,19 +782,25 @@ func TestBuildAllPassingPartsPropagatesInfrastructureFailureWithoutPartialPlan(t
 }
 
 func TestBuildAllPassingPartsPreservesOutputCapPartition(t *testing.T) {
-	sources := makeSyntheticLocalSources(5)
-	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
-		if len(candidate) > 3 {
-			return BuiltOutput{}, deterministicFailure("output_exceeds_put_cap", struct {
-				CandidateCount int `json:"candidate_count"`
-			}{len(candidate)}, errors.New("bounded output cap"))
-		}
-		return BuiltOutput{SourceCount: len(candidate)}, nil
-	}
+	for _, reason := range []string{"output_exceeds_put_cap", "lossless_normalization_expansion_cap"} {
+		t.Run(reason, func(t *testing.T) {
+			sources := makeSyntheticLocalSources(5)
+			attempts := 0
+			attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+				attempts++
+				if len(candidate) > 3 {
+					return BuiltOutput{}, deterministicFailure(reason, struct {
+						CandidateCount int `json:"candidate_count"`
+					}{len(candidate)}, errors.New("bounded output cap"))
+				}
+				return BuiltOutput{SourceCount: len(candidate)}, nil
+			}
 
-	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
-	if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 3 || parts[1].SourceCount != 2 {
-		t.Fatalf("parts=%+v quarantines=%+v err=%v", parts, quarantines, err)
+			parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+			if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 3 || parts[1].SourceCount != 2 || attempts > 6 {
+				t.Fatalf("parts=%+v quarantines=%+v attempts=%d err=%v", parts, quarantines, attempts, err)
+			}
+		})
 	}
 }
 
