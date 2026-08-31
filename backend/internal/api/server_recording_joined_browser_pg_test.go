@@ -178,6 +178,37 @@ func TestRecordingJoinedProgressUsesExactPublishedMediaProvenance(t *testing.T) 
 	}
 }
 
+func TestRecordingJoinedProgressDoesNotReusePublishedOlderGeneration(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recordings(id,account_id,status) VALUES (60,47,'completed');
+		INSERT INTO recording_clips VALUES
+			(107,60,'2026-05-04 08:00:00Z','2026-05-04 08:02:00Z',NULL);
+		INSERT INTO recording_joined_hours VALUES
+			(205,1,47,60,'sealed','old-generation','2026-05-04',1,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z'),
+			(206,2,47,60,'pending','new-generation','2026-05-04',1,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z');
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id,start_at,end_at) VALUES
+			(407,205,1,47,60,107,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z'),
+			(408,206,2,47,60,107,'2026-05-04 08:00:00Z','2026-05-04 08:02:00Z');
+		INSERT INTO recording_joined_artifacts VALUES
+			(310,205,1,47,'hour_manifest','published',now(),'old-manifest','old-manifest-version','application/json','May/Monday/hour_01.json',10,repeat('4',64),'joined/private/old-manifest.json',1),
+			(311,205,1,47,'media','published',now(),'old-media','old-media-version','video/mp4','May/Monday/hour_01_part_01_0800-0801.mp4',10,repeat('5',64),'joined/private/old-media.mp4',1);
+		INSERT INTO recording_joined_media_sources VALUES (311,407,1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	progress, err := (&Server{pool: pool}).recordingJoinedProgressForAccount(ctx, 47, []int64{60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := progress[60]
+	if !ok || got.SourceDurationMS != 120_000 || got.JoinedReadyMS != 0 || got.Percent == nil || *got.Percent != 0 {
+		t.Fatalf("new frozen generation progress=%+v present=%t want source=120000 ready=0 percent=0", got, ok)
+	}
+}
+
 func TestRecordingJoinedBinProgressRejectsUnpublishedMismatchedAndPurgedSources(t *testing.T) {
 	pool := joinedBrowserTestPool(t)
 	seedJoinedBrowserTestData(t, pool)

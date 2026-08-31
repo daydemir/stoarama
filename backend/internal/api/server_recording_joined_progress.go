@@ -15,7 +15,7 @@ type recordingJoinedProgress struct {
 	Percent          *int  `json:"joined_percent"`
 }
 
-const recordingJoinedReadyFromCandidateHoursSQL = `SELECT DISTINCT src.clip_id
+const recordingJoinedReadyFromCandidateHoursSQL = `SELECT DISTINCT ms.source_id,src.clip_id
 	FROM candidate_hours h
 	JOIN recording_joined_artifacts media
 	  ON media.hour_record_id=h.id
@@ -58,12 +58,12 @@ const recordingJoinedProgressSQL = `WITH requested AS (
 	WHERE account_id=$1 AND status<>'canceled' AND id=ANY($2::bigint[])
 ), frozen_sources AS MATERIALIZED (
 	SELECT DISTINCT ON (src.recording_id,src.clip_id)
-		src.recording_id,src.clip_id,src.start_at,src.end_at
+		src.id AS source_id,src.recording_id,src.clip_id,src.start_at,src.end_at
 	FROM recording_joined_sources src
 	JOIN requested req ON req.recording_id=src.recording_id
 	WHERE src.account_id=$1 AND src.recording_id=ANY($2::bigint[])
 	ORDER BY src.recording_id,src.clip_id,src.batch_record_id DESC,src.id DESC
-), ready_clip_ids AS (` + recordingJoinedReadyClipsSQL + `), source AS (
+), ready_sources AS (` + recordingJoinedReadyClipsSQL + `), source AS (
 	SELECT src.recording_id,
 		COALESCE(sum(EXTRACT(epoch FROM (src.end_at-src.start_at))*1000),0)::bigint AS duration_ms
 	FROM frozen_sources src
@@ -72,7 +72,7 @@ const recordingJoinedProgressSQL = `WITH requested AS (
 	SELECT src.recording_id,
 		COALESCE(sum(EXTRACT(epoch FROM (src.end_at-src.start_at))*1000),0)::bigint AS duration_ms
 	FROM frozen_sources src
-	JOIN ready_clip_ids ready_clip ON ready_clip.clip_id=src.clip_id
+	JOIN ready_sources ready_source ON ready_source.source_id=src.source_id
 	GROUP BY src.recording_id
 )
 SELECT req.recording_id,COALESCE(source.duration_ms,0),COALESCE(ready.duration_ms,0)
