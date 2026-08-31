@@ -30,10 +30,14 @@ Run this on each disabled worker host with shell tracing off. The command emits
 one hash and never emits the token.
 
 ```sh
+set -eu
 set +x
 umask 077
 token_file=/etc/stoarama-joined-worker-token.env
-test ! -e "$token_file"
+if test -e "$token_file"; then
+  echo "refusing to overwrite existing worker token file" >&2
+  exit 1
+fi
 worker_token="$(openssl rand -hex 32)"
 printf 'STOARAMA_JOINED_WORKER_TOKEN=%s\n' "$worker_token" >"$token_file"
 chmod 600 "$token_file"
