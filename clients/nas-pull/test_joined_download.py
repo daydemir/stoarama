@@ -717,7 +717,15 @@ class JoinedDownloadTests(unittest.TestCase):
         for fingerprint in (verification["source_fingerprint"], verification["output_fingerprint"]):
             fingerprint["decoded_video_sha256"] = "d" * 64
         verification["acceptance_mode"] = "lossless_native_timeline_normalized"
-        trigger_facts = {"category": "stream_copy_changed_decoded_frames"}
+        rejected_source = json.loads(json.dumps(verification["source_fingerprint"]))
+        rejected_output = json.loads(json.dumps(verification["output_fingerprint"]))
+        rejected_output["decoded_video_sha256"] = "e" * 64
+        rejected_output["tracks"]["video"]["packet_chain_sha256"] = "e" * 64
+        trigger_facts = {
+            "status": "failed", "packet_payload_order_status": "", "decoded_frame_sequence_status": "failed",
+            "decoded_frame_totals_status": "", "decoded_audio_totals_status": "", "output_timestamp_status": "",
+            "strict_decode_status": "", "source_fingerprint": rejected_source, "output_fingerprint": rejected_output,
+        }
         verification["lossless_normalization"] = {
             "codec": "libx264", "preset": "veryfast", "quantizer": 0, "pixel_format": "yuv420p",
             "frame_rate": "10", "sample_aspect_ratio": "1:1", "color_range": "", "color_space": "",
@@ -741,10 +749,21 @@ class JoinedDownloadTests(unittest.TestCase):
         verification = {key: verification[key] for key in order}
         pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
 
-        verification["lossless_normalization"]["trigger_failure_facts"]["category"] = "fabricated"
-        with self.assertRaisesRegex(ValueError, "trigger evidence"):
+        verification["lossless_normalization"]["trigger_failure_facts"] = {"category": "fabricated"}
+        verification["lossless_normalization"]["trigger_failure_sha256"] = pull.joined_canonical_sha({"category": "fabricated"})
+        with self.assertRaisesRegex(ValueError, "rejected stream-copy"):
             pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
-        verification["lossless_normalization"]["trigger_failure_facts"] = {"category": "stream_copy_changed_decoded_frames"}
+        verification["lossless_normalization"]["trigger_failure_facts"] = trigger_facts
+        verification["lossless_normalization"]["trigger_failure_sha256"] = pull.joined_canonical_sha(trigger_facts)
+
+        unbound_trigger = json.loads(json.dumps(trigger_facts))
+        unbound_trigger["source_fingerprint"]["duration_seconds"] += 0.25
+        verification["lossless_normalization"]["trigger_failure_facts"] = unbound_trigger
+        verification["lossless_normalization"]["trigger_failure_sha256"] = pull.joined_canonical_sha(unbound_trigger)
+        with self.assertRaisesRegex(ValueError, "source fingerprint"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+        verification["lossless_normalization"]["trigger_failure_facts"] = trigger_facts
+        verification["lossless_normalization"]["trigger_failure_sha256"] = pull.joined_canonical_sha(trigger_facts)
 
         verification["lossless_normalization"]["output_decoded_frames"] += 1
         with self.assertRaisesRegex(ValueError, "frame evidence"):

@@ -151,7 +151,7 @@ func TestBuildLosslessNativeTimelinePreservesEveryDecodedFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	built, err := buildLosslessNativeTimeline(ctx, sources, dir, testLosslessTrigger())
+	built, err := buildLosslessNativeTimeline(ctx, sources, dir, testLosslessTrigger(t, sources))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestBuildLosslessNativeTimelinePreservesDisplayMetadataAndRejectsChanges(t 
 	}
 	first := makeSARClip("sar-one.mp4", "2/1", 1)
 	second := makeSARClip("sar-two.mp4", "2/1", 2)
-	built, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger())
+	built, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger(t, []LocalSource{first, second}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestBuildLosslessNativeTimelinePreservesDisplayMetadataAndRejectsChanges(t 
 	}
 
 	changed := makeSARClip("sar-changed.mp4", "1/1", 3)
-	_, err = buildLosslessNativeTimeline(context.Background(), []LocalSource{first, changed}, dir, testLosslessTrigger())
+	_, err = buildLosslessNativeTimeline(context.Background(), []LocalSource{first, changed}, dir, testLosslessTrigger(t, []LocalSource{first, changed}))
 	var deterministic *deterministicMediaError
 	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_layout_mismatch" {
 		t.Fatalf("display metadata change did not fail closed: %v", err)
@@ -235,7 +235,7 @@ func TestBuildSealedOutputReproducesFrozenLosslessModeWhenFlagIsOff(t *testing.T
 	if err := os.MkdirAll(originalDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	original, err := buildLosslessNativeTimeline(context.Background(), sources, originalDir, testLosslessTrigger())
+	original, err := buildLosslessNativeTimeline(context.Background(), sources, originalDir, testLosslessTrigger(t, sources))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,25 +291,24 @@ func TestLosslessNativeTimelineKeepsAudioOnStrictPath(t *testing.T) {
 	first := makeMediaClip(t, dir, "audio-one.mp4", 440, true)
 	second := makeMediaClip(t, dir, "audio-two.mp4", 880, true)
 	first.ClipID, second.ClipID = 1, 2
-	_, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger())
+	_, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger(t, []LocalSource{first, second}))
 	var deterministic *deterministicMediaError
 	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_audio_unsupported" {
 		t.Fatalf("audio-bearing candidate did not fail closed: %v", err)
 	}
 }
 
-func testLosslessTrigger() *deterministicMediaError {
-	err := deterministicFailure("media_sequence_mismatch", struct {
-		Stage string `json:"stage"`
-	}{"stream_copy"}, errors.New("stream copy changed decoded frames"))
-	failure, _ := deterministicBuildFailure(err)
-	return failure
-}
-
-func TestReachedLosslessOutputLimitAccountsForMuxerSlack(t *testing.T) {
-	if !reachedLosslessOutputLimit(950, 1000) || !reachedLosslessOutputLimit(1000, 1000) || reachedLosslessOutputLimit(949, 1000) || reachedLosslessOutputLimit(1, 0) {
-		t.Fatal("lossless output limit threshold differs")
+func testLosslessTrigger(t *testing.T, sources []LocalSource) *deterministicMediaError {
+	t.Helper()
+	if len(sources) < 2 {
+		t.Fatal("lossless trigger fixture requires multiple sources")
 	}
+	_, err := VerifyJoinedMedia(context.Background(), sources, sources[0].Path)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "media_sequence_mismatch" {
+		t.Fatalf("make rejected stream-copy evidence: %v", err)
+	}
+	return failure
 }
 
 func TestLosslessExpansionLimitUsesSingleExplicitProof(t *testing.T) {
@@ -902,6 +901,22 @@ func TestBuildAllPassingPartsPreservesOutputCapPartition(t *testing.T) {
 	}
 }
 
+func TestSizeBoundPartitionDoesNotAssumePerPrefixExpansionIsMonotonic(t *testing.T) {
+	sources := makeSyntheticLocalSources(5)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if candidate[0].ClipID == 1 && (len(candidate) == 5 || len(candidate) == 2) {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_expansion_cap", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("candidate-specific expansion cap"))
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 4 || parts[1].SourceCount != 1 {
+		t.Fatalf("nonmonotonic expansion partition=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	}
+}
+
 func TestBuildAllPassingPartsOutputCapKeepsLargeWorkloadAndQuarantine(t *testing.T) {
 	sources := makeSyntheticLocalSources(60)
 	attempts := 0
@@ -926,8 +941,8 @@ func TestBuildAllPassingPartsOutputCapKeepsLargeWorkloadAndQuarantine(t *testing
 	if err != nil || len(parts) != 20 || len(quarantines) != 1 || quarantines[0].Source.ClipID != 10 {
 		t.Fatalf("parts=%d quarantines=%+v attempts=%d err=%v", len(parts), quarantines, attempts, err)
 	}
-	if attempts > 100 {
-		t.Fatalf("size-bounded search regressed toward linear full encodes: attempts=%d", attempts)
+	if attempts <= 6*len(sources)+2 {
+		t.Fatalf("fixture did not exercise exhaustive longest-prefix proof: attempts=%d", attempts)
 	}
 }
 

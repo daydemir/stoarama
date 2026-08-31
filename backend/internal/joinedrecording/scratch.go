@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 
-	"github.com/daydemir/stoarama/backend/internal/r2"
 	"golang.org/x/sys/unix"
 )
 
@@ -48,12 +47,10 @@ func WorkerTaskBudgetBytes(available int64) (int64, error) {
 		if err != nil || legacy > available {
 			return false
 		}
-		output := int64(r2.MaxConditionalPutBytes)
-		if source <= math.MaxInt64/losslessNormalizationExpansionLimit {
-			if expanded := source * losslessNormalizationExpansionLimit; expanded < output {
-				output = expanded
-			}
+		if source > math.MaxInt64/losslessNormalizationExpansionLimit {
+			return false
 		}
+		output := source * losslessNormalizationExpansionLimit
 		return source <= available-output
 	}
 	low, high := int64(0), available
@@ -90,9 +87,9 @@ func (e *ScratchHeadroomError) Error() string {
 }
 
 // RequiredScratchBytes reserves the complete frozen source set plus the
-// bounded QP 0 fallback output, then adds a fixed safety margin. The fallback
-// may expand compact source media by at most seven times and can never exceed
-// the single-object conditional PUT cap.
+// bounded QP 0 fallback outputs, then adds a fixed safety margin. Each part is
+// capped independently, so the aggregate retained outputs reserve seven times
+// the complete source set even when the R2 single-object cap creates parts.
 func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 	return requiredScratchBytes(sources, losslessNormalizationEnabled())
 }
@@ -111,12 +108,10 @@ func requiredScratchBytes(sources []SourceClip, lossless bool) (uint64, error) {
 	}
 	outputBytes := sourceBytes
 	if lossless {
-		outputBytes = uint64(r2.MaxConditionalPutBytes)
-		if sourceBytes <= math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
-			if expanded := sourceBytes * uint64(losslessNormalizationExpansionLimit); expanded < outputBytes {
-				outputBytes = expanded
-			}
+		if sourceBytes > math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
+			return 0, fmt.Errorf("joined lossless output scratch size overflows")
 		}
+		outputBytes = sourceBytes * uint64(losslessNormalizationExpansionLimit)
 	}
 	maxScratch := uint64(math.MaxInt64)
 	if outputBytes > maxScratch-ScratchSafetyMarginBytes || sourceBytes > maxScratch-outputBytes-ScratchSafetyMarginBytes {

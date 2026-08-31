@@ -625,7 +625,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 			emitStageTiming(ctx, "media_candidate_size", time.Since(started), err)
 			return built, err
 		}
-		return buildSizeBoundParts(ctx, sources, scratchDir, mediaToolIdentity, timedAttempt, firstFailure)
+		return buildSizeBoundParts(ctx, sources, scratchDir, mediaToolIdentity, timedAttempt)
 	} else {
 		if repeatedBuild, repeatFailure, repeatErr := repeatMatchingFailure(run, "full_repeat", sources, firstFailure); repeatErr != nil {
 			return nil, nil, repeatErr
@@ -814,13 +814,12 @@ func repeatMatchingFailure(run func(string, []LocalSource) (BuiltOutput, error),
 	return BuiltOutput{}, second, nil
 }
 
-func buildSizeBoundParts(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, initialFailure *deterministicMediaError) ([]BuiltOutput, []QuarantinedBuild, error) {
+func buildSizeBoundParts(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt) ([]BuiltOutput, []QuarantinedBuild, error) {
 	remaining := sources
 	parts := make([]BuiltOutput, 0, 1)
 	quarantines := []QuarantinedBuild{}
 	for len(remaining) > 0 {
-		part, err := buildLargestSizeBoundPrefix(ctx, remaining, scratchDir, mediaToolIdentity, attempt, initialFailure)
-		initialFailure = nil
+		part, err := buildLargestPassingPrefix(ctx, remaining, scratchDir, mediaToolIdentity, attempt)
 		if err != nil {
 			var failure *deterministicMediaError
 			if !errors.As(err, &failure) || outputSizeFailure(failure) {
@@ -844,126 +843,6 @@ func buildSizeBoundParts(ctx context.Context, sources []LocalSource, scratchDir,
 		remaining = remaining[part.SourceCount:]
 	}
 	return parts, quarantines, nil
-}
-
-// buildLargestSizeBoundPrefix assumes only the monotonic property needed for
-// a prefix split: once adding a source makes the exact candidate fail, larger
-// prefixes cannot establish a shorter passing boundary. It grows
-// exponentially, then bisects, and finally proves the exact adjacent
-// extension. This avoids up to N full lossless encodes per size-bounded part.
-func buildLargestSizeBoundPrefix(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, knownFullFailure *deterministicMediaError) (BuiltOutput, error) {
-	if len(sources) == 0 {
-		return BuiltOutput{}, fmt.Errorf("bounded sources are required")
-	}
-	attemptPrefix := func(n int) (BuiltOutput, *deterministicMediaError, error) {
-		built, err := attempt(ctx, sources[:n], scratchDir)
-		if err == nil {
-			if built.SourceCount != n {
-				discardIsolatedBuild(built, scratchDir)
-				return BuiltOutput{}, nil, fmt.Errorf("size-bounded attempt source accounting differs")
-			}
-			return built, nil, nil
-		}
-		failure, ok := deterministicBuildFailure(err)
-		if !ok {
-			return BuiltOutput{}, nil, err
-		}
-		return BuiltOutput{}, failure, err
-	}
-
-	best, failure, err := attemptPrefix(1)
-	if err != nil {
-		if outputSizeFailure(failure) {
-			return BuiltOutput{}, err
-		}
-		repeatedBuild, repeated, repeatErr := repeatMatchingFailure(func(_ string, candidate []LocalSource) (BuiltOutput, error) {
-			return attempt(ctx, candidate, scratchDir)
-		}, "size_singleton_repeat", sources[:1], failure)
-		if repeatErr != nil {
-			return BuiltOutput{}, repeatErr
-		}
-		if repeated == nil {
-			discardIsolatedBuild(repeatedBuild, scratchDir)
-			return BuiltOutput{}, fmt.Errorf("%w: size-bounded singleton failure was not repeatable", errMediaSplitNotIsolated)
-		}
-		return BuiltOutput{}, err
-	}
-	if len(sources) == 1 {
-		return best, nil
-	}
-
-	low, high := 1, len(sources)
-	failedAt := 0
-	var adjacentFailure *deterministicMediaError
-	for probe := 2; ; probe *= 2 {
-		if probe > len(sources) {
-			probe = len(sources)
-		}
-		if probe == len(sources) && knownFullFailure != nil {
-			high, failedAt, adjacentFailure = probe-1, probe, knownFullFailure
-			break
-		}
-		built, candidateFailure, candidateErr := attemptPrefix(probe)
-		if candidateErr == nil {
-			discardIsolatedBuild(best, scratchDir)
-			best, low = built, probe
-			if probe == len(sources) {
-				return best, nil
-			}
-			continue
-		}
-		if candidateFailure == nil {
-			discardIsolatedBuild(best, scratchDir)
-			return BuiltOutput{}, candidateErr
-		}
-		high, failedAt, adjacentFailure = probe-1, probe, candidateFailure
-		break
-	}
-
-	for low < high {
-		mid := low + (high-low+1)/2
-		built, candidateFailure, candidateErr := attemptPrefix(mid)
-		if candidateErr == nil {
-			discardIsolatedBuild(best, scratchDir)
-			best, low = built, mid
-			continue
-		}
-		if candidateFailure == nil {
-			discardIsolatedBuild(best, scratchDir)
-			return BuiltOutput{}, candidateErr
-		}
-		high, failedAt, adjacentFailure = mid-1, mid, candidateFailure
-	}
-
-	adjacent := low + 1
-	if failedAt != adjacent {
-		_, candidateFailure, candidateErr := attemptPrefix(adjacent)
-		if candidateErr == nil || candidateFailure == nil {
-			discardIsolatedBuild(best, scratchDir)
-			if candidateErr == nil {
-				return BuiltOutput{}, fmt.Errorf("%w: size-bounded adjacent extension unexpectedly passed", errMediaSplitNotIsolated)
-			}
-			return BuiltOutput{}, candidateErr
-		}
-		adjacentFailure = candidateFailure
-	}
-	repeats := 1
-	if !outputSizeFailure(adjacentFailure) {
-		repeatedBuild, repeated, repeatErr := repeatMatchingFailure(func(_ string, candidate []LocalSource) (BuiltOutput, error) {
-			return attempt(ctx, candidate, scratchDir)
-		}, "size_adjacent_repeat", sources[:adjacent], adjacentFailure)
-		if repeatErr != nil || repeated == nil {
-			discardIsolatedBuild(best, scratchDir)
-			if repeatErr != nil {
-				return BuiltOutput{}, repeatErr
-			}
-			discardIsolatedBuild(repeatedBuild, scratchDir)
-			return BuiltOutput{}, fmt.Errorf("%w: size-bounded adjacent failure was not repeatable", errMediaSplitNotIsolated)
-		}
-		repeats = 2
-	}
-	best.SplitEvidence = []MaximalityEvidence{maximalityEvidence(sources[:adjacent], adjacentFailure, repeats, mediaToolIdentity)}
-	return best, nil
 }
 
 func discardIsolatedBuild(built BuiltOutput, scratchDir string) {
@@ -1338,9 +1217,6 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	encodeArgs = appendLosslessDisplayMetadata(encodeArgs, layout)
 	encodeArgs = append(encodeArgs, "-movflags", "+faststart", "-fs", strconv.FormatInt(outputLimit, 10), outputPath)
 	if err := runBounded(ctx, ffmpegBinary(), encodeArgs...); err != nil {
-		if info, statErr := os.Stat(outputPath); statErr == nil && reachedLosslessOutputLimit(info.Size(), outputLimit) {
-			return BuiltOutput{}, losslessOutputLimitFailure(info.Size(), outputLimit)
-		}
 		return BuiltOutput{}, deterministicCommandFailure(ctx, "lossless_normalization_encode_failure", err)
 	}
 	size, sha, err := localIdentity(outputPath)
@@ -1352,9 +1228,6 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	}
 	verification, err := verifyLosslessNormalizedMedia(ctx, sources, outputPath, layout)
 	if err != nil {
-		if reachedLosslessOutputLimit(size, outputLimit) {
-			return BuiltOutput{}, losslessOutputLimitFailure(size, outputLimit)
-		}
 		return BuiltOutput{}, deterministicFailure("lossless_normalization_verification_failure", verification, err)
 	}
 	sourceVideo, outputVideo := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
@@ -1390,10 +1263,6 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	}
 	keep = true
 	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
-}
-
-func reachedLosslessOutputLimit(size, limit int64) bool {
-	return size > 0 && limit > 0 && size >= limit-limit/20
 }
 
 func losslessOutputLimitFailure(size, limit int64) error {
@@ -1491,7 +1360,7 @@ func validateLosslessNormalizationVerification(v Verification) error {
 		return fmt.Errorf("lossless normalization codec evidence differs")
 	}
 	triggerSHA, triggerFacts, triggerErr := stitchcert.CanonicalSHA(evidence.TriggerFailureFacts)
-	if triggerErr != nil || len(triggerFacts) == 0 || triggerSHA != evidence.TriggerFailureSHA256 {
+	if triggerErr != nil || len(triggerFacts) == 0 || triggerSHA != evidence.TriggerFailureSHA256 || validateRejectedStreamCopyVerification(evidence.TriggerFailureFacts, v.SourceFingerprint) != nil {
 		return fmt.Errorf("lossless normalization trigger evidence differs")
 	}
 	rate, ok := new(big.Rat).SetString(evidence.FrameRate)
@@ -1510,6 +1379,20 @@ func validateLosslessNormalizationVerification(v Verification) error {
 	sourceVideo, outputVideo := v.SourceFingerprint.Tracks["video"], v.OutputFingerprint.Tracks["video"]
 	if sourceVideo == nil || outputVideo == nil || sourceVideo.TimestampStatus != "source_clips_independent" || outputVideo.TimestampStatus != "monotonic" || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || evidence.SourceDecodedFrames != sourceVideo.DecodedFrames || evidence.OutputDecodedFrames != outputVideo.DecodedFrames || v.SourceFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 || v.OutputFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 {
 		return fmt.Errorf("lossless normalization decoded frame evidence differs")
+	}
+	return nil
+}
+
+func validateRejectedStreamCopyVerification(raw json.RawMessage, normalizedSource MediaFingerprint) error {
+	var rejected Verification
+	if decodeStrictJSON(raw, &rejected) != nil || rejected.Status != "failed" || rejected.AcceptanceMode != "" || rejected.LosslessNormalization != nil || rejected.PacketPayloadOrderStatus != "" || rejected.DecodedFrameSequenceStatus != "failed" || rejected.DecodedFrameTotalsStatus != "" || rejected.DecodedAudioTotalsStatus != "" || rejected.OutputTimestampStatus != "" || rejected.StrictDecodeStatus != "" {
+		return fmt.Errorf("rejected stream-copy status evidence differs")
+	}
+	if validateFingerprint(rejected.SourceFingerprint, false) != nil || validateFingerprint(rejected.OutputFingerprint, false) != nil || !lowerHex64(rejected.SourceFingerprint.DecodedVideoSHA256) || !lowerHex64(rejected.OutputFingerprint.DecodedVideoSHA256) || !sameCanonical([]MediaFingerprint{rejected.SourceFingerprint}, []MediaFingerprint{normalizedSource}) {
+		return fmt.Errorf("rejected stream-copy fingerprint evidence differs")
+	}
+	if compareFingerprints(rejected.SourceFingerprint, rejected.OutputFingerprint) == nil || validateDecodedEquivalentFingerprints(rejected.SourceFingerprint, rejected.OutputFingerprint) == nil {
+		return fmt.Errorf("stream-copy evidence does not prove both acceptance modes rejected it")
 	}
 	return nil
 }
@@ -1666,6 +1549,19 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 	if strictErr := compareFingerprints(expected, actual); strictErr != nil {
 		decodedVideoSHA, relaxedErr := compareDecodedEquivalent(ctx, sources, outputPath, expected, actual)
 		if relaxedErr != nil {
+			sourcePaths := make([]string, len(sources))
+			for i := range sources {
+				sourcePaths[i] = sources[i].Path
+			}
+			wantFrames, wantSHA, wantErr := decodedVideoSequenceIdentity(ctx, sourcePaths)
+			gotFrames, gotSHA, gotErr := decodedVideoSequenceIdentity(ctx, []string{outputPath})
+			wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
+			if wantErr != nil || gotErr != nil || wantVideo == nil || gotVideo == nil || wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || !lowerHex64(wantSHA) || !lowerHex64(gotSHA) {
+				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source=%v output=%v", wantErr, gotErr)
+			}
+			verification.SourceFingerprint.DecodedVideoSHA256 = wantSHA
+			verification.OutputFingerprint.DecodedVideoSHA256 = gotSHA
+			verification.DecodedFrameSequenceStatus = "failed"
 			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%v", strictErr, relaxedErr))
 		}
 		verification.AcceptanceMode = "decoded_frame_equivalent"

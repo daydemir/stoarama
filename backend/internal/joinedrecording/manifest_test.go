@@ -843,9 +843,18 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 	verification.SourceFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
 	verification.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
 	frames := verification.SourceFingerprint.Tracks["video"].DecodedFrames
-	triggerSHA, triggerFacts, err := stitchcert.CanonicalSHA(struct {
-		Stage string `json:"stage"`
-	}{"stream_copy"})
+	rejected := passingVerification()
+	rejected.Status = "failed"
+	rejected.PacketPayloadOrderStatus = ""
+	rejected.DecodedFrameSequenceStatus = "failed"
+	rejected.DecodedFrameTotalsStatus = ""
+	rejected.DecodedAudioTotalsStatus = ""
+	rejected.OutputTimestampStatus = ""
+	rejected.StrictDecodeStatus = ""
+	rejected.SourceFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
+	rejected.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("e", 64)
+	rejected.OutputFingerprint.Tracks["video"].PacketChainSHA256 = strings.Repeat("e", 64)
+	triggerSHA, triggerFacts, err := stitchcert.CanonicalSHA(rejected)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,9 +880,31 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 		t.Fatal("lossless normalization manifest accepted mismatched frame accounting")
 	}
 	mutated = cloneHourManifest(t, manifest)
-	mutated.Media[0].Verification.LosslessNormalization.TriggerFailureFacts = json.RawMessage(`{"stage":"fabricated"}`)
+	fabricatedSHA, fabricatedFacts, err := stitchcert.CanonicalSHA(struct {
+		Category string `json:"category"`
+	}{"fabricated"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated.Media[0].Verification.LosslessNormalization.TriggerFailureFacts = fabricatedFacts
+	mutated.Media[0].Verification.LosslessNormalization.TriggerFailureSHA256 = fabricatedSHA
 	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
-		t.Fatal("lossless normalization manifest accepted unbound stream-copy rejection facts")
+		t.Fatal("lossless normalization manifest accepted self-consistent but fabricated stream-copy rejection facts")
+	}
+	mutated = cloneHourManifest(t, manifest)
+	var unbound Verification
+	if err := json.Unmarshal(mutated.Media[0].Verification.LosslessNormalization.TriggerFailureFacts, &unbound); err != nil {
+		t.Fatal(err)
+	}
+	unbound.SourceFingerprint.DurationSeconds += 0.25
+	unboundSHA, unboundFacts, err := stitchcert.CanonicalSHA(unbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated.Media[0].Verification.LosslessNormalization.TriggerFailureFacts = unboundFacts
+	mutated.Media[0].Verification.LosslessNormalization.TriggerFailureSHA256 = unboundSHA
+	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+		t.Fatal("lossless normalization manifest accepted rejected stream-copy facts from different sources")
 	}
 	singleton := oneOutputPlan(t)
 	singletonAllocation, singletonLedger := testAllocation(singleton)

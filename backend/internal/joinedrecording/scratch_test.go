@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/daydemir/stoarama/backend/internal/r2"
 	"golang.org/x/sys/unix"
 )
 
@@ -24,6 +23,19 @@ func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
 	}
 	if want := uint64(8*350) + ScratchSafetyMarginBytes; got != want {
 		t.Fatalf("required scratch=%d want %d", got, want)
+	}
+}
+
+func TestRequiredScratchBytesReservesAllRetainedLosslessParts(t *testing.T) {
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
+	const sourceBytes int64 = 1 << 30
+	got, err := RequiredScratchBytes([]SourceClip{{ClipID: 1, Object: ObjectIdentity{SizeBytes: sourceBytes}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := uint64(sourceBytes*(1+losslessNormalizationExpansionLimit)) + ScratchSafetyMarginBytes
+	if got != want {
+		t.Fatalf("multipart lossless scratch=%d want %d", got, want)
 	}
 }
 
@@ -49,7 +61,7 @@ func TestWorkerTaskBudgetCannotAdmitMoreThanLosslessPreflightFits(t *testing.T) 
 		t.Fatalf("lossless task budget=%d available=%d", taskBudget, available)
 	}
 	maxSource := (taskBudget - JoinedScratchFixedBytes) / 2
-	if maxSource <= 0 || maxSource+min(maxSource*losslessNormalizationExpansionLimit, int64(r2.MaxConditionalPutBytes)) > available {
+	if maxSource <= 0 || maxSource+maxSource*losslessNormalizationExpansionLimit > available {
 		t.Fatalf("server-admitted source=%d exceeds local lossless budget=%d", maxSource, available)
 	}
 
