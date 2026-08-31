@@ -112,8 +112,8 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 				}
 			}
 			if tc.wantRecent {
-				// Authenticated lists retain the compatibility field, but its exact
-				// clip scan belongs to enrichment rather than the baseline response.
+				// Authenticated lists retain the compatibility field without making
+				// its historical clip scan part of the baseline response.
 				if got := string(items[0]["recent_clip_count"]); got != "0" {
 					t.Fatalf("baseline recent_clip_count=%s want placeholder 0", got)
 				}
@@ -142,8 +142,8 @@ func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
 		VALUES(1,47,'Exact storage','https://example.test','auto','clips','access',''::bytea,'verified');
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
 		VALUES(700,47,1,'Exact metric detail','https://example.test/live.m3u8','active',now()-interval '5 minutes','sampled','* * * * *','UTC',60);
-		INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at)
-		VALUES(700,1,now()-interval '1 minute',now());
+		INSERT INTO recording_clips(recording_id,storage_destination_id,size_bytes,clip_start_at,clip_end_at)
+		VALUES(700,1,1,now()-interval '1 minute',now());
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -369,8 +369,8 @@ func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t
 		UPDATE recordings SET status='active' WHERE id=700;
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
 		VALUES(900,99,2,'Foreign batch recording','https://example.test/foreign.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60);
-		INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at)
-		VALUES(700,1,now()-interval '1 minute',now());
+		INSERT INTO recording_clips(recording_id,storage_destination_id,size_bytes,clip_start_at,clip_end_at)
+		VALUES(700,1,1,now()-interval '1 minute',now());
 	`); err != nil {
 		t.Fatal(err)
 	}
