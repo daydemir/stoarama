@@ -692,7 +692,7 @@ class JoinedDownloadTests(unittest.TestCase):
         verification["decoded_frame_sequence_status"] = "passed"
         for fingerprint in (verification["source_fingerprint"], verification["output_fingerprint"]):
             fingerprint["decoded_video_sha256"] = "d" * 64
-        verification["output_fingerprint"]["tracks"]["video"]["packet_chain_sha256"] = "e" * 64
+        verification["output_fingerprint"]["tracks"]["video"]["packet_timing_sha256"] = "e" * 64
         order = (
             "status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status",
             "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status",
@@ -700,6 +700,11 @@ class JoinedDownloadTests(unittest.TestCase):
         )
         verification = {key: verification[key] for key in order}
         pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+
+        verification["output_fingerprint"]["tracks"]["video"]["packet_chain_sha256"] = "e" * 64
+        with self.assertRaisesRegex(ValueError, "fingerprint sequence"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+        verification["output_fingerprint"]["tracks"]["video"]["packet_chain_sha256"] = verification["source_fingerprint"]["tracks"]["video"]["packet_chain_sha256"]
 
         verification["output_fingerprint"]["decoded_video_sha256"] = "f" * 64
         with self.assertRaisesRegex(ValueError, "decoded video sequence"):

@@ -792,6 +792,44 @@ func TestHourManifestV1Golden(t *testing.T) {
 	}
 }
 
+func TestHourManifestAcceptsDecodedFrameEquivalentVerification(t *testing.T) {
+	plan := oneOutputPlan(t)
+	verification := passingVerification()
+	verification.AcceptanceMode = "decoded_frame_equivalent"
+	verification.DecodedFrameSequenceStatus = "passed"
+	verification.SourceFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
+	verification.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
+	verification.OutputFingerprint.Tracks["video"].PacketTimingSHA256 = strings.Repeat("e", 64)
+	built := []BuiltOutput{{
+		SizeBytes:    plan.Outputs[0].ExpectedSize,
+		SHA256:       plan.Outputs[0].ExpectedSHA,
+		SourceCount:  1,
+		Verification: verification,
+	}}
+	allocation, ledger := testAllocation(plan)
+
+	manifest, _, _, err := BuildHourManifest(HourManifestInput{
+		Plan: plan, Allocation: allocation, AllocationLedger: ledger,
+		MediaArtifactIDs: []int64{88}, Built: built,
+	})
+	if err != nil {
+		t.Fatalf("decoded-frame-equivalent verification did not seal: %v", err)
+	}
+	if _, _, err := CanonicalHourManifestArtifact(manifest); err != nil {
+		t.Fatalf("decoded-frame-equivalent manifest did not revalidate: %v", err)
+	}
+	changedPayload := cloneHourManifest(t, manifest)
+	changedPayload.Media[0].Verification.OutputFingerprint.Tracks["video"].PacketChainSHA256 = strings.Repeat("f", 64)
+	if _, _, err := CanonicalHourManifestArtifact(changedPayload); err == nil {
+		t.Fatal("decoded-frame-equivalent manifest accepted a changed packet payload sequence")
+	}
+	changedFrames := cloneHourManifest(t, manifest)
+	changedFrames.Media[0].Verification.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("f", 64)
+	if _, _, err := CanonicalHourManifestArtifact(changedFrames); err == nil {
+		t.Fatal("decoded-frame-equivalent manifest accepted a changed output frame sequence")
+	}
+}
+
 func TestHourManifestAllocationUsesCanonicalLedgerProjection(t *testing.T) {
 	plan := oneOutputPlan(t)
 	allocation, ledger := testAllocation(plan)

@@ -985,8 +985,8 @@ func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, output
 	}
 	for mediaType, want := range expected.Tracks {
 		got := actual.Tracks[mediaType]
-		if got == nil || want.TimestampStatus != "source_clips_independent" || got.TimestampStatus != "monotonic" || want.DecodedFrames <= 0 || want.DecodedFrames != got.DecodedFrames || (mediaType == "audio" && want.DecodedSamples != got.DecodedSamples) {
-			return "", fmt.Errorf("joined %s decoded totals or timeline mismatch", mediaType)
+		if got == nil || want.TimestampStatus != "source_clips_independent" || got.TimestampStatus != "monotonic" || want.PacketCount != got.PacketCount || want.PacketChainSHA256 != got.PacketChainSHA256 || want.DecodedFrames <= 0 || want.DecodedFrames != got.DecodedFrames || (mediaType == "audio" && want.DecodedSamples != got.DecodedSamples) {
+			return "", fmt.Errorf("joined %s packet payload, decoded totals, or timeline mismatch", mediaType)
 		}
 	}
 	if expected.EffectiveAudioBytes != actual.EffectiveAudioBytes || expected.EffectiveAudioFrames != actual.EffectiveAudioFrames || expected.EffectiveAudioSHA256 != actual.EffectiveAudioSHA256 {

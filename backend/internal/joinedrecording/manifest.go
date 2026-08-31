@@ -662,8 +662,39 @@ func sourceSubsetByIDs(accounted []SourceClip, ids []int64) ([]SourceClip, error
 }
 
 func validatePassedVerification(v Verification) error {
-	if v.Status != "passed" || v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" || validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil || compareFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+	if v.Status != "passed" || v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" || validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil {
 		return fmt.Errorf("complete media verification did not pass")
+	}
+	switch v.AcceptanceMode {
+	case "":
+		if v.DecodedFrameSequenceStatus != "" || compareFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+			return fmt.Errorf("complete media verification did not pass")
+		}
+	case "decoded_frame_equivalent":
+		if v.DecodedFrameSequenceStatus != "passed" || validateDecodedEquivalentFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+			return fmt.Errorf("complete media verification did not pass")
+		}
+	default:
+		return fmt.Errorf("complete media verification did not pass")
+	}
+	return nil
+}
+
+func validateDecodedEquivalentFingerprints(expected, actual MediaFingerprint) error {
+	if len(expected.Tracks) != len(actual.Tracks) || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 || !lowerHex64(expected.DecodedVideoSHA256) || expected.DecodedVideoSHA256 != actual.DecodedVideoSHA256 {
+		return fmt.Errorf("decoded frame equivalent fingerprint differs")
+	}
+	for mediaType, want := range expected.Tracks {
+		got := actual.Tracks[mediaType]
+		if got == nil || want.TimestampStatus != "source_clips_independent" || want.PacketCount != got.PacketCount || want.PacketChainSHA256 != got.PacketChainSHA256 || want.DecodedFrames != got.DecodedFrames || (mediaType == "audio" && want.DecodedSamples != got.DecodedSamples) {
+			return fmt.Errorf("decoded frame equivalent track differs")
+		}
+	}
+	if expected.EffectiveAudioBytes != actual.EffectiveAudioBytes || expected.EffectiveAudioFrames != actual.EffectiveAudioFrames || expected.EffectiveAudioSHA256 != actual.EffectiveAudioSHA256 {
+		return fmt.Errorf("decoded frame equivalent audio differs")
+	}
+	if len(expected.AudioContracts) > 0 && (len(actual.AudioContracts) != 1 || !sameAudioFormat(expected.AudioContracts[0], actual.AudioContracts[0])) {
+		return fmt.Errorf("decoded frame equivalent audio format differs")
 	}
 	return nil
 }
