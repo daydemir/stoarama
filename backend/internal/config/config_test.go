@@ -150,6 +150,7 @@ func TestJoinedWorkerBootstrapSHA256AllowlistFailsClosed(t *testing.T) {
 	for _, raw := range []string{
 		"abc",
 		strings.Repeat("A", sha256.Size*2),
+		" " + hex.EncodeToString(workerDigest[:]),
 		hex.EncodeToString(workerDigest[:]) + ", " + strings.Repeat("a", sha256.Size*2),
 		hex.EncodeToString(workerDigest[:]) + "," + hex.EncodeToString(workerDigest[:]),
 		hex.EncodeToString(protected[:]),

@@ -200,7 +200,7 @@ func Load() (Config, error) {
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
-		JoinedWorkerBootstrapHashes:      strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST")),
+		JoinedWorkerBootstrapHashes:      os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST"),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
 		JoinedOperatorToken:              strings.TrimSpace(os.Getenv("STOARAMA_JOINED_OPERATOR_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
