@@ -113,6 +113,12 @@ func TestVerifyJoinedMediaAllowsDecodedEquivalentTimebaseNormalization(t *testin
 	if verification.Status != "passed" || verification.AcceptanceMode != "decoded_frame_equivalent" || verification.DecodedFrameSequenceStatus != "passed" || !lowerHex64(verification.SourceFingerprint.DecodedVideoSHA256) || verification.SourceFingerprint.DecodedVideoSHA256 != verification.OutputFingerprint.DecodedVideoSHA256 || verification.StrictDecodeStatus != "passed" {
 		t.Fatalf("normalized timebase was not accepted by decoded equivalence: %+v", verification)
 	}
+	for mediaType, want := range verification.SourceFingerprint.Tracks {
+		got := verification.OutputFingerprint.Tracks[mediaType]
+		if got == nil || want.PacketCount != got.PacketCount || want.PacketChainSHA256 != got.PacketChainSHA256 {
+			t.Fatalf("decoded equivalence certified changed %s packet payloads", mediaType)
+		}
+	}
 }
 
 func TestVerifyJoinedMediaRejectsChangedDecodedFrames(t *testing.T) {
@@ -126,7 +132,7 @@ func TestVerifyJoinedMediaRejectsChangedDecodedFrames(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := VerifyJoinedMedia(ctx, []LocalSource{source}, changedPath)
-	if err == nil || !strings.Contains(err.Error(), "media_sequence_mismatch") || !strings.Contains(err.Error(), "decoded video frame sequence mismatch") {
+	if err == nil || !strings.Contains(err.Error(), "media_sequence_mismatch") || !strings.Contains(err.Error(), "packet payload, decoded totals, or timeline mismatch") {
 		t.Fatalf("changed decoded frames were not rejected: %v", err)
 	}
 }

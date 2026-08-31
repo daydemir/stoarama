@@ -3824,7 +3824,7 @@ def valid_verification(verification):
             raise ValueError("joined decoded video sequence conflicts")
     for media_type, want in expected["tracks"].items():
         got = actual["tracks"][media_type]
-        comparable = (("decoded_frames",) if relaxed else (
+        comparable = (("packet_count", "packet_chain_sha256", "decoded_frames") if relaxed else (
             "packet_time_bases", "packet_duration_seconds", "first_packet_pts_seconds", "last_packet_pts_seconds",
             "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_count", "packet_chain_sha256",
             "packet_timing_sha256", "decoded_frames",
