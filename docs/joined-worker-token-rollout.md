@@ -2,7 +2,8 @@
 
 This migration lets each dedicated join host create and retain its own worker
 bootstrap token. Only the token's SHA-256 hash leaves that host. The existing
-shared bootstrap token remains valid until every old worker has moved.
+shared bootstrap token remains valid while old workers move, then can be
+retired in a separate change after this rollout.
 
 It changes bootstrap authentication only. It does not change recording, raw
 objects, joined objects, claims, leases, or the signing key.
@@ -23,14 +24,17 @@ objects, joined objects, claims, leases, or the signing key.
 - Stop a host before revoking its hash. A claim token minted before revocation
   can remain valid for up to 10 minutes, and an active operation token remains
   fenced by its database lease.
+- A per-host token supports individual revocation. It is not host attestation
+  or trusted attribution. An allowed token can be replayed from another host,
+  and the later `worker_id` is supplied by the client.
 
 ## Host-local token creation
 
 Run this on each disabled worker host with shell tracing off. The command emits
 one hash and never emits the token.
 
-```sh
-set -eu
+```bash
+set -euo pipefail
 set +x
 umask 077
 token_file=/etc/stoarama-joined-worker-token.env
@@ -39,7 +43,9 @@ if test -e "$token_file"; then
   exit 1
 fi
 worker_token="$(openssl rand -hex 32)"
+set -o noclobber
 printf 'STOARAMA_JOINED_WORKER_TOKEN=%s\n' "$worker_token" >"$token_file"
+set +o noclobber
 chmod 600 "$token_file"
 printf '%s' "$worker_token" | sha256sum | awk '{print $1}'
 unset worker_token
