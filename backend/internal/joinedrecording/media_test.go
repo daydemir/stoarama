@@ -74,6 +74,39 @@ func makeMediaClip(t *testing.T, dir, name string, tone int, audio bool) LocalSo
 	return local
 }
 
+func makeProgressiveLosslessSource(t *testing.T, dir, name string, tone int, audio bool) LocalSource {
+	t.Helper()
+	if _, err := exec.LookPath(ffmpegBinary()); err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	if _, err := exec.LookPath(ffprobeBinary()); err != nil {
+		t.Skip("ffprobe unavailable")
+	}
+	mediaPath := filepath.Join(dir, name)
+	args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1"}
+	if audio {
+		args = append(args, "-f", "lavfi", "-i", "sine=frequency="+strconv.Itoa(tone)+":sample_rate=48000:duration=1", "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-shortest")
+	}
+	args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-field_order", "progressive", mediaPath)
+	cmd := exec.Command(ffmpegBinary(), args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make progressive lossless fixture: %v (%s)", err, output)
+	}
+	size, sha, err := localIdentity(mediaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := LocalSource{Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	if audio {
+		_, _, contract, err := probeMediaMetadata(context.Background(), mediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		local.AudioContract = contract
+	}
+	return local
+}
+
 func TestBuildLargestPassingPrefixPreservesPacketsFramesAndAudio(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)
@@ -140,8 +173,8 @@ func TestVerifyJoinedMediaRejectsChangedDecodedFrames(t *testing.T) {
 
 func TestBuildLosslessNativeTimelinePreservesEveryDecodedFrame(t *testing.T) {
 	dir := t.TempDir()
-	first := makeMediaClip(t, dir, "lossless-one.mp4", 440, false)
-	second := makeMediaClip(t, dir, "lossless-two.mp4", 880, false)
+	first := makeProgressiveLosslessSource(t, dir, "lossless-one.mp4", 440, false)
+	second := makeProgressiveLosslessSource(t, dir, "lossless-two.mp4", 880, false)
 	first.ClipID, second.ClipID = 1, 2
 	sources := []LocalSource{first, second}
 
@@ -187,7 +220,7 @@ func TestBuildLosslessNativeTimelinePreservesDisplayMetadataAndRejectsChanges(t 
 	dir := t.TempDir()
 	makeSARClip := func(name, sar string, clipID int64) LocalSource {
 		mediaPath := filepath.Join(dir, name)
-		cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-vf", "setsar="+sar, "-c:v", "mpeg4", mediaPath)
+		cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-vf", "setsar="+sar, "-c:v", "libx264", "-field_order", "progressive", mediaPath)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("make SAR fixture: %v (%s)", err, output)
 		}
@@ -224,10 +257,61 @@ func TestBuildLosslessNativeTimelinePreservesDisplayMetadataAndRejectsChanges(t 
 	}
 }
 
+func TestBuildLosslessNativeTimelineRejectsMissingFieldOrder(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "unknown-field-order-one.mp4", 440, false)
+	second := makeMediaClip(t, dir, "unknown-field-order-two.mp4", 880, false)
+	first.ClipID, second.ClipID = 1, 2
+	sources := []LocalSource{first, second}
+	layout, _, err := probeLosslessVideoLayout(context.Background(), first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.FieldOrder == "progressive" {
+		t.Fatalf("fixture unexpectedly reports explicit progressive field order: %+v", layout)
+	}
+	_, err = buildLosslessNativeTimeline(context.Background(), sources, dir, testLosslessTrigger(t, sources))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_field_order_unsupported" {
+		t.Fatalf("missing field order did not fail closed: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelineRejectsInterlacedFieldOrder(t *testing.T) {
+	dir := t.TempDir()
+	makeInterlaced := func(name string, clipID int64) LocalSource {
+		mediaPath := filepath.Join(dir, name)
+		cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=1", "-c:v", "libx264", "-flags", "+ilme+ildct", "-x264-params", "tff=1", mediaPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("make interlaced fixture: %v (%s)", err, output)
+		}
+		size, sha, err := localIdentity(mediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return LocalSource{ClipID: clipID, Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha}
+	}
+	first := makeInterlaced("interlaced-one.mp4", 1)
+	second := makeInterlaced("interlaced-two.mp4", 2)
+	sources := []LocalSource{first, second}
+	layout, _, err := probeLosslessVideoLayout(context.Background(), first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.FieldOrder == "" || layout.FieldOrder == "unknown" || layout.FieldOrder == "progressive" {
+		t.Fatalf("fixture did not expose an interlaced field order: %+v", layout)
+	}
+	_, err = buildLosslessNativeTimeline(context.Background(), sources, dir, testLosslessTrigger(t, sources))
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_field_order_unsupported" {
+		t.Fatalf("interlaced field order did not fail closed: %v", err)
+	}
+}
+
 func TestBuildSealedOutputReproducesFrozenLosslessModeWhenFlagIsOff(t *testing.T) {
 	dir := t.TempDir()
-	first := makeMediaClip(t, dir, "sealed-lossless-one.mp4", 440, false)
-	second := makeMediaClip(t, dir, "sealed-lossless-two.mp4", 880, false)
+	first := makeProgressiveLosslessSource(t, dir, "sealed-lossless-one.mp4", 440, false)
+	second := makeProgressiveLosslessSource(t, dir, "sealed-lossless-two.mp4", 880, false)
 	first.ClipID, second.ClipID = 1, 2
 	sources := []LocalSource{first, second}
 	originalDir := filepath.Join(dir, "original")
@@ -288,8 +372,8 @@ func TestBuildWithLosslessFallbackRunsOnlyAfterSequenceMismatch(t *testing.T) {
 
 func TestLosslessNativeTimelineKeepsAudioOnStrictPath(t *testing.T) {
 	dir := t.TempDir()
-	first := makeMediaClip(t, dir, "audio-one.mp4", 440, true)
-	second := makeMediaClip(t, dir, "audio-two.mp4", 880, true)
+	first := makeProgressiveLosslessSource(t, dir, "audio-one.mp4", 440, true)
+	second := makeProgressiveLosslessSource(t, dir, "audio-two.mp4", 880, true)
 	first.ClipID, second.ClipID = 1, 2
 	_, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir, testLosslessTrigger(t, []LocalSource{first, second}))
 	var deterministic *deterministicMediaError
@@ -914,6 +998,73 @@ func TestSizeBoundPartitionDoesNotAssumePerPrefixExpansionIsMonotonic(t *testing
 	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
 	if err != nil || len(quarantines) != 0 || len(parts) != 2 || parts[0].SourceCount != 4 || parts[1].SourceCount != 1 {
 		t.Fatalf("nonmonotonic expansion partition=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestLosslessScratchReservationCoversRetainedPartAndBoundaryExtension(t *testing.T) {
+	const sourceSize int64 = 100
+	sources := makeSyntheticLocalSources(3)
+	for i := range sources {
+		sources[i].SizeBytes = sourceSize
+		sources[i].SHA256 = strings.Repeat(string(rune('1'+i)), 64)
+	}
+	scratch := t.TempDir()
+	for i := range sources {
+		sources[i].Path = filepath.Join(scratch, fmt.Sprintf("source-%d.mp4", sources[i].ClipID))
+		if err := os.WriteFile(sources[i].Path, make([]byte, sourceSize), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var peakScratchBytes int64
+	attempt := func(_ context.Context, candidate []LocalSource, root string) (BuiltOutput, error) {
+		attemptDir, err := os.MkdirTemp(root, "attempt-")
+		if err != nil {
+			return BuiltOutput{}, err
+		}
+		outputPath := filepath.Join(attemptDir, "joined.mp4")
+		outputSize := int64(len(candidate)) * sourceSize * losslessNormalizationExpansionLimit
+		if err := os.WriteFile(outputPath, make([]byte, outputSize), 0o600); err != nil {
+			return BuiltOutput{}, err
+		}
+		var live int64
+		if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() {
+				return walkErr
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			live += info.Size()
+			return nil
+		}); err != nil {
+			return BuiltOutput{}, err
+		}
+		if live > peakScratchBytes {
+			peakScratchBytes = live
+		}
+		if containsAdjacentClipIDs(candidate, 2, 3) {
+			_ = os.RemoveAll(attemptDir)
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{Path: outputPath, SizeBytes: outputSize, SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, scratch, strings.Repeat("f", 64), attempt)
+	if err != nil || len(quarantines) != 0 || len(parts) != 2 {
+		t.Fatalf("overlap fixture parts=%+v quarantines=%+v err=%v", parts, quarantines, err)
+	}
+	clips := make([]SourceClip, len(sources))
+	for i := range clips {
+		clips[i] = SourceClip{ClipID: sources[i].ClipID, Object: ObjectIdentity{SizeBytes: sourceSize}}
+	}
+	required, err := requiredScratchBytes(clips, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservedScratch := int64(required - ScratchSafetyMarginBytes)
+	oldSingleSetReserve := int64(len(sources)) * sourceSize * (1 + losslessNormalizationExpansionLimit)
+	if peakScratchBytes <= oldSingleSetReserve || reservedScratch < peakScratchBytes {
+		t.Fatalf("peak scratch=%d old reserve=%d new reserve=%d", peakScratchBytes, oldSingleSetReserve, reservedScratch)
 	}
 }
 

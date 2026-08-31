@@ -729,7 +729,7 @@ class JoinedDownloadTests(unittest.TestCase):
         verification["lossless_normalization"] = {
             "codec": "libx264", "preset": "veryfast", "quantizer": 0, "pixel_format": "yuv420p",
             "frame_rate": "10", "sample_aspect_ratio": "1:1", "color_range": "", "color_space": "",
-            "color_transfer": "", "color_primaries": "", "chroma_location": "left", "field_order": "",
+            "color_transfer": "", "color_primaries": "", "chroma_location": "left", "field_order": "progressive",
             "timeline_rule": "settb=expr=1/10,setpts=N,setsar=1/1",
             "source_decoded_frames": source_video["decoded_frames"],
             "output_decoded_frames": output_video["decoded_frames"],
@@ -767,6 +767,11 @@ class JoinedDownloadTests(unittest.TestCase):
 
         verification["lossless_normalization"]["output_decoded_frames"] += 1
         with self.assertRaisesRegex(ValueError, "frame evidence"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+        verification["lossless_normalization"]["output_decoded_frames"] -= 1
+
+        verification["lossless_normalization"]["field_order"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "field order"):
             pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
 
     def test_audio_codec_and_quarantine_reason_are_exactly_bound(self):

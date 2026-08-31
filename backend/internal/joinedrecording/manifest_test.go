@@ -860,7 +860,7 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 	}
 	verification.LosslessNormalization = &LosslessNormalizationEvidence{
 		Codec: "libx264", Preset: "veryfast", Quantizer: 0, PixelFormat: "yuv420p",
-		FrameRate: "10", SampleAspectRatio: "1:1", ChromaLocation: "left", TimelineRule: "settb=expr=1/10,setpts=N,setsar=1/1",
+		FrameRate: "10", SampleAspectRatio: "1:1", ChromaLocation: "left", FieldOrder: "progressive", TimelineRule: "settb=expr=1/10,setpts=N,setsar=1/1",
 		SourceDecodedFrames: frames, OutputDecodedFrames: frames,
 		DecodedFrameSequenceSHA256: strings.Repeat("d", 64), SourceTimelineSignatureSHA256: strings.Repeat("e", 64),
 		OutputLimitBytes: 1024, AudioStatus: "absent", TriggerReasonCode: "media_sequence_mismatch", TriggerFailureFacts: triggerFacts, TriggerFailureSHA256: triggerSHA,
@@ -878,6 +878,11 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 	mutated.Media[0].Verification.LosslessNormalization.OutputDecodedFrames--
 	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
 		t.Fatal("lossless normalization manifest accepted mismatched frame accounting")
+	}
+	mutated = cloneHourManifest(t, manifest)
+	mutated.Media[0].Verification.LosslessNormalization.FieldOrder = "unknown"
+	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+		t.Fatal("lossless normalization manifest accepted ambiguous field order")
 	}
 	mutated = cloneHourManifest(t, manifest)
 	fabricatedSHA, fabricatedFacts, err := stitchcert.CanonicalSHA(struct {

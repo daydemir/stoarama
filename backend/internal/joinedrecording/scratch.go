@@ -47,10 +47,10 @@ func WorkerTaskBudgetBytes(available int64) (int64, error) {
 		if err != nil || legacy > available {
 			return false
 		}
-		if source > math.MaxInt64/losslessNormalizationExpansionLimit {
+		if source > math.MaxInt64/losslessNormalizationScratchOutputMultiplier {
 			return false
 		}
-		output := source * losslessNormalizationExpansionLimit
+		output := source * losslessNormalizationScratchOutputMultiplier
 		return source <= available-output
 	}
 	low, high := int64(0), available
@@ -88,8 +88,9 @@ func (e *ScratchHeadroomError) Error() string {
 
 // RequiredScratchBytes reserves the complete frozen source set plus the
 // bounded QP 0 fallback outputs, then adds a fixed safety margin. Each part is
-// capped independently, so the aggregate retained outputs reserve seven times
-// the complete source set even when the R2 single-object cap creates parts.
+// capped independently. The planner may retain completed parts while proving
+// one boundary extension that overlaps the current part, so output scratch
+// reserves two complete seven-times source sets.
 func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 	return requiredScratchBytes(sources, losslessNormalizationEnabled())
 }
@@ -108,10 +109,10 @@ func requiredScratchBytes(sources []SourceClip, lossless bool) (uint64, error) {
 	}
 	outputBytes := sourceBytes
 	if lossless {
-		if sourceBytes > math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
+		if sourceBytes > math.MaxUint64/uint64(losslessNormalizationScratchOutputMultiplier) {
 			return 0, fmt.Errorf("joined lossless output scratch size overflows")
 		}
-		outputBytes = sourceBytes * uint64(losslessNormalizationExpansionLimit)
+		outputBytes = sourceBytes * uint64(losslessNormalizationScratchOutputMultiplier)
 	}
 	maxScratch := uint64(math.MaxInt64)
 	if outputBytes > maxScratch-ScratchSafetyMarginBytes || sourceBytes > maxScratch-outputBytes-ScratchSafetyMarginBytes {

@@ -3879,6 +3879,8 @@ def valid_verification(verification):
         for display_field in ("color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order"):
             if not isinstance(evidence[display_field], str) or len(evidence[display_field]) > 64:
                 raise ValueError("joined lossless normalization display metadata conflicts")
+        if evidence["field_order"] != "progressive":
+            raise ValueError("joined lossless normalization field order conflicts")
         rate_parts = [int(value) for value in evidence["frame_rate"].split("/", 1)]
         rate_num, rate_den = (rate_parts[0], 1) if len(rate_parts) == 1 else rate_parts
         if evidence["timeline_rule"] != "settb=expr=%d/%d,setpts=N,setsar=%s" % (rate_den, rate_num, evidence["sample_aspect_ratio"].replace(":", "/")):

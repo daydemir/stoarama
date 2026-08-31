@@ -21,7 +21,7 @@ func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := uint64(8*350) + ScratchSafetyMarginBytes; got != want {
+	if want := uint64((1+losslessNormalizationScratchOutputMultiplier)*350) + ScratchSafetyMarginBytes; got != want {
 		t.Fatalf("required scratch=%d want %d", got, want)
 	}
 }
@@ -33,7 +33,7 @@ func TestRequiredScratchBytesReservesAllRetainedLosslessParts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := uint64(sourceBytes*(1+losslessNormalizationExpansionLimit)) + ScratchSafetyMarginBytes
+	want := uint64(sourceBytes*(1+losslessNormalizationScratchOutputMultiplier)) + ScratchSafetyMarginBytes
 	if got != want {
 		t.Fatalf("multipart lossless scratch=%d want %d", got, want)
 	}
@@ -61,7 +61,7 @@ func TestWorkerTaskBudgetCannotAdmitMoreThanLosslessPreflightFits(t *testing.T) 
 		t.Fatalf("lossless task budget=%d available=%d", taskBudget, available)
 	}
 	maxSource := (taskBudget - JoinedScratchFixedBytes) / 2
-	if maxSource <= 0 || maxSource+maxSource*losslessNormalizationExpansionLimit > available {
+	if maxSource <= 0 || maxSource+maxSource*losslessNormalizationScratchOutputMultiplier > available {
 		t.Fatalf("server-admitted source=%d exceeds local lossless budget=%d", maxSource, available)
 	}
 

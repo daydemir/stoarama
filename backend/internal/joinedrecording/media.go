@@ -1078,6 +1078,11 @@ func buildStreamCopyAndVerify(ctx context.Context, sources []LocalSource, scratc
 
 const losslessNormalizationExpansionLimit int64 = 7
 
+// The planner can retain outputs for prior/current source sets P+A while an
+// exact boundary extension A+x is encoded. Since P+A+x is within the frozen
+// source set S, 7(P+A)+7(A+x) is at most 14S.
+const losslessNormalizationScratchOutputMultiplier int64 = losslessNormalizationExpansionLimit * 2
+
 type losslessVideoLayout struct {
 	Width             int
 	Height            int
@@ -1137,6 +1142,12 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 				ClipID      int64  `json:"clip_id"`
 				PixelFormat string `json:"pixel_format"`
 			}{source.ClipID, layout.PixelFormat}, fmt.Errorf("lossless normalization requires yuv420p input"))
+		}
+		if layout.FieldOrder != "progressive" {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_field_order_unsupported", struct {
+				ClipID     int64  `json:"clip_id"`
+				FieldOrder string `json:"field_order"`
+			}{source.ClipID, layout.FieldOrder}, fmt.Errorf("lossless normalization requires explicitly progressive input"))
 		}
 		if i > 0 && layout != layouts[0] {
 			return BuiltOutput{}, deterministicFailure("lossless_normalization_layout_mismatch", struct {
@@ -1368,7 +1379,10 @@ func validateLosslessNormalizationVerification(v Verification) error {
 	if !ok || rate.Sign() <= 0 || !rate.Num().IsInt64() || !rate.Denom().IsInt64() || !aspectOK || aspect.Sign() <= 0 || !aspect.Num().IsInt64() || !aspect.Denom().IsInt64() || evidence.TimelineRule != fmt.Sprintf("settb=expr=%d/%d,setpts=N,setsar=%s", rate.Denom().Int64(), rate.Num().Int64(), strings.ReplaceAll(evidence.SampleAspectRatio, ":", "/")) {
 		return fmt.Errorf("lossless normalization timeline evidence differs")
 	}
-	for _, value := range []string{evidence.ColorRange, evidence.ColorSpace, evidence.ColorTransfer, evidence.ColorPrimaries, evidence.ChromaLocation, evidence.FieldOrder} {
+	if evidence.FieldOrder != "progressive" {
+		return fmt.Errorf("lossless normalization field order differs")
+	}
+	for _, value := range []string{evidence.ColorRange, evidence.ColorSpace, evidence.ColorTransfer, evidence.ColorPrimaries, evidence.ChromaLocation} {
 		if len(value) > 64 {
 			return fmt.Errorf("lossless normalization display metadata differs")
 		}
@@ -1467,14 +1481,7 @@ func probeLosslessVideoLayout(ctx context.Context, mediaPath string) (losslessVi
 			if !ok || rat.Sign() <= 0 || !rat.Num().IsInt64() || !rat.Denom().IsInt64() || stream.Width <= 0 || stream.Height <= 0 || strings.TrimSpace(stream.PixelFormat) == "" || strings.TrimSpace(stream.SampleAspectRatio) == "" {
 				return losslessVideoLayout{}, false, fmt.Errorf("invalid native video layout")
 			}
-			fieldOrder := stream.FieldOrder
-			// FFprobe omits field_order for codecs whose decoded frames carry no
-			// interlace signal. The normalized H.264 stream spells that same
-			// progressive display semantics explicitly.
-			if fieldOrder == "" || fieldOrder == "unknown" {
-				fieldOrder = "progressive"
-			}
-			layout = losslessVideoLayout{Width: stream.Width, Height: stream.Height, PixelFormat: stream.PixelFormat, FrameRate: rat.RatString(), RateNum: rat.Num().Int64(), RateDen: rat.Denom().Int64(), SampleAspectRatio: stream.SampleAspectRatio, ColorRange: stream.ColorRange, ColorSpace: stream.ColorSpace, ColorTransfer: stream.ColorTransfer, ColorPrimaries: stream.ColorPrimaries, ChromaLocation: stream.ChromaLocation, FieldOrder: fieldOrder}
+			layout = losslessVideoLayout{Width: stream.Width, Height: stream.Height, PixelFormat: stream.PixelFormat, FrameRate: rat.RatString(), RateNum: rat.Num().Int64(), RateDen: rat.Denom().Int64(), SampleAspectRatio: stream.SampleAspectRatio, ColorRange: stream.ColorRange, ColorSpace: stream.ColorSpace, ColorTransfer: stream.ColorTransfer, ColorPrimaries: stream.ColorPrimaries, ChromaLocation: stream.ChromaLocation, FieldOrder: stream.FieldOrder}
 		}
 	}
 	if videoCount != 1 {
