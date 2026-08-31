@@ -450,7 +450,7 @@ func testLosslessTrigger(t *testing.T, sources []LocalSource) *deterministicMedi
 
 func TestLosslessExpansionLimitUsesSingleExplicitProof(t *testing.T) {
 	sources := makeSyntheticLocalSources(2)
-	err := losslessOutputLimitFailure(700, 700)
+	err := losslessOutputLimitFailure(899, 900, 700, 700)
 	failure, ok := deterministicBuildFailure(err)
 	if !ok || failure.code != "lossless_normalization_expansion_cap" {
 		t.Fatalf("lossless bounded output did not retain its explicit expansion-cap reason: %v", err)
@@ -467,25 +467,55 @@ func TestLosslessExpansionLimitUsesSingleExplicitProof(t *testing.T) {
 }
 
 func TestLosslessTruncatedOutputUsesExpansionCapBelowFFmpegFileLimit(t *testing.T) {
-	verification := Verification{
-		SourceFingerprint: MediaFingerprint{Tracks: map[string]*TrackFingerprint{
-			"video": {DecodedFrames: 900},
-		}},
-		OutputFingerprint: MediaFingerprint{Tracks: map[string]*TrackFingerprint{
-			"video": {DecodedFrames: 899},
-		}},
-	}
-	err := losslessTruncatedOutputFailure(verification, 699, 700)
+	err := losslessTruncatedOutputFailure(899, 900, 699, 700)
 	failure, ok := deterministicBuildFailure(err)
 	if !ok || failure.code != "lossless_normalization_expansion_cap" {
 		t.Fatalf("ffmpeg -fs truncation below its byte limit was not routed to size partitioning: %v", err)
 	}
-	if err := losslessTruncatedOutputFailure(verification, 699, 0); err != nil {
+	if err := losslessTruncatedOutputFailure(0, 900, 699, 700); err == nil {
+		t.Fatal("zero-frame encoder output was not classified without probing the partial media")
+	}
+	if err := losslessTruncatedOutputFailure(899, 900, 699, 0); err != nil {
 		t.Fatalf("invalid limit fabricated a bounded-output failure: %v", err)
 	}
-	verification.OutputFingerprint.Tracks["video"].DecodedFrames = 900
-	if err := losslessTruncatedOutputFailure(verification, 699, 700); err != nil {
+	if err := losslessTruncatedOutputFailure(900, 900, 699, 700); err != nil {
 		t.Fatalf("complete output was misclassified as truncated: %v", err)
+	}
+}
+
+func TestBuildLosslessNativeTimelineClassifiesPinnedFFmpegZeroFrameCapAndCleansOutput(t *testing.T) {
+	dir := t.TempDir()
+	first := makeProgressiveLosslessSource(t, dir, "capped-one.mp4", 440, false)
+	second := makeProgressiveLosslessSource(t, dir, "capped-two.mp4", 880, false)
+	first.ClipID, second.ClipID = 1, 2
+	sources := []LocalSource{first, second}
+	before, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = buildLosslessNativeTimelineWithOutputLimit(ctx, sources, dir, testLosslessTrigger(t, sources), 1)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "lossless_normalization_expansion_cap" {
+		t.Fatalf("pinned ffmpeg zero-frame cap did not route to size partitioning: %v", err)
+	}
+	var evidence struct {
+		EncodedFrames  int64 `json:"encoded_frames"`
+		ExpectedFrames int64 `json:"expected_frames"`
+	}
+	if err := json.Unmarshal(failure.evidence, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.EncodedFrames != 0 || evidence.ExpectedFrames <= 0 {
+		t.Fatalf("cap was not proven independently of output probing: %+v", evidence)
+	}
+	after, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Fatalf("failed capped output was retained: before=%v after=%v", before, after)
 	}
 }
 
