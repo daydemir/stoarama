@@ -161,13 +161,31 @@ func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 	}
 }
 
-func TestRenderJoinedWorkScopeShipsDisabled(t *testing.T) {
+func TestRenderJoinedWorkScopesSeparateActiveAPIFromDisabledWorker(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count := strings.Count(string(data), "- key: STOARAMA_JOINED_WORK_SCOPE\n        value: disabled"); count != 2 {
-		t.Fatalf("disabled joined work scope declarations=%d want=2", count)
+	serviceSection := func(name string) string {
+		marker := "name: " + name
+		start := strings.Index(string(data), marker)
+		if start < 0 {
+			t.Fatalf("service %s not found", name)
+		}
+		section := string(data)[start:]
+		if next := strings.Index(section[len(marker):], "\n  - type:"); next >= 0 {
+			section = section[:len(marker)+next]
+		}
+		return section
+	}
+	worker, api := serviceSection("stoarama-joined-worker"), serviceSection("stoarama-api")
+	if !strings.Contains(worker, "- key: STOARAMA_JOINED_WORK_SCOPE\n        value: disabled") ||
+		strings.Contains(worker, "- key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch") {
+		t.Fatal("joined worker must remain disabled")
+	}
+	if !strings.Contains(api, "- key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch") ||
+		strings.Contains(api, "- key: STOARAMA_JOINED_WORK_SCOPE\n        value: disabled") {
+		t.Fatal("joined API must remain scoped to the frozen batch")
 	}
 }
 
@@ -540,7 +558,7 @@ func TestRenderJoinedWorkerIsFixedDormantAndUnprivileged(t *testing.T) {
 	}
 }
 
-func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
+func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "..", "render.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -551,11 +569,13 @@ func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
 		section = section[:len(marker)+next]
 	}
 	for _, required := range []string{
-		"key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"false\"",
+		"key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"true\"",
 		"key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"false\"",
-		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"0\"",
-		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"0\"",
-		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"0\"",
+		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"1\"",
+		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"13\"",
+		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"7\"",
+		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"3\"",
+		"key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch",
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
 		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
 		"key: JOINED_WORKER_BOOTSTRAP_TOKEN\n        sync: false",
@@ -564,9 +584,6 @@ func TestRenderJoinedControlPlaneIsShipDarkAndScoped(t *testing.T) {
 		if !strings.Contains(section, required) {
 			t.Fatalf("joined API missing %q", required)
 		}
-	}
-	if strings.Contains(section, "key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"true\"") {
-		t.Fatal("joined API control plane was enabled in source configuration")
 	}
 	if strings.Contains(section, "key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"true\"") {
 		t.Fatal("joined NAS delivery was enabled in source configuration")
