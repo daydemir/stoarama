@@ -67,7 +67,8 @@ func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 			outputBytes = expanded
 		}
 	}
-	if sourceBytes > math.MaxUint64-outputBytes || sourceBytes+outputBytes > math.MaxUint64-ScratchSafetyMarginBytes {
+	maxScratch := uint64(math.MaxInt64)
+	if outputBytes > maxScratch-ScratchSafetyMarginBytes || sourceBytes > maxScratch-outputBytes-ScratchSafetyMarginBytes {
 		return 0, fmt.Errorf("joined scratch requirement overflows")
 	}
 	return sourceBytes + outputBytes + ScratchSafetyMarginBytes, nil

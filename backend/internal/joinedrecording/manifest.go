@@ -662,16 +662,20 @@ func sourceSubsetByIDs(accounted []SourceClip, ids []int64) ([]SourceClip, error
 }
 
 func validatePassedVerification(v Verification) error {
-	if v.Status != "passed" || v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" || validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil {
+	if v.Status != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" || validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil {
 		return fmt.Errorf("complete media verification did not pass")
 	}
 	switch v.AcceptanceMode {
 	case "":
-		if v.DecodedFrameSequenceStatus != "" || compareFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+		if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "" || v.LosslessNormalization != nil || compareFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
 			return fmt.Errorf("complete media verification did not pass")
 		}
 	case "decoded_frame_equivalent":
-		if v.DecodedFrameSequenceStatus != "passed" || validateDecodedEquivalentFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+		if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "passed" || v.LosslessNormalization != nil || validateDecodedEquivalentFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+			return fmt.Errorf("complete media verification did not pass")
+		}
+	case "lossless_native_timeline_normalized":
+		if validateLosslessNormalizationVerification(v) != nil {
 			return fmt.Errorf("complete media verification did not pass")
 		}
 	default:

@@ -710,6 +710,36 @@ class JoinedDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decoded video sequence"):
             pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
 
+    def test_lossless_normalization_verification_binds_codec_and_frames(self):
+        verification = self.golden("hour_manifest_v1.golden.json")["media"][0]["verification"]
+        source_video = verification["source_fingerprint"]["tracks"]["video"]
+        output_video = verification["output_fingerprint"]["tracks"]["video"]
+        for fingerprint in (verification["source_fingerprint"], verification["output_fingerprint"]):
+            fingerprint["decoded_video_sha256"] = "d" * 64
+        verification["acceptance_mode"] = "lossless_native_timeline_normalized"
+        verification["lossless_normalization"] = {
+            "codec": "libx264", "preset": "veryfast", "quantizer": 0, "pixel_format": "yuv420p",
+            "frame_rate": "10", "timeline_rule": "settb=expr=1/10,setpts=N",
+            "source_decoded_frames": source_video["decoded_frames"],
+            "output_decoded_frames": output_video["decoded_frames"],
+            "decoded_frame_sequence_sha256": "d" * 64,
+            "source_timeline_signature_sha256": "e" * 64,
+            "output_limit_bytes": 1024, "audio_status": "absent",
+        }
+        verification["packet_payload_order_status"] = "not_applicable_lossless_normalization"
+        verification["decoded_frame_sequence_status"] = "passed"
+        order = (
+            "status", "acceptance_mode", "lossless_normalization", "packet_payload_order_status",
+            "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status",
+            "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint",
+        )
+        verification = {key: verification[key] for key in order}
+        pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+
+        verification["lossless_normalization"]["output_decoded_frames"] += 1
+        with self.assertRaisesRegex(ValueError, "frame evidence"):
+            pull.valid_verification(pull.decode_joined_json(pull.joined_canonical_bytes(verification)))
+
     def test_audio_codec_and_quarantine_reason_are_exactly_bound(self):
         verification = self.golden("hour_manifest_v1.golden.json")["media"][0]["verification"]
         def audio_track(video):

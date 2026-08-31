@@ -1149,7 +1149,7 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 			LimitBytes  int64 `json:"limit_bytes"`
 		}{size, outputLimit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
 	}
-	verification, err := VerifyJoinedMedia(ctx, sources, outputPath)
+	verification, err := verifyLosslessNormalizedMedia(ctx, sources, outputPath)
 	if err != nil {
 		return BuiltOutput{}, deterministicFailure("lossless_normalization_verification_failure", verification, err)
 	}
@@ -1176,6 +1176,55 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	}
 	keep = true
 	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
+}
+
+func verifyLosslessNormalizedMedia(ctx context.Context, sources []LocalSource, outputPath string) (Verification, error) {
+	expectedAccumulator := newMediaAccumulator()
+	for sourceIndex, source := range sources {
+		if err := probeMediaInto(ctx, source.Path, expectedAccumulator, source.AudioContract, true); err != nil {
+			return Verification{}, fmt.Errorf("probe lossless source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, err)
+		}
+	}
+	expected := expectedAccumulator.fingerprint()
+	actual, err := probeMedia(ctx, outputPath)
+	if err != nil {
+		return Verification{}, fmt.Errorf("probe lossless output: %w", err)
+	}
+	verification := Verification{Status: "failed", AcceptanceMode: "lossless_native_timeline_normalized", PacketPayloadOrderStatus: "not_applicable_lossless_normalization", SourceFingerprint: expected, OutputFingerprint: actual}
+	if len(expected.Tracks) != 1 || len(actual.Tracks) != 1 || expected.Tracks["audio"] != nil || actual.Tracks["audio"] != nil || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
+		return verification, fmt.Errorf("lossless output duration or stream cardinality mismatch")
+	}
+	wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
+	if wantVideo == nil || gotVideo == nil || wantVideo.TimestampStatus != "source_clips_independent" || gotVideo.TimestampStatus != "monotonic" || wantVideo.DecodedFrames <= 0 || wantVideo.DecodedFrames != gotVideo.DecodedFrames {
+		return verification, fmt.Errorf("lossless output decoded frame totals or timeline mismatch")
+	}
+	sourcePaths := make([]string, len(sources))
+	for i := range sources {
+		sourcePaths[i] = sources[i].Path
+	}
+	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, sourcePaths)
+	if err != nil {
+		return verification, fmt.Errorf("decode lossless source frame sequence: %w", err)
+	}
+	gotFrames, gotSHA, err := decodedVideoSequenceIdentity(ctx, []string{outputPath})
+	if err != nil {
+		return verification, fmt.Errorf("decode lossless output frame sequence: %w", err)
+	}
+	if wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || wantFrames != gotFrames || wantSHA != gotSHA {
+		return verification, fmt.Errorf("lossless output decoded frame sequence mismatch")
+	}
+	verification.SourceFingerprint.DecodedVideoSHA256 = wantSHA
+	verification.OutputFingerprint.DecodedVideoSHA256 = gotSHA
+	verification.DecodedFrameSequenceStatus = "passed"
+	verification.DecodedFrameTotalsStatus = "passed"
+	verification.DecodedAudioTotalsStatus = "passed"
+	verification.OutputTimestampStatus = "passed"
+	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", outputPath, "-map", "0:v:0", "-an", "-f", "null", "-"); err != nil {
+		return verification, fmt.Errorf("strict lossless output decode: %w", err)
+	}
+	verification.StrictDecodeStatus = "passed"
+	verification.Status = "passed"
+	return verification, nil
 }
 
 func validateLosslessNormalizationVerification(v Verification) error {

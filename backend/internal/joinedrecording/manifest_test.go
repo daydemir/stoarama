@@ -830,6 +830,38 @@ func TestHourManifestAcceptsDecodedFrameEquivalentVerification(t *testing.T) {
 	}
 }
 
+func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing.T) {
+	plan := oneOutputPlan(t)
+	verification := passingVerification()
+	verification.AcceptanceMode = "lossless_native_timeline_normalized"
+	verification.PacketPayloadOrderStatus = "not_applicable_lossless_normalization"
+	verification.DecodedFrameSequenceStatus = "passed"
+	verification.SourceFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
+	verification.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("d", 64)
+	frames := verification.SourceFingerprint.Tracks["video"].DecodedFrames
+	verification.LosslessNormalization = &LosslessNormalizationEvidence{
+		Codec: "libx264", Preset: "veryfast", Quantizer: 0, PixelFormat: "yuv420p",
+		FrameRate: "10", TimelineRule: "settb=expr=1/10,setpts=N",
+		SourceDecodedFrames: frames, OutputDecodedFrames: frames,
+		DecodedFrameSequenceSHA256: strings.Repeat("d", 64), SourceTimelineSignatureSHA256: strings.Repeat("e", 64),
+		OutputLimitBytes: 1024, AudioStatus: "absent",
+	}
+	built := []BuiltOutput{{SizeBytes: plan.Outputs[0].ExpectedSize, SHA256: plan.Outputs[0].ExpectedSHA, SourceCount: 1, Verification: verification}}
+	allocation, ledger := testAllocation(plan)
+	manifest, _, _, err := BuildHourManifest(HourManifestInput{Plan: plan, Allocation: allocation, AllocationLedger: ledger, MediaArtifactIDs: []int64{88}, Built: built})
+	if err != nil {
+		t.Fatalf("lossless normalization verification did not seal: %v", err)
+	}
+	if _, _, err := CanonicalHourManifestArtifact(manifest); err != nil {
+		t.Fatalf("lossless normalization manifest did not revalidate: %v", err)
+	}
+	mutated := cloneHourManifest(t, manifest)
+	mutated.Media[0].Verification.LosslessNormalization.OutputDecodedFrames--
+	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+		t.Fatal("lossless normalization manifest accepted mismatched frame accounting")
+	}
+}
+
 func TestHourManifestAllocationUsesCanonicalLedgerProjection(t *testing.T) {
 	plan := oneOutputPlan(t)
 	allocation, ledger := testAllocation(plan)

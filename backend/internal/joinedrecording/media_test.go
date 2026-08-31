@@ -214,6 +214,18 @@ func TestBuildWithLosslessFallbackRunsOnlyAfterSequenceMismatch(t *testing.T) {
 	}
 }
 
+func TestLosslessNativeTimelineKeepsAudioOnStrictPath(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "audio-one.mp4", 440, true)
+	second := makeMediaClip(t, dir, "audio-two.mp4", 880, true)
+	first.ClipID, second.ClipID = 1, 2
+	_, err := buildLosslessNativeTimeline(context.Background(), []LocalSource{first, second}, dir)
+	var deterministic *deterministicMediaError
+	if !errors.As(err, &deterministic) || deterministic.code != "lossless_normalization_audio_unsupported" {
+		t.Fatalf("audio-bearing candidate did not fail closed: %v", err)
+	}
+}
+
 func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)
