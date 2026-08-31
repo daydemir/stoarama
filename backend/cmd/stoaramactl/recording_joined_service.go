@@ -25,7 +25,10 @@ import (
 const (
 	joinedAPITimeout       = 55 * time.Second
 	joinedWorkerIdlePoll   = 2 * time.Second
-	joinedWorkerTaskLimit  = 2 * time.Hour
+	// A strict 60-source hour can legitimately spend more than two hours in
+	// deterministic media isolation. Each media subprocess keeps its narrower
+	// deadline; this is only the outer bound for one renewable, fenced task.
+	joinedWorkerTaskLimit  = 4 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
 	// Sealed-hour claims repeat canonical source, plan, manifest, and proof data.
 	// Thirty-part hours can legitimately exceed the ordinary API response cap.
