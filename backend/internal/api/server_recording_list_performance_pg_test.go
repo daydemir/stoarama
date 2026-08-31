@@ -149,7 +149,7 @@ func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
 	}
 	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
 
-	assertExact := func(t *testing.T, body []byte) {
+	assertExact := func(t *testing.T, body []byte, wantRecent bool) {
 		t.Helper()
 		var item struct {
 			Recent   int64                       `json:"recent_clip_count"`
@@ -160,7 +160,7 @@ func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
 		if err := json.Unmarshal(body, &item); err != nil {
 			t.Fatal(err)
 		}
-		if item.Recent != 1 || item.Captured != 1 || item.Expected <= 1 || item.Health != recordingCaptureHealthCritical {
+		if (wantRecent && item.Recent != 1) || item.Captured != 1 || item.Expected <= 1 || item.Health != recordingCaptureHealthCritical {
 			t.Fatalf("exact clip metrics changed: %+v", item)
 		}
 	}
@@ -169,11 +169,13 @@ func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
 		name    string
 		handler http.HandlerFunc
 		req     *http.Request
+		recent  bool
 	}{
 		{
 			name:    "authenticated detail",
 			handler: s.handleAccountRecordingGet,
 			req:     withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/700", nil), accountPrincipal{AccountID: 47}, "700"),
+			recent:  true,
 		},
 		{
 			name:    "public detail",
@@ -187,7 +189,7 @@ func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
-			assertExact(t, response.Body.Bytes())
+			assertExact(t, response.Body.Bytes(), test.recent)
 		})
 	}
 

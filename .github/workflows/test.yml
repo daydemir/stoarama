@@ -94,6 +94,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1
+      - name: Test recording folder API parity and baseline independence
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^(TestSharedRecordingsExposeTypedNamingWithAuthenticatedParity|TestRecordingListBaselineDoesNotWaitForMetricTables|TestRecordingDetailTimelineEnrichmentDoesNotWaitForClipMetrics|TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList|TestRecordingDetailAndCSVRetainExactClipMetrics)$' -count=1 -v
       - name: Install system FFmpeg for NAS tests
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Install pinned FFmpeg for joined lifecycle tests
@@ -119,10 +123,6 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api -run '^(TestRecordingJoinedProgressUsesExactPublishedMediaProvenance|TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes|TestRecordingJoinedBrowserAuthPublicParityAndIsolation|TestRecordingJoinedDownloadSupportsUnversionedExactRange|TestJoinedBrowserIndexMigrationIsTransactionalAndRejectsWrongPrecreate|TestJoinedFolderIsSameOriginScopedAndRedacted|TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials)$' -count=1 -v
-      - name: Test recording folder API parity and baseline independence
-        env:
-          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run '^(TestSharedRecordingsExposeTypedNamingWithAuthenticatedParity|TestRecordingListBaselineDoesNotWaitForMetricTables|TestRecordingDetailTimelineEnrichmentDoesNotWaitForClipMetrics|TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList|TestRecordingDetailAndCSVRetainExactClipMetrics)$' -count=1 -v
       - name: Test capture-health joined-metric isolation
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

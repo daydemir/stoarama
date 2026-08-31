@@ -57,9 +57,12 @@ type recordingListEnrichmentResult struct {
 }
 
 type recordingListEnrichmentItem struct {
-	RecordingID       int64                    `json:"recording_id"`
-	CaptureHealthBins []recordingHealthBin     `json:"capture_health_bins"`
-	TimelineHealth    *recordingTimelineHealth `json:"timeline_health"`
+	RecordingID       int64                        `json:"recording_id"`
+	CaptureHealthBins []recordingHealthBin         `json:"capture_health_bins"`
+	TimelineHealth    *recordingTimelineHealth     `json:"timeline_health"`
+	CapturedClipCount *int64                       `json:"captured_clip_count,omitempty"`
+	ExpectedClipCount *int64                       `json:"expected_clip_count,omitempty"`
+	CaptureHealth     *recordingCaptureHealthState `json:"capture_health,omitempty"`
 }
 
 type recordingJoinedProgressItem struct {
@@ -126,6 +129,17 @@ func recordingMetricScopeSignature(ids []int64) string {
 		scope.WriteString(strconv.FormatInt(id, 10))
 	}
 	return scope.String()
+}
+
+func recordingListCaptureMetrics(bins []recordingHealthBin) (int64, int64, recordingCaptureHealthState) {
+	// Keep the summary and the graph on one bounded snapshot: both describe the
+	// same twelve most-recent scheduled bins loaded by this enrichment request.
+	var captured, expected int64
+	for _, bin := range bins {
+		captured += bin.Captured
+		expected += bin.Expected
+	}
+	return captured, expected, recordingCaptureHealth("active", captured, expected)
 }
 
 func (s *Server) recordingMetricWorkSlots() chan struct{} {
@@ -432,6 +446,12 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		item := recordingListEnrichmentItem{RecordingID: id, CaptureHealthBins: bins}
 		if health, ok := result.Timeline[id]; ok {
 			item.TimelineHealth = &health
+		}
+		if !timelineOnly {
+			captured, expected, health := recordingListCaptureMetrics(bins)
+			item.CapturedClipCount = &captured
+			item.ExpectedClipCount = &expected
+			item.CaptureHealth = &health
 		}
 		items = append(items, item)
 	}
