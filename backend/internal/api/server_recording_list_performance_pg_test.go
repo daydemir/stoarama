@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +129,87 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 				t.Fatalf("baseline naming=%+v", naming)
 			}
 		})
+	}
+}
+
+func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status) VALUES(47,'exact-metrics@example.test','Exact metrics','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(1,47,'Exact storage','https://example.test','auto','clips','access',''::bytea,'verified');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
+		VALUES(700,47,1,'Exact metric detail','https://example.test/live.m3u8','active',now()-interval '5 minutes','sampled','* * * * *','UTC',60);
+		INSERT INTO recording_clips(recording_id,size_bytes,clip_start_at,clip_end_at)
+		VALUES(700,1,now()-interval '1 minute',now());
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
+
+	assertExact := func(t *testing.T, body []byte) {
+		t.Helper()
+		var item struct {
+			Recent   int64                       `json:"recent_clip_count"`
+			Captured int64                       `json:"captured_clip_count"`
+			Expected int64                       `json:"expected_clip_count"`
+			Health   recordingCaptureHealthState `json:"capture_health"`
+		}
+		if err := json.Unmarshal(body, &item); err != nil {
+			t.Fatal(err)
+		}
+		if item.Recent != 1 || item.Captured != 1 || item.Expected <= 1 || item.Health != recordingCaptureHealthCritical {
+			t.Fatalf("exact clip metrics changed: %+v", item)
+		}
+	}
+
+	for _, test := range []struct {
+		name    string
+		handler http.HandlerFunc
+		req     *http.Request
+	}{
+		{
+			name:    "authenticated detail",
+			handler: s.handleAccountRecordingGet,
+			req:     withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/700", nil), accountPrincipal{AccountID: 47}, "700"),
+		},
+		{
+			name:    "public detail",
+			handler: s.handleSharedRecordingGet,
+			req:     withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/700", nil), accountPrincipal{}, "700"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			test.handler(response, test.req)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			assertExact(t, response.Body.Bytes())
+		})
+	}
+
+	csvResponse := httptest.NewRecorder()
+	csvRequest := withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings.csv", nil), accountPrincipal{AccountID: 47}, "")
+	s.handleAccountRecordingsCSV(csvResponse, csvRequest)
+	if csvResponse.Code != http.StatusOK {
+		t.Fatalf("CSV status=%d body=%s", csvResponse.Code, csvResponse.Body.String())
+	}
+	records, err := csv.NewReader(strings.NewReader(csvResponse.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("CSV records=%d want 2", len(records))
+	}
+	columns := make(map[string]string, len(records[0]))
+	for i, name := range records[0] {
+		columns[name] = records[1][i]
+	}
+	if columns["recent_clip_count_24h"] != "1" || columns["captured_clip_count"] != "1" || columns["expected_clip_count"] == "0" || columns["capture_health"] != string(recordingCaptureHealthCritical) {
+		t.Fatalf("CSV exact clip metrics changed: %+v", columns)
 	}
 }
 
