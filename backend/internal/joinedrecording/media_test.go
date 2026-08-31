@@ -1,6 +1,7 @@
 package joinedrecording
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -190,6 +191,206 @@ func TestBuildAllPassingPartsHasLinearCandidateWork(t *testing.T) {
 	}
 	if totalSourcesBuilt > sourceCount*12 {
 		t.Fatalf("candidate work is superlinear: attempts=%d total_sources_built=%d limit=%d", attempts, totalSourcesBuilt, sourceCount*12)
+	}
+}
+
+func TestBuildAllPassingPartsReusesExactPairFailureProofForSingletonBoundaries(t *testing.T) {
+	const sourceCount = 60
+	sources := makeSyntheticLocalSourcesWithIdentity(t, sourceCount)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == 1 {
+			return BuiltOutput{SourceCount: 1}, nil
+		}
+		return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+			CandidateClipIDs []int64 `json:"candidate_clip_ids"`
+		}{clipIDs(candidate)}, errors.New("repeatable seam failure"))
+	}
+
+	legacyAttempts := 0
+	legacyAttempt := func(ctx context.Context, candidate []LocalSource, scratch string) (BuiltOutput, error) {
+		legacyAttempts++
+		return attempt(ctx, candidate, scratch)
+	}
+	legacyParts, legacyQuarantines, err := buildAllPassingPartsWithPairProofReuse(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), legacyAttempt, defaultMediaCandidateBudget, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reusedAttempts := 0
+	successfulOutputAttempts := 0
+	reuseEvents := 0
+	ctx := WithStageTimingObserver(context.Background(), func(event StageTimingEvent) {
+		if event.Stage == "media_candidate_extension_pair_proof_reused" && event.Outcome == "ok" {
+			reuseEvents++
+		}
+	})
+	reusedAttempt := func(ctx context.Context, candidate []LocalSource, scratch string) (BuiltOutput, error) {
+		reusedAttempts++
+		built, err := attempt(ctx, candidate, scratch)
+		if err == nil {
+			successfulOutputAttempts++
+		}
+		return built, err
+	}
+	reusedParts, reusedQuarantines, err := buildAllPassingPartsWithPairProofReuse(ctx, sources, t.TempDir(), strings.Repeat("f", 64), reusedAttempt, defaultMediaCandidateBudget, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyAttempts != 298 || reusedAttempts != 180 {
+		t.Fatalf("attempts legacy=%d reused=%d want=298/180", legacyAttempts, reusedAttempts)
+	}
+	if successfulOutputAttempts != sourceCount {
+		t.Fatalf("successful outputs attempted=%d want=%d", successfulOutputAttempts, sourceCount)
+	}
+	if reuseEvents != sourceCount-1 {
+		t.Fatalf("reuse metric events=%d want=%d", reuseEvents, sourceCount-1)
+	}
+	legacyJSON, _ := json.Marshal(struct {
+		Parts       []BuiltOutput
+		Quarantines []QuarantinedBuild
+	}{legacyParts, legacyQuarantines})
+	reusedJSON, _ := json.Marshal(struct {
+		Parts       []BuiltOutput
+		Quarantines []QuarantinedBuild
+	}{reusedParts, reusedQuarantines})
+	if !bytes.Equal(legacyJSON, reusedJSON) {
+		t.Fatalf("reused proof changed evidence\nlegacy=%s\nreused=%s", legacyJSON, reusedJSON)
+	}
+}
+
+func TestExactPairFailureProofIdentityIsFailClosed(t *testing.T) {
+	base := makeSyntheticLocalSources(2)
+	base[0].SizeBytes, base[1].SizeBytes = 11, 12
+	base[0].SHA256, base[1].SHA256 = strings.Repeat("1", 64), strings.Repeat("2", 64)
+	base[0].AudioContract = &AudioSequenceContract{CodecName: "aac", SampleRate: 48000, Channels: 2, ChannelLayout: "stereo"}
+	base[1].AudioContract = &AudioSequenceContract{CodecName: "aac", SampleRate: 48000, Channels: 2, ChannelLayout: "stereo"}
+	baseKey, err := exactPairFailureProofKey(base, 0, PlanPolicyVersion, strings.Repeat("f", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := map[string]func([]LocalSource) ([]LocalSource, int, string, string){
+		"order": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			return []LocalSource{in[1], in[0]}, 0, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"locator position": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			return in, 1, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"clip id": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			in[0].ClipID++
+			return in, 0, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"source claim": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			in[0].SourceClaimSHA256 = strings.Repeat("b", 64)
+			return in, 0, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"local sha": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			in[0].SHA256 = strings.Repeat("3", 64)
+			return in, 0, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"local size": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			in[0].SizeBytes++
+			return in, 0, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"audio contract": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			copy := *in[0].AudioContract
+			copy.SampleRate++
+			in[0].AudioContract = &copy
+			return in, 0, PlanPolicyVersion, strings.Repeat("f", 64)
+		},
+		"policy": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			return in, 0, PlanPolicyVersion + "-changed", strings.Repeat("f", 64)
+		},
+		"tool": func(in []LocalSource) ([]LocalSource, int, string, string) {
+			return in, 0, PlanPolicyVersion, strings.Repeat("e", 64)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			candidate := append([]LocalSource(nil), base...)
+			candidate, position, policy, tool := mutate(candidate)
+			got, err := exactPairFailureProofKey(candidate, position, policy, tool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == baseKey {
+				t.Fatal("identity mutation reused an exact-pair proof")
+			}
+		})
+	}
+}
+
+func TestBuildAllPassingPartsNeverReusesSourceFailure(t *testing.T) {
+	sources := makeSyntheticLocalSourcesWithIdentity(t, 2)
+	calls := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		calls++
+		return BuiltOutput{}, deterministicFailure("corrupt_source_media", struct {
+			CandidateClipIDs []int64 `json:"candidate_clip_ids"`
+		}{clipIDs(candidate)}, errors.New("source probe failed"))
+	}
+	_, _, _ = buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if calls != 8 {
+		t.Fatalf("source failure attempts=%d want=8", calls)
+	}
+}
+
+func TestBuildAllPassingPartsExactPairProofFailsClosedOnSourceMutation(t *testing.T) {
+	sources := makeSyntheticLocalSourcesWithIdentity(t, 3)
+	calls12 := 0
+	mutated := false
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		ids := clipIDs(candidate)
+		if equalInt64s(ids, []int64{1}) && !mutated {
+			mutated = true
+			if err := os.WriteFile(sources[1].Path, []byte("changed exact bytes"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if equalInt64s(ids, []int64{1, 2}) {
+			calls12++
+			return BuiltOutput{}, seamFailure(1, 2)
+		}
+		if len(candidate) > 1 {
+			return BuiltOutput{}, seamFailure(candidate[0].ClipID, candidate[1].ClipID)
+		}
+		return BuiltOutput{SourceCount: 1}, nil
+	}
+	_, _, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls12 != 4 {
+		t.Fatalf("mutated source reused stale pair proof: calls=%d want=4", calls12)
+	}
+}
+
+func TestBuildAllPassingPartsExactPairProofHonorsCancellation(t *testing.T) {
+	sources := makeSyntheticLocalSourcesWithIdentity(t, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == 1 {
+			cancel()
+			return BuiltOutput{SourceCount: 1}, nil
+		}
+		return BuiltOutput{}, seamFailure(1, 2)
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, context.Canceled) || len(parts) != 0 || len(quarantines) != 0 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestCloneDeterministicMediaErrorDoesNotAliasFacts(t *testing.T) {
+	original, ok := deterministicBuildFailure(deterministicFailure("media_sequence_mismatch", struct {
+		Value string `json:"value"`
+	}{"original"}, errors.New("mismatch")))
+	if !ok {
+		t.Fatal("fixture is not deterministic")
+	}
+	copy := cloneDeterministicMediaError(original)
+	original.evidence[0] = 'x'
+	if bytes.Equal(original.evidence, copy.evidence) || copy.evidenceSHA256 != original.evidenceSHA256 || copy.code != original.code {
+		t.Fatalf("proof copy aliases or changes evidence: original=%q copy=%q", original.evidence, copy.evidence)
 	}
 }
 
@@ -521,6 +722,26 @@ func makeSyntheticLocalSources(count int) []LocalSource {
 	sources := make([]LocalSource, count)
 	for i := range sources {
 		sources[i] = LocalSource{ClipID: int64(i + 1), SourceClaimSHA256: strings.Repeat("a", 64)}
+	}
+	return sources
+}
+
+func makeSyntheticLocalSourcesWithIdentity(t *testing.T, count int) []LocalSource {
+	t.Helper()
+	dir := t.TempDir()
+	sources := makeSyntheticLocalSources(count)
+	for i := range sources {
+		path := filepath.Join(dir, fmt.Sprintf("source-%03d.mp4", i))
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("source-%03d", i)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		size, sha, err := localIdentity(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources[i].Path = path
+		sources[i].SizeBytes = size
+		sources[i].SHA256 = sha
 	}
 	return sources
 }
