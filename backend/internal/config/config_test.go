@@ -635,7 +635,7 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"1\"",
 		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"13\"",
 		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"7\"",
-		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"4\"",
+		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"5\"",
 		"key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch",
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
 		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
@@ -646,6 +646,26 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 		if !strings.Contains(section, required) {
 			t.Fatalf("joined API missing %q", required)
 		}
+	}
+	nonsecretValue := regexp.MustCompile(`(?m)^      - key: (JOINED_RECORDING_[A-Z0-9_]+|STOARAMA_JOINED_WORK_SCOPE)\n        value: "?([^"\n]+)"?$`)
+	got := map[string]string{}
+	for _, match := range nonsecretValue.FindAllStringSubmatch(section, -1) {
+		if _, duplicate := got[match[1]]; duplicate {
+			t.Fatalf("joined API duplicates nonsecret control-plane value %q", match[1])
+		}
+		got[match[1]] = match[2]
+	}
+	want := map[string]string{
+		"JOINED_RECORDING_CONTROL_PLANE_ENABLED": "true",
+		"JOINED_RECORDING_NAS_DELIVERY_ENABLED":  "false",
+		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
+		"JOINED_RECORDING_CONNECTION_ID":         "13",
+		"JOINED_RECORDING_PROTOCOL_GENERATION":   "7",
+		"JOINED_RECORDING_MAX_ACTIVE_TASKS":      "5",
+		"STOARAMA_JOINED_WORK_SCOPE":             "frozen_batch",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("joined API nonsecret control-plane values=%v want=%v", got, want)
 	}
 	if strings.Contains(section, "key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"true\"") {
 		t.Fatal("joined NAS delivery was enabled in source configuration")
