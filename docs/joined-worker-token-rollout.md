@@ -24,6 +24,11 @@ objects, joined objects, claims, leases, or the signing key.
 - Stop a host before revoking its hash. A claim token minted before revocation
   can remain valid for up to 10 minutes, and an active operation token remains
   fenced by its database lease.
+- Dedicated-host systemd units must set `TimeoutStopSec=14700`. On `SIGTERM`,
+  the worker stops claim admission but lets its one admitted task run to the
+  four-hour hard deadline. The extra five minutes covers its bounded failure
+  report and process shutdown. Keep the unit's process-group kill behavior so
+  systemd still stops every child after that bound.
 - A per-host token supports individual revocation. It is not host attestation
   or trusted attribution. An allowed token can be replayed from another host,
   and the later `worker_id` is supplied by the client.

@@ -582,6 +582,32 @@ func TestJoinedWorkerDrainPreservesAdmittedTaskFailure(t *testing.T) {
 	}
 }
 
+func TestJoinedWorkerDrainIsBoundedByAdmittedTaskDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runJoinedWorkerLoop(ctx, time.Hour, func(_ context.Context, admittedCtx context.Context) (bool, error) {
+			err := runJoinedWorkerTask(admittedCtx, 20*time.Millisecond, "preflight_and_publish", func(taskCtx context.Context) error {
+				close(started)
+				<-taskCtx.Done()
+				return taskCtx.Err()
+			})
+			return true, err
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("bounded drain error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("draining worker outlived admitted task deadline")
+	}
+}
+
 func TestJoinedWorkerScratchCleanupUsesBootstrapScopedLeaseProof(t *testing.T) {
 	t.Parallel()
 	cfg := validJoinedWorkerConfig()
@@ -1093,6 +1119,17 @@ func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 	<-started
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "joined worker task deadline exceeded stage=preflight_and_publish") {
 		t.Fatalf("task deadline err=%v", err)
+	}
+}
+
+func TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime(t *testing.T) {
+	// Production hour 865 made healthy, monotonic progress for the full
+	// two-hour task budget and was canceled after producing 50 of 60 strict
+	// singleton outputs. Four hours covers the measured remaining work plus
+	// seal and create-only publication without removing the hard stop.
+	const minimumStrictHourBudget = 4 * time.Hour
+	if joinedWorkerTaskLimit < minimumStrictHourBudget {
+		t.Fatalf("joined worker task limit=%s is below measured strict-hour budget=%s", joinedWorkerTaskLimit, minimumStrictHourBudget)
 	}
 }
 
