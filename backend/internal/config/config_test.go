@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -126,6 +128,62 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	}
 }
 
+func TestJoinedWorkerBootstrapSHA256AllowlistFailsClosed(t *testing.T) {
+	t.Parallel()
+	const bootstrap = "joined-bootstrap-credential-32bytes"
+	const signing = "joined-signing-credential-32-bytes"
+	workerDigest := sha256.Sum256([]byte("dedicated-worker-token-32-bytes-0001"))
+	valid := Config{
+		JoinedWorkerBootstrapToken:  bootstrap,
+		JoinedWorkerBootstrapHashes: hex.EncodeToString(workerDigest[:]),
+		JoinedWorkerSigningKey:      signing,
+	}
+	if err := valid.ValidateJoined(); err != nil {
+		t.Fatalf("valid joined worker digest allowlist: %v", err)
+	}
+	digests, err := valid.JoinedWorkerBootstrapSHA256s()
+	if err != nil || len(digests) != 1 || digests[0] != workerDigest {
+		t.Fatalf("parsed worker digests=%x err=%v", digests, err)
+	}
+
+	protected := sha256.Sum256([]byte(signing))
+	for _, raw := range []string{
+		"abc",
+		strings.Repeat("A", sha256.Size*2),
+		hex.EncodeToString(workerDigest[:]) + ", " + strings.Repeat("a", sha256.Size*2),
+		hex.EncodeToString(workerDigest[:]) + "," + hex.EncodeToString(workerDigest[:]),
+		hex.EncodeToString(protected[:]),
+		strings.Repeat("a", sha256.Size*2) + ",",
+		strings.Repeat("a", sha256.Size*2+1),
+		strings.TrimSuffix(strings.Repeat(strings.Repeat("a", sha256.Size*2)+",", 65), ","),
+	} {
+		candidate := valid
+		candidate.JoinedWorkerBootstrapHashes = raw
+		if err := candidate.ValidateJoined(); err == nil {
+			t.Fatalf("unsafe joined worker digest allowlist accepted: %q", raw)
+		}
+	}
+
+	for name, credential := range map[string]string{
+		"legacy bootstrap": bootstrap,
+		"service":          "generic-service-key",
+		"operator":         "joined-operator-token-32-bytes-0001",
+		"storage":          "joined-storage-token-32-bytes-0001",
+	} {
+		t.Run("protected "+name, func(t *testing.T) {
+			candidate := valid
+			candidate.ServiceToken = "generic-service-key"
+			candidate.JoinedOperatorToken = "joined-operator-token-32-bytes-0001"
+			candidate.R2SecretAccessKey = "joined-storage-token-32-bytes-0001"
+			digest := sha256.Sum256([]byte(credential))
+			candidate.JoinedWorkerBootstrapHashes = hex.EncodeToString(digest[:])
+			if err := candidate.ValidateJoined(); err == nil {
+				t.Fatalf("%s credential hash accepted as joined worker authority", name)
+			}
+		})
+	}
+}
+
 func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 	renderPath := filepath.Join("..", "..", "..", "render.yaml")
 	data, err := os.ReadFile(renderPath)
@@ -209,6 +267,7 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 		"JOINED_RECORDING_FFPROBE_BINARY_SHA256",
 		"STOARAMA_JOINED_WORKER_TOKEN",
 		"JOINED_WORKER_BOOTSTRAP_TOKEN",
+		"JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST",
 		"JOINED_WORKER_SIGNING_KEY",
 		"STOARAMA_JOINED_OPERATOR_TOKEN",
 	} {
@@ -579,6 +638,7 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
 		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
 		"key: JOINED_WORKER_BOOTSTRAP_TOKEN\n        sync: false",
+		"key: JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST\n        sync: false",
 		"key: JOINED_WORKER_SIGNING_KEY\n        sync: false",
 	} {
 		if !strings.Contains(section, required) {

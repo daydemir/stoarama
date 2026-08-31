@@ -673,8 +673,8 @@ func (s *Server) handleJoinedSourceCapability(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusInternalServerError, "decrypt joined source storage credential")
 		return
 	}
-	bootstrap, signing := strings.TrimSpace(s.cfg.JoinedWorkerBootstrapToken), strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
-	if d.accessKeyID == bootstrap || d.accessKeyID == signing || string(secret) == bootstrap || string(secret) == signing {
+	workerAuthority, authorityErr := s.joinedWorkerAuthorityDigests()
+	if authorityErr != nil || credentialDigestMatches(d.accessKeyID, workerAuthority) || credentialDigestMatches(string(secret), workerAuthority) {
 		util.WriteError(w, http.StatusServiceUnavailable, "joined worker and source storage credentials must be distinct")
 		return
 	}
