@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -782,6 +783,9 @@ func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fall
 	if err != nil {
 		return Segment{}, fmt.Errorf("read segment: %w", err)
 	}
+	if err := validateMP4Container(body); err != nil {
+		return Segment{}, fmt.Errorf("validate finalized segment: %w", err)
+	}
 	readDuration := time.Since(readStarted)
 	hashStarted := time.Now()
 	sum := sha256.Sum256(body)
@@ -799,6 +803,12 @@ func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fall
 			timestampContract, timestampStatus, timestampReason = nil, TimestampProbeUnknown, timestampContractErrorCode(timestampErr)
 		}
 	}
+	// A non-empty file is not proof that the MP4 trailer was written. In
+	// particular, an interrupted HLS/FFmpeg attempt can leave bytes on disk
+	// without a moov atom; accepting those bytes would register an unreadable
+	// clip and poison the quality window. Legacy captures require the ordinary
+	// probe to succeed. The timestamp-contract canary may use its stronger
+	// immutable-byte probe as the fallback, but only when that probe completed.
 	probeDuration := time.Since(probeStarted)
 	durationMs := int64(0)
 	videoCodec := "h264"
@@ -857,6 +867,51 @@ func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fall
 		TimestampContractStatus: timestampStatus,
 		TimestampContractReason: timestampReason,
 	}, nil
+}
+
+// validateMP4Container checks the immutable bytes for complete top-level ISO
+// BMFF boxes and requires both media data and the moov trailer. This catches a
+// non-empty file left behind when FFmpeg is interrupted before writing its
+// trailer, without depending on ffprobe being installed on the relay host.
+func validateMP4Container(body []byte) error {
+	if len(body) < 8 {
+		return fmt.Errorf("file is too small for an MP4 box")
+	}
+	foundMdat, foundMoov := false, false
+	for offset := 0; offset < len(body); {
+		remaining := len(body) - offset
+		if remaining < 8 {
+			return fmt.Errorf("truncated box header at byte %d", offset)
+		}
+		size := uint64(binary.BigEndian.Uint32(body[offset : offset+4]))
+		headerSize := uint64(8)
+		if size == 1 {
+			if remaining < 16 {
+				return fmt.Errorf("truncated extended box header at byte %d", offset)
+			}
+			size = binary.BigEndian.Uint64(body[offset+8 : offset+16])
+			headerSize = 16
+		} else if size == 0 {
+			size = uint64(remaining)
+		}
+		if size < headerSize || size > uint64(remaining) {
+			return fmt.Errorf("truncated box at byte %d", offset)
+		}
+		switch string(body[offset+4 : offset+8]) {
+		case "mdat":
+			foundMdat = true
+		case "moov":
+			foundMoov = true
+		}
+		offset += int(size)
+	}
+	if !foundMdat {
+		return fmt.Errorf("missing mdat box")
+	}
+	if !foundMoov {
+		return fmt.Errorf("missing moov box")
+	}
+	return nil
 }
 
 func timestampContractHasAudio(contract *TimestampContract) bool {
