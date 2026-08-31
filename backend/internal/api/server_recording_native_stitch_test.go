@@ -46,7 +46,7 @@ func TestNativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease(t *
 	for _, ddl := range []string{
 		`CREATE TABLE accounts(id bigint primary key)`,
 		`INSERT INTO accounts VALUES(47)`,
-		`ALTER TABLE recording_clips ADD COLUMN capture_attempt_id uuid, ADD COLUMN timestamp_contract_version text, ADD COLUMN timestamp_contract jsonb, ADD COLUMN timestamp_contract_status text, ADD COLUMN timestamp_contract_reason text`,
+		`ALTER TABLE recording_clips ADD COLUMN IF NOT EXISTS capture_attempt_id uuid, ADD COLUMN IF NOT EXISTS timestamp_contract_version text, ADD COLUMN IF NOT EXISTS timestamp_contract jsonb, ADD COLUMN IF NOT EXISTS timestamp_contract_status text, ADD COLUMN IF NOT EXISTS timestamp_contract_reason text`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
@@ -179,6 +179,39 @@ func TestNativeStitchClaimSelectsEligibleConnectionBeforeLimitAndFencesLease(t *
 	}
 }
 
+func TestNativeStitchClaimIgnoresRetainedZeroByteDeliveryRows(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE TABLE accounts(id bigint primary key)`,
+		`INSERT INTO accounts VALUES(47)`,
+		`INSERT INTO connections(account_id,kind,api_key_id,inventory_generation,inventory_digest,inventory_scan_completed_at) VALUES(47,'nas_pull',101,'generation',repeat('a',64),now())`,
+		`INSERT INTO recordings(id,account_id,name,status,delivery) VALUES(73,47,'retained-empty','active','nas_pull')`,
+		`INSERT INTO recording_clips(id,recording_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,created_at) VALUES(13,73,0,repeat('0',64),now()-interval '2 hours',now()-interval '1 hour','recordings/empty.mp4',now()-interval '2 hours')`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile("../../../infra/sql/migrations/0133_recording_native_stitch_certification.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{pool: pool}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/stitch-certifications/claim", bytes.NewReader([]byte(`{}`)))
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, APIKeyID: ptrInt64(101)}))
+	rec := httptest.NewRecorder()
+	s.handleAccountNativeStitchClaim(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"reason":"empty"`) {
+		t.Fatalf("zero-byte retained row blocked stitch claim status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestNativeStitchWholeWindowContinuityRequiresExactEnvelope(t *testing.T) {
 	full := stitchcert.Timeline{ExpectedSeconds: 43200, CoveredSeconds: 43200}
 	if !nativeStitchWholeWindowContinuous(full) {
@@ -206,7 +239,7 @@ func TestNativeStitchCompletionKeepsV1FrameProofPartialAndRejectsForgedSeamProve
 	for _, ddl := range []string{
 		`CREATE TABLE accounts(id bigint primary key)`,
 		`INSERT INTO accounts VALUES(47)`,
-		`ALTER TABLE recording_clips ADD COLUMN capture_attempt_id uuid, ADD COLUMN timestamp_contract_version text, ADD COLUMN timestamp_contract jsonb, ADD COLUMN timestamp_contract_status text, ADD COLUMN timestamp_contract_reason text`,
+		`ALTER TABLE recording_clips ADD COLUMN IF NOT EXISTS capture_attempt_id uuid, ADD COLUMN IF NOT EXISTS timestamp_contract_version text, ADD COLUMN IF NOT EXISTS timestamp_contract jsonb, ADD COLUMN IF NOT EXISTS timestamp_contract_status text, ADD COLUMN IF NOT EXISTS timestamp_contract_reason text`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
@@ -234,12 +267,16 @@ func TestNativeStitchCompletionKeepsV1FrameProofPartialAndRejectsForgedSeamProve
 	}
 	if _, err = pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,size_bytes,sha256,clip_start_at,clip_end_at,display_path,released_at,recording_job_id,capture_lease_token,capture_sequence,capture_attempt_id,timestamp_contract_version,timestamp_contract_status,timestamp_contract) VALUES
 		(21,77,4,repeat('a',64),$1,$2,'recordings/one.mp4',now(),99,$4,1,$5,'continuous-source-pts-v1','per_clip_probe_complete',$6),
+		(23,77,0,repeat('0',64),$1,$2,'recordings/empty.mp4',NULL,99,$4,3,$5,'continuous-source-pts-v1','per_clip_probe_complete',$6),
 		(22,77,4,repeat('b',64),$2,$3,'recordings/two.mp4',now(),99,$4,2,$5,'continuous-source-pts-v1','per_clip_probe_complete',$7)`, start, middle, end, lease, attempt, contractOneRaw, contractTwoRaw); err != nil {
 		t.Fatal(err)
 	}
 	clips, manifestSHA, sourceBytes, err := loadNativeStitchManifest(ctx, pool, 47, 77, 99, start, end)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(clips) != 2 || sourceBytes != 8 || clips[0].ClipID != 21 || clips[1].ClipID != 22 {
+		t.Fatalf("positive-only manifest clips=%v source_bytes=%d", clips, sourceBytes)
 	}
 	manifestRaw, _ := json.Marshal(clips)
 	health := `{"clip_count":2,"expected_seconds":43200,"covered_seconds":43200,"coverage_pct":100,"largest_gap_seconds":0,"gap_count":0,"gap_over_30s_count":0,"gap_over_5m_count":0,"overlap_count":0,"overlap_seconds":0}`

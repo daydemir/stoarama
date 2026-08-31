@@ -176,6 +176,7 @@ const connectionPendingLateralSQL = `
 		JOIN recordings rec ON rec.id = c.recording_id
 		WHERE conn.kind='nas_pull' AND rec.account_id=conn.account_id AND rec.delivery='nas_pull'
 		  AND c.purged_at IS NULL AND c.released_at IS NULL
+		  AND c.size_bytes > 0
 		  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
 		  AND c.id > conn.last_cursor_id
 	) pending ON true

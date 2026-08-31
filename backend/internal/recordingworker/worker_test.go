@@ -245,6 +245,37 @@ func TestSegmentDeliveryRefreshesExpiringUploadIntent(t *testing.T) {
 	}
 }
 
+func TestSegmentDeliveryReuploadsAfterRemoteIntegrityMismatch(t *testing.T) {
+	var reserveCalls, uploadCalls, ingestCalls, retryCalls int
+	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{
+		Reserve: func() (recordingapi.ClipUploadIntent, error) {
+			reserveCalls++
+			return recordingapi.ClipUploadIntent{IntentID: "intent-1", UploadURL: "https://upload.test", ExpiresAt: time.Now().Add(time.Hour)}, nil
+		},
+		Upload: func(recordingapi.ClipUploadIntent) error {
+			uploadCalls++
+			return nil
+		},
+		Ingest: func(recordingapi.ClipUploadIntent) error {
+			ingestCalls++
+			if ingestCalls == 1 {
+				err := &apihttp.StatusError{Label: "ingest", Code: http.StatusServiceUnavailable, Body: `{"code":"recording_uploaded_object_integrity_mismatch"}`}
+				if recordingapi.ErrorCodeFrom(err) != recordingapi.ErrorCodeUploadedObjectIntegrity {
+					t.Fatal("remote integrity mismatch lost its stable error code")
+				}
+				return err
+			}
+			return nil
+		},
+	}, func(error) { retryCalls++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reserveCalls != 2 || uploadCalls != 2 || ingestCalls != 2 || retryCalls != 1 {
+		t.Fatalf("reserve=%d upload=%d ingest=%d retries=%d, want full replay", reserveCalls, uploadCalls, ingestCalls, retryCalls)
+	}
+}
+
 func TestSegmentDeliverySkipsConsumedReplay(t *testing.T) {
 	var uploadCalls, ingestCalls, replayCalls int
 	err := deliverSegmentWithRetry(context.Background(), time.Millisecond, func() bool { return true }, segmentDeliveryOps{

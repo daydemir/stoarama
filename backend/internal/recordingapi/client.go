@@ -34,6 +34,7 @@ type ErrorCode string
 const (
 	ErrorCodeClipAlreadyIngested     ErrorCode = "recording_clip_already_ingested"
 	ErrorCodeUploadIntentUnavailable ErrorCode = "recording_upload_intent_unavailable"
+	ErrorCodeUploadedObjectIntegrity ErrorCode = "recording_uploaded_object_integrity_mismatch"
 )
 
 // ErrorCodeFrom returns a structured recording API error code, when present.

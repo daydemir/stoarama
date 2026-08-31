@@ -177,6 +177,7 @@ func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) (digestNAS, error) {
 		       c.nas_batch_clips,c.nas_batch_failures,c.nas_batch_completed_at,c.inventory_clips,c.inventory_mismatches,c.inventory_unmatched,c.inventory_reported_at,
 		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
 		         WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
+		           AND rc.size_bytes>0
 		           AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
 		             AND i.relative_path=rc.display_path AND i.size_bytes=rc.size_bytes AND i.sha256=lower(rc.sha256)
 		             AND i.verified_at>=now()-interval '72 hours' AND i.verified_at<=now()+interval '5 minutes'
