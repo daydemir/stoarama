@@ -803,12 +803,13 @@ func finalizeSegmentWithTimestampContract(ctx context.Context, path string, fall
 			timestampContract, timestampStatus, timestampReason = nil, TimestampProbeUnknown, timestampContractErrorCode(timestampErr)
 		}
 	}
-	// A non-empty file is not proof that the MP4 trailer was written. In
-	// particular, an interrupted HLS/FFmpeg attempt can leave bytes on disk
-	// without a moov atom; accepting those bytes would register an unreadable
-	// clip and poison the quality window. Legacy captures require the ordinary
-	// probe to succeed. The timestamp-contract canary may use its stronger
-	// immutable-byte probe as the fallback, but only when that probe completed.
+	// A non-empty file is not proof that the MP4 trailer was written. The
+	// immutable byte-level validation above is the acceptance gate: an
+	// interrupted HLS/FFmpeg attempt without a complete moov atom is rejected
+	// before delivery. Ordinary ffprobe metadata remains best-effort because
+	// relay hosts vendor ffmpeg but may not install ffprobe; when the optional
+	// timestamp contract completes, its immutable-byte evidence remains
+	// authoritative for the canary path.
 	probeDuration := time.Since(probeStarted)
 	durationMs := int64(0)
 	videoCodec := "h264"
