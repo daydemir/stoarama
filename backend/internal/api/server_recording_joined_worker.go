@@ -440,7 +440,11 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.hour_record_id=h.id
 		    AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		  AND ((h.state='pending' AND h.next_attempt_at<=now()) OR (h.state='leased' AND h.lease_expires_at<=now()))
-		ORDER BY h.priority_ordinal,h.next_attempt_at,h.id
+		-- A frozen recording owns 14 days * 12 hours = 168 consecutive
+		-- ordinals. Interleave the same hour position across recordings, then
+		-- use the frozen recording priority as the deterministic tie-breaker.
+		ORDER BY CASE WHEN $3 THEN (h.priority_ordinal-1)%168 ELSE h.priority_ordinal END,
+		  CASE WHEN $3 THEN (h.priority_ordinal-1)/168 ELSE 0 END,h.next_attempt_at,h.id
 		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch, capacityBytes,
 		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes, s.cfg.JoinedRecordingConnectionID).Scan(&hourRecordID)
 	if errors.Is(err, pgx.ErrNoRows) {
