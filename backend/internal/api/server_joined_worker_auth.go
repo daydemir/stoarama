@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"net/http"
@@ -14,6 +15,45 @@ import (
 )
 
 type joinedWorkerClaimsContextKey struct{}
+
+func constantTimeDigestMatch(candidate [sha256.Size]byte, allowed [][sha256.Size]byte) bool {
+	matched := 0
+	for _, digest := range allowed {
+		matched |= subtle.ConstantTimeCompare(candidate[:], digest[:])
+	}
+	return matched == 1
+}
+
+func (s *Server) joinedBootstrapAuthDigests() ([][sha256.Size]byte, error) {
+	if err := s.cfg.ValidateJoined(); err != nil {
+		return nil, err
+	}
+	digests, err := s.cfg.JoinedWorkerBootstrapSHA256s()
+	if err != nil {
+		return nil, err
+	}
+	legacy := strings.TrimSpace(s.cfg.JoinedWorkerBootstrapToken)
+	if legacy == "" {
+		return nil, errors.New("joined worker bootstrap authority is unavailable")
+	}
+	return append(digests, sha256.Sum256([]byte(legacy))), nil
+}
+
+func (s *Server) joinedWorkerAuthorityDigests() ([][sha256.Size]byte, error) {
+	digests, err := s.joinedBootstrapAuthDigests()
+	if err != nil {
+		return nil, err
+	}
+	signing := strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
+	if signing == "" {
+		return nil, errors.New("joined worker signing authority is unavailable")
+	}
+	return append(digests, sha256.Sum256([]byte(signing))), nil
+}
+
+func credentialDigestMatches(credential string, allowed [][sha256.Size]byte) bool {
+	return constantTimeDigestMatch(sha256.Sum256([]byte(strings.TrimSpace(credential))), allowed)
+}
 
 func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) error {
 	if s.joinedCredentialCheck != nil {
@@ -28,8 +68,10 @@ func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) e
 		return err
 	}
 	defer rows.Close()
-	bootstrap := strings.TrimSpace(s.cfg.JoinedWorkerBootstrapToken)
-	signing := strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
+	workerAuthority, err := s.joinedWorkerAuthorityDigests()
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		var accessKey string
 		var encrypted []byte
@@ -45,7 +87,7 @@ func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) e
 		}
 		accessKey = strings.TrimSpace(accessKey)
 		storageSecret := strings.TrimSpace(string(secret))
-		if accessKey == bootstrap || accessKey == signing || storageSecret == bootstrap || storageSecret == signing {
+		if credentialDigestMatches(accessKey, workerAuthority) || credentialDigestMatches(storageSecret, workerAuthority) {
 			return errors.New("joined storage credential aliases worker authority")
 		}
 	}
@@ -54,12 +96,14 @@ func (s *Server) validateJoinedStorageCredentialIsolation(ctx context.Context) e
 
 func (s *Server) requireJoinedWorkerBootstrapAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		expected := strings.TrimSpace(s.cfg.JoinedWorkerBootstrapToken)
-		serviceToken := strings.TrimSpace(s.cfg.ServiceToken)
-		signingKey := strings.TrimSpace(s.cfg.JoinedWorkerSigningKey)
+		allowed, err := s.joinedBootstrapAuthDigests()
 		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-		if expected == "" || expected == serviceToken || expected == signingKey || !strings.HasPrefix(authorization, "Bearer ") ||
-			subtle.ConstantTimeCompare([]byte(strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))), []byte(expected)) != 1 {
+		if err != nil || !strings.HasPrefix(authorization, "Bearer ") {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		presented := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+		if len(presented) < 32 || !constantTimeDigestMatch(sha256.Sum256([]byte(presented)), allowed) {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
