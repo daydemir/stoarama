@@ -181,16 +181,36 @@ type MediaFingerprint struct {
 }
 
 type Verification struct {
-	Status                     string           `json:"status"`
-	AcceptanceMode             string           `json:"acceptance_mode,omitempty"`
-	PacketPayloadOrderStatus   string           `json:"packet_payload_order_status"`
-	DecodedFrameSequenceStatus string           `json:"decoded_frame_sequence_status,omitempty"`
-	DecodedFrameTotalsStatus   string           `json:"decoded_frame_totals_status"`
-	DecodedAudioTotalsStatus   string           `json:"decoded_audio_totals_status"`
-	OutputTimestampStatus      string           `json:"output_timestamp_status"`
-	StrictDecodeStatus         string           `json:"strict_decode_status"`
-	SourceFingerprint          MediaFingerprint `json:"source_fingerprint"`
-	OutputFingerprint          MediaFingerprint `json:"output_fingerprint"`
+	Status                     string                         `json:"status"`
+	AcceptanceMode             string                         `json:"acceptance_mode,omitempty"`
+	LosslessNormalization      *LosslessNormalizationEvidence `json:"lossless_normalization,omitempty"`
+	PacketPayloadOrderStatus   string                         `json:"packet_payload_order_status"`
+	DecodedFrameSequenceStatus string                         `json:"decoded_frame_sequence_status,omitempty"`
+	DecodedFrameTotalsStatus   string                         `json:"decoded_frame_totals_status"`
+	DecodedAudioTotalsStatus   string                         `json:"decoded_audio_totals_status"`
+	OutputTimestampStatus      string                         `json:"output_timestamp_status"`
+	StrictDecodeStatus         string                         `json:"strict_decode_status"`
+	SourceFingerprint          MediaFingerprint               `json:"source_fingerprint"`
+	OutputFingerprint          MediaFingerprint               `json:"output_fingerprint"`
+}
+
+// LosslessNormalizationEvidence records the exact, bounded codec contract
+// used only after both stream-copy verification modes reject a candidate.
+// QP 0 preserves decoded pixels; the ordered decoded-frame hash proves that
+// the normalized output represents every source frame exactly once.
+type LosslessNormalizationEvidence struct {
+	Codec                         string `json:"codec"`
+	Preset                        string `json:"preset"`
+	Quantizer                     int    `json:"quantizer"`
+	PixelFormat                   string `json:"pixel_format"`
+	FrameRate                     string `json:"frame_rate"`
+	TimelineRule                  string `json:"timeline_rule"`
+	SourceDecodedFrames           int64  `json:"source_decoded_frames"`
+	OutputDecodedFrames           int64  `json:"output_decoded_frames"`
+	DecodedFrameSequenceSHA256    string `json:"decoded_frame_sequence_sha256"`
+	SourceTimelineSignatureSHA256 string `json:"source_timeline_signature_sha256"`
+	OutputLimitBytes              int64  `json:"output_limit_bytes"`
+	AudioStatus                   string `json:"audio_status"`
 }
 
 type BuiltOutput struct {
@@ -917,6 +937,27 @@ func BuildSealedOutput(ctx context.Context, sources []LocalSource, scratchDir st
 }
 
 func buildAndVerify(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
+	if len(sources) == 1 {
+		return buildStreamCopyAndVerify(ctx, sources, scratchDir)
+	}
+	return buildWithLosslessFallback(ctx, sources, scratchDir, buildStreamCopyAndVerify, buildLosslessNativeTimeline)
+}
+
+type mediaBuilder func(context.Context, []LocalSource, string) (BuiltOutput, error)
+
+func buildWithLosslessFallback(ctx context.Context, sources []LocalSource, scratchDir string, streamCopy, normalize mediaBuilder) (BuiltOutput, error) {
+	built, err := streamCopy(ctx, sources, scratchDir)
+	if err == nil {
+		return built, nil
+	}
+	failure, deterministic := deterministicBuildFailure(err)
+	if !deterministic || failure.code != "media_sequence_mismatch" {
+		return BuiltOutput{}, err
+	}
+	return normalize(ctx, sources, scratchDir)
+}
+
+func buildStreamCopyAndVerify(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
 	var sourceBytes int64
 	for _, source := range sources {
 		if source.SizeBytes > r2.MaxConditionalPutBytes-sourceBytes {
@@ -980,6 +1021,248 @@ func buildAndVerify(ctx context.Context, sources []LocalSource, scratchDir strin
 	}
 	keep = true
 	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
+}
+
+const losslessNormalizationExpansionLimit int64 = 7
+
+type losslessVideoLayout struct {
+	Width       int
+	Height      int
+	PixelFormat string
+	FrameRate   string
+	RateNum     int64
+	RateDen     int64
+}
+
+func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
+	if len(sources) < 2 {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization requires multiple sources")
+	}
+	layouts := make([]losslessVideoLayout, len(sources))
+	timelineFacts := make([]struct {
+		ClipID            int64  `json:"clip_id"`
+		SourceClaimSHA256 string `json:"source_claim_sha256"`
+		Width             int    `json:"width"`
+		Height            int    `json:"height"`
+		PixelFormat       string `json:"pixel_format"`
+		FrameRate         string `json:"frame_rate"`
+	}, len(sources))
+	var sourceBytes int64
+	for i, source := range sources {
+		layout, hasAudio, err := probeLosslessVideoLayout(ctx, source.Path)
+		if err != nil {
+			return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_source_probe_failure", err)
+		}
+		if hasAudio {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_audio_unsupported", struct {
+				ClipID int64 `json:"clip_id"`
+			}{source.ClipID}, fmt.Errorf("audio-bearing sources remain on the strict stream-copy path"))
+		}
+		if layout.PixelFormat != "yuv420p" {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_pixel_format_unsupported", struct {
+				ClipID      int64  `json:"clip_id"`
+				PixelFormat string `json:"pixel_format"`
+			}{source.ClipID, layout.PixelFormat}, fmt.Errorf("lossless normalization requires yuv420p input"))
+		}
+		if i > 0 && layout != layouts[0] {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_layout_mismatch", struct {
+				ClipID int64 `json:"clip_id"`
+			}{source.ClipID}, fmt.Errorf("source video layout or native frame rate changes within candidate"))
+		}
+		layouts[i] = layout
+		timelineFacts[i] = struct {
+			ClipID            int64  `json:"clip_id"`
+			SourceClaimSHA256 string `json:"source_claim_sha256"`
+			Width             int    `json:"width"`
+			Height            int    `json:"height"`
+			PixelFormat       string `json:"pixel_format"`
+			FrameRate         string `json:"frame_rate"`
+		}{source.ClipID, source.SourceClaimSHA256, layout.Width, layout.Height, layout.PixelFormat, layout.FrameRate}
+		if source.SizeBytes > math.MaxInt64-sourceBytes {
+			return BuiltOutput{}, fmt.Errorf("lossless normalization source size overflows")
+		}
+		sourceBytes += source.SizeBytes
+	}
+
+	outputLimit := r2.MaxConditionalPutBytes
+	if sourceBytes <= math.MaxInt64/losslessNormalizationExpansionLimit {
+		if expanded := sourceBytes * losslessNormalizationExpansionLimit; expanded < outputLimit {
+			outputLimit = expanded
+		}
+	}
+	if outputLimit <= 0 {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization output limit is invalid")
+	}
+	timelineSHA, _, err := stitchcert.CanonicalSHA(timelineFacts)
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	manifest, err := os.CreateTemp(scratchDir, "lossless-concat-*.txt")
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	manifestPath := manifest.Name()
+	defer os.Remove(manifestPath)
+	for _, source := range sources {
+		if strings.ContainsAny(source.Path, "\r\n") {
+			_ = manifest.Close()
+			return BuiltOutput{}, fmt.Errorf("source path contains newline")
+		}
+		escaped := strings.ReplaceAll(source.Path, "'", "'\\''")
+		if _, err := fmt.Fprintf(manifest, "file '%s'\n", escaped); err != nil {
+			_ = manifest.Close()
+			return BuiltOutput{}, err
+		}
+	}
+	if err := manifest.Close(); err != nil {
+		return BuiltOutput{}, err
+	}
+	handle, err := os.CreateTemp(scratchDir, "joined-lossless-*.mp4")
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	outputPath := handle.Name()
+	_ = handle.Close()
+	_ = os.Remove(outputPath)
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(outputPath)
+		}
+	}()
+	layout := layouts[0]
+	timelineRule := fmt.Sprintf("settb=expr=%d/%d,setpts=N", layout.RateDen, layout.RateNum)
+	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-f", "concat", "-safe", "0", "-i", manifestPath, "-map", "0:v:0", "-an", "-vf", timelineRule, "-c:v", "libx264", "-preset", "veryfast", "-qp", "0", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-enc_time_base", fmt.Sprintf("%d:%d", layout.RateDen, layout.RateNum), "-movflags", "+faststart", "-fs", strconv.FormatInt(outputLimit, 10), outputPath); err != nil {
+		return BuiltOutput{}, deterministicCommandFailure(ctx, "lossless_normalization_encode_failure", err)
+	}
+	size, sha, err := localIdentity(outputPath)
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	if size >= outputLimit {
+		code := "lossless_normalization_expansion_cap"
+		if outputLimit == r2.MaxConditionalPutBytes {
+			code = "output_exceeds_put_cap"
+		}
+		return BuiltOutput{}, deterministicFailure(code, struct {
+			OutputBytes int64 `json:"output_bytes"`
+			LimitBytes  int64 `json:"limit_bytes"`
+		}{size, outputLimit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
+	}
+	verification, err := VerifyJoinedMedia(ctx, sources, outputPath)
+	if err != nil {
+		return BuiltOutput{}, deterministicFailure("lossless_normalization_verification_failure", verification, err)
+	}
+	sourceVideo, outputVideo := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
+	decodedSHA := verification.SourceFingerprint.DecodedVideoSHA256
+	if sourceVideo == nil || outputVideo == nil || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || !lowerHex64(decodedSHA) || decodedSHA != verification.OutputFingerprint.DecodedVideoSHA256 {
+		return BuiltOutput{}, deterministicFailure("lossless_normalization_frame_mismatch", verification, fmt.Errorf("lossless decoded frame evidence differs"))
+	}
+	verification.AcceptanceMode = "lossless_native_timeline_normalized"
+	verification.PacketPayloadOrderStatus = "not_applicable_lossless_normalization"
+	verification.LosslessNormalization = &LosslessNormalizationEvidence{
+		Codec:                         "libx264",
+		Preset:                        "veryfast",
+		Quantizer:                     0,
+		PixelFormat:                   layout.PixelFormat,
+		FrameRate:                     layout.FrameRate,
+		TimelineRule:                  timelineRule,
+		SourceDecodedFrames:           sourceVideo.DecodedFrames,
+		OutputDecodedFrames:           outputVideo.DecodedFrames,
+		DecodedFrameSequenceSHA256:    decodedSHA,
+		SourceTimelineSignatureSHA256: timelineSHA,
+		OutputLimitBytes:              outputLimit,
+		AudioStatus:                   "absent",
+	}
+	keep = true
+	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
+}
+
+func validateLosslessNormalizationVerification(v Verification) error {
+	evidence := v.LosslessNormalization
+	if v.AcceptanceMode != "lossless_native_timeline_normalized" || evidence == nil || v.Status != "passed" || v.PacketPayloadOrderStatus != "not_applicable_lossless_normalization" || v.DecodedFrameSequenceStatus != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" {
+		return fmt.Errorf("lossless normalization status evidence differs")
+	}
+	if evidence.Codec != "libx264" || evidence.Preset != "veryfast" || evidence.Quantizer != 0 || evidence.PixelFormat != "yuv420p" || evidence.AudioStatus != "absent" || !lowerHex64(evidence.DecodedFrameSequenceSHA256) || !lowerHex64(evidence.SourceTimelineSignatureSHA256) || evidence.OutputLimitBytes <= 0 || evidence.OutputLimitBytes > r2.MaxConditionalPutBytes {
+		return fmt.Errorf("lossless normalization codec evidence differs")
+	}
+	rate, ok := new(big.Rat).SetString(evidence.FrameRate)
+	if !ok || rate.Sign() <= 0 || !rate.Num().IsInt64() || !rate.Denom().IsInt64() || evidence.TimelineRule != fmt.Sprintf("settb=expr=%d/%d,setpts=N", rate.Denom().Int64(), rate.Num().Int64()) {
+		return fmt.Errorf("lossless normalization timeline evidence differs")
+	}
+	if validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil || len(v.SourceFingerprint.Tracks) != 1 || len(v.OutputFingerprint.Tracks) != 1 || v.SourceFingerprint.Tracks["audio"] != nil || v.OutputFingerprint.Tracks["audio"] != nil || math.Abs(v.SourceFingerprint.DurationSeconds-v.OutputFingerprint.DurationSeconds) > 2 {
+		return fmt.Errorf("lossless normalization media fingerprint differs")
+	}
+	sourceVideo, outputVideo := v.SourceFingerprint.Tracks["video"], v.OutputFingerprint.Tracks["video"]
+	if sourceVideo == nil || outputVideo == nil || sourceVideo.TimestampStatus != "source_clips_independent" || outputVideo.TimestampStatus != "monotonic" || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || evidence.SourceDecodedFrames != sourceVideo.DecodedFrames || evidence.OutputDecodedFrames != outputVideo.DecodedFrames || v.SourceFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 || v.OutputFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 {
+		return fmt.Errorf("lossless normalization decoded frame evidence differs")
+	}
+	return nil
+}
+
+func probeLosslessVideoLayout(ctx context.Context, mediaPath string) (losslessVideoLayout, bool, error) {
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-show_entries", "stream=codec_type,width,height,pix_fmt,avg_frame_rate,r_frame_rate", "-of", "json", mediaPath)
+	stdout, err := process.cmd.StdoutPipe()
+	if err != nil {
+		return losslessVideoLayout{}, false, err
+	}
+	var stderr limitedOutput
+	process.cmd.Stderr = &stderr
+	if err := process.Start(); err != nil {
+		return losslessVideoLayout{}, false, err
+	}
+	out, readErr := io.ReadAll(io.LimitReader(stdout, mediaCommandOutputLimit+1))
+	tooLarge := len(out) > mediaCommandOutputLimit
+	if tooLarge || readErr != nil {
+		_ = process.Kill()
+	}
+	waitErr := process.Wait()
+	if readErr != nil {
+		return losslessVideoLayout{}, false, readErr
+	}
+	if tooLarge {
+		return losslessVideoLayout{}, false, fmt.Errorf("ffprobe lossless layout exceeds bounded output")
+	}
+	if waitErr != nil {
+		return losslessVideoLayout{}, false, fmt.Errorf("ffprobe lossless layout: %w (%s)", waitErr, stderr.String())
+	}
+	var payload struct {
+		Streams []struct {
+			CodecType    string `json:"codec_type"`
+			Width        int    `json:"width"`
+			Height       int    `json:"height"`
+			PixelFormat  string `json:"pix_fmt"`
+			AvgFrameRate string `json:"avg_frame_rate"`
+			RFrameRate   string `json:"r_frame_rate"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return losslessVideoLayout{}, false, err
+	}
+	var layout losslessVideoLayout
+	videoCount, hasAudio := 0, false
+	for _, stream := range payload.Streams {
+		switch stream.CodecType {
+		case "audio":
+			hasAudio = true
+		case "video":
+			videoCount++
+			rate := stream.AvgFrameRate
+			rat, ok := new(big.Rat).SetString(rate)
+			if !ok || rat.Sign() <= 0 {
+				rate = stream.RFrameRate
+				rat, ok = new(big.Rat).SetString(rate)
+			}
+			if !ok || rat.Sign() <= 0 || !rat.Num().IsInt64() || !rat.Denom().IsInt64() || stream.Width <= 0 || stream.Height <= 0 || strings.TrimSpace(stream.PixelFormat) == "" {
+				return losslessVideoLayout{}, false, fmt.Errorf("invalid native video layout")
+			}
+			layout = losslessVideoLayout{Width: stream.Width, Height: stream.Height, PixelFormat: stream.PixelFormat, FrameRate: rat.RatString(), RateNum: rat.Num().Int64(), RateDen: rat.Denom().Int64()}
+		}
+	}
+	if videoCount != 1 {
+		return losslessVideoLayout{}, false, fmt.Errorf("lossless normalization requires exactly one video stream")
+	}
+	return layout, hasAudio, nil
 }
 
 func copyAndVerifySingleton(ctx context.Context, source LocalSource, scratchDir string) (BuiltOutput, error) {

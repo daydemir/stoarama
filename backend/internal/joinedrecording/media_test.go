@@ -138,6 +138,82 @@ func TestVerifyJoinedMediaRejectsChangedDecodedFrames(t *testing.T) {
 	}
 }
 
+func TestBuildLosslessNativeTimelinePreservesEveryDecodedFrame(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "lossless-one.mp4", 440, false)
+	second := makeMediaClip(t, dir, "lossless-two.mp4", 880, false)
+	first.ClipID, second.ClipID = 1, 2
+	sources := []LocalSource{first, second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, []string{first.Path, second.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	built, err := buildLosslessNativeTimeline(ctx, sources, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(built.Path)
+	gotFrames, gotSHA, err := decodedVideoSequenceIdentity(ctx, []string{built.Path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFrames != wantFrames || gotSHA != wantSHA {
+		t.Fatalf("lossless fallback changed decoded frame order: frames=%d/%d sha=%s/%s", gotFrames, wantFrames, gotSHA, wantSHA)
+	}
+	evidence := built.Verification.LosslessNormalization
+	if built.SourceCount != 2 || built.Verification.Status != "passed" || built.Verification.AcceptanceMode != "lossless_native_timeline_normalized" || evidence == nil {
+		t.Fatalf("lossless fallback evidence=%+v", built.Verification)
+	}
+	if evidence.Codec != "libx264" || evidence.Quantizer != 0 || evidence.SourceDecodedFrames != wantFrames || evidence.OutputDecodedFrames != wantFrames || evidence.DecodedFrameSequenceSHA256 != wantSHA || !lowerHex64(evidence.SourceTimelineSignatureSHA256) {
+		t.Fatalf("lossless fallback evidence differs: %+v", evidence)
+	}
+	if built.Verification.PacketPayloadOrderStatus != "not_applicable_lossless_normalization" || validateLosslessNormalizationVerification(built.Verification) != nil {
+		t.Fatalf("lossless fallback verification contract differs: %+v", built.Verification)
+	}
+
+	mutated := built.Verification
+	copyEvidence := *mutated.LosslessNormalization
+	mutated.LosslessNormalization = &copyEvidence
+	mutated.LosslessNormalization.OutputDecodedFrames--
+	if validateLosslessNormalizationVerification(mutated) == nil {
+		t.Fatal("lossless normalization accepted mismatched frame accounting")
+	}
+}
+
+func TestBuildWithLosslessFallbackRunsOnlyAfterSequenceMismatch(t *testing.T) {
+	sources := []LocalSource{{ClipID: 1}, {ClipID: 2}}
+	fastCalls, fallbackCalls := 0, 0
+	fast := func(context.Context, []LocalSource, string) (BuiltOutput, error) {
+		fastCalls++
+		return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct{}{}, errors.New("stream copy dropped a frame"))
+	}
+	fallback := func(context.Context, []LocalSource, string) (BuiltOutput, error) {
+		fallbackCalls++
+		return BuiltOutput{SourceCount: 2, Verification: Verification{Status: "passed", AcceptanceMode: "lossless_native_timeline_normalized"}}, nil
+	}
+	built, err := buildWithLosslessFallback(context.Background(), sources, t.TempDir(), fast, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fastCalls != 1 || fallbackCalls != 1 || built.Verification.AcceptanceMode != "lossless_native_timeline_normalized" {
+		t.Fatalf("fallback policy differed: fast=%d fallback=%d built=%+v", fastCalls, fallbackCalls, built)
+	}
+
+	fast = func(context.Context, []LocalSource, string) (BuiltOutput, error) {
+		return BuiltOutput{}, deterministicFailure("corrupt_source_media", struct{}{}, errors.New("bad source"))
+	}
+	_, err = buildWithLosslessFallback(context.Background(), sources, t.TempDir(), fast, fallback)
+	if err == nil {
+		t.Fatal("non-sequence failure unexpectedly reached fallback")
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("fallback ran for unrelated failure: %d", fallbackCalls)
+	}
+}
+
 func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)

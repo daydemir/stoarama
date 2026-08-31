@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestRequiredScratchBytesReservesSourcesOutputAndMargin(t *testing.T) {
+func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
 	sources := []SourceClip{
 		{ClipID: 1, Object: ObjectIdentity{SizeBytes: 100}},
 		{ClipID: 2, Object: ObjectIdentity{SizeBytes: 250}},
@@ -20,7 +20,7 @@ func TestRequiredScratchBytesReservesSourcesOutputAndMargin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := uint64(2*350) + ScratchSafetyMarginBytes; got != want {
+	if want := uint64(8*350) + ScratchSafetyMarginBytes; got != want {
 		t.Fatalf("required scratch=%d want %d", got, want)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"golang.org/x/sys/unix"
 )
 
@@ -44,9 +45,10 @@ func (e *ScratchHeadroomError) Error() string {
 	return fmt.Sprintf("joined scratch headroom is insufficient: available=%d required=%d", e.Available, e.Required)
 }
 
-// RequiredScratchBytes reserves the complete frozen source set plus an equal
-// amount for the largest joined output, then adds a fixed safety margin. The
-// worker currently keeps all verified source files while ffmpeg builds output.
+// RequiredScratchBytes reserves the complete frozen source set plus the
+// bounded QP 0 fallback output, then adds a fixed safety margin. The fallback
+// may expand compact source media by at most seven times and can never exceed
+// the single-object conditional PUT cap.
 func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 	var sourceBytes uint64
 	for _, source := range sources {
@@ -59,10 +61,16 @@ func RequiredScratchBytes(sources []SourceClip) (uint64, error) {
 		}
 		sourceBytes += size
 	}
-	if sourceBytes > (math.MaxUint64-ScratchSafetyMarginBytes)/2 {
+	outputBytes := uint64(r2.MaxConditionalPutBytes)
+	if sourceBytes <= math.MaxUint64/uint64(losslessNormalizationExpansionLimit) {
+		if expanded := sourceBytes * uint64(losslessNormalizationExpansionLimit); expanded < outputBytes {
+			outputBytes = expanded
+		}
+	}
+	if sourceBytes > math.MaxUint64-outputBytes || sourceBytes+outputBytes > math.MaxUint64-ScratchSafetyMarginBytes {
 		return 0, fmt.Errorf("joined scratch requirement overflows")
 	}
-	return sourceBytes*2 + ScratchSafetyMarginBytes, nil
+	return sourceBytes + outputBytes + ScratchSafetyMarginBytes, nil
 }
 
 func checkScratchHeadroom(available, required uint64) error {
