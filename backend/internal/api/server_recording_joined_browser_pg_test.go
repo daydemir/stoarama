@@ -92,15 +92,15 @@ func seedJoinedBrowserTestData(t *testing.T, pool *pgxpool.Pool) {
 			(401,201,1,47,20,102),(402,201,1,47,20,103),(403,201,1,47,20,104),
 			(404,202,1,47,30,105),(405,203,1,47,10,101),(406,204,2,99,50,106);
 		INSERT INTO recording_joined_artifacts VALUES
-			(301,201,1,47,'hour_manifest','published',now(),'manifest-1','','application/json','May/Monday/hour_01.json',10,repeat('a',64),'joined/private/manifest-1.json',1),
-			(302,201,1,47,'media',NULL,now(),'media-1','','video/mp4','May/Monday/hour_01_part_01_0800-0801.mp4',10,repeat('b',64),'joined/private/media-1.mp4',1),
-			(303,201,1,47,'media',NULL,now(),'media-2','','video/mp4','May/Monday/hour_01_part_02_0801-0802.mp4',10,repeat('c',64),'joined/private/media-2.mp4',2),
-			(304,202,1,47,'hour_manifest','published',now(),'manifest-2','','application/json','May/Monday/hour_02.json',10,repeat('d',64),'joined/private/manifest-2.json',1),
-			(305,202,1,47,'media',NULL,now(),'media-3','','video/mp4','May/Monday/hour_02_part_01_0859-0900.mp4',10,repeat('e',64),'joined/private/media-3.mp4',1),
-			(306,203,1,47,'hour_manifest','published',now(),'manifest-3','','application/json','May/Monday/hour_03.json',10,repeat('f',64),'joined/private/manifest-3.json',1),
-			(307,203,1,47,'media',NULL,now(),'media-4','','video/mp4','May/Monday/hour_03_part_01_1000-1001.mp4',10,repeat('1',64),'joined/private/media-4.mp4',1),
-			(308,204,2,99,'hour_manifest','published',now(),'manifest-4','','application/json','May/Monday/hour_01.json',10,repeat('2',64),'joined/foreign/manifest.json',1),
-			(309,204,2,99,'media',NULL,now(),'media-5','','video/mp4','May/Monday/hour_01_part_01.mp4',10,repeat('3',64),'joined/foreign/media.mp4',1);
+			(301,201,1,47,'hour_manifest','published',now(),'manifest-1','','application/json','20_Europe_Poland_Luban/coverage/hours/hour_01.json',10,repeat('a',64),'joined/private/manifest-1.json',1),
+			(302,201,1,47,'media',NULL,now(),'media-1','','video/mp4','20_Europe_Poland_Luban/May/Monday/hour_01_part_01_0800-0801.mp4',10,repeat('b',64),'joined/private/media-1.mp4',1),
+			(303,201,1,47,'media',NULL,now(),'media-2','','video/mp4','20_Europe_Poland_Luban/May/Monday/hour_01_part_02_0801-0802.mp4',10,repeat('c',64),'joined/private/media-2.mp4',2),
+			(304,202,1,47,'hour_manifest','published',now(),'manifest-2','','application/json','30_Europe_Poland_Test/coverage/hours/hour_02.json',10,repeat('d',64),'joined/private/manifest-2.json',1),
+			(305,202,1,47,'media',NULL,now(),'media-3','','video/mp4','30_Europe_Poland_Test/May/Monday/hour_02_part_01_0859-0900.mp4',10,repeat('e',64),'joined/private/media-3.mp4',1),
+			(306,203,1,47,'hour_manifest','published',now(),'manifest-3','','application/json','10_Europe_Poland_Test/coverage/hours/hour_03.json',10,repeat('f',64),'joined/private/manifest-3.json',1),
+			(307,203,1,47,'media',NULL,now(),'media-4','','video/mp4','10_Europe_Poland_Test/May/Monday/hour_03_part_01_1000-1001.mp4',10,repeat('1',64),'joined/private/media-4.mp4',1),
+			(308,204,2,99,'hour_manifest','published',now(),'manifest-4','','application/json','50_Europe_Poland_Foreign/coverage/hours/hour_01.json',10,repeat('2',64),'joined/foreign/manifest.json',1),
+			(309,204,2,99,'media',NULL,now(),'media-5','','video/mp4','50_Europe_Poland_Foreign/May/Monday/hour_01_part_01.mp4',10,repeat('3',64),'joined/foreign/media.mp4',1);
 		INSERT INTO recording_joined_media_sources VALUES (302,401,1),(303,402,1),(305,404,1),(307,405,1),(309,406,1);
 		INSERT INTO recording_joined_hour_dispositions VALUES (201,401,'included'),(201,402,'included'),(201,403,'quarantined');
 	`); err != nil {
@@ -637,9 +637,9 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 		path string
 		want []string
 	}{
-		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"May", "folder=May", "2 clips"}},
+		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"20_Europe_Poland_Luban", "May", "folder=May", "2 MP4", "All joined recordings"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May", want: []string{"Monday", "folder=May%2FMonday"}},
-		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", ">View</a>", ">Download</a>"}},
+		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", `class="type mp4">MP4`, ">View</a>", ">Download</a>"}},
 	} {
 		req := httptest.NewRequest(http.MethodGet, test.path, nil)
 		route := chi.NewRouteContext()
@@ -656,10 +656,36 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 				t.Fatalf("path=%s missing %q body=%s", test.path, want, response.Body.String())
 			}
 		}
-		for _, forbidden := range []string{"joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
+		for _, forbidden := range []string{"/archive", "joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
 			if strings.Contains(response.Body.String(), forbidden) {
 				t.Fatalf("folder leaked %q", forbidden)
 			}
+		}
+	}
+}
+
+func TestJoinedFolderRootListsCanonicalFoldersWithoutStorageAuthority(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	seedJoinedBrowserTestData(t, pool)
+	s := &Server{pool: pool}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/joined/folder", nil)
+	ctx := context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: 47, AuthType: "session"})
+	response := httptest.NewRecorder()
+	s.handleAccountJoinedFolderRoot(response, req.WithContext(ctx))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, want := range []string{
+		"20_Europe_Poland_Luban", "/recordings/20/joined/folder",
+		"30_Europe_Poland_Test", "Open a folder",
+	} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Fatalf("missing %q body=%s", want, response.Body.String())
+		}
+	}
+	for _, forbidden := range []string{"50_Europe_Poland_Foreign", "joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("root leaked %q", forbidden)
 		}
 	}
 }
@@ -683,6 +709,7 @@ func TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials(t *testing.T) {
 		wantBody          string
 	}{
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined", wantCode: http.StatusOK, wantBody: `"total":2`},
+		{path: "/api/v1/shared/mit-scl/recordings/joined/folder", wantCode: http.StatusOK, wantBody: "20_Europe_Poland_Luban"},
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder", wantCode: http.StatusOK, wantBody: "Joined clips"},
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined/302/download?disposition=inline", rangeHeader: "bytes=2-5", wantCode: http.StatusPartialContent, wantBody: "2345"},
 		{path: "/api/v1/shared/mit-scl/recordings/50/joined", wantCode: http.StatusNotFound, wantBody: "recording not found"},

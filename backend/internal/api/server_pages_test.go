@@ -817,7 +817,7 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 			t.Fatalf("recordings html still contains stale action copy %q", stale)
 		}
 	}
-	for _, label := range []string{">View recording<", ">Browse joined folder<"} {
+	for _, label := range []string{">View recording<", "function joinedFolderDisplayName(rec)"} {
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
 		}
@@ -897,8 +897,9 @@ func TestRecordingDetailLinksToDedicatedJoinedFolderWithoutEagerJoinedFetch(t *t
 	page := string(body)
 	for _, marker := range []string{
 		`const folderPath = recordingAPIPath(`,
+		`const folderName = joinedFolderDisplayName(rec);`,
 		`class="btn-link primary joined-folder-cta"`,
-		`>Browse joined folder</a>`,
+		`${escapeHTML(folderName)}</a>`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording detail missing dedicated joined folder link %q", marker)
