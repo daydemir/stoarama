@@ -196,19 +196,28 @@ const recordingJoinedProgressBinsSQL = `WITH bins AS (
 	SELECT recording_id,bin_start,bin_end,ordinality
 	FROM unnest($1::bigint[],$2::timestamptz[],$3::timestamptz[])
 		WITH ORDINALITY b(recording_id,bin_start,bin_end,ordinality)
+), requested AS (
+	SELECT DISTINCT recording_id FROM bins
+), frozen_sources AS MATERIALIZED (
+	SELECT DISTINCT ON (src.recording_id,src.clip_id)
+		src.id AS source_id,src.recording_id,src.clip_id,src.start_at,src.end_at
+	FROM recording_joined_sources src
+	JOIN requested req ON req.recording_id=src.recording_id
+	WHERE src.account_id=$4
+	ORDER BY src.recording_id,src.clip_id,src.batch_record_id DESC,src.id DESC
 ), candidate_hours AS MATERIALIZED (
 	SELECT id,batch_record_id,account_id,recording_id
 	FROM recording_joined_hours
 	WHERE account_id=$4 AND recording_id=ANY($1::bigint[]) AND state='sealed'
 ), ready AS (` + recordingJoinedReadyFromCandidateHoursSQL + `)
 SELECT b.ordinality,
-	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000),0)::bigint,
-	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000)
-		FILTER (WHERE ready.clip_id IS NOT NULL),0)::bigint
+	COALESCE(sum(EXTRACT(epoch FROM (least(src.end_at,b.bin_end)-greatest(src.start_at,b.bin_start)))*1000),0)::bigint,
+	COALESCE(sum(EXTRACT(epoch FROM (least(src.end_at,b.bin_end)-greatest(src.start_at,b.bin_start)))*1000)
+		FILTER (WHERE ready.source_id IS NOT NULL),0)::bigint
 FROM bins b
-LEFT JOIN recording_clips c ON c.recording_id=b.recording_id AND c.purged_at IS NULL
-	AND c.clip_start_at<b.bin_end AND c.clip_end_at>b.bin_start
-LEFT JOIN ready ON ready.clip_id=c.id
+LEFT JOIN frozen_sources src ON src.recording_id=b.recording_id
+	AND src.start_at<b.bin_end AND src.end_at>b.bin_start
+LEFT JOIN ready ON ready.source_id=src.source_id
 GROUP BY b.ordinality
 ORDER BY b.ordinality`
 

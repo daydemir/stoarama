@@ -89,8 +89,12 @@ func seedJoinedBrowserTestData(t *testing.T, pool *pgxpool.Pool) {
 			(203,1,47,10,'pending','unsealed-hour','2026-05-04',3,'2026-05-04 10:00:00Z','2026-05-04 11:00:00Z'),
 			(204,2,99,50,'sealed','foreign-hour','2026-05-04',1,'2026-05-04 08:00:00Z','2026-05-04 09:00:00Z');
 		INSERT INTO recording_joined_sources VALUES
-			(401,201,1,47,20,102),(402,201,1,47,20,103),(403,201,1,47,20,104),
-			(404,202,1,47,30,105),(405,203,1,47,10,101),(406,204,2,99,50,106);
+			(401,201,1,47,20,102,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z'),
+			(402,201,1,47,20,103,'2026-05-04 08:01:00Z','2026-05-04 08:02:00Z'),
+			(403,201,1,47,20,104,'2026-05-04 08:02:00Z','2026-05-04 08:03:00Z'),
+			(404,202,1,47,30,105,'2026-05-04 08:59:30Z','2026-05-04 09:00:30Z'),
+			(405,203,1,47,10,101,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z'),
+			(406,204,2,99,50,106,'2026-05-04 08:00:00Z','2026-05-04 08:01:00Z');
 		INSERT INTO recording_joined_artifacts VALUES
 			(301,201,1,47,'hour_manifest','published',now(),'manifest-1','','application/json','20_Europe_Poland_Luban/coverage/hours/hour_01.json',10,repeat('a',64),'joined/private/manifest-1.json',1),
 			(302,201,1,47,'media',NULL,now(),'media-1','','video/mp4','20_Europe_Poland_Luban/May/Monday/hour_01_part_01_0800-0801.mp4',10,repeat('b',64),'joined/private/media-1.mp4',1),
@@ -207,9 +211,20 @@ func TestRecordingJoinedProgressDoesNotReusePublishedOlderGeneration(t *testing.
 	if !ok || got.SourceDurationMS != 120_000 || got.JoinedReadyMS != 0 || got.Percent == nil || *got.Percent != 0 {
 		t.Fatalf("new frozen generation progress=%+v present=%t want source=120000 ready=0 percent=0", got, ok)
 	}
+	bins, err := (&Server{pool: pool}).recordingJoinedProgressForBins(ctx, 47,
+		[]int64{60},
+		[]time.Time{time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)},
+		[]time.Time{time.Date(2026, 5, 4, 9, 0, 0, 0, time.UTC)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bins) != 1 || bins[0].SourceDurationMS != 120_000 || bins[0].JoinedReadyMS != 0 {
+		t.Fatalf("new frozen generation bin=%+v want source=120000 ready=0", bins)
+	}
 }
 
-func TestRecordingJoinedBinProgressRejectsUnpublishedMismatchedAndPurgedSources(t *testing.T) {
+func TestRecordingJoinedBinProgressRejectsUnpublishedAndMismatchedSources(t *testing.T) {
 	pool := joinedBrowserTestPool(t)
 	seedJoinedBrowserTestData(t, pool)
 	ctx := context.Background()
@@ -240,8 +255,11 @@ func TestRecordingJoinedBinProgressRejectsUnpublishedMismatchedAndPurgedSources(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(progress) != 1 || progress[0].SourceDurationMS != 120_000 || progress[0].JoinedReadyMS != 0 {
-		t.Fatalf("joined bin=%+v want source=120000 ready=0", progress)
+	// Frozen source timing remains the immutable denominator even if mutable raw
+	// clip metadata later changes. Production retention guards prevent this
+	// synthetic purged state while a source remains frozen.
+	if len(progress) != 1 || progress[0].SourceDurationMS != 180_000 || progress[0].JoinedReadyMS != 60_000 {
+		t.Fatalf("joined bin=%+v want source=180000 ready=60000", progress)
 	}
 }
 
@@ -264,8 +282,10 @@ func TestRecordingJoinedBinProgressSingleHighVolumeRecordingIsBounded(t *testing
 		INSERT INTO recording_joined_hours VALUES
 			(270,7,47,70,'sealed','eligible','2026-05-21',1,'2026-05-20 00:00:00Z','2026-05-22 00:00:00Z'),
 			(271,7,47,70,'pending','historical','2026-05-01',2,'2026-05-01 00:00:00Z','2026-05-20 00:00:00Z');
-		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id)
-		SELECT 3000000+value,CASE WHEN value>14400 THEN 270 ELSE 271 END,7,47,70,2000000+value
+		INSERT INTO recording_joined_sources(id,hour_record_id,batch_record_id,account_id,recording_id,clip_id,start_at,end_at)
+		SELECT 3000000+value,CASE WHEN value>14400 THEN 270 ELSE 271 END,7,47,70,2000000+value,
+			'2026-05-01 00:00:00Z'::timestamptz+value*interval '2 minutes',
+			'2026-05-01 00:00:00Z'::timestamptz+value*interval '2 minutes'+interval '1 minute'
 		FROM generate_series(1,15000) value;
 		INSERT INTO recording_joined_artifacts VALUES
 			(370,270,7,47,'hour_manifest','published',now(),'manifest-70','','application/json','manifest.json',10,repeat('a',64),'joined/70/manifest.json',1),
@@ -318,8 +338,8 @@ func TestRecordingJoinedBinProgressSingleHighVolumeRecordingIsBounded(t *testing
 	}
 	visits := joinedBinPlanRelationVisits(document[0]["Plan"].(map[string]any), "recording_clips")
 	t.Logf("single-recording joined bins elapsed=%s recording_clips_visits=%d", time.Since(started), visits)
-	if visits > 17_000 {
-		t.Fatalf("single-recording joined bins visited %d recording_clips rows; want one bounded historical pass", visits)
+	if visits != 0 {
+		t.Fatalf("single-recording joined bins visited %d recording_clips rows; want immutable sources only", visits)
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("single-recording joined bins took %s", elapsed)
