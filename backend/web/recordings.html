@@ -302,9 +302,25 @@
     .health-heatmap-cell.critical { background: var(--err); }
     .health-heatmap-cell:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
     .health-page-actions { display: flex; gap: 8px; margin-left: auto; }
-    .health-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 11px; }
-    .health-legend span { display: inline-flex; align-items: center; gap: 5px; }
-    .health-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+    .health-legend { display: grid; gap: 7px; margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .health-legend-group { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: start; gap: 6px 10px; }
+    .health-legend-title { color: var(--text); font-weight: 600; }
+    .health-legend-items { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+    .health-legend-item { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+    .health-legend-swatch { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 2px; }
+    .health-legend-marker {
+      flex: 0 0 auto;
+      display: inline-grid;
+      place-items: center;
+      width: 14px;
+      height: 14px;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      background: color-mix(in srgb, var(--muted) 18%, var(--panel2));
+      color: var(--text);
+      font: 700 7px/1 var(--mono);
+    }
+    .health-legend-marker svg { display: block; width: 10px; height: 10px; }
     .health-tooltip {
       position: fixed;
       z-index: 1000;
@@ -652,6 +668,7 @@
       .recordings-table tbody { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
+      .health-legend-group { grid-template-columns: 1fr; gap: 4px; }
       .score-grade-key { grid-template-columns: 1fr; gap: 3px; }
       .score-grade-key dd { margin: 0 0 7px 27px; }
       .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
@@ -4441,6 +4458,28 @@
       };
     }
 
+    function captureHealthLegendHTML() {
+      return `<div class="health-legend" role="group" aria-label="Hourly heatmap legend">
+        <div class="health-legend-group" role="group" aria-label="Capture percentage shown by cell color">
+          <span class="health-legend-title">Capture</span>
+          <span class="health-legend-items">
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:var(--ok)" aria-hidden="true"></span>98% or better</span>
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:var(--warn)" aria-hidden="true"></span>90% to 97.9%</span>
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:var(--err)" aria-hidden="true"></span>Below 90%</span>
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:color-mix(in srgb, var(--muted) 12%, transparent)" aria-hidden="true"></span>Not scheduled</span>
+          </span>
+        </div>
+        <div class="health-legend-group" role="group" aria-label="Joined coverage shown by the corner mark">
+          <span class="health-legend-title">Joined mark</span>
+          <span class="health-legend-items">
+            <span class="health-legend-item"><span class="health-legend-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Check means 100% joined</span>
+            <span class="health-legend-item"><span class="health-legend-marker" aria-hidden="true">42</span>Number is joined percentage</span>
+            <span class="health-legend-item">No mark means 0%, loading, or unavailable. Focus the hour for the exact status.</span>
+          </span>
+        </div>
+      </div>`;
+    }
+
     function captureHealthCardHTML() {
       const page = clipPageState.captureHealth;
       if (!page) return '';
@@ -4475,12 +4514,7 @@
           <div class="hint">${escapeHTML(page.from)} through ${escapeHTML(page.to)} in ${escapeHTML(page.timezone)}. Hover or focus an hour for details.</div>
           ${joinedStatusHTML}
           <div class="health-heatmap" aria-label="Hourly capture health by local date">${captureHealthHeatmap(page)}</div>
-          <div class="health-legend">
-            <span><i style="background:var(--ok)"></i>98% or better</span>
-            <span><i style="background:var(--warn)"></i>90% to 97.9%</span>
-            <span><i style="background:var(--err)"></i>Below 90%</span>
-            <span><i style="background:color-mix(in srgb, var(--muted) 12%, transparent)"></i>Not scheduled</span>
-          </div>
+          ${captureHealthLegendHTML()}
         </div>`;
     }
 

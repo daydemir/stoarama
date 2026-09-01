@@ -748,6 +748,10 @@ func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
 		"source_duration_ms",
 		"joined_ready_ms",
 		"<svg viewBox=\"0 0 10 10\"",
+		`aria-label="Hourly heatmap legend"`,
+		"Check means 100% joined",
+		"Number is joined percentage",
+		"No mark means 0%, loading, or unavailable",
 	} {
 		if !strings.Contains(string(body), marker) {
 			t.Fatalf("recordings html missing joined-progress marker %q", marker)
