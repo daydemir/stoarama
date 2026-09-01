@@ -41,9 +41,9 @@ func TestRecordingJoinedBrowserRequiresAccountPrincipal(t *testing.T) {
 func TestJoinedFolderEntriesDrillMonthWeekdayAndExposeOnlyLeafFiles(t *testing.T) {
 	from := time.Date(2026, time.August, 6, 8, 0, 0, 0, time.UTC)
 	source := []recordingJoinedFile{
-		{RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", DownloadPath: "/joined/1", LocalDate: "2026-08-06", ScheduledFrom: from, ScheduledTo: from.Add(time.Hour), SizeBytes: 1024},
-		{RelativePath: "377_Europe_Poland_Luban/August/Thursday/b.mp4", DownloadPath: "/joined/2", LocalDate: "2026-08-06", ScheduledFrom: from.Add(time.Hour), ScheduledTo: from.Add(2 * time.Hour), SizeBytes: 2 * 1024 * 1024},
-		{RelativePath: "377_Europe_Poland_Luban/August/Friday/c.mp4", DownloadPath: "/joined/3", LocalDate: "2026-08-07", ScheduledFrom: from, ScheduledTo: from.Add(30 * time.Minute), SizeBytes: 3 * 1024 * 1024},
+		{Kind: "media", ContentType: "video/mp4", RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", DownloadPath: "/joined/1", LocalDate: "2026-08-06", ScheduledFrom: from, ScheduledTo: from.Add(time.Hour), SizeBytes: 1024},
+		{Kind: "media", ContentType: "video/mp4", RelativePath: "377_Europe_Poland_Luban/August/Thursday/b.mp4", DownloadPath: "/joined/2", LocalDate: "2026-08-06", ScheduledFrom: from.Add(time.Hour), ScheduledTo: from.Add(2 * time.Hour), SizeBytes: 2 * 1024 * 1024},
+		{Kind: "media", ContentType: "video/mp4", RelativePath: "377_Europe_Poland_Luban/August/Friday/c.mp4", DownloadPath: "/joined/3", LocalDate: "2026-08-07", ScheduledFrom: from, ScheduledTo: from.Add(30 * time.Minute), SizeBytes: 3 * 1024 * 1024},
 	}
 	root := "/api/v1/shared/mit-scl/recordings/377/joined/folder"
 	folders, files, found := joinedFolderEntries(root, source, nil)
@@ -63,6 +63,36 @@ func TestJoinedFolderEntriesDrillMonthWeekdayAndExposeOnlyLeafFiles(t *testing.T
 	}
 	if _, _, found = joinedFolderEntries(root, source, []string{"September"}); found {
 		t.Fatal("missing folder reported as found")
+	}
+	if got := joinedCanonicalRootName(source); got != "377_Europe_Poland_Luban" {
+		t.Fatalf("canonical root=%q", got)
+	}
+}
+
+func TestJoinedFolderArchivePathPreservesSameValidatedFolderContract(t *testing.T) {
+	root := "/api/v1/shared/mit-scl/recordings/377/joined/folder"
+	if got := joinedFolderArchivePath(root, nil); got != root+"/archive" {
+		t.Fatalf("root archive=%q", got)
+	}
+	if got := joinedFolderArchivePath(root, []string{"August", "Thursday"}); got != root+"/archive?folder=August%2FThursday" {
+		t.Fatalf("nested archive=%q", got)
+	}
+}
+
+func TestJoinedFolderFileTypeUsesSafeExtensionAndKindFallback(t *testing.T) {
+	for _, test := range []struct {
+		file recordingJoinedFile
+		want string
+	}{
+		{file: recordingJoinedFile{RelativePath: "part.mp4", Kind: "media"}, want: "MP4"},
+		{file: recordingJoinedFile{RelativePath: "manifest.json", Kind: "hour_manifest"}, want: "JSON"},
+		{file: recordingJoinedFile{ContentType: "application/json", Kind: "hour_manifest"}, want: "JSON"},
+		{file: recordingJoinedFile{Kind: "media"}, want: "MP4"},
+		{file: recordingJoinedFile{RelativePath: "thing.extensiontoolong"}, want: "FILE"},
+	} {
+		if got := joinedFolderFileType(test.file); got != test.want {
+			t.Fatalf("type for %+v=%q want %q", test.file, got, test.want)
+		}
 	}
 }
 

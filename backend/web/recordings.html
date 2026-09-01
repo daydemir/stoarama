@@ -346,7 +346,14 @@
        Delete button: accent border + accent text, not plain dark text. */
     .clip-row-actions button.secondary, .clip-row-actions a.secondary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
     .clip-row-actions button.secondary:hover, .clip-row-actions a.secondary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-    .joined-folder-cta { min-height: 44px; padding: 8px 15px; font-weight: 650; }
+    .joined-folder-cta {
+      max-width: min(520px, 58vw);
+      min-height: 40px;
+      padding: 7px 12px;
+      font: 650 12px/1.25 var(--mono);
+      overflow-wrap: anywhere;
+      text-align: left;
+    }
     details.action-menu { position: relative; display: inline-block; }
     details.action-menu > summary { list-style: none; width: 30px; height: 28px; display: grid; place-items: center; border: 1px solid var(--muted); border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1; }
     details.action-menu > summary::-webkit-details-marker { display: none; }
@@ -3475,6 +3482,12 @@
       return words.every((word) => haystack.includes(word));
     }
 
+    function joinedFolderDisplayName(rec) {
+      const naming = rec && rec.naming && typeof rec.naming === 'object' ? rec.naming : {};
+      const folderName = String(naming.folder_name || '').trim();
+      return folderName || `recording_${Number(rec && rec.id) || 0}`;
+    }
+
     function recordingSortFromSearch(search) {
       const value = new URLSearchParams(String(search || '')).get('sort') || '';
       return ['newest', 'best14', 'joined_desc', 'joined_asc'].includes(value) ? value : 'joined_desc';
@@ -4579,6 +4592,7 @@
       const st = statusLine(rec);
       const recId = clipPageState.recId;
       const folderPath = recordingAPIPath(`/${encodeURIComponent(recId)}/joined/folder`);
+      const folderName = joinedFolderDisplayName(rec);
       const header = `
         <div class="clip-page-head">
           <div>
@@ -4588,7 +4602,7 @@
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <div class="recording-head-actions">
-            <a class="btn-link primary joined-folder-cta" href="${escapeHTML(folderPath)}">Browse joined folder</a>
+            <a class="btn-link primary joined-folder-cta" href="${escapeHTML(folderPath)}" aria-label="Browse joined folder ${escapeHTML(folderName)}">${escapeHTML(folderName)}</a>
             <a class="btn-link secondary" href="${recordingsPagePath}">Back to recordings</a>
           </div>
         </div>`;

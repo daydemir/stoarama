@@ -897,8 +897,9 @@ func TestRecordingDetailLinksToDedicatedJoinedFolderWithoutEagerJoinedFetch(t *t
 	page := string(body)
 	for _, marker := range []string{
 		`const folderPath = recordingAPIPath(`,
+		`const folderName = joinedFolderDisplayName(rec);`,
 		`class="btn-link primary joined-folder-cta"`,
-		`>Browse joined folder</a>`,
+		`${escapeHTML(folderName)}</a>`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording detail missing dedicated joined folder link %q", marker)

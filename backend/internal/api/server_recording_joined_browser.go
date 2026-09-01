@@ -183,10 +183,13 @@ func (s *Server) handleAccountRecordingJoinedList(w http.ResponseWriter, r *http
 type joinedFolderPage struct {
 	RecordingID int64
 	BackPath    string
+	RootPath    string
+	RootName    string
+	ArchivePath string
 	Crumbs      []joinedFolderCrumb
 	Folders     []joinedFolderEntry
 	Files       []joinedFolderFile
-	Total       int64
+	MediaTotal  int
 }
 
 type joinedFolderCrumb struct {
@@ -206,15 +209,36 @@ type joinedFolderFile struct {
 	DownloadPath string
 	LocalDate    string
 	Size         string
+	Type         string
+	TypeClass    string
+}
+
+type joinedFolderRootEntry struct {
+	RecordingID int64
+	Name        string
+	ClipCount   int64
+	Size        string
+	Path        string
+	ArchivePath string
+}
+
+type joinedFolderRootPage struct {
+	BackPath string
+	Folders  []joinedFolderRootEntry
 }
 
 var joinedFolderTemplate = template.Must(template.New("joined-folder").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Joined clips</title><style>
-:root{color-scheme:dark;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0f13;color:#f3f5f8}*{box-sizing:border-box}body{max-width:1120px;margin:0 auto;padding:32px 24px 56px}a{color:#a8ceff}a:focus-visible{outline:2px solid #8bbcff;outline-offset:3px}.back{display:inline-flex;align-items:center;min-height:44px;margin-bottom:22px;color:#aeb8c7;font-size:14px;text-decoration:none}.back:hover{color:#f3f5f8}.head{display:flex;gap:24px;align-items:end;justify-content:space-between;margin-bottom:24px}.head h1{margin:0 0 7px;font-size:clamp(26px,4vw,38px);line-height:1.12;letter-spacing:-.025em}.note{max-width:70ch;margin:0;color:#aeb8c7;font-size:14px;line-height:1.55}.count{flex:0 0 auto;color:#aeb8c7;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}.browser{overflow:hidden;border:1px solid #303744;border-radius:14px;background:#15191f;box-shadow:0 12px 32px rgba(0,0,0,.22)}.crumbs{display:flex;align-items:center;gap:7px;min-height:52px;padding:4px 14px;overflow-x:auto;border-bottom:1px solid #303744;white-space:nowrap}.crumbs a,.crumbs span{display:inline-flex;align-items:center;min-height:44px;font-size:14px}.crumbs span{color:#f3f5f8;font-weight:650}.crumbs .sep{min-height:0;color:#667085}.entry{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:16px;min-height:64px;padding:10px 14px;border-bottom:1px solid #292f39}.entry:last-child{border-bottom:0}.folder{display:flex;align-items:center;gap:12px;min-width:0;min-height:44px;color:#f3f5f8;font-weight:650;text-decoration:none}.folder:hover .name{text-decoration:underline;text-underline-offset:3px}.folder-icon{position:relative;flex:0 0 auto;width:24px;height:17px;border-radius:4px;background:#5e9de7}.folder-icon:before{content:"";position:absolute;top:-5px;left:2px;width:10px;height:6px;border-radius:4px 4px 0 0;background:inherit}.name{min-width:0;overflow-wrap:anywhere}.meta{margin-top:5px;color:#aeb8c7;font-size:13px;line-height:1.45}.actions{display:flex;gap:8px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:38px;padding:7px 13px;border:1px solid #4d596b;border-radius:8px;color:#dceaff;text-decoration:none}.button:hover{border-color:#78aeea;background:#202a36}.empty{padding:28px 18px;color:#aeb8c7;text-align:center}@media(max-width:640px){body{padding:20px 14px 40px}.head{align-items:start;flex-direction:column;gap:8px}.entry{grid-template-columns:1fr;gap:10px;padding:14px}.actions{justify-content:flex-start}.button{min-height:44px;flex:1}.count{white-space:normal}}
-</style></head><body><a class="back" href="{{.BackPath}}">← Back to recording</a><header class="head"><div><h1>Joined clips</h1><p class="note">Browse the published continuous clips for this recording. Separate files mark a detected gap or incompatible source layout.</p></div><div class="count">{{.Total}} clip{{if ne .Total 1}}s{{end}}</div></header>
+:root{color-scheme:dark;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0f13;color:#f3f5f8}*{box-sizing:border-box}body{max-width:1280px;margin:0 auto;padding:22px 20px 48px}a{color:#a8ceff}a:focus-visible{outline:2px solid #8bbcff;outline-offset:2px}.topbar,.head,.actions{display:flex;align-items:center}.topbar{min-height:44px;gap:18px;margin-bottom:14px}.topbar a{color:#aeb8c7;font-size:13px;text-decoration:none}.topbar a:hover{color:#f3f5f8}.head{gap:18px;align-items:end;justify-content:space-between;margin-bottom:16px}.head h1{max-width:100%;margin:0 0 5px;font:650 clamp(20px,3vw,28px)/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.025em;overflow-wrap:anywhere}.note{max-width:72ch;margin:0;color:#aeb8c7;font-size:13px;line-height:1.45}.head-actions{display:flex;flex:0 0 auto;align-items:center;gap:9px}.count{color:#aeb8c7;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}.browser{overflow:hidden;border:1px solid #303744;border-radius:10px;background:#15191f}.crumbs{display:flex;align-items:center;gap:6px;min-height:44px;padding:0 12px;overflow-x:auto;border-bottom:1px solid #303744;white-space:nowrap}.crumbs a,.crumbs span{display:inline-flex;align-items:center;min-height:40px;font-size:13px}.crumbs span{color:#f3f5f8;font-weight:650}.crumbs .sep{min-height:0;color:#667085}.entry{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;min-height:48px;padding:6px 12px;border-bottom:1px solid #292f39}.entry:last-child{border-bottom:0}.folder{display:flex;align-items:center;gap:10px;min-width:0;min-height:36px;color:#f3f5f8;font-size:13px;font-weight:650;text-decoration:none}.folder:hover .name{text-decoration:underline;text-underline-offset:3px}.folder-icon{position:relative;flex:0 0 auto;width:19px;height:13px;border-radius:3px;background:#5e9de7}.folder-icon:before{content:"";position:absolute;top:-4px;left:2px;width:8px;height:5px;border-radius:3px 3px 0 0;background:inherit}.file-main{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:9px;min-width:0}.name{min-width:0;font-size:13px;overflow-wrap:anywhere}.meta{margin-top:2px;color:#aeb8c7;font-size:11px;line-height:1.35}.type{min-width:42px;padding:3px 6px;border:1px solid #475568;border-radius:5px;color:#b9c6d8;font:700 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center}.type.mp4{border-color:#376891;color:#9fd1ff}.type.json{border-color:#6b5935;color:#f1d18d}.actions{gap:6px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:5px 10px;border:1px solid #4d596b;border-radius:6px;color:#dceaff;font-size:12px;text-decoration:none}.button:hover{border-color:#78aeea;background:#202a36}.button.primary{border-color:#4f86bf;background:#1c4168;color:#fff}.empty{padding:24px 16px;color:#aeb8c7;text-align:center}@media(max-width:680px){body{padding:14px 10px 36px}.topbar{gap:12px;overflow-x:auto;white-space:nowrap}.head{align-items:start;flex-direction:column;gap:10px}.head-actions{width:100%;justify-content:space-between}.entry{gap:8px;padding:7px 9px}.button{min-height:40px;padding:7px 9px}.actions{flex-wrap:wrap;justify-content:flex-end}.count{white-space:normal}.file-main{align-items:start}}
+</style></head><body><nav class="topbar" aria-label="Joined recordings navigation"><a href="{{.BackPath}}">Back to recording</a><a href="{{.RootPath}}">All joined recordings</a></nav><header class="head"><div><h1>{{.RootName}}</h1><p class="note">Published continuous parts. Separate MP4 files mark a detected gap or incompatible source layout.</p></div><div class="head-actions"><span class="count">{{.MediaTotal}} MP4</span><a class="button primary" href="{{.ArchivePath}}">Download this folder</a></div></header>
 <main class="browser"><nav class="crumbs" aria-label="Joined clip folders">{{range $index, $crumb := .Crumbs}}{{if $index}}<span class="sep" aria-hidden="true">/</span>{{end}}{{if $crumb.Current}}<span aria-current="page">{{$crumb.Name}}</span>{{else}}<a href="{{$crumb.Path}}">{{$crumb.Name}}</a>{{end}}{{end}}</nav>
-<div>{{range .Folders}}<div class="entry"><a class="folder" href="{{.Path}}"><span class="folder-icon" aria-hidden="true"></span><span class="name">{{.Name}}</span></a><span class="meta">{{.Count}} clip{{if ne .Count 1}}s{{end}}</span></div>{{end}}{{range .Files}}<div class="entry"><div><div class="name">{{.Name}}</div><div class="meta">{{.LocalDate}} · {{.Size}}</div></div><div class="actions"><a class="button" href="{{.DownloadPath}}?disposition=inline" target="_blank" rel="noopener noreferrer">View</a><a class="button" href="{{.DownloadPath}}?disposition=attachment">Download</a></div></div>{{end}}{{if and (not .Folders) (not .Files)}}<div class="empty">No joined clips are published in this folder yet.</div>{{end}}</div></main></body></html>`))
+<div>{{range .Folders}}<div class="entry"><a class="folder" href="{{.Path}}"><span class="folder-icon" aria-hidden="true"></span><span class="name">{{.Name}}</span></a><span class="meta">{{.Count}} file{{if ne .Count 1}}s{{end}}</span></div>{{end}}{{range .Files}}<div class="entry"><div class="file-main"><span class="type {{.TypeClass}}">{{.Type}}</span><div><div class="name">{{.Name}}</div><div class="meta">{{.LocalDate}} · {{.Size}}</div></div></div><div class="actions"><a class="button" href="{{.DownloadPath}}?disposition=inline" target="_blank" rel="noopener noreferrer">View</a><a class="button" href="{{.DownloadPath}}?disposition=attachment">Download</a></div></div>{{end}}{{if and (not .Folders) (not .Files)}}<div class="empty">No joined files are published in this folder yet.</div>{{end}}</div></main></body></html>`))
+
+var joinedFolderRootTemplate = template.Must(template.New("joined-folder-root").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Joined recordings</title><style>
+:root{color-scheme:dark;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d0f13;color:#f3f5f8}*{box-sizing:border-box}body{max-width:1280px;margin:0 auto;padding:22px 20px 48px}a{color:#a8ceff}a:focus-visible{outline:2px solid #8bbcff;outline-offset:2px}.back{display:inline-flex;align-items:center;min-height:44px;margin-bottom:14px;color:#aeb8c7;font-size:13px;text-decoration:none}.back:hover{color:#f3f5f8}h1{margin:0 0 5px;font-size:clamp(24px,3vw,32px);letter-spacing:-.025em}.note{max-width:70ch;margin:0 0 16px;color:#aeb8c7;font-size:13px;line-height:1.45}.browser{overflow:hidden;border:1px solid #303744;border-radius:10px;background:#15191f}.entry{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px;min-height:52px;padding:7px 12px;border-bottom:1px solid #292f39}.entry:last-child{border-bottom:0}.folder{display:flex;align-items:center;gap:10px;min-width:0;min-height:38px;color:#f3f5f8;font:650 13px ui-monospace,SFMono-Regular,Menlo,monospace;text-decoration:none}.folder:hover .name{text-decoration:underline;text-underline-offset:3px}.folder-icon{position:relative;flex:0 0 auto;width:19px;height:13px;border-radius:3px;background:#5e9de7}.folder-icon:before{content:"";position:absolute;top:-4px;left:2px;width:8px;height:5px;border-radius:3px 3px 0 0;background:inherit}.name{min-width:0;overflow-wrap:anywhere}.meta{margin-top:3px;color:#aeb8c7;font:11px ui-monospace,SFMono-Regular,Menlo,monospace}.actions{display:flex;gap:6px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:5px 10px;border:1px solid #4d596b;border-radius:6px;color:#dceaff;font-size:12px;text-decoration:none}.button:hover{border-color:#78aeea;background:#202a36}.empty{padding:24px 16px;color:#aeb8c7;text-align:center}@media(max-width:680px){body{padding:14px 10px 36px}.entry{grid-template-columns:1fr;gap:6px;padding:8px 9px}.actions{justify-content:flex-start}.button{min-height:40px}}
+</style></head><body><a class="back" href="{{.BackPath}}">Back to recordings</a><h1>Joined recordings</h1><p class="note">Each folder uses its canonical delivery name. Open a folder to browse files, or download its published MP4 files and redacted JSON index as a ZIP.</p><main class="browser">{{range .Folders}}<div class="entry"><div><a class="folder" href="{{.Path}}"><span class="folder-icon" aria-hidden="true"></span><span class="name">{{.Name}}</span></a><div class="meta">{{.ClipCount}} MP4 · {{.Size}}</div></div><div class="actions"><a class="button" href="{{.Path}}">Open</a><a class="button" href="{{.ArchivePath}}">Download ZIP</a></div></div>{{else}}<div class="empty">No joined recordings are published yet.</div>{{end}}</main></body></html>`))
 
 // handleAccountRecordingJoinedFolder renders a same-origin folder view for
 // people who do not have R2 access. It uses the same account/cohort scope as the
@@ -260,6 +284,11 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 		}
 		result.Files = append(result.Files, next.Files...)
 	}
+	rootName := joinedCanonicalRootName(result.Files)
+	if rootName == "" {
+		rootName = fmt.Sprintf("Recording %d", recordingID)
+	}
+	mediaTotal := len(result.Files)
 	folders, files, found := joinedFolderEntries(result.FolderPath, result.Files, activePath)
 	if !found {
 		util.WriteError(w, http.StatusNotFound, "joined folder not found")
@@ -274,19 +303,92 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 	if err := joinedFolderTemplate.Execute(w, joinedFolderPage{
 		RecordingID: recordingID,
 		BackPath:    fmt.Sprintf("%s/%d", s.recordingJoinedPageRoot(principal), recordingID),
+		RootPath:    s.recordingJoinedAPIRoot(principal) + "/recordings/joined/folder",
+		RootName:    rootName,
+		ArchivePath: joinedFolderArchivePath(result.FolderPath, activePath),
 		Crumbs:      crumbs,
 		Folders:     folders,
 		Files:       files,
-		Total:       result.Total,
+		MediaTotal:  mediaTotal,
 	}); err != nil {
 		return
 	}
 }
 
-var joinedFolderMonths = map[string]bool{
-	"January": true, "February": true, "March": true, "April": true,
-	"May": true, "June": true, "July": true, "August": true,
-	"September": true, "October": true, "November": true, "December": true,
+func (s *Server) handleAccountJoinedFolderRoot(w http.ResponseWriter, r *http.Request) {
+	principal, ok := accountPrincipalFromContext(r.Context())
+	if !ok {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	rows, err := s.pool.Query(r.Context(), `
+		SELECT h.recording_id,
+		       min(split_part(a.relative_path,'/',1)) AS folder_name,
+		       count(*) AS clip_count,
+		       coalesce(sum(a.expected_size_bytes),0)
+		FROM recording_joined_artifacts a
+		JOIN recording_joined_hours h
+		  ON h.id=a.hour_record_id AND h.batch_record_id=a.batch_record_id AND h.account_id=a.account_id
+		JOIN recordings rec
+		  ON rec.id=h.recording_id AND rec.account_id=h.account_id
+		WHERE rec.account_id=$1
+		  AND rec.status IN ('active','paused','completed')
+		  AND h.state='sealed'
+		  AND a.artifact_kind='media'
+		  AND a.published_at IS NOT NULL
+		  AND a.etag IS NOT NULL AND a.etag<>''
+		  AND a.version_id IS NOT NULL
+		  AND EXISTS (
+		    SELECT 1 FROM recording_joined_artifacts manifest
+		    WHERE manifest.hour_record_id=h.id
+		      AND manifest.batch_record_id=h.batch_record_id
+		      AND manifest.account_id=h.account_id
+		      AND manifest.artifact_kind='hour_manifest'
+		      AND manifest.publication_state='published'
+		      AND manifest.published_at IS NOT NULL
+		      AND manifest.etag IS NOT NULL AND manifest.etag<>''
+		      AND manifest.version_id IS NOT NULL)
+		GROUP BY h.recording_id
+		ORDER BY folder_name,h.recording_id`, principal.AccountID)
+	if err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "list joined recording folders")
+		return
+	}
+	defer rows.Close()
+	root := s.recordingJoinedAPIRoot(principal)
+	entries := make([]joinedFolderRootEntry, 0)
+	for rows.Next() {
+		var entry joinedFolderRootEntry
+		var sizeBytes int64
+		if err := rows.Scan(&entry.RecordingID, &entry.Name, &entry.ClipCount, &sizeBytes); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "list joined recording folders")
+			return
+		}
+		if strings.TrimSpace(entry.Name) == "" {
+			entry.Name = fmt.Sprintf("Recording %d", entry.RecordingID)
+		}
+		entry.Size = joinedFolderSize(sizeBytes)
+		entry.Path = fmt.Sprintf("%s/recordings/%d/joined/folder", root, entry.RecordingID)
+		entry.ArchivePath = entry.Path + "/archive"
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "list joined recording folders")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	_ = joinedFolderRootTemplate.Execute(w, joinedFolderRootPage{
+		BackPath: s.recordingJoinedPageRoot(principal),
+		Folders:  entries,
+	})
+}
+
+func (s *Server) handleSharedJoinedFolderRoot(w http.ResponseWriter, r *http.Request) {
+	s.handleAccountJoinedFolderRoot(w, s.sharedRecordingPrincipalRequest(r))
 }
 
 func parseJoinedFolderPath(raw string) ([]string, bool) {
@@ -311,12 +413,20 @@ func parseJoinedFolderPath(raw string) ([]string, bool) {
 
 func joinedFolderFileParts(relativePath string) []string {
 	parts := strings.FieldsFunc(strings.TrimSpace(relativePath), func(r rune) bool { return r == '/' || r == '\\' })
-	for i, part := range parts {
-		if joinedFolderMonths[part] {
-			return parts[i:]
-		}
+	if len(parts) > 1 {
+		return parts[1:]
 	}
 	return parts
+}
+
+func joinedCanonicalRootName(files []recordingJoinedFile) string {
+	for _, file := range files {
+		parts := strings.FieldsFunc(strings.TrimSpace(file.RelativePath), func(r rune) bool { return r == '/' || r == '\\' })
+		if len(parts) > 1 && parts[0] != "." && parts[0] != ".." {
+			return parts[0]
+		}
+	}
+	return ""
 }
 
 func joinedFolderPath(root string, parts []string) string {
@@ -324,6 +434,14 @@ func joinedFolderPath(root string, parts []string) string {
 		return root
 	}
 	return root + "?folder=" + url.QueryEscape(strings.Join(parts, "/"))
+}
+
+func joinedFolderArchivePath(root string, parts []string) string {
+	archive := root + "/archive"
+	if len(parts) == 0 {
+		return archive
+	}
+	return archive + "?folder=" + url.QueryEscape(strings.Join(parts, "/"))
 }
 
 func joinedFolderCrumbs(root string, active []string) []joinedFolderCrumb {
@@ -369,10 +487,25 @@ func joinedFolderEntries(root string, source []recordingJoinedFile, active []str
 		}
 		files = append(files, joinedFolderFile{
 			Name: parts[len(parts)-1], DownloadPath: file.DownloadPath, LocalDate: file.LocalDate,
-			Size: joinedFolderSize(file.SizeBytes),
+			Size: joinedFolderSize(file.SizeBytes), Type: joinedFolderFileType(file),
+			TypeClass: strings.ToLower(joinedFolderFileType(file)),
 		})
 	}
 	return folders, files, matched
+}
+
+func joinedFolderFileType(file recordingJoinedFile) string {
+	extension := strings.TrimPrefix(strings.ToUpper(path.Ext(file.RelativePath)), ".")
+	if extension != "" && len(extension) <= 8 {
+		return extension
+	}
+	if file.Kind == "hour_manifest" || strings.Contains(strings.ToLower(file.ContentType), "json") {
+		return "JSON"
+	}
+	if file.Kind == "media" {
+		return "MP4"
+	}
+	return "FILE"
 }
 
 func joinedFolderSize(bytes int64) string {
