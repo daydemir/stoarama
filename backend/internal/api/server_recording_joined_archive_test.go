@@ -1,145 +1,94 @@
 package api
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
-	"errors"
-	"io"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/go-chi/chi/v5"
 )
 
-type joinedArchiveStoreStub struct {
-	bodies    map[string][]byte
-	heads     map[string]r2.ObjectHead
-	openErr   map[string]error
-	opened    []string
-	openCheck func(context.Context)
-}
-
-func (s *joinedArchiveStoreStub) Head(_ context.Context, key string) (r2.ObjectHead, error) {
-	head, ok := s.heads[key]
-	if !ok {
-		return r2.ObjectHead{}, errors.New("missing")
-	}
-	return head, nil
-}
-
-func (s *joinedArchiveStoreStub) OpenExact(ctx context.Context, key, _, _ string) (io.ReadCloser, error) {
-	s.opened = append(s.opened, key)
-	if s.openCheck != nil {
-		s.openCheck(ctx)
-	}
-	if err := s.openErr[key]; err != nil {
-		return nil, err
-	}
-	return io.NopCloser(bytes.NewReader(s.bodies[key])), nil
-}
-
-func (s *joinedArchiveStoreStub) PresignPutCreateOnlyRequest(context.Context, string, string, int64, string, time.Duration) (r2.PresignedRequest, error) {
-	panic("archive must never mutate storage")
-}
-
-func (s *joinedArchiveStoreStub) PresignGetExactRequest(context.Context, string, string, string, time.Duration) (r2.PresignedRequest, error) {
-	panic("archive streams through exact reads")
-}
-
-func TestJoinedFolderArchiveStreamsCanonicalMP4AndJSON(t *testing.T) {
-	artifacts := []joinedArchiveArtifact{
-		{ArtifactID: 1, ObjectKey: "joined/o1", ETag: "e1", RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", ContentType: "video/mp4", SizeBytes: 3, SHA256: ""},
-	}
-	store := &joinedArchiveStoreStub{
-		bodies: map[string][]byte{"joined/o1": []byte("mp4")},
-		heads: map[string]r2.ObjectHead{
-			"joined/o1": {ETag: "e1", SizeBytes: 3},
-		},
-		openErr: map[string]error{},
-	}
-	if err := preflightJoinedArchive(context.Background(), store, artifacts); err != nil {
-		t.Fatal(err)
-	}
-	recorder := httptest.NewRecorder()
-	if err := streamJoinedArchive(context.Background(), recorder, store, artifacts); err != nil {
-		t.Fatal(err)
-	}
-	archive, err := zip.NewReader(bytes.NewReader(recorder.Body.Bytes()), int64(recorder.Body.Len()))
+func joinedArchiveWorkerTestIdentity(t *testing.T) (string, ed25519.PrivateKey) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(archive.File) != 2 || archive.File[0].Name != "joined-files.json" || archive.File[1].Name != artifacts[0].RelativePath {
-		t.Fatalf("archive entries=%v", archive.File)
+	return base64.RawURLEncoding.EncodeToString(public), private
+}
+
+func signJoinedArchiveWorkerRequest(req *http.Request, private ed25519.PrivateKey, operation string, now time.Time) {
+	timestamp := now.UTC().Format(time.RFC3339)
+	digest := sha256.Sum256([]byte(req.URL.Query().Get("token")))
+	message := joinedArchiveCapabilityAudience + "\x00" + operation + "\x00" + timestamp + "\x00" + base64.RawURLEncoding.EncodeToString(digest[:])
+	req.Header.Set("X-Stoarama-Archive-Timestamp", timestamp)
+	req.Header.Set("X-Stoarama-Archive-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, []byte(message))))
+}
+
+func TestJoinedArchiveCapabilityIsScopedTamperEvidentAndShortLived(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	claims := joinedArchiveClaims{AccountID: 47, RecordingID: 377, Folder: []string{"August", "Thursday"}, ExpiresAt: now.Add(5 * time.Minute).Unix(), Nonce: "0123456789abcdef", ClientScope: strings.Repeat("c", 43)}
+	token, err := mintJoinedArchiveCapability("archive-signing-key-32-bytes-long", claims)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for index, contains := range []string{`"artifact_id":1`, "mp4"} {
-		body, err := archive.File[index].Open()
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, _ := io.ReadAll(body)
-		body.Close()
-		if !strings.Contains(string(got), contains) {
-			t.Fatalf("entry %d=%q missing %q", index, got, contains)
-		}
+	verified, err := verifyJoinedArchiveCapability("archive-signing-key-32-bytes-long", token, now)
+	if err != nil || verified.AccountID != 47 || verified.RecordingID != 377 || strings.Join(verified.Folder, "/") != "August/Thursday" {
+		t.Fatalf("claims=%+v err=%v", verified, err)
 	}
-	indexBody, _ := archive.File[0].Open()
-	indexJSON, _ := io.ReadAll(indexBody)
-	indexBody.Close()
-	for _, forbidden := range []string{"joined/o1", "e1", "version_id", "object_key"} {
-		if strings.Contains(string(indexJSON), forbidden) {
-			t.Fatalf("safe index leaked %q: %s", forbidden, indexJSON)
-		}
+	if _, err := verifyJoinedArchiveCapability("other-signing-key-32-bytes-long", token, now); err == nil {
+		t.Fatal("changed signing key accepted")
+	}
+	if _, err := verifyJoinedArchiveCapability("archive-signing-key-32-bytes-long", token+"x", now); err == nil {
+		t.Fatal("tampered capability accepted")
+	}
+	if _, err := verifyJoinedArchiveCapability("archive-signing-key-32-bytes-long", token, now.Add(6*time.Minute)); err == nil {
+		t.Fatal("expired capability accepted")
 	}
 }
 
-func TestJoinedFolderArchiveRejectsUnsafeOrDuplicatePathsBeforeStorageRead(t *testing.T) {
-	for _, relative := range []string{"../raw/private.mp4", "/absolute.mp4", "a\\b.mp4", "a/../b.mp4", "a\x00b.mp4"} {
-		store := &joinedArchiveStoreStub{heads: map[string]r2.ObjectHead{}, bodies: map[string][]byte{}, openErr: map[string]error{}}
-		err := preflightJoinedArchive(context.Background(), store, []joinedArchiveArtifact{{ObjectKey: "x", RelativePath: relative, SizeBytes: 1}})
-		if err == nil || len(store.opened) != 0 {
-			t.Fatalf("path %q err=%v opened=%v", relative, err, store.opened)
+func TestJoinedArchiveWorkerSignatureRejectsTamperAndStaleRequests(t *testing.T) {
+	public, private := joinedArchiveWorkerTestIdentity(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	digest := sha256.Sum256([]byte("capability"))
+	message := joinedArchiveCapabilityAudience + "\x00manifest\x00" + now.Format(time.RFC3339) + "\x00" + base64.RawURLEncoding.EncodeToString(digest[:])
+	signature := base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, []byte(message)))
+	if !verifyJoinedArchiveWorker(public, "manifest", now.Format(time.RFC3339), signature, "capability", now) {
+		t.Fatal("valid worker signature rejected")
+	}
+	if verifyJoinedArchiveWorker(public, "manifest", now.Format(time.RFC3339), signature, "other", now) {
+		t.Fatal("signature accepted for another capability")
+	}
+	if verifyJoinedArchiveWorker(public, "manifest", now.Add(-time.Minute).Format(time.RFC3339), signature, "capability", now) {
+		t.Fatal("stale signature accepted")
+	}
+}
+
+func TestJoinedArchiveRejectsTraversalWindowsPathsAndPortableCollisions(t *testing.T) {
+	valid := joinedArchiveArtifact{ArtifactID: 1, BatchID: "batch-1", RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", SizeBytes: 1, SHA256: strings.Repeat("a", 64)}
+	for _, relative := range []string{"../raw.mp4", "/absolute.mp4", "a\\b.mp4", "a/../b.mp4", "C:/outside.mp4", "folder/CON.mp4", "folder/name. ", "a\x00b.mp4"} {
+		artifact := valid
+		artifact.RelativePath = relative
+		if _, err := validateJoinedArchive([]joinedArchiveArtifact{artifact}); err == nil {
+			t.Fatalf("unsafe path %q accepted", relative)
 		}
 	}
-	duplicate := []joinedArchiveArtifact{{ObjectKey: "a", RelativePath: "x.mp4", SizeBytes: 1}, {ObjectKey: "b", RelativePath: "x.mp4", SizeBytes: 1}}
-	if err := validateJoinedArchive(duplicate); err == nil {
-		t.Fatal("duplicate ZIP path accepted")
+	second := valid
+	second.ArtifactID = 2
+	second.RelativePath = strings.ToUpper(valid.RelativePath)
+	if _, err := validateJoinedArchive([]joinedArchiveArtifact{valid, second}); err == nil {
+		t.Fatal("case-insensitive extraction collision accepted")
 	}
 }
 
-func TestJoinedFolderArchivePreflightRejectsIdentityDriftBeforeResponse(t *testing.T) {
-	artifact := joinedArchiveArtifact{ObjectKey: "joined/o1", ETag: "ledger", VersionID: "v1", RelativePath: "root/a.mp4", SizeBytes: 3}
-	store := &joinedArchiveStoreStub{heads: map[string]r2.ObjectHead{"joined/o1": {ETag: "changed", VersionID: "v1", SizeBytes: 3}}, bodies: map[string][]byte{}, openErr: map[string]error{}}
-	if err := preflightJoinedArchive(context.Background(), store, []joinedArchiveArtifact{artifact}); err == nil {
-		t.Fatal("identity drift accepted")
-	}
-	if len(store.opened) != 0 {
-		t.Fatalf("opened before clean preflight: %v", store.opened)
-	}
-}
-
-func TestJoinedFolderArchiveStopsOnReadErrorAndClientCancellation(t *testing.T) {
-	artifacts := []joinedArchiveArtifact{{ObjectKey: "joined/o1", ETag: "e1", RelativePath: "root/a.mp4", SizeBytes: 3}}
-	readFailure := &joinedArchiveStoreStub{heads: map[string]r2.ObjectHead{"joined/o1": {ETag: "e1", SizeBytes: 3}}, bodies: map[string][]byte{}, openErr: map[string]error{"joined/o1": errors.New("r2 read failed")}}
-	if err := streamJoinedArchive(context.Background(), io.Discard, readFailure, artifacts); err == nil || !strings.Contains(err.Error(), "r2 read failed") {
-		t.Fatalf("read error=%v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	cancelled := &joinedArchiveStoreStub{heads: map[string]r2.ObjectHead{}, bodies: map[string][]byte{}, openErr: map[string]error{}, openCheck: func(got context.Context) {
-		if got.Err() == nil {
-			t.Fatal("cancelled request context was not propagated")
-		}
-	}}
-	if err := streamJoinedArchive(ctx, io.Discard, cancelled, artifacts); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancel error=%v", err)
-	}
-}
-
-func TestJoinedFolderArchiveScopeUsesCanonicalFolderSegments(t *testing.T) {
+func TestJoinedArchiveScopeSelectsRootMonthAndWeekday(t *testing.T) {
 	all := []joinedArchiveArtifact{
 		{RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4"},
 		{RelativePath: "377_Europe_Poland_Luban/August/Friday/b.mp4"},
@@ -149,10 +98,31 @@ func TestJoinedFolderArchiveScopeUsesCanonicalFolderSegments(t *testing.T) {
 		t.Fatalf("root=%+v name=%q ok=%v", root, name, ok)
 	}
 	day, name, ok := scopeJoinedArchive(all, []string{"August", "Thursday"})
-	if !ok || name != "Thursday" || len(day) != 1 || day[0].RelativePath != "377_Europe_Poland_Luban/August/Thursday/a.mp4" {
+	if !ok || name != "Thursday" || len(day) != 1 || day[0].RelativePath != all[0].RelativePath {
 		t.Fatalf("day=%+v name=%q ok=%v", day, name, ok)
 	}
 	if _, _, ok := scopeJoinedArchive(all, []string{"September"}); ok {
 		t.Fatal("missing folder accepted")
+	}
+}
+
+func TestJoinedArchiveRedirectRequiresPrincipalAndValidWorkerHTTPSURL(t *testing.T) {
+	route := chi.NewRouteContext()
+	route.URLParams.Add("id", "377")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/377/joined/folder/archive", nil)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, route))
+	response := httptest.NewRecorder()
+	(&Server{}).handleAccountRecordingJoinedFolderArchive(response, req)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, base := range []string{"http://downloads.example.test", "https://user@example.test", "https://example.test/?query=1"} {
+		if _, err := joinedArchiveWorkerURL(base, "token"); err == nil {
+			t.Fatalf("unsafe worker URL %q accepted", base)
+		}
+	}
+	got, err := joinedArchiveWorkerURL("https://joined.example.test/base", "a.b")
+	if err != nil || got != "https://joined.example.test/base/archive?token=a.b" {
+		t.Fatalf("worker URL=%q err=%v", got, err)
 	}
 }

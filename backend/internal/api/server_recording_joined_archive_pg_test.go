@@ -1,71 +1,94 @@
 package api
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
-	"github.com/daydemir/stoarama/backend/internal/r2"
+	"github.com/go-chi/chi/v5"
 )
 
-func TestPublicJoinedFolderArchiveIsAccountScopedAndContainsPublishedMP4AndJSON(t *testing.T) {
+func TestJoinedArchiveRedirectAndManifestUsePublishedAccountScopedMediaOnly(t *testing.T) {
+	workerPublic, workerPrivate := joinedArchiveWorkerTestIdentity(t)
 	pool := joinedBrowserTestPool(t)
-	seedJoinedBrowserTestData(t, pool)
-	body := []byte("0123456789")
-	digest := sha256.Sum256(body)
-	if _, err := pool.Exec(context.Background(), `UPDATE recording_joined_artifacts SET expected_sha256=$1 WHERE expected_size_bytes=10`, hex.EncodeToString(digest[:])); err != nil {
+	if _, err := pool.Exec(context.Background(), `CREATE TABLE recording_joined_batches(id bigint PRIMARY KEY,account_id bigint NOT NULL,batch_id text NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	store := &joinedArchiveStoreStub{
-		bodies: map[string][]byte{
-			"joined/private/media-1.mp4": body,
-			"joined/private/media-2.mp4": body,
-		},
-		heads: map[string]r2.ObjectHead{
-			"joined/private/media-1.mp4": {ETag: "media-1", SizeBytes: 10},
-			"joined/private/media-2.mp4": {ETag: "media-2", SizeBytes: 10},
-		},
-		openErr: map[string]error{},
+	seedJoinedBrowserTestData(t, pool)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO recording_joined_batches VALUES(1,47,'batch-1'),(2,99,'foreign-batch-1')`); err != nil {
+		t.Fatal(err)
 	}
-	s := &Server{pool: pool, joinedOutputStorage: store, cfg: config.Config{
-		SharedRecordingsAccountID: 47,
-		SharedRecordingsSlug:      "mit-scl",
-		SharedRecordingsPublic:    true,
+	s := &Server{pool: pool, cfg: config.Config{
+		JoinedWorkerSigningKey:       "archive-signing-key-32-bytes-long",
+		JoinedArchiveWorkerURL:       "https://joined-download.example.test",
+		JoinedArchiveWorkerPublicKey: workerPublic,
+		SharedRecordingsAccountID:    47,
+		SharedRecordingsSlug:         "mit-scl",
+		SharedRecordingsPublic:       true,
 	}}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/20/joined/folder/archive?folder=May%2FMonday", nil)
+	route := chi.NewRouteContext()
+	route.URLParams.Add("id", strconv.FormatInt(20, 10))
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, route)
+	ctx = context.WithValue(ctx, accountPrincipalContextKey, accountPrincipal{AccountID: 47, AuthType: "session"})
 	response := httptest.NewRecorder()
-	s.router().ServeHTTP(response, httptest.NewRequest(http.MethodGet,
-		"/api/v1/shared/mit-scl/recordings/20/joined/folder/archive", nil))
-	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/zip" {
+	s.handleAccountRecordingJoinedFolderArchive(response, req.WithContext(ctx))
+	if response.Code != http.StatusTemporaryRedirect || response.Header().Get("Cache-Control") != "private, no-store" {
 		t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
 	}
-	archive, err := zip.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
-	if err != nil {
+	location, err := url.Parse(response.Header().Get("Location"))
+	if err != nil || location.Host != "joined-download.example.test" || location.Path != "/archive" || location.Query().Get("token") == "" {
+		t.Fatalf("location=%q err=%v", response.Header().Get("Location"), err)
+	}
+	admissionResponse := httptest.NewRecorder()
+	admissionRequest := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/archive/admission?token="+url.QueryEscape(location.Query().Get("token")), nil)
+	signJoinedArchiveWorkerRequest(admissionRequest, workerPrivate, "admission", time.Now().UTC())
+	s.handleJoinedArchiveAdmission(admissionResponse, admissionRequest)
+	var admission joinedArchiveAdmission
+	if admissionResponse.Code != http.StatusOK || json.Unmarshal(admissionResponse.Body.Bytes(), &admission) != nil || len(admission.RateScope) < 32 || len(admission.CapabilityID) < 32 {
+		t.Fatalf("admission status=%d body=%s", admissionResponse.Code, admissionResponse.Body.String())
+	}
+	if strings.Contains(admissionResponse.Body.String(), "batch-1") || strings.Contains(admissionResponse.Body.String(), ".mp4") {
+		t.Fatalf("admission leaked artifact metadata: %s", admissionResponse.Body.String())
+	}
+
+	manifestResponse := httptest.NewRecorder()
+	manifestRequest := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/archive/manifest?token="+url.QueryEscape(location.Query().Get("token")), nil)
+	signJoinedArchiveWorkerRequest(manifestRequest, workerPrivate, "manifest", time.Now().UTC())
+	s.handleJoinedArchiveManifest(manifestResponse, manifestRequest)
+	if manifestResponse.Code != http.StatusOK {
+		t.Fatalf("manifest status=%d body=%s", manifestResponse.Code, manifestResponse.Body.String())
+	}
+	var manifest joinedArchiveManifest
+	if err := json.Unmarshal(manifestResponse.Body.Bytes(), &manifest); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]bool{
-		"joined-files.json":                        true,
-		"May/Monday/hour_01_part_01_0800-0801.mp4": true,
-		"May/Monday/hour_01_part_02_0801-0802.mp4": true,
+	if manifest.SchemaVersion != 1 || manifest.TotalBytes != 20 || len(manifest.Files) != 2 || manifest.ArchiveName != "Monday.zip" {
+		t.Fatalf("manifest=%+v", manifest)
 	}
-	if len(archive.File) != len(want) {
-		t.Fatalf("entries=%v", archive.File)
+	for _, file := range manifest.Files {
+		if file.BatchID != "batch-1" || file.ContentType != "video/mp4" || !strings.HasSuffix(file.RelativePath, ".mp4") {
+			t.Fatalf("file=%+v", file)
+		}
 	}
-	for _, file := range archive.File {
-		if !want[file.Name] {
-			t.Fatalf("unexpected entry %q", file.Name)
+	for _, forbidden := range []string{"object_" + "key", "joined/" + "private/", "cloudflare" + "storage.com", "access_" + "key", "sec" + "ret"} {
+		if strings.Contains(manifestResponse.Body.String(), forbidden) {
+			t.Fatalf("manifest leaked %q: %s", forbidden, manifestResponse.Body.String())
 		}
 	}
 
-	foreign := httptest.NewRecorder()
-	s.router().ServeHTTP(foreign, httptest.NewRequest(http.MethodGet,
-		"/api/v1/shared/mit-scl/recordings/50/joined/folder/archive", nil))
-	if foreign.Code != http.StatusNotFound {
-		t.Fatalf("foreign status=%d body=%s", foreign.Code, foreign.Body.String())
+	tampered := httptest.NewRecorder()
+	tamperedRequest := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/archive/manifest?token="+url.QueryEscape(location.Query().Get("token")+"x"), nil)
+	signJoinedArchiveWorkerRequest(tamperedRequest, workerPrivate, "manifest", time.Now().UTC())
+	s.handleJoinedArchiveManifest(tampered, tamperedRequest)
+	if tampered.Code != http.StatusUnauthorized {
+		t.Fatalf("tampered status=%d body=%s", tampered.Code, tampered.Body.String())
 	}
 }

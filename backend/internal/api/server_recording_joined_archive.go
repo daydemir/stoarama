@@ -1,54 +1,102 @@
 package api
 
 import (
-	"archive/zip"
 	"context"
+	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
 )
 
 const (
-	joinedArchiveMaxArtifacts  = 5000
-	joinedArchiveMaxBytes      = int64(1 << 40)
-	joinedArchiveHeadWorkers   = 8
-	joinedArchiveHeadTimeout   = 30 * time.Second
-	joinedArchiveObjectTimeout = 2 * time.Hour
+	joinedArchiveCapabilityAudience = "joined-folder-archive-v1"
+	joinedArchiveCapabilityTTL      = 5 * time.Minute
+	joinedArchiveMaxArtifacts       = 4997
+	joinedArchiveMaxBytes           = int64(256 << 30)
 )
 
-var joinedArchiveSlots = make(chan struct{}, 4)
+type joinedArchiveClaims struct {
+	Version     int      `json:"v"`
+	Audience    string   `json:"aud"`
+	AccountID   int64    `json:"account_id"`
+	RecordingID int64    `json:"recording_id"`
+	Folder      []string `json:"folder,omitempty"`
+	ExpiresAt   int64    `json:"exp"`
+	Nonce       string   `json:"nonce"`
+	ClientScope string   `json:"client_scope"`
+}
 
 type joinedArchiveArtifact struct {
-	ArtifactID   int64
-	ObjectKey    string
-	ETag         string
-	VersionID    string
-	ContentType  string
-	RelativePath string
-	SizeBytes    int64
-	SHA256       string
+	ArtifactID   int64  `json:"artifact_id"`
+	BatchID      string `json:"batch_id"`
+	ETag         string `json:"etag"`
+	VersionID    string `json:"version_id"`
+	ContentType  string `json:"content_type"`
+	RelativePath string `json:"relative_path"`
+	SizeBytes    int64  `json:"size_bytes"`
+	SHA256       string `json:"sha256"`
+}
+
+type joinedArchiveManifest struct {
+	SchemaVersion int                     `json:"schema_version"`
+	ArchiveName   string                  `json:"archive_name"`
+	ExpiresAt     time.Time               `json:"expires_at"`
+	TotalBytes    int64                   `json:"total_bytes"`
+	Files         []joinedArchiveArtifact `json:"files"`
+}
+
+type joinedArchiveAdmission struct {
+	RateScope    string `json:"rate_scope"`
+	CapabilityID string `json:"capability_id"`
+}
+
+func joinedArchiveOpaqueID(signingKey, domain, value string) string {
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(signingKey)))
+	_, _ = mac.Write([]byte(domain + "\x00" + value))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func verifyJoinedArchiveWorker(publicKey, operation, timestamp, signature, token string, now time.Time) bool {
+	key, keyErr := base64.RawURLEncoding.DecodeString(strings.TrimSpace(publicKey))
+	sig, sigErr := base64.RawURLEncoding.DecodeString(strings.TrimSpace(signature))
+	when, timeErr := time.Parse(time.RFC3339, strings.TrimSpace(timestamp))
+	if keyErr != nil || sigErr != nil || timeErr != nil || len(key) != ed25519.PublicKeySize || len(sig) != ed25519.SignatureSize || now.Sub(when) < -30*time.Second || now.Sub(when) > 30*time.Second {
+		return false
+	}
+	digest := sha256.Sum256([]byte(token))
+	if operation != "manifest" && operation != "admission" {
+		return false
+	}
+	message := joinedArchiveCapabilityAudience + "\x00" + operation + "\x00" + when.UTC().Format(time.RFC3339) + "\x00" + base64.RawURLEncoding.EncodeToString(digest[:])
+	return ed25519.Verify(ed25519.PublicKey(key), []byte(message), sig)
+}
+
+func validJoinedArchiveWorkerPublicKey(value string) bool {
+	key, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(value))
+	return err == nil && len(key) == ed25519.PublicKeySize
 }
 
 func canonicalJoinedArchivePath(relative string) (string, bool) {
-	if relative == "" || len(relative) > 1024 || strings.HasPrefix(relative, "/") || strings.ContainsAny(relative, "\\\x00\r\n") {
+	if relative == "" || len(relative) > 1024 || strings.HasPrefix(relative, "/") || strings.ContainsAny(relative, "\\:\x00\r\n") {
 		return "", false
 	}
 	parts := strings.Split(relative, "/")
 	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
+		if part == "" || part == "." || part == ".." || strings.TrimRight(part, " .") != part || joinedArchiveWindowsReserved(part) {
 			return "", false
 		}
 	}
@@ -56,49 +104,52 @@ func canonicalJoinedArchivePath(relative string) (string, bool) {
 	return clean, clean == relative
 }
 
-func validateJoinedArchive(artifacts []joinedArchiveArtifact) error {
+func joinedArchiveWindowsReserved(segment string) bool {
+	base := strings.ToUpper(strings.TrimSuffix(segment, path.Ext(segment)))
+	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
+		return true
+	}
+	if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) {
+		return base[3] >= '1' && base[3] <= '9'
+	}
+	return false
+}
+
+func validateJoinedArchive(artifacts []joinedArchiveArtifact) (int64, error) {
 	if len(artifacts) == 0 {
-		return errors.New("joined folder is empty")
+		return 0, errors.New("joined folder is empty")
 	}
 	if len(artifacts) > joinedArchiveMaxArtifacts {
-		return errors.New("joined folder has too many files")
+		return 0, errors.New("joined folder has too many files")
 	}
 	seen := make(map[string]struct{}, len(artifacts))
 	var total int64
 	for _, artifact := range artifacts {
 		name, ok := canonicalJoinedArchivePath(artifact.RelativePath)
-		if !ok {
-			return fmt.Errorf("unsafe joined archive path for artifact %d", artifact.ArtifactID)
+		if !ok || artifact.ArtifactID <= 0 || !joinedrecording.ValidBatchID(artifact.BatchID) || !lowerHex64(artifact.SHA256) {
+			return 0, fmt.Errorf("invalid joined archive artifact %d", artifact.ArtifactID)
 		}
-		if _, duplicate := seen[name]; duplicate {
-			return fmt.Errorf("duplicate joined archive path %q", name)
+		portable := strings.ToLower(name)
+		if _, duplicate := seen[portable]; duplicate {
+			return 0, fmt.Errorf("ambiguous joined archive path %q", name)
 		}
-		seen[name] = struct{}{}
-		if name == "joined-files.json" {
-			return errors.New("joined artifact conflicts with archive index")
-		}
-		if artifact.SizeBytes < 0 || artifact.SizeBytes > joinedArchiveMaxBytes-total {
-			return errors.New("joined folder exceeds archive size limit")
+		seen[portable] = struct{}{}
+		if artifact.SizeBytes <= 0 || artifact.SizeBytes > joinedArchiveMaxBytes-total {
+			return 0, errors.New("joined folder exceeds archive size limit")
 		}
 		total += artifact.SizeBytes
 	}
-	return nil
+	return total, nil
 }
 
-// scopeJoinedArchive preserves canonical delivery-relative names. A nested
-// folder contains only artifacts whose canonical media delivery path is below
-// that folder. Coverage manifests remain available from the recording root.
 func scopeJoinedArchive(all []joinedArchiveArtifact, active []string) ([]joinedArchiveArtifact, string, bool) {
 	rootName := ""
 	for _, artifact := range all {
-		parts := joinedFolderFileParts(artifact.RelativePath)
-		if len(parts) >= 2 {
-			original := strings.Split(artifact.RelativePath, "/")
-			for index, part := range original {
-				if joinedFolderMonths[part] && index > 0 {
-					rootName = original[index-1]
-					break
-				}
+		original := strings.Split(artifact.RelativePath, "/")
+		for index, part := range original {
+			if joinedFolderMonths[part] && index > 0 {
+				rootName = original[index-1]
+				break
 			}
 		}
 		if rootName != "" {
@@ -131,135 +182,6 @@ func scopeJoinedArchive(all []joinedArchiveArtifact, active []string) ([]joinedA
 	return selected, active[len(active)-1], len(selected) > 0
 }
 
-func preflightJoinedArchive(ctx context.Context, store joinedOutputObjectStore, artifacts []joinedArchiveArtifact) error {
-	if store == nil {
-		return errors.New("joined output storage unavailable")
-	}
-	if err := validateJoinedArchive(artifacts); err != nil {
-		return err
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	jobs := make(chan joinedArchiveArtifact)
-	var wg sync.WaitGroup
-	var firstErr error
-	var errOnce sync.Once
-	worker := func() {
-		defer wg.Done()
-		for artifact := range jobs {
-			headCtx, headCancel := context.WithTimeout(ctx, joinedArchiveHeadTimeout)
-			head, err := store.Head(headCtx, artifact.ObjectKey)
-			headCancel()
-			if err == nil && (head.ETag != artifact.ETag || head.VersionID != artifact.VersionID || head.SizeBytes != artifact.SizeBytes) {
-				err = errors.New("joined artifact identity changed")
-			}
-			if err != nil {
-				errOnce.Do(func() { firstErr = err; cancel() })
-				return
-			}
-		}
-	}
-	workers := joinedArchiveHeadWorkers
-	if len(artifacts) < workers {
-		workers = len(artifacts)
-	}
-	for index := 0; index < workers; index++ {
-		wg.Add(1)
-		go worker()
-	}
-send:
-	for _, artifact := range artifacts {
-		select {
-		case jobs <- artifact:
-		case <-ctx.Done():
-			break send
-		}
-	}
-	close(jobs)
-	wg.Wait()
-	if firstErr != nil {
-		return firstErr
-	}
-	return ctx.Err()
-}
-
-func streamJoinedArchive(ctx context.Context, destination io.Writer, store joinedOutputObjectStore, artifacts []joinedArchiveArtifact) error {
-	archive := zip.NewWriter(destination)
-	indexBytes, err := json.Marshal(struct {
-		SchemaVersion int                      `json:"schema_version"`
-		Files         []joinedArchiveIndexFile `json:"files"`
-	}{SchemaVersion: 1, Files: joinedArchiveIndex(artifacts)})
-	if err != nil {
-		return err
-	}
-	indexHeader := &zip.FileHeader{Name: "joined-files.json", Method: zip.Store}
-	indexHeader.SetMode(0o644)
-	indexHeader.SetModTime(time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC))
-	indexEntry, err := archive.CreateHeader(indexHeader)
-	if err != nil {
-		return err
-	}
-	if _, err := indexEntry.Write(indexBytes); err != nil {
-		return err
-	}
-	for _, artifact := range artifacts {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		objectCtx, objectCancel := context.WithTimeout(ctx, joinedArchiveObjectTimeout)
-		body, err := store.OpenExact(objectCtx, artifact.ObjectKey, artifact.ETag, artifact.VersionID)
-		if err != nil {
-			objectCancel()
-			return err
-		}
-		header := &zip.FileHeader{Name: artifact.RelativePath, Method: zip.Store}
-		header.SetMode(0o644)
-		header.SetModTime(time.Date(1980, 1, 1, 0, 0, 0, 0, time.UTC))
-		entry, err := archive.CreateHeader(header)
-		if err != nil {
-			body.Close()
-			objectCancel()
-			return err
-		}
-		hash := sha256.New()
-		written, copyErr := io.CopyN(io.MultiWriter(entry, hash), body, artifact.SizeBytes)
-		closeErr := body.Close()
-		objectCancel()
-		if copyErr != nil || written != artifact.SizeBytes {
-			if copyErr != nil {
-				return copyErr
-			}
-			return io.ErrUnexpectedEOF
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if artifact.SHA256 != "" && hex.EncodeToString(hash.Sum(nil)) != artifact.SHA256 {
-			return errors.New("joined artifact checksum changed")
-		}
-	}
-	return archive.Close()
-}
-
-type joinedArchiveIndexFile struct {
-	ArtifactID  int64  `json:"artifact_id"`
-	Path        string `json:"path"`
-	ContentType string `json:"content_type"`
-	SizeBytes   int64  `json:"size_bytes"`
-	SHA256      string `json:"sha256"`
-}
-
-func joinedArchiveIndex(artifacts []joinedArchiveArtifact) []joinedArchiveIndexFile {
-	files := make([]joinedArchiveIndexFile, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		files = append(files, joinedArchiveIndexFile{
-			ArtifactID: artifact.ArtifactID, Path: artifact.RelativePath, ContentType: artifact.ContentType,
-			SizeBytes: artifact.SizeBytes, SHA256: artifact.SHA256,
-		})
-	}
-	return files
-}
-
 func safeJoinedArchiveFilename(name string, recordingID int64) string {
 	name = strings.TrimSpace(name)
 	var safe strings.Builder
@@ -276,19 +198,84 @@ func safeJoinedArchiveFilename(name string, recordingID int64) string {
 	return safe.String() + ".zip"
 }
 
-func (s *Server) joinedArchiveArtifacts(ctx context.Context, principal accountPrincipal, recordingID int64) ([]joinedArchiveArtifact, error) {
+func mintJoinedArchiveCapability(signingKey string, claims joinedArchiveClaims) (string, error) {
+	if strings.TrimSpace(signingKey) == "" || claims.AccountID <= 0 || claims.RecordingID <= 0 || claims.ExpiresAt <= 0 || len(claims.Nonce) < 16 {
+		return "", errors.New("invalid joined archive capability")
+	}
+	claims.Version = 1
+	claims.Audience = joinedArchiveCapabilityAudience
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(signingKey)))
+	_, _ = mac.Write([]byte(joinedArchiveCapabilityAudience + "\x00" + encoded))
+	return encoded + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func verifyJoinedArchiveCapability(signingKey, token string, now time.Time) (joinedArchiveClaims, error) {
+	var claims joinedArchiveClaims
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if strings.TrimSpace(signingKey) == "" || len(token) > 2048 || len(parts) != 2 {
+		return claims, errors.New("invalid joined archive capability")
+	}
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(signingKey)))
+	_, _ = mac.Write([]byte(joinedArchiveCapabilityAudience + "\x00" + parts[0]))
+	want := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(want), []byte(parts[1])) {
+		return claims, errors.New("invalid joined archive capability")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || json.Unmarshal(payload, &claims) != nil || claims.Version != 1 || claims.Audience != joinedArchiveCapabilityAudience ||
+		claims.AccountID <= 0 || claims.RecordingID <= 0 || claims.ExpiresAt <= now.UTC().Unix() ||
+		claims.ExpiresAt > now.UTC().Add(10*time.Minute).Unix() || len(claims.Nonce) < 16 {
+		return joinedArchiveClaims{}, errors.New("invalid or expired joined archive capability")
+	}
+	if _, ok := parseJoinedFolderPath(strings.Join(claims.Folder, "/")); !ok {
+		return joinedArchiveClaims{}, errors.New("invalid joined archive folder scope")
+	}
+	if len(claims.ClientScope) < 32 {
+		return joinedArchiveClaims{}, errors.New("invalid joined archive client scope")
+	}
+	return claims, nil
+}
+
+func newJoinedArchiveNonce() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(value), nil
+}
+
+func joinedArchiveWorkerURL(base, token string) (string, error) {
+	worker, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || worker.Scheme != "https" || worker.Host == "" || worker.User != nil || worker.RawQuery != "" || worker.Fragment != "" {
+		return "", errors.New("joined archive worker is unavailable")
+	}
+	worker.Path = strings.TrimRight(worker.Path, "/") + "/archive"
+	query := worker.Query()
+	query.Set("token", token)
+	worker.RawQuery = query.Encode()
+	return worker.String(), nil
+}
+
+func (s *Server) joinedArchiveArtifacts(ctx context.Context, accountID, recordingID int64) ([]joinedArchiveArtifact, error) {
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND status IN ('active','paused','completed'))`, recordingID, principal.AccountID).Scan(&exists); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recordings WHERE id=$1 AND account_id=$2 AND status IN ('active','paused','completed'))`, recordingID, accountID).Scan(&exists); err != nil {
 		return nil, err
 	}
 	if !exists {
 		return nil, pgx.ErrNoRows
 	}
-	rows, err := s.pool.Query(ctx, `SELECT a.id,a.object_key,a.etag,a.version_id,a.content_type,a.relative_path,a.expected_size_bytes,a.expected_sha256 `+
+	rows, err := s.pool.Query(ctx, `SELECT a.id,
+		(SELECT b.batch_id FROM recording_joined_batches b WHERE b.id=a.batch_record_id AND b.account_id=a.account_id),
+		a.etag,a.version_id,a.content_type,a.relative_path,a.expected_size_bytes,a.expected_sha256 `+
 		recordingJoinedPublishedArtifactScopeSQL+`
 		  AND a.artifact_kind='media'
 		ORDER BY a.relative_path,a.id
-		LIMIT $3`, recordingID, principal.AccountID, joinedArchiveMaxArtifacts+1)
+		LIMIT $3`, recordingID, accountID, joinedArchiveMaxArtifacts+1)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +283,7 @@ func (s *Server) joinedArchiveArtifacts(ctx context.Context, principal accountPr
 	artifacts := make([]joinedArchiveArtifact, 0)
 	for rows.Next() {
 		var artifact joinedArchiveArtifact
-		if err := rows.Scan(&artifact.ArtifactID, &artifact.ObjectKey, &artifact.ETag, &artifact.VersionID,
+		if err := rows.Scan(&artifact.ArtifactID, &artifact.BatchID, &artifact.ETag, &artifact.VersionID,
 			&artifact.ContentType, &artifact.RelativePath, &artifact.SizeBytes, &artifact.SHA256); err != nil {
 			return nil, err
 		}
@@ -311,24 +298,25 @@ func (s *Server) handleAccountRecordingJoinedFolderArchive(w http.ResponseWriter
 		util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	if !validJoinedArchiveWorkerPublicKey(s.cfg.JoinedArchiveWorkerPublicKey) {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined archive worker is unavailable")
+		return
+	}
+	requester := sharedRecordingsRequesterIP(r, s.cfg.SharedRecordingsProxyCIDRs)
+	if !s.joinedArchiveLimiter.allow(requester) {
+		util.WriteError(w, http.StatusTooManyRequests, "joined archive download limit reached")
+		return
+	}
 	recordingID, ok := parseInt64Path(w, r, "id")
 	if !ok {
 		return
 	}
-	activePath, ok := parseJoinedFolderPath(r.URL.Query().Get("folder"))
+	folder, ok := parseJoinedFolderPath(r.URL.Query().Get("folder"))
 	if !ok {
 		util.WriteError(w, http.StatusBadRequest, "invalid joined folder")
 		return
 	}
-	select {
-	case joinedArchiveSlots <- struct{}{}:
-		defer func() { <-joinedArchiveSlots }()
-	default:
-		util.WriteError(w, http.StatusTooManyRequests, "joined archive capacity is busy")
-		return
-	}
-	ctx := r.Context()
-	artifacts, err := s.joinedArchiveArtifacts(ctx, principal, recordingID)
+	artifacts, err := s.joinedArchiveArtifacts(r.Context(), principal.AccountID, recordingID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "recording not found")
 		return
@@ -337,29 +325,100 @@ func (s *Server) handleAccountRecordingJoinedFolderArchive(w http.ResponseWriter
 		util.WriteError(w, http.StatusServiceUnavailable, "joined folder is unavailable")
 		return
 	}
-	artifacts, archiveName, found := scopeJoinedArchive(artifacts, activePath)
+	selected, _, found := scopeJoinedArchive(artifacts, folder)
 	if !found {
 		util.WriteError(w, http.StatusNotFound, "joined folder not found")
 		return
 	}
-	sort.SliceStable(artifacts, func(i, j int) bool {
-		if artifacts[i].RelativePath == artifacts[j].RelativePath {
-			return artifacts[i].ArtifactID < artifacts[j].ArtifactID
-		}
-		return artifacts[i].RelativePath < artifacts[j].RelativePath
-	})
-	if err := preflightJoinedArchive(ctx, s.joinedOutputStore(), artifacts); err != nil {
-		util.WriteError(w, http.StatusConflict, "joined folder changed while preparing archive")
+	if _, err := validateJoinedArchive(selected); err != nil {
+		util.WriteError(w, http.StatusRequestEntityTooLarge, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": safeJoinedArchiveFilename(archiveName, recordingID)}))
+	nonce, err := newJoinedArchiveNonce()
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined archive capability is unavailable")
+		return
+	}
+	expiresAt := time.Now().UTC().Add(joinedArchiveCapabilityTTL)
+	token, err := mintJoinedArchiveCapability(s.cfg.JoinedWorkerSigningKey, joinedArchiveClaims{
+		AccountID: principal.AccountID, RecordingID: recordingID, Folder: folder, ExpiresAt: expiresAt.Unix(), Nonce: nonce,
+		ClientScope: joinedArchiveOpaqueID(s.cfg.JoinedWorkerSigningKey, "joined-archive-client-scope-v1", requester),
+	})
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined archive capability is unavailable")
+		return
+	}
+	location, err := joinedArchiveWorkerURL(s.cfg.JoinedArchiveWorkerURL, token)
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined archive worker is unavailable")
+		return
+	}
 	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
-	_ = streamJoinedArchive(ctx, w, s.joinedOutputStore(), artifacts)
+	http.Redirect(w, r, location, http.StatusTemporaryRedirect)
 }
 
 func (s *Server) handleSharedRecordingJoinedFolderArchive(w http.ResponseWriter, r *http.Request) {
 	s.handleAccountRecordingJoinedFolderArchive(w, s.sharedRecordingPrincipalRequest(r))
+}
+
+func (s *Server) handleJoinedArchiveManifest(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	token := r.URL.Query().Get("token")
+	if !verifyJoinedArchiveWorker(s.cfg.JoinedArchiveWorkerPublicKey, "manifest", r.Header.Get("X-Stoarama-Archive-Timestamp"), r.Header.Get("X-Stoarama-Archive-Signature"), token, now) {
+		util.WriteError(w, http.StatusUnauthorized, "archive worker authentication failed")
+		return
+	}
+	claims, err := verifyJoinedArchiveCapability(s.cfg.JoinedWorkerSigningKey, token, now)
+	if err != nil {
+		util.WriteError(w, http.StatusUnauthorized, "invalid joined archive capability")
+		return
+	}
+	artifacts, err := s.joinedArchiveArtifacts(r.Context(), claims.AccountID, claims.RecordingID)
+	if err != nil {
+		util.WriteError(w, http.StatusNotFound, "joined archive scope not found")
+		return
+	}
+	selected, folderName, found := scopeJoinedArchive(artifacts, claims.Folder)
+	if !found {
+		util.WriteError(w, http.StatusNotFound, "joined folder not found")
+		return
+	}
+	sort.SliceStable(selected, func(i, j int) bool {
+		if selected[i].RelativePath == selected[j].RelativePath {
+			return selected[i].ArtifactID < selected[j].ArtifactID
+		}
+		return selected[i].RelativePath < selected[j].RelativePath
+	})
+	total, err := validateJoinedArchive(selected)
+	if err != nil {
+		util.WriteError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	util.WriteJSON(w, http.StatusOK, joinedArchiveManifest{
+		SchemaVersion: 1,
+		ArchiveName:   safeJoinedArchiveFilename(folderName, claims.RecordingID),
+		ExpiresAt:     time.Unix(claims.ExpiresAt, 0).UTC(),
+		TotalBytes:    total,
+		Files:         selected,
+	})
+}
+
+func (s *Server) handleJoinedArchiveAdmission(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	token := r.URL.Query().Get("token")
+	if !verifyJoinedArchiveWorker(s.cfg.JoinedArchiveWorkerPublicKey, "admission", r.Header.Get("X-Stoarama-Archive-Timestamp"), r.Header.Get("X-Stoarama-Archive-Signature"), token, now) {
+		util.WriteError(w, http.StatusUnauthorized, "archive worker authentication failed")
+		return
+	}
+	claims, err := verifyJoinedArchiveCapability(s.cfg.JoinedWorkerSigningKey, token, now)
+	if err != nil {
+		util.WriteError(w, http.StatusUnauthorized, "invalid joined archive capability")
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	util.WriteJSON(w, http.StatusOK, joinedArchiveAdmission{
+		RateScope:    joinedArchiveOpaqueID(s.cfg.JoinedWorkerSigningKey, "joined-archive-rate-scope-v1", fmt.Sprintf("%d:%s", claims.AccountID, claims.ClientScope)),
+		CapabilityID: joinedArchiveOpaqueID(s.cfg.JoinedWorkerSigningKey, "joined-archive-capability-id-v1", claims.Nonce),
+	})
 }
