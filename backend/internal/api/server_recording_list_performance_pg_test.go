@@ -132,6 +132,54 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 	}
 }
 
+func TestRecordingHealthBinCaptureCountUsesCoveringStartedIndex(t *testing.T) {
+	if strings.Contains(recordingHealthBinCaptureCountsSQL, "COUNT(c.id)") ||
+		!strings.Contains(recordingHealthBinCaptureCountsSQL, "COUNT(c.clip_start_at)") {
+		t.Fatal("capture-bin count must use the indexed, join-required clip_start_at column")
+	}
+	_, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status)
+		VALUES(47,'capture-plan@example.test','Capture plan','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(1,47,'Capture plan storage','https://example.test','auto','clips','access',''::bytea,'verified');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
+		VALUES(700,47,1,'Capture plan recording','https://example.test/live.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60);
+		INSERT INTO recording_clips(recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at)
+		SELECT 700,1,'https://example.test','clips','raw/plan-'||g||'.mp4',1,
+		       now()-g*interval '1 minute',now()-g*interval '1 minute',now()-(g-1)*interval '1 minute'
+		FROM generate_series(1,240) AS g;
+		ANALYZE recording_clips;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	starts := []time.Time{time.Now().Add(-4 * time.Hour), time.Now().Add(-2 * time.Hour)}
+	ends := []time.Time{time.Now().Add(-2 * time.Hour), time.Now()}
+	rows, err := pool.Query(ctx, `EXPLAIN (COSTS OFF) `+recordingHealthBinCaptureCountsSQL,
+		[]int64{700, 700}, starts, ends)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.String(), "Index Only Scan using idx_recording_clips_recording_started") {
+		t.Fatalf("capture-bin query must stay index-only; plan:\n%s", plan.String())
+	}
+}
+
 func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
 	s, pool, cleanup := testIdentityServer(t)
 	defer cleanup()

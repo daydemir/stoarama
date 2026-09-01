@@ -16,6 +16,18 @@ const (
 	recentContinuousLookback = 90 * 24 * time.Hour
 )
 
+const recordingHealthBinCaptureCountsSQL = `
+	SELECT b.ordinality, COUNT(c.clip_start_at)::bigint
+	FROM unnest($1::bigint[], $2::timestamptz[], $3::timestamptz[])
+	     WITH ORDINALITY AS b(recording_id, bin_start, bin_end, ordinality)
+	LEFT JOIN recording_clips c
+	  ON c.recording_id=b.recording_id
+	 AND c.clip_start_at >= b.bin_start
+	 AND c.clip_start_at < b.bin_end
+	GROUP BY b.ordinality
+	ORDER BY b.ordinality
+`
+
 type recordingHealthBin struct {
 	Start            time.Time                   `json:"start"`
 	End              time.Time                   `json:"end"`
@@ -213,17 +225,7 @@ func (s *Server) recordingHealthBinsForAccount(ctx context.Context, accountID in
 	if len(refs) == 0 {
 		return out, nil
 	}
-	countRows, err := s.pool.Query(ctx, `
-		SELECT b.ordinality, COUNT(c.id)::bigint
-		FROM unnest($1::bigint[], $2::timestamptz[], $3::timestamptz[])
-		     WITH ORDINALITY AS b(recording_id, bin_start, bin_end, ordinality)
-		LEFT JOIN recording_clips c
-		  ON c.recording_id=b.recording_id
-		 AND c.clip_start_at >= b.bin_start
-		 AND c.clip_start_at < b.bin_end
-		GROUP BY b.ordinality
-		ORDER BY b.ordinality
-	`, binRecordingIDs, binStarts, binEnds)
+	countRows, err := s.pool.Query(ctx, recordingHealthBinCaptureCountsSQL, binRecordingIDs, binStarts, binEnds)
 	if err != nil {
 		return nil, err
 	}
