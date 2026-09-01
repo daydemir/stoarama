@@ -74,6 +74,17 @@ class WorkerArtifactWorkflowTests(unittest.TestCase):
         self.assertIn("TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime", self.text)
         self.assertIn("TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline", self.text)
         self.assertIn("-timeout=4h", self.text)
+        tests_at = self.text.index("- name: Run focused four-hour worker-budget tests")
+        builds_at = self.text.index("- name: Build twice and verify embedded provenance")
+        attestation_at = self.text.index("- name: Write nonsecret build attestation")
+        upload_at = self.text.index("- name: Upload binary and attestation")
+        self.assertLess(tests_at, builds_at)
+        self.assertLess(builds_at, attestation_at)
+        self.assertLess(attestation_at, upload_at)
+        self.assertIn(
+            'root="$(mktemp --directory "$RUNNER_TEMP/stoaramactl-worker.XXXXXXXX")"',
+            self.text,
+        )
 
     def test_only_binary_and_nonsecret_attestation_are_uploaded(self) -> None:
         self.assertNotRegex(self.text, r"\$\{\{\s*secrets\.")

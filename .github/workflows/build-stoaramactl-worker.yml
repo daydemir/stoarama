@@ -158,6 +158,17 @@ jobs:
             exit 1
           fi
 
+      - name: Run focused four-hour worker-budget tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source-a/backend
+          GOCACHE="$RUNNER_TEMP/stoaramactl-worker-tests/cache" \
+          GOMODCACHE="$RUNNER_TEMP/stoaramactl-worker-tests/mod" \
+            go test -mod=readonly ./cmd/stoaramactl \
+              -run '^(TestJoinedWorkerTaskHasHardDeadline|TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime|TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline)$' \
+              -count=1 -timeout=4h -v
+
       - name: Build twice and verify embedded provenance
         id: artifact
         shell: bash
@@ -166,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          root="$RUNNER_TEMP/stoaramactl-worker"
+          root="$(mktemp --directory "$RUNNER_TEMP/stoaramactl-worker.XXXXXXXX")"
           artifact_dir="$root/artifact"
           export SOURCE_DATE_EPOCH="$(git -C source-a show -s --format=%ct HEAD)"
           mkdir -p "$artifact_dir" "$root/cache-a" "$root/cache-b" "$root/mod-a" "$root/mod-b"
@@ -243,17 +254,6 @@ jobs:
             echo "size_bytes=$size_bytes"
             echo "artifact_dir=$artifact_dir"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Run focused four-hour worker-budget tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd source-a/backend
-          GOCACHE="$RUNNER_TEMP/stoaramactl-worker/test-cache" \
-          GOMODCACHE="$RUNNER_TEMP/stoaramactl-worker/mod-a" \
-            go test -mod=readonly ./cmd/stoaramactl \
-              -run '^(TestJoinedWorkerTaskHasHardDeadline|TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime|TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline)$' \
-              -count=1 -timeout=4h -v
 
       - name: Write nonsecret build attestation
         shell: bash
