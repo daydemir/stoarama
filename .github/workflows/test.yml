@@ -175,6 +175,9 @@ jobs:
         run: go test ./...
       - name: Test recordings detail browser resilience
         run: node --test web/recordings_resilience_test.mjs
+      - name: Test exact-commit worker artifact workflow
+        working-directory: .
+        run: python3 backend/scripts/test_worker_artifact_workflow.py
       - name: Test NAS pull client
         working-directory: .
         run: python3 -m unittest -q clients/nas-pull/test_stoarama_pull.py
