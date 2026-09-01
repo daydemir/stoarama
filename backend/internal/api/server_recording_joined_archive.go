@@ -91,16 +91,7 @@ func validateJoinedArchive(artifacts []joinedArchiveArtifact) error {
 func scopeJoinedArchive(all []joinedArchiveArtifact, active []string) ([]joinedArchiveArtifact, string, bool) {
 	rootName := ""
 	for _, artifact := range all {
-		parts := joinedFolderFileParts(artifact.RelativePath)
-		if len(parts) >= 2 {
-			original := strings.Split(artifact.RelativePath, "/")
-			for index, part := range original {
-				if joinedFolderMonths[part] && index > 0 {
-					rootName = original[index-1]
-					break
-				}
-			}
-		}
+		rootName = joinedCanonicalRootFromPath(artifact.RelativePath)
 		if rootName != "" {
 			break
 		}

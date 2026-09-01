@@ -817,7 +817,7 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 			t.Fatalf("recordings html still contains stale action copy %q", stale)
 		}
 	}
-	for _, label := range []string{">View recording<", ">Browse joined folder<"} {
+	for _, label := range []string{">View recording<", "function joinedFolderDisplayName(rec)"} {
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
 		}

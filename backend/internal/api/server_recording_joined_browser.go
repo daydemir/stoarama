@@ -288,7 +288,6 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 	if rootName == "" {
 		rootName = fmt.Sprintf("Recording %d", recordingID)
 	}
-	mediaTotal := len(result.Files)
 	folders, files, found := joinedFolderEntries(result.FolderPath, result.Files, activePath)
 	if !found {
 		util.WriteError(w, http.StatusNotFound, "joined folder not found")
@@ -309,10 +308,18 @@ func (s *Server) handleAccountRecordingJoinedFolder(w http.ResponseWriter, r *ht
 		Crumbs:      crumbs,
 		Folders:     folders,
 		Files:       files,
-		MediaTotal:  mediaTotal,
+		MediaTotal:  joinedFolderEntryCount(folders, files),
 	}); err != nil {
 		return
 	}
+}
+
+func joinedFolderEntryCount(folders []joinedFolderEntry, files []joinedFolderFile) int {
+	total := len(files)
+	for _, folder := range folders {
+		total += folder.Count
+	}
+	return total
 }
 
 func (s *Server) handleAccountJoinedFolderRoot(w http.ResponseWriter, r *http.Request) {
@@ -421,10 +428,17 @@ func joinedFolderFileParts(relativePath string) []string {
 
 func joinedCanonicalRootName(files []recordingJoinedFile) string {
 	for _, file := range files {
-		parts := strings.FieldsFunc(strings.TrimSpace(file.RelativePath), func(r rune) bool { return r == '/' || r == '\\' })
-		if len(parts) > 1 && parts[0] != "." && parts[0] != ".." {
-			return parts[0]
+		if root := joinedCanonicalRootFromPath(file.RelativePath); root != "" {
+			return root
 		}
+	}
+	return ""
+}
+
+func joinedCanonicalRootFromPath(relativePath string) string {
+	parts := strings.FieldsFunc(strings.TrimSpace(relativePath), func(r rune) bool { return r == '/' || r == '\\' })
+	if len(parts) > 1 && parts[0] != "." && parts[0] != ".." {
+		return parts[0]
 	}
 	return ""
 }
