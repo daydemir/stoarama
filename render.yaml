@@ -163,7 +163,7 @@ services:
       - key: JOINED_RECORDING_PROTOCOL_GENERATION
         value: "7"
       - key: JOINED_RECORDING_MAX_ACTIVE_TASKS
-        value: "8"
+        value: "12"
       - key: STOARAMA_JOINED_WORK_SCOPE
         value: frozen_batch
       - key: JOINED_RECORDING_BATCH_ID
