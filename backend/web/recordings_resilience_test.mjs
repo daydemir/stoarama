@@ -123,4 +123,6 @@ test('heatmap legend explains capture colors and every joined corner-mark state'
   assert.match(output, /Number is joined percentage/);
   assert.match(output, /No mark means 0%, loading, or unavailable/);
   assert.match(output, /<svg viewBox="0 0 10 10">/);
+  assert.doesNotMatch(output, /<(?:a|button|input|select|textarea)\b/i);
+  assert.doesNotMatch(output, /\bdata-[a-z-]+=/i);
 });
