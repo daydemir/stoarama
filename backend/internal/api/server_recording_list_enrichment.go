@@ -160,6 +160,15 @@ func (s *Server) recordingMetricHeavyWorkSlots() chan struct{} {
 	return s.recordingHeavySlots
 }
 
+func (s *Server) recordingEnrichmentHeavyWorkSlots() chan struct{} {
+	s.recordingMetricSlotsMu.Lock()
+	defer s.recordingMetricSlotsMu.Unlock()
+	if s.recordingEnrichmentSlots == nil {
+		s.recordingEnrichmentSlots = make(chan struct{}, recordingMetricConcurrency-1)
+	}
+	return s.recordingEnrichmentSlots
+}
+
 // loadRecordingMetricCached collapses identical requests and admits at most two
 // expensive recording-metric loaders per API instance. Each caller can stop
 // waiting independently, while the shared flight keeps the initiating request's
@@ -412,7 +421,7 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: scope}
 	var classSlots chan struct{}
 	if !timelineOnly {
-		classSlots = s.recordingMetricHeavyWorkSlots()
+		classSlots = s.recordingEnrichmentHeavyWorkSlots()
 	}
 	result, err := loadRecordingMetricCachedWithClass(ctx, &s.recordingEnrichmentCache, key, recordingListEnrichmentTimeout, recordingEnrichmentCacheTTL, recordingMetricFailureTTL, classSlots, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingListEnrichmentResult, error) {
 		if timelineOnly {

@@ -78,6 +78,7 @@ type Server struct {
 	recordingMetricSlotsMu   sync.Mutex
 	recordingMetricSlots     chan struct{}
 	recordingHeavySlots      chan struct{}
+	recordingEnrichmentSlots chan struct{}
 	recordingEnrichmentCache recordingMetricCache[recordingListEnrichmentResult]
 	recordingProgressCache   recordingMetricCache[map[int64]recordingJoinedProgress]
 	recordingHealthPageCache recordingMetricCache[recordingCaptureHealthPage]
