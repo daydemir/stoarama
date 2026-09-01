@@ -782,6 +782,16 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		`els.recordingSort.value = next;`,
 		`Joined, highest first`,
 		`Joined, lowest first`,
+		`class="recordings-joined-header"`,
+		`class="recordings-joined-cell" data-label="Joined"`,
+		`class="cell-main recordings-joined-value loading"`,
+		`Joined coverage for the selected best consecutive 14-day period:`,
+		`.recordings-table { width: 100%; min-width: 1180px;`,
+		`.recordings-table th:nth-child(5) { width: 92px; }`,
+		`.recordings-joined-value { white-space: nowrap; }`,
+		`#cards:not(.hidden) {`,
+		`width: min(1320px, calc(100vw - 40px));`,
+		`.recordings-table, .recordings-table tbody { display: block; width: 100%; min-width: 0; }`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing joined sort/state marker %q", marker)

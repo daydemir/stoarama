@@ -521,14 +521,14 @@
     @keyframes loading-spin { to { transform: rotate(360deg); } }
     @keyframes loading-pulse { 50% { opacity: 0.45; } }
     .recordings-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
-    .recordings-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+    .recordings-table { width: 100%; min-width: 1180px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
     .recordings-table th, .recordings-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
     .recordings-table th:nth-child(1) { width: 38px; }
     .recordings-table th:nth-child(2) { width: 18%; }
     .recordings-table th:nth-child(3) { width: 15%; }
     .recordings-table th:nth-child(4) { width: 17%; }
-    .recordings-table th:nth-child(5) { width: 7%; }
+    .recordings-table th:nth-child(5) { width: 92px; }
     .recordings-table th:nth-child(6) { width: 11%; }
     .recordings-table th:nth-child(7) { width: 8%; }
     .recordings-table th:nth-child(8) { width: 7%; }
@@ -550,6 +550,18 @@
     .recordings-sort-button:hover { color: var(--text); }
     .recordings-sort-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .recordings-sort-indicator { min-width: 9px; color: var(--text); }
+    .recordings-joined-header .recordings-sort-button,
+    .recordings-joined-cell,
+    .recordings-joined-value { white-space: nowrap; }
+    .recordings-joined-value {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: normal !important;
+    }
+    .recordings-joined-value.loading { color: var(--muted); font-family: var(--sans); font-weight: 500; }
     .recordings-table input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
     .recordings-table .cell-main { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
     .recordings-table .cell-sub { color: var(--muted); margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
@@ -593,6 +605,10 @@
         grid-template-columns: 260px minmax(0, 1fr);
         gap: 16px;
       }
+      #cards:not(.hidden) {
+        width: min(1320px, calc(100vw - 40px));
+        margin-inline: calc((880px - min(1320px, calc(100vw - 40px))) / 2);
+      }
       .folder-rail { display: block; }
       .folder-browser-mobile { display: none; }
     }
@@ -607,7 +623,7 @@
       .recordings-table thead th:not(:first-child) { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
       .recordings-table thead th:first-child { position: static; display: flex; align-items: center; gap: 6px; width: auto; padding: 0; border: 0; background: transparent; }
       .recordings-table .select-visible-label { display: inline; }
-      .recordings-table, .recordings-table tbody { display: block; width: 100%; }
+      .recordings-table, .recordings-table tbody { display: block; width: 100%; min-width: 0; }
       .recordings-table tbody { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
       .recordings-table tbody tr {
         position: relative;
@@ -3570,12 +3586,12 @@
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       const joined = joinedCoverage(rec);
       const joinedHTML = !state.joinedProgressLoaded && !state.joinedProgressError
-	    ? `<div class="cell-main" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading...</div>`
+	    ? `<div class="cell-main recordings-joined-value loading" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading</div>`
 	    : joined.available
-        ? `<div class="cell-main" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
+        ? `<div class="cell-main recordings-joined-value" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
 	    : state.joinedProgressError
-	      ? `<div class="cell-main" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
-          : `<div class="cell-main" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
+	      ? `<div class="cell-main recordings-joined-value" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
+          : `<div class="cell-main recordings-joined-value" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
       let storage = sharedReadOnly ? '&mdash;' : (rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage'));
       if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
       let warning = '';
@@ -3596,7 +3612,7 @@
         <td class="recording-cell-wide" data-label="Recording"><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
 		<td class="recording-cell-wide" data-label="Status / Last 12 hours"><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td class="recording-cell-wide" data-label="Recording quality">${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>
-        <td data-label="Joined">${joinedHTML}</td>
+        <td class="recordings-joined-cell" data-label="Joined">${joinedHTML}</td>
         <td data-label="Schedule"><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
         <td data-label="Clip / Capture"><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
 		<td data-label="Storage"><div class="cell-main">${storage}</div></td>
@@ -3617,7 +3633,7 @@
         percent,
         sourceMS,
         readyMS: Math.max(0, readyMS),
-        title: `Joined coverage: ${percent}% (${formatDuration(Math.max(0, readyMS))} joined of ${formatDuration(sourceMS)} usable recorded footage)`,
+        title: `Joined coverage for the selected best consecutive 14-day period: ${percent}% (${formatDuration(Math.max(0, readyMS))} joined of ${formatDuration(sourceMS)} usable recorded footage)`,
       };
     }
 
@@ -3735,7 +3751,7 @@
       const ariaSort = ascending ? 'ascending' : (descending ? 'descending' : 'none');
       const label = ascending ? 'Joined, lowest first' : (descending ? 'Joined, highest first' : 'Sort by joined amount, highest first');
       const indicator = ascending ? '&#8593;' : (descending ? '&#8595;' : '&#8597;');
-      return `<th aria-sort="${ariaSort}"><button type="button" class="recordings-sort-button" data-sortjoined aria-label="${label}" title="${label}"><span>Joined</span><span class="recordings-sort-indicator" aria-hidden="true">${indicator}</span></button></th>`;
+      return `<th class="recordings-joined-header" aria-sort="${ariaSort}"><button type="button" class="recordings-sort-button" data-sortjoined aria-label="${label}" title="${label}"><span>Joined</span><span class="recordings-sort-indicator" aria-hidden="true">${indicator}</span></button></th>`;
     }
 
     function recordingsTableHTML(rows) {
