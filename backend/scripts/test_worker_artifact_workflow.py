@@ -58,7 +58,8 @@ class WorkerArtifactWorkflowTests(unittest.TestCase):
             "GOOS: linux",
             "GOARCH: amd64",
             "GOAMD64: v1",
-            'export SOURCE_DATE_EPOCH="$(git -C source-a show -s --format=%ct HEAD)"',
+            'SOURCE_DATE_EPOCH="$(git -C source-a show -s --format=%ct HEAD)"',
+            "export SOURCE_DATE_EPOCH",
             "go build -mod=readonly -trimpath -buildvcs=true",
             'build_one source-a "$root/stoaramactl-a"',
             'build_one source-b "$root/stoaramactl-b"',
@@ -71,7 +72,12 @@ class WorkerArtifactWorkflowTests(unittest.TestCase):
             self.assertIn(fragment, self.text)
 
     def test_four_hour_budget_tests_and_job_timeout_are_fixed(self) -> None:
-        self.assertIn("timeout-minutes: 240", self.text)
+        job_timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", self.text)
+        test_timeout = re.search(r"-timeout=(\d+)h", self.text)
+        self.assertIsNotNone(job_timeout)
+        self.assertIsNotNone(test_timeout)
+        self.assertGreater(int(job_timeout.group(1)), int(test_timeout.group(1)) * 60)
+        self.assertLessEqual(int(job_timeout.group(1)), 360)
         self.assertIn("TestJoinedWorkerTaskHasHardDeadline", self.text)
         self.assertIn("TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime", self.text)
         self.assertIn("TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline", self.text)

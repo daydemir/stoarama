@@ -19,7 +19,7 @@ jobs:
   build:
     name: linux-amd64 reproducible build
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 300
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       REQUESTED_COMMIT: ${{ inputs.commit }}
@@ -230,7 +230,8 @@ jobs:
 
           root="$(mktemp --directory "$RUNNER_TEMP/stoaramactl-worker.XXXXXXXX")"
           artifact_dir="$root/artifact"
-          export SOURCE_DATE_EPOCH="$(git -C source-a show -s --format=%ct HEAD)"
+          SOURCE_DATE_EPOCH="$(git -C source-a show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
           mkdir -p "$artifact_dir" "$root/cache-a" "$root/cache-b" "$root/mod-a" "$root/mod-b"
 
           build_one() {
