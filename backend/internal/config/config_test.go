@@ -635,7 +635,7 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"1\"",
 		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"13\"",
 		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"7\"",
-		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"8\"",
+		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"12\"",
 		"key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch",
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
 		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
@@ -661,7 +661,7 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
 		"JOINED_RECORDING_CONNECTION_ID":         "13",
 		"JOINED_RECORDING_PROTOCOL_GENERATION":   "7",
-		"JOINED_RECORDING_MAX_ACTIVE_TASKS":      "8",
+		"JOINED_RECORDING_MAX_ACTIVE_TASKS":      "12",
 		"STOARAMA_JOINED_WORK_SCOPE":             "frozen_batch",
 	}
 	if !reflect.DeepEqual(got, want) {
