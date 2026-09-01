@@ -103,3 +103,24 @@ test('joined heatmap labels distinguish loading, failure, zero, and unavailable'
   assert.equal(captureHealthJoinedLabel({ source_duration_ms: 3600000, joined_ready_ms: 0 }, { joined_status: 'ready' }), 'Joined: 0%');
   assert.equal(captureHealthJoinedLabel({ source_duration_ms: 0, joined_ready_ms: 0 }, { joined_status: 'ready' }), 'Joined: unavailable');
 });
+
+test('heatmap legend explains capture colors and every joined corner-mark state', () => {
+  const source = sourceBetween(
+    'function captureHealthLegendHTML()',
+    'function captureHealthCardHTML()',
+  );
+  const evaluate = new Function(`${source}; return { captureHealthLegendHTML };`);
+  const output = evaluate().captureHealthLegendHTML();
+
+  assert.match(output, /aria-label="Hourly heatmap legend"/);
+  assert.match(output, /Capture/);
+  assert.match(output, /98% or better/);
+  assert.match(output, /90% to 97\.9%/);
+  assert.match(output, /Below 90%/);
+  assert.match(output, /Not scheduled/);
+  assert.match(output, /Joined mark/);
+  assert.match(output, /Check means 100% joined/);
+  assert.match(output, /Number is joined percentage/);
+  assert.match(output, /No mark means 0%, loading, or unavailable/);
+  assert.match(output, /<svg viewBox="0 0 10 10">/);
+});
