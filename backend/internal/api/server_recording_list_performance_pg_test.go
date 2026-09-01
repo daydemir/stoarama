@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +23,7 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		VALUES(1,47,'Metrics storage','https://example.test','auto','clips','access',''::bytea,'verified');
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec,
 			naming_profile,folder_name,naming_metadata_jsonb)
-		VALUES(700,47,1,'Metric-independent list','https://example.test/live.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60,
+		VALUES(700,47,1,'Metric-independent list','https://example.test/live.m3u8','active',now()-interval '1 day','sampled','* * * * *','UTC',60,
 			'plaza_hourly_v1','08_Europe_Poland_Swidnik_Plac_Konstytucji',
 			'{"plaza_id":"08","continent":"Europe","country":"Poland","city":"Swidnik","plaza_name":"Plac Konstytucji"}'::jsonb);
 	`); err != nil {
@@ -39,22 +41,24 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(ctx, `LOCK TABLE recording_joined_sources, recording_window_health IN ACCESS EXCLUSIVE MODE`); err != nil {
+	if _, err := tx.Exec(ctx, `LOCK TABLE recording_clips, recording_joined_sources, recording_window_health IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
 
 	requests := []struct {
-		name    string
-		handler http.HandlerFunc
-		path    string
-		rowsKey string
-		setup   func(*http.Request) *http.Request
+		name       string
+		handler    http.HandlerFunc
+		path       string
+		rowsKey    string
+		wantRecent bool
+		setup      func(*http.Request) *http.Request
 	}{
 		{
-			name:    "authenticated",
-			handler: s.handleAccountRecordingsList,
-			path:    "/api/v1/account/recordings",
-			rowsKey: "items",
+			name:       "authenticated",
+			handler:    s.handleAccountRecordingsList,
+			path:       "/api/v1/account/recordings",
+			rowsKey:    "items",
+			wantRecent: true,
 			setup: func(req *http.Request) *http.Request {
 				return withPrincipal(req, accountPrincipal{AccountID: 47}, "")
 			},
@@ -98,10 +102,20 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 				"source_duration_ms":  "0",
 				"joined_ready_ms":     "0",
 				"joined_percent":      "null",
+				"captured_clip_count": "0",
+				"expected_clip_count": "0",
+				"capture_health":      `"unavailable"`,
 			}
 			for field, expected := range want {
 				if got, ok := items[0][field]; !ok || string(got) != expected {
 					t.Fatalf("baseline compatibility field %s=%s present=%t want %s", field, got, ok, expected)
+				}
+			}
+			if tc.wantRecent {
+				// Authenticated lists retain the compatibility field without making
+				// its historical clip scan part of the baseline response.
+				if got := string(items[0]["recent_clip_count"]); got != "0" {
+					t.Fatalf("baseline recent_clip_count=%s want placeholder 0", got)
 				}
 			}
 			var naming struct {
@@ -115,6 +129,89 @@ func TestRecordingListBaselineDoesNotWaitForMetricTables(t *testing.T) {
 				t.Fatalf("baseline naming=%+v", naming)
 			}
 		})
+	}
+}
+
+func TestRecordingDetailAndCSVRetainExactClipMetrics(t *testing.T) {
+	s, pool, cleanup := testIdentityServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts(id,email,name,role,status) VALUES(47,'exact-metrics@example.test','Exact metrics','admin','active');
+		INSERT INTO storage_destinations(id,account_id,name,endpoint,region,bucket,access_key_id,secret_access_key_enc,status)
+		VALUES(1,47,'Exact storage','https://example.test','auto','clips','access',''::bytea,'verified');
+		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
+		VALUES(700,47,1,'Exact metric detail','https://example.test/live.m3u8','active',now()-interval '5 minutes','sampled','* * * * *','UTC',60);
+		INSERT INTO recording_clips(recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at)
+		VALUES(700,1,'https://example.test','clips','raw/exact.mp4',1,now()-interval '1 minute',now()-interval '1 minute',now());
+	`); err != nil {
+		t.Fatal(err)
+	}
+	s.cfg = config.Config{SharedRecordingsAccountID: 47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true}
+
+	assertExact := func(t *testing.T, body []byte, wantRecent bool) {
+		t.Helper()
+		var item struct {
+			Recent   int64                       `json:"recent_clip_count"`
+			Captured int64                       `json:"captured_clip_count"`
+			Expected int64                       `json:"expected_clip_count"`
+			Health   recordingCaptureHealthState `json:"capture_health"`
+		}
+		if err := json.Unmarshal(body, &item); err != nil {
+			t.Fatal(err)
+		}
+		if (wantRecent && item.Recent != 1) || item.Captured != 1 || item.Expected <= 1 || item.Health != recordingCaptureHealthCritical {
+			t.Fatalf("exact clip metrics changed: %+v", item)
+		}
+	}
+
+	for _, test := range []struct {
+		name    string
+		handler http.HandlerFunc
+		req     *http.Request
+		recent  bool
+	}{
+		{
+			name:    "authenticated detail",
+			handler: s.handleAccountRecordingGet,
+			req:     withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/700", nil), accountPrincipal{AccountID: 47}, "700"),
+			recent:  true,
+		},
+		{
+			name:    "public detail",
+			handler: s.handleSharedRecordingGet,
+			req:     withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/shared/mit-scl/recordings/700", nil), accountPrincipal{}, "700"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			test.handler(response, test.req)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			assertExact(t, response.Body.Bytes(), test.recent)
+		})
+	}
+
+	csvResponse := httptest.NewRecorder()
+	csvRequest := withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings.csv", nil), accountPrincipal{AccountID: 47}, "")
+	s.handleAccountRecordingsCSV(csvResponse, csvRequest)
+	if csvResponse.Code != http.StatusOK {
+		t.Fatalf("CSV status=%d body=%s", csvResponse.Code, csvResponse.Body.String())
+	}
+	records, err := csv.NewReader(strings.NewReader(csvResponse.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("CSV records=%d want 2", len(records))
+	}
+	columns := make(map[string]string, len(records[0]))
+	for i, name := range records[0] {
+		columns[name] = records[1][i]
+	}
+	if columns["recent_clip_count_24h"] != "1" || columns["captured_clip_count"] != "1" || columns["expected_clip_count"] == "0" || columns["capture_health"] != string(recordingCaptureHealthCritical) {
+		t.Fatalf("CSV exact clip metrics changed: %+v", columns)
 	}
 }
 
@@ -227,6 +324,17 @@ func TestRecordingDetailTimelineEnrichmentDoesNotWaitForClipMetrics(t *testing.T
 			if len(payload.Items) != 1 || payload.Items[0].RecordingID != 700 || payload.Items[0].TimelineHealth == nil || len(payload.Items[0].CaptureHealthBins) != 0 {
 				t.Fatalf("unexpected timeline-only payload: %+v", payload.Items)
 			}
+			var rawPayload struct {
+				Items []map[string]json.RawMessage `json:"items"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &rawPayload); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"captured_clip_count", "expected_clip_count", "capture_health"} {
+				if _, ok := rawPayload.Items[0][field]; ok {
+					t.Fatalf("timeline-only detail enrichment must omit %s", field)
+				}
+			}
 		})
 	}
 
@@ -260,8 +368,11 @@ func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t
 		       'UTC',60
 		FROM generate_series(0,103) AS g;
 		UPDATE recordings SET status='canceled',cron_expr='* * * * *' WHERE id=803;
+		UPDATE recordings SET status='active' WHERE id=700;
 		INSERT INTO recordings(id,account_id,storage_destination_id,name,stream_url,status,start_at,mode,cron_expr,cron_timezone,clip_duration_sec)
 		VALUES(900,99,2,'Foreign batch recording','https://example.test/foreign.m3u8','completed',now()-interval '1 day','sampled','* * * * *','UTC',60);
+		INSERT INTO recording_clips(recording_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at)
+		VALUES(700,1,'https://example.test','clips','raw/enrichment.mp4',1,now()-interval '1 minute',now()-interval '1 minute',now());
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +399,21 @@ func TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList(t
 		if item.RecordingID != wantID {
 			t.Fatalf("item[%d].recording_id=%d want %d", index, item.RecordingID, wantID)
 		}
+	}
+	var enriched struct {
+		Items []struct {
+			RecordingID       int64                        `json:"recording_id"`
+			CapturedClipCount *int64                       `json:"captured_clip_count"`
+			ExpectedClipCount *int64                       `json:"expected_clip_count"`
+			CaptureHealth     *recordingCaptureHealthState `json:"capture_health"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &enriched); err != nil {
+		t.Fatal(err)
+	}
+	first := enriched.Items[0]
+	if first.RecordingID != 700 || first.CapturedClipCount == nil || *first.CapturedClipCount != 1 || first.ExpectedClipCount == nil || *first.ExpectedClipCount <= 1 || first.CaptureHealth == nil || *first.CaptureHealth != recordingCaptureHealthCritical {
+		t.Fatalf("recording list enrichment did not backfill capture metrics: %+v", first)
 	}
 
 	for _, test := range []struct {
