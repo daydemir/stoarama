@@ -639,7 +639,7 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 	}{
 		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"20_Europe_Poland_Luban", "May", "folder=May", "2 MP4", "Download this folder", "All joined recordings"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May", want: []string{"Monday", "folder=May%2FMonday"}},
-		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", `class="type mp4">MP4`, ">View</a>", ">Download</a>", "archive?folder=May%2FMonday"}},
+		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", `class="type mp4">MP4`, ">View</a>", ">Download</a>"}},
 	} {
 		req := httptest.NewRequest(http.MethodGet, test.path, nil)
 		route := chi.NewRouteContext()
@@ -676,8 +676,8 @@ func TestJoinedFolderRootListsCanonicalFoldersWithoutStorageAuthority(t *testing
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 	for _, want := range []string{
-		"20_Europe_Poland_Luban", "/recordings/20/joined/folder", "/recordings/20/joined/folder/archive",
-		"30_Europe_Poland_Test", "Download ZIP", "redacted JSON index",
+		"20_Europe_Poland_Luban", "/recordings/20/joined/folder",
+		"30_Europe_Poland_Test", "Open a folder",
 	} {
 		if !strings.Contains(response.Body.String(), want) {
 			t.Fatalf("missing %q body=%s", want, response.Body.String())

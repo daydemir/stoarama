@@ -69,16 +69,6 @@ func TestJoinedFolderEntriesDrillMonthWeekdayAndExposeOnlyLeafFiles(t *testing.T
 	}
 }
 
-func TestJoinedFolderArchivePathPreservesSameValidatedFolderContract(t *testing.T) {
-	root := "/api/v1/shared/mit-scl/recordings/377/joined/folder"
-	if got := joinedFolderArchivePath(root, nil); got != root+"/archive" {
-		t.Fatalf("root archive=%q", got)
-	}
-	if got := joinedFolderArchivePath(root, []string{"August", "Thursday"}); got != root+"/archive?folder=August%2FThursday" {
-		t.Fatalf("nested archive=%q", got)
-	}
-}
-
 func TestJoinedFolderFileTypeUsesSafeExtensionAndKindFallback(t *testing.T) {
 	for _, test := range []struct {
 		file recordingJoinedFile
