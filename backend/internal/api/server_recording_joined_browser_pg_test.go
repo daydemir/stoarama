@@ -637,7 +637,7 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 		path string
 		want []string
 	}{
-		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"20_Europe_Poland_Luban", "May", "folder=May", "2 MP4", "Download this folder", "All joined recordings"}},
+		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"20_Europe_Poland_Luban", "May", "folder=May", "2 MP4", "All joined recordings"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May", want: []string{"Monday", "folder=May%2FMonday"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", `class="type mp4">MP4`, ">View</a>", ">Download</a>"}},
 	} {
@@ -656,7 +656,7 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 				t.Fatalf("path=%s missing %q body=%s", test.path, want, response.Body.String())
 			}
 		}
-		for _, forbidden := range []string{"joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
+		for _, forbidden := range []string{"/archive", "joined/private/", "cloudflarestorage.com", "access_key", "secret"} {
 			if strings.Contains(response.Body.String(), forbidden) {
 				t.Fatalf("folder leaked %q", forbidden)
 			}
