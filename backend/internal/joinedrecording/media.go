@@ -1120,8 +1120,15 @@ func (e *unsupportedDecodedFrameField) Error() string {
 }
 
 func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scratchDir string, trigger *deterministicMediaError) (BuiltOutput, error) {
+	return buildLosslessNativeTimelineWithOutputLimit(ctx, sources, scratchDir, trigger, r2.MaxConditionalPutBytes)
+}
+
+func buildLosslessNativeTimelineWithOutputLimit(ctx context.Context, sources []LocalSource, scratchDir string, trigger *deterministicMediaError, maximumOutputBytes int64) (BuiltOutput, error) {
 	if len(sources) < 2 {
 		return BuiltOutput{}, fmt.Errorf("lossless normalization requires multiple sources")
+	}
+	if maximumOutputBytes <= 0 || maximumOutputBytes > r2.MaxConditionalPutBytes {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization output limit is invalid")
 	}
 	if trigger == nil || trigger.code != "media_sequence_mismatch" || !lowerHex64(trigger.evidenceSHA256) {
 		return BuiltOutput{}, fmt.Errorf("lossless normalization requires the rejected stream-copy evidence")
@@ -1211,7 +1218,7 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 		return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_frame_field_probe_failure", err)
 	}
 
-	outputLimit := r2.MaxConditionalPutBytes
+	outputLimit := maximumOutputBytes
 	if sourceBytes <= math.MaxInt64/losslessNormalizationExpansionLimit {
 		if expanded := sourceBytes * losslessNormalizationExpansionLimit; expanded < outputLimit {
 			outputLimit = expanded
@@ -1261,16 +1268,17 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	timelineRule := fmt.Sprintf("settb=expr=%d/%d,setpts=N,setsar=%s", layout.RateDen, layout.RateNum, strings.ReplaceAll(layout.SampleAspectRatio, ":", "/"))
 	encodeArgs := []string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-f", "concat", "-safe", "0", "-i", manifestPath, "-map", "0:v:0", "-an", "-vf", timelineRule, "-c:v", "libx264", "-preset", "veryfast", "-qp", "0", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-enc_time_base", fmt.Sprintf("%d:%d", layout.RateDen, layout.RateNum)}
 	encodeArgs = appendLosslessDisplayMetadata(encodeArgs, layout)
-	encodeArgs = append(encodeArgs, "-movflags", "+faststart", "-fs", strconv.FormatInt(outputLimit, 10), outputPath)
-	if err := runBounded(ctx, ffmpegBinary(), encodeArgs...); err != nil {
+	encodeArgs = append(encodeArgs, "-movflags", "+faststart", "-fs", strconv.FormatInt(outputLimit, 10), "-progress", "pipe:1", "-nostats", outputPath)
+	encodedFrames, err := runLosslessEncoder(ctx, encodeArgs...)
+	if err != nil {
 		return BuiltOutput{}, deterministicCommandFailure(ctx, "lossless_normalization_encode_failure", err)
 	}
 	size, sha, err := localIdentity(outputPath)
 	if err != nil {
 		return BuiltOutput{}, err
 	}
-	if size >= outputLimit {
-		return BuiltOutput{}, losslessOutputLimitFailure(size, outputLimit)
+	if err := losslessTruncatedOutputFailure(encodedFrames, sourceFrameFields.Frames, size, outputLimit); err != nil {
+		return BuiltOutput{}, err
 	}
 	verification, err := verifyLosslessNormalizedMedia(ctx, sources, outputPath, layout)
 	if err != nil {
@@ -1325,15 +1333,85 @@ func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scr
 	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
 }
 
-func losslessOutputLimitFailure(size, limit int64) error {
+func losslessOutputLimitFailure(encodedFrames, expectedFrames, size, limit int64) error {
 	code := "lossless_normalization_expansion_cap"
 	if limit == r2.MaxConditionalPutBytes {
 		code = "output_exceeds_put_cap"
 	}
 	return deterministicFailure(code, struct {
-		OutputBytes int64 `json:"output_bytes"`
-		LimitBytes  int64 `json:"limit_bytes"`
-	}{size, limit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
+		EncodedFrames  int64 `json:"encoded_frames"`
+		ExpectedFrames int64 `json:"expected_frames"`
+		OutputBytes    int64 `json:"output_bytes"`
+		LimitBytes     int64 `json:"limit_bytes"`
+	}{encodedFrames, expectedFrames, size, limit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
+}
+
+// ffmpeg's -fs stops before writing the packet that would cross the limit, so
+// a capped file can be smaller than the configured byte ceiling or impossible
+// to probe. Encoder progress is captured before output probing and compared to
+// the independently decoded frozen-source frame count, making truncation an
+// explicit size-partitioning signal even for a zero-frame partial container.
+func losslessTruncatedOutputFailure(encodedFrames, expectedFrames, size, limit int64) error {
+	if limit <= 0 {
+		return nil
+	}
+	if expectedFrames > 0 && encodedFrames >= 0 && encodedFrames < expectedFrames {
+		return losslessOutputLimitFailure(encodedFrames, expectedFrames, size, limit)
+	}
+	if size >= limit {
+		return losslessOutputLimitFailure(encodedFrames, expectedFrames, size, limit)
+	}
+	return nil
+}
+
+func runLosslessEncoder(ctx context.Context, args ...string) (int64, error) {
+	process := newBoundedMediaProcess(ctx, ffmpegBinary(), args...)
+	stdout, err := process.cmd.StdoutPipe()
+	if err != nil {
+		return 0, err
+	}
+	var stderr limitedOutput
+	process.cmd.Stderr = &stderr
+	if err := process.Start(); err != nil {
+		return 0, &boundedCommandError{cause: err, output: stderr.String()}
+	}
+	encodedFrames := int64(-1)
+	progressEnded := false
+	var progressErr error
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		key, value, found := strings.Cut(strings.TrimSpace(scanner.Text()), "=")
+		if !found {
+			continue
+		}
+		switch key {
+		case "frame":
+			frames, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if parseErr != nil || frames < 0 {
+				progressErr = fmt.Errorf("invalid lossless encoder frame progress")
+				continue
+			}
+			encodedFrames = frames
+		case "progress":
+			if strings.TrimSpace(value) == "end" {
+				progressEnded = true
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil && progressErr == nil {
+		progressErr = fmt.Errorf("read lossless encoder progress: %w", err)
+	}
+	waitErr := process.Wait()
+	if waitErr != nil {
+		return 0, &boundedCommandError{cause: waitErr, output: stderr.String()}
+	}
+	if progressErr != nil {
+		return 0, progressErr
+	}
+	if encodedFrames < 0 || !progressEnded {
+		return 0, fmt.Errorf("lossless encoder progress is incomplete")
+	}
+	return encodedFrames, nil
 }
 
 func appendLosslessDisplayMetadata(args []string, layout losslessVideoLayout) []string {

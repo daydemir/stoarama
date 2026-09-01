@@ -890,6 +890,11 @@ func TestHourManifestAcceptsOnlyCompleteLosslessNormalizationEvidence(t *testing
 		t.Fatal("lossless normalization manifest accepted fabricated per-frame field proof")
 	}
 	mutated = cloneHourManifest(t, manifest)
+	mutated.Media[0].Verification.LosslessNormalization.OutputLimitBytes = mutated.Media[0].SizeBytes
+	if _, _, err := CanonicalHourManifestArtifact(mutated); err == nil {
+		t.Fatal("lossless normalization manifest accepted media at its exclusive output limit")
+	}
+	mutated = cloneHourManifest(t, manifest)
 	fabricatedSHA, fabricatedFacts, err := stitchcert.CanonicalSHA(struct {
 		Category string `json:"category"`
 	}{"fabricated"})
