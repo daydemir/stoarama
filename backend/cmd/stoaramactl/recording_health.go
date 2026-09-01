@@ -55,7 +55,7 @@ const healthAlertDeliveryRetryBackoff = 15 * time.Minute
 const (
 	healthAlertSilentDeathMaturity = 4 * time.Minute
 	// The hourly full sweep deliberately occupies the missing :30 live slot and
-	// evaluates the same live registry under the same timeline lock. Therefore
+	// evaluates the same live registry. Therefore
 	// either timeline run refreshes this continuity interval.
 	healthAlertDetectionContinuity = 12 * time.Minute
 	healthAlertReopenCooldown      = 30 * time.Minute
@@ -153,12 +153,14 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	defer releaseRunLock()
 
 	var incidents []healthIncident
+	evaluatedSignals := evaluatedHealthSignals(*verifyMedia, *liveOnly)
 	if *verifyMedia {
 		incidents = detectLatestStoredClipHealth(ctx, pool, cfg)
 	} else if *liveOnly {
 		incidents = detectLiveRecordingHealthIncidents(ctx, pool, *freshnessMin)
 	} else {
-		incidents = detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
+		detection := detectRecordingHealthIncidents(ctx, pool, *freshnessMin)
+		incidents, evaluatedSignals = detection.incidents, detection.evaluatedSignals
 	}
 	bySignal := map[string]int{}
 	for _, inc := range incidents {
@@ -182,9 +184,9 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	}
 	now := time.Now()
 	if !*verifyMedia && !*liveOnly {
-		if err := materializeRecordingWindowHealth(ctx, pool, now); err != nil {
-			log.Fatalf("materialize recording window health: %v", err)
-		}
+		runSoftRecordingWindowHealthMaterialization(ctx, func(stageCtx context.Context) error {
+			return materializeRecordingWindowHealth(stageCtx, pool, now)
+		})
 	}
 
 	toNotify := make([]healthIncident, 0, len(incidents))
@@ -197,7 +199,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 			toNotify = append(toNotify, inc)
 		}
 	}
-	if err := resolveClearedHealthAlerts(ctx, pool, incidents, evaluatedHealthSignals(*verifyMedia, *liveOnly)); err != nil {
+	if err := resolveClearedHealthAlerts(ctx, pool, incidents, evaluatedSignals); err != nil {
 		log.Fatalf("resolve cleared health alerts: %v", err)
 	}
 
@@ -245,9 +247,11 @@ const (
 	recordingHealthMediaAdvisoryLock    int64 = 0x53544f4152414d42
 )
 
-// acquireRecordingHealthRunLock serializes runs within one signal class. The
-// expensive daily object/decode verifier deliberately uses a different lock
-// from the hourly timeline sweep, so it cannot delay a silent-death alert.
+// acquireRecordingHealthRunLock keeps full and live-only timeline snapshots
+// serialized, preventing stale alert-resolution races. Combining the former
+// two roughly three-minute historical scans should let the full run release
+// this lock before :35; the production canary must verify that runtime.
+// The expensive media verifier uses its own lock.
 // PostgreSQL owns the session lock, so process death releases it.
 func acquireRecordingHealthRunLock(ctx context.Context, pool *pgxpool.Pool, verifyMedia bool) (func(), error) {
 	lockID := recordingHealthTimelineAdvisoryLock
@@ -496,7 +500,25 @@ func composeHealthEmailBody(baseURL string, incidents []healthIncident) string {
 
 // detectRecordingHealthIncidents runs the read-only signal queries and
 // returns the union of detected incidents, ordered by severity then recording.
-func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) []healthIncident {
+type recordingHealthDetection struct {
+	incidents        []healthIncident
+	evaluatedSignals []string
+}
+
+const (
+	// These bounds cover only the two historical database stages. The full-run
+	// advisory lock also covers current detectors, alert/email work, and ledger
+	// maintenance; it intentionally has no misleading aggregate deadline.
+	completedWindowHealthTimeout                = 4 * time.Minute
+	recordingWindowHealthMaterializationTimeout = 30 * time.Second
+)
+
+var completedWindowHealthSignals = []string{
+	signalContinuousCoverageLow, signalContinuousOverlap, signalContinuousLongGap,
+	signalContinuousFragmented, signalContinuousLayoutChange,
+}
+
+func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) recordingHealthDetection {
 	incidents := make([]healthIncident, 0, 16)
 	incidents = append(incidents, detectContinuousSilentDeath(ctx, pool, freshnessMin)...)
 	incidents = append(incidents, detectContinuousWindowEndedEarly(ctx, pool)...)
@@ -504,8 +526,18 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	incidents = append(incidents, detectStuckLease(ctx, pool)...)
 	incidents = append(incidents, detectSampledOverdue(ctx, pool)...)
 	incidents = append(incidents, detectClipTimestampDrift(ctx, pool)...)
-	incidents = append(incidents, detectCompletedWindowStitchHealth(ctx, pool)...)
-	incidents = append(incidents, detectCompletedWindowLayoutChanges(ctx, pool)...)
+	baseSignals := []string{
+		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
+		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
+		signalClipTimestampDrift,
+	}
+	historicalCtx, cancel := context.WithTimeout(ctx, completedWindowHealthTimeout)
+	defer cancel()
+	result := runCompletedWindowHealthStage(historicalCtx, incidents, func(stageCtx context.Context) ([]healthIncident, error) {
+		return detectCompletedWindowHealth(stageCtx, pool)
+	})
+	result.evaluatedSignals = append(baseSignals, result.evaluatedSignals...)
+	incidents = result.incidents
 
 	severityRank := map[string]int{"CRITICAL": 0, "HIGH": 1}
 	sort.SliceStable(incidents, func(i, j int) bool {
@@ -515,7 +547,33 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 		}
 		return incidents[i].RecordingID < incidents[j].RecordingID
 	})
-	return incidents
+	result.incidents = incidents
+	return result
+}
+
+// runCompletedWindowHealthStage executes the historical scan once. A timeout
+// keeps live detection useful, but deliberately withholds historical signals
+// from cleared-alert resolution because those signals were not evaluated.
+func runCompletedWindowHealthStage(ctx context.Context, base []healthIncident, detect func(context.Context) ([]healthIncident, error)) recordingHealthDetection {
+	incidents, err := detect(ctx)
+	if err != nil {
+		log.Printf("recording health: completed-window stage skipped: %v", err)
+		return recordingHealthDetection{incidents: base}
+	}
+	return recordingHealthDetection{
+		incidents:        append(base, incidents...),
+		evaluatedSignals: append([]string(nil), completedWindowHealthSignals...),
+	}
+}
+
+// runSoftRecordingWindowHealthMaterialization bounds summary maintenance but
+// never lets it suppress detection, alert delivery, or cleared-alert handling.
+func runSoftRecordingWindowHealthMaterialization(ctx context.Context, materialize func(context.Context) error) {
+	stageCtx, cancel := context.WithTimeout(ctx, recordingWindowHealthMaterializationTimeout)
+	defer cancel()
+	if err := materialize(stageCtx); err != nil {
+		log.Printf("recording health: window summary materialization skipped: %v", err)
+	}
 }
 
 // detectLiveRecordingHealthIncidents is the cheap, current-window subset used
@@ -590,6 +648,17 @@ type stitchWindow struct {
 	open         time.Time
 	close        time.Time
 	clips        [][2]time.Time
+	previousClip *completedWindowClip
+	layoutChange *healthIncident
+	layoutClipID int64
+}
+
+type completedWindowClip struct {
+	id                     int64
+	videoCodec, audioCodec string
+	audioPresent           bool
+	fps                    float64
+	width, height          int
 }
 
 type stitchWindowMetrics struct {
@@ -614,7 +683,7 @@ type stitchWindowMetrics struct {
 // are reported separately: operators can distinguish duplicated capture chains
 // from honest missing footage, and researchers know exactly when a long-video or
 // CV track must break.
-func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
+func detectCompletedWindowHealth(ctx context.Context, pool *pgxpool.Pool) ([]healthIncident, error) {
 	rows, err := pool.Query(ctx, `
 		WITH latest AS (
 		  SELECT DISTINCT ON (r.id)
@@ -631,14 +700,16 @@ func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) 
 		  ORDER BY r.id, j.window_end_at DESC, j.id DESC
 		)
 		SELECT l.id,l.stream_id,l.account_id,l.recording_name,l.stream_url,l.org_name,l.org_email,
-		       l.fire_at,l.window_end_at,c.clip_start_at,c.clip_end_at
+		       l.fire_at,l.window_end_at,c.id,c.clip_start_at,c.clip_end_at,
+		       COALESCE(c.video_codec,''),COALESCE(c.audio_codec,''),COALESCE(c.audio_present,false),
+		       COALESCE(c.actual_fps,0),COALESCE(c.video_width,0),COALESCE(c.video_height,0)
 		FROM latest l
 		LEFT JOIN recording_clips c ON c.recording_id=l.id
 		  AND c.clip_end_at>l.fire_at AND c.clip_start_at<l.window_end_at
 		ORDER BY l.id,c.clip_start_at,c.id
 	`)
 	if err != nil {
-		log.Fatalf("signal completed_window_stitch_health: %v", err)
+		return nil, fmt.Errorf("query completed-window health: %w", err)
 	}
 	defer rows.Close()
 	windows := map[int64]*stitchWindow{}
@@ -647,10 +718,16 @@ func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) 
 		var id, streamID, accountID int64
 		var recName, streamURL, orgName, orgEmail string
 		var open, close time.Time
+		var clipID *int64
 		var clipStart, clipEnd *time.Time
+		var videoCodec, audioCodec string
+		var audioPresent bool
+		var fps float64
+		var width, height int
 		if err := rows.Scan(&id, &streamID, &accountID, &recName, &streamURL, &orgName, &orgEmail,
-			&open, &close, &clipStart, &clipEnd); err != nil {
-			log.Fatalf("scan completed_window_stitch_health: %v", err)
+			&open, &close, &clipID, &clipStart, &clipEnd, &videoCodec, &audioCodec, &audioPresent,
+			&fps, &width, &height); err != nil {
+			return nil, fmt.Errorf("scan completed-window health: %w", err)
 		}
 		win := windows[id]
 		if win == nil {
@@ -664,9 +741,30 @@ func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) 
 		if clipStart != nil && clipEnd != nil {
 			win.clips = append(win.clips, [2]time.Time{*clipStart, *clipEnd})
 		}
+		if clipID != nil {
+			clip := &completedWindowClip{id: *clipID, videoCodec: videoCodec, audioCodec: audioCodec,
+				audioPresent: audioPresent, fps: fps, width: width, height: height}
+			// Adjacency follows presentation order. When several seams change,
+			// retain the smallest current clip ID to preserve the former SQL
+			// DISTINCT ON (recording) ORDER BY recording,clip_id diagnostic.
+			if previous := win.previousClip; previous != nil && completedWindowLayoutChanged(*previous, *clip) &&
+				(win.layoutChange == nil || clip.id < win.layoutClipID) {
+				inc := win.incidentBase
+				inc.Signal, inc.Severity = signalContinuousLayoutChange, healthSignalSeverity[signalContinuousLayoutChange]
+				inc.SinceText = fmt.Sprintf("completed window %s to %s", open.UTC().Format(time.RFC3339), close.UTC().Format(time.RFC3339))
+				inc.Diag = diagText("seam", fmt.Sprintf("%d->%d", previous.id, clip.id),
+					"video", fmt.Sprintf("%s/%s", previous.videoCodec, clip.videoCodec),
+					"audio", fmt.Sprintf("%t:%s/%t:%s", previous.audioPresent, previous.audioCodec, clip.audioPresent, clip.audioCodec),
+					"fps", fmt.Sprintf("%.3f/%.3f", previous.fps, clip.fps),
+					"dimensions", fmt.Sprintf("%d×%d/%d×%d", previous.width, previous.height, clip.width, clip.height))
+				win.layoutChange = &inc
+				win.layoutClipID = clip.id
+			}
+			win.previousClip = clip
+		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("iterate completed_window_stitch_health: %v", err)
+		return nil, fmt.Errorf("iterate completed-window health: %w", err)
 	}
 
 	out := []healthIncident{}
@@ -698,92 +796,19 @@ func detectCompletedWindowStitchHealth(ctx context.Context, pool *pgxpool.Pool) 
 			inc.Diag = diagText("reconnect_gaps", fmt.Sprint(m.gapClips), "largest_gap", m.maxGap.Round(time.Second).String())
 			out = append(out, inc)
 		}
+		if win.layoutChange != nil {
+			out = append(out, *win.layoutChange)
+		}
 	}
-	return out
+	return out, nil
 }
 
-// detectCompletedWindowLayoutChanges checks every adjacent seam in the latest
-// completed window using metadata already measured by ffprobe before ingest.
-// It is O(clips) SQL metadata work and never downloads, rewrites, or normalizes
-// source-native media.
-func detectCompletedWindowLayoutChanges(ctx context.Context, pool *pgxpool.Pool) []healthIncident {
-	rows, err := pool.Query(ctx, `
-		WITH latest AS (
-		  SELECT DISTINCT ON (r.id)
-		    r.id,COALESCE(r.stream_id,0) AS stream_id,r.account_id,r.name AS recording_name,r.stream_url,
-		    acc.name AS org_name,acc.email AS org_email,j.fire_at,j.window_end_at
-		  FROM recordings r
-		  JOIN accounts acc ON acc.id=r.account_id
-		  JOIN account_billing b ON b.account_id=r.account_id AND b.has_payment_method=true
-		  JOIN recording_jobs j ON j.recording_id=r.id AND j.kind='continuous_window'
-		  WHERE r.status='active' AND r.mode='continuous' AND j.window_end_at<=now()
-		    AND j.window_end_at>=now()-interval '48 hours'
-		  ORDER BY r.id,j.window_end_at DESC,j.id DESC
-		), ordered AS (
-		  SELECT l.*,c.id AS clip_id,COALESCE(c.video_codec,'') AS video_codec,COALESCE(c.audio_codec,'') AS audio_codec,
-		    c.audio_present,COALESCE(c.actual_fps,0) AS actual_fps,
-		    COALESCE(c.video_width,0) AS video_width,COALESCE(c.video_height,0) AS video_height,
-		    lag(c.id) OVER seam AS previous_clip_id,
-		    lag(COALESCE(c.video_codec,'')) OVER seam AS previous_video_codec,
-		    lag(COALESCE(c.audio_codec,'')) OVER seam AS previous_audio_codec,
-		    lag(c.audio_present) OVER seam AS previous_audio_present,
-		    lag(COALESCE(c.actual_fps,0)) OVER seam AS previous_actual_fps,
-		    lag(COALESCE(c.video_width,0)) OVER seam AS previous_video_width,
-		    lag(COALESCE(c.video_height,0)) OVER seam AS previous_video_height
-		  FROM latest l
-		  JOIN recording_clips c ON c.recording_id=l.id
-		    AND c.clip_end_at>l.fire_at AND c.clip_start_at<l.window_end_at
-		  WINDOW seam AS (PARTITION BY l.id ORDER BY c.clip_start_at,c.id)
-		), changed AS (
-		  SELECT * FROM ordered
-		  WHERE previous_clip_id IS NOT NULL AND (
-		    video_codec IS DISTINCT FROM previous_video_codec OR
-		    audio_present IS DISTINCT FROM previous_audio_present OR
-		    (audio_present AND audio_codec IS DISTINCT FROM previous_audio_codec) OR
-		    (video_width>0 AND previous_video_width>0 AND
-		      (video_width<>previous_video_width OR video_height<>previous_video_height))
-		  )
-		)
-		SELECT DISTINCT ON (id)
-		  id,stream_id,account_id,recording_name,stream_url,org_name,org_email,fire_at,window_end_at,
-		  previous_clip_id,clip_id,previous_video_codec,video_codec,previous_audio_present,audio_present,
-		  previous_audio_codec,audio_codec,previous_actual_fps,actual_fps,
-		  previous_video_width,previous_video_height,video_width,video_height
-		FROM changed ORDER BY id,clip_id
-	`)
-	if err != nil {
-		log.Fatalf("signal continuous_layout_change: %v", err)
-	}
-	defer rows.Close()
-	out := []healthIncident{}
-	for rows.Next() {
-		var inc healthIncident
-		var open, close time.Time
-		var previousClipID, clipID int64
-		var previousVideoCodec, videoCodec, previousAudioCodec, audioCodec string
-		var previousAudioPresent, audioPresent bool
-		var previousFPS, actualFPS float64
-		var previousWidth, previousHeight, width, height int
-		if err := rows.Scan(&inc.RecordingID, &inc.StreamID, &inc.AccountID, &inc.RecName, &inc.StreamURL,
-			&inc.OrgName, &inc.OrgEmail, &open, &close, &previousClipID, &clipID,
-			&previousVideoCodec, &videoCodec, &previousAudioPresent, &audioPresent,
-			&previousAudioCodec, &audioCodec, &previousFPS, &actualFPS,
-			&previousWidth, &previousHeight, &width, &height); err != nil {
-			log.Fatalf("scan continuous_layout_change: %v", err)
-		}
-		inc.Signal, inc.Severity = signalContinuousLayoutChange, healthSignalSeverity[signalContinuousLayoutChange]
-		inc.SinceText = fmt.Sprintf("completed window %s to %s", open.UTC().Format(time.RFC3339), close.UTC().Format(time.RFC3339))
-		inc.Diag = diagText("seam", fmt.Sprintf("%d->%d", previousClipID, clipID),
-			"video", fmt.Sprintf("%s/%s", previousVideoCodec, videoCodec),
-			"audio", fmt.Sprintf("%t:%s/%t:%s", previousAudioPresent, previousAudioCodec, audioPresent, audioCodec),
-			"fps", fmt.Sprintf("%.3f/%.3f", previousFPS, actualFPS),
-			"dimensions", fmt.Sprintf("%d×%d/%d×%d", previousWidth, previousHeight, width, height))
-		out = append(out, inc)
-	}
-	if err := rows.Err(); err != nil {
-		log.Fatalf("iterate continuous_layout_change: %v", err)
-	}
-	return out
+func completedWindowLayoutChanged(previous, current completedWindowClip) bool {
+	return previous.videoCodec != current.videoCodec ||
+		previous.audioPresent != current.audioPresent ||
+		(current.audioPresent && previous.audioCodec != current.audioCodec) ||
+		(previous.width > 0 && current.width > 0 &&
+			(previous.width != current.width || previous.height != current.height))
 }
 
 func measureStitchWindow(open, close time.Time, clips [][2]time.Time) stitchWindowMetrics {
