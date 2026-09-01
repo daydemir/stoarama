@@ -38,6 +38,8 @@ class WorkerArtifactWorkflowTests(unittest.TestCase):
             "^[0-9a-f]{40}$",
             "cat-file -e \"${REQUESTED_COMMIT}^{commit}\"",
             "merge-base --is-ancestor",
+            "MINIMUM_WORKER_COMMIT: c8c64847eff3ab8aa4211e6865adc9a0ac51a4e8",
+            'merge-base --is-ancestor "$MINIMUM_WORKER_COMMIT" "$REQUESTED_COMMIT"',
             '[[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]',
             "rev-parse --is-shallow-repository",
             '[[ ! -d "$source/.git" ]]',
@@ -73,6 +75,10 @@ class WorkerArtifactWorkflowTests(unittest.TestCase):
         self.assertIn("TestJoinedWorkerTaskHasHardDeadline", self.text)
         self.assertIn("TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime", self.text)
         self.assertIn("TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline", self.text)
+        self.assertIn('go test -mod=readonly ./cmd/stoaramactl -list "$test_regex"', self.text)
+        self.assertIn('grep -Fxq "$required_test" <<< "$test_list"', self.text)
+        self.assertIn('-json | tee "$test_root/results.json"', self.text)
+        self.assertIn('event.get("Action") == "pass"', self.text)
         self.assertIn("-timeout=4h", self.text)
         tests_at = self.text.index("- name: Run focused four-hour worker-budget tests")
         builds_at = self.text.index("- name: Build twice and verify embedded provenance")

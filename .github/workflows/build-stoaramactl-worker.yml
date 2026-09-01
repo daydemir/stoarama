@@ -23,6 +23,7 @@ jobs:
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       REQUESTED_COMMIT: ${{ inputs.commit }}
+      MINIMUM_WORKER_COMMIT: c8c64847eff3ab8aa4211e6865adc9a0ac51a4e8
       GO_VERSION: 1.25.14
       GOTOOLCHAIN: local
       CGO_ENABLED: "1"
@@ -77,6 +78,14 @@ jobs:
           fi
           if ! git -C main-proof merge-base --is-ancestor "$REQUESTED_COMMIT" "$remote_main_commit"; then
             echo "requested commit is not an ancestor of the current remote default branch" >&2
+            exit 1
+          fi
+          if ! git -C main-proof cat-file -e "${MINIMUM_WORKER_COMMIT}^{commit}"; then
+            echo "minimum joined-worker commit is missing from default-branch history" >&2
+            exit 1
+          fi
+          if ! git -C main-proof merge-base --is-ancestor "$MINIMUM_WORKER_COMMIT" "$REQUESTED_COMMIT"; then
+            echo "requested commit predates the four-hour joined-worker safety fix" >&2
             exit 1
           fi
 
@@ -163,11 +172,53 @@ jobs:
         run: |
           set -euo pipefail
           cd source-a/backend
-          GOCACHE="$RUNNER_TEMP/stoaramactl-worker-tests/cache" \
-          GOMODCACHE="$RUNNER_TEMP/stoaramactl-worker-tests/mod" \
-            go test -mod=readonly ./cmd/stoaramactl \
-              -run '^(TestJoinedWorkerTaskHasHardDeadline|TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime|TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline)$' \
-              -count=1 -timeout=4h -v
+          test_root="$(mktemp --directory "$RUNNER_TEMP/stoaramactl-worker-tests.XXXXXXXX")"
+          test_regex='^(TestJoinedWorkerTaskHasHardDeadline|TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime|TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline)$'
+          required_tests=(
+            TestJoinedWorkerTaskHasHardDeadline
+            TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime
+            TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline
+          )
+
+          test_list="$(
+            GOCACHE="$test_root/cache" GOMODCACHE="$test_root/mod" \
+              go test -mod=readonly ./cmd/stoaramactl -list "$test_regex"
+          )"
+          for required_test in "${required_tests[@]}"; do
+            if ! grep -Fxq "$required_test" <<< "$test_list"; then
+              echo "required worker-budget test is missing: $required_test" >&2
+              exit 1
+            fi
+          done
+
+          set +e
+          GOCACHE="$test_root/cache" GOMODCACHE="$test_root/mod" \
+            go test -mod=readonly ./cmd/stoaramactl -run "$test_regex" \
+              -count=1 -timeout=4h -json | tee "$test_root/results.json"
+          test_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$test_status" -ne 0 ]]; then
+            exit "$test_status"
+          fi
+
+          python3 - "$test_root/results.json" "${required_tests[@]}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          expected = set(sys.argv[2:])
+          passed = []
+          for line in path.read_text(encoding="utf-8").splitlines():
+              event = json.loads(line)
+              if event.get("Action") == "pass" and event.get("Test") in expected:
+                  passed.append(event["Test"])
+          if len(passed) != len(expected) or set(passed) != expected:
+              raise SystemExit(
+                  "required worker-budget tests did not each pass exactly once: "
+                  f"expected={sorted(expected)} passed={sorted(passed)}"
+              )
+          PY
 
       - name: Build twice and verify embedded provenance
         id: artifact
@@ -275,6 +326,7 @@ jobs:
               "build_flags": ["-mod=readonly", "-trimpath", "-buildvcs=true"],
               "cgo_enabled": True,
               "go_version": "go" + os.environ["GO_VERSION"],
+              "minimum_worker_commit": os.environ["MINIMUM_WORKER_COMMIT"],
               "reproducible_build_count": 2,
               "repository": os.environ["GITHUB_REPOSITORY"],
               "runner": "ubuntu-24.04",
