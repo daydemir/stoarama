@@ -369,13 +369,8 @@ func evaluatedHealthSignals(verifyMedia, liveOnly bool) []string {
 	if liveOnly {
 		return liveRecordingHealthSignals()
 	}
-	signals := []string{
-		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
-		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
-		signalClipTimestampDrift, signalContinuousCoverageLow,
-		signalContinuousOverlap, signalContinuousLongGap, signalContinuousFragmented,
-		signalContinuousLayoutChange,
-	}
+	signals := append([]string(nil), fullCurrentHealthSignals...)
+	signals = append(signals, completedWindowHealthSignals...)
 	return signals
 }
 
@@ -518,6 +513,12 @@ var completedWindowHealthSignals = []string{
 	signalContinuousFragmented, signalContinuousLayoutChange,
 }
 
+var fullCurrentHealthSignals = []string{
+	signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
+	signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
+	signalClipTimestampDrift,
+}
+
 func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) recordingHealthDetection {
 	incidents := make([]healthIncident, 0, 16)
 	incidents = append(incidents, detectContinuousSilentDeath(ctx, pool, freshnessMin)...)
@@ -526,11 +527,7 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	incidents = append(incidents, detectStuckLease(ctx, pool)...)
 	incidents = append(incidents, detectSampledOverdue(ctx, pool)...)
 	incidents = append(incidents, detectClipTimestampDrift(ctx, pool)...)
-	baseSignals := []string{
-		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
-		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
-		signalClipTimestampDrift,
-	}
+	baseSignals := append([]string(nil), fullCurrentHealthSignals...)
 	historicalCtx, cancel := context.WithTimeout(ctx, completedWindowHealthTimeout)
 	defer cancel()
 	result := runCompletedWindowHealthStage(historicalCtx, incidents, func(stageCtx context.Context) ([]healthIncident, error) {

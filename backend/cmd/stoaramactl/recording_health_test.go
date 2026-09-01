@@ -336,6 +336,26 @@ func TestCompletedWindowHealthStageMarksSignalsEvaluatedAfterSuccess(t *testing.
 	}
 }
 
+func TestCompletedWindowLayoutChangePreservesEmptyKnownCodecParity(t *testing.T) {
+	base := completedWindowClip{audioPresent: true, width: 1280, height: 720}
+	cases := []struct {
+		name              string
+		previous, current completedWindowClip
+	}{
+		{"video empty to known", base, completedWindowClip{videoCodec: "h264", audioPresent: true, width: 1280, height: 720}},
+		{"video known to empty", completedWindowClip{videoCodec: "h264", audioPresent: true, width: 1280, height: 720}, base},
+		{"audio empty to known", base, completedWindowClip{audioCodec: "aac", audioPresent: true, width: 1280, height: 720}},
+		{"audio known to empty", completedWindowClip{audioCodec: "aac", audioPresent: true, width: 1280, height: 720}, base},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !completedWindowLayoutChanged(tc.previous, tc.current) {
+				t.Fatal("empty/known codec transition no longer matches former COALESCE plus IS DISTINCT FROM semantics")
+			}
+		})
+	}
+}
+
 func TestCompletedWindowHealthStageCancelsPostgresQueryWithoutLeak(t *testing.T) {
 	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
 	if databaseURL == "" {
@@ -428,9 +448,11 @@ func TestHistoricalStageFailureKeepsHistoricalAlertOpenWhileResolvingLiveAlert(t
 		CREATE TABLE recorder_health_alerts (
 		  recording_id BIGINT NOT NULL, signal TEXT NOT NULL, resolved_at TIMESTAMPTZ,
 		  PRIMARY KEY(recording_id,signal));
-		INSERT INTO recorder_health_alerts(recording_id,signal) VALUES
-		  (1,'continuous_coverage_low'),(2,'continuous_silent_death');
 	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_health_alerts(recording_id,signal) VALUES (1,$1),(2,$2)`,
+		signalContinuousCoverageLow, signalContinuousSilentDeath); err != nil {
 		t.Fatal(err)
 	}
 
@@ -486,8 +508,10 @@ func TestMaterializationFailureStillRunsRealAlertResolution(t *testing.T) {
 		CREATE TABLE recorder_health_alerts (
 		  recording_id BIGINT NOT NULL, signal TEXT NOT NULL, resolved_at TIMESTAMPTZ,
 		  PRIMARY KEY(recording_id,signal));
-		INSERT INTO recorder_health_alerts(recording_id,signal) VALUES (9,'continuous_silent_death');
 	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_health_alerts(recording_id,signal) VALUES (9,$1)`, signalContinuousSilentDeath); err != nil {
 		t.Fatal(err)
 	}
 
