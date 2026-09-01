@@ -1,0 +1,316 @@
+name: build exact stoaramactl worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-character commit on the current default branch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stoaramactl-worker-${{ inputs.commit }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: linux-amd64 reproducible build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      REQUESTED_COMMIT: ${{ inputs.commit }}
+      GO_VERSION: 1.25.14
+      GOTOOLCHAIN: local
+      CGO_ENABLED: "1"
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: v1
+      LANG: C
+      LC_ALL: C
+      TZ: UTC
+    steps:
+      - name: Checkout current default branch for ancestry proof
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: main-proof
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+
+      - name: Validate exact source commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$REQUESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit must be exactly 40 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          if [[ ! "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$DEFAULT_BRANCH" == /* ]] || [[ "$DEFAULT_BRANCH" == *..* ]]; then
+            echo "remote default branch name is invalid" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "dispatch must run from the remote default branch" >&2
+            exit 1
+          fi
+          if [[ "$(git -C main-proof rev-parse --is-shallow-repository)" != "false" ]]; then
+            echo "default-branch proof checkout is shallow" >&2
+            exit 1
+          fi
+
+          remote_main_commit="$(git -C main-proof rev-parse HEAD)"
+          if ! git -C main-proof cat-file -e "${REQUESTED_COMMIT}^{commit}"; then
+            echo "requested commit does not exist in full default-branch history" >&2
+            exit 1
+          fi
+          resolved_commit="$(git -C main-proof rev-parse "${REQUESTED_COMMIT}^{commit}")"
+          if [[ "$resolved_commit" != "$REQUESTED_COMMIT" ]]; then
+            echo "requested object did not resolve to the exact commit" >&2
+            exit 1
+          fi
+          if ! git -C main-proof merge-base --is-ancestor "$REQUESTED_COMMIT" "$remote_main_commit"; then
+            echo "requested commit is not an ancestor of the current remote default branch" >&2
+            exit 1
+          fi
+
+          source_epoch="$(git -C main-proof show -s --format=%ct "$REQUESTED_COMMIT")"
+          source_time="$(date --utc --date="@$source_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+          {
+            echo "commit=$REQUESTED_COMMIT"
+            echo "commit_time=$source_time"
+            echo "remote_main_commit=$remote_main_commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout source clone A
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.commit }}
+          path: source-a
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+
+      - name: Checkout source clone B
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.commit }}
+          path: source-b
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+
+      - name: Verify independent clean source clones
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for source in source-a source-b; do
+            if [[ ! -d "$source/.git" ]]; then
+              echo "$source does not have a standalone .git directory" >&2
+              exit 1
+            fi
+            if [[ "$(git -C "$source" rev-parse --git-dir)" != ".git" ]] || [[ "$(git -C "$source" rev-parse --git-common-dir)" != ".git" ]]; then
+              echo "$source is not a standalone clone" >&2
+              exit 1
+            fi
+            if [[ "$(git -C "$source" rev-parse --is-shallow-repository)" != "false" ]]; then
+              echo "$source is shallow" >&2
+              exit 1
+            fi
+            if [[ "$(git -C "$source" rev-parse HEAD)" != "$REQUESTED_COMMIT" ]]; then
+              echo "$source is not at the requested commit" >&2
+              exit 1
+            fi
+            if [[ -n "$(git -C "$source" status --porcelain=v1 --untracked-files=all)" ]]; then
+              echo "$source is not clean" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "$(git -C source-a show -s --format=%ct HEAD)" != "$(git -C source-b show -s --format=%ct HEAD)" ]]; then
+            echo "source clone commit times differ" >&2
+            exit 1
+          fi
+
+      - name: Install exact Go toolchain
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: 1.25.14
+          cache: false
+
+      - name: Verify Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(go env GOVERSION)" != "go$GO_VERSION" ]]; then
+            echo "unexpected Go toolchain: $(go env GOVERSION)" >&2
+            exit 1
+          fi
+          if [[ "$(go env GOHOSTOS)" != "linux" ]] || [[ "$(go env GOHOSTARCH)" != "amd64" ]]; then
+            echo "workflow runner is not linux-amd64" >&2
+            exit 1
+          fi
+
+      - name: Build twice and verify embedded provenance
+        id: artifact
+        shell: bash
+        env:
+          SOURCE_COMMIT_TIME: ${{ steps.source.outputs.commit_time }}
+        run: |
+          set -euo pipefail
+
+          root="$RUNNER_TEMP/stoaramactl-worker"
+          artifact_dir="$root/artifact"
+          export SOURCE_DATE_EPOCH="$(git -C source-a show -s --format=%ct HEAD)"
+          mkdir -p "$artifact_dir" "$root/cache-a" "$root/cache-b" "$root/mod-a" "$root/mod-b"
+
+          build_one() {
+            local source="$1"
+            local output="$2"
+            local cache="$3"
+            local mod_cache="$4"
+
+            if [[ -n "$(git -C "$source" status --porcelain=v1 --untracked-files=all)" ]]; then
+              echo "$source became dirty before build" >&2
+              exit 1
+            fi
+            (
+              cd "$source/backend"
+              GOCACHE="$cache" GOMODCACHE="$mod_cache" \
+                go build -mod=readonly -trimpath -buildvcs=true -o "$output" ./cmd/stoaramactl
+            )
+            if [[ -n "$(git -C "$source" status --porcelain=v1 --untracked-files=all)" ]]; then
+              echo "$source became dirty during build" >&2
+              exit 1
+            fi
+          }
+
+          build_one source-a "$root/stoaramactl-a" "$root/cache-a" "$root/mod-a"
+          build_one source-b "$root/stoaramactl-b" "$root/cache-b" "$root/mod-b"
+
+          if ! cmp --silent "$root/stoaramactl-a" "$root/stoaramactl-b"; then
+            echo "independent builds are not byte-identical" >&2
+            exit 1
+          fi
+
+          metadata_value() {
+            local binary="$1"
+            local key="$2"
+            go version -m "$binary" | awk -v wanted="$key" '
+              $1 == "build" {
+                value = $2
+                split(value, fields, "=")
+                if (fields[1] == wanted) {
+                  sub(/^[^=]*=/, "", value)
+                  print value
+                }
+              }
+            '
+          }
+
+          verify_metadata() {
+            local binary="$1"
+            local embedded_go
+            embedded_go="$(go version -m "$binary" | awk 'NR == 1 { print $2 }')"
+            [[ "$embedded_go" == "go$GO_VERSION" ]]
+            [[ "$(metadata_value "$binary" vcs)" == "git" ]]
+            [[ "$(metadata_value "$binary" vcs.revision)" == "$REQUESTED_COMMIT" ]]
+            [[ "$(metadata_value "$binary" vcs.time)" == "$SOURCE_COMMIT_TIME" ]]
+            [[ "$(metadata_value "$binary" vcs.modified)" == "false" ]]
+            [[ "$(metadata_value "$binary" CGO_ENABLED)" == "1" ]]
+            [[ "$(metadata_value "$binary" GOOS)" == "linux" ]]
+            [[ "$(metadata_value "$binary" GOARCH)" == "amd64" ]]
+            [[ "$(metadata_value "$binary" GOAMD64)" == "v1" ]]
+            [[ "$(metadata_value "$binary" -trimpath)" == "true" ]]
+          }
+
+          verify_metadata "$root/stoaramactl-a"
+          verify_metadata "$root/stoaramactl-b"
+          file "$root/stoaramactl-a" | grep -Eq 'ELF 64-bit LSB (pie )?executable, x86-64'
+
+          install -m 0755 "$root/stoaramactl-a" "$artifact_dir/stoaramactl"
+          sha256="$(sha256sum "$artifact_dir/stoaramactl" | awk '{print $1}')"
+          size_bytes="$(stat --format=%s "$artifact_dir/stoaramactl")"
+          {
+            echo "sha256=$sha256"
+            echo "size_bytes=$size_bytes"
+            echo "artifact_dir=$artifact_dir"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run focused four-hour worker-budget tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source-a/backend
+          GOCACHE="$RUNNER_TEMP/stoaramactl-worker/test-cache" \
+          GOMODCACHE="$RUNNER_TEMP/stoaramactl-worker/mod-a" \
+            go test -mod=readonly ./cmd/stoaramactl \
+              -run '^(TestJoinedWorkerTaskHasHardDeadline|TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime|TestJoinedWorkerTaskPreservesCompletedSuccessAtDeadline)$' \
+              -count=1 -timeout=4h -v
+
+      - name: Write nonsecret build attestation
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ steps.artifact.outputs.artifact_dir }}
+          ARTIFACT_SHA256: ${{ steps.artifact.outputs.sha256 }}
+          ARTIFACT_SIZE_BYTES: ${{ steps.artifact.outputs.size_bytes }}
+          SOURCE_COMMIT_TIME: ${{ steps.source.outputs.commit_time }}
+          REMOTE_MAIN_COMMIT: ${{ steps.source.outputs.remote_main_commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          attestation = {
+              "artifact": "stoaramactl",
+              "build_flags": ["-mod=readonly", "-trimpath", "-buildvcs=true"],
+              "cgo_enabled": True,
+              "go_version": "go" + os.environ["GO_VERSION"],
+              "reproducible_build_count": 2,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "runner": "ubuntu-24.04",
+              "schema_version": 1,
+              "sha256": os.environ["ARTIFACT_SHA256"],
+              "size_bytes": int(os.environ["ARTIFACT_SIZE_BYTES"]),
+              "source_commit": os.environ["REQUESTED_COMMIT"],
+              "source_commit_time": os.environ["SOURCE_COMMIT_TIME"],
+              "source_remote_default_tip": os.environ["REMOTE_MAIN_COMMIT"],
+              "target": {
+                  "goamd64": "v1",
+                  "goarch": "amd64",
+                  "goos": "linux",
+              },
+              "vcs_modified": False,
+              "workflow_commit": os.environ["GITHUB_SHA"],
+              "workflow_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+          }
+          path = Path(os.environ["ARTIFACT_DIR"]) / "attestation.json"
+          path.write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+          test "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -print | wc -l)" -eq 2
+          test -x "$ARTIFACT_DIR/stoaramactl"
+          test -f "$ARTIFACT_DIR/attestation.json"
+
+      - name: Upload binary and attestation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stoaramactl-linux-amd64-${{ inputs.commit }}
+          path: |
+            ${{ steps.artifact.outputs.artifact_dir }}/stoaramactl
+            ${{ steps.artifact.outputs.artifact_dir }}/attestation.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
