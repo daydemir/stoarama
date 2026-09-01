@@ -157,7 +157,15 @@ func TestRecordingHealthBinCaptureCountUsesCoveringStartedIndex(t *testing.T) {
 	}
 	starts := []time.Time{time.Now().Add(-4 * time.Hour), time.Now().Add(-2 * time.Hour)}
 	ends := []time.Time{time.Now().Add(-2 * time.Hour), time.Now()}
-	rows, err := pool.Query(ctx, `EXPLAIN (COSTS OFF) `+recordingHealthBinCaptureCountsSQL,
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan=off`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.Query(ctx, `EXPLAIN (COSTS OFF) `+recordingHealthBinCaptureCountsSQL,
 		[]int64{700, 700}, starts, ends)
 	if err != nil {
 		t.Fatal(err)
