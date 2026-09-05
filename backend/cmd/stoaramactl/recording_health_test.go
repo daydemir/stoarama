@@ -988,9 +988,9 @@ func TestDetectClipTimestampDriftAndLayoutChangeFindsNativeSeamChange(t *testing
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY,has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY,stream_id BIGINT,account_id BIGINT NOT NULL,name TEXT NOT NULL,stream_url TEXT NOT NULL,status TEXT NOT NULL,mode TEXT NOT NULL);
-		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ,status TEXT NOT NULL DEFAULT 'done',error_text TEXT NOT NULL DEFAULT '');
 		CREATE TABLE recording_clips (
-		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
+		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,recording_job_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
 		  video_codec TEXT,audio_codec TEXT,audio_present BOOLEAN NOT NULL,actual_fps DOUBLE PRECISION,video_width INTEGER,video_height INTEGER);
 		INSERT INTO accounts VALUES (1,'MIT SCL','scl@example.edu');
 		INSERT INTO account_billing VALUES (1,true);
@@ -1002,26 +1002,31 @@ func TestDetectClipTimestampDriftAndLayoutChangeFindsNativeSeamChange(t *testing
 		  (24,124,1,'fragmented overlap','https://e.test/fragments','active','continuous');
 		INSERT INTO recording_jobs VALUES
 		  (200,20,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (209,21,'clip',now()-interval '3 hours',now()-interval '2 hours'),
 		  (210,21,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
 		  (220,22,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
 		  (230,23,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (231,23,'continuous_window',now()-interval '10 minutes',now()+interval '1 hour'),
 		  (240,24,'continuous_window',now()-interval '2 hours',now()-interval '1 hour');
 		INSERT INTO recording_clips VALUES
-		  (100,20,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (50,20,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1920,1080),
-		  (60,20,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
-		  (10,20,now()-interval '108 minutes',now()-interval '107 minutes','h264','aac',true,30,640,480),
-		  (3,21,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (4,21,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
-		  (5,22,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (6,22,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,24,1280,720);
+		  (100,20,200,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (50,20,200,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1920,1080),
+		  (60,20,200,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
+		  (10,20,200,now()-interval '108 minutes',now()-interval '107 minutes','h264','aac',true,30,640,480),
+		  (3,21,210,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (9,21,209,now()-interval '109 minutes 30 seconds',now()-interval '108 minutes 30 seconds','h264','aac',true,30,1920,1080),
+		  (8,20,210,now()-interval '109 minutes 30 seconds',now()-interval '108 minutes 30 seconds','h264','aac',true,30,1920,1080),
+		  (4,21,210,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
+		  (5,22,220,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (6,22,220,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,24,1280,720),
+		  (7,23,230,now()-interval '5 minutes',now()-interval '4 minutes','h264','aac',true,30,1280,720);
 		INSERT INTO recording_clips
-		SELECT 1000+n,24,now()-interval '2 hours'+n*interval '3 minutes',
+		SELECT 1000+n,24,240,now()-interval '2 hours'+n*interval '3 minutes',
 		       now()-interval '2 hours'+n*interval '3 minutes'+interval '1 minute',
 		       'h264','aac',true,30,1280,720
 		FROM generate_series(0,11) n;
 		INSERT INTO recording_clips VALUES
-		  (2000,24,now()-interval '2 hours'+interval '30 seconds',now()-interval '2 hours'+interval '90 seconds','h264','aac',true,30,1280,720);
+		  (2000,24,240,now()-interval '2 hours'+interval '30 seconds',now()-interval '2 hours'+interval '90 seconds','h264','aac',true,30,1280,720);
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -1072,5 +1077,9 @@ func TestDetectClipTimestampDriftAndLayoutChangeFindsNativeSeamChange(t *testing
 				t.Fatalf("recording %d signals=%v missing %q", recordingID, gotSet, signal)
 			}
 		}
+	}
+	early := detectContinuousWindowEndedEarly(ctx, pool)
+	if len(early) != 1 || early[0].RecordingID != 23 || !strings.Contains(early[0].Diag, "job_id=231") {
+		t.Fatalf("ended-early incidents=%+v, want only recording 23 job 231", early)
 	}
 }

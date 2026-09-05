@@ -478,7 +478,8 @@ func (s *Server) handleAccountRecordingQualification(w http.ResponseWriter, r *h
 		       h.coverage_pct,h.largest_gap_seconds,h.gap_over_30s_count,h.gap_over_5m_count,h.overlap_count,
 		       h.metric_version,h.expected_seconds,
 		       EXISTS (SELECT 1 FROM recording_clips c WHERE c.recording_id=m.recording_id
-		          AND c.clip_end_at>w.window_start_at AND c.clip_start_at<w.window_end_at AND c.created_at>h.calculated_at) AS late_clip
+		          AND c.recording_job_id=j.job_id AND c.clip_end_at>w.window_start_at
+		          AND c.clip_start_at<w.window_end_at AND c.created_at>h.calculated_at) AS late_clip
 		FROM recording_qualification_members m
 		JOIN recording_qualification_windows w ON w.run_id=m.run_id AND w.recording_id=m.recording_id
 		LEFT JOIN LATERAL (
