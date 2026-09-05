@@ -975,6 +975,15 @@ func TestRecordingListLoadsJoinedProgressInProgressiveBoundedBatches(t *testing.
 	if strings.Contains(section, "recordingAPIPath(`/joined-progress${sortQuery}`)") {
 		t.Fatal("joined progress still loads the whole cohort in one request")
 	}
+	failedBatchAt := strings.Index(section, "hadError = true;")
+	if failedBatchAt < 0 {
+		t.Fatal("joined progress does not record failed batches")
+	}
+	staleGuardAt := strings.LastIndex(section[:failedBatchAt], "if (requestToken !== recordingsLoadToken) return;")
+	catchAt := strings.LastIndex(section[:failedBatchAt], "} catch (_) {")
+	if catchAt < 0 || staleGuardAt < catchAt {
+		t.Fatal("failed joined batch can update a newer recordings load")
+	}
 }
 
 func TestRecordingDetailLoadsTimelineWithoutDuplicateClipMetrics(t *testing.T) {

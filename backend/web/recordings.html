@@ -5359,6 +5359,7 @@
 	      try {
 	        payload = await fetchJSON(recordingAPIPath(`/joined-progress?${params.toString()}`));
 	      } catch (_) {
+	        if (requestToken !== recordingsLoadToken) return;
 	        hadError = true;
 	        continue;
 	      }
