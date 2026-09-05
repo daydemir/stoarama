@@ -61,16 +61,17 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	start := now.Add(-2 * time.Hour)
-	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (402)`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (402),(403)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2),(2,402,'sampled',$1,$2)`, start, start.Add(time.Hour)); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2),(2,402,'clip',$1,$2)`, start, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recording_clips VALUES
 		  (1,402,1,$1,$1::timestamptz+interval '20 minutes','h264','aac',true,1280,720,$3),
 		  (3,402,2,$1::timestamptz+interval '20 minutes',$1::timestamptz+interval '30 minutes','h264','aac',true,1280,720,$3),
+		  (6,403,1,$1::timestamptz+interval '20 minutes',$1::timestamptz+interval '30 minutes','h264','aac',true,3840,2160,$3),
 		  (2,402,1,$1::timestamptz+interval '30 minutes',$2,'h264','',false,1280,720,$3)
 	`, start, start.Add(time.Hour), now.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
@@ -97,7 +98,11 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	if recentCoverage != coverage || lifetimeCoverage != coverage || recentWindows != 1 || lifetimeWindows != 1 || expectedWindows != 1 || !complete {
 		t.Fatalf("summary recent=%f lifetime=%f windows=%d/%d expected=%d complete=%t", recentCoverage, lifetimeCoverage, recentWindows, lifetimeWindows, expectedWindows, complete)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES (4,402,2,$1,$1::timestamptz+interval '5 minutes','h264','aac',true,1920,1080,$2)`, start, now.Add(time.Minute)); err != nil {
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips VALUES
+		  (4,402,2,$1,$1::timestamptz+interval '5 minutes','h264','aac',true,1920,1080,$2),
+		  (7,403,1,$1,$1::timestamptz+interval '5 minutes','h264','aac',true,3840,2160,$2)
+	`, start, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := materializeRecordingWindowHealth(ctx, pool, now.Add(2*time.Minute)); err != nil {

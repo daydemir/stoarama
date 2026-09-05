@@ -43,7 +43,7 @@ func materializeRecordingWindowHealth(ctx context.Context, pool *pgxpool.Pool, n
 		    AND j.window_end_at>$1::timestamptz-interval '48 hours'
 		    AND (h.job_id IS NULL OR h.metric_version IS DISTINCT FROM $2 OR EXISTS (
 		      SELECT 1 FROM recording_clips late
-		      WHERE late.recording_job_id=j.id AND late.clip_end_at>j.fire_at
+		      WHERE late.recording_id=j.recording_id AND late.recording_job_id=j.id AND late.clip_end_at>j.fire_at
 		        AND late.clip_start_at<j.window_end_at AND late.created_at>h.calculated_at
 		    ))
 		), backfill_jobs AS (
@@ -63,7 +63,7 @@ func materializeRecordingWindowHealth(ctx context.Context, pool *pgxpool.Pool, n
 		       COALESCE(c.video_width,0),COALESCE(c.video_height,0)
 		FROM candidate_jobs j
 		JOIN recordings r ON r.id=j.recording_id
-		LEFT JOIN recording_clips c ON c.recording_job_id=j.id
+		LEFT JOIN recording_clips c ON c.recording_id=j.recording_id AND c.recording_job_id=j.id
 		  AND c.clip_end_at>j.fire_at AND c.clip_start_at<j.window_end_at
 		ORDER BY j.recording_id,j.id,c.clip_start_at,c.id
 	`, now.UTC(), recordingWindowMetricVersion)

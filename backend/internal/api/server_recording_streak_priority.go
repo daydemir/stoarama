@@ -57,7 +57,7 @@ const streakPriorityFactsSQL = `
 		), recent AS (SELECT *,row_number() OVER(PARTITION BY id ORDER BY window_end_at DESC) rn FROM expected)
 		SELECT q.id,q.name,q.status,q.window_end_at,h.coverage_pct,h.largest_gap_seconds,h.gap_over_30s_count,h.gap_over_5m_count,h.overlap_count,h.metric_version,h.expected_seconds,
 		       extract(epoch FROM(q.window_end_at-q.fire_at))::bigint,q.job_count,COALESCE(h.health_count,0),
-		       EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=q.id AND c.clip_end_at>q.fire_at AND c.clip_start_at<q.window_end_at AND c.created_at>h.calculated_at) late_clip
+		       EXISTS(SELECT 1 FROM recording_clips c WHERE c.recording_id=q.id AND c.recording_job_id=q.job_id AND c.clip_end_at>q.fire_at AND c.clip_start_at<q.window_end_at AND c.created_at>h.calculated_at) late_clip
 		FROM recent q LEFT JOIN LATERAL (SELECT count(*)::int health_count,max(coverage_pct) coverage_pct,max(largest_gap_seconds) largest_gap_seconds,max(gap_over_30s_count) gap_over_30s_count,
 		 max(gap_over_5m_count) gap_over_5m_count,max(overlap_count) overlap_count,max(metric_version) metric_version,max(expected_seconds) expected_seconds,max(calculated_at) calculated_at
 		 FROM recording_window_health x WHERE x.recording_id=q.id AND x.job_id=q.job_id AND x.calculated_at>=q.window_end_at AND x.calculated_at<=$2::timestamptz+interval '5 minutes') h ON true
