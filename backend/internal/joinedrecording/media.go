@@ -393,6 +393,9 @@ func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
 	if kind == "full" || kind == "full_repeat" {
 		return 25 * time.Minute
 	}
+	if kind == "pair" || kind == "pair_repeat" {
+		return 5 * time.Minute
+	}
 	budget := 2*time.Minute + time.Duration(sourceCount)*25*time.Second
 	if budget > 25*time.Minute {
 		return 25 * time.Minute

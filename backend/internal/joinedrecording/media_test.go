@@ -534,6 +534,22 @@ func TestLosslessNormalizationRequiresExplicitWorkerOptIn(t *testing.T) {
 	}
 }
 
+func TestDefaultMediaCandidateBudgetDoesNotRushExactPairProofs(t *testing.T) {
+	for _, kind := range []string{"full", "full_repeat"} {
+		if got := defaultMediaCandidateBudget(kind, 2); got != 25*time.Minute {
+			t.Errorf("%s budget=%s want=25m", kind, got)
+		}
+	}
+	for _, kind := range []string{"pair", "pair_repeat"} {
+		if got := defaultMediaCandidateBudget(kind, 2); got != 5*time.Minute {
+			t.Errorf("%s budget=%s want=5m", kind, got)
+		}
+	}
+	if got := defaultMediaCandidateBudget("prefix", 2); got != 170*time.Second {
+		t.Fatalf("two-source discovery budget=%s want=170s", got)
+	}
+}
+
 func TestBuildLargestPassingPrefixPeelsRepeatableCorruptSource(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, false)
@@ -926,6 +942,40 @@ func TestBuildAllPassingPartsLocalizesAfterFullCandidateDeadline(t *testing.T) {
 	}
 	if parentCtx.Err() != nil || len(parts) != 2 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || len(parts[0].SplitEvidence) != 1 || len(quarantines) != 0 {
 		t.Fatalf("parent_err=%v parts=%+v quarantines=%+v", parentCtx.Err(), parts, quarantines)
+	}
+}
+
+func TestBuildAllPassingPartsLetsSlowPairReachStrictClassification(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	pairClassifications := 0
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		ids := clipIDs(candidate)
+		if equalInt64s(ids, []int64{2, 3}) {
+			deadline, ok := ctx.Deadline()
+			if !ok || time.Until(deadline) < 4*time.Minute {
+				return BuiltOutput{}, context.DeadlineExceeded
+			}
+			pairClassifications++
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		if len(candidate) == len(sources) || containsAdjacentClipIDs(candidate, 2, 3) {
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pairClassifications != 2 {
+		t.Fatalf("pair classifications=%d want=2", pairClassifications)
+	}
+	if len(parts) != 2 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || len(quarantines) != 0 {
+		t.Fatalf("strict seam split changed: parts=%+v quarantines=%+v", parts, quarantines)
+	}
+	if len(parts[0].SplitEvidence) != 1 || parts[0].SplitEvidence[0].ReasonCode != "media_sequence_mismatch" {
+		t.Fatalf("strict seam evidence=%+v", parts[0].SplitEvidence)
 	}
 }
 
