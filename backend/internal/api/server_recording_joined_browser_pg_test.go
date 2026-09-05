@@ -572,6 +572,9 @@ func TestRecordingJoinedBrowserAuthPublicParityAndIsolation(t *testing.T) {
 		{path: "/api/v1/account/recordings/20/joined/302/download", params: map[string]string{"id": "20", "joinedId": "302"}, call: func(server *Server, w http.ResponseWriter, r *http.Request) {
 			server.handleAccountRecordingJoinedDownload(w, r)
 		}},
+		{path: "/api/v1/account/recordings/20/joined/301/download", params: map[string]string{"id": "20", "joinedId": "301"}, call: func(server *Server, w http.ResponseWriter, r *http.Request) {
+			server.handleAccountRecordingJoinedDownload(w, r)
+		}},
 	} {
 		req := httptest.NewRequest(http.MethodGet, request.path, nil)
 		route := chi.NewRouteContext()
@@ -649,6 +652,54 @@ func TestRecordingJoinedDownloadSupportsUnversionedExactRange(t *testing.T) {
 	}
 }
 
+func TestRecordingJoinedManifestDownloadAuthAndShared(t *testing.T) {
+	pool := joinedBrowserTestPool(t)
+	seedJoinedBrowserTestData(t, pool)
+	body := []byte("null      ")
+	store := &joinedBrowserRangeStore{
+		joinedOutputStoreStub: joinedOutputStoreStub{head: r2.ObjectHead{ETag: "manifest-1", SizeBytes: int64(len(body))}},
+		body:                  body,
+	}
+	s := &Server{pool: pool, joinedOutputStorage: store, cfg: config.Config{
+		SharedRecordingsAccountID: 47,
+		SharedRecordingsSlug:      "mit-scl",
+		SharedRecordingsPublic:    true,
+	}}
+
+	for _, test := range []struct {
+		name, path, disposition string
+		shared                  bool
+	}{
+		{name: "account view", path: "/api/v1/account/recordings/20/joined/301/download?disposition=inline", disposition: "inline"},
+		{name: "shared download", path: "/api/v1/shared/mit-scl/recordings/20/joined/301/download?disposition=attachment", disposition: "attachment", shared: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, test.path, nil)
+			response := httptest.NewRecorder()
+			if test.shared {
+				s.router().ServeHTTP(response, req)
+			} else {
+				route := chi.NewRouteContext()
+				route.URLParams.Add("id", "20")
+				route.URLParams.Add("joinedId", "301")
+				ctx := context.WithValue(req.Context(), chi.RouteCtxKey, route)
+				ctx = context.WithValue(ctx, accountPrincipalContextKey, accountPrincipal{AccountID: 47, AuthType: "session"})
+				s.handleAccountRecordingJoinedDownload(response, req.WithContext(ctx))
+			}
+			if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), body) {
+				t.Fatalf("status=%d body=%q", response.Code, response.Body.Bytes())
+			}
+			if got := response.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("content type=%q", got)
+			}
+			wantDisposition := test.disposition + `; filename=hour_01.json`
+			if got := response.Header().Get("Content-Disposition"); got != wantDisposition {
+				t.Fatalf("content disposition=%q want %q", got, wantDisposition)
+			}
+		})
+	}
+}
+
 func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 	pool := joinedBrowserTestPool(t)
 	seedJoinedBrowserTestData(t, pool)
@@ -657,9 +708,11 @@ func TestJoinedFolderIsSameOriginScopedAndRedacted(t *testing.T) {
 		path string
 		want []string
 	}{
-		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"20_Europe_Poland_Luban", "May", "folder=May", "2 MP4", "All joined recordings"}},
+		{path: "/api/v1/account/recordings/20/joined/folder", want: []string{"20_Europe_Poland_Luban", "May", "folder=May", "coverage", "folder=coverage", "2 MP4", "1 JSON", "All joined recordings"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May", want: []string{"Monday", "folder=May%2FMonday"}},
 		{path: "/api/v1/account/recordings/20/joined/folder?folder=May%2FMonday", want: []string{"hour_01_part_01_0800-0801.mp4", `class="type mp4">MP4`, ">View</a>", ">Download</a>"}},
+		{path: "/api/v1/account/recordings/20/joined/folder?folder=coverage", want: []string{"hours", "folder=coverage%2Fhours"}},
+		{path: "/api/v1/account/recordings/20/joined/folder?folder=coverage%2Fhours", want: []string{"hour_01.json", `class="type json">JSON`, `/api/v1/account/recordings/20/joined/301/download?disposition=inline`, `/api/v1/account/recordings/20/joined/301/download?disposition=attachment`}},
 	} {
 		req := httptest.NewRequest(http.MethodGet, test.path, nil)
 		route := chi.NewRouteContext()
@@ -731,6 +784,8 @@ func TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials(t *testing.T) {
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined", wantCode: http.StatusOK, wantBody: `"total":2`},
 		{path: "/api/v1/shared/mit-scl/recordings/joined/folder", wantCode: http.StatusOK, wantBody: "20_Europe_Poland_Luban"},
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder", wantCode: http.StatusOK, wantBody: "Joined clips"},
+		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder?folder=coverage%2Fhours", wantCode: http.StatusOK, wantBody: `/api/v1/shared/mit-scl/recordings/20/joined/301/download?disposition=inline`},
+		{path: "/api/v1/shared/mit-scl/recordings/20/joined/folder?folder=coverage%2Fhours", wantCode: http.StatusOK, wantBody: `/api/v1/shared/mit-scl/recordings/20/joined/301/download?disposition=attachment`},
 		{path: "/api/v1/shared/mit-scl/recordings/20/joined/302/download?disposition=inline", rangeHeader: "bytes=2-5", wantCode: http.StatusPartialContent, wantBody: "2345"},
 		{path: "/api/v1/shared/mit-scl/recordings/50/joined", wantCode: http.StatusNotFound, wantBody: "recording not found"},
 	} {
