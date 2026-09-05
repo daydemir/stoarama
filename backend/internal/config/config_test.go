@@ -1,7 +1,10 @@
 package config
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"net/netip"
 	"os"
@@ -849,6 +852,27 @@ func TestMITSharedRecordingsAllowsEmptyTrustedProxyCIDRs(t *testing.T) {
 	}
 	if len(cfg.SharedRecordingsProxyCIDRs) != 0 {
 		t.Fatalf("trusted proxy CIDRs=%v want none", cfg.SharedRecordingsProxyCIDRs)
+	}
+}
+
+func TestJoinedArchiveWorkerConfigurationMustBePairedAndPinned(t *testing.T) {
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := base64.RawURLEncoding.EncodeToString(public)
+	for _, cfg := range []Config{
+		{JoinedArchiveWorkerURL: "https://stoarama-joined-folder-zip.example.workers.dev"},
+		{JoinedArchiveWorkerPublicKey: key},
+		{JoinedArchiveWorkerURL: "https://evil.example", JoinedArchiveWorkerPublicKey: key},
+		{JoinedArchiveWorkerURL: "https://stoarama-joined-folder-zip.example.workers.dev", JoinedArchiveWorkerPublicKey: "bad"},
+	} {
+		if err := cfg.ValidateJoined(); err == nil {
+			t.Fatalf("invalid archive config accepted: %+v", cfg)
+		}
+	}
+	if err := (Config{JoinedArchiveWorkerURL: "https://stoarama-joined-folder-zip.example.workers.dev", JoinedArchiveWorkerPublicKey: key}).ValidateJoined(); err != nil {
+		t.Fatalf("valid archive config rejected: %v", err)
 	}
 }
 

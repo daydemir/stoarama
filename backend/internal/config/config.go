@@ -1,8 +1,10 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/netip"
@@ -26,6 +28,8 @@ type Config struct {
 	JoinedWorkerBootstrapToken       string
 	JoinedWorkerBootstrapHashes      string
 	JoinedWorkerSigningKey           string
+	JoinedArchiveWorkerURL           string
+	JoinedArchiveWorkerPublicKey     string
 	JoinedOperatorToken              string
 	BootstrapAdminEmail              string
 	MigrationDir                     string
@@ -202,6 +206,8 @@ func Load() (Config, error) {
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
 		JoinedWorkerBootstrapHashes:      os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST"),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
+		JoinedArchiveWorkerURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_WORKER_URL")), "/"),
+		JoinedArchiveWorkerPublicKey:     strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_WORKER_PUBLIC_KEY")),
 		JoinedOperatorToken:              strings.TrimSpace(os.Getenv("STOARAMA_JOINED_OPERATOR_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
@@ -400,6 +406,22 @@ func (c Config) ValidateAPI() error {
 }
 
 func (c Config) ValidateJoined() error {
+	archiveURL := strings.TrimSpace(c.JoinedArchiveWorkerURL)
+	archiveKey := strings.TrimSpace(c.JoinedArchiveWorkerPublicKey)
+	if (archiveURL == "") != (archiveKey == "") {
+		return fmt.Errorf("JOINED_ARCHIVE_WORKER_URL and JOINED_ARCHIVE_WORKER_PUBLIC_KEY must be configured together")
+	}
+	if archiveURL != "" {
+		worker, err := url.Parse(archiveURL)
+		key, keyErr := base64.RawURLEncoding.DecodeString(archiveKey)
+		if err != nil || worker.Scheme != "https" || worker.User != nil || worker.RawQuery != "" || worker.Fragment != "" || (worker.Path != "" && worker.Path != "/") ||
+			!strings.HasPrefix(strings.ToLower(worker.Hostname()), "stoarama-joined-folder-zip.") || !strings.HasSuffix(strings.ToLower(worker.Hostname()), ".workers.dev") {
+			return fmt.Errorf("JOINED_ARCHIVE_WORKER_URL must be the stoarama-joined-folder-zip HTTPS workers.dev origin")
+		}
+		if keyErr != nil || len(key) != ed25519.PublicKeySize {
+			return fmt.Errorf("JOINED_ARCHIVE_WORKER_PUBLIC_KEY must be a base64url Ed25519 public key")
+		}
+	}
 	bootstrap := strings.TrimSpace(c.JoinedWorkerBootstrapToken)
 	bootstrapSHA256s, err := c.JoinedWorkerBootstrapSHA256s()
 	if err != nil {

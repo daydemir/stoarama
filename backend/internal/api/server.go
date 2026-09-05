@@ -67,6 +67,7 @@ type Server struct {
 	dayZipSlot               chan struct{}
 	authLinkLimiter          *authLinkLimiter
 	sharedRecordingsLimiter  *sharedRecordingsLimiter
+	joinedArchiveLimiter     *authLinkLimiter
 	joinedConnectionStatusMu sync.Mutex
 	joinedConnectionStatusAt time.Time
 	joinedContainmentMu      sync.Mutex
@@ -191,6 +192,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool, r2c *r2.Client, mailer ema
 		dayZipSlot:              make(chan struct{}, 1),
 		authLinkLimiter:         newAuthLinkLimiter(),
 		sharedRecordingsLimiter: newSharedRecordingsLimiter(),
+		joinedArchiveLimiter:    &authLinkLimiter{hits: map[string][]time.Time{}, window: time.Hour, max: 10, now: time.Now},
 	}
 	if key := strings.TrimSpace(cfg.StorageCredKey); key != "" {
 		cipher, err := secretbox.NewFromBase64Key(key)
@@ -252,6 +254,12 @@ func (s *Server) router() http.Handler {
 	r.Post("/webhooks/billing/stripe", s.handleStripeWebhook)
 
 	r.Route("/api/v1", func(api chi.Router) {
+		// A short-lived signed archive capability is the only authority accepted
+		// here. The response contains no raw manifest, storage credential, or
+		// arbitrary object key; the read-only edge worker derives canonical media
+		// keys from the batch/content identities.
+		api.Get("/recording/joined/archive/manifest", s.handleJoinedArchiveManifest)
+		api.Get("/recording/joined/archive/admission", s.handleJoinedArchiveAdmission)
 		api.Route("/shared/"+s.cfg.SharedRecordingsSlug, func(shared chi.Router) {
 			shared.Post("/unlock", s.handleSharedRecordingsUnlock)
 			shared.Post("/logout", s.handleSharedRecordingsLogout)
@@ -265,6 +273,7 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings/{id}/capture-health", s.handleSharedRecordingCaptureHealth)
 				read.Get("/recordings/{id}/joined", s.handleSharedRecordingJoinedList)
 				read.Get("/recordings/{id}/joined/folder", s.handleSharedRecordingJoinedFolder)
+				read.Get("/recordings/{id}/joined/folder/archive", s.handleSharedRecordingJoinedFolderArchive)
 				read.Get("/recordings/{id}/joined/{joinedId}/download", s.handleSharedRecordingJoinedDownload)
 				read.Get("/recordings/{id}/clips", s.handleSharedRecordingClips)
 				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
@@ -322,6 +331,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
 			account.Get("/recordings/{id}/joined", s.handleAccountRecordingJoinedList)
 			account.Get("/recordings/{id}/joined/folder", s.handleAccountRecordingJoinedFolder)
+			account.Get("/recordings/{id}/joined/folder/archive", s.handleAccountRecordingJoinedFolderArchive)
 			account.Get("/recordings/{id}/joined/{joinedId}/download", s.handleAccountRecordingJoinedDownload)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
 			account.Get("/recordings/{id}/stitch-certification", s.handleAccountNativeStitchGet)
