@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -138,6 +139,42 @@ func TestBoundedMediaProcessCancelNaturalExitRacePreservesUnrelatedGroup(t *test
 		if err := syscall.Kill(-sibling.Process.Pid, syscall.Signal(0)); err != nil {
 			t.Fatalf("iteration=%d unrelated process group was lost: %v", i, err)
 		}
+	}
+}
+
+func TestVerifyJoinedMediaPreservesDecodedFallbackDeadline(t *testing.T) {
+	dir := t.TempDir()
+	first := makeMediaClip(t, dir, "one.mp4", 440, false)
+	second := makeMediaClip(t, dir, "two.mp4", 880, false)
+	manifestPath := filepath.Join(dir, "concat.txt")
+	manifest := "file '" + first.Path + "'\nfile '" + second.Path + "'\n"
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(dir, "normalized-timebase.mp4")
+	cmd := exec.Command(ffmpegBinary(), "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-i", manifestPath, "-map", "0:v:0", "-c", "copy", "-video_track_timescale", "90000", outputPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("make normalized-timebase fixture: %v (%s)", err, output)
+	}
+
+	readyFile := filepath.Join(dir, "ffmpeg.ready")
+	fakeFFmpeg := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(fakeFFmpeg, []byte("#!/bin/sh\n: > \"$"+mediaProcessReadyFile+"\"\nexec sleep 60\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(mediaProcessReadyFile, readyFile)
+	t.Setenv("FFMPEG_BIN", fakeFFmpeg)
+	ctx := newMediaProcessDeadlineContext()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := VerifyJoinedMedia(ctx, []LocalSource{first, second}, outputPath)
+		errCh <- err
+	}()
+	waitForMediaProcessFile(t, readyFile)
+	ctx.expire()
+	err := <-errCh
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "bind rejected stream-copy decoded evidence") {
+		t.Fatalf("decoded fallback deadline was flattened: %v", err)
 	}
 }
 

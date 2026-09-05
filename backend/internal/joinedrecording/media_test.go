@@ -914,7 +914,7 @@ func TestBuildAllPassingPartsDescendsAfterRepeatedPrefixFailure(t *testing.T) {
 	}
 }
 
-func TestBuildAllPassingPartsLocalizesAfterFullCandidateDeadline(t *testing.T) {
+func TestBuildAllPassingPartsLocalizesAfterOpaqueFullCandidateDeadline(t *testing.T) {
 	sources := makeSyntheticLocalSources(4)
 	parentCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -922,7 +922,7 @@ func TestBuildAllPassingPartsLocalizesAfterFullCandidateDeadline(t *testing.T) {
 		ids := clipIDs(candidate)
 		if equalInt64s(ids, []int64{1, 2, 3, 4}) {
 			<-ctx.Done()
-			return BuiltOutput{}, ctx.Err()
+			return BuiltOutput{}, errors.Join(fmt.Errorf("lossless fallback: %v", ctx.Err()), ctx.Err())
 		}
 		if containsAdjacentClipIDs(candidate, 2, 3) {
 			return BuiltOutput{}, seamFailure(2, 3)
@@ -942,6 +942,30 @@ func TestBuildAllPassingPartsLocalizesAfterFullCandidateDeadline(t *testing.T) {
 	}
 	if parentCtx.Err() != nil || len(parts) != 2 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || len(parts[0].SplitEvidence) != 1 || len(quarantines) != 0 {
 		t.Fatalf("parent_err=%v parts=%+v quarantines=%+v", parentCtx.Err(), parts, quarantines)
+	}
+}
+
+func TestBuildAllPassingPartsPreservesOpaqueSizeAttemptDeadline(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	attempts := 0
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		attempts++
+		if attempts == 1 {
+			return BuiltOutput{}, deterministicFailure("output_exceeds_put_cap", struct{}{}, errors.New("bounded output cap"))
+		}
+		<-ctx.Done()
+		return BuiltOutput{}, errors.Join(fmt.Errorf("lossless fallback: %v", ctx.Err()), ctx.Err())
+	}
+	budget := func(kind string, _ int) time.Duration {
+		if kind == "size" {
+			return 10 * time.Millisecond
+		}
+		return 100 * time.Millisecond
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithPolicy(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt, budget)
+	if !errors.Is(err, context.DeadlineExceeded) || len(parts) != 0 || len(quarantines) != 0 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
 	}
 }
 
@@ -1113,6 +1137,31 @@ func TestBuildAllPassingPartsPropagatesInfrastructureFailureWithoutPartialPlan(t
 	}
 
 	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, syscall.ENOSPC) || len(parts) != 0 || len(quarantines) != 0 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsDoesNotLocalizeENOSPCAfterAttemptExpiry(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == len(sources) {
+			<-ctx.Done()
+			return BuiltOutput{}, syscall.ENOSPC
+		}
+		if containsAdjacentClipIDs(candidate, 2, 3) {
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	budget := func(kind string, _ int) time.Duration {
+		if kind == "full" {
+			return 10 * time.Millisecond
+		}
+		return 100 * time.Millisecond
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithPolicy(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt, budget)
 	if !errors.Is(err, syscall.ENOSPC) || len(parts) != 0 || len(quarantines) != 0 {
 		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
 	}

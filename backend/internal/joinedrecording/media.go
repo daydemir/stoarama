@@ -1810,13 +1810,16 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 			wantFrames, wantSHA, wantErr := decodedVideoSequenceIdentity(ctx, sourcePaths)
 			gotFrames, gotSHA, gotErr := decodedVideoSequenceIdentity(ctx, []string{outputPath})
 			wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
-			if wantErr != nil || gotErr != nil || wantVideo == nil || gotVideo == nil || wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || !lowerHex64(wantSHA) || !lowerHex64(gotSHA) {
+			if wantErr != nil || gotErr != nil {
+				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(wantErr, gotErr))
+			}
+			if wantVideo == nil || gotVideo == nil || wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || !lowerHex64(wantSHA) || !lowerHex64(gotSHA) {
 				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source=%v output=%v", wantErr, gotErr)
 			}
 			verification.SourceFingerprint.DecodedVideoSHA256 = wantSHA
 			verification.OutputFingerprint.DecodedVideoSHA256 = gotSHA
 			verification.DecodedFrameSequenceStatus = "failed"
-			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%v", strictErr, relaxedErr))
+			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%w", strictErr, relaxedErr))
 		}
 		verification.AcceptanceMode = "decoded_frame_equivalent"
 		verification.DecodedFrameSequenceStatus = "passed"
