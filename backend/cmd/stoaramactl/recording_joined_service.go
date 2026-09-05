@@ -25,7 +25,10 @@ import (
 const (
 	joinedAPITimeout       = 55 * time.Second
 	joinedWorkerIdlePoll   = 2 * time.Second
-	joinedWorkerTaskLimit  = 2 * time.Hour
+	// A strict 60-source hour can legitimately spend more than two hours in
+	// deterministic media isolation. Each media subprocess keeps its narrower
+	// deadline; this is only the outer bound for one renewable, fenced task.
+	joinedWorkerTaskLimit  = 4 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
 	// Sealed-hour claims repeat canonical source, plan, manifest, and proof data.
 	// Thirty-part hours can legitimately exceed the ordinary API response cap.
@@ -848,8 +851,12 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		if err != nil {
 			return false, fmt.Errorf("measure joined scratch admission budget: %w", err)
 		}
+		taskBudget, err := joinedrecording.WorkerTaskBudgetBytes(budget)
+		if err != nil {
+			return false, fmt.Errorf("derive joined scratch admission budget: %w", err)
+		}
 		claimRequest.ScratchAvailableBytes = budget
-		claimRequest.TaskBudgetBytes = budget
+		claimRequest.TaskBudgetBytes = taskBudget
 	}
 	// Cancellation can race after either claim API commits a lease but before
 	// this client receives it. No local task starts in that case. The unseen
@@ -872,8 +879,18 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
 	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
-	if err != nil || !ok {
+	if err != nil {
 		return false, err
+	}
+	if !ok {
+		removed, err := s.cleanupInactiveScratch(admissionCtx, req)
+		if err != nil {
+			return false, fmt.Errorf("cleanup inactive joined scratch while idle: %w", err)
+		}
+		if len(removed) > 0 {
+			log.Printf("joined worker removed inactive scratch directories count=%d", len(removed))
+		}
+		return false, nil
 	}
 	if !joinedHourWithinScope(s.cfg, preflight.HourID) {
 		return false, errors.New("joined preflight claim is outside configured work scope")
@@ -915,6 +932,12 @@ func joinedPublicationLeaseIdentity(response joinedrecording.PublicationClaimRes
 func joinedFailureClassification(err error) (class, reason string) {
 	if errors.Is(err, syscall.ENOSPC) || strings.Contains(strings.ToLower(err.Error()), "scratch") {
 		return "resource", "scratch_resource_exhausted"
+	}
+	if errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) {
+		return "transient", "preflight_seal_request_invalid"
+	}
+	if errors.Is(err, joinedrecording.ErrPreflightLeaseEndedBeforeSeal) {
+		return "transient", "preflight_lease_ended_before_seal"
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "transient", "worker_task_deadline"

@@ -302,9 +302,25 @@
     .health-heatmap-cell.critical { background: var(--err); }
     .health-heatmap-cell:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
     .health-page-actions { display: flex; gap: 8px; margin-left: auto; }
-    .health-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 11px; }
-    .health-legend span { display: inline-flex; align-items: center; gap: 5px; }
-    .health-legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+    .health-legend { display: grid; gap: 7px; margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+    .health-legend-group { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: start; gap: 6px 10px; }
+    .health-legend-title { color: var(--text); font-weight: 600; }
+    .health-legend-items { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+    .health-legend-item { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+    .health-legend-swatch { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 2px; }
+    .health-legend-marker {
+      flex: 0 0 auto;
+      display: inline-grid;
+      place-items: center;
+      width: 14px;
+      height: 14px;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      background: color-mix(in srgb, var(--muted) 18%, var(--panel2));
+      color: var(--text);
+      font: 700 7px/1 var(--mono);
+    }
+    .health-legend-marker svg { display: block; width: 10px; height: 10px; }
     .health-tooltip {
       position: fixed;
       z-index: 1000;
@@ -346,7 +362,14 @@
        Delete button: accent border + accent text, not plain dark text. */
     .clip-row-actions button.secondary, .clip-row-actions a.secondary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
     .clip-row-actions button.secondary:hover, .clip-row-actions a.secondary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-    .joined-folder-cta { min-height: 44px; padding: 8px 15px; font-weight: 650; }
+    .joined-folder-cta {
+      max-width: min(520px, 58vw);
+      min-height: 40px;
+      padding: 7px 12px;
+      font: 650 12px/1.25 var(--mono);
+      overflow-wrap: anywhere;
+      text-align: left;
+    }
     details.action-menu { position: relative; display: inline-block; }
     details.action-menu > summary { list-style: none; width: 30px; height: 28px; display: grid; place-items: center; border: 1px solid var(--muted); border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1; }
     details.action-menu > summary::-webkit-details-marker { display: none; }
@@ -521,14 +544,14 @@
     @keyframes loading-spin { to { transform: rotate(360deg); } }
     @keyframes loading-pulse { 50% { opacity: 0.45; } }
     .recordings-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px; }
-    .recordings-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+    .recordings-table { width: 100%; min-width: 1180px; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
     .recordings-table th { position: sticky; top: 0; z-index: 1; background: var(--panel2); color: var(--muted); text-align: left; font-weight: 500; }
     .recordings-table th, .recordings-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
     .recordings-table th:nth-child(1) { width: 38px; }
     .recordings-table th:nth-child(2) { width: 18%; }
     .recordings-table th:nth-child(3) { width: 15%; }
     .recordings-table th:nth-child(4) { width: 17%; }
-    .recordings-table th:nth-child(5) { width: 7%; }
+    .recordings-table th:nth-child(5) { width: 92px; }
     .recordings-table th:nth-child(6) { width: 11%; }
     .recordings-table th:nth-child(7) { width: 8%; }
     .recordings-table th:nth-child(8) { width: 7%; }
@@ -550,6 +573,18 @@
     .recordings-sort-button:hover { color: var(--text); }
     .recordings-sort-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .recordings-sort-indicator { min-width: 9px; color: var(--text); }
+    .recordings-joined-header .recordings-sort-button,
+    .recordings-joined-cell,
+    .recordings-joined-value { white-space: nowrap; }
+    .recordings-joined-value {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: normal !important;
+    }
+    .recordings-joined-value.loading { color: var(--muted); font-family: var(--sans); font-weight: 500; }
     .recordings-table input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
     .recordings-table .cell-main { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
     .recordings-table .cell-sub { color: var(--muted); margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; }
@@ -593,6 +628,10 @@
         grid-template-columns: 260px minmax(0, 1fr);
         gap: 16px;
       }
+      #cards:not(.hidden) {
+        width: min(1320px, calc(100vw - 40px));
+        margin-inline: calc((880px - min(1320px, calc(100vw - 40px))) / 2);
+      }
       .folder-rail { display: block; }
       .folder-browser-mobile { display: none; }
     }
@@ -607,7 +646,7 @@
       .recordings-table thead th:not(:first-child) { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
       .recordings-table thead th:first-child { position: static; display: flex; align-items: center; gap: 6px; width: auto; padding: 0; border: 0; background: transparent; }
       .recordings-table .select-visible-label { display: inline; }
-      .recordings-table, .recordings-table tbody { display: block; width: 100%; }
+      .recordings-table, .recordings-table tbody { display: block; width: 100%; min-width: 0; }
       .recordings-table tbody { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
       .recordings-table tbody tr {
         position: relative;
@@ -629,6 +668,7 @@
       .recordings-table tbody { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
+      .health-legend-group { grid-template-columns: 1fr; gap: 4px; }
       .score-grade-key { grid-template-columns: 1fr; gap: 3px; }
       .score-grade-key dd { margin: 0 0 7px 27px; }
       .action-menu-pop { position: fixed; top: 50%; right: 12px; left: 12px; min-width: 0; max-height: calc(100vh - 24px); overflow-y: auto; transform: translateY(-50%); z-index: 1000; }
@@ -1395,9 +1435,10 @@
 
     // Mutable view state.
     // High-volume completed recordings can have more than 10,000 source clips.
-    // One recording per request keeps each exact interval query inside its fixed
-    // deadline and prevents a large cohort from occupying both metric work slots.
+    // Heatmaps need one recording per request; joined summaries use the API's
+    // bounded 12-recording scope so the table fills without a cohort-wide query.
     const RECORDING_ENRICHMENT_BATCH_SIZE = 1;
+	const JOINED_PROGRESS_BATCH_SIZE = 12;
     const state = {
       account: null,
       billingEnabled: true,
@@ -3459,6 +3500,12 @@
       return words.every((word) => haystack.includes(word));
     }
 
+    function joinedFolderDisplayName(rec) {
+      const naming = rec && rec.naming && typeof rec.naming === 'object' ? rec.naming : {};
+      const folderName = String(naming.folder_name || '').trim();
+      return folderName || `recording_${Number(rec && rec.id) || 0}`;
+    }
+
     function recordingSortFromSearch(search) {
       const value = new URLSearchParams(String(search || '')).get('sort') || '';
       return ['newest', 'best14', 'joined_desc', 'joined_asc'].includes(value) ? value : 'joined_desc';
@@ -3569,13 +3616,13 @@
       const capture = rec.capture_via === 'relay'
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       const joined = joinedCoverage(rec);
-      const joinedHTML = !state.joinedProgressLoaded && !state.joinedProgressError
-	    ? `<div class="cell-main" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading...</div>`
-	    : joined.available
-        ? `<div class="cell-main" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
+      const joinedHTML = joined.available
+        ? `<div class="cell-main recordings-joined-value" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
+	    : !state.joinedProgressLoaded && !state.joinedProgressError
+	      ? `<div class="cell-main recordings-joined-value loading" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading</div>`
 	    : state.joinedProgressError
-	      ? `<div class="cell-main" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
-          : `<div class="cell-main" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
+	      ? `<div class="cell-main recordings-joined-value" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
+          : `<div class="cell-main recordings-joined-value" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
       let storage = sharedReadOnly ? '&mdash;' : (rec.delivery === 'nas_pull' ? 'Your NAS' : (rec.storage_managed === true ? 'Managed' : 'Connected storage'));
       if (rec.storage_managed === true && rec.delivery !== 'nas_pull') storage += rec.storage_retention_tier === 'yearly_prepaid' ? ' · yearly $0.05/hr-mo' : ' · monthly $0.10/hr-mo';
       let warning = '';
@@ -3596,7 +3643,7 @@
         <td class="recording-cell-wide" data-label="Recording"><div class="cell-main"><span class="mono">#${id}</span> ${escapeHTML(title)}</div><div class="cell-sub">${escapeHTML(location || recordingName)}</div>${streamName && recordingName ? `<div class="cell-sub">${escapeHTML(recordingName)}</div>` : ''}${Number(rec.stream_id) > 0 ? `<div class="cell-sub mono">Stream #${Number(rec.stream_id)}</div>` : ''}</td>
 		<td class="recording-cell-wide" data-label="Status / Last 12 hours"><div class="card-status ${st.cls}"><span class="dot"></span>${st.text}</div>${captureHealthHTML}${warning}</td>
 		<td class="recording-cell-wide" data-label="Recording quality">${timelineHealthHTML || '<div class="capture-health unavailable">Timeline check pending</div>'}</td>
-        <td data-label="Joined">${joinedHTML}</td>
+        <td class="recordings-joined-cell" data-label="Joined">${joinedHTML}</td>
         <td data-label="Schedule"><div class="cell-main" title="${escapeHTML(String(rec.cron_expr || ''))}">${escapeHTML(scheduleLabel(rec))}</div><div class="cell-sub">${escapeHTML(timezone)}${localTime ? ` · Local time ${escapeHTML(localTime)}` : ''}</div>${ends ? `<div class="cell-sub">Ends ${escapeHTML(ends)}</div>` : '<div class="cell-sub">No scheduled end</div>'}</td>
         <td data-label="Clip / Capture"><div class="cell-main">${clip}s${fps > 0 ? ` · ${fps} fps` : ''}</div><div class="cell-sub">${capture}</div></td>
 		<td data-label="Storage"><div class="cell-main">${storage}</div></td>
@@ -3617,7 +3664,7 @@
         percent,
         sourceMS,
         readyMS: Math.max(0, readyMS),
-        title: `Joined coverage: ${percent}% (${formatDuration(Math.max(0, readyMS))} joined of ${formatDuration(sourceMS)} usable recorded footage)`,
+        title: `Joined coverage for the selected best consecutive 14-day period: ${percent}% (${formatDuration(Math.max(0, readyMS))} joined of ${formatDuration(sourceMS)} usable recorded footage)`,
       };
     }
 
@@ -3735,7 +3782,7 @@
       const ariaSort = ascending ? 'ascending' : (descending ? 'descending' : 'none');
       const label = ascending ? 'Joined, lowest first' : (descending ? 'Joined, highest first' : 'Sort by joined amount, highest first');
       const indicator = ascending ? '&#8593;' : (descending ? '&#8595;' : '&#8597;');
-      return `<th aria-sort="${ariaSort}"><button type="button" class="recordings-sort-button" data-sortjoined aria-label="${label}" title="${label}"><span>Joined</span><span class="recordings-sort-indicator" aria-hidden="true">${indicator}</span></button></th>`;
+      return `<th class="recordings-joined-header" aria-sort="${ariaSort}"><button type="button" class="recordings-sort-button" data-sortjoined aria-label="${label}" title="${label}"><span>Joined</span><span class="recordings-sort-indicator" aria-hidden="true">${indicator}</span></button></th>`;
     }
 
     function recordingsTableHTML(rows) {
@@ -4412,6 +4459,28 @@
       };
     }
 
+    function captureHealthLegendHTML() {
+      return `<div class="health-legend" role="group" aria-label="Hourly heatmap legend">
+        <div class="health-legend-group" role="group" aria-label="Capture percentage shown by cell color">
+          <span class="health-legend-title">Capture</span>
+          <span class="health-legend-items">
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:var(--ok)" aria-hidden="true"></span>98% or better</span>
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:var(--warn)" aria-hidden="true"></span>90% to 97.9%</span>
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:var(--err)" aria-hidden="true"></span>Below 90%</span>
+            <span class="health-legend-item"><span class="health-legend-swatch" style="background:color-mix(in srgb, var(--muted) 12%, transparent)" aria-hidden="true"></span>Not scheduled</span>
+          </span>
+        </div>
+        <div class="health-legend-group" role="group" aria-label="Joined coverage shown by the corner mark">
+          <span class="health-legend-title">Joined mark</span>
+          <span class="health-legend-items">
+            <span class="health-legend-item"><span class="health-legend-marker" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M1.5 5.2 4 7.6 8.6 2.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>Check means 100% joined</span>
+            <span class="health-legend-item"><span class="health-legend-marker" aria-hidden="true">42</span>Number is joined percentage</span>
+            <span class="health-legend-item">No mark means 0%, loading, or unavailable. Focus the hour for the exact status.</span>
+          </span>
+        </div>
+      </div>`;
+    }
+
     function captureHealthCardHTML() {
       const page = clipPageState.captureHealth;
       if (!page) return '';
@@ -4446,12 +4515,7 @@
           <div class="hint">${escapeHTML(page.from)} through ${escapeHTML(page.to)} in ${escapeHTML(page.timezone)}. Hover or focus an hour for details.</div>
           ${joinedStatusHTML}
           <div class="health-heatmap" aria-label="Hourly capture health by local date">${captureHealthHeatmap(page)}</div>
-          <div class="health-legend">
-            <span><i style="background:var(--ok)"></i>98% or better</span>
-            <span><i style="background:var(--warn)"></i>90% to 97.9%</span>
-            <span><i style="background:var(--err)"></i>Below 90%</span>
-            <span><i style="background:color-mix(in srgb, var(--muted) 12%, transparent)"></i>Not scheduled</span>
-          </div>
+          ${captureHealthLegendHTML()}
         </div>`;
     }
 
@@ -4563,6 +4627,7 @@
       const st = statusLine(rec);
       const recId = clipPageState.recId;
       const folderPath = recordingAPIPath(`/${encodeURIComponent(recId)}/joined/folder`);
+      const folderName = joinedFolderDisplayName(rec);
       const header = `
         <div class="clip-page-head">
           <div>
@@ -4572,7 +4637,7 @@
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <div class="recording-head-actions">
-            <a class="btn-link primary joined-folder-cta" href="${escapeHTML(folderPath)}">Browse joined folder</a>
+            <a class="btn-link primary joined-folder-cta" href="${escapeHTML(folderPath)}" aria-label="Browse joined folder ${escapeHTML(folderName)}">${escapeHTML(folderName)}</a>
             <a class="btn-link secondary" href="${recordingsPagePath}">Back to recordings</a>
           </div>
         </div>`;
@@ -5283,13 +5348,27 @@
 	  if (state.joinedProgressLoading) return;
 	  state.joinedProgressLoading = true;
 	  try {
-	    const sortQuery = state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc'
-	      ? `?sort=${encodeURIComponent(state.recordingSort)}` : '';
-	    const payload = await fetchJSON(recordingAPIPath(`/joined-progress${sortQuery}`));
-	    if (requestToken !== recordingsLoadToken) return;
-	    mergeRecordingMetricItems(payload.items);
+	    let hadError = false;
+	    const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);
+	    for (let offset = 0; offset < ids.length; offset += JOINED_PROGRESS_BATCH_SIZE) {
+	      if (requestToken !== recordingsLoadToken) return;
+	      const batch = ids.slice(offset, offset + JOINED_PROGRESS_BATCH_SIZE);
+	      const params = new URLSearchParams();
+	      params.set('recording_ids', batch.join(','));
+	      let payload;
+	      try {
+	        payload = await fetchJSON(recordingAPIPath(`/joined-progress?${params.toString()}`));
+	      } catch (_) {
+	        if (requestToken !== recordingsLoadToken) return;
+	        hadError = true;
+	        continue;
+	      }
+	      if (requestToken !== recordingsLoadToken) return;
+	      mergeRecordingMetricItems(payload.items);
+	      renderCards();
+	    }
 	    state.joinedProgressLoaded = true;
-	    state.joinedProgressError = false;
+	    state.joinedProgressError = hadError;
 	    renderCards();
 	  } catch (_) {
 	    if (requestToken !== recordingsLoadToken) return;

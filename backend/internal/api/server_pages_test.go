@@ -748,6 +748,10 @@ func TestRecordingHeatmapShowsAccessibleJoinedProgress(t *testing.T) {
 		"source_duration_ms",
 		"joined_ready_ms",
 		"<svg viewBox=\"0 0 10 10\"",
+		`aria-label="Hourly heatmap legend"`,
+		"Check means 100% joined",
+		"Number is joined percentage",
+		"No mark means 0%, loading, or unavailable",
 	} {
 		if !strings.Contains(string(body), marker) {
 			t.Fatalf("recordings html missing joined-progress marker %q", marker)
@@ -782,6 +786,16 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		`els.recordingSort.value = next;`,
 		`Joined, highest first`,
 		`Joined, lowest first`,
+		`class="recordings-joined-header"`,
+		`class="recordings-joined-cell" data-label="Joined"`,
+		`class="cell-main recordings-joined-value loading"`,
+		`Joined coverage for the selected best consecutive 14-day period:`,
+		`.recordings-table { width: 100%; min-width: 1180px;`,
+		`.recordings-table th:nth-child(5) { width: 92px; }`,
+		`.recordings-joined-value { white-space: nowrap; }`,
+		`#cards:not(.hidden) {`,
+		`width: min(1320px, calc(100vw - 40px));`,
+		`.recordings-table, .recordings-table tbody { display: block; width: 100%; min-width: 0; }`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing joined sort/state marker %q", marker)
@@ -798,16 +812,17 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 	refresh := page[refreshStart : refreshStart+refreshEnd]
 	mergeAt := strings.Index(refresh, "mergeRecordingMetricItems(payload.items);")
 	loadedAt := strings.Index(refresh, "state.joinedProgressLoaded = true;")
-	renderAt := strings.Index(refresh, "renderCards();")
-	if mergeAt < 0 || loadedAt < mergeAt || renderAt < loadedAt {
-		t.Fatalf("joined lazy values do not rerender in order: merge=%d loaded=%d render=%d", mergeAt, loadedAt, renderAt)
+	progressRenderAt := strings.Index(refresh, "renderCards();")
+	finalRenderAt := strings.LastIndex(refresh, "renderCards();")
+	if mergeAt < 0 || progressRenderAt < mergeAt || loadedAt < progressRenderAt || finalRenderAt < loadedAt {
+		t.Fatalf("joined lazy values do not rerender progressively: merge=%d progress_render=%d loaded=%d final_render=%d", mergeAt, progressRenderAt, loadedAt, finalRenderAt)
 	}
 	for _, stale := range []string{">View joined<", ">Browse joined recordings<"} {
 		if strings.Contains(page, stale) {
 			t.Fatalf("recordings html still contains stale action copy %q", stale)
 		}
 	}
-	for _, label := range []string{">View recording<", ">Browse joined folder<"} {
+	for _, label := range []string{">View recording<", "function joinedFolderDisplayName(rec)"} {
 		if !strings.Contains(page, label) {
 			t.Fatalf("recordings html missing exact action copy %q", label)
 		}
@@ -887,8 +902,9 @@ func TestRecordingDetailLinksToDedicatedJoinedFolderWithoutEagerJoinedFetch(t *t
 	page := string(body)
 	for _, marker := range []string{
 		`const folderPath = recordingAPIPath(`,
+		`const folderName = joinedFolderDisplayName(rec);`,
 		`class="btn-link primary joined-folder-cta"`,
-		`>Browse joined folder</a>`,
+		`${escapeHTML(folderName)}</a>`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording detail missing dedicated joined folder link %q", marker)
@@ -912,7 +928,7 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 		"void refreshRecordingEnrichment(requestToken);",
 		"void refreshJoinedProgress(requestToken);",
 		"recordingAPIPath(`/enrichment?${params.toString()}`)",
-		"recordingAPIPath(`/joined-progress${sortQuery}`)",
+		"recordingAPIPath(`/joined-progress?${params.toString()}`)",
 		"Joined coverage is loading",
 		"void loadRecordingDetailCaptureHealth(recId);",
 		"renderClipPage();",
@@ -923,6 +939,50 @@ func TestRecordingListLoadsMetricsAfterBaseline(t *testing.T) {
 	}
 	if strings.Contains(page, "clipPageState.captureHealth = await fetchRecordingCaptureHealth(recId, '');") {
 		t.Fatal("recording detail still waits for capture health before loading joined files")
+	}
+}
+
+func TestRecordingListLoadsJoinedProgressInProgressiveBoundedBatches(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	start := strings.Index(page, "async function refreshJoinedProgress(requestToken)")
+	if start < 0 {
+		t.Fatal("joined progress refresh function not found")
+	}
+	end := strings.Index(page[start:], "// ---- Composer open/close ----")
+	if end < 0 {
+		t.Fatal("joined progress refresh function end not found")
+	}
+	section := page[start : start+end]
+	for _, marker := range []string{
+		"const JOINED_PROGRESS_BATCH_SIZE = 12;",
+		"offset < ids.length; offset += JOINED_PROGRESS_BATCH_SIZE",
+		"const batch = ids.slice(offset, offset + JOINED_PROGRESS_BATCH_SIZE);",
+		"params.set('recording_ids', batch.join(','));",
+		"recordingAPIPath(`/joined-progress?${params.toString()}`)",
+		"hadError = true;",
+		"state.joinedProgressError = hadError;",
+		"mergeRecordingMetricItems(payload.items);",
+		"renderCards();",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing progressive joined-progress marker %q", marker)
+		}
+	}
+	if strings.Contains(section, "recordingAPIPath(`/joined-progress${sortQuery}`)") {
+		t.Fatal("joined progress still loads the whole cohort in one request")
+	}
+	failedBatchAt := strings.Index(section, "hadError = true;")
+	if failedBatchAt < 0 {
+		t.Fatal("joined progress does not record failed batches")
+	}
+	staleGuardAt := strings.LastIndex(section[:failedBatchAt], "if (requestToken !== recordingsLoadToken) return;")
+	catchAt := strings.LastIndex(section[:failedBatchAt], "} catch (_) {")
+	if catchAt < 0 || staleGuardAt < catchAt {
+		t.Fatal("failed joined batch can update a newer recordings load")
 	}
 }
 

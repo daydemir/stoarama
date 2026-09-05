@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -262,6 +263,270 @@ func TestEvaluatedHealthSignalsAreDisjointByRunClass(t *testing.T) {
 	}
 	if got := healthRunClass(false, true); got != "live" {
 		t.Fatalf("healthRunClass live=%q", got)
+	}
+}
+
+func TestCompletedWindowHealthStageRunsOnceAndDoesNotClearSignalsOnTimeout(t *testing.T) {
+	if completedWindowHealthTimeout != 4*time.Minute {
+		t.Fatalf("completed-window timeout=%s, want 4m above the observed 189s normal runtime", completedWindowHealthTimeout)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	base := []healthIncident{{RecordingID: 7, Signal: signalContinuousSilentDeath}}
+	result := runCompletedWindowHealthStage(ctx, base, func(stageCtx context.Context) ([]healthIncident, error) {
+		calls++
+		if stageCtx.Err() == nil {
+			t.Fatal("completed-window detector did not receive bounded canceled context")
+		}
+		return nil, context.Canceled
+	})
+
+	if calls != 1 {
+		t.Fatalf("completed-window detector calls=%d, want exactly one bounded historical pass", calls)
+	}
+	if len(result.incidents) != 1 || result.incidents[0].Signal != signalContinuousSilentDeath {
+		t.Fatalf("incidents=%v, want live incident preserved", result.incidents)
+	}
+	for _, signal := range result.evaluatedSignals {
+		if signal == signalContinuousCoverageLow || signal == signalContinuousOverlap ||
+			signal == signalContinuousLongGap || signal == signalContinuousFragmented ||
+			signal == signalContinuousLayoutChange {
+			t.Fatalf("failed historical stage falsely marked %q evaluated", signal)
+		}
+	}
+}
+
+func TestRecordingWindowHealthHistoricalStageBounds(t *testing.T) {
+	if recordingWindowHealthMaterializationTimeout != 30*time.Second {
+		t.Fatalf("materialization timeout=%s, want 30s", recordingWindowHealthMaterializationTimeout)
+	}
+	if completedWindowHealthTimeout+recordingWindowHealthMaterializationTimeout != 4*time.Minute+30*time.Second {
+		t.Fatalf("bounded historical stages=%s, want 4m30s", completedWindowHealthTimeout+recordingWindowHealthMaterializationTimeout)
+	}
+	runSoftRecordingWindowHealthMaterialization(context.Background(), func(stageCtx context.Context) error {
+		deadline, ok := stageCtx.Deadline()
+		if !ok || time.Until(deadline) > 30*time.Second || time.Until(deadline) < 29*time.Second {
+			t.Fatalf("materialization deadline=%v ok=%t", deadline, ok)
+		}
+		return nil
+	})
+}
+
+func TestCompletedWindowHealthStageMarksSignalsEvaluatedAfterSuccess(t *testing.T) {
+	base := []healthIncident{{RecordingID: 7, Signal: signalContinuousSilentDeath}}
+	historical := healthIncident{RecordingID: 8, Signal: signalContinuousLayoutChange}
+	result := runCompletedWindowHealthStage(context.Background(), base, func(context.Context) ([]healthIncident, error) {
+		return []healthIncident{historical}, nil
+	})
+
+	if len(result.incidents) != 2 || result.incidents[1] != historical {
+		t.Fatalf("incidents=%v, want live and completed-window incidents", result.incidents)
+	}
+	if fmt.Sprint(result.evaluatedSignals) != fmt.Sprint(completedWindowHealthSignals) {
+		t.Fatalf("evaluated signals=%v want=%v", result.evaluatedSignals, completedWindowHealthSignals)
+	}
+	full := append([]string{
+		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
+		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
+		signalClipTimestampDrift,
+	}, result.evaluatedSignals...)
+	if fmt.Sprint(full) != fmt.Sprint(evaluatedHealthSignals(false, false)) {
+		t.Fatalf("successful full-sweep signal registry=%v want=%v", full, evaluatedHealthSignals(false, false))
+	}
+}
+
+func TestCompletedWindowLayoutChangePreservesEmptyKnownCodecParity(t *testing.T) {
+	base := completedWindowClip{audioPresent: true, width: 1280, height: 720}
+	cases := []struct {
+		name              string
+		previous, current completedWindowClip
+	}{
+		{"video empty to known", base, completedWindowClip{videoCodec: "h264", audioPresent: true, width: 1280, height: 720}},
+		{"video known to empty", completedWindowClip{videoCodec: "h264", audioPresent: true, width: 1280, height: 720}, base},
+		{"audio empty to known", base, completedWindowClip{audioCodec: "aac", audioPresent: true, width: 1280, height: 720}},
+		{"audio known to empty", completedWindowClip{audioCodec: "aac", audioPresent: true, width: 1280, height: 720}, base},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !completedWindowLayoutChanged(tc.previous, tc.current) {
+				t.Fatal("empty/known codec transition no longer matches former COALESCE plus IS DISTINCT FROM semantics")
+			}
+		})
+	}
+}
+
+func TestCompletedWindowHealthStageCancelsPostgresQueryWithoutLeak(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed cancellation regression")
+	}
+	appName := fmt.Sprintf("health_cancel_%d", time.Now().UnixNano())
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["application_name"] = appName
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	stageCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var queryErr error
+	runCompletedWindowHealthStage(stageCtx, nil, func(queryCtx context.Context) ([]healthIncident, error) {
+		_, queryErr = pool.Exec(queryCtx, `SELECT pg_sleep(10)`)
+		return nil, queryErr
+	})
+	if queryErr == nil || !errors.Is(stageCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("query error=%v context error=%v, want deadline cancellation", queryErr, stageCtx.Err())
+	}
+	var one int
+	if err := pool.QueryRow(context.Background(), `SELECT 1`).Scan(&one); err != nil || one != 1 {
+		t.Fatalf("pool unusable after cancellation: one=%d err=%v", one, err)
+	}
+
+	admin, err := pgxpool.New(context.Background(), databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var running int
+		if err := admin.QueryRow(context.Background(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE application_name=$1 AND state='active' AND query LIKE '%pg_sleep%'
+		`, appName).Scan(&running); err != nil {
+			t.Fatal(err)
+		}
+		if running == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("canceled historical query still active for application %q", appName)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestHistoricalStageFailureKeepsHistoricalAlertOpenWhileResolvingLiveAlert(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed alert-state regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("health_stage_alerts_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE recorder_health_alerts (
+		  recording_id BIGINT NOT NULL, signal TEXT NOT NULL, resolved_at TIMESTAMPTZ,
+		  PRIMARY KEY(recording_id,signal));
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_health_alerts(recording_id,signal) VALUES (1,$1),(2,$2)`,
+		signalContinuousCoverageLow, signalContinuousSilentDeath); err != nil {
+		t.Fatal(err)
+	}
+
+	result := runCompletedWindowHealthStage(ctx, nil, func(context.Context) ([]healthIncident, error) {
+		return nil, errors.New("fixture historical scan failed")
+	})
+	evaluated := append([]string{signalContinuousSilentDeath}, result.evaluatedSignals...)
+	if err := resolveClearedHealthAlerts(ctx, pool, result.incidents, evaluated); err != nil {
+		t.Fatal(err)
+	}
+	var historicalResolved, liveResolved *time.Time
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=1`).Scan(&historicalResolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=2`).Scan(&liveResolved); err != nil {
+		t.Fatal(err)
+	}
+	if historicalResolved != nil || liveResolved == nil {
+		t.Fatalf("historical resolved=%v live resolved=%v, want historical open and live cleared", historicalResolved, liveResolved)
+	}
+}
+
+func TestMaterializationFailureStillRunsRealAlertResolution(t *testing.T) {
+	databaseURL := strings.TrimSpace(os.Getenv("STOARAMA_TEST_DATABASE_URL"))
+	if databaseURL == "" {
+		t.Skip("set STOARAMA_TEST_DATABASE_URL to run DB-backed materialization regression")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := fmt.Sprintf("health_materialize_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = admin.Exec(ctx, `DROP SCHEMA `+schema+` CASCADE`) }()
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE recorder_health_alerts (
+		  recording_id BIGINT NOT NULL, signal TEXT NOT NULL, resolved_at TIMESTAMPTZ,
+		  PRIMARY KEY(recording_id,signal));
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recorder_health_alerts(recording_id,signal) VALUES (9,$1)`, signalContinuousSilentDeath); err != nil {
+		t.Fatal(err)
+	}
+
+	runSoftRecordingWindowHealthMaterialization(ctx, func(context.Context) error {
+		return errors.New("fixture materialization failed")
+	})
+	if err := resolveClearedHealthAlerts(ctx, pool, nil, []string{signalContinuousSilentDeath}); err != nil {
+		t.Fatal(err)
+	}
+	var resolved *time.Time
+	if err := pool.QueryRow(ctx, `SELECT resolved_at FROM recorder_health_alerts WHERE recording_id=9`).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved == nil {
+		t.Fatal("materialization failure suppressed real alert resolution mutation")
 	}
 }
 
@@ -723,32 +988,98 @@ func TestDetectClipTimestampDriftAndLayoutChangeFindsNativeSeamChange(t *testing
 		CREATE TABLE accounts (id BIGINT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL);
 		CREATE TABLE account_billing (account_id BIGINT PRIMARY KEY,has_payment_method BOOLEAN NOT NULL);
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY,stream_id BIGINT,account_id BIGINT NOT NULL,name TEXT NOT NULL,stream_url TEXT NOT NULL,status TEXT NOT NULL,mode TEXT NOT NULL);
-		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ);
+		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ,status TEXT NOT NULL DEFAULT 'done',error_text TEXT NOT NULL DEFAULT '');
 		CREATE TABLE recording_clips (
-		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
+		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,recording_job_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
 		  video_codec TEXT,audio_codec TEXT,audio_present BOOLEAN NOT NULL,actual_fps DOUBLE PRECISION,video_width INTEGER,video_height INTEGER);
 		INSERT INTO accounts VALUES (1,'MIT SCL','scl@example.edu');
 		INSERT INTO account_billing VALUES (1,true);
 		INSERT INTO recordings VALUES
 		  (20,120,1,'changed','https://e.test/changed','active','continuous'),
 		  (21,121,1,'stable','https://e.test/stable','active','continuous'),
-		  (22,122,1,'native variable fps','https://e.test/variable','active','continuous');
+		  (22,122,1,'native variable fps','https://e.test/variable','active','continuous'),
+		  (23,123,1,'no clips','https://e.test/empty','active','continuous'),
+		  (24,124,1,'fragmented overlap','https://e.test/fragments','active','continuous');
 		INSERT INTO recording_jobs VALUES
 		  (200,20,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (209,21,'clip',now()-interval '3 hours',now()-interval '2 hours'),
 		  (210,21,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
-		  (220,22,'continuous_window',now()-interval '2 hours',now()-interval '1 hour');
+		  (220,22,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (230,23,'continuous_window',now()-interval '2 hours',now()-interval '1 hour'),
+		  (231,23,'continuous_window',now()-interval '10 minutes',now()+interval '1 hour'),
+		  (240,24,'continuous_window',now()-interval '2 hours',now()-interval '1 hour');
 		INSERT INTO recording_clips VALUES
-		  (1,20,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (2,20,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1920,1080),
-		  (3,21,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (4,21,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
-		  (5,22,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
-		  (6,22,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,24,1280,720);
+		  (100,20,200,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (50,20,200,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1920,1080),
+		  (60,20,200,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
+		  (10,20,200,now()-interval '108 minutes',now()-interval '107 minutes','h264','aac',true,30,640,480),
+		  (3,21,210,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (9,21,209,now()-interval '109 minutes 30 seconds',now()-interval '108 minutes 30 seconds','h264','aac',true,30,1920,1080),
+		  (8,20,210,now()-interval '109 minutes 30 seconds',now()-interval '108 minutes 30 seconds','h264','aac',true,30,1920,1080),
+		  (4,21,210,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,30,1280,720),
+		  (5,22,220,now()-interval '110 minutes',now()-interval '109 minutes','h264','aac',true,30,1280,720),
+		  (6,22,220,now()-interval '109 minutes',now()-interval '108 minutes','h264','aac',true,24,1280,720),
+		  (7,23,230,now()-interval '5 minutes',now()-interval '4 minutes','h264','aac',true,30,1280,720);
+		INSERT INTO recording_clips
+		SELECT 1000+n,24,240,now()-interval '2 hours'+n*interval '3 minutes',
+		       now()-interval '2 hours'+n*interval '3 minutes'+interval '1 minute',
+		       'h264','aac',true,30,1280,720
+		FROM generate_series(0,11) n;
+		INSERT INTO recording_clips VALUES
+		  (2000,24,240,now()-interval '2 hours'+interval '30 seconds',now()-interval '2 hours'+interval '90 seconds','h264','aac',true,30,1280,720);
 	`); err != nil {
 		t.Fatal(err)
 	}
-	got := detectCompletedWindowLayoutChanges(ctx, pool)
-	if len(got) != 1 || got[0].RecordingID != 20 || got[0].Signal != signalContinuousLayoutChange {
-		t.Fatalf("layout incidents=%+v", got)
+	got, err := detectCompletedWindowHealth(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var timeline, layout *healthIncident
+	for i := range got {
+		if got[i].RecordingID == 20 && got[i].Signal == signalContinuousCoverageLow {
+			timeline = &got[i]
+		}
+		if got[i].RecordingID == 20 && got[i].Signal == signalContinuousLayoutChange {
+			layout = &got[i]
+		}
+	}
+	if timeline == nil {
+		t.Fatalf("combined incidents lack recording 20 timeline result: %+v", got)
+	}
+	if layout == nil {
+		t.Fatalf("combined incidents lack recording 20 layout result: %+v", got)
+	}
+	wantDiag := "seam=60->10 video=h264/h264 audio=true:aac/true:aac fps=30.000/30.000 dimensions=1280×720/640×480"
+	if layout.Diag != wantDiag {
+		t.Fatalf("layout diagnostic=%q want=%q", layout.Diag, wantDiag)
+	}
+	signalsByRecording := map[int64]map[string]bool{}
+	for _, inc := range got {
+		if signalsByRecording[inc.RecordingID] == nil {
+			signalsByRecording[inc.RecordingID] = map[string]bool{}
+		}
+		signalsByRecording[inc.RecordingID][inc.Signal] = true
+	}
+	wantSignals := map[int64][]string{
+		20: {signalContinuousCoverageLow, signalContinuousOverlap, signalContinuousLongGap, signalContinuousLayoutChange},
+		21: {signalContinuousCoverageLow, signalContinuousLongGap},
+		22: {signalContinuousCoverageLow, signalContinuousLongGap},
+		23: {signalContinuousCoverageLow, signalContinuousLongGap},
+		24: {signalContinuousCoverageLow, signalContinuousOverlap, signalContinuousLongGap, signalContinuousFragmented},
+	}
+	for recordingID, want := range wantSignals {
+		gotSet := signalsByRecording[recordingID]
+		if len(gotSet) != len(want) {
+			t.Fatalf("recording %d signals=%v want exactly %v", recordingID, gotSet, want)
+		}
+		for _, signal := range want {
+			if !gotSet[signal] {
+				t.Fatalf("recording %d signals=%v missing %q", recordingID, gotSet, signal)
+			}
+		}
+	}
+	early := detectContinuousWindowEndedEarly(ctx, pool)
+	if len(early) != 1 || early[0].RecordingID != 23 || !strings.Contains(early[0].Diag, "job_id=231") {
+		t.Fatalf("ended-early incidents=%+v, want only recording 23 job 231", early)
 	}
 }

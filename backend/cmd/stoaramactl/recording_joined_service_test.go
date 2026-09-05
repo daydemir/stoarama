@@ -384,8 +384,12 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	root := filepath.Join(t.TempDir(), "scratch")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	service := &remoteJoinedOperatorService{cfg: validJoinedWorkerConfig(), api: api}
-	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{BatchID: batchID, WorkerID: workerID, ScratchRoot: t.TempDir()})
+	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{BatchID: batchID, WorkerID: workerID, ScratchRoot: root})
 	if err != nil || worked {
 		t.Fatalf("run once: worked=%v err=%v", worked, err)
 	}
@@ -402,7 +406,7 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 }
 
 func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
-	t.Parallel()
+	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
 	cfg := validJoinedWorkerConfig()
 	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	cfg.JoinedRecordingCanaryHourIDs = ""
@@ -423,7 +427,7 @@ func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
 		case "/api/v1/recording/joined/publication/claim", "/api/v1/recording/joined/claim":
 			var request joinedrecording.WorkClaimRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Validate() != nil ||
-				request.ScratchAvailableBytes <= 0 || request.TaskBudgetBytes != request.ScratchAvailableBytes {
+				request.ScratchAvailableBytes <= 0 || request.TaskBudgetBytes <= 0 || request.TaskBudgetBytes > request.ScratchAvailableBytes {
 				t.Errorf("unsafe broad claim request: %+v err=%v", request, err)
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -451,6 +455,12 @@ func TestJoinedFailureReportingUsesStableClassAndFencedEndpoint(t *testing.T) {
 	}
 	if class, reason := joinedFailureClassification(context.DeadlineExceeded); class != "transient" || reason != "worker_task_deadline" {
 		t.Fatalf("deadline class=%q reason=%q", class, reason)
+	}
+	if class, reason := joinedFailureClassification(joinedrecording.ErrPreflightSealRequestInvalid); class != "transient" || reason != "preflight_seal_request_invalid" {
+		t.Fatalf("seal validation class=%q reason=%q", class, reason)
+	}
+	if class, reason := joinedFailureClassification(joinedrecording.ErrPreflightLeaseEndedBeforeSeal); class != "transient" || reason != "preflight_lease_ended_before_seal" {
+		t.Fatalf("pre-seal lease class=%q reason=%q", class, reason)
 	}
 	const token = "operation-token-kept-secret-value"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -582,24 +592,68 @@ func TestJoinedWorkerDrainPreservesAdmittedTaskFailure(t *testing.T) {
 	}
 }
 
-func TestJoinedWorkerScratchCleanupUsesBootstrapScopedLeaseProof(t *testing.T) {
+func TestJoinedWorkerDrainIsBoundedByAdmittedTaskDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runJoinedWorkerLoop(ctx, time.Hour, func(_ context.Context, admittedCtx context.Context) (bool, error) {
+			err := runJoinedWorkerTask(admittedCtx, 20*time.Millisecond, "preflight_and_publish", func(taskCtx context.Context) error {
+				close(started)
+				<-taskCtx.Done()
+				return taskCtx.Err()
+			})
+			return true, err
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("bounded drain error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("draining worker outlived admitted task deadline")
+	}
+}
+
+func TestJoinedWorkerIdleCleansOnlyInactiveScratchAfterClaims(t *testing.T) {
 	t.Parallel()
 	cfg := validJoinedWorkerConfig()
 	inactive := strings.Repeat("I", 43)
 	active := strings.Repeat("A", 43)
+	unknown := "operator-notes"
 	root := filepath.Join(t.TempDir(), "scratch")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, leaseID := range []string{inactive, active} {
+	for _, leaseID := range []string{inactive, active, unknown} {
 		if err := os.Mkdir(filepath.Join(root, leaseID), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	const bootstrapToken = "scratch-proof-bootstrap-token-kept-secret"
+	const (
+		bootstrapToken = "scratch-proof-bootstrap-token-kept-secret"
+		claimToken     = "claim-token-kept-secret-value"
+	)
+	var claims atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/api/v1/recording/joined/token":
+			var request joinedrecording.WorkerBootstrapRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Validate() != nil {
+				t.Errorf("invalid bootstrap request: %+v err=%v", request, err)
+			}
+			writeJoinedTestJSON(t, w, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				BatchID: cfg.JoinedRecordingBatchID, ClaimToken: claimToken, ExpiresAt: time.Now().Add(time.Hour), WorkScopeIdentity: request.WorkScopeIdentity})
+		case "/api/v1/recording/joined/publication/claim", "/api/v1/recording/joined/claim":
+			claims.Add(1)
+			w.WriteHeader(http.StatusNoContent)
 		case "/api/v1/recording/joined/leases/status":
+			if claims.Load() != 2 {
+				t.Errorf("scratch cleanup started after %d claims", claims.Load())
+			}
 			if r.Header.Get("Authorization") != "Bearer "+bootstrapToken {
 				t.Errorf("lease proof auth=%q", r.Header.Get("Authorization"))
 			}
@@ -621,13 +675,59 @@ func TestJoinedWorkerScratchCleanupUsesBootstrapScopedLeaseProof(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &remoteJoinedOperatorService{cfg: cfg, api: api}
-	removed, err := service.cleanupInactiveScratch(context.Background(), joinedWorkerRequest{
+	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{
 		BatchID: cfg.JoinedRecordingBatchID, WorkerID: "worker-1", ScratchRoot: root})
-	if err != nil || !slices.Equal(removed, []string{inactive}) {
-		t.Fatalf("scratch cleanup removed=%v err=%v", removed, err)
+	if err != nil || worked || claims.Load() != 2 {
+		t.Fatalf("idle cleanup worked=%v claims=%d err=%v", worked, claims.Load(), err)
 	}
-	if _, err := os.Stat(filepath.Join(root, active)); err != nil {
-		t.Fatalf("active scratch was removed: %v", err)
+	if _, err := os.Stat(filepath.Join(root, inactive)); !os.IsNotExist(err) {
+		t.Fatalf("inactive scratch remains: %v", err)
+	}
+	for _, name := range []string{active, unknown} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("retained scratch %s: %v", name, err)
+		}
+	}
+}
+
+func TestJoinedWorkerIdleScratchCleanupFailsClosed(t *testing.T) {
+	t.Parallel()
+	cfg := validJoinedWorkerConfig()
+	leaseID := strings.Repeat("L", 43)
+	root := filepath.Join(t.TempDir(), "scratch")
+	if err := os.MkdirAll(filepath.Join(root, leaseID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/recording/joined/token":
+			var request joinedrecording.WorkerBootstrapRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			writeJoinedTestJSON(t, w, joinedrecording.WorkerBootstrapResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				BatchID: cfg.JoinedRecordingBatchID, ClaimToken: "claim-token-kept-secret-value", ExpiresAt: time.Now().Add(time.Hour), WorkScopeIdentity: request.WorkScopeIdentity})
+		case "/api/v1/recording/joined/publication/claim", "/api/v1/recording/joined/claim":
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/recording/joined/leases/status":
+			http.Error(w, "proof unavailable", http.StatusServiceUnavailable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "scratch-proof-bootstrap-token-kept-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{cfg: cfg, api: api}
+	worked, err := service.runWorkerOnce(context.Background(), joinedWorkerRequest{
+		BatchID: cfg.JoinedRecordingBatchID, WorkerID: "worker-1", ScratchRoot: root})
+	if err == nil || worked || !strings.Contains(err.Error(), "cleanup inactive joined scratch while idle") {
+		t.Fatalf("idle cleanup failure worked=%v err=%v", worked, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, leaseID)); err != nil {
+		t.Fatalf("failed cleanup changed scratch: %v", err)
 	}
 }
 
@@ -1093,6 +1193,17 @@ func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 	<-started
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "joined worker task deadline exceeded stage=preflight_and_publish") {
 		t.Fatalf("task deadline err=%v", err)
+	}
+}
+
+func TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime(t *testing.T) {
+	// Production hour 865 made healthy, monotonic progress for the full
+	// two-hour task budget and was canceled after producing 50 of 60 strict
+	// singleton outputs. Four hours covers the measured remaining work plus
+	// seal and create-only publication without removing the hard stop.
+	const minimumStrictHourBudget = 4 * time.Hour
+	if joinedWorkerTaskLimit < minimumStrictHourBudget {
+		t.Fatalf("joined worker task limit=%s is below measured strict-hour budget=%s", joinedWorkerTaskLimit, minimumStrictHourBudget)
 	}
 }
 

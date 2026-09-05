@@ -55,6 +55,15 @@ func TestRecordingEnrichmentRejectsCombinedSingleAndBatchScopes(t *testing.T) {
 	}
 }
 
+func TestRecordingJoinedProgressRejectsCombinedSingleAndBatchScopes(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/recordings/joined-progress?recording_id=9&recording_ids=9", nil)
+	rec := httptest.NewRecorder()
+	(&Server{}).handleSharedRecordingJoinedProgress(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 func TestRecordingTimelineOnlyEnrichmentRequiresOneRecording(t *testing.T) {
 	for _, path := range []string{
 		"/recordings/enrichment?timeline_only=1",
@@ -174,6 +183,60 @@ func TestRecordingMetricCacheBoundsConcurrentLazyDatabaseWork(t *testing.T) {
 	value, err := loadRecordingMetricCached(context.Background(), &cache, sameKey, time.Minute, time.Minute, time.Second, slots, loader(-1))
 	if err != nil || value != 47 || calls.Load() != 3 {
 		t.Fatalf("cached reload value=%d err=%v calls=%d", value, err, calls.Load())
+	}
+}
+
+func TestRecordingEnrichmentHasIndependentHeavyAdmission(t *testing.T) {
+	s := &Server{}
+	totalSlots := s.recordingMetricWorkSlots()
+	joinedSlots := s.recordingMetricHeavyWorkSlots()
+	enrichmentSlots := s.recordingEnrichmentHeavyWorkSlots()
+	if joinedSlots == enrichmentSlots {
+		t.Fatal("joined progress and list enrichment share a starvation-prone class gate")
+	}
+
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	load := func(name string) func(context.Context) (string, error) {
+		return func(ctx context.Context) (string, error) {
+			started <- name
+			select {
+			case <-release:
+				return name, nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+	}
+	var joinedCache, enrichmentCache recordingMetricCache[string]
+	results := make(chan error, 2)
+	go func() {
+		_, err := loadRecordingMetricCachedWithClass(context.Background(), &joinedCache,
+			recordingMetricCacheKey{AccountID: 47, Scope: "joined"}, time.Second, time.Minute, time.Second,
+			joinedSlots, totalSlots, load("joined"))
+		results <- err
+	}()
+	go func() {
+		_, err := loadRecordingMetricCachedWithClass(context.Background(), &enrichmentCache,
+			recordingMetricCacheKey{AccountID: 47, Scope: "enrichment"}, time.Second, time.Minute, time.Second,
+			enrichmentSlots, totalSlots, load("enrichment"))
+		results <- err
+	}()
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case name := <-started:
+			seen[name] = true
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("metric class starved: started=%v", seen)
+		}
+	}
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

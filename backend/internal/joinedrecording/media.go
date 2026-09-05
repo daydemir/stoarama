@@ -181,16 +181,48 @@ type MediaFingerprint struct {
 }
 
 type Verification struct {
-	Status                     string           `json:"status"`
-	AcceptanceMode             string           `json:"acceptance_mode,omitempty"`
-	PacketPayloadOrderStatus   string           `json:"packet_payload_order_status"`
-	DecodedFrameSequenceStatus string           `json:"decoded_frame_sequence_status,omitempty"`
-	DecodedFrameTotalsStatus   string           `json:"decoded_frame_totals_status"`
-	DecodedAudioTotalsStatus   string           `json:"decoded_audio_totals_status"`
-	OutputTimestampStatus      string           `json:"output_timestamp_status"`
-	StrictDecodeStatus         string           `json:"strict_decode_status"`
-	SourceFingerprint          MediaFingerprint `json:"source_fingerprint"`
-	OutputFingerprint          MediaFingerprint `json:"output_fingerprint"`
+	Status                     string                         `json:"status"`
+	AcceptanceMode             string                         `json:"acceptance_mode,omitempty"`
+	LosslessNormalization      *LosslessNormalizationEvidence `json:"lossless_normalization,omitempty"`
+	PacketPayloadOrderStatus   string                         `json:"packet_payload_order_status"`
+	DecodedFrameSequenceStatus string                         `json:"decoded_frame_sequence_status,omitempty"`
+	DecodedFrameTotalsStatus   string                         `json:"decoded_frame_totals_status"`
+	DecodedAudioTotalsStatus   string                         `json:"decoded_audio_totals_status"`
+	OutputTimestampStatus      string                         `json:"output_timestamp_status"`
+	StrictDecodeStatus         string                         `json:"strict_decode_status"`
+	SourceFingerprint          MediaFingerprint               `json:"source_fingerprint"`
+	OutputFingerprint          MediaFingerprint               `json:"output_fingerprint"`
+}
+
+// LosslessNormalizationEvidence records the exact, bounded codec contract
+// used only after both stream-copy verification modes reject a candidate.
+// QP 0 preserves decoded pixels; the ordered decoded-frame hash proves that
+// the normalized output represents every source frame exactly once.
+type LosslessNormalizationEvidence struct {
+	Codec                         string          `json:"codec"`
+	Preset                        string          `json:"preset"`
+	Quantizer                     int             `json:"quantizer"`
+	PixelFormat                   string          `json:"pixel_format"`
+	FrameRate                     string          `json:"frame_rate"`
+	SampleAspectRatio             string          `json:"sample_aspect_ratio"`
+	ColorRange                    string          `json:"color_range"`
+	ColorSpace                    string          `json:"color_space"`
+	ColorTransfer                 string          `json:"color_transfer"`
+	ColorPrimaries                string          `json:"color_primaries"`
+	ChromaLocation                string          `json:"chroma_location"`
+	FieldOrder                    string          `json:"field_order"`
+	TimelineRule                  string          `json:"timeline_rule"`
+	SourceDecodedFrames           int64           `json:"source_decoded_frames"`
+	OutputDecodedFrames           int64           `json:"output_decoded_frames"`
+	DecodedFrameSequenceSHA256    string          `json:"decoded_frame_sequence_sha256"`
+	DecodedFrameFieldStatus       string          `json:"decoded_frame_field_status"`
+	DecodedFrameFieldSHA256       string          `json:"decoded_frame_field_sha256"`
+	SourceTimelineSignatureSHA256 string          `json:"source_timeline_signature_sha256"`
+	OutputLimitBytes              int64           `json:"output_limit_bytes"`
+	AudioStatus                   string          `json:"audio_status"`
+	TriggerReasonCode             string          `json:"trigger_reason_code"`
+	TriggerFailureFacts           json.RawMessage `json:"trigger_failure_facts"`
+	TriggerFailureSHA256          string          `json:"trigger_failure_sha256"`
 }
 
 type BuiltOutput struct {
@@ -361,6 +393,9 @@ func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
 	if kind == "full" || kind == "full_repeat" {
 		return 25 * time.Minute
 	}
+	if kind == "pair" || kind == "pair_repeat" {
+		return 5 * time.Minute
+	}
 	budget := 2*time.Minute + time.Duration(sourceCount)*25*time.Second
 	if budget > 25*time.Minute {
 		return 25 * time.Minute
@@ -381,7 +416,7 @@ func buildLargestPassingPrefix(ctx context.Context, sources []LocalSource, scrat
 		if !errors.As(err, &firstDeterministic) {
 			return BuiltOutput{}, err
 		}
-		if firstDeterministic.code == "output_exceeds_put_cap" {
+		if outputSizeFailure(firstDeterministic) {
 			evidence = append(evidence, maximalityEvidence(sources[:n], firstDeterministic, 1, mediaToolIdentity))
 			lastErr = err
 			continue
@@ -473,9 +508,79 @@ func buildAllPassingPartsWithAttempt(ctx context.Context, sources []LocalSource,
 }
 
 func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, budget mediaCandidateBudget) (parts []BuiltOutput, quarantines []QuarantinedBuild, err error) {
+	return buildAllPassingPartsWithPairProofReuse(ctx, sources, scratchDir, mediaToolIdentity, attempt, budget, true)
+}
+
+type exactPairFailureProof struct {
+	failure *deterministicMediaError
+}
+
+func cloneDeterministicMediaError(failure *deterministicMediaError) *deterministicMediaError {
+	if failure == nil {
+		return nil
+	}
+	return &deterministicMediaError{
+		code:           failure.code,
+		evidenceSHA256: failure.evidenceSHA256,
+		evidence:       append(json.RawMessage(nil), failure.evidence...),
+		err:            failure.err,
+	}
+}
+
+func exactPairFailureProofKey(sources []LocalSource, locatorPosition int, policyVersion, mediaToolIdentity string) (string, error) {
+	if len(sources) != 2 || locatorPosition < 0 || strings.TrimSpace(policyVersion) == "" || !lowerHex64(mediaToolIdentity) {
+		return "", fmt.Errorf("invalid exact pair proof identity")
+	}
+	type sourceIdentity struct {
+		ClipID            int64                  `json:"clip_id"`
+		SizeBytes         int64                  `json:"size_bytes"`
+		SHA256            string                 `json:"sha256"`
+		SourceClaimSHA256 string                 `json:"source_claim_sha256"`
+		AudioContract     *AudioSequenceContract `json:"audio_contract,omitempty"`
+	}
+	identity := struct {
+		PolicyVersion     string           `json:"policy_version"`
+		MediaToolIdentity string           `json:"media_tool_identity"`
+		LocatorPosition   int              `json:"locator_position"`
+		Sources           []sourceIdentity `json:"sources"`
+	}{PolicyVersion: policyVersion, MediaToolIdentity: mediaToolIdentity, LocatorPosition: locatorPosition, Sources: make([]sourceIdentity, len(sources))}
+	for i, source := range sources {
+		if source.ClipID <= 0 || source.SizeBytes <= 0 || !lowerHex64(source.SHA256) || !lowerHex64(source.SourceClaimSHA256) || (source.AudioContract != nil && validateAudioContract(*source.AudioContract) != nil) {
+			return "", fmt.Errorf("invalid exact pair source identity")
+		}
+		var audio *AudioSequenceContract
+		if source.AudioContract != nil {
+			copy := *source.AudioContract
+			audio = &copy
+		}
+		identity.Sources[i] = sourceIdentity{source.ClipID, source.SizeBytes, source.SHA256, source.SourceClaimSHA256, audio}
+	}
+	digest, _, err := stitchcert.CanonicalSHA(identity)
+	return digest, err
+}
+
+func reusableExactPairFailure(failure *deterministicMediaError) bool {
+	if failure == nil {
+		return false
+	}
+	switch failure.code {
+	case "source_media_incompatible", "joined_output_probe_failure", "media_sequence_mismatch", "strict_decode_failure":
+		return true
+	default:
+		return false
+	}
+}
+
+// buildAllPassingPartsWithPairProofReuse may reuse only the two matching
+// failures produced by the adjacent-pair locator. It never reuses a successful
+// build or a source-attributed failure. The later extension must identify the
+// same ordered pair at the same source position, and its exact files are
+// rehashed before the proof replaces two fresh failing extension attempts.
+func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []LocalSource, scratchDir, mediaToolIdentity string, attempt isolatedBuildAttempt, budget mediaCandidateBudget, reusePairProofs bool) (parts []BuiltOutput, quarantines []QuarantinedBuild, err error) {
 	if len(sources) == 0 {
 		return nil, nil, fmt.Errorf("bounded sources are required")
 	}
+	pairProofs := make(map[string]exactPairFailureProof)
 	attempts := 0
 	maxAttempts := 6*len(sources) + 2
 	run := func(kind string, candidate []LocalSource) (BuiltOutput, error) {
@@ -516,7 +621,7 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		if !errors.Is(firstErr, context.DeadlineExceeded) || ctx.Err() != nil {
 			return nil, nil, firstErr
 		}
-	} else if firstFailure.code == "output_exceeds_put_cap" {
+	} else if outputSizeFailure(firstFailure) {
 		timedAttempt := func(attemptCtx context.Context, candidate []LocalSource, attemptScratch string) (BuiltOutput, error) {
 			started := time.Now()
 			candidateCtx, cancel := context.WithTimeout(attemptCtx, budget("size", len(candidate)))
@@ -547,7 +652,7 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 			continue
 		}
 		pairFailure, deterministic := deterministicBuildFailure(pairErr)
-		if !deterministic || pairFailure.code == "output_exceeds_put_cap" {
+		if !deterministic || outputSizeFailure(pairFailure) {
 			return nil, nil, pairErr
 		}
 		if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "pair_repeat", pair, pairFailure); repeatErr != nil {
@@ -555,6 +660,12 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		} else if repeated == nil {
 			discardIsolatedBuild(repeatedBuild, scratchDir)
 			return nil, nil, fmt.Errorf("%w: adjacent failure changed across repeats", errMediaSplitNotIsolated)
+		}
+		if reusePairProofs && reusableExactPairFailure(pairFailure) {
+			key, keyErr := exactPairFailureProofKey(pair, i, PlanPolicyVersion, mediaToolIdentity)
+			if keyErr == nil {
+				pairProofs[key] = exactPairFailureProof{failure: cloneDeterministicMediaError(pairFailure)}
+			}
 		}
 		boundaries = append(boundaries, i+1)
 	}
@@ -578,7 +689,7 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 					break
 				}
 				failure, deterministic := deterministicBuildFailure(candidateErr)
-				if !deterministic || failure.code == "output_exceeds_put_cap" {
+				if !deterministic || outputSizeFailure(failure) {
 					return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr, candidateErr)
 				}
 				if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "prefix_repeat", candidate, failure); repeatErr != nil {
@@ -600,7 +711,7 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 				return parts, nil, nil
 			}
 			failure, deterministic := deterministicBuildFailure(remainingErr)
-			if !deterministic || failure.code == "output_exceeds_put_cap" {
+			if !deterministic || outputSizeFailure(failure) {
 				return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr, remainingErr)
 			}
 			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "remaining_repeat", remaining, failure); repeatErr != nil {
@@ -625,7 +736,7 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		built, segmentErr := run("segment", segment)
 		if segmentErr != nil {
 			failure, deterministic := deterministicBuildFailure(segmentErr)
-			if len(segment) != 1 || !deterministic || failure.code == "output_exceeds_put_cap" {
+			if len(segment) != 1 || !deterministic || outputSizeFailure(failure) {
 				return nil, nil, errors.Join(errMediaSplitNotIsolated, fmt.Errorf("isolated segment failed: %w", segmentErr))
 			}
 			if repeatedBuild, repeated, repeatErr := repeatMatchingFailure(run, "singleton_repeat", segment, failure); repeatErr != nil {
@@ -642,9 +753,25 @@ func buildAllPassingPartsWithPolicy(ctx context.Context, sources []LocalSource, 
 		ownedParts = append(ownedParts, built)
 		if end < len(sources) {
 			extension := sources[start : end+1]
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			if reusePairProofs && len(extension) == 2 && ctx.Err() == nil {
+				key, keyErr := exactPairFailureProofKey(extension, start, PlanPolicyVersion, mediaToolIdentity)
+				proof, found := pairProofs[key]
+				if keyErr == nil && found && reusableExactPairFailure(proof.failure) && verifyLocalIdentity(extension[0]) == nil && verifyLocalIdentity(extension[1]) == nil {
+					if err := ctx.Err(); err != nil {
+						return nil, nil, err
+					}
+					parts[len(parts)-1].SplitEvidence = []MaximalityEvidence{maximalityEvidence(extension, cloneDeterministicMediaError(proof.failure), 2, mediaToolIdentity)}
+					emitStageTiming(ctx, "media_candidate_extension_pair_proof_reused", 0, nil)
+					start = end
+					continue
+				}
+			}
 			extensionBuild, extensionErr := run("extension", extension)
 			extensionFailure, deterministic := deterministicBuildFailure(extensionErr)
-			if extensionErr == nil || !deterministic || extensionFailure.code == "output_exceeds_put_cap" {
+			if extensionErr == nil || !deterministic || outputSizeFailure(extensionFailure) {
 				if extensionErr == nil {
 					discardIsolatedBuild(extensionBuild, scratchDir)
 					return nil, nil, fmt.Errorf("%w: exact boundary extension unexpectedly passed", errMediaSplitNotIsolated)
@@ -673,6 +800,10 @@ func deterministicBuildFailure(err error) (*deterministicMediaError, bool) {
 	return failure, ok
 }
 
+func outputSizeFailure(failure *deterministicMediaError) bool {
+	return failure != nil && (failure.code == "output_exceeds_put_cap" || failure.code == "lossless_normalization_expansion_cap")
+}
+
 func repeatMatchingFailure(run func(string, []LocalSource) (BuiltOutput, error), kind string, sources []LocalSource, first *deterministicMediaError) (BuiltOutput, *deterministicMediaError, error) {
 	built, err := run(kind, sources)
 	if err == nil {
@@ -696,7 +827,7 @@ func buildSizeBoundParts(ctx context.Context, sources []LocalSource, scratchDir,
 		part, err := buildLargestPassingPrefix(ctx, remaining, scratchDir, mediaToolIdentity, attempt)
 		if err != nil {
 			var failure *deterministicMediaError
-			if !errors.As(err, &failure) || failure.code == "output_exceeds_put_cap" {
+			if !errors.As(err, &failure) || outputSizeFailure(failure) {
 				for _, provisional := range parts {
 					discardIsolatedBuild(provisional, scratchDir)
 				}
@@ -810,21 +941,81 @@ func PreflightHour(ctx context.Context, draft HourDraft, locals []LocalSource, s
 // BuildSealedOutput verifies the complete frozen claim or fails. Runtime media
 // failure invalidates that campaign generation; there is no runtime tail peel.
 func BuildSealedOutput(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
-	if len(sources) == 0 || strings.TrimSpace(scratchDir) == "" {
-		return BuiltOutput{}, fmt.Errorf("bounded sources and scratch directory are required")
-	}
-	if err := os.MkdirAll(scratchDir, 0700); err != nil {
-		return BuiltOutput{}, fmt.Errorf("create scratch: %w", err)
-	}
-	for _, source := range sources {
-		if err := verifyLocalIdentity(source); err != nil {
-			return BuiltOutput{}, err
-		}
+	if err := validateSealedBuildInputs(sources, scratchDir); err != nil {
+		return BuiltOutput{}, err
 	}
 	return buildAndVerify(ctx, sources, scratchDir)
 }
 
+// BuildSealedOutputForVerification rebuilds the already-frozen media mode.
+// Reproduction cannot depend on a later worker environment change: a sealed
+// normalized artifact stays normalized, while a sealed stream-copy artifact
+// never gains a fallback during rebuild.
+func BuildSealedOutputForVerification(ctx context.Context, sources []LocalSource, scratchDir string, expected Verification) (BuiltOutput, error) {
+	if err := validateSealedBuildInputs(sources, scratchDir); err != nil {
+		return BuiltOutput{}, err
+	}
+	if validatePassedVerification(expected) != nil {
+		return BuiltOutput{}, fmt.Errorf("sealed media verification evidence is invalid")
+	}
+	if expected.AcceptanceMode != "lossless_native_timeline_normalized" {
+		return buildStreamCopyAndVerify(ctx, sources, scratchDir)
+	}
+	if len(sources) < 2 {
+		return BuiltOutput{}, fmt.Errorf("sealed lossless normalization evidence is invalid")
+	}
+	evidence := expected.LosslessNormalization
+	trigger := &deterministicMediaError{
+		code:           evidence.TriggerReasonCode,
+		evidenceSHA256: evidence.TriggerFailureSHA256,
+		evidence:       append(json.RawMessage(nil), evidence.TriggerFailureFacts...),
+		err:            fmt.Errorf("sealed stream-copy rejection"),
+	}
+	return buildLosslessNativeTimeline(ctx, sources, scratchDir, trigger)
+}
+
+func validateSealedBuildInputs(sources []LocalSource, scratchDir string) error {
+	if len(sources) == 0 || strings.TrimSpace(scratchDir) == "" {
+		return fmt.Errorf("bounded sources and scratch directory are required")
+	}
+	if err := os.MkdirAll(scratchDir, 0700); err != nil {
+		return fmt.Errorf("create scratch: %w", err)
+	}
+	for _, source := range sources {
+		if err := verifyLocalIdentity(source); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func buildAndVerify(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
+	if len(sources) == 1 || !losslessNormalizationEnabled() {
+		return buildStreamCopyAndVerify(ctx, sources, scratchDir)
+	}
+	return buildWithLosslessFallback(ctx, sources, scratchDir, buildStreamCopyAndVerify, buildLosslessNativeTimeline)
+}
+
+func losslessNormalizationEnabled() bool {
+	return os.Getenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED") == "true"
+}
+
+type mediaBuilder func(context.Context, []LocalSource, string) (BuiltOutput, error)
+type losslessMediaBuilder func(context.Context, []LocalSource, string, *deterministicMediaError) (BuiltOutput, error)
+
+func buildWithLosslessFallback(ctx context.Context, sources []LocalSource, scratchDir string, streamCopy mediaBuilder, normalize losslessMediaBuilder) (BuiltOutput, error) {
+	built, err := streamCopy(ctx, sources, scratchDir)
+	if err == nil {
+		return built, nil
+	}
+	failure, deterministic := deterministicBuildFailure(err)
+	if !deterministic || failure.code != "media_sequence_mismatch" {
+		return BuiltOutput{}, err
+	}
+	return normalize(ctx, sources, scratchDir, failure)
+}
+
+func buildStreamCopyAndVerify(ctx context.Context, sources []LocalSource, scratchDir string) (BuiltOutput, error) {
 	var sourceBytes int64
 	for _, source := range sources {
 		if source.SizeBytes > r2.MaxConditionalPutBytes-sourceBytes {
@@ -888,6 +1079,662 @@ func buildAndVerify(ctx context.Context, sources []LocalSource, scratchDir strin
 	}
 	keep = true
 	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
+}
+
+const losslessNormalizationExpansionLimit int64 = 7
+
+// The planner can retain outputs for prior/current source sets P+A while an
+// exact boundary extension A+x is encoded. Since P+A+x is within the frozen
+// source set S, 7(P+A)+7(A+x) is at most 14S.
+const losslessNormalizationScratchOutputMultiplier int64 = losslessNormalizationExpansionLimit * 2
+
+type losslessVideoLayout struct {
+	Width             int
+	Height            int
+	PixelFormat       string
+	FrameRate         string
+	RateNum           int64
+	RateDen           int64
+	SampleAspectRatio string
+	ColorRange        string
+	ColorSpace        string
+	ColorTransfer     string
+	ColorPrimaries    string
+	ChromaLocation    string
+	FieldOrder        string
+}
+
+const explicitProgressiveFrameStatus = "all_frames_match_explicit_progressive_layout"
+
+type decodedFrameFieldProof struct {
+	Frames int64
+	SHA256 string
+}
+
+type unsupportedDecodedFrameField struct {
+	SourceIndex  int
+	FrameOrdinal int64
+	Field        string
+	Value        string
+}
+
+func (e *unsupportedDecodedFrameField) Error() string {
+	return fmt.Sprintf("decoded frame %d has unsupported %s=%s", e.FrameOrdinal, e.Field, e.Value)
+}
+
+func buildLosslessNativeTimeline(ctx context.Context, sources []LocalSource, scratchDir string, trigger *deterministicMediaError) (BuiltOutput, error) {
+	return buildLosslessNativeTimelineWithOutputLimit(ctx, sources, scratchDir, trigger, r2.MaxConditionalPutBytes)
+}
+
+func buildLosslessNativeTimelineWithOutputLimit(ctx context.Context, sources []LocalSource, scratchDir string, trigger *deterministicMediaError, maximumOutputBytes int64) (BuiltOutput, error) {
+	if len(sources) < 2 {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization requires multiple sources")
+	}
+	if maximumOutputBytes <= 0 || maximumOutputBytes > r2.MaxConditionalPutBytes {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization output limit is invalid")
+	}
+	if trigger == nil || trigger.code != "media_sequence_mismatch" || !lowerHex64(trigger.evidenceSHA256) {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization requires the rejected stream-copy evidence")
+	}
+	triggerSHA, triggerFacts, triggerErr := stitchcert.CanonicalSHA(trigger.evidence)
+	if triggerErr != nil || len(triggerFacts) == 0 || triggerSHA != trigger.evidenceSHA256 {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization stream-copy evidence is invalid")
+	}
+	layouts := make([]losslessVideoLayout, len(sources))
+	timelineFacts := make([]struct {
+		ClipID            int64  `json:"clip_id"`
+		SourceClaimSHA256 string `json:"source_claim_sha256"`
+		Width             int    `json:"width"`
+		Height            int    `json:"height"`
+		PixelFormat       string `json:"pixel_format"`
+		FrameRate         string `json:"frame_rate"`
+		SampleAspectRatio string `json:"sample_aspect_ratio"`
+		ColorRange        string `json:"color_range"`
+		ColorSpace        string `json:"color_space"`
+		ColorTransfer     string `json:"color_transfer"`
+		ColorPrimaries    string `json:"color_primaries"`
+		ChromaLocation    string `json:"chroma_location"`
+		FieldOrder        string `json:"field_order"`
+	}, len(sources))
+	var sourceBytes int64
+	sourcePaths := make([]string, len(sources))
+	for i, source := range sources {
+		layout, hasAudio, err := probeLosslessVideoLayout(ctx, source.Path)
+		if err != nil {
+			return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_source_probe_failure", err)
+		}
+		if hasAudio {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_audio_unsupported", struct {
+				ClipID int64 `json:"clip_id"`
+			}{source.ClipID}, fmt.Errorf("audio-bearing sources remain on the strict stream-copy path"))
+		}
+		if layout.PixelFormat != "yuv420p" {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_pixel_format_unsupported", struct {
+				ClipID      int64  `json:"clip_id"`
+				PixelFormat string `json:"pixel_format"`
+			}{source.ClipID, layout.PixelFormat}, fmt.Errorf("lossless normalization requires yuv420p input"))
+		}
+		if layout.FieldOrder != "progressive" {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_field_order_unsupported", struct {
+				ClipID     int64  `json:"clip_id"`
+				FieldOrder string `json:"field_order"`
+			}{source.ClipID, layout.FieldOrder}, fmt.Errorf("lossless normalization requires explicitly progressive input"))
+		}
+		if i > 0 && layout != layouts[0] {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_layout_mismatch", struct {
+				ClipID int64 `json:"clip_id"`
+			}{source.ClipID}, fmt.Errorf("source video layout or native frame rate changes within candidate"))
+		}
+		layouts[i] = layout
+		sourcePaths[i] = source.Path
+		timelineFacts[i] = struct {
+			ClipID            int64  `json:"clip_id"`
+			SourceClaimSHA256 string `json:"source_claim_sha256"`
+			Width             int    `json:"width"`
+			Height            int    `json:"height"`
+			PixelFormat       string `json:"pixel_format"`
+			FrameRate         string `json:"frame_rate"`
+			SampleAspectRatio string `json:"sample_aspect_ratio"`
+			ColorRange        string `json:"color_range"`
+			ColorSpace        string `json:"color_space"`
+			ColorTransfer     string `json:"color_transfer"`
+			ColorPrimaries    string `json:"color_primaries"`
+			ChromaLocation    string `json:"chroma_location"`
+			FieldOrder        string `json:"field_order"`
+		}{source.ClipID, source.SourceClaimSHA256, layout.Width, layout.Height, layout.PixelFormat, layout.FrameRate, layout.SampleAspectRatio, layout.ColorRange, layout.ColorSpace, layout.ColorTransfer, layout.ColorPrimaries, layout.ChromaLocation, layout.FieldOrder}
+		if source.SizeBytes > math.MaxInt64-sourceBytes {
+			return BuiltOutput{}, fmt.Errorf("lossless normalization source size overflows")
+		}
+		sourceBytes += source.SizeBytes
+	}
+	sourceFrameFields, err := decodedFrameFieldSequenceProof(ctx, sourcePaths, layouts[0])
+	if err != nil {
+		var unsupported *unsupportedDecodedFrameField
+		if errors.As(err, &unsupported) && unsupported.SourceIndex >= 0 && unsupported.SourceIndex < len(sources) {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_frame_fields_unsupported", struct {
+				ClipID       int64  `json:"clip_id"`
+				FrameOrdinal int64  `json:"frame_ordinal"`
+				Field        string `json:"field"`
+				Value        string `json:"value"`
+			}{sources[unsupported.SourceIndex].ClipID, unsupported.FrameOrdinal, unsupported.Field, unsupported.Value}, err)
+		}
+		return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_frame_field_probe_failure", err)
+	}
+
+	outputLimit := maximumOutputBytes
+	if sourceBytes <= math.MaxInt64/losslessNormalizationExpansionLimit {
+		if expanded := sourceBytes * losslessNormalizationExpansionLimit; expanded < outputLimit {
+			outputLimit = expanded
+		}
+	}
+	if outputLimit <= 0 {
+		return BuiltOutput{}, fmt.Errorf("lossless normalization output limit is invalid")
+	}
+	timelineSHA, _, err := stitchcert.CanonicalSHA(timelineFacts)
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	manifest, err := os.CreateTemp(scratchDir, "lossless-concat-*.txt")
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	manifestPath := manifest.Name()
+	defer os.Remove(manifestPath)
+	for _, source := range sources {
+		if strings.ContainsAny(source.Path, "\r\n") {
+			_ = manifest.Close()
+			return BuiltOutput{}, fmt.Errorf("source path contains newline")
+		}
+		escaped := strings.ReplaceAll(source.Path, "'", "'\\''")
+		if _, err := fmt.Fprintf(manifest, "file '%s'\n", escaped); err != nil {
+			_ = manifest.Close()
+			return BuiltOutput{}, err
+		}
+	}
+	if err := manifest.Close(); err != nil {
+		return BuiltOutput{}, err
+	}
+	handle, err := os.CreateTemp(scratchDir, "joined-lossless-*.mp4")
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	outputPath := handle.Name()
+	_ = handle.Close()
+	_ = os.Remove(outputPath)
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(outputPath)
+		}
+	}()
+	layout := layouts[0]
+	timelineRule := fmt.Sprintf("settb=expr=%d/%d,setpts=N,setsar=%s", layout.RateDen, layout.RateNum, strings.ReplaceAll(layout.SampleAspectRatio, ":", "/"))
+	encodeArgs := []string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-f", "concat", "-safe", "0", "-i", manifestPath, "-map", "0:v:0", "-an", "-vf", timelineRule, "-c:v", "libx264", "-preset", "veryfast", "-qp", "0", "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-enc_time_base", fmt.Sprintf("%d:%d", layout.RateDen, layout.RateNum)}
+	encodeArgs = appendLosslessDisplayMetadata(encodeArgs, layout)
+	encodeArgs = append(encodeArgs, "-movflags", "+faststart", "-fs", strconv.FormatInt(outputLimit, 10), "-progress", "pipe:1", "-nostats", outputPath)
+	encodedFrames, err := runLosslessEncoder(ctx, encodeArgs...)
+	if err != nil {
+		return BuiltOutput{}, deterministicCommandFailure(ctx, "lossless_normalization_encode_failure", err)
+	}
+	size, sha, err := localIdentity(outputPath)
+	if err != nil {
+		return BuiltOutput{}, err
+	}
+	if err := losslessTruncatedOutputFailure(encodedFrames, sourceFrameFields.Frames, size, outputLimit); err != nil {
+		return BuiltOutput{}, err
+	}
+	verification, err := verifyLosslessNormalizedMedia(ctx, sources, outputPath, layout)
+	if err != nil {
+		return BuiltOutput{}, deterministicFailure("lossless_normalization_verification_failure", verification, err)
+	}
+	sourceVideo, outputVideo := verification.SourceFingerprint.Tracks["video"], verification.OutputFingerprint.Tracks["video"]
+	decodedSHA := verification.SourceFingerprint.DecodedVideoSHA256
+	outputFrameFields, outputFieldErr := decodedFrameFieldSequenceProof(ctx, []string{outputPath}, layout)
+	if outputFieldErr != nil {
+		var unsupported *unsupportedDecodedFrameField
+		if errors.As(outputFieldErr, &unsupported) {
+			return BuiltOutput{}, deterministicFailure("lossless_normalization_output_frame_fields_invalid", struct {
+				FrameOrdinal int64  `json:"frame_ordinal"`
+				Field        string `json:"field"`
+				Value        string `json:"value"`
+			}{unsupported.FrameOrdinal, unsupported.Field, unsupported.Value}, outputFieldErr)
+		}
+		return BuiltOutput{}, deterministicEvidenceFailure(ctx, "lossless_normalization_output_frame_field_probe_failure", outputFieldErr)
+	}
+	if sourceVideo == nil || outputVideo == nil || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || sourceFrameFields.Frames != sourceVideo.DecodedFrames || outputFrameFields.Frames != outputVideo.DecodedFrames || sourceFrameFields.SHA256 != outputFrameFields.SHA256 || !lowerHex64(decodedSHA) || decodedSHA != verification.OutputFingerprint.DecodedVideoSHA256 {
+		return BuiltOutput{}, deterministicFailure("lossless_normalization_frame_mismatch", verification, fmt.Errorf("lossless decoded frame evidence differs"))
+	}
+	verification.AcceptanceMode = "lossless_native_timeline_normalized"
+	verification.PacketPayloadOrderStatus = "not_applicable_lossless_normalization"
+	verification.LosslessNormalization = &LosslessNormalizationEvidence{
+		Codec:                         "libx264",
+		Preset:                        "veryfast",
+		Quantizer:                     0,
+		PixelFormat:                   layout.PixelFormat,
+		FrameRate:                     layout.FrameRate,
+		SampleAspectRatio:             layout.SampleAspectRatio,
+		ColorRange:                    layout.ColorRange,
+		ColorSpace:                    layout.ColorSpace,
+		ColorTransfer:                 layout.ColorTransfer,
+		ColorPrimaries:                layout.ColorPrimaries,
+		ChromaLocation:                layout.ChromaLocation,
+		FieldOrder:                    layout.FieldOrder,
+		TimelineRule:                  timelineRule,
+		SourceDecodedFrames:           sourceVideo.DecodedFrames,
+		OutputDecodedFrames:           outputVideo.DecodedFrames,
+		DecodedFrameSequenceSHA256:    decodedSHA,
+		DecodedFrameFieldStatus:       explicitProgressiveFrameStatus,
+		DecodedFrameFieldSHA256:       sourceFrameFields.SHA256,
+		SourceTimelineSignatureSHA256: timelineSHA,
+		OutputLimitBytes:              outputLimit,
+		AudioStatus:                   "absent",
+		TriggerReasonCode:             trigger.code,
+		TriggerFailureFacts:           append(json.RawMessage(nil), trigger.evidence...),
+		TriggerFailureSHA256:          trigger.evidenceSHA256,
+	}
+	keep = true
+	return BuiltOutput{Path: outputPath, SizeBytes: size, SHA256: sha, SourceCount: len(sources), Verification: verification}, nil
+}
+
+func losslessOutputLimitFailure(encodedFrames, expectedFrames, size, limit int64) error {
+	code := "lossless_normalization_expansion_cap"
+	if limit == r2.MaxConditionalPutBytes {
+		code = "output_exceeds_put_cap"
+	}
+	return deterministicFailure(code, struct {
+		EncodedFrames  int64 `json:"encoded_frames"`
+		ExpectedFrames int64 `json:"expected_frames"`
+		OutputBytes    int64 `json:"output_bytes"`
+		LimitBytes     int64 `json:"limit_bytes"`
+	}{encodedFrames, expectedFrames, size, limit}, fmt.Errorf("lossless normalized output reached its bounded size limit"))
+}
+
+// ffmpeg's -fs stops before writing the packet that would cross the limit, so
+// a capped file can be smaller than the configured byte ceiling or impossible
+// to probe. Encoder progress is captured before output probing and compared to
+// the independently decoded frozen-source frame count, making truncation an
+// explicit size-partitioning signal even for a zero-frame partial container.
+func losslessTruncatedOutputFailure(encodedFrames, expectedFrames, size, limit int64) error {
+	if limit <= 0 {
+		return nil
+	}
+	if expectedFrames > 0 && encodedFrames >= 0 && encodedFrames < expectedFrames {
+		return losslessOutputLimitFailure(encodedFrames, expectedFrames, size, limit)
+	}
+	if size >= limit {
+		return losslessOutputLimitFailure(encodedFrames, expectedFrames, size, limit)
+	}
+	return nil
+}
+
+func runLosslessEncoder(ctx context.Context, args ...string) (int64, error) {
+	process := newBoundedMediaProcess(ctx, ffmpegBinary(), args...)
+	stdout, err := process.cmd.StdoutPipe()
+	if err != nil {
+		return 0, err
+	}
+	var stderr limitedOutput
+	process.cmd.Stderr = &stderr
+	if err := process.Start(); err != nil {
+		return 0, &boundedCommandError{cause: err, output: stderr.String()}
+	}
+	encodedFrames := int64(-1)
+	progressEnded := false
+	var progressErr error
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		key, value, found := strings.Cut(strings.TrimSpace(scanner.Text()), "=")
+		if !found {
+			continue
+		}
+		switch key {
+		case "frame":
+			frames, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if parseErr != nil || frames < 0 {
+				progressErr = fmt.Errorf("invalid lossless encoder frame progress")
+				continue
+			}
+			encodedFrames = frames
+		case "progress":
+			if strings.TrimSpace(value) == "end" {
+				progressEnded = true
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil && progressErr == nil {
+		progressErr = fmt.Errorf("read lossless encoder progress: %w", err)
+	}
+	waitErr := process.Wait()
+	if waitErr != nil {
+		return 0, &boundedCommandError{cause: waitErr, output: stderr.String()}
+	}
+	if progressErr != nil {
+		return 0, progressErr
+	}
+	if encodedFrames < 0 || !progressEnded {
+		return 0, fmt.Errorf("lossless encoder progress is incomplete")
+	}
+	return encodedFrames, nil
+}
+
+func appendLosslessDisplayMetadata(args []string, layout losslessVideoLayout) []string {
+	for _, option := range []struct {
+		flag  string
+		value string
+	}{
+		{"-color_range", layout.ColorRange},
+		{"-colorspace", layout.ColorSpace},
+		{"-color_trc", layout.ColorTransfer},
+		{"-color_primaries", layout.ColorPrimaries},
+		{"-chroma_sample_location", layout.ChromaLocation},
+		{"-field_order", layout.FieldOrder},
+	} {
+		if value := strings.TrimSpace(option.value); value != "" && value != "unknown" {
+			args = append(args, option.flag, value)
+		}
+	}
+	return args
+}
+
+func verifyLosslessNormalizedMedia(ctx context.Context, sources []LocalSource, outputPath string, sourceLayout losslessVideoLayout) (Verification, error) {
+	outputLayout, hasAudio, err := probeLosslessVideoLayout(ctx, outputPath)
+	if err != nil {
+		return Verification{}, fmt.Errorf("probe lossless output display metadata: %w", err)
+	}
+	if hasAudio || outputLayout != sourceLayout {
+		return Verification{}, fmt.Errorf("lossless output display metadata differs from sources: source=%+v output=%+v audio=%t", sourceLayout, outputLayout, hasAudio)
+	}
+	expectedAccumulator := newMediaAccumulator()
+	for sourceIndex, source := range sources {
+		if err := probeMediaInto(ctx, source.Path, expectedAccumulator, source.AudioContract, true); err != nil {
+			return Verification{}, fmt.Errorf("probe lossless source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, err)
+		}
+	}
+	expected := expectedAccumulator.fingerprint()
+	actual, err := probeMedia(ctx, outputPath)
+	if err != nil {
+		return Verification{}, fmt.Errorf("probe lossless output: %w", err)
+	}
+	verification := Verification{Status: "failed", AcceptanceMode: "lossless_native_timeline_normalized", PacketPayloadOrderStatus: "not_applicable_lossless_normalization", SourceFingerprint: expected, OutputFingerprint: actual}
+	if len(expected.Tracks) != 1 || len(actual.Tracks) != 1 || expected.Tracks["audio"] != nil || actual.Tracks["audio"] != nil || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
+		return verification, fmt.Errorf("lossless output duration or stream cardinality mismatch")
+	}
+	wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
+	if wantVideo == nil || gotVideo == nil || wantVideo.TimestampStatus != "source_clips_independent" || gotVideo.TimestampStatus != "monotonic" || wantVideo.DecodedFrames <= 0 || wantVideo.DecodedFrames != gotVideo.DecodedFrames {
+		return verification, fmt.Errorf("lossless output decoded frame totals or timeline mismatch")
+	}
+	sourcePaths := make([]string, len(sources))
+	for i := range sources {
+		sourcePaths[i] = sources[i].Path
+	}
+	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, sourcePaths)
+	if err != nil {
+		return verification, fmt.Errorf("decode lossless source frame sequence: %w", err)
+	}
+	gotFrames, gotSHA, err := decodedVideoSequenceIdentity(ctx, []string{outputPath})
+	if err != nil {
+		return verification, fmt.Errorf("decode lossless output frame sequence: %w", err)
+	}
+	if wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || wantFrames != gotFrames || wantSHA != gotSHA {
+		return verification, fmt.Errorf("lossless output decoded frame sequence mismatch")
+	}
+	verification.SourceFingerprint.DecodedVideoSHA256 = wantSHA
+	verification.OutputFingerprint.DecodedVideoSHA256 = gotSHA
+	verification.DecodedFrameSequenceStatus = "passed"
+	verification.DecodedFrameTotalsStatus = "passed"
+	verification.DecodedAudioTotalsStatus = "passed"
+	verification.OutputTimestampStatus = "passed"
+	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", outputPath, "-map", "0:v:0", "-an", "-f", "null", "-"); err != nil {
+		return verification, fmt.Errorf("strict lossless output decode: %w", err)
+	}
+	verification.StrictDecodeStatus = "passed"
+	verification.Status = "passed"
+	return verification, nil
+}
+
+func validateLosslessNormalizationVerification(v Verification) error {
+	evidence := v.LosslessNormalization
+	if v.AcceptanceMode != "lossless_native_timeline_normalized" || evidence == nil || v.Status != "passed" || v.PacketPayloadOrderStatus != "not_applicable_lossless_normalization" || v.DecodedFrameSequenceStatus != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" {
+		return fmt.Errorf("lossless normalization status evidence differs")
+	}
+	if evidence.Codec != "libx264" || evidence.Preset != "veryfast" || evidence.Quantizer != 0 || evidence.PixelFormat != "yuv420p" || evidence.AudioStatus != "absent" || evidence.TriggerReasonCode != "media_sequence_mismatch" || !lowerHex64(evidence.TriggerFailureSHA256) || !lowerHex64(evidence.DecodedFrameSequenceSHA256) || evidence.DecodedFrameFieldStatus != explicitProgressiveFrameStatus || !lowerHex64(evidence.DecodedFrameFieldSHA256) || !lowerHex64(evidence.SourceTimelineSignatureSHA256) || evidence.OutputLimitBytes <= 0 || evidence.OutputLimitBytes > r2.MaxConditionalPutBytes {
+		return fmt.Errorf("lossless normalization codec evidence differs")
+	}
+	triggerSHA, triggerFacts, triggerErr := stitchcert.CanonicalSHA(evidence.TriggerFailureFacts)
+	if triggerErr != nil || len(triggerFacts) == 0 || triggerSHA != evidence.TriggerFailureSHA256 || validateRejectedStreamCopyVerification(evidence.TriggerFailureFacts, v.SourceFingerprint) != nil {
+		return fmt.Errorf("lossless normalization trigger evidence differs")
+	}
+	rate, ok := new(big.Rat).SetString(evidence.FrameRate)
+	aspect, aspectOK := new(big.Rat).SetString(strings.ReplaceAll(evidence.SampleAspectRatio, ":", "/"))
+	if !ok || rate.Sign() <= 0 || !rate.Num().IsInt64() || !rate.Denom().IsInt64() || !aspectOK || aspect.Sign() <= 0 || !aspect.Num().IsInt64() || !aspect.Denom().IsInt64() || evidence.TimelineRule != fmt.Sprintf("settb=expr=%d/%d,setpts=N,setsar=%s", rate.Denom().Int64(), rate.Num().Int64(), strings.ReplaceAll(evidence.SampleAspectRatio, ":", "/")) {
+		return fmt.Errorf("lossless normalization timeline evidence differs")
+	}
+	if evidence.FieldOrder != "progressive" {
+		return fmt.Errorf("lossless normalization field order differs")
+	}
+	for _, value := range []string{evidence.ColorRange, evidence.ColorSpace, evidence.ColorTransfer, evidence.ColorPrimaries, evidence.ChromaLocation} {
+		if len(value) > 64 {
+			return fmt.Errorf("lossless normalization display metadata differs")
+		}
+	}
+	if validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil || len(v.SourceFingerprint.Tracks) != 1 || len(v.OutputFingerprint.Tracks) != 1 || v.SourceFingerprint.Tracks["audio"] != nil || v.OutputFingerprint.Tracks["audio"] != nil || math.Abs(v.SourceFingerprint.DurationSeconds-v.OutputFingerprint.DurationSeconds) > 2 {
+		return fmt.Errorf("lossless normalization media fingerprint differs")
+	}
+	sourceVideo, outputVideo := v.SourceFingerprint.Tracks["video"], v.OutputFingerprint.Tracks["video"]
+	if sourceVideo == nil || outputVideo == nil || sourceVideo.TimestampStatus != "source_clips_independent" || outputVideo.TimestampStatus != "monotonic" || sourceVideo.DecodedFrames <= 0 || sourceVideo.DecodedFrames != outputVideo.DecodedFrames || evidence.SourceDecodedFrames != sourceVideo.DecodedFrames || evidence.OutputDecodedFrames != outputVideo.DecodedFrames || v.SourceFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 || v.OutputFingerprint.DecodedVideoSHA256 != evidence.DecodedFrameSequenceSHA256 {
+		return fmt.Errorf("lossless normalization decoded frame evidence differs")
+	}
+	if progressiveFrameFieldSequenceSHA256(evidence.SourceDecodedFrames) != evidence.DecodedFrameFieldSHA256 {
+		return fmt.Errorf("lossless normalization decoded frame field evidence differs")
+	}
+	return nil
+}
+
+func progressiveFrameFieldSequenceSHA256(frames int64) string {
+	payload := fmt.Sprintf("%s|%d\n", explicitProgressiveFrameStatus, frames)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func frameLayoutValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	return value
+}
+
+func validateDecodedFrameFieldLine(line string, sourceIndex int, frameOrdinal int64, layout losslessVideoLayout) error {
+	fields := strings.Split(strings.TrimSpace(line), "|")
+	values := make(map[string]string, 12)
+	seen := make(map[string]bool, len(fields)-1)
+	if len(fields) == 0 || fields[0] != "frame" {
+		return fmt.Errorf("invalid decoded frame field evidence")
+	}
+	for _, field := range fields[1:] {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok || seen[key] {
+			return fmt.Errorf("invalid decoded frame field evidence")
+		}
+		seen[key] = true
+		if strings.HasSuffix(key, ":side_data_type") {
+			switch value {
+			case "H.26[45] User Data Unregistered SEI message", "H.264 User Data Unregistered SEI message", "H.265 User Data Unregistered SEI message":
+				continue
+			}
+		}
+		switch key {
+		case "width", "height", "pix_fmt", "sample_aspect_ratio", "interlaced_frame", "top_field_first", "repeat_pict", "color_range", "color_space", "color_primaries", "color_transfer", "chroma_location":
+		default:
+			return fmt.Errorf("unsupported decoded frame side data")
+		}
+		values[key] = value
+	}
+	expected := map[string]string{
+		"width":               strconv.Itoa(layout.Width),
+		"height":              strconv.Itoa(layout.Height),
+		"pix_fmt":             layout.PixelFormat,
+		"sample_aspect_ratio": layout.SampleAspectRatio,
+		"interlaced_frame":    "0",
+		"top_field_first":     "0",
+		"repeat_pict":         "0",
+		"color_range":         frameLayoutValue(layout.ColorRange),
+		"color_space":         frameLayoutValue(layout.ColorSpace),
+		"color_primaries":     frameLayoutValue(layout.ColorPrimaries),
+		"color_transfer":      frameLayoutValue(layout.ColorTransfer),
+		"chroma_location":     frameLayoutValue(layout.ChromaLocation),
+	}
+	for _, key := range []string{"width", "height", "pix_fmt", "sample_aspect_ratio", "interlaced_frame", "top_field_first", "repeat_pict", "color_range", "color_space", "color_primaries", "color_transfer", "chroma_location"} {
+		if values[key] != expected[key] {
+			value := values[key]
+			if value == "" {
+				value = "missing"
+			}
+			return &unsupportedDecodedFrameField{SourceIndex: sourceIndex, FrameOrdinal: frameOrdinal, Field: key, Value: value}
+		}
+	}
+	return nil
+}
+
+func decodedFrameFieldSequenceProof(ctx context.Context, mediaPaths []string, layout losslessVideoLayout) (decodedFrameFieldProof, error) {
+	var frames int64
+	for sourceIndex, mediaPath := range mediaPaths {
+		process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-err_detect", "explode", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=width,height,pix_fmt,sample_aspect_ratio,interlaced_frame,top_field_first,repeat_pict,color_range,color_space,color_primaries,color_transfer,chroma_location", "-of", "compact=p=1:nk=0", mediaPath)
+		stdout, err := process.cmd.StdoutPipe()
+		if err != nil {
+			return decodedFrameFieldProof{}, err
+		}
+		var stderr limitedOutput
+		process.cmd.Stderr = &stderr
+		if err := process.Start(); err != nil {
+			return decodedFrameFieldProof{}, err
+		}
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4096), 1<<20)
+		var sourceFrames int64
+		for scanner.Scan() {
+			if err := ctx.Err(); err != nil {
+				_ = process.Kill()
+				_ = process.Wait()
+				return decodedFrameFieldProof{}, err
+			}
+			sourceFrames++
+			if err := validateDecodedFrameFieldLine(scanner.Text(), sourceIndex, sourceFrames, layout); err != nil {
+				_ = process.Kill()
+				_ = process.Wait()
+				return decodedFrameFieldProof{}, err
+			}
+			frames++
+		}
+		if err := scanner.Err(); err != nil {
+			_ = process.Kill()
+			_ = process.Wait()
+			return decodedFrameFieldProof{}, err
+		}
+		if err := process.Wait(); err != nil {
+			return decodedFrameFieldProof{}, fmt.Errorf("ffprobe decoded frame fields: %w (%s)", err, stderr.String())
+		}
+		if sourceFrames == 0 {
+			return decodedFrameFieldProof{}, fmt.Errorf("decoded frame field evidence is empty")
+		}
+	}
+	if frames == 0 {
+		return decodedFrameFieldProof{}, fmt.Errorf("decoded frame field evidence is empty")
+	}
+	return decodedFrameFieldProof{Frames: frames, SHA256: progressiveFrameFieldSequenceSHA256(frames)}, nil
+}
+
+func validateRejectedStreamCopyVerification(raw json.RawMessage, normalizedSource MediaFingerprint) error {
+	var rejected Verification
+	if decodeStrictJSON(raw, &rejected) != nil || rejected.Status != "failed" || rejected.AcceptanceMode != "" || rejected.LosslessNormalization != nil || rejected.PacketPayloadOrderStatus != "" || rejected.DecodedFrameSequenceStatus != "failed" || rejected.DecodedFrameTotalsStatus != "" || rejected.DecodedAudioTotalsStatus != "" || rejected.OutputTimestampStatus != "" || rejected.StrictDecodeStatus != "" {
+		return fmt.Errorf("rejected stream-copy status evidence differs")
+	}
+	if validateFingerprint(rejected.SourceFingerprint, false) != nil || validateFingerprint(rejected.OutputFingerprint, false) != nil || !lowerHex64(rejected.SourceFingerprint.DecodedVideoSHA256) || !lowerHex64(rejected.OutputFingerprint.DecodedVideoSHA256) || !sameCanonical([]MediaFingerprint{rejected.SourceFingerprint}, []MediaFingerprint{normalizedSource}) {
+		return fmt.Errorf("rejected stream-copy fingerprint evidence differs")
+	}
+	if compareFingerprints(rejected.SourceFingerprint, rejected.OutputFingerprint) == nil || validateDecodedEquivalentFingerprints(rejected.SourceFingerprint, rejected.OutputFingerprint) == nil {
+		return fmt.Errorf("stream-copy evidence does not prove both acceptance modes rejected it")
+	}
+	return nil
+}
+
+func probeLosslessVideoLayout(ctx context.Context, mediaPath string) (losslessVideoLayout, bool, error) {
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-show_entries", "stream=codec_type,width,height,pix_fmt,avg_frame_rate,r_frame_rate,sample_aspect_ratio,color_range,color_space,color_transfer,color_primaries,chroma_location,field_order:stream_side_data=side_data_type,rotation", "-of", "json", mediaPath)
+	stdout, err := process.cmd.StdoutPipe()
+	if err != nil {
+		return losslessVideoLayout{}, false, err
+	}
+	var stderr limitedOutput
+	process.cmd.Stderr = &stderr
+	if err := process.Start(); err != nil {
+		return losslessVideoLayout{}, false, err
+	}
+	out, readErr := io.ReadAll(io.LimitReader(stdout, mediaCommandOutputLimit+1))
+	tooLarge := len(out) > mediaCommandOutputLimit
+	if tooLarge || readErr != nil {
+		_ = process.Kill()
+	}
+	waitErr := process.Wait()
+	if readErr != nil {
+		return losslessVideoLayout{}, false, readErr
+	}
+	if tooLarge {
+		return losslessVideoLayout{}, false, fmt.Errorf("ffprobe lossless layout exceeds bounded output")
+	}
+	if waitErr != nil {
+		return losslessVideoLayout{}, false, fmt.Errorf("ffprobe lossless layout: %w (%s)", waitErr, stderr.String())
+	}
+	var payload struct {
+		Streams []struct {
+			CodecType         string `json:"codec_type"`
+			Width             int    `json:"width"`
+			Height            int    `json:"height"`
+			PixelFormat       string `json:"pix_fmt"`
+			AvgFrameRate      string `json:"avg_frame_rate"`
+			RFrameRate        string `json:"r_frame_rate"`
+			SampleAspectRatio string `json:"sample_aspect_ratio"`
+			ColorRange        string `json:"color_range"`
+			ColorSpace        string `json:"color_space"`
+			ColorTransfer     string `json:"color_transfer"`
+			ColorPrimaries    string `json:"color_primaries"`
+			ChromaLocation    string `json:"chroma_location"`
+			FieldOrder        string `json:"field_order"`
+			SideDataList      []struct {
+				SideDataType string `json:"side_data_type"`
+				Rotation     int    `json:"rotation"`
+			} `json:"side_data_list"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return losslessVideoLayout{}, false, err
+	}
+	var layout losslessVideoLayout
+	videoCount, hasAudio := 0, false
+	for _, stream := range payload.Streams {
+		switch stream.CodecType {
+		case "audio":
+			hasAudio = true
+		case "video":
+			videoCount++
+			if len(stream.SideDataList) != 0 {
+				return losslessVideoLayout{}, false, fmt.Errorf("lossless normalization does not support video side data")
+			}
+			rate := stream.AvgFrameRate
+			rat, ok := new(big.Rat).SetString(rate)
+			if !ok || rat.Sign() <= 0 {
+				rate = stream.RFrameRate
+				rat, ok = new(big.Rat).SetString(rate)
+			}
+			if !ok || rat.Sign() <= 0 || !rat.Num().IsInt64() || !rat.Denom().IsInt64() || stream.Width <= 0 || stream.Height <= 0 || strings.TrimSpace(stream.PixelFormat) == "" || strings.TrimSpace(stream.SampleAspectRatio) == "" {
+				return losslessVideoLayout{}, false, fmt.Errorf("invalid native video layout")
+			}
+			layout = losslessVideoLayout{Width: stream.Width, Height: stream.Height, PixelFormat: stream.PixelFormat, FrameRate: rat.RatString(), RateNum: rat.Num().Int64(), RateDen: rat.Denom().Int64(), SampleAspectRatio: stream.SampleAspectRatio, ColorRange: stream.ColorRange, ColorSpace: stream.ColorSpace, ColorTransfer: stream.ColorTransfer, ColorPrimaries: stream.ColorPrimaries, ChromaLocation: stream.ChromaLocation, FieldOrder: stream.FieldOrder}
+		}
+	}
+	if videoCount != 1 {
+		return losslessVideoLayout{}, false, fmt.Errorf("lossless normalization requires exactly one video stream")
+	}
+	return layout, hasAudio, nil
 }
 
 func copyAndVerifySingleton(ctx context.Context, source LocalSource, scratchDir string) (BuiltOutput, error) {
@@ -956,6 +1803,19 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 	if strictErr := compareFingerprints(expected, actual); strictErr != nil {
 		decodedVideoSHA, relaxedErr := compareDecodedEquivalent(ctx, sources, outputPath, expected, actual)
 		if relaxedErr != nil {
+			sourcePaths := make([]string, len(sources))
+			for i := range sources {
+				sourcePaths[i] = sources[i].Path
+			}
+			wantFrames, wantSHA, wantErr := decodedVideoSequenceIdentity(ctx, sourcePaths)
+			gotFrames, gotSHA, gotErr := decodedVideoSequenceIdentity(ctx, []string{outputPath})
+			wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
+			if wantErr != nil || gotErr != nil || wantVideo == nil || gotVideo == nil || wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || !lowerHex64(wantSHA) || !lowerHex64(gotSHA) {
+				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source=%v output=%v", wantErr, gotErr)
+			}
+			verification.SourceFingerprint.DecodedVideoSHA256 = wantSHA
+			verification.OutputFingerprint.DecodedVideoSHA256 = gotSHA
+			verification.DecodedFrameSequenceStatus = "failed"
 			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%v", strictErr, relaxedErr))
 		}
 		verification.AcceptanceMode = "decoded_frame_equivalent"

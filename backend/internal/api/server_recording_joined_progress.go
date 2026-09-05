@@ -15,7 +15,7 @@ type recordingJoinedProgress struct {
 	Percent          *int  `json:"joined_percent"`
 }
 
-const recordingJoinedReadyFromCandidateHoursSQL = `SELECT DISTINCT src.clip_id
+const recordingJoinedReadyFromCandidateHoursSQL = `SELECT DISTINCT ms.source_id,src.clip_id
 	FROM candidate_hours h
 	JOIN recording_joined_artifacts media
 	  ON media.hour_record_id=h.id
@@ -56,21 +56,24 @@ const recordingJoinedProgressSQL = `WITH requested AS (
 	SELECT DISTINCT id AS recording_id
 	FROM recordings
 	WHERE account_id=$1 AND status<>'canceled' AND id=ANY($2::bigint[])
-), ready_clip_ids AS (` + recordingJoinedReadyClipsSQL + `), source AS (
-	SELECT c.recording_id,
-		COALESCE(sum(EXTRACT(epoch FROM (c.clip_end_at-c.clip_start_at))*1000),0)::bigint AS duration_ms
-	FROM recording_clips c
-	JOIN requested req ON req.recording_id=c.recording_id
-	WHERE c.purged_at IS NULL AND c.recording_id=ANY($2::bigint[])
-	GROUP BY c.recording_id
+), frozen_sources AS MATERIALIZED (
+	SELECT DISTINCT ON (src.recording_id,src.clip_id)
+		src.id AS source_id,src.recording_id,src.clip_id,src.start_at,src.end_at
+	FROM recording_joined_sources src
+	JOIN requested req ON req.recording_id=src.recording_id
+	WHERE src.account_id=$1 AND src.recording_id=ANY($2::bigint[])
+	ORDER BY src.recording_id,src.clip_id,src.batch_record_id DESC,src.id DESC
+), ready_sources AS (` + recordingJoinedReadyClipsSQL + `), source AS (
+	SELECT src.recording_id,
+		COALESCE(sum(EXTRACT(epoch FROM (src.end_at-src.start_at))*1000),0)::bigint AS duration_ms
+	FROM frozen_sources src
+	GROUP BY src.recording_id
 ), ready AS (
-	SELECT c.recording_id,
-		COALESCE(sum(EXTRACT(epoch FROM (c.clip_end_at-c.clip_start_at))*1000),0)::bigint AS duration_ms
-	FROM recording_clips c
-	JOIN requested req ON req.recording_id=c.recording_id
-	JOIN ready_clip_ids ready_clip ON ready_clip.clip_id=c.id
-	WHERE c.purged_at IS NULL AND c.recording_id=ANY($2::bigint[])
-	GROUP BY c.recording_id
+	SELECT src.recording_id,
+		COALESCE(sum(EXTRACT(epoch FROM (src.end_at-src.start_at))*1000),0)::bigint AS duration_ms
+	FROM frozen_sources src
+	JOIN ready_sources ready_source ON ready_source.source_id=src.source_id
+	GROUP BY src.recording_id
 )
 SELECT req.recording_id,COALESCE(source.duration_ms,0),COALESCE(ready.duration_ms,0)
 FROM requested req
@@ -79,8 +82,11 @@ LEFT JOIN ready ON ready.recording_id=req.recording_id
 ORDER BY req.recording_id`
 
 // recordingJoinedProgressForAccount returns duration-based joined coverage for
-// the requested account-owned recordings. A mapped source counts only when its
-// specific media artifact and containing hour manifest are both published.
+// the requested account-owned recordings. Its denominator is the immutable
+// frozen source population selected for joining, not every raw clip ever
+// recorded. Repeated generations are deduplicated by clip ID. A mapped source
+// counts only when its specific media artifact and containing hour manifest are
+// both published.
 func (s *Server) recordingJoinedProgressForAccount(ctx context.Context, accountID int64, recordingIDs []int64) (map[int64]recordingJoinedProgress, error) {
 	out := make(map[int64]recordingJoinedProgress, len(recordingIDs))
 	if accountID <= 0 || len(recordingIDs) == 0 {
@@ -190,19 +196,28 @@ const recordingJoinedProgressBinsSQL = `WITH bins AS (
 	SELECT recording_id,bin_start,bin_end,ordinality
 	FROM unnest($1::bigint[],$2::timestamptz[],$3::timestamptz[])
 		WITH ORDINALITY b(recording_id,bin_start,bin_end,ordinality)
+), requested AS (
+	SELECT DISTINCT recording_id FROM bins
+), frozen_sources AS MATERIALIZED (
+	SELECT DISTINCT ON (src.recording_id,src.clip_id)
+		src.id AS source_id,src.recording_id,src.clip_id,src.start_at,src.end_at
+	FROM recording_joined_sources src
+	JOIN requested req ON req.recording_id=src.recording_id
+	WHERE src.account_id=$4
+	ORDER BY src.recording_id,src.clip_id,src.batch_record_id DESC,src.id DESC
 ), candidate_hours AS MATERIALIZED (
 	SELECT id,batch_record_id,account_id,recording_id
 	FROM recording_joined_hours
 	WHERE account_id=$4 AND recording_id=ANY($1::bigint[]) AND state='sealed'
 ), ready AS (` + recordingJoinedReadyFromCandidateHoursSQL + `)
 SELECT b.ordinality,
-	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000),0)::bigint,
-	COALESCE(sum(EXTRACT(epoch FROM (least(c.clip_end_at,b.bin_end)-greatest(c.clip_start_at,b.bin_start)))*1000)
-		FILTER (WHERE ready.clip_id IS NOT NULL),0)::bigint
+	COALESCE(sum(EXTRACT(epoch FROM (least(src.end_at,b.bin_end)-greatest(src.start_at,b.bin_start)))*1000),0)::bigint,
+	COALESCE(sum(EXTRACT(epoch FROM (least(src.end_at,b.bin_end)-greatest(src.start_at,b.bin_start)))*1000)
+		FILTER (WHERE ready.source_id IS NOT NULL),0)::bigint
 FROM bins b
-LEFT JOIN recording_clips c ON c.recording_id=b.recording_id AND c.purged_at IS NULL
-	AND c.clip_start_at<b.bin_end AND c.clip_end_at>b.bin_start
-LEFT JOIN ready ON ready.clip_id=c.id
+LEFT JOIN frozen_sources src ON src.recording_id=b.recording_id
+	AND src.start_at<b.bin_end AND src.end_at>b.bin_start
+LEFT JOIN ready ON ready.source_id=src.source_id
 GROUP BY b.ordinality
 ORDER BY b.ordinality`
 

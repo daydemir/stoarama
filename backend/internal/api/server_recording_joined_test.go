@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -429,6 +431,85 @@ func TestJoinedWorkerAuthIsShortLivedAndRouteScoped(t *testing.T) {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestJoinedWorkerBootstrapAuthAcceptsLegacyAndHashedHostTokens(t *testing.T) {
+	t.Parallel()
+	const legacy = "joined-bootstrap-credential-32bytes"
+	const hostToken = "dedicated-worker-token-32-bytes-0001"
+	hostDigest := sha256.Sum256([]byte(hostToken))
+	s := &Server{cfg: config.Config{
+		ServiceToken:                "generic-service-key",
+		JoinedWorkerBootstrapToken:  legacy,
+		JoinedWorkerBootstrapHashes: hex.EncodeToString(hostDigest[:]),
+		JoinedWorkerSigningKey:      "joined-signing-credential-32-bytes",
+	}, joinedCredentialCheck: func(context.Context) error { return nil }}
+	reached := false
+	handler := s.requireJoinedWorkerBootstrapAuth(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  int
+	}{
+		{name: "legacy", token: legacy, want: http.StatusNoContent},
+		{name: "dedicated host", token: hostToken, want: http.StatusNoContent},
+		{name: "unknown same length", token: "dedicated-worker-token-32-bytes-0002", want: http.StatusUnauthorized},
+		{name: "short token with matching format", token: "short", want: http.StatusUnauthorized},
+		{name: "service alias", token: "generic-service-key", want: http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reached = false
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.want || reached != (tc.want == http.StatusNoContent) {
+				t.Fatalf("status=%d reached=%v", rec.Code, reached)
+			}
+		})
+	}
+}
+
+func TestJoinedWorkerBootstrapAuthRejectsMalformedDigestConfig(t *testing.T) {
+	t.Parallel()
+	s := &Server{cfg: config.Config{
+		JoinedWorkerBootstrapToken:  "joined-bootstrap-credential-32bytes",
+		JoinedWorkerBootstrapHashes: "not-a-sha256",
+		JoinedWorkerSigningKey:      "joined-signing-credential-32-bytes",
+	}, joinedCredentialCheck: func(context.Context) error { return nil }}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/recording/joined/token", nil)
+	req.Header.Set("Authorization", "Bearer joined-bootstrap-credential-32bytes")
+	rec := httptest.NewRecorder()
+	s.requireJoinedWorkerBootstrapAuth(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("malformed digest configuration reached handler")
+	})).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d", rec.Code)
+	}
+}
+
+func TestJoinedWorkerAuthorityIncludesHostHashesForStorageIsolation(t *testing.T) {
+	t.Parallel()
+	const hostToken = "dedicated-worker-token-32-bytes-0001"
+	hostDigest := sha256.Sum256([]byte(hostToken))
+	s := &Server{cfg: config.Config{
+		JoinedWorkerBootstrapToken:  "joined-bootstrap-credential-32bytes",
+		JoinedWorkerBootstrapHashes: hex.EncodeToString(hostDigest[:]),
+		JoinedWorkerSigningKey:      "joined-signing-credential-32-bytes",
+	}}
+	authority, err := s.joinedWorkerAuthorityDigests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !credentialDigestMatches("  "+hostToken+"  ", authority) {
+		t.Fatal("host-local bootstrap token was absent from storage credential isolation")
+	}
+	if credentialDigestMatches("unrelated-storage-secret", authority) {
+		t.Fatal("unrelated storage credential aliased joined worker authority")
 	}
 }
 

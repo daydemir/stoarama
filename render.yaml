@@ -163,7 +163,7 @@ services:
       - key: JOINED_RECORDING_PROTOCOL_GENERATION
         value: "7"
       - key: JOINED_RECORDING_MAX_ACTIVE_TASKS
-        value: "3"
+        value: "12"
       - key: STOARAMA_JOINED_WORK_SCOPE
         value: frozen_batch
       - key: JOINED_RECORDING_BATCH_ID
@@ -173,6 +173,8 @@ services:
       - key: JOINED_RECORDING_FROZEN_EXCLUDED_PUBLICATION_ARTIFACT_IDS
         sync: false
       - key: JOINED_WORKER_BOOTSTRAP_TOKEN
+        sync: false
+      - key: JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST
         sync: false
       - key: JOINED_WORKER_SIGNING_KEY
         sync: false

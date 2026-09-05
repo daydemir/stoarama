@@ -15,6 +15,28 @@ permissions:
   contents: read
 
 jobs:
+  joined-folder-zip-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/joined-folder-zip
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: workers/joined-folder-zip/package-lock.json
+      - run: npm ci
+      - run: npm run types
+      - run: npm test
+      - run: npm run typecheck
+      - run: npx wrangler types --check
+      - run: npm audit
+      - run: npm run dry-run
+
   backend:
     runs-on: ubuntu-latest
     services:
@@ -94,12 +116,20 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/db -run TestRecordingQualificationMigrationFreezesCompleteCohort -count=1
+      - name: Test recording folder API parity and baseline independence
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^(TestSharedRecordingsExposeTypedNamingWithAuthenticatedParity|TestRecordingListBaselineDoesNotWaitForMetricTables|TestRecordingDetailTimelineEnrichmentDoesNotWaitForClipMetrics|TestRecordingListEnrichmentScopesAVisibleBatchWithoutScanningTheWholeList|TestRecordingDetailAndCSVRetainExactClipMetrics)$' -count=1 -v
+      - name: Test joined progress batch scope and public parity
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation$' -count=1 -v
       - name: Install system FFmpeg for NAS tests
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Install pinned FFmpeg for joined lifecycle tests
         env:
-          JOINED_RECORDING_FFMPEG_ARCHIVE_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz
-          JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256: b2ad9015c296a61c1f6127c4aa3ce8614a9bd8d7519987b6e0d151edaa7f39fb
+          JOINED_RECORDING_FFMPEG_ARCHIVE_URL: https://github.com/daydemir/stoarama/releases/download/joined-media-tools-ffmpeg-N-126239-g88ae625e69/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz
+          JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256: b7d2cf59ccb19372f6ee0198a938ccc1b6654d8704d056f8c72b82fda30af34f
           JOINED_RECORDING_FFMPEG_BINARY_SHA256: eab722b24d599876819f89f503cc142b39a096a971d7d7913a0282b0484b9d5e
           JOINED_RECORDING_FFPROBE_BINARY_SHA256: 95cda0f6de6e2d0c48cc2afe24e8ef9bcb8b4ffc5897af77158b1a59b303a97a
         run: bash ./scripts/install-pinned-media-tools.sh
@@ -118,11 +148,7 @@ jobs:
       - name: Test joined recording browser provenance, isolation, and query plan
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run '^(TestRecordingJoinedProgressUsesExactPublishedMediaProvenance|TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes|TestRecordingJoinedBrowserAuthPublicParityAndIsolation|TestRecordingJoinedDownloadSupportsUnversionedExactRange|TestJoinedBrowserIndexMigrationIsTransactionalAndRejectsWrongPrecreate|TestJoinedFolderIsSameOriginScopedAndRedacted|TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials)$' -count=1 -v
-      - name: Test recording folder API parity and baseline independence
-        env:
-          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run '^(TestSharedRecordingsExposeTypedNamingWithAuthenticatedParity|TestRecordingListBaselineDoesNotWaitForMetricTables)$' -count=1 -v
+        run: go test ./internal/api -run '^(TestRecordingJoinedProgressUsesExactPublishedMediaProvenance|TestRecordingJoinedProgressExplainAnalyzeUsesBoundedIndexes|TestRecordingJoinedBrowserAuthPublicParityAndIsolation|TestRecordingJoinedDownloadSupportsUnversionedExactRange|TestJoinedBrowserIndexMigrationIsTransactionalAndRejectsWrongPrecreate|TestJoinedFolderIsSameOriginScopedAndRedacted|TestJoinedFolderRootListsCanonicalFoldersWithoutStorageAuthority|TestPublicJoinedBrowserRoutesEndToEndWithoutR2Credentials|TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia)$' -count=1 -v
       - name: Test capture-health joined-metric isolation
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -175,6 +201,9 @@ jobs:
         run: go test ./...
       - name: Test recordings detail browser resilience
         run: node --test web/recordings_resilience_test.mjs
+      - name: Test exact-commit worker artifact workflow
+        working-directory: .
+        run: python3 backend/scripts/test_worker_artifact_workflow.py
       - name: Test NAS pull client
         working-directory: .
         run: python3 -m unittest -q clients/nas-pull/test_stoarama_pull.py

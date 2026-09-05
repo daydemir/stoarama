@@ -41,7 +41,7 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY);
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE recording_clips (
-		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
+		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,recording_job_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
 		  video_codec TEXT,audio_codec TEXT,audio_present BOOLEAN,video_width INTEGER,video_height INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_window_health (
 		  recording_id BIGINT NOT NULL,job_id BIGINT NOT NULL,window_start_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ NOT NULL,
@@ -61,17 +61,19 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	start := now.Add(-2 * time.Hour)
-	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (402)`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (402),(403)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2)`, start, start.Add(time.Hour)); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2),(2,402,'clip',$1,$2)`, start, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recording_clips VALUES
-		  (1,402,$1,$1::timestamptz+interval '20 minutes','h264','aac',true,1280,720),
-		  (2,402,$1::timestamptz+interval '30 minutes',$2,'h264','',false,1280,720)
-	`, start, start.Add(time.Hour)); err != nil {
+		  (1,402,1,$1,$1::timestamptz+interval '20 minutes','h264','aac',true,1280,720,$3),
+		  (3,402,2,$1::timestamptz+interval '20 minutes',$1::timestamptz+interval '30 minutes','h264','aac',true,1280,720,$3),
+		  (6,403,1,$1::timestamptz+interval '20 minutes',$1::timestamptz+interval '30 minutes','h264','aac',true,3840,2160,$3),
+		  (2,402,1,$1::timestamptz+interval '30 minutes',$2,'h264','',false,1280,720,$3)
+	`, start, start.Add(time.Hour), now.Add(-time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := materializeRecordingWindowHealth(ctx, pool, now); err != nil {
@@ -80,7 +82,8 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	var coverage, largestGap float64
 	var gaps, gapsOver30s, gapsOver5m, overlaps, layouts, clips int
 	var metricVersion int
-	if err := pool.QueryRow(ctx, `SELECT coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,layout_change_count,clip_count,metric_version FROM recording_window_health WHERE recording_id=402`).Scan(&coverage, &largestGap, &gaps, &gapsOver30s, &gapsOver5m, &overlaps, &layouts, &clips, &metricVersion); err != nil {
+	var calculatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,layout_change_count,clip_count,metric_version,calculated_at FROM recording_window_health WHERE recording_id=402`).Scan(&coverage, &largestGap, &gaps, &gapsOver30s, &gapsOver5m, &overlaps, &layouts, &clips, &metricVersion, &calculatedAt); err != nil {
 		t.Fatal(err)
 	}
 	if coverage < 83.32 || coverage > 83.34 || largestGap != 600 || gaps != 1 || gapsOver30s != 1 || gapsOver5m != 1 || overlaps != 0 || layouts != 1 || clips != 2 || metricVersion != recordingWindowMetricVersion {
@@ -94,6 +97,35 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	}
 	if recentCoverage != coverage || lifetimeCoverage != coverage || recentWindows != 1 || lifetimeWindows != 1 || expectedWindows != 1 || !complete {
 		t.Fatalf("summary recent=%f lifetime=%f windows=%d/%d expected=%d complete=%t", recentCoverage, lifetimeCoverage, recentWindows, lifetimeWindows, expectedWindows, complete)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips VALUES
+		  (4,402,2,$1,$1::timestamptz+interval '5 minutes','h264','aac',true,1920,1080,$2),
+		  (7,403,1,$1,$1::timestamptz+interval '5 minutes','h264','aac',true,3840,2160,$2)
+	`, start, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := materializeRecordingWindowHealth(ctx, pool, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT calculated_at FROM recording_window_health WHERE recording_id=402`).Scan(&calculatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !calculatedAt.Equal(now) {
+		t.Fatalf("neighboring sampled job recalculated continuous health at %s", calculatedAt)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES (5,402,1,$1::timestamptz+interval '20 minutes',$1::timestamptz+interval '30 minutes','h264','aac',true,1280,720,$2)`, start, now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	refreshedAt := now.Add(4 * time.Minute)
+	if err := materializeRecordingWindowHealth(ctx, pool, refreshedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT coverage_pct,largest_gap_seconds,gap_count,overlap_count,layout_change_count,clip_count,calculated_at FROM recording_window_health WHERE recording_id=402`).Scan(&coverage, &largestGap, &gaps, &overlaps, &layouts, &clips, &calculatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if coverage != 100 || largestGap != 0 || gaps != 0 || overlaps != 0 || layouts != 1 || clips != 3 || !calculatedAt.Equal(refreshedAt) {
+		t.Fatalf("late canonical clip coverage=%f gap=%f gaps=%d overlaps=%d layouts=%d clips=%d calculated=%s", coverage, largestGap, gaps, overlaps, layouts, clips, calculatedAt)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id=1`); err != nil {
 		t.Fatal(err)

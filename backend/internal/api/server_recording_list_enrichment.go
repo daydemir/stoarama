@@ -17,7 +17,9 @@ import (
 
 const (
 	recordingListEnrichmentTimeout = 5 * time.Second
-	recordingJoinedProgressTimeout = 8 * time.Second
+	// A cold indexed joined batch can take 15 seconds; let it finish once instead
+	// of timing out at 8 seconds and starting the same work again.
+	recordingJoinedProgressTimeout = 20 * time.Second
 	recordingEnrichmentCacheTTL    = 30 * time.Second
 	recordingProgressCacheTTL      = 60 * time.Second
 	recordingHealthPageCacheTTL    = 30 * time.Second
@@ -57,9 +59,12 @@ type recordingListEnrichmentResult struct {
 }
 
 type recordingListEnrichmentItem struct {
-	RecordingID       int64                    `json:"recording_id"`
-	CaptureHealthBins []recordingHealthBin     `json:"capture_health_bins"`
-	TimelineHealth    *recordingTimelineHealth `json:"timeline_health"`
+	RecordingID       int64                        `json:"recording_id"`
+	CaptureHealthBins []recordingHealthBin         `json:"capture_health_bins"`
+	TimelineHealth    *recordingTimelineHealth     `json:"timeline_health"`
+	CapturedClipCount *int64                       `json:"captured_clip_count,omitempty"`
+	ExpectedClipCount *int64                       `json:"expected_clip_count,omitempty"`
+	CaptureHealth     *recordingCaptureHealthState `json:"capture_health,omitempty"`
 }
 
 type recordingJoinedProgressItem struct {
@@ -128,6 +133,17 @@ func recordingMetricScopeSignature(ids []int64) string {
 	return scope.String()
 }
 
+func recordingListCaptureMetrics(bins []recordingHealthBin) (int64, int64, recordingCaptureHealthState) {
+	// Keep the summary and the graph on one bounded snapshot: both describe the
+	// same twelve most-recent scheduled bins loaded by this enrichment request.
+	var captured, expected int64
+	for _, bin := range bins {
+		captured += bin.Captured
+		expected += bin.Expected
+	}
+	return captured, expected, recordingCaptureHealth("active", captured, expected)
+}
+
 func (s *Server) recordingMetricWorkSlots() chan struct{} {
 	s.recordingMetricSlotsMu.Lock()
 	defer s.recordingMetricSlotsMu.Unlock()
@@ -144,6 +160,15 @@ func (s *Server) recordingMetricHeavyWorkSlots() chan struct{} {
 		s.recordingHeavySlots = make(chan struct{}, recordingMetricConcurrency-1)
 	}
 	return s.recordingHeavySlots
+}
+
+func (s *Server) recordingEnrichmentHeavyWorkSlots() chan struct{} {
+	s.recordingMetricSlotsMu.Lock()
+	defer s.recordingMetricSlotsMu.Unlock()
+	if s.recordingEnrichmentSlots == nil {
+		s.recordingEnrichmentSlots = make(chan struct{}, recordingMetricConcurrency-1)
+	}
+	return s.recordingEnrichmentSlots
 }
 
 // loadRecordingMetricCached collapses identical requests and admits at most two
@@ -398,7 +423,7 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 	key := recordingMetricCacheKey{AccountID: accountID, RecordingID: recordingID, Shared: shared, Scope: scope}
 	var classSlots chan struct{}
 	if !timelineOnly {
-		classSlots = s.recordingMetricHeavyWorkSlots()
+		classSlots = s.recordingEnrichmentHeavyWorkSlots()
 	}
 	result, err := loadRecordingMetricCachedWithClass(ctx, &s.recordingEnrichmentCache, key, recordingListEnrichmentTimeout, recordingEnrichmentCacheTTL, recordingMetricFailureTTL, classSlots, s.recordingMetricWorkSlots(), func(loadCtx context.Context) (recordingListEnrichmentResult, error) {
 		if timelineOnly {
@@ -433,6 +458,12 @@ func (s *Server) handleRecordingListEnrichment(w http.ResponseWriter, r *http.Re
 		if health, ok := result.Timeline[id]; ok {
 			item.TimelineHealth = &health
 		}
+		if !timelineOnly {
+			captured, expected, health := recordingListCaptureMetrics(bins)
+			item.CapturedClipCount = &captured
+			item.ExpectedClipCount = &expected
+			item.CaptureHealth = &health
+		}
 		items = append(items, item)
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
@@ -458,9 +489,23 @@ func (s *Server) handleRecordingJoinedProgress(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	selectedIDs, err := requestedRecordingEnrichmentIDs(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if recordingID > 0 && len(selectedIDs) > 0 {
+		util.WriteError(w, http.StatusBadRequest, "recording_id and recording_ids cannot be combined")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), recordingJoinedProgressTimeout)
 	defer cancel()
-	ids, err := s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
+	var ids []int64
+	if len(selectedIDs) > 0 {
+		ids, err = s.recordingMetricSelectedIDs(ctx, accountID, selectedIDs, shared)
+	} else {
+		ids, err = s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
+	}
 	if err != nil {
 		writeRecordingMetricError(w, err, "load joined progress")
 		return

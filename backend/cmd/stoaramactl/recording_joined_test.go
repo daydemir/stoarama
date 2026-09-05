@@ -306,7 +306,8 @@ func TestJoinedAdmissionParsingIsBounded(t *testing.T) {
 	if req, err := parseJoinedAdmission(cfg, []string{"drain", "--timeout-sec", "60"}); err != nil || req.Action != "drain" || req.Timeout != time.Minute {
 		t.Fatalf("parse drain req=%+v err=%v", req, err)
 	}
-	for _, args := range [][]string{{"drain", "--timeout-sec", "0"}, {"drain", "--timeout-sec", "7201"}, {"unknown"}} {
+	overLimit := fmt.Sprintf("%d", int(joinedWorkerTaskLimit/time.Second)+1)
+	for _, args := range [][]string{{"drain", "--timeout-sec", "0"}, {"drain", "--timeout-sec", overLimit}, {"unknown"}} {
 		if _, err := parseJoinedAdmission(cfg, args); err == nil {
 			t.Fatalf("unsafe admission args accepted: %v", args)
 		}

@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stoarama-joined-folder-zip",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 }
+  },
+  "limits": {
+    "cpu_ms": 300000,
+    "subrequests": 10000
+  },
+  "secrets": {
+    "required": ["BACKEND_WORKER_TOKEN"]
+  },
+  "r2_buckets": [
+    { "binding": "JOINED", "bucket_name": "stoarama" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ARCHIVE_LIMITER", "class_name": "ArchiveLimiter" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ArchiveLimiter"] }
+  ],
+  "vars": {
+    "BACKEND_MANIFEST_URL": "https://stoarama.com/api/v1/recording/joined/archive/manifest"
+  }
+}

@@ -176,6 +176,23 @@ func TestStreakPriorityPostgresExpectedWindowFailuresAndTenantWall(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var otherJobID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind) VALUES($1,$2,$2,60,'done','streak-other-job','clip') RETURNING id`, recID, open).Scan(&otherJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,(SELECT id FROM storage_destinations WHERE account_id=$3 LIMIT 1),'https://s3.example.test','streak','other-job-late',1,$4::timestamptz,$4::timestamptz,$4::timestamptz+interval '1 minute',$5::timestamptz)`, recID, otherJobID, accountID, open, open.Add(12*time.Hour+2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	out = call()
+	mine = nil
+	for i := range out.Items {
+		if out.Items[i].RecordingID == recID {
+			mine = &out.Items[i]
+		}
+	}
+	if mine == nil || mine.CurrentStreak != 1 || mine.RecentWindows[0].Grade != "GREAT_CANDIDATE" {
+		t.Fatalf("other-job late clip contaminated streak: %+v", mine)
+	}
 	_, err = pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at) VALUES($1,$2,(SELECT id FROM storage_destinations WHERE account_id=$3 LIMIT 1),'https://s3.example.test','streak','late',1,$4::timestamptz,$4::timestamptz,$4::timestamptz+interval '1 minute',$5::timestamptz)`, recID, jobID, accountID, open, open.Add(12*time.Hour+2*time.Minute))
 	if err != nil {
 		t.Fatal(err)

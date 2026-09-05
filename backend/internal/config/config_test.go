@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -126,6 +128,64 @@ func TestValidateJoinedCredentialsFailStartupOnAliasOrPartialConfig(t *testing.T
 	}
 }
 
+func TestJoinedWorkerBootstrapSHA256AllowlistFailsClosed(t *testing.T) {
+	t.Parallel()
+	const bootstrap = "joined-bootstrap-credential-32bytes"
+	const signing = "joined-signing-credential-32-bytes"
+	workerDigest := sha256.Sum256([]byte("dedicated-worker-token-32-bytes-0001"))
+	valid := Config{
+		JoinedWorkerBootstrapToken:  bootstrap,
+		JoinedWorkerBootstrapHashes: hex.EncodeToString(workerDigest[:]),
+		JoinedWorkerSigningKey:      signing,
+		JoinedOperatorToken:         "joined-operator-token-32-bytes-0001",
+	}
+	if err := valid.ValidateJoined(); err != nil {
+		t.Fatalf("valid joined worker digest allowlist: %v", err)
+	}
+	digests, err := valid.JoinedWorkerBootstrapSHA256s()
+	if err != nil || len(digests) != 1 || digests[0] != workerDigest {
+		t.Fatalf("parsed worker digests=%x err=%v", digests, err)
+	}
+
+	protected := sha256.Sum256([]byte(signing))
+	for _, raw := range []string{
+		"abc",
+		strings.Repeat("A", sha256.Size*2),
+		" " + hex.EncodeToString(workerDigest[:]),
+		hex.EncodeToString(workerDigest[:]) + ", " + strings.Repeat("a", sha256.Size*2),
+		hex.EncodeToString(workerDigest[:]) + "," + hex.EncodeToString(workerDigest[:]),
+		hex.EncodeToString(protected[:]),
+		strings.Repeat("a", sha256.Size*2) + ",",
+		strings.Repeat("a", sha256.Size*2+1),
+		strings.TrimSuffix(strings.Repeat(strings.Repeat("a", sha256.Size*2)+",", 65), ","),
+	} {
+		candidate := valid
+		candidate.JoinedWorkerBootstrapHashes = raw
+		if err := candidate.ValidateJoined(); err == nil {
+			t.Fatalf("unsafe joined worker digest allowlist accepted: %q", raw)
+		}
+	}
+
+	for name, credential := range map[string]string{
+		"legacy bootstrap": bootstrap,
+		"service":          "generic-service-key",
+		"operator":         "joined-operator-token-32-bytes-0001",
+		"storage":          "joined-storage-token-32-bytes-0001",
+	} {
+		t.Run("protected "+name, func(t *testing.T) {
+			candidate := valid
+			candidate.ServiceToken = "generic-service-key"
+			candidate.JoinedOperatorToken = "joined-operator-token-32-bytes-0001"
+			candidate.R2SecretAccessKey = "joined-storage-token-32-bytes-0001"
+			digest := sha256.Sum256([]byte(credential))
+			candidate.JoinedWorkerBootstrapHashes = hex.EncodeToString(digest[:])
+			if err := candidate.ValidateJoined(); err == nil {
+				t.Fatalf("%s credential hash accepted as joined worker authority", name)
+			}
+		})
+	}
+}
+
 func TestRenderServicesDeclareIdenticalStripeVariables(t *testing.T) {
 	renderPath := filepath.Join("..", "..", "..", "render.yaml")
 	data, err := os.ReadFile(renderPath)
@@ -209,6 +269,7 @@ func TestJoinedRecordingDefaultsShipDark(t *testing.T) {
 		"JOINED_RECORDING_FFPROBE_BINARY_SHA256",
 		"STOARAMA_JOINED_WORKER_TOKEN",
 		"JOINED_WORKER_BOOTSTRAP_TOKEN",
+		"JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST",
 		"JOINED_WORKER_SIGNING_KEY",
 		"STOARAMA_JOINED_OPERATOR_TOKEN",
 	} {
@@ -574,16 +635,37 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"1\"",
 		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"13\"",
 		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"7\"",
-		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"3\"",
+		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"12\"",
 		"key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch",
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
 		"key: JOINED_RECORDING_CANARY_HOUR_IDS\n        sync: false",
 		"key: JOINED_WORKER_BOOTSTRAP_TOKEN\n        sync: false",
+		"key: JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST\n        sync: false",
 		"key: JOINED_WORKER_SIGNING_KEY\n        sync: false",
 	} {
 		if !strings.Contains(section, required) {
 			t.Fatalf("joined API missing %q", required)
 		}
+	}
+	nonsecretValue := regexp.MustCompile(`(?m)^      - key: (JOINED_RECORDING_[A-Z0-9_]+|STOARAMA_JOINED_WORK_SCOPE)\n        value: "?([^"\n]+)"?$`)
+	got := map[string]string{}
+	for _, match := range nonsecretValue.FindAllStringSubmatch(section, -1) {
+		if _, duplicate := got[match[1]]; duplicate {
+			t.Fatalf("joined API duplicates nonsecret control-plane value %q", match[1])
+		}
+		got[match[1]] = match[2]
+	}
+	want := map[string]string{
+		"JOINED_RECORDING_CONTROL_PLANE_ENABLED": "true",
+		"JOINED_RECORDING_NAS_DELIVERY_ENABLED":  "false",
+		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
+		"JOINED_RECORDING_CONNECTION_ID":         "13",
+		"JOINED_RECORDING_PROTOCOL_GENERATION":   "7",
+		"JOINED_RECORDING_MAX_ACTIVE_TASKS":      "12",
+		"STOARAMA_JOINED_WORK_SCOPE":             "frozen_batch",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("joined API nonsecret control-plane values=%v want=%v", got, want)
 	}
 	if strings.Contains(section, "key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"true\"") {
 		t.Fatal("joined NAS delivery was enabled in source configuration")
@@ -783,5 +865,33 @@ func TestMITSharedRecordingsSlugMustBeURLSafe(t *testing.T) {
 	t.Setenv("MIT_SCL_RECORDINGS_READ_SLUG", "MIT SCL")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load succeeded with an invalid shared recordings slug")
+	}
+}
+
+func TestJoinedArchiveConfigurationIsShipDarkAndCredentialIsolated(t *testing.T) {
+	if err := (Config{}).ValidateJoined(); err != nil {
+		t.Fatalf("empty archive configuration must stay ship-dark: %v", err)
+	}
+	valid := Config{
+		JoinedArchiveWorkerURL:     "https://joined-download.example.test",
+		JoinedArchiveCapabilityKey: "archive-capability-key-at-least-32-bytes",
+		JoinedArchiveWorkerToken:   "archive-worker-token-at-least-32-bytes",
+	}
+	if err := valid.ValidateJoined(); err != nil {
+		t.Fatalf("valid archive configuration: %v", err)
+	}
+	invalid := []Config{
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL},
+		{JoinedArchiveWorkerURL: "http://joined-download.example.test", JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken},
+		{JoinedArchiveWorkerURL: "https://joined-download.example.test/base", JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveCapabilityKey},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken, ServiceToken: valid.JoinedArchiveWorkerToken},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken, JoinedRecordingWorkerToken: valid.JoinedArchiveCapabilityKey},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken, JoinedOperatorToken: valid.JoinedArchiveWorkerToken},
+	}
+	for index, candidate := range invalid {
+		if err := candidate.ValidateJoined(); err == nil {
+			t.Fatalf("invalid archive configuration %d accepted", index)
+		}
 	}
 }

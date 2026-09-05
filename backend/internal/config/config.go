@@ -2,6 +2,8 @@ package config
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"net/url"
@@ -22,7 +24,11 @@ type Config struct {
 	APIToken                         string
 	ServiceToken                     string
 	JoinedWorkerBootstrapToken       string
+	JoinedWorkerBootstrapHashes      string
 	JoinedWorkerSigningKey           string
+	JoinedArchiveWorkerURL           string
+	JoinedArchiveCapabilityKey       string
+	JoinedArchiveWorkerToken         string
 	JoinedOperatorToken              string
 	BootstrapAdminEmail              string
 	MigrationDir                     string
@@ -197,7 +203,11 @@ func Load() (Config, error) {
 		APIToken:                         firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		ServiceToken:                     firstNonEmpty(os.Getenv("SERVICE_TOKEN"), os.Getenv("API_TOKEN")),
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
+		JoinedWorkerBootstrapHashes:      os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST"),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
+		JoinedArchiveWorkerURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_WORKER_URL")), "/"),
+		JoinedArchiveCapabilityKey:       strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_CAPABILITY_KEY")),
+		JoinedArchiveWorkerToken:         strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_WORKER_TOKEN")),
 		JoinedOperatorToken:              strings.TrimSpace(os.Getenv("STOARAMA_JOINED_OPERATOR_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
@@ -396,7 +406,32 @@ func (c Config) ValidateAPI() error {
 }
 
 func (c Config) ValidateJoined() error {
+	archiveURL := strings.TrimSpace(c.JoinedArchiveWorkerURL)
+	archiveCapability := strings.TrimSpace(c.JoinedArchiveCapabilityKey)
+	archiveWorker := strings.TrimSpace(c.JoinedArchiveWorkerToken)
+	configuredArchiveValues := 0
+	for _, value := range []string{archiveURL, archiveCapability, archiveWorker} {
+		if value != "" {
+			configuredArchiveValues++
+		}
+	}
+	if configuredArchiveValues != 0 && configuredArchiveValues != 3 {
+		return fmt.Errorf("JOINED_ARCHIVE_WORKER_URL, JOINED_ARCHIVE_CAPABILITY_KEY, and JOINED_ARCHIVE_WORKER_TOKEN must be configured together")
+	}
+	if configuredArchiveValues == 3 {
+		worker, err := url.Parse(archiveURL)
+		if err != nil || worker.Scheme != "https" || worker.Host == "" || worker.User != nil || (worker.Path != "" && worker.Path != "/") || worker.RawQuery != "" || worker.Fragment != "" {
+			return fmt.Errorf("JOINED_ARCHIVE_WORKER_URL must be an HTTPS origin without a path, credentials, query, or fragment")
+		}
+		if len(archiveCapability) < 32 || len(archiveWorker) < 32 || archiveCapability == archiveWorker {
+			return fmt.Errorf("joined archive credentials must be distinct and at least 32 bytes")
+		}
+	}
 	bootstrap := strings.TrimSpace(c.JoinedWorkerBootstrapToken)
+	bootstrapSHA256s, err := c.JoinedWorkerBootstrapSHA256s()
+	if err != nil {
+		return err
+	}
 	signing := strings.TrimSpace(c.JoinedWorkerSigningKey)
 	operator := strings.TrimSpace(c.JoinedOperatorToken)
 	service := strings.TrimSpace(c.ServiceToken)
@@ -405,7 +440,17 @@ func (c Config) ValidateJoined() error {
 	if databaseConfig, err := pgx.ParseConfig(strings.TrimSpace(c.DatabaseURL)); err == nil {
 		protected = append(protected, databaseConfig.Password)
 	}
-	if bootstrap != "" || signing != "" || c.JoinedRecordingControlPlaneEnabled {
+	if configuredArchiveValues == 3 {
+		archiveProtected := append(append([]string(nil), protected...), operator, strings.TrimSpace(c.JoinedRecordingWorkerToken))
+		for _, credential := range archiveProtected {
+			credential = strings.TrimSpace(credential)
+			if credential != "" && (archiveCapability == credential || archiveWorker == credential) {
+				return fmt.Errorf("joined archive credentials must differ from service, database, storage, operator, and recording worker credentials")
+			}
+		}
+		protected = append(protected, archiveCapability, archiveWorker)
+	}
+	if bootstrap != "" || signing != "" || len(bootstrapSHA256s) > 0 || c.JoinedRecordingControlPlaneEnabled {
 		if bootstrap == "" || signing == "" {
 			return fmt.Errorf("joined recording requires distinct JOINED_WORKER_BOOTSTRAP_TOKEN and JOINED_WORKER_SIGNING_KEY")
 		}
@@ -419,6 +464,19 @@ func (c Config) ValidateJoined() error {
 			protected = strings.TrimSpace(protected)
 			if protected != "" && (bootstrap == protected || signing == protected) {
 				return fmt.Errorf("joined worker credentials must differ from service, database, and storage credentials")
+			}
+		}
+		hashProtected := append(append([]string(nil), protected...), bootstrap, signing, operator, strings.TrimSpace(c.JoinedRecordingWorkerToken))
+		for _, digest := range bootstrapSHA256s {
+			for _, credential := range hashProtected {
+				credential = strings.TrimSpace(credential)
+				if credential == "" {
+					continue
+				}
+				candidate := sha256.Sum256([]byte(credential))
+				if subtle.ConstantTimeCompare(digest[:], candidate[:]) == 1 {
+					return fmt.Errorf("joined worker bootstrap token hashes must differ from backend, storage, signing, operator, and legacy worker credentials")
+				}
 			}
 		}
 	}
@@ -468,6 +526,38 @@ func (c Config) ValidateJoined() error {
 		return fmt.Errorf("JOINED_RECORDING_NAS_DELIVERY_ENABLED requires JOINED_RECORDING_CONTROL_PLANE_ENABLED=true")
 	}
 	return nil
+}
+
+// JoinedWorkerBootstrapSHA256s parses hashes of host-local bootstrap tokens.
+// Tokens themselves never need to leave their worker hosts.
+func (c Config) JoinedWorkerBootstrapSHA256s() ([][sha256.Size]byte, error) {
+	raw := c.JoinedWorkerBootstrapHashes
+	if raw == "" {
+		return nil, nil
+	}
+	items := strings.Split(raw, ",")
+	if len(items) > 64 {
+		return nil, fmt.Errorf("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST must contain at most 64 hashes")
+	}
+	digests := make([][sha256.Size]byte, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == "" || item != strings.TrimSpace(item) || !validLowerSHA256(item) {
+			return nil, fmt.Errorf("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST must contain comma-separated lowercase SHA-256 hashes")
+		}
+		if _, duplicate := seen[item]; duplicate {
+			return nil, fmt.Errorf("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST must not contain duplicate hashes")
+		}
+		decoded, err := hex.DecodeString(item)
+		if err != nil || len(decoded) != sha256.Size {
+			return nil, fmt.Errorf("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST must contain comma-separated lowercase SHA-256 hashes")
+		}
+		var digest [sha256.Size]byte
+		copy(digest[:], decoded)
+		digests = append(digests, digest)
+		seen[item] = struct{}{}
+	}
+	return digests, nil
 }
 
 // JoinedFrozenExcludedPublicationArtifactIDs returns the exact legacy deny

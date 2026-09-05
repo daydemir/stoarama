@@ -2,12 +2,18 @@ package joinedrecording
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
 
 type PreflightSourceCapability func(context.Context, PreflightHourClaim, SourceClip, string) (SourceReadCapability, error)
 type SealPreflightHour func(context.Context, PreflightHourClaim, SealHourRequest) (WorkerClaim, error)
+
+var (
+	ErrPreflightSealRequestInvalid   = errors.New("preflight seal request invalid")
+	ErrPreflightLeaseEndedBeforeSeal = errors.New("preflight lease ended before seal")
+)
 
 // RunPreflightHourRenewing owns the complete source-only lease lifecycle. It
 // heartbeats while downloading, inspecting, building, and verifying, then
@@ -97,12 +103,21 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 			return err
 		}
 		quarantine := quarantineEvidenceFromBuilds(append(initialQuarantines, preflight.Quarantines...))
-		sealRequest := sealHourRequest(claim, plan, preflight.Built, quarantine)
+		sealRequest, err := sealHourRequest(claim, plan, preflight.Built, quarantine)
+		if err != nil {
+			emitStageTiming(workCtx, "build_verify", time.Since(stageStarted), err)
+			return err
+		}
 		emitStageTiming(workCtx, "build_verify", time.Since(stageStarted), nil)
 		stageStarted = time.Now()
 		currentClaim, err := fresh()
-		if err != nil || workCtx.Err() != nil {
-			err = fmt.Errorf("preflight lease ended before seal")
+		if err != nil {
+			err = fmt.Errorf("%w: %v", ErrPreflightLeaseEndedBeforeSeal, err)
+			emitStageTiming(workCtx, "seal", time.Since(stageStarted), err)
+			return err
+		}
+		if contextErr := workCtx.Err(); contextErr != nil {
+			err = fmt.Errorf("%w: %w", ErrPreflightLeaseEndedBeforeSeal, contextErr)
 			emitStageTiming(workCtx, "seal", time.Since(stageStarted), err)
 			return err
 		}
@@ -165,7 +180,7 @@ func quarantineEvidenceFromBuilds(builds []QuarantinedBuild) []QuarantineEvidenc
 	return out
 }
 
-func sealHourRequest(claim PreflightHourClaim, plan BatchPlan, built []BuiltOutput, quarantine []QuarantineEvidence) SealHourRequest {
+func sealHourRequest(claim PreflightHourClaim, plan BatchPlan, built []BuiltOutput, quarantine []QuarantineEvidence) (SealHourRequest, error) {
 	media := make([]SealHourMedia, len(built))
 	for i, output := range plan.Outputs {
 		ids := make([]int64, len(output.Sources))
@@ -174,5 +189,9 @@ func sealHourRequest(claim PreflightHourClaim, plan BatchPlan, built []BuiltOutp
 		}
 		media[i] = SealHourMedia{Ordinal: i + 1, SourceClipIDs: ids, SizeBytes: built[i].SizeBytes, SHA256: built[i].SHA256, Verification: built[i].Verification, MaximalityEvidence: append([]MaximalityEvidence(nil), built[i].SplitEvidence...)}
 	}
-	return SealHourRequest{ProtocolVersion: JoinedProtocolVersion, HourID: claim.HourID, SourceClaimSHA256: plan.SourceClaimSHA256, AccountedSources: append([]SourceClip(nil), plan.Sources...), Media: media, Quarantine: quarantine}
+	request := SealHourRequest{ProtocolVersion: JoinedProtocolVersion, HourID: claim.HourID, SourceClaimSHA256: plan.SourceClaimSHA256, AccountedSources: append([]SourceClip(nil), plan.Sources...), Media: media, Quarantine: quarantine}
+	if err := request.Validate(plan.RecordingID, plan.MediaTool.IdentitySHA256); err != nil {
+		return SealHourRequest{}, fmt.Errorf("%w: %v", ErrPreflightSealRequestInvalid, err)
+	}
+	return request, nil
 }

@@ -418,7 +418,11 @@ func (s *Server) handleSharedRecordingJoinedFolder(w http.ResponseWriter, r *htt
 }
 
 func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sharedRecording, error) {
-	query := recordingListSelectSQL + `
+	selectSQL := recordingListBaselineSelectSQL
+	if recordingID > 0 {
+		selectSQL = recordingListSelectSQL
+	}
+	query := selectSQL + `
 		WHERE rec.account_id=$1 AND ` + sharedRecordingsVisibleStatusesSQL
 	args := []any{s.cfg.SharedRecordingsAccountID}
 	if recordingID > 0 {
@@ -435,7 +439,12 @@ func (s *Server) loadSharedRecordings(r *http.Request, recordingID int64) ([]sha
 	defer rows.Close()
 	items := []sharedRecording{}
 	for rows.Next() {
-		raw, err := scanRecordingListRow(rows, s.billing != nil)
+		var raw map[string]any
+		if recordingID > 0 {
+			raw, err = scanRecordingListRow(rows, s.billing != nil)
+		} else {
+			raw, err = scanRecordingListBaselineRow(rows, s.billing != nil)
+		}
 		if err != nil {
 			return nil, err
 		}
