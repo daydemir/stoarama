@@ -879,8 +879,18 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
 	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
-	if err != nil || !ok {
+	if err != nil {
 		return false, err
+	}
+	if !ok {
+		removed, err := s.cleanupInactiveScratch(admissionCtx, req)
+		if err != nil {
+			return false, fmt.Errorf("cleanup inactive joined scratch while idle: %w", err)
+		}
+		if len(removed) > 0 {
+			log.Printf("joined worker removed inactive scratch directories count=%d", len(removed))
+		}
+		return false, nil
 	}
 	if !joinedHourWithinScope(s.cfg, preflight.HourID) {
 		return false, errors.New("joined preflight claim is outside configured work scope")
