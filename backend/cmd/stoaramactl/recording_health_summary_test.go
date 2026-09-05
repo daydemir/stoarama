@@ -41,7 +41,7 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 		CREATE TABLE recordings (id BIGINT PRIMARY KEY);
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,kind TEXT NOT NULL,fire_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ NOT NULL);
 		CREATE TABLE recording_clips (
-		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
+		  id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,recording_job_id BIGINT NOT NULL,clip_start_at TIMESTAMPTZ NOT NULL,clip_end_at TIMESTAMPTZ NOT NULL,
 		  video_codec TEXT,audio_codec TEXT,audio_present BOOLEAN,video_width INTEGER,video_height INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_window_health (
 		  recording_id BIGINT NOT NULL,job_id BIGINT NOT NULL,window_start_at TIMESTAMPTZ NOT NULL,window_end_at TIMESTAMPTZ NOT NULL,
@@ -64,13 +64,14 @@ func TestMaterializeRecordingWindowHealthPersistsExactTimelineAndSummary(t *test
 	if _, err := pool.Exec(ctx, `INSERT INTO recordings VALUES (402)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2)`, start, start.Add(time.Hour)); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_jobs VALUES (1,402,'continuous_window',$1,$2),(2,402,'sampled',$1,$2)`, start, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recording_clips VALUES
-		  (1,402,$1,$1::timestamptz+interval '20 minutes','h264','aac',true,1280,720),
-		  (2,402,$1::timestamptz+interval '30 minutes',$2,'h264','',false,1280,720)
+		  (1,402,1,$1,$1::timestamptz+interval '20 minutes','h264','aac',true,1280,720),
+		  (3,402,2,$1::timestamptz+interval '20 minutes',$1::timestamptz+interval '30 minutes','h264','aac',true,1280,720),
+		  (2,402,1,$1::timestamptz+interval '30 minutes',$2,'h264','',false,1280,720)
 	`, start, start.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
