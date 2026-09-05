@@ -337,7 +337,8 @@ func (s *Server) handleJoinedArchiveManifest(w http.ResponseWriter, r *http.Requ
 	now := time.Now().UTC()
 	claims, err := verifyJoinedArchiveCapability(s.cfg.JoinedArchiveCapabilityKey, r.URL.Query().Get("token"), now)
 	if err != nil {
-		util.WriteError(w, http.StatusUnauthorized, "invalid joined archive capability")
+		w.Header().Set("Cache-Control", "private, no-store")
+		util.WriteError(w, http.StatusGone, "invalid or expired joined archive capability")
 		return
 	}
 	artifacts, err := s.joinedArchiveArtifacts(r.Context(), claims.AccountID, claims.RecordingID)

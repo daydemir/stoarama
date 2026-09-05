@@ -23,7 +23,14 @@ const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const MAX_SUBREQUESTS = 10000;
 const PREFLIGHT_CONCURRENCY = 4;
 const ACTIVE_DOWNLOAD_TTL_MS = 12 * 60 * 60_000;
+const RELEASE_RETRY_DELAYS_MS = [0, 100, 500] as const;
 const encoder = new TextEncoder();
+
+export class ArchiveRequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -78,13 +85,19 @@ export default {
         throw error;
       }
     } catch (error) {
+      if (error instanceof ArchiveRequestError) {
+        return new Response(error.message, {
+          status: error.status,
+          headers: { "Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer" },
+        });
+      }
       console.error(JSON.stringify({ message: "joined archive request failed", error: errorMessage(error) }));
       return new Response("Joined archive is unavailable", { status: 502 });
     }
   },
 } satisfies ExportedHandler<Env>;
 
-async function loadManifest(env: Env, token: string): Promise<ArchiveManifest> {
+export async function loadManifest(env: Env, token: string): Promise<ArchiveManifest> {
   const endpoint = new URL(env.BACKEND_MANIFEST_URL);
   if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
     throw new Error("invalid backend manifest URL");
@@ -93,9 +106,13 @@ async function loadManifest(env: Env, token: string): Promise<ArchiveManifest> {
   const response = await fetch(endpoint, {
     headers: { Authorization: `Bearer ${env.BACKEND_WORKER_TOKEN}` },
     redirect: "error",
+    signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) {
     await response.body?.cancel();
+    if (response.status === 410) {
+      throw new ArchiveRequestError(410, "Invalid or expired archive capability");
+    }
     throw new Error(`backend rejected archive capability (${response.status})`);
   }
   const manifest = await readBoundedJSON(response, MAX_MANIFEST_BYTES);
@@ -148,19 +165,31 @@ function validManifest(value: unknown): value is ArchiveManifest {
     return false;
   }
   const total = manifest.files.reduce((sum, file) => sum + (Number.isSafeInteger(file?.size_bytes) ? file.size_bytes : Number.NaN), 0);
-  return total === manifest.total_bytes && 2 * manifest.files.length + 3 <= MAX_SUBREQUESTS;
+  return total === manifest.total_bytes && 2 * manifest.files.length + 5 <= MAX_SUBREQUESTS;
 }
 
-async function release(limiter: DurableObjectStub, capabilityID: string): Promise<void> {
-  try {
-    const response = await limiter.fetch("https://archive-limiter/release", {
-      method: "POST",
-      body: JSON.stringify({ capability_id: capabilityID }),
-    });
-    await response.body?.cancel();
-  } catch (error) {
-    console.error(JSON.stringify({ message: "joined archive limiter release failed", error: errorMessage(error) }));
+export async function release(limiter: DurableObjectStub, capabilityID: string, wait = waitForRetry): Promise<void> {
+  let lastError: unknown = new Error("joined archive limiter release failed");
+  for (const delay of RELEASE_RETRY_DELAYS_MS) {
+    if (delay) await wait(delay);
+    try {
+      const response = await limiter.fetch("https://archive-limiter/release", {
+        method: "POST",
+        body: JSON.stringify({ capability_id: capabilityID }),
+        signal: AbortSignal.timeout(2_000),
+      });
+      await response.body?.cancel();
+      if (response.ok) return;
+      lastError = new Error(`archive limiter rejected release (${response.status})`);
+    } catch (error) {
+      lastError = error;
+    }
   }
+  console.error(JSON.stringify({ message: "joined archive limiter release failed", error: errorMessage(lastError) }));
+}
+
+function waitForRetry(delay: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
 function errorMessage(error: unknown): string {

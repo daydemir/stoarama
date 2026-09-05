@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ArchiveRequestError, loadManifest, release } from "../src/index";
 import { createJoinedZip, type JoinedBucket, type JoinedFile } from "../src/zip";
 import { bucketFor, bytes, file, objectFor, options } from "./helpers";
 
@@ -106,6 +107,44 @@ describe("createJoinedZip", () => {
     await reader.cancel("stop");
     await expect(archive.completed).rejects.toBeDefined();
     expect(cancelled).toBe(true);
+  });
+});
+
+describe("release", () => {
+  it("retries failures and requires a successful response", async () => {
+    const statuses = [new Error("temporary"), new Response(null, { status: 503 }), new Response(null, { status: 204 })];
+    const waits: number[] = [];
+    const limiter = {
+      async fetch() {
+        const result = statuses.shift();
+        if (result instanceof Error) throw result;
+        return result ?? new Response(null, { status: 500 });
+      },
+    };
+    await release(limiter as unknown as DurableObjectStub, "a".repeat(43), async (delay) => { waits.push(delay); });
+    expect(statuses).toHaveLength(0);
+    expect(waits).toEqual([100, 500]);
+  });
+});
+
+describe("loadManifest", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("maps only the backend capability status and bounds the request", async () => {
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.redirect).toBe("error");
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      return new Response(null, { status: 410 });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const env = {
+      BACKEND_MANIFEST_URL: "https://stoarama.example.test/api/v1/recording/joined/archive/manifest",
+      BACKEND_WORKER_TOKEN: "worker-token",
+    } as Env;
+    await expect(loadManifest(env, "capability")).rejects.toMatchObject({ status: 410 });
+
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 401 }));
+    await expect(loadManifest(env, "capability")).rejects.not.toBeInstanceOf(ArchiveRequestError);
   });
 });
 

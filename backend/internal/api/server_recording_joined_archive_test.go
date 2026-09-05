@@ -65,7 +65,7 @@ func TestJoinedArchiveWorkerAuthenticationAndPortablePaths(t *testing.T) {
 		}
 	}
 	second := valid
-	second.RelativePath = strings.ToUpper(valid.RelativePath)
+	second.RelativePath = "377_Europe_Poland_Luban/August/Thursday/A.MP4"
 	if _, err := validateJoinedArchive([]joinedArchiveArtifact{valid, second}); err == nil {
 		t.Fatal("case-insensitive extraction collision accepted")
 	}
@@ -112,6 +112,21 @@ func TestJoinedArchiveRedirectRequiresPrincipal(t *testing.T) {
 	response := httptest.NewRecorder()
 	(&Server{}).handleAccountRecordingJoinedFolderArchive(response, req)
 	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestJoinedArchiveManifestDistinguishesCapabilityFailure(t *testing.T) {
+	server := &Server{cfg: config.Config{
+		JoinedArchiveWorkerURL:     "https://joined.example.test",
+		JoinedArchiveCapabilityKey: "archive-capability-key-at-least-32-bytes",
+		JoinedArchiveWorkerToken:   "archive-worker-token-at-least-32-bytes",
+	}}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/recording/joined/archive/manifest?token=invalid", nil)
+	request.Header.Set("Authorization", "Bearer archive-worker-token-at-least-32-bytes")
+	response := httptest.NewRecorder()
+	server.handleJoinedArchiveManifest(response, request)
+	if response.Code != http.StatusGone || response.Header().Get("Cache-Control") != "private, no-store" || !strings.Contains(response.Body.String(), "invalid or expired") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
