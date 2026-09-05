@@ -102,8 +102,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Install pinned FFmpeg for joined lifecycle tests
         env:
-          JOINED_RECORDING_FFMPEG_ARCHIVE_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz
-          JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256: b2ad9015c296a61c1f6127c4aa3ce8614a9bd8d7519987b6e0d151edaa7f39fb
+          JOINED_RECORDING_FFMPEG_ARCHIVE_URL: https://github.com/daydemir/stoarama/releases/download/joined-media-tools-ffmpeg-N-126239-g88ae625e69/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz
+          JOINED_RECORDING_FFMPEG_ARCHIVE_SHA256: b7d2cf59ccb19372f6ee0198a938ccc1b6654d8704d056f8c72b82fda30af34f
           JOINED_RECORDING_FFMPEG_BINARY_SHA256: eab722b24d599876819f89f503cc142b39a096a971d7d7913a0282b0484b9d5e
           JOINED_RECORDING_FFPROBE_BINARY_SHA256: 95cda0f6de6e2d0c48cc2afe24e8ef9bcb8b4ffc5897af77158b1a59b303a97a
         run: bash ./scripts/install-pinned-media-tools.sh
