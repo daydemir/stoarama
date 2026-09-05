@@ -26,6 +26,9 @@ type Config struct {
 	JoinedWorkerBootstrapToken       string
 	JoinedWorkerBootstrapHashes      string
 	JoinedWorkerSigningKey           string
+	JoinedArchiveWorkerURL           string
+	JoinedArchiveCapabilityKey       string
+	JoinedArchiveWorkerToken         string
 	JoinedOperatorToken              string
 	BootstrapAdminEmail              string
 	MigrationDir                     string
@@ -202,6 +205,9 @@ func Load() (Config, error) {
 		JoinedWorkerBootstrapToken:       strings.TrimSpace(os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN")),
 		JoinedWorkerBootstrapHashes:      os.Getenv("JOINED_WORKER_BOOTSTRAP_TOKEN_SHA256_ALLOWLIST"),
 		JoinedWorkerSigningKey:           strings.TrimSpace(os.Getenv("JOINED_WORKER_SIGNING_KEY")),
+		JoinedArchiveWorkerURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_WORKER_URL")), "/"),
+		JoinedArchiveCapabilityKey:       strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_CAPABILITY_KEY")),
+		JoinedArchiveWorkerToken:         strings.TrimSpace(os.Getenv("JOINED_ARCHIVE_WORKER_TOKEN")),
 		JoinedOperatorToken:              strings.TrimSpace(os.Getenv("STOARAMA_JOINED_OPERATOR_TOKEN")),
 		BootstrapAdminEmail:              strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		MigrationDir:                     strEnv("MIGRATION_DIR", ""),
@@ -400,6 +406,27 @@ func (c Config) ValidateAPI() error {
 }
 
 func (c Config) ValidateJoined() error {
+	archiveURL := strings.TrimSpace(c.JoinedArchiveWorkerURL)
+	archiveCapability := strings.TrimSpace(c.JoinedArchiveCapabilityKey)
+	archiveWorker := strings.TrimSpace(c.JoinedArchiveWorkerToken)
+	configuredArchiveValues := 0
+	for _, value := range []string{archiveURL, archiveCapability, archiveWorker} {
+		if value != "" {
+			configuredArchiveValues++
+		}
+	}
+	if configuredArchiveValues != 0 && configuredArchiveValues != 3 {
+		return fmt.Errorf("JOINED_ARCHIVE_WORKER_URL, JOINED_ARCHIVE_CAPABILITY_KEY, and JOINED_ARCHIVE_WORKER_TOKEN must be configured together")
+	}
+	if configuredArchiveValues == 3 {
+		worker, err := url.Parse(archiveURL)
+		if err != nil || worker.Scheme != "https" || worker.Host == "" || worker.User != nil || (worker.Path != "" && worker.Path != "/") || worker.RawQuery != "" || worker.Fragment != "" {
+			return fmt.Errorf("JOINED_ARCHIVE_WORKER_URL must be an HTTPS origin without a path, credentials, query, or fragment")
+		}
+		if len(archiveCapability) < 32 || len(archiveWorker) < 32 || archiveCapability == archiveWorker {
+			return fmt.Errorf("joined archive credentials must be distinct and at least 32 bytes")
+		}
+	}
 	bootstrap := strings.TrimSpace(c.JoinedWorkerBootstrapToken)
 	bootstrapSHA256s, err := c.JoinedWorkerBootstrapSHA256s()
 	if err != nil {
@@ -412,6 +439,16 @@ func (c Config) ValidateJoined() error {
 		strings.TrimSpace(c.StorageCredKey), strings.TrimSpace(c.R2AccessKeyID), strings.TrimSpace(c.R2SecretAccessKey)}
 	if databaseConfig, err := pgx.ParseConfig(strings.TrimSpace(c.DatabaseURL)); err == nil {
 		protected = append(protected, databaseConfig.Password)
+	}
+	if configuredArchiveValues == 3 {
+		archiveProtected := append(append([]string(nil), protected...), operator, strings.TrimSpace(c.JoinedRecordingWorkerToken))
+		for _, credential := range archiveProtected {
+			credential = strings.TrimSpace(credential)
+			if credential != "" && (archiveCapability == credential || archiveWorker == credential) {
+				return fmt.Errorf("joined archive credentials must differ from service, database, storage, operator, and recording worker credentials")
+			}
+		}
+		protected = append(protected, archiveCapability, archiveWorker)
 	}
 	if bootstrap != "" || signing != "" || len(bootstrapSHA256s) > 0 || c.JoinedRecordingControlPlaneEnabled {
 		if bootstrap == "" || signing == "" {

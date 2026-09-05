@@ -867,3 +867,31 @@ func TestMITSharedRecordingsSlugMustBeURLSafe(t *testing.T) {
 		t.Fatal("Load succeeded with an invalid shared recordings slug")
 	}
 }
+
+func TestJoinedArchiveConfigurationIsShipDarkAndCredentialIsolated(t *testing.T) {
+	if err := (Config{}).ValidateJoined(); err != nil {
+		t.Fatalf("empty archive configuration must stay ship-dark: %v", err)
+	}
+	valid := Config{
+		JoinedArchiveWorkerURL:     "https://joined-download.example.test",
+		JoinedArchiveCapabilityKey: "archive-capability-key-at-least-32-bytes",
+		JoinedArchiveWorkerToken:   "archive-worker-token-at-least-32-bytes",
+	}
+	if err := valid.ValidateJoined(); err != nil {
+		t.Fatalf("valid archive configuration: %v", err)
+	}
+	invalid := []Config{
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL},
+		{JoinedArchiveWorkerURL: "http://joined-download.example.test", JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken},
+		{JoinedArchiveWorkerURL: "https://joined-download.example.test/base", JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveCapabilityKey},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken, ServiceToken: valid.JoinedArchiveWorkerToken},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken, JoinedRecordingWorkerToken: valid.JoinedArchiveCapabilityKey},
+		{JoinedArchiveWorkerURL: valid.JoinedArchiveWorkerURL, JoinedArchiveCapabilityKey: valid.JoinedArchiveCapabilityKey, JoinedArchiveWorkerToken: valid.JoinedArchiveWorkerToken, JoinedOperatorToken: valid.JoinedArchiveWorkerToken},
+	}
+	for index, candidate := range invalid {
+		if err := candidate.ValidateJoined(); err == nil {
+			t.Fatalf("invalid archive configuration %d accepted", index)
+		}
+	}
+}

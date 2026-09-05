@@ -252,6 +252,9 @@ func (s *Server) router() http.Handler {
 	r.Post("/webhooks/billing/stripe", s.handleStripeWebhook)
 
 	r.Route("/api/v1", func(api chi.Router) {
+		// The browser receives only a short-lived scoped capability. The edge
+		// Worker must authenticate separately before this route returns metadata.
+		api.Get("/recording/joined/archive/manifest", s.handleJoinedArchiveManifest)
 		api.Route("/shared/"+s.cfg.SharedRecordingsSlug, func(shared chi.Router) {
 			shared.Post("/unlock", s.handleSharedRecordingsUnlock)
 			shared.Post("/logout", s.handleSharedRecordingsLogout)
@@ -265,6 +268,7 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings/{id}/capture-health", s.handleSharedRecordingCaptureHealth)
 				read.Get("/recordings/{id}/joined", s.handleSharedRecordingJoinedList)
 				read.Get("/recordings/{id}/joined/folder", s.handleSharedRecordingJoinedFolder)
+				read.Get("/recordings/{id}/joined/folder/archive", s.handleSharedRecordingJoinedFolderArchive)
 				read.Get("/recordings/{id}/joined/{joinedId}/download", s.handleSharedRecordingJoinedDownload)
 				read.Get("/recordings/{id}/clips", s.handleSharedRecordingClips)
 				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
@@ -322,6 +326,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
 			account.Get("/recordings/{id}/joined", s.handleAccountRecordingJoinedList)
 			account.Get("/recordings/{id}/joined/folder", s.handleAccountRecordingJoinedFolder)
+			account.Get("/recordings/{id}/joined/folder/archive", s.handleAccountRecordingJoinedFolderArchive)
 			account.Get("/recordings/{id}/joined/{joinedId}/download", s.handleAccountRecordingJoinedDownload)
 			account.Get("/recordings/{id}/clips.csv", s.handleAccountRecordingClipsCSV)
 			account.Get("/recordings/{id}/stitch-certification", s.handleAccountNativeStitchGet)

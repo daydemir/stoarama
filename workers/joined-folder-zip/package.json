@@ -1,0 +1,22 @@
+{
+  "name": "@stoarama/joined-folder-zip",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm run test:worker && npm run test:node",
+    "test:worker": "BACKEND_WORKER_TOKEN=local-test-worker-token-at-least-32-bytes vitest run --config vitest.worker.config.ts",
+    "test:node": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types",
+    "dry-run": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.1.4",
+    "@types/node": "^24.3.0",
+    "@vitest/runner": "4.1.11",
+    "@vitest/snapshot": "4.1.11",
+    "typescript": "^5.9.2",
+    "vitest": "4.1.11",
+    "wrangler": "^4.126.0"
+  }
+}
