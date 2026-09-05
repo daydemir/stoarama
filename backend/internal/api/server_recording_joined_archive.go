@@ -91,7 +91,7 @@ func canonicalJoinedArchivePath(relative string) (string, bool) {
 }
 
 func joinedArchiveWindowsReserved(segment string) bool {
-	base := strings.ToUpper(strings.TrimSuffix(segment, path.Ext(segment)))
+	base := strings.ToUpper(strings.SplitN(segment, ".", 2)[0])
 	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
 		return true
 	}

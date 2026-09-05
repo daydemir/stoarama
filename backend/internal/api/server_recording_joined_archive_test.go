@@ -57,7 +57,7 @@ func TestJoinedArchiveWorkerAuthenticationAndPortablePaths(t *testing.T) {
 		BatchID: "batch-1", ETag: "etag", ContentType: "video/mp4",
 		RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", SizeBytes: 1, SHA256: strings.Repeat("a", 64),
 	}
-	for _, relative := range []string{"../raw.mp4", "/absolute.mp4", "a\\b.mp4", "a/../b.mp4", "C:/outside.mp4", "folder/CON.mp4", "folder/name. ", "folder/name?.mp4", "a\x00b.mp4"} {
+	for _, relative := range []string{"../raw.mp4", "/absolute.mp4", "a\\b.mp4", "a/../b.mp4", "C:/outside.mp4", "folder/CON.mp4", "folder/COM1.tar.mp4", "folder/name. ", "folder/name?.mp4", "a\x00b.mp4"} {
 		artifact := valid
 		artifact.RelativePath = relative
 		if _, err := validateJoinedArchive([]joinedArchiveArtifact{artifact}); err == nil {

@@ -76,7 +76,7 @@ describe("createJoinedZip", () => {
   });
 
   it.each([
-    "../escape.mp4", "/absolute.mp4", "dir\\clip.mp4", "./clip.mp4", "C:/clip.mp4", "dir/con.txt", "dir/trailing. /clip.mp4",
+    "../escape.mp4", "/absolute.mp4", "dir\\clip.mp4", "./clip.mp4", "C:/clip.mp4", "dir/con.txt", "dir/COM1.tar.mp4", "dir/trailing. /clip.mp4",
   ])("rejects unsafe extraction path %s", async (relative_path) => {
     const entry = file({ relative_path });
     await expect(createJoinedZip(bucketFor([entry]), [entry], options)).rejects.toThrow(/unsafe.*path|invalid media/i);
