@@ -155,13 +155,13 @@ services:
       - key: JOINED_RECORDING_CONTROL_PLANE_ENABLED
         value: "true"
       - key: JOINED_RECORDING_NAS_DELIVERY_ENABLED
-        value: "false"
+        value: "true"
       - key: JOINED_RECORDING_PROTOCOL_VERSION
         value: "1"
       - key: JOINED_RECORDING_CONNECTION_ID
         value: "13"
       - key: JOINED_RECORDING_PROTOCOL_GENERATION
-        value: "7"
+        value: "8"
       - key: JOINED_RECORDING_MAX_ACTIVE_TASKS
         value: "12"
       - key: STOARAMA_JOINED_WORK_SCOPE
