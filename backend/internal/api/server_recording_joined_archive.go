@@ -95,7 +95,12 @@ func joinedArchiveWindowsReserved(segment string) bool {
 	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" {
 		return true
 	}
-	return len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '1' && base[3] <= '9'
+	runes := []rune(base)
+	if len(runes) != 4 || (!strings.HasPrefix(base, "COM") && !strings.HasPrefix(base, "LPT")) {
+		return false
+	}
+	digit := runes[3]
+	return digit >= '1' && digit <= '9' || digit == '¹' || digit == '²' || digit == '³'
 }
 
 func validateJoinedArchive(artifacts []joinedArchiveArtifact) (int64, error) {

@@ -50,7 +50,7 @@ interface Options {
 
 const encoder = new TextEncoder();
 const MAX_SAFE_SIZE = BigInt(Number.MAX_SAFE_INTEGER);
-const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
 
 export async function createJoinedZip(bucket: JoinedBucket, manifest: readonly JoinedFile[], options: Options): Promise<JoinedZip> {
   const entries = validateAndSort(manifest, options);
