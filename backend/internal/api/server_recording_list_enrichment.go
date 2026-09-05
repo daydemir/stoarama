@@ -17,7 +17,9 @@ import (
 
 const (
 	recordingListEnrichmentTimeout = 5 * time.Second
-	recordingJoinedProgressTimeout = 8 * time.Second
+	// A cold indexed joined batch can take 15 seconds; let it finish once instead
+	// of timing out at 8 seconds and starting the same work again.
+	recordingJoinedProgressTimeout = 20 * time.Second
 	recordingEnrichmentCacheTTL    = 30 * time.Second
 	recordingProgressCacheTTL      = 60 * time.Second
 	recordingHealthPageCacheTTL    = 30 * time.Second
@@ -487,9 +489,23 @@ func (s *Server) handleRecordingJoinedProgress(w http.ResponseWriter, r *http.Re
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	selectedIDs, err := requestedRecordingEnrichmentIDs(r)
+	if err != nil {
+		util.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if recordingID > 0 && len(selectedIDs) > 0 {
+		util.WriteError(w, http.StatusBadRequest, "recording_id and recording_ids cannot be combined")
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), recordingJoinedProgressTimeout)
 	defer cancel()
-	ids, err := s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
+	var ids []int64
+	if len(selectedIDs) > 0 {
+		ids, err = s.recordingMetricSelectedIDs(ctx, accountID, selectedIDs, shared)
+	} else {
+		ids, err = s.recordingMetricScopeIDs(ctx, accountID, recordingID, shared)
+	}
 	if err != nil {
 		writeRecordingMetricError(w, err, "load joined progress")
 		return

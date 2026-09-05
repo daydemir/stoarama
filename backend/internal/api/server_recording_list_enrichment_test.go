@@ -55,6 +55,15 @@ func TestRecordingEnrichmentRejectsCombinedSingleAndBatchScopes(t *testing.T) {
 	}
 }
 
+func TestRecordingJoinedProgressRejectsCombinedSingleAndBatchScopes(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/recordings/joined-progress?recording_id=9&recording_ids=9", nil)
+	rec := httptest.NewRecorder()
+	(&Server{}).handleSharedRecordingJoinedProgress(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 func TestRecordingTimelineOnlyEnrichmentRequiresOneRecording(t *testing.T) {
 	for _, path := range []string{
 		"/recordings/enrichment?timeline_only=1",
