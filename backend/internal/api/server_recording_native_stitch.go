@@ -41,6 +41,7 @@ func loadNativeStitchManifest(ctx context.Context, q nativeStitchQueryer, accoun
 		       COALESCE(c.timestamp_contract_reason,''),c.timestamp_contract
 		FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
 		WHERE r.account_id=$1 AND c.recording_id=$2 AND c.clip_end_at>$3 AND c.clip_start_at<$4
+		  AND c.size_bytes>0
 		ORDER BY c.clip_start_at,c.id
 		FOR SHARE OF c`, accountID, recordingID, start, end)
 	if err != nil {
@@ -145,7 +146,7 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 		return
 	}
 	var backlog bool
-	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL AND c.created_at<now()-`+accountClipsCommitWatermark+`)`, p.AccountID).Scan(&backlog); err != nil {
+	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL AND c.size_bytes>0 AND c.created_at<now()-`+accountClipsCommitWatermark+`)`, p.AccountID).Scan(&backlog); err != nil {
 		util.WriteError(w, 500, "check delivery backlog")
 		return
 	}

@@ -23,6 +23,7 @@ func TestAccountClipsCursorSQLShape(t *testing.T) {
 		"r.account_id = $1",
 		"c.purged_at IS NULL",
 		"c.released_at IS NULL",
+		"c.size_bytes > 0",
 		"r.delivery = 'nas_pull'",
 		"c.created_at < now() - ",
 		"c.id > $2",
@@ -88,9 +89,10 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 		return id
 	}
 
-	// Owner: three live clips, one purged clip, and one released clip (ascending ids
-	// by insert order). Both purged and released must be excluded from the pull feed.
+	// Owner: three deliverable clips, one retained zero-byte row, one purged clip,
+	// and one released clip. Only the three deliverable clips belong in the feed.
 	live1 := insertClip(ownerRecID, 111, false, false)
+	zeroByte := insertClip(ownerRecID, 0, false, false)
 	live2 := insertClip(ownerRecID, 222, false, false)
 	if _, err := pool.Exec(ctx, `
 		UPDATE recording_clips
@@ -113,7 +115,14 @@ func TestAccountClipsCursorEndpoint(t *testing.T) {
 	gotIDs := clipIDs(page.Clips)
 	wantIDs := []int64{live1, live2, live3}
 	if !equalInt64(gotIDs, wantIDs) {
-		t.Fatalf("page1 clip ids = %v, want %v (purged %d, released %d and foreign account must be excluded)", gotIDs, wantIDs, purged, released)
+		t.Fatalf("page1 clip ids = %v, want %v (zero-byte %d, purged %d, released %d and foreign account must be excluded)", gotIDs, wantIDs, zeroByte, purged, released)
+	}
+	var zeroReleasedAt, zeroPurgedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT released_at,purged_at FROM recording_clips WHERE id=$1`, zeroByte).Scan(&zeroReleasedAt, &zeroPurgedAt); err != nil {
+		t.Fatalf("read retained zero-byte clip: %v", err)
+	}
+	if zeroReleasedAt != nil || zeroPurgedAt != nil {
+		t.Fatalf("zero-byte clip was mutated: released_at=%v purged_at=%v", zeroReleasedAt, zeroPurgedAt)
 	}
 	if page.NextAfterID == nil || *page.NextAfterID != live3 {
 		t.Fatalf("page1 next_after_id = %v, want %d", page.NextAfterID, live3)
@@ -491,7 +500,12 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			released_at TIMESTAMPTZ,
 			recording_job_id BIGINT,
 			capture_lease_token UUID,
-			capture_sequence BIGINT
+			capture_sequence BIGINT,
+			capture_attempt_id UUID,
+			timestamp_contract_version TEXT,
+			timestamp_contract JSONB,
+			timestamp_contract_status TEXT,
+			timestamp_contract_reason TEXT
 		)`,
 		`CREATE TABLE nas_inventory_files (
 			connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,

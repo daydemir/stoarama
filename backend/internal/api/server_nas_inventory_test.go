@@ -149,6 +149,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 			t.Fatal(err)
 		}
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,size_bytes,sha256,display_path,clip_start_at,clip_end_at) VALUES($1,0,$2,'retained/empty.mp4',now()-interval '1 minute',now())`, recordingID, strings.Repeat("0", 64)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES
 		($1,'Africa/July/orphan.mp4',9,$2,'present',now()),($1,'Africa/July/one.mp4',1,$2,'present',now()),($1,'root.mp4',4,$2,'present',now())`, connectionID, sha); err != nil {
 		t.Fatal(err)
@@ -657,11 +660,15 @@ func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {
 	if err := pool.QueryRow(ctx, `INSERT INTO recording_clips(recording_id,size_bytes,sha256,display_path,clip_start_at,clip_end_at) VALUES($1,3,$2,'mode/clip.mp4',now()-interval '1 minute',now()) RETURNING id`, recordingID, sha).Scan(&clipID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(recording_id,size_bytes,sha256,display_path,clip_start_at,clip_end_at) VALUES($1,0,$2,'mode/empty.mp4',now()-interval '1 minute',now())`, recordingID, strings.Repeat("0", 64)); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{pool: pool}
 	callMode := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPatch, "/api/v1/account/connections/x/inventory-mode", bytes.NewBufferString(`{"mode":"enforce"}`))
-		req.SetPathValue("id", fmt.Sprint(connectionID))
-		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}))
+		routeCtx := chi.NewRouteContext()
+		routeCtx.URLParams.Add("id", fmt.Sprint(connectionID))
+		req = req.WithContext(context.WithValue(context.WithValue(req.Context(), accountPrincipalContextKey, accountPrincipal{AccountID: accountID}), chi.RouteCtxKey, routeCtx))
 		rec := httptest.NewRecorder()
 		s.handleAccountConnectionInventoryMode(rec, req)
 		return rec

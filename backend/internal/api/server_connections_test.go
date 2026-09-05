@@ -246,6 +246,7 @@ func TestConnectionPendingClipsEligibility(t *testing.T) {
 	}
 	old := time.Now().UTC().Add(-10 * time.Minute)
 	belowCursor := insertClip(ownerNAS, 1, old, false, false)
+	insertClip(ownerNAS, 0, old, false, false)
 	wanted := insertClip(ownerNAS, 2, old, false, false)
 	insertClip(ownerNAS, 4, old, true, false)
 	insertClip(ownerNAS, 8, old, false, true)

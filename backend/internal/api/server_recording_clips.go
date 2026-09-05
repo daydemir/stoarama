@@ -1131,6 +1131,16 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusBadRequest, fmt.Sprintf("uploaded object not found: %v", err))
 		return
 	}
+	if head.SizeBytes <= 0 || (req.SizeBytes > 0 && head.SizeBytes != req.SizeBytes) {
+		// Treat a stale, truncated, or empty remote object as replayable. A 5xx keeps
+		// old workers retrying during a backend-first deploy; the stable code lets
+		// current workers identify the exact reason and reserve a fresh upload URL.
+		util.WriteJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"code":  recordingapi.ErrorCodeUploadedObjectIntegrity,
+			"error": "uploaded object size does not match the local clip",
+		})
+		return
+	}
 	if head.SizeBytes > maxSize {
 		util.WriteError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("uploaded clip %d bytes exceeds cap %d bytes", head.SizeBytes, maxSize))
 		return
@@ -1943,9 +1953,9 @@ func deliveryObjectKey(keyPrefix string, recordingID, clipID int64, sourceObject
 	return storageObjectKey(keyPrefix, displayPath)
 }
 
-// accountClipsCursorSQL forward-cursors the calling account's still-org-visible
-// clips by the monotonic recording_clips.id (BIGSERIAL), so a NAS pull client can
-// drain every clip exactly once and resume from its last seen id. object_key is
+// accountClipsCursorSQL forward-cursors the calling account's still-org-visible,
+// nonempty clips by the monotonic recording_clips.id (BIGSERIAL), so a NAS pull
+// client can drain every deliverable clip exactly once and resume from its last seen id. object_key is
 // never selected: the caller gets a download_path to the existing presign endpoint
 // instead. Released clips (already pulled/detached) and purged clips are both
 // excluded, so the working set stays small: the NAS releases each clip right after
@@ -1972,6 +1982,9 @@ const accountClipsCursorSQL = `
 	JOIN recordings r ON r.id = c.recording_id
 	WHERE r.account_id = $1 AND c.purged_at IS NULL AND c.released_at IS NULL
 	  AND r.delivery = 'nas_pull'
+	  -- Retain zero-byte rows for audit, but never let one poison the forward
+	  -- cursor page and block every later valid clip.
+	  AND c.size_bytes > 0
 	  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
 	  AND c.id > $2
 	ORDER BY c.id ASC
@@ -1979,7 +1992,7 @@ const accountClipsCursorSQL = `
 `
 
 // handleAccountClips returns one forward-cursored page of the calling account's
-// unpurged clips, ordered by the monotonic clip id, for the NAS pull client.
+// unpurged, nonempty clips, ordered by the monotonic clip id, for the NAS pull client.
 // It is mounted under requireAccountAuth so a Bearer sir_ account API key can
 // drain it. Each row carries a download_path to the existing per-recording clip
 // download endpoint; object_key is never exposed. The response order is delivery

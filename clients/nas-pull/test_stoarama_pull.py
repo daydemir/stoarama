@@ -1412,6 +1412,64 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(sidecar["capture_sequence"], 9)
             self.assertEqual(sidecar["sha256"], clip["sha256"])
 
+    def test_filtered_poison_page_advances_over_199_exact_existing_files_without_redownload(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
+            runtime.cursor_id = 811789
+            clips = []
+            original_files = {}
+            for clip_id in range(811791, 811990):
+                content = ("clip-%d" % clip_id).encode()
+                relative_path = "recordings/%d.mp4" % clip_id
+                path = cfg.output_dir / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+                stat = path.stat()
+                clip = {
+                    "clip_id": clip_id,
+                    "recording_id": 389,
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "relative_path": relative_path,
+                    "download_path": "/unused",
+                    "clip_start_at": "2026-08-26T15:10:03Z",
+                    "clip_end_at": "2026-08-26T15:11:03Z",
+                }
+                clips.append(clip)
+                pull.write_stitch_sidecar(path, clip)
+                original_files[path] = (
+                    stat.st_ino, stat.st_mtime_ns, content, pull.stitch_sidecar_path(path).read_bytes()
+                )
+
+            storage = {"available": True, "total_bytes": 10**13, "free_bytes": 10**13}
+            with mock.patch.object(pull, "storage_status", return_value=storage), mock.patch.object(
+                pull, "request_json", return_value={"clips": clips}
+            ), mock.patch.object(pull, "download_verified") as download, mock.patch.object(
+                pull, "release_clips"
+            ) as release, mock.patch.object(pull, "log"):
+                self.assertTrue(pull.drain_page(cfg, runtime))
+
+            download.assert_not_called()
+            release.assert_called_once_with(cfg, clips)
+            self.assertEqual(runtime.cursor_id, 811989)
+            self.assertEqual(runtime.clips_pulled, 199)
+            self.assertEqual(runtime.bytes_pulled, sum(clip["size_bytes"] for clip in clips))
+            self.assertEqual(runtime.batch["clips"], 199)
+            self.assertEqual(runtime.batch["bytes"], 0)
+            self.assertEqual(runtime.batch["failures"], 0)
+            self.assertEqual(runtime.last_error, "")
+            self.assertEqual(list(cfg.output_dir.rglob("*.part-*")), [])
+            self.assertEqual(list(cfg.output_dir.rglob("*.invalid-*")), [])
+            for path, (inode, mtime_ns, content, sidecar_bytes) in original_files.items():
+                stat = path.stat()
+                self.assertEqual((stat.st_ino, stat.st_mtime_ns, path.read_bytes()), (inode, mtime_ns, content))
+                self.assertEqual(pull.stitch_sidecar_path(path).read_bytes(), sidecar_bytes)
+                sidecar = json.loads(sidecar_bytes)
+                self.assertEqual(sidecar["clip_id"], int(path.stem))
+                self.assertEqual(sidecar["size_bytes"], len(content))
+                self.assertEqual(sidecar["sha256"], hashlib.sha256(content).hexdigest())
+
     def test_legacy_stitch_sidecar_preserves_null_provenance(self):
         clip = {
             "clip_id": 8,

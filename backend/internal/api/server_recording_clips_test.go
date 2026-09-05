@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
 )
 
@@ -1221,12 +1223,14 @@ func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testi
 	defer cleanup()
 	ctx := context.Background()
 	var headCount atomic.Int64
+	var headSize atomic.Int64
+	headSize.Store(5)
 	objectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead {
 			t.Errorf("method=%s", r.Method)
 		}
 		headCount.Add(1)
-		w.Header().Set("Content-Length", "5")
+		w.Header().Set("Content-Length", strconv.FormatInt(headSize.Load(), 10))
 		w.Header().Set("ETag", `"etag"`)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -1304,7 +1308,34 @@ func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testi
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_timestamp_contract_admissions(recording_job_id,lease_token,node_id,account_id,recording_id,policy_version) VALUES(1,$1,1,42,1,'continuous-source-pts-v1')`, lease); err != nil {
 		t.Fatal(err)
 	}
+	headSize.Store(0)
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(body))
+	req.Header.Set(recordingLeaseTokenHeader, lease)
+	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+	rec = httptest.NewRecorder()
+	(&Server{pool: pool, secrets: secrets}).handleRecordingClipIngest(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), string(recordingapi.ErrorCodeUploadedObjectIntegrity)) {
+		t.Fatalf("zero-byte ingest status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var zeroClipCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips`).Scan(&zeroClipCount); err != nil || zeroClipCount != 0 {
+		t.Fatalf("zero-byte ingest clip count=%d err=%v", zeroClipCount, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM recording_upload_intents WHERE id=$1`, intent).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("zero-byte ingest intent status=%q err=%v", status, err)
+	}
+	sizedBody := strings.Replace(body, "{", `{"size_bytes":5,`, 1)
+	headSize.Store(4)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(sizedBody))
+	req.Header.Set(recordingLeaseTokenHeader, lease)
+	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
+	rec = httptest.NewRecorder()
+	(&Server{pool: pool, secrets: secrets}).handleRecordingClipIngest(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), string(recordingapi.ErrorCodeUploadedObjectIntegrity)) {
+		t.Fatalf("truncated ingest status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	headSize.Store(5)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/recording/clips/ingest", strings.NewReader(sizedBody))
 	req.Header.Set(recordingLeaseTokenHeader, lease)
 	req = req.WithContext(context.WithValue(req.Context(), nodePrincipalContextKey, nodePrincipal{NodeID: 1, AccountID: 42, NodeType: nodeTypeRelay}))
 	rec = httptest.NewRecorder()
@@ -1312,7 +1343,7 @@ func TestRecordingClipIngestRejectsUnadmittedProvenanceAndRetainsIntent(t *testi
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admitted status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if headCount.Load() != 1 {
+	if headCount.Load() != 3 {
 		t.Fatalf("admitted request HEAD count=%d", headCount.Load())
 	}
 	var persistedStatus string
