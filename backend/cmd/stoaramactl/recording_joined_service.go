@@ -933,6 +933,12 @@ func joinedFailureClassification(err error) (class, reason string) {
 	if errors.Is(err, syscall.ENOSPC) || strings.Contains(strings.ToLower(err.Error()), "scratch") {
 		return "resource", "scratch_resource_exhausted"
 	}
+	if errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) {
+		return "transient", "preflight_seal_request_invalid"
+	}
+	if errors.Is(err, joinedrecording.ErrPreflightLeaseEndedBeforeSeal) {
+		return "transient", "preflight_lease_ended_before_seal"
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "transient", "worker_task_deadline"
 	}
