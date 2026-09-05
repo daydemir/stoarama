@@ -404,12 +404,26 @@ func TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation(t *test
 			t.Fatalf("item[%d]=%+v want recording %d and no foreign recording", i, item, wantOrder[i])
 		}
 	}
+	batchAuth := call(t, false, "/api/v1/account/recordings/joined-progress?recording_ids=30,10&sort=joined_desc")
+	batchShared := call(t, true, "/api/v1/shared/mit-scl/recordings/joined-progress?recording_ids=30,10&sort=joined_desc")
+	if !reflect.DeepEqual(batchAuth, batchShared) {
+		t.Fatalf("batched auth/public mismatch:\nauth=%+v\npublic=%+v", batchAuth, batchShared)
+	}
+	if len(batchAuth.Items) != 2 || batchAuth.Items[0].RecordingID != 30 || batchAuth.Items[1].RecordingID != 10 {
+		t.Fatalf("batched items=%+v want joined-desc recordings 30,10", batchAuth.Items)
+	}
 
 	foreign := httptest.NewRecorder()
 	s.router().ServeHTTP(foreign, httptest.NewRequest(http.MethodGet,
 		"/api/v1/shared/mit-scl/recordings/joined-progress?recording_id=50", nil))
 	if foreign.Code != http.StatusNotFound {
 		t.Fatalf("foreign status=%d want=404 body=%s", foreign.Code, foreign.Body.String())
+	}
+	foreignBatch := httptest.NewRecorder()
+	s.router().ServeHTTP(foreignBatch, httptest.NewRequest(http.MethodGet,
+		"/api/v1/shared/mit-scl/recordings/joined-progress?recording_ids=30,50", nil))
+	if foreignBatch.Code != http.StatusNotFound {
+		t.Fatalf("foreign batch status=%d want=404 body=%s", foreignBatch.Code, foreignBatch.Body.String())
 	}
 }
 

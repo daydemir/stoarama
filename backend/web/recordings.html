@@ -1435,9 +1435,10 @@
 
     // Mutable view state.
     // High-volume completed recordings can have more than 10,000 source clips.
-    // One recording per request keeps each exact interval query inside its fixed
-    // deadline and prevents a large cohort from occupying both metric work slots.
+    // Heatmaps need one recording per request; joined summaries use the API's
+    // bounded 12-recording scope so the table fills without a cohort-wide query.
     const RECORDING_ENRICHMENT_BATCH_SIZE = 1;
+	const JOINED_PROGRESS_BATCH_SIZE = 12;
     const state = {
       account: null,
       billingEnabled: true,
@@ -3615,10 +3616,10 @@
       const capture = rec.capture_via === 'relay'
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       const joined = joinedCoverage(rec);
-      const joinedHTML = !state.joinedProgressLoaded && !state.joinedProgressError
-	    ? `<div class="cell-main recordings-joined-value loading" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading</div>`
-	    : joined.available
+      const joinedHTML = joined.available
         ? `<div class="cell-main recordings-joined-value" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
+	    : !state.joinedProgressLoaded && !state.joinedProgressError
+	      ? `<div class="cell-main recordings-joined-value loading" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading</div>`
 	    : state.joinedProgressError
 	      ? `<div class="cell-main recordings-joined-value" title="Joined coverage is temporarily unavailable" aria-label="Joined coverage is temporarily unavailable">&mdash;</div>`
           : `<div class="cell-main recordings-joined-value" title="Joined coverage unavailable: no usable recorded footage" aria-label="Joined coverage unavailable: no usable recorded footage">&mdash;</div>`;
@@ -5347,13 +5348,26 @@
 	  if (state.joinedProgressLoading) return;
 	  state.joinedProgressLoading = true;
 	  try {
-	    const sortQuery = state.recordingSort === 'joined_asc' || state.recordingSort === 'joined_desc'
-	      ? `?sort=${encodeURIComponent(state.recordingSort)}` : '';
-	    const payload = await fetchJSON(recordingAPIPath(`/joined-progress${sortQuery}`));
-	    if (requestToken !== recordingsLoadToken) return;
-	    mergeRecordingMetricItems(payload.items);
+	    let hadError = false;
+	    const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);
+	    for (let offset = 0; offset < ids.length; offset += JOINED_PROGRESS_BATCH_SIZE) {
+	      if (requestToken !== recordingsLoadToken) return;
+	      const batch = ids.slice(offset, offset + JOINED_PROGRESS_BATCH_SIZE);
+	      const params = new URLSearchParams();
+	      params.set('recording_ids', batch.join(','));
+	      let payload;
+	      try {
+	        payload = await fetchJSON(recordingAPIPath(`/joined-progress?${params.toString()}`));
+	      } catch (_) {
+	        hadError = true;
+	        continue;
+	      }
+	      if (requestToken !== recordingsLoadToken) return;
+	      mergeRecordingMetricItems(payload.items);
+	      renderCards();
+	    }
 	    state.joinedProgressLoaded = true;
-	    state.joinedProgressError = false;
+	    state.joinedProgressError = hadError;
 	    renderCards();
 	  } catch (_) {
 	    if (requestToken !== recordingsLoadToken) return;
