@@ -1426,8 +1426,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
                 stat = path.stat()
-                original_files[path] = (stat.st_ino, stat.st_mtime_ns, content)
-                clips.append({
+                clip = {
                     "clip_id": clip_id,
                     "recording_id": 389,
                     "size_bytes": len(content),
@@ -1436,7 +1435,12 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                     "download_path": "/unused",
                     "clip_start_at": "2026-08-26T15:10:03Z",
                     "clip_end_at": "2026-08-26T15:11:03Z",
-                })
+                }
+                clips.append(clip)
+                pull.write_stitch_sidecar(path, clip)
+                original_files[path] = (
+                    stat.st_ino, stat.st_mtime_ns, content, pull.stitch_sidecar_path(path).read_bytes()
+                )
 
             storage = {"available": True, "total_bytes": 10**13, "free_bytes": 10**13}
             with mock.patch.object(pull, "storage_status", return_value=storage), mock.patch.object(
@@ -1457,10 +1461,11 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(runtime.last_error, "")
             self.assertEqual(list(cfg.output_dir.rglob("*.part-*")), [])
             self.assertEqual(list(cfg.output_dir.rglob("*.invalid-*")), [])
-            for path, (inode, mtime_ns, content) in original_files.items():
+            for path, (inode, mtime_ns, content, sidecar_bytes) in original_files.items():
                 stat = path.stat()
                 self.assertEqual((stat.st_ino, stat.st_mtime_ns, path.read_bytes()), (inode, mtime_ns, content))
-                sidecar = json.loads(pull.stitch_sidecar_path(path).read_text())
+                self.assertEqual(pull.stitch_sidecar_path(path).read_bytes(), sidecar_bytes)
+                sidecar = json.loads(sidecar_bytes)
                 self.assertEqual(sidecar["clip_id"], int(path.stem))
                 self.assertEqual(sidecar["size_bytes"], len(content))
                 self.assertEqual(sidecar["sha256"], hashlib.sha256(content).hexdigest())
