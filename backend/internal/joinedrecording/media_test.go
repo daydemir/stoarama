@@ -1465,7 +1465,10 @@ func TestPreflightQuarantinesDeterministicallyCorruptSingletonPartAndContinues(t
 		t.Fatal(err)
 	}
 	claim := PreflightHourClaim{HourID: plan.HourID}
-	seal := sealHourRequest(claim, plan, result.Built, quarantineEvidenceFromBuilds(result.Quarantines))
+	seal, err := sealHourRequest(claim, plan, result.Built, quarantineEvidenceFromBuilds(result.Quarantines))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := seal.Validate(plan.RecordingID, plan.MediaTool.IdentitySHA256); err != nil {
 		t.Fatalf("preflight quarantine must satisfy the seal contract: %v", err)
 	}

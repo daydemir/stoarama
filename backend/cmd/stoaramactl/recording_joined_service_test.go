@@ -456,6 +456,12 @@ func TestJoinedFailureReportingUsesStableClassAndFencedEndpoint(t *testing.T) {
 	if class, reason := joinedFailureClassification(context.DeadlineExceeded); class != "transient" || reason != "worker_task_deadline" {
 		t.Fatalf("deadline class=%q reason=%q", class, reason)
 	}
+	if class, reason := joinedFailureClassification(joinedrecording.ErrPreflightSealRequestInvalid); class != "transient" || reason != "preflight_seal_request_invalid" {
+		t.Fatalf("seal validation class=%q reason=%q", class, reason)
+	}
+	if class, reason := joinedFailureClassification(joinedrecording.ErrPreflightLeaseEndedBeforeSeal); class != "transient" || reason != "preflight_lease_ended_before_seal" {
+		t.Fatalf("pre-seal lease class=%q reason=%q", class, reason)
+	}
 	const token = "operation-token-kept-secret-value"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/recording/joined/failure" || r.Header.Get("Authorization") != "Bearer "+token {
