@@ -168,6 +168,66 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if frozen.Code != http.StatusCreated {
 		t.Fatalf("freeze status=%d body=%s", frozen.Code, frozen.Body.String())
 	}
+	var activeRunID, jobID, otherJobID int64
+	var windowStart, windowEnd time.Time
+	var expectedSeconds int64
+	if err := pool.QueryRow(ctx, `
+		SELECT r.id,w.window_start_at,w.window_end_at,w.expected_seconds
+		FROM recording_qualification_runs r
+		JOIN recording_qualification_windows w ON w.run_id=r.id
+		WHERE r.account_id=$1 AND r.status='active' AND w.recording_id=$2
+		ORDER BY w.ordinal LIMIT 1
+	`, accountID, ids[0]).Scan(&activeRunID, &windowStart, &windowEnd, &expectedSeconds); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind,window_end_at)
+		VALUES($1,$2,$2,60,'done','qualification-health-job','continuous_window',$3) RETURNING id
+	`, ids[0], windowStart, windowEnd).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_window_health(recording_id,job_id,window_start_at,window_end_at,expected_seconds,covered_seconds,coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,overlap_seconds,longest_run_seconds,layout_change_count,clip_count,metric_version,calculated_at)
+		VALUES($1,$2,$3,$4,$5::bigint,$5::double precision,99.8,10,1,0,0,0,0,$5::double precision,0,10,2,$4::timestamptz+interval '1 minute')
+	`, ids[0], jobID, windowStart, windowEnd, expectedSeconds); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO recording_jobs(recording_id,fire_at,scheduled_for,clip_duration_sec,status,idempotency_key,kind)
+		VALUES($1,$2,$2,60,'done','qualification-other-job','clip') RETURNING id
+	`, ids[0], windowStart).Scan(&otherJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO recording_clips(recording_id,recording_job_id,storage_destination_id,endpoint,bucket,object_key,size_bytes,fire_at,clip_start_at,clip_end_at,created_at)
+		VALUES($1,$2,(SELECT storage_destination_id FROM recordings WHERE id=$1),'https://s3.example.test','qual','qualification-other-job-late',1,$3,$3,$3::timestamptz+interval '1 minute',$4::timestamptz+interval '2 minutes')
+	`, ids[0], otherJobID, windowStart, windowEnd); err != nil {
+		t.Fatal(err)
+	}
+	reportReq := withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/qualification", nil), accountPrincipal{AccountID: accountID, UserID: userID, MemberRole: "owner"}, "")
+	reportRecorder := httptest.NewRecorder()
+	s.handleAccountRecordingQualification(reportRecorder, reportReq)
+	if reportRecorder.Code != http.StatusOK {
+		t.Fatalf("report status=%d body=%s", reportRecorder.Code, reportRecorder.Body.String())
+	}
+	var report recordingQualificationResponse
+	if err := json.Unmarshal(reportRecorder.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	var reported *recordingQualificationWindow
+	for i := range report.Members {
+		if report.Members[i].RecordingID != ids[0] {
+			continue
+		}
+		for j := range report.Members[i].Windows {
+			if report.Members[i].Windows[j].WindowStartAt.Equal(windowStart) {
+				reported = &report.Members[i].Windows[j]
+			}
+		}
+	}
+	if reported == nil || reported.TimelineGrade != "GREAT_CANDIDATE" {
+		t.Fatalf("other-job late clip contaminated qualification: %+v", reported)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='paused',paused_at=now() WHERE id=$1`, ids[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +258,7 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE recordings SET status='active',paused_at=NULL WHERE account_id=$1`, accountID); err != nil {
 		t.Fatal(err)
 	}
-	var activeRunID, nullSceneRunID int64
+	var nullSceneRunID int64
 	if err := pool.QueryRow(ctx, `SELECT id FROM recording_qualification_runs WHERE account_id=$1 AND status='active'`, accountID).
 		Scan(&activeRunID); err != nil {
 		t.Fatal(err)
