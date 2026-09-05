@@ -631,10 +631,10 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 	}
 	for _, required := range []string{
 		"key: JOINED_RECORDING_CONTROL_PLANE_ENABLED\n        value: \"true\"",
-		"key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"false\"",
+		"key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"true\"",
 		"key: JOINED_RECORDING_PROTOCOL_VERSION\n        value: \"1\"",
 		"key: JOINED_RECORDING_CONNECTION_ID\n        value: \"13\"",
-		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"7\"",
+		"key: JOINED_RECORDING_PROTOCOL_GENERATION\n        value: \"8\"",
 		"key: JOINED_RECORDING_MAX_ACTIVE_TASKS\n        value: \"12\"",
 		"key: STOARAMA_JOINED_WORK_SCOPE\n        value: frozen_batch",
 		"key: JOINED_RECORDING_BATCH_ID\n        sync: false",
@@ -657,18 +657,18 @@ func TestRenderJoinedControlPlaneIsActiveFrozenBatchAndScoped(t *testing.T) {
 	}
 	want := map[string]string{
 		"JOINED_RECORDING_CONTROL_PLANE_ENABLED": "true",
-		"JOINED_RECORDING_NAS_DELIVERY_ENABLED":  "false",
+		"JOINED_RECORDING_NAS_DELIVERY_ENABLED":  "true",
 		"JOINED_RECORDING_PROTOCOL_VERSION":      "1",
 		"JOINED_RECORDING_CONNECTION_ID":         "13",
-		"JOINED_RECORDING_PROTOCOL_GENERATION":   "7",
+		"JOINED_RECORDING_PROTOCOL_GENERATION":   "8",
 		"JOINED_RECORDING_MAX_ACTIVE_TASKS":      "12",
 		"STOARAMA_JOINED_WORK_SCOPE":             "frozen_batch",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("joined API nonsecret control-plane values=%v want=%v", got, want)
 	}
-	if strings.Contains(section, "key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"true\"") {
-		t.Fatal("joined NAS delivery was enabled in source configuration")
+	if strings.Contains(section, "key: JOINED_RECORDING_NAS_DELIVERY_ENABLED\n        value: \"false\"") {
+		t.Fatal("joined NAS delivery was disabled in source configuration")
 	}
 	if strings.Contains(section, "STOARAMA_JOINED_OPERATOR_TOKEN") {
 		t.Fatal("joined operator credential must not be deployed to the API")
