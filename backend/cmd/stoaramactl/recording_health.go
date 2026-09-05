@@ -686,7 +686,7 @@ func detectCompletedWindowHealth(ctx context.Context, pool *pgxpool.Pool) ([]hea
 		  SELECT DISTINCT ON (r.id)
 		    r.id, COALESCE(r.stream_id,0) AS stream_id, r.account_id,
 		    r.name AS recording_name, r.stream_url,
-		    acc.name AS org_name, acc.email AS org_email, j.fire_at, j.window_end_at
+		    acc.name AS org_name, acc.email AS org_email, j.id AS job_id, j.fire_at, j.window_end_at
 		  FROM recordings r
 		  JOIN accounts acc ON acc.id=r.account_id
 		  JOIN account_billing b ON b.account_id=r.account_id AND b.has_payment_method=true
@@ -701,7 +701,7 @@ func detectCompletedWindowHealth(ctx context.Context, pool *pgxpool.Pool) ([]hea
 		       COALESCE(c.video_codec,''),COALESCE(c.audio_codec,''),COALESCE(c.audio_present,false),
 		       COALESCE(c.actual_fps,0),COALESCE(c.video_width,0),COALESCE(c.video_height,0)
 		FROM latest l
-		LEFT JOIN recording_clips c ON c.recording_id=l.id
+		LEFT JOIN recording_clips c ON c.recording_job_id=l.job_id
 		  AND c.clip_end_at>l.fire_at AND c.clip_start_at<l.window_end_at
 		ORDER BY l.id,c.clip_start_at,c.id
 	`)
