@@ -188,7 +188,7 @@ func TestQualificationBuildFreezesAndIsIdempotent(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO recording_window_health(recording_id,job_id,window_start_at,window_end_at,expected_seconds,covered_seconds,coverage_pct,largest_gap_seconds,gap_count,gap_over_30s_count,gap_over_5m_count,overlap_count,overlap_seconds,longest_run_seconds,layout_change_count,clip_count,metric_version,calculated_at)
-		VALUES($1,$2,$3,$4,$5,$5,99.8,10,1,0,0,0,0,$5,0,10,2,$4::timestamptz+interval '1 minute')
+		VALUES($1,$2,$3,$4,$5::bigint,$5::double precision,99.8,10,1,0,0,0,0,$5::double precision,0,10,2,$4::timestamptz+interval '1 minute')
 	`, ids[0], jobID, windowStart, windowEnd, expectedSeconds); err != nil {
 		t.Fatal(err)
 	}
