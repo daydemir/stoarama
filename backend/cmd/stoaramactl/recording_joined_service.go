@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	joinedAPITimeout       = 55 * time.Second
-	joinedWorkerIdlePoll   = 2 * time.Second
+	joinedAPITimeout     = 55 * time.Second
+	joinedWorkerIdlePoll = 2 * time.Second
 	// A strict 60-source hour can legitimately spend more than two hours in
 	// deterministic media isolation. Each media subprocess keeps its narrower
 	// deadline; this is only the outer bound for one renewable, fenced task.
@@ -48,7 +48,10 @@ type joinedAPIResponseError struct {
 	message string
 }
 
-var errJoinedWorkerTaskDeadline = errors.New("joined worker task deadline")
+var (
+	errJoinedWorkerTaskDeadline  = errors.New("joined worker task deadline")
+	errJoinedTaskFailureReported = errors.New("joined worker task failure reported")
+)
 
 type joinedAPITransportError struct{ cause error }
 
@@ -812,6 +815,9 @@ func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce fu
 		}
 		worked, err := runOnce(ctx, taskBase)
 		if err != nil {
+			if errors.Is(err, errJoinedTaskFailureReported) {
+				return nil
+			}
 			if ctx.Err() != nil && !worked {
 				return nil
 			}
@@ -969,7 +975,7 @@ func (s *remoteJoinedOperatorService) reportJoinedTaskFailure(taskCtx context.Co
 	} else {
 		log.Printf("joined worker task failure recorded scope_kind=%s scope_id=%s class=%s reason=%s", kind, id, class, reason)
 	}
-	return nil
+	return errJoinedTaskFailureReported
 }
 
 func joinedTaskFailureDiagnostic(err error) string {

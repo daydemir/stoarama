@@ -485,8 +485,19 @@ func TestJoinedFailureReportingUsesStableClassAndFencedEndpoint(t *testing.T) {
 	}
 	service := &remoteJoinedOperatorService{api: api}
 	err = service.reportJoinedTaskFailure(context.Background(), token, "hour", "hour-1", errors.New("decoder failed"))
-	if err != nil {
-		t.Fatalf("recorded task failure stopped worker: %v", err)
+	if !errors.Is(err, errJoinedTaskFailureReported) {
+		t.Fatalf("recorded task failure signal=%v", err)
+	}
+	var calls atomic.Int32
+	loopErr := runJoinedWorkerLoop(context.Background(), time.Hour, func(context.Context, context.Context) (bool, error) {
+		calls.Add(1)
+		return true, err
+	})
+	if loopErr != nil {
+		t.Fatalf("recorded task failure restarted worker: %v", loopErr)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("worker calls after recorded task failure=%d want 1", got)
 	}
 }
 
@@ -516,8 +527,33 @@ func TestJoinedHeartbeatFailureReportsDistinctReason(t *testing.T) {
 	}
 	service := &remoteJoinedOperatorService{api: api}
 	err = service.reportJoinedTaskFailure(context.Background(), token, "hour", "hour-1", errors.Join(joinedrecording.ErrWorkerHeartbeatFailed, context.DeadlineExceeded))
+	if !errors.Is(err, errJoinedTaskFailureReported) {
+		t.Fatalf("record heartbeat failure signal=%v", err)
+	}
+}
+
+func TestJoinedFailureReportErrorRemainsFatal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "bootstrap-token-kept-secret", server.Client())
 	if err != nil {
-		t.Fatalf("record heartbeat failure: %v", err)
+		t.Fatal(err)
+	}
+	taskErr := errors.New("decoder failed")
+	service := &remoteJoinedOperatorService{api: api}
+	reportErr := service.reportJoinedTaskFailure(context.Background(), "operation-token-kept-secret-value", "hour", "hour-1", taskErr)
+	if reportErr == nil || !errors.Is(reportErr, taskErr) || errors.Is(reportErr, errJoinedTaskFailureReported) {
+		t.Fatalf("failure report error=%v", reportErr)
+	}
+	var calls atomic.Int32
+	loopErr := runJoinedWorkerLoop(context.Background(), time.Hour, func(context.Context, context.Context) (bool, error) {
+		calls.Add(1)
+		return true, reportErr
+	})
+	if !errors.Is(loopErr, taskErr) || calls.Load() != 1 {
+		t.Fatalf("failure report loop error=%v calls=%d", loopErr, calls.Load())
 	}
 }
 
@@ -567,6 +603,24 @@ func TestJoinedWorkerIdleCancellationStopsCleanly(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("cancelled idle worker: %v", err)
+	}
+}
+
+func TestJoinedWorkerSuccessfulTaskRefills(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls atomic.Int32
+	err := runJoinedWorkerLoop(ctx, time.Hour, func(context.Context, context.Context) (bool, error) {
+		if calls.Add(1) == 1 {
+			return true, nil
+		}
+		cancel()
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("successful task refill: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("worker calls after successful task=%d want 2", got)
 	}
 }
 
