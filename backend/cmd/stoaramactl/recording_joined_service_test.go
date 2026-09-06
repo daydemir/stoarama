@@ -453,7 +453,7 @@ func TestJoinedFailureReportingUsesStableClassAndFencedEndpoint(t *testing.T) {
 	if class, reason := joinedFailureClassification(syscall.ENOSPC); class != "resource" || reason != "scratch_resource_exhausted" {
 		t.Fatalf("disk failure class=%q reason=%q", class, reason)
 	}
-	if class, reason := joinedFailureClassification(context.DeadlineExceeded); class != "transient" || reason != "worker_task_deadline" {
+	if class, reason := joinedFailureClassification(context.DeadlineExceeded); class != "transient" || reason != "worker_task_failed" {
 		t.Fatalf("deadline class=%q reason=%q", class, reason)
 	}
 	if class, reason := joinedFailureClassification(joinedrecording.ErrPreflightSealRequestInvalid); class != "transient" || reason != "preflight_seal_request_invalid" {
@@ -487,6 +487,37 @@ func TestJoinedFailureReportingUsesStableClassAndFencedEndpoint(t *testing.T) {
 	err = service.reportJoinedTaskFailure(context.Background(), token, "hour", "hour-1", errors.New("decoder failed"))
 	if err != nil {
 		t.Fatalf("recorded task failure stopped worker: %v", err)
+	}
+}
+
+func TestJoinedFailureClassificationDoesNotMistakeCandidateDeadlineForWorkerDeadline(t *testing.T) {
+	err := errors.Join(context.DeadlineExceeded, errors.New("strict joined decode failed"))
+	if class, reason := joinedFailureClassification(err); class != "transient" || reason != "worker_task_failed" {
+		t.Fatalf("candidate failure classification=%s/%s err=%v", class, reason, err)
+	}
+}
+
+func TestJoinedHeartbeatFailureReportsDistinctReason(t *testing.T) {
+	const token = "operation-token-kept-secret-value"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request joinedrecording.WorkFailureRequest
+		if r.URL.Path != "/api/v1/recording/joined/failure" || r.Header.Get("Authorization") != "Bearer "+token || json.NewDecoder(r.Body).Decode(&request) != nil || request.Validate() != nil || request.FailureClass != "transient" || request.ReasonCode != "worker_heartbeat_failed" {
+			t.Errorf("failure request path=%q request=%+v", r.URL.Path, request)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		next := time.Now().UTC().Add(time.Minute)
+		writeJoinedTestJSON(t, w, joinedrecording.WorkFailureResponse{ProtocolVersion: 1, State: "retry", AttemptCount: 1, NextAttemptAt: &next})
+	}))
+	defer server.Close()
+	api, err := newJoinedAPIClient(server.URL, "bootstrap-token-kept-secret", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &remoteJoinedOperatorService{api: api}
+	err = service.reportJoinedTaskFailure(context.Background(), token, "hour", "hour-1", errors.Join(joinedrecording.ErrWorkerHeartbeatFailed, context.DeadlineExceeded))
+	if err != nil {
+		t.Fatalf("record heartbeat failure: %v", err)
 	}
 }
 
@@ -1185,14 +1216,41 @@ func TestJoinedWorkerRejectsMalformedReclaimedHourBeforeStorage(t *testing.T) {
 
 func TestJoinedWorkerTaskHasHardDeadline(t *testing.T) {
 	started := make(chan struct{})
+	workFailure := errors.New("media parser raced the deadline")
 	err := runJoinedWorkerTask(context.Background(), time.Millisecond, "preflight_and_publish", func(ctx context.Context) error {
 		close(started)
 		<-ctx.Done()
-		return errors.New("media parser raced the deadline")
+		return workFailure
 	})
 	<-started
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "joined worker task deadline exceeded stage=preflight_and_publish") {
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, workFailure) || !strings.Contains(err.Error(), "joined worker task deadline exceeded stage=preflight_and_publish") {
 		t.Fatalf("task deadline err=%v", err)
+	}
+	if class, reason := joinedFailureClassification(err); class != "transient" || reason != "worker_task_deadline" {
+		t.Fatalf("outer task deadline classification=%s/%s err=%v", class, reason, err)
+	}
+}
+
+func TestJoinedWorkerTaskDeadlinePreservesPriorityFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		workErr    error
+		wantClass  string
+		wantReason string
+	}{
+		{"resource", syscall.ENOSPC, "resource", "scratch_resource_exhausted"},
+		{"heartbeat", joinedrecording.ErrWorkerHeartbeatFailed, "transient", "worker_heartbeat_failed"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := runJoinedWorkerTask(context.Background(), time.Millisecond, "preflight_and_publish", func(ctx context.Context) error {
+				<-ctx.Done()
+				return tt.workErr
+			})
+			class, reason := joinedFailureClassification(err)
+			if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, tt.workErr) || class != tt.wantClass || reason != tt.wantReason {
+				t.Fatalf("classification=%s/%s err=%v", class, reason, err)
+			}
+		})
 	}
 }
 
@@ -1207,7 +1265,7 @@ func TestJoinedWorkerTaskBudgetCoversMeasuredStrictHourRuntime(t *testing.T) {
 	}
 }
 
-func TestBoundedMediaDeadlineUsesWorkerTaskClassification(t *testing.T) {
+func TestBoundedMediaDeadlineDoesNotUseWorkerTaskClassification(t *testing.T) {
 	ffprobe := strings.TrimSpace(os.Getenv("FFPROBE_BIN"))
 	if ffprobe == "" {
 		ffprobe = "ffprobe"
@@ -1227,7 +1285,7 @@ func TestBoundedMediaDeadlineUsesWorkerTaskClassification(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("bounded media deadline err=%v", err)
 	}
-	if class, reason := joinedFailureClassification(err); class != "transient" || reason != "worker_task_deadline" {
+	if class, reason := joinedFailureClassification(err); class != "transient" || reason != "worker_task_failed" {
 		t.Fatalf("classification=%s/%s err=%v", class, reason, err)
 	}
 }

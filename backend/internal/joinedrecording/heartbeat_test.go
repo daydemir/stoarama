@@ -143,7 +143,7 @@ func TestHeartbeatRejectsExpiredAndForeignRenewalsBeforeWorkCanFinish(t *testing
 				finished.Store(true)
 				return ctx.Err()
 			}, func() time.Time { return now }, ticks)
-			if err == nil || !finished.Load() {
+			if !errors.Is(err, ErrWorkerHeartbeatFailed) || !finished.Load() {
 				t.Fatalf("invalid renewal did not cancel work: %v", err)
 			}
 		})
@@ -185,7 +185,7 @@ func TestHeartbeatFailureDoesNotMaskWorkFailure(t *testing.T) {
 		<-ctx.Done()
 		return workFailure
 	}, func() time.Time { return now }, ticks)
-	if !errors.Is(err, workFailure) || !errors.Is(err, heartbeatFailure) {
+	if !errors.Is(err, ErrWorkerHeartbeatFailed) || !errors.Is(err, workFailure) || !errors.Is(err, heartbeatFailure) {
 		t.Fatalf("work or heartbeat failure was masked: %v", err)
 	}
 }

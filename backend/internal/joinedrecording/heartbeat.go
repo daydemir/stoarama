@@ -10,6 +10,9 @@ import (
 
 const DefaultHeartbeatInterval = 60 * time.Second
 
+// ErrWorkerHeartbeatFailed marks a terminal lease-renewal failure.
+var ErrWorkerHeartbeatFailed = errors.New("joined worker heartbeat failed")
+
 type OperationCredentials struct {
 	LeaseID        string    `json:"lease_id"`
 	OperationToken string    `json:"operation_token"`
@@ -64,7 +67,7 @@ func runWithHeartbeat(ctx context.Context, initial OperationCredentials, interva
 						continue
 					}
 					select {
-					case heartbeatErr <- fmt.Errorf("joined heartbeat failed before lease expiry: %w", err):
+					case heartbeatErr <- fmt.Errorf("%w before lease expiry: %w", ErrWorkerHeartbeatFailed, err):
 					default:
 					}
 					cancel()
@@ -72,7 +75,7 @@ func runWithHeartbeat(ctx context.Context, initial OperationCredentials, interva
 				}
 				if next.LeaseID != prior.LeaseID || !validOperationToken(next.OperationToken) || !next.ExpiresAt.After(now()) {
 					select {
-					case heartbeatErr <- fmt.Errorf("joined heartbeat moved lease identity"):
+					case heartbeatErr <- fmt.Errorf("%w: moved lease identity", ErrWorkerHeartbeatFailed):
 					default:
 					}
 					cancel()
