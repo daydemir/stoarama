@@ -30,7 +30,7 @@ type digestNAS struct {
 	ReportedAt, BatchCompletedAt, InventoryAt      *time.Time
 	CapacityTransitionAt                           *time.Time
 	Blocked                                        bool
-	BatchClips, BatchFailures, ServerOnly          int64
+	BatchClips, BatchFailures                      int64
 	InventoryClips, InventoryMismatches, Unmatched int64
 }
 
@@ -170,32 +170,38 @@ func claimHealthDigestDelivery(ctx context.Context, pool *pgxpool.Pool, bucket t
 	return claimed, err
 }
 
-func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) (digestNAS, error) {
-	var n digestNAS
-	err := pool.QueryRow(ctx, `
+const digestNASSQL = `
 		SELECT c.label,c.client_phase,c.nas_storage_free_bytes,c.nas_storage_total_bytes,c.nas_storage_reported_at,c.nas_capacity_blocked,
 		       c.nas_batch_clips,c.nas_batch_failures,c.nas_batch_completed_at,c.inventory_clips,c.inventory_mismatches,c.inventory_unmatched,c.inventory_reported_at,
-		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
-		         WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
-		           AND rc.size_bytes>0
-		           AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
-		             AND i.relative_path=rc.display_path AND i.size_bytes=rc.size_bytes AND i.sha256=lower(rc.sha256)
-		             AND i.verified_at>=now()-interval '72 hours' AND i.verified_at<=now()+interval '5 minutes'
-		             AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other WHERE other.connection_id=i.connection_id
-		               AND other.relative_path=i.relative_path AND other.clip_id<>i.clip_id AND other.state IN ('present','mismatch'))
-		             AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched WHERE unmatched.connection_id=i.connection_id
-		               AND unmatched.relative_path=i.relative_path AND unmatched.state='present'))),
 		       COALESCE(e.state::text,''),e.observed_at
 		FROM connections c
 		LEFT JOIN LATERAL (SELECT state,observed_at FROM nas_storage_capacity_alert_events WHERE connection_id=c.id ORDER BY id DESC LIMIT 1) e ON true
-		WHERE c.kind='nas_pull' ORDER BY c.last_seen_at DESC LIMIT 1`).Scan(
+		WHERE c.kind='nas_pull' ORDER BY c.last_seen_at DESC LIMIT 1`
+
+func loadDigestNAS(ctx context.Context, pool *pgxpool.Pool) (digestNAS, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return digestNAS{}, err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout='5s'`); err != nil {
+		return digestNAS{}, err
+	}
+	var n digestNAS
+	err = tx.QueryRow(ctx, digestNASSQL).Scan(
 		&n.Label, &n.Phase, &n.Free, &n.Total, &n.ReportedAt, &n.Blocked,
 		&n.BatchClips, &n.BatchFailures, &n.BatchCompletedAt, &n.InventoryClips, &n.InventoryMismatches, &n.Unmatched, &n.InventoryAt,
-		&n.ServerOnly, &n.CapacityTransitionState, &n.CapacityTransitionAt)
+		&n.CapacityTransitionState, &n.CapacityTransitionAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return digestNAS{}, nil
+		err = nil
 	}
-	return n, err
+	if err != nil {
+		return digestNAS{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return digestNAS{}, err
+	}
+	return n, nil
 }
 
 func healthDigestIdempotencyKey(bucket time.Time, recipient string) string {
@@ -259,7 +265,7 @@ func composeHealthDigest(base string, now time.Time, items []digestRecording, na
 		percent := float64(*nas.Free) * 100 / float64(*nas.Total)
 		fmt.Fprintf(&b, "  Current: state=%s phase=%s free=%s/%s (%.2f%%) capacity_blocked=%t telemetry_age=%s. Gates: warning <=10%%, critical <=5%%, stale >=15m is unknown.\n", state, nas.Phase, formatDigestBytes(nas.Free), formatDigestBytes(nas.Total), percent, nas.Blocked, now.Sub(nas.ReportedAt.UTC()).Round(time.Second))
 	}
-	fmt.Fprintf(&b, "  Delivery: server_only=%d; last_batch clips=%d failures=%d completed=%s. Inventory: clips=%d mismatches=%d unmatched=%d reported=%s.\n", nas.ServerOnly, nas.BatchClips, nas.BatchFailures, formatDigestTime(nas.BatchCompletedAt), nas.InventoryClips, nas.InventoryMismatches, nas.Unmatched, formatDigestTime(nas.InventoryAt))
+	fmt.Fprintf(&b, "  Delivery: server_only=not_computed; last_batch clips=%d failures=%d completed=%s. Inventory: clips=%d mismatches=%d unmatched=%d reported=%s.\n", nas.BatchClips, nas.BatchFailures, formatDigestTime(nas.BatchCompletedAt), nas.InventoryClips, nas.InventoryMismatches, nas.Unmatched, formatDigestTime(nas.InventoryAt))
 	if nas.CapacityTransitionState != "" && nas.CapacityTransitionAt != nil {
 		fmt.Fprintf(&b, "  Latest historical storage-capacity transition: %s at %s (not the current derived state above).\n", nas.CapacityTransitionState, nas.CapacityTransitionAt.UTC().Format(time.RFC3339))
 	}

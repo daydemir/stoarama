@@ -127,6 +127,29 @@ func TestLoadHealthDigestRecordingsFormatsCoverageInPostgres(t *testing.T) {
 	}
 }
 
+func TestLoadDigestNASUsesOnlyPersistedBoundedTelemetry(t *testing.T) {
+	for _, forbidden := range []string{"recording_clips", "nas_inventory_files", "nas_inventory_unmatched_files"} {
+		if strings.Contains(digestNASSQL, forbidden) {
+			t.Fatalf("digest NAS query must not scan %s", forbidden)
+		}
+	}
+	for _, want := range []string{"c.inventory_clips", "c.inventory_mismatches", "c.inventory_unmatched", "c.inventory_reported_at"} {
+		if !strings.Contains(digestNASSQL, want) {
+			t.Fatalf("digest NAS query missing persisted telemetry %q", want)
+		}
+	}
+}
+
+func TestComposeHealthDigestDoesNotClaimExactServerOnlyCount(t *testing.T) {
+	body := composeHealthDigest("", time.Now(), nil, digestNAS{})
+	if !strings.Contains(body, "server_only=not_computed") {
+		t.Fatalf("digest must disclose that exact server-only reconciliation is omitted:\n%s", body)
+	}
+	if strings.Contains(body, "server_only=0") {
+		t.Fatalf("digest presented an exact server-only count:\n%s", body)
+	}
+}
+
 func TestComposeHealthDigestSeparatesCurrentAndHistorical(t *testing.T) {
 	now := time.Date(2026, 8, 12, 16, 0, 0, 0, time.UTC)
 	items := []digestRecording{
