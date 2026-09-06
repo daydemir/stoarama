@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	joinedAPITimeout       = 55 * time.Second
-	joinedWorkerIdlePoll   = 2 * time.Second
+	joinedAPITimeout     = 55 * time.Second
+	joinedWorkerIdlePoll = 2 * time.Second
 	// A strict 60-source hour can legitimately spend more than two hours in
 	// deterministic media isolation. Each media subprocess keeps its narrower
 	// deadline; this is only the outer bound for one renewable, fenced task.
@@ -47,6 +47,11 @@ type joinedAPIResponseError struct {
 	status  int
 	message string
 }
+
+var (
+	errJoinedWorkerTaskDeadline  = errors.New("joined worker task deadline")
+	errJoinedTaskFailureReported = errors.New("joined worker task failure reported")
+)
 
 type joinedAPITransportError struct{ cause error }
 
@@ -810,6 +815,9 @@ func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce fu
 		}
 		worked, err := runOnce(ctx, taskBase)
 		if err != nil {
+			if errors.Is(err, errJoinedTaskFailureReported) {
+				return nil
+			}
 			if ctx.Err() != nil && !worked {
 				return nil
 			}
@@ -933,13 +941,16 @@ func joinedFailureClassification(err error) (class, reason string) {
 	if errors.Is(err, syscall.ENOSPC) || strings.Contains(strings.ToLower(err.Error()), "scratch") {
 		return "resource", "scratch_resource_exhausted"
 	}
+	if errors.Is(err, joinedrecording.ErrWorkerHeartbeatFailed) {
+		return "transient", "worker_heartbeat_failed"
+	}
 	if errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) {
 		return "transient", "preflight_seal_request_invalid"
 	}
 	if errors.Is(err, joinedrecording.ErrPreflightLeaseEndedBeforeSeal) {
 		return "transient", "preflight_lease_ended_before_seal"
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, errJoinedWorkerTaskDeadline) {
 		return "transient", "worker_task_deadline"
 	}
 	return "transient", "worker_task_failed"
@@ -964,7 +975,7 @@ func (s *remoteJoinedOperatorService) reportJoinedTaskFailure(taskCtx context.Co
 	} else {
 		log.Printf("joined worker task failure recorded scope_kind=%s scope_id=%s class=%s reason=%s", kind, id, class, reason)
 	}
-	return nil
+	return errJoinedTaskFailureReported
 }
 
 func joinedTaskFailureDiagnostic(err error) string {
@@ -1046,7 +1057,7 @@ func runJoinedWorkerTask(ctx context.Context, limit time.Duration, stage string,
 	defer cancel()
 	err := work(taskCtx)
 	if err != nil && errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("joined worker task deadline exceeded stage=%s elapsed=%s limit=%s: %w", stage, time.Since(startedAt).Round(time.Millisecond), limit, context.DeadlineExceeded)
+		return errors.Join(fmt.Errorf("%w exceeded stage=%s elapsed=%s limit=%s: %w", errJoinedWorkerTaskDeadline, stage, time.Since(startedAt).Round(time.Millisecond), limit, context.DeadlineExceeded), err)
 	}
 	// A nil result means the task completed its finalize call. Preserve that
 	// committed success if the cooperative deadline becomes visible at the
