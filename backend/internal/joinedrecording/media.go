@@ -389,9 +389,17 @@ func BuildLargestPassingPrefix(ctx context.Context, sources []LocalSource, scrat
 type isolatedBuildAttempt func(context.Context, []LocalSource, string) (BuiltOutput, error)
 type mediaCandidateBudget func(string, int) time.Duration
 
+const (
+	fullTimeoutRetryBudget  = 60 * time.Minute
+	fullTimeoutRetryReserve = 75 * time.Minute
+)
+
 func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
 	if kind == "full" || kind == "full_repeat" {
 		return 25 * time.Minute
+	}
+	if kind == "full_timeout_retry" {
+		return fullTimeoutRetryBudget
 	}
 	if kind == "pair" || kind == "pair_repeat" {
 		return 5 * time.Minute
@@ -583,21 +591,24 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 	pairProofs := make(map[string]exactPairFailureProof)
 	attempts := 0
 	maxAttempts := 6*len(sources) + 2
-	run := func(kind string, candidate []LocalSource) (BuiltOutput, error) {
+	runWithParent := func(parent context.Context, kind string, candidate []LocalSource) (BuiltOutput, error) {
 		attempts++
 		if attempts > maxAttempts {
 			return BuiltOutput{}, fmt.Errorf("%w: attempt budget exceeded", errMediaSplitNotIsolated)
 		}
-		attemptCtx := ctx
+		attemptCtx := parent
 		cancel := func() {}
 		if duration := budget(kind, len(candidate)); duration > 0 {
-			attemptCtx, cancel = context.WithTimeout(ctx, duration)
+			attemptCtx, cancel = context.WithTimeout(parent, duration)
 		}
 		defer cancel()
 		started := time.Now()
 		built, err := attempt(attemptCtx, candidate, scratchDir)
 		emitStageTiming(ctx, "media_candidate_"+kind, time.Since(started), err)
 		return built, err
+	}
+	run := func(kind string, candidate []LocalSource) (BuiltOutput, error) {
+		return runWithParent(ctx, kind, candidate)
 	}
 	ownedParts := make([]BuiltOutput, 0)
 	cleanupParts := func() {
@@ -618,7 +629,13 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 	}
 	firstFailure, ok := deterministicBuildFailure(firstErr)
 	if !ok {
-		if !errors.Is(firstErr, context.DeadlineExceeded) || ctx.Err() != nil {
+		if !errors.Is(firstErr, context.DeadlineExceeded) {
+			return nil, nil, firstErr
+		}
+		if parentErr := ctx.Err(); parentErr != nil {
+			return nil, nil, errors.Join(firstErr, parentErr)
+		}
+		if errors.Is(firstErr, syscall.ENOSPC) {
 			return nil, nil, firstErr
 		}
 	} else if outputSizeFailure(firstFailure) {
@@ -671,6 +688,22 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 	}
 	if len(boundaries) == 0 {
 		if firstFailure == nil {
+			if parentErr := ctx.Err(); parentErr != nil {
+				return nil, nil, errors.Join(firstErr, parentErr)
+			}
+			if parentDeadline, ok := ctx.Deadline(); ctx.Err() == nil && ok {
+				retryDeadline := parentDeadline.Add(-fullTimeoutRetryReserve)
+				if time.Until(retryDeadline) >= fullTimeoutRetryBudget {
+					retryCtx, cancel := context.WithDeadline(ctx, retryDeadline)
+					retry, retryErr := runWithParent(retryCtx, "full_timeout_retry", sources)
+					cancel()
+					if retryErr == nil {
+						return []BuiltOutput{retry}, nil, nil
+					}
+					discardIsolatedBuild(retry, scratchDir)
+					return nil, nil, errors.Join(firstErr, retryErr)
+				}
+			}
 			return nil, nil, errors.Join(errMediaSplitNotIsolated, firstErr)
 		}
 		remaining := sources

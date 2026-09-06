@@ -540,6 +540,9 @@ func TestDefaultMediaCandidateBudgetDoesNotRushExactPairProofs(t *testing.T) {
 			t.Errorf("%s budget=%s want=25m", kind, got)
 		}
 	}
+	if got := defaultMediaCandidateBudget("full_timeout_retry", 2); got != 60*time.Minute {
+		t.Errorf("full timeout retry budget=%s want=60m", got)
+	}
 	for _, kind := range []string{"pair", "pair_repeat"} {
 		if got := defaultMediaCandidateBudget(kind, 2); got != 5*time.Minute {
 			t.Errorf("%s budget=%s want=5m", kind, got)
@@ -942,6 +945,255 @@ func TestBuildAllPassingPartsLocalizesAfterOpaqueFullCandidateDeadline(t *testin
 	}
 	if parentCtx.Err() != nil || len(parts) != 2 || parts[0].SourceCount != 2 || parts[1].SourceCount != 2 || len(parts[0].SplitEvidence) != 1 || len(quarantines) != 0 {
 		t.Fatalf("parent_err=%v parts=%+v quarantines=%+v", parentCtx.Err(), parts, quarantines)
+	}
+}
+
+func TestBuildAllPassingPartsRetriesUnisolatedFullDeadlineWithLongParent(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	parentCtx, cancel := context.WithTimeout(context.Background(), 140*time.Minute)
+	defer cancel()
+	parentDeadline, _ := parentCtx.Deadline()
+	fullAttempts := 0
+	pairAttempts := 0
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == len(sources) {
+			fullAttempts++
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("full candidate lacked deadline")
+			}
+			if fullAttempts == 1 {
+				if remaining := time.Until(deadline); remaining > 25*time.Minute || remaining < 24*time.Minute {
+					t.Fatalf("initial full budget=%s want about 25m", remaining)
+				}
+				return BuiltOutput{}, context.DeadlineExceeded
+			}
+			if deadline.After(parentDeadline.Add(-75 * time.Minute)) {
+				t.Fatalf("retry deadline=%s exceeds parent reserve cutoff=%s", deadline, parentDeadline.Add(-75*time.Minute))
+			}
+			if remaining := time.Until(deadline); remaining > 60*time.Minute || remaining < 59*time.Minute {
+				t.Fatalf("retry budget=%s want about 60m", remaining)
+			}
+			return BuiltOutput{SourceCount: len(candidate)}, nil
+		}
+		pairAttempts++
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(parentCtx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 1 || parts[0].SourceCount != len(sources) || len(quarantines) != 0 {
+		t.Fatalf("full_attempts=%d pair_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, pairAttempts, parts, quarantines, err)
+	}
+	if fullAttempts != 2 || pairAttempts != len(sources)-1 {
+		t.Fatalf("full_attempts=%d pair_attempts=%d want=2/%d", fullAttempts, pairAttempts, len(sources)-1)
+	}
+}
+
+func TestBuildAllPassingPartsDoesNotRetryFullDeadlineWithoutReserve(t *testing.T) {
+	tests := []struct {
+		name         string
+		ctx          func() (context.Context, context.CancelFunc)
+		wantCanceled bool
+	}{
+		{"no deadline", func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, false},
+		{"short deadline", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 134*time.Minute)
+		}, false},
+		{"cancelled parent", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, func() {}
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := tt.ctx()
+			defer cancel()
+			sources := makeSyntheticLocalSources(3)
+			fullAttempts := 0
+			attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+				if len(candidate) == len(sources) {
+					fullAttempts++
+					return BuiltOutput{}, context.DeadlineExceeded
+				}
+				return BuiltOutput{SourceCount: len(candidate)}, nil
+			}
+			parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+			if !errors.Is(err, context.DeadlineExceeded) || len(parts) != 0 || len(quarantines) != 0 || fullAttempts != 1 {
+				t.Fatalf("full_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, parts, quarantines, err)
+			}
+			if tt.wantCanceled && !errors.Is(err, context.Canceled) {
+				t.Fatalf("parent cancellation was lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildAllPassingPartsPreservesCancellationAfterPairScan(t *testing.T) {
+	sources := makeSyntheticLocalSources(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	fullAttempts := 0
+	pairAttempts := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == len(sources) {
+			fullAttempts++
+			return BuiltOutput{}, context.DeadlineExceeded
+		}
+		pairAttempts++
+		if pairAttempts == len(sources)-1 {
+			cancel()
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, context.Canceled) || len(parts) != 0 || len(quarantines) != 0 || fullAttempts != 1 || pairAttempts != 2 {
+		t.Fatalf("full_attempts=%d pair_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, pairAttempts, parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsDoesNotLocalizeDeadlineJoinedWithENOSPC(t *testing.T) {
+	sources := makeSyntheticLocalSources(3)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+	attempts := 0
+	attempt := func(_ context.Context, _ []LocalSource, _ string) (BuiltOutput, error) {
+		attempts++
+		return BuiltOutput{}, errors.Join(context.DeadlineExceeded, syscall.ENOSPC)
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, syscall.ENOSPC) || len(parts) != 0 || len(quarantines) != 0 || attempts != 1 {
+		t.Fatalf("attempts=%d parts=%+v quarantines=%+v err=%v", attempts, parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsDoesNotRetryFullDeadlineAcrossBoundary(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+	fullAttempts := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == len(sources) {
+			fullAttempts++
+			return BuiltOutput{}, context.DeadlineExceeded
+		}
+		if containsAdjacentClipIDs(candidate, 2, 3) {
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 2 || len(quarantines) != 0 || fullAttempts != 1 {
+		t.Fatalf("full_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsFullTimeoutRetryFailureCleansOutput(t *testing.T) {
+	for _, retryErr := range []error{context.DeadlineExceeded, syscall.ENOSPC} {
+		t.Run(retryErr.Error(), func(t *testing.T) {
+			sources := makeSyntheticLocalSources(3)
+			scratch := t.TempDir()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+			defer cancel()
+			initialCause := errors.New("initial full timeout")
+			initialErr := errors.Join(initialCause, context.DeadlineExceeded)
+			fullAttempts := 0
+			attempt := func(_ context.Context, candidate []LocalSource, scratchDir string) (BuiltOutput, error) {
+				if len(candidate) != len(sources) {
+					return BuiltOutput{SourceCount: len(candidate)}, nil
+				}
+				fullAttempts++
+				if fullAttempts == 1 {
+					return BuiltOutput{}, initialErr
+				}
+				attemptDir, err := os.MkdirTemp(scratchDir, "attempt-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(attemptDir, "joined.mp4")
+				if err := os.WriteFile(path, []byte("partial"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				return BuiltOutput{Path: path, SourceCount: len(candidate)}, retryErr
+			}
+			parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, scratch, strings.Repeat("f", 64), attempt)
+			if !errors.Is(err, initialCause) || !errors.Is(err, retryErr) || len(parts) != 0 || len(quarantines) != 0 || fullAttempts != 2 {
+				t.Fatalf("parts=%+v quarantines=%+v err=%v", parts, quarantines, err)
+			}
+			entries, readErr := os.ReadDir(scratch)
+			if readErr != nil || len(entries) != 0 {
+				t.Fatalf("retry scratch retained: entries=%v err=%v", entries, readErr)
+			}
+		})
+	}
+}
+
+func TestBuildAllPassingPartsFullTimeoutRetryDeterministicFailureDoesNotRepeat(t *testing.T) {
+	sources := makeSyntheticLocalSources(3)
+	scratch := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+	initialCause := errors.New("initial full timeout")
+	retryCause := errors.New("retry deterministic mismatch")
+	fullAttempts := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) != len(sources) {
+			return BuiltOutput{SourceCount: len(candidate)}, nil
+		}
+		fullAttempts++
+		if fullAttempts == 1 {
+			return BuiltOutput{}, errors.Join(initialCause, context.DeadlineExceeded)
+		}
+		return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct{}{}, retryCause)
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, scratch, strings.Repeat("f", 64), attempt)
+	if !errors.Is(err, initialCause) || !errors.Is(err, retryCause) || len(parts) != 0 || len(quarantines) != 0 || fullAttempts != 2 {
+		t.Fatalf("full_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, parts, quarantines, err)
+	}
+	if entries, readErr := os.ReadDir(scratch); readErr != nil || len(entries) != 0 {
+		t.Fatalf("deterministic retry retained output/evidence: entries=%v err=%v", entries, readErr)
+	}
+}
+
+func TestBuildAllPassingPartsDeterministicFullRepeatKeeps25MinuteBudget(t *testing.T) {
+	sources := makeSyntheticLocalSources(4)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+	fullAttempts := 0
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == len(sources) {
+			fullAttempts++
+			deadline, ok := ctx.Deadline()
+			if !ok || time.Until(deadline) > 25*time.Minute {
+				t.Fatalf("deterministic full attempt %d exceeded 25m: deadline=%s ok=%v", fullAttempts, deadline, ok)
+			}
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		if containsAdjacentClipIDs(candidate, 2, 3) {
+			return BuiltOutput{}, seamFailure(2, 3)
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 2 || len(quarantines) != 0 || fullAttempts != 2 {
+		t.Fatalf("full_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, parts, quarantines, err)
+	}
+}
+
+func TestBuildAllPassingPartsRetriesSingletonFullDeadline(t *testing.T) {
+	sources := makeSyntheticLocalSources(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+	fullAttempts := 0
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		fullAttempts++
+		if fullAttempts == 1 {
+			return BuiltOutput{}, context.DeadlineExceeded
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(ctx, sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 1 || parts[0].SourceCount != 1 || len(quarantines) != 0 || fullAttempts != 2 {
+		t.Fatalf("full_attempts=%d parts=%+v quarantines=%+v err=%v", fullAttempts, parts, quarantines, err)
 	}
 }
 
