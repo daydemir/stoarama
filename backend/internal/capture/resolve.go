@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -837,8 +836,7 @@ func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, erro
 	}
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
-		cmd := exec.CommandContext(resolveCtx, bin, args...)
-		out, err := cmd.CombinedOutput()
+		out, err := RunYTDLPCommand(resolveCtx, bin, args...)
 		if streamURL := firstHTTPURL(string(out)); streamURL != "" {
 			return streamURL, nil
 		}
