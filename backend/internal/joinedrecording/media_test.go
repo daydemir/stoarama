@@ -1967,6 +1967,33 @@ func TestAACVariablePaddingVerificationSeparatesSeamAndDecodedDeltas(t *testing.
 	}
 }
 
+func TestAACVariablePaddingZeroOffsetSerializesEmptyTrimEvents(t *testing.T) {
+	evidence := aacSourcePaddingEvidence(&aacStreamProof{
+		PacketCount: 2, MaxFrameSamples: 1024, LastFrameSamples: 1024,
+		TerminalPacketDurationSamples: 1024,
+	})
+	zero := int64(0)
+	evidence.ClipID, evidence.SourceClaimSHA256 = 1, strings.Repeat("c", 64)
+	evidence.FirstPacketPTSSamples, evidence.FirstPacketDTSSamples = &zero, &zero
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"first_packet_pts_samples":0,"first_packet_dts_samples":0`)) || !bytes.Contains(raw, []byte(`"trim_events":[]`)) {
+		t.Fatalf("v2 zero-offset source evidence is not canonical NAS JSON: %s", raw)
+	}
+	legacy, err := json.Marshal(aacSourcePaddingEvidence(&aacStreamProof{
+		PacketCount: 2, MaxFrameSamples: 1024, LastFrameSamples: 1024,
+		TerminalPacketDurationSamples: 1024,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(legacy, []byte(`"trim_events":[]`)) {
+		t.Fatalf("zero-event serialization is not accepted NAS JSON: %s", legacy)
+	}
+}
+
 func rowVariableAACPaddingVerificationFixture(t *testing.T) Verification {
 	t.Helper()
 	discards := []int64{100, 200, 300}

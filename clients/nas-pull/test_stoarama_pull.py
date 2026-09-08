@@ -3162,19 +3162,30 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         actual = verification["output_fingerprint"]
         evidence = verification["audio_padding_normalization"]
         evidence["policy_version"] = "aac-discard-padding-v2"
-        discards = (441, 970)
+        evidence["sources"].append(json.loads(json.dumps(evidence["sources"][-1])))
+        evidence["sources"][-1]["clip_id"] = 435624
+        evidence["sources"][-1]["source_claim_sha256"] = "e" * 64
+        expected["audio_sequence_contracts"].append(dict(expected["audio_sequence_contracts"][-1]))
+        discards = (0, 100, 353)
         for item, contract, discard in zip(evidence["sources"], expected["audio_sequence_contracts"], discards):
             item["first_packet_pts_samples"] = discard
             item["first_packet_dts_samples"] = discard
             item["last_decoded_frame_samples"] = 1024 - discard
-            item["trim_events"][0]["discard_padding"] = discard
+            item["trim_events"] = [] if discard == 0 else [{
+                "packet_ordinal": item["packet_count"], "skip_samples": 0, "discard_padding": discard,
+            }]
             contract["discard_padding"] = discard
+        total_packets = sum(item["packet_count"] for item in evidence["sources"])
+        expected["tracks"]["audio"]["packet_count"] = expected["tracks"]["audio"]["decoded_frames"] = total_packets
+        actual["tracks"]["audio"]["packet_count"] = actual["tracks"]["audio"]["decoded_frames"] = total_packets
+        evidence["output"]["packet_count"] = total_packets
+        evidence["output"]["trim_events"][0]["packet_ordinal"] = total_packets
         evidence["output"]["last_decoded_frame_samples"] = 1024 - discards[-1]
         evidence["output"]["trim_events"][0]["discard_padding"] = discards[-1]
         actual["audio_sequence_contracts"][0]["discard_padding"] = discards[-1]
 
-        decoded_surplus = discards[0]
-        timing_surplus = discards[1]
+        decoded_surplus = sum(discards[:-1])
+        timing_surplus = sum(discards[1:])
         want_audio = expected["tracks"]["audio"]
         got_audio = actual["tracks"]["audio"]
         evidence["decoded_audio_surplus_samples"] = decoded_surplus
@@ -3203,7 +3214,10 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             verification["audio_padding_normalization"]["sources"]
         )
         pull.valid_verification(verification)
-        pull.decode_joined_json(pull.joined_canonical_bytes(verification))
+        encoded = pull.joined_canonical_bytes(verification)
+        self.assertIn(b'"first_packet_pts_samples":0,"first_packet_dts_samples":0', encoded)
+        self.assertIn(b'"trim_events":[]', encoded)
+        pull.decode_joined_json(encoded)
 
         def change_output_trim(value):
             value["audio_padding_normalization"]["output"]["last_decoded_frame_samples"] = 55
@@ -3212,9 +3226,9 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
 
         for label, mutate in (
             ("missing source PTS", lambda value: value["audio_padding_normalization"]["sources"][0].pop("first_packet_pts_samples")),
-            ("source PTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][0].__setitem__("first_packet_pts_samples", 440)),
-            ("source DTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][1].__setitem__("first_packet_dts_samples", 969)),
-            ("timing uses non-final discards", lambda value: value["audio_padding_normalization"].__setitem__("packet_duration_delta_seconds", "1/100")),
+            ("source PTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][0].__setitem__("first_packet_pts_samples", 1)),
+            ("source DTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][1].__setitem__("first_packet_dts_samples", 99)),
+            ("timing uses non-final discards", lambda value: value["audio_padding_normalization"].__setitem__("packet_duration_delta_seconds", str(pull.Fraction(decoded_surplus, 44100)))),
             ("decoded surplus uses non-initial offsets", lambda value: value["audio_padding_normalization"].__setitem__("decoded_audio_surplus_samples", timing_surplus)),
             ("output trim differs from final source", change_output_trim),
         ):

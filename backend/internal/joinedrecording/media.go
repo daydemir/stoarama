@@ -2351,7 +2351,7 @@ func aacSourcePaddingEvidence(proof *aacStreamProof) AACSourcePaddingEvidence {
 	return AACSourcePaddingEvidence{
 		PacketCount: proof.PacketCount, MaxDecodedFrameSamples: proof.MaxFrameSamples,
 		LastDecodedFrameSamples: proof.LastFrameSamples, TerminalPacketDurationSamples: proof.TerminalPacketDurationSamples,
-		TrimEvents: append([]AACTrimEventEvidence(nil), proof.TrimEvents...),
+		TrimEvents: append([]AACTrimEventEvidence{}, proof.TrimEvents...),
 	}
 }
 
