@@ -2023,14 +2023,21 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 		if want.sha == got.sha && relaxedErr == nil {
 			verification.AcceptanceMode = "decoded_frame_equivalent"
 			verification.DecodedFrameSequenceStatus = "passed"
-		} else if want.sha == got.sha && aacPaddingProofEnabled(ctx) {
+		} else if (want.sha == got.sha || want.pixelSHA == got.pixelSHA) && aacPaddingProofEnabled(ctx) {
 			if err := attachAACPaddingProofs(ctx, sources, outputPath, &expected, &actual); err != nil {
 				return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%w; decoded_equivalent=%w; AAC_padding=%w", strictErr, relaxedErr, err))
 			}
 			verification.SourceFingerprint, verification.OutputFingerprint = expected, actual
-			verification.SourceFingerprint.DecodedVideoSHA256 = want.sha
-			verification.OutputFingerprint.DecodedVideoSHA256 = got.sha
 			paddingEvidence, paddingErr := buildAudioPaddingNormalizationEvidence(sources, expected, actual)
+			if paddingErr == nil {
+				decodedSHA, decodedErr := decodedVideoSHAForAACPolicy(paddingEvidence.PolicyVersion, want, got)
+				if decodedErr != nil {
+					paddingErr = decodedErr
+				} else {
+					verification.SourceFingerprint.DecodedVideoSHA256 = decodedSHA
+					verification.OutputFingerprint.DecodedVideoSHA256 = decodedSHA
+				}
+			}
 			if paddingErr == nil {
 				verification.AcceptanceMode = audioPaddingAcceptanceMode
 				verification.AudioPaddingNormalization = paddingEvidence
@@ -2063,9 +2070,27 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 }
 
 type decodedIdentity struct {
-	frames int64
-	sha    string
-	err    error
+	frames   int64
+	sha      string
+	pixelSHA string
+	err      error
+}
+
+func decodedVideoSHAForAACPolicy(policy string, want, got decodedIdentity) (string, error) {
+	switch policy {
+	case aacVariablePaddingPolicyVersion:
+		if !lowerHex64(want.pixelSHA) || want.pixelSHA != got.pixelSHA {
+			return "", fmt.Errorf("variable AAC decoded video pixel sequence differs")
+		}
+		return want.pixelSHA, nil
+	case aacDiscardPaddingPolicyVersion:
+		if !lowerHex64(want.sha) || want.sha != got.sha {
+			return "", fmt.Errorf("constant AAC decoded video duration or pixel sequence differs")
+		}
+		return want.sha, nil
+	default:
+		return "", fmt.Errorf("AAC decoded video policy differs")
+	}
 }
 
 func decodedSourceOutputIdentities(ctx context.Context, sourcePaths []string, outputPath string) (decodedIdentity, decodedIdentity) {
@@ -2073,14 +2098,14 @@ func decodedSourceOutputIdentities(ctx context.Context, sourcePaths []string, ou
 	defer cancelOutput()
 	outputResult := make(chan decodedIdentity, 1)
 	go func() {
-		frames, sha, err := decodedVideoSequenceIdentity(outputCtx, []string{outputPath})
-		outputResult <- decodedIdentity{frames: frames, sha: sha, err: err}
+		frames, sha, pixelSHA, err := decodedVideoSequenceIdentities(outputCtx, []string{outputPath})
+		outputResult <- decodedIdentity{frames: frames, sha: sha, pixelSHA: pixelSHA, err: err}
 	}()
-	wantFrames, wantSHA, wantErr := decodedVideoSequenceIdentity(ctx, sourcePaths)
+	wantFrames, wantSHA, wantPixelSHA, wantErr := decodedVideoSequenceIdentities(ctx, sourcePaths)
 	if wantErr != nil {
 		cancelOutput()
 	}
-	return decodedIdentity{frames: wantFrames, sha: wantSHA, err: wantErr}, <-outputResult
+	return decodedIdentity{frames: wantFrames, sha: wantSHA, pixelSHA: wantPixelSHA, err: wantErr}, <-outputResult
 }
 
 func onlyContextCanceled(err error) bool {
@@ -2145,7 +2170,7 @@ func validateDecodedVideoIdentityBinding(ctx context.Context, want, got decodedI
 		outputFingerprintFrames = gotVideo.DecodedFrames
 	}
 	cause := fmt.Errorf("bind rejected stream-copy decoded evidence: source_frames=%d output_frames=%d source_sha=%s output_sha=%s", want.frames, got.frames, want.sha, got.sha)
-	if !lowerHex64(want.sha) || !lowerHex64(got.sha) {
+	if !lowerHex64(want.sha) || !lowerHex64(got.sha) || !lowerHex64(want.pixelSHA) || !lowerHex64(got.pixelSHA) {
 		return cause
 	}
 	if !sourceTrackPresent || !outputTrackPresent || want.frames != sourceFingerprintFrames || got.frames != outputFingerprintFrames {
@@ -2516,6 +2541,11 @@ func validateAudioPaddingNormalizationFacts(expected, actual MediaFingerprint, e
 	if evidence.PolicyVersion == aacVariablePaddingPolicyVersion && !variablePadding {
 		return fmt.Errorf("variable AAC padding policy has constant offsets")
 	}
+	if evidence.PolicyVersion == aacVariablePaddingPolicyVersion {
+		if err := validateVariableAACVideoTimeline(expected, actual, len(expected.AudioContracts)); err != nil {
+			return err
+		}
+	}
 	outputDiscard, err := validateAACPaddingSource(evidence.Output)
 	last := expected.AudioContracts[len(expected.AudioContracts)-1]
 	if err != nil || evidence.Output.ClipID != 0 || evidence.Output.SourceClaimSHA256 != "" || evidence.Output.FirstPacketPTSSamples != nil || evidence.Output.FirstPacketDTSSamples != nil || padding <= 0 || sourcePackets != wantAudio.PacketCount || evidence.Output.PacketCount != gotAudio.PacketCount || outputDiscard != out.DiscardPadding || out.SkipSamples != 0 || out.DiscardPadding != last.DiscardPadding || out.InitialPadding != 0 || out.CodecDelay != 0 || out.TrailingPadding != 0 {
@@ -2571,6 +2601,45 @@ func validateAudioPaddingNormalizationFacts(expected, actual MediaFingerprint, e
 	return nil
 }
 
+// Variable AAC offsets make the concat demuxer hold some boundary frames
+// longer. V2 permits that bounded timing transform, but never missing,
+// reordered, or changed video frames; pixel identity is proved separately.
+func validateVariableAACVideoTimeline(expected, actual MediaFingerprint, sourceCount int) error {
+	want, got := expected.Tracks["video"], actual.Tracks["video"]
+	if want == nil || got == nil || sourceCount < 2 || want.PacketCount <= 0 || want.PacketCount != want.DecodedFrames || want.DecodeTimelineSpanSeconds != want.PacketDurationSeconds {
+		return fmt.Errorf("variable AAC video timing proof is incomplete")
+	}
+	for _, pair := range [][2]string{{want.FirstPacketPTSSeconds, got.FirstPacketPTSSeconds}, {want.FirstPacketDTSSeconds, got.FirstPacketDTSSeconds}} {
+		delta, err := rationalDifference(pair[1], pair[0])
+		if err != nil || delta.Sign() != 0 {
+			return fmt.Errorf("variable AAC video first timestamp differs")
+		}
+	}
+	hold, err := rationalDifference(got.PacketDurationSeconds, want.PacketDurationSeconds)
+	if err != nil || hold.Sign() < 0 {
+		return fmt.Errorf("variable AAC video hold duration differs")
+	}
+	for _, pair := range [][2]string{
+		{want.DecodeTimelineSpanSeconds, got.DecodeTimelineSpanSeconds},
+		{want.LastPacketPTSSeconds, got.LastPacketPTSSeconds},
+		{want.LastPacketDTSSeconds, got.LastPacketDTSSeconds},
+	} {
+		delta, deltaErr := rationalDifference(pair[1], pair[0])
+		if deltaErr != nil || delta.Cmp(hold) != 0 {
+			return fmt.Errorf("variable AAC video timing transform differs")
+		}
+	}
+	packetDuration, ok := new(big.Rat).SetString(want.PacketDurationSeconds)
+	if !ok || packetDuration.Sign() <= 0 {
+		return fmt.Errorf("variable AAC video packet duration is invalid")
+	}
+	maximum := new(big.Rat).Mul(new(big.Rat).Quo(packetDuration, big.NewRat(want.PacketCount, 1)), big.NewRat(int64(sourceCount-1), 1))
+	if hold.Cmp(maximum) > 0 || hold.Cmp(big.NewRat(2, 1)) > 0 {
+		return fmt.Errorf("variable AAC video hold exceeds aggregate seam budget")
+	}
+	return nil
+}
+
 func validateAACPaddingSource(source AACSourcePaddingEvidence) (int64, error) {
 	if source.PacketCount <= 0 || source.MaxDecodedFrameSamples != aacLCFrameSamples || source.TerminalPacketDurationSamples != source.MaxDecodedFrameSamples || source.LastDecodedFrameSamples <= 0 || source.LastDecodedFrameSamples > source.MaxDecodedFrameSamples {
 		return 0, fmt.Errorf("AAC frame contract differs")
@@ -2610,23 +2679,29 @@ func rationalDifference(actual, expected string) (*big.Rat, error) {
 }
 
 func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int64, string, error) {
+	frames, sha, _, err := decodedVideoSequenceIdentities(ctx, mediaPaths)
+	return frames, sha, err
+}
+
+func decodedVideoSequenceIdentities(ctx context.Context, mediaPaths []string) (int64, string, string, error) {
 	sequence := sha256.New()
+	pixels := sha256.New()
 	var frames int64
 	for _, mediaPath := range mediaPaths {
 		process := newBoundedMediaProcess(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", mediaPath, "-map", "0:v:0", "-an", "-sn", "-dn", "-f", "framemd5", "-hash", "sha256", "-")
 		stdout, err := process.cmd.StdoutPipe()
 		if err != nil {
-			return 0, "", err
+			return 0, "", "", err
 		}
 		var stderr limitedOutput
 		process.cmd.Stderr = &stderr
 		if err := process.Start(); err != nil {
-			return 0, "", err
+			return 0, "", "", err
 		}
-		abort := func(err error) (int64, string, error) {
+		abort := func(err error) (int64, string, string, error) {
 			_ = process.Kill()
 			_ = process.Wait()
-			return 0, "", err
+			return 0, "", "", err
 		}
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 4096), 1<<20)
@@ -2651,17 +2726,22 @@ func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int
 			if _, err := strconv.ParseInt(size, 10, 64); err != nil || !lowerHex64(frameSHA) {
 				return abort(fmt.Errorf("invalid decoded frame identity"))
 			}
-			_, _ = fmt.Fprintf(sequence, "%s|%s|%s\n", duration, size, frameSHA)
+			writeDecodedFrameIdentities(sequence, pixels, duration, size, frameSHA)
 			frames++
 		}
 		if err := scanner.Err(); err != nil {
 			return abort(err)
 		}
 		if err := process.Wait(); err != nil {
-			return 0, "", fmt.Errorf("framemd5 decode: %w (%s)", err, stderr.String())
+			return 0, "", "", fmt.Errorf("framemd5 decode: %w (%s)", err, stderr.String())
 		}
 	}
-	return frames, hex.EncodeToString(sequence.Sum(nil)), nil
+	return frames, hex.EncodeToString(sequence.Sum(nil)), hex.EncodeToString(pixels.Sum(nil)), nil
+}
+
+func writeDecodedFrameIdentities(sequence, pixels hash.Hash, duration, size, frameSHA string) {
+	_, _ = fmt.Fprintf(sequence, "%s|%s|%s\n", duration, size, frameSHA)
+	_, _ = fmt.Fprintf(pixels, "%s|%s\n", size, frameSHA)
 }
 
 func compareFingerprints(expected, actual MediaFingerprint) error {

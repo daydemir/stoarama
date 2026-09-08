@@ -3200,6 +3200,12 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         want_audio["first_packet_pts_seconds"] = want_audio["first_packet_dts_seconds"] = first
         got_audio["first_packet_pts_seconds"] = got_audio["first_packet_dts_seconds"] = first
 
+        want_video = expected["tracks"]["video"]
+        got_video = actual["tracks"]["video"]
+        video_hold = pull.Fraction(1, 30)
+        for key in ("packet_duration_seconds", "decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds"):
+            got_video[key] = str(pull.Fraction(want_video[key]) + video_hold)
+
         def go_order(value: object) -> object:
             if isinstance(value, list):
                 return [go_order(item) for item in value]
@@ -3231,6 +3237,11 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ("timing uses non-final discards", lambda value: value["audio_padding_normalization"].__setitem__("packet_duration_delta_seconds", str(pull.Fraction(decoded_surplus, 44100)))),
             ("decoded surplus uses non-initial offsets", lambda value: value["audio_padding_normalization"].__setitem__("decoded_audio_surplus_samples", timing_surplus)),
             ("output trim differs from final source", change_output_trim),
+            ("video first timestamp differs", lambda value: value["output_fingerprint"]["tracks"]["video"].__setitem__("first_packet_dts_seconds", "1/30")),
+            ("video hold is negative", lambda value: value["output_fingerprint"]["tracks"]["video"].__setitem__("packet_duration_seconds", "60")),
+            ("video hold is incoherent", lambda value: value["output_fingerprint"]["tracks"]["video"].__setitem__("last_packet_pts_seconds", value["source_fingerprint"]["tracks"]["video"]["last_packet_pts_seconds"])),
+            ("video source timeline is incomplete", lambda value: value["source_fingerprint"]["tracks"]["video"].__setitem__("decode_timeline_span_seconds", "60")),
+            ("video hold exceeds seam budget", lambda value: [value["output_fingerprint"]["tracks"]["video"].__setitem__(key, str(pull.Fraction(value["source_fingerprint"]["tracks"]["video"][key]) + 3)) for key in ("packet_duration_seconds", "decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds")]),
         ):
             with self.subTest(label=label):
                 changed = json.loads(json.dumps(verification))

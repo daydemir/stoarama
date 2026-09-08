@@ -3946,6 +3946,26 @@ def valid_aac_padding_verification(verification):
         source_packets += item["packet_count"]
         if index < len(source_contracts) - 1:
             padding += discard
+    if policy == "aac-discard-padding-v2":
+        if (
+            want_video["packet_count"] != want_video["decoded_frames"]
+            or want_video["decode_timeline_span_seconds"] != want_video["packet_duration_seconds"]
+        ):
+            raise ValueError("joined variable AAC video timing proof is incomplete")
+        if any(Fraction(got_video[key]) != Fraction(want_video[key]) for key in ("first_packet_pts_seconds", "first_packet_dts_seconds")):
+            raise ValueError("joined variable AAC video first timestamp conflicts")
+        hold = Fraction(got_video["packet_duration_seconds"]) - Fraction(want_video["packet_duration_seconds"])
+        if hold < 0:
+            raise ValueError("joined variable AAC video hold conflicts")
+        for key in ("decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds"):
+            if Fraction(got_video[key]) - Fraction(want_video[key]) != hold:
+                raise ValueError("joined variable AAC video timing transform conflicts")
+        maximum_hold = min(
+            Fraction(2),
+            Fraction(want_video["packet_duration_seconds"]) * (len(source_contracts) - 1) / want_video["packet_count"],
+        )
+        if hold > maximum_hold:
+            raise ValueError("joined variable AAC video hold exceeds aggregate seam budget")
     output_discard = valid_trim(evidence["output"], False)
     output_contract = output_contracts[0]
     if (

@@ -1967,6 +1967,82 @@ func TestAACVariablePaddingVerificationSeparatesSeamAndDecodedDeltas(t *testing.
 	}
 }
 
+func TestAACVariablePaddingVideoHoldMustBeCoherentAndBounded(t *testing.T) {
+	verification := rowVariableAACPaddingVerificationFixture(t)
+	for name, mutate := range map[string]func(*Verification){
+		"first timestamp": func(v *Verification) { v.OutputFingerprint.Tracks["video"].FirstPacketDTSSeconds = "1/30" },
+		"negative hold": func(v *Verification) {
+			v.OutputFingerprint.Tracks["video"].PacketDurationSeconds = "9"
+		},
+		"incoherent last timestamp": func(v *Verification) {
+			v.OutputFingerprint.Tracks["video"].LastPacketPTSSeconds = "9"
+		},
+		"excessive hold": func(v *Verification) {
+			video := v.OutputFingerprint.Tracks["video"]
+			video.PacketDurationSeconds, video.DecodeTimelineSpanSeconds = "14", "14"
+			video.LastPacketPTSSeconds, video.LastPacketDTSSeconds = "13", "13"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(verification)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var changed Verification
+			if err := json.Unmarshal(raw, &changed); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&changed)
+			if err := validatePassedVerification(changed); err == nil {
+				t.Fatal("invalid variable AAC video hold passed")
+			}
+		})
+	}
+}
+
+func TestDecodedFramePixelIdentityExcludesDuration(t *testing.T) {
+	firstSequence, secondSequence := sha256.New(), sha256.New()
+	firstPixels, secondPixels := sha256.New(), sha256.New()
+	frameSHA := strings.Repeat("a", 64)
+	writeDecodedFrameIdentities(firstSequence, firstPixels, "1", "1382400", frameSHA)
+	writeDecodedFrameIdentities(secondSequence, secondPixels, "2", "1382400", frameSHA)
+	if bytes.Equal(firstSequence.Sum(nil), secondSequence.Sum(nil)) {
+		t.Fatal("duration-inclusive decoded identities unexpectedly match")
+	}
+	if !bytes.Equal(firstPixels.Sum(nil), secondPixels.Sum(nil)) {
+		t.Fatal("duration-only change altered decoded pixel identity")
+	}
+	changedSize, changedPixel := sha256.New(), sha256.New()
+	writeDecodedFrameIdentities(sha256.New(), changedSize, "1", "1382401", frameSHA)
+	writeDecodedFrameIdentities(sha256.New(), changedPixel, "1", "1382400", strings.Repeat("b", 64))
+	if bytes.Equal(firstPixels.Sum(nil), changedSize.Sum(nil)) || bytes.Equal(firstPixels.Sum(nil), changedPixel.Sum(nil)) {
+		t.Fatal("decoded size or pixel change reused the pixel identity")
+	}
+	firstOrder, secondOrder := sha256.New(), sha256.New()
+	writeDecodedFrameIdentities(sha256.New(), firstOrder, "1", "1", strings.Repeat("a", 64))
+	writeDecodedFrameIdentities(sha256.New(), firstOrder, "1", "1", strings.Repeat("b", 64))
+	writeDecodedFrameIdentities(sha256.New(), secondOrder, "1", "1", strings.Repeat("b", 64))
+	writeDecodedFrameIdentities(sha256.New(), secondOrder, "1", "1", strings.Repeat("a", 64))
+	if bytes.Equal(firstOrder.Sum(nil), secondOrder.Sum(nil)) {
+		t.Fatal("reordered decoded pixels reused the pixel identity")
+	}
+}
+
+func TestDecodedVideoSHAForAACPolicyKeepsV1Strict(t *testing.T) {
+	want := decodedIdentity{sha: strings.Repeat("a", 64), pixelSHA: strings.Repeat("c", 64)}
+	got := decodedIdentity{sha: strings.Repeat("b", 64), pixelSHA: want.pixelSHA}
+	if sha, err := decodedVideoSHAForAACPolicy(aacVariablePaddingPolicyVersion, want, got); err != nil || sha != want.pixelSHA {
+		t.Fatalf("v2 duration-only transform rejected: sha=%s err=%v", sha, err)
+	}
+	if _, err := decodedVideoSHAForAACPolicy(aacDiscardPaddingPolicyVersion, want, got); err == nil {
+		t.Fatal("v1 accepted duration-inclusive decoded video mismatch")
+	}
+	got.pixelSHA = strings.Repeat("d", 64)
+	if _, err := decodedVideoSHAForAACPolicy(aacVariablePaddingPolicyVersion, want, got); err == nil {
+		t.Fatal("v2 accepted decoded pixel mismatch")
+	}
+}
+
 func TestAACVariablePaddingZeroOffsetSerializesEmptyTrimEvents(t *testing.T) {
 	evidence := aacSourcePaddingEvidence(&aacStreamProof{
 		PacketCount: 2, MaxFrameSamples: 1024, LastFrameSamples: 1024,
@@ -2020,6 +2096,8 @@ func rowVariableAACPaddingVerificationFixture(t *testing.T) Verification {
 	videoSource := &TrackFingerprint{MediaType: "video", PacketCount: 6, PacketChainSHA256: strings.Repeat("2", 64), PacketTimingSHA256: strings.Repeat("3", 64), PacketTimeBases: []string{"1/90000"}, FirstPacketPTSSeconds: "0", LastPacketPTSSeconds: "9", FirstPacketDTSSeconds: "0", LastPacketDTSSeconds: "9", PacketDurationSeconds: "10", DecodeTimelineSpanSeconds: "10", DecodedFrames: 6, TimestampStatus: "source_clips_independent"}
 	videoOutput := *videoSource
 	videoOutput.TimestampStatus = "monotonic"
+	videoOutput.LastPacketPTSSeconds, videoOutput.LastPacketDTSSeconds = "55/6", "55/6"
+	videoOutput.PacketDurationSeconds, videoOutput.DecodeTimelineSpanSeconds = "61/6", "61/6"
 	audioSource := &TrackFingerprint{MediaType: "audio", PacketCount: 6, PacketChainSHA256: strings.Repeat("4", 64), PacketTimingSHA256: strings.Repeat("5", 64), PacketTimeBases: []string{"1/44100"}, FirstPacketPTSSeconds: "1/441", LastPacketPTSSeconds: "9", FirstPacketDTSSeconds: "1/441", LastPacketDTSSeconds: "9", PacketDurationSeconds: "10", DecodeTimelineSpanSeconds: "10", DecodedFrames: 6, DecodedSamples: 5544, CodecProfile: "LC", CodecExtradataSHA256: strings.Repeat("6", 64), AACPaddingNormalizedTimingSHA256: strings.Repeat("7", 64), TimestampStatus: "source_clips_independent"}
 	audioOutput := *audioSource
 	audioOutput.PacketTimingSHA256 = strings.Repeat("7", 64)
@@ -2558,8 +2636,8 @@ func TestDecodedVideoIdentityBindingClassifiesMediaEvidenceButNotInfrastructure(
 		t.Fatalf("parent cancellation was classified or lost: %v", err)
 	}
 	err = validateDecodedVideoIdentityBinding(ctx,
-		decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)},
-		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+		decodedIdentity{frames: 1, sha: strings.Repeat("a", 64), pixelSHA: strings.Repeat("c", 64)},
+		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64), pixelSHA: strings.Repeat("d", 64)},
 		&TrackFingerprint{DecodedFrames: 2}, &TrackFingerprint{DecodedFrames: 1})
 	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, context.Canceled) {
 		t.Fatalf("parent cancellation did not win structural mismatch: %v", err)
@@ -2569,16 +2647,16 @@ func TestDecodedVideoIdentityBindingClassifiesMediaEvidenceButNotInfrastructure(
 func TestDecodedVideoIdentityBindingFactsDriveDeterminismAndQuarantine(t *testing.T) {
 	wantTrack := &TrackFingerprint{DecodedFrames: 2}
 	gotTrack := &TrackFingerprint{DecodedFrames: 1}
-	want := decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)}
-	got := decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)}
+	want := decodedIdentity{frames: 1, sha: strings.Repeat("a", 64), pixelSHA: strings.Repeat("c", 64)}
+	got := decodedIdentity{frames: 1, sha: strings.Repeat("b", 64), pixelSHA: strings.Repeat("d", 64)}
 	err := validateDecodedVideoIdentityBinding(context.Background(), want, got, wantTrack, gotTrack)
 	failure, ok := deterministicBuildFailure(err)
 	if !ok || failure.code != "media_sequence_mismatch" {
 		t.Fatalf("structural binding failure was not deterministic: %v", err)
 	}
 	err = validateDecodedVideoIdentityBinding(context.Background(),
-		decodedIdentity{frames: 2, sha: "invalid"},
-		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+		decodedIdentity{frames: 2, sha: "invalid", pixelSHA: strings.Repeat("c", 64)},
+		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64), pixelSHA: strings.Repeat("d", 64)},
 		wantTrack, gotTrack)
 	if _, ok := deterministicBuildFailure(err); ok {
 		t.Fatalf("invalid generated SHA was treated as a media fact: %v", err)
@@ -2595,8 +2673,8 @@ func TestDecodedVideoIdentityBindingFactsDriveDeterminismAndQuarantine(t *testin
 		for _, source := range candidate {
 			if source.ClipID == 2 {
 				return BuiltOutput{}, validateDecodedVideoIdentityBinding(context.Background(),
-					decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)},
-					decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+					decodedIdentity{frames: 1, sha: strings.Repeat("a", 64), pixelSHA: strings.Repeat("c", 64)},
+					decodedIdentity{frames: 1, sha: strings.Repeat("b", 64), pixelSHA: strings.Repeat("d", 64)},
 					&TrackFingerprint{DecodedFrames: 2}, &TrackFingerprint{DecodedFrames: 1})
 			}
 		}
