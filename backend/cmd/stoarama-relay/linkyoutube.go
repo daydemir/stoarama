@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -87,7 +86,7 @@ func runLinkYouTube(_ []string) error {
 	// info-extract against a stable public video. No --no-warnings: we want the
 	// "Extracted N cookies" / "could not be decrypted" lines for validation.
 	args := []string{"--cookies-from-browser", "chrome", "--cookies", rawPath, "--skip-download", probeURL}
-	out, runErr := exec.CommandContext(ctx, ytdlp, args...).CombinedOutput()
+	out, runErr := capture.RunYTDLPCommand(ctx, ytdlp, args...)
 
 	// Filter the exported jar down to ONLY YouTube/Google sign-in domains before it
 	// lands at the path the background relay reads. Everything else (banking, trackers,

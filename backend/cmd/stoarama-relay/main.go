@@ -35,6 +35,9 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	if err := prepareYTDLPPrivateTemp(os.Args[1]); err != nil {
+		fatal(err)
+	}
 	args := os.Args[2:]
 	switch os.Args[1] {
 	case "enroll":
@@ -86,10 +89,6 @@ func main() {
 		if err := recordSystemdExit(args); err != nil {
 			fatal(err)
 		}
-	case "cleanup-ytdlp-temp":
-		if err := runCleanupYTDLPTemp(args); err != nil {
-			fatal(err)
-		}
 	case "version", "--version", "-v":
 		fmt.Printf("stoarama-relay %s\n", version)
 	default:
@@ -111,7 +110,6 @@ func usage() {
 		"  self-update --rollback                                 restore the previous relay binary",
 		"  canary --recording-id ID                               run a 15s local native capture without recording or upload",
 		"  record-exit                                            persist systemd stop result (service helper)",
-		"  cleanup-ytdlp-temp [--apply]                           dry-run/apply stale yt-dlp runtime cleanup",
 		"  version                                               print the relay version",
 		"",
 	}, "\n"))

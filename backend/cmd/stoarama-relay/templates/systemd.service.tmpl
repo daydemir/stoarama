@@ -5,7 +5,8 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-ExecStart={{.ExePath}} run
+{{if .PrivateYTDLPTemp}}Environment=STOARAMA_YTDLP_PRIVATE_TMP=1
+{{end}}ExecStart={{.ExePath}} run
 ExecStopPost={{.ExePath}} record-exit --service-result=${SERVICE_RESULT} --exit-code=${EXIT_CODE} --exit-status=${EXIT_STATUS}
 Restart=always
 RestartSec=30s

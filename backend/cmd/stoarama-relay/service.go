@@ -356,12 +356,21 @@ func newServiceInstanceID() string {
 
 type launchdPlistData struct {
 	Label, ExePath, LogPath, InstanceID string
-	UserDomain                          bool
+	UserDomain, PrivateYTDLPTemp        bool
 }
 
 func launchdTemplateData(label, exePath, logPath, instanceID string, userDomain bool) launchdPlistData {
 	escape := html.EscapeString
-	return launchdPlistData{escape(label), escape(exePath), escape(logPath), escape(instanceID), userDomain}
+	return launchdPlistData{escape(label), escape(exePath), escape(logPath), escape(instanceID), userDomain, privateYTDLPTempEnabled()}
+}
+
+type systemdUnitData struct {
+	ExePath          string
+	PrivateYTDLPTemp bool
+}
+
+func systemdTemplateData(exePath string) systemdUnitData {
+	return systemdUnitData{ExePath: exePath, PrivateYTDLPTemp: privateYTDLPTempEnabled()}
 }
 
 func readPriorFile(path string) ([]byte, os.FileMode, bool, error) {
@@ -426,9 +435,7 @@ func installSystemd() error {
 		return fmt.Errorf("create systemd user dir: %w", err)
 	}
 	unitPath := filepath.Join(unitDir, systemdUnit)
-	if err := renderTemplate("templates/systemd.service.tmpl", unitPath, 0o644, map[string]string{
-		"ExePath": filepath.Join(bd, "stoarama-relay"),
-	}); err != nil {
+	if err := renderTemplate("templates/systemd.service.tmpl", unitPath, 0o644, systemdTemplateData(filepath.Join(bd, "stoarama-relay"))); err != nil {
 		return err
 	}
 	fmt.Printf("Wrote %s\n", unitPath)
@@ -463,7 +470,7 @@ func refreshSystemdUnit() error {
 	if err != nil {
 		return err
 	}
-	updated, err := executeTemplate("templates/systemd.service.tmpl", map[string]string{"ExePath": filepath.Join(bd, "stoarama-relay")})
+	updated, err := executeTemplate("templates/systemd.service.tmpl", systemdTemplateData(filepath.Join(bd, "stoarama-relay")))
 	if err != nil {
 		return err
 	}
