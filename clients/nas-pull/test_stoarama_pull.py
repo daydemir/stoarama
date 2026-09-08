@@ -3232,6 +3232,33 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             value["audio_padding_normalization"]["output"]["trim_events"][0]["discard_padding"] = 969
             value["output_fingerprint"]["audio_sequence_contracts"][0]["discard_padding"] = 969
 
+        def change_video_hold(value, delta):
+            want = value["source_fingerprint"]["tracks"]["video"]
+            got = value["output_fingerprint"]["tracks"]["video"]
+            for key in ("packet_duration_seconds", "decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds"):
+                got[key] = str(pull.Fraction(want[key]) + delta)
+
+        def decrease_source_offset(value):
+            sources = value["audio_padding_normalization"]["sources"]
+            contracts = value["source_fingerprint"]["audio_sequence_contracts"]
+            for source, contract, discard in zip(sources, contracts, (100, 0, 353)):
+                source["first_packet_pts_samples"] = source["first_packet_dts_samples"] = discard
+                source["last_decoded_frame_samples"] = 1024 - discard
+                source["trim_events"] = [] if discard == 0 else [{
+                    "packet_ordinal": source["packet_count"], "skip_samples": 0, "discard_padding": discard,
+                }]
+                contract["discard_padding"] = discard
+            timing_delta = pull.Fraction(353, 44100)
+            evidence = value["audio_padding_normalization"]
+            evidence["packet_duration_delta_seconds"] = evidence["decode_timeline_span_delta_seconds"] = str(timing_delta)
+            want_audio = value["source_fingerprint"]["tracks"]["audio"]
+            got_audio = value["output_fingerprint"]["tracks"]["audio"]
+            for key in ("packet_duration_seconds", "decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds"):
+                got_audio[key] = str(pull.Fraction(want_audio[key]) + timing_delta)
+            first = str(pull.Fraction(100, 44100))
+            want_audio["first_packet_pts_seconds"] = want_audio["first_packet_dts_seconds"] = first
+            got_audio["first_packet_pts_seconds"] = got_audio["first_packet_dts_seconds"] = first
+
         for label, mutate in (
             ("missing source PTS", lambda value: value["audio_padding_normalization"]["sources"][0].pop("first_packet_pts_samples")),
             ("source PTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][0].__setitem__("first_packet_pts_samples", 1)),
@@ -3240,10 +3267,9 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ("decoded surplus uses non-initial offsets", lambda value: value["audio_padding_normalization"].__setitem__("decoded_audio_surplus_samples", timing_surplus)),
             ("output trim differs from final source", change_output_trim),
             ("video first timestamp differs", lambda value: value["output_fingerprint"]["tracks"]["video"].__setitem__("first_packet_dts_seconds", "1/30")),
-            ("video hold is negative", lambda value: value["output_fingerprint"]["tracks"]["video"].__setitem__("packet_duration_seconds", "60")),
             ("video hold is incoherent", lambda value: value["output_fingerprint"]["tracks"]["video"].__setitem__("last_packet_pts_seconds", value["source_fingerprint"]["tracks"]["video"]["last_packet_pts_seconds"])),
             ("video source timeline is incomplete", lambda value: value["source_fingerprint"]["tracks"]["video"].__setitem__("decode_timeline_span_seconds", "60")),
-            ("video hold exceeds seam budget", lambda value: [value["output_fingerprint"]["tracks"]["video"].__setitem__(key, str(pull.Fraction(value["source_fingerprint"]["tracks"]["video"][key]) + 3)) for key in ("packet_duration_seconds", "decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds")]),
+            ("video hold exceeds seam budget", lambda value: change_video_hold(value, 3)),
         ):
             with self.subTest(label=label):
                 changed = json.loads(json.dumps(verification))
@@ -3253,6 +3279,18 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 )
                 with self.assertRaises(ValueError):
                     pull.valid_verification(changed)
+
+        for mutate, message in (
+            (lambda value: change_video_hold(value, -1), "video hold conflicts"),
+            (decrease_source_offset, "source offsets decrease"),
+        ):
+            changed = json.loads(json.dumps(verification))
+            mutate(changed)
+            changed["audio_padding_normalization"]["ordered_source_evidence_sha256"] = pull.joined_canonical_sha(
+                changed["audio_padding_normalization"]["sources"]
+            )
+            with self.assertRaisesRegex(ValueError, message):
+                pull.valid_verification(changed)
 
         constant = self.aac_padding_verification()
         constant_evidence = constant["audio_padding_normalization"]

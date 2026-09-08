@@ -2506,6 +2506,7 @@ func validateAudioPaddingNormalizationFacts(expected, actual MediaFingerprint, e
 	}
 	var sourcePackets, padding int64
 	variablePadding := false
+	var previousDiscard int64
 	seenSourceIDs := make(map[int64]bool, len(evidence.Sources))
 	for i, contract := range expected.AudioContracts {
 		if contract.CodecName != "aac" || !sameAudioFormat(base, contract) || contract.SkipSamples != 0 || contract.InitialPadding != 0 || contract.CodecDelay != 0 || contract.TrailingPadding != 0 {
@@ -2524,9 +2525,13 @@ func validateAudioPaddingNormalizationFacts(expected, actual MediaFingerprint, e
 			if source.FirstPacketPTSSamples == nil || source.FirstPacketDTSSamples == nil || *source.FirstPacketPTSSamples != discard || *source.FirstPacketDTSSamples != discard {
 				return fmt.Errorf("variable AAC source start differs from frozen discard padding")
 			}
+			if i > 0 && discard < previousDiscard {
+				return fmt.Errorf("variable AAC source offsets decrease")
+			}
 		} else if source.FirstPacketPTSSamples != nil || source.FirstPacketDTSSamples != nil {
 			return fmt.Errorf("constant AAC padding evidence contains variable timing")
 		}
+		previousDiscard = discard
 		sourcePackets += source.PacketCount
 		if contract.DiscardPadding != base.DiscardPadding {
 			variablePadding = true

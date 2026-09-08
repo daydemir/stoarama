@@ -1967,6 +1967,24 @@ func TestAACVariablePaddingVerificationSeparatesSeamAndDecodedDeltas(t *testing.
 	}
 }
 
+func TestAACVariablePaddingVerificationRejectsDecreasingOffsets(t *testing.T) {
+	verification := rowVariableAACPaddingVerificationFixture(t)
+	source := &verification.AudioPaddingNormalization.Sources[2]
+	discard := int64(50)
+	source.FirstPacketPTSSamples, source.FirstPacketDTSSamples = &discard, &discard
+	source.LastDecodedFrameSamples = 1024 - discard
+	source.TrimEvents[0].DiscardPadding = discard
+	verification.SourceFingerprint.AudioContracts[2].DiscardPadding = discard
+	orderedSHA, _, err := stitchcert.CanonicalSHA(verification.AudioPaddingNormalization.Sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification.AudioPaddingNormalization.OrderedSourceEvidenceSHA256 = orderedSHA
+	if err := validateAudioPaddingNormalizationFacts(verification.SourceFingerprint, verification.OutputFingerprint, verification.AudioPaddingNormalization); err == nil || !strings.Contains(err.Error(), "source offsets decrease") {
+		t.Fatalf("decreasing variable AAC offsets did not reach the monotonicity guard: %v", err)
+	}
+}
+
 func TestAACVariablePaddingVideoHoldMustBeCoherentAndBounded(t *testing.T) {
 	verification := rowVariableAACPaddingVerificationFixture(t)
 	for name, mutate := range map[string]func(*Verification){

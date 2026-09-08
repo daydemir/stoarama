@@ -3947,6 +3947,9 @@ def valid_aac_padding_verification(verification):
         if index < len(source_contracts) - 1:
             padding += discard
     if policy == "aac-discard-padding-v2":
+        offsets = [contract["discard_padding"] for contract in source_contracts]
+        if any(offsets[index] < offsets[index - 1] for index in range(1, len(offsets))):
+            raise ValueError("joined variable AAC source offsets decrease")
         if (
             want_video["packet_count"] != want_video["decoded_frames"]
             or want_video["decode_timeline_span_seconds"] != want_video["packet_duration_seconds"]
