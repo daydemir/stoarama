@@ -943,6 +943,7 @@ class Runtime:
         self.joined_protocol_generation = 0
         self.joined_delivery = None
         self.joined_raw_priority_polled_at = 0.0
+        self.joined_range_credit = False
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1086,6 +1087,20 @@ class Runtime:
     def clear_joined_delivery_error(self):
         with self.lock:
             self.joined_delivery = None
+
+    def grant_joined_range_credit(self):
+        with self.lock:
+            self.joined_range_credit = True
+
+    def has_joined_range_credit(self):
+        with self.lock:
+            return self.joined_range_credit
+
+    def consume_joined_range_credit(self):
+        with self.lock:
+            granted = self.joined_range_credit
+            self.joined_range_credit = False
+            return granted
 
     def reserve_joined_storage(self, cfg, storage, expected_bytes):
         """Reserve one joined range only when it cannot consume raw headroom."""
@@ -5063,7 +5078,7 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
 
 
 def download_joined_item(cfg, runtime, item, stop_event):
-    if poll_raw_pending(cfg, runtime):
+    if poll_raw_pending(cfg, runtime) and not runtime.has_joined_range_credit():
         raise JoinedDownloadYield("joined delivery yielded to raw delivery")
     ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
     validate_media_manifest_binding(cfg, runtime, item, stop_event)
@@ -5096,7 +5111,8 @@ def download_joined_item(cfg, runtime, item, stop_event):
         while part_size < item["size_bytes"]:
             if not runtime.joined_protocol_enabled() or stop_event.is_set():
                 raise JoinedDownloadYield("joined download stopped at a range boundary")
-            if poll_raw_pending(cfg, runtime):
+            raw_pending = poll_raw_pending(cfg, runtime)
+            if raw_pending and not runtime.has_joined_range_credit():
                 raise JoinedDownloadYield("joined delivery yielded to raw delivery")
             try:
                 current_prepared = prepare_joined_download(cfg, item)
@@ -5108,6 +5124,8 @@ def download_joined_item(cfg, runtime, item, stop_event):
             range_bytes = end - part_size + 1
             require_joined_storage_capacity(cfg, runtime, range_bytes)
             try:
+                if raw_pending and not runtime.consume_joined_range_credit():
+                    raise JoinedDownloadYield("joined delivery yielded to raw delivery")
                 append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end, stop_event)
             finally:
                 runtime.release_storage_reservation(range_bytes)
@@ -5228,6 +5246,8 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
         raise ExistingFileMismatch("joined dependency file identity conflicts")
     identity = joined_ack_identity({**dependency, "size_bytes": size_bytes})
     if not has_joined_ack_receipt(cfg, item["connection_id"], identity):
+        if poll_raw_pending(cfg, runtime):
+            raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         if not runtime.run_joined_completion(lambda: post_joined_ack(cfg, item["connection_id"], identity)):
             raise JoinedDownloadYield("joined protocol was disabled")
 
@@ -5415,6 +5435,7 @@ def process_clip(cfg, clip, release=True):
 
 def drain_page(cfg, runtime, inventory=None):
     require_storage_capacity(cfg, runtime)
+    starting_cursor = runtime.cursor_id
     page = request_json(
         cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
     )
@@ -5480,6 +5501,8 @@ def drain_page(cfg, runtime, inventory=None):
         cursor = clip_id
     if successes:
         runtime.add_successes(cfg, cursor, successes)
+        if runtime.cursor_id > starting_cursor:
+            runtime.grant_joined_range_credit()
     failures = [(clip_id, error) for clip_id, _, error in results if error is not None]
     runtime.set_batch(len(prepared), downloaded_bytes, time.monotonic() - started, retries, len(failures))
     if failures:

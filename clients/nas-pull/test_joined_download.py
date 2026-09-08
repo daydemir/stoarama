@@ -293,6 +293,17 @@ class JoinedDownloadTests(unittest.TestCase):
             ))
             self.assertTrue(runtime.joined_background_enabled())
 
+    def test_joined_range_credit_is_bounded_consumed_once_and_resets_on_restart(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            self.assertFalse(runtime.consume_joined_range_credit())
+            runtime.grant_joined_range_credit()
+            runtime.grant_joined_range_credit()
+            self.assertTrue(runtime.consume_joined_range_credit())
+            self.assertFalse(runtime.consume_joined_range_credit())
+            self.assertFalse(pull.Runtime(cfg).consume_joined_range_credit())
+
     def test_joined_failure_heartbeat_is_typed_and_opaque(self):
         raw_item = self.media_item()
         with tempfile.TemporaryDirectory() as raw:
@@ -979,6 +990,35 @@ class JoinedDownloadTests(unittest.TestCase):
             pending.assert_called_once_with(cfg, runtime)
             dependency.assert_not_called()
             storage.assert_not_called()
+
+    def test_raw_backlog_credit_downloads_exactly_one_range_then_preserves_partial(self):
+        content = b"abcdef"
+        raw_item = self.media_item(content)
+        item = pull.valid_joined_item(raw_item)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            runtime.grant_joined_range_credit()
+            self.install_manifest(cfg, item)
+            ranges = []
+
+            def open_range(request, **_kwargs):
+                start, end = map(int, dict(request.header_items())["Range"].removeprefix("bytes=").split("-"))
+                ranges.append((start, end))
+                return RangeResponse(content[start:end + 1], start, end, len(content))
+
+            with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), \
+                 mock.patch.object(pull, "poll_raw_pending", return_value=True), \
+                 mock.patch.object(pull, "storage_status", return_value=self.storage()), \
+                 mock.patch.object(pull, "request_json", return_value=self.prepared(raw_item)), \
+                 mock.patch.object(pull, "open_joined_url", side_effect=open_range), \
+                 self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
+                pull.download_joined_item(cfg, runtime, item, threading.Event())
+            self.assertEqual(ranges, [(0, 2)])
+            final = pull.joined_output_path(cfg, item)
+            self.assertFalse(final.exists())
+            self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
+            self.assertFalse(runtime.consume_joined_range_credit())
 
     def test_raw_arrival_yields_after_one_durable_joined_range(self):
         content = b"abcdef"
