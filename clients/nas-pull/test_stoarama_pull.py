@@ -3244,7 +3244,19 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             "first_packet_pts_samples": 662,
             "first_packet_dts_samples": 662,
         })
-        with self.assertRaises(ValueError):
+        def go_order(value):
+            if isinstance(value, list):
+                return [go_order(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            allowed = pull.JOINED_OBJECT_ORDERS.get(frozenset(value))
+            order = next(iter(allowed)) if allowed else tuple(sorted(value))
+            return {key: go_order(value[key]) for key in order}
+
+        verification = go_order(verification)
+        evidence = verification["audio_padding_normalization"]
+        evidence["ordered_source_evidence_sha256"] = pull.joined_canonical_sha(evidence["sources"])
+        with self.assertRaisesRegex(ValueError, "AAC trim evidence has invalid fields"):
             pull.valid_verification(verification)
 
 
