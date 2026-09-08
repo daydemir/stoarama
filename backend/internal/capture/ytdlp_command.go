@@ -30,8 +30,18 @@ type ytdlpInvocationTemp struct {
 // directory and removes that exact directory only after the child is reaped.
 // Cleanup failure is logged but never replaces the resolver's output or error.
 func RunYTDLPCommand(ctx context.Context, bin string, args ...string) ([]byte, error) {
+	return runYTDLPCommand(ctx, true, bin, args...)
+}
+
+// RunYTDLPCommandOutput is the stdout-only form used where the prior yt-dlp
+// call deliberately ignored stderr.
+func RunYTDLPCommandOutput(ctx context.Context, bin string, args ...string) ([]byte, error) {
+	return runYTDLPCommand(ctx, false, bin, args...)
+}
+
+func runYTDLPCommand(ctx context.Context, combined bool, bin string, args ...string) ([]byte, error) {
 	if os.Getenv(YTDLPPrivateTempEnv) != "1" {
-		return exec.CommandContext(ctx, bin, args...).CombinedOutput()
+		return commandOutput(exec.CommandContext(ctx, bin, args...), combined)
 	}
 	invocation, err := newYTDLPInvocationTemp(os.Getenv(YTDLPRuntimeTempRootEnv))
 	if err != nil {
@@ -40,11 +50,18 @@ func RunYTDLPCommand(ctx context.Context, bin string, args ...string) ([]byte, e
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = replaceCommandEnvironment(os.Environ(), "TMPDIR", invocation.path)
 	configureYTDLPProcessGroup(cmd)
-	output, runErr := cmd.CombinedOutput()
+	output, runErr := commandOutput(cmd, combined)
 	if cleanupErr := invocation.remove(); cleanupErr != nil {
 		log.Printf("yt-dlp private temp cleanup failed; owned invocation retained")
 	}
 	return output, runErr
+}
+
+func commandOutput(cmd *exec.Cmd, combined bool) ([]byte, error) {
+	if combined {
+		return cmd.CombinedOutput()
+	}
+	return cmd.Output()
 }
 
 func newYTDLPInvocationTemp(root string) (ytdlpInvocationTemp, error) {

@@ -119,6 +119,24 @@ func TestRunYTDLPCommandDefaultOffPreservesParentEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunYTDLPCommandOutputPreservesStdoutOnly(t *testing.T) {
+	for _, gate := range []string{"0", "1"} {
+		t.Run(gate, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv(YTDLPPrivateTempEnv, gate)
+			t.Setenv(YTDLPRuntimeTempRootEnv, root)
+			t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "split")
+			output, err := RunYTDLPCommandOutput(context.Background(), os.Args[0], "-test.run=TestYTDLPCommandHelperProcess")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(output); got != "stdout\n" {
+				t.Fatalf("output=%q", got)
+			}
+		})
+	}
+}
+
 func TestRunYTDLPCommandConcurrentInvocationsAreIsolated(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(YTDLPPrivateTempEnv, "1")
@@ -244,6 +262,11 @@ func TestYTDLPCommandHelperProcess(t *testing.T) {
 	temp := os.Getenv("TMPDIR")
 	if behavior == "report" {
 		fmt.Println(temp)
+		os.Exit(0)
+	}
+	if behavior == "split" {
+		fmt.Println("stdout")
+		fmt.Fprintln(os.Stderr, "stderr")
 		os.Exit(0)
 	}
 	root := os.Getenv(YTDLPRuntimeTempRootEnv)
