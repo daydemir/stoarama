@@ -456,7 +456,7 @@ const (
 )
 
 func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
-	if kind == "full" || kind == "full_repeat" {
+	if kind == "full" || kind == "full_repeat" || kind == "segment" {
 		return fullTimeoutRetryBudget
 	}
 	if kind == "full_timeout_retry" {
