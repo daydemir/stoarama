@@ -1895,15 +1895,29 @@ func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, output
 	for i := range sources {
 		sourcePaths[i] = sources[i].Path
 	}
+	type decodedIdentity struct {
+		frames int64
+		sha    string
+		err    error
+	}
+	outputCtx, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	outputResult := make(chan decodedIdentity, 1)
+	go func() {
+		frames, sha, err := decodedVideoSequenceIdentity(outputCtx, []string{outputPath})
+		outputResult <- decodedIdentity{frames: frames, sha: sha, err: err}
+	}()
 	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, sourcePaths)
 	if err != nil {
+		cancelOutput()
+		<-outputResult
 		return "", fmt.Errorf("decode source frame sequence: %w", err)
 	}
-	gotFrames, gotSHA, err := decodedVideoSequenceIdentity(ctx, []string{outputPath})
-	if err != nil {
-		return "", fmt.Errorf("decode joined frame sequence: %w", err)
+	got := <-outputResult
+	if got.err != nil {
+		return "", fmt.Errorf("decode joined frame sequence: %w", got.err)
 	}
-	if wantFrames <= 0 || wantFrames != gotFrames || wantSHA != gotSHA {
+	if wantFrames <= 0 || wantFrames != got.frames || wantSHA != got.sha {
 		return "", fmt.Errorf("joined decoded video frame sequence mismatch")
 	}
 	return wantSHA, nil
@@ -1923,13 +1937,16 @@ func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int
 		if err := process.Start(); err != nil {
 			return 0, "", err
 		}
+		abort := func(err error) (int64, string, error) {
+			_ = process.Kill()
+			_ = process.Wait()
+			return 0, "", err
+		}
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 4096), 1<<20)
 		for scanner.Scan() {
 			if err := ctx.Err(); err != nil {
-				_ = process.Kill()
-				_ = process.Wait()
-				return 0, "", err
+				return abort(err)
 			}
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || strings.HasPrefix(line, "#") {
@@ -1937,26 +1954,22 @@ func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int
 			}
 			fields := strings.Split(line, ",")
 			if len(fields) != 6 {
-				_ = process.Kill()
-				_ = process.Wait()
-				return 0, "", fmt.Errorf("invalid framemd5 evidence")
+				return abort(fmt.Errorf("invalid framemd5 evidence"))
 			}
 			duration := strings.TrimSpace(fields[3])
 			size := strings.TrimSpace(fields[4])
 			frameSHA := strings.ToLower(strings.TrimSpace(fields[5]))
 			if _, err := strconv.ParseInt(duration, 10, 64); err != nil {
-				return 0, "", fmt.Errorf("invalid decoded frame duration")
+				return abort(fmt.Errorf("invalid decoded frame duration"))
 			}
 			if _, err := strconv.ParseInt(size, 10, 64); err != nil || !lowerHex64(frameSHA) {
-				return 0, "", fmt.Errorf("invalid decoded frame identity")
+				return abort(fmt.Errorf("invalid decoded frame identity"))
 			}
 			_, _ = fmt.Fprintf(sequence, "%s|%s|%s\n", duration, size, frameSHA)
 			frames++
 		}
 		if err := scanner.Err(); err != nil {
-			_ = process.Kill()
-			_ = process.Wait()
-			return 0, "", err
+			return abort(err)
 		}
 		if err := process.Wait(); err != nil {
 			return 0, "", fmt.Errorf("framemd5 decode: %w (%s)", err, stderr.String())

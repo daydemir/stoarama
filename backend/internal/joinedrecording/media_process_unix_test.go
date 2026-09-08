@@ -178,6 +178,234 @@ func TestVerifyJoinedMediaPreservesDecodedFallbackDeadline(t *testing.T) {
 	}
 }
 
+func TestCompareDecodedEquivalentOverlapsOutputWithSerialSources(t *testing.T) {
+	dir := t.TempDir()
+	useDecodedIdentityFFmpeg(t, dir, "overlap")
+	want, got := decodedEquivalentFingerprints(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	sha, err := compareDecodedEquivalent(ctx, []LocalSource{
+		{Path: filepath.Join(dir, "source-one.mp4")},
+		{Path: filepath.Join(dir, "source-two.mp4")},
+	}, filepath.Join(dir, "output.mp4"), want, got)
+	if err != nil || !lowerHex64(sha) {
+		t.Fatalf("decoded equivalence did not overlap output with serial sources: sha=%q err=%v", sha, err)
+	}
+}
+
+func TestCompareDecodedEquivalentSourceErrorCancelsAndReapsOutput(t *testing.T) {
+	dir := t.TempDir()
+	useDecodedIdentityFFmpeg(t, dir, "source-error")
+	want, got := decodedEquivalentFingerprints(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := compareDecodedEquivalent(ctx, []LocalSource{{Path: filepath.Join(dir, "source-one.mp4")}}, filepath.Join(dir, "output.mp4"), want, got)
+	if err == nil || !strings.Contains(err.Error(), "decode source frame sequence") || !strings.Contains(err.Error(), "source decode failed") {
+		t.Fatalf("source error lost precedence: %v", err)
+	}
+	outputPID := readMediaProcessPID(t, filepath.Join(dir, "output.pid"))
+	waitForMediaProcessGone(t, outputPID)
+}
+
+func TestCompareDecodedEquivalentEarlyOutputErrorIsReaped(t *testing.T) {
+	dir := t.TempDir()
+	useDecodedIdentityFFmpeg(t, dir, "output-error")
+	want, got := decodedEquivalentFingerprints(1)
+
+	_, err := compareDecodedEquivalent(context.Background(), []LocalSource{{Path: filepath.Join(dir, "source-one.mp4")}}, filepath.Join(dir, "output.mp4"), want, got)
+	if err == nil || !strings.Contains(err.Error(), "decode joined frame sequence") || !strings.Contains(err.Error(), "output decode failed") {
+		t.Fatalf("output error was not preserved: %v", err)
+	}
+	outputPID := readMediaProcessPID(t, filepath.Join(dir, "output.pid"))
+	waitForMediaProcessGone(t, outputPID)
+}
+
+func TestCompareDecodedEquivalentMalformedOutputReapsProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	useDecodedIdentityFFmpeg(t, dir, "malformed-output")
+	cleanupDecodedIdentityProcessGroups(t, dir, "output")
+	want, got := decodedEquivalentFingerprints(1)
+
+	_, err := compareDecodedEquivalent(context.Background(), []LocalSource{{Path: filepath.Join(dir, "source-one.mp4")}}, filepath.Join(dir, "output.mp4"), want, got)
+	if err == nil || !strings.Contains(err.Error(), "decode joined frame sequence") || !strings.Contains(err.Error(), "invalid decoded frame duration") {
+		t.Fatalf("malformed output error was not preserved: %v", err)
+	}
+	assertDecodedIdentityProcessGroupsGone(t, dir, "output")
+}
+
+func TestCompareDecodedEquivalentMalformedSourceWinsAndReapsBothGroups(t *testing.T) {
+	dir := t.TempDir()
+	useDecodedIdentityFFmpeg(t, dir, "malformed-source")
+	cleanupDecodedIdentityProcessGroups(t, dir, "source", "output")
+	want, got := decodedEquivalentFingerprints(1)
+
+	_, err := compareDecodedEquivalent(context.Background(), []LocalSource{{Path: filepath.Join(dir, "source-one.mp4")}}, filepath.Join(dir, "output.mp4"), want, got)
+	if err == nil || !strings.Contains(err.Error(), "decode source frame sequence") || !strings.Contains(err.Error(), "invalid decoded frame identity") || strings.Contains(err.Error(), "decode joined frame sequence") {
+		t.Fatalf("malformed source error lost precedence: %v", err)
+	}
+	assertDecodedIdentityProcessGroupsGone(t, dir, "source", "output")
+}
+
+func TestCompareDecodedEquivalentParentCancelReapsBothBranches(t *testing.T) {
+	dir := t.TempDir()
+	useDecodedIdentityFFmpeg(t, dir, "cancel")
+	want, got := decodedEquivalentFingerprints(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := compareDecodedEquivalent(ctx, []LocalSource{{Path: filepath.Join(dir, "source-one.mp4")}}, filepath.Join(dir, "output.mp4"), want, got)
+		errCh <- err
+	}()
+	waitForMediaProcessFile(t, filepath.Join(dir, "source-one.mp4.started"))
+	waitForMediaProcessFile(t, filepath.Join(dir, "output.mp4.started"))
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent cancellation was not preserved: %v", err)
+	}
+	for _, name := range []string{"source-one.mp4", "output.mp4"} {
+		pid := readMediaProcessPID(t, filepath.Join(dir, name+".pid"))
+		waitForMediaProcessGone(t, pid)
+	}
+}
+
+func decodedEquivalentFingerprints(frames int64) (MediaFingerprint, MediaFingerprint) {
+	packetSHA := strings.Repeat("a", 64)
+	want := MediaFingerprint{DurationSeconds: float64(frames), Tracks: map[string]*TrackFingerprint{
+		"video": {TimestampStatus: "source_clips_independent", PacketCount: frames, PacketChainSHA256: packetSHA, DecodedFrames: frames},
+	}}
+	got := MediaFingerprint{DurationSeconds: float64(frames), Tracks: map[string]*TrackFingerprint{
+		"video": {TimestampStatus: "monotonic", PacketCount: frames, PacketChainSHA256: packetSHA, DecodedFrames: frames},
+	}}
+	return want, got
+}
+
+func useDecodedIdentityFFmpeg(t *testing.T, dir, mode string) {
+	t.Helper()
+	fake := filepath.Join(dir, "ffmpeg")
+	script := `#!/bin/sh
+input=
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = "-i" ]; then
+		shift
+		input=$1
+		break
+	fi
+	shift
+done
+name=${input##*/}
+case "$STOARAMA_TEST_DECODE_IDENTITY_MODE:$name" in
+	overlap:output.mp4)
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started"
+		while [ ! -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/source.started" ]; do sleep 0.01; done
+		printf '0,0,0,1,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n0,0,1,1,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		;;
+	overlap:source-one.mp4)
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/source.started"
+		while [ ! -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started" ]; do sleep 0.01; done
+		printf '0,0,0,1,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/source-one.done"
+		;;
+	overlap:source-two.mp4)
+		[ -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/source-one.done" ] || exit 42
+		printf '0,0,1,1,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		;;
+	source-error:output.mp4)
+		printf '%s' $$ > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.pid"
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started"
+		exec sleep 60
+		;;
+	source-error:source-one.mp4)
+		while [ ! -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started" ]; do sleep 0.01; done
+		echo 'source decode failed' >&2
+		exit 23
+		;;
+	output-error:output.mp4)
+		printf '%s' $$ > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.pid"
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started"
+		echo 'output decode failed' >&2
+		exit 24
+		;;
+	output-error:source-one.mp4)
+		while [ ! -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started" ]; do sleep 0.01; done
+		printf '0,0,0,1,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		;;
+	malformed-output:output.mp4)
+		printf '%s' $$ > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.pid"
+		sleep 60 &
+		printf '%s' $! > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.child.pid"
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started"
+		printf '0,0,0,bad-duration,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		wait
+		;;
+	malformed-output:source-one.mp4)
+		while [ ! -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started" ]; do sleep 0.01; done
+		printf '0,0,0,1,4,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		;;
+	malformed-source:output.mp4)
+		printf '%s' $$ > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.pid"
+		sleep 60 &
+		printf '%s' $! > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.child.pid"
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started"
+		wait
+		;;
+	malformed-source:source-one.mp4)
+		while [ ! -e "$STOARAMA_TEST_DECODE_IDENTITY_DIR/output.started" ]; do sleep 0.01; done
+		printf '%s' $$ > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/source.pid"
+		sleep 60 &
+		printf '%s' $! > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/source.child.pid"
+		printf '0,0,0,1,bad-size,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+		wait
+		;;
+	cancel:*)
+		printf '%s' $$ > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/$name.pid"
+		: > "$STOARAMA_TEST_DECODE_IDENTITY_DIR/$name.started"
+		exec sleep 60
+		;;
+	*)
+		exit 44
+		;;
+esac
+`
+	if err := os.WriteFile(fake, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FFMPEG_BIN", fake)
+	t.Setenv("STOARAMA_TEST_DECODE_IDENTITY_DIR", dir)
+	t.Setenv("STOARAMA_TEST_DECODE_IDENTITY_MODE", mode)
+}
+
+func cleanupDecodedIdentityProcessGroups(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, name := range names {
+			raw, err := os.ReadFile(filepath.Join(dir, name+".pid"))
+			if err != nil {
+				continue
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if err != nil || pid <= 0 {
+				continue
+			}
+			if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid {
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}
+	})
+}
+
+func assertDecodedIdentityProcessGroupsGone(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		for _, suffix := range []string{".pid", ".child.pid"} {
+			pid := readMediaProcessPID(t, filepath.Join(dir, name+suffix))
+			waitForMediaProcessGone(t, pid)
+		}
+	}
+}
+
 func signalIgnoreTERM() {
 	signalIgnore(syscall.SIGTERM)
 }
