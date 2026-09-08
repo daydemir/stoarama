@@ -14,7 +14,10 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 )
 
-const HourManifestSchemaVersion = 1
+const (
+	HourManifestSchemaVersion           = 1
+	HourManifestAACPaddingSchemaVersion = 2
+)
 
 type HourManifestStatus string
 
@@ -213,6 +216,9 @@ func BuildHourManifest(input HourManifestInput) (HourManifest, []byte, string, e
 			clipIDs[j] = source.ClipID
 			included[source.ClipID] = SourceDisposition{ClipID: source.ClipID, Disposition: "included", MediaArtifactID: artifactID, MediaOrdinal: output.Ordinal}
 		}
+		if err := validateAudioPaddingSourceClaims(built.Verification, output.Sources); err != nil {
+			return HourManifest{}, nil, "", fmt.Errorf("hour media AAC source evidence differs from sealed plan")
+		}
 		for _, evidence := range built.SplitEvidence {
 			candidateSources, sourceErr := sourceSubsetByIDs(plan.Sources, evidence.CandidateClipIDs)
 			expectedClaim, claimErr := candidateSourceClaimSHA(candidateSources)
@@ -279,7 +285,11 @@ func BuildHourManifest(input HourManifestInput) (HourManifest, []byte, string, e
 	if status == HourStatusGapOnly {
 		scheduledGap = &ScheduledGapEvidence{ReasonCode: plan.GapOnlyReason, SignedGapNanoseconds: scheduledEnd.Sub(scheduledStart).Nanoseconds(), NoAllocatableSources: true}
 	}
-	manifest := HourManifest{SchemaVersion: HourManifestSchemaVersion, PolicyVersion: PlanPolicyVersion, Status: status, BatchID: plan.BatchID, HourID: plan.HourID, RecordingID: plan.RecordingID, Timezone: plan.Timezone, LocalDate: plan.LocalDate, DeliveryHour: plan.LocalHour, ClockHour: clockHour, ScheduledStartUTC: scheduledStart, ScheduledEndUTC: scheduledEnd, QualificationDay: qualificationDay, QualificationSHA256: plan.Qualification.EvidenceSHA, Allocation: input.Allocation, MediaTool: plan.MediaTool, SourceClaimSHA256: plan.SourceClaimSHA256, SourceCount: len(plan.Sources), Sources: append([]SourceClip{}, plan.Sources...), SourceDispositions: dispositions, Gaps: append([]Gap{}, plan.Gaps...), ScheduledGap: scheduledGap, QuarantineReasonCode: plan.QuarantineReason, QuarantineEvidence: append([]QuarantineEvidence{}, input.QuarantineEvidence...), Media: media}
+	schemaVersion := HourManifestSchemaVersion
+	if containsAACPaddingMedia(media) {
+		schemaVersion = HourManifestAACPaddingSchemaVersion
+	}
+	manifest := HourManifest{SchemaVersion: schemaVersion, PolicyVersion: PlanPolicyVersion, Status: status, BatchID: plan.BatchID, HourID: plan.HourID, RecordingID: plan.RecordingID, Timezone: plan.Timezone, LocalDate: plan.LocalDate, DeliveryHour: plan.LocalHour, ClockHour: clockHour, ScheduledStartUTC: scheduledStart, ScheduledEndUTC: scheduledEnd, QualificationDay: qualificationDay, QualificationSHA256: plan.Qualification.EvidenceSHA, Allocation: input.Allocation, MediaTool: plan.MediaTool, SourceClaimSHA256: plan.SourceClaimSHA256, SourceCount: len(plan.Sources), Sources: append([]SourceClip{}, plan.Sources...), SourceDispositions: dispositions, Gaps: append([]Gap{}, plan.Gaps...), ScheduledGap: scheduledGap, QuarantineReasonCode: plan.QuarantineReason, QuarantineEvidence: append([]QuarantineEvidence{}, input.QuarantineEvidence...), Media: media}
 	canonical, sha, err := CanonicalHourManifestArtifact(manifest)
 	return manifest, canonical, sha, err
 }
@@ -295,7 +305,11 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		return nil, "", fmt.Errorf("canonical hour manifest timezone differs")
 	}
 	day, dateErr := time.ParseInLocation("2006-01-02", manifest.LocalDate, loc)
-	if generationErr != nil || hourErr != nil || dateErr != nil || manifest.SchemaVersion != HourManifestSchemaVersion || manifest.PolicyVersion != PlanPolicyVersion || manifest.HourID != hourID || manifest.ClockHour != manifest.DeliveryHour+7 || ValidateMediaToolEvidence(manifest.MediaTool) != nil || !lowerHex64(manifest.QualificationSHA256) || validateQualifiedLedgerDay(manifest.QualificationDay, manifest.RecordingID, manifest.Timezone, manifest.LocalDate) != nil {
+	expectedSchemaVersion := HourManifestSchemaVersion
+	if containsAACPaddingMedia(manifest.Media) {
+		expectedSchemaVersion = HourManifestAACPaddingSchemaVersion
+	}
+	if generationErr != nil || hourErr != nil || dateErr != nil || manifest.SchemaVersion != expectedSchemaVersion || manifest.PolicyVersion != PlanPolicyVersion || manifest.HourID != hourID || manifest.ClockHour != manifest.DeliveryHour+7 || ValidateMediaToolEvidence(manifest.MediaTool) != nil || !lowerHex64(manifest.QualificationSHA256) || validateQualifiedLedgerDay(manifest.QualificationDay, manifest.RecordingID, manifest.Timezone, manifest.LocalDate) != nil {
 		return nil, "", fmt.Errorf("canonical hour manifest identity differs")
 	}
 	scheduledStart := time.Date(day.Year(), day.Month(), day.Day(), manifest.ClockHour, 0, 0, 0, loc).UTC()
@@ -373,6 +387,12 @@ func CanonicalHourManifestArtifact(manifest HourManifest) ([]byte, string, error
 		sourceFingerprint := media.Verification.SourceFingerprint
 		if (sourceFingerprint.Tracks["audio"] == nil && len(sourceAudioContracts) != 0) || (sourceFingerprint.Tracks["audio"] != nil && (len(sourceAudioContracts) != len(media.SourceClipIDs) || !sameCanonical(sourceAudioContracts, sourceFingerprint.AudioContracts))) {
 			return nil, "", fmt.Errorf("canonical hour manifest audio contracts differ from verification")
+		}
+		if media.Verification.AcceptanceMode == audioPaddingAcceptanceMode {
+			mediaSources, sourceErr := sourceSubsetByIDs(manifest.Sources, media.SourceClipIDs)
+			if sourceErr != nil || validateAudioPaddingSourceClaims(media.Verification, mediaSources) != nil {
+				return nil, "", fmt.Errorf("canonical hour manifest AAC source evidence differs")
+			}
 		}
 		for _, evidence := range media.MaximalityEvidence {
 			candidateSources, sourceErr := sourceSubsetByIDs(manifest.Sources, evidence.CandidateClipIDs)
@@ -639,6 +659,31 @@ func validateQuarantineEvidence(e QuarantineEvidence, toolIdentity, expectedSour
 	}
 	return nil
 }
+func containsAACPaddingMedia(media []HourManifestMedia) bool {
+	for _, item := range media {
+		if item.Verification.AcceptanceMode == audioPaddingAcceptanceMode {
+			return true
+		}
+	}
+	return false
+}
+
+func validateAudioPaddingSourceClaims(verification Verification, sources []SourceClip) error {
+	if verification.AcceptanceMode != audioPaddingAcceptanceMode {
+		return nil
+	}
+	evidence := verification.AudioPaddingNormalization
+	if evidence == nil || len(evidence.Sources) != len(sources) {
+		return fmt.Errorf("AAC source evidence cardinality differs")
+	}
+	for i, source := range sources {
+		claimSHA, _, err := sourceClaimSHA([]SourceClip{source})
+		if err != nil || evidence.Sources[i].ClipID != source.ClipID || evidence.Sources[i].SourceClaimSHA256 != claimSHA {
+			return fmt.Errorf("AAC source evidence identity differs at ordinal %d", i+1)
+		}
+	}
+	return nil
+}
 
 func sourceSubsetByIDs(accounted []SourceClip, ids []int64) ([]SourceClip, error) {
 	byID := make(map[int64]SourceClip, len(accounted))
@@ -662,24 +707,52 @@ func sourceSubsetByIDs(accounted []SourceClip, ids []int64) ([]SourceClip, error
 }
 
 func validatePassedVerification(v Verification) error {
-	if v.Status != "passed" || v.DecodedFrameTotalsStatus != "passed" || v.DecodedAudioTotalsStatus != "passed" || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" || validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil {
+	audioTotalsPassed := v.DecodedAudioTotalsStatus == "passed"
+	if v.AcceptanceMode == audioPaddingAcceptanceMode {
+		audioTotalsPassed = v.DecodedAudioTotalsStatus == audioPaddingDecodedTotalsStatus
+	}
+	if v.Status != "passed" || v.DecodedFrameTotalsStatus != "passed" || !audioTotalsPassed || v.OutputTimestampStatus != "passed" || v.StrictDecodeStatus != "passed" || validateFingerprint(v.SourceFingerprint, false) != nil || validateFingerprint(v.OutputFingerprint, true) != nil {
 		return fmt.Errorf("complete media verification did not pass")
 	}
 	switch v.AcceptanceMode {
 	case "":
-		if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "" || v.LosslessNormalization != nil || compareFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+		if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "" || v.LosslessNormalization != nil || v.AudioPaddingNormalization != nil || hasAACPaddingTrackFields(v.SourceFingerprint, v.OutputFingerprint) || compareFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
 			return fmt.Errorf("complete media verification did not pass")
 		}
 	case "decoded_frame_equivalent":
-		if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "passed" || v.LosslessNormalization != nil || validateDecodedEquivalentFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
+		if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "passed" || v.LosslessNormalization != nil || v.AudioPaddingNormalization != nil || hasAACPaddingTrackFields(v.SourceFingerprint, v.OutputFingerprint) || validateDecodedEquivalentFingerprints(v.SourceFingerprint, v.OutputFingerprint) != nil {
 			return fmt.Errorf("complete media verification did not pass")
 		}
 	case "lossless_native_timeline_normalized":
-		if validateLosslessNormalizationVerification(v) != nil {
+		if v.AudioPaddingNormalization != nil || hasAACPaddingTrackFields(v.SourceFingerprint, v.OutputFingerprint) || validateLosslessNormalizationVerification(v) != nil {
+			return fmt.Errorf("complete media verification did not pass")
+		}
+	case audioPaddingAcceptanceMode:
+		if validateAudioPaddingNormalizationVerification(v) != nil {
 			return fmt.Errorf("complete media verification did not pass")
 		}
 	default:
 		return fmt.Errorf("complete media verification did not pass")
+	}
+	return nil
+}
+func hasAACPaddingTrackFields(fingerprints ...MediaFingerprint) bool {
+	for _, fingerprint := range fingerprints {
+		for _, track := range fingerprint.Tracks {
+			if track != nil && (track.CodecProfile != "" || track.CodecExtradataSHA256 != "" || track.AACPaddingNormalizedTimingSHA256 != "") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validateAudioPaddingNormalizationVerification(v Verification) error {
+	if v.PacketPayloadOrderStatus != "passed" || v.DecodedFrameSequenceStatus != "passed" || v.LosslessNormalization != nil || v.AudioPaddingNormalization == nil || !lowerHex64(v.SourceFingerprint.DecodedVideoSHA256) || v.SourceFingerprint.DecodedVideoSHA256 != v.OutputFingerprint.DecodedVideoSHA256 {
+		return fmt.Errorf("invalid AAC padding normalization verification")
+	}
+	if err := validateAudioPaddingNormalizationFacts(v.SourceFingerprint, v.OutputFingerprint, v.AudioPaddingNormalization); err != nil {
+		return fmt.Errorf("invalid AAC padding normalization evidence: %w", err)
 	}
 	return nil
 }

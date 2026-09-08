@@ -257,6 +257,15 @@ func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID strin
 	if err != nil {
 		return canonical, state, 0, err
 	}
+	for _, manifest := range hourByID {
+		switch manifest.SchemaVersion {
+		case joinedrecording.HourManifestSchemaVersion:
+		case joinedrecording.HourManifestAACPaddingSchemaVersion:
+			canonical.Index.HourManifestSchemaVersion = joinedrecording.HourManifestAACPaddingSchemaVersion
+		default:
+			return canonical, state, 0, errors.New("joined hour-manifest schema is unsupported")
+		}
+	}
 	canonical.Index.BatchGenerationSHA256, err = joinedrecording.ComputeBatchGenerationSHA256(canonical.Index)
 	if err != nil {
 		return canonical, state, 0, err

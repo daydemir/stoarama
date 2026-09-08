@@ -353,6 +353,14 @@ class JoinedDownloadTests(unittest.TestCase):
             validator = pull.valid_allocation_ledger if name.startswith("allocation") else pull.valid_batch_index if name.startswith("batch") else pull.valid_hour_manifest
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "invalid fields"):
                 validator(payload)
+        for name, validator, field in (
+            ("hour_manifest_v1.golden.json", pull.valid_hour_manifest, "schema_version"),
+            ("batch_index_v1.golden.json", pull.valid_batch_index, "hour_manifest_schema_version"),
+        ):
+            payload = self.golden(name)
+            del payload[field]
+            with self.subTest(name=name, missing=field), self.assertRaisesRegex(ValueError, "invalid fields"):
+                validator(payload)
         self.assertEqual(
             pull.joined_timestamp_nanoseconds("2026-05-04T08:00:00.000000009Z", "fixture")
             - pull.joined_timestamp_nanoseconds("2026-05-04T08:00:00.000000001Z", "fixture"), 8,
@@ -1127,6 +1135,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 "actual_start_utc": source["start_utc"], "actual_end_utc": source["end_utc"],
             }] if delivery_hour == 1 else []
             manifests[path] = {
+                "schema_version": 1,
                 "batch_id": ledger["batch_id"], "hour_id": hour_id, "recording_id": 377, "local_date": "2026-05-04",
                 "delivery_hour": delivery_hour, "status": "media" if media else "gap_only", "source_count": len(ids),
                 "qualification_sha256": ledger["qualification_sha256"],
@@ -1142,6 +1151,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 "media_artifact_count": len(media),
             })
         index = {
+            "hour_manifest_schema_version": 1,
             "batch_id": ledger["batch_id"], "allocation_ledgers": [ledger_ref], "hours": hour_refs,
             "generation": ledger["generation"], "frozen_recordings": [frozen], "media_tool": media_tool,
             "selection_authority": selection_authority,

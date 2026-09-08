@@ -22,6 +22,18 @@ func TestBatchIndexV1Golden(t *testing.T) {
 	assertGolden(t, "testdata/batch_index_v1.golden.json", canonical)
 }
 
+func TestBatchIndexV2DeclarationRequiresResolvedV2Hour(t *testing.T) {
+	index, ledgers, manifests := testBatchIndex(t)
+	index.HourManifestSchemaVersion = HourManifestAACPaddingSchemaVersion
+	index.BatchGenerationSHA256, _ = ComputeBatchGenerationSHA256(index)
+	if _, _, _, err := canonicalSealedBatchIndex(index); err != nil {
+		t.Fatalf("sealed v2-capable batch declaration was rejected without hour resolver: %v", err)
+	}
+	if _, _, _, err := BuildBatchIndex(index, testSelectionResolver(index, ledgers), testLedgerResolver(ledgers), testHourResolver(manifests)); err == nil {
+		t.Fatal("v2 batch declaration without a resolved v2 hour was accepted")
+	}
+}
+
 func TestBatchIndexBindsRecordingSelectionEvidence(t *testing.T) {
 	index, ledgers, manifests := testBatchIndex(t)
 	baseline, denominator := index.BatchGenerationSHA256, index.FrozenDenominatorSHA256
@@ -1138,6 +1150,7 @@ func TestHourManifestRejectsMutatedLedgerAndDowngradedEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*HourManifest){
+		"unexpected AAC schema":  func(manifest *HourManifest) { manifest.SchemaVersion = HourManifestAACPaddingSchemaVersion },
 		"invalid audio contract": func(manifest *HourManifest) { manifest.Sources[0].AudioContract = &AudioSequenceContract{} },
 		"audio contract without verified audio": func(manifest *HourManifest) {
 			manifest.Sources[0].AudioContract = &AudioSequenceContract{CodecName: "aac", SampleRate: 48000, Channels: 2, ChannelLayout: "stereo"}

@@ -142,6 +142,27 @@ type AudioSequenceContract struct {
 	TrailingPadding int64  `json:"trailing_padding"`
 	EditListKind    string `json:"edit_list_kind,omitempty"`
 	EditListSHA256  string `json:"edit_list_sha256,omitempty"`
+	aacProof        *aacStreamProof
+}
+
+type aacPacketTiming struct {
+	PTS, DTS, Duration int64
+	TimeBaseNum        int64
+	TimeBaseDen        int64
+}
+
+type AACTrimEventEvidence struct {
+	PacketOrdinal  int64 `json:"packet_ordinal"`
+	SkipSamples    int64 `json:"skip_samples"`
+	DiscardPadding int64 `json:"discard_padding"`
+}
+
+type aacStreamProof struct {
+	Profile, ExtradataSHA256                       string
+	PacketCount, MaxFrameSamples, LastFrameSamples int64
+	TerminalPacketDurationSamples                  int64
+	TrimEvents                                     []AACTrimEventEvidence
+	PacketTimings                                  []aacPacketTiming
 }
 
 func validateAudioContract(c AudioSequenceContract) error {
@@ -152,22 +173,25 @@ func validateAudioContract(c AudioSequenceContract) error {
 }
 
 type TrackFingerprint struct {
-	MediaType                 string   `json:"media_type"`
-	PacketCount               int64    `json:"packet_count"`
-	PacketChainSHA256         string   `json:"packet_chain_sha256"`
-	PacketTimingSHA256        string   `json:"packet_timing_sha256"`
-	PacketTimeBases           []string `json:"packet_time_bases"`
-	FirstPacketPTSSeconds     string   `json:"first_packet_pts_seconds"`
-	LastPacketPTSSeconds      string   `json:"last_packet_pts_seconds"`
-	FirstPacketDTSSeconds     string   `json:"first_packet_dts_seconds"`
-	LastPacketDTSSeconds      string   `json:"last_packet_dts_seconds"`
-	PacketDurationSeconds     string   `json:"packet_duration_seconds"`
-	DecodeTimelineSpanSeconds string   `json:"decode_timeline_span_seconds"`
-	DecodedFrames             int64    `json:"decoded_frames"`
-	DecodedSamples            int64    `json:"decoded_samples,omitempty"`
-	FirstTimestamp            int64    `json:"first_timestamp"`
-	LastTimestamp             int64    `json:"last_timestamp"`
-	TimestampStatus           string   `json:"timestamp_status"`
+	MediaType                        string   `json:"media_type"`
+	PacketCount                      int64    `json:"packet_count"`
+	PacketChainSHA256                string   `json:"packet_chain_sha256"`
+	PacketTimingSHA256               string   `json:"packet_timing_sha256"`
+	PacketTimeBases                  []string `json:"packet_time_bases"`
+	FirstPacketPTSSeconds            string   `json:"first_packet_pts_seconds"`
+	LastPacketPTSSeconds             string   `json:"last_packet_pts_seconds"`
+	FirstPacketDTSSeconds            string   `json:"first_packet_dts_seconds"`
+	LastPacketDTSSeconds             string   `json:"last_packet_dts_seconds"`
+	PacketDurationSeconds            string   `json:"packet_duration_seconds"`
+	DecodeTimelineSpanSeconds        string   `json:"decode_timeline_span_seconds"`
+	DecodedFrames                    int64    `json:"decoded_frames"`
+	DecodedSamples                   int64    `json:"decoded_samples,omitempty"`
+	FirstTimestamp                   int64    `json:"first_timestamp"`
+	LastTimestamp                    int64    `json:"last_timestamp"`
+	CodecProfile                     string   `json:"codec_profile,omitempty"`
+	CodecExtradataSHA256             string   `json:"codec_extradata_sha256,omitempty"`
+	AACPaddingNormalizedTimingSHA256 string   `json:"aac_padding_normalized_timing_sha256,omitempty"`
+	TimestampStatus                  string   `json:"timestamp_status"`
 }
 
 type MediaFingerprint struct {
@@ -181,17 +205,51 @@ type MediaFingerprint struct {
 }
 
 type Verification struct {
-	Status                     string                         `json:"status"`
-	AcceptanceMode             string                         `json:"acceptance_mode,omitempty"`
-	LosslessNormalization      *LosslessNormalizationEvidence `json:"lossless_normalization,omitempty"`
-	PacketPayloadOrderStatus   string                         `json:"packet_payload_order_status"`
-	DecodedFrameSequenceStatus string                         `json:"decoded_frame_sequence_status,omitempty"`
-	DecodedFrameTotalsStatus   string                         `json:"decoded_frame_totals_status"`
-	DecodedAudioTotalsStatus   string                         `json:"decoded_audio_totals_status"`
-	OutputTimestampStatus      string                         `json:"output_timestamp_status"`
-	StrictDecodeStatus         string                         `json:"strict_decode_status"`
-	SourceFingerprint          MediaFingerprint               `json:"source_fingerprint"`
-	OutputFingerprint          MediaFingerprint               `json:"output_fingerprint"`
+	Status                     string                             `json:"status"`
+	AcceptanceMode             string                             `json:"acceptance_mode,omitempty"`
+	LosslessNormalization      *LosslessNormalizationEvidence     `json:"lossless_normalization,omitempty"`
+	AudioPaddingNormalization  *AudioPaddingNormalizationEvidence `json:"audio_padding_normalization,omitempty"`
+	PacketPayloadOrderStatus   string                             `json:"packet_payload_order_status"`
+	DecodedFrameSequenceStatus string                             `json:"decoded_frame_sequence_status,omitempty"`
+	DecodedFrameTotalsStatus   string                             `json:"decoded_frame_totals_status"`
+	DecodedAudioTotalsStatus   string                             `json:"decoded_audio_totals_status"`
+	OutputTimestampStatus      string                             `json:"output_timestamp_status"`
+	StrictDecodeStatus         string                             `json:"strict_decode_status"`
+	SourceFingerprint          MediaFingerprint                   `json:"source_fingerprint"`
+	OutputFingerprint          MediaFingerprint                   `json:"output_fingerprint"`
+}
+
+const (
+	audioPaddingAcceptanceMode       = "video_frame_exact_audio_padding_normalized"
+	aacDiscardPaddingPolicyVersion   = "aac-discard-padding-v1"
+	audioPaddingNotSampleExactStatus = "compressed_packets_exact_decoded_audio_not_sample_exact"
+	audioPaddingDecodedTotalsStatus  = "aac_discard_padding_normalized"
+	aacLCFrameSamples                = 1024
+	audioPaddingFeatureEnv           = "STOARAMA_JOINED_AAC_PADDING_NORMALIZATION_ENABLED"
+)
+
+// AudioPaddingNormalizationEvidence permits only the AAC decoder surplus
+// declared by frozen non-final discard_padding. Compressed audio packets stay
+// exact, but the decoded PCM is explicitly not certified sample-exact.
+type AudioPaddingNormalizationEvidence struct {
+	PolicyVersion                  string                     `json:"policy_version"`
+	Sources                        []AACSourcePaddingEvidence `json:"sources"`
+	Output                         AACSourcePaddingEvidence   `json:"output"`
+	OrderedSourceEvidenceSHA256    string                     `json:"ordered_source_evidence_sha256"`
+	DecodedAudioSurplusSamples     int64                      `json:"decoded_audio_surplus_samples"`
+	PacketDurationDeltaSeconds     string                     `json:"packet_duration_delta_seconds"`
+	DecodeTimelineSpanDeltaSeconds string                     `json:"decode_timeline_span_delta_seconds"`
+	AudioContentStatus             string                     `json:"audio_content_status"`
+}
+
+type AACSourcePaddingEvidence struct {
+	ClipID                        int64                  `json:"clip_id,omitempty"`
+	SourceClaimSHA256             string                 `json:"source_claim_sha256,omitempty"`
+	PacketCount                   int64                  `json:"packet_count"`
+	MaxDecodedFrameSamples        int64                  `json:"max_decoded_frame_samples"`
+	LastDecodedFrameSamples       int64                  `json:"last_decoded_frame_samples"`
+	TerminalPacketDurationSamples int64                  `json:"terminal_packet_duration_samples"`
+	TrimEvents                    []AACTrimEventEvidence `json:"trim_events"`
 }
 
 // LosslessNormalizationEvidence records the exact, bounded codec contract
@@ -991,6 +1049,9 @@ func BuildSealedOutputForVerification(ctx context.Context, sources []LocalSource
 	if validatePassedVerification(expected) != nil {
 		return BuiltOutput{}, fmt.Errorf("sealed media verification evidence is invalid")
 	}
+	if expected.AcceptanceMode == audioPaddingAcceptanceMode {
+		return buildStreamCopyAndVerify(context.WithValue(ctx, aacPaddingProofContextKey{}, true), sources, scratchDir)
+	}
 	if expected.AcceptanceMode != "lossless_native_timeline_normalized" {
 		return buildStreamCopyAndVerify(ctx, sources, scratchDir)
 	}
@@ -1679,7 +1740,7 @@ func decodedFrameFieldSequenceProof(ctx context.Context, mediaPaths []string, la
 
 func validateRejectedStreamCopyVerification(raw json.RawMessage, normalizedSource MediaFingerprint) error {
 	var rejected Verification
-	if decodeStrictJSON(raw, &rejected) != nil || rejected.Status != "failed" || rejected.AcceptanceMode != "" || rejected.LosslessNormalization != nil || rejected.PacketPayloadOrderStatus != "" || rejected.DecodedFrameSequenceStatus != "failed" || rejected.DecodedFrameTotalsStatus != "" || rejected.DecodedAudioTotalsStatus != "" || rejected.OutputTimestampStatus != "" || rejected.StrictDecodeStatus != "" {
+	if decodeStrictJSON(raw, &rejected) != nil || rejected.Status != "failed" || rejected.AcceptanceMode != "" || rejected.LosslessNormalization != nil || rejected.AudioPaddingNormalization != nil || hasAACPaddingTrackFields(rejected.SourceFingerprint, rejected.OutputFingerprint) || rejected.PacketPayloadOrderStatus != "" || rejected.DecodedFrameSequenceStatus != "failed" || rejected.DecodedFrameTotalsStatus != "" || rejected.DecodedAudioTotalsStatus != "" || rejected.OutputTimestampStatus != "" || rejected.StrictDecodeStatus != "" {
 		return fmt.Errorf("rejected stream-copy status evidence differs")
 	}
 	if validateFingerprint(rejected.SourceFingerprint, false) != nil || validateFingerprint(rejected.OutputFingerprint, false) != nil || !lowerHex64(rejected.SourceFingerprint.DecodedVideoSHA256) || !lowerHex64(rejected.OutputFingerprint.DecodedVideoSHA256) || !sameCanonical([]MediaFingerprint{rejected.SourceFingerprint}, []MediaFingerprint{normalizedSource}) {
@@ -1855,33 +1916,51 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 	actual := output.fingerprint
 	verification := Verification{Status: "failed", SourceFingerprint: expected, OutputFingerprint: actual}
 	if strictErr := compareFingerprints(expected, actual); strictErr != nil {
-		decodedVideoSHA, relaxedErr := compareDecodedEquivalent(ctx, sources, outputPath, expected, actual)
-		if relaxedErr != nil {
-			sourcePaths := make([]string, len(sources))
-			for i := range sources {
-				sourcePaths[i] = sources[i].Path
+		sourcePaths := make([]string, len(sources))
+		for i := range sources {
+			sourcePaths[i] = sources[i].Path
+		}
+		want, got := decodedSourceOutputIdentities(ctx, sourcePaths, outputPath)
+		wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
+		if want.err != nil || got.err != nil {
+			return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(want.err, got.err))
+		}
+		if wantVideo == nil || gotVideo == nil || want.frames != wantVideo.DecodedFrames || got.frames != gotVideo.DecodedFrames || !lowerHex64(want.sha) || !lowerHex64(got.sha) {
+			return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source_frames=%d output_frames=%d source_sha=%s output_sha=%s", want.frames, got.frames, want.sha, got.sha)
+		}
+		verification.SourceFingerprint.DecodedVideoSHA256 = want.sha
+		verification.OutputFingerprint.DecodedVideoSHA256 = got.sha
+		verification.DecodedFrameSequenceStatus = "failed"
+		relaxedErr := validateDecodedEquivalentMetadata(expected, actual)
+		if want.sha == got.sha && relaxedErr == nil {
+			verification.AcceptanceMode = "decoded_frame_equivalent"
+			verification.DecodedFrameSequenceStatus = "passed"
+		} else if want.sha == got.sha && aacPaddingProofEnabled(ctx) {
+			if err := attachAACPaddingProofs(ctx, sources, outputPath, &expected, &actual); err != nil {
+				return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%w; decoded_equivalent=%w; AAC_padding=%w", strictErr, relaxedErr, err))
 			}
-			want, got := decodedSourceOutputIdentities(ctx, sourcePaths, outputPath)
-			wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
-			if want.err != nil || got.err != nil {
-				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(want.err, got.err))
-			}
-			if wantVideo == nil || gotVideo == nil || want.frames != wantVideo.DecodedFrames || got.frames != gotVideo.DecodedFrames || !lowerHex64(want.sha) || !lowerHex64(got.sha) {
-				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source_frames=%d output_frames=%d source_sha=%s output_sha=%s", want.frames, got.frames, want.sha, got.sha)
-			}
+			verification.SourceFingerprint, verification.OutputFingerprint = expected, actual
 			verification.SourceFingerprint.DecodedVideoSHA256 = want.sha
 			verification.OutputFingerprint.DecodedVideoSHA256 = got.sha
-			verification.DecodedFrameSequenceStatus = "failed"
-			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%w", strictErr, relaxedErr))
+			paddingEvidence, paddingErr := buildAudioPaddingNormalizationEvidence(sources, expected, actual)
+			if paddingErr == nil {
+				verification.AcceptanceMode = audioPaddingAcceptanceMode
+				verification.AudioPaddingNormalization = paddingEvidence
+				verification.DecodedFrameSequenceStatus = "passed"
+			} else {
+				return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%w; decoded_equivalent=%w; AAC_padding=%w", strictErr, relaxedErr, paddingErr))
+			}
+		} else {
+			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%w; decoded_equivalent=%w", strictErr, relaxedErr))
 		}
-		verification.AcceptanceMode = "decoded_frame_equivalent"
-		verification.DecodedFrameSequenceStatus = "passed"
-		verification.SourceFingerprint.DecodedVideoSHA256 = decodedVideoSHA
-		verification.OutputFingerprint.DecodedVideoSHA256 = decodedVideoSHA
 	}
 	verification.PacketPayloadOrderStatus = "passed"
 	verification.DecodedFrameTotalsStatus = "passed"
-	verification.DecodedAudioTotalsStatus = "passed"
+	if verification.AcceptanceMode == audioPaddingAcceptanceMode {
+		verification.DecodedAudioTotalsStatus = audioPaddingDecodedTotalsStatus
+	} else {
+		verification.DecodedAudioTotalsStatus = "passed"
+	}
 	verification.OutputTimestampStatus = "passed"
 	if err := runBounded(ctx, ffmpegBinary(), "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-i", outputPath, "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"); err != nil {
 		classified := deterministicCommandFailure(ctx, "strict_decode_failure", err)
@@ -1916,6 +1995,25 @@ func decodedSourceOutputIdentities(ctx context.Context, sourcePaths []string, ou
 	return decodedIdentity{frames: wantFrames, sha: wantSHA, err: wantErr}, <-outputResult
 }
 
+func validateDecodedEquivalentMetadata(expected, actual MediaFingerprint) error {
+	if len(expected.Tracks) != len(actual.Tracks) || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
+		return fmt.Errorf("joined duration or stream cardinality mismatch")
+	}
+	for mediaType, want := range expected.Tracks {
+		got := actual.Tracks[mediaType]
+		if got == nil || want.TimestampStatus != "source_clips_independent" || got.TimestampStatus != "monotonic" || want.PacketCount != got.PacketCount || want.PacketChainSHA256 != got.PacketChainSHA256 || want.DecodedFrames <= 0 || want.DecodedFrames != got.DecodedFrames || (mediaType == "audio" && want.DecodedSamples != got.DecodedSamples) {
+			return fmt.Errorf("joined %s packet payload, decoded totals, or timeline mismatch", mediaType)
+		}
+	}
+	if expected.EffectiveAudioBytes != actual.EffectiveAudioBytes || expected.EffectiveAudioFrames != actual.EffectiveAudioFrames || expected.EffectiveAudioSHA256 != actual.EffectiveAudioSHA256 {
+		return fmt.Errorf("joined effective decoded audio sequence mismatch")
+	}
+	if len(expected.AudioContracts) > 0 && (len(actual.AudioContracts) != 1 || !sameAudioFormat(expected.AudioContracts[0], actual.AudioContracts[0])) {
+		return fmt.Errorf("joined effective audio format mismatch")
+	}
+	return nil
+}
+
 func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, outputPath string, expected, actual MediaFingerprint) (string, error) {
 	if len(expected.Tracks) != len(actual.Tracks) || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
 		return "", fmt.Errorf("joined duration or stream cardinality mismatch")
@@ -1947,6 +2045,332 @@ func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, output
 		return "", fmt.Errorf("joined decoded video frame sequence mismatch")
 	}
 	return want.sha, nil
+}
+
+func audioPaddingNormalizationEnabled() bool {
+	return os.Getenv(audioPaddingFeatureEnv) == "1"
+}
+
+func attachAACPaddingProofs(ctx context.Context, sources []LocalSource, outputPath string, expected, actual *MediaFingerprint) error {
+	if len(sources) < 2 || len(expected.AudioContracts) != len(sources) || len(actual.AudioContracts) != 1 {
+		return fmt.Errorf("AAC padding normalization proof cardinality differs")
+	}
+	expectedContracts := append([]AudioSequenceContract(nil), expected.AudioContracts...)
+	for i, source := range sources {
+		proof, err := probeAACPaddingContract(ctx, source.Path, expectedContracts[i])
+		if err != nil {
+			return fmt.Errorf("source ordinal=%d AAC proof: %w", i+1, err)
+		}
+		expectedContracts[i].aacProof = proof
+	}
+	outputContracts := append([]AudioSequenceContract(nil), actual.AudioContracts...)
+	proof, err := probeAACPaddingContract(ctx, outputPath, outputContracts[0])
+	if err != nil {
+		return fmt.Errorf("output AAC proof: %w", err)
+	}
+	outputContracts[0].aacProof = proof
+	expected.AudioContracts, actual.AudioContracts = expectedContracts, outputContracts
+	return nil
+}
+
+func probeAACPaddingContract(ctx context.Context, mediaPath string, frozen AudioSequenceContract) (*aacStreamProof, error) {
+	_, indexType, observed, err := probeMediaMetadata(ctx, mediaPath)
+	if err != nil {
+		return nil, err
+	}
+	if observed == nil || observed.aacProof == nil || !sameObservableAudioContract(frozen, *observed) {
+		return nil, fmt.Errorf("frozen audio sequence contract differs from exact source bytes")
+	}
+	proof, err := probeAACStreamProof(ctx, mediaPath, observed.SampleRate, indexType)
+	if err != nil {
+		return nil, err
+	}
+	proof.Profile, proof.ExtradataSHA256 = observed.aacProof.Profile, observed.aacProof.ExtradataSHA256
+	skip, discard, err := summedAudioTrim(proof.TrimEvents)
+	if err != nil || skip != frozen.SkipSamples || discard != frozen.DiscardPadding {
+		return nil, fmt.Errorf("detailed AAC trim differs from frozen contract")
+	}
+	return &proof, nil
+}
+
+type aacPaddingProofContextKey struct{}
+
+func aacPaddingProofEnabled(ctx context.Context) bool {
+	forced, _ := ctx.Value(aacPaddingProofContextKey{}).(bool)
+	return forced || audioPaddingNormalizationEnabled()
+}
+
+func buildAudioPaddingNormalizationEvidence(sources []LocalSource, expected, actual MediaFingerprint) (*AudioPaddingNormalizationEvidence, error) {
+
+	wantAudio, gotAudio := expected.Tracks["audio"], actual.Tracks["audio"]
+	if wantAudio == nil || gotAudio == nil || len(wantAudio.PacketTimeBases) != 1 || len(gotAudio.PacketTimeBases) != 1 || len(expected.AudioContracts) < 2 || len(expected.AudioContracts) != len(sources) || len(actual.AudioContracts) != 1 {
+		return nil, fmt.Errorf("AAC padding normalization proof is incomplete")
+	}
+	base, out := expected.AudioContracts[0], actual.AudioContracts[0]
+	if base.aacProof == nil || out.aacProof == nil {
+		return nil, fmt.Errorf("AAC padding normalization codec proof is missing")
+	}
+	sourceEvidence := make([]AACSourcePaddingEvidence, len(expected.AudioContracts))
+	for i, contract := range expected.AudioContracts {
+		if contract.aacProof == nil || contract.aacProof.Profile != base.aacProof.Profile || contract.aacProof.ExtradataSHA256 != base.aacProof.ExtradataSHA256 {
+			return nil, fmt.Errorf("AAC padding normalization source proof is missing")
+		}
+		sourceEvidence[i] = aacSourcePaddingEvidence(contract.aacProof)
+		if sources[i].ClipID <= 0 || !lowerHex64(sources[i].SourceClaimSHA256) {
+			return nil, fmt.Errorf("AAC padding normalization source identity is missing")
+		}
+		sourceEvidence[i].ClipID, sourceEvidence[i].SourceClaimSHA256 = sources[i].ClipID, sources[i].SourceClaimSHA256
+	}
+	outputEvidence := aacSourcePaddingEvidence(out.aacProof)
+	sourceTimingSHA, err := aacPacketTimingSHA(expected.AudioContracts, false)
+	if err != nil || sourceTimingSHA != wantAudio.PacketTimingSHA256 {
+		return nil, fmt.Errorf("AAC source packet timing proof differs")
+	}
+	expectedOutputTimingSHA, err := aacPacketTimingSHA(expected.AudioContracts, true)
+	if err != nil {
+		return nil, err
+	}
+	outputTimingSHA, err := aacPacketTimingSHA(actual.AudioContracts, false)
+	if err != nil || outputTimingSHA != gotAudio.PacketTimingSHA256 || outputTimingSHA != expectedOutputTimingSHA {
+		return nil, fmt.Errorf("AAC output packet timing transform differs")
+	}
+	padding, err := nonFinalPaddingSamples(expected.AudioContracts)
+	if err != nil {
+		return nil, err
+	}
+	packetDelta, err := rationalDifference(gotAudio.PacketDurationSeconds, wantAudio.PacketDurationSeconds)
+	if err != nil {
+		return nil, err
+	}
+	timelineDelta, err := rationalDifference(gotAudio.DecodeTimelineSpanSeconds, wantAudio.DecodeTimelineSpanSeconds)
+	if err != nil {
+		return nil, err
+	}
+	evidence := &AudioPaddingNormalizationEvidence{
+		PolicyVersion: aacDiscardPaddingPolicyVersion,
+		Sources:       sourceEvidence, Output: outputEvidence,
+		DecodedAudioSurplusSamples: padding, PacketDurationDeltaSeconds: packetDelta.RatString(),
+		DecodeTimelineSpanDeltaSeconds: timelineDelta.RatString(), AudioContentStatus: audioPaddingNotSampleExactStatus,
+	}
+	orderedSourceSHA, _, err := stitchcert.CanonicalSHA(sourceEvidence)
+	if err != nil {
+		return nil, err
+	}
+	evidence.OrderedSourceEvidenceSHA256 = orderedSourceSHA
+	wantAudioCopy, gotAudioCopy := *wantAudio, *gotAudio
+	wantAudioCopy.CodecProfile, wantAudioCopy.CodecExtradataSHA256, wantAudioCopy.AACPaddingNormalizedTimingSHA256 = base.aacProof.Profile, base.aacProof.ExtradataSHA256, expectedOutputTimingSHA
+	gotAudioCopy.CodecProfile, gotAudioCopy.CodecExtradataSHA256 = out.aacProof.Profile, out.aacProof.ExtradataSHA256
+	checkedExpected, checkedActual := expected, actual
+	checkedExpected.Tracks, checkedActual.Tracks = make(map[string]*TrackFingerprint, len(expected.Tracks)), make(map[string]*TrackFingerprint, len(actual.Tracks))
+	for kind, track := range expected.Tracks {
+		checkedExpected.Tracks[kind] = track
+	}
+	for kind, track := range actual.Tracks {
+		checkedActual.Tracks[kind] = track
+	}
+	checkedExpected.Tracks["audio"], checkedActual.Tracks["audio"] = &wantAudioCopy, &gotAudioCopy
+	if err := validateAudioPaddingNormalizationFacts(checkedExpected, checkedActual, evidence); err != nil {
+		return nil, err
+	}
+	*wantAudio, *gotAudio = wantAudioCopy, gotAudioCopy
+	return evidence, nil
+}
+
+func aacSourcePaddingEvidence(proof *aacStreamProof) AACSourcePaddingEvidence {
+	return AACSourcePaddingEvidence{
+		PacketCount: proof.PacketCount, MaxDecodedFrameSamples: proof.MaxFrameSamples,
+		LastDecodedFrameSamples: proof.LastFrameSamples, TerminalPacketDurationSamples: proof.TerminalPacketDurationSamples,
+		TrimEvents: append([]AACTrimEventEvidence(nil), proof.TrimEvents...),
+	}
+}
+
+func nonFinalPaddingSamples(contracts []AudioSequenceContract) (int64, error) {
+	if len(contracts) < 2 {
+		return 0, fmt.Errorf("AAC padding normalization requires multiple sources")
+	}
+	var padding int64
+	for _, contract := range contracts[:len(contracts)-1] {
+		if contract.DiscardPadding < 0 || padding > math.MaxInt64-contract.DiscardPadding {
+			return 0, fmt.Errorf("AAC seam padding overflows")
+		}
+		padding += contract.DiscardPadding
+	}
+	if padding <= 0 {
+		return 0, fmt.Errorf("AAC seam padding is empty")
+	}
+	return padding, nil
+}
+
+func aacPacketTimingSHA(contracts []AudioSequenceContract, applyNonFinalPadding bool) (string, error) {
+	if len(contracts) == 0 {
+		return "", fmt.Errorf("AAC packet timing proof is empty")
+	}
+	h := sha256.New()
+	base := new(big.Rat)
+	for sourceIndex, contract := range contracts {
+		if contract.aacProof == nil || len(contract.aacProof.PacketTimings) == 0 || contract.SampleRate <= 0 {
+			return "", fmt.Errorf("AAC packet timing proof is incomplete")
+		}
+		first := contract.aacProof.PacketTimings[0]
+		firstDTS := ticksToRational(first.DTS, first.TimeBaseNum, first.TimeBaseDen)
+		sourceDuration := new(big.Rat)
+		for packetIndex, packet := range contract.aacProof.PacketTimings {
+			pts := new(big.Rat).Add(base, new(big.Rat).Sub(ticksToRational(packet.PTS, packet.TimeBaseNum, packet.TimeBaseDen), firstDTS))
+			dts := new(big.Rat).Add(base, new(big.Rat).Sub(ticksToRational(packet.DTS, packet.TimeBaseNum, packet.TimeBaseDen), firstDTS))
+			duration := ticksToRational(packet.Duration, packet.TimeBaseNum, packet.TimeBaseDen)
+			sourceDuration.Add(sourceDuration, duration)
+			if applyNonFinalPadding && sourceIndex < len(contracts)-1 && packetIndex == len(contract.aacProof.PacketTimings)-1 {
+				duration = new(big.Rat).Add(duration, new(big.Rat).SetFrac(big.NewInt(contract.DiscardPadding), big.NewInt(contract.SampleRate)))
+			}
+			_, _ = fmt.Fprintf(h, "%s|%s|%s\n", pts.RatString(), dts.RatString(), duration.RatString())
+		}
+		base.Add(base, sourceDuration)
+		if applyNonFinalPadding && sourceIndex < len(contracts)-1 {
+			base.Add(base, new(big.Rat).SetFrac(big.NewInt(contract.DiscardPadding), big.NewInt(contract.SampleRate)))
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func validateAudioPaddingNormalizationFacts(expected, actual MediaFingerprint, evidence *AudioPaddingNormalizationEvidence) error {
+	if evidence == nil {
+		return fmt.Errorf("AAC padding normalization evidence differs")
+	}
+	orderedSourceSHA, _, sourceSHAErr := stitchcert.CanonicalSHA(evidence.Sources)
+	if sourceSHAErr != nil || !lowerHex64(evidence.OrderedSourceEvidenceSHA256) || orderedSourceSHA != evidence.OrderedSourceEvidenceSHA256 || evidence.PolicyVersion != aacDiscardPaddingPolicyVersion || evidence.AudioContentStatus != audioPaddingNotSampleExactStatus || len(expected.Tracks) != 2 || len(actual.Tracks) != 2 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
+		return fmt.Errorf("AAC padding normalization evidence differs")
+	}
+	wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
+	wantAudio, gotAudio := expected.Tracks["audio"], actual.Tracks["audio"]
+	if wantVideo == nil || gotVideo == nil || wantAudio == nil || gotAudio == nil {
+		return fmt.Errorf("AAC padding normalization requires video and audio")
+	}
+	if wantVideo.CodecProfile != "" || wantVideo.CodecExtradataSHA256 != "" || wantVideo.AACPaddingNormalizedTimingSHA256 != "" || gotVideo.CodecProfile != "" || gotVideo.CodecExtradataSHA256 != "" || gotVideo.AACPaddingNormalizedTimingSHA256 != "" || gotAudio.AACPaddingNormalizedTimingSHA256 != "" {
+		return fmt.Errorf("AAC padding evidence is attached to the wrong track")
+	}
+	if wantVideo.TimestampStatus != "source_clips_independent" || gotVideo.TimestampStatus != "monotonic" || wantVideo.PacketCount != gotVideo.PacketCount || wantVideo.PacketChainSHA256 != gotVideo.PacketChainSHA256 || !sameStringSequence(wantVideo.PacketTimeBases, gotVideo.PacketTimeBases) || wantVideo.DecodedFrames != gotVideo.DecodedFrames {
+		return fmt.Errorf("AAC padding normalization changed video packets, timing, or decoded frame count")
+	}
+	if wantAudio.TimestampStatus != "source_clips_independent" || gotAudio.TimestampStatus != "monotonic" || wantAudio.PacketCount != gotAudio.PacketCount || wantAudio.PacketChainSHA256 != gotAudio.PacketChainSHA256 || wantAudio.DecodedFrames != gotAudio.DecodedFrames || len(wantAudio.PacketTimeBases) != 1 || !sameStringSequence(wantAudio.PacketTimeBases, gotAudio.PacketTimeBases) {
+		return fmt.Errorf("AAC padding normalization changed audio packets or decoded record count")
+	}
+	if len(expected.AudioContracts) < 2 || len(actual.AudioContracts) != 1 || len(evidence.Sources) != len(expected.AudioContracts) {
+		return fmt.Errorf("AAC padding normalization contract cardinality differs")
+	}
+	if wantAudio.CodecProfile != "LC" || gotAudio.CodecProfile != wantAudio.CodecProfile || !lowerHex64(wantAudio.CodecExtradataSHA256) || gotAudio.CodecExtradataSHA256 != wantAudio.CodecExtradataSHA256 || wantAudio.PacketTimeBases[0] != "1/44100" {
+		return fmt.Errorf("AAC-LC codec identity differs")
+	}
+	base, out := expected.AudioContracts[0], actual.AudioContracts[0]
+	if base.CodecName != "aac" || out.CodecName != "aac" || !sameAudioFormat(base, out) || base.SampleRate != 44100 || base.Channels != 2 || base.ChannelLayout != "stereo" {
+		return fmt.Errorf("AAC padding normalization format differs")
+	}
+	var sourcePackets, padding int64
+	seenSourceIDs := make(map[int64]bool, len(evidence.Sources))
+	for i, contract := range expected.AudioContracts {
+		if contract.CodecName != "aac" || !sameAudioFormat(base, contract) || contract.SkipSamples != 0 || contract.InitialPadding != 0 || contract.CodecDelay != 0 || contract.TrailingPadding != 0 {
+			return fmt.Errorf("AAC padding normalization source format or skip differs")
+		}
+		source := evidence.Sources[i]
+		if source.ClipID <= 0 || seenSourceIDs[source.ClipID] || !lowerHex64(source.SourceClaimSHA256) {
+			return fmt.Errorf("AAC padding normalization source identity differs")
+		}
+		seenSourceIDs[source.ClipID] = true
+		discard, err := validateAACPaddingSource(source)
+		if err != nil || discard != contract.DiscardPadding || sourcePackets > math.MaxInt64-source.PacketCount {
+			return fmt.Errorf("AAC padding normalization source trim differs")
+		}
+		sourcePackets += source.PacketCount
+		if i < len(expected.AudioContracts)-1 {
+			if padding > math.MaxInt64-discard {
+				return fmt.Errorf("AAC seam padding overflows")
+			}
+			padding += discard
+		}
+	}
+	outputDiscard, err := validateAACPaddingSource(evidence.Output)
+	last := expected.AudioContracts[len(expected.AudioContracts)-1]
+	if err != nil || evidence.Output.ClipID != 0 || evidence.Output.SourceClaimSHA256 != "" || padding <= 0 || sourcePackets != wantAudio.PacketCount || evidence.Output.PacketCount != gotAudio.PacketCount || outputDiscard != out.DiscardPadding || out.SkipSamples != 0 || out.DiscardPadding != last.DiscardPadding || out.InitialPadding != 0 || out.CodecDelay != 0 || out.TrailingPadding != 0 {
+		return fmt.Errorf("AAC padding normalization output trim differs")
+	}
+	if !sameExpectedOutputTrim(evidence.Output, last, gotAudio.PacketCount) {
+		return fmt.Errorf("AAC padding normalization output trim position differs")
+	}
+	if gotAudio.PacketTimingSHA256 != wantAudio.AACPaddingNormalizedTimingSHA256 || !lowerHex64(wantAudio.AACPaddingNormalizedTimingSHA256) {
+		return fmt.Errorf("AAC padding normalization packet timing transform differs")
+	}
+	if base.Channels <= 0 || base.Channels > 64 {
+		return fmt.Errorf("AAC channel count exceeds policy")
+	}
+	bytesPerFrame := int64(base.Channels) * 4
+	if gotAudio.DecodedSamples <= wantAudio.DecodedSamples || actual.EffectiveAudioFrames <= expected.EffectiveAudioFrames || actual.EffectiveAudioBytes <= expected.EffectiveAudioBytes || padding > math.MaxInt64/bytesPerFrame || expected.EffectiveAudioFrames > math.MaxInt64/bytesPerFrame || actual.EffectiveAudioFrames > math.MaxInt64/bytesPerFrame {
+		return fmt.Errorf("AAC padding normalization decoded surplus differs")
+	}
+	observedSamples := gotAudio.DecodedSamples - wantAudio.DecodedSamples
+	observedFrames := actual.EffectiveAudioFrames - expected.EffectiveAudioFrames
+	observedBytes := actual.EffectiveAudioBytes - expected.EffectiveAudioBytes
+	if evidence.DecodedAudioSurplusSamples != padding || observedSamples != padding || expected.EffectiveAudioFrames != wantAudio.DecodedSamples || actual.EffectiveAudioFrames != gotAudio.DecodedSamples || observedFrames != padding || observedBytes != padding*bytesPerFrame || expected.EffectiveAudioBytes != expected.EffectiveAudioFrames*bytesPerFrame || actual.EffectiveAudioBytes != actual.EffectiveAudioFrames*bytesPerFrame || !lowerHex64(expected.EffectiveAudioSHA256) || !lowerHex64(actual.EffectiveAudioSHA256) || expected.EffectiveAudioSHA256 == actual.EffectiveAudioSHA256 {
+		return fmt.Errorf("AAC padding normalization decoded surplus differs")
+	}
+	wantDelta := new(big.Rat).SetFrac(big.NewInt(padding), big.NewInt(base.SampleRate))
+	packetDelta, err := rationalDifference(gotAudio.PacketDurationSeconds, wantAudio.PacketDurationSeconds)
+	if err != nil || packetDelta.Cmp(wantDelta) != 0 || evidence.PacketDurationDeltaSeconds != packetDelta.RatString() {
+		return fmt.Errorf("AAC padding normalization packet duration delta differs")
+	}
+	timelineDelta, err := rationalDifference(gotAudio.DecodeTimelineSpanSeconds, wantAudio.DecodeTimelineSpanSeconds)
+	if err != nil || timelineDelta.Cmp(wantDelta) != 0 || evidence.DecodeTimelineSpanDeltaSeconds != timelineDelta.RatString() {
+		return fmt.Errorf("AAC padding normalization decode timeline delta differs")
+	}
+	for _, timestamps := range [][2]string{{wantAudio.FirstPacketPTSSeconds, gotAudio.FirstPacketPTSSeconds}, {wantAudio.FirstPacketDTSSeconds, gotAudio.FirstPacketDTSSeconds}} {
+		delta, err := rationalDifference(timestamps[1], timestamps[0])
+		if err != nil || delta.Sign() != 0 {
+			return fmt.Errorf("AAC padding normalization first packet timestamp differs")
+		}
+	}
+	for _, timestamps := range [][2]string{{wantAudio.LastPacketPTSSeconds, gotAudio.LastPacketPTSSeconds}, {wantAudio.LastPacketDTSSeconds, gotAudio.LastPacketDTSSeconds}} {
+		delta, err := rationalDifference(timestamps[1], timestamps[0])
+		if err != nil || delta.Cmp(wantDelta) != 0 {
+			return fmt.Errorf("AAC padding normalization last packet timestamp delta differs")
+		}
+	}
+	return nil
+}
+
+func validateAACPaddingSource(source AACSourcePaddingEvidence) (int64, error) {
+	if source.PacketCount <= 0 || source.MaxDecodedFrameSamples != aacLCFrameSamples || source.TerminalPacketDurationSamples != source.MaxDecodedFrameSamples || source.LastDecodedFrameSamples <= 0 || source.LastDecodedFrameSamples > source.MaxDecodedFrameSamples {
+		return 0, fmt.Errorf("AAC frame contract differs")
+	}
+	var discard int64
+	lastOrdinal := int64(0)
+	for _, event := range source.TrimEvents {
+		if event.PacketOrdinal <= lastOrdinal || event.PacketOrdinal > source.PacketCount || event.SkipSamples != 0 || event.DiscardPadding <= 0 || discard != 0 {
+			return 0, fmt.Errorf("AAC trim event differs")
+		}
+		lastOrdinal = event.PacketOrdinal
+		discard = event.DiscardPadding
+	}
+	if discard > 0 && (lastOrdinal != source.PacketCount || discard > source.TerminalPacketDurationSamples || source.LastDecodedFrameSamples+discard != source.MaxDecodedFrameSamples) {
+		return 0, fmt.Errorf("AAC discard padding is not terminal and frame-bounded")
+	}
+	if discard == 0 && source.LastDecodedFrameSamples != source.MaxDecodedFrameSamples {
+		return 0, fmt.Errorf("AAC non-final decoded frame is partial without padding")
+	}
+	return discard, nil
+}
+
+func sameExpectedOutputTrim(output AACSourcePaddingEvidence, final AudioSequenceContract, outputPacketCount int64) bool {
+	if final.DiscardPadding == 0 {
+		return len(output.TrimEvents) == 0
+	}
+	return len(output.TrimEvents) == 1 && output.TrimEvents[0].PacketOrdinal == outputPacketCount && output.TrimEvents[0].SkipSamples == 0 && output.TrimEvents[0].DiscardPadding == final.DiscardPadding
+}
+
+func rationalDifference(actual, expected string) (*big.Rat, error) {
+	actualValue, actualOK := new(big.Rat).SetString(actual)
+	expectedValue, expectedOK := new(big.Rat).SetString(expected)
+	if !actualOK || !expectedOK {
+		return nil, fmt.Errorf("invalid rational delta")
+	}
+	return new(big.Rat).Sub(actualValue, expectedValue), nil
 }
 
 func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int64, string, error) {
@@ -2082,8 +2506,11 @@ func (a *mediaAccumulator) fingerprint() MediaFingerprint {
 	}
 	if a.effectiveBytes > 0 {
 		out.EffectiveAudioSHA256 = hex.EncodeToString(a.effectiveAudio.Sum(nil))
-		if len(a.audioContracts) > 0 && a.audioContracts[0].Channels > 0 {
-			out.EffectiveAudioFrames = a.effectiveBytes / int64(4*a.audioContracts[0].Channels)
+		if len(a.audioContracts) > 0 {
+			channels := a.audioContracts[0].Channels
+			if channels > 0 && channels <= 64 {
+				out.EffectiveAudioFrames = a.effectiveBytes / (int64(channels) * 4)
+			}
 		}
 	}
 	return out
@@ -2109,9 +2536,11 @@ func probeMediaInto(ctx context.Context, mediaPath string, accumulator *mediaAcc
 		if len(accumulator.audioContracts) > 0 && !sameAudioFormat(accumulator.audioContracts[0], *observedAudio) {
 			return fmt.Errorf("audio format changes within output")
 		}
+		proof := observedAudio.aacProof
 		contract := *observedAudio
 		if expectedAudio != nil {
 			contract = *expectedAudio
+			contract.aacProof = proof
 		}
 		accumulator.audioContracts = append(accumulator.audioContracts, contract)
 	}
@@ -2161,7 +2590,7 @@ func probeMediaInto(ctx context.Context, mediaPath string, accumulator *mediaAcc
 }
 
 func probeMediaMetadata(ctx context.Context, mediaPath string) (float64, map[int]probedStream, *AudioSequenceContract, error) {
-	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-show_streams", "-show_format", "-show_entries", "format=duration:stream=index,codec_type,codec_name,sample_rate,channels,channel_layout,initial_padding,codec_delay,trailing_padding,start_pts,start_time,duration_ts,duration,time_base", "-of", "json", mediaPath)
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-show_data_hash", "sha256", "-show_streams", "-show_format", "-show_entries", "format=duration:stream=index,codec_type,codec_name,profile,extradata_hash,sample_rate,channels,channel_layout,initial_padding,codec_delay,trailing_padding,start_pts,start_time,duration_ts,duration,time_base", "-of", "json", mediaPath)
 	cmd := process.cmd
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -2196,6 +2625,8 @@ func probeMediaMetadata(ctx context.Context, mediaPath string) (float64, map[int
 			CodecType       string `json:"codec_type"`
 			CodecName       string `json:"codec_name"`
 			SampleRate      string `json:"sample_rate"`
+			Profile         string `json:"profile"`
+			ExtradataHash   string `json:"extradata_hash"`
 			Channels        int    `json:"channels"`
 			ChannelLayout   string `json:"channel_layout"`
 			InitialPadding  int64  `json:"initial_padding"`
@@ -2249,18 +2680,17 @@ func probeMediaMetadata(ctx context.Context, mediaPath string) (float64, map[int
 				return 0, nil, nil, marshalErr
 			}
 			timelineSHA := sha256.Sum256(timelineJSON)
-			audio = &AudioSequenceContract{CodecName: stream.CodecName, SampleRate: sampleRate, Channels: stream.Channels, ChannelLayout: stream.ChannelLayout, InitialPadding: stream.InitialPadding, CodecDelay: stream.CodecDelay, TrailingPadding: stream.TrailingPadding, EditListKind: "decoder_timeline_v1", EditListSHA256: hex.EncodeToString(timelineSHA[:])}
+			audio = &AudioSequenceContract{CodecName: stream.CodecName, SampleRate: sampleRate, Channels: stream.Channels, ChannelLayout: stream.ChannelLayout, InitialPadding: stream.InitialPadding, CodecDelay: stream.CodecDelay, TrailingPadding: stream.TrailingPadding, EditListKind: "decoder_timeline_v1", EditListSHA256: hex.EncodeToString(timelineSHA[:]), aacProof: &aacStreamProof{Profile: strings.TrimSpace(stream.Profile), ExtradataSHA256: strings.TrimPrefix(strings.ToLower(strings.TrimSpace(stream.ExtradataHash)), "sha256:")}}
 		}
 	}
 	if !seenType["video"] {
 		return 0, nil, nil, fmt.Errorf("video stream missing")
 	}
 	if audio != nil {
-		skip, discard, sideErr := probeAudioTrimSideData(ctx, mediaPath)
-		if sideErr != nil {
-			return 0, nil, nil, sideErr
+		audio.SkipSamples, audio.DiscardPadding, err = probeAudioTrimSideData(ctx, mediaPath)
+		if err != nil {
+			return 0, nil, nil, err
 		}
-		audio.SkipSamples, audio.DiscardPadding = skip, discard
 		if err := validateAudioContract(*audio); err != nil {
 			return 0, nil, nil, err
 		}
@@ -2276,20 +2706,25 @@ func sameAudioFormat(a, b AudioSequenceContract) bool {
 	return a.CodecName == b.CodecName && a.SampleRate == b.SampleRate && a.Channels == b.Channels && a.ChannelLayout == b.ChannelLayout
 }
 
+type audioTrimProbe struct {
+	PacketCount, MaxFrameSamples, LastFrameSamples int64
+	TerminalPacketDurationSamples                  int64
+	TrimEvents                                     []AACTrimEventEvidence
+	PacketTimings                                  []aacPacketTiming
+}
+
 func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64, error) {
 	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-select_streams", "a:0", "-show_packets", "-show_entries", "packet=side_data_list", "-of", "compact=p=1:nk=0", mediaPath)
-	cmd := process.cmd
-	stdout, err := cmd.StdoutPipe()
+	stdout, err := process.cmd.StdoutPipe()
 	if err != nil {
 		return 0, 0, err
 	}
 	var stderr limitedOutput
-	cmd.Stderr = &stderr
+	process.cmd.Stderr = &stderr
 	if err := process.Start(); err != nil {
 		return 0, 0, err
 	}
 	var skip, discard int64
-	var parseErr error
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
@@ -2312,10 +2747,11 @@ func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64
 			default:
 				continue
 			}
-			parsed, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || parsed < 0 || *target > math.MaxInt64-parsed {
-				parseErr = fmt.Errorf("invalid audio trim side data")
-				continue
+			parsed, parseErr := strconv.ParseInt(value, 10, 64)
+			if parseErr != nil || parsed < 0 || *target > math.MaxInt64-parsed {
+				_ = process.Kill()
+				_ = process.Wait()
+				return 0, 0, fmt.Errorf("invalid audio trim side data")
 			}
 			*target += parsed
 		}
@@ -2328,8 +2764,152 @@ func probeAudioTrimSideData(ctx context.Context, mediaPath string) (int64, int64
 	if err := process.Wait(); err != nil {
 		return 0, 0, fmt.Errorf("ffprobe audio trim: %w (%s)", err, stderr.String())
 	}
-	if parseErr != nil {
-		return 0, 0, parseErr
+	return skip, discard, nil
+}
+
+func probeAACStreamProof(ctx context.Context, mediaPath string, sampleRate int64, indexType map[int]probedStream) (aacStreamProof, error) {
+	var audioStream probedStream
+	found := false
+	for _, stream := range indexType {
+		if stream.MediaType == "audio" {
+			if found {
+				return aacStreamProof{}, fmt.Errorf("multiple audio streams are unsupported")
+			}
+			audioStream, found = stream, true
+		}
+	}
+	if !found || sampleRate <= 0 {
+		return aacStreamProof{}, fmt.Errorf("audio stream timing is missing")
+	}
+	process := newBoundedMediaProcess(ctx, ffprobeBinary(), "-v", "error", "-select_streams", "a:0", "-show_packets", "-show_frames", "-show_entries", "packet=pts,dts,duration,side_data_list:frame=media_type,nb_samples", "-of", "compact=p=1:nk=0", mediaPath)
+	stdout, err := process.cmd.StdoutPipe()
+	if err != nil {
+		return aacStreamProof{}, err
+	}
+	var stderr limitedOutput
+	process.cmd.Stderr = &stderr
+	if err := process.Start(); err != nil {
+		return aacStreamProof{}, err
+	}
+	abort := func(err error) (aacStreamProof, error) {
+		_ = process.Kill()
+		_ = process.Wait()
+		return aacStreamProof{}, err
+	}
+	proof := aacStreamProof{}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return abort(err)
+		}
+		fields := strings.Split(scanner.Text(), "|")
+		if len(fields) < 2 {
+			return abort(fmt.Errorf("invalid audio packet/frame evidence"))
+		}
+		values, valuesErr := parseUniqueCompactFields(fields[1:])
+		if valuesErr != nil {
+			return abort(valuesErr)
+		}
+		switch fields[0] {
+		case "packet":
+			pts, ptsErr := strconv.ParseInt(values["pts"], 10, 64)
+			dts, dtsErr := strconv.ParseInt(values["dts"], 10, 64)
+			duration, durationErr := strconv.ParseInt(values["duration"], 10, 64)
+			if ptsErr != nil || dtsErr != nil || durationErr != nil || duration <= 0 {
+				return abort(fmt.Errorf("invalid exact audio packet timing"))
+			}
+			proof.PacketCount++
+			proof.PacketTimings = append(proof.PacketTimings, aacPacketTiming{PTS: pts, DTS: dts, Duration: duration, TimeBaseNum: audioStream.TimeBaseNum, TimeBaseDen: audioStream.TimeBaseDen})
+			skip, discard, sideDataErr := parseAACPacketSideData(values)
+			if sideDataErr != nil {
+				return abort(sideDataErr)
+			}
+			if skip > 0 || discard > 0 {
+				proof.TrimEvents = append(proof.TrimEvents, AACTrimEventEvidence{PacketOrdinal: proof.PacketCount, SkipSamples: skip, DiscardPadding: discard})
+			}
+		case "frame":
+			if len(values) != 2 || values["media_type"] != "audio" {
+				return abort(fmt.Errorf("invalid decoded audio frame evidence"))
+			}
+			samples, parseErr := strconv.ParseInt(values["nb_samples"], 10, 64)
+			if parseErr != nil || samples <= 0 {
+				return abort(fmt.Errorf("invalid decoded audio frame samples"))
+			}
+			proof.LastFrameSamples = samples
+			if samples > proof.MaxFrameSamples {
+				proof.MaxFrameSamples = samples
+			}
+		default:
+			return abort(fmt.Errorf("invalid audio packet/frame evidence"))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return abort(err)
+	}
+	if err := process.Wait(); err != nil {
+		return aacStreamProof{}, fmt.Errorf("ffprobe audio trim: %w (%s)", err, stderr.String())
+	}
+	if proof.PacketCount <= 0 || len(proof.PacketTimings) != int(proof.PacketCount) || proof.MaxFrameSamples <= 0 || proof.LastFrameSamples <= 0 {
+		return aacStreamProof{}, fmt.Errorf("incomplete audio packet/frame evidence")
+	}
+	terminal := proof.PacketTimings[len(proof.PacketTimings)-1]
+	durationSamples := new(big.Rat).Mul(ticksToRational(terminal.Duration, terminal.TimeBaseNum, terminal.TimeBaseDen), new(big.Rat).SetInt64(sampleRate))
+	if !durationSamples.IsInt() || !durationSamples.Num().IsInt64() || durationSamples.Sign() <= 0 {
+		return aacStreamProof{}, fmt.Errorf("audio terminal packet duration is not integral samples")
+
+	}
+	proof.TerminalPacketDurationSamples = durationSamples.Num().Int64()
+	return proof, nil
+}
+func parseUniqueCompactFields(fields []string) (map[string]string, error) {
+	values := make(map[string]string, len(fields))
+	for _, field := range fields {
+		key, value, ok := strings.Cut(field, "=")
+		_, duplicate := values[key]
+		if !ok || key == "" || duplicate {
+			return nil, fmt.Errorf("duplicate or invalid audio packet/frame evidence")
+		}
+		values[key] = value
+	}
+	return values, nil
+}
+
+func parseAACPacketSideData(values map[string]string) (int64, int64, error) {
+	const prefix = "side_datum/skip_samples:"
+	for key := range values {
+		if key != "pts" && key != "dts" && key != "duration" && !strings.HasPrefix(key, prefix) {
+			return 0, 0, fmt.Errorf("unsupported audio packet side data")
+		}
+	}
+	if len(values) == 3 {
+		return 0, 0, nil
+	}
+	required := []string{"side_data_type", "skip_samples", "discard_padding", "skip_reason", "discard_reason"}
+	if len(values) != 3+len(required) || values[prefix+"side_data_type"] != "Skip Samples" || values[prefix+"skip_reason"] != "0" || values[prefix+"discard_reason"] != "0" {
+		return 0, 0, fmt.Errorf("unsupported or malformed audio packet side data")
+	}
+	for _, key := range required {
+		if _, ok := values[prefix+key]; !ok {
+			return 0, 0, fmt.Errorf("incomplete audio trim side data")
+		}
+	}
+	skip, skipErr := strconv.ParseInt(values[prefix+"skip_samples"], 10, 64)
+	discard, discardErr := strconv.ParseInt(values[prefix+"discard_padding"], 10, 64)
+	if skipErr != nil || discardErr != nil || skip < 0 || discard < 0 {
+		return 0, 0, fmt.Errorf("invalid audio trim side data")
+	}
+	return skip, discard, nil
+}
+
+func summedAudioTrim(events []AACTrimEventEvidence) (int64, int64, error) {
+	var skip, discard int64
+	for _, event := range events {
+		if event.PacketOrdinal <= 0 || event.SkipSamples < 0 || event.DiscardPadding < 0 || skip > math.MaxInt64-event.SkipSamples || discard > math.MaxInt64-event.DiscardPadding {
+			return 0, 0, fmt.Errorf("invalid audio trim side data")
+		}
+		skip += event.SkipSamples
+		discard += event.DiscardPadding
 	}
 	return skip, discard, nil
 }
