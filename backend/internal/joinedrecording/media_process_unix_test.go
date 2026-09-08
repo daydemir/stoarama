@@ -178,6 +178,61 @@ func TestVerifyJoinedMediaPreservesDecodedFallbackDeadline(t *testing.T) {
 	}
 }
 
+func TestVerifyJoinedMediaOverlapsOutputProbeWithSerialSources(t *testing.T) {
+	dir := t.TempDir()
+	source := makeMediaClip(t, dir, "source.mp4", 440, false)
+	outputPath := filepath.Join(dir, "output.mp4")
+	body, err := os.ReadFile(source.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, body, 0600); err != nil {
+		t.Fatal(err)
+	}
+	realFFprobe, err := exec.LookPath(ffprobeBinary())
+	if err != nil {
+		t.Skip("ffprobe unavailable")
+	}
+	fakeFFprobe := filepath.Join(dir, "ffprobe")
+	script := `#!/bin/sh
+packets=false
+last=
+for arg do
+	last=$arg
+	if [ "$arg" = "-show_packets" ]; then packets=true; fi
+done
+if [ "$packets" = true ]; then
+	case "${last##*/}" in
+	source.mp4)
+		: > "$STOARAMA_TEST_PROBE_DIR/source.ready"
+		while [ ! -e "$STOARAMA_TEST_PROBE_DIR/output.ready" ]; do sleep 0.01; done
+		;;
+	output.mp4)
+		: > "$STOARAMA_TEST_PROBE_DIR/output.ready"
+		while [ ! -e "$STOARAMA_TEST_PROBE_DIR/source.ready" ]; do sleep 0.01; done
+		;;
+	esac
+fi
+exec "$STOARAMA_TEST_REAL_FFPROBE" "$@"
+`
+	if err := os.WriteFile(fakeFFprobe, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STOARAMA_TEST_PROBE_DIR", dir)
+	t.Setenv("STOARAMA_TEST_REAL_FFPROBE", realFFprobe)
+	t.Setenv("FFPROBE_BIN", fakeFFprobe)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	verification, err := VerifyJoinedMedia(ctx, []LocalSource{source}, outputPath)
+	if err != nil {
+		t.Fatalf("overlapped verification failed: %v", err)
+	}
+	if verification.Status != "passed" {
+		t.Fatalf("verification status=%q want=passed", verification.Status)
+	}
+}
+
 func TestCompareDecodedEquivalentOverlapsOutputWithSerialSources(t *testing.T) {
 	dir := t.TempDir()
 	useDecodedIdentityFFmpeg(t, dir, "overlap")

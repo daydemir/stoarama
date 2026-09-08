@@ -396,7 +396,7 @@ const (
 
 func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
 	if kind == "full" || kind == "full_repeat" {
-		return 25 * time.Minute
+		return fullTimeoutRetryBudget
 	}
 	if kind == "full_timeout_retry" {
 		return fullTimeoutRetryBudget
@@ -1814,24 +1814,45 @@ func copyAndVerifySingleton(ctx context.Context, source LocalSource, scratchDir 
 }
 
 func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath string) (Verification, error) {
+	type fingerprintResult struct {
+		fingerprint MediaFingerprint
+		err         error
+	}
+	outputCtx, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	outputResult := make(chan fingerprintResult, 1)
+	go func() {
+		fingerprint, err := probeMedia(outputCtx, outputPath)
+		outputResult <- fingerprintResult{fingerprint: fingerprint, err: err}
+	}()
+	cancelAndWaitOutput := func() {
+		cancelOutput()
+		<-outputResult
+	}
 	expectedAccumulator := newMediaAccumulator()
 	for sourceIndex, source := range sources {
 		if err := ctx.Err(); err != nil {
+			cancelAndWaitOutput()
 			return Verification{}, fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, err)
 		}
 		if err := probeMediaInto(ctx, source.Path, expectedAccumulator, source.AudioContract, true); err != nil {
+			var sourceErr error
 			if contextErr := ctx.Err(); contextErr != nil {
-				return Verification{}, fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, contextErr)
+				sourceErr = fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, contextErr)
+			} else {
+				classified := deterministicEvidenceFailure(ctx, "corrupt_source_media", err)
+				sourceErr = fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, classified)
 			}
-			classified := deterministicEvidenceFailure(ctx, "corrupt_source_media", err)
-			return Verification{}, fmt.Errorf("probe source ordinal=%d clip_id=%d: %w", sourceIndex+1, source.ClipID, classified)
+			cancelAndWaitOutput()
+			return Verification{}, sourceErr
 		}
 	}
 	expected := expectedAccumulator.fingerprint()
-	actual, err := probeMedia(ctx, outputPath)
-	if err != nil {
-		return Verification{}, deterministicEvidenceFailure(ctx, "joined_output_probe_failure", fmt.Errorf("probe joined output: %w", err))
+	output := <-outputResult
+	if output.err != nil {
+		return Verification{}, deterministicEvidenceFailure(ctx, "joined_output_probe_failure", fmt.Errorf("probe joined output: %w", output.err))
 	}
+	actual := output.fingerprint
 	verification := Verification{Status: "failed", SourceFingerprint: expected, OutputFingerprint: actual}
 	if strictErr := compareFingerprints(expected, actual); strictErr != nil {
 		decodedVideoSHA, relaxedErr := compareDecodedEquivalent(ctx, sources, outputPath, expected, actual)
@@ -1840,17 +1861,16 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 			for i := range sources {
 				sourcePaths[i] = sources[i].Path
 			}
-			wantFrames, wantSHA, wantErr := decodedVideoSequenceIdentity(ctx, sourcePaths)
-			gotFrames, gotSHA, gotErr := decodedVideoSequenceIdentity(ctx, []string{outputPath})
+			want, got := decodedSourceOutputIdentities(ctx, sourcePaths, outputPath)
 			wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
-			if wantErr != nil || gotErr != nil {
-				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(wantErr, gotErr))
+			if want.err != nil || got.err != nil {
+				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(want.err, got.err))
 			}
-			if wantVideo == nil || gotVideo == nil || wantFrames != wantVideo.DecodedFrames || gotFrames != gotVideo.DecodedFrames || !lowerHex64(wantSHA) || !lowerHex64(gotSHA) {
-				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source=%v output=%v", wantErr, gotErr)
+			if wantVideo == nil || gotVideo == nil || want.frames != wantVideo.DecodedFrames || got.frames != gotVideo.DecodedFrames || !lowerHex64(want.sha) || !lowerHex64(got.sha) {
+				return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source_frames=%d output_frames=%d source_sha=%s output_sha=%s", want.frames, got.frames, want.sha, got.sha)
 			}
-			verification.SourceFingerprint.DecodedVideoSHA256 = wantSHA
-			verification.OutputFingerprint.DecodedVideoSHA256 = gotSHA
+			verification.SourceFingerprint.DecodedVideoSHA256 = want.sha
+			verification.OutputFingerprint.DecodedVideoSHA256 = got.sha
 			verification.DecodedFrameSequenceStatus = "failed"
 			return verification, deterministicFailure("media_sequence_mismatch", verification, fmt.Errorf("strict=%v; decoded_equivalent=%w", strictErr, relaxedErr))
 		}
@@ -1875,6 +1895,27 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 	return verification, nil
 }
 
+type decodedIdentity struct {
+	frames int64
+	sha    string
+	err    error
+}
+
+func decodedSourceOutputIdentities(ctx context.Context, sourcePaths []string, outputPath string) (decodedIdentity, decodedIdentity) {
+	outputCtx, cancelOutput := context.WithCancel(ctx)
+	defer cancelOutput()
+	outputResult := make(chan decodedIdentity, 1)
+	go func() {
+		frames, sha, err := decodedVideoSequenceIdentity(outputCtx, []string{outputPath})
+		outputResult <- decodedIdentity{frames: frames, sha: sha, err: err}
+	}()
+	wantFrames, wantSHA, wantErr := decodedVideoSequenceIdentity(ctx, sourcePaths)
+	if wantErr != nil {
+		cancelOutput()
+	}
+	return decodedIdentity{frames: wantFrames, sha: wantSHA, err: wantErr}, <-outputResult
+}
+
 func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, outputPath string, expected, actual MediaFingerprint) (string, error) {
 	if len(expected.Tracks) != len(actual.Tracks) || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
 		return "", fmt.Errorf("joined duration or stream cardinality mismatch")
@@ -1895,32 +1936,17 @@ func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, output
 	for i := range sources {
 		sourcePaths[i] = sources[i].Path
 	}
-	type decodedIdentity struct {
-		frames int64
-		sha    string
-		err    error
+	want, got := decodedSourceOutputIdentities(ctx, sourcePaths, outputPath)
+	if want.err != nil {
+		return "", fmt.Errorf("decode source frame sequence: %w", want.err)
 	}
-	outputCtx, cancelOutput := context.WithCancel(ctx)
-	defer cancelOutput()
-	outputResult := make(chan decodedIdentity, 1)
-	go func() {
-		frames, sha, err := decodedVideoSequenceIdentity(outputCtx, []string{outputPath})
-		outputResult <- decodedIdentity{frames: frames, sha: sha, err: err}
-	}()
-	wantFrames, wantSHA, err := decodedVideoSequenceIdentity(ctx, sourcePaths)
-	if err != nil {
-		cancelOutput()
-		<-outputResult
-		return "", fmt.Errorf("decode source frame sequence: %w", err)
-	}
-	got := <-outputResult
 	if got.err != nil {
 		return "", fmt.Errorf("decode joined frame sequence: %w", got.err)
 	}
-	if wantFrames <= 0 || wantFrames != got.frames || wantSHA != got.sha {
+	if want.frames <= 0 || want.frames != got.frames || want.sha != got.sha {
 		return "", fmt.Errorf("joined decoded video frame sequence mismatch")
 	}
-	return wantSHA, nil
+	return want.sha, nil
 }
 
 func decodedVideoSequenceIdentity(ctx context.Context, mediaPaths []string) (int64, string, error) {
