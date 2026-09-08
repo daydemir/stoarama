@@ -6,4 +6,4 @@ import "os/exec"
 
 func configureYTDLPProcessGroup(cmd *exec.Cmd) {}
 
-func stopYTDLPProcessGroup(cmd *exec.Cmd) error { return nil }
+func waitForYTDLPProcessGroupExit(cmd *exec.Cmd) error { return nil }

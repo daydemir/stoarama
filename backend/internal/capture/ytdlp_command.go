@@ -51,7 +51,7 @@ func runYTDLPCommand(ctx context.Context, combined bool, bin string, args ...str
 	cmd.Env = replaceCommandEnvironment(os.Environ(), "TMPDIR", invocation.path)
 	configureYTDLPProcessGroup(cmd)
 	output, runErr := commandOutput(cmd, combined)
-	if groupErr := stopYTDLPProcessGroup(cmd); groupErr != nil {
+	if groupErr := waitForYTDLPProcessGroupExit(cmd); groupErr != nil {
 		log.Printf("yt-dlp private temp cleanup skipped; owned process group may still be active")
 		return output, runErr
 	}

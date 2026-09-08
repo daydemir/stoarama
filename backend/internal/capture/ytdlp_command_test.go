@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +23,6 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 	}{
 		{name: "success", behavior: "success", timeout: 5 * time.Second},
 		{name: "error", behavior: "error", timeout: 5 * time.Second},
-		{name: "normal exit with stubborn grandchild", behavior: "orphan", timeout: 5 * time.Second},
 		{name: "timeout", behavior: "timeout", timeout: 100 * time.Millisecond},
 		{name: "stubborn grandchild", behavior: "stubborn", timeout: 100 * time.Millisecond},
 	} {
@@ -43,7 +41,7 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 			defer cancel()
 			output, err := RunYTDLPCommand(ctx, os.Args[0], "-test.run=TestYTDLPCommandHelperProcess")
 			switch test.behavior {
-			case "success", "orphan":
+			case "success":
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -57,7 +55,7 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 					t.Fatalf("ctx=%v err=%v", ctx.Err(), err)
 				}
 			}
-			if test.behavior == "stubborn" || test.behavior == "orphan" {
+			if test.behavior == "stubborn" {
 				lines := strings.Fields(string(output))
 				if len(lines) < 2 {
 					t.Fatalf("stubborn helper output=%q", output)
@@ -77,6 +75,38 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 				t.Fatalf("parent TMPDIR changed to %q", got)
 			}
 		})
+	}
+}
+
+func TestRunYTDLPCommandRetainsTempWhileNormalExitGrandchildLives(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(YTDLPRuntimeTempRootEnv, root)
+	t.Setenv(YTDLPPrivateTempEnv, "1")
+	t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "orphan")
+
+	output, err := RunYTDLPCommand(context.Background(), os.Args[0], "-test.run=TestYTDLPCommandHelperProcess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) != 3 {
+		t.Fatalf("helper output=%q", output)
+	}
+	groupPID, err := strconv.Atoi(fields[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(-groupPID, 0); err != nil {
+		t.Fatalf("owned group was not retained for safety: %v", err)
+	}
+	if _, err := os.Lstat(fields[0]); err != nil {
+		t.Fatalf("live group's temp directory was removed: %v", err)
+	}
+	if err := syscall.Kill(-groupPID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForProcessExit(fields[2]); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -303,12 +333,10 @@ func TestYTDLPCommandHelperProcess(t *testing.T) {
 		os.Exit(0)
 	case "orphan":
 		child := exec.Command("/bin/sh", "-c", `trap '' TERM; sleep 30`)
-		child.Stdout = io.Discard
-		child.Stderr = io.Discard
 		if err := child.Start(); err != nil {
 			os.Exit(97)
 		}
-		fmt.Println(child.Process.Pid)
+		fmt.Println(os.Getpid(), child.Process.Pid)
 		os.Exit(0)
 	case "swap":
 		saved := temp + "-saved"
