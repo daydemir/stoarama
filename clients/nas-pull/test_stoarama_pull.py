@@ -1154,7 +1154,6 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 self.assertTrue(pull.drain_page(cfg, runtime, Inventory()))
             self.assertEqual(calls, [("record", 1), ("sync", [1]), ("release", 1)])
             self.assertEqual(runtime.cursor_id, 1)
-            self.assertTrue(runtime.consume_joined_range_credit())
 
             runtime = pull.Runtime(cfg)
             runtime.cursor_id = 0
@@ -1172,38 +1171,6 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 pull.drain_page(cfg, runtime, FailingInventory())
             release.assert_not_called()
             self.assertEqual(runtime.cursor_id, 0)
-            self.assertFalse(runtime.consume_joined_range_credit())
-
-    def test_joined_credit_requires_a_successful_cursor_advancing_raw_page(self):
-        with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw))
-            storage = {"available": True, "total_bytes": 10**12, "free_bytes": 10**12}
-
-            runtime = pull.Runtime(cfg)
-            with mock.patch.object(pull, "storage_status", return_value=storage), mock.patch.object(
-                pull, "request_json", return_value={"clips": []}
-            ):
-                self.assertFalse(pull.drain_page(cfg, runtime))
-            self.assertFalse(runtime.consume_joined_range_credit())
-
-            runtime = pull.Runtime(cfg)
-            clip = {"clip_id": 1, "recording_id": 3, "size_bytes": 10}
-            with mock.patch.object(pull, "storage_status", return_value=storage), mock.patch.object(
-                pull, "request_json", return_value={"clips": [clip]}
-            ), mock.patch.object(pull, "process_clip", side_effect=RuntimeError("download failed")):
-                self.assertFalse(pull.drain_page(cfg, runtime))
-            self.assertFalse(runtime.consume_joined_range_credit())
-
-            runtime = pull.Runtime(cfg)
-            runtime.cursor_id = 1
-            with mock.patch.object(pull, "storage_status", return_value=storage), mock.patch.object(
-                pull, "request_json", return_value={"clips": [clip]}
-            ), mock.patch.object(pull, "process_clip", return_value=(1, 10, 0, 0)), mock.patch.object(
-                pull, "release_clips"
-            ):
-                self.assertTrue(pull.drain_page(cfg, runtime))
-            self.assertEqual(runtime.cursor_id, 1)
-            self.assertFalse(runtime.consume_joined_range_credit())
 
     def test_storage_must_be_real_mounts(self):
         with tempfile.TemporaryDirectory() as raw:

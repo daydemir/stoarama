@@ -293,17 +293,6 @@ class JoinedDownloadTests(unittest.TestCase):
             ))
             self.assertTrue(runtime.joined_background_enabled())
 
-    def test_joined_range_credit_is_bounded_consumed_once_and_resets_on_restart(self):
-        with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw))
-            runtime = self.runtime(cfg)
-            self.assertFalse(runtime.consume_joined_range_credit())
-            runtime.grant_joined_range_credit()
-            runtime.grant_joined_range_credit()
-            self.assertTrue(runtime.consume_joined_range_credit())
-            self.assertFalse(runtime.consume_joined_range_credit())
-            self.assertFalse(pull.Runtime(cfg).consume_joined_range_credit())
-
     def test_joined_failure_heartbeat_is_typed_and_opaque(self):
         raw_item = self.media_item()
         with tempfile.TemporaryDirectory() as raw:
@@ -939,6 +928,50 @@ class JoinedDownloadTests(unittest.TestCase):
                 runtime.apply_joined_protocol_response(malformed)
                 self.assertFalse(runtime.joined_protocol_enabled())
 
+    def test_slow_joined_completion_does_not_block_raw_runtime_updates(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            entered = threading.Event()
+            release = threading.Event()
+            completed = threading.Event()
+
+            worker = threading.Thread(target=lambda: (
+                runtime.run_joined_completion(lambda: (entered.set(), release.wait(1))), completed.set()
+            ))
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            runtime.add_successes(cfg, 7, [(7, 3, 3, 0)])
+            self.assertEqual(runtime.cursor_id, 7)
+            self.assertFalse(completed.is_set())
+            release.set()
+            worker.join(1)
+            self.assertTrue(completed.is_set())
+
+    def test_protocol_downgrade_waits_for_inflight_joined_completion(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            entered = threading.Event()
+            release = threading.Event()
+            downgraded = threading.Event()
+            completion = threading.Thread(target=lambda: runtime.run_joined_completion(
+                lambda: (entered.set(), release.wait(1))
+            ))
+            completion.start()
+            self.assertTrue(entered.wait(1))
+            downgrade = threading.Thread(target=lambda: (
+                runtime.apply_joined_protocol_response(self.protocol_response(0, 2)), downgraded.set()
+            ))
+            downgrade.start()
+            self.assertFalse(downgraded.wait(.05))
+            self.assertTrue(runtime.joined_protocol_enabled())
+            release.set()
+            completion.join(1)
+            downgrade.join(1)
+            self.assertTrue(downgraded.is_set())
+            self.assertFalse(runtime.joined_protocol_enabled())
+
     def test_downgrade_after_feed_fetch_stops_before_joined_item(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -977,11 +1010,12 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertFalse(final.exists())
             self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
 
-    def test_raw_pending_yields_before_joined_storage_or_dependency_work(self):
+    def test_generation_8_endless_raw_backlog_hard_yields_before_joined_work(self):
         item = pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = self.runtime(cfg)
+            runtime.apply_joined_protocol_response(self.protocol_response(1, 8))
             with mock.patch.object(pull, "poll_raw_pending", return_value=True) as pending, \
                  mock.patch.object(pull, "ensure_joined_dependency_ack") as dependency, \
                  mock.patch.object(pull, "open_joined_output_dir") as storage, \
@@ -991,34 +1025,58 @@ class JoinedDownloadTests(unittest.TestCase):
             dependency.assert_not_called()
             storage.assert_not_called()
 
-    def test_raw_backlog_credit_downloads_exactly_one_range_then_preserves_partial(self):
+    def test_generation_9_joined_completes_while_raw_page_keeps_advancing(self):
         content = b"abcdef"
         raw_item = self.media_item(content)
         item = pull.valid_joined_item(raw_item)
+        raw_clip = {"clip_id": 9, "recording_id": 3, "size_bytes": 10}
+        acks = []
+        active_ranges = 0
+        max_active_ranges = 0
+
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
             runtime = self.runtime(cfg)
-            runtime.grant_joined_range_credit()
+            runtime.apply_joined_protocol_response(self.protocol_response(1, pull.JOINED_FAIR_SHARE_MIN_GENERATION))
             self.install_manifest(cfg, item)
-            ranges = []
+
+            def api(_cfg, method, path, body=None, **_kwargs):
+                if path == "/account/joined":
+                    return {"item": raw_item}
+                if path == raw_item["download_path"]:
+                    return self.prepared(raw_item)
+                if path.startswith("/account/clips?"):
+                    return {"clips": [raw_clip]}
+                if path == "/account/clips/release":
+                    return {"ok": True}
+                if path == "/account/joined/ack":
+                    acks.append(body)
+                    return {"ok": True}
+                raise AssertionError((method, path))
 
             def open_range(request, **_kwargs):
-                start, end = map(int, dict(request.header_items())["Range"].removeprefix("bytes=").split("-"))
-                ranges.append((start, end))
-                return RangeResponse(content[start:end + 1], start, end, len(content))
+                nonlocal active_ranges, max_active_ranges
+                active_ranges += 1
+                max_active_ranges = max(max_active_ranges, active_ranges)
+                try:
+                    if runtime.cursor_id == 0:
+                        self.assertTrue(pull.drain_page(cfg, runtime))
+                    start, end = map(int, dict(request.header_items())["Range"].removeprefix("bytes=").split("-"))
+                    return RangeResponse(content[start:end + 1], start, end, len(content))
+                finally:
+                    active_ranges -= 1
 
-            with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), \
-                 mock.patch.object(pull, "poll_raw_pending", return_value=True), \
-                 mock.patch.object(pull, "storage_status", return_value=self.storage()), \
-                 mock.patch.object(pull, "request_json", return_value=self.prepared(raw_item)), \
-                 mock.patch.object(pull, "open_joined_url", side_effect=open_range), \
-                 self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
-                pull.download_joined_item(cfg, runtime, item, threading.Event())
-            self.assertEqual(ranges, [(0, 2)])
-            final = pull.joined_output_path(cfg, item)
-            self.assertFalse(final.exists())
-            self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
-            self.assertFalse(runtime.consume_joined_range_credit())
+            with mock.patch.object(pull, "JOINED_RANGE_BYTES", 3), mock.patch.object(
+                pull, "storage_status", return_value=self.storage()
+            ), mock.patch.object(pull, "process_clip", return_value=(9, 10, 10, 0)), mock.patch.object(
+                pull, "request_json", side_effect=api
+            ), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
+                self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
+
+            self.assertEqual(runtime.cursor_id, 9)
+            self.assertEqual(pull.joined_output_path(cfg, item).read_bytes(), content)
+            self.assertEqual(len(acks), 1)
+            self.assertEqual(max_active_ranges, 1)
 
     def test_raw_arrival_yields_after_one_durable_joined_range(self):
         content = b"abcdef"

@@ -49,6 +49,7 @@ USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 JOINED_ROOT = "joined"
 JOINED_PROTOCOL_VERSION = 1
 JOINED_BACKGROUND_MIN_GENERATION = 4
+JOINED_FAIR_SHARE_MIN_GENERATION = 9
 JOINED_RANGE_BYTES = 8 * 1024 * 1024
 JOINED_DOWNLOAD_BYTES_PER_SEC = 8 * 1024 * 1024
 JOINED_HASH_BYTES_PER_SEC = 32 * 1024 * 1024
@@ -923,6 +924,7 @@ class Runtime:
         if not progress and cfg.legacy_progress_file.exists():
             progress = read_json(cfg.legacy_progress_file, {})
         self.lock = threading.Lock()
+        self.joined_completion_lock = threading.Lock()
         self.cursor_id = max(0, int(progress.get("after_id", 0)))
         self.clips_pulled = max(0, int(progress.get("clips_pulled", 0)))
         self.bytes_pulled = max(0, int(progress.get("bytes_pulled", 0)))
@@ -943,7 +945,6 @@ class Runtime:
         self.joined_protocol_generation = 0
         self.joined_delivery = None
         self.joined_raw_priority_polled_at = 0.0
-        self.joined_range_credit = False
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -1039,6 +1040,13 @@ class Runtime:
                 and self.joined_protocol_generation >= JOINED_BACKGROUND_MIN_GENERATION
             )
 
+    def joined_fair_share_enabled(self):
+        with self.lock:
+            return (
+                self.joined_protocol_version == JOINED_PROTOCOL_VERSION
+                and self.joined_protocol_generation >= JOINED_FAIR_SHARE_MIN_GENERATION
+            )
+
     def apply_joined_protocol_response(self, response):
         version = response.get("joined_protocol_version") if isinstance(response, dict) else None
         generation = response.get("joined_protocol_generation") if isinstance(response, dict) else None
@@ -1052,24 +1060,26 @@ class Runtime:
             and (generation > 0 or version == 0)
             and (response.get("joined_delivery_accepted") is True or (version == 0 and generation == 0))
         )
-        with self.lock:
-            if not valid or generation < self.joined_protocol_generation:
-                self.joined_protocol_version = 0
-                return
-            if generation == self.joined_protocol_generation:
-                if version != self.joined_protocol_version:
+        with self.joined_completion_lock:
+            with self.lock:
+                if not valid or generation < self.joined_protocol_generation:
                     self.joined_protocol_version = 0
-                return
-            self.joined_protocol_generation = generation
-            self.joined_protocol_version = version
+                    return
+                if generation == self.joined_protocol_generation:
+                    if version != self.joined_protocol_version:
+                        self.joined_protocol_version = 0
+                    return
+                self.joined_protocol_generation = generation
+                self.joined_protocol_version = version
 
     def run_joined_completion(self, operation):
         # Completion is serialized with heartbeat response application. Once
         # admitted, the operation finishes; HTTP operations remain bounded by
         # HTTP_TIMEOUT_SEC. The next joined boundary observes any downgrade.
-        with self.lock:
-            if self.joined_protocol_version != JOINED_PROTOCOL_VERSION:
-                return False
+        with self.joined_completion_lock:
+            with self.lock:
+                if self.joined_protocol_version != JOINED_PROTOCOL_VERSION:
+                    return False
             operation()
             return True
 
@@ -1087,20 +1097,6 @@ class Runtime:
     def clear_joined_delivery_error(self):
         with self.lock:
             self.joined_delivery = None
-
-    def grant_joined_range_credit(self):
-        with self.lock:
-            self.joined_range_credit = True
-
-    def has_joined_range_credit(self):
-        with self.lock:
-            return self.joined_range_credit
-
-    def consume_joined_range_credit(self):
-        with self.lock:
-            granted = self.joined_range_credit
-            self.joined_range_credit = False
-            return granted
 
     def reserve_joined_storage(self, cfg, storage, expected_bytes):
         """Reserve one joined range only when it cannot consume raw headroom."""
@@ -2716,7 +2712,7 @@ def hash_joined_entry(cfg, runtime, directory_fd, name, stop_event):
             size += len(chunk)
             digest.update(chunk)
             if size - raw_poll_size >= JOINED_HASH_BYTES_PER_SEC:
-                if poll_raw_pending(cfg, runtime):
+                if joined_must_yield_to_raw(cfg, runtime):
                     raise JoinedDownloadYield("joined hashing yielded to raw delivery")
                 raw_poll_size = size
             throttle_joined_io(started, size, JOINED_HASH_BYTES_PER_SEC, stop_event)
@@ -2738,7 +2734,7 @@ def joined_raw_priority_checkpoint(cfg, runtime):
         if now - runtime.joined_raw_priority_polled_at < 1.0:
             return
         runtime.joined_raw_priority_polled_at = now
-    if poll_raw_pending(cfg, runtime):
+    if joined_must_yield_to_raw(cfg, runtime):
         raise JoinedDownloadYield("joined validation yielded to raw delivery")
 
 
@@ -4908,6 +4904,10 @@ def poll_raw_pending(cfg, runtime):
     return bool(clips)
 
 
+def joined_must_yield_to_raw(cfg, runtime):
+    return not runtime.joined_fair_share_enabled() and poll_raw_pending(cfg, runtime)
+
+
 def prepare_joined_download(cfg, item):
     prepared = request_json(cfg, "GET", item["download_path"], base=cfg.origin)
     if set(prepared) != {
@@ -5078,7 +5078,7 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
 
 
 def download_joined_item(cfg, runtime, item, stop_event):
-    if poll_raw_pending(cfg, runtime) and not runtime.has_joined_range_credit():
+    if joined_must_yield_to_raw(cfg, runtime):
         raise JoinedDownloadYield("joined delivery yielded to raw delivery")
     ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
     validate_media_manifest_binding(cfg, runtime, item, stop_event)
@@ -5111,8 +5111,7 @@ def download_joined_item(cfg, runtime, item, stop_event):
         while part_size < item["size_bytes"]:
             if not runtime.joined_protocol_enabled() or stop_event.is_set():
                 raise JoinedDownloadYield("joined download stopped at a range boundary")
-            raw_pending = poll_raw_pending(cfg, runtime)
-            if raw_pending and not runtime.has_joined_range_credit():
+            if joined_must_yield_to_raw(cfg, runtime):
                 raise JoinedDownloadYield("joined delivery yielded to raw delivery")
             try:
                 current_prepared = prepare_joined_download(cfg, item)
@@ -5124,15 +5123,13 @@ def download_joined_item(cfg, runtime, item, stop_event):
             range_bytes = end - part_size + 1
             require_joined_storage_capacity(cfg, runtime, range_bytes)
             try:
-                if raw_pending and not runtime.consume_joined_range_credit():
-                    raise JoinedDownloadYield("joined delivery yielded to raw delivery")
                 append_joined_range(current_prepared, directory_fd, part_name, item, part_size, end, stop_event)
             finally:
                 runtime.release_storage_reservation(range_bytes)
             part_size = end + 1
         if not runtime.joined_protocol_enabled():
             raise JoinedDownloadYield("joined protocol was disabled")
-        if poll_raw_pending(cfg, runtime):
+        if joined_must_yield_to_raw(cfg, runtime):
             raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         try:
             verify_joined_entry(
@@ -5141,10 +5138,10 @@ def download_joined_item(cfg, runtime, item, stop_event):
         except ExistingFileMismatch:
             truncate_joined_part(directory_fd, part_name)
             raise RuntimeError("joined download checksum mismatch; partial restarted")
-        if poll_raw_pending(cfg, runtime):
+        if joined_must_yield_to_raw(cfg, runtime):
             raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
-        if poll_raw_pending(cfg, runtime):
+        if joined_must_yield_to_raw(cfg, runtime):
             raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         def publish_final():
             os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
@@ -5246,8 +5243,6 @@ def ensure_joined_dependency_ack(cfg, runtime, item, stop_event):
         raise ExistingFileMismatch("joined dependency file identity conflicts")
     identity = joined_ack_identity({**dependency, "size_bytes": size_bytes})
     if not has_joined_ack_receipt(cfg, item["connection_id"], identity):
-        if poll_raw_pending(cfg, runtime):
-            raise JoinedDownloadYield("joined delivery yielded to raw delivery")
         if not runtime.run_joined_completion(lambda: post_joined_ack(cfg, item["connection_id"], identity)):
             raise JoinedDownloadYield("joined protocol was disabled")
 
@@ -5435,7 +5430,6 @@ def process_clip(cfg, clip, release=True):
 
 def drain_page(cfg, runtime, inventory=None):
     require_storage_capacity(cfg, runtime)
-    starting_cursor = runtime.cursor_id
     page = request_json(
         cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
     )
@@ -5501,8 +5495,6 @@ def drain_page(cfg, runtime, inventory=None):
         cursor = clip_id
     if successes:
         runtime.add_successes(cfg, cursor, successes)
-        if runtime.cursor_id > starting_cursor:
-            runtime.grant_joined_range_credit()
     failures = [(clip_id, error) for clip_id, _, error in results if error is not None]
     runtime.set_batch(len(prepared), downloaded_bytes, time.monotonic() - started, retries, len(failures))
     if failures:
