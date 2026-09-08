@@ -214,7 +214,7 @@ func ytdlpSupportsJSRuntime(bin string) bool {
 	// first launch, especially while Gatekeeper validates a freshly updated file.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := capture.RunYTDLPCommand(ctx, bin, "--help")
+	out, err := capture.RunYTDLPCommandOutput(ctx, bin, "--help")
 	return err == nil && bytes.Contains(out, []byte("--js-runtimes"))
 }
 
