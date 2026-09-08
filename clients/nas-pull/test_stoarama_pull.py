@@ -3167,6 +3167,8 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         evidence["sources"][-1]["source_claim_sha256"] = "e" * 64
         expected["audio_sequence_contracts"].append(dict(expected["audio_sequence_contracts"][-1]))
         discards = (0, 100, 353)
+        self.assertEqual(len(evidence["sources"]), len(expected["audio_sequence_contracts"]))
+        self.assertEqual(len(evidence["sources"]), len(discards))
         for item, contract, discard in zip(evidence["sources"], expected["audio_sequence_contracts"], discards):
             item["first_packet_pts_samples"] = discard
             item["first_packet_dts_samples"] = discard
