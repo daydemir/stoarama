@@ -2841,6 +2841,7 @@ for _joined_order in (
     ("status", "acceptance_mode", "audio_padding_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("policy_version", "sources", "output", "ordered_source_evidence_sha256", "decoded_audio_surplus_samples", "packet_duration_delta_seconds", "decode_timeline_span_delta_seconds", "audio_content_status"),
     ("clip_id", "source_claim_sha256", "packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples", "trim_events"),
+    ("clip_id", "source_claim_sha256", "first_packet_pts_samples", "first_packet_dts_samples", "packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples", "trim_events"),
     ("packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples", "trim_events"),
     ("packet_ordinal", "skip_samples", "discard_padding"),
     ("status", "acceptance_mode", "lossless_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
@@ -3852,7 +3853,8 @@ def valid_aac_padding_verification(verification):
         "decode_timeline_span_delta_seconds", "audio_content_status",
     }
     exact_joined_fields(evidence, evidence_fields, "AAC padding normalization")
-    if evidence["policy_version"] != "aac-discard-padding-v1" or evidence["audio_content_status"] != "compressed_packets_exact_decoded_audio_not_sample_exact":
+    policy = evidence["policy_version"]
+    if policy not in ("aac-discard-padding-v1", "aac-discard-padding-v2") or evidence["audio_content_status"] != "compressed_packets_exact_decoded_audio_not_sample_exact":
         raise ValueError("joined AAC padding policy conflicts")
     if not isinstance(evidence["sources"], list) or len(evidence["sources"]) < 2:
         raise ValueError("joined AAC padding sources are invalid")
@@ -3889,10 +3891,15 @@ def valid_aac_padding_verification(verification):
         }
         if source:
             fields |= {"clip_id", "source_claim_sha256"}
+            if policy == "aac-discard-padding-v2":
+                fields |= {"first_packet_pts_samples", "first_packet_dts_samples"}
         exact_joined_fields(item, fields, "AAC trim evidence")
         if source:
             positive_joined_int(item["clip_id"], "AAC source clip_id")
             valid_sha256(item["source_claim_sha256"], "AAC source claim")
+            if policy == "aac-discard-padding-v2":
+                positive_joined_int(item["first_packet_pts_samples"], "AAC source first PTS", allow_zero=True)
+                positive_joined_int(item["first_packet_dts_samples"], "AAC source first DTS", allow_zero=True)
         for key in ("packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples"):
             positive_joined_int(item[key], "AAC trim %s" % key)
         if item["max_decoded_frame_samples"] != 1024 or item["terminal_packet_duration_samples"] != 1024:
@@ -3928,11 +3935,40 @@ def valid_aac_padding_verification(verification):
         ):
             raise ValueError("joined AAC source padding conflicts")
         discard = valid_trim(item, True)
-        if discard != contract["discard_padding"]:
+        if (
+            discard != contract["discard_padding"]
+            or policy == "aac-discard-padding-v2" and (
+                item["first_packet_pts_samples"] != discard
+                or item["first_packet_dts_samples"] != discard
+            )
+        ):
             raise ValueError("joined AAC source discard conflicts")
         source_packets += item["packet_count"]
         if index < len(source_contracts) - 1:
             padding += discard
+    if policy == "aac-discard-padding-v2":
+        offsets = [contract["discard_padding"] for contract in source_contracts]
+        if any(offsets[index] < offsets[index - 1] for index in range(1, len(offsets))):
+            raise ValueError("joined variable AAC source offsets decrease")
+        if (
+            want_video["packet_count"] != want_video["decoded_frames"]
+            or want_video["decode_timeline_span_seconds"] != want_video["packet_duration_seconds"]
+        ):
+            raise ValueError("joined variable AAC video timing proof is incomplete")
+        if any(Fraction(got_video[key]) != Fraction(want_video[key]) for key in ("first_packet_pts_seconds", "first_packet_dts_seconds")):
+            raise ValueError("joined variable AAC video first timestamp conflicts")
+        hold = Fraction(got_video["packet_duration_seconds"]) - Fraction(want_video["packet_duration_seconds"])
+        if hold < 0:
+            raise ValueError("joined variable AAC video hold conflicts")
+        for key in ("decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds"):
+            if Fraction(got_video[key]) - Fraction(want_video[key]) != hold:
+                raise ValueError("joined variable AAC video timing transform conflicts")
+        maximum_hold = min(
+            Fraction(2),
+            Fraction(want_video["packet_duration_seconds"]) * (len(source_contracts) - 1) / want_video["packet_count"],
+        )
+        if hold > maximum_hold:
+            raise ValueError("joined variable AAC video hold exceeds aggregate seam budget")
     output_discard = valid_trim(evidence["output"], False)
     output_contract = output_contracts[0]
     if (
@@ -3956,7 +3992,10 @@ def valid_aac_padding_verification(verification):
         or expected["effective_audio_sha256"] == actual["effective_audio_sha256"]
     ):
         raise ValueError("joined AAC decoded surplus conflicts")
-    delta = Fraction(padding, 44100)
+    timing_padding = padding if policy == "aac-discard-padding-v1" else sum(contract["discard_padding"] for contract in source_contracts[1:])
+    if policy == "aac-discard-padding-v2" and all(contract["discard_padding"] == source_contracts[0]["discard_padding"] for contract in source_contracts[1:]):
+        raise ValueError("joined variable AAC padding policy has constant offsets")
+    delta = Fraction(timing_padding, 44100)
     for key in ("packet_duration_seconds", "decode_timeline_span_seconds"):
         observed = Fraction(got_audio[key]) - Fraction(want_audio[key])
         evidence_key = "packet_duration_delta_seconds" if key == "packet_duration_seconds" else "decode_timeline_span_delta_seconds"
