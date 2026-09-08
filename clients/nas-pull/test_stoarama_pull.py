@@ -18,6 +18,7 @@ import unittest
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("stoarama_pull.py")
@@ -3133,7 +3134,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
 
     def test_aac_padding_verification_accepts_exact_662_and_rejects_tamper(self):
         verification = self.aac_padding_verification()
-        def go_order(value):
+        def go_order(value: Any) -> Any:
             if isinstance(value, list):
                 return [go_order(item) for item in value]
             if not isinstance(value, dict):
@@ -3189,7 +3190,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         want_audio["first_packet_pts_seconds"] = want_audio["first_packet_dts_seconds"] = first
         got_audio["first_packet_pts_seconds"] = got_audio["first_packet_dts_seconds"] = first
 
-        def go_order(value):
+        def go_order(value: Any) -> Any:
             if isinstance(value, list):
                 return [go_order(item) for item in value]
             if not isinstance(value, dict):
@@ -3244,7 +3245,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             "first_packet_pts_samples": 662,
             "first_packet_dts_samples": 662,
         })
-        def go_order(value):
+        def go_order(value: Any) -> Any:
             if isinstance(value, list):
                 return [go_order(item) for item in value]
             if not isinstance(value, dict):
