@@ -1922,11 +1922,8 @@ func VerifyJoinedMedia(ctx context.Context, sources []LocalSource, outputPath st
 		}
 		want, got := decodedSourceOutputIdentities(ctx, sourcePaths, outputPath)
 		wantVideo, gotVideo := expected.Tracks["video"], actual.Tracks["video"]
-		if want.err != nil || got.err != nil {
-			return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(want.err, got.err))
-		}
-		if wantVideo == nil || gotVideo == nil || want.frames != wantVideo.DecodedFrames || got.frames != gotVideo.DecodedFrames || !lowerHex64(want.sha) || !lowerHex64(got.sha) {
-			return verification, fmt.Errorf("bind rejected stream-copy decoded evidence: source_frames=%d output_frames=%d source_sha=%s output_sha=%s", want.frames, got.frames, want.sha, got.sha)
+		if err := validateDecodedVideoIdentityBinding(ctx, want, got, wantVideo, gotVideo); err != nil {
+			return verification, err
 		}
 		verification.SourceFingerprint.DecodedVideoSHA256 = want.sha
 		verification.OutputFingerprint.DecodedVideoSHA256 = got.sha
@@ -1995,6 +1992,86 @@ func decodedSourceOutputIdentities(ctx context.Context, sourcePaths []string, ou
 	return decodedIdentity{frames: wantFrames, sha: wantSHA, err: wantErr}, <-outputResult
 }
 
+func onlyContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !onlyContextCanceled(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return onlyContextCanceled(wrapped)
+	}
+	return err == context.Canceled
+}
+
+func validateDecodedVideoIdentityBinding(ctx context.Context, want, got decodedIdentity, wantVideo, gotVideo *TrackFingerprint) error {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(want.err, got.err, contextErr))
+	}
+	if want.err != nil || got.err != nil {
+		cause := fmt.Errorf("bind rejected stream-copy decoded evidence: %w", errors.Join(want.err, got.err))
+		facts := struct {
+			SourceFailure                    json.RawMessage `json:"source_failure,omitempty"`
+			OutputFailure                    json.RawMessage `json:"output_failure,omitempty"`
+			OutputCanceledAfterSourceFailure bool            `json:"output_canceled_after_source_failure,omitempty"`
+		}{}
+		if want.err != nil {
+			sourceFailure, ok := deterministicBuildFailure(deterministicEvidenceFailure(ctx, "media_sequence_mismatch", want.err))
+			if !ok {
+				return cause
+			}
+			facts.SourceFailure = append(json.RawMessage(nil), sourceFailure.evidence...)
+		}
+		if got.err != nil {
+			if want.err != nil && onlyContextCanceled(got.err) {
+				facts.OutputCanceledAfterSourceFailure = true
+			} else {
+				outputFailure, ok := deterministicBuildFailure(deterministicEvidenceFailure(ctx, "media_sequence_mismatch", got.err))
+				if !ok {
+					return cause
+				}
+				facts.OutputFailure = append(json.RawMessage(nil), outputFailure.evidence...)
+			}
+		}
+		return deterministicFailure("media_sequence_mismatch", facts, cause)
+	}
+	sourceFingerprintFrames, outputFingerprintFrames := int64(0), int64(0)
+	sourceTrackPresent, outputTrackPresent := wantVideo != nil, gotVideo != nil
+	if sourceTrackPresent {
+		sourceFingerprintFrames = wantVideo.DecodedFrames
+	}
+	if outputTrackPresent {
+		outputFingerprintFrames = gotVideo.DecodedFrames
+	}
+	cause := fmt.Errorf("bind rejected stream-copy decoded evidence: source_frames=%d output_frames=%d source_sha=%s output_sha=%s", want.frames, got.frames, want.sha, got.sha)
+	if !lowerHex64(want.sha) || !lowerHex64(got.sha) {
+		return cause
+	}
+	if !sourceTrackPresent || !outputTrackPresent || want.frames != sourceFingerprintFrames || got.frames != outputFingerprintFrames {
+		return deterministicFailure("media_sequence_mismatch", struct {
+			SourceTrackPresent      bool   `json:"source_track_present"`
+			OutputTrackPresent      bool   `json:"output_track_present"`
+			SourceSequenceFrames    int64  `json:"source_sequence_frames"`
+			OutputSequenceFrames    int64  `json:"output_sequence_frames"`
+			SourceFingerprintFrames int64  `json:"source_fingerprint_frames"`
+			OutputFingerprintFrames int64  `json:"output_fingerprint_frames"`
+			SourceSequenceSHA256    string `json:"source_sequence_sha256"`
+			OutputSequenceSHA256    string `json:"output_sequence_sha256"`
+		}{sourceTrackPresent, outputTrackPresent, want.frames, got.frames, sourceFingerprintFrames, outputFingerprintFrames, want.sha, got.sha}, cause)
+	}
+	return nil
+}
+
 func validateDecodedEquivalentMetadata(expected, actual MediaFingerprint) error {
 	if len(expected.Tracks) != len(actual.Tracks) || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
 		return fmt.Errorf("joined duration or stream cardinality mismatch")
@@ -2015,20 +2092,8 @@ func validateDecodedEquivalentMetadata(expected, actual MediaFingerprint) error 
 }
 
 func compareDecodedEquivalent(ctx context.Context, sources []LocalSource, outputPath string, expected, actual MediaFingerprint) (string, error) {
-	if len(expected.Tracks) != len(actual.Tracks) || actual.DurationSeconds <= 0 || math.Abs(actual.DurationSeconds-expected.DurationSeconds) > 2 {
-		return "", fmt.Errorf("joined duration or stream cardinality mismatch")
-	}
-	for mediaType, want := range expected.Tracks {
-		got := actual.Tracks[mediaType]
-		if got == nil || want.TimestampStatus != "source_clips_independent" || got.TimestampStatus != "monotonic" || want.PacketCount != got.PacketCount || want.PacketChainSHA256 != got.PacketChainSHA256 || want.DecodedFrames <= 0 || want.DecodedFrames != got.DecodedFrames || (mediaType == "audio" && want.DecodedSamples != got.DecodedSamples) {
-			return "", fmt.Errorf("joined %s packet payload, decoded totals, or timeline mismatch", mediaType)
-		}
-	}
-	if expected.EffectiveAudioBytes != actual.EffectiveAudioBytes || expected.EffectiveAudioFrames != actual.EffectiveAudioFrames || expected.EffectiveAudioSHA256 != actual.EffectiveAudioSHA256 {
-		return "", fmt.Errorf("joined effective decoded audio sequence mismatch")
-	}
-	if len(expected.AudioContracts) > 0 && (len(actual.AudioContracts) != 1 || !sameAudioFormat(expected.AudioContracts[0], actual.AudioContracts[0])) {
-		return "", fmt.Errorf("joined effective audio format mismatch")
+	if err := validateDecodedEquivalentMetadata(expected, actual); err != nil {
+		return "", err
 	}
 	sourcePaths := make([]string, len(sources))
 	for i := range sources {

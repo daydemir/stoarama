@@ -2270,3 +2270,99 @@ func TestPacketEvidenceFailuresAreDeterministicMedia(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodedVideoIdentityBindingClassifiesMediaEvidenceButNotInfrastructure(t *testing.T) {
+	exitErr := exec.Command("sh", "-c", "exit 9").Run()
+	malformed := fmt.Errorf("framemd5 decode: %w (Invalid data found when processing input)", exitErr)
+	err := validateDecodedVideoIdentityBinding(context.Background(),
+		decodedIdentity{err: malformed}, decodedIdentity{err: context.Canceled}, nil, nil)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "media_sequence_mismatch" || !errors.Is(err, malformed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("malformed decoded evidence was not classified with its causes: %v", err)
+	}
+	var facts struct {
+		SourceFailure                    json.RawMessage `json:"source_failure"`
+		OutputCanceledAfterSourceFailure bool            `json:"output_canceled_after_source_failure"`
+	}
+	if err := json.Unmarshal(failure.evidence, &facts); err != nil || len(facts.SourceFailure) == 0 || !facts.OutputCanceledAfterSourceFailure {
+		t.Fatalf("decoded evidence facts=%s err=%v", failure.evidence, err)
+	}
+
+	unknownExit := exec.Command("sh", "-c", "exit 8").Run()
+	for name, testErr := range map[string]error{
+		"missing_binary":  &os.PathError{Op: "fork/exec", Path: "/missing/ffmpeg", Err: os.ErrNotExist},
+		"no_space":        syscall.ENOSPC,
+		"io":              syscall.EIO,
+		"unknown_exit":    unknownExit,
+		"parser_contract": errors.New("invalid decoded frame duration"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateDecodedVideoIdentityBinding(context.Background(), decodedIdentity{err: testErr}, decodedIdentity{}, nil, nil)
+			if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, testErr) {
+				t.Fatalf("infrastructure failure was classified or lost: %v", err)
+			}
+		})
+	}
+
+	joinedInfra := errors.Join(context.Canceled, syscall.ENOSPC)
+	err = validateDecodedVideoIdentityBinding(context.Background(), decodedIdentity{err: malformed}, decodedIdentity{err: joinedInfra}, nil, nil)
+	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, context.Canceled) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("joined peer infrastructure failure was classified or lost: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = validateDecodedVideoIdentityBinding(ctx, decodedIdentity{err: malformed}, decodedIdentity{}, nil, nil)
+	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, malformed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent cancellation was classified or lost: %v", err)
+	}
+	err = validateDecodedVideoIdentityBinding(ctx,
+		decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)},
+		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+		&TrackFingerprint{DecodedFrames: 2}, &TrackFingerprint{DecodedFrames: 1})
+	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent cancellation did not win structural mismatch: %v", err)
+	}
+}
+
+func TestDecodedVideoIdentityBindingFactsDriveDeterminismAndQuarantine(t *testing.T) {
+	wantTrack := &TrackFingerprint{DecodedFrames: 2}
+	gotTrack := &TrackFingerprint{DecodedFrames: 1}
+	want := decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)}
+	got := decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)}
+	err := validateDecodedVideoIdentityBinding(context.Background(), want, got, wantTrack, gotTrack)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "media_sequence_mismatch" {
+		t.Fatalf("structural binding failure was not deterministic: %v", err)
+	}
+	err = validateDecodedVideoIdentityBinding(context.Background(),
+		decodedIdentity{frames: 2, sha: "invalid"},
+		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+		wantTrack, gotTrack)
+	if _, ok := deterministicBuildFailure(err); ok {
+		t.Fatalf("invalid generated SHA was treated as a media fact: %v", err)
+	}
+
+	want.frames = 0
+	changed, ok := deterministicBuildFailure(validateDecodedVideoIdentityBinding(context.Background(), want, got, wantTrack, gotTrack))
+	if !ok || changed.evidenceSHA256 == failure.evidenceSHA256 {
+		t.Fatalf("changed decoded binding facts reused evidence: before=%s after=%s", failure.evidenceSHA256, changed.evidenceSHA256)
+	}
+
+	sources := makeSyntheticLocalSourcesWithIdentity(t, 3)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		for _, source := range candidate {
+			if source.ClipID == 2 {
+				return BuiltOutput{}, validateDecodedVideoIdentityBinding(context.Background(),
+					decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)},
+					decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+					&TrackFingerprint{DecodedFrames: 2}, &TrackFingerprint{DecodedFrames: 1})
+			}
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 2 || len(quarantines) != 1 || quarantines[0].Source.ClipID != 2 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
+	}
+}
