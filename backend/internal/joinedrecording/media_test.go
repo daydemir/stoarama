@@ -543,6 +543,9 @@ func TestDefaultMediaCandidateBudgetDoesNotRushExactPairProofs(t *testing.T) {
 			t.Errorf("%s budget=%s want=60m", kind, got)
 		}
 	}
+	if got := defaultMediaCandidateBudget("segment", 37); got != 60*time.Minute {
+		t.Fatalf("37-source segment budget=%s want=60m", got)
+	}
 	if got := defaultMediaCandidateBudget("full_timeout_retry", 2); got != 60*time.Minute {
 		t.Errorf("full timeout retry budget=%s want=60m", got)
 	}
