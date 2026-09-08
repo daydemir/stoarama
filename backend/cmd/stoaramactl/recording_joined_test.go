@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -267,6 +271,153 @@ func TestJoinedWorkerEnabledProcessHandlesSIGTERM(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatal("enabled worker ignored SIGTERM")
 	}
+}
+
+func TestJoinedWorkerProcessExitContract(t *testing.T) {
+	if mode := os.Getenv("STOARAMA_TEST_JOINED_PROCESS_MODE"); os.Getenv("STOARAMA_TEST_JOINED_PROCESS_CHILD") == "1" {
+		polls, reports, err := runJoinedWorkerProcessCase(mode)
+		result := "stopped"
+		if err != nil {
+			result = "error"
+		}
+		fmt.Printf("result=%s polls=%d reports=%d\n", result, polls, reports)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	t.Run("ambient-mode-requires-child-cookie", func(t *testing.T) {
+		if os.Getenv("STOARAMA_TEST_JOINED_PROCESS_AMBIENT_PROBE") == "1" {
+			fmt.Println("ambient-mode-reached-parent")
+			return
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestJoinedWorkerProcessExitContract$/ambient-mode-requires-child-cookie$")
+		cmd.Env = []string{
+			"STOARAMA_TEST_JOINED_PROCESS_MODE=success",
+			"STOARAMA_TEST_JOINED_PROCESS_AMBIENT_PROBE=1",
+		}
+		output, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(output), "ambient-mode-reached-parent") {
+			t.Fatalf("ambient mode selected child: err=%v output=%q", err, output)
+		}
+	})
+
+	for _, tc := range []struct {
+		mode       string
+		wantExit   int
+		wantOutput string
+		wantError  string
+		wantCause  string
+	}{
+		{mode: "success", wantExit: 0, wantOutput: "result=stopped polls=2 reports=0"},
+		{mode: "failure-acknowledged", wantExit: 0, wantOutput: "result=stopped polls=1 reports=1"},
+		{mode: "failure-report-503", wantExit: 1, wantOutput: "result=error polls=1 reports=1", wantError: "joined API /api/v1/recording/joined/failure returned status 503", wantCause: "decoder failed"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestJoinedWorkerProcessExitContract$")
+			cmd.Env = []string{
+				"STOARAMA_TEST_JOINED_PROCESS_CHILD=1",
+				"STOARAMA_TEST_JOINED_PROCESS_MODE=" + tc.mode,
+			}
+			output, err := cmd.CombinedOutput()
+			gotExit := 0
+			if err != nil {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) {
+					t.Fatalf("run helper: %v", err)
+				}
+				gotExit = exitErr.ExitCode()
+			}
+			if gotExit != tc.wantExit || !strings.Contains(string(output), tc.wantOutput) ||
+				(tc.wantError != "" && !strings.Contains(string(output), tc.wantError)) ||
+				(tc.wantCause != "" && !strings.Contains(string(output), tc.wantCause)) {
+				t.Fatalf("exit=%d want=%d output=%q", gotExit, tc.wantExit, output)
+			}
+		})
+	}
+}
+
+func runJoinedWorkerProcessCase(mode string) (int32, int32, error) {
+	const operationToken = "operation-token-not-a-secret-value"
+	var polls atomic.Int32
+	var reports atomic.Int32
+	var service *remoteJoinedOperatorService
+	var server *httptest.Server
+
+	switch mode {
+	case "success":
+	case "failure-acknowledged", "failure-report-503":
+		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/api/v1/recording/joined/failure" ||
+				r.Header.Get("Authorization") != "Bearer "+operationToken {
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+				return
+			}
+			decoder := json.NewDecoder(r.Body)
+			var request joinedrecording.WorkFailureRequest
+			want := joinedrecording.WorkFailureRequest{
+				ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				ScopeKind:       "hour",
+				ScopeID:         "hour-1",
+				FailureClass:    "transient",
+				ReasonCode:      "worker_task_failed",
+			}
+			if err := decoder.Decode(&request); err != nil || request.Validate() != nil || request != want ||
+				decoder.Decode(&struct{}{}) != io.EOF {
+				http.Error(w, "unexpected request", http.StatusBadRequest)
+				return
+			}
+			reports.Add(1)
+			if mode == "failure-report-503" {
+				http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+				return
+			}
+			next := time.Now().UTC().Add(time.Minute)
+			if err := json.NewEncoder(w).Encode(joinedrecording.WorkFailureResponse{
+				ProtocolVersion: joinedrecording.JoinedProtocolVersion,
+				State:           "retry",
+				AttemptCount:    1,
+				NextAttemptAt:   &next,
+			}); err != nil {
+				panic(err)
+			}
+		}))
+		defer server.Close()
+		api, err := newJoinedAPIClient(server.URL, "bootstrap-token-not-a-secret-value", server.Client())
+		if err != nil {
+			return 0, 0, err
+		}
+		service = &remoteJoinedOperatorService{api: api}
+	default:
+		return 0, 0, fmt.Errorf("unknown joined worker process mode %q", mode)
+	}
+
+	taskErr := errors.New("decoder failed")
+	fake := &fakeJoinedOperator{runWorker: func(ctx context.Context, _ joinedWorkerRequest) error {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		return runJoinedWorkerLoop(ctx, time.Hour, func(_ context.Context, taskCtx context.Context) (bool, error) {
+			poll := polls.Add(1)
+			if mode == "success" {
+				if poll == 1 {
+					return true, nil
+				}
+				cancel()
+				return false, nil
+			}
+			if poll > 1 {
+				return false, errors.New("worker polled after a task failure")
+			}
+			return true, service.reportJoinedTaskFailure(taskCtx, operationToken, "hour", "hour-1", taskErr)
+		})
+	}}
+	_, err := runRecordingJoinedCommand(context.Background(), validJoinedWorkerConfig(), []string{"worker", "run"},
+		func(context.Context, config.Config) (joinedOperatorService, error) { return fake, nil })
+	if mode == "failure-report-503" && !errors.Is(err, taskErr) {
+		return polls.Load(), reports.Load(), errors.New("failure report lost the original task error")
+	}
+	return polls.Load(), reports.Load(), err
 }
 
 func TestJoinedAdmissionDrainPausesBeforeZeroLeaseGate(t *testing.T) {
