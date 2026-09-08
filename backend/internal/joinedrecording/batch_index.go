@@ -336,7 +336,7 @@ func SelectedQualificationWindowsSHA256(recordings []FrozenRecording) (string, e
 
 func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindow, resolveLedger AllocationLedgerResolver, resolveHour HourManifestResolver) (BatchIndex, []byte, string, error) {
 	selectedWindowsSHA, windowsErr := SelectedQualificationWindowsSHA256(index.FrozenRecordings)
-	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || index.HourManifestSchemaVersion != HourManifestSchemaVersion || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || index.FrozenAt.Before(index.SelectionAuthority.Cutoff) || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || ValidateSelectionAuthority(index.SelectionAuthority, index.RecordingIDs) != nil || windowsErr != nil || selectedWindowsSHA != index.SelectionAuthority.SelectedQualificationWindowsSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
+	if index.SchemaVersion != BatchIndexSchemaVersion || index.PolicyVersion != PlanPolicyVersion || index.AllocationSchemaVersion != 1 || (index.HourManifestSchemaVersion != HourManifestSchemaVersion && index.HourManifestSchemaVersion != HourManifestAACPaddingSchemaVersion) || !safeBatchID.MatchString(index.BatchID) || index.Generation <= 0 || index.FrozenAt.IsZero() || index.FrozenAt.Before(index.SelectionAuthority.Cutoff) || !lowerHex64(index.BatchGenerationSHA256) || len(index.RecordingIDs) == 0 || len(index.FrozenRecordings) != len(index.RecordingIDs) || ValidateSelectionAuthority(index.SelectionAuthority, index.RecordingIDs) != nil || windowsErr != nil || selectedWindowsSHA != index.SelectionAuthority.SelectedQualificationWindowsSHA256 || ValidateMediaToolEvidence(index.MediaTool) != nil || index.ExpectedLedgerCount != len(index.AllocationLedgers) || index.ExpectedLedgerCount != len(index.RecordingIDs)*14 || index.ScheduledHourCount != len(index.Hours) || index.ScheduledHourCount != index.ExpectedLedgerCount*12 || index.SourceClipCount < 0 || index.SourceBytes < 0 || index.FinalMediaCount < 0 {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch index denominator differs")
 	}
 	seenRecording := map[int64]bool{}
@@ -388,6 +388,7 @@ func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindo
 	}
 	var hourSources, mediaCount int
 	var hourBytes int64
+	maxHourManifestSchemaVersion := HourManifestSchemaVersion
 	var canonicalLedger StreamDayAllocation
 	var previousCanonicalLedger StreamDayAllocation
 	for hourIndex, hour := range index.Hours {
@@ -414,6 +415,12 @@ func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindo
 			canonicalManifest, resolveErr := resolveHour(hour)
 			if resolveErr != nil {
 				return BatchIndex{}, nil, "", fmt.Errorf("resolve canonical hour manifest: %w", resolveErr)
+			}
+			if canonicalManifest.SchemaVersion > maxHourManifestSchemaVersion {
+				maxHourManifestSchemaVersion = canonicalManifest.SchemaVersion
+			}
+			if canonicalManifest.SchemaVersion > index.HourManifestSchemaVersion {
+				return BatchIndex{}, nil, "", fmt.Errorf("batch hour schema exceeds declared support")
 			}
 			if err := ValidateBatchIndexHour(hour, canonicalManifest); err != nil {
 				return BatchIndex{}, nil, "", fmt.Errorf("batch hour does not match its canonical manifest artifact: %w", err)
@@ -458,7 +465,7 @@ func buildBatchIndex(index BatchIndex, qualificationWindows []QualificationWindo
 		hourBytes += hour.SourceBytes
 		mediaCount += hour.MediaArtifactCount
 	}
-	if len(expectedHours) != 0 || sourceCount != index.SourceClipCount || sourceBytes != index.SourceBytes || hourSources != sourceCount || hourBytes != sourceBytes || mediaCount != index.FinalMediaCount {
+	if len(expectedHours) != 0 || (resolveHour != nil && index.HourManifestSchemaVersion != maxHourManifestSchemaVersion) || sourceCount != index.SourceClipCount || sourceBytes != index.SourceBytes || hourSources != sourceCount || hourBytes != sourceBytes || mediaCount != index.FinalMediaCount {
 		return BatchIndex{}, nil, "", fmt.Errorf("batch proof root does not exactly account its denominator")
 	}
 	denominatorSHA, err := ComputeFrozenDenominatorSHA256(index.SelectionAuthority, index.FrozenRecordings, frozenDenominatorDays(index.AllocationLedgers))

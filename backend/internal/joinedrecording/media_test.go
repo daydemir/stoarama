@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/daydemir/stoarama/backend/internal/stitchcert"
 	"time"
 )
 
@@ -1681,6 +1683,295 @@ func TestBuildLargestPassingPrefixRejectsAACPrimingTotalChange(t *testing.T) {
 	}
 }
 
+func TestAACDiscardPaddingNormalizationIsDefaultOff(t *testing.T) {
+	t.Setenv(audioPaddingFeatureEnv, "")
+	if audioPaddingNormalizationEnabled() {
+		t.Fatal("AAC padding normalization unexpectedly enabled by default")
+	}
+	t.Setenv(audioPaddingFeatureEnv, "1")
+	if !audioPaddingNormalizationEnabled() {
+		t.Fatal("explicit AAC padding normalization gate was ignored")
+	}
+}
+func TestAACPaddingModeBuildsAndRebuildsExactRow1923WithCreationGateOff(t *testing.T) {
+	fixtureDir := os.Getenv("STOARAMA_ROW1923_FIXTURE_DIR")
+	if fixtureDir == "" {
+		t.Skip("set STOARAMA_ROW1923_FIXTURE_DIR to the preserved exact row1923 fixture")
+	}
+	sources := make([]LocalSource, 2)
+	for i, fixture := range []struct {
+		name string
+		id   int64
+		sha  string
+	}{
+		{"clip-435622.mp4", 435622, "2c09397a529e12a6ac278240e953573a8d76f37c3be5437fbf0144aeb9b0b134"},
+		{"clip-435667.mp4", 435667, "fce1715a807030246c060780d54c1027a2d457c0239eb7baae090bacb3df4efa"},
+	} {
+		mediaPath := filepath.Join(fixtureDir, fixture.name)
+		size, sha, err := localIdentity(mediaPath)
+		if err != nil || sha != fixture.sha {
+			t.Fatalf("row1923 fixture identity differs: name=%s sha=%s err=%v", fixture.name, sha, err)
+		}
+		_, _, contract, err := probeMediaMetadata(context.Background(), mediaPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources[i] = LocalSource{ClipID: fixture.id, Path: mediaPath, SizeBytes: size, SHA256: sha, SourceClaimSHA256: sha, AudioContract: contract}
+	}
+	dir := t.TempDir()
+	t.Setenv(audioPaddingFeatureEnv, "1")
+	built, err := BuildSealedOutput(context.Background(), sources, filepath.Join(dir, "first-build"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(built.Path)
+	if built.SHA256 != "148c9293c2dfc989881692e497432fce1e643cac5f1879322857393b370dbeb1" || built.Verification.AcceptanceMode != audioPaddingAcceptanceMode || built.Verification.AudioPaddingNormalization == nil || built.Verification.AudioPaddingNormalization.DecodedAudioSurplusSamples != 662 {
+		t.Fatalf("exact row1923 fixture did not use bounded mode: sha=%s verification=%+v", built.SHA256, built.Verification)
+	}
+	if err := validateAudioPaddingNormalizationVerification(built.Verification); err != nil {
+		t.Fatalf("fresh row1923 verification did not revalidate: %v", err)
+	}
+	t.Setenv(audioPaddingFeatureEnv, "")
+	rebuilt, err := BuildSealedOutputForVerification(context.Background(), sources, filepath.Join(dir, "rebuild"), built.Verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(rebuilt.Path)
+	if rebuilt.SizeBytes != built.SizeBytes || rebuilt.SHA256 != built.SHA256 || !sameCanonical([]Verification{rebuilt.Verification}, []Verification{built.Verification}) {
+		t.Fatalf("gate-off sealed rebuild differed: first=%+v rebuilt=%+v", built, rebuilt)
+	}
+}
+
+func TestProbeAACStreamProofBindsCodecFramesAndTrimEvidence(t *testing.T) {
+	t.Setenv(audioPaddingFeatureEnv, "1")
+	clip := makeMediaClip(t, t.TempDir(), "aac-proof.mp4", 440, true)
+	fingerprint, err := probeMedia(context.Background(), clip.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fingerprint.AudioContracts) != 1 {
+		t.Fatal("AAC contract is missing")
+	}
+	contract := fingerprint.AudioContracts[0]
+	proof, err := probeAACPaddingContract(context.Background(), clip.Path, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proof.Profile != "LC" || !lowerHex64(proof.ExtradataSHA256) || proof.PacketCount <= 0 || proof.MaxFrameSamples != 1024 || proof.TerminalPacketDurationSamples <= 0 || proof.TerminalPacketDurationSamples > proof.MaxFrameSamples {
+		t.Fatalf("AAC stream proof differs: contract=%+v proof=%+v", contract, proof)
+	}
+	var skip, discard, terminalDiscard, lastOrdinal int64
+	for _, event := range proof.TrimEvents {
+		if event.PacketOrdinal <= lastOrdinal || event.PacketOrdinal > proof.PacketCount || event.SkipSamples < 0 || event.DiscardPadding < 0 {
+			t.Fatalf("AAC trim event is invalid: %+v", proof)
+		}
+		lastOrdinal = event.PacketOrdinal
+		skip += event.SkipSamples
+		discard += event.DiscardPadding
+		if event.PacketOrdinal == proof.PacketCount {
+			terminalDiscard = event.DiscardPadding
+		}
+	}
+	if skip+discard <= 0 || skip != contract.SkipSamples || discard != contract.DiscardPadding {
+		t.Fatalf("AAC trim did not match observed stream facts: contract=%+v proof=%+v", contract, proof)
+	}
+	if discard > 0 && (terminalDiscard != discard || proof.LastFrameSamples+discard != proof.MaxFrameSamples) {
+		t.Fatalf("terminal AAC discard was not position/frame bounded: contract=%+v proof=%+v", contract, proof)
+	}
+}
+
+func TestAACDiscardPaddingTimingTransformAdjustsOnlyTerminalSeamPacket(t *testing.T) {
+	packet := func(pts, duration int64) aacPacketTiming {
+		return aacPacketTiming{PTS: pts, DTS: pts, Duration: duration, TimeBaseNum: 1, TimeBaseDen: 44100}
+	}
+	first := AudioSequenceContract{SampleRate: 44100, DiscardPadding: 662, aacProof: &aacStreamProof{PacketTimings: []aacPacketTiming{packet(0, 1024), packet(1024, 1024)}}}
+	second := AudioSequenceContract{SampleRate: 44100, aacProof: &aacStreamProof{PacketTimings: []aacPacketTiming{packet(0, 1024), packet(1024, 1024)}}}
+	output := AudioSequenceContract{SampleRate: 44100, aacProof: &aacStreamProof{PacketTimings: []aacPacketTiming{packet(0, 1024), packet(1024, 1686), packet(2710, 1024), packet(3734, 1024)}}}
+	want, err := aacPacketTimingSHA([]AudioSequenceContract{first, second}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := aacPacketTimingSHA([]AudioSequenceContract{output}, false)
+	if err != nil || got != want {
+		t.Fatalf("exact seam timing transform differed: got=%s want=%s err=%v", got, want, err)
+	}
+	output.aacProof.PacketTimings[2].PTS++
+	if changed, _ := aacPacketTimingSHA([]AudioSequenceContract{output}, false); changed == want {
+		t.Fatal("internal packet timing drift preserved the seam transform hash")
+	}
+}
+func TestAACDiscardPaddingMalformedEvidenceRejectsWithoutPanic(t *testing.T) {
+	verification := row1923AACPaddingVerificationFixture(t)
+	verification.OutputFingerprint.Tracks["audio"] = nil
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("malformed AAC evidence panicked: %v", recovered)
+		}
+	}()
+	if err := validateAudioPaddingNormalizationFacts(verification.SourceFingerprint, verification.OutputFingerprint, verification.AudioPaddingNormalization); err == nil {
+		t.Fatal("malformed AAC evidence passed")
+	}
+}
+func TestAACPacketSideDataRejectsUnknownAndDuplicateEvidence(t *testing.T) {
+	valid := map[string]string{
+		"pts": "0", "dts": "0", "duration": "1024",
+		"side_datum/skip_samples:side_data_type":  "Skip Samples",
+		"side_datum/skip_samples:skip_samples":    "0",
+		"side_datum/skip_samples:discard_padding": "662",
+		"side_datum/skip_samples:skip_reason":     "0",
+		"side_datum/skip_samples:discard_reason":  "0",
+	}
+	if skip, discard, err := parseAACPacketSideData(valid); err != nil || skip != 0 || discard != 662 {
+		t.Fatalf("valid terminal trim rejected: skip=%d discard=%d err=%v", skip, discard, err)
+	}
+	unknown := make(map[string]string, len(valid)+1)
+	for key, value := range valid {
+		unknown[key] = value
+	}
+	unknown["side_datum/new_extradata:side_data_type"] = "New Extradata"
+	if _, _, err := parseAACPacketSideData(unknown); err == nil {
+		t.Fatal("decoder-affecting packet side data passed")
+	}
+	if _, err := parseUniqueCompactFields([]string{"pts=0", "pts=1"}); err == nil {
+		t.Fatal("duplicate packet evidence passed")
+	}
+}
+
+func TestAACPaddingSourceClaimsBindEveryEvidenceOrdinal(t *testing.T) {
+	verification := row1923AACPaddingVerificationFixture(t)
+	sources := []SourceClip{{ClipID: 435622}, {ClipID: 435667}}
+	for i := range sources {
+		claimSHA, _, err := sourceClaimSHA([]SourceClip{sources[i]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		verification.AudioPaddingNormalization.Sources[i].ClipID = sources[i].ClipID
+		verification.AudioPaddingNormalization.Sources[i].SourceClaimSHA256 = claimSHA
+	}
+	orderedSHA, _, err := stitchcert.CanonicalSHA(verification.AudioPaddingNormalization.Sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification.AudioPaddingNormalization.OrderedSourceEvidenceSHA256 = orderedSHA
+	if err := validateAudioPaddingSourceClaims(verification, sources); err != nil {
+		t.Fatal(err)
+	}
+	sources[0], sources[1] = sources[1], sources[0]
+	if err := validateAudioPaddingSourceClaims(verification, sources); err == nil {
+		t.Fatal("reordered AAC source claims passed")
+	}
+}
+
+func TestRejectedLegacyStreamCopyEvidenceRejectsAACPaddingBlock(t *testing.T) {
+	verification := row1923AACPaddingVerificationFixture(t)
+	verification.Status, verification.AcceptanceMode = "failed", ""
+	verification.PacketPayloadOrderStatus, verification.DecodedFrameTotalsStatus, verification.DecodedAudioTotalsStatus = "", "", ""
+	verification.DecodedFrameSequenceStatus, verification.OutputTimestampStatus, verification.StrictDecodeStatus = "failed", "", ""
+	for _, fingerprint := range []*MediaFingerprint{&verification.SourceFingerprint, &verification.OutputFingerprint} {
+		for _, track := range fingerprint.Tracks {
+			track.CodecProfile, track.CodecExtradataSHA256, track.AACPaddingNormalizedTimingSHA256 = "", "", ""
+		}
+	}
+	raw, err := json.Marshal(verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRejectedStreamCopyVerification(raw, verification.SourceFingerprint); err == nil {
+		t.Fatal("legacy rejected stream-copy evidence accepted an AAC padding block")
+	}
+}
+
+func TestAACDiscardPaddingNormalizationAcceptsExact662SampleSeamAndRejectsTamper(t *testing.T) {
+	verification := row1923AACPaddingVerificationFixture(t)
+	if err := validatePassedVerification(verification); err != nil {
+		t.Fatalf("exact 662-sample AAC seam was rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Verification){
+		"video packet count":   func(v *Verification) { v.OutputFingerprint.Tracks["video"].PacketCount-- },
+		"video packet order":   func(v *Verification) { v.OutputFingerprint.Tracks["video"].PacketChainSHA256 = strings.Repeat("9", 64) },
+		"video decoded count":  func(v *Verification) { v.OutputFingerprint.Tracks["video"].DecodedFrames-- },
+		"video decoded pixels": func(v *Verification) { v.OutputFingerprint.DecodedVideoSHA256 = strings.Repeat("8", 64) },
+		"video packet timing":  func(v *Verification) { v.OutputFingerprint.Tracks["video"].TimestampStatus = "nonmonotonic" },
+		"audio packet count":   func(v *Verification) { v.OutputFingerprint.Tracks["audio"].PacketCount-- },
+		"audio packet order":   func(v *Verification) { v.OutputFingerprint.Tracks["audio"].PacketChainSHA256 = strings.Repeat("7", 64) },
+		"audio timing evidence": func(v *Verification) {
+			v.OutputFingerprint.Tracks["audio"].PacketTimingSHA256 = strings.Repeat("7", 64)
+		},
+		"audio decoded surplus":         func(v *Verification) { v.OutputFingerprint.EffectiveAudioFrames++ },
+		"strict decode":                 func(v *Verification) { v.StrictDecodeStatus = "failed" },
+		"audio packet timing":           func(v *Verification) { v.OutputFingerprint.Tracks["audio"].TimestampStatus = "nonmonotonic" },
+		"padding evidence":              func(v *Verification) { v.AudioPaddingNormalization.DecodedAudioSurplusSamples++ },
+		"padding location":              func(v *Verification) { v.AudioPaddingNormalization.Sources[0].TrimEvents[0].PacketOrdinal-- },
+		"intermediate initial padding":  func(v *Verification) { v.SourceFingerprint.AudioContracts[1].InitialPadding = 1 },
+		"intermediate codec delay":      func(v *Verification) { v.SourceFingerprint.AudioContracts[1].CodecDelay = 1 },
+		"intermediate trailing padding": func(v *Verification) { v.SourceFingerprint.AudioContracts[1].TrailingPadding = 1 },
+		"padding seam bound":            func(v *Verification) { v.AudioPaddingNormalization.Sources[0].TrimEvents[0].DiscardPadding = 1025 },
+		"codec profile":                 func(v *Verification) { v.OutputFingerprint.Tracks["audio"].CodecProfile = "HE-AAC" },
+		"codec extradata": func(v *Verification) {
+			v.OutputFingerprint.Tracks["audio"].CodecExtradataSHA256 = strings.Repeat("9", 64)
+		},
+		"timing transform": func(v *Verification) {
+			v.SourceFingerprint.Tracks["audio"].AACPaddingNormalizedTimingSHA256 = strings.Repeat("9", 64)
+		},
+		"legacy totals status": func(v *Verification) { v.DecodedAudioTotalsStatus = "passed" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(verification)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var changed Verification
+			if err := json.Unmarshal(raw, &changed); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&changed)
+			if err := validatePassedVerification(changed); err == nil {
+				t.Fatal("tampered AAC padding verification passed")
+			}
+		})
+	}
+}
+
+func row1923AACPaddingVerificationFixture(t *testing.T) Verification {
+	t.Helper()
+	sourceEvidence := []AACSourcePaddingEvidence{
+		{ClipID: 435622, SourceClaimSHA256: strings.Repeat("c", 64), PacketCount: 2584, MaxDecodedFrameSamples: 1024, LastDecodedFrameSamples: 362, TerminalPacketDurationSamples: 1024, TrimEvents: []AACTrimEventEvidence{{PacketOrdinal: 2584, DiscardPadding: 662}}},
+		{ClipID: 435623, SourceClaimSHA256: strings.Repeat("d", 64), PacketCount: 2584, MaxDecodedFrameSamples: 1024, LastDecodedFrameSamples: 362, TerminalPacketDurationSamples: 1024, TrimEvents: []AACTrimEventEvidence{{PacketOrdinal: 2584, DiscardPadding: 662}}},
+	}
+	orderedSourceSHA, _, err := stitchcert.CanonicalSHA(sourceEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstContract := AudioSequenceContract{CodecName: "aac", SampleRate: 44100, Channels: 2, ChannelLayout: "stereo", DiscardPadding: 662, EditListKind: "decoder_timeline_v1", EditListSHA256: strings.Repeat("1", 64)}
+	videoSource := &TrackFingerprint{MediaType: "video", PacketCount: 1800, PacketChainSHA256: strings.Repeat("2", 64), PacketTimingSHA256: strings.Repeat("3", 64), PacketTimeBases: []string{"1/90000"}, FirstPacketPTSSeconds: "0", LastPacketPTSSeconds: "60", FirstPacketDTSSeconds: "0", LastPacketDTSSeconds: "60", PacketDurationSeconds: "61", DecodeTimelineSpanSeconds: "61", DecodedFrames: 1800, TimestampStatus: "source_clips_independent"}
+	videoOutput := *videoSource
+	videoOutput.TimestampStatus = "monotonic"
+	audioSource := &TrackFingerprint{MediaType: "audio", PacketCount: 5168, PacketChainSHA256: "3930be7a305e40819fb3b78e0752c5e48bb3584e956b12686830112c0fd9d42e", PacketTimingSHA256: strings.Repeat("4", 64), PacketTimeBases: []string{"1/44100"}, FirstPacketPTSSeconds: "0", LastPacketPTSSeconds: "5291008/44100", FirstPacketDTSSeconds: "0", LastPacketDTSSeconds: "5291008/44100", PacketDurationSeconds: "5292032/44100", DecodeTimelineSpanSeconds: "5292032/44100", DecodedFrames: 5168, DecodedSamples: 5290708, CodecProfile: "LC", CodecExtradataSHA256: strings.Repeat("6", 64), AACPaddingNormalizedTimingSHA256: strings.Repeat("5", 64), TimestampStatus: "source_clips_independent"}
+	audioOutput := *audioSource
+	audioOutput.PacketTimingSHA256 = strings.Repeat("5", 64)
+	audioOutput.AACPaddingNormalizedTimingSHA256 = ""
+	audioOutput.LastPacketPTSSeconds = "5291670/44100"
+	audioOutput.LastPacketDTSSeconds = "5291670/44100"
+	audioOutput.PacketDurationSeconds = "5292694/44100"
+	audioOutput.DecodeTimelineSpanSeconds = "5292694/44100"
+	audioOutput.DecodedSamples = 5291370
+	audioOutput.TimestampStatus = "monotonic"
+	return Verification{
+		Status: "passed", AcceptanceMode: audioPaddingAcceptanceMode,
+		AudioPaddingNormalization: &AudioPaddingNormalizationEvidence{
+			PolicyVersion:               aacDiscardPaddingPolicyVersion,
+			Sources:                     sourceEvidence,
+			OrderedSourceEvidenceSHA256: orderedSourceSHA,
+			Output:                      AACSourcePaddingEvidence{PacketCount: 5168, MaxDecodedFrameSamples: 1024, LastDecodedFrameSamples: 362, TerminalPacketDurationSamples: 1024, TrimEvents: []AACTrimEventEvidence{{PacketOrdinal: 5168, DiscardPadding: 662}}},
+			DecodedAudioSurplusSamples:  662, PacketDurationDeltaSeconds: "331/22050", DecodeTimelineSpanDeltaSeconds: "331/22050", AudioContentStatus: audioPaddingNotSampleExactStatus,
+		},
+		PacketPayloadOrderStatus: "passed", DecodedFrameSequenceStatus: "passed", DecodedFrameTotalsStatus: "passed", DecodedAudioTotalsStatus: audioPaddingDecodedTotalsStatus, OutputTimestampStatus: "passed", StrictDecodeStatus: "passed",
+		SourceFingerprint: MediaFingerprint{DurationSeconds: 120, Tracks: map[string]*TrackFingerprint{"video": videoSource, "audio": audioSource}, DecodedVideoSHA256: strings.Repeat("a", 64), AudioContracts: []AudioSequenceContract{firstContract, firstContract}, EffectiveAudioBytes: 42325664, EffectiveAudioFrames: 5290708, EffectiveAudioSHA256: "2edf342c" + strings.Repeat("a", 56)},
+		OutputFingerprint: MediaFingerprint{DurationSeconds: 120.015, Tracks: map[string]*TrackFingerprint{"video": &videoOutput, "audio": &audioOutput}, DecodedVideoSHA256: strings.Repeat("a", 64), AudioContracts: []AudioSequenceContract{firstContract}, EffectiveAudioBytes: 42330960, EffectiveAudioFrames: 5291370, EffectiveAudioSHA256: "a0a08641" + strings.Repeat("b", 56)},
+	}
+}
+
 func TestBuildAllPassingPartsContinuesAfterAACSeamSplit(t *testing.T) {
 	dir := t.TempDir()
 	first := makeMediaClip(t, dir, "one.mp4", 440, true)
@@ -1977,5 +2268,101 @@ func TestPacketEvidenceFailuresAreDeterministicMedia(t *testing.T) {
 		if err := deterministicEvidenceFailure(context.Background(), "packet_timing_failed", errors.New(fact)); !errors.As(err, &deterministic) {
 			t.Fatalf("repeatable packet fact %q was not classified", fact)
 		}
+	}
+}
+
+func TestDecodedVideoIdentityBindingClassifiesMediaEvidenceButNotInfrastructure(t *testing.T) {
+	exitErr := exec.Command("sh", "-c", "exit 9").Run()
+	malformed := fmt.Errorf("framemd5 decode: %w (Invalid data found when processing input)", exitErr)
+	err := validateDecodedVideoIdentityBinding(context.Background(),
+		decodedIdentity{err: malformed}, decodedIdentity{err: context.Canceled}, nil, nil)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "media_sequence_mismatch" || !errors.Is(err, malformed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("malformed decoded evidence was not classified with its causes: %v", err)
+	}
+	var facts struct {
+		SourceFailure                    json.RawMessage `json:"source_failure"`
+		OutputCanceledAfterSourceFailure bool            `json:"output_canceled_after_source_failure"`
+	}
+	if err := json.Unmarshal(failure.evidence, &facts); err != nil || len(facts.SourceFailure) == 0 || !facts.OutputCanceledAfterSourceFailure {
+		t.Fatalf("decoded evidence facts=%s err=%v", failure.evidence, err)
+	}
+
+	unknownExit := exec.Command("sh", "-c", "exit 8").Run()
+	for name, testErr := range map[string]error{
+		"missing_binary":  &os.PathError{Op: "fork/exec", Path: "/missing/ffmpeg", Err: os.ErrNotExist},
+		"no_space":        syscall.ENOSPC,
+		"io":              syscall.EIO,
+		"unknown_exit":    unknownExit,
+		"parser_contract": errors.New("invalid decoded frame duration"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateDecodedVideoIdentityBinding(context.Background(), decodedIdentity{err: testErr}, decodedIdentity{}, nil, nil)
+			if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, testErr) {
+				t.Fatalf("infrastructure failure was classified or lost: %v", err)
+			}
+		})
+	}
+
+	joinedInfra := errors.Join(context.Canceled, syscall.ENOSPC)
+	err = validateDecodedVideoIdentityBinding(context.Background(), decodedIdentity{err: malformed}, decodedIdentity{err: joinedInfra}, nil, nil)
+	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, context.Canceled) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("joined peer infrastructure failure was classified or lost: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = validateDecodedVideoIdentityBinding(ctx, decodedIdentity{err: malformed}, decodedIdentity{}, nil, nil)
+	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, malformed) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent cancellation was classified or lost: %v", err)
+	}
+	err = validateDecodedVideoIdentityBinding(ctx,
+		decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)},
+		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+		&TrackFingerprint{DecodedFrames: 2}, &TrackFingerprint{DecodedFrames: 1})
+	if _, ok := deterministicBuildFailure(err); ok || !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent cancellation did not win structural mismatch: %v", err)
+	}
+}
+
+func TestDecodedVideoIdentityBindingFactsDriveDeterminismAndQuarantine(t *testing.T) {
+	wantTrack := &TrackFingerprint{DecodedFrames: 2}
+	gotTrack := &TrackFingerprint{DecodedFrames: 1}
+	want := decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)}
+	got := decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)}
+	err := validateDecodedVideoIdentityBinding(context.Background(), want, got, wantTrack, gotTrack)
+	failure, ok := deterministicBuildFailure(err)
+	if !ok || failure.code != "media_sequence_mismatch" {
+		t.Fatalf("structural binding failure was not deterministic: %v", err)
+	}
+	err = validateDecodedVideoIdentityBinding(context.Background(),
+		decodedIdentity{frames: 2, sha: "invalid"},
+		decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+		wantTrack, gotTrack)
+	if _, ok := deterministicBuildFailure(err); ok {
+		t.Fatalf("invalid generated SHA was treated as a media fact: %v", err)
+	}
+
+	want.frames = 0
+	changed, ok := deterministicBuildFailure(validateDecodedVideoIdentityBinding(context.Background(), want, got, wantTrack, gotTrack))
+	if !ok || changed.evidenceSHA256 == failure.evidenceSHA256 {
+		t.Fatalf("changed decoded binding facts reused evidence: before=%s after=%s", failure.evidenceSHA256, changed.evidenceSHA256)
+	}
+
+	sources := makeSyntheticLocalSourcesWithIdentity(t, 3)
+	attempt := func(_ context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		for _, source := range candidate {
+			if source.ClipID == 2 {
+				return BuiltOutput{}, validateDecodedVideoIdentityBinding(context.Background(),
+					decodedIdentity{frames: 1, sha: strings.Repeat("a", 64)},
+					decodedIdentity{frames: 1, sha: strings.Repeat("b", 64)},
+					&TrackFingerprint{DecodedFrames: 2}, &TrackFingerprint{DecodedFrames: 1})
+			}
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 2 || len(quarantines) != 1 || quarantines[0].Source.ClipID != 2 {
+		t.Fatalf("parts=%v quarantines=%v err=%v", parts, quarantines, err)
 	}
 }

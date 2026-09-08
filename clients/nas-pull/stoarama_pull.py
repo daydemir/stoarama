@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from fractions import Fraction
 import time
 import urllib.error
 import urllib.parse
@@ -2837,6 +2838,11 @@ for _joined_order in (
     ("status", "packet_payload_order_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("status", "acceptance_mode", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("status", "acceptance_mode", "audio_padding_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
+    ("policy_version", "sources", "output", "ordered_source_evidence_sha256", "decoded_audio_surplus_samples", "packet_duration_delta_seconds", "decode_timeline_span_delta_seconds", "audio_content_status"),
+    ("clip_id", "source_claim_sha256", "packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples", "trim_events"),
+    ("packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples", "trim_events"),
+    ("packet_ordinal", "skip_samples", "discard_padding"),
     ("status", "acceptance_mode", "lossless_normalization", "packet_payload_order_status", "decoded_frame_sequence_status", "decoded_frame_totals_status", "decoded_audio_totals_status", "output_timestamp_status", "strict_decode_status", "source_fingerprint", "output_fingerprint"),
     ("codec", "preset", "quantizer", "pixel_format", "frame_rate", "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries", "chroma_location", "field_order", "timeline_rule", "source_decoded_frames", "output_decoded_frames", "decoded_frame_sequence_sha256", "decoded_frame_field_status", "decoded_frame_field_sha256", "source_timeline_signature_sha256", "output_limit_bytes", "audio_status", "trigger_reason_code", "trigger_failure_facts", "trigger_failure_sha256"),
     ("duration_seconds", "tracks"),
@@ -2845,6 +2851,8 @@ for _joined_order in (
     ("duration_seconds", "tracks", "decoded_video_sha256", "audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"),
     ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "first_timestamp", "last_timestamp", "timestamp_status"),
     ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "decoded_samples", "first_timestamp", "last_timestamp", "timestamp_status"),
+    ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "decoded_samples", "first_timestamp", "last_timestamp", "codec_profile", "codec_extradata_sha256", "aac_padding_normalized_timing_sha256", "timestamp_status"),
+    ("media_type", "packet_count", "packet_chain_sha256", "packet_timing_sha256", "packet_time_bases", "first_packet_pts_seconds", "last_packet_pts_seconds", "first_packet_dts_seconds", "last_packet_dts_seconds", "packet_duration_seconds", "decode_timeline_span_seconds", "decoded_frames", "decoded_samples", "first_timestamp", "last_timestamp", "codec_profile", "codec_extradata_sha256", "timestamp_status"),
     ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding"),
     ("codec_name", "sample_rate", "channels", "channel_layout", "initial_padding", "skip_samples", "discard_padding", "codec_delay", "trailing_padding", "edit_list_kind", "edit_list_sha256"),
     ("reason_code", "signed_gap_nanoseconds", "no_allocatable_sources"),
@@ -3590,7 +3598,7 @@ def valid_batch_index(payload, item=None):
         "allocation_ledgers", "hours",
     }
     exact_joined_fields(payload, fields, "batch index")
-    if payload["schema_version"] != 1 or payload["policy_version"] != "joined-delivery-v1" or payload["allocation_schema_version"] != 1 or payload["hour_manifest_schema_version"] != 1:
+    if payload["schema_version"] != 1 or payload["policy_version"] != "joined-delivery-v1" or payload["allocation_schema_version"] != 1 or payload["hour_manifest_schema_version"] not in (1, 2):
         raise ValueError("joined batch index schema conflicts")
     batch_id = payload["batch_id"]
     if not isinstance(batch_id, str) or JOINED_BATCH.fullmatch(batch_id) is None:
@@ -3736,7 +3744,7 @@ def valid_audio_contract(contract):
         valid_sha256(contract["edit_list_sha256"], "edit list")
 
 
-def valid_media_fingerprint(fingerprint, output):
+def valid_media_fingerprint(fingerprint, output, aac_padding=False):
     base_fields = {"duration_seconds", "tracks"}
     decoded_video_fields = {"decoded_video_sha256"}
     audio_fields = {"audio_sequence_contracts", "effective_audio_bytes", "effective_audio_sample_frames", "effective_audio_sha256"}
@@ -3763,11 +3771,21 @@ def valid_media_fingerprint(fingerprint, output):
     }
     for media_type, track in tracks.items():
         fields = track_base | ({"decoded_samples"} if media_type == "audio" else set())
+        if aac_padding and media_type == "audio":
+            fields |= {"codec_profile", "codec_extradata_sha256"}
+            if not output:
+                fields.add("aac_padding_normalized_timing_sha256")
         exact_joined_fields(track, fields, "media track fingerprint")
         if track["media_type"] != media_type:
             raise ValueError("joined media track identity conflicts")
         for key in ("packet_count", "decoded_frames"):
             positive_joined_int(track[key], "media track %s" % key)
+        if aac_padding and media_type == "audio":
+            if track["codec_profile"] != "LC":
+                raise ValueError("joined AAC profile conflicts")
+            valid_sha256(track["codec_extradata_sha256"], "AAC codec extradata")
+            if not output:
+                valid_sha256(track["aac_padding_normalized_timing_sha256"], "AAC normalized timing")
         if media_type == "audio":
             positive_joined_int(track["decoded_samples"], "decoded_samples")
         for key in ("packet_chain_sha256", "packet_timing_sha256"):
@@ -3825,6 +3843,133 @@ def rejected_video_stream_copy_equivalent(expected, actual, decoded):
         want["decoded_frames"] == got["decoded_frames"]
     )
 
+def valid_aac_padding_verification(verification):
+    expected, actual = verification["source_fingerprint"], verification["output_fingerprint"]
+    evidence = verification["audio_padding_normalization"]
+    evidence_fields = {
+        "policy_version", "sources", "output", "ordered_source_evidence_sha256",
+        "decoded_audio_surplus_samples", "packet_duration_delta_seconds",
+        "decode_timeline_span_delta_seconds", "audio_content_status",
+    }
+    exact_joined_fields(evidence, evidence_fields, "AAC padding normalization")
+    if evidence["policy_version"] != "aac-discard-padding-v1" or evidence["audio_content_status"] != "compressed_packets_exact_decoded_audio_not_sample_exact":
+        raise ValueError("joined AAC padding policy conflicts")
+    if not isinstance(evidence["sources"], list) or len(evidence["sources"]) < 2:
+        raise ValueError("joined AAC padding sources are invalid")
+    valid_sha256(evidence["ordered_source_evidence_sha256"], "ordered AAC source evidence")
+    if joined_canonical_sha(evidence["sources"]) != evidence["ordered_source_evidence_sha256"]:
+        raise ValueError("joined AAC source evidence hash conflicts")
+
+    source_contracts, output_contracts = expected.get("audio_sequence_contracts", []), actual.get("audio_sequence_contracts", [])
+    if len(source_contracts) != len(evidence["sources"]) or len(output_contracts) != 1:
+        raise ValueError("joined AAC contract cardinality conflicts")
+    want_audio, got_audio = expected["tracks"].get("audio"), actual["tracks"].get("audio")
+    want_video, got_video = expected["tracks"].get("video"), actual["tracks"].get("video")
+    if any(track is None for track in (want_audio, got_audio, want_video, got_video)):
+        raise ValueError("joined AAC tracks are incomplete")
+    if (
+        want_audio["codec_profile"] != "LC" or got_audio["codec_profile"] != "LC"
+        or want_audio["codec_extradata_sha256"] != got_audio["codec_extradata_sha256"]
+        or want_audio["packet_time_bases"] != ["1/44100"] or got_audio["packet_time_bases"] != ["1/44100"]
+    ):
+        raise ValueError("joined AAC codec identity conflicts")
+    if (
+        want_video["timestamp_status"] != "source_clips_independent" or got_video["timestamp_status"] != "monotonic"
+        or any(want_video[key] != got_video[key] for key in ("packet_count", "packet_chain_sha256", "packet_time_bases", "decoded_frames"))
+        or want_audio["timestamp_status"] != "source_clips_independent" or got_audio["timestamp_status"] != "monotonic"
+        or any(want_audio[key] != got_audio[key] for key in ("packet_count", "packet_chain_sha256", "packet_time_bases", "decoded_frames"))
+        or got_audio["packet_timing_sha256"] != want_audio["aac_padding_normalized_timing_sha256"]
+    ):
+        raise ValueError("joined AAC exact packet or video evidence conflicts")
+
+    def valid_trim(item, source):
+        fields = {
+            "packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples",
+            "terminal_packet_duration_samples", "trim_events",
+        }
+        if source:
+            fields |= {"clip_id", "source_claim_sha256"}
+        exact_joined_fields(item, fields, "AAC trim evidence")
+        if source:
+            positive_joined_int(item["clip_id"], "AAC source clip_id")
+            valid_sha256(item["source_claim_sha256"], "AAC source claim")
+        for key in ("packet_count", "max_decoded_frame_samples", "last_decoded_frame_samples", "terminal_packet_duration_samples"):
+            positive_joined_int(item[key], "AAC trim %s" % key)
+        if item["max_decoded_frame_samples"] != 1024 or item["terminal_packet_duration_samples"] != 1024:
+            raise ValueError("joined AAC frame contract conflicts")
+        events = item["trim_events"]
+        if not isinstance(events, list) or len(events) > 1:
+            raise ValueError("joined AAC trim events conflict")
+        if not events:
+            if item["last_decoded_frame_samples"] != 1024:
+                raise ValueError("joined AAC partial frame lacks padding")
+            return 0
+        event = exact_joined_fields(events[0], {"packet_ordinal", "skip_samples", "discard_padding"}, "AAC trim event")
+        if (
+            event["packet_ordinal"] != item["packet_count"] or event["skip_samples"] != 0
+            or isinstance(event["discard_padding"], bool) or not isinstance(event["discard_padding"], int)
+            or event["discard_padding"] <= 0 or event["discard_padding"] > 1024
+            or item["last_decoded_frame_samples"] + event["discard_padding"] != 1024
+        ):
+            raise ValueError("joined AAC trim position conflicts")
+        return event["discard_padding"]
+
+    source_packets, padding, seen_source_ids = 0, 0, set()
+    first_format = {key: source_contracts[0][key] for key in ("codec_name", "sample_rate", "channels", "channel_layout")}
+    if first_format != {"codec_name": "aac", "sample_rate": 44100, "channels": 2, "channel_layout": "stereo"}:
+        raise ValueError("joined AAC format conflicts")
+    for index, (item, contract) in enumerate(zip(evidence["sources"], source_contracts)):
+        if item["clip_id"] in seen_source_ids:
+            raise ValueError("joined AAC source identity is duplicated")
+        seen_source_ids.add(item["clip_id"])
+        if (
+            {key: contract[key] for key in first_format} != first_format
+            or any(contract[key] != 0 for key in ("initial_padding", "skip_samples", "codec_delay", "trailing_padding"))
+        ):
+            raise ValueError("joined AAC source padding conflicts")
+        discard = valid_trim(item, True)
+        if discard != contract["discard_padding"]:
+            raise ValueError("joined AAC source discard conflicts")
+        source_packets += item["packet_count"]
+        if index < len(source_contracts) - 1:
+            padding += discard
+    output_discard = valid_trim(evidence["output"], False)
+    output_contract = output_contracts[0]
+    if (
+        {key: output_contract[key] for key in first_format} != first_format
+        or any(output_contract[key] != 0 for key in ("initial_padding", "skip_samples", "codec_delay", "trailing_padding"))
+        or output_discard != output_contract["discard_padding"]
+        or output_discard != source_contracts[-1]["discard_padding"]
+        or source_packets != want_audio["packet_count"] or evidence["output"]["packet_count"] != got_audio["packet_count"]
+        or padding <= 0 or evidence["decoded_audio_surplus_samples"] != padding
+    ):
+        raise ValueError("joined AAC output padding conflicts")
+    bytes_per_frame = first_format["channels"] * 4
+    if (
+        got_audio["decoded_samples"] - want_audio["decoded_samples"] != padding
+        or actual["effective_audio_sample_frames"] - expected["effective_audio_sample_frames"] != padding
+        or actual["effective_audio_bytes"] - expected["effective_audio_bytes"] != padding * bytes_per_frame
+        or expected["effective_audio_sample_frames"] != want_audio["decoded_samples"]
+        or actual["effective_audio_sample_frames"] != got_audio["decoded_samples"]
+        or expected["effective_audio_bytes"] != expected["effective_audio_sample_frames"] * bytes_per_frame
+        or actual["effective_audio_bytes"] != actual["effective_audio_sample_frames"] * bytes_per_frame
+        or expected["effective_audio_sha256"] == actual["effective_audio_sha256"]
+    ):
+        raise ValueError("joined AAC decoded surplus conflicts")
+    delta = Fraction(padding, 44100)
+    for key in ("packet_duration_seconds", "decode_timeline_span_seconds"):
+        observed = Fraction(got_audio[key]) - Fraction(want_audio[key])
+        evidence_key = "packet_duration_delta_seconds" if key == "packet_duration_seconds" else "decode_timeline_span_delta_seconds"
+        if observed != delta or Fraction(evidence[evidence_key]) != delta or evidence[evidence_key] != str(delta):
+            raise ValueError("joined AAC timing delta conflicts")
+    for key in ("first_packet_pts_seconds", "first_packet_dts_seconds"):
+        if Fraction(got_audio[key]) != Fraction(want_audio[key]):
+            raise ValueError("joined AAC first timestamp conflicts")
+    for key in ("last_packet_pts_seconds", "last_packet_dts_seconds"):
+        if Fraction(got_audio[key]) - Fraction(want_audio[key]) != delta:
+            raise ValueError("joined AAC last timestamp conflicts")
+
+
 
 def valid_verification(verification, media_size=None):
     strict_fields = {
@@ -3833,32 +3978,40 @@ def valid_verification(verification, media_size=None):
     }
     relaxed_fields = strict_fields | {"acceptance_mode", "decoded_frame_sequence_status"}
     normalized_fields = relaxed_fields | {"lossless_normalization"}
+    padding_fields = relaxed_fields | {"audio_padding_normalization"}
     fields = set(verification) if isinstance(verification, dict) else set()
-    if fields not in (strict_fields, relaxed_fields, normalized_fields):
+    if fields not in (strict_fields, relaxed_fields, normalized_fields, padding_fields):
         raise ValueError("joined media verification has invalid fields")
     exact_joined_fields(verification, fields, "media verification")
     normalized = fields == normalized_fields
-    for key in fields - {"source_fingerprint", "output_fingerprint", "lossless_normalization"}:
+    padding = fields == padding_fields
+    for key in fields - {"source_fingerprint", "output_fingerprint", "lossless_normalization", "audio_padding_normalization"}:
         if key == "acceptance_mode":
-            want_mode = "lossless_native_timeline_normalized" if normalized else "decoded_frame_equivalent"
+            want_mode = "lossless_native_timeline_normalized" if normalized else ("video_frame_exact_audio_padding_normalized" if padding else "decoded_frame_equivalent")
             if verification[key] != want_mode:
                 raise ValueError("joined media verification has invalid acceptance mode")
         elif key == "packet_payload_order_status" and normalized:
             if verification[key] != "not_applicable_lossless_normalization":
                 raise ValueError("joined lossless normalization has invalid packet status")
+        elif key == "decoded_audio_totals_status" and padding:
+            if verification[key] != "aac_discard_padding_normalized":
+                raise ValueError("joined AAC padding normalization has invalid audio status")
         elif verification[key] != "passed":
             raise ValueError("joined media verification did not pass")
-    valid_media_fingerprint(verification["source_fingerprint"], False)
-    valid_media_fingerprint(verification["output_fingerprint"], True)
+    valid_media_fingerprint(verification["source_fingerprint"], False, aac_padding=padding)
+    valid_media_fingerprint(verification["output_fingerprint"], True, aac_padding=padding)
     expected, actual = verification["source_fingerprint"], verification["output_fingerprint"]
     if set(expected["tracks"]) != set(actual["tracks"]) or abs(actual["duration_seconds"] - expected["duration_seconds"]) > 2:
         raise ValueError("joined media fingerprint stream set conflicts")
-    relaxed = fields == relaxed_fields
+    relaxed = fields in (relaxed_fields, padding_fields)
     if relaxed:
         valid_sha256(expected.get("decoded_video_sha256"), "decoded video")
         valid_sha256(actual.get("decoded_video_sha256"), "decoded video")
         if expected["decoded_video_sha256"] != actual["decoded_video_sha256"]:
             raise ValueError("joined decoded video sequence conflicts")
+    if padding:
+        valid_aac_padding_verification(verification)
+        return
     if normalized:
         evidence = verification["lossless_normalization"]
         evidence_fields = {
@@ -3948,6 +4101,21 @@ def valid_verification(verification, media_size=None):
             raise ValueError("joined effective audio format conflicts")
 
 
+
+def valid_aac_padding_source_claims(verification, run_sources):
+    sources = verification["audio_padding_normalization"]["sources"]
+    if len(sources) != len(run_sources):
+        raise ValueError("joined AAC source evidence cardinality conflicts")
+    for evidence, source in zip(sources, run_sources):
+        if evidence["clip_id"] != source["clip_id"] or evidence["source_claim_sha256"] != source_claim_sha([source]):
+            raise ValueError("joined AAC source claim conflicts")
+
+
+def valid_hour_manifest_schema(schema_version, has_aac_padding):
+    if schema_version != (2 if has_aac_padding else 1):
+        raise ValueError("joined hour schema does not match AAC acceptance mode")
+
+
 def valid_hour_manifest(payload, item=None):
     fields = {
         "schema_version", "policy_version", "status", "batch_id", "hour_id", "recording_id", "timezone",
@@ -3958,7 +4126,7 @@ def valid_hour_manifest(payload, item=None):
     }
     exact_joined_fields(payload, fields, "hour manifest")
     batch_id, hour_id = payload["batch_id"], payload["hour_id"]
-    if payload["schema_version"] != 1 or payload["policy_version"] != "joined-delivery-v1" or not isinstance(batch_id, str) or JOINED_BATCH.fullmatch(batch_id) is None or not valid_joined_hour_id(batch_id, hour_id):
+    if payload["schema_version"] not in (1, 2) or payload["policy_version"] != "joined-delivery-v1" or not isinstance(batch_id, str) or JOINED_BATCH.fullmatch(batch_id) is None or not valid_joined_hour_id(batch_id, hour_id):
         raise ValueError("joined hour manifest identity is invalid")
     recording_id = positive_joined_int(payload["recording_id"], "recording_id")
     local_date = valid_joined_date(payload["local_date"])
@@ -4111,6 +4279,7 @@ def valid_hour_manifest(payload, item=None):
     if not isinstance(payload["media"], list):
         raise ValueError("joined hour media is invalid")
     seen_media, media_sources = set(), []
+    has_aac_padding = False
     for ordinal, media in enumerate(payload["media"], 1):
         exact_joined_fields(media, media_fields, "hour media")
         artifact_id = positive_joined_int(media["artifact_id"], "media artifact_id")
@@ -4150,6 +4319,9 @@ def valid_hour_manifest(payload, item=None):
                 raise ValueError("joined hour media crosses a gap or non-continuous seam")
         media_sources.extend(ids)
         valid_verification(media["verification"], media["size_bytes"])
+        if media["verification"].get("acceptance_mode") == "video_frame_exact_audio_padding_normalized":
+            has_aac_padding = True
+            valid_aac_padding_source_claims(media["verification"], run_sources)
         if media["verification"].get("acceptance_mode") == "lossless_native_timeline_normalized" and len(ids) < 2:
             raise ValueError("joined lossless normalization requires multiple sources")
         source_fingerprint = media["verification"]["source_fingerprint"]
@@ -4195,6 +4367,7 @@ def valid_hour_manifest(payload, item=None):
             adjacent = media["maximality_evidence"][-1]["candidate_clip_ids"]
             if adjacent[:-1] != media["source_clip_ids"] or positions[-1] + 1 >= len(source_ids) or adjacent[-1] != source_ids[positions[-1] + 1]:
                 raise ValueError("joined maximality evidence is not the immediate source extension")
+    valid_hour_manifest_schema(payload["schema_version"], has_aac_padding)
     if media_sources != [clip_id for clip_id in source_ids if clip_id in included]:
         raise ValueError("joined media does not exactly cover included sources")
     broken = 0
@@ -4410,6 +4583,7 @@ def verify_joined_relative_file(cfg, runtime, batch_id, relative_path, size_byte
 def validate_batch_index_proof(cfg, runtime, index, stop_event):
     batch_id = index["batch_id"]
     total_sources = total_bytes = total_media = 0
+    max_hour_manifest_schema_version = 1
     seen_media_artifacts = {
         reference["artifact_id"] for reference in index["allocation_ledgers"]
     } | {
@@ -4458,6 +4632,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
                 cfg, runtime, batch_id, hour_ref["relative_path"], hour_ref["size_bytes"], hour_ref["sha256"], stop_event,
             )
             valid_hour_manifest(manifest)
+            max_hour_manifest_schema_version = max(max_hour_manifest_schema_version, manifest["schema_version"])
             if (
                 manifest["hour_id"] != hour_ref["hour_id"] or manifest["recording_id"] != hour_ref["recording_id"]
                 or manifest["local_date"] != hour_ref["local_date"] or manifest["delivery_hour"] != delivery_hour
@@ -4500,7 +4675,7 @@ def validate_batch_index_proof(cfg, runtime, index, stop_event):
                 raise ExistingFileMismatch("joined batch qualification window seal conflicts")
             qualification_days = []
     if (
-        total_sources != index["source_clip_count"] or total_bytes != index["source_bytes"]
+        total_sources != index["source_clip_count"] or total_bytes != index["source_bytes"] or index["hour_manifest_schema_version"] != max_hour_manifest_schema_version
         or total_media != index["final_media_artifact_count"]
         or frozen_denominator_sha(index["selection_authority"], index["frozen_recordings"], denominator_ledgers) != index["frozen_denominator_sha256"]
     ):

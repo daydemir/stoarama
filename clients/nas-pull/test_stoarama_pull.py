@@ -3056,5 +3056,122 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
         self.assertEqual(report["native_runs"], [])
 
 
+    def aac_padding_verification(self):
+        sha = lambda value: value * 64
+
+        def track(media_type, output=False):
+            value = {
+                "media_type": media_type, "packet_count": 1800 if media_type == "video" else 5168,
+                "packet_chain_sha256": sha("2") if media_type == "video" else "3930be7a305e40819fb3b78e0752c5e48bb3584e956b12686830112c0fd9d42e",
+                "packet_timing_sha256": sha("3") if media_type == "video" else sha("5" if output else "4"),
+                "packet_time_bases": ["1/90000"] if media_type == "video" else ["1/44100"],
+                "first_packet_pts_seconds": "0", "last_packet_pts_seconds": "60",
+                "first_packet_dts_seconds": "0", "last_packet_dts_seconds": "60",
+                "packet_duration_seconds": "61", "decode_timeline_span_seconds": "61",
+                "decoded_frames": 1800 if media_type == "video" else 5168,
+                "first_timestamp": 0, "last_timestamp": 1,
+                "timestamp_status": "monotonic" if output else "source_clips_independent",
+            }
+            if media_type == "audio":
+                value.update({
+                    "decoded_samples": 5291370 if output else 5290708,
+                    "codec_profile": "LC", "codec_extradata_sha256": sha("6"),
+                    "last_packet_pts_seconds": "5291670/44100" if output else "5291008/44100",
+                    "last_packet_dts_seconds": "5291670/44100" if output else "5291008/44100",
+                    "packet_duration_seconds": "5292694/44100" if output else "5292032/44100",
+                    "decode_timeline_span_seconds": "5292694/44100" if output else "5292032/44100",
+                })
+                if not output:
+                    value["aac_padding_normalized_timing_sha256"] = sha("5")
+            return value
+
+        contract = {
+            "codec_name": "aac", "sample_rate": 44100, "channels": 2, "channel_layout": "stereo",
+            "initial_padding": 0, "skip_samples": 0, "discard_padding": 662,
+            "codec_delay": 0, "trailing_padding": 0,
+        }
+        sources = [
+            {
+                "clip_id": clip_id, "source_claim_sha256": sha(claim),
+                "packet_count": 2584, "max_decoded_frame_samples": 1024,
+                "last_decoded_frame_samples": 362, "terminal_packet_duration_samples": 1024,
+                "trim_events": [{"packet_ordinal": 2584, "skip_samples": 0, "discard_padding": 662}],
+            }
+            for clip_id, claim in ((435622, "c"), (435623, "d"))
+        ]
+        output_trim = {
+            "packet_count": 5168, "max_decoded_frame_samples": 1024,
+            "last_decoded_frame_samples": 362, "terminal_packet_duration_samples": 1024,
+            "trim_events": [{"packet_ordinal": 5168, "skip_samples": 0, "discard_padding": 662}],
+        }
+        source_fingerprint = {
+            "duration_seconds": 120, "tracks": {"video": track("video"), "audio": track("audio")},
+            "decoded_video_sha256": sha("a"), "audio_sequence_contracts": [dict(contract), dict(contract)],
+            "effective_audio_bytes": 42325664, "effective_audio_sample_frames": 5290708,
+            "effective_audio_sha256": "2edf342c" + "a" * 56,
+        }
+        output_fingerprint = {
+            "duration_seconds": 120.015, "tracks": {"video": track("video", True), "audio": track("audio", True)},
+            "decoded_video_sha256": sha("a"), "audio_sequence_contracts": [dict(contract)],
+            "effective_audio_bytes": 42330960, "effective_audio_sample_frames": 5291370,
+            "effective_audio_sha256": "a0a08641" + "b" * 56,
+        }
+        return {
+            "status": "passed", "acceptance_mode": "video_frame_exact_audio_padding_normalized",
+            "packet_payload_order_status": "passed", "decoded_frame_sequence_status": "passed",
+            "decoded_frame_totals_status": "passed", "decoded_audio_totals_status": "aac_discard_padding_normalized",
+            "output_timestamp_status": "passed", "strict_decode_status": "passed",
+            "source_fingerprint": source_fingerprint, "output_fingerprint": output_fingerprint,
+            "audio_padding_normalization": {
+                "policy_version": "aac-discard-padding-v1", "sources": sources, "output": output_trim,
+                "ordered_source_evidence_sha256": pull.joined_canonical_sha(sources),
+                "decoded_audio_surplus_samples": 662, "packet_duration_delta_seconds": "331/22050",
+                "decode_timeline_span_delta_seconds": "331/22050",
+                "audio_content_status": "compressed_packets_exact_decoded_audio_not_sample_exact",
+            },
+        }
+
+    def test_aac_padding_verification_accepts_exact_662_and_rejects_tamper(self):
+        verification = self.aac_padding_verification()
+        def go_order(value):
+            if isinstance(value, list):
+                return [go_order(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            allowed = pull.JOINED_OBJECT_ORDERS.get(frozenset(value))
+            order = next(iter(allowed)) if allowed else tuple(sorted(value))
+            return {key: go_order(value[key]) for key in order}
+        verification = go_order(verification)
+        pull.valid_verification(verification)
+        pull.decode_joined_json(pull.joined_canonical_bytes(verification))
+        for label, mutate in (
+            ("packet loss", lambda value: value["output_fingerprint"]["tracks"]["audio"].__setitem__("packet_count", 5167)),
+            ("pixel change", lambda value: value["output_fingerprint"].__setitem__("decoded_video_sha256", "8" * 64)),
+            ("source claim", lambda value: value["audio_padding_normalization"]["sources"][0].__setitem__("source_claim_sha256", "9" * 64)),
+            ("noncanonical delta", lambda value: value["audio_padding_normalization"].__setitem__("packet_duration_delta_seconds", "662/44100")),
+        ):
+            with self.subTest(label=label):
+                changed = json.loads(json.dumps(verification))
+                mutate(changed)
+                with self.assertRaises(ValueError):
+                    pull.valid_verification(changed)
+
+
+    def test_aac_padding_hour_schema_and_ordered_source_claims(self):
+        verification = self.aac_padding_verification()
+        run_sources = [{"clip_id": 435622}, {"clip_id": 435623}]
+        claims = {435622: "c" * 64, 435623: "d" * 64}
+        with mock.patch.object(pull, "source_claim_sha", side_effect=lambda sources: claims[sources[0]["clip_id"]]):
+            pull.valid_aac_padding_source_claims(verification, run_sources)
+            reversed_sources = list(reversed(run_sources))
+            with self.assertRaises(ValueError):
+                pull.valid_aac_padding_source_claims(verification, reversed_sources)
+        pull.valid_hour_manifest_schema(1, False)
+        pull.valid_hour_manifest_schema(2, True)
+        for schema_version, has_aac_padding in ((1, True), (2, False), (3, True)):
+            with self.assertRaises(ValueError):
+                pull.valid_hour_manifest_schema(schema_version, has_aac_padding)
+
+
 if __name__ == "__main__":
     unittest.main()
