@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 	}{
 		{name: "success", behavior: "success", timeout: 5 * time.Second},
 		{name: "error", behavior: "error", timeout: 5 * time.Second},
+		{name: "normal exit with stubborn grandchild", behavior: "orphan", timeout: 5 * time.Second},
 		{name: "timeout", behavior: "timeout", timeout: 100 * time.Millisecond},
 		{name: "stubborn grandchild", behavior: "stubborn", timeout: 100 * time.Millisecond},
 	} {
@@ -41,7 +43,7 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 			defer cancel()
 			output, err := RunYTDLPCommand(ctx, os.Args[0], "-test.run=TestYTDLPCommandHelperProcess")
 			switch test.behavior {
-			case "success":
+			case "success", "orphan":
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -55,7 +57,7 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 					t.Fatalf("ctx=%v err=%v", ctx.Err(), err)
 				}
 			}
-			if test.behavior == "stubborn" {
+			if test.behavior == "stubborn" || test.behavior == "orphan" {
 				lines := strings.Fields(string(output))
 				if len(lines) < 2 {
 					t.Fatalf("stubborn helper output=%q", output)
@@ -298,6 +300,15 @@ func TestYTDLPCommandHelperProcess(t *testing.T) {
 		}
 		fmt.Println(child.Process.Pid)
 		time.Sleep(30 * time.Second)
+		os.Exit(0)
+	case "orphan":
+		child := exec.Command("/bin/sh", "-c", `trap '' TERM; sleep 30`)
+		child.Stdout = io.Discard
+		child.Stderr = io.Discard
+		if err := child.Start(); err != nil {
+			os.Exit(97)
+		}
+		fmt.Println(child.Process.Pid)
 		os.Exit(0)
 	case "swap":
 		saved := temp + "-saved"
