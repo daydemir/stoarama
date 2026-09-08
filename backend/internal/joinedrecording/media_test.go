@@ -536,8 +536,8 @@ func TestLosslessNormalizationRequiresExplicitWorkerOptIn(t *testing.T) {
 
 func TestDefaultMediaCandidateBudgetDoesNotRushExactPairProofs(t *testing.T) {
 	for _, kind := range []string{"full", "full_repeat"} {
-		if got := defaultMediaCandidateBudget(kind, 2); got != 25*time.Minute {
-			t.Errorf("%s budget=%s want=25m", kind, got)
+		if got := defaultMediaCandidateBudget(kind, 2); got != 60*time.Minute {
+			t.Errorf("%s budget=%s want=60m", kind, got)
 		}
 	}
 	if got := defaultMediaCandidateBudget("full_timeout_retry", 2); got != 60*time.Minute {
@@ -963,8 +963,8 @@ func TestBuildAllPassingPartsRetriesUnisolatedFullDeadlineWithLongParent(t *test
 				t.Fatal("full candidate lacked deadline")
 			}
 			if fullAttempts == 1 {
-				if remaining := time.Until(deadline); remaining > 25*time.Minute || remaining < 24*time.Minute {
-					t.Fatalf("initial full budget=%s want about 25m", remaining)
+				if remaining := time.Until(deadline); remaining > 60*time.Minute || remaining < 59*time.Minute {
+					t.Fatalf("initial full budget=%s want about 60m", remaining)
 				}
 				return BuiltOutput{}, context.DeadlineExceeded
 			}
@@ -1154,7 +1154,7 @@ func TestBuildAllPassingPartsFullTimeoutRetryDeterministicFailureDoesNotRepeat(t
 	}
 }
 
-func TestBuildAllPassingPartsDeterministicFullRepeatKeeps25MinuteBudget(t *testing.T) {
+func TestBuildAllPassingPartsDeterministicFullRepeatKeeps60MinuteBudget(t *testing.T) {
 	sources := makeSyntheticLocalSources(4)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
 	defer cancel()
@@ -1163,8 +1163,8 @@ func TestBuildAllPassingPartsDeterministicFullRepeatKeeps25MinuteBudget(t *testi
 		if len(candidate) == len(sources) {
 			fullAttempts++
 			deadline, ok := ctx.Deadline()
-			if !ok || time.Until(deadline) > 25*time.Minute {
-				t.Fatalf("deterministic full attempt %d exceeded 25m: deadline=%s ok=%v", fullAttempts, deadline, ok)
+			if remaining := time.Until(deadline); !ok || remaining > 60*time.Minute || remaining < 59*time.Minute {
+				t.Fatalf("deterministic full attempt %d exceeded 60m: deadline=%s ok=%v", fullAttempts, deadline, ok)
 			}
 			return BuiltOutput{}, seamFailure(2, 3)
 		}
