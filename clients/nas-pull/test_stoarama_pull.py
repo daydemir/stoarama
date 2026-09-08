@@ -3156,6 +3156,97 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 with self.assertRaises(ValueError):
                     pull.valid_verification(changed)
 
+    def test_aac_padding_v2_validates_source_offsets_and_distinct_deltas(self):
+        verification = self.aac_padding_verification()
+        expected = verification["source_fingerprint"]
+        actual = verification["output_fingerprint"]
+        evidence = verification["audio_padding_normalization"]
+        evidence["policy_version"] = "aac-discard-padding-v2"
+        discards = (441, 970)
+        for item, contract, discard in zip(evidence["sources"], expected["audio_sequence_contracts"], discards):
+            item["first_packet_pts_samples"] = discard
+            item["first_packet_dts_samples"] = discard
+            item["last_decoded_frame_samples"] = 1024 - discard
+            item["trim_events"][0]["discard_padding"] = discard
+            contract["discard_padding"] = discard
+        evidence["output"]["last_decoded_frame_samples"] = 1024 - discards[-1]
+        evidence["output"]["trim_events"][0]["discard_padding"] = discards[-1]
+        actual["audio_sequence_contracts"][0]["discard_padding"] = discards[-1]
+
+        decoded_surplus = discards[0]
+        timing_surplus = discards[1]
+        want_audio = expected["tracks"]["audio"]
+        got_audio = actual["tracks"]["audio"]
+        evidence["decoded_audio_surplus_samples"] = decoded_surplus
+        evidence["packet_duration_delta_seconds"] = str(pull.Fraction(timing_surplus, 44100))
+        evidence["decode_timeline_span_delta_seconds"] = str(pull.Fraction(timing_surplus, 44100))
+        got_audio["decoded_samples"] = want_audio["decoded_samples"] + decoded_surplus
+        actual["effective_audio_sample_frames"] = expected["effective_audio_sample_frames"] + decoded_surplus
+        actual["effective_audio_bytes"] = expected["effective_audio_bytes"] + decoded_surplus * 8
+        for key in ("packet_duration_seconds", "decode_timeline_span_seconds", "last_packet_pts_seconds", "last_packet_dts_seconds"):
+            got_audio[key] = str(pull.Fraction(want_audio[key]) + pull.Fraction(timing_surplus, 44100))
+        first = str(pull.Fraction(discards[0], 44100))
+        want_audio["first_packet_pts_seconds"] = want_audio["first_packet_dts_seconds"] = first
+        got_audio["first_packet_pts_seconds"] = got_audio["first_packet_dts_seconds"] = first
+
+        def go_order(value):
+            if isinstance(value, list):
+                return [go_order(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            allowed = pull.JOINED_OBJECT_ORDERS.get(frozenset(value))
+            order = next(iter(allowed)) if allowed else tuple(sorted(value))
+            return {key: go_order(value[key]) for key in order}
+
+        verification = go_order(verification)
+        verification["audio_padding_normalization"]["ordered_source_evidence_sha256"] = pull.joined_canonical_sha(
+            verification["audio_padding_normalization"]["sources"]
+        )
+        pull.valid_verification(verification)
+        pull.decode_joined_json(pull.joined_canonical_bytes(verification))
+
+        def change_output_trim(value):
+            value["audio_padding_normalization"]["output"]["last_decoded_frame_samples"] = 55
+            value["audio_padding_normalization"]["output"]["trim_events"][0]["discard_padding"] = 969
+            value["output_fingerprint"]["audio_sequence_contracts"][0]["discard_padding"] = 969
+
+        for label, mutate in (
+            ("missing source PTS", lambda value: value["audio_padding_normalization"]["sources"][0].pop("first_packet_pts_samples")),
+            ("source PTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][0].__setitem__("first_packet_pts_samples", 440)),
+            ("source DTS differs from discard", lambda value: value["audio_padding_normalization"]["sources"][1].__setitem__("first_packet_dts_samples", 969)),
+            ("timing uses non-final discards", lambda value: value["audio_padding_normalization"].__setitem__("packet_duration_delta_seconds", "1/100")),
+            ("decoded surplus uses non-initial offsets", lambda value: value["audio_padding_normalization"].__setitem__("decoded_audio_surplus_samples", timing_surplus)),
+            ("output trim differs from final source", change_output_trim),
+        ):
+            with self.subTest(label=label):
+                changed = json.loads(json.dumps(verification))
+                mutate(changed)
+                changed["audio_padding_normalization"]["ordered_source_evidence_sha256"] = pull.joined_canonical_sha(
+                    changed["audio_padding_normalization"]["sources"]
+                )
+                with self.assertRaises(ValueError):
+                    pull.valid_verification(changed)
+
+        constant = self.aac_padding_verification()
+        constant_evidence = constant["audio_padding_normalization"]
+        constant_evidence["policy_version"] = "aac-discard-padding-v2"
+        for item in constant_evidence["sources"]:
+            item["first_packet_pts_samples"] = item["first_packet_dts_samples"] = 662
+        constant = go_order(constant)
+        constant_evidence = constant["audio_padding_normalization"]
+        constant_evidence["ordered_source_evidence_sha256"] = pull.joined_canonical_sha(constant_evidence["sources"])
+        with self.assertRaisesRegex(ValueError, "variable AAC padding policy has constant offsets"):
+            pull.valid_verification(constant)
+
+    def test_aac_padding_v1_rejects_v2_only_source_fields(self):
+        verification = self.aac_padding_verification()
+        verification["audio_padding_normalization"]["sources"][0].update({
+            "first_packet_pts_samples": 662,
+            "first_packet_dts_samples": 662,
+        })
+        with self.assertRaises(ValueError):
+            pull.valid_verification(verification)
+
 
     def test_aac_padding_hour_schema_and_ordered_source_claims(self):
         verification = self.aac_padding_verification()
