@@ -1464,6 +1464,13 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("exact ACK did not clear joined telemetry artifact=%v blocker=%q attempted=%v retry=%v transfer=%v err=%v",
 			ackedArtifactID, ackedBlocker, ackedAttemptedAt, ackedRetryAt, ackedTransferArtifactID, err)
 	}
+	if response := heartbeatTransfer(1, 8<<20); response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
+		t.Fatalf("stale transfer heartbeat after exact ACK was not accepted: %+v", response)
+	}
+	if err := pool.QueryRow(ctx, `SELECT joined_transfer_artifact_id FROM connections WHERE id=$1`, connectionID).
+		Scan(&ackedTransferArtifactID); err != nil || ackedTransferArtifactID != nil {
+		t.Fatalf("stale transfer heartbeat rewrote cleared ACK state transfer=%v err=%v", ackedTransferArtifactID, err)
+	}
 	if rec, response := heartbeatTelemetry(principal, ledgerArtifactID, 300001, "acked-report", "storage_guard", 203); rec.Code != http.StatusOK ||
 		!response.OK || response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {
 		t.Fatalf("acked joined blocker telemetry status=%d body=%s", rec.Code, rec.Body.String())

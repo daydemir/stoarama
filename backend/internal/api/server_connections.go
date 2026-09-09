@@ -1056,7 +1056,16 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 				return
 			}
 			if ct.RowsAffected() == 0 {
-				joinedDeliveryAccepted = false
+				var alreadyAcknowledged bool
+				if err := tx.QueryRow(r.Context(), `SELECT EXISTS(
+					SELECT 1 FROM recording_joined_artifacts a
+					JOIN recording_joined_artifact_acks ack ON ack.artifact_id=a.id AND ack.connection_id=a.connection_id
+					WHERE a.id=$1 AND a.connection_id=$2 AND a.batch_id=$3)`,
+					transfer.ArtifactID, connectionID, s.cfg.JoinedRecordingBatchID).Scan(&alreadyAcknowledged); err != nil {
+					util.WriteError(w, http.StatusInternalServerError, "check joined transfer acknowledgment failed")
+					return
+				}
+				joinedDeliveryAccepted = alreadyAcknowledged
 			}
 		}
 	}
