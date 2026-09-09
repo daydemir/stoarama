@@ -89,6 +89,39 @@ test('joined augmentation failure retains base captured bins', () => {
   assert.deepEqual(unavailable.bins, base.bins);
 });
 
+test('recording enrichment falls back from a failed pair without stopping later recordings', async () => {
+  const source = sourceBetween(
+    'function mergeRecordingMetricItems(items)',
+    'async function refreshJoinedProgress(requestToken)',
+  );
+  const calls = [];
+  const state = {
+    recordings: [1, 2, 3, 4].map((id) => ({ id })),
+    recordingEnrichmentLoading: false,
+    recordingEnrichmentLoaded: false,
+    recordingEnrichmentError: false,
+  };
+  const fetchJSON = async (path) => {
+    const ids = new URL(`https://example.test${path}`).searchParams.get('recording_ids').split(',').map(Number);
+    calls.push(ids);
+    if (ids.join(',') === '1,2') throw new Error('pair timed out');
+    return { items: ids.map((recording_id) => ({ recording_id, timeline_health: { grade: 'great' } })) };
+  };
+  const evaluate = new Function(
+    'state', 'fetchJSON', 'recordingAPIPath', 'renderCards', 'recordingsLoadToken', 'RECORDING_ENRICHMENT_BATCH_SIZE',
+    `${source}; return { refreshRecordingEnrichment };`,
+  );
+  const { refreshRecordingEnrichment } = evaluate(state, fetchJSON, (path) => path, () => {}, 7, 2);
+
+  await refreshRecordingEnrichment(7);
+
+  assert.deepEqual(calls, [[1, 2], [1], [2], [3], [4]]);
+  assert.equal(state.recordingEnrichmentLoaded, true);
+  assert.equal(state.recordingEnrichmentError, false);
+  assert.equal(state.recordingEnrichmentLoading, false);
+  assert.ok(state.recordings.every((recording) => recording.timeline_health?.grade === 'great'));
+});
+
 test('joined heatmap labels distinguish loading, failure, zero, and unavailable', () => {
   const source = sourceBetween(
     'function captureHealthJoinedLabel(bin, page)',

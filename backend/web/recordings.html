@@ -363,6 +363,8 @@
     .clip-row-actions button.secondary, .clip-row-actions a.secondary { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
     .clip-row-actions button.secondary:hover, .clip-row-actions a.secondary:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
     .joined-folder-cta {
+      display: grid;
+      gap: 2px;
       max-width: min(520px, 58vw);
       min-height: 40px;
       padding: 7px 12px;
@@ -370,6 +372,7 @@
       overflow-wrap: anywhere;
       text-align: left;
     }
+    .joined-folder-name { color: color-mix(in srgb, currentColor 72%, transparent); font: 500 10px/1.25 var(--mono); }
     details.action-menu { position: relative; display: inline-block; }
     details.action-menu > summary { list-style: none; width: 30px; height: 28px; display: grid; place-items: center; border: 1px solid var(--muted); border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1; }
     details.action-menu > summary::-webkit-details-marker { display: none; }
@@ -1435,9 +1438,9 @@
 
     // Mutable view state.
     // High-volume completed recordings can have more than 10,000 source clips.
-    // Heatmaps need one recording per request; joined summaries use the API's
-    // bounded 12-recording scope so the table fills without a cohort-wide query.
-    const RECORDING_ENRICHMENT_BATCH_SIZE = 1;
+	// Real recordings can exhaust the five-second enrichment budget in larger
+	// groups. Pairs cut request count in half without making those queries brittle.
+    const RECORDING_ENRICHMENT_BATCH_SIZE = 2;
 	const JOINED_PROGRESS_BATCH_SIZE = 12;
     const state = {
       account: null,
@@ -4637,7 +4640,7 @@
             <div class="card-status ${st.cls}" style="font-family:var(--mono);font-size:12px;"><span class="dot"></span>${st.text}</div>
           </div>
           <div class="recording-head-actions">
-            <a class="btn-link primary joined-folder-cta" href="${escapeHTML(folderPath)}" aria-label="Browse joined folder ${escapeHTML(folderName)}">${escapeHTML(folderName)}</a>
+            <a class="btn-link primary joined-folder-cta" href="${escapeHTML(folderPath)}" aria-label="Browse joined clips for ${escapeHTML(folderName)}"><span>Joined clips</span><span class="joined-folder-name">${escapeHTML(folderName)}</span></a>
             <a class="btn-link secondary" href="${recordingsPagePath}">Back to recordings</a>
           </div>
         </div>`;
@@ -5273,7 +5276,15 @@
       try {
         const payload = await fetchJSON(recordingAPIPath());
         if (requestToken !== recordingsLoadToken) return false;
+		const previousByID = new Map(state.recordings.map((rec) => [Number(rec.id), rec]));
         state.recordings = Array.isArray(payload.items) ? payload.items : (Array.isArray(payload.recordings) ? payload.recordings : []);
+		for (const rec of state.recordings) {
+			const previous = previousByID.get(Number(rec.id));
+			if (!previous) continue;
+			for (const key of ['capture_health_bins', 'timeline_health', 'captured_clip_count', 'expected_clip_count', 'capture_health', 'joined_ready_ms', 'source_duration_ms', 'joined_percent']) {
+				if (previous[key] !== undefined) rec[key] = previous[key];
+			}
+		}
 		state.recordingEnrichmentLoaded = false;
 		state.recordingEnrichmentLoading = false;
 		state.recordingEnrichmentError = false;
@@ -5312,10 +5323,17 @@
 	  }
 	}
 
+	function fetchRecordingEnrichment(ids) {
+		const params = new URLSearchParams();
+		params.set('recording_ids', ids.join(','));
+		return fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`));
+	}
+
 	async function refreshRecordingEnrichment(requestToken) {
 	  if (state.recordingEnrichmentLoading) return;
 	  state.recordingEnrichmentLoading = true;
 	  try {
+	    let hadError = false;
 	    const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);
 	    if (ids.length === 0) {
 	      state.recordingEnrichmentLoaded = true;
@@ -5323,18 +5341,39 @@
 	      renderCards();
 	      return;
 	    }
-	    for (let offset = 0; offset < ids.length; offset += RECORDING_ENRICHMENT_BATCH_SIZE) {
+	    let offset = 0;
+	    let batchSize = RECORDING_ENRICHMENT_BATCH_SIZE;
+	    while (offset < ids.length) {
 	      if (requestToken !== recordingsLoadToken) return;
-	      const batch = ids.slice(offset, offset + RECORDING_ENRICHMENT_BATCH_SIZE);
-	      const params = new URLSearchParams();
-	      params.set('recording_ids', batch.join(','));
-	      const payload = await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`));
+	      const batch = ids.slice(offset, offset + batchSize);
+	      let payload;
+	      try {
+	        payload = await fetchRecordingEnrichment(batch);
+	      } catch (_) {
+	        if (requestToken !== recordingsLoadToken) return;
+	        for (const id of batch) {
+	          try {
+	            const single = await fetchRecordingEnrichment([id]);
+	            if (requestToken !== recordingsLoadToken) return;
+	            mergeRecordingMetricItems(single.items);
+	            renderCards();
+	          } catch (_) {
+	            if (requestToken !== recordingsLoadToken) return;
+	            hadError = true;
+	          }
+	        }
+	        offset += batch.length;
+	        batchSize = 1;
+	        continue;
+	      }
 	      if (requestToken !== recordingsLoadToken) return;
 	      mergeRecordingMetricItems(payload.items);
-	      state.recordingEnrichmentError = false;
-	      state.recordingEnrichmentLoaded = offset + batch.length >= ids.length;
 	      renderCards();
+	      offset += batch.length;
 	    }
+	    state.recordingEnrichmentError = hadError;
+	    state.recordingEnrichmentLoaded = true;
+	    renderCards();
 	  } catch (_) {
 	    if (requestToken !== recordingsLoadToken) return;
 	    state.recordingEnrichmentError = true;
@@ -6260,7 +6299,8 @@
     window.setInterval(() => {
       if (clipPageState.recId && clipPageState.rec && clipPageState.rec.capture_via === 'relay' && !detailEditorOpen()) {
         void loadClipPage();
-      } else if (!clipPageState.recId && (sharedReadOnly || !newRecordingRoute())) {
+      } else if (!clipPageState.recId && (sharedReadOnly || !newRecordingRoute())
+		&& !state.recordingsLoading && !state.recordingEnrichmentLoading && !state.joinedProgressLoading) {
         void refreshRecordings();
       }
     }, 30000);

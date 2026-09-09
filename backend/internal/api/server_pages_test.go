@@ -904,7 +904,7 @@ func TestRecordingDetailLinksToDedicatedJoinedFolderWithoutEagerJoinedFetch(t *t
 		`const folderPath = recordingAPIPath(`,
 		`const folderName = joinedFolderDisplayName(rec);`,
 		`class="btn-link primary joined-folder-cta"`,
-		`${escapeHTML(folderName)}</a>`,
+		`<span>Joined clips</span><span class="joined-folder-name">${escapeHTML(folderName)}</span>`,
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recording detail missing dedicated joined folder link %q", marker)
@@ -1007,12 +1007,15 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 	}
 	page := string(body)
 	for _, marker := range []string{
-		"const RECORDING_ENRICHMENT_BATCH_SIZE = 1;",
+		"const RECORDING_ENRICHMENT_BATCH_SIZE = 2;",
 		"const ids = state.recordings.map((rec) => Number(rec.id)).filter((id) => id > 0);",
-		"offset < ids.length; offset += RECORDING_ENRICHMENT_BATCH_SIZE",
-		"const batch = ids.slice(offset, offset + RECORDING_ENRICHMENT_BATCH_SIZE);",
-		"params.set('recording_ids', batch.join(','));",
-		"await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`))",
+		"let batchSize = RECORDING_ENRICHMENT_BATCH_SIZE;",
+		"while (offset < ids.length)",
+		"const batch = ids.slice(offset, offset + batchSize);",
+		"return fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`));",
+		"payload = await fetchRecordingEnrichment(batch);",
+		"const single = await fetchRecordingEnrichment([id]);",
+		"batchSize = 1;",
 		"mergeRecordingMetricItems(payload.items);",
 		"renderCards();",
 	} {
@@ -1029,13 +1032,10 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 		t.Fatal("recording enrichment refresh function end not found")
 	}
 	refresh := page[refreshStart : refreshStart+refreshEnd]
-	if got := strings.Count(refresh, "await fetchJSON("); got != 1 {
-		t.Fatalf("recording enrichment has %d fetch sites; want one awaited request inside the loop", got)
-	}
 	if strings.Contains(refresh, "Promise.all") {
 		t.Fatal("recording enrichment must not fan out concurrent browser requests")
 	}
-	fetchAt := strings.Index(refresh, "await fetchJSON(recordingAPIPath(`/enrichment?${params.toString()}`))")
+	fetchAt := strings.Index(refresh, "payload = await fetchRecordingEnrichment(batch);")
 	mergeAt := -1
 	renderAt := -1
 	catchAt := strings.Index(refresh, "} catch (_)")
@@ -1049,8 +1049,42 @@ func TestRecordingListLoadsEnrichmentInProgressiveBoundedBatches(t *testing.T) {
 			renderAt = mergeAt + relative
 		}
 	}
-	if fetchAt < 0 || mergeAt < fetchAt || renderAt < mergeAt || catchAt < renderAt {
-		t.Fatalf("enrichment batch does not await, merge, render incrementally, then stop on failure: fetch=%d merge=%d render=%d catch=%d", fetchAt, mergeAt, renderAt, catchAt)
+	if fetchAt < 0 || catchAt < fetchAt || mergeAt < catchAt || renderAt < mergeAt {
+		t.Fatalf("enrichment batch does not await, merge, and render incrementally: fetch=%d merge=%d render=%d catch=%d", fetchAt, mergeAt, renderAt, catchAt)
+	}
+}
+
+func TestRecordingListAutoRefreshWaitsForMetricLoads(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"!state.recordingsLoading && !state.recordingEnrichmentLoading && !state.joinedProgressLoading",
+		"void refreshRecordings();",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings auto-refresh missing in-flight metric guard %q", marker)
+		}
+	}
+}
+
+func TestRecordingListRefreshPreservesProgressiveMetrics(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		"const previousByID = new Map(state.recordings.map((rec) => [Number(rec.id), rec]));",
+		"const previous = previousByID.get(Number(rec.id));",
+		"'joined_ready_ms', 'source_duration_ms', 'joined_percent'",
+		"if (previous[key] !== undefined) rec[key] = previous[key];",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings refresh missing progressive metric preservation %q", marker)
+		}
 	}
 }
 
