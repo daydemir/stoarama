@@ -148,7 +148,7 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -156,7 +156,7 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout='5s'"); err != nil {
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout='15s'"); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "set joined delivery status timeout failed")
 		return
 	}
