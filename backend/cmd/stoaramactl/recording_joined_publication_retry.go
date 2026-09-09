@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"syscall"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
@@ -23,7 +26,10 @@ func joinedPublicationFailureRetryable(err error) bool {
 	visitJoinedError(err, func(candidate error) {
 		switch candidate := candidate.(type) {
 		case *joinedrecording.StorageCapabilityError:
-			if candidate.Reason == "transport" || candidate.Reason == "status" && joinedTransientHTTPStatus(candidate.StatusCode) {
+			operationOK := candidate.Operation == "put" || candidate.Operation == "create_capability" ||
+				candidate.Operation == "reread_capability" || candidate.Operation == "reread"
+			if operationOK && (candidate.Reason == "transport" && joinedTransientTransportCause(candidate.Cause) ||
+				candidate.Reason == "status" && joinedTransientHTTPStatus(candidate.StatusCode)) {
 				sawRetryable = true
 			} else {
 				sawForbidden = true
@@ -35,7 +41,11 @@ func joinedPublicationFailureRetryable(err error) bool {
 				sawForbidden = true
 			}
 		case *joinedAPITransportError:
-			sawRetryable = true
+			if joinedTransientTransportCause(candidate.cause) {
+				sawRetryable = true
+			} else {
+				sawForbidden = true
+			}
 		default:
 			if candidate == errJoinedWorkerTaskDeadline || candidate == context.DeadlineExceeded && errors.Is(err, errJoinedWorkerTaskDeadline) {
 				sawRetryable = true
@@ -45,6 +55,25 @@ func joinedPublicationFailureRetryable(err error) bool {
 		}
 	})
 	return sawRetryable && !sawForbidden && !sawUnknown
+}
+
+func joinedTransientTransportCause(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	for _, candidate := range []error{syscall.ECONNABORTED, syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EPIPE, syscall.ETIMEDOUT} {
+		if errors.Is(err, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func visitJoinedError(err error, visit func(error)) {
@@ -71,11 +100,15 @@ func joinedTransientHTTPStatus(status int) bool {
 		status == http.StatusTooManyRequests || status >= 500 && status <= 599
 }
 
-func (s *remoteJoinedOperatorService) reportJoinedPublicationFailure(waitCtx, taskCtx context.Context, token, kind, id string, taskErr error) error {
+func (s *remoteJoinedOperatorService) reportJoinedPublicationFailure(taskCtx context.Context, token, kind, id string, taskErr error) error {
 	if taskErr == nil {
 		return nil
 	}
+	retryable := joinedPublicationFailureRetryable(taskErr)
 	class, reason := joinedFailureClassification(taskErr)
+	if !retryable {
+		class, reason = "deterministic", "publication_failure_not_retryable"
+	}
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(taskCtx), 30*time.Second)
 	defer cancel()
 	response, reportErr := s.api.reportFailure(reportCtx, token, joinedrecording.WorkFailureRequest{
@@ -86,21 +119,12 @@ func (s *remoteJoinedOperatorService) reportJoinedPublicationFailure(waitCtx, ta
 		return errors.Join(taskErr, fmt.Errorf("report joined publication failure: %w", reportErr))
 	}
 	log.Printf("joined publication failure recorded scope_kind=%s scope_id=%s class=%s reason=%s state=%s", kind, id, class, reason, response.State)
-	if response.State != "retry" || !joinedPublicationFailureRetryable(taskErr) {
+	if response.State != "retry" || !retryable {
 		return errJoinedTaskFailureReported
 	}
 	delay := time.Until(*response.NextAttemptAt)
 	if delay > joinedPublicationRetryMaxWait {
 		return errors.Join(taskErr, fmt.Errorf("joined publication retry wait exceeds bound"))
-	}
-	if delay > 0 {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-waitCtx.Done():
-			return errJoinedTaskFailureReported
-		case <-timer.C:
-		}
 	}
 	return errors.Join(errJoinedTaskFailureReported, errJoinedPublicationRetryAcknowledged)
 }

@@ -53,7 +53,10 @@ var (
 	errJoinedTaskFailureReported = errors.New("joined worker task failure reported")
 )
 
-type joinedAPITransportError struct{ cause error }
+type joinedAPITransportError struct {
+	path  string
+	cause error
+}
 
 func (*joinedAPITransportError) Error() string   { return "joined API transport failed" }
 func (e *joinedAPITransportError) Unwrap() error { return e.cause }
@@ -809,12 +812,30 @@ func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce fu
 		return errors.New("joined worker loop configuration is required")
 	}
 	taskBase := context.WithoutCancel(ctx)
+	var admissionRetries joinedAdmissionRetryState
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 		worked, err := runOnce(ctx, taskBase)
+		if worked || err == nil {
+			admissionRetries.reset()
+		}
 		if err != nil {
+			if !worked {
+				if delay, ok := admissionRetries.next(err, idlePoll, time.Now()); ok {
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						if !timer.Stop() {
+							<-timer.C
+						}
+						return nil
+					case <-timer.C:
+					}
+					continue
+				}
+			}
 			if errors.Is(err, errJoinedPublicationRetryAcknowledged) {
 				continue
 			}
@@ -888,7 +909,7 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 			return s.processClaim(workCtx, publication, req.ScratchRoot)
 		})
 		if workScope.WorkScope == config.JoinedWorkScopeFrozenBatch {
-			return true, s.reportJoinedPublicationFailure(admissionCtx, taskCtx, tracker.get(), kind, id, taskErr)
+			return true, s.reportJoinedPublicationFailure(taskCtx, tracker.get(), kind, id, taskErr)
 		}
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
@@ -1494,7 +1515,7 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		return false, &joinedAPITransportError{cause: err}
+		return false, &joinedAPITransportError{path: path, cause: err}
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode == http.StatusNoContent {

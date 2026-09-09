@@ -24,12 +24,14 @@ func TestJoinedPublicationFailureRetryabilityFailsClosed(t *testing.T) {
 		err  error
 		want bool
 	}{
-		{"typed transport", &joinedAPITransportError{cause: errors.New("connection reset")}, true},
+		{"typed connection reset", &joinedAPITransportError{cause: syscall.ECONNRESET}, true},
+		{"typed deterministic transport", &joinedAPITransportError{cause: errors.New("TLS certificate differs")}, false},
 		{"storage transport", &joinedrecording.StorageCapabilityError{Operation: "put", Reason: "transport", Cause: context.DeadlineExceeded}, true},
 		{"request timeout", &joinedrecording.StorageCapabilityError{Operation: "put", Reason: "status", StatusCode: http.StatusRequestTimeout}, true},
 		{"too early", &joinedAPIResponseError{path: "/finalize", status: http.StatusTooEarly}, true},
 		{"rate limited", &joinedAPIResponseError{path: "/finalize", status: http.StatusTooManyRequests}, true},
 		{"server error", &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "status", StatusCode: http.StatusServiceUnavailable}, true},
+		{"unknown storage operation", &joinedrecording.StorageCapabilityError{Operation: "delete", Reason: "transport"}, false},
 		{"worker timeout", errJoinedWorkerTaskDeadline, true},
 		{"runner timeout", errors.Join(errJoinedWorkerTaskDeadline, context.DeadlineExceeded), true},
 		{"timeout plus unknown invariant", errors.Join(errJoinedWorkerTaskDeadline, context.DeadlineExceeded, errors.New("identity invariant")), false},
@@ -38,8 +40,8 @@ func TestJoinedPublicationFailureRetryabilityFailsClosed(t *testing.T) {
 		{"identity", &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "identity", StatusCode: http.StatusOK}, false},
 		{"hash", &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "hash", StatusCode: http.StatusOK}, false},
 		{"capability schema", &joinedrecording.StorageCapabilityError{Operation: "create_capability", Reason: "capability"}, false},
-		{"heartbeat", errors.Join(joinedrecording.ErrWorkerHeartbeatFailed, &joinedAPITransportError{cause: errors.New("reset")}), false},
-		{"mixed transport and identity", errors.Join(&joinedAPITransportError{cause: errors.New("reset")}, &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "identity"}), false},
+		{"heartbeat", errors.Join(joinedrecording.ErrWorkerHeartbeatFailed, &joinedAPITransportError{cause: syscall.ECONNRESET}), false},
+		{"mixed transport and identity", errors.Join(&joinedAPITransportError{cause: syscall.ECONNRESET}, &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "identity"}), false},
 		{"caller canceled", errors.Join(context.Canceled, &joinedAPITransportError{cause: context.Canceled}), false},
 		{"ambiguous deadline", context.DeadlineExceeded, false},
 		{"ordinary process failure", errors.New("decoder failed"), false},
@@ -178,7 +180,7 @@ func TestJoinedPublicationRetryRequiresBoundedAcknowledgement(t *testing.T) {
 				t.Fatal(err)
 			}
 			service := &remoteJoinedOperatorService{api: api}
-			err = service.reportJoinedPublicationFailure(context.Background(), context.Background(), "operation-token-kept-secret", "hour", "hour-1",
+			err = service.reportJoinedPublicationFailure(context.Background(), "operation-token-kept-secret", "hour", "hour-1",
 				&joinedAPIResponseError{path: "/finalize", status: http.StatusServiceUnavailable})
 			if tc.name == "terminal" {
 				if !errors.Is(err, errJoinedTaskFailureReported) || errors.Is(err, errJoinedPublicationRetryAcknowledged) {
@@ -202,7 +204,7 @@ func TestJoinedPublicationRetryStopsOnAmbiguousFailureReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	taskErr := &joinedAPIResponseError{path: "/finalize", status: http.StatusServiceUnavailable}
-	err = (&remoteJoinedOperatorService{api: api}).reportJoinedPublicationFailure(context.Background(), context.Background(),
+	err = (&remoteJoinedOperatorService{api: api}).reportJoinedPublicationFailure(context.Background(),
 		"operation-token-kept-secret", "hour", "hour-1", taskErr)
 	if err == nil || !errors.Is(err, taskErr) || errors.Is(err, errJoinedPublicationRetryAcknowledged) || errors.Is(err, errJoinedTaskFailureReported) {
 		t.Fatalf("ambiguous failure report err=%v", err)
