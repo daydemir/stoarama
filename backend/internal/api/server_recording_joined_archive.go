@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
 )
@@ -28,6 +29,7 @@ const (
 	joinedArchiveMaxFiles     = 4000
 	joinedArchiveMaxBytes     = int64(256 << 30)
 	joinedArchiveMaxTokenSize = 4096
+	joinedArchiveSourceTTL    = 12 * time.Hour
 )
 
 type joinedArchiveClaims struct {
@@ -42,13 +44,22 @@ type joinedArchiveClaims struct {
 }
 
 type joinedArchiveArtifact struct {
-	BatchID      string `json:"batch_id"`
-	ETag         string `json:"etag"`
-	VersionID    string `json:"version_id"`
-	ContentType  string `json:"content_type"`
-	RelativePath string `json:"relative_path"`
-	SizeBytes    int64  `json:"size_bytes"`
-	SHA256       string `json:"sha256"`
+	BatchID      string               `json:"batch_id"`
+	ObjectKey    string               `json:"-"`
+	ETag         string               `json:"etag"`
+	VersionID    string               `json:"version_id"`
+	ContentType  string               `json:"content_type"`
+	RelativePath string               `json:"relative_path"`
+	SizeBytes    int64                `json:"size_bytes"`
+	SHA256       string               `json:"sha256"`
+	Head         joinedArchiveRequest `json:"head"`
+	Get          joinedArchiveRequest `json:"get"`
+}
+
+type joinedArchiveRequest struct {
+	URL     string      `json:"url"`
+	Method  string      `json:"method"`
+	Headers http.Header `json:"headers"`
 }
 
 type joinedArchiveManifest struct {
@@ -115,7 +126,8 @@ func validateJoinedArchive(artifacts []joinedArchiveArtifact) (int64, error) {
 	var total int64
 	for _, artifact := range artifacts {
 		name, ok := canonicalJoinedArchivePath(artifact.RelativePath)
-		if !ok || artifact.ContentType != "video/mp4" || !strings.HasSuffix(strings.ToLower(name), ".mp4") || !joinedrecording.ValidBatchID(artifact.BatchID) || !lowerHex64(artifact.SHA256) || artifact.ETag == "" {
+		canonicalKey := path.Join("joined", artifact.BatchID, "objects", artifact.SHA256+".mp4")
+		if !ok || artifact.ContentType != "video/mp4" || !strings.HasSuffix(strings.ToLower(name), ".mp4") || !joinedrecording.ValidBatchID(artifact.BatchID) || !lowerHex64(artifact.SHA256) || artifact.ObjectKey != canonicalKey || artifact.ETag == "" {
 			return 0, errors.New("invalid joined archive artifact")
 		}
 		entryRoot := strings.SplitN(name, "/", 2)[0]
@@ -135,6 +147,51 @@ func validateJoinedArchive(artifacts []joinedArchiveArtifact) (int64, error) {
 		total += artifact.SizeBytes
 	}
 	return total, nil
+}
+
+func signJoinedArchiveArtifacts(ctx context.Context, store joinedOutputObjectStore, artifacts []joinedArchiveArtifact) ([]joinedArchiveArtifact, error) {
+	if store == nil {
+		return nil, errors.New("joined archive storage is unavailable")
+	}
+	signed := append([]joinedArchiveArtifact(nil), artifacts...)
+	for index := range signed {
+		artifact := &signed[index]
+		head, err := store.PresignHeadExactRequest(ctx, artifact.ObjectKey, artifact.ETag, artifact.VersionID, joinedArchiveSourceTTL)
+		if err != nil {
+			return nil, fmt.Errorf("presign archive head: %w", err)
+		}
+		get, err := store.PresignGetExactRequest(ctx, artifact.ObjectKey, artifact.ETag, artifact.VersionID, joinedArchiveSourceTTL)
+		if err != nil {
+			return nil, fmt.Errorf("presign archive get: %w", err)
+		}
+		artifact.Head, err = joinedArchiveRequestFrom(head, http.MethodHead)
+		if err != nil {
+			return nil, err
+		}
+		artifact.Get, err = joinedArchiveRequestFrom(get, http.MethodGet)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return signed, nil
+}
+
+func joinedArchiveRequestFrom(request r2.PresignedRequest, method string) (joinedArchiveRequest, error) {
+	parsed, err := url.Parse(request.URL)
+	if err != nil || request.Method != method || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return joinedArchiveRequest{}, errors.New("invalid joined archive read capability")
+	}
+	headers := make(http.Header)
+	for name, values := range request.Headers {
+		if !strings.EqualFold(name, "If-Match") || len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+			return joinedArchiveRequest{}, errors.New("invalid joined archive read headers")
+		}
+		headers.Set("If-Match", values[0])
+	}
+	if headers.Get("If-Match") == "" {
+		return joinedArchiveRequest{}, errors.New("joined archive exact read is missing If-Match")
+	}
+	return joinedArchiveRequest{URL: request.URL, Method: method, Headers: headers}, nil
 }
 
 func scopeJoinedArchive(all []joinedArchiveArtifact, active []string) ([]joinedArchiveArtifact, string, bool) {
@@ -245,7 +302,7 @@ func (s *Server) joinedArchiveArtifacts(ctx context.Context, accountID, recordin
 	}
 	rows, err := s.pool.Query(ctx, `SELECT
 		(SELECT b.batch_id FROM recording_joined_batches b WHERE b.id=a.batch_record_id AND b.account_id=a.account_id),
-		a.etag,a.version_id,a.content_type,a.relative_path,a.expected_size_bytes,a.expected_sha256 `+
+		a.object_key,a.etag,a.version_id,a.content_type,a.relative_path,a.expected_size_bytes,a.expected_sha256 `+
 		recordingJoinedPublishedArtifactScopeSQL+`
 		  AND a.artifact_kind='media'
 		ORDER BY a.relative_path,a.id
@@ -257,7 +314,7 @@ func (s *Server) joinedArchiveArtifacts(ctx context.Context, accountID, recordin
 	artifacts := make([]joinedArchiveArtifact, 0)
 	for rows.Next() {
 		var artifact joinedArchiveArtifact
-		if err := rows.Scan(&artifact.BatchID, &artifact.ETag, &artifact.VersionID,
+		if err := rows.Scan(&artifact.BatchID, &artifact.ObjectKey, &artifact.ETag, &artifact.VersionID,
 			&artifact.ContentType, &artifact.RelativePath, &artifact.SizeBytes, &artifact.SHA256); err != nil {
 			return nil, err
 		}
@@ -360,6 +417,11 @@ func (s *Server) handleJoinedArchiveManifest(w http.ResponseWriter, r *http.Requ
 	total, err := validateJoinedArchive(selected)
 	if err != nil {
 		util.WriteError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	selected, err = signJoinedArchiveArtifacts(r.Context(), s.joinedOutputStore(), selected)
+	if err != nil {
+		util.WriteError(w, http.StatusServiceUnavailable, "joined archive read capabilities are unavailable")
 		return
 	}
 	w.Header().Set("Cache-Control", "private, no-store")

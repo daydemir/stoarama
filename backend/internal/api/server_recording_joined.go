@@ -77,6 +77,7 @@ type joinedOutputObjectStore interface {
 	OpenExact(context.Context, string, string, string) (io.ReadCloser, error)
 	PresignPutCreateOnlyRequest(context.Context, string, string, int64, string, time.Duration) (r2.PresignedRequest, error)
 	PresignGetExactRequest(context.Context, string, string, string, time.Duration) (r2.PresignedRequest, error)
+	PresignHeadExactRequest(context.Context, string, string, string, time.Duration) (r2.PresignedRequest, error)
 }
 
 func (s *Server) joinedOutputStore() joinedOutputObjectStore {

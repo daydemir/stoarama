@@ -8,6 +8,8 @@ export interface JoinedFile {
   size_bytes: number;
   relative_path: string;
   content_type: string;
+  head: JoinedReadRequest;
+  get: JoinedReadRequest;
 }
 
 export interface JoinedZip {
@@ -15,17 +17,14 @@ export interface JoinedZip {
   completed: Promise<void>;
 }
 
-interface JoinedObject {
-  key: string;
-  version: string;
-  size: number;
-  etag: string;
-  body?: ReadableStream<Uint8Array>;
+export interface JoinedReadRequest {
+  url: string;
+  method: "HEAD" | "GET";
+  headers: Record<string, string[]>;
 }
 
-export interface JoinedBucket {
-  head(key: string): Promise<JoinedObject | null>;
-  get(key: string, options: { onlyIf: { etagMatches: string } }): Promise<JoinedObject | null>;
+export interface JoinedSource {
+  read(request: JoinedReadRequest): Promise<Response>;
 }
 
 interface ArchiveEntry {
@@ -52,9 +51,9 @@ const encoder = new TextEncoder();
 const MAX_SAFE_SIZE = BigInt(Number.MAX_SAFE_INTEGER);
 const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
 
-export async function createJoinedZip(bucket: JoinedBucket, manifest: readonly JoinedFile[], options: Options): Promise<JoinedZip> {
+export async function createJoinedZip(source: JoinedSource, manifest: readonly JoinedFile[], options: Options): Promise<JoinedZip> {
   const entries = validateAndSort(manifest, options);
-  await preflight(bucket, entries, options.preflightConcurrency);
+  await preflight(source, entries, options.preflightConcurrency);
 
   const publicManifest = entries.map((entry) => ({
     relative_path: entry.relative_path,
@@ -66,7 +65,7 @@ export async function createJoinedZip(bucket: JoinedBucket, manifest: readonly J
     { path: "joined-files.json", size: BigInt(manifestBytes.length), inline: manifestBytes },
     ...entries.map((source) => ({ path: source.relative_path, size: BigInt(source.size_bytes), source })),
   ];
-  return streamZip(bucket, archiveEntries);
+  return streamZip(source, archiveEntries);
 }
 
 function validateAndSort(manifest: readonly JoinedFile[], options: Options): JoinedFile[] {
@@ -81,7 +80,7 @@ function validateAndSort(manifest: readonly JoinedFile[], options: Options): Joi
     if (typeof entry.relative_path !== "string") throw new Error("invalid archive path");
     if (typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256)) throw new Error(`Invalid sha256 for ${entry.relative_path}`);
     if (typeof entry.batch_id !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/.test(entry.batch_id)) throw new Error(`Invalid batch_id for ${entry.relative_path}`);
-    if (typeof entry.etag !== "string" || !entry.etag || entry.etag.length > 256 || typeof entry.version_id !== "string" || entry.version_id.length > 256) throw new Error(`Missing object identity for ${entry.relative_path}`);
+    if (typeof entry.etag !== "string" || !entry.etag || entry.etag.length > 256 || typeof entry.version_id !== "string" || entry.version_id.length > 256 || !validReadRequest(entry.head, "HEAD") || !validReadRequest(entry.get, "GET")) throw new Error(`Missing object identity or read capability for ${entry.relative_path}`);
     if (entry.content_type !== "video/mp4" || !entry.relative_path.toLowerCase().endsWith(".mp4")) throw new Error(`Invalid media type for ${entry.relative_path}`);
     if (!Number.isSafeInteger(entry.size_bytes) || entry.size_bytes <= 0 || BigInt(entry.size_bytes) > MAX_SAFE_SIZE) throw new Error(`Invalid size for ${entry.relative_path}`);
     total += entry.size_bytes;
@@ -106,26 +105,30 @@ function assertPortablePath(value: string): void {
   }
 }
 
-async function preflight(bucket: JoinedBucket, entries: readonly JoinedFile[], concurrency: number): Promise<void> {
+async function preflight(source: JoinedSource, entries: readonly JoinedFile[], concurrency: number): Promise<void> {
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 6) throw new Error("preflight concurrency must be between 1 and 6");
   let next = 0;
   const workers = Array.from({ length: Math.min(concurrency, entries.length) }, async () => {
     while (next < entries.length) {
       const entry = entries[next++];
       if (!entry) return;
-      assertIdentity(await bucket.head(keyFor(entry)), entry, "preflight");
+      const response = await source.read(entry.head);
+      try {
+        assertIdentity(response, entry, "preflight");
+      } finally {
+        await response.body?.cancel().catch(() => undefined);
+      }
     }
   });
   await Promise.all(workers);
 }
 
-function assertIdentity(object: JoinedObject | null, entry: JoinedFile, stage: string): asserts object is JoinedObject {
-  if (!object) throw new Error(`R2 identity mismatch during ${stage}: missing ${entry.relative_path}`);
+function assertIdentity(response: Response, entry: JoinedFile, stage: string): void {
+  if (!response.ok) throw new Error(`R2 identity mismatch during ${stage}: unavailable ${entry.relative_path}`);
   const mismatches: string[] = [];
-  if (object.key !== keyFor(entry)) mismatches.push("key");
-  if (object.size !== entry.size_bytes) mismatches.push("size");
-  if (normalizeETag(object.etag) !== normalizeETag(entry.etag)) mismatches.push("etag");
-  if (entry.version_id && object.version !== entry.version_id) mismatches.push("version");
+  if (Number(response.headers.get("Content-Length")) !== entry.size_bytes) mismatches.push("size");
+  if (normalizeETag(response.headers.get("ETag") ?? "") !== normalizeETag(entry.etag)) mismatches.push("etag");
+  if (entry.version_id && response.headers.get("x-amz-version-id") !== entry.version_id) mismatches.push("version");
   if (mismatches.length) throw new Error(`R2 identity mismatch during ${stage} for ${entry.relative_path}: ${mismatches.join(", ")}`);
 }
 
@@ -133,11 +136,12 @@ function normalizeETag(etag: string): string {
   return etag.startsWith('"') && etag.endsWith('"') ? etag.slice(1, -1) : etag;
 }
 
-function keyFor(entry: JoinedFile): string {
-  return `joined/${entry.batch_id}/objects/${entry.sha256}.mp4`;
+function validReadRequest(request: JoinedReadRequest, method: "HEAD" | "GET"): boolean {
+  return !!request && request.method === method && typeof request.url === "string" && request.url.length > 0 &&
+    !!request.headers && Object.keys(request.headers).length === 1 && Array.isArray(request.headers["If-Match"]) && request.headers["If-Match"]?.length === 1;
 }
 
-function streamZip(bucket: JoinedBucket, entries: readonly ArchiveEntry[]): JoinedZip {
+function streamZip(source: JoinedSource, entries: readonly ArchiveEntry[]): JoinedZip {
   const channel = new TransformStream<Uint8Array, Uint8Array>();
   const writer = channel.writable.getWriter();
   let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -152,17 +156,17 @@ function streamZip(bucket: JoinedBucket, entries: readonly ArchiveEntry[]): Join
           const inline = entry.inline;
           body = new ReadableStream({ start(controller) { controller.enqueue(inline); controller.close(); } });
         } else {
-          const source = entry.source;
-          if (!source) throw new Error("archive source is missing");
-          const object = await bucket.get(keyFor(source), { onlyIf: { etagMatches: source.etag } });
+          const file = entry.source;
+          if (!file) throw new Error("archive source is missing");
+          const response = await source.read(file.get);
           try {
-            assertIdentity(object, source, "download");
+            assertIdentity(response, file, "download");
           } catch (error) {
-            await object?.body?.cancel(error).catch(() => undefined);
+            await response.body?.cancel(error).catch(() => undefined);
             throw error;
           }
-          if (!object.body) throw new Error(`R2 conditional get failed for ${source.relative_path}`);
-          body = object.body;
+          if (!response.body) throw new Error(`R2 conditional get failed for ${file.relative_path}`);
+          body = response.body;
         }
         const pathBytes = encoder.encode(entry.path);
         const localOffset = offset;

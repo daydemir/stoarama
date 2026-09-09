@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createJoinedZip } from "../src/zip";
-import { bucketFor, bytes, file, options } from "./helpers";
+import { bytes, file, options, sourceFor } from "./helpers";
 
 describe("ZIP64 interoperability", () => {
   it("produces an archive accepted by an independent unzip implementation", async () => {
     const entry = file();
-    const archive = await createJoinedZip(bucketFor([entry]), [entry], options);
+    const archive = await createJoinedZip(sourceFor([entry]), [entry], options);
     const output = await bytes(archive.body);
     await archive.completed;
     const directory = mkdtempSync(join(tmpdir(), "stoarama-joined-zip-test-"));
