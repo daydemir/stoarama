@@ -1043,6 +1043,7 @@ class JoinedDownloadTests(unittest.TestCase):
         raw_clip = {"clip_id": 9, "recording_id": 3, "size_bytes": 10}
         acks = []
         raw_pages = 0
+        joined_start_cursors = []
 
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1054,6 +1055,7 @@ class JoinedDownloadTests(unittest.TestCase):
             def api(_cfg, method, path, body=None, **_kwargs):
                 nonlocal raw_pages
                 if path == "/account/joined":
+                    joined_start_cursors.append(runtime.cursor_id)
                     return {"item": raw_item}
                 if path == raw_item["download_path"]:
                     return self.prepared(raw_item)
@@ -1073,8 +1075,26 @@ class JoinedDownloadTests(unittest.TestCase):
                 return RangeResponse(content[start:end + 1], start, end, len(content))
 
             def produce_raw_pages():
-                while not producer_stop.is_set():
-                    pull.drain_page(cfg, runtime)
+                try:
+                    while not producer_stop.is_set():
+                        pull.drain_page(cfg, runtime)
+                except BaseException as exc:
+                    producer_errors.append(exc)
+                    producer_stop.set()
+
+            def consume_joined():
+                try:
+                    joined_results.append(pull.drain_joined(cfg, runtime, joined_stop))
+                except BaseException as exc:
+                    consumer_errors.append(exc)
+                finally:
+                    consumer_done.set()
+
+            producer_errors = []
+            consumer_errors = []
+            joined_results = []
+            consumer_done = threading.Event()
+            joined_stop = threading.Event()
 
             with mock.patch.object(pull, "storage_status", return_value=self.storage()
             ), mock.patch.object(pull, "process_clip", return_value=(9, 10, 10, 0)), mock.patch.object(
@@ -1082,14 +1102,28 @@ class JoinedDownloadTests(unittest.TestCase):
             ), mock.patch.object(pull, "open_joined_url", side_effect=open_range):
                 producer = threading.Thread(target=produce_raw_pages)
                 producer.start()
+                consumer = threading.Thread(target=consume_joined)
+                consumer.start()
                 try:
-                    self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
+                    deadline = pull.time.monotonic() + 3
+                    while not consumer_done.wait(.05):
+                        if producer_errors:
+                            self.fail("raw producer failed: %s" % producer_errors[0])
+                        if pull.time.monotonic() >= deadline:
+                            self.fail("joined consumer missed its deadline")
                 finally:
                     producer_stop.set()
+                    joined_stop.set()
                     producer.join(2)
+                    consumer.join(2)
 
             self.assertFalse(producer.is_alive())
-            self.assertGreater(runtime.cursor_id, 0)
+            self.assertFalse(consumer.is_alive())
+            self.assertEqual(producer_errors, [])
+            self.assertEqual(consumer_errors, [])
+            self.assertEqual(joined_results, [True])
+            self.assertEqual(len(joined_start_cursors), 1)
+            self.assertGreater(runtime.cursor_id, joined_start_cursors[0])
             self.assertGreater(raw_pages, 1)
             self.assertEqual(pull.joined_output_path(cfg, item).read_bytes(), content)
             self.assertEqual(len(acks), 1)
@@ -1435,6 +1469,19 @@ class JoinedDownloadTests(unittest.TestCase):
                 pull.joined_raw_priority_checkpoint(cfg, runtime)
                 with self.assertRaisesRegex(pull.JoinedDownloadYield, "raw delivery"):
                     pull.joined_raw_priority_checkpoint(cfg, runtime)
+            self.assertEqual(pending.call_count, 2)
+
+    def test_fair_share_wait_reuses_raw_pending_result_for_one_second(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            runtime.apply_joined_protocol_response(self.protocol_response(1, pull.JOINED_FAIR_SHARE_MIN_GENERATION))
+            with mock.patch.object(pull.time, "monotonic", side_effect=[10.0, 10.5, 11.0]), mock.patch.object(
+                pull, "poll_raw_pending", side_effect=[True, False]
+            ) as pending:
+                self.assertTrue(pull.poll_raw_pending_cached(cfg, runtime))
+                self.assertTrue(pull.poll_raw_pending_cached(cfg, runtime))
+                self.assertFalse(pull.poll_raw_pending_cached(cfg, runtime))
             self.assertEqual(pending.call_count, 2)
 
     def test_unknown_partial_and_hardlink_are_never_modified(self):

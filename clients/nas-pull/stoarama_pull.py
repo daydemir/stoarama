@@ -947,6 +947,7 @@ class Runtime:
         self.joined_protocol_generation = 0
         self.joined_delivery = None
         self.joined_raw_priority_polled_at = 0.0
+        self.joined_raw_priority_pending = False
         # A new client explicitly clears any stale server-side capacity until
         # the independent probe proves that the configured NAS mount is live.
         self.storage = {"available": False}
@@ -2762,12 +2763,7 @@ def joined_raw_priority_checkpoint(cfg, runtime, stop_event=None):
     if runtime.joined_fair_share_enabled():
         await_joined_work(cfg, runtime, stop_event or threading.Event())
         return
-    now = time.monotonic()
-    with runtime.lock:
-        if now - runtime.joined_raw_priority_polled_at < 1.0:
-            return
-        runtime.joined_raw_priority_polled_at = now
-    if poll_raw_pending(cfg, runtime):
+    if poll_raw_pending_cached(cfg, runtime):
         raise JoinedDownloadYield("joined validation yielded to raw delivery")
 
 
@@ -4939,11 +4935,23 @@ def poll_raw_pending(cfg, runtime):
     return bool(clips)
 
 
+def poll_raw_pending_cached(cfg, runtime):
+    now = time.monotonic()
+    with runtime.lock:
+        if now - runtime.joined_raw_priority_polled_at < 1.0:
+            return runtime.joined_raw_priority_pending
+    pending = poll_raw_pending(cfg, runtime)
+    with runtime.lock:
+        runtime.joined_raw_priority_polled_at = now
+        runtime.joined_raw_priority_pending = pending
+    return pending
+
+
 def await_joined_work(cfg, runtime, stop_event):
     if not runtime.joined_fair_share_enabled():
         return
     while not runtime.consume_joined_work_credit():
-        if not poll_raw_pending(cfg, runtime):
+        if not poll_raw_pending_cached(cfg, runtime):
             return
         if stop_event.is_set() or not runtime.joined_protocol_enabled():
             raise JoinedDownloadYield("joined work stopped at a bounded boundary")
