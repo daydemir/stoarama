@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/recordingapi"
 	"github.com/daydemir/stoarama/backend/internal/recordingworker"
@@ -213,7 +214,7 @@ func ytdlpSupportsJSRuntime(bin string) bool {
 	// first launch, especially while Gatekeeper validates a freshly updated file.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--help").Output()
+	out, err := capture.RunYTDLPCommandOutput(ctx, bin, "--help")
 	return err == nil && bytes.Contains(out, []byte("--js-runtimes"))
 }
 

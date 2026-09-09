@@ -35,6 +35,9 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	if err := prepareYTDLPPrivateTemp(os.Args[1]); err != nil {
+		fatal(err)
+	}
 	args := os.Args[2:]
 	switch os.Args[1] {
 	case "enroll":
