@@ -51,6 +51,7 @@ type joinedAPIResponseError struct {
 var (
 	errJoinedWorkerTaskDeadline  = errors.New("joined worker task deadline")
 	errJoinedTaskFailureReported = errors.New("joined worker task failure reported")
+	errJoinedTaskMayContinue     = errors.New("joined worker task may continue")
 )
 
 type joinedAPITransportError struct{ cause error }
@@ -825,6 +826,9 @@ func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce fu
 		worked, err := runOnce(ctx, taskBase)
 		if err != nil {
 			if errors.Is(err, errJoinedTaskFailureReported) {
+				if errors.Is(err, errJoinedTaskMayContinue) {
+					continue
+				}
 				return nil
 			}
 			if ctx.Err() != nil && !worked {
@@ -864,13 +868,27 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 	}
 	claimRequest := joinedrecording.WorkClaimRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: req.BatchID, WorkerID: req.WorkerID}
 	if workScope.WorkScope == joinedrecording.WorkScopeFrozenBatch {
-		budget, err := joinedrecording.AvailableScratchBudget(req.ScratchRoot)
+		measure := func() (int64, int64, error) {
+			budget, err := joinedrecording.AvailableScratchBudget(req.ScratchRoot)
+			if err != nil {
+				return 0, 0, err
+			}
+			taskBudget, err := joinedrecording.WorkerTaskBudgetBytes(budget)
+			return budget, taskBudget, err
+		}
+		budget, taskBudget, err := measure()
+		var headroom *joinedrecording.ScratchHeadroomError
+		if errors.As(err, &headroom) {
+			if _, cleanupErr := s.cleanupInactiveScratch(admissionCtx, req); cleanupErr != nil {
+				return false, fmt.Errorf("cleanup inactive joined scratch before admission: %w", cleanupErr)
+			}
+			budget, taskBudget, err = measure()
+			if errors.As(err, &headroom) {
+				return false, nil
+			}
+		}
 		if err != nil {
 			return false, fmt.Errorf("measure joined scratch admission budget: %w", err)
-		}
-		taskBudget, err := joinedrecording.WorkerTaskBudgetBytes(budget)
-		if err != nil {
-			return false, fmt.Errorf("derive joined scratch admission budget: %w", err)
 		}
 		claimRequest.ScratchAvailableBytes = budget
 		claimRequest.TaskBudgetBytes = taskBudget
@@ -917,7 +935,78 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		workCtx = context.WithValue(workCtx, joinedOperationTrackerContextKey{}, tracker)
 		return s.processPreflight(workCtx, preflight, req.ScratchRoot)
 	})
-	return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), "hour", preflight.HourID, taskErr)
+	mayContinue := joinedMayContinuePreflight(workScope, taskErr)
+	return true, s.reportJoinedTaskResult(taskCtx, req.ScratchRoot, preflight, tracker.get(), taskErr, mayContinue)
+}
+
+func joinedMayContinuePreflight(workScope joinedrecording.WorkScopeIdentity, err error) bool {
+	return workScope.WorkScope == joinedrecording.WorkScopeFrozenBatch && joinedRecoverablePresealFailure(err)
+}
+
+func joinedRecoverablePresealFailure(err error) bool {
+	if joinedRecoverablePresealDeadline(err) {
+		return true
+	}
+	return joinedrecording.RecoverablePresealMediaFailure(err) ||
+		(errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) && joinedrecording.RecoverablePresealMediaValidation(err))
+}
+
+type joinedPresealDeadlineFacts struct{ known, taskDeadline, beforeSeal bool }
+
+func joinedRecoverablePresealDeadline(err error) bool {
+	facts := joinedPresealDeadlineErrorTree(err)
+	return facts.known && facts.taskDeadline && facts.beforeSeal
+}
+
+func joinedPresealDeadlineErrorTree(err error) joinedPresealDeadlineFacts {
+	switch err {
+	case errJoinedWorkerTaskDeadline:
+		return joinedPresealDeadlineFacts{known: true, taskDeadline: true}
+	case joinedrecording.ErrPreflightDeadlineBeforeSeal:
+		return joinedPresealDeadlineFacts{known: true, beforeSeal: true}
+	case context.DeadlineExceeded:
+		return joinedPresealDeadlineFacts{known: true}
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		facts := joinedPresealDeadlineFacts{known: true}
+		for _, child := range joined.Unwrap() {
+			childFacts := joinedPresealDeadlineErrorTree(child)
+			facts.known = facts.known && childFacts.known
+			facts.taskDeadline = facts.taskDeadline || childFacts.taskDeadline
+			facts.beforeSeal = facts.beforeSeal || childFacts.beforeSeal
+		}
+		return facts
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return joinedPresealDeadlineErrorTree(wrapped.Unwrap())
+	}
+	return joinedPresealDeadlineFacts{}
+}
+
+func (s *remoteJoinedOperatorService) reportJoinedTaskResult(taskCtx context.Context, scratchRoot string, claim joinedrecording.PreflightHourClaim, token string, taskErr error, mayContinue bool) error {
+	if taskErr == nil || !mayContinue {
+		return s.reportJoinedTaskFailure(taskCtx, token, "hour", claim.HourID, taskErr)
+	}
+	_, reason := joinedFailureClassification(taskErr)
+	diagnostic := joinedrecording.FailedPreflightDiagnostic{ReasonCode: reason}
+	if code, sha, ok := joinedrecording.PresealMediaFailureDiagnostic(taskErr); ok {
+		diagnostic.FailureCode, diagnostic.EvidenceSHA256 = code, sha
+	} else if sealClass, media, proof, ok := joinedrecording.SealValidationDiagnostic(taskErr); ok {
+		diagnostic.SealClass, diagnostic.MediaOrdinal, diagnostic.ProofOrdinal = string(sealClass), media, proof
+	}
+	if errors.Is(taskErr, joinedrecording.ErrPreflightDeadlineBeforeSeal) {
+		diagnostic.FailureCode = "deadline_before_seal"
+	}
+	if preserveErr := joinedrecording.PreserveFailedPreflightEvidence(scratchRoot, claim, diagnostic); preserveErr != nil {
+		return errors.Join(taskErr, fmt.Errorf("preserve joined failed task evidence: %w", preserveErr))
+	}
+	if err := s.reportJoinedTaskFailure(taskCtx, token, "hour", claim.HourID, taskErr); err != nil {
+		if errors.Is(err, errJoinedTaskFailureReported) {
+			return errors.Join(err, errJoinedTaskMayContinue)
+		}
+		return err
+	}
+	return nil
 }
 
 func joinedPublicationFailureIdentity(response joinedrecording.PublicationClaimResponse) (kind, id, token string) {
@@ -955,6 +1044,15 @@ func joinedFailureClassification(err error) (class, reason string) {
 	}
 	if errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) {
 		return "transient", "preflight_seal_request_invalid"
+	}
+	if errors.Is(err, errJoinedWorkerTaskDeadline) && errors.Is(err, joinedrecording.ErrPreflightDeadlineBeforeSeal) {
+		return "transient", "preflight_deadline_before_seal"
+	}
+	if joinedrecording.RecoverablePresealMediaFailure(err) {
+		if errors.Is(err, joinedrecording.ErrPresealMediaBoundaryContradiction) {
+			return "transient", "preflight_media_boundary_contradiction"
+		}
+		return "transient", "preflight_media_validation_failed"
 	}
 	if errors.Is(err, joinedrecording.ErrPreflightLeaseEndedBeforeSeal) {
 		return "transient", "preflight_lease_ended_before_seal"

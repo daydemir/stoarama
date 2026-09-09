@@ -80,6 +80,19 @@ func TestSealHourValidationDiagnosticIsBoundedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestRecoverablePresealMediaValidationIsNarrow(t *testing.T) {
+	for _, class := range []SealValidationClass{SealValidationMedia, SealValidationMaximalityProof, SealValidationQuarantineProof} {
+		if !RecoverablePresealMediaValidation(newSealValidationError(class, 1, 1, "media proof failed")) {
+			t.Fatalf("class %q should be recoverable", class)
+		}
+	}
+	for _, class := range []SealValidationClass{SealValidationRequest, SealValidationSourceClaim, SealValidationSource, SealValidationMediaAssignment, SealValidationQuarantineAssignment, SealValidationSourceAccounting} {
+		if RecoverablePresealMediaValidation(newSealValidationError(class, 1, 1, "integrity failed")) {
+			t.Fatalf("class %q must stop", class)
+		}
+	}
+}
+
 func TestBroadClaimRequiresACompleteCapacityPair(t *testing.T) {
 	base := WorkClaimRequest{ProtocolVersion: 1, BatchID: "tier1-generation-1", WorkerID: "worker-1"}
 	if err := base.Validate(); err != nil {

@@ -98,6 +98,29 @@ func TestCleanupInactiveLeaseScratchResumesFencedDirectory(t *testing.T) {
 	}
 }
 
+func TestFailedPreflightEvidenceSurvivesScratchCleanup(t *testing.T) {
+	root := privateScratchRoot(t)
+	leaseID := strings.Repeat("P", 43)
+	dir := filepath.Join(root, leaseID)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claim := PreflightHourClaim{BatchID: "tier1-2026-08", HourID: "hour-1", LeaseID: leaseID, RecordingID: 377, LocalDate: "2026-08-01", LocalHour: 1, SourceClaimSHA256: strings.Repeat("a", 64), MediaTool: MediaToolEvidence{IdentitySHA256: strings.Repeat("b", 64)}, Sources: []SourceClip{{ClipID: 1, Object: ObjectIdentity{Key: "raw/clip.mp4", ETag: "etag", SizeBytes: 1, SHA256: strings.Repeat("c", 64)}}}}
+	if err := PreserveFailedPreflightEvidence(root, claim, FailedPreflightDiagnostic{ReasonCode: "preflight_media_validation_failed", FailureCode: "media_sequence_mismatch", EvidenceSHA256: strings.Repeat("d", 64)}); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := CleanupInactiveLeaseScratch(context.Background(), root, func(context.Context, []string) (map[string]bool, error) { return map[string]bool{leaseID: true}, nil })
+	if err != nil || !slices.Equal(removed, []string{leaseID}) {
+		t.Fatalf("cleanup removed=%v err=%v", removed, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("lease scratch remains: %v", err)
+	}
+	if payload, err := os.ReadFile(filepath.Join(root, failedEvidenceDirectory, leaseID+".json")); err != nil || !strings.Contains(string(payload), "media_sequence_mismatch") || strings.Contains(string(payload), "operation_token") {
+		t.Fatalf("compact evidence payload=%q err=%v", payload, err)
+	}
+}
+
 func TestCleanupInactiveLeaseScratchChunksProofBeforeMutation(t *testing.T) {
 	root := privateScratchRoot(t)
 	for i := 0; i < scratchLeaseProofLimit+1; i++ {

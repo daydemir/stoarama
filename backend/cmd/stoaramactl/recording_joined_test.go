@@ -312,6 +312,8 @@ func TestJoinedWorkerProcessExitContract(t *testing.T) {
 	}{
 		{mode: "success", wantExit: 0, wantOutput: "result=stopped polls=2 reports=0"},
 		{mode: "failure-acknowledged", wantExit: 0, wantOutput: "result=stopped polls=1 reports=1"},
+		{mode: "recoverable-then-distinct", wantExit: 0, wantOutput: "result=stopped polls=2 reports=1"},
+		{mode: "recoverable-canary-stops", wantExit: 0, wantOutput: "result=stopped polls=1 reports=1"},
 		{mode: "failure-report-503", wantExit: 1, wantOutput: "result=error polls=1 reports=1", wantError: "joined API /api/v1/recording/joined/failure returned status 503", wantCause: "decoder failed"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -347,7 +349,7 @@ func runJoinedWorkerProcessCase(mode string) (int32, int32, error) {
 
 	switch mode {
 	case "success":
-	case "failure-acknowledged", "failure-report-503":
+	case "failure-acknowledged", "failure-report-503", "recoverable-then-distinct", "recoverable-canary-stops":
 		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost || r.URL.Path != "/api/v1/recording/joined/failure" ||
 				r.Header.Get("Authorization") != "Bearer "+operationToken {
@@ -362,6 +364,9 @@ func runJoinedWorkerProcessCase(mode string) (int32, int32, error) {
 				ScopeID:         "hour-1",
 				FailureClass:    "transient",
 				ReasonCode:      "worker_task_failed",
+			}
+			if strings.HasPrefix(mode, "recoverable-") {
+				want.ReasonCode = "preflight_media_boundary_contradiction"
 			}
 			if err := decoder.Decode(&request); err != nil || request.Validate() != nil || request != want ||
 				decoder.Decode(&struct{}{}) != io.EOF {
@@ -394,6 +399,19 @@ func runJoinedWorkerProcessCase(mode string) (int32, int32, error) {
 	}
 
 	taskErr := errors.New("decoder failed")
+	var scratchRoot, failedLease string
+	if mode == "recoverable-then-distinct" || mode == "recoverable-canary-stops" {
+		var err error
+		scratchRoot, err = os.MkdirTemp("", "joined-process-")
+		if err != nil {
+			return 0, 0, err
+		}
+		defer os.RemoveAll(scratchRoot)
+		failedLease = strings.Repeat("F", 43)
+		if err := os.Mkdir(filepath.Join(scratchRoot, failedLease), 0o700); err != nil {
+			return 0, 0, err
+		}
+	}
 	fake := &fakeJoinedOperator{runWorker: func(ctx context.Context, _ joinedWorkerRequest) error {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -405,6 +423,22 @@ func runJoinedWorkerProcessCase(mode string) (int32, int32, error) {
 				}
 				cancel()
 				return false, nil
+			}
+			if mode == "recoverable-then-distinct" || mode == "recoverable-canary-stops" {
+				if poll == 1 {
+					scope, _ := joinedrecording.NewWorkScopeIdentity("tier1-2026-08", joinedrecording.WorkScopeFrozenBatch, nil)
+					if mode == "recoverable-canary-stops" {
+						scope, _ = joinedrecording.NewWorkScopeIdentity("tier1-2026-08", joinedrecording.WorkScopeSingleCanary, []string{"tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1"})
+					}
+					taskErr = errors.Join(joinedrecording.ErrPresealMediaSplitNotIsolated, joinedrecording.ErrPresealMediaBoundaryContradiction)
+					claim := joinedrecording.PreflightHourClaim{BatchID: "tier1-2026-08", HourID: "hour-1", LeaseID: failedLease, RecordingID: 377, LocalDate: "2026-08-01", LocalHour: 1, SourceClaimSHA256: strings.Repeat("a", 64), MediaTool: joinedrecording.MediaToolEvidence{IdentitySHA256: strings.Repeat("b", 64)}, Sources: []joinedrecording.SourceClip{{ClipID: 1, Object: joinedrecording.ObjectIdentity{Key: "raw/clip.mp4", ETag: "etag", SizeBytes: 1, SHA256: strings.Repeat("c", 64)}}}}
+					return true, service.reportJoinedTaskResult(taskCtx, scratchRoot, claim, operationToken, taskErr, joinedMayContinuePreflight(scope, taskErr))
+				}
+				if _, err := os.Stat(filepath.Join(scratchRoot, ".failed-evidence", failedLease+".json")); err != nil {
+					return false, fmt.Errorf("failed evidence was not preserved before distinct claim: %w", err)
+				}
+				cancel()
+				return true, nil
 			}
 			if poll > 1 {
 				return false, errors.New("worker polled after a task failure")

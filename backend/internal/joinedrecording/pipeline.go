@@ -13,6 +13,7 @@ type SealPreflightHour func(context.Context, PreflightHourClaim, SealHourRequest
 var (
 	ErrPreflightSealRequestInvalid   = errors.New("preflight seal request invalid")
 	ErrPreflightLeaseEndedBeforeSeal = errors.New("preflight lease ended before seal")
+	ErrPreflightDeadlineBeforeSeal   = errors.New("preflight deadline before seal")
 )
 
 // RunPreflightHourRenewing owns the complete source-only lease lifecycle. It
@@ -30,6 +31,7 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 	initial := OperationCredentials{LeaseID: claim.LeaseID, OperationToken: claim.OperationToken, ExpiresAt: claim.LeaseExpires}
 	var sealed WorkerClaim
 	var sealedScratch SealedHourScratch
+	sealAttempted := false
 	err := run(ctx, initial, heartbeat, func(workCtx context.Context, current func() OperationCredentials) error {
 		fresh := func() (PreflightHourClaim, error) { return claim.WithOperation(current()) }
 		actualTool, err := InspectMediaToolEvidence(workCtx)
@@ -121,6 +123,7 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 			emitStageTiming(workCtx, "seal", time.Since(stageStarted), err)
 			return err
 		}
+		sealAttempted = true
 		sealed, err = seal(workCtx, currentClaim, sealRequest)
 		emitStageTiming(workCtx, "seal", time.Since(stageStarted), err)
 		if err != nil {
@@ -130,6 +133,9 @@ func runPreflightHourRenewing(ctx context.Context, claim PreflightHourClaim, scr
 		sealedScratch, err = bindSealedHourScratch(verified, sealed)
 		return err
 	})
+	if !sealAttempted && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = errors.Join(err, ErrPreflightDeadlineBeforeSeal)
+	}
 	return sealed, sealedScratch, err
 }
 
