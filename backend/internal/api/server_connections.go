@@ -636,6 +636,7 @@ type connectionHeartbeatRequest struct {
 	CapacityBlocked    bool                       `json:"capacity_blocked"`
 	JoinedProtocol     int                        `json:"joined_protocol_version"`
 	JoinedDelivery     *connectionJoinedDelivery  `json:"joined_delivery,omitempty"`
+	JoinedTransfer     *connectionJoinedTransfer  `json:"joined_transfer,omitempty"`
 }
 
 type connectionHeartbeatResponse struct {
@@ -664,6 +665,15 @@ type connectionJoinedDelivery struct {
 	Blocker     string     `json:"blocker"`
 	AttemptedAt *time.Time `json:"attempted_at"`
 	RetryAt     *time.Time `json:"retry_at"`
+}
+
+type connectionJoinedTransfer struct {
+	ArtifactID         int64      `json:"artifact_id"`
+	ProtocolGeneration int        `json:"protocol_generation"`
+	OffsetBytes        int64      `json:"offset_bytes"`
+	Operation          string     `json:"operation"`
+	ErrnoClass         string     `json:"errno_class"`
+	ObservedAt         *time.Time `json:"observed_at"`
 }
 
 type connectionStorageStatus struct {
@@ -710,6 +720,12 @@ var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": tru
 var connectionJoinedBlockers = map[string]bool{
 	"download_failed": true, "hash_mismatch": true, "http_error": true,
 	"io_error": true, "path_conflict": true, "storage_guard": true,
+}
+var connectionJoinedTransferOperations = map[string]bool{
+	"range": true, "verify": true, "validate": true, "publish": true,
+}
+var connectionJoinedErrnoClasses = map[string]bool{
+	"": true, "no_space": true, "permission": true, "missing": true, "io": true, "os_error": true,
 }
 var inventorySkipReasons = map[string]bool{
 	"changed_during_hash": true, "invalid_sidecar": true, "io_error": true,
@@ -788,6 +804,14 @@ func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
 			return errors.New("invalid joined delivery telemetry")
 		}
 	}
+	if transfer := req.JoinedTransfer; transfer != nil {
+		if req.JoinedProtocol != 1 || transfer.ArtifactID <= 0 || transfer.ProtocolGeneration <= 0 ||
+			transfer.OffsetBytes < 0 || !connectionJoinedTransferOperations[transfer.Operation] ||
+			!connectionJoinedErrnoClasses[transfer.ErrnoClass] || transfer.ObservedAt == nil ||
+			transfer.ObservedAt.After(time.Now().Add(connectionHeartbeatFutureSkew)) {
+			return errors.New("invalid joined transfer telemetry")
+		}
+	}
 	if req.JoinedProtocol == 1 && req.ClientVersion == "" {
 		return errors.New("joined protocol capability requires client_version")
 	}
@@ -836,7 +860,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	var frozenScopeSHA string
-	if req.JoinedDelivery != nil {
+	if req.JoinedDelivery != nil || req.JoinedTransfer != nil {
 		var err error
 		frozenScopeSHA, err = joinedFrozenScopeSHA(s.cfg.JoinedRecordingBatchID)
 		if err != nil {
@@ -1009,6 +1033,40 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		}
 		if ct.RowsAffected() == 0 {
 			joinedDeliveryAccepted = false
+		}
+	}
+	if transfer := req.JoinedTransfer; transfer != nil {
+		if effectiveProtocol != 1 || transfer.ProtocolGeneration != desiredGeneration {
+			joinedDeliveryAccepted = false
+		} else {
+			ct, err := tx.Exec(r.Context(), `
+				UPDATE connections c SET
+				  joined_transfer_reset_count=CASE
+				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $6 < joined_transfer_offset_bytes
+				      THEN joined_transfer_reset_count+1
+				    WHEN joined_transfer_generation<>$5 OR joined_transfer_artifact_id IS DISTINCT FROM $4 THEN 0
+				    ELSE joined_transfer_reset_count END,
+				  joined_transfer_generation=$5,joined_transfer_artifact_id=$4,joined_transfer_offset_bytes=$6,
+				  joined_transfer_operation=$7,joined_transfer_errno_class=$8,joined_transfer_observed_at=$9
+				WHERE c.id=$1 AND c.joined_protocol_version=1 AND $4=(SELECT a.id `+joinedFeedHeadFromWhere+`)`,
+				connectionID, s.cfg.JoinedRecordingBatchID, frozenScopeSHA, transfer.ArtifactID,
+				transfer.ProtocolGeneration, transfer.OffsetBytes, transfer.Operation, transfer.ErrnoClass, transfer.ObservedAt)
+			if err != nil {
+				util.WriteError(w, http.StatusInternalServerError, "record joined transfer telemetry failed")
+				return
+			}
+			if ct.RowsAffected() == 0 {
+				var alreadyAcknowledged bool
+				if err := tx.QueryRow(r.Context(), `SELECT EXISTS(
+					SELECT 1 FROM recording_joined_artifacts a
+					JOIN recording_joined_artifact_acks ack ON ack.artifact_id=a.id AND ack.connection_id=a.connection_id
+					WHERE a.id=$1 AND a.connection_id=$2 AND a.batch_id=$3)`,
+					transfer.ArtifactID, connectionID, s.cfg.JoinedRecordingBatchID).Scan(&alreadyAcknowledged); err != nil {
+					util.WriteError(w, http.StatusInternalServerError, "check joined transfer acknowledgment failed")
+					return
+				}
+				joinedDeliveryAccepted = alreadyAcknowledged
+			}
 		}
 	}
 	if err := tx.Commit(r.Context()); err != nil {

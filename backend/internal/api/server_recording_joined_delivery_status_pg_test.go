@@ -53,7 +53,11 @@ func joinedDeliveryStatusTestPool(t *testing.T) (*pgxpool.Pool, func()) {
 		 last_cursor_id bigint NOT NULL DEFAULT 0,clips_pulled bigint NOT NULL DEFAULT 0,bytes_pulled bigint NOT NULL DEFAULT 0,
 		 client_last_success_at timestamptz,nas_batch_completed_at timestamptz,nas_batch_clips integer NOT NULL DEFAULT 0,
 		 nas_batch_bytes bigint NOT NULL DEFAULT 0,nas_batch_failures integer NOT NULL DEFAULT 0,
-		 joined_files_pulled bigint NOT NULL DEFAULT 0,joined_bytes_pulled bigint NOT NULL DEFAULT 0);
+		 joined_files_pulled bigint NOT NULL DEFAULT 0,joined_bytes_pulled bigint NOT NULL DEFAULT 0,
+		 joined_transfer_generation integer NOT NULL DEFAULT 0,joined_transfer_artifact_id bigint,
+		 joined_transfer_offset_bytes bigint NOT NULL DEFAULT 0,joined_transfer_operation text NOT NULL DEFAULT '',
+		 joined_transfer_errno_class text NOT NULL DEFAULT '',joined_transfer_observed_at timestamptz,
+		 joined_transfer_reset_count bigint NOT NULL DEFAULT 0);
 		CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint NOT NULL,delivery text NOT NULL);
 		CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint NOT NULL,size_bytes bigint NOT NULL,
 		 created_at timestamptz NOT NULL,purged_at timestamptz,released_at timestamptz);
@@ -196,7 +200,10 @@ func TestJoinedDeliveryStatusReadsExactAppendOnlyAckWithoutWriting(t *testing.T)
 		}
 	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET joined_last_attempt_artifact_id=480,
-		joined_last_blocker='download_error',joined_last_attempt_at=now(),joined_retry_at=now()+interval '1 minute' WHERE id=13`); err != nil {
+		joined_last_blocker='download_error',joined_last_attempt_at=now(),joined_retry_at=now()+interval '1 minute',
+		joined_transfer_generation=1,joined_transfer_artifact_id=492,joined_transfer_offset_bytes=8388608,
+		joined_transfer_operation='range',joined_transfer_errno_class='io',joined_transfer_observed_at=now(),
+		joined_transfer_reset_count=2 WHERE id=13`); err != nil {
 		t.Fatal(err)
 	}
 	s := &Server{pool: pool, cfg: config.Config{
@@ -236,12 +243,24 @@ func TestJoinedDeliveryStatusReadsExactAppendOnlyAckWithoutWriting(t *testing.T)
 		status.LastAttemptBlockerClass != "present" || status.LastAttemptBlockerSHA256 == "" ||
 		status.RawDelivery.LastCursorID != 100 || status.RawDelivery.ClipsPulled != 90 ||
 		status.RawDelivery.PendingClips != 1 || status.RawDelivery.PendingBytes != 250 ||
-		status.RawDelivery.JoinedFilesPulled != 7 || status.RawDelivery.JoinedBytesPulled != 700 {
+		status.RawDelivery.JoinedFilesPulled != 7 || status.RawDelivery.JoinedBytesPulled != 700 ||
+		status.TransferArtifactID == nil || *status.TransferArtifactID != 492 || status.TransferGeneration != 1 ||
+		status.TransferOffsetBytes != 8388608 || status.TransferOperation != "range" || status.TransferErrnoClass != "io" ||
+		status.TransferObservedAt == nil || status.TransferResetCount != 2 || status.TransferMatchesHead || !status.TransferGenerationCurrent {
 		t.Fatalf("unacked=%+v", status)
 	}
 	if strings.Contains(unacked.Body.String(), "download_error") {
 		t.Fatal("status exposed raw NAS blocker")
 	}
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	s.cfg.JoinedRecordingMaxActiveTasks = 1
+	s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
+	if frozen := call("492"); frozen.Code != http.StatusOK || !strings.Contains(frozen.Body.String(), `"transfer_offset_bytes":8388608`) {
+		t.Fatalf("frozen-batch transfer status=%d body=%s", frozen.Code, frozen.Body.String())
+	}
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeSingleCanary
+	s.cfg.JoinedRecordingCanaryHourIDs = hourID
 	assertCounts(4, 0)
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_artifact_acks VALUES(480,13,'coverage/ledgers/foreign.json',100,$1,now())`, sha); err != nil {
 		t.Fatal(err)

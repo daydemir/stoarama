@@ -307,6 +307,39 @@ class JoinedDownloadTests(unittest.TestCase):
             self.assertEqual(joined["blocker"], "download_failed")
             self.assertNotIn("secret", json.dumps(joined))
 
+    def test_joined_transfer_heartbeat_reports_only_fenced_progress(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            runtime.apply_joined_protocol_response(self.protocol_response(
+                1, pull.JOINED_FAIR_SHARE_MIN_GENERATION,
+            ))
+            runtime.set_joined_transfer(41, 8 * 1024 * 1024, "range")
+            transfer = runtime.heartbeat_payload(None)["joined_transfer"]
+            self.assertEqual(transfer, {
+                "artifact_id": 41,
+                "protocol_generation": pull.JOINED_FAIR_SHARE_MIN_GENERATION,
+                "offset_bytes": 8 * 1024 * 1024,
+                "operation": "range",
+                "errno_class": "",
+                "observed_at": transfer["observed_at"],
+            })
+            self.assertRegex(transfer["observed_at"], r"Z$")
+
+            runtime.set_joined_transfer_error(41, OSError(errno.ENOSPC, "/secret/path"))
+            failed = runtime.heartbeat_payload(None)["joined_transfer"]
+            self.assertEqual(failed["errno_class"], "no_space")
+            self.assertNotIn("secret", json.dumps(failed))
+
+            runtime.clear_joined_transfer()
+            self.assertNotIn("joined_transfer", runtime.heartbeat_payload(None))
+            runtime.set_joined_transfer(41, 1, "range")
+
+            runtime.apply_joined_protocol_response(self.protocol_response(
+                1, pull.JOINED_FAIR_SHARE_MIN_GENERATION + 1,
+            ))
+            self.assertNotIn("joined_transfer", runtime.heartbeat_payload(None))
+
     def test_joined_io_throttle_uses_cumulative_rate_and_is_stoppable(self):
         stop = mock.Mock()
         stop.wait.return_value = False
@@ -1152,6 +1185,8 @@ class JoinedDownloadTests(unittest.TestCase):
             final = pull.joined_output_path(cfg, item)
             self.assertFalse(final.exists())
             self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
+            transfer = runtime.heartbeat_payload(None)["joined_transfer"]
+            self.assertEqual((transfer["artifact_id"], transfer["offset_bytes"], transfer["operation"]), (item["id"], 3, "range"))
 
     def test_downgrade_after_download_stops_before_ack(self):
         raw_item = self.media_item()

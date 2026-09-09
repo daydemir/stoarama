@@ -17,32 +17,41 @@ import (
 const joinedDeliveryStatusInterval = time.Second
 
 type joinedDeliveryStatusResponse struct {
-	BatchID                  string                      `json:"batch_id"`
-	ArtifactID               int64                       `json:"artifact_id"`
-	ArtifactKind             string                      `json:"artifact_kind"`
-	HourID                   string                      `json:"hour_id"`
-	RelativePath             string                      `json:"relative_path"`
-	ExpectedSizeBytes        int64                       `json:"expected_size_bytes"`
-	ExpectedSHA256           string                      `json:"expected_sha256"`
-	PublicationState         string                      `json:"publication_state"`
-	PublishedAt              *time.Time                  `json:"published_at,omitempty"`
-	Acknowledged             bool                        `json:"acknowledged"`
-	VerifiedAt               *time.Time                  `json:"verified_at,omitempty"`
-	AcknowledgedPath         string                      `json:"acknowledged_relative_path,omitempty"`
-	AcknowledgedSize         *int64                      `json:"acknowledged_size_bytes,omitempty"`
-	AcknowledgedSHA256       string                      `json:"acknowledged_sha256,omitempty"`
-	IdentityMatches          bool                        `json:"identity_matches"`
-	ConnectionID             int64                       `json:"connection_id"`
-	ConnectionProtocol       int                         `json:"connection_protocol_version"`
-	ObservedAt               time.Time                   `json:"observed_at"`
-	FeedHead                 *joinedFeedHeadDiagnostic   `json:"feed_head,omitempty"`
-	LastAttemptArtifactID    *int64                      `json:"last_attempt_artifact_id,omitempty"`
-	LastAttemptBlockerClass  string                      `json:"last_attempt_blocker_class,omitempty"`
-	LastAttemptBlockerSHA256 string                      `json:"last_attempt_blocker_sha256,omitempty"`
-	LastAttemptAt            *time.Time                  `json:"last_attempt_at,omitempty"`
-	RetryAt                  *time.Time                  `json:"retry_at,omitempty"`
-	TelemetryMatchesHead     bool                        `json:"telemetry_matches_head"`
-	RawDelivery              joinedRawDeliveryDiagnostic `json:"raw_delivery"`
+	BatchID                   string                      `json:"batch_id"`
+	ArtifactID                int64                       `json:"artifact_id"`
+	ArtifactKind              string                      `json:"artifact_kind"`
+	HourID                    string                      `json:"hour_id"`
+	RelativePath              string                      `json:"relative_path"`
+	ExpectedSizeBytes         int64                       `json:"expected_size_bytes"`
+	ExpectedSHA256            string                      `json:"expected_sha256"`
+	PublicationState          string                      `json:"publication_state"`
+	PublishedAt               *time.Time                  `json:"published_at,omitempty"`
+	Acknowledged              bool                        `json:"acknowledged"`
+	VerifiedAt                *time.Time                  `json:"verified_at,omitempty"`
+	AcknowledgedPath          string                      `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize          *int64                      `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256        string                      `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches           bool                        `json:"identity_matches"`
+	ConnectionID              int64                       `json:"connection_id"`
+	ConnectionProtocol        int                         `json:"connection_protocol_version"`
+	ObservedAt                time.Time                   `json:"observed_at"`
+	FeedHead                  *joinedFeedHeadDiagnostic   `json:"feed_head,omitempty"`
+	LastAttemptArtifactID     *int64                      `json:"last_attempt_artifact_id,omitempty"`
+	LastAttemptBlockerClass   string                      `json:"last_attempt_blocker_class,omitempty"`
+	LastAttemptBlockerSHA256  string                      `json:"last_attempt_blocker_sha256,omitempty"`
+	LastAttemptAt             *time.Time                  `json:"last_attempt_at,omitempty"`
+	RetryAt                   *time.Time                  `json:"retry_at,omitempty"`
+	TelemetryMatchesHead      bool                        `json:"telemetry_matches_head"`
+	TransferArtifactID        *int64                      `json:"transfer_artifact_id,omitempty"`
+	TransferGeneration        int                         `json:"transfer_protocol_generation,omitempty"`
+	TransferOffsetBytes       int64                       `json:"transfer_offset_bytes,omitempty"`
+	TransferOperation         string                      `json:"transfer_operation,omitempty"`
+	TransferErrnoClass        string                      `json:"transfer_errno_class,omitempty"`
+	TransferObservedAt        *time.Time                  `json:"transfer_observed_at,omitempty"`
+	TransferResetCount        int64                       `json:"transfer_reset_count,omitempty"`
+	TransferMatchesHead       bool                        `json:"transfer_matches_head"`
+	TransferGenerationCurrent bool                        `json:"transfer_generation_current"`
+	RawDelivery               joinedRawDeliveryDiagnostic `json:"raw_delivery"`
 }
 
 type joinedFeedHeadDiagnostic struct {
@@ -90,7 +99,7 @@ func (s *Server) joinedDeliveryStatusAllowed(now time.Time) bool {
 }
 
 // handleJoinedDeliveryStatus exposes the append-only NAS acknowledgement for
-// one exact artifact in the configured canary scope. It never contacts the NAS
+// one exact artifact in the configured joined scope. It never contacts the NAS
 // and cannot create, retry, or acknowledge a delivery.
 func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -128,9 +137,14 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusServiceUnavailable, "joined work scope is unavailable")
 		return
 	}
-	canaryIDs, err := s.cfg.JoinedCanaryHourIDs()
-	if err != nil || !config.IsJoinedCanaryWorkScope(workScope) {
-		util.WriteError(w, http.StatusConflict, "joined delivery status requires an exact canary scope")
+	var canaryIDs []string
+	if config.IsJoinedCanaryWorkScope(workScope) {
+		canaryIDs, err = s.cfg.JoinedCanaryHourIDs()
+	} else if workScope != config.JoinedWorkScopeFrozenBatch {
+		err = errors.New("unsupported joined scope")
+	}
+	if err != nil {
+		util.WriteError(w, http.StatusConflict, "joined delivery status requires an active joined scope")
 		return
 	}
 
@@ -161,8 +175,9 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		JOIN connections c ON c.id=a.connection_id AND c.id=$2
 		LEFT JOIN recording_joined_artifact_acks ack ON ack.artifact_id=a.id AND ack.connection_id=a.connection_id
 		WHERE a.id=$3 AND a.batch_id=$1 AND a.batch_record_id=b.id
-		  AND a.artifact_kind IN ('hour_manifest','media') AND h.hour_id=ANY($4::text[])`,
-		batchValues[0], s.cfg.JoinedRecordingConnectionID, artifactID, canaryIDs).Scan(
+		  AND a.artifact_kind IN ('hour_manifest','media') AND ($4 OR h.hour_id=ANY($5::text[]))`,
+		batchValues[0], s.cfg.JoinedRecordingConnectionID, artifactID,
+		workScope == config.JoinedWorkScopeFrozenBatch, canaryIDs).Scan(
 		&response.ArtifactKind, &response.HourID, &response.RelativePath, &response.ExpectedSizeBytes,
 		&response.ExpectedSHA256, &response.PublicationState, &response.PublishedAt, &response.VerifiedAt,
 		&acknowledgedPath, &acknowledgedSize, &acknowledgedSHA, &response.ConnectionID, &response.ConnectionProtocol)
@@ -210,7 +225,10 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		conn.joined_last_attempt_at,conn.joined_retry_at,conn.last_cursor_id,conn.clips_pulled,conn.bytes_pulled,
 		conn.client_last_success_at,conn.nas_batch_completed_at,conn.nas_batch_clips,conn.nas_batch_bytes,
 		conn.nas_batch_failures,pending.clips,pending.bytes,pending.oldest_at,
-		conn.joined_files_pulled,conn.joined_bytes_pulled
+		conn.joined_files_pulled,conn.joined_bytes_pulled,
+		conn.joined_transfer_artifact_id,conn.joined_transfer_generation,conn.joined_transfer_offset_bytes,
+		conn.joined_transfer_operation,conn.joined_transfer_errno_class,conn.joined_transfer_observed_at,
+		conn.joined_transfer_reset_count
 		FROM connections conn `+connectionPendingLateralSQL+`
 		WHERE conn.id=$1 AND conn.kind='nas_pull'`, response.ConnectionID).Scan(
 		&response.LastAttemptArtifactID, &blocker, &response.LastAttemptAt, &response.RetryAt,
@@ -218,7 +236,10 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 		&response.RawDelivery.ClientLastSuccessAt, &response.RawDelivery.NASBatchCompletedAt,
 		&response.RawDelivery.NASBatchClips, &response.RawDelivery.NASBatchBytes, &response.RawDelivery.NASBatchFailures,
 		&response.RawDelivery.PendingClips, &response.RawDelivery.PendingBytes, &response.RawDelivery.OldestPendingAt,
-		&response.RawDelivery.JoinedFilesPulled, &response.RawDelivery.JoinedBytesPulled)
+		&response.RawDelivery.JoinedFilesPulled, &response.RawDelivery.JoinedBytesPulled,
+		&response.TransferArtifactID, &response.TransferGeneration, &response.TransferOffsetBytes,
+		&response.TransferOperation, &response.TransferErrnoClass, &response.TransferObservedAt,
+		&response.TransferResetCount)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined delivery telemetry failed")
 		return
@@ -227,6 +248,9 @@ func (s *Server) handleJoinedDeliveryStatus(w http.ResponseWriter, r *http.Reque
 	response.LastAttemptBlockerSHA256 = joinedClientErrorSHA256(blocker)
 	response.TelemetryMatchesHead = response.FeedHead != nil && response.LastAttemptArtifactID != nil &&
 		*response.LastAttemptArtifactID == response.FeedHead.ArtifactID
+	response.TransferMatchesHead = response.FeedHead != nil && response.TransferArtifactID != nil &&
+		*response.TransferArtifactID == response.FeedHead.ArtifactID
+	response.TransferGenerationCurrent = response.TransferGeneration == s.cfg.JoinedRecordingProtocolGeneration
 	if err := tx.Commit(ctx); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "finish joined delivery status read failed")
 		return

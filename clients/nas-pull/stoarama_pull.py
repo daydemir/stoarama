@@ -946,6 +946,7 @@ class Runtime:
         self.joined_protocol_version = 0
         self.joined_protocol_generation = 0
         self.joined_delivery = None
+        self.joined_transfer = None
         self.joined_raw_priority_polled_at = 0.0
         self.joined_raw_priority_pending = False
         # A new client explicitly clears any stale server-side capacity until
@@ -1098,6 +1099,7 @@ class Runtime:
                     return
                 self.joined_protocol_generation = generation
                 self.joined_protocol_version = version
+                self.joined_transfer = None
         with self.joined_work_condition:
             self.joined_work_condition.notify_all()
 
@@ -1126,6 +1128,30 @@ class Runtime:
     def clear_joined_delivery_error(self):
         with self.lock:
             self.joined_delivery = None
+
+    def set_joined_transfer(self, artifact_id, offset_bytes, operation):
+        with self.lock:
+            if self.joined_protocol_version != JOINED_PROTOCOL_VERSION:
+                return
+            self.joined_transfer = {
+                "artifact_id": int(artifact_id),
+                "protocol_generation": self.joined_protocol_generation,
+                "offset_bytes": max(0, int(offset_bytes)),
+                "operation": operation,
+                "errno_class": "",
+                "observed_at": utc_now_precise(),
+            }
+
+    def set_joined_transfer_error(self, artifact_id, exc):
+        with self.lock:
+            if self.joined_transfer is None or self.joined_transfer["artifact_id"] != int(artifact_id):
+                return
+            self.joined_transfer["errno_class"] = joined_errno_class(exc)
+            self.joined_transfer["observed_at"] = utc_now_precise()
+
+    def clear_joined_transfer(self):
+        with self.lock:
+            self.joined_transfer = None
 
     def reserve_joined_storage(self, cfg, storage, expected_bytes):
         """Reserve one joined range only when it cannot consume raw headroom."""
@@ -1189,6 +1215,7 @@ class Runtime:
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
             joined_delivery = self.joined_delivery.copy() if self.joined_delivery is not None else None
+            joined_transfer = self.joined_transfer.copy() if self.joined_transfer is not None else None
         if outage:
             payload["last_outage"] = outage
         if storage is not None and storage_age <= STORAGE_TELEMETRY_MAX_AGE_SEC:
@@ -1197,6 +1224,8 @@ class Runtime:
             payload["storage"] = {"available": False}
         if joined_delivery is not None and payload["joined_protocol_version"] == JOINED_PROTOCOL_VERSION:
             payload["joined_delivery"] = joined_delivery
+        if joined_transfer is not None and payload["joined_protocol_version"] == JOINED_PROTOCOL_VERSION:
+            payload["joined_transfer"] = joined_transfer
         if self.inventory is not None:
             inventory = self.inventory.summary()
             if inventory is not None:
@@ -5165,6 +5194,7 @@ def download_joined_item(cfg, runtime, item, stop_event):
         if part_size > item["size_bytes"]:
             truncate_joined_part(directory_fd, part_name)
             part_size = 0
+        runtime.set_joined_transfer(item["id"], part_size, "range")
         while part_size < item["size_bytes"]:
             if not runtime.joined_protocol_enabled() or stop_event.is_set():
                 raise JoinedDownloadYield("joined download stopped at a range boundary")
@@ -5183,9 +5213,11 @@ def download_joined_item(cfg, runtime, item, stop_event):
             finally:
                 runtime.release_storage_reservation(range_bytes)
             part_size = end + 1
+            runtime.set_joined_transfer(item["id"], part_size, "range")
         if not runtime.joined_protocol_enabled():
             raise JoinedDownloadYield("joined protocol was disabled")
         joined_raw_priority_boundary(cfg, runtime, stop_event)
+        runtime.set_joined_transfer(item["id"], part_size, "verify")
         try:
             verify_joined_entry(
                 cfg, runtime, directory_fd, part_name, item["size_bytes"], item["sha256"], stop_event,
@@ -5194,8 +5226,10 @@ def download_joined_item(cfg, runtime, item, stop_event):
             truncate_joined_part(directory_fd, part_name)
             raise RuntimeError("joined download checksum mismatch; partial restarted")
         joined_raw_priority_boundary(cfg, runtime, stop_event)
+        runtime.set_joined_transfer(item["id"], part_size, "validate")
         validate_joined_artifact(cfg, runtime, directory_fd, part_name, item, stop_event)
         joined_raw_priority_boundary(cfg, runtime, stop_event)
+        runtime.set_joined_transfer(item["id"], part_size, "publish")
         def publish_final():
             os.link(part_name, final_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
             os.fsync(directory_fd)
@@ -5325,11 +5359,13 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
         log("INFO", "joined artifact_id=%d stopped at a safe boundary" % item["id"])
         return False
     except Exception as exc:
+        runtime.set_joined_transfer_error(item["id"], exc)
         runtime.set_joined_delivery_error(
             item["id"], classify_joined_delivery_error(exc), min(getattr(cfg, "poll_interval_sec", 60), 10),
         )
         raise
     runtime.clear_joined_delivery_error()
+    runtime.clear_joined_transfer()
     log(
         "INFO", "joined artifact_id=%d bytes=%d saved=%s%s"
         % (item["id"], item["size_bytes"], joined_output_path(cfg, item), "" if downloaded else " existing"),
@@ -5347,6 +5383,23 @@ def classify_joined_delivery_error(exc):
     if "checksum mismatch" in str(exc):
         return "hash_mismatch"
     return "download_failed"
+
+
+def joined_errno_class(exc):
+    cursor = exc
+    while cursor is not None:
+        if isinstance(cursor, OSError):
+            if cursor.errno in (errno.ENOSPC, errno.EDQUOT):
+                return "no_space"
+            if cursor.errno in (errno.EACCES, errno.EPERM):
+                return "permission"
+            if cursor.errno == errno.ENOENT:
+                return "missing"
+            if cursor.errno == errno.EIO:
+                return "io"
+            return "os_error"
+        cursor = cursor.__cause__
+    return ""
 
 
 def joined_loop(cfg, runtime, stop_event):
