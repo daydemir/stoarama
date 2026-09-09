@@ -815,6 +815,9 @@ func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce fu
 		}
 		worked, err := runOnce(ctx, taskBase)
 		if err != nil {
+			if errors.Is(err, errJoinedPublicationRetryAcknowledged) {
+				continue
+			}
 			if errors.Is(err, errJoinedTaskFailureReported) {
 				return nil
 			}
@@ -884,6 +887,9 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 			workCtx = context.WithValue(workCtx, joinedOperationTrackerContextKey{}, tracker)
 			return s.processClaim(workCtx, publication, req.ScratchRoot)
 		})
+		if workScope.WorkScope == config.JoinedWorkScopeFrozenBatch {
+			return true, s.reportJoinedPublicationFailure(admissionCtx, taskCtx, tracker.get(), kind, id, taskErr)
+		}
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
 	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
