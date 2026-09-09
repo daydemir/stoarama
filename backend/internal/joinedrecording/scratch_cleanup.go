@@ -1,8 +1,11 @@
 package joinedrecording
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +14,132 @@ import (
 
 const scratchReapPrefix = ".reap-"
 const scratchLeaseProofLimit = 256
+const failedEvidenceDirectory = ".failed-evidence"
+
+type FailedPreflightDiagnostic struct {
+	ReasonCode     string `json:"reason_code"`
+	FailureCode    string `json:"failure_code,omitempty"`
+	EvidenceSHA256 string `json:"evidence_sha256,omitempty"`
+	SealClass      string `json:"seal_class,omitempty"`
+	MediaOrdinal   int    `json:"media_ordinal,omitempty"`
+	ProofOrdinal   int    `json:"proof_ordinal,omitempty"`
+}
+
+func PreserveFailedPreflightEvidence(root string, claim PreflightHourClaim, diagnostic FailedPreflightDiagnostic) error {
+	if err := validatePrivateScratchRoot(root); err != nil {
+		return err
+	}
+	if !validLeaseID(claim.LeaseID) || claim.HourID == "" || !lowerHex64(claim.SourceClaimSHA256) || len(claim.Sources) == 0 || !safeReasonCode(diagnostic.ReasonCode) {
+		return fmt.Errorf("invalid joined failed preflight evidence")
+	}
+	mediaDiagnostic := safeReasonCode(diagnostic.FailureCode) && (diagnostic.EvidenceSHA256 == "" || lowerHex64(diagnostic.EvidenceSHA256)) && diagnostic.SealClass == "" && diagnostic.MediaOrdinal == 0 && diagnostic.ProofOrdinal == 0
+	sealClass := SealValidationClass(diagnostic.SealClass)
+	sealDiagnostic := diagnostic.FailureCode == "" && diagnostic.EvidenceSHA256 == "" && sealClass.Valid() && diagnostic.MediaOrdinal >= 0 && diagnostic.ProofOrdinal >= 0
+	if !mediaDiagnostic && !sealDiagnostic {
+		return fmt.Errorf("invalid joined failed preflight diagnostic")
+	}
+	type source struct {
+		ClipID int64          `json:"clip_id"`
+		Object ObjectIdentity `json:"object"`
+	}
+	record := struct {
+		Schema            int                       `json:"schema"`
+		BatchID           string                    `json:"batch_id"`
+		HourID            string                    `json:"hour_id"`
+		LeaseID           string                    `json:"lease_id"`
+		RecordingID       int64                     `json:"recording_id"`
+		LocalDate         string                    `json:"local_date"`
+		LocalHour         int                       `json:"local_hour"`
+		SourceClaimSHA256 string                    `json:"source_claim_sha256"`
+		Sources           []source                  `json:"sources"`
+		MediaToolIdentity string                    `json:"media_tool_identity_sha256"`
+		Diagnostic        FailedPreflightDiagnostic `json:"diagnostic"`
+	}{1, claim.BatchID, claim.HourID, claim.LeaseID, claim.RecordingID, claim.LocalDate, claim.LocalHour, claim.SourceClaimSHA256, make([]source, len(claim.Sources)), claim.MediaTool.IdentitySHA256, diagnostic}
+	for i, item := range claim.Sources {
+		record.Sources[i] = source{item.ClipID, item.Object}
+	}
+	payload, err := json.Marshal(record)
+	if err != nil || len(payload) > 1<<20 {
+		return fmt.Errorf("encode joined failed preflight evidence")
+	}
+	payload = append(payload, '\n')
+	rootHandle, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("open joined scratch root: %w", err)
+	}
+	defer rootHandle.Close()
+	createdDirectory := false
+	if err := rootHandle.Mkdir(failedEvidenceDirectory, 0o700); err == nil {
+		createdDirectory = true
+	} else if !os.IsExist(err) {
+		return fmt.Errorf("create joined failed evidence directory: %w", err)
+	}
+	if createdDirectory {
+		rootDir, err := rootHandle.Open(".")
+		if err != nil {
+			return fmt.Errorf("open joined scratch root directory: %w", err)
+		}
+		err = rootDir.Sync()
+		closeErr := rootDir.Close()
+		if err != nil {
+			return fmt.Errorf("sync joined scratch root: %w", err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close joined scratch root: %w", closeErr)
+		}
+	}
+	if info, err := rootHandle.Lstat(failedEvidenceDirectory); err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("joined failed evidence directory is not private")
+	}
+	name := failedEvidenceDirectory + "/" + claim.LeaseID + ".json"
+	file, err := rootHandle.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if os.IsExist(err) {
+		info, statErr := rootHandle.Lstat(name)
+		if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("joined failed evidence file is invalid")
+		}
+		existing, openErr := rootHandle.Open(name)
+		if openErr != nil {
+			return fmt.Errorf("open joined failed evidence: %w", openErr)
+		}
+		got, readErr := io.ReadAll(io.LimitReader(existing, 1<<20+1))
+		closeErr := existing.Close()
+		if readErr != nil || closeErr != nil || !bytes.Equal(got, payload) {
+			return fmt.Errorf("joined failed evidence differs")
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create joined failed evidence: %w", err)
+	}
+	var written int
+	if written, err = file.Write(payload); err == nil && written != len(payload) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return fmt.Errorf("write joined failed evidence: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close joined failed evidence: %w", closeErr)
+	}
+	leaseDir, err := rootHandle.Open(failedEvidenceDirectory)
+	if err != nil {
+		return fmt.Errorf("open joined failed evidence directory: %w", err)
+	}
+	err = leaseDir.Sync()
+	closeErr = leaseDir.Close()
+	if err != nil {
+		return fmt.Errorf("sync joined failed evidence directory: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close joined failed evidence directory: %w", closeErr)
+	}
+	return nil
+}
 
 // ScratchLeaseProof marks leases that the API proved cannot own live work.
 // Missing and false entries are retained. Cleanup must fail closed when proof

@@ -146,6 +146,20 @@ func TestPreflightPreservesMediaToolInspectionErrorBeforeSourceAccess(t *testing
 	}
 }
 
+func TestPreflightOuterDeadlineBeforeSealIsTyped(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	claim := PreflightHourClaim{LeaseID: strings.Repeat("L", 43), OperationToken: strings.Repeat("a", 32), LeaseExpires: time.Now().Add(time.Hour)}
+	sealed := false
+	_, _, err := runPreflightHourRenewing(ctx, claim, t.TempDir(), nil, testSourceAuthority, noHeartbeat,
+		func(context.Context, PreflightHourClaim, SourceClip, string) (SourceReadCapability, error) { return SourceReadCapability{}, nil },
+		func(context.Context, PreflightHourClaim, SealHourRequest) (WorkerClaim, error) { sealed = true; return WorkerClaim{}, nil },
+		func(ctx context.Context, _ OperationCredentials, _ HeartbeatOperation, _ func(context.Context, func() OperationCredentials) error) error { <-ctx.Done(); return ctx.Err() })
+	if !errors.Is(err, ErrPreflightDeadlineBeforeSeal) || sealed {
+		t.Fatalf("deadline err=%v sealed=%t", err, sealed)
+	}
+}
+
 func TestLedgerAndBatchIndexRenewingUseRefreshedToken(t *testing.T) {
 	leaseID := strings.Repeat("L", 43)
 	initialToken, refreshedToken := strings.Repeat("a", 32), strings.Repeat("b", 32)
