@@ -771,7 +771,7 @@ func TestRecordingJoinedColumnSortsLazyValuesAndDistinguishesZeroFromUnavailable
 		`const direction = sort === 'joined_asc' ? 1 : -1;`,
 		`if (left.available !== right.available) return left.available ? -1 : 1;`,
 		`if (left.available && left.percent !== right.percent) return direction * (left.percent - right.percent);`,
-		`if (!(sourceMS > 0) || rawPercent === null || rawPercent === undefined`,
+		`if (!Number.isFinite(sourceMS) || !(sourceMS > 0) || rawPercent === null || rawPercent === undefined`,
 		`return { available: false, percent: null, sourceMS: 0, readyMS: 0 };`,
 		`available: true,`,
 		`>${joined.percent}%</div>`,
@@ -967,6 +967,8 @@ func TestRecordingListLoadsJoinedProgressInProgressiveBoundedBatches(t *testing.
 		"state.joinedProgressError = hadError;",
 		"mergeRecordingMetricItems(payload.items);",
 		"renderCards();",
+		"state.joinedProgressUpdatedAt = hadError ? null : new Date();",
+		"renderJoinedProgressFreshness();",
 	} {
 		if !strings.Contains(page, marker) {
 			t.Fatalf("recordings html missing progressive joined-progress marker %q", marker)
@@ -983,6 +985,27 @@ func TestRecordingListLoadsJoinedProgressInProgressiveBoundedBatches(t *testing.
 	catchAt := strings.LastIndex(section[:failedBatchAt], "} catch (_) {")
 	if catchAt < 0 || staleGuardAt < catchAt {
 		t.Fatal("failed joined batch can update a newer recordings load")
+	}
+}
+
+func TestRecordingListLabelsJoinedOutputWithoutClaimingProcessingCompletion(t *testing.T) {
+	body, err := loadHTMLPage("recordings.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(body)
+	for _, marker := range []string{
+		`id="joinedProgressFreshness"`,
+		`100% media ready`,
+		`Joined data loaded`,
+		`mediaReady: Number.isFinite(readyMS) && readyMS >= sourceMS`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("recordings html missing joined completion marker %q", marker)
+		}
+	}
+	if strings.Contains(page, "Processing complete") || strings.Contains(page, "All footage joined") {
+		t.Fatal("joined media percentage must not claim terminal processing or complete delivery")
 	}
 }
 
