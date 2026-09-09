@@ -58,13 +58,15 @@ func TestUploadVerifyFailureStagesAreClosedAndBounded(t *testing.T) {
 func TestStageTimingExtractsOnlySealValidationCoordinates(t *testing.T) {
 	var got StageTimingEvent
 	ctx := WithStageTimingObserver(context.Background(), func(event StageTimingEvent) { got = event })
+	const secret = "token=must-not-log path=/tmp/source-secret.mp4"
 	err := fmt.Errorf("%w: %w", ErrPreflightSealRequestInvalid,
-		newSealValidationError(SealValidationMaximalityProof, 59, 1, "joined hour seal maximality differs"))
+		&sealValidationError{class: SealValidationQuarantineProof, proofOrdinal: 1,
+			message: "joined hour seal quarantine differs", cause: errors.New(secret)})
 	emitStageTiming(ctx, "build_verify", time.Millisecond, err)
-	if got.ValidationClass != SealValidationMaximalityProof || got.MediaOrdinal != 59 || got.ProofOrdinal != 1 {
+	if got.ValidationClass != SealValidationQuarantineProof || got.MediaOrdinal != 0 || got.ProofOrdinal != 1 {
 		t.Fatalf("validation timing coordinates differ: %+v", got)
 	}
-	if strings.Contains(fmt.Sprint(got), "joined hour seal maximality differs") {
+	if rendered := fmt.Sprint(got); strings.Contains(rendered, secret) || strings.Contains(rendered, "/tmp/") || strings.Contains(rendered, "token=") {
 		t.Fatalf("validation payload escaped into timing event: %+v", got)
 	}
 }
