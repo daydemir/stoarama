@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -76,9 +77,11 @@ func joinedRetryableAdmissionPath(err error) (string, bool) {
 }
 
 func joinedAdmissionPath(path string) bool {
-	switch path {
+	base, _, _ := strings.Cut(path, "?")
+	switch base {
 	case "/api/v1/recording/joined/token", "/api/v1/recording/joined/publication/claim",
-		"/api/v1/recording/joined/claim", "/api/v1/recording/joined/leases/status":
+		"/api/v1/recording/joined/claim", "/api/v1/recording/joined/leases/status",
+		"/api/v1/recording/joined/status":
 		return true
 	default:
 		return false
