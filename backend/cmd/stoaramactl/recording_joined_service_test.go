@@ -1392,8 +1392,9 @@ func TestJoinedStageTimingLogIncludesOnlyBoundedSealValidationDiagnostic(t *test
 		event := joinedrecording.StageTimingEvent{Stage: "build_verify", ElapsedMS: 1234, Outcome: "error",
 			ValidationClass: test.class, MediaOrdinal: test.mediaOrdinal, ProofOrdinal: test.proofOrdinal}
 		got := joinedStageTimingLog("batch__recording-429__hour-01", event)
-		if !strings.HasSuffix(got, test.want) {
-			t.Fatalf("diagnostic log=%q want suffix=%q", got, test.want)
+		want := "joined worker stage timing hour_id=batch__recording-429__hour-01 stage=build_verify elapsed_ms=1234 outcome=error " + test.want
+		if got != want {
+			t.Fatalf("diagnostic log=%q want=%q", got, want)
 		}
 		for _, forbidden := range []string{"https://", "X-Amz-", "token", "object_key", "/tmp/", "payload"} {
 			if strings.Contains(got, forbidden) {
