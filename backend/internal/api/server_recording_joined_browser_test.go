@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -46,26 +47,58 @@ func TestJoinedFolderEntriesDrillMonthWeekdayAndExposeOnlyLeafFiles(t *testing.T
 		{Kind: "media", ContentType: "video/mp4", RelativePath: "377_Europe_Poland_Luban/August/Friday/c.mp4", DownloadPath: "/joined/3", LocalDate: "2026-08-07", ScheduledFrom: from, ScheduledTo: from.Add(30 * time.Minute), SizeBytes: 3 * 1024 * 1024},
 	}
 	root := "/api/v1/shared/mit-scl/recordings/377/joined/folder"
-	folders, files, found := joinedFolderEntries(root, source, nil)
+	folders, files, found := joinedFolderEntries(root, source, nil, true)
 	if !found || len(folders) != 1 || folders[0].Name != "August" || folders[0].Count != 3 || len(files) != 0 {
 		t.Fatalf("root folders=%+v files=%+v found=%v", folders, files, found)
 	}
-	folders, files, found = joinedFolderEntries(root, source, []string{"August"})
+	if folders[0].ArchivePath != root+"/archive?folder=August" {
+		t.Fatalf("root child archive=%q", folders[0].ArchivePath)
+	}
+	folders, files, found = joinedFolderEntries(root, source, []string{"August"}, true)
 	if !found || len(folders) != 2 || folders[0].Name != "Thursday" || folders[0].Count != 2 || len(files) != 0 {
 		t.Fatalf("month folders=%+v files=%+v found=%v", folders, files, found)
 	}
-	folders, files, found = joinedFolderEntries(root, source, []string{"August", "Thursday"})
+	if folders[0].ArchivePath != root+"/archive?folder=August%2FThursday" {
+		t.Fatalf("month child archive=%q", folders[0].ArchivePath)
+	}
+	folders, files, found = joinedFolderEntries(root, source, []string{"August", "Thursday"}, true)
 	if !found || len(folders) != 0 || len(files) != 2 || files[0].Name != "a.mp4" || files[0].DownloadPath != "/joined/1" {
 		t.Fatalf("weekday folders=%+v files=%+v found=%v", folders, files, found)
 	}
 	if files[0].Size != "1.0 KB" {
 		t.Fatalf("leaf metadata=%+v", files[0])
 	}
-	if _, _, found = joinedFolderEntries(root, source, []string{"September"}); found {
+	if _, _, found = joinedFolderEntries(root, source, []string{"September"}, true); found {
 		t.Fatal("missing folder reported as found")
 	}
 	if got := joinedCanonicalRootName(source); got != "377_Europe_Poland_Luban" {
 		t.Fatalf("canonical root=%q", got)
+	}
+}
+
+func TestJoinedFolderEntriesHideArchivesWhenWorkerIsDisabled(t *testing.T) {
+	source := []recordingJoinedFile{{RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4"}}
+	folders, _, found := joinedFolderEntries("/joined/folder", source, nil, false)
+	if !found || len(folders) != 1 || folders[0].ArchivePath != "" {
+		t.Fatalf("folders=%+v found=%v", folders, found)
+	}
+}
+
+func TestJoinedFolderTemplateShowsChildArchiveControl(t *testing.T) {
+	var rendered bytes.Buffer
+	err := joinedFolderTemplate.Execute(&rendered, joinedFolderPage{
+		Folders: []joinedFolderEntry{{
+			Name: "August", Count: 2, Path: "/joined/folder?folder=August",
+			ArchivePath: "/joined/folder/archive?folder=August",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`href="/joined/folder?folder=August"`, `href="/joined/folder/archive?folder=August"`, `Download ZIP`} {
+		if !bytes.Contains(rendered.Bytes(), []byte(want)) {
+			t.Fatalf("rendered folder page missing %q", want)
+		}
 	}
 }
 
