@@ -293,6 +293,8 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 	retry := observed.Add(time.Minute)
 	headHour := "older-hour-1"
 	lastAttemptID := int64(401)
+	transferID := int64(401)
+	transferObserved := observed.Add(-30 * time.Second)
 	blockerSHA := strings.Repeat("b", 64)
 	lastSuccess := observed.Add(-2 * time.Minute)
 	batchCompleted := observed.Add(-3 * time.Minute)
@@ -312,6 +314,9 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 				HourID: &headHour, Kind: "media", Ordinal: 2, ExpectedSizeBytes: 99, ExpectedSHA256: strings.Repeat("c", 64)},
 			LastAttemptArtifactID: &lastAttemptID, LastAttemptBlockerClass: "present",
 			LastAttemptBlockerSHA256: blockerSHA, LastAttemptAt: &attempted, RetryAt: &retry, TelemetryMatchesHead: true,
+			TransferArtifactID: &transferID, TransferGeneration: 10, TransferOffsetBytes: 8 << 20,
+			TransferOperation: "range", TransferErrnoClass: "io", TransferObservedAt: &transferObserved,
+			TransferResetCount: 1, TransferMatchesHead: true, TransferGenerationCurrent: true,
 			RawDelivery: joinedRawDeliveryStatus{LastCursorID: 100, ClipsPulled: 90, BytesPulled: 9000,
 				ClientLastSuccessAt: &lastSuccess, NASBatchCompletedAt: &batchCompleted, NASBatchClips: 4,
 				NASBatchBytes: 400, PendingClips: 3, PendingBytes: 300, OldestPendingAt: &oldestPending,
@@ -334,6 +339,10 @@ func TestJoinedDeliveryStatusUsesOperatorReadContract(t *testing.T) {
 		got.LastAttemptBlockerClass != "present" || got.LastAttemptBlockerSHA256 != blockerSHA ||
 		got.LastAttemptAt == nil || !got.LastAttemptAt.Equal(attempted) || got.RetryAt == nil || !got.RetryAt.Equal(retry) ||
 		!got.TelemetryMatchesHead || got.RawDelivery.LastCursorID != 100 || got.RawDelivery.ClipsPulled != 90 ||
+		got.TransferArtifactID == nil || *got.TransferArtifactID != transferID || got.TransferGeneration != 10 ||
+		got.TransferOffsetBytes != 8<<20 || got.TransferOperation != "range" || got.TransferErrnoClass != "io" ||
+		got.TransferObservedAt == nil || !got.TransferObservedAt.Equal(transferObserved) || got.TransferResetCount != 1 ||
+		!got.TransferMatchesHead || !got.TransferGenerationCurrent ||
 		got.RawDelivery.PendingClips != 3 || got.RawDelivery.PendingBytes != 300 ||
 		got.RawDelivery.ClientLastSuccessAt == nil || !got.RawDelivery.ClientLastSuccessAt.Equal(lastSuccess) ||
 		got.RawDelivery.OldestPendingAt == nil || !got.RawDelivery.OldestPendingAt.Equal(oldestPending) ||
