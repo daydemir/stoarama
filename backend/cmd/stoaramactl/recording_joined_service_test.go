@@ -405,6 +405,29 @@ func TestJoinedWorkerClaimsPublicationBeforePreflight(t *testing.T) {
 	}
 }
 
+func TestJoinedPresealContinuationScopeAndFailureFence(t *testing.T) {
+	frozen, err := joinedrecording.NewWorkScopeIdentity("tier1-2026-08", joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canary, err := joinedrecording.NewWorkScopeIdentity("tier1-2026-08", joinedrecording.WorkScopeSingleCanary, []string{"tier1-2026-08__recording-377__date-2026-08-01__hour-01__generation-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := errors.Join(joinedrecording.ErrPresealMediaSplitNotIsolated, joinedrecording.ErrPresealMediaBoundaryContradiction)
+	deadline := errors.Join(errJoinedWorkerTaskDeadline, joinedrecording.ErrPreflightDeadlineBeforeSeal, context.DeadlineExceeded)
+	for _, taskErr := range []error{boundary, deadline} {
+		if !joinedMayContinuePreflight(frozen, taskErr) || joinedMayContinuePreflight(canary, taskErr) {
+			t.Fatalf("scope fence failed for %v", taskErr)
+		}
+	}
+	for _, taskErr := range []error{errors.Join(boundary, errors.New("unknown")), errors.Join(boundary, syscall.EIO), errors.Join(boundary, joinedrecording.ErrWorkerHeartbeatFailed), errors.Join(deadline, joinedrecording.ErrWorkerHeartbeatFailed)} {
+		if joinedMayContinuePreflight(frozen, taskErr) {
+			t.Fatalf("unsafe failure continued: %v", taskErr)
+		}
+	}
+}
+
 func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
 	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
 	cfg := validJoinedWorkerConfig()

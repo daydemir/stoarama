@@ -28,6 +28,22 @@ type generatedEvidence struct {
 	active *strings.Reader
 }
 
+func TestRecoverablePresealMediaFailureRejectsInfrastructureErrors(t *testing.T) {
+	deterministic := deterministicFailure("media_sequence_mismatch", struct{ Clip int }{7}, errors.New("repeatable mismatch"))
+	if !RecoverablePresealMediaFailure(errors.Join(errMediaSplitNotIsolated, deterministic)) {
+		t.Fatal("deterministic isolated media failure was not recoverable")
+	}
+	if !RecoverablePresealMediaFailure(errors.Join(errMediaSplitNotIsolated, ErrPresealMediaBoundaryContradiction)) {
+		t.Fatal("typed boundary contradiction was not recoverable")
+	}
+	unknown := errors.New("unknown process failure")
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded, syscall.ENOSPC, unknown, &os.PathError{Op: "read", Path: "source", Err: syscall.EIO}, errors.Join(deterministic, context.DeadlineExceeded), errors.Join(deterministic, ErrWorkerHeartbeatFailed), errors.Join(deterministic, unknown), errMediaSplitNotIsolated} {
+		if RecoverablePresealMediaFailure(err) {
+			t.Fatalf("infrastructure error was recoverable: %v", err)
+		}
+	}
+}
+
 func (r *generatedEvidence) Read(p []byte) (int, error) {
 	for r.active == nil || r.active.Len() == 0 {
 		if r.line >= r.frames*2 {

@@ -570,7 +570,9 @@ func buildAllPassingParts(ctx context.Context, sources []LocalSource, scratchDir
 	return buildAllPassingPartsWithAttempt(ctx, sources, scratchDir, mediaToolIdentity, buildIsolatedAttempt)
 }
 
-var errMediaSplitNotIsolated = errors.New("media split could not be isolated")
+var ErrPresealMediaSplitNotIsolated = errors.New("preseal media split could not be isolated")
+var errMediaSplitNotIsolated = ErrPresealMediaSplitNotIsolated
+var ErrPresealMediaBoundaryContradiction = errors.New("preseal media boundary contradiction")
 
 // buildAllPassingPartsWithAttempt keeps preflight work linear in source media.
 // Adjacent pairs only locate possible seams. The exact segment plus its next
@@ -907,7 +909,7 @@ func buildAllPassingPartsWithPairProofReuse(ctx context.Context, sources []Local
 			if extensionErr == nil || !deterministic || outputSizeFailure(extensionFailure) {
 				if extensionErr == nil {
 					discardIsolatedBuild(extensionBuild, scratchDir)
-					return nil, nil, fmt.Errorf("%w: exact boundary extension unexpectedly passed", errMediaSplitNotIsolated)
+					return nil, nil, errors.Join(errMediaSplitNotIsolated, ErrPresealMediaBoundaryContradiction)
 				}
 				return nil, nil, errors.Join(errMediaSplitNotIsolated, fmt.Errorf("exact boundary extension did not fail deterministically: %w", extensionErr))
 			}
@@ -931,6 +933,60 @@ func deterministicBuildFailure(err error) (*deterministicMediaError, bool) {
 	var failure *deterministicMediaError
 	ok := errors.As(err, &failure)
 	return failure, ok
+}
+
+// RecoverablePresealMediaFailure reports only errors backed by the builder's
+// deterministic media evidence. Cancellation, storage, resource, and unknown
+// process failures never satisfy this predicate.
+func RecoverablePresealMediaFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ENOSPC) || errors.Is(err, ErrWorkerHeartbeatFailed) {
+		return false
+	}
+	known, evidence := recoverablePresealMediaErrorTree(err)
+	return known && evidence
+}
+
+func PresealMediaFailureDiagnostic(err error) (code, evidenceSHA256 string, ok bool) {
+	if !RecoverablePresealMediaFailure(err) {
+		return "", "", false
+	}
+	var deterministic *deterministicMediaError
+	if errors.As(err, &deterministic) {
+		return deterministic.code, deterministic.evidenceSHA256, true
+	}
+	if errors.Is(err, ErrPresealMediaBoundaryContradiction) {
+		return "boundary_contradiction", "", true
+	}
+	return "", "", false
+}
+
+func recoverablePresealMediaErrorTree(err error) (known, evidence bool) {
+	if err == nil {
+		return false, false
+	}
+	if err == errMediaSplitNotIsolated {
+		return true, false
+	}
+	if err == ErrPresealMediaBoundaryContradiction {
+		return true, true
+	}
+	var deterministic *deterministicMediaError
+	if errors.As(err, &deterministic) && err == deterministic {
+		return true, true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		known, evidence := true, false
+		for _, child := range joined.Unwrap() {
+			childKnown, childEvidence := recoverablePresealMediaErrorTree(child)
+			known = known && childKnown
+			evidence = evidence || childEvidence
+		}
+		return known, evidence
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return recoverablePresealMediaErrorTree(wrapped.Unwrap())
+	}
+	return false, false
 }
 
 func outputSizeFailure(failure *deterministicMediaError) bool {
