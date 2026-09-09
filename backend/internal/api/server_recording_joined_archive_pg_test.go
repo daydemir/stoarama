@@ -107,11 +107,20 @@ func TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia(t *te
 		}
 		paths[file.RelativePath] = struct{}{}
 	}
-	if auth.ArchiveName != shared.ArchiveName || auth.TotalBytes != shared.TotalBytes || !reflect.DeepEqual(auth.Files, shared.Files) {
+	if len(auth.Files) != len(shared.Files) {
+		t.Fatalf("account/shared archive file counts differ: %d != %d", len(auth.Files), len(shared.Files))
+	}
+	authFiles, sharedFiles := append([]joinedArchiveArtifact(nil), auth.Files...), append([]joinedArchiveArtifact(nil), shared.Files...)
+	for index := range authFiles {
+		authFiles[index].Head, authFiles[index].Get = joinedArchiveRequest{}, joinedArchiveRequest{}
+		sharedFiles[index].Head, sharedFiles[index].Get = joinedArchiveRequest{}, joinedArchiveRequest{}
+	}
+	if auth.ArchiveName != shared.ArchiveName || auth.TotalBytes != shared.TotalBytes || !reflect.DeepEqual(authFiles, sharedFiles) {
 		t.Fatalf("account/shared archive scope differs:\nauth=%+v\nshared=%+v", auth, shared)
 	}
 	for _, file := range auth.Files {
-		if file.BatchID != "batch-1" || file.ContentType != "video/mp4" || !strings.HasSuffix(file.RelativePath, ".mp4") {
+		if file.BatchID != "batch-1" || file.ContentType != "video/mp4" || !strings.HasSuffix(file.RelativePath, ".mp4") ||
+			file.Head.Method != http.MethodHead || file.Get.Method != http.MethodGet {
 			t.Fatalf("file=%+v", file)
 		}
 	}
