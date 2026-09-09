@@ -68,7 +68,7 @@ func TestJoinedWorkerLoopRecoversBriefBootstrapOutage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var calls atomic.Int32
-	err := runJoinedWorkerLoop(ctx, time.Millisecond, func(context.Context, context.Context) (bool, error) {
+	err := runJoinedWorkerLoopWithAdmissionRetry(ctx, time.Millisecond, true, func(context.Context, context.Context) (bool, error) {
 		if calls.Add(1) == 1 {
 			return false, &joinedAPIResponseError{path: "/api/v1/recording/joined/token", status: http.StatusServiceUnavailable}
 		}
@@ -77,5 +77,18 @@ func TestJoinedWorkerLoopRecoversBriefBootstrapOutage(t *testing.T) {
 	})
 	if err != nil || calls.Load() != 2 {
 		t.Fatalf("worker err=%v calls=%d", err, calls.Load())
+	}
+}
+
+func TestJoinedWorkerLoopKeepsCanaryAdmissionFailClosed(t *testing.T) {
+	t.Parallel()
+	want := &joinedAPIResponseError{path: "/api/v1/recording/joined/claim", status: http.StatusServiceUnavailable}
+	var calls atomic.Int32
+	err := runJoinedWorkerLoop(context.Background(), time.Millisecond, func(context.Context, context.Context) (bool, error) {
+		calls.Add(1)
+		return false, want
+	})
+	if err != want || calls.Load() != 1 {
+		t.Fatalf("canary worker err=%v calls=%d", err, calls.Load())
 	}
 }

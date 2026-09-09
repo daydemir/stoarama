@@ -61,19 +61,40 @@ func joinedTransientTransportCause(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
-		return true
-	}
-	for _, candidate := range []error{syscall.ECONNABORTED, syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EPIPE, syscall.ETIMEDOUT} {
-		if errors.Is(err, candidate) {
-			return true
+	sawTransient, sawUnknown := false, false
+	visitTransportCause(err, func(candidate error) {
+		if candidate == context.DeadlineExceeded || candidate == io.EOF || candidate == io.ErrUnexpectedEOF {
+			sawTransient = true
+			return
 		}
+		for _, transient := range []error{syscall.ECONNABORTED, syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.EPIPE, syscall.ETIMEDOUT} {
+			if candidate == transient {
+				sawTransient = true
+				return
+			}
+		}
+		var netErr net.Error
+		if errors.As(candidate, &netErr) && netErr.Timeout() {
+			sawTransient = true
+			return
+		}
+		sawUnknown = true
+	})
+	return sawTransient && !sawUnknown
+}
+
+func visitTransportCause(err error, visit func(error)) {
+	if many, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range many.Unwrap() {
+			visitTransportCause(child, visit)
+		}
+		return
 	}
-	return false
+	if one, ok := err.(interface{ Unwrap() error }); ok {
+		visitTransportCause(one.Unwrap(), visit)
+		return
+	}
+	visit(err)
 }
 
 func visitJoinedError(err error, visit func(error)) {

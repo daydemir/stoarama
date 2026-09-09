@@ -809,7 +809,11 @@ func joinedConfiguredWorkScope(cfg config.Config) (joinedrecording.WorkScopeIden
 }
 
 func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedWorkerRequest) error {
-	return runJoinedWorkerLoop(ctx, s.idlePoll, func(admissionCtx, taskCtx context.Context) (bool, error) {
+	scope, err := s.cfg.JoinedWorkScope()
+	if err != nil {
+		return err
+	}
+	return runJoinedWorkerLoopWithAdmissionRetry(ctx, s.idlePoll, scope == config.JoinedWorkScopeFrozenBatch, func(admissionCtx, taskCtx context.Context) (bool, error) {
 		return s.runWorkerOnceWithTaskContext(admissionCtx, taskCtx, req)
 	})
 }
@@ -818,6 +822,10 @@ func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedW
 // Canceling admission stops the next bootstrap or claim immediately, while a
 // claimed task keeps its lease heartbeat and gets its existing hard deadline.
 func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce func(context.Context, context.Context) (bool, error)) error {
+	return runJoinedWorkerLoopWithAdmissionRetry(ctx, idlePoll, false, runOnce)
+}
+
+func runJoinedWorkerLoopWithAdmissionRetry(ctx context.Context, idlePoll time.Duration, recoverAdmission bool, runOnce func(context.Context, context.Context) (bool, error)) error {
 	if idlePoll <= 0 || runOnce == nil {
 		return errors.New("joined worker loop configuration is required")
 	}
@@ -832,7 +840,7 @@ func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce fu
 			admissionRetries.reset()
 		}
 		if err != nil {
-			if !worked {
+			if recoverAdmission && !worked {
 				if delay, ok := admissionRetries.next(err, idlePoll, time.Now()); ok {
 					timer := time.NewTimer(delay)
 					select {
