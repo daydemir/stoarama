@@ -551,7 +551,10 @@ func TestDefaultMediaCandidateBudgetPolicy(t *testing.T) {
 		{"pair_repeat", 2, 5 * time.Minute},
 		{"extension", 2, 170 * time.Second},
 		{"extension_repeat", 2, 170 * time.Second},
-		{"prefix", 2, 170 * time.Second},
+		{"prefix", 2, 90 * time.Minute},
+		{"prefix_repeat", 2, 90 * time.Minute},
+		{"remaining", 2, 90 * time.Minute},
+		{"remaining_repeat", 2, 90 * time.Minute},
 	}
 	for _, tt := range tests {
 		if got := defaultMediaCandidateBudget(tt.kind, tt.sourceCount); got != tt.want {
@@ -890,6 +893,40 @@ func TestBuildAllPassingPartsUsesMaximalPassingPrefixForNonlocalFailure(t *testi
 	}
 	if countSpan(calls, clipIDs(sources)) != 2 || countSpan(calls, clipIDs(sources[:31])) != 1 || countSpan(calls, clipIDs(sources[31:])) != 1 {
 		t.Fatalf("candidates were not independently and minimally proved: %v", calls)
+	}
+}
+
+func TestBuildAllPassingPartsGivesNearHourPrefixLongCandidateBudget(t *testing.T) {
+	sources := makeSyntheticLocalSources(60)
+	fullAttempts := 0
+	sawPrefix := false
+	attempt := func(ctx context.Context, candidate []LocalSource, _ string) (BuiltOutput, error) {
+		if len(candidate) == len(sources) {
+			fullAttempts++
+			return BuiltOutput{}, deterministicFailure("media_sequence_mismatch", struct {
+				CandidateCount int `json:"candidate_count"`
+			}{len(candidate)}, errors.New("repeatable nonlocal mismatch"))
+		}
+		if len(candidate) == len(sources)-1 && candidate[0].ClipID == sources[0].ClipID {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("near-hour prefix lacked a deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining < 89*time.Minute || remaining > 90*time.Minute {
+				t.Fatalf("near-hour prefix budget=%s want about 90m", remaining)
+			}
+			sawPrefix = true
+		}
+		return BuiltOutput{SourceCount: len(candidate)}, nil
+	}
+
+	parts, quarantines, err := buildAllPassingPartsWithAttempt(context.Background(), sources, t.TempDir(), strings.Repeat("f", 64), attempt)
+	if err != nil || len(parts) != 2 || parts[0].SourceCount != 59 || parts[1].SourceCount != 1 || len(quarantines) != 0 {
+		t.Fatalf("full_attempts=%d saw_prefix=%t parts=%+v quarantines=%+v err=%v", fullAttempts, sawPrefix, parts, quarantines, err)
+	}
+	if fullAttempts != 2 || !sawPrefix {
+		t.Fatalf("full_attempts=%d saw_prefix=%t", fullAttempts, sawPrefix)
 	}
 }
 
