@@ -1185,6 +1185,8 @@ class JoinedDownloadTests(unittest.TestCase):
             final = pull.joined_output_path(cfg, item)
             self.assertFalse(final.exists())
             self.assertEqual(final.parent.joinpath(".%s.joined-%d.part" % (final.name, item["id"])).stat().st_size, 3)
+            transfer = runtime.heartbeat_payload(None)["joined_transfer"]
+            self.assertEqual((transfer["artifact_id"], transfer["offset_bytes"], transfer["operation"]), (item["id"], 3, "range"))
 
     def test_downgrade_after_download_stops_before_ack(self):
         raw_item = self.media_item()

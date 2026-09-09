@@ -5165,7 +5165,6 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
 
 
 def download_joined_item(cfg, runtime, item, stop_event):
-    runtime.set_joined_transfer(item["id"], 0, "prepare")
     joined_raw_priority_boundary(cfg, runtime, stop_event)
     ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
     validate_media_manifest_binding(cfg, runtime, item, stop_event)

@@ -13,7 +13,7 @@ ALTER TABLE connections
       AND joined_transfer_operation = '' AND joined_transfer_errno_class = '' AND joined_transfer_observed_at IS NULL
       AND joined_transfer_reset_count = 0)
     OR (joined_transfer_generation > 0 AND joined_transfer_artifact_id > 0 AND joined_transfer_offset_bytes >= 0
-      AND joined_transfer_operation IN ('prepare','range','verify','validate','publish')
+      AND joined_transfer_operation IN ('range','verify','validate','publish')
       AND joined_transfer_errno_class IN ('','no_space','permission','missing','io','os_error')
       AND joined_transfer_observed_at IS NOT NULL AND joined_transfer_reset_count >= 0)
   );

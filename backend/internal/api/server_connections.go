@@ -722,7 +722,7 @@ var connectionJoinedBlockers = map[string]bool{
 	"io_error": true, "path_conflict": true, "storage_guard": true,
 }
 var connectionJoinedTransferOperations = map[string]bool{
-	"prepare": true, "range": true, "verify": true, "validate": true, "publish": true,
+	"range": true, "verify": true, "validate": true, "publish": true,
 }
 var connectionJoinedErrnoClasses = map[string]bool{
 	"": true, "no_space": true, "permission": true, "missing": true, "io": true, "os_error": true,
