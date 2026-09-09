@@ -216,6 +216,12 @@ func (s joinedOutputStoreStub) PresignGetExactRequest(_ context.Context, key, et
 	}, nil
 }
 
+func (s joinedOutputStoreStub) PresignHeadExactRequest(_ context.Context, key, etag, versionID string, ttl time.Duration) (r2.PresignedRequest, error) {
+	request, err := s.PresignGetExactRequest(context.Background(), key, etag, versionID, ttl)
+	request.Method = http.MethodHead
+	return request, err
+}
+
 func TestJoinedCapabilityEnvelopeRejectsChangedAuthorityAndExpiredLease(t *testing.T) {
 	capability := r2.PresignedRequest{Method: http.MethodGet, URL: "https://storage.example.test/bucket/exact?signature=1",
 		Headers: http.Header{"Host": {"storage.example.test"}, "If-Match": {`"etag"`}}}

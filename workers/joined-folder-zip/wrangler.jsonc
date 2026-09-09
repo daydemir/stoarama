@@ -16,9 +16,6 @@
   "secrets": {
     "required": ["BACKEND_WORKER_TOKEN"]
   },
-  "r2_buckets": [
-    { "binding": "JOINED", "bucket_name": "stoarama" }
-  ],
   "durable_objects": {
     "bindings": [
       { "name": "ARCHIVE_LIMITER", "class_name": "ArchiveLimiter" }
