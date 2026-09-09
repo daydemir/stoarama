@@ -340,6 +340,22 @@ class JoinedDownloadTests(unittest.TestCase):
             ))
             self.assertNotIn("joined_transfer", runtime.heartbeat_payload(None))
 
+    def test_joined_preflight_io_error_reports_validate_phase_and_errno(self):
+        raw_item = self.media_item()
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            with mock.patch.object(pull, "request_json", return_value={"item": raw_item}), \
+                 mock.patch.object(pull, "joined_raw_priority_boundary"), \
+                 mock.patch.object(pull, "ensure_joined_dependency_ack", side_effect=OSError(errno.EIO, "opaque")), \
+                 self.assertRaises(OSError):
+                pull.drain_joined(cfg, runtime, threading.Event())
+            transfer = runtime.heartbeat_payload(None)["joined_transfer"]
+            self.assertEqual(
+                (transfer["artifact_id"], transfer["offset_bytes"], transfer["operation"], transfer["errno_class"]),
+                (raw_item["artifact_id"], 0, "validate", "io"),
+            )
+
     def test_joined_io_throttle_uses_cumulative_rate_and_is_stoppable(self):
         stop = mock.Mock()
         stop.wait.return_value = False
