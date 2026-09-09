@@ -50,7 +50,10 @@ describe("createJoinedZip", () => {
   it("rejects identity drift before returning a stream", async () => {
     const entry = file();
     const source = sourceFor([entry]);
-    source.read = async () => responseFor(entry, undefined, { "x-amz-version-id": "changed" });
+    source.read = async (request) => {
+      if (request.method === "GET") source.gets.push(request.url);
+      return responseFor(entry, undefined, { "x-amz-version-id": "changed" });
+    };
     await expect(createJoinedZip(source, [entry], options)).rejects.toThrow(/identity mismatch.*version/i);
     expect(source.gets).toHaveLength(0);
   });
