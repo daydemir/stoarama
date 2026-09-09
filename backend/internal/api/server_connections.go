@@ -172,13 +172,18 @@ type connectionListItem struct {
 const connectionPendingLateralSQL = `
 	LEFT JOIN LATERAL (
 		SELECT COUNT(*) AS clips, COALESCE(SUM(c.size_bytes), 0) AS bytes, MIN(c.created_at) AS oldest_at
-		FROM recording_clips c
+		FROM (
+			-- Preserve the selective clip-id range scan before joining the account's recordings.
+			SELECT candidate.recording_id,candidate.size_bytes,candidate.created_at
+			FROM recording_clips candidate
+			WHERE candidate.purged_at IS NULL AND candidate.released_at IS NULL
+			  AND candidate.size_bytes > 0
+			  AND candidate.created_at < now() - ` + accountClipsCommitWatermark + `
+			  AND candidate.id > conn.last_cursor_id
+			OFFSET 0
+		) c
 		JOIN recordings rec ON rec.id = c.recording_id
 		WHERE conn.kind='nas_pull' AND rec.account_id=conn.account_id AND rec.delivery='nas_pull'
-		  AND c.purged_at IS NULL AND c.released_at IS NULL
-		  AND c.size_bytes > 0
-		  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
-		  AND c.id > conn.last_cursor_id
 	) pending ON true
 `
 
