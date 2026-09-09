@@ -9,7 +9,7 @@ Joined coverage uses recorded source duration inside each selected best consecut
 
 ## Operating limits
 
-Recording and raw NAS transfers retain priority. Joining runs on dedicated hosts under the API's task cap. Raw and joined media on R2 and NAS remain unchanged; output publication is additive and verified. Failed seams retain source identities and diagnostic evidence. Temporary worker caches may be released only by the existing API-proven inactive-lease cleanup; historical protected evidence roots stay read-only.
+Recording and raw NAS transfers retain priority. Joining runs on dedicated hosts under the API's task cap. Existing raw and joined objects on R2 and NAS are never modified or deleted; publication is create-only, additive, and verified. Failed seams retain source identities and diagnostic evidence. Deferred preseal failures remain unresolved review work; they do not count as completed footage or confirmed gaps. Temporary worker caches may be released only by the existing API-proven inactive-lease cleanup; historical protected evidence roots stay read-only.
 
 The worker handles explicitly classified recoverable failures. Authentication, integrity, unknown failures, and ambiguous failure acknowledgements remain visible stops. Never solve a stop with an unconditional restart loop, a manual database reset, or relaxed media validation.
 
