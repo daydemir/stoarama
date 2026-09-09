@@ -77,11 +77,12 @@ func joinedRetryableAdmissionPath(err error) (string, bool) {
 }
 
 func joinedAdmissionPath(path string) bool {
-	base, _, _ := strings.Cut(path, "?")
-	switch base {
+	if path == "/api/v1/recording/joined/status" || strings.HasPrefix(path, "/api/v1/recording/joined/status?") {
+		return true
+	}
+	switch path {
 	case "/api/v1/recording/joined/token", "/api/v1/recording/joined/publication/claim",
-		"/api/v1/recording/joined/claim", "/api/v1/recording/joined/leases/status",
-		"/api/v1/recording/joined/status":
+		"/api/v1/recording/joined/claim", "/api/v1/recording/joined/leases/status":
 		return true
 	default:
 		return false

@@ -23,6 +23,7 @@ func TestJoinedAdmissionRetryDistinguishesBootstrapAndAmbiguousClaim(t *testing.
 		{"status", &joinedAPITransportError{path: "/api/v1/recording/joined/leases/status", cause: syscall.ECONNRESET}, 2 * time.Second, true},
 		{"publication claim", &joinedAPIResponseError{path: "/api/v1/recording/joined/publication/claim", status: http.StatusTooManyRequests}, joinedClaimLeaseTTL + joinedClaimLeaseMargin, true},
 		{"preflight claim", &joinedAPITransportError{path: "/api/v1/recording/joined/claim", cause: context.DeadlineExceeded}, joinedClaimLeaseTTL + joinedClaimLeaseMargin, true},
+		{"claim query ambiguity", &joinedAPITransportError{path: "/api/v1/recording/joined/claim?unexpected=1", cause: context.DeadlineExceeded}, 0, false},
 		{"auth", &joinedAPIResponseError{path: "/api/v1/recording/joined/token", status: http.StatusUnauthorized}, 0, false},
 		{"schema", errors.New("invalid bootstrap response"), 0, false},
 		{"deterministic transport", &joinedAPITransportError{path: "/api/v1/recording/joined/token", cause: errors.New("TLS certificate differs")}, 0, false},
