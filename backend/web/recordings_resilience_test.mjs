@@ -137,6 +137,19 @@ test('joined heatmap labels distinguish loading, failure, zero, and unavailable'
   assert.equal(captureHealthJoinedLabel({ source_duration_ms: 0, joined_ready_ms: 0 }, { joined_status: 'ready' }), 'Joined: unavailable');
 });
 
+test('media-ready status requires exact duration coverage, not a rounded percentage', () => {
+  const source = sourceBetween(
+    'function joinedCoverage(rec)',
+    'function dailyGradesHTML(rawGrades, timezone)',
+  );
+  const evaluate = new Function('formatDuration', `${source}; return { joinedCoverage };`);
+  const { joinedCoverage } = evaluate((value) => String(value));
+
+  assert.equal(joinedCoverage({ source_duration_ms: 1000, joined_ready_ms: 999, joined_percent: 100 }).mediaReady, false);
+  assert.equal(joinedCoverage({ source_duration_ms: 1000, joined_ready_ms: 1000, joined_percent: 100 }).mediaReady, true);
+  assert.equal(joinedCoverage({ source_duration_ms: Infinity, joined_ready_ms: Infinity, joined_percent: 100 }).available, false);
+});
+
 test('heatmap legend explains capture colors and every joined corner-mark state', () => {
   const source = sourceBetween(
     'function captureHealthLegendHTML()',

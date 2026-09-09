@@ -319,13 +319,36 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	s.cfg.JoinedRecordingCanaryHourIDs = ""
 	frozenToken := joinedGapBootstrapToken(t, s, req.BatchID)
+	setHour(t, "leased", 1)
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_hours DISABLE TRIGGER recording_joined_hour_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, liveLeaseErr := pool.Exec(ctx, `UPDATE recording_joined_hours SET lease_expires_at=now()+interval '5 minutes' WHERE hour_id=$1`, hourID)
+	_, enableHourErr := pool.Exec(ctx, `ALTER TABLE recording_joined_hours ENABLE TRIGGER recording_joined_hour_update_guard`)
+	if liveLeaseErr != nil || enableHourErr != nil {
+		t.Fatalf("prepare live lease update=%v enable=%v", liveLeaseErr, enableHourErr)
+	}
+	liveCodes := claimRace(t, frozenToken)
+	if liveCodes[0] != http.StatusNoContent || liveCodes[1] != http.StatusNoContent {
+		t.Fatalf("live preflight lease escaped frozen reclaim fence: %v", liveCodes)
+	}
+	setHour(t, "leased", 1)
+	rebootCodes := claimRace(t, frozenToken)
+	sort.Ints(rebootCodes)
+	if rebootCodes[0] != http.StatusOK || rebootCodes[1] != http.StatusNoContent {
+		t.Fatalf("concurrent clean expired preflight claims=%v want one recovery claim", rebootCodes)
+	}
+	var rebootAttempts int
+	if err := pool.QueryRow(ctx, `SELECT attempt_count FROM recording_joined_hours WHERE hour_id=$1`, hourID).Scan(&rebootAttempts); err != nil || rebootAttempts != 2 {
+		t.Fatalf("recovered preflight attempts=%d err=%v", rebootAttempts, err)
+	}
 	for _, legacy := range []struct {
 		name     string
 		state    string
 		attempts int
 	}{
 		{name: "row2774_pending_attempt1", state: "pending", attempts: 1},
-		{name: "row4549_expired_attempt1", state: "leased", attempts: 1},
+		{name: "expired_attempt2", state: "leased", attempts: 2},
 		{name: "row5111_expired_attempt7", state: "leased", attempts: 7},
 		{name: "row4729_exhausted_attempt8", state: "leased", attempts: 8},
 	} {
@@ -372,5 +395,83 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 		claimToken == "00000000-0000-0000-0000-000000000099" || claimToken == "" || !leaseExpires.After(time.Now()) {
 		t.Fatalf("remediation lease attempts=%d claimed_by=%q token_replaced=%v future_expiry=%v",
 			attempts, claimedBy, claimToken != "00000000-0000-0000-0000-000000000099", leaseExpires.After(time.Now()))
+	}
+
+	// Any persisted output identity means preflight crossed the clean-reboot
+	// boundary, even if a damaged legacy row still says leased.
+	setHour(t, "leased", 1)
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_hours DISABLE TRIGGER recording_joined_hour_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, liveLeaseErr = pool.Exec(ctx, `UPDATE recording_joined_hours SET lease_expires_at=now()+interval '5 minutes'
+		WHERE hour_id=$1`, hourID)
+	_, enableHourErr = pool.Exec(ctx, `ALTER TABLE recording_joined_hours ENABLE TRIGGER recording_joined_hour_update_guard`)
+	if liveLeaseErr != nil || enableHourErr != nil {
+		t.Fatalf("prepare artifact evidence live lease update=%v enable=%v", liveLeaseErr, enableHourErr)
+	}
+	const artifactSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var artifactID int64
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_hour_seal_complete`); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO recording_joined_artifacts
+		(batch_record_id,account_id,connection_id,batch_id,scope_kind,scope_id,stream_day_id,hour_record_id,
+		 artifact_kind,ordinal,relative_path,object_key,content_type,content_id,expected_size_bytes,expected_sha256)
+		SELECT batch_record_id,account_id,connection_id,batch_id,'hour',hour_id,stream_day_id,id,
+		 'media',99,'reclaim-fence.mp4','joined/'||batch_id||'/objects/'||$2||'.mp4','video/mp4',$2,1,$2
+		FROM recording_joined_hours WHERE hour_id=$1 RETURNING id`, hourID, artifactSHA).Scan(&artifactID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_hour_seal_complete`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_hours DISABLE TRIGGER recording_joined_hour_seal_complete`); err != nil {
+		t.Fatal(err)
+	}
+	setHour(t, "leased", 1)
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_hours ENABLE TRIGGER recording_joined_hour_seal_complete`); err != nil {
+		t.Fatal(err)
+	}
+	artifactCodes := claimRace(t, frozenToken)
+	if artifactCodes[0] != http.StatusNoContent || artifactCodes[1] != http.StatusNoContent {
+		t.Fatalf("persisted artifact escaped frozen reclaim fence: %v", artifactCodes)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts DISABLE TRIGGER recording_joined_artifact_no_delete`); err != nil {
+		t.Fatal(err)
+	}
+	_, deleteArtifactErr := pool.Exec(ctx, `DELETE FROM recording_joined_artifacts WHERE id=$1`, artifactID)
+	_, enableArtifactErr = pool.Exec(ctx, `ALTER TABLE recording_joined_artifacts ENABLE TRIGGER recording_joined_artifact_no_delete`)
+	if deleteArtifactErr != nil || enableArtifactErr != nil {
+		t.Fatalf("remove disposable artifact evidence delete=%v enable=%v", deleteArtifactErr, enableArtifactErr)
+	}
+
+	// A recorded worker failure is immutable evidence, so frozen_batch must
+	// never reinterpret its expired lease as an unreported reboot.
+	setHour(t, "leased", 1)
+	s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+	s.cfg.JoinedRecordingCanaryHourIDs = ""
+	if _, err := pool.Exec(ctx, `ALTER TABLE recording_joined_hours DISABLE TRIGGER recording_joined_hour_update_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, liveLeaseErr = pool.Exec(ctx, `UPDATE recording_joined_hours SET lease_expires_at=now()+interval '5 minutes'
+		WHERE hour_id=$1`, hourID)
+	_, enableHourErr = pool.Exec(ctx, `ALTER TABLE recording_joined_hours ENABLE TRIGGER recording_joined_hour_update_guard`)
+	if liveLeaseErr != nil || enableHourErr != nil {
+		t.Fatalf("prepare failure evidence live lease update=%v enable=%v", liveLeaseErr, enableHourErr)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_worker_failures
+		(batch_record_id,hour_record_id,batch_id,scope_kind,scope_id,claim_token,attempt_count,
+		 failure_class,reason_code,disposition,retry_at,created_at)
+		SELECT batch_record_id,id,batch_id,'hour',hour_id,claim_token,attempt_count,
+		 'transient','worker_task_failed','retry',now()-interval '1 minute',now()-interval '2 minutes'
+		FROM recording_joined_hours WHERE hour_id=$1`, hourID); err != nil {
+		t.Fatal(err)
+	}
+	setHour(t, "leased", 1)
+	failureCodes := claimRace(t, frozenToken)
+	if failureCodes[0] != http.StatusNoContent || failureCodes[1] != http.StatusNoContent {
+		t.Fatalf("recorded failure escaped frozen reclaim fence: %v", failureCodes)
 	}
 }

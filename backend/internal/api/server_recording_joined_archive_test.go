@@ -54,7 +54,7 @@ func TestJoinedArchiveWorkerAuthenticationAndPortablePaths(t *testing.T) {
 		t.Fatalf("non-Bearer credential status=%d body=%s", response.Code, response.Body.String())
 	}
 	valid := joinedArchiveArtifact{
-		BatchID: "batch-1", ETag: "etag", ContentType: "video/mp4",
+		BatchID: "batch-1", ObjectKey: "joined/batch-1/objects/" + strings.Repeat("a", 64) + ".mp4", ETag: "etag", ContentType: "video/mp4",
 		RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", SizeBytes: 1, SHA256: strings.Repeat("a", 64),
 	}
 	for _, relative := range []string{"../raw.mp4", "/absolute.mp4", "a\\b.mp4", "a/../b.mp4", "C:/outside.mp4", "folder/CON.mp4", "folder/COM1.tar.mp4", "folder/COM¹.tar.mp4", "folder/LPT³.data.mp4", "folder/name. ", "folder/name?.mp4", "a\x00b.mp4"} {
@@ -77,6 +77,22 @@ func TestJoinedArchiveWorkerAuthenticationAndPortablePaths(t *testing.T) {
 	second.ContentType = "application/octet-stream"
 	if _, err := validateJoinedArchive([]joinedArchiveArtifact{second}); err == nil {
 		t.Fatal("non-MP4 media accepted")
+	}
+}
+
+func TestJoinedArchiveSignsOnlyExactHeadAndGetRequests(t *testing.T) {
+	artifact := joinedArchiveArtifact{
+		BatchID: "batch-1", ObjectKey: "joined/batch-1/objects/" + strings.Repeat("a", 64) + ".mp4",
+		ETag: "etag", VersionID: "version", ContentType: "video/mp4",
+		RelativePath: "377_Europe_Poland_Luban/August/Thursday/a.mp4", SizeBytes: 9, SHA256: strings.Repeat("a", 64),
+	}
+	signed, err := signJoinedArchiveArtifacts(context.Background(), joinedOutputStoreStub{}, []joinedArchiveArtifact{artifact})
+	if err != nil || len(signed) != 1 {
+		t.Fatalf("signed=%+v err=%v", signed, err)
+	}
+	if signed[0].Head.Method != http.MethodHead || signed[0].Get.Method != http.MethodGet ||
+		signed[0].Head.URL == "" || signed[0].Get.URL == "" || signed[0].Head.Headers.Get("If-Match") != `"etag"` {
+		t.Fatalf("signed artifact=%+v", signed[0])
 	}
 }
 

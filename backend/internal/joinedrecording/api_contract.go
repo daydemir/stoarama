@@ -443,6 +443,14 @@ func SealValidationDiagnostic(err error) (SealValidationClass, int, int, bool) {
 	return validation.class, validation.mediaOrdinal, validation.proofOrdinal, true
 }
 
+// RecoverablePresealMediaValidation identifies deterministic media-proof
+// failures before sealing. Request, assignment, and accounting failures remain
+// integrity failures and stop the worker.
+func RecoverablePresealMediaValidation(err error) bool {
+	class, _, _, ok := SealValidationDiagnostic(err)
+	return ok && (class == SealValidationMedia || class == SealValidationMaximalityProof || class == SealValidationQuarantineProof)
+}
+
 func (r SealHourRequest) Validate(recordingID int64, toolIdentity string) error {
 	if r.ProtocolVersion != JoinedProtocolVersion || r.HourID == "" || !lowerHex64(r.SourceClaimSHA256) || len(r.AccountedSources) == 0 || !lowerHex64(toolIdentity) {
 		return newSealValidationError(SealValidationRequest, 0, 0, "invalid joined hour seal request")

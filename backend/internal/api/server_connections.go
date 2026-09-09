@@ -172,13 +172,18 @@ type connectionListItem struct {
 const connectionPendingLateralSQL = `
 	LEFT JOIN LATERAL (
 		SELECT COUNT(*) AS clips, COALESCE(SUM(c.size_bytes), 0) AS bytes, MIN(c.created_at) AS oldest_at
-		FROM recording_clips c
+		FROM (
+			-- Preserve the selective clip-id range scan before joining the account's recordings.
+			SELECT candidate.recording_id,candidate.size_bytes,candidate.created_at
+			FROM recording_clips candidate
+			WHERE candidate.purged_at IS NULL AND candidate.released_at IS NULL
+			  AND candidate.size_bytes > 0
+			  AND candidate.created_at < now() - ` + accountClipsCommitWatermark + `
+			  AND candidate.id > conn.last_cursor_id
+			OFFSET 0
+		) c
 		JOIN recordings rec ON rec.id = c.recording_id
 		WHERE conn.kind='nas_pull' AND rec.account_id=conn.account_id AND rec.delivery='nas_pull'
-		  AND c.purged_at IS NULL AND c.released_at IS NULL
-		  AND c.size_bytes > 0
-		  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
-		  AND c.id > conn.last_cursor_id
 	) pending ON true
 `
 
@@ -1042,11 +1047,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 			ct, err := tx.Exec(r.Context(), `
 				UPDATE connections c SET
 				  joined_transfer_reset_count=CASE
-				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $6 < joined_transfer_offset_bytes
+				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $7='range' AND $6 < joined_transfer_offset_bytes
 				      THEN joined_transfer_reset_count+1
 				    WHEN joined_transfer_generation<>$5 OR joined_transfer_artifact_id IS DISTINCT FROM $4 THEN 0
 				    ELSE joined_transfer_reset_count END,
-				  joined_transfer_generation=$5,joined_transfer_artifact_id=$4,joined_transfer_offset_bytes=$6,
+				  joined_transfer_generation=$5,joined_transfer_artifact_id=$4,
+				  joined_transfer_offset_bytes=CASE
+				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $7='validate' AND $6=0
+				      THEN joined_transfer_offset_bytes ELSE $6 END,
 				  joined_transfer_operation=$7,joined_transfer_errno_class=$8,joined_transfer_observed_at=$9
 				WHERE c.id=$1 AND c.joined_protocol_version=1 AND $4=(SELECT a.id `+joinedFeedHeadFromWhere+`)`,
 				connectionID, s.cfg.JoinedRecordingBatchID, frozenScopeSHA, transfer.ArtifactID,

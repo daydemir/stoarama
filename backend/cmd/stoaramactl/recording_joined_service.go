@@ -51,9 +51,13 @@ type joinedAPIResponseError struct {
 var (
 	errJoinedWorkerTaskDeadline  = errors.New("joined worker task deadline")
 	errJoinedTaskFailureReported = errors.New("joined worker task failure reported")
+	errJoinedTaskMayContinue     = errors.New("joined worker task may continue")
 )
 
-type joinedAPITransportError struct{ cause error }
+type joinedAPITransportError struct {
+	path  string
+	cause error
+}
 
 func (*joinedAPITransportError) Error() string   { return "joined API transport failed" }
 func (e *joinedAPITransportError) Unwrap() error { return e.cause }
@@ -139,32 +143,41 @@ type joinedWorkerStatus struct {
 }
 
 type joinedDeliveryStatus struct {
-	BatchID                  string                  `json:"batch_id"`
-	ArtifactID               int64                   `json:"artifact_id"`
-	ArtifactKind             string                  `json:"artifact_kind"`
-	HourID                   string                  `json:"hour_id"`
-	RelativePath             string                  `json:"relative_path"`
-	ExpectedSizeBytes        int64                   `json:"expected_size_bytes"`
-	ExpectedSHA256           string                  `json:"expected_sha256"`
-	PublicationState         string                  `json:"publication_state"`
-	PublishedAt              *time.Time              `json:"published_at,omitempty"`
-	Acknowledged             bool                    `json:"acknowledged"`
-	VerifiedAt               *time.Time              `json:"verified_at,omitempty"`
-	AcknowledgedPath         string                  `json:"acknowledged_relative_path,omitempty"`
-	AcknowledgedSize         *int64                  `json:"acknowledged_size_bytes,omitempty"`
-	AcknowledgedSHA256       string                  `json:"acknowledged_sha256,omitempty"`
-	IdentityMatches          bool                    `json:"identity_matches"`
-	ConnectionID             int64                   `json:"connection_id"`
-	ConnectionProtocol       int                     `json:"connection_protocol_version"`
-	ObservedAt               time.Time               `json:"observed_at"`
-	FeedHead                 *joinedFeedHeadStatus   `json:"feed_head,omitempty"`
-	LastAttemptArtifactID    *int64                  `json:"last_attempt_artifact_id,omitempty"`
-	LastAttemptBlockerClass  string                  `json:"last_attempt_blocker_class,omitempty"`
-	LastAttemptBlockerSHA256 string                  `json:"last_attempt_blocker_sha256,omitempty"`
-	LastAttemptAt            *time.Time              `json:"last_attempt_at,omitempty"`
-	RetryAt                  *time.Time              `json:"retry_at,omitempty"`
-	TelemetryMatchesHead     bool                    `json:"telemetry_matches_head"`
-	RawDelivery              joinedRawDeliveryStatus `json:"raw_delivery"`
+	BatchID                   string                  `json:"batch_id"`
+	ArtifactID                int64                   `json:"artifact_id"`
+	ArtifactKind              string                  `json:"artifact_kind"`
+	HourID                    string                  `json:"hour_id"`
+	RelativePath              string                  `json:"relative_path"`
+	ExpectedSizeBytes         int64                   `json:"expected_size_bytes"`
+	ExpectedSHA256            string                  `json:"expected_sha256"`
+	PublicationState          string                  `json:"publication_state"`
+	PublishedAt               *time.Time              `json:"published_at,omitempty"`
+	Acknowledged              bool                    `json:"acknowledged"`
+	VerifiedAt                *time.Time              `json:"verified_at,omitempty"`
+	AcknowledgedPath          string                  `json:"acknowledged_relative_path,omitempty"`
+	AcknowledgedSize          *int64                  `json:"acknowledged_size_bytes,omitempty"`
+	AcknowledgedSHA256        string                  `json:"acknowledged_sha256,omitempty"`
+	IdentityMatches           bool                    `json:"identity_matches"`
+	ConnectionID              int64                   `json:"connection_id"`
+	ConnectionProtocol        int                     `json:"connection_protocol_version"`
+	ObservedAt                time.Time               `json:"observed_at"`
+	FeedHead                  *joinedFeedHeadStatus   `json:"feed_head,omitempty"`
+	LastAttemptArtifactID     *int64                  `json:"last_attempt_artifact_id,omitempty"`
+	LastAttemptBlockerClass   string                  `json:"last_attempt_blocker_class,omitempty"`
+	LastAttemptBlockerSHA256  string                  `json:"last_attempt_blocker_sha256,omitempty"`
+	LastAttemptAt             *time.Time              `json:"last_attempt_at,omitempty"`
+	RetryAt                   *time.Time              `json:"retry_at,omitempty"`
+	TelemetryMatchesHead      bool                    `json:"telemetry_matches_head"`
+	TransferArtifactID        *int64                  `json:"transfer_artifact_id,omitempty"`
+	TransferGeneration        int                     `json:"transfer_protocol_generation,omitempty"`
+	TransferOffsetBytes       int64                   `json:"transfer_offset_bytes,omitempty"`
+	TransferOperation         string                  `json:"transfer_operation,omitempty"`
+	TransferErrnoClass        string                  `json:"transfer_errno_class,omitempty"`
+	TransferObservedAt        *time.Time              `json:"transfer_observed_at,omitempty"`
+	TransferResetCount        int64                   `json:"transfer_reset_count,omitempty"`
+	TransferMatchesHead       bool                    `json:"transfer_matches_head"`
+	TransferGenerationCurrent bool                    `json:"transfer_generation_current"`
+	RawDelivery               joinedRawDeliveryStatus `json:"raw_delivery"`
 }
 
 type joinedFeedHeadStatus struct {
@@ -796,7 +809,11 @@ func joinedConfiguredWorkScope(cfg config.Config) (joinedrecording.WorkScopeIden
 }
 
 func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedWorkerRequest) error {
-	return runJoinedWorkerLoop(ctx, s.idlePoll, func(admissionCtx, taskCtx context.Context) (bool, error) {
+	scope, err := s.cfg.JoinedWorkScope()
+	if err != nil {
+		return err
+	}
+	return runJoinedWorkerLoopWithAdmissionRetry(ctx, s.idlePoll, scope == config.JoinedWorkScopeFrozenBatch, func(admissionCtx, taskCtx context.Context) (bool, error) {
 		return s.runWorkerOnceWithTaskContext(admissionCtx, taskCtx, req)
 	})
 }
@@ -805,17 +822,45 @@ func (s *remoteJoinedOperatorService) RunWorker(ctx context.Context, req joinedW
 // Canceling admission stops the next bootstrap or claim immediately, while a
 // claimed task keeps its lease heartbeat and gets its existing hard deadline.
 func runJoinedWorkerLoop(ctx context.Context, idlePoll time.Duration, runOnce func(context.Context, context.Context) (bool, error)) error {
+	return runJoinedWorkerLoopWithAdmissionRetry(ctx, idlePoll, false, runOnce)
+}
+
+func runJoinedWorkerLoopWithAdmissionRetry(ctx context.Context, idlePoll time.Duration, recoverAdmission bool, runOnce func(context.Context, context.Context) (bool, error)) error {
 	if idlePoll <= 0 || runOnce == nil {
 		return errors.New("joined worker loop configuration is required")
 	}
 	taskBase := context.WithoutCancel(ctx)
+	var admissionRetries joinedAdmissionRetryState
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 		worked, err := runOnce(ctx, taskBase)
+		if worked || err == nil {
+			admissionRetries.reset()
+		}
 		if err != nil {
+			if recoverAdmission && !worked {
+				if delay, ok := admissionRetries.next(err, idlePoll, time.Now()); ok {
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						if !timer.Stop() {
+							<-timer.C
+						}
+						return nil
+					case <-timer.C:
+					}
+					continue
+				}
+			}
+			if errors.Is(err, errJoinedPublicationRetryAcknowledged) {
+				continue
+			}
 			if errors.Is(err, errJoinedTaskFailureReported) {
+				if errors.Is(err, errJoinedTaskMayContinue) {
+					continue
+				}
 				return nil
 			}
 			if ctx.Err() != nil && !worked {
@@ -855,13 +900,27 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 	}
 	claimRequest := joinedrecording.WorkClaimRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, BatchID: req.BatchID, WorkerID: req.WorkerID}
 	if workScope.WorkScope == joinedrecording.WorkScopeFrozenBatch {
-		budget, err := joinedrecording.AvailableScratchBudget(req.ScratchRoot)
+		measure := func() (int64, int64, error) {
+			budget, err := joinedrecording.AvailableScratchBudget(req.ScratchRoot)
+			if err != nil {
+				return 0, 0, err
+			}
+			taskBudget, err := joinedrecording.WorkerTaskBudgetBytes(budget)
+			return budget, taskBudget, err
+		}
+		budget, taskBudget, err := measure()
+		var headroom *joinedrecording.ScratchHeadroomError
+		if errors.As(err, &headroom) {
+			if _, cleanupErr := s.cleanupInactiveScratch(admissionCtx, req); cleanupErr != nil {
+				return false, fmt.Errorf("cleanup inactive joined scratch before admission: %w", cleanupErr)
+			}
+			budget, taskBudget, err = measure()
+			if errors.As(err, &headroom) {
+				return false, nil
+			}
+		}
 		if err != nil {
 			return false, fmt.Errorf("measure joined scratch admission budget: %w", err)
-		}
-		taskBudget, err := joinedrecording.WorkerTaskBudgetBytes(budget)
-		if err != nil {
-			return false, fmt.Errorf("derive joined scratch admission budget: %w", err)
 		}
 		claimRequest.ScratchAvailableBytes = budget
 		claimRequest.TaskBudgetBytes = taskBudget
@@ -884,6 +943,9 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 			workCtx = context.WithValue(workCtx, joinedOperationTrackerContextKey{}, tracker)
 			return s.processClaim(workCtx, publication, req.ScratchRoot)
 		})
+		if workScope.WorkScope == config.JoinedWorkScopeFrozenBatch {
+			return true, s.reportJoinedPublicationFailure(taskCtx, tracker.get(), kind, id, taskErr)
+		}
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
 	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
@@ -908,7 +970,78 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		workCtx = context.WithValue(workCtx, joinedOperationTrackerContextKey{}, tracker)
 		return s.processPreflight(workCtx, preflight, req.ScratchRoot)
 	})
-	return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), "hour", preflight.HourID, taskErr)
+	mayContinue := joinedMayContinuePreflight(workScope, taskErr)
+	return true, s.reportJoinedTaskResult(taskCtx, req.ScratchRoot, preflight, tracker.get(), taskErr, mayContinue)
+}
+
+func joinedMayContinuePreflight(workScope joinedrecording.WorkScopeIdentity, err error) bool {
+	return workScope.WorkScope == joinedrecording.WorkScopeFrozenBatch && joinedRecoverablePresealFailure(err)
+}
+
+func joinedRecoverablePresealFailure(err error) bool {
+	if joinedRecoverablePresealDeadline(err) {
+		return true
+	}
+	return joinedrecording.RecoverablePresealMediaFailure(err) ||
+		(errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) && joinedrecording.RecoverablePresealMediaValidation(err))
+}
+
+type joinedPresealDeadlineFacts struct{ known, taskDeadline, beforeSeal bool }
+
+func joinedRecoverablePresealDeadline(err error) bool {
+	facts := joinedPresealDeadlineErrorTree(err)
+	return facts.known && facts.taskDeadline && facts.beforeSeal
+}
+
+func joinedPresealDeadlineErrorTree(err error) joinedPresealDeadlineFacts {
+	switch err {
+	case errJoinedWorkerTaskDeadline:
+		return joinedPresealDeadlineFacts{known: true, taskDeadline: true}
+	case joinedrecording.ErrPreflightDeadlineBeforeSeal:
+		return joinedPresealDeadlineFacts{known: true, beforeSeal: true}
+	case context.DeadlineExceeded:
+		return joinedPresealDeadlineFacts{known: true}
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		facts := joinedPresealDeadlineFacts{known: true}
+		for _, child := range joined.Unwrap() {
+			childFacts := joinedPresealDeadlineErrorTree(child)
+			facts.known = facts.known && childFacts.known
+			facts.taskDeadline = facts.taskDeadline || childFacts.taskDeadline
+			facts.beforeSeal = facts.beforeSeal || childFacts.beforeSeal
+		}
+		return facts
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return joinedPresealDeadlineErrorTree(wrapped.Unwrap())
+	}
+	return joinedPresealDeadlineFacts{}
+}
+
+func (s *remoteJoinedOperatorService) reportJoinedTaskResult(taskCtx context.Context, scratchRoot string, claim joinedrecording.PreflightHourClaim, token string, taskErr error, mayContinue bool) error {
+	if taskErr == nil || !mayContinue {
+		return s.reportJoinedTaskFailure(taskCtx, token, "hour", claim.HourID, taskErr)
+	}
+	_, reason := joinedFailureClassification(taskErr)
+	diagnostic := joinedrecording.FailedPreflightDiagnostic{ReasonCode: reason}
+	if code, sha, ok := joinedrecording.PresealMediaFailureDiagnostic(taskErr); ok {
+		diagnostic.FailureCode, diagnostic.EvidenceSHA256 = code, sha
+	} else if sealClass, media, proof, ok := joinedrecording.SealValidationDiagnostic(taskErr); ok {
+		diagnostic.SealClass, diagnostic.MediaOrdinal, diagnostic.ProofOrdinal = string(sealClass), media, proof
+	}
+	if errors.Is(taskErr, joinedrecording.ErrPreflightDeadlineBeforeSeal) {
+		diagnostic.FailureCode = "deadline_before_seal"
+	}
+	if preserveErr := joinedrecording.PreserveFailedPreflightEvidence(scratchRoot, claim, diagnostic); preserveErr != nil {
+		return errors.Join(taskErr, fmt.Errorf("preserve joined failed task evidence: %w", preserveErr))
+	}
+	if err := s.reportJoinedTaskFailure(taskCtx, token, "hour", claim.HourID, taskErr); err != nil {
+		if errors.Is(err, errJoinedTaskFailureReported) {
+			return errors.Join(err, errJoinedTaskMayContinue)
+		}
+		return err
+	}
+	return nil
 }
 
 func joinedPublicationFailureIdentity(response joinedrecording.PublicationClaimResponse) (kind, id, token string) {
@@ -946,6 +1079,15 @@ func joinedFailureClassification(err error) (class, reason string) {
 	}
 	if errors.Is(err, joinedrecording.ErrPreflightSealRequestInvalid) {
 		return "transient", "preflight_seal_request_invalid"
+	}
+	if errors.Is(err, errJoinedWorkerTaskDeadline) && errors.Is(err, joinedrecording.ErrPreflightDeadlineBeforeSeal) {
+		return "transient", "preflight_deadline_before_seal"
+	}
+	if joinedrecording.RecoverablePresealMediaFailure(err) {
+		if errors.Is(err, joinedrecording.ErrPresealMediaBoundaryContradiction) {
+			return "transient", "preflight_media_boundary_contradiction"
+		}
+		return "transient", "preflight_media_validation_failed"
 	}
 	if errors.Is(err, joinedrecording.ErrPreflightLeaseEndedBeforeSeal) {
 		return "transient", "preflight_lease_ended_before_seal"
@@ -1488,7 +1630,7 @@ func (c *joinedAPIClient) postOptionalJSON(ctx context.Context, path, token stri
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		return false, &joinedAPITransportError{cause: err}
+		return false, &joinedAPITransportError{path: path, cause: err}
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode == http.StatusNoContent {

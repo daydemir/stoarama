@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { createJoinedZip, type JoinedFile } from "./zip";
+import { createJoinedZip, type JoinedFile, type JoinedReadRequest, type JoinedSource } from "./zip";
 
 interface ArchiveManifest {
   schema_version: 1;
@@ -59,7 +59,7 @@ export default {
       }
 
       try {
-        const archive = await createJoinedZip(env.JOINED, manifest.files, {
+        const archive = await createJoinedZip(presignedJoinedSource, manifest.files, {
           maxFiles: MAX_FILES,
           maxBytes: MAX_BYTES,
           preflightConcurrency: PREFLIGHT_CONCURRENCY,
@@ -96,6 +96,28 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+const presignedJoinedSource: JoinedSource = { read: readPresignedJoinedObject };
+
+export async function readPresignedJoinedObject(request: JoinedReadRequest): Promise<Response> {
+  if (!request || (request.method !== "HEAD" && request.method !== "GET")) throw new Error("invalid joined read method");
+  const url = new URL(request.url);
+  if (url.protocol !== "https:" || url.username || url.password || url.hash ||
+    !url.hostname.endsWith(".r2.cloudflarestorage.com") || !url.search) {
+    throw new Error("invalid joined read URL");
+  }
+  const keys = Object.keys(request.headers ?? {});
+  const matches = request.headers?.["If-Match"];
+  if (keys.length !== 1 || !Array.isArray(matches) || matches.length !== 1 || !matches[0] || matches[0].length > 258) {
+    throw new Error("invalid joined read headers");
+  }
+  return fetch(url, {
+    method: request.method,
+    headers: { "If-Match": matches[0] },
+    redirect: "error",
+    ...(request.method === "HEAD" ? { signal: AbortSignal.timeout(10_000) } : {}),
+  });
+}
 
 export async function loadManifest(env: Env, token: string): Promise<ArchiveManifest> {
   const endpoint = new URL(env.BACKEND_MANIFEST_URL);

@@ -21,13 +21,18 @@ func TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia(t *te
 		t.Fatal(err)
 	}
 	seedJoinedBrowserTestData(t, pool)
+	if _, err := pool.Exec(context.Background(), `UPDATE recording_joined_artifacts
+		SET object_key='joined/batch-1/objects/'||expected_sha256||'.mp4'
+		WHERE id IN (302,303)`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(context.Background(), `INSERT INTO recording_joined_batches VALUES(1,47,'batch-1'),(2,99,'foreign-batch-1')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
 		SELECT 2000+value*2,201,1,47,'media',NULL,now(),'media-bulk-'||value,'','video/mp4',
-		       '20_Europe_Poland_Luban/May/Monday/hour_01_part_'||lpad(value::text,4,'0')||'.mp4',10,lpad(to_hex(value),64,'0'),'joined/private/media-bulk-'||value||'.mp4',100+value
+		       '20_Europe_Poland_Luban/May/Monday/hour_01_part_'||lpad(value::text,4,'0')||'.mp4',10,lpad(to_hex(value),64,'0'),'joined/batch-1/objects/'||lpad(to_hex(value),64,'0')||'.mp4',100+value
 		FROM generate_series(1,510) value;
 		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
 		SELECT 2001+value*2,201,1,47,'hour_manifest','published',now(),'manifest-bulk-'||value,'','application/json',
@@ -42,7 +47,7 @@ func TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia(t *te
 		JoinedArchiveCapabilityKey: capabilityKey,
 		JoinedArchiveWorkerToken:   workerToken,
 		SharedRecordingsAccountID:  47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true,
-	}}
+	}, joinedOutputStorage: joinedOutputStoreStub{}}
 
 	capability := func(t *testing.T, shared bool) string {
 		t.Helper()
@@ -102,11 +107,20 @@ func TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia(t *te
 		}
 		paths[file.RelativePath] = struct{}{}
 	}
-	if auth.ArchiveName != shared.ArchiveName || auth.TotalBytes != shared.TotalBytes || !reflect.DeepEqual(auth.Files, shared.Files) {
+	if len(auth.Files) != len(shared.Files) {
+		t.Fatalf("account/shared archive file counts differ: %d != %d", len(auth.Files), len(shared.Files))
+	}
+	authFiles, sharedFiles := append([]joinedArchiveArtifact(nil), auth.Files...), append([]joinedArchiveArtifact(nil), shared.Files...)
+	for index := range authFiles {
+		authFiles[index].Head, authFiles[index].Get = joinedArchiveRequest{}, joinedArchiveRequest{}
+		sharedFiles[index].Head, sharedFiles[index].Get = joinedArchiveRequest{}, joinedArchiveRequest{}
+	}
+	if auth.ArchiveName != shared.ArchiveName || auth.TotalBytes != shared.TotalBytes || !reflect.DeepEqual(authFiles, sharedFiles) {
 		t.Fatalf("account/shared archive scope differs:\nauth=%+v\nshared=%+v", auth, shared)
 	}
 	for _, file := range auth.Files {
-		if file.BatchID != "batch-1" || file.ContentType != "video/mp4" || !strings.HasSuffix(file.RelativePath, ".mp4") {
+		if file.BatchID != "batch-1" || file.ContentType != "video/mp4" || !strings.HasSuffix(file.RelativePath, ".mp4") ||
+			file.Head.Method != http.MethodHead || file.Get.Method != http.MethodGet {
 			t.Fatalf("file=%+v", file)
 		}
 	}

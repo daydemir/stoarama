@@ -7,5 +7,5 @@ export default defineConfig({
       "./crc32.wasm": fileURLToPath(new URL("./test/crc32-wasm.ts", import.meta.url)),
     },
   },
-  test: { include: ["test/zip-node.test.ts"] },
+  test: { include: ["test/zip-node.test.ts", "test/config.test.ts"] },
 });

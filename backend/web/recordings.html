@@ -844,6 +844,7 @@
       </div>
 
       <div id="scoreFilterResult" class="score-filter-result hidden" role="status" aria-live="polite"></div>
+      <div id="joinedProgressFreshness" class="score-filter-result hidden" role="status" aria-live="polite"></div>
       <div id="recordingsLoading" class="recordings-loading hidden" role="status" aria-live="polite">
         <div class="recordings-loading-head"><span class="loading-spinner" aria-hidden="true"></span><span>Loading recordings and daily scores…</span></div>
         <div class="recordings-skeleton" aria-hidden="true">
@@ -1268,6 +1269,7 @@
       recordingSortWrap: document.getElementById('recordingSortWrap'),
       recordingSort: document.getElementById('recordingSort'),
       scoreFilterResult: document.getElementById('scoreFilterResult'),
+      joinedProgressFreshness: document.getElementById('joinedProgressFreshness'),
       recordingsLoading: document.getElementById('recordingsLoading'),
       recordingsLoadNotice: document.getElementById('recordingsLoadNotice'),
       recordingsLoadError: document.getElementById('recordingsLoadError'),
@@ -1463,6 +1465,7 @@
 	  joinedProgressLoaded: false,
 	  joinedProgressLoading: false,
 	  joinedProgressError: false,
+	  joinedProgressUpdatedAt: null,
       destinations: [],
       schedPreset: 'hourly',
       // Capture mode: 'sampled' (one clip per cron fire) or 'continuous' (gapless
@@ -3620,7 +3623,7 @@
         ? `Relay${rec.relay_node_name ? ` · ${escapeHTML(String(rec.relay_node_name))}` : ''}${rec.preferred_relay_group_name ? ` · prefers ${escapeHTML(String(rec.preferred_relay_group_name))}` : ''}` : 'Cloud';
       const joined = joinedCoverage(rec);
       const joinedHTML = joined.available
-        ? `<div class="cell-main recordings-joined-value" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>`
+        ? `<div class="cell-main recordings-joined-value" title="${escapeHTML(joined.title)}" aria-label="${escapeHTML(joined.title)}">${joined.percent}%</div>${joined.mediaReady ? '<div class="cell-sub">100% media ready</div>' : ''}`
 	    : !state.joinedProgressLoaded && !state.joinedProgressError
 	      ? `<div class="cell-main recordings-joined-value loading" title="Joined coverage is loading" aria-label="Joined coverage is loading">Loading</div>`
 	    : state.joinedProgressError
@@ -3658,7 +3661,7 @@
       const sourceMS = Number(rec && rec.source_duration_ms);
       const readyMS = Number(rec && rec.joined_ready_ms);
       const rawPercent = rec && rec.joined_percent;
-      if (!(sourceMS > 0) || rawPercent === null || rawPercent === undefined || !Number.isFinite(Number(rawPercent))) {
+      if (!Number.isFinite(sourceMS) || !(sourceMS > 0) || rawPercent === null || rawPercent === undefined || !Number.isFinite(Number(rawPercent))) {
         return { available: false, percent: null, sourceMS: 0, readyMS: 0 };
       }
       const percent = Math.max(0, Math.min(100, Math.trunc(Number(rawPercent))));
@@ -3667,6 +3670,7 @@
         percent,
         sourceMS,
         readyMS: Math.max(0, readyMS),
+        mediaReady: Number.isFinite(readyMS) && readyMS >= sourceMS,
         title: `Joined coverage for the selected best consecutive 14-day period: ${percent}% (${formatDuration(Math.max(0, readyMS))} joined of ${formatDuration(sourceMS)} usable recorded footage)`,
       };
     }
@@ -5291,6 +5295,8 @@
 		state.joinedProgressLoaded = false;
 		state.joinedProgressLoading = false;
 		state.joinedProgressError = false;
+		state.joinedProgressUpdatedAt = null;
+		renderJoinedProgressFreshness();
         const present = new Set(state.recordings.map((rec) => Number(rec.id)));
         state.selectedRecordings = new Set([...state.selectedRecordings].filter((id) => present.has(id)));
         updateBulkCancelButton();
@@ -5408,6 +5414,8 @@
 	    }
 	    state.joinedProgressLoaded = true;
 	    state.joinedProgressError = hadError;
+	    state.joinedProgressUpdatedAt = hadError ? null : new Date();
+	    renderJoinedProgressFreshness();
 	    renderCards();
 	  } catch (_) {
 	    if (requestToken !== recordingsLoadToken) return;
@@ -5416,6 +5424,14 @@
 	  } finally {
 	    if (requestToken === recordingsLoadToken) state.joinedProgressLoading = false;
 	  }
+	}
+
+	function renderJoinedProgressFreshness() {
+	  const updated = state.joinedProgressUpdatedAt;
+	  els.joinedProgressFreshness.classList.toggle('hidden', !(updated instanceof Date));
+	  els.joinedProgressFreshness.textContent = updated instanceof Date
+	    ? `Joined data loaded ${updated.toLocaleString()}. Percentages cover usable recorded footage in each selected best consecutive 14-day period.`
+	    : '';
 	}
 
     // ---- Composer open/close ----

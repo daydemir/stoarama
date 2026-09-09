@@ -192,8 +192,15 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		    AND h.source_clip_count>0 AND h.attempt_count<$4
 		    AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.hour_record_id=h.id
 		      AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
-		    AND ((h.state='pending' AND h.next_attempt_at<=now())
-		      OR (h.state='leased' AND h.lease_expires_at<=now()))
+		    AND (((NOT $3) AND ((h.state='pending' AND h.next_attempt_at<=now())
+		      OR (h.state='leased' AND h.lease_expires_at<=now())))
+		      OR ($3 AND ((h.state='pending' AND h.attempt_count=0 AND h.next_attempt_at<=now())
+		        OR (h.state='leased' AND h.attempt_count=1 AND h.lease_expires_at<=now()
+		          AND h.source_only_sha256 IS NULL AND h.canonical_plan IS NULL AND h.manifest_bytes IS NULL
+		          AND h.manifest_sha256 IS NULL AND h.sealed_at IS NULL
+		          AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures any_failure WHERE any_failure.hour_record_id=h.id)
+		          AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts any_artifact WHERE any_artifact.hour_record_id=h.id)
+		          AND NOT EXISTS(SELECT 1 FROM recording_joined_hour_dispositions any_disposition WHERE any_disposition.hour_record_id=h.id)))))
 		    AND EXISTS(SELECT 1 FROM recording_joined_artifacts ledger WHERE ledger.stream_day_id=h.stream_day_id
 		      AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'))
 		  OR EXISTS(SELECT 1 FROM recording_joined_artifacts a WHERE a.batch_record_id=b.id
@@ -435,11 +442,17 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		WHERE h.batch_id=$1 AND ($3 OR h.hour_id=ANY($2::text[]))
 		  AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
 		  AND h.source_clip_count>0 AND h.attempt_count<$5
-		  AND (NOT $3 OR (h.state='pending' AND h.attempt_count=0))
 		  AND h.source_bytes<=GREATEST(($4::bigint-$6::bigint)/2,-1::bigint)
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.hour_record_id=h.id
 		    AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
-		  AND ((h.state='pending' AND h.next_attempt_at<=now()) OR (h.state='leased' AND h.lease_expires_at<=now()))
+		  AND (((NOT $3) AND ((h.state='pending' AND h.next_attempt_at<=now()) OR (h.state='leased' AND h.lease_expires_at<=now())))
+		    OR ($3 AND ((h.state='pending' AND h.attempt_count=0 AND h.next_attempt_at<=now())
+		      OR (h.state='leased' AND h.attempt_count=1 AND h.lease_expires_at<=now()
+		        AND h.source_only_sha256 IS NULL AND h.canonical_plan IS NULL AND h.manifest_bytes IS NULL
+		        AND h.manifest_sha256 IS NULL AND h.sealed_at IS NULL
+		        AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures any_failure WHERE any_failure.hour_record_id=h.id)
+		        AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts any_artifact WHERE any_artifact.hour_record_id=h.id)
+		        AND NOT EXISTS(SELECT 1 FROM recording_joined_hour_dispositions any_disposition WHERE any_disposition.hour_record_id=h.id)))))
 		-- A frozen recording owns 14 days * 12 hours = 168 consecutive
 		-- ordinals. Interleave the same hour position across recordings, then
 		-- use the frozen recording priority as the deterministic tie-breaker.
@@ -459,11 +472,17 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 	var item joinedrecording.PreflightHourClaim
 	var metadataJSON, qualificationJSON, mediaToolJSON []byte
 	err = tx.QueryRow(r.Context(), `
-		UPDATE recording_joined_hours SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
+		UPDATE recording_joined_hours h SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
 		  lease_expires_at=date_trunc('second',now()+$4::interval),heartbeat_at=now()
-		WHERE id=$1 AND batch_id=$5 AND ($7 OR hour_id=ANY($6::text[]))
-		  AND (NOT $7 OR (state='pending' AND attempt_count=0))
-		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=recording_joined_hours.connection_id AND c.id=$8)
+		WHERE h.id=$1 AND h.batch_id=$5 AND ($7 OR h.hour_id=ANY($6::text[]))
+		  AND ((NOT $7) OR (h.state='pending' AND h.attempt_count=0)
+		    OR (h.state='leased' AND h.attempt_count=1 AND h.lease_expires_at<=now()
+		      AND h.source_only_sha256 IS NULL AND h.canonical_plan IS NULL AND h.manifest_bytes IS NULL
+		      AND h.manifest_sha256 IS NULL AND h.sealed_at IS NULL
+		      AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures any_failure WHERE any_failure.hour_record_id=h.id)
+		      AND NOT EXISTS(SELECT 1 FROM recording_joined_artifacts any_artifact WHERE any_artifact.hour_record_id=h.id)
+		      AND NOT EXISTS(SELECT 1 FROM recording_joined_hour_dispositions any_disposition WHERE any_disposition.hour_record_id=h.id)))
+		  AND EXISTS(SELECT 1 FROM connections c WHERE c.id=h.connection_id AND c.id=$8)
 		RETURNING hour_id,lease_expires_at`, hourRecordID, claimToken, workerID, joinedLeaseDuration.String(), claims.BatchID,
 		canaryHours, frozenBatch, s.cfg.JoinedRecordingConnectionID).
 		Scan(&item.HourID, &item.LeaseExpires)
