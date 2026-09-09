@@ -463,9 +463,9 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO recording_joined_worker_failures
 		(batch_record_id,hour_record_id,batch_id,scope_kind,scope_id,claim_token,attempt_count,
-		 failure_class,reason_code,disposition,retry_at)
+		 failure_class,reason_code,disposition,retry_at,created_at)
 		SELECT batch_record_id,id,batch_id,'hour',hour_id,claim_token,attempt_count,
-		 'transient','worker_task_failed','retry',now()+interval '10 minutes'
+		 'transient','worker_task_failed','retry',now()-interval '1 minute',now()-interval '2 minutes'
 		FROM recording_joined_hours WHERE hour_id=$1`, hourID); err != nil {
 		t.Fatal(err)
 	}
