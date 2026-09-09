@@ -1099,6 +1099,9 @@ func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, c
 
 func joinedStageTimingLog(hourID string, event joinedrecording.StageTimingEvent) string {
 	base := fmt.Sprintf("joined worker stage timing hour_id=%s stage=%s elapsed_ms=%d outcome=%s", hourID, event.Stage, event.ElapsedMS, event.Outcome)
+	if event.Stage == "build_verify" && event.Outcome == "error" && event.ValidationClass.Valid() {
+		return fmt.Sprintf("%s validation_class=%s media_ordinal=%d proof_ordinal=%d", base, event.ValidationClass, event.MediaOrdinal, event.ProofOrdinal)
+	}
 	if event.Stage != "upload_verify" || event.Outcome != "error" || !event.FailureStage.Valid() {
 		return base
 	}

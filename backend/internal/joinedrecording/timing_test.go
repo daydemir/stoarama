@@ -3,7 +3,9 @@ package joinedrecording
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,5 +52,19 @@ func TestUploadVerifyFailureStagesAreClosedAndBounded(t *testing.T) {
 	if got.Stage != "upload_verify" || got.Outcome != "error" || got.FailureStage != UploadVerifyFailurePartUpload ||
 		got.ArtifactID != 646 || got.ArtifactOrdinal != 29 {
 		t.Fatalf("bounded diagnostic differs: %+v", got)
+	}
+}
+
+func TestStageTimingExtractsOnlySealValidationCoordinates(t *testing.T) {
+	var got StageTimingEvent
+	ctx := WithStageTimingObserver(context.Background(), func(event StageTimingEvent) { got = event })
+	err := fmt.Errorf("%w: %w", ErrPreflightSealRequestInvalid,
+		newSealValidationError(SealValidationMaximalityProof, 59, 1, "joined hour seal maximality differs"))
+	emitStageTiming(ctx, "build_verify", time.Millisecond, err)
+	if got.ValidationClass != SealValidationMaximalityProof || got.MediaOrdinal != 59 || got.ProofOrdinal != 1 {
+		t.Fatalf("validation timing coordinates differ: %+v", got)
+	}
+	if strings.Contains(fmt.Sprint(got), "joined hour seal maximality differs") {
+		t.Fatalf("validation payload escaped into timing event: %+v", got)
 	}
 }

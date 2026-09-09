@@ -1380,6 +1380,21 @@ func TestJoinedStageTimingLogIncludesOnlyBoundedUploadVerifyDiagnostic(t *testin
 	}
 }
 
+func TestJoinedStageTimingLogIncludesOnlyBoundedSealValidationDiagnostic(t *testing.T) {
+	event := joinedrecording.StageTimingEvent{Stage: "build_verify", ElapsedMS: 1234, Outcome: "error",
+		ValidationClass: joinedrecording.SealValidationQuarantineProof, ProofOrdinal: 1}
+	got := joinedStageTimingLog("batch__recording-429__hour-01", event)
+	want := "joined worker stage timing hour_id=batch__recording-429__hour-01 stage=build_verify elapsed_ms=1234 outcome=error validation_class=quarantine_proof media_ordinal=0 proof_ordinal=1"
+	if got != want {
+		t.Fatalf("diagnostic log=%q want=%q", got, want)
+	}
+	for _, forbidden := range []string{"https://", "X-Amz-", "token", "object_key", "/tmp/", "payload"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("validation log contains forbidden field %q: %q", forbidden, got)
+		}
+	}
+}
+
 func TestJoinedCreateCapabilityErrorClassificationIsClosedAndSafe(t *testing.T) {
 	tests := []struct {
 		name, reason string
