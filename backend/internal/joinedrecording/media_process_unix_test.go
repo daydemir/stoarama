@@ -97,6 +97,10 @@ func TestBoundedMediaProcessKillsDescendantsAndPreservesDeadline(t *testing.T) {
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("deadline was not preserved: %v output=%q", err, processOutput.String())
 			}
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				t.Fatalf("canceled media process leaked an exit error into recovery classification: %v", err)
+			}
 			if elapsed := time.Since(started); elapsed > time.Second {
 				t.Fatalf("process group exceeded kill bound: %s", elapsed)
 			}
