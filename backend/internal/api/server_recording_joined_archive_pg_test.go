@@ -21,13 +21,18 @@ func TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia(t *te
 		t.Fatal(err)
 	}
 	seedJoinedBrowserTestData(t, pool)
+	if _, err := pool.Exec(context.Background(), `UPDATE recording_joined_artifacts
+		SET object_key='joined/batch-1/objects/'||expected_sha256||'.mp4'
+		WHERE id IN (302,303)`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(context.Background(), `INSERT INTO recording_joined_batches VALUES(1,47,'batch-1'),(2,99,'foreign-batch-1')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
 		SELECT 2000+value*2,201,1,47,'media',NULL,now(),'media-bulk-'||value,'','video/mp4',
-		       '20_Europe_Poland_Luban/May/Monday/hour_01_part_'||lpad(value::text,4,'0')||'.mp4',10,lpad(to_hex(value),64,'0'),'joined/private/media-bulk-'||value||'.mp4',100+value
+		       '20_Europe_Poland_Luban/May/Monday/hour_01_part_'||lpad(value::text,4,'0')||'.mp4',10,lpad(to_hex(value),64,'0'),'joined/batch-1/objects/'||lpad(to_hex(value),64,'0')||'.mp4',100+value
 		FROM generate_series(1,510) value;
 		INSERT INTO recording_joined_artifacts(id,hour_record_id,batch_record_id,account_id,artifact_kind,publication_state,published_at,etag,version_id,content_type,relative_path,expected_size_bytes,expected_sha256,object_key,ordinal)
 		SELECT 2001+value*2,201,1,47,'hour_manifest','published',now(),'manifest-bulk-'||value,'','application/json',
