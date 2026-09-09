@@ -26,6 +26,7 @@ func TestJoinedPublicationFailureRetryabilityFailsClosed(t *testing.T) {
 	}{
 		{"typed connection reset", &joinedAPITransportError{cause: syscall.ECONNRESET}, true},
 		{"typed deterministic transport", &joinedAPITransportError{cause: errors.New("TLS certificate differs")}, false},
+		{"typed file descriptor exhaustion", &joinedAPITransportError{cause: syscall.EMFILE}, false},
 		{"mixed transport cause", &joinedAPITransportError{cause: errors.Join(syscall.ECONNRESET, errors.New("TLS certificate differs"))}, false},
 		{"storage transport", &joinedrecording.StorageCapabilityError{Operation: "put", Reason: "transport", Cause: context.DeadlineExceeded}, true},
 		{"request timeout", &joinedrecording.StorageCapabilityError{Operation: "put", Reason: "status", StatusCode: http.StatusRequestTimeout}, true},
