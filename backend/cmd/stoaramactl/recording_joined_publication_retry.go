@@ -19,7 +19,6 @@ func joinedPublicationFailureRetryable(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, joinedrecording.ErrWorkerHeartbeatFailed) {
 		return false
 	}
-	deadline := errors.Is(err, errJoinedWorkerTaskDeadline)
 	sawRetryable, sawUnknown, sawForbidden := false, false, false
 	visitJoinedError(err, func(candidate error) {
 		switch candidate := candidate.(type) {
@@ -38,14 +37,14 @@ func joinedPublicationFailureRetryable(err error) bool {
 		case *joinedAPITransportError:
 			sawRetryable = true
 		default:
-			if candidate == errJoinedWorkerTaskDeadline {
+			if candidate == errJoinedWorkerTaskDeadline || candidate == context.DeadlineExceeded && errors.Is(err, errJoinedWorkerTaskDeadline) {
 				sawRetryable = true
 			} else {
 				sawUnknown = true
 			}
 		}
 	})
-	return sawRetryable && !sawForbidden && (deadline || !sawUnknown)
+	return sawRetryable && !sawForbidden && !sawUnknown
 }
 
 func visitJoinedError(err error, visit func(error)) {

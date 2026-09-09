@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,6 +31,9 @@ func TestJoinedPublicationFailureRetryabilityFailsClosed(t *testing.T) {
 		{"rate limited", &joinedAPIResponseError{path: "/finalize", status: http.StatusTooManyRequests}, true},
 		{"server error", &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "status", StatusCode: http.StatusServiceUnavailable}, true},
 		{"worker timeout", errJoinedWorkerTaskDeadline, true},
+		{"runner timeout", errors.Join(errJoinedWorkerTaskDeadline, context.DeadlineExceeded), true},
+		{"timeout plus unknown invariant", errors.Join(errJoinedWorkerTaskDeadline, context.DeadlineExceeded, errors.New("identity invariant")), false},
+		{"timeout plus IO error", errors.Join(errJoinedWorkerTaskDeadline, context.DeadlineExceeded, syscall.EIO), false},
 		{"conflict", &joinedAPIResponseError{path: "/finalize", status: http.StatusConflict}, false},
 		{"identity", &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "identity", StatusCode: http.StatusOK}, false},
 		{"hash", &joinedrecording.StorageCapabilityError{Operation: "reread", Reason: "hash", StatusCode: http.StatusOK}, false},
