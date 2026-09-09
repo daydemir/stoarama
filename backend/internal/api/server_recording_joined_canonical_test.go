@@ -1328,13 +1328,13 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		attemptedArtifactID == nil || *attemptedArtifactID != ledgerArtifactID || blocker != "download_failed" {
 		t.Fatalf("persisted joined blocker artifact=%v blocker=%q err=%v", attemptedArtifactID, blocker, err)
 	}
-	heartbeatTransfer := func(generation int, offset int64) heartbeatTelemetryResponse {
+	heartbeatTransfer := func(generation int, offset int64, operation string) heartbeatTelemetryResponse {
 		t.Helper()
 		observedAt := time.Now().UTC().Add(-time.Second)
 		body, _ := json.Marshal(connectionHeartbeatRequest{
 			ClientVersion: "joined-v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1,
 			JoinedTransfer: &connectionJoinedTransfer{ArtifactID: ledgerArtifactID, ProtocolGeneration: generation,
-				OffsetBytes: offset, Operation: "range", ObservedAt: &observedAt},
+				OffsetBytes: offset, Operation: operation, ObservedAt: &observedAt},
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", bytes.NewReader(body))
 		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
@@ -1348,7 +1348,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		return response
 	}
 	for _, offset := range []int64{16 << 20, 8 << 20, 24 << 20} {
-		response := heartbeatTransfer(1, offset)
+		response := heartbeatTransfer(1, offset, "range")
 		if response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
 			t.Fatalf("current transfer heartbeat rejected: %+v", response)
 		}
@@ -1368,7 +1368,16 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("transfer progress artifact=%v generation=%d offset=%d operation=%q errno=%q observed=%v resets=%d err=%v",
 			transferArtifactID, transferGeneration, transferOffset, transferOperation, transferErrno, transferObservedAt, resetCount, err)
 	}
-	if response := heartbeatTransfer(2, 1); response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {
+	if response := heartbeatTransfer(1, 0, "validate"); response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
+		t.Fatalf("preflight transfer heartbeat rejected: %+v", response)
+	}
+	if err := pool.QueryRow(ctx, `SELECT joined_transfer_offset_bytes,joined_transfer_operation,joined_transfer_reset_count
+		FROM connections WHERE id=$1`, connectionID).Scan(&transferOffset, &transferOperation, &resetCount); err != nil ||
+		transferOffset != 24<<20 || transferOperation != "validate" || resetCount != 1 {
+		t.Fatalf("preflight transfer lost durable progress offset=%d operation=%q resets=%d err=%v",
+			transferOffset, transferOperation, resetCount, err)
+	}
+	if response := heartbeatTransfer(2, 1, "range"); response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {
 		t.Fatalf("future generation transfer accepted: %+v", response)
 	}
 	var afterRejectedOffset, afterRejectedResets int64
@@ -1464,7 +1473,7 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		t.Fatalf("exact ACK did not clear joined telemetry artifact=%v blocker=%q attempted=%v retry=%v transfer=%v err=%v",
 			ackedArtifactID, ackedBlocker, ackedAttemptedAt, ackedRetryAt, ackedTransferArtifactID, err)
 	}
-	if response := heartbeatTransfer(1, 8<<20); response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
+	if response := heartbeatTransfer(1, 8<<20, "range"); response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
 		t.Fatalf("stale transfer heartbeat after exact ACK was not accepted: %+v", response)
 	}
 	if err := pool.QueryRow(ctx, `SELECT joined_transfer_artifact_id FROM connections WHERE id=$1`, connectionID).

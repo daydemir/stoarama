@@ -5166,6 +5166,9 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
 
 def download_joined_item(cfg, runtime, item, stop_event):
     joined_raw_priority_boundary(cfg, runtime, stop_event)
+    # Expose failures while opening or hashing prerequisite manifests. Offset
+    # zero is a phase marker; the server preserves any prior durable range.
+    runtime.set_joined_transfer(item["id"], 0, "validate")
     ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
     validate_media_manifest_binding(cfg, runtime, item, stop_event)
     directory_fd = open_joined_output_dir(cfg, item)

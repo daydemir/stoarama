@@ -1047,11 +1047,14 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 			ct, err := tx.Exec(r.Context(), `
 				UPDATE connections c SET
 				  joined_transfer_reset_count=CASE
-				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $6 < joined_transfer_offset_bytes
+				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $7='range' AND $6 < joined_transfer_offset_bytes
 				      THEN joined_transfer_reset_count+1
 				    WHEN joined_transfer_generation<>$5 OR joined_transfer_artifact_id IS DISTINCT FROM $4 THEN 0
 				    ELSE joined_transfer_reset_count END,
-				  joined_transfer_generation=$5,joined_transfer_artifact_id=$4,joined_transfer_offset_bytes=$6,
+				  joined_transfer_generation=$5,joined_transfer_artifact_id=$4,
+				  joined_transfer_offset_bytes=CASE
+				    WHEN joined_transfer_generation=$5 AND joined_transfer_artifact_id=$4 AND $7='validate' AND $6=0
+				      THEN joined_transfer_offset_bytes ELSE $6 END,
 				  joined_transfer_operation=$7,joined_transfer_errno_class=$8,joined_transfer_observed_at=$9
 				WHERE c.id=$1 AND c.joined_protocol_version=1 AND $4=(SELECT a.id `+joinedFeedHeadFromWhere+`)`,
 				connectionID, s.cfg.JoinedRecordingBatchID, frozenScopeSHA, transfer.ArtifactID,
