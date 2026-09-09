@@ -537,25 +537,26 @@ func TestLosslessNormalizationRequiresExplicitWorkerOptIn(t *testing.T) {
 	}
 }
 
-func TestDefaultMediaCandidateBudgetDoesNotRushExactPairProofs(t *testing.T) {
-	for _, kind := range []string{"full", "full_repeat"} {
-		if got := defaultMediaCandidateBudget(kind, 2); got != 60*time.Minute {
-			t.Errorf("%s budget=%s want=60m", kind, got)
+func TestDefaultMediaCandidateBudgetPolicy(t *testing.T) {
+	tests := []struct {
+		kind        string
+		sourceCount int
+		want        time.Duration
+	}{
+		{"segment", 37, 90 * time.Minute},
+		{"full", 2, 60 * time.Minute},
+		{"full_repeat", 2, 60 * time.Minute},
+		{"full_timeout_retry", 2, 60 * time.Minute},
+		{"pair", 2, 5 * time.Minute},
+		{"pair_repeat", 2, 5 * time.Minute},
+		{"extension", 2, 170 * time.Second},
+		{"extension_repeat", 2, 170 * time.Second},
+		{"prefix", 2, 170 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := defaultMediaCandidateBudget(tt.kind, tt.sourceCount); got != tt.want {
+			t.Errorf("%s budget=%s want=%s", tt.kind, got, tt.want)
 		}
-	}
-	if got := defaultMediaCandidateBudget("segment", 37); got != 60*time.Minute {
-		t.Fatalf("37-source segment budget=%s want=60m", got)
-	}
-	if got := defaultMediaCandidateBudget("full_timeout_retry", 2); got != 60*time.Minute {
-		t.Errorf("full timeout retry budget=%s want=60m", got)
-	}
-	for _, kind := range []string{"pair", "pair_repeat"} {
-		if got := defaultMediaCandidateBudget(kind, 2); got != 5*time.Minute {
-			t.Errorf("%s budget=%s want=5m", kind, got)
-		}
-	}
-	if got := defaultMediaCandidateBudget("prefix", 2); got != 170*time.Second {
-		t.Fatalf("two-source discovery budget=%s want=170s", got)
 	}
 }
 

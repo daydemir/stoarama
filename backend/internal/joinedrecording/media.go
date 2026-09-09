@@ -453,10 +453,14 @@ type mediaCandidateBudget func(string, int) time.Duration
 const (
 	fullTimeoutRetryBudget  = 60 * time.Minute
 	fullTimeoutRetryReserve = 75 * time.Minute
+	segmentCandidateBudget  = 90 * time.Minute
 )
 
 func defaultMediaCandidateBudget(kind string, sourceCount int) time.Duration {
-	if kind == "full" || kind == "full_repeat" || kind == "segment" {
+	if kind == "segment" {
+		return segmentCandidateBudget
+	}
+	if kind == "full" || kind == "full_repeat" {
 		return fullTimeoutRetryBudget
 	}
 	if kind == "full_timeout_retry" {
