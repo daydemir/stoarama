@@ -741,6 +741,12 @@ func (s *remoteJoinedOperatorService) CheckWorkerStartup(ctx context.Context, re
 	if tool.FFmpegSHA256 != s.cfg.JoinedRecordingFFmpegSHA256 || tool.FFprobeSHA256 != s.cfg.JoinedRecordingFFprobeSHA256 {
 		return fmt.Errorf("installed media tool hashes differ from configured pins")
 	}
+	return checkJoinedWorkerRemoteStartupWithRetry(ctx, s.cfg, s.idlePoll, func(callCtx context.Context) error {
+		return s.checkJoinedWorkerBackendStartup(callCtx, req)
+	})
+}
+
+func (s *remoteJoinedOperatorService) checkJoinedWorkerBackendStartup(ctx context.Context, req joinedWorkerRequest) error {
 	status, err := s.Status(ctx, joinedStatusRequest{BatchID: req.BatchID})
 	if err != nil {
 		return fmt.Errorf("read joined backend status: %w", err)
@@ -1687,12 +1693,12 @@ func (c *joinedAPIClient) getJSON(ctx context.Context, path, token string, respo
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("execute joined API status")
+		return &joinedAPITransportError{path: path, cause: err}
 	}
 	defer httpResponse.Body.Close()
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, joinedAPIResponseLimit))
-		return fmt.Errorf("joined API status returned status %d", httpResponse.StatusCode)
+		return &joinedAPIResponseError{path: path, status: httpResponse.StatusCode}
 	}
 	return decodeJoinedAPIResponse(httpResponse.Body, response)
 }
