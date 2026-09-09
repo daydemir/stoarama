@@ -3,6 +3,7 @@ package joinedrecording
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -33,6 +34,49 @@ func TestJoinedLifecycleRequestWireContracts(t *testing.T) {
 				t.Fatalf("wire=%s want=%s err=%v", encoded, tc.want, err)
 			}
 		})
+	}
+}
+
+func TestSealHourRequestAcceptsFiftyNineMediaAndOneQuarantine(t *testing.T) {
+	start := time.Date(2026, time.May, 4, 8, 0, 0, 0, time.UTC)
+	sources := make([]SourceClip, 60)
+	for i := range sources {
+		sources[i] = testSource(int64(i+1), start.Add(time.Duration(i)*time.Minute))
+	}
+	sources[0].SeamToPrevious = SeamEvidence{}
+	request := testRequest(sources)
+	claimSHA, _, err := sourceClaimSHA(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := SealHourRequest{ProtocolVersion: JoinedProtocolVersion, HourID: "bounded-hour", SourceClaimSHA256: claimSHA, AccountedSources: sources}
+	for i := 0; i < 59; i++ {
+		seal.Media = append(seal.Media, SealHourMedia{Ordinal: i + 1, SourceClipIDs: []int64{sources[i].ClipID}, SizeBytes: 1,
+			SHA256: strings.Repeat("a", 64), Verification: passingVerification()})
+	}
+	seal.Quarantine = []QuarantineEvidence{testQuarantineEvidence(BatchPlan{Sources: sources, MediaTool: request.MediaTool}, []int64{sources[59].ClipID}, "corrupt_source_media")}
+	if err := seal.Validate(request.RecordingID, request.MediaTool.IdentitySHA256); err != nil {
+		t.Fatalf("59-media+1-quarantine request rejected: %v", err)
+	}
+}
+
+func TestSealHourValidationDiagnosticIsBoundedAndRedacted(t *testing.T) {
+	err := newSealValidationError(SealValidationMaximalityProof, 42, 3, "joined hour seal maximality differs")
+	class, mediaOrdinal, proofOrdinal, ok := SealValidationDiagnostic(fmt.Errorf("preflight: %w", err))
+	if !ok || class != SealValidationMaximalityProof || mediaOrdinal != 42 || proofOrdinal != 3 {
+		t.Fatalf("diagnostic=%q/%d/%d ok=%t", class, mediaOrdinal, proofOrdinal, ok)
+	}
+	rendered := fmt.Sprint(err)
+	for _, forbidden := range []string{"https://", "X-Amz-", "token", "object_key", "/tmp/", "payload"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Fatalf("validation diagnostic exposed %q: %q", forbidden, rendered)
+		}
+	}
+	if _, _, _, ok := SealValidationDiagnostic(errors.New("secret-path=/tmp/source.mp4 token=hidden")); ok {
+		t.Fatal("arbitrary error received a validation diagnostic")
+	}
+	if SealValidationClass("secret-path").Valid() {
+		t.Fatal("arbitrary validation class was accepted")
 	}
 }
 

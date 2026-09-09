@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -386,57 +387,113 @@ func validScope(kind, id string) bool {
 	}
 }
 
+// SealValidationClass is a closed diagnostic for local seal validation. It
+// deliberately carries no media contents, paths, object identities, or errors.
+type SealValidationClass string
+
+const (
+	SealValidationRequest              SealValidationClass = "request"
+	SealValidationSourceClaim          SealValidationClass = "source_claim"
+	SealValidationSource               SealValidationClass = "source"
+	SealValidationMedia                SealValidationClass = "media"
+	SealValidationMediaAssignment      SealValidationClass = "media_assignment"
+	SealValidationMaximalityProof      SealValidationClass = "maximality_proof"
+	SealValidationQuarantineProof      SealValidationClass = "quarantine_proof"
+	SealValidationQuarantineAssignment SealValidationClass = "quarantine_assignment"
+	SealValidationSourceAccounting     SealValidationClass = "source_accounting"
+)
+
+func (c SealValidationClass) Valid() bool {
+	switch c {
+	case SealValidationRequest, SealValidationSourceClaim, SealValidationSource,
+		SealValidationMedia, SealValidationMediaAssignment, SealValidationMaximalityProof,
+		SealValidationQuarantineProof, SealValidationQuarantineAssignment,
+		SealValidationSourceAccounting:
+		return true
+	default:
+		return false
+	}
+}
+
+type sealValidationError struct {
+	class                      SealValidationClass
+	mediaOrdinal, proofOrdinal int
+	message                    string
+	cause                      error
+}
+
+func (e *sealValidationError) Error() string {
+	if e.cause != nil {
+		return e.message + ": " + e.cause.Error()
+	}
+	return e.message
+}
+func (e *sealValidationError) Unwrap() error { return e.cause }
+
+func newSealValidationError(class SealValidationClass, mediaOrdinal, proofOrdinal int, message string) error {
+	return &sealValidationError{class: class, mediaOrdinal: mediaOrdinal, proofOrdinal: proofOrdinal, message: message}
+}
+
+// SealValidationDiagnostic returns only bounded, non-sensitive coordinates.
+func SealValidationDiagnostic(err error) (SealValidationClass, int, int, bool) {
+	var validation *sealValidationError
+	if !errors.As(err, &validation) || !validation.class.Valid() {
+		return "", 0, 0, false
+	}
+	return validation.class, validation.mediaOrdinal, validation.proofOrdinal, true
+}
+
 func (r SealHourRequest) Validate(recordingID int64, toolIdentity string) error {
 	if r.ProtocolVersion != JoinedProtocolVersion || r.HourID == "" || !lowerHex64(r.SourceClaimSHA256) || len(r.AccountedSources) == 0 || !lowerHex64(toolIdentity) {
-		return fmt.Errorf("invalid joined hour seal request")
+		return newSealValidationError(SealValidationRequest, 0, 0, "invalid joined hour seal request")
 	}
 	claimSHA, _, err := sourceClaimSHA(r.AccountedSources)
 	if err != nil || claimSHA != r.SourceClaimSHA256 {
-		return fmt.Errorf("joined hour seal source claim differs")
+		return newSealValidationError(SealValidationSourceClaim, 0, 0, "joined hour seal source claim differs")
 	}
 	accounted, disposed := map[int64]bool{}, map[int64]bool{}
 	for _, source := range r.AccountedSources {
 		if accounted[source.ClipID] || validatePreflightSource(source, recordingID) != nil {
-			return fmt.Errorf("joined hour seal source differs")
+			return newSealValidationError(SealValidationSource, 0, 0, "joined hour seal source differs")
 		}
 		accounted[source.ClipID] = true
 	}
 	for i, media := range r.Media {
 		if media.Ordinal != i+1 || media.SizeBytes <= 0 || !lowerHex64(media.SHA256) || len(media.SourceClipIDs) == 0 || validatePassedVerification(media.Verification) != nil {
-			return fmt.Errorf("joined hour seal media differs")
+			return newSealValidationError(SealValidationMedia, i+1, 0, "joined hour seal media differs")
 		}
 		for _, clipID := range media.SourceClipIDs {
 			if !accounted[clipID] || disposed[clipID] {
-				return fmt.Errorf("joined hour seal media source assignment differs")
+				return newSealValidationError(SealValidationMediaAssignment, i+1, 0, "joined hour seal media source assignment differs")
 			}
 			disposed[clipID] = true
 		}
-		for _, evidence := range media.MaximalityEvidence {
+		for proofIndex, evidence := range media.MaximalityEvidence {
 			candidateSources, sourceErr := sourceSubsetByIDs(r.AccountedSources, evidence.CandidateClipIDs)
 			expectedClaim, claimErr := candidateSourceClaimSHA(candidateSources)
 			if sourceErr != nil || claimErr != nil || validateMaximalityEvidence(evidence, toolIdentity, expectedClaim) != nil {
-				return fmt.Errorf("joined hour seal maximality differs")
+				return newSealValidationError(SealValidationMaximalityProof, i+1, proofIndex+1, "joined hour seal maximality differs")
 			}
 		}
 	}
-	for _, evidence := range r.Quarantine {
+	for proofIndex, evidence := range r.Quarantine {
 		quarantineSources, sourceErr := sourceSubsetByIDs(r.AccountedSources, evidence.SourceClipIDs)
 		expectedClaim, claimErr := candidateSourceClaimSHA(quarantineSources)
 		if sourceErr != nil || claimErr != nil {
-			return fmt.Errorf("joined hour seal quarantine differs")
+			return newSealValidationError(SealValidationQuarantineProof, 0, proofIndex+1, "joined hour seal quarantine differs")
 		}
 		if evidenceErr := validateQuarantineEvidence(evidence, toolIdentity, expectedClaim); evidenceErr != nil {
-			return fmt.Errorf("joined hour seal quarantine differs: %w", evidenceErr)
+			return &sealValidationError{class: SealValidationQuarantineProof, proofOrdinal: proofIndex + 1, message: "joined hour seal quarantine differs", cause: evidenceErr}
 		}
 		for _, clipID := range evidence.SourceClipIDs {
 			if !accounted[clipID] || disposed[clipID] {
-				return fmt.Errorf("joined hour seal quarantine source assignment differs")
+				return newSealValidationError(SealValidationQuarantineAssignment, 0, proofIndex+1, "joined hour seal quarantine source assignment differs")
 			}
 			disposed[clipID] = true
 		}
 	}
 	if len(disposed) != len(accounted) {
-		return fmt.Errorf("joined hour seal omits accounted sources")
+		return newSealValidationError(SealValidationSourceAccounting, 0, 0, "joined hour seal omits accounted sources")
 	}
 	return nil
 }

@@ -191,7 +191,7 @@ func sealHourRequest(claim PreflightHourClaim, plan BatchPlan, built []BuiltOutp
 	}
 	request := SealHourRequest{ProtocolVersion: JoinedProtocolVersion, HourID: claim.HourID, SourceClaimSHA256: plan.SourceClaimSHA256, AccountedSources: append([]SourceClip(nil), plan.Sources...), Media: media, Quarantine: quarantine}
 	if err := request.Validate(plan.RecordingID, plan.MediaTool.IdentitySHA256); err != nil {
-		return SealHourRequest{}, fmt.Errorf("%w: %v", ErrPreflightSealRequestInvalid, err)
+		return SealHourRequest{}, fmt.Errorf("%w: %w", ErrPreflightSealRequestInvalid, err)
 	}
 	return request, nil
 }

@@ -3,7 +3,9 @@ package joinedrecording
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,5 +52,21 @@ func TestUploadVerifyFailureStagesAreClosedAndBounded(t *testing.T) {
 	if got.Stage != "upload_verify" || got.Outcome != "error" || got.FailureStage != UploadVerifyFailurePartUpload ||
 		got.ArtifactID != 646 || got.ArtifactOrdinal != 29 {
 		t.Fatalf("bounded diagnostic differs: %+v", got)
+	}
+}
+
+func TestStageTimingExtractsOnlySealValidationCoordinates(t *testing.T) {
+	var got StageTimingEvent
+	ctx := WithStageTimingObserver(context.Background(), func(event StageTimingEvent) { got = event })
+	const secret = "token=must-not-log path=/tmp/source-secret.mp4"
+	err := fmt.Errorf("%w: %w", ErrPreflightSealRequestInvalid,
+		&sealValidationError{class: SealValidationQuarantineProof, proofOrdinal: 1,
+			message: "joined hour seal quarantine differs", cause: errors.New(secret)})
+	emitStageTiming(ctx, "build_verify", time.Millisecond, err)
+	if got.ValidationClass != SealValidationQuarantineProof || got.MediaOrdinal != 0 || got.ProofOrdinal != 1 {
+		t.Fatalf("validation timing coordinates differ: %+v", got)
+	}
+	if rendered := fmt.Sprint(got); strings.Contains(rendered, secret) || strings.Contains(rendered, "/tmp/") || strings.Contains(rendered, "token=") {
+		t.Fatalf("validation payload escaped into timing event: %+v", got)
 	}
 }

@@ -14,6 +14,9 @@ type StageTimingEvent struct {
 	FailureStage    UploadVerifyFailureStage
 	ArtifactID      int64
 	ArtifactOrdinal int
+	ValidationClass SealValidationClass
+	MediaOrdinal    int
+	ProofOrdinal    int
 }
 
 // UploadVerifyFailureStage is a closed, non-sensitive publication checkpoint.
@@ -62,7 +65,11 @@ func emitStageTiming(ctx context.Context, stage string, elapsed time.Duration, e
 	if err != nil {
 		outcome = "error"
 	}
-	observer(StageTimingEvent{Stage: stage, ElapsedMS: elapsed.Milliseconds(), Outcome: outcome})
+	event := StageTimingEvent{Stage: stage, ElapsedMS: elapsed.Milliseconds(), Outcome: outcome}
+	if class, mediaOrdinal, proofOrdinal, ok := SealValidationDiagnostic(err); ok {
+		event.ValidationClass, event.MediaOrdinal, event.ProofOrdinal = class, mediaOrdinal, proofOrdinal
+	}
+	observer(event)
 }
 
 func emitUploadVerifyFailure(ctx context.Context, started time.Time, failureStage UploadVerifyFailureStage,
