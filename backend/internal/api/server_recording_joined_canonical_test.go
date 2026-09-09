@@ -1328,6 +1328,54 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		attemptedArtifactID == nil || *attemptedArtifactID != ledgerArtifactID || blocker != "download_failed" {
 		t.Fatalf("persisted joined blocker artifact=%v blocker=%q err=%v", attemptedArtifactID, blocker, err)
 	}
+	heartbeatTransfer := func(generation int, offset int64) heartbeatTelemetryResponse {
+		t.Helper()
+		observedAt := time.Now().UTC().Add(-time.Second)
+		body, _ := json.Marshal(connectionHeartbeatRequest{
+			ClientVersion: "joined-v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1,
+			JoinedTransfer: &connectionJoinedTransfer{ArtifactID: ledgerArtifactID, ProtocolGeneration: generation,
+				OffsetBytes: offset, Operation: "range", ObservedAt: &observedAt},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", bytes.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionHeartbeat(rec, req)
+		var response heartbeatTelemetryResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &response)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("transfer heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return response
+	}
+	for _, offset := range []int64{16 << 20, 8 << 20, 24 << 20} {
+		response := heartbeatTransfer(1, offset)
+		if response.JoinedDeliveryAccepted == nil || !*response.JoinedDeliveryAccepted {
+			t.Fatalf("current transfer heartbeat rejected: %+v", response)
+		}
+	}
+	var transferArtifactID *int64
+	var transferGeneration int
+	var transferOffset, resetCount int64
+	var transferOperation, transferErrno string
+	var transferObservedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT joined_transfer_artifact_id,joined_transfer_generation,
+		joined_transfer_offset_bytes,joined_transfer_operation,joined_transfer_errno_class,
+		joined_transfer_observed_at,joined_transfer_reset_count FROM connections WHERE id=$1`, connectionID).Scan(
+		&transferArtifactID, &transferGeneration, &transferOffset, &transferOperation, &transferErrno,
+		&transferObservedAt, &resetCount); err != nil || transferArtifactID == nil || *transferArtifactID != ledgerArtifactID ||
+		transferGeneration != 1 || transferOffset != 24<<20 || transferOperation != "range" || transferErrno != "" ||
+		transferObservedAt == nil || resetCount != 1 {
+		t.Fatalf("transfer progress artifact=%v generation=%d offset=%d operation=%q errno=%q observed=%v resets=%d err=%v",
+			transferArtifactID, transferGeneration, transferOffset, transferOperation, transferErrno, transferObservedAt, resetCount, err)
+	}
+	if response := heartbeatTransfer(2, 1); response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {
+		t.Fatalf("future generation transfer accepted: %+v", response)
+	}
+	var afterRejectedOffset, afterRejectedResets int64
+	if err := pool.QueryRow(ctx, `SELECT joined_transfer_offset_bytes,joined_transfer_reset_count FROM connections WHERE id=$1`,
+		connectionID).Scan(&afterRejectedOffset, &afterRejectedResets); err != nil || afterRejectedOffset != 24<<20 || afterRejectedResets != 1 {
+		t.Fatalf("rejected transfer changed progress offset=%d resets=%d err=%v", afterRejectedOffset, afterRejectedResets, err)
+	}
 	assertRawHeartbeat := func(id, cursorID int64, inventoryGeneration string, freeBytes int64) {
 		t.Helper()
 		var gotCursor, gotFree int64
@@ -1406,13 +1454,15 @@ func TestJoinedCanonicalLedgerPublicationFeedAndExactAck(t *testing.T) {
 		}
 	}
 	var ackedArtifactID *int64
+	var ackedTransferArtifactID *int64
 	var ackedBlocker string
 	var ackedAttemptedAt, ackedRetryAt *time.Time
-	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at
-		FROM connections WHERE id=$1`, connectionID).Scan(&ackedArtifactID, &ackedBlocker, &ackedAttemptedAt, &ackedRetryAt); err != nil ||
-		ackedArtifactID != nil || ackedBlocker != "" || ackedAttemptedAt != nil || ackedRetryAt != nil {
-		t.Fatalf("exact ACK did not clear joined telemetry artifact=%v blocker=%q attempted=%v retry=%v err=%v",
-			ackedArtifactID, ackedBlocker, ackedAttemptedAt, ackedRetryAt, err)
+	if err := pool.QueryRow(ctx, `SELECT joined_last_attempt_artifact_id,joined_last_blocker,joined_last_attempt_at,joined_retry_at,
+		joined_transfer_artifact_id FROM connections WHERE id=$1`, connectionID).Scan(
+		&ackedArtifactID, &ackedBlocker, &ackedAttemptedAt, &ackedRetryAt, &ackedTransferArtifactID); err != nil ||
+		ackedArtifactID != nil || ackedBlocker != "" || ackedAttemptedAt != nil || ackedRetryAt != nil || ackedTransferArtifactID != nil {
+		t.Fatalf("exact ACK did not clear joined telemetry artifact=%v blocker=%q attempted=%v retry=%v transfer=%v err=%v",
+			ackedArtifactID, ackedBlocker, ackedAttemptedAt, ackedRetryAt, ackedTransferArtifactID, err)
 	}
 	if rec, response := heartbeatTelemetry(principal, ledgerArtifactID, 300001, "acked-report", "storage_guard", 203); rec.Code != http.StatusOK ||
 		!response.OK || response.JoinedDeliveryAccepted == nil || *response.JoinedDeliveryAccepted {

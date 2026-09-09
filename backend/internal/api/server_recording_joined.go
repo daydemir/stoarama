@@ -428,8 +428,15 @@ func (s *Server) handleAccountJoinedAck(w http.ResponseWriter, r *http.Request) 
 		if _, err := tx.Exec(r.Context(), `
 			UPDATE connections SET joined_files_pulled=joined_files_pulled+1,
 			  joined_bytes_pulled=joined_bytes_pulled+$2,
-			  joined_last_attempt_artifact_id=NULL,joined_last_blocker='',joined_last_attempt_at=NULL,joined_retry_at=NULL
-			WHERE id=$1`, connectionID, sizeBytes); err != nil {
+			  joined_last_attempt_artifact_id=NULL,joined_last_blocker='',joined_last_attempt_at=NULL,joined_retry_at=NULL,
+			  joined_transfer_generation=CASE WHEN joined_transfer_artifact_id=$3 THEN 0 ELSE joined_transfer_generation END,
+			  joined_transfer_artifact_id=CASE WHEN joined_transfer_artifact_id=$3 THEN NULL ELSE joined_transfer_artifact_id END,
+			  joined_transfer_offset_bytes=CASE WHEN joined_transfer_artifact_id=$3 THEN 0 ELSE joined_transfer_offset_bytes END,
+			  joined_transfer_operation=CASE WHEN joined_transfer_artifact_id=$3 THEN '' ELSE joined_transfer_operation END,
+			  joined_transfer_errno_class=CASE WHEN joined_transfer_artifact_id=$3 THEN '' ELSE joined_transfer_errno_class END,
+			  joined_transfer_observed_at=CASE WHEN joined_transfer_artifact_id=$3 THEN NULL ELSE joined_transfer_observed_at END,
+			  joined_transfer_reset_count=CASE WHEN joined_transfer_artifact_id=$3 THEN 0 ELSE joined_transfer_reset_count END
+			WHERE id=$1`, connectionID, sizeBytes, req.ArtifactID); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("advance joined totals: %v", err))
 			return
 		}

@@ -448,6 +448,11 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	if err := validateConnectionHeartbeat(joined); err != nil {
 		t.Fatalf("joined capability heartbeat rejected: %v", err)
 	}
+	joined.JoinedTransfer = &connectionJoinedTransfer{ArtifactID: 9, ProtocolGeneration: 7, OffsetBytes: 8 << 20,
+		Operation: "range", ErrnoClass: "", ObservedAt: &now}
+	if err := validateConnectionHeartbeat(joined); err != nil {
+		t.Fatalf("joined transfer heartbeat rejected: %v", err)
+	}
 	legacy := connectionHeartbeatRequest{CursorID: 1, ClipsPulled: 1}
 	if err := validateConnectionHeartbeat(legacy); err != nil {
 		t.Fatalf("legacy heartbeat rejected during rollout: %v", err)
@@ -484,6 +489,13 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "io_error", AttemptedAt: &future}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "io_error", AttemptedAt: &now, RetryAt: &beforeAttempt}},
 		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedDelivery: &connectionJoinedDelivery{ArtifactID: 1, Blocker: "io_error", AttemptedAt: &now, RetryAt: &farRetry}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 1, ProtocolGeneration: 7, Operation: "range", ObservedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 0, ProtocolGeneration: 7, Operation: "range", ObservedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 1, ProtocolGeneration: 0, Operation: "range", ObservedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 1, ProtocolGeneration: 7, OffsetBytes: -1, Operation: "range", ObservedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 1, ProtocolGeneration: 7, Operation: "secret/path", ObservedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 1, ProtocolGeneration: 7, Operation: "range", ErrnoClass: "raw errno", ObservedAt: &now}},
+		{ClientVersion: "v1", ClientPhase: "idle", ClientPreviousExit: "clean", JoinedProtocol: 1, JoinedTransfer: &connectionJoinedTransfer{ArtifactID: 1, ProtocolGeneration: 7, Operation: "range", ObservedAt: &future}},
 	}
 	for i, request := range invalid {
 		if err := validateConnectionHeartbeat(request); err == nil {
