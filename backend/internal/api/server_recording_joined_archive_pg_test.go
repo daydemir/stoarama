@@ -47,7 +47,7 @@ func TestJoinedArchivePublicAndAccountCapabilitiesResolveToSameScopedMedia(t *te
 		JoinedArchiveCapabilityKey: capabilityKey,
 		JoinedArchiveWorkerToken:   workerToken,
 		SharedRecordingsAccountID:  47, SharedRecordingsSlug: "mit-scl", SharedRecordingsPublic: true,
-	}}
+	}, joinedOutputStorage: joinedOutputStoreStub{}}
 
 	capability := func(t *testing.T, shared bool) string {
 		t.Helper()
