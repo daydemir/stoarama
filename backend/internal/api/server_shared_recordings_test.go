@@ -628,7 +628,7 @@ func TestSharedRecordingsPageHasAccessibleHeatmap(t *testing.T) {
 		`function recordingAPIPath`,
 		`sharedReadOnly ? '' :`,
 		`/joined/folder`,
-		`Browse joined folder`,
+		`<span>Joined clips</span>`,
 		`View recording`,
 		`Joined: highest first`,
 		`function joinedCoverage`,
