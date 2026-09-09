@@ -87,7 +87,13 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	poolConfig, err := nasInventoryPoolConfig(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal("invalid inventory database configuration")
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Fatalf("connect database: %v", err)
 	}
@@ -187,6 +193,22 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	if err := writeNASInventoryReport(os.Stdout, summary, opts.asJSON); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func nasInventoryPoolConfig(databaseURL string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	// Bound the report on the server too: a disconnected diagnostic must not
+	// retain table locks for hours and prevent an otherwise safe deployment.
+	cfg.MaxConns = 1
+	cfg.MinConns = 0
+	cfg.ConnConfig.RuntimeParams["application_name"] = "stoarama-nas-inventory-report"
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "30s"
+	cfg.ConnConfig.RuntimeParams["lock_timeout"] = "2s"
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	return cfg, nil
 }
 
 func writeNASInventoryReport(out io.Writer, summary nasInventorySummary, asJSON bool) error {

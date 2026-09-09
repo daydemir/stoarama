@@ -19,6 +19,24 @@ func TestParseNASInventoryArgs(t *testing.T) {
 	}
 }
 
+func TestNASInventoryPoolBoundsOverrideUnboundedConnectionSettings(t *testing.T) {
+	cfg, err := nasInventoryPoolConfig("postgres://localhost/inventory?statement_timeout=0&lock_timeout=0&default_transaction_read_only=off&pool_max_conns=20&pool_min_conns=5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxConns != 1 || cfg.MinConns != 0 {
+		t.Fatalf("report pool is not bounded: max=%d min=%d", cfg.MaxConns, cfg.MinConns)
+	}
+	for key, want := range map[string]string{
+		"statement_timeout": "30s", "lock_timeout": "2s",
+		"default_transaction_read_only": "on", "application_name": "stoarama-nas-inventory-report",
+	} {
+		if got := cfg.ConnConfig.RuntimeParams[key]; got != want {
+			t.Errorf("%s=%q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestWriteNASInventoryReportEmptyAndPopulated(t *testing.T) {
 	total, free := int64(92_136_325_632_000), int64(3_725_420_699_648)
 	for _, summary := range []nasInventorySummary{
