@@ -34,7 +34,9 @@ func TestJoinedPreflightSourceCapabilityRetries520(t *testing.T) {
 	}))
 	defer server.Close()
 	api, err := newJoinedAPIClient(server.URL, "bootstrap-token", server.Client())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg := validJoinedWorkerConfig()
 	cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	cfg.JoinedRecordingCanaryHourIDs = ""
@@ -48,11 +50,11 @@ func TestJoinedPreflightSourceCapabilityRetries520(t *testing.T) {
 func TestJoinedPreflightSourceCapabilityStopsAndBounds(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name string
-		status int
-		body string
+		name                   string
+		status                 int
+		body                   string
 		canary, direct, cancel bool
-		wantCalls int32
+		wantCalls              int32
 	}{
 		{name: "auth", status: 401, wantCalls: 1},
 		{name: "forbidden", status: 403, wantCalls: 1},
@@ -73,7 +75,9 @@ func TestJoinedPreflightSourceCapabilityStopsAndBounds(t *testing.T) {
 			}))
 			defer server.Close()
 			api, err := newJoinedAPIClient(server.URL, "bootstrap-token", server.Client())
-			if err != nil { t.Fatal(err) }
+			if err != nil {
+				t.Fatal(err)
+			}
 			cfg := validJoinedWorkerConfig()
 			if !tc.canary {
 				cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
@@ -105,7 +109,11 @@ func TestJoinedPreflightSourceCapabilityStopsAndBounds(t *testing.T) {
 func TestJoinedSourceCapabilityRetryClassification(t *testing.T) {
 	t.Parallel()
 	transient := &joinedAPIResponseError{path: joinedSourceCapabilityPath, status: 520}
-	for _, tc := range []struct { name string; err error; want bool }{
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
 		{"520", transient, true},
 		{"429", &joinedAPIResponseError{path: joinedSourceCapabilityPath, status: 429}, true},
 		{"transport", &joinedAPITransportError{path: joinedSourceCapabilityPath, cause: io.EOF}, true},

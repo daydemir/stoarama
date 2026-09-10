@@ -10,8 +10,8 @@ import (
 
 const (
 	joinedSourceCapabilityAttempts = 5
-	joinedSourceCapabilityTimeout = time.Minute
-	joinedSourceCapabilityPath = "/api/v1/recording/joined/capabilities/source"
+	joinedSourceCapabilityTimeout  = time.Minute
+	joinedSourceCapabilityPath     = "/api/v1/recording/joined/capabilities/source"
 )
 
 // Only frozen preflight retries this read-capability mint. Publication rebuilds,
