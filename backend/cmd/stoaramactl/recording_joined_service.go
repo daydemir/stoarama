@@ -1223,7 +1223,7 @@ func (s *remoteJoinedOperatorService) preflightAndPublish(ctx context.Context, c
 	ctx = withJoinedStageTiming(ctx, claim.HourID)
 	heartbeat := s.hourHeartbeat(claim.HourID)
 	resolveSource := func(callCtx context.Context, current joinedrecording.PreflightHourClaim, source joinedrecording.SourceClip, operation string) (joinedrecording.SourceReadCapability, error) {
-		return s.api.sourceCapability(callCtx, current.OperationToken, joinedrecording.SourceCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, HourID: current.HourID, ClipID: source.ClipID, Operation: operation})
+		return s.preflightSourceCapability(callCtx, current.OperationToken, joinedrecording.SourceCapabilityRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion, HourID: current.HourID, ClipID: source.ClipID, Operation: operation})
 	}
 	seal := func(callCtx context.Context, current joinedrecording.PreflightHourClaim, request joinedrecording.SealHourRequest) (joinedrecording.WorkerClaim, error) {
 		if err := request.Validate(current.RecordingID, current.MediaTool.IdentitySHA256); err != nil {
