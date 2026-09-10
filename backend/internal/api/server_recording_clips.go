@@ -595,7 +595,7 @@ func (s *Server) handleRecordingUploadIntent(w http.ResponseWriter, r *http.Requ
 	}
 	var req recordingUploadIntentRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
+		writeRecordingRequestDecodeError(w, err)
 		return
 	}
 	if req.JobID <= 0 {
@@ -923,7 +923,7 @@ func (s *Server) handleRecordingClipIngest(w http.ResponseWriter, r *http.Reques
 	}
 	var req recordingClipIngestRequest
 	if err := util.DecodeJSON(r, &req); err != nil {
-		util.WriteError(w, http.StatusBadRequest, err.Error())
+		writeRecordingRequestDecodeError(w, err)
 		return
 	}
 	intentID, err := uuid.Parse(strings.TrimSpace(req.IntentID))
