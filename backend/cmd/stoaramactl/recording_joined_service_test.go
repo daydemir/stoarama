@@ -437,6 +437,44 @@ func TestJoinedPresealContinuationScopeAndFailureFence(t *testing.T) {
 	}
 }
 
+func TestJoinedPresealDeadlineRetainsKnownMediaFailure(t *testing.T) {
+	frozen, err := joinedrecording.NewWorkScopeIdentity("tier1-2026-08", joinedrecording.WorkScopeFrozenBatch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := errors.Join(errJoinedWorkerTaskDeadline, joinedrecording.ErrPreflightDeadlineBeforeSeal, context.DeadlineExceeded)
+	media := errors.Join(joinedrecording.ErrPresealMediaSplitNotIsolated, joinedrecording.ErrPresealMediaBoundaryContradiction)
+	// The prefix builder preserves its initial media failure when a later
+	// candidate exhausts the outer task deadline. Every leaf must remain known.
+	for _, taskErr := range []error{
+		errors.Join(deadline, media),
+		fmt.Errorf("preflight: %w", errors.Join(deadline, fmt.Errorf("prefix: %w", media))),
+		errors.Join(deadline, joinedrecording.ErrPresealMediaSplitNotIsolated),
+	} {
+		if !joinedMayContinuePreflight(frozen, taskErr) {
+			t.Fatalf("known pre-seal deadline stopped worker: %v", taskErr)
+		}
+	}
+	for _, unsafe := range []error{
+		errors.New("unknown process failure"), syscall.EIO, syscall.ENOSPC,
+		context.Canceled, joinedrecording.ErrWorkerHeartbeatFailed,
+		&os.PathError{Op: "read", Path: "source", Err: syscall.EIO},
+		&joinedAPIResponseError{path: "/api/v1/recording/joined/seal", status: http.StatusUnauthorized},
+	} {
+		if joinedMayContinuePreflight(frozen, errors.Join(deadline, media, unsafe)) {
+			t.Fatalf("mixed unsafe deadline continued: %v", unsafe)
+		}
+	}
+	for _, unfenced := range []error{
+		errors.Join(errJoinedWorkerTaskDeadline, context.DeadlineExceeded, media),
+		errors.Join(joinedrecording.ErrPreflightDeadlineBeforeSeal, context.DeadlineExceeded, media),
+	} {
+		if joinedMayContinuePreflight(frozen, unfenced) {
+			t.Fatalf("deadline lacking both required fences continued: %v", unfenced)
+		}
+	}
+}
+
 func TestJoinedFrozenBatchClaimReportsSafeScratchBudget(t *testing.T) {
 	t.Setenv("JOINED_LOSSLESS_NORMALIZATION_ENABLED", "true")
 	cfg := validJoinedWorkerConfig()
