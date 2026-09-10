@@ -63,13 +63,18 @@ func TestJoinedPreflightSourceCapabilityStopsAndBounds(t *testing.T) {
 		{name: "canary", status: 520, canary: true, wantCalls: 1},
 		{name: "postseal unchanged", status: 520, direct: true, wantCalls: 1},
 		{name: "exhausted", status: 520, wantCalls: joinedSourceCapabilityAttempts},
-		{name: "canceled wait", status: 520, cancel: true, wantCalls: 1},
+		{name: "canceled request", status: 520, cancel: true, wantCalls: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var calls atomic.Int32
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
+				if tc.cancel {
+					cancel()
+				}
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, tc.body)
 			}))
@@ -84,12 +89,6 @@ func TestJoinedPreflightSourceCapabilityStopsAndBounds(t *testing.T) {
 				cfg.JoinedRecordingCanaryHourIDs = ""
 			}
 			service := &remoteJoinedOperatorService{cfg: cfg, api: api}
-			ctx := context.Background()
-			if tc.cancel {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, 100*time.Millisecond)
-				defer cancel()
-			}
 			request := joinedrecording.SourceCapabilityRequest{ProtocolVersion: 1, HourID: "hour-test", ClipID: 7, Operation: "get"}
 			if tc.direct {
 				_, err = api.sourceCapability(ctx, "operation-token", request)
@@ -99,7 +98,7 @@ func TestJoinedPreflightSourceCapabilityStopsAndBounds(t *testing.T) {
 			if err == nil || calls.Load() != tc.wantCalls {
 				t.Fatalf("err=%v calls=%d want=%d", err, calls.Load(), tc.wantCalls)
 			}
-			if tc.cancel && !errors.Is(err, context.DeadlineExceeded) {
+			if tc.cancel && !errors.Is(err, context.Canceled) {
 				t.Fatalf("lost parent cancellation: %v", err)
 			}
 		})
@@ -130,5 +129,47 @@ func TestJoinedSourceCapabilityRetryClassification(t *testing.T) {
 				t.Fatalf("retryable=%v want=%v", got, tc.want)
 			}
 		})
+	}
+}
+
+type joinedSourceDeadlineTransport func(*http.Request) (*http.Response, error)
+
+func (f joinedSourceDeadlineTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestJoinedPreflightSourceCapabilityDeadline(t *testing.T) {
+	t.Parallel()
+	for _, earlierParent := range []bool{false, true} {
+		ctx := context.Background()
+		if earlierParent {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+		}
+		calls := 0
+		client := &http.Client{Transport: joinedSourceDeadlineTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			deadline, ok := r.Context().Deadline()
+			if !ok || time.Until(deadline) > joinedSourceCapabilityTimeout || !deadline.After(time.Now()) {
+				t.Fatalf("source request lacks bounded deadline: %v %v", deadline, ok)
+			}
+			if parent, ok := ctx.Deadline(); ok && !deadline.Equal(parent) {
+				t.Fatalf("source request extended parent deadline: %v != %v", deadline, parent)
+			}
+			return nil, errors.New("intentional nonretryable transport stop")
+		})}
+		api, err := newJoinedAPIClient("https://example.invalid", "bootstrap-token", client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := validJoinedWorkerConfig()
+		cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
+		cfg.JoinedRecordingCanaryHourIDs = ""
+		service := &remoteJoinedOperatorService{cfg: cfg, api: api}
+		_, err = service.preflightSourceCapability(ctx, "operation-token", joinedrecording.SourceCapabilityRequest{ProtocolVersion: 1, HourID: "hour-test", ClipID: 7, Operation: "get"})
+		if err == nil || calls != 1 {
+			t.Fatalf("err=%v calls=%d", err, calls)
+		}
 	}
 }
