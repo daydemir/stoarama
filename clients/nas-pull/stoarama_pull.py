@@ -5164,13 +5164,28 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
     return True
 
 
+JOINED_IDENTITY_BLOCKERS = frozenset((
+    "dependency_identity", "manifest_identity", "existing_output_identity",
+    "prepared_object_identity", "transfer_marker_identity",
+))
+
+
+def joined_identity_step(reason_code, operation, *args):
+    """Attach a safe diagnostic without changing the original failure or operation."""
+    try:
+        return operation(*args)
+    except ExistingFileMismatch as exc:
+        exc.joined_identity_reason = reason_code
+        raise
+
+
 def download_joined_item(cfg, runtime, item, stop_event):
     joined_raw_priority_boundary(cfg, runtime, stop_event)
     # Expose failures while opening or hashing prerequisite manifests. Offset
     # zero is a phase marker; the server preserves any prior durable range.
     runtime.set_joined_transfer(item["id"], 0, "validate")
-    ensure_joined_dependency_ack(cfg, runtime, item, stop_event)
-    validate_media_manifest_binding(cfg, runtime, item, stop_event)
+    joined_identity_step("dependency_identity", ensure_joined_dependency_ack, cfg, runtime, item, stop_event)
+    joined_identity_step("manifest_identity", validate_media_manifest_binding, cfg, runtime, item, stop_event)
     directory_fd = open_joined_output_dir(cfg, item)
     final_name = Path(item["relative_path"]).name
     part_name = ".%s.joined-%d.part" % (final_name, item["id"])
@@ -5180,15 +5195,15 @@ def download_joined_item(cfg, runtime, item, stop_event):
         final_stat = joined_entry_stat(directory_fd, final_name)
         part_stat = joined_entry_stat(directory_fd, part_name)
         marker_stat = joined_entry_stat(directory_fd, marker_name)
-        if final_stat is not None and part_stat is None and marker_stat is None and complete_existing_joined(
+        if final_stat is not None and part_stat is None and marker_stat is None and joined_identity_step("existing_output_identity", complete_existing_joined,
             cfg, runtime, directory_fd, item, names, None, stop_event,
         ):
             return False
-        prepared = prepare_joined_download(cfg, item)
+        prepared = joined_identity_step("prepared_object_identity", prepare_joined_download, cfg, item)
         marker = joined_transfer_marker_bytes(item, prepared)
-        if complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, stop_event):
+        if joined_identity_step("existing_output_identity", complete_existing_joined, cfg, runtime, directory_fd, item, names, marker, stop_event):
             return False
-        part_stat = ensure_owned_joined_partial(
+        part_stat = joined_identity_step("transfer_marker_identity", ensure_owned_joined_partial,
             cfg, runtime, directory_fd, part_name, marker_name, marker, stop_event,
         )
         if part_stat.st_nlink != 1:
@@ -5380,7 +5395,8 @@ def classify_joined_delivery_error(exc):
     if isinstance(exc, urllib.error.HTTPError):
         return "http_error"
     if isinstance(exc, ExistingFileMismatch):
-        return "path_conflict"
+        reason = getattr(exc, "joined_identity_reason", None)
+        return reason if isinstance(reason, str) and reason in JOINED_IDENTITY_BLOCKERS else "path_conflict"
     if isinstance(exc, OSError):
         return "io_error"
     if "checksum mismatch" in str(exc):

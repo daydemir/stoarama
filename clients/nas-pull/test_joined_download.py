@@ -218,6 +218,54 @@ class JoinedDownloadTests(unittest.TestCase):
             os.close(descriptor)
         os.fsync(directory_fd)
 
+
+    def test_identity_diagnostic_preserves_exception_and_allowlists_only_codes(self):
+        for reason in pull.JOINED_IDENTITY_BLOCKERS:
+            original = pull.ExistingFileMismatch("private path and signed URL must stay local")
+            operation = mock.Mock(side_effect=original)
+            with self.assertRaises(pull.ExistingFileMismatch) as failure:
+                pull.joined_identity_step(reason, operation, "argument")
+            self.assertIs(failure.exception, original)
+            operation.assert_called_once_with("argument")
+            self.assertEqual(pull.classify_joined_delivery_error(failure.exception), reason)
+        for reason in (None, [], {}, "https://private.invalid/?token=secret", "manifest_identity extra", ""):
+            original = pull.ExistingFileMismatch("private exception text")
+            original.joined_identity_reason = reason
+            self.assertEqual(pull.classify_joined_delivery_error(original), "path_conflict")
+        self.assertEqual(pull.classify_joined_delivery_error(pull.ExistingFileMismatch("legacy")), "path_conflict")
+        original = OSError(errno.EIO, "original I/O failure")
+        with self.assertRaises(OSError) as failure:
+            pull.joined_identity_step("manifest_identity", mock.Mock(side_effect=original))
+        self.assertIs(failure.exception, original)
+        self.assertFalse(hasattr(original, "joined_identity_reason"))
+        self.assertEqual(pull.joined_identity_step("manifest_identity", lambda value: value, 7), 7)
+
+    def test_conflicting_final_is_untouched_and_reports_safe_identity_subreason(self):
+        item = pull.valid_joined_item(self.media_item())
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+            self.install_manifest(cfg, item)
+            directory_fd, final, part, marker = self.names(cfg, item)
+            original = b"conflicting user-owned final bytes"
+            try:
+                self.write_entry(directory_fd, final, original)
+                before = os.stat(final, dir_fd=directory_fd)
+                with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(
+                    pull, "prepare_joined_download"
+                ) as prepare, self.assertRaises(pull.ExistingFileMismatch) as failure:
+                    pull.download_joined_item(cfg, runtime, item, threading.Event())
+                self.assertEqual(pull.classify_joined_delivery_error(failure.exception), "existing_output_identity")
+                prepare.assert_not_called()
+                descriptor = os.open(final, os.O_RDONLY, dir_fd=directory_fd)
+                try: self.assertEqual(os.read(descriptor, len(original) + 1), original)
+                finally: os.close(descriptor)
+                after = os.stat(final, dir_fd=directory_fd)
+                self.assertEqual((before.st_ino, before.st_size, before.st_mtime_ns, before.st_nlink),
+                                 (after.st_ino, after.st_size, after.st_mtime_ns, after.st_nlink))
+                self.assertIsNone(pull.joined_entry_stat(directory_fd, part))
+                self.assertIsNone(pull.joined_entry_stat(directory_fd, marker))
+            finally: os.close(directory_fd)
+
     def test_protocol_artifact_shape_and_kind_validation(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1548,8 +1596,12 @@ class JoinedDownloadTests(unittest.TestCase):
             }
             try:
                 self.write_entry(directory_fd, part, b"unknown")
-                with mock.patch.object(pull, "prepare_joined_download", return_value=prepared), mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "ownership marker"):
+                with mock.patch.object(pull, "prepare_joined_download", return_value=prepared), mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "ownership marker") as failure:
                     pull.download_joined_item(cfg, runtime, item, threading.Event())
+                self.assertEqual(pull.classify_joined_delivery_error(failure.exception), "transfer_marker_identity")
+                descriptor = os.open(part, os.O_RDONLY, dir_fd=directory_fd)
+                try: self.assertEqual(os.read(descriptor, 8), b"unknown")
+                finally: os.close(descriptor)
                 self.write_entry(directory_fd, marker, self.marker(item)); os.link(part, "external-hardlink", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
                 with mock.patch.object(pull, "prepare_joined_download", return_value=prepared), mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "unknown hardlink"):
                     pull.download_joined_item(cfg, runtime, item, threading.Event())
