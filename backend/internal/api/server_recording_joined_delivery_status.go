@@ -85,6 +85,9 @@ func joinedAttemptBlockerClass(value string) string {
 	if value == "" {
 		return ""
 	}
+	if connectionJoinedBlockers[value] {
+		return value
+	}
 	return "present"
 }
 

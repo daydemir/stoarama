@@ -725,6 +725,8 @@ var connectionOutageClasses = map[string]bool{"dns_failed": true, "timeout": tru
 var connectionJoinedBlockers = map[string]bool{
 	"download_failed": true, "hash_mismatch": true, "http_error": true,
 	"io_error": true, "path_conflict": true, "storage_guard": true,
+	"dependency_identity": true, "manifest_identity": true, "existing_output_identity": true,
+	"prepared_object_identity": true, "transfer_marker_identity": true,
 }
 var connectionJoinedTransferOperations = map[string]bool{
 	"range": true, "verify": true, "validate": true, "publish": true,
