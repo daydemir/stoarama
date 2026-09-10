@@ -1005,7 +1005,13 @@ func joinedPresealDeadlineErrorTree(err error) joinedPresealDeadlineFacts {
 		return joinedPresealDeadlineFacts{known: true, taskDeadline: true}
 	case joinedrecording.ErrPreflightDeadlineBeforeSeal:
 		return joinedPresealDeadlineFacts{known: true, beforeSeal: true}
-	case context.DeadlineExceeded:
+	case context.DeadlineExceeded, joinedrecording.ErrPresealMediaSplitNotIsolated:
+		return joinedPresealDeadlineFacts{known: true}
+	}
+	// Prefix search retains earlier deterministic media evidence alongside a
+	// later task deadline. These known causes do not make that deadline unsafe;
+	// the caller still requires both outer-task and before-seal sentinels.
+	if joinedrecording.RecoverablePresealMediaFailure(err) {
 		return joinedPresealDeadlineFacts{known: true}
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
