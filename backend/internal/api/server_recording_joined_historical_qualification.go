@@ -299,8 +299,8 @@ func (s *Server) applyJoinedHistoricalQualification(ctx context.Context, req joi
 	err = tx.QueryRow(ctx, `SELECT id,definition_version,COALESCE(definition_jsonb->>'request_sha256',''),frozen_at,
 		definition_jsonb->'canonical_plan',definition_jsonb->'recording_jobs'
 		FROM recording_qualification_runs WHERE account_id=$1 AND status='active'
-		AND COALESCE(definition_jsonb->>'batch_id'=$2,false)=($3=$2)`, accountID,
-		joinedrecording.SeptemberBatchID, req.BatchID).
+		AND (definition_version=$4 AND COALESCE(definition_jsonb->>'batch_id'=$2,false))=($3=$2)`, accountID,
+		joinedrecording.SeptemberBatchID, req.BatchID, joinedrecording.Tier1HistoricalQualificationVersion).
 		Scan(&existingID, &existingVersion, &existingSHA, &existingFrozen, &existingPlanJSON, &existingJobsJSON)
 	if err == nil {
 		jobBytes, _ := json.Marshal(req.RecordingJobs)

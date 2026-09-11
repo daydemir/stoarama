@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +108,17 @@ func TestJoinedAdditiveCohortCoexistsAndFreezesWithoutLegacyMutation(t *testing.
 	}
 	if replay, _, replayID := fixture.callHistorical(request); replay.Code != http.StatusOK || replayID != runID {
 		t.Fatalf("additive replay status=%d run=%d body=%s", replay.Code, replayID, replay.Body.String())
+	}
+	// The separate joining authority must not replace the account's established
+	// qualification report simply because the additive run was activated later.
+	reportRequest := withPrincipal(httptest.NewRequest(http.MethodGet, "/api/v1/account/recordings/qualification", nil),
+		accountPrincipal{AccountID: fixture.accountID, UserID: fixture.userID, MemberRole: "owner"}, "")
+	reportRecorder := httptest.NewRecorder()
+	fixture.s.handleAccountRecordingQualification(reportRecorder, reportRequest)
+	var report recordingQualificationResponse
+	if reportRecorder.Code != http.StatusOK || json.Unmarshal(reportRecorder.Body.Bytes(), &report) != nil ||
+		report.RunID != fixture.runID || report.TargetRecordings != 33 || len(report.Members) != 33 {
+		t.Fatalf("additive run replaced legacy account report: status=%d body=%s", reportRecorder.Code, reportRecorder.Body.String())
 	}
 	var active, members, windows int
 	if err := fixture.pool.QueryRow(ctx, `SELECT

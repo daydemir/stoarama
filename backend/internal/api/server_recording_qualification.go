@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
@@ -277,7 +278,11 @@ func (s *Server) handleAccountRecordingQualificationBuild(w http.ResponseWriter,
 	var existingDefinition string
 	var existingCount int
 	var existingStart time.Time
-	err = tx.QueryRow(r.Context(), `SELECT id,definition_version,COALESCE(definition_jsonb->>'plan_sha256',''),COALESCE(definition_jsonb->>'recording_ids_sha256',''),target_recording_count,window_sequence_start_at FROM recording_qualification_runs WHERE account_id=$1 AND status='active'`, principal.AccountID).Scan(&existing, &existingDefinition, &existingPlan, &existingIDsHash, &existingCount, &existingStart)
+	err = tx.QueryRow(r.Context(), `SELECT id,definition_version,COALESCE(definition_jsonb->>'plan_sha256',''),COALESCE(definition_jsonb->>'recording_ids_sha256',''),target_recording_count,window_sequence_start_at
+		FROM recording_qualification_runs WHERE account_id=$1 AND status='active'
+		AND NOT (definition_version=$2 AND COALESCE(definition_jsonb->>'batch_id'=$3,false))`,
+		principal.AccountID, joinedrecording.Tier1HistoricalQualificationVersion, joinedrecording.SeptemberBatchID).
+		Scan(&existing, &existingDefinition, &existingPlan, &existingIDsHash, &existingCount, &existingStart)
 	if err == nil {
 		if existingDefinition != recordingQualificationDefinition || !strings.EqualFold(existingPlan, req.ExpectedPlanSHA256) || existingIDsHash != requestIDsHash || existingCount != len(ids) || !existingStart.Equal(req.SequenceStart.UTC()) {
 			util.WriteError(w, http.StatusConflict, "a different active qualification run already exists")
@@ -459,8 +464,10 @@ func (s *Server) handleAccountRecordingQualification(w http.ResponseWriter, r *h
 		SELECT id,status,frozen_at,target_recording_count,definition_version
 		FROM recording_qualification_runs
 		WHERE account_id=$1 AND status IN ('active','canceled') AND frozen_at IS NOT NULL
+		AND NOT (definition_version=$2 AND COALESCE(definition_jsonb->>'batch_id'=$3,false))
 		ORDER BY (status='active') DESC,frozen_at DESC LIMIT 1
-	`, principal.AccountID).Scan(&out.RunID, &out.RunStatus, &out.FrozenAt, &out.TargetRecordings, &out.DefinitionVersion)
+	`, principal.AccountID, joinedrecording.Tier1HistoricalQualificationVersion, joinedrecording.SeptemberBatchID).
+		Scan(&out.RunID, &out.RunStatus, &out.FrozenAt, &out.TargetRecordings, &out.DefinitionVersion)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusNotFound, "no frozen qualification run")
