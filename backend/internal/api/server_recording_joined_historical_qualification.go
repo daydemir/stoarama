@@ -64,14 +64,15 @@ type joinedHistoricalQualificationQuerier interface {
 }
 
 func (r joinedHistoricalQualificationRequest) validate() error {
+	cohort := joinedrecording.CohortForBatch(r.BatchID)
 	if r.ProtocolVersion != joinedrecording.JoinedProtocolVersion || r.ConnectionID <= 0 ||
-		r.BatchID != joinedrecording.Tier1BatchID || r.Generation != 1 ||
-		len(r.RecordingJobs) != len(joinedrecording.Tier1RecordingIDs) {
+		(r.BatchID != joinedrecording.Tier1BatchID && r.BatchID != joinedrecording.SeptemberBatchID) || r.Generation != 1 ||
+		len(r.RecordingJobs) != len(cohort.RecordingIDs) {
 		return errors.New("invalid exact Tier-1 historical qualification request")
 	}
 	seenJobs := make(map[int64]bool, len(r.RecordingJobs)*14)
 	for i, recording := range r.RecordingJobs {
-		if recording.RecordingID != joinedrecording.Tier1RecordingIDs[i] || len(recording.JobIDs) != 14 {
+		if recording.RecordingID != cohort.RecordingIDs[i] || len(recording.JobIDs) != 14 {
 			return errors.New("historical qualification recording order or cardinality differs")
 		}
 		for _, jobID := range recording.JobIDs {
@@ -92,14 +93,15 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 	if err := req.validate(); err != nil {
 		return joinedHistoricalQualificationPlan{}, err
 	}
-	cutoff, err := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	cohort := joinedrecording.CohortForBatch(req.BatchID)
+	cutoff, err := time.Parse(time.RFC3339Nano, cohort.FrozenAt)
 	if err != nil {
 		return joinedHistoricalQualificationPlan{}, err
 	}
 	plan := joinedHistoricalQualificationPlan{
 		SchemaVersion: 1, AuthorityKind: joinedrecording.Tier1HistoricalAuthorityKind, BatchID: req.BatchID,
 		Generation: req.Generation, ConnectionID: req.ConnectionID, Cutoff: cutoff,
-		OrderedRecordingIDSHA256: joinedrecording.Tier1RecordingIDSHA,
+		OrderedRecordingIDSHA256: cohort.RecordingIDSHA,
 		QualificationRuleVersion: joinedrecording.Tier1HistoricalQualificationVersion,
 		Members:                  make([]joinedHistoricalQualificationMember, 0, len(req.RecordingJobs)),
 	}
@@ -129,7 +131,7 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 		JOIN recording_jobs j ON j.id=expected.job_id AND j.recording_id=r.id AND j.kind='continuous_window'
 		  AND j.status IN('done','error') AND j.completed_at IS NOT NULL
 		ORDER BY array_position($5::bigint[],expected.recording_id),expected.day_ordinal
-		FOR SHARE OF r,s,j`, plan.AccountID, recordingIDs, jobIDs, dayOrdinals, joinedrecording.Tier1RecordingIDs)
+		FOR SHARE OF r,s,j`, plan.AccountID, recordingIDs, jobIDs, dayOrdinals, cohort.RecordingIDs)
 	if err != nil {
 		return plan, fmt.Errorf("resolve historical qualification jobs: %w", err)
 	}
@@ -147,8 +149,8 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 		}
 		recordingOrdinal := len(plan.Members)
 		if dayOrdinal == 1 {
-			if recordingOrdinal >= len(joinedrecording.Tier1RecordingIDs) ||
-				recordingID != joinedrecording.Tier1RecordingIDs[recordingOrdinal] {
+			if recordingOrdinal >= len(cohort.RecordingIDs) ||
+				recordingID != cohort.RecordingIDs[recordingOrdinal] {
 				return plan, errors.New("historical qualification recording order differs")
 			}
 			plan.Members = append(plan.Members, joinedHistoricalQualificationMember{
@@ -168,6 +170,10 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 			return plan, errors.New("historical qualification timezone differs")
 		}
 		startLocal, endLocal := fireAt.In(location), windowEnd.In(location)
+		if dayOrdinal == 1 && len(cohort.FirstDates) > 0 &&
+			startLocal.Format("2006-01-02") != cohort.FirstDates[len(plan.Members)-1] {
+			return plan, errors.New("historical qualification differs from approved best-14 window")
+		}
 		if member.RecordingID != recordingID || member.StreamID != streamID ||
 			dayOrdinal != len(member.Qualification.Days)+1 ||
 			windowEnd.Sub(fireAt) != 12*time.Hour || startLocal.Hour() != 8 || startLocal.Minute() != 0 ||
@@ -201,8 +207,8 @@ func buildJoinedHistoricalQualificationPlan(ctx context.Context, q joinedHistori
 	if err := rows.Err(); err != nil {
 		return plan, err
 	}
-	if len(plan.Members) != len(joinedrecording.Tier1RecordingIDs) {
-		return plan, errors.New("historical qualification lacks exactly 33 recordings")
+	if len(plan.Members) != len(cohort.RecordingIDs) {
+		return plan, errors.New("historical qualification lacks the exact approved recording count")
 	}
 	for i := range plan.Members {
 		sealed, err := joinedrecording.SealQualificationWindow(plan.Members[i].Qualification)
@@ -292,7 +298,9 @@ func (s *Server) applyJoinedHistoricalQualification(ctx context.Context, req joi
 	var existingPlanJSON, existingJobsJSON []byte
 	err = tx.QueryRow(ctx, `SELECT id,definition_version,COALESCE(definition_jsonb->>'request_sha256',''),frozen_at,
 		definition_jsonb->'canonical_plan',definition_jsonb->'recording_jobs'
-		FROM recording_qualification_runs WHERE account_id=$1 AND status='active'`, accountID).
+		FROM recording_qualification_runs WHERE account_id=$1 AND status='active'
+		AND COALESCE(definition_jsonb->>'batch_id'=$2,false)=($3=$2)`, accountID,
+		joinedrecording.SeptemberBatchID, req.BatchID).
 		Scan(&existingID, &existingVersion, &existingSHA, &existingFrozen, &existingPlanJSON, &existingJobsJSON)
 	if err == nil {
 		jobBytes, _ := json.Marshal(req.RecordingJobs)
@@ -346,8 +354,8 @@ func (s *Server) applyJoinedHistoricalQualification(ctx context.Context, req joi
 	firstWindow := plan.Members[0].Qualification.Days[0].WindowStart
 	var runID int64
 	if err := tx.QueryRow(ctx, `INSERT INTO recording_qualification_runs(account_id,definition_version,definition_jsonb,
-		target_recording_count,window_sequence_start_at) VALUES($1,$2,$3,33,$4) RETURNING id`, plan.AccountID,
-		joinedrecording.Tier1HistoricalQualificationVersion, definition, firstWindow).Scan(&runID); err != nil {
+		target_recording_count,window_sequence_start_at) VALUES($1,$2,$3,$5,$4) RETURNING id`, plan.AccountID,
+		joinedrecording.Tier1HistoricalQualificationVersion, definition, firstWindow, len(plan.Members)).Scan(&runID); err != nil {
 		return plan, 0, time.Time{}, false, err
 	}
 	memberBatch, windowBatch := &pgx.Batch{}, &pgx.Batch{}
