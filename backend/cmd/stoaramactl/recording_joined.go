@@ -130,6 +130,7 @@ type joinedOperatorService interface {
 	SealBatchIndex(context.Context, joinedSealBatchIndexRequest) (any, error)
 	ClaimAdmissionStatus(context.Context, string) (joinedrecording.ClaimAdmissionStatus, error)
 	SetClaimAdmission(context.Context, joinedrecording.ClaimAdmissionRequest) (joinedrecording.ClaimAdmissionStatus, error)
+	GrantExactRetry(context.Context, joinedrecording.ExactRetryGrantRequest) (joinedrecording.ExactRetryGrant, error)
 	CheckWorkerStartup(context.Context, joinedWorkerRequest) error
 	RunWorker(context.Context, joinedWorkerRequest) error
 	Status(context.Context, joinedStatusRequest) (any, error)
@@ -186,6 +187,28 @@ func runRecordingJoinedWith(ctx context.Context, cfg config.Config, args []strin
 	}
 
 	switch args[0] {
+	case "retry-grant":
+		flags := flag.NewFlagSet("retry-grant", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		req := joinedrecording.ExactRetryGrantRequest{ProtocolVersion: joinedrecording.JoinedProtocolVersion}
+		flags.StringVar(&req.BatchID, "batch-id", cfg.JoinedRecordingBatchID, "exact frozen batch")
+		flags.StringVar(&req.HourID, "hour-id", "", "exact hour identity")
+		flags.IntVar(&req.ExpectedAttemptCount, "expected-attempt-count", 0, "reviewed expired attempt")
+		flags.StringVar(&req.Reason, "reason", "", "operator review evidence")
+		if err := flags.Parse(args[1:]); err != nil {
+			return nil, err
+		}
+		if flags.NArg() != 0 {
+			return nil, errors.New("retry-grant accepts no positional arguments")
+		}
+		if err := req.Validate(); err != nil {
+			return nil, err
+		}
+		service, err := factory(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return service.GrantExactRetry(ctx, req)
 	case "admission":
 		req, err := parseJoinedAdmission(cfg, args[1:])
 		if err != nil {

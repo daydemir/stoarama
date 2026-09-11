@@ -666,6 +666,24 @@ func (s *remoteJoinedOperatorService) validOperatorToken() (string, error) {
 	return token, nil
 }
 
+func (s *remoteJoinedOperatorService) GrantExactRetry(ctx context.Context, req joinedrecording.ExactRetryGrantRequest) (joinedrecording.ExactRetryGrant, error) {
+	var grant joinedrecording.ExactRetryGrant
+	token, err := s.validOperatorToken()
+	if err != nil {
+		return grant, err
+	}
+	if err := req.Validate(); err != nil {
+		return grant, err
+	}
+	if err := s.api.putJSON(ctx, "/api/v1/recording/joined/retry-grant", token, req, &grant); err != nil {
+		return grant, err
+	}
+	if grant.BatchID != req.BatchID || grant.HourID != req.HourID || grant.ExpectedAttemptCount != req.ExpectedAttemptCount || grant.Reason != req.Reason || grant.FailureID <= 0 || grant.GrantedAt.IsZero() {
+		return grant, errors.New("joined exact retry grant identity differs")
+	}
+	return grant, nil
+}
+
 func (s *remoteJoinedOperatorService) Status(ctx context.Context, req joinedStatusRequest) (any, error) {
 	if strings.TrimSpace(s.api.bootstrapToken) == "" {
 		return nil, errors.New("joined worker bootstrap token is required for worker status")
