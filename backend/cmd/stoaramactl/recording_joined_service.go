@@ -268,7 +268,8 @@ func (s *remoteJoinedOperatorService) FreezeTier1(ctx context.Context, req joine
 	if err != nil {
 		return nil, err
 	}
-	cutoff, err := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	cohort := joinedrecording.CohortForBatch(req.BatchID)
+	cutoff, err := time.Parse(time.RFC3339Nano, cohort.FrozenAt)
 	if err != nil {
 		return nil, fmt.Errorf("parse frozen Tier-1 cutoff: %w", err)
 	}
@@ -285,8 +286,8 @@ func (s *remoteJoinedOperatorService) FreezeTier1(ctx context.Context, req joine
 		Apply                    bool      `json:"apply"`
 		ExpectedRequestSHA256    string    `json:"expected_request_sha256,omitempty"`
 	}{joinedrecording.JoinedProtocolVersion, req.ConnectionID, req.BatchID, req.Generation, req.SourceEndpoint,
-		req.QualificationRunID, append([]int64(nil), joinedrecording.Tier1RecordingIDs...),
-		joinedrecording.Tier1RecordingIDSHA, cutoff, req.Apply, req.ExpectedRequestSHA256}
+		req.QualificationRunID, cohort.RecordingIDs,
+		cohort.RecordingIDSHA, cutoff, req.Apply, req.ExpectedRequestSHA256}
 	var response map[string]any
 	if err := s.api.postJSON(ctx, "/api/v1/recording/joined/freeze-tier1", token, payload, &response); err != nil {
 		return nil, err
@@ -316,7 +317,7 @@ func (s *remoteJoinedOperatorService) FreezeTier1Checkpointed(ctx context.Contex
 		return nil, err
 	}
 	for {
-		if err := validateJoinedTier1CheckpointedProgress(progress); err != nil {
+		if err := validateJoinedTier1CheckpointedProgress(progress, req.BatchID); err != nil {
 			return nil, err
 		}
 		if progress.State == "ready" {
@@ -353,7 +354,7 @@ func (s *remoteJoinedOperatorService) FreezeTier1Checkpointed(ctx context.Contex
 			progress = statusProgress
 			continue
 		}
-		if err := validateJoinedTier1CheckpointedProgress(stepProgress); err != nil {
+		if err := validateJoinedTier1CheckpointedProgress(stepProgress, req.BatchID); err != nil {
 			return nil, err
 		}
 		// Prefer the freshly reread server status over the POST response. This
@@ -367,7 +368,8 @@ func (s *remoteJoinedOperatorService) FreezeTier1Checkpointed(ctx context.Contex
 }
 
 func joinedTier1FreezePayload(req joinedFreezeTier1Request) (any, error) {
-	cutoff, err := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	cohort := joinedrecording.CohortForBatch(req.BatchID)
+	cutoff, err := time.Parse(time.RFC3339Nano, cohort.FrozenAt)
 	if err != nil {
 		return nil, fmt.Errorf("parse frozen Tier-1 cutoff: %w", err)
 	}
@@ -383,8 +385,8 @@ func joinedTier1FreezePayload(req joinedFreezeTier1Request) (any, error) {
 		EligibilityCutoff        time.Time `json:"eligibility_cutoff"`
 		Apply                    bool      `json:"apply"`
 	}{joinedrecording.JoinedProtocolVersion, req.ConnectionID, req.BatchID, req.Generation, req.SourceEndpoint,
-		req.QualificationRunID, append([]int64(nil), joinedrecording.Tier1RecordingIDs...),
-		joinedrecording.Tier1RecordingIDSHA, cutoff, false}, nil
+		req.QualificationRunID, cohort.RecordingIDs,
+		cohort.RecordingIDSHA, cutoff, false}, nil
 }
 
 func (s *remoteJoinedOperatorService) joinedTier1CheckpointedStatus(ctx context.Context, token, runID string) (joinedTier1CheckpointedProgress, error) {
@@ -396,8 +398,8 @@ func (s *remoteJoinedOperatorService) joinedTier1CheckpointedStatus(ctx context.
 	return progress, nil
 }
 
-func validateJoinedTier1CheckpointedProgress(progress joinedTier1CheckpointedProgress) error {
-	if _, err := uuid.Parse(progress.RunID); err != nil || progress.ExpectedRecordings != len(joinedrecording.Tier1RecordingIDs) ||
+func validateJoinedTier1CheckpointedProgress(progress joinedTier1CheckpointedProgress, batchID string) error {
+	if _, err := uuid.Parse(progress.RunID); err != nil || progress.ExpectedRecordings != len(joinedrecording.CohortForBatch(batchID).RecordingIDs) ||
 		progress.CompletedRecordings < 0 || progress.CompletedRecordings > progress.ExpectedRecordings {
 		return errors.New("checkpointed Tier-1 dry-run progress differs")
 	}
@@ -523,16 +525,17 @@ func (s *remoteJoinedOperatorService) SealRemainingDays(ctx context.Context, req
 }
 
 func validateJoinedAdminBatchStatus(status joinedAdminBatchStatus, batchID string) error {
+	cohort := joinedrecording.CohortForBatch(batchID)
 	if status.ProtocolVersion != joinedrecording.JoinedProtocolVersion || status.BatchID != batchID ||
 		status.State != "building" || status.FreezeStartedAt != nil || status.FrozenAt != nil ||
-		status.ExpectedStreamDays != len(joinedrecording.Tier1RecordingIDs)*14 ||
-		status.ExpectedScheduledHours != len(joinedrecording.Tier1RecordingIDs)*14*12 ||
+		status.ExpectedStreamDays != len(cohort.RecordingIDs)*14 ||
+		status.ExpectedScheduledHours != len(cohort.RecordingIDs)*14*12 ||
 		len(status.StreamDays) != status.ExpectedStreamDays ||
 		validateExpectedHash("frozen_denominator_sha256", status.FrozenDenominatorSHA256, true) != nil {
 		return errors.New("joined batch is not ready for serial stream-day sealing")
 	}
 	for index, day := range status.StreamDays {
-		if day.RecordingID != joinedrecording.Tier1RecordingIDs[index/14] || day.SourceCount < 0 || day.SourceBytes < 0 ||
+		if day.RecordingID != cohort.RecordingIDs[index/14] || day.SourceCount < 0 || day.SourceBytes < 0 ||
 			(day.SourceCount == 0) != (day.SourceBytes == 0) || (day.State != "pending" && day.State != "sealed") ||
 			(day.State == "pending" && day.SealRequestSHA256 != "") ||
 			(day.State == "sealed" && validateExpectedHash("seal_request_sha256", day.SealRequestSHA256, true) != nil) {

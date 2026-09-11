@@ -171,7 +171,7 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 		freeze_request_bytes,freeze_request_sha256,frozen_denominator_sha256,freeze_exclusions_sha256,
 		expected_recordings,expected_stream_days,expected_scheduled_hours,expected_source_clips,expected_source_bytes,
 		expected_freeze_exclusions)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,33,462,5544,$22,$23,$24)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$25,$26,$27,$22,$23,$24)
 		RETURNING id`, plan.AccountID, plan.ConnectionID, plan.BatchID, plan.Generation, plan.SourceEndpoint,
 		plan.SelectionAuthority.QualificationRunID, plan.SelectionAuthority.QualificationCohortSHA256,
 		plan.SelectionAuthority.QualificationWindowsSHA256, plan.SelectionAuthority.SelectedQualificationWindowsSHA256,
@@ -179,7 +179,8 @@ func (s *Server) loadOrInitializeJoinedTier1Snapshot(ctx context.Context, tx pgx
 		plan.SelectionAuthority.OrderedRecordingIDSHA256, plan.SelectionAuthority.SelectionBasis, plan.PolicyVersion,
 		plan.SelectionAuthority.Cutoff, mediaToolJSON, plan.MediaTool.IdentitySHA256, requestBytes, plan.RequestSHA256,
 		plan.FrozenDenominatorSHA256, plan.FreezeExclusionsSHA256, plan.ProvisionalSourceClips,
-		plan.ProvisionalSourceBytes, plan.ProvisionalExclusions).Scan(&batchRecordID); err != nil {
+		plan.ProvisionalSourceBytes, plan.ProvisionalExclusions, len(plan.Recordings),
+		plan.ExpectedStreamDays, plan.ExpectedScheduledHours).Scan(&batchRecordID); err != nil {
 		return plan, 0, "", false, err
 	}
 	for _, recording := range plan.Recordings {

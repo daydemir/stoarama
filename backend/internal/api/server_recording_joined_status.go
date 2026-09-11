@@ -9,8 +9,6 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-const joinedAdminBatchStatusStreamDays = 462
-
 type joinedAdminBatchStatusStreamDay struct {
 	RecordingID       int64  `json:"recording_id"`
 	LocalDate         string `json:"local_date"`
@@ -47,6 +45,7 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, http.StatusNotFound, "joined batch not found")
 		return
 	}
+	expectedStreamDays := len(joinedrecording.CohortForBatch(batchIDs[0]).RecordingIDs) * 14
 
 	rows, err := s.pool.Query(r.Context(), `SELECT b.batch_id,b.state,b.frozen_denominator_sha256,
 		b.freeze_started_at,b.frozen_at,b.expected_stream_days,b.expected_scheduled_hours,
@@ -57,7 +56,7 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 		JOIN recording_joined_stream_days d ON d.batch_record_id=b.id AND d.batch_recording_id=br.id
 		WHERE b.batch_id=$1 AND b.connection_id=$3 AND b.state<>'snapshotting'
 		ORDER BY br.priority_ordinal,d.date_ordinal
-		LIMIT $2`, batchIDs[0], joinedAdminBatchStatusStreamDays+1, s.cfg.JoinedRecordingConnectionID)
+		LIMIT $2`, batchIDs[0], expectedStreamDays+1, s.cfg.JoinedRecordingConnectionID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load joined batch status: %v", err))
 		return
@@ -65,7 +64,7 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 	defer rows.Close()
 
 	response := joinedAdminBatchStatusResponse{ProtocolVersion: joinedrecording.JoinedProtocolVersion,
-		StreamDays: make([]joinedAdminBatchStatusStreamDay, 0, joinedAdminBatchStatusStreamDays)}
+		StreamDays: make([]joinedAdminBatchStatusStreamDay, 0, expectedStreamDays)}
 	for rows.Next() {
 		var batchID, state, denominator string
 		var freezeStartedAt, frozenAt *time.Time
@@ -109,8 +108,8 @@ func (s *Server) handleAdminJoinedBatchStatus(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if response.BatchID != batchIDs[0] || !lowerHexSHA256(response.FrozenDenominatorSHA256) ||
-		response.ExpectedStreamDays != joinedAdminBatchStatusStreamDays ||
-		response.ExpectedScheduledHours != joinedAdminBatchStatusStreamDays*12 ||
+		response.ExpectedStreamDays != expectedStreamDays ||
+		response.ExpectedScheduledHours != expectedStreamDays*12 ||
 		len(response.StreamDays) != response.ExpectedStreamDays {
 		util.WriteError(w, http.StatusConflict, "joined batch status is incomplete")
 		return

@@ -189,7 +189,7 @@ func (s *Server) startJoinedTier1DryRun(ctx context.Context, req joinedTier1Free
 	if err != nil {
 		return joinedTier1DryRunProgress{}, err
 	}
-	if command.RowsAffected() != 462 && command.RowsAffected() != 0 {
+	if command.RowsAffected() != int64(plan.ExpectedStreamDays) && command.RowsAffected() != 0 {
 		return joinedTier1DryRunProgress{}, fmt.Errorf("create dry-run scopes: rows=%d", command.RowsAffected())
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -208,7 +208,8 @@ func (s *Server) handleAdminJoinedFreezeTier1DryRunStep(w http.ResponseWriter, r
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if _, err := uuid.Parse(req.RunID); err != nil || req.PriorityOrdinal < 1 || req.PriorityOrdinal > 33 {
+	if _, err := uuid.Parse(req.RunID); err != nil || req.PriorityOrdinal < 1 ||
+		req.PriorityOrdinal > len(joinedrecording.CohortForBatch(s.cfg.JoinedRecordingBatchID).RecordingIDs) {
 		util.WriteError(w, http.StatusBadRequest, "invalid Tier-1 dry-run step")
 		return
 	}
@@ -260,6 +261,9 @@ func (s *Server) stepJoinedTier1DryRun(ctx context.Context, req joinedTier1DryRu
 	var skeleton joinedTier1FreezePlan
 	if err := json.Unmarshal(skeletonBytes, &skeleton); err != nil {
 		return joinedTier1DryRunProgress{}, err
+	}
+	if req.PriorityOrdinal < 1 || req.PriorityOrdinal > len(skeleton.Recordings) {
+		return joinedTier1DryRunProgress{}, errors.New("joined dry-run ordinal exceeds approved cohort")
 	}
 	mini := skeleton
 	mini.Recordings = []joinedTier1FreezeRecording{skeleton.Recordings[req.PriorityOrdinal-1]}
@@ -337,7 +341,7 @@ func (s *Server) stepJoinedTier1DryRun(ctx context.Context, req joinedTier1DryRu
 	if err != nil {
 		return joinedTier1DryRunProgress{}, err
 	}
-	if req.PriorityOrdinal == len(joinedrecording.Tier1RecordingIDs) {
+	if req.PriorityOrdinal == len(skeleton.Recordings) {
 		if err := finalizeJoinedTier1DryRun(ctx, tx, req.RunID, &skeleton); err != nil {
 			return joinedTier1DryRunProgress{}, err
 		}
@@ -380,7 +384,7 @@ func finalizeJoinedTier1DryRun(ctx context.Context, tx pgx.Tx, runID string, pla
 		return err
 	}
 	rows.Close()
-	if len(recordings) != len(joinedrecording.Tier1RecordingIDs) {
+	if len(recordings) != len(joinedrecording.CohortForBatch(plan.BatchID).RecordingIDs) {
 		return errors.New("Tier-1 dry-run recordings are incomplete")
 	}
 	plan.Recordings = recordings
@@ -408,7 +412,7 @@ func finalizeJoinedTier1DryRun(ctx context.Context, tx pgx.Tx, runID string, pla
 	}
 	plan.FreezeExclusionsSHA256 = sha256Bytes([]byte(exclusionCanonical.String()))
 	frozen := make([]joinedrecording.FrozenRecording, len(recordings))
-	days := make([]joinedrecording.FrozenDenominatorDayProjection, 0, 462)
+	days := make([]joinedrecording.FrozenDenominatorDayProjection, 0, plan.ExpectedStreamDays)
 	for i, recording := range recordings {
 		frozen[i] = recording.Frozen
 		for _, day := range recording.SnapshotDays {
@@ -423,8 +427,8 @@ func finalizeJoinedTier1DryRun(ctx context.Context, tx pgx.Tx, runID string, pla
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE recording_joined_dry_runs SET state='ready',completed_recordings=33,final_plan_bytes=$2,
-		final_plan_sha256=$3,ready_at=clock_timestamp() WHERE id=$1 AND state='building'`, runID, raw, sealed.RequestSHA256)
+	_, err = tx.Exec(ctx, `UPDATE recording_joined_dry_runs SET state='ready',completed_recordings=$4,final_plan_bytes=$2,
+		final_plan_sha256=$3,ready_at=clock_timestamp() WHERE id=$1 AND state='building'`, runID, raw, sealed.RequestSHA256, len(recordings))
 	return err
 }
 
@@ -507,7 +511,7 @@ func (s *Server) joinedTier1DryRunStatus(ctx context.Context, runID string) (joi
 		Scan(&p.RunID, &p.State, &p.CompletedRecordings, &sha); err != nil {
 		return p, err
 	}
-	p.ExpectedRecordings = len(joinedrecording.Tier1RecordingIDs)
+	p.ExpectedRecordings = len(joinedrecording.CohortForBatch(s.cfg.JoinedRecordingBatchID).RecordingIDs)
 	p.RequestSHA256 = sha
 	if p.State == "building" {
 		next := p.CompletedRecordings + 1

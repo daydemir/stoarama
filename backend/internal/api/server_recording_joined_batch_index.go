@@ -216,7 +216,8 @@ func loadJoinedCanonicalBatchIndex(ctx context.Context, tx pgx.Tx, batchID strin
 	if err != nil {
 		return canonical, state, 0, fmt.Errorf("load joined frozen batch: %w", err)
 	}
-	if canonical.Index.FrozenAt.IsZero() || expectedRecordings != 33 || expectedLedgers != 462 || expectedHours != 5544 ||
+	cohortSize := len(joinedrecording.CohortForBatch(batchID).RecordingIDs)
+	if canonical.Index.FrozenAt.IsZero() || expectedRecordings != cohortSize || expectedLedgers != cohortSize*14 || expectedHours != cohortSize*168 ||
 		sourceCount64 < 0 || sourceCount64 > math.MaxInt {
 		return canonical, state, 0, errors.New("joined frozen batch denominator differs")
 	}

@@ -458,7 +458,8 @@ func parseJoinedImportHistoricalQualification(cfg config.Config, args []string) 
 	req := joinedImportHistoricalQualificationRequest{BatchID: joinedrecording.Tier1BatchID, Generation: 1}
 	flags := newJoinedFlagSet("recording-joined import-tier1-historical")
 	flags.Int64Var(&req.ConnectionID, "connection-id", 0, "NAS connection identifier")
-	evidenceFile := flags.String("evidence-file", "", "strict JSON file containing the exact ordered 33x14 job-ID map")
+	flags.StringVar(&req.BatchID, "batch-id", req.BatchID, "exact approved historical batch identifier")
+	evidenceFile := flags.String("evidence-file", "", "strict JSON file containing the approved ordered recording/day job-ID map")
 	flags.StringVar(&req.ExpectedRequestSHA256, "expected-request-sha256", "", "request hash returned by dry-run")
 	flags.BoolVar(&req.Apply, "apply", false, "create and freeze the historical authority")
 	if err := parseJoinedFlags(flags, args); err != nil {
@@ -467,6 +468,10 @@ func parseJoinedImportHistoricalQualification(cfg config.Config, args []string) 
 	if req.ConnectionID <= 0 {
 		return req, errors.New("exact Tier-1 connection is required")
 	}
+	if req.BatchID != joinedrecording.Tier1BatchID && req.BatchID != joinedrecording.SeptemberBatchID {
+		return req, errors.New("--batch-id must name an approved historical cohort")
+	}
+	cohort := joinedrecording.CohortForBatch(req.BatchID)
 	var evidence struct {
 		RecordingJobs []joinedHistoricalQualificationJobs `json:"recording_jobs"`
 	}
@@ -474,12 +479,12 @@ func parseJoinedImportHistoricalQualification(cfg config.Config, args []string) 
 		return req, fmt.Errorf("read --evidence-file: %w", err)
 	}
 	req.RecordingJobs = evidence.RecordingJobs
-	if len(req.RecordingJobs) != len(joinedrecording.Tier1RecordingIDs) {
-		return req, errors.New("--evidence-file must contain exactly 33 recordings")
+	if len(req.RecordingJobs) != len(cohort.RecordingIDs) {
+		return req, errors.New("--evidence-file must contain the exact approved recording count")
 	}
 	seenJobs := make(map[int64]bool, len(req.RecordingJobs)*14)
 	for i, recording := range req.RecordingJobs {
-		if recording.RecordingID != joinedrecording.Tier1RecordingIDs[i] || len(recording.JobIDs) != 14 {
+		if recording.RecordingID != cohort.RecordingIDs[i] || len(recording.JobIDs) != 14 {
 			return req, errors.New("--evidence-file recording order or day cardinality differs")
 		}
 		for _, jobID := range recording.JobIDs {
@@ -583,7 +588,7 @@ func parseJoinedSealStreamDay(cfg config.Config, args []string) (joinedSealStrea
 	if err := validateJoinedBatchID(req.BatchID); err != nil {
 		return req, err
 	}
-	if !slices.Contains(joinedrecording.Tier1RecordingIDs, req.RecordingID) {
+	if !slices.Contains(joinedrecording.CohortForBatch(req.BatchID).RecordingIDs, req.RecordingID) {
 		return req, errors.New("--recording-id must be in the frozen Tier-1 cohort")
 	}
 	date, err := time.Parse("2006-01-02", req.LocalDate)
@@ -636,14 +641,14 @@ func parseJoinedSealRemainingDays(cfg config.Config, args []string) (joinedSealR
 	flags.Int64Var(&req.CanaryRecordingID, "canary-recording-id", 0, "approved canary recording identifier")
 	flags.StringVar(&req.CanaryLocalDate, "canary-local-date", "", "approved canary local date")
 	flags.StringVar(&req.ExpectedCanarySealRequestSHA256, "expected-canary-seal-request-sha256", "", "approved canary receipt hash")
-	flags.BoolVar(&req.Apply, "apply", false, "seal the other 461 stream days serially")
+	flags.BoolVar(&req.Apply, "apply", false, "seal the remaining approved stream days serially")
 	if err := parseJoinedFlags(flags, args); err != nil {
 		return req, err
 	}
 	if err := validateJoinedBatchID(req.BatchID); err != nil {
 		return req, err
 	}
-	if !slices.Contains(joinedrecording.Tier1RecordingIDs, req.CanaryRecordingID) {
+	if !slices.Contains(joinedrecording.CohortForBatch(req.BatchID).RecordingIDs, req.CanaryRecordingID) {
 		return req, errors.New("--canary-recording-id must be in the frozen Tier-1 cohort")
 	}
 	date, err := time.Parse("2006-01-02", req.CanaryLocalDate)

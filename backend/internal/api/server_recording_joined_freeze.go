@@ -112,13 +112,14 @@ type joinedTier1FreezeQuerier interface {
 }
 
 func (r joinedTier1FreezeRequest) validate() error {
-	cutoff, err := time.Parse(time.RFC3339Nano, joinedrecording.Tier1FrozenAt)
+	cohort := joinedrecording.CohortForBatch(r.BatchID)
+	cutoff, err := time.Parse(time.RFC3339Nano, cohort.FrozenAt)
 	if err != nil {
 		return err
 	}
 	if r.ProtocolVersion != joinedrecording.JoinedProtocolVersion || r.ConnectionID <= 0 || r.QualificationRunID <= 0 ||
-		r.Generation <= 0 || !joinedBatchIDPattern.MatchString(r.BatchID) || len(r.RecordingIDs) != len(joinedrecording.Tier1RecordingIDs) ||
-		r.OrderedRecordingIDSHA256 != joinedrecording.Tier1RecordingIDSHA || !r.EligibilityCutoff.Equal(cutoff) ||
+		r.Generation <= 0 || !joinedBatchIDPattern.MatchString(r.BatchID) || len(r.RecordingIDs) != len(cohort.RecordingIDs) ||
+		r.OrderedRecordingIDSHA256 != cohort.RecordingIDSHA || !r.EligibilityCutoff.Equal(cutoff) ||
 		!strings.HasSuffix(r.BatchID, fmt.Sprintf("-generation-%d", r.Generation)) {
 		return errors.New("invalid Tier-1 freeze request")
 	}
@@ -126,7 +127,7 @@ func (r joinedTier1FreezeRequest) validate() error {
 		return errors.New("invalid Tier-1 source endpoint")
 	}
 	for i := range r.RecordingIDs {
-		if r.RecordingIDs[i] != joinedrecording.Tier1RecordingIDs[i] {
+		if r.RecordingIDs[i] != cohort.RecordingIDs[i] {
 			return errors.New("Tier-1 recording order differs")
 		}
 	}
@@ -274,10 +275,8 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 			return plan, nil, errors.New("Tier-1 qualification order differs")
 		}
 		if len(plan.Recordings)+1 == ordinal {
-			profile, parseErr := recordingnaming.ParseProfile(profileRaw)
-			metadata, metadataErr := recordingnaming.ParseMetadata(metadataRaw)
-			folder, folderErr := recordingnaming.BuildFolderName(profile, recordingID, metadata, folderRaw)
-			if parseErr != nil || metadataErr != nil || folderErr != nil {
+			folder, metadata, namingErr := joinedFrozenRecordingNaming(req.BatchID, recordingID, profileRaw, folderRaw, metadataRaw)
+			if namingErr != nil {
 				return plan, nil, fmt.Errorf("Tier-1 recording %d naming differs", recordingID)
 			}
 			plan.Recordings = append(plan.Recordings, joinedTier1FreezeRecording{
@@ -331,7 +330,7 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 		return plan, nil, err
 	}
 	if len(plan.Recordings) != len(req.RecordingIDs) || len(jobs) != plan.ExpectedStreamDays {
-		return plan, nil, errors.New("Tier-1 run lacks exactly 33 members and 462 completed jobs")
+		return plan, nil, errors.New("joined run lacks its exact approved members and completed jobs")
 	}
 	plan.SelectionAuthority.QualificationRunFrozenAt = plan.SelectionAuthority.QualificationRunFrozenAt.UTC()
 	frozenRecordings := make([]joinedrecording.FrozenRecording, len(plan.Recordings))
@@ -369,6 +368,27 @@ func (s *Server) buildJoinedTier1FreezePlanWithTool(ctx context.Context, q joine
 		return plan, nil, err
 	}
 	return sealJoinedTier1FreezePlan(plan)
+}
+
+// This delivery-only override is pinned to the approved September batch. The
+// original recording's generic raw folder and naming metadata remain untouched.
+// Identity: campaigns/mit-scl-top-50/source-evidence.json, stream17200/square052.
+func joinedFrozenRecordingNaming(batchID string, recordingID int64, profileRaw, folderRaw string, metadataRaw []byte) (string, recordingnaming.Metadata, error) {
+	if batchID == joinedrecording.SeptemberBatchID && recordingID == 339 {
+		metadata := recordingnaming.Metadata{PlazaID: "052", Continent: "Europe", Country: "Germany", City: "Schwäbisch Gmünd", PlazaName: "Marktplatz"}
+		folder, err := recordingnaming.BuildFolderName(recordingnaming.ProfilePlazaHourlyV1, recordingID, metadata, "")
+		return folder, metadata, err
+	}
+	profile, err := recordingnaming.ParseProfile(profileRaw)
+	if err != nil {
+		return "", recordingnaming.Metadata{}, err
+	}
+	metadata, err := recordingnaming.ParseMetadata(metadataRaw)
+	if err != nil {
+		return "", metadata, err
+	}
+	folder, err := recordingnaming.BuildFolderName(profile, recordingID, metadata, folderRaw)
+	return folder, metadata, err
 }
 
 func sealJoinedTier1FreezePlan(plan joinedTier1FreezePlan) (joinedTier1FreezePlan, []byte, error) {
@@ -562,7 +582,7 @@ func populateJoinedTier1FrozenEvidenceWithWatermarks(ctx context.Context, q join
 		}
 	}
 	plan.ProvisionalSourceClips, plan.ProvisionalSourceBytes = sourceCount, sourceBytes
-	if len(plan.Recordings) == len(joinedrecording.Tier1RecordingIDs) {
+	if len(plan.Recordings) == len(joinedrecording.CohortForBatch(plan.BatchID).RecordingIDs) {
 		denominatorSHA, err := joinedrecording.ComputeFrozenDenominatorSHA256(plan.SelectionAuthority, frozenRecordings, dayProjections)
 		if err != nil {
 			return nil, err
@@ -742,7 +762,7 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 		freeze_request_bytes,freeze_request_sha256,frozen_denominator_sha256,freeze_exclusions_sha256,
 		expected_recordings,expected_stream_days,expected_scheduled_hours,expected_source_clips,expected_source_bytes,
 		expected_freeze_exclusions)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,33,462,5544,$22,$23,$24)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$25,$26,$27,$22,$23,$24)
 		RETURNING id`, plan.AccountID, plan.ConnectionID, plan.BatchID, plan.Generation, plan.SourceEndpoint,
 		plan.SelectionAuthority.QualificationRunID, plan.SelectionAuthority.QualificationCohortSHA256,
 		plan.SelectionAuthority.QualificationWindowsSHA256, plan.SelectionAuthority.SelectedQualificationWindowsSHA256,
@@ -750,7 +770,8 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 		plan.SelectionAuthority.OrderedRecordingIDSHA256, plan.SelectionAuthority.SelectionBasis, plan.PolicyVersion,
 		plan.SelectionAuthority.Cutoff, mediaToolJSON, plan.MediaTool.IdentitySHA256, requestBytes, plan.RequestSHA256,
 		plan.FrozenDenominatorSHA256, plan.FreezeExclusionsSHA256, plan.ProvisionalSourceClips,
-		plan.ProvisionalSourceBytes, plan.ProvisionalExclusions).Scan(&batchRecordID); err != nil {
+		plan.ProvisionalSourceBytes, plan.ProvisionalExclusions, len(plan.Recordings),
+		plan.ExpectedStreamDays, plan.ExpectedScheduledHours).Scan(&batchRecordID); err != nil {
 		return joinedTier1FreezePlan{}, false, err
 	}
 	for _, recording := range plan.Recordings {
@@ -792,7 +813,7 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 			ON br.batch_record_id=$1 AND br.recording_id=e.recording_id`, batchRecordID); err != nil {
 		return joinedTier1FreezePlan{}, false, err
 	}
-	if err := s.insertJoinedTier1SourceSnapshots(ctx, tx, batchRecordID, plan.AccountID, plan.ConnectionID); err != nil {
+	if err := s.insertJoinedTier1SourceSnapshots(ctx, tx, batchRecordID, plan.AccountID, plan.ConnectionID, plan.BatchID); err != nil {
 		return joinedTier1FreezePlan{}, false, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -810,7 +831,7 @@ func (s *Server) applyJoinedTier1Freeze(ctx context.Context, req joinedTier1Free
 	return plan, true, nil
 }
 
-func (s *Server) insertJoinedTier1SourceSnapshots(ctx context.Context, tx pgx.Tx, batchRecordID, accountID, connectionID int64) error {
+func (s *Server) insertJoinedTier1SourceSnapshots(ctx context.Context, tx pgx.Tx, batchRecordID, accountID, connectionID int64, batchID string) error {
 	type streamDay struct {
 		id          int64
 		sourceCount int64
@@ -822,7 +843,8 @@ func (s *Server) insertJoinedTier1SourceSnapshots(ctx context.Context, tx pgx.Tx
 	if err != nil {
 		return fmt.Errorf("load Tier-1 source snapshot stream days: %w", err)
 	}
-	streamDays := make([]streamDay, 0, len(joinedrecording.Tier1RecordingIDs)*14)
+	expectedDays := len(joinedrecording.CohortForBatch(batchID).RecordingIDs) * 14
+	streamDays := make([]streamDay, 0, expectedDays)
 	for rows.Next() {
 		var day streamDay
 		if err := rows.Scan(&day.id, &day.sourceCount, &day.priority); err != nil {
@@ -836,9 +858,9 @@ func (s *Server) insertJoinedTier1SourceSnapshots(ctx context.Context, tx pgx.Tx
 		return fmt.Errorf("load Tier-1 source snapshot stream days: %w", err)
 	}
 
-	if len(streamDays) != len(joinedrecording.Tier1RecordingIDs)*14 {
+	if len(streamDays) != expectedDays {
 		return fmt.Errorf("load Tier-1 source snapshot stream days: got %d want %d",
-			len(streamDays), len(joinedrecording.Tier1RecordingIDs)*14)
+			len(streamDays), expectedDays)
 	}
 	for start := 0; start < len(streamDays); start += 14 {
 		if err := ctx.Err(); err != nil {
