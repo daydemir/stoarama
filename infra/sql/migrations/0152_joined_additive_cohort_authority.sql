@@ -45,7 +45,7 @@ CREATE UNIQUE INDEX recording_qualification_runs_one_active_idx
 DO $$
 DECLARE item RECORD; replaced INTEGER:=0; replacement TEXT;
 BEGIN
-  FOR item IN SELECT conname,pg_get_expr(conbin,conrelid) expression
+  FOR item IN SELECT conname,conkey,pg_get_expr(conbin,conrelid) expression
     FROM pg_constraint WHERE conrelid='recording_joined_batches'::regclass AND contype='c'
   LOOP
     replacement:=NULL;
@@ -53,7 +53,10 @@ BEGIN
       replacement:='expected_recordings=9 AND expected_stream_days=126 AND expected_scheduled_hours=1512';
     ELSIF item.expression LIKE '%6038d4a23be9b0b5c2bb29ea933743a5ceb7f06b8875e417a3f16b44051ebd71%' THEN
       replacement:='ordered_recording_ids_sha256=''85b4fc9db34b50aa53666f1d364bef8ce267b581d56d17411d5342bd20648888''';
-    ELSIF item.expression LIKE '%eligibility_cutoff%2026-08-21%' THEN
+    -- pg_get_expr renders timestamptz constants in the session timezone. Match
+    -- the single-column cutoff guard structurally, not by its rendered date.
+    ELSIF item.conkey=ARRAY[(SELECT attnum FROM pg_attribute
+      WHERE attrelid='recording_joined_batches'::regclass AND attname='eligibility_cutoff')]::SMALLINT[] THEN
       replacement:='eligibility_cutoff=''2026-09-11T05:15:24.544Z''::TIMESTAMPTZ';
     END IF;
     IF replacement IS NOT NULL THEN
@@ -646,4 +649,3 @@ BEGIN
   THEN RAISE EXCEPTION 'joined dry-run authority is immutable'; END IF;
   RETURN NEW;
 END $$;
-

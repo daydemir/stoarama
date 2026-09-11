@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/db"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const additiveCohortTestBatch = "goodplus-20260911-generation-1"
@@ -20,6 +22,33 @@ var additiveCohortTestIDs = []int64{339, 407, 417, 424, 427, 430, 441, 444, 445}
 var additiveCohortTestDates = []string{
 	"2026-08-26", "2026-08-27", "2026-08-15", "2026-08-07", "2026-08-13",
 	"2026-08-08", "2026-08-07", "2026-08-08", "2026-08-12",
+}
+
+func TestJoinedAdditiveMigrationDoesNotDependOnSessionTimezone(t *testing.T) {
+	_, pool, _, cleanup := testJoinedServerBeforeMigration(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg := pool.Config()
+	cfg.ConnConfig.RuntimeParams["timezone"] = "America/Los_Angeles"
+	nonUTC, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nonUTC.Close()
+	for _, migration := range joinedMigrationNames {
+		if _, err := nonUTC.Exec(ctx, `DELETE FROM schema_migrations WHERE version=$1`, migration); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.MigrateUp(ctx, nonUTC, findMigrationsDir(t)); err != nil {
+		t.Fatalf("joined migration failed in a non-UTC session: %v", err)
+	}
+	var timezone string
+	var count int
+	if err := nonUTC.QueryRow(ctx, `SELECT current_setting('TimeZone'),cardinality(recording_joined_cohort_ids($1))`, additiveCohortTestBatch).Scan(&timezone, &count); err != nil || timezone != "America/Los_Angeles" || count != 9 {
+		t.Fatalf("migration changed session timezone or cohort: timezone=%s count=%d err=%v", timezone, count, err)
+	}
+	t.Log("JOINED_ADDITIVE_NON_UTC_MIGRATION_EXECUTED")
 }
 
 func seedJoinedAdditiveCohort(t *testing.T, fixture joinedHistoricalTier1Fixture) joinedHistoricalQualificationRequest {
