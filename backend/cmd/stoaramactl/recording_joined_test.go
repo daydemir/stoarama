@@ -111,6 +111,10 @@ func validJoinedWorkerConfig() config.Config {
 	}
 }
 
+func (f *fakeJoinedOperator) GrantExactRetry(context.Context, joinedrecording.ExactRetryGrantRequest) (joinedrecording.ExactRetryGrant, error) {
+	return joinedrecording.ExactRetryGrant{}, errors.New("unexpected exact retry grant")
+}
+
 func (f *fakeJoinedOperator) FreezeTier1(_ context.Context, req joinedFreezeTier1Request) (any, error) {
 	f.freezeReq = req
 	return map[string]any{"status": "planned"}, nil

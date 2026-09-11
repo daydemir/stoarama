@@ -194,7 +194,7 @@ func (s *Server) handleJoinedToken(w http.ResponseWriter, r *http.Request) {
 		      AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		    AND (((NOT $3) AND ((h.state='pending' AND h.next_attempt_at<=now())
 		      OR (h.state='leased' AND h.lease_expires_at<=now())))
-		      OR ($3 AND ((h.state='pending' AND h.attempt_count=0 AND h.next_attempt_at<=now())
+		      OR ($3 AND (joined_exact_retry_available(h) OR (h.state='pending' AND h.attempt_count=0 AND h.next_attempt_at<=now())
 		        OR (h.state='leased' AND h.attempt_count=1 AND h.lease_expires_at<=now()
 		          AND h.source_only_sha256 IS NULL AND h.canonical_plan IS NULL AND h.manifest_bytes IS NULL
 		          AND h.manifest_sha256 IS NULL AND h.sealed_at IS NULL
@@ -431,11 +431,12 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// Broad frozen-batch admission never retries persisted legacy work. An
-	// operator must isolate that exact hour under canary_single instead.
+	// Legacy attempts remain fenced unless an operator granted this exact
+	// output-free due retry. The grant is consumed in this claim transaction.
 	var hourRecordID int64
+	var exactRetry bool
 	err = tx.QueryRow(r.Context(), `
-		SELECT h.id FROM recording_joined_hours h
+		SELECT h.id,($3 AND joined_exact_retry_available(h)) FROM recording_joined_hours h
 		JOIN recording_joined_artifacts ledger ON ledger.stream_day_id=h.stream_day_id
 		  AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
 		JOIN connections c ON c.id=h.connection_id AND c.id=$7
@@ -446,7 +447,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		  AND NOT EXISTS(SELECT 1 FROM recording_joined_worker_failures f WHERE f.hour_record_id=h.id
 		    AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		  AND (((NOT $3) AND ((h.state='pending' AND h.next_attempt_at<=now()) OR (h.state='leased' AND h.lease_expires_at<=now())))
-		    OR ($3 AND ((h.state='pending' AND h.attempt_count=0 AND h.next_attempt_at<=now())
+		    OR ($3 AND (joined_exact_retry_available(h) OR (h.state='pending' AND h.attempt_count=0 AND h.next_attempt_at<=now())
 		      OR (h.state='leased' AND h.attempt_count=1 AND h.lease_expires_at<=now()
 		        AND h.source_only_sha256 IS NULL AND h.canonical_plan IS NULL AND h.manifest_bytes IS NULL
 		        AND h.manifest_sha256 IS NULL AND h.sealed_at IS NULL
@@ -459,7 +460,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		ORDER BY CASE WHEN $3 THEN (h.priority_ordinal-1)%168 ELSE h.priority_ordinal END,
 		  CASE WHEN $3 THEN (h.priority_ordinal-1)/168 ELSE 0 END,h.next_attempt_at,h.id
 		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch, capacityBytes,
-		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes, s.cfg.JoinedRecordingConnectionID).Scan(&hourRecordID)
+		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes, s.cfg.JoinedRecordingConnectionID).Scan(&hourRecordID, &exactRetry)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -475,7 +476,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		UPDATE recording_joined_hours h SET state='leased',attempt_count=attempt_count+1,claim_token=$2,claimed_by=$3,
 		  lease_expires_at=date_trunc('second',now()+$4::interval),heartbeat_at=now()
 		WHERE h.id=$1 AND h.batch_id=$5 AND ($7 OR h.hour_id=ANY($6::text[]))
-		  AND ((NOT $7) OR (h.state='pending' AND h.attempt_count=0)
+		  AND ((NOT $7) OR ($7 AND joined_exact_retry_available(h)) OR (h.state='pending' AND h.attempt_count=0)
 		    OR (h.state='leased' AND h.attempt_count=1 AND h.lease_expires_at<=now()
 		      AND h.source_only_sha256 IS NULL AND h.canonical_plan IS NULL AND h.manifest_bytes IS NULL
 		      AND h.manifest_sha256 IS NULL AND h.sealed_at IS NULL
@@ -490,6 +491,16 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		writeJoinedHourDBError(w, http.StatusConflict, "claim joined hour", "hour_claim", "lease_update",
 			claims.BatchID, workerID, hourRecordID, err)
 		return
+	}
+	if exactRetry {
+		tag, consumeErr := tx.Exec(r.Context(), `UPDATE recording_joined_exact_retry_grants g
+			SET consumed_at=now(),consumed_claim_token=$2 FROM recording_joined_hours h
+			WHERE g.hour_record_id=$1 AND h.id=g.hour_record_id AND g.consumed_at IS NULL
+			  AND g.expected_attempt_count=h.attempt_count-1 AND h.claim_token=$2`, hourRecordID, claimToken)
+		if consumeErr != nil || tag.RowsAffected() != 1 {
+			util.WriteError(w, http.StatusConflict, "consume exact joined retry grant")
+			return
+		}
 	}
 	err = tx.QueryRow(r.Context(), `
 		SELECT h.batch_id,b.generation,h.recording_id,br.timezone,h.local_date::text,h.delivery_hour,
