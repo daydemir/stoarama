@@ -474,4 +474,5 @@ func TestJoinedFrozenBatchLegacyRetryFence(t *testing.T) {
 	if failureCodes[0] != http.StatusNoContent || failureCodes[1] != http.StatusNoContent {
 		t.Fatalf("recorded failure escaped frozen reclaim fence: %v", failureCodes)
 	}
+	testJoinedExactRetryGrant(t, s, pool, req.BatchID, hourID, claimRace, setHour)
 }
