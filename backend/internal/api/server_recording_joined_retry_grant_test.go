@@ -134,6 +134,12 @@ func testJoinedExactRetryGrant(t *testing.T, s *Server, pool *pgxpool.Pool, batc
 			t.Fatalf("concurrent idempotent grant status=%d", code)
 		}
 	}
+	var count, attempts int
+	if err := pool.QueryRow(ctx, `SELECT h.attempt_count,count(g.*) FROM recording_joined_hours h
+		LEFT JOIN recording_joined_exact_retry_grants g ON g.hour_record_id=h.id
+		WHERE h.hour_id=$1 GROUP BY h.attempt_count`, hour).Scan(&attempts, &count); err != nil || attempts != 1 || count != 1 {
+		t.Fatalf("grant changed attempt or duplicated authority: attempt=%d grants=%d err=%v", attempts, count, err)
+	}
 	changed := request
 	changed.Reason = "different review"
 	if got := call(changed, s.cfg.JoinedOperatorToken); got.Code != 409 {
@@ -169,6 +175,12 @@ func testJoinedExactRetryGrant(t *testing.T, s *Server, pool *pgxpool.Pool, batc
 	var grant joinedrecording.ExactRetryGrant
 	if replay.Code != http.StatusOK || json.Unmarshal(replay.Body.Bytes(), &grant) != nil || grant.ConsumedAt == nil {
 		t.Fatalf("grant consumption absent: %d %s", replay.Code, replay.Body.String())
+	}
+	var bound bool
+	if err := pool.QueryRow(ctx, `SELECT h.attempt_count,g.consumed_claim_token=h.claim_token AND h.lease_expires_at>now()
+		FROM recording_joined_hours h JOIN recording_joined_exact_retry_grants g ON g.hour_record_id=h.id
+		WHERE h.hour_id=$1`, hour).Scan(&attempts, &bound); err != nil || attempts != 2 || !bound {
+		t.Fatalf("consumption not bound to exactly next live attempt: attempt=%d bound=%v err=%v", attempts, bound, err)
 	}
 	var failureAfter string
 	if err := pool.QueryRow(ctx, `SELECT row_to_json(f)::text FROM recording_joined_worker_failures f WHERE scope_id=$1`, hour).Scan(&failureAfter); err != nil || failureBefore != failureAfter {
