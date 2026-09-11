@@ -126,6 +126,10 @@ func TestJoinedAdditiveCohortCoexistsAndFreezesWithoutLegacyMutation(t *testing.
 	fixture.s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	fixture.s.cfg.JoinedRecordingCanaryHourIDs = ""
 	fixture.s.cfg.JoinedRecordingMaxActiveTasks = 2
+	fixture.s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
+	if err := fixture.s.cfg.ValidateJoined(); err != nil {
+		t.Fatal(err)
+	}
 	dry, plan, _ := fixture.callHistorical(request)
 	if dry.Code != http.StatusOK || len(plan.Members) != 9 {
 		t.Fatalf("additive dry status=%d body=%s", dry.Code, dry.Body.String())
@@ -229,6 +233,10 @@ func TestJoinedAdditiveCohortPinsRejectUnapprovedCountAndBatch(t *testing.T) {
 	fixture.s.cfg.JoinedRecordingWorkScope = config.JoinedWorkScopeFrozenBatch
 	fixture.s.cfg.JoinedRecordingCanaryHourIDs = ""
 	fixture.s.cfg.JoinedRecordingMaxActiveTasks = 2
+	fixture.s.cfg.JoinedRecordingFrozenExcludedPublicationArtifactIDs = joinedFrozenPublicationDenyForTest
+	if err := fixture.s.cfg.ValidateJoined(); err != nil {
+		t.Fatal(err)
+	}
 	request.RecordingJobs[0], request.RecordingJobs[1] = request.RecordingJobs[1], request.RecordingJobs[0]
 	if response, _, _ := fixture.callHistorical(request); response.Code == http.StatusOK {
 		t.Fatal("additive import accepted reordered cohort")
