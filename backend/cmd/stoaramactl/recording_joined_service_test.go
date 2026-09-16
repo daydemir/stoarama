@@ -371,6 +371,23 @@ func TestJoinedWorkerDrainPreservesAdmittedTaskFailure(t *testing.T) {
 	}
 }
 
+func TestRetryJoinedClaimRetriesOnlyTransientHTTPFailures(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	ok, err := retryJoinedClaim(context.Background(), func() (bool, error) {
+		if calls.Add(1) < 3 {
+			return false, errors.New("joined API /api/v1/recording/joined/claim returned status 500")
+		}
+		return true, nil
+	})
+	if err != nil || !ok || calls.Load() != 3 {
+		t.Fatalf("retry result=(%t,%v), calls=%d", ok, err, calls.Load())
+	}
+	if retryableJoinedClaimError(errors.New("execute joined API /api/v1/recording/joined/claim")) {
+		t.Fatal("network error was treated as a retryable claim response")
+	}
+}
+
 func TestJoinedWorkerScratchCleanupUsesBootstrapScopedLeaseProof(t *testing.T) {
 	t.Parallel()
 	cfg := validJoinedWorkerConfig()

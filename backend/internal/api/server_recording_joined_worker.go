@@ -309,6 +309,10 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err := tx.Exec(r.Context(), `SET LOCAL lock_timeout='500ms'; SET LOCAL statement_timeout='5s'`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "bound joined claim")
+		return
+	}
 	admissionAllowed, err := s.joinedClaimAdmissionAllowed(r.Context(), tx, claims.BatchID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined claim admission")
@@ -327,12 +331,14 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	var hourRecordID int64
+	var hourRecordID, connectionID int64
 	err = tx.QueryRow(r.Context(), `
-		SELECT h.id FROM recording_joined_hours h
+		SELECT h.id,h.connection_id FROM recording_joined_hours h
 		JOIN recording_joined_artifacts ledger ON ledger.stream_day_id=h.stream_day_id
 		  AND ledger.artifact_kind='allocation_ledger' AND ledger.publication_state='published'
-		JOIN connections c ON c.id=h.connection_id AND c.joined_protocol_version=1
+		JOIN LATERAL (SELECT c.id FROM connections c
+			WHERE c.id=h.connection_id AND c.joined_protocol_version=1
+			FOR SHARE SKIP LOCKED) eligible_connection ON true
 		WHERE h.batch_id=$1 AND ($3 OR h.hour_id=ANY($2::text[]))
 		  AND EXISTS(SELECT 1 FROM recording_joined_batches b WHERE b.id=h.batch_record_id AND b.state='frozen')
 		  AND h.source_clip_count>0 AND h.attempt_count<$5
@@ -341,8 +347,8 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		    AND f.attempt_count=h.attempt_count AND f.disposition='retry' AND f.retry_at>now())
 		  AND ((h.state='pending' AND h.next_attempt_at<=now()) OR (h.state='leased' AND h.lease_expires_at<=now()))
 		ORDER BY h.priority_ordinal,h.next_attempt_at,h.id
-		FOR UPDATE OF h,c SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch, capacityBytes,
-		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes).Scan(&hourRecordID)
+		FOR UPDATE OF h SKIP LOCKED LIMIT 1`, claims.BatchID, canaryHours, frozenBatch, capacityBytes,
+		joinedMaxAttempts, joinedrecording.JoinedScratchFixedBytes).Scan(&hourRecordID, &connectionID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -470,6 +476,10 @@ func (s *Server) handleJoinedPublicationClaim(w http.ResponseWriter, r *http.Req
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
+	if _, err := tx.Exec(r.Context(), `SET LOCAL lock_timeout='500ms'; SET LOCAL statement_timeout='5s'`); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "bound joined publication claim")
+		return
+	}
 	admissionAllowed, err := s.joinedClaimAdmissionAllowed(r.Context(), tx, claims.BatchID)
 	if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "read joined publication claim admission")

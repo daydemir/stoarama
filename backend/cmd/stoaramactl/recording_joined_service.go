@@ -27,6 +27,7 @@ const (
 	joinedWorkerIdlePoll   = 2 * time.Second
 	joinedWorkerTaskLimit  = 2 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
+	joinedClaimRetryLimit  = 3
 )
 
 type joinedAPIClient struct {
@@ -832,7 +833,12 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 	// Cancellation can race after either claim API commits a lease but before
 	// this client receives it. No local task starts in that case. The unseen
 	// fenced lease expires and becomes reclaimable through the normal path.
-	publication, ok, err := s.api.claimPublication(admissionCtx, bootstrap.ClaimToken, claimRequest)
+	var publication joinedrecording.PublicationClaimResponse
+	ok, err = retryJoinedClaim(admissionCtx, func() (bool, error) {
+		var claimErr error
+		publication, ok, claimErr = s.api.claimPublication(admissionCtx, bootstrap.ClaimToken, claimRequest)
+		return ok, claimErr
+	})
 	if err != nil {
 		return false, err
 	}
@@ -849,7 +855,12 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		})
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
-	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
+	var preflight joinedrecording.PreflightHourClaim
+	ok, err = retryJoinedClaim(admissionCtx, func() (bool, error) {
+		var claimErr error
+		preflight, ok, claimErr = s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
+		return ok, claimErr
+	})
 	if err != nil || !ok {
 		return false, err
 	}
@@ -862,6 +873,37 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		return s.processPreflight(workCtx, preflight, req.ScratchRoot)
 	})
 	return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), "hour", preflight.HourID, taskErr)
+}
+
+func retryJoinedClaim(ctx context.Context, claim func() (bool, error)) (bool, error) {
+	for attempt := 0; attempt < joinedClaimRetryLimit; attempt++ {
+		ok, err := claim()
+		if err == nil || !retryableJoinedClaimError(err) || attempt == joinedClaimRetryLimit-1 {
+			return ok, err
+		}
+		delay := time.Duration(150+attempt*200+int(time.Now().UnixNano()%250)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return false, errors.New("joined claim retry loop exhausted")
+}
+
+func retryableJoinedClaimError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "joined API /api/v1/recording/joined/claim returned status 409") ||
+		strings.Contains(message, "joined API /api/v1/recording/joined/claim returned status 500") ||
+		strings.Contains(message, "joined API /api/v1/recording/joined/publication/claim returned status 409") ||
+		strings.Contains(message, "joined API /api/v1/recording/joined/publication/claim returned status 500")
 }
 
 func joinedPublicationFailureIdentity(response joinedrecording.PublicationClaimResponse) (kind, id, token string) {
