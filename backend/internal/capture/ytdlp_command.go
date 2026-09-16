@@ -12,11 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
 	YTDLPPrivateTempEnv     = "STOARAMA_YTDLP_PRIVATE_TMP"
 	YTDLPRuntimeTempRootEnv = "STOARAMA_YTDLP_RUNTIME_TMP_ROOT"
+	ytdlpOrphanCleanupPoll  = 5 * time.Second
+	ytdlpOrphanCleanupMax   = 24 * time.Hour
 )
 
 type ytdlpInvocationTemp struct {
@@ -54,13 +57,40 @@ func runYTDLPCommand(ctx context.Context, combined bool, bin string, args ...str
 	configureYTDLPProcessGroup(cmd)
 	output, runErr := commandOutput(cmd, combined)
 	if groupErr := waitForYTDLPProcessGroupExit(cmd); groupErr != nil {
-		log.Printf("yt-dlp private temp cleanup skipped; owned process group may still be active")
+		log.Printf("yt-dlp private temp cleanup deferred; owned process group may still be active")
+		go cleanupYTDLPInvocationWhenGroupExits(invocation, func() error {
+			return waitForYTDLPProcessGroupExit(cmd)
+		})
 		return output, runErr
 	}
 	if cleanupErr := invocation.remove(); cleanupErr != nil {
 		log.Printf("yt-dlp private temp cleanup failed; owned invocation retained")
 	}
 	return output, runErr
+}
+
+// cleanupYTDLPInvocationWhenGroupExits is the bounded scavenger for the one
+// case where CommandContext has reaped yt-dlp but a child retained its process
+// group and private TMPDIR. It never searches arbitrary temp paths: the
+// invocation carries the parent/device/inode identity captured at creation,
+// and remove revalidates that identity before deleting anything. A bounded
+// lifetime prevents a broken process-table implementation from leaking a
+// goroutine forever; the retained directory remains for the next audit.
+func cleanupYTDLPInvocationWhenGroupExits(invocation ytdlpInvocationTemp, wait func() error) {
+	deadline := time.Now().Add(ytdlpOrphanCleanupMax)
+	for {
+		if err := wait(); err == nil {
+			if err := invocation.remove(); err != nil {
+				log.Printf("yt-dlp private temp cleanup failed after process-group exit; owned invocation retained")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("yt-dlp private temp cleanup abandoned after bounded wait; owned invocation retained")
+			return
+		}
+		time.Sleep(ytdlpOrphanCleanupPoll)
+	}
 }
 
 func commandOutput(cmd *exec.Cmd, combined bool) ([]byte, error) {
