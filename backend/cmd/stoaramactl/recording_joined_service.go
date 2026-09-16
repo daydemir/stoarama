@@ -30,6 +30,7 @@ const (
 	// deadline; this is only the outer bound for one renewable, fenced task.
 	joinedWorkerTaskLimit  = 4 * time.Hour
 	joinedAPIResponseLimit = 1 << 20
+	joinedClaimRetryLimit  = 3
 	// Sealed-hour claims repeat canonical source, plan, manifest, and proof data.
 	// Thirty-part hours can legitimately exceed the ordinary API response cap.
 	joinedLargeHourAPIResponseLimit = 2 << 20
@@ -955,7 +956,12 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 	// Cancellation can race after either claim API commits a lease but before
 	// this client receives it. No local task starts in that case. The unseen
 	// fenced lease expires and becomes reclaimable through the normal path.
-	publication, ok, err := s.api.claimPublication(admissionCtx, bootstrap.ClaimToken, claimRequest)
+	var publication joinedrecording.PublicationClaimResponse
+	ok, err = retryJoinedClaim(admissionCtx, func() (bool, error) {
+		var claimErr error
+		publication, ok, claimErr = s.api.claimPublication(admissionCtx, bootstrap.ClaimToken, claimRequest)
+		return ok, claimErr
+	})
 	if err != nil {
 		return false, err
 	}
@@ -975,7 +981,12 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 		}
 		return true, s.reportJoinedTaskFailure(taskCtx, tracker.get(), kind, id, taskErr)
 	}
-	preflight, ok, err := s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
+	var preflight joinedrecording.PreflightHourClaim
+	ok, err = retryJoinedClaim(admissionCtx, func() (bool, error) {
+		var claimErr error
+		preflight, ok, claimErr = s.api.claimPreflight(admissionCtx, bootstrap.ClaimToken, claimRequest)
+		return ok, claimErr
+	})
 	if err != nil {
 		return false, err
 	}
@@ -999,6 +1010,34 @@ func (s *remoteJoinedOperatorService) runWorkerOnceWithTaskContext(admissionCtx,
 	})
 	mayContinue := joinedMayContinuePreflight(workScope, taskErr)
 	return true, s.reportJoinedTaskResult(taskCtx, req.ScratchRoot, preflight, tracker.get(), taskErr, mayContinue)
+}
+
+func retryJoinedClaim(ctx context.Context, claim func() (bool, error)) (bool, error) {
+	for attempt := 0; attempt < joinedClaimRetryLimit; attempt++ {
+		ok, err := claim()
+		if err == nil || !retryableJoinedClaimError(err) || attempt == joinedClaimRetryLimit-1 {
+			return ok, err
+		}
+		delay := time.Duration(150+attempt*200+int(time.Now().UnixNano()%250)) * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return false, errors.New("joined claim retry loop exhausted")
+}
+
+func retryableJoinedClaimError(err error) bool {
+	var responseErr *joinedAPIResponseError
+	if !errors.As(err, &responseErr) || (responseErr.status != http.StatusConflict && responseErr.status != http.StatusInternalServerError) {
+		return false
+	}
+	return responseErr.path == "/api/v1/recording/joined/claim" || responseErr.path == "/api/v1/recording/joined/publication/claim"
 }
 
 func joinedMayContinuePreflight(workScope joinedrecording.WorkScopeIdentity, err error) bool {
