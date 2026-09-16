@@ -60,9 +60,27 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 				if len(lines) < 2 {
 					t.Fatalf("stubborn helper output=%q", output)
 				}
+				childPID, err := strconv.Atoi(lines[len(lines)-1])
+				if err != nil {
+					t.Fatal(err)
+				}
+				groupPID, err := syscall.Getpgid(childPID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Lstat(lines[0]); err != nil {
+					t.Fatalf("live cancelled descendant's temp directory was removed: %v", err)
+				}
+				if err := syscall.Kill(-groupPID, syscall.SIGKILL); err != nil {
+					t.Fatal(err)
+				}
 				if err := waitForProcessExit(lines[len(lines)-1]); err != nil {
 					t.Fatal(err)
 				}
+				if got := os.Getenv("TMPDIR"); got != parentTemp {
+					t.Fatalf("parent TMPDIR changed to %q", got)
+				}
+				return
 			}
 			entries, readErr := os.ReadDir(root)
 			if readErr != nil {

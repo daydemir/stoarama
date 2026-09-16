@@ -12,9 +12,6 @@ import (
 
 func configureYTDLPProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return killYTDLPProcessGroup(cmd)
-	}
 	cmd.WaitDelay = 5 * time.Second
 }
 
@@ -32,15 +29,4 @@ func waitForYTDLPProcessGroupExit(cmd *exec.Cmd) error {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return fmt.Errorf("yt-dlp process group %d remains", -group)
-}
-
-func killYTDLPProcessGroup(cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return err
 }

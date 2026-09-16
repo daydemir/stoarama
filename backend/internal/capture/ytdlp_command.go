@@ -2,6 +2,8 @@ package capture
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -104,8 +106,61 @@ func (invocation ytdlpInvocationTemp) remove() error {
 	if err != nil || path != invocation.path || uint64(pathStat.Dev) != invocation.device || pathStat.Ino != invocation.inode {
 		return errors.New("private temp directory changed; retained for audit")
 	}
-	if err := os.RemoveAll(invocation.path); err != nil {
+	parent, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("open private temp parent: %w", err)
+	}
+	defer parent.Close()
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("name private temp quarantine: %w", err)
+	}
+	quarantine := ".stoarama-ytdlp-delete-" + hex.EncodeToString(nonce[:])
+	if err := parent.Rename(relative, quarantine); err != nil {
+		return fmt.Errorf("quarantine owned private temp: %w", err)
+	}
+	owned, err := parent.OpenRoot(quarantine)
+	if err != nil {
+		return fmt.Errorf("open quarantined private temp: %w", err)
+	}
+	defer owned.Close()
+	info, err := owned.Stat(".")
+	if err != nil {
+		return errors.New("quarantined private temp changed; retained for audit")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || uint64(stat.Dev) != invocation.device || stat.Ino != invocation.inode {
+		return errors.New("quarantined private temp changed; retained for audit")
+	}
+	if err := removeRootContents(owned); err != nil {
 		return fmt.Errorf("remove owned private temp: %w", err)
+	}
+	// Contents were removed through the descriptor for the verified inode. A
+	// concurrent name replacement can therefore make this final empty-directory
+	// removal fail, but cannot redirect recursive deletion into another tree.
+	if err := parent.Remove(quarantine); err != nil {
+		return fmt.Errorf("remove empty private temp: %w", err)
+	}
+	return nil
+}
+
+func removeRootContents(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, entry := range entries {
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
 	}
 	return nil
 }
