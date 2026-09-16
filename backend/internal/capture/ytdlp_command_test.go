@@ -150,6 +150,41 @@ func TestRunYTDLPCommandCleanupFailurePreservesSuccessfulResult(t *testing.T) {
 	}
 }
 
+func TestCleanupYTDLPInvocationWhenGroupExitsRevalidatesIdentity(t *testing.T) {
+	root := t.TempDir()
+	invocation, err := newYTDLPInvocationTemp(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	cleanupYTDLPInvocationWhenGroupExits(invocation, func() error {
+		called = true
+		return nil
+	})
+	if !called {
+		t.Fatal("process-group proof was not checked")
+	}
+	if _, err := os.Lstat(invocation.path); !os.IsNotExist(err) {
+		t.Fatalf("verified exited invocation remains: %v", err)
+	}
+
+	invocation, err = newYTDLPInvocationTemp(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := invocation.path + "-original"
+	if err := os.Rename(invocation.path, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(original, invocation.path); err != nil {
+		t.Fatal(err)
+	}
+	cleanupYTDLPInvocationWhenGroupExits(invocation, func() error { return nil })
+	if _, err := os.Lstat(original); err != nil {
+		t.Fatalf("original inode was removed after replacement: %v", err)
+	}
+}
+
 func TestRunYTDLPCommandDefaultOffPreservesParentEnvironment(t *testing.T) {
 	parentTemp := t.TempDir()
 	t.Setenv("TMPDIR", parentTemp)
