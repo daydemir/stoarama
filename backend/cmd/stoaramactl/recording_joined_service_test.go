@@ -1599,6 +1599,23 @@ func TestJoinedWorkerStatusBindsFrozenBatchScopeWithoutCanaryHours(t *testing.T)
 	}
 }
 
+func TestRetryJoinedClaimRetriesOnlyTransientResponses(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	ok, err := retryJoinedClaim(context.Background(), func() (bool, error) {
+		if calls.Add(1) < 3 {
+			return false, &joinedAPIResponseError{path: "/api/v1/recording/joined/claim", status: http.StatusInternalServerError}
+		}
+		return true, nil
+	})
+	if err != nil || !ok || calls.Load() != 3 {
+		t.Fatalf("retry result=(%t,%v), calls=%d", ok, err, calls.Load())
+	}
+	if retryableJoinedClaimError(&joinedAPITransportError{path: "/api/v1/recording/joined/claim", cause: errors.New("network")}) {
+		t.Fatal("transport error was treated as retryable claim response")
+	}
+}
+
 func writeJoinedTestJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
