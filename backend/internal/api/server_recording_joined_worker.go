@@ -407,7 +407,7 @@ func (s *Server) handleJoinedClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	if _, err := tx.Exec(r.Context(), `SET LOCAL lock_timeout='500ms'; SET LOCAL statement_timeout='5s'`); err != nil {
+	if _, err := tx.Exec(r.Context(), `SET LOCAL lock_timeout='500ms'; SET LOCAL statement_timeout='30s'`); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "bound joined claim")
 		return
 	}
