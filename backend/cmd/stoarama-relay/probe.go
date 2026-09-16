@@ -79,7 +79,7 @@ func (p *probe) runOnce(ctx context.Context) {
 			args = append([]string{"--cookies", cp}, args...)
 		}
 	}
-	out, err := exec.CommandContext(cctx, p.ytdlpBin, args...).CombinedOutput()
+	out, err := capture.RunYTDLPCommand(cctx, p.ytdlpBin, args...)
 
 	var class capture.YTDLPClass
 	switch {
@@ -183,7 +183,7 @@ func hasHTTPURL(out string) bool {
 func readYtdlpVersion(bin string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
+	out, err := capture.RunYTDLPCommand(ctx, bin, "--version")
 	if err != nil {
 		return ""
 	}

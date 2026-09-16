@@ -11,7 +11,8 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>STOARAMA_SERVICE_INSTANCE_ID</key><string>{{.InstanceID}}</string>
-  </dict>
+{{if .PrivateYTDLPTemp}}    <key>STOARAMA_YTDLP_PRIVATE_TMP</key><string>1</string>
+{{end}}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   {{if .UserDomain}}<key>LimitLoadToSessionType</key><string>Background</string>{{end}}
