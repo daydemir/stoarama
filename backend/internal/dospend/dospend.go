@@ -259,7 +259,9 @@ func Analyze(inv Inventory, managed ManagedSet, cfg Config, now time.Time) Repor
 				switch {
 				case poolDroplets[id]:
 					res.Owner, res.AllowEntry = OwnerPool, ""
-				case allowedDroplets[id] != "" && res.Owner == OwnerUnmanaged:
+				// The attached droplet's entry wins over a name match, so a
+				// capped fleet cannot shed volume cost onto another entry.
+				case allowedDroplets[id] != "" && res.Owner != OwnerPool:
 					res.Owner, res.AllowEntry = OwnerAllowlist, allowedDroplets[id]
 				}
 			}

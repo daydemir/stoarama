@@ -177,6 +177,8 @@ func TestAllowlistCapCountsDropletAndAttachedVolumes(t *testing.T) {
 			{Kind: KindDroplet, ID: "10", Name: "stoarama-collate-01", Size: "c-16", CreatedAt: old, USDPerDay: DropletUSDPerDay(dropletPerHour)},
 			{Kind: KindVolume, ID: "v10", Name: "scratch-200", Size: "200GiB", CreatedAt: old, DropletIDs: []string{"10"}, USDPerDay: StorageUSDPerDay(volGiB, VolumeUSDPerGiBMonth)},
 			{Kind: KindDroplet, ID: "11", Name: "copresence-api-01", CreatedAt: old, USDPerDay: 0.21},
+			// Named like another entry but attached to the collation droplet: charged to collation.
+			{Kind: KindVolume, ID: "v11", Name: "copresence-data", Size: "10GiB", CreatedAt: old, DropletIDs: []string{"10"}, USDPerDay: StorageUSDPerDay(10, VolumeUSDPerGiBMonth)},
 		}}
 	}
 	// c-8 ($0.25/h = $6/day) + 200 GiB ($0.66/day) stays under $15.
@@ -190,7 +192,7 @@ func TestAllowlistCapCountsDropletAndAttachedVolumes(t *testing.T) {
 			got = a
 		}
 	}
-	if got.Count != 2 || got.CapUSDPerDay != 15 || !near(got.USDPerDay, 6+StorageUSDPerDay(200, VolumeUSDPerGiBMonth)) {
+	if got.Count != 3 || got.CapUSDPerDay != 15 || !near(got.USDPerDay, 6+StorageUSDPerDay(210, VolumeUSDPerGiBMonth)) {
 		t.Fatalf("collate spend=%+v", got)
 	}
 	// c-32 ($1.19/h = $28.56/day) breaches the $15 cap; burn counts it either way.
