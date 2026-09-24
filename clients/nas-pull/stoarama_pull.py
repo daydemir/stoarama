@@ -5739,7 +5739,7 @@ def restore_api(cfg, path, body, retry_stale=False):
     """POST JSON to the API over a keep-alive connection; request_json semantics."""
     base = getattr(cfg, "api_base", "")
     parsed = urllib.parse.urlsplit(base + path)
-    proxied = bool(urllib.request.getproxies().get("https")) and not urllib.request.proxy_bypass(parsed.hostname or "")
+    proxied = bool(urllib.request.getproxies().get("https")) and not urllib.request.proxy_bypass(parsed.netloc)
     if parsed.scheme != "https" or proxied:
         # Plain HTTP (tests) and proxied installs keep urllib's transport.
         return request_json(cfg, "POST", path, body=body, timeout=HTTP_TIMEOUT_SEC)
