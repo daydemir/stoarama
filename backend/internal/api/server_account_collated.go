@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"log"
 	"net/http"
 	"path"
@@ -84,6 +85,11 @@ const collatedEligibleSQL = `
 	JOIN recordings r ON r.id=h.recording_id
 	JOIN connections conn ON conn.id=$1 AND conn.kind='nas_pull' AND r.account_id=conn.account_id
 	WHERE r.delivery='nas_pull' AND conn.collated_delivery_enabled
+	  -- Scope: only outputs collated from clips held for collated-only delivery
+	  -- (nasdelivery.HoldContractMode). The NAS already has the raw of every other
+	  -- output (e.g. the good+ backfill), so those stay in R2.
+	  AND EXISTS (SELECT 1 FROM clip_storage_billing_contracts hold
+	    WHERE hold.clip_id=ANY(o.source_clip_ids) AND hold.mode='` + nasdelivery.HoldContractMode + `')
 	  AND NOT EXISTS (SELECT 1 FROM recording_collation_hours newer
 	    WHERE newer.recording_id=h.recording_id AND newer.local_date=h.local_date
 	      AND newer.delivery_hour=h.delivery_hour AND newer.generation>h.generation)

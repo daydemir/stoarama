@@ -101,7 +101,11 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		CREATE TABLE recordings(id BIGINT PRIMARY KEY,account_id BIGINT NOT NULL,delivery TEXT NOT NULL);
 		CREATE TABLE recording_collation_hours(id BIGINT PRIMARY KEY,recording_id BIGINT NOT NULL,local_date DATE NOT NULL,delivery_hour SMALLINT NOT NULL,generation INTEGER NOT NULL);
 		CREATE TABLE recording_collation_outputs(id BIGINT PRIMARY KEY,collation_hour_id BIGINT NOT NULL REFERENCES recording_collation_hours(id),part INTEGER NOT NULL,
-		  object_key TEXT NOT NULL,nas_relative_path TEXT NOT NULL UNIQUE,size_bytes BIGINT NOT NULL,sha256 TEXT NOT NULL);
+		  object_key TEXT NOT NULL,nas_relative_path TEXT NOT NULL UNIQUE,size_bytes BIGINT NOT NULL,sha256 TEXT NOT NULL,
+		  source_clip_ids BIGINT[] NOT NULL);
+		CREATE TABLE clip_storage_billing_contracts(clip_id BIGINT PRIMARY KEY,mode TEXT NOT NULL,authoritative BOOLEAN NOT NULL DEFAULT true);
+		INSERT INTO clip_storage_billing_contracts(clip_id,mode) SELECT g,'nas_collated_hold' FROM generate_series(1,1000) g;
+		INSERT INTO clip_storage_billing_contracts(clip_id,mode) VALUES(5000,'nas_pull_monthly');
 		INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);
 		INSERT INTO recordings VALUES(1,47,'nas_pull'),(2,47,'managed'),(3,48,'nas_pull');
 		INSERT INTO recording_collation_hours VALUES(10,1,'2026-07-26',6,2),(11,1,'2026-07-26',6,3),(12,1,'2026-07-26',7,2),(13,2,'2026-07-26',6,2),(14,3,'2026-07-26',6,2);
@@ -127,8 +131,13 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 		{103, 12, dir + "14_140001-150001.mp4"},
 		{104, 13, dir + "15_150001-160001.mp4"}, // managed recording
 		{105, 14, dir + "16_160001-170001.mp4"}, // other account
+		{106, 12, dir + "17_170001-180001.mp4"}, // backfill: raw already on the NAS
 	} {
-		if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES($1,$2,1,$3,$4,1000,$5)`, o.id, o.hour, fmt.Sprintf("joined/b/objects/%d.mp4", o.id), o.rel, sha); err != nil {
+		sources := "{" + fmt.Sprint(o.id) + "}"
+		if o.id == 106 {
+			sources = "{5000}"
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO recording_collation_outputs VALUES($1,$2,1,$3,$4,1000,$5,$6)`, o.id, o.hour, fmt.Sprintf("joined/b/objects/%d.mp4", o.id), o.rel, sha, sources); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -197,7 +206,7 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, map[string]string{"outputId": "102"}); code != 409 {
 		t.Fatalf("size drift download code=%d", code)
 	}
-	for _, id := range []string{"100", "104", "105"} {
+	for _, id := range []string{"100", "104", "105", "106"} {
 		if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, map[string]string{"outputId": id}); code != 404 {
 			t.Fatalf("ineligible %s download code=%d", id, code)
 		}
