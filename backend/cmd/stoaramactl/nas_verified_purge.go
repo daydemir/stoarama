@@ -170,6 +170,22 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 	return opts, nil
 }
 
+// nasPurgeNASLateral is the NAS proof for clip c, as a LATERAL join so the
+// planner always probes the inventory primary key per clip. As an EXISTS in
+// the select list it could pick a hashed alternative that seq-scans the whole
+// inventory on every page (~60 s per page in production).
+const nasPurgeNASLateral = `
+LEFT JOIN LATERAL (
+  SELECT true AS ok FROM nas_inventory_files n
+  WHERE n.connection_id=$1 AND n.clip_id=c.id AND n.state='present'
+    AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes AND n.relative_path=c.display_path
+    AND ($4::bigint=0 OR n.verified_at>=now()-make_interval(secs => $4::bigint))
+    AND NOT EXISTS(SELECT 1 FROM nas_inventory_files other WHERE other.connection_id=n.connection_id
+      AND other.relative_path=n.relative_path AND other.clip_id<>n.clip_id AND other.state IN ('present','mismatch'))
+    AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=n.connection_id
+      AND u.relative_path=n.relative_path AND u.state='present')
+  LIMIT 1) nasx ON true`
+
 // nasPurgeFactsSQL evaluates every rule for clip c (recording rec, destination
 // sd) as named booleans. $1 connection, $2 bucket, $3 grace seconds, $4 NAS max
 // age seconds. The candidate scan classifies with them; the locked re-check
@@ -177,14 +193,7 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 const nasPurgeFactsSQL = `
   (c.size_bytes>0 AND lower(COALESCE(c.sha256,'')) ~ '^[0-9a-f]{64}$' AND COALESCE(c.object_key,'')<>'' AND c.object_key=btrim(c.object_key) AND COALESCE(c.display_path,'')<>'') AS identity_ok,
   (COALESCE(sd.managed,false) AND COALESCE(c.bucket,'')=$2 AND COALESCE(sd.bucket,'')=$2) AS managed_ok,
-  EXISTS(SELECT 1 FROM nas_inventory_files n
-    WHERE n.connection_id=$1 AND n.clip_id=c.id AND n.state='present'
-      AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes AND n.relative_path=c.display_path
-      AND ($4::bigint=0 OR n.verified_at>=now()-make_interval(secs => $4::bigint))
-      AND NOT EXISTS(SELECT 1 FROM nas_inventory_files other WHERE other.connection_id=n.connection_id
-        AND other.relative_path=n.relative_path AND other.clip_id<>n.clip_id AND other.state IN ('present','mismatch'))
-      AND NOT EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=n.connection_id
-        AND u.relative_path=n.relative_path AND u.state='present')) AS nas_ok,
+  COALESCE(nasx.ok,false) AS nas_ok,
   (c.clip_end_at<=now()-make_interval(secs => $3::bigint) AND c.created_at<=now()-make_interval(secs => $3::bigint)) AS aged,
   NOT (rec.status='active' AND c.clip_end_at>now()-interval '7 days') AS schedule_ok,
   NOT EXISTS(SELECT 1 FROM recording_joined_source_snapshots s WHERE s.clip_id=c.id) AS no_snapshot,
@@ -218,7 +227,7 @@ SELECT c.id, c.recording_id, c.size_bytes, lower(COALESCE(c.sha256,'')), COALESC
 FROM recording_clips c
 JOIN recordings rec ON rec.id=c.recording_id AND rec.delivery='nas_pull'
 JOIN connections conn ON conn.id=$1 AND conn.account_id=rec.account_id AND conn.kind='nas_pull'
-LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id
+LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id` + nasPurgeNASLateral + `
 WHERE c.purged_at IS NULL AND c.id>$5
   AND ($6::bigint=0 OR c.recording_id=$6)
   AND ($7::timestamptz IS NULL OR c.clip_start_at>=$7) AND ($8::timestamptz IS NULL OR c.clip_start_at<$8)
@@ -232,7 +241,7 @@ FROM (SELECT c.id, c.size_bytes, c.sha256, c.object_key, ` + nasPurgeFactsSQL + 
       FROM recording_clips c
       JOIN recordings rec ON rec.id=c.recording_id AND rec.delivery='nas_pull'
       JOIN connections conn ON conn.id=$1 AND conn.account_id=rec.account_id AND conn.kind='nas_pull'
-      LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id
+      LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id` + nasPurgeNASLateral + `
       WHERE c.id=ANY($5) AND c.purged_at IS NULL) f
 JOIN recording_clips c ON c.id=f.id
 WHERE f.` + strings.Join(nasPurgeFactNames, " AND f.") + `
