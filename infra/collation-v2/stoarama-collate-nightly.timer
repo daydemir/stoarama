@@ -1,0 +1,9 @@
+[Unit]
+Description=Stoarama collation v2 nightly runner (hourly catch-up)
+
+[Timer]
+OnCalendar=*-*-* *:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

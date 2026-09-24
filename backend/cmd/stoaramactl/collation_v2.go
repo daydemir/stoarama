@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,15 +19,15 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/collation"
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const collationV2Usage = `usage:
-  stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD]
-  stoaramactl collation-v2 run --worklist FILE|r2:KEY --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch]
-  stoaramactl collation-v2 register --worklist FILE|r2:KEY [--dry-run]
+  stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N]
+  stoaramactl collation-v2 run --worklist FILE|r2:KEY|r2prefix:PREFIX --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch]
+  stoaramactl collation-v2 register --worklist FILE|r2:KEY|r2prefix:PREFIX [--dry-run]
   stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
 
 // NightlyBatchID names the rolling generation-2 batch for closed local days.
@@ -48,14 +47,15 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		broken := fs.String("broken-ids", "", "file of known-unplayable clip ids (one per line)")
 		recordings := fs.String("recordings", "", "optional comma-separated recording ids")
 		hourIDs := fs.String("hour-ids", "", "optional file of hour ids to keep")
-		date := fs.String("date", "", "nightly: local date to plan (default: yesterday in each recording's timezone)")
+		date := fs.String("date", "", "nightly: local date to plan (default: the last --days closed days in each recording's timezone)")
+		days := fs.Int("days", 2, "nightly: how many closed local days to (re)plan; published hours are skipped by run")
 		_ = fs.Parse(args[1:])
 		if *out == "" || (*scope != "backfill" && *scope != "nightly") {
 			log.Fatal(collationV2Usage)
 		}
 		pool := mustCollationPool(ctx, cfg)
 		defer pool.Close()
-		opts := collationPlanOptions{scope: *scope, date: *date, now: time.Now()}
+		opts := collationPlanOptions{scope: *scope, date: *date, days: *days, now: time.Now()}
 		var err error
 		if opts.broken, err = readIDSet(*broken); err != nil {
 			log.Fatal(err)
@@ -187,6 +187,35 @@ func mustCollationPool(ctx context.Context, cfg config.Config) *pgxpool.Pool {
 }
 
 func loadWorklist(ctx context.Context, store collation.R2Store, ref string) ([]collation.HourWork, error) {
+	if prefix, ok := strings.CutPrefix(ref, "r2prefix:"); ok {
+		if !strings.HasPrefix(prefix, "collation-v2/worklists/") {
+			return nil, fmt.Errorf("worklist prefix must be under collation-v2/worklists/")
+		}
+		var keys []string
+		if err := store.Client.ListPrefix(ctx, prefix, 0, func(o r2.ObjectInfo) error {
+			if strings.HasSuffix(o.Key, ".jsonl") {
+				keys = append(keys, o.Key)
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		seen := map[string]bool{}
+		var all []collation.HourWork
+		for _, key := range keys {
+			work, err := loadWorklist(ctx, store, "r2:"+key)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", key, err)
+			}
+			for _, w := range work {
+				if !seen[w.HourID] {
+					seen[w.HourID] = true
+					all = append(all, w)
+				}
+			}
+		}
+		return all, nil
+	}
 	if key, ok := strings.CutPrefix(ref, "r2:"); ok {
 		body, err := store.Client.Get(ctx, key)
 		if err != nil {
@@ -273,6 +302,7 @@ func parseIDList(raw string) (map[int64]bool, error) {
 type collationPlanOptions struct {
 	scope      string
 	date       string
+	days       int
 	now        time.Time
 	broken     map[int64]bool
 	recordings map[int64]bool
@@ -354,11 +384,13 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				rows.Close()
 				return nil, err
 			}
-			date := opts.date
-			if date == "" {
-				date = opts.now.In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+			if opts.date != "" {
+				days = append(days, collationDay{batchID: NightlyBatchID, recordingID: id, localDate: opts.date})
+				continue
 			}
-			days = append(days, collationDay{batchID: NightlyBatchID, recordingID: id, localDate: date})
+			for k := max(opts.days, 1); k >= 1; k-- {
+				days = append(days, collationDay{batchID: NightlyBatchID, recordingID: id, localDate: opts.now.In(loc).AddDate(0, 0, -k).Format("2006-01-02")})
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -383,6 +415,10 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 			return nil, err
 		}
 		loc, err := time.LoadLocation(rec.timezone)
+		if err != nil {
+			return nil, err
+		}
+		gen1, err := loadGen1Hours(ctx, pool, recordingID)
 		if err != nil {
 			return nil, err
 		}
@@ -420,23 +456,46 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 						w.Clips = append(w.Clips, c)
 					}
 				}
-				if d.batchID != NightlyBatchID {
-					gen1, err := joinedrecording.CanonicalHourID(d.batchID, recordingID, d.localDate, h, 1)
-					if err != nil {
-						return nil, err
-					}
-					err = pool.QueryRow(ctx, `SELECT id FROM recording_joined_hours WHERE hour_id=$1`, gen1).Scan(&w.SupersedesHourRecordID)
-					if err == nil {
-						w.SupersedesHourID = gen1
-					} else if !errors.Is(err, pgx.ErrNoRows) {
-						return nil, err
-					}
+				if gen1ID, ok := gen1[collationGen1Key{d.batchID, d.localDate, h}]; ok {
+					w.SupersedesHourRecordID = gen1ID.id
+					w.SupersedesHourID = gen1ID.hourID
 				}
 				work = append(work, w)
 			}
 		}
 	}
 	return work, nil
+}
+
+type collationGen1Key struct {
+	batchID   string
+	localDate string
+	hour      int
+}
+
+type collationGen1Hour struct {
+	id     int64
+	hourID string
+}
+
+// loadGen1Hours maps every generation-1 joined hour of a recording to its row.
+func loadGen1Hours(ctx context.Context, pool *pgxpool.Pool, recordingID int64) (map[collationGen1Key]collationGen1Hour, error) {
+	rows, err := pool.Query(ctx, `SELECT id, hour_id, batch_id, to_char(local_date,'YYYY-MM-DD'), delivery_hour FROM recording_joined_hours
+		WHERE recording_id=$1 AND hour_id LIKE '%__generation-1'`, recordingID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[collationGen1Key]collationGen1Hour{}
+	for rows.Next() {
+		var h collationGen1Hour
+		var k collationGen1Key
+		if err := rows.Scan(&h.id, &h.hourID, &k.batchID, &k.localDate, &k.hour); err != nil {
+			return nil, err
+		}
+		out[k] = h
+	}
+	return out, rows.Err()
 }
 
 func loadCollationRecording(ctx context.Context, pool *pgxpool.Pool, id int64) (collationRecording, error) {
