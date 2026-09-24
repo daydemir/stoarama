@@ -56,10 +56,10 @@ broken file:
   8 MiB range, and every 32 MiB of hashing, it lists the raw feed and gives up if
   any raw clip is pending. With about 20 live recordings the raw feed is almost
   never empty, so joined work rarely gets past the first boundary.
-- The `io_error` blocker is only the last transient failure of that raw-feed
-  poll (for example the API restart during the 12:35 UTC deploy on 2026-09-24).
-  The failure happens before the client records transfer progress, which is why
-  the server's transfer telemetry still shows 2026-09-11.
+- The `io_error` blocker is only the most recent transient network failure
+  (an `OSError`) at that yield boundary. It happens before the client records
+  transfer progress, so the server's transfer telemetry still shows 2026-09-11
+  even though the client restarted on 2026-09-24.
 - Even fair-share mode grants one 8 MiB range per raw page, about 11 GB/day,
   and the download rate is hard-coded at 8 MiB/s.
 
