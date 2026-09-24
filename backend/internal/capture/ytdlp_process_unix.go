@@ -5,14 +5,32 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
 )
 
-func configureYTDLPProcessGroup(cmd *exec.Cmd) {
+// configureYTDLPProcessGroup puts yt-dlp in its own process group and makes
+// context cancellation a graceful group SIGTERM. exec escalates to SIGKILL of the
+// leader after grace; runYTDLPCommand then kills any surviving group member.
+func configureYTDLPProcessGroup(cmd *exec.Cmd, grace time.Duration) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = 5 * time.Second
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = grace
+}
+
+func killYTDLPProcessGroup(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 }
 
 func waitForYTDLPProcessGroupExit(cmd *exec.Cmd) error {

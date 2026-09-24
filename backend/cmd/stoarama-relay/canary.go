@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -60,18 +59,21 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 	}
 
 	resolveCtx, cancelResolve := context.WithTimeout(reservationCtx, 60*time.Second)
-	resolvedURL, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(
-		resolveCtx, spec.Provider, spec.SourceURL, spec.SourcePageURL,
-	)
+	input, err := capture.ResolveCapture(resolveCtx, spec.Provider, spec.SourceURL, spec.SourcePageURL)
 	cancelResolve()
 	if err != nil {
 		return fmt.Errorf("resolve canary source: %s", recordingworker.SanitizeDiagnosticError(err))
 	}
-	if isImage {
+	if input.IsImage {
 		return fmt.Errorf("recording canary requires a video source")
 	}
-	if _, err := netguard.ValidatePublicURL(resolvedURL); err != nil {
-		return fmt.Errorf("resolved canary source rejected: %s", recordingworker.SanitizeDiagnosticError(err))
+	for _, inputURL := range []string{input.URL, input.AudioURL} {
+		if inputURL == "" {
+			continue
+		}
+		if _, err := netguard.ValidatePublicURL(inputURL); err != nil {
+			return fmt.Errorf("resolved canary source rejected: %s", recordingworker.SanitizeDiagnosticError(err))
+		}
 	}
 
 	// Recheck immediately before starting FFmpeg. The server-side reservation is
@@ -106,9 +108,7 @@ func runRecordingCanary(ctx context.Context, args []string) error {
 	}
 	defer os.RemoveAll(root)
 	started := time.Now()
-	seg, captureErr := capture.CaptureSegmentInDirWithHeadersNoThumbnail(
-		canaryCtx, resolvedURL, recordingCanaryDuration, "", root, inputHeaders,
-	)
+	seg, captureErr := capture.CaptureSegmentInputInDirNoThumbnail(canaryCtx, input, recordingCanaryDuration, root)
 	var validationErr error
 	if captureErr == nil {
 		defer capture.CleanupSegment(seg)
@@ -196,7 +196,7 @@ func configureCanaryCaptureRuntime() error {
 	if err != nil {
 		return err
 	}
-	ytdlp := filepath.Join(bd, "yt-dlp")
+	ytdlp := installedYTDLPPath(bd)
 	if err := os.Setenv("TZ", "UTC"); err != nil {
 		return fmt.Errorf("set TZ: %w", err)
 	}

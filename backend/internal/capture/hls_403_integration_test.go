@@ -137,9 +137,12 @@ func TestContinuousGooglevideoHLSAdvancingManifestExpiredFragments(t *testing.T)
 }
 
 // TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart covers
-// the healthy production shape that a first-403 trigger misclassifies. FFmpeg
-// may see one unavailable child fragment while the manifest keeps publishing
-// valid media. CaptureContinuous must keep the child when output resumes.
+// the healthy production shape that a first-403 trigger misclassifies (stream
+// 435, #267). While media is flowing, FFmpeg may see one unavailable child
+// fragment while the manifest keeps publishing valid media. CaptureContinuous
+// must keep the child when output resumes. The 403 is placed after FFmpeg has
+// finished probing and opened its first output segment; a 403 before that is
+// the expired-on-arrival case covered below.
 func TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart(t *testing.T) {
 	ffmpeg, err := exec.LookPath(ffmpegBin())
 	if err != nil {
@@ -147,33 +150,45 @@ func TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart(t *tes
 	}
 
 	temp := t.TempDir()
-	segments := generateHLSFixtureSegments(t, ffmpeg, temp, 7)
+	segments := generateHLSFixtureSegments(t, ffmpeg, temp, 14)
+	outDir := t.TempDir()
 
 	var playlistRequests atomic.Int64
 	var forbiddenRequests atomic.Int64
-	var freshRequests atomic.Int64
+	var freshAfterForbidden atomic.Int64
+	var transientPublished atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/live.m3u8":
 			request := playlistRequests.Add(1)
+			sequence := request - 1
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-			if request == 1 {
-				fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,\n/segment.ts\n#EXTINF:1,\n/transient.ts\n")
+			// Publish the transient fragment only once output exists, so the
+			// fixture never depends on how much media FFmpeg probes first.
+			outputStarted := false
+			if sizes, err := continuousOutputSizes(outDir); err == nil {
+				outputStarted = continuousOutputStarted(sizes)
+			}
+			if outputStarted && transientPublished.CompareAndSwap(false, true) {
+				fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXTINF:1,\n/transient.ts\n", sequence)
 				return
 			}
-			sequence := request
-			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXTINF:1,\n/fresh-%d.ts\n", sequence, sequence)
-			if request >= 4 {
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXTINF:1,\n/fresh-%d.ts\n", sequence, sequence%int64(len(segments)))
+			if transientPublished.Load() && freshAfterForbidden.Load() >= 2 {
 				fmt.Fprint(w, "#EXT-X-ENDLIST\n")
 			}
-		case r.URL.Path == "/segment.ts":
+		case r.URL.Path == "/transient.ts":
+			// One 403, then the fragment is available to FFmpeg's HTTP retry.
+			if forbiddenRequests.Add(1) == 1 {
+				http.Error(w, "temporarily unavailable", http.StatusForbidden)
+				return
+			}
 			w.Header().Set("Content-Type", "video/mp2t")
 			_, _ = w.Write(segments[0])
-		case r.URL.Path == "/transient.ts":
-			forbiddenRequests.Add(1)
-			http.Error(w, "temporarily unavailable", http.StatusForbidden)
 		case strings.HasPrefix(r.URL.Path, "/fresh-"):
-			freshRequests.Add(1)
+			if forbiddenRequests.Load() > 0 {
+				freshAfterForbidden.Add(1)
+			}
 			var index int
 			if _, err := fmt.Sscanf(r.URL.Path, "/fresh-%d.ts", &index); err != nil || index >= len(segments) {
 				http.NotFound(w, r)
@@ -187,7 +202,7 @@ func TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart(t *tes
 	}))
 	defer server.Close()
 
-	captureCtx, captureCancel := context.WithTimeout(context.Background(), 7*time.Second)
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer captureCancel()
 	result := make(chan error, 1)
 	go func() {
@@ -197,22 +212,22 @@ func TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart(t *tes
 			time.Second,
 			"manifest.googlevideo.com",
 			nil,
-			temp,
+			outDir,
 			func(Segment) error { return nil },
 			"",
-			10*time.Second,
-			10*time.Second,
+			20*time.Second,
+			20*time.Second,
 		)
 	}()
 
-	deadline := time.NewTimer(6 * time.Second)
+	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()
-	for forbiddenRequests.Load() == 0 || freshRequests.Load() < 2 {
+	for forbiddenRequests.Load() == 0 || freshAfterForbidden.Load() < 2 {
 		select {
 		case err := <-result:
-			t.Fatalf("capture restarted after a transient 403 before media recovered: %v; playlists=%d forbidden=%d fresh=%d", err, playlistRequests.Load(), forbiddenRequests.Load(), freshRequests.Load())
+			t.Fatalf("capture restarted after a transient 403 before media recovered: %v; playlists=%d forbidden=%d fresh_after=%d", err, playlistRequests.Load(), forbiddenRequests.Load(), freshAfterForbidden.Load())
 		case <-deadline.C:
-			t.Fatalf("fixture did not recover after transient 403; playlists=%d forbidden=%d fresh=%d", playlistRequests.Load(), forbiddenRequests.Load(), freshRequests.Load())
+			t.Fatalf("fixture did not recover after transient 403; playlists=%d forbidden=%d fresh_after=%d", playlistRequests.Load(), forbiddenRequests.Load(), freshAfterForbidden.Load())
 		case <-time.After(25 * time.Millisecond):
 		}
 	}
@@ -222,10 +237,74 @@ func TestContinuousGooglevideoHLSTransientForbiddenRecoversWithoutRestart(t *tes
 	select {
 	case err := <-result:
 		if err != nil {
-			t.Fatalf("capture misclassified a clean exit after recovered media: %v; playlists=%d forbidden=%d fresh=%d", err, playlistRequests.Load(), forbiddenRequests.Load(), freshRequests.Load())
+			t.Fatalf("capture misclassified a clean exit after recovered media: %v; playlists=%d forbidden=%d fresh_after=%d", err, playlistRequests.Load(), forbiddenRequests.Load(), freshAfterForbidden.Load())
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatalf("capture did not finish the recovered finite fixture; playlists=%d forbidden=%d fresh=%d", playlistRequests.Load(), forbiddenRequests.Load(), freshRequests.Load())
+	case <-time.After(5 * time.Second):
+		t.Fatalf("capture did not finish the recovered finite fixture; playlists=%d forbidden=%d fresh_after=%d", playlistRequests.Load(), forbiddenRequests.Load(), freshAfterForbidden.Load())
+	}
+}
+
+// TestContinuousGooglevideoHLSForbiddenBeforeOutputReResolvesImmediately covers
+// the expired-on-arrival shape: the resolved URL's first child fragment is
+// already 403. No media exists yet, so CaptureContinuous must hand control back
+// to the resolver at once rather than spend the post-output confirmation window
+// or the startup watchdog on it, even though later fragments would succeed.
+func TestContinuousGooglevideoHLSForbiddenBeforeOutputReResolvesImmediately(t *testing.T) {
+	ffmpeg, err := exec.LookPath(ffmpegBin())
+	if err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	temp := t.TempDir()
+	segment := generateHLSFixtureSegment(t, ffmpeg, temp)
+
+	var playlistRequests atomic.Int64
+	var forbiddenRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/live.m3u8":
+			request := playlistRequests.Add(1)
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			if request == 1 {
+				fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,\n/expired.ts\n")
+				return
+			}
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:%d\n#EXTINF:1,\n/segment.ts\n", request-1)
+		case r.URL.Path == "/segment.ts":
+			w.Header().Set("Content-Type", "video/mp2t")
+			_, _ = w.Write(segment)
+		case r.URL.Path == "/expired.ts":
+			forbiddenRequests.Add(1)
+			http.Error(w, "expired", http.StatusForbidden)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer captureCancel()
+	started := time.Now()
+	err = captureContinuousWithHeaders(
+		captureCtx,
+		server.URL+"/live.m3u8",
+		time.Second,
+		"manifest.googlevideo.com",
+		nil,
+		temp,
+		func(Segment) error { return nil },
+		"",
+		30*time.Second,
+		30*time.Second,
+	)
+	elapsed := time.Since(started)
+	if !errors.Is(err, ErrContinuousExpiredGooglevideoFragment) {
+		t.Fatalf("capture error=%v, want expired Googlevideo HLS fragment; forbidden=%d", err, forbiddenRequests.Load())
+	}
+	if elapsed >= continuousExpiredFragmentConfirmationWindow {
+		t.Fatalf("pre-output 403 waited %s, want an immediate re-resolve", elapsed)
+	}
+	if forbiddenRequests.Load() == 0 {
+		t.Fatal("fixture never served an expired fragment")
 	}
 }
 

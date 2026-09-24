@@ -181,6 +181,7 @@ type Config struct {
 	DropletPoolProvisionTimeoutSec  int
 	DropletPoolIdleGraceSec         int
 	DropletPoolDrainTimeoutSec      int
+	DropletPoolStaleHeartbeatSec    int
 	DropletPoolScaleUpCooldownSec   int
 	DropletPoolScaleDownCooldownSec int
 	DropletPoolMin                  int
@@ -329,6 +330,7 @@ func Load() (Config, error) {
 		DropletPoolProvisionTimeoutSec:  intEnv("DROPLET_POOL_PROVISION_TIMEOUT_SEC", 900),
 		DropletPoolIdleGraceSec:         intEnv("DROPLET_POOL_IDLE_GRACE_SEC", 600),
 		DropletPoolDrainTimeoutSec:      intEnv("DROPLET_POOL_DRAIN_TIMEOUT_SEC", 600),
+		DropletPoolStaleHeartbeatSec:    intEnv("DROPLET_POOL_STALE_HEARTBEAT_SEC", 900),
 		DropletPoolScaleUpCooldownSec:   intEnv("DROPLET_POOL_SCALEUP_COOLDOWN_SEC", 60),
 		DropletPoolScaleDownCooldownSec: intEnv("DROPLET_POOL_SCALEDOWN_COOLDOWN_SEC", 300),
 		DropletPoolMin:                  intEnv("DROPLET_POOL_MIN", 0),
@@ -930,6 +932,13 @@ func (c Config) ValidatePool() error {
 	}
 	if c.DropletPoolMaxScaleUpBatch <= 0 {
 		return fmt.Errorf("DROPLET_POOL_MAX_SCALEUP_BATCH must be > 0")
+	}
+	// Zero disables unresponsive-worker retirement. Otherwise the threshold must
+	// clear several missed worker heartbeats so a briefly slow worker is never
+	// mistaken for a dead one.
+	if c.DropletPoolStaleHeartbeatSec < 0 ||
+		(c.DropletPoolStaleHeartbeatSec > 0 && c.DropletPoolStaleHeartbeatSec < 5*max(c.RecordingWorkerHeartbeatSec, 60)) {
+		return fmt.Errorf("DROPLET_POOL_STALE_HEARTBEAT_SEC must be 0 (disabled) or at least five worker heartbeats and 300s")
 	}
 	if strings.TrimSpace(c.DropletPoolRegion) == "" || strings.TrimSpace(c.DropletPoolSize) == "" || strings.TrimSpace(c.DropletPoolImage) == "" {
 		return fmt.Errorf("DROPLET_POOL_REGION, DROPLET_POOL_SIZE, and DROPLET_POOL_IMAGE are required")

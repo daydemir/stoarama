@@ -9,65 +9,49 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/capture"
 )
 
-func TestServiceTemplatesKeepPrivateTempDefaultOffAndPersistOptIn(t *testing.T) {
+// The private temp root is unconditional, so service templates must not carry
+// the retired STOARAMA_YTDLP_PRIVATE_TMP opt-in gate.
+func TestServiceTemplatesDoNotCarryRetiredPrivateTempGate(t *testing.T) {
 	for _, template := range []struct {
 		name string
 		path string
-		data func() any
+		data any
 	}{
-		{
-			name: "launchd",
-			path: "templates/launchd.plist.tmpl",
-			data: func() any { return launchdTemplateData("label", "/relay", "/log", "instance", false) },
-		},
-		{
-			name: "systemd",
-			path: "templates/systemd.service.tmpl",
-			data: func() any { return systemdTemplateData("/relay") },
-		},
+		{name: "launchd", path: "templates/launchd.plist.tmpl", data: launchdTemplateData("label", "/relay", "/log", "instance", false)},
+		{name: "systemd", path: "templates/systemd.service.tmpl", data: systemdTemplateData("/relay")},
 	} {
 		t.Run(template.name, func(t *testing.T) {
-			t.Setenv(capture.YTDLPPrivateTempEnv, "")
-			off, err := executeTemplate(template.path, template.data())
+			t.Setenv("STOARAMA_YTDLP_PRIVATE_TMP", "1")
+			rendered, err := executeTemplate(template.path, template.data)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(string(off), capture.YTDLPPrivateTempEnv) {
-				t.Fatalf("default-off template persisted opt-in:\n%s", off)
-			}
-
-			t.Setenv(capture.YTDLPPrivateTempEnv, "1")
-			on, err := executeTemplate(template.path, template.data())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(string(on), capture.YTDLPPrivateTempEnv) {
-				t.Fatalf("opt-in template omitted gate:\n%s", on)
+			if strings.Contains(string(rendered), "STOARAMA_YTDLP_PRIVATE_TMP") {
+				t.Fatalf("template persisted retired gate:\n%s", rendered)
 			}
 		})
 	}
 }
 
-func TestPrepareYTDLPPrivateTempIsDefaultOff(t *testing.T) {
+func TestPrepareYTDLPPrivateTempSkipsNonServiceCommands(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	t.Setenv(capture.YTDLPPrivateTempEnv, "")
 	t.Setenv(capture.YTDLPRuntimeTempRootEnv, "parent-value")
-	if err := prepareYTDLPPrivateTemp("run"); err != nil {
+	if err := prepareYTDLPPrivateTemp("version"); err != nil {
 		t.Fatal(err)
 	}
 	if got := os.Getenv(capture.YTDLPRuntimeTempRootEnv); got != "parent-value" {
-		t.Fatalf("default-off root env changed to %q", got)
+		t.Fatalf("non-service command changed root env to %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".stoarama")); !os.IsNotExist(err) {
-		t.Fatalf("default-off mode changed filesystem: %v", err)
+		t.Fatalf("non-service command changed filesystem: %v", err)
 	}
 }
 
-func TestPrepareYTDLPPrivateTempCreatesPrivateRelayRoot(t *testing.T) {
+func TestPrepareYTDLPPrivateTempCreatesPrivateRelayRootByDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	t.Setenv(capture.YTDLPPrivateTempEnv, "1")
+	t.Setenv("STOARAMA_YTDLP_PRIVATE_TMP", "")
 	t.Setenv(capture.YTDLPRuntimeTempRootEnv, "")
 	if err := prepareYTDLPPrivateTemp("run"); err != nil {
 		t.Fatal(err)
