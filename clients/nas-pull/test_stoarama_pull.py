@@ -3712,6 +3712,45 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(len(received), 3)
         self.assertEqual(opened, ["bucket.example.test"])
 
+    def test_restore_once_worker_reuses_its_connection_across_leases(self):
+        received = self.serve(200)
+        opened = []
+        real_factory = pull.http.client.HTTPSConnection.side_effect
+
+        def counting(netloc, timeout, blocksize):
+            opened.append(netloc)
+            return real_factory(netloc, timeout, blocksize)
+
+        pull.http.client.HTTPSConnection.side_effect = counting
+        leases = [[self.task(task_id=1)], [self.task(task_id=2)], [self.task(task_id=3)]]
+
+        def fake_request(cfg, method, path, body=None, timeout=None, **_kw):
+            if path.endswith("/lease"):
+                return {"retry_after_sec": 120, "tasks": leases.pop(0) if leases else []}
+            return {"ok": True, "state": "verified"}
+
+        cfg = SimpleNamespace(output_dir=self.root, restore_workers=1)
+        with mock.patch.object(pull, "request_json", side_effect=fake_request):
+            self.assertEqual(pull.restore_once(cfg), 120)
+        self.assertEqual(len(received), 3)
+        self.assertEqual(opened, ["bucket.example.test"])
+
+    def test_restore_put_retries_once_on_a_stale_connection(self):
+        received = self.serve(200)
+        calls = []
+        real = pull.restore_https
+
+        def flaky(*args, **kwargs):
+            calls.append(args[1])
+            if len(calls) == 1:
+                raise pull.http.client.RemoteDisconnected("closed")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(pull, "restore_https", side_effect=flaky):
+            result = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task()))
+        self.assertEqual((result["outcome"], calls), ("uploaded", ["PUT", "PUT"]))
+        self.assertEqual(received[0][1], self.body)
+
     def test_run_restore_task_maps_existing_key_and_http_failure(self):
         self.serve(412)
         self.assertEqual(pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task()))["outcome"], "exists")

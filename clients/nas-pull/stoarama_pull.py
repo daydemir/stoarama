@@ -5700,8 +5700,11 @@ def reset_restore_connections():
     _restore_http.conns = {}
 
 
-def restore_https(netloc, method, target, body, headers, timeout):
-    """One request on this thread's keep-alive connection to netloc."""
+def restore_https(netloc, method, target, body, headers, timeout, read_limit=None):
+    """One request on this thread's keep-alive connection to netloc.
+
+    With read_limit, at most that many response bytes are read; a longer
+    response closes the connection instead of being buffered."""
     conns = getattr(_restore_http, "conns", None)
     if conns is None:
         conns = _restore_http.conns = {}
@@ -5715,12 +5718,16 @@ def restore_https(netloc, method, target, body, headers, timeout):
     try:
         conn.request(method, target, body=body, headers=headers)
         response = conn.getresponse()
-        data = response.read()
+        data = response.read() if read_limit is None else response.read(read_limit + 1)
     except BaseException:
         conns.pop(netloc, None)
         conn.close()
         raise
-    if response.will_close:
+    if read_limit is not None and len(data) > read_limit:
+        data = data[:read_limit]
+        conns.pop(netloc, None)
+        conn.close()
+    elif response.will_close:
         conns.pop(netloc, None)
         conn.close()
     else:
@@ -5732,7 +5739,9 @@ def restore_api(cfg, path, body, retry_stale=False):
     """POST JSON to the API over a keep-alive connection; request_json semantics."""
     base = getattr(cfg, "api_base", "")
     parsed = urllib.parse.urlsplit(base + path)
-    if parsed.scheme != "https":
+    proxied = bool(urllib.request.getproxies().get("https")) and not urllib.request.proxy_bypass(parsed.hostname or "")
+    if parsed.scheme != "https" or proxied:
+        # Plain HTTP (tests) and proxied installs keep urllib's transport.
         return request_json(cfg, "POST", path, body=body, timeout=HTTP_TIMEOUT_SEC)
     data = json.dumps(body).encode("utf-8")
     headers = {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"}
@@ -5754,7 +5763,7 @@ def restore_put(task, body):
     headers["Content-Length"] = str(task["size_bytes"])
     headers["User-Agent"] = USER_AGENT
     status, _ = restore_https(url.netloc, "PUT", url.path + ("?" + url.query if url.query else ""), body, headers,
-                              RESTORE_SOCKET_TIMEOUT_SEC)
+                              RESTORE_SOCKET_TIMEOUT_SEC, read_limit=64 * 1024)
     return status
 
 
@@ -5770,7 +5779,15 @@ def run_restore_task(cfg, task):
         fd = open_restore_source(cfg, task)
         upload_started = time.monotonic()
         body = RestoreBody(fd, task["size_bytes"])
-        status = restore_put(task, body)
+        try:
+            status = restore_put(task, body)
+        except _RESTORE_STALE_ERRORS:
+            # A kept-alive connection the peer already closed: rewind the
+            # proven descriptor and retry once on a fresh connection. If the
+            # first attempt had landed, this one gets 412 and reports exists.
+            os.lseek(fd, 0, os.SEEK_SET)
+            body = RestoreBody(fd, task["size_bytes"])
+            status = restore_put(task, body)
         result["duration_ms"] = max(0, round((time.monotonic() - upload_started) * 1000))
         if status == 412:
             # The key already exists (an earlier attempt landed): the server
