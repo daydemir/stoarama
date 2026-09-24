@@ -327,6 +327,9 @@ func diagnosticMap(j *jobDiagnostic) map[string]any {
 	out["delivery_queue_max"] = j.DeliveryQueueMax
 	out["delivery_retries"] = j.DeliveryRetries
 	out["resolves_total"] = j.ResolvesTotal
+	// resolve_count + started_at are the server's relay_resolve_churn contract
+	// (resolves since the job started on this relay).
+	out["resolve_count"] = j.ResolvesTotal
 	out["resolves_last_hour"] = len(j.resolveTimes)
 	return out
 }

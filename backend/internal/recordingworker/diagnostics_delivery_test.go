@@ -55,6 +55,32 @@ func TestRelayDiagnosticsReportsResolvesPerHour(t *testing.T) {
 	if active[0]["job_id"] != int64(7) || active[0]["resolves_last_hour"] != 3 || active[0]["resolves_total"] != 4 {
 		t.Fatalf("job 7 resolve diagnostics=%v", active[0])
 	}
+	// Server contract (relay_resolve_churn): numeric resolve_count plus an
+	// RFC3339 started_at on every active entry, as serialized in the heartbeat.
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Active []struct {
+			ResolveCount *float64 `json:"resolve_count"`
+			StartedAt    string   `json:"started_at"`
+		} `json:"active"`
+	}
+	if err := json.Unmarshal(encoded, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range wire.Active {
+		if entry.ResolveCount == nil {
+			t.Fatalf("active entry lacks numeric resolve_count: %s", encoded)
+		}
+		if _, err := time.Parse(time.RFC3339, entry.StartedAt); err != nil {
+			t.Fatalf("started_at %q is not RFC3339: %v", entry.StartedAt, err)
+		}
+	}
+	if *wire.Active[0].ResolveCount != 4 || *wire.Active[1].ResolveCount != 1 {
+		t.Fatalf("resolve_count wire values: %s", encoded)
+	}
 	if active[1]["resolves_last_hour"] != 1 || active[1]["resolves_total"] != 1 {
 		t.Fatalf("job 8 resolve diagnostics=%v", active[1])
 	}
