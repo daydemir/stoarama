@@ -1,0 +1,19 @@
+# Collation v2 nightly runner (droplet side, R2 credentials only).
+# Runs every worklist the ops host published under
+# collation-v2/worklists/nightly/<UTC date>- for today and yesterday.
+# Hours whose manifest is already published are skipped, so reruns are safe.
+# Install: /opt/collate/bin/{stoaramactl,ffmpeg,ffprobe}, /opt/collate/r2.env (0600).
+# Enable only after the backfill proves out:
+#   systemctl enable --now stoarama-collate-nightly.timer
+[Unit]
+Description=Stoarama collation v2 nightly runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/collate/r2.env
+WorkingDirectory=/opt/collate
+ExecStart=/bin/sh -c 'for d in $(date -u +%%F) $(date -u -d yesterday +%%F); do /opt/collate/bin/stoaramactl collation-v2 run --worklist r2prefix:collation-v2/worklists/nightly/$d- --scratch /mnt/stoarama_collate_01_scratch/nightly --results /opt/collate/nightly-results.jsonl || exit 1; done'
+TimeoutStartSec=20h
+Nice=5

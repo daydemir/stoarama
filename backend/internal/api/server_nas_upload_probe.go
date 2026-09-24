@@ -55,9 +55,6 @@ type nasUploadProbeResponse struct {
 	Streams       int                  `json:"streams,omitempty"`
 	ExpiresAt     *time.Time           `json:"expires_at,omitempty"`
 	Parts         []nasUploadProbePart `json:"parts,omitempty"`
-	// DownloadParts presign GETs of the same objects. After uploading, the
-	// client downloads them (discarding the bytes) to measure the downlink.
-	DownloadParts []nasUploadProbePart `json:"download_parts,omitempty"`
 }
 
 type nasUploadProbeResultRequest struct {
@@ -70,9 +67,6 @@ type nasUploadProbeResultRequest struct {
 	ClientPhaseEnd       string     `json:"client_phase_end"`
 	JoinedTransferActive bool       `json:"joined_transfer_active"`
 	BytesPulledDuring    int64      `json:"bytes_pulled_during"`
-	BytesDownloaded      *int64     `json:"bytes_downloaded,omitempty"`
-	DownloadDurationMS   *int64     `json:"download_duration_ms,omitempty"`
-	DownloadError        string     `json:"download_error,omitempty"`
 }
 
 // nasUploadProbePartSizes splits size evenly over streams; the last part
@@ -134,25 +128,6 @@ func validateNASUploadProbeResult(req nasUploadProbeResultRequest, sizeBytes int
 	}
 	if req.BytesUploaded < sizeBytes && req.Error == "" {
 		return errors.New("a partial upload requires an error")
-	}
-	if (req.BytesDownloaded == nil) != (req.DownloadDurationMS == nil) {
-		return errors.New("bytes_downloaded and download_duration_ms go together")
-	}
-	if req.BytesDownloaded != nil {
-		if *req.BytesDownloaded < 0 || *req.BytesDownloaded > sizeBytes {
-			return errors.New("bytes_downloaded must be between 0 and the probe size")
-		}
-		if *req.DownloadDurationMS < 1 || *req.DownloadDurationMS > nasUploadProbeMaxDuration.Milliseconds() {
-			return errors.New("download_duration_ms must be between 1 and 86400000")
-		}
-		if *req.BytesDownloaded < sizeBytes && req.DownloadError == "" {
-			return errors.New("a partial download requires download_error")
-		}
-	} else if req.DownloadError != "" {
-		return errors.New("download_error requires a download measurement")
-	}
-	if len(req.DownloadError) > nasUploadProbeMaxError {
-		return errors.New("download_error is too long")
 	}
 	if req.BytesPulledDuring < 0 {
 		return errors.New("bytes_pulled_during must be non-negative")
@@ -269,7 +244,6 @@ func (s *Server) handleAccountConnectionUploadProbe(w http.ResponseWriter, r *ht
 	keys := nasUploadProbeKeys(prefix, streams)
 	sizes := nasUploadProbePartSizes(size, streams)
 	parts := make([]nasUploadProbePart, streams)
-	downloadParts := make([]nasUploadProbePart, streams)
 	for i := range parts {
 		presigned, err := s.r2.PresignPutSizedRequest(ctx, keys[i], nasUploadProbeContentType, sizes[i], nasUploadProbeTTL)
 		if err != nil {
@@ -284,12 +258,6 @@ func (s *Server) handleAccountConnectionUploadProbe(w http.ResponseWriter, r *ht
 			headers[http.CanonicalHeaderKey(name)] = values[0]
 		}
 		parts[i] = nasUploadProbePart{URL: presigned.URL, Method: presigned.Method, Headers: headers, SizeBytes: sizes[i]}
-		getURL, err := s.r2.PresignGet(ctx, keys[i], nasUploadProbeTTL)
-		if err != nil {
-			util.WriteError(w, http.StatusInternalServerError, "presign download probe failed")
-			return
-		}
-		downloadParts[i] = nasUploadProbePart{URL: getURL, Method: http.MethodGet, Headers: map[string]string{}, SizeBytes: sizes[i]}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "commit upload probe failed")
@@ -297,7 +265,7 @@ func (s *Server) handleAccountConnectionUploadProbe(w http.ResponseWriter, r *ht
 	}
 	util.WriteJSON(w, http.StatusOK, nasUploadProbeResponse{
 		Enabled: true, Due: true, RetryAfterSec: int(interval.Seconds()),
-		ProbeID: probeID, SizeBytes: size, Streams: streams, ExpiresAt: &expires, Parts: parts, DownloadParts: downloadParts,
+		ProbeID: probeID, SizeBytes: size, Streams: streams, ExpiresAt: &expires, Parts: parts,
 	})
 }
 
@@ -350,12 +318,10 @@ func (s *Server) handleAccountConnectionUploadProbeResult(w http.ResponseWriter,
 	if _, err := tx.Exec(ctx, `
 		UPDATE nas_upload_probes SET reported_at=now(),started_at=$2,bytes_uploaded=$3,duration_ms=$4,error=$5,
 		  client_version=CASE WHEN $6<>'' THEN $6 ELSE client_version END,
-		  client_phase_start=$7,client_phase_end=$8,joined_transfer_active=$9,bytes_pulled_during=$10,
-		  bytes_downloaded=$11,download_duration_ms=$12,download_error=$13
+		  client_phase_start=$7,client_phase_end=$8,joined_transfer_active=$9,bytes_pulled_during=$10
 		WHERE id=$1`,
 		probeID, req.StartedAt, req.BytesUploaded, req.DurationMS, req.Error, req.ClientVersion,
-		req.ClientPhaseStart, req.ClientPhaseEnd, req.JoinedTransferActive, req.BytesPulledDuring,
-		req.BytesDownloaded, req.DownloadDurationMS, req.DownloadError); err != nil {
+		req.ClientPhaseStart, req.ClientPhaseEnd, req.JoinedTransferActive, req.BytesPulledDuring); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "record upload probe result failed")
 		return
 	}
