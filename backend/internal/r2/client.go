@@ -543,6 +543,42 @@ func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
 	return nil
 }
 
+// MaxDeleteBatch is the S3/R2 multi-object delete limit per request.
+const MaxDeleteBatch = 1000
+
+// DeleteObjectsEach deletes up to MaxDeleteBatch keys in one request and
+// returns the keys the store reported as not deleted, with their error. A
+// non-nil error means the request itself failed and no key may be assumed
+// deleted or kept. Keys are sent exactly as given: a key with surrounding
+// whitespace is refused rather than normalized into a different key.
+func (c *Client) DeleteObjectsEach(ctx context.Context, keys []string) (map[string]string, error) {
+	if len(keys) == 0 {
+		return map[string]string{}, nil
+	}
+	if len(keys) > MaxDeleteBatch {
+		return nil, fmt.Errorf("delete batch of %d keys exceeds %d", len(keys), MaxDeleteBatch)
+	}
+	objects := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		if key == "" || strings.TrimSpace(key) != key {
+			return nil, fmt.Errorf("delete object key %q is empty or padded", key)
+		}
+		objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+	}
+	out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: aws.String(c.bucket),
+		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("delete objects: %w", err)
+	}
+	failed := make(map[string]string, len(out.Errors))
+	for _, e := range out.Errors {
+		failed[aws.ToString(e.Key)] = strings.TrimSpace(aws.ToString(e.Code) + " " + aws.ToString(e.Message))
+	}
+	return failed, nil
+}
+
 func cleanETag(v string) string {
 	return strings.Trim(v, "\"")
 }

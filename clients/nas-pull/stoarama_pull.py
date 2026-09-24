@@ -94,6 +94,21 @@ UPLOAD_PROBE_ERROR_WAIT_SEC = 60 * 60
 UPLOAD_PROBE_JITTER = 0.1
 UPLOAD_PROBE_REPORT_ATTEMPTS = 3
 UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
+# NAS -> R2 restore: the server queues clips and signs one create-only PUT per
+# clip; the client proves its local bytes first and the server re-hashes the
+# uploaded object before a restore counts.
+DEFAULT_RESTORE_WORKERS = 8
+MAX_RESTORE_WORKERS = 16
+RESTORE_MAX_LEASE = 64
+RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
+RESTORE_BLOCK_BYTES = 1024 * 1024
+RESTORE_SOCKET_TIMEOUT_SEC = 120
+RESTORE_STARTUP_DELAY_SEC = (30, 120)
+RESTORE_MIN_WAIT_SEC = 1
+RESTORE_MAX_WAIT_SEC = 30 * 60
+RESTORE_ERROR_WAIT_SEC = 5 * 60
+RESTORE_REPORT_ATTEMPTS = 3
+RESTORE_REPORT_BACKOFF_SEC = 10
 
 
 class ExistingFileMismatch(RuntimeError):
@@ -272,6 +287,7 @@ class Config:
         self.lock_file = self.state_dir / "client.lock"
         self.poll_interval_sec = env_int("STOARAMA_POLL_INTERVAL_SEC", 60)
         self.download_workers = env_int("STOARAMA_DOWNLOAD_WORKERS", DEFAULT_DOWNLOAD_WORKERS)
+        self.restore_workers = env_int("STOARAMA_RESTORE_WORKERS", DEFAULT_RESTORE_WORKERS)
         self.inventory_scan_interval_sec = env_int("STOARAMA_INVENTORY_SCAN_INTERVAL_SEC", INVENTORY_SCAN_INTERVAL_SEC)
         # Hash throughput already bounds disk pressure. An additional per-file
         # sleep makes a 100k+ first scan spend hours idle on small clips.
@@ -298,6 +314,8 @@ class Config:
             raise SystemExit("STOARAMA_POLL_INTERVAL_SEC must be between 10 and 3600")
         if self.download_workers < 1 or self.download_workers > MAX_DOWNLOAD_WORKERS:
             raise SystemExit("STOARAMA_DOWNLOAD_WORKERS must be between 1 and %d" % MAX_DOWNLOAD_WORKERS)
+        if self.restore_workers < 1 or self.restore_workers > MAX_RESTORE_WORKERS:
+            raise SystemExit("STOARAMA_RESTORE_WORKERS must be between 1 and %d" % MAX_RESTORE_WORKERS)
         if self.inventory_scan_interval_sec < 300 or self.inventory_scan_delay_ms < 0 or self.inventory_hash_mbps < 1 or self.inventory_hash_mbps > 1000:
             raise SystemExit("invalid NAS inventory scan cadence")
         if self.min_free_bytes < 1:
@@ -5579,6 +5597,234 @@ def process_clip(cfg, clip, release=True):
     return clip_id, expected_bytes, downloaded_bytes, retries
 
 
+class RestoreLocalError(RuntimeError):
+    """A restore the local copy cannot satisfy: outcome is reported as-is."""
+
+    def __init__(self, outcome, message):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+def valid_restore_task(task):
+    if not isinstance(task, dict):
+        raise ValueError("invalid restore task")
+    out = {}
+    for name in ("task_id", "attempt", "clip_id", "size_bytes"):
+        value = task.get(name)
+        if type(value) is not int or value <= 0:
+            raise ValueError("invalid restore task %s" % name)
+        out[name] = value
+    if out["size_bytes"] > RESTORE_MAX_BYTES:
+        raise ValueError("restore task exceeds the single-PUT ceiling")
+    sha = task.get("sha256")
+    if not isinstance(sha, str) or len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+        raise ValueError("invalid restore task sha256")
+    out["sha256"] = sha
+    out["relative_path"] = valid_relative_path({"clip_id": out["clip_id"], "relative_path": task.get("relative_path")})
+    put = task.get("put")
+    if not isinstance(put, dict):
+        raise ValueError("invalid restore capability")
+    url = urllib.parse.urlsplit(str(put.get("url", "")))
+    headers = put.get("headers") or {}
+    if url.scheme != "https" or not url.hostname or put.get("method") != "PUT" or not isinstance(headers, dict):
+        raise ValueError("restore capability must be an https PUT")
+    out["url"] = url
+    out["headers"] = {str(k): str(v) for k, v in headers.items()}
+    return out
+
+
+class RestoreBody:
+    """Streams the already-verified descriptor and hashes exactly what is sent."""
+
+    def __init__(self, fd, size):
+        self.fd = fd
+        self.remaining = size
+        self.sent = 0
+        self.digest = hashlib.sha256()
+
+    def read(self, amount=-1):
+        if self.remaining <= 0:
+            return b""
+        count = RESTORE_BLOCK_BYTES if amount is None or amount < 0 else min(amount, RESTORE_BLOCK_BYTES)
+        chunk = os.read(self.fd, min(count, self.remaining))
+        if not chunk:
+            raise RestoreLocalError("local_mismatch", "local file shrank during upload")
+        self.remaining -= len(chunk)
+        self.sent += len(chunk)
+        self.digest.update(chunk)
+        return chunk
+
+
+def open_restore_source(cfg, task):
+    """Open the clip under the NAS root and prove its size and sha256 first."""
+    try:
+        path, path_stat = confined_regular_file(cfg.output_dir, str(task["relative_path"]))
+    except MediaCertificationError as exc:
+        raise RestoreLocalError("local_missing", str(exc)) from exc
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(fd)
+        if certification_identity(before) != certification_identity(path_stat):
+            raise RestoreLocalError("local_mismatch", "local file changed while opening")
+        if before.st_size != task["size_bytes"]:
+            raise RestoreLocalError("local_mismatch", "local size %d differs from %d" % (before.st_size, task["size_bytes"]))
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, RESTORE_BLOCK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != task["sha256"]:
+            raise RestoreLocalError("local_mismatch", "local sha256 differs from the recorded sha256")
+        if certification_identity(os.fstat(fd)) != certification_identity(before):
+            raise RestoreLocalError("local_mismatch", "local file changed while hashing")
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def restore_put(task, body):
+    url = task["url"]
+    connection = http.client.HTTPSConnection(url.netloc, timeout=RESTORE_SOCKET_TIMEOUT_SEC, blocksize=RESTORE_BLOCK_BYTES)
+    try:
+        headers = dict(task["headers"])
+        headers["Content-Length"] = str(task["size_bytes"])
+        headers["User-Agent"] = USER_AGENT
+        connection.request("PUT", url.path + ("?" + url.query if url.query else ""), body=body, headers=headers)
+        response = connection.getresponse()
+        response.read(64 * 1024)
+        return response.status
+    finally:
+        connection.close()
+
+
+def run_restore_task(cfg, task):
+    """Verify the local copy, upload it create-only, and describe the outcome."""
+    started_at = utc_now_precise()
+    started = time.monotonic()
+    result = {"attempt": task["attempt"], "outcome": "upload_failed", "error": "", "bytes_uploaded": 0,
+              "duration_ms": 0, "started_at": started_at, "client_version": CLIENT_VERSION}
+    fd = None
+    body = None
+    try:
+        fd = open_restore_source(cfg, task)
+        upload_started = time.monotonic()
+        body = RestoreBody(fd, task["size_bytes"])
+        status = restore_put(task, body)
+        result["duration_ms"] = max(0, round((time.monotonic() - upload_started) * 1000))
+        if status == 412:
+            # The key already exists (an earlier attempt landed): the server
+            # re-hashes it and accepts it only if it is exactly these bytes.
+            result["outcome"] = "exists"
+        elif 200 <= status < 300:
+            result["outcome"] = "uploaded"
+            result["bytes_uploaded"] = body.sent
+        else:
+            result["error"] = "restore PUT returned HTTP %d" % status
+    except RestoreLocalError as exc:
+        result["outcome"], result["error"] = exc.outcome, str(exc)
+    except Exception as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if not result["duration_ms"]:
+        result["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
+    result["error"] = result["error"][:500]
+    return result
+
+
+def report_restore(cfg, task_id, result, sleep=time.sleep):
+    """Report once, retrying transient failures; 409 means the lease moved on."""
+    for attempt in range(1, RESTORE_REPORT_ATTEMPTS + 1):
+        try:
+            return request_json(
+                cfg, "POST", "/account/connections/nas-restore/%d/result" % task_id, body=result, timeout=HTTP_TIMEOUT_SEC,
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                return {"state": "stale"}
+            if not transient_error(exc) or attempt == RESTORE_REPORT_ATTEMPTS:
+                raise
+        except Exception as exc:
+            if not transient_error(exc) or attempt == RESTORE_REPORT_ATTEMPTS:
+                raise
+        sleep(RESTORE_REPORT_BACKOFF_SEC * attempt)
+
+
+def restore_once(cfg):
+    """Lease one batch of restores, run it in parallel, report each. Returns the wait."""
+    lease = request_json(
+        cfg, "POST", "/account/connections/nas-restore/lease",
+        body={"client_version": CLIENT_VERSION, "max_tasks": min(RESTORE_MAX_LEASE, cfg.restore_workers)},
+        timeout=HTTP_TIMEOUT_SEC,
+    )
+    if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
+        raise RuntimeError("invalid restore lease response")
+    retry_after = lease.get("retry_after_sec", RESTORE_ERROR_WAIT_SEC)
+    tasks = []
+    for raw in lease.get("tasks") or []:
+        try:
+            tasks.append(valid_restore_task(raw))
+        except ValueError as exc:
+            # Unusable task: fail it explicitly if it can be addressed at all,
+            # otherwise its lease simply expires.
+            task_id, attempt = (raw or {}).get("task_id"), (raw or {}).get("attempt")
+            if type(task_id) is int and type(attempt) is int and task_id > 0 and attempt > 0:
+                bad = {"attempt": attempt, "outcome": "local_missing", "error": "invalid restore task: %s" % exc,
+                       "bytes_uploaded": 0, "duration_ms": 0, "started_at": utc_now_precise(), "client_version": CLIENT_VERSION}
+                try:
+                    report_restore(cfg, task_id, bad)
+                except Exception as report_exc:
+                    log("WARN", "restore %d report failed: %s" % (task_id, report_exc))
+    if not tasks:
+        return retry_after
+    started = time.monotonic()
+    counts = {}
+    uploaded_bytes = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.restore_workers) as pool:
+        futures = {pool.submit(run_restore_task, cfg, task): task for task in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            task = futures[future]
+            result = future.result()
+            uploaded_bytes += result["bytes_uploaded"]
+            try:
+                state = (report_restore(cfg, task["task_id"], result) or {}).get("state", "unknown")
+            except Exception as exc:
+                state = "unreported"
+                log("WARN", "restore %d report failed: %s" % (task["task_id"], exc))
+            counts[state] = counts.get(state, 0) + 1
+            if state != "verified":
+                log("WARN", "restore %d clip=%d outcome=%s state=%s %s" % (
+                    task["task_id"], task["clip_id"], result["outcome"], state, result["error"]))
+    seconds = max(time.monotonic() - started, 0.001)
+    log("INFO", "nas restore batch tasks=%d bytes=%d seconds=%.1f mbps=%.1f %s" % (
+        len(tasks), uploaded_bytes, seconds, uploaded_bytes * 8 / seconds / 1e6,
+        " ".join("%s=%d" % item for item in sorted(counts.items()))))
+    return retry_after
+
+
+def restore_wait(seconds):
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        seconds = RESTORE_ERROR_WAIT_SEC
+    return min(max(seconds, RESTORE_MIN_WAIT_SEC), RESTORE_MAX_WAIT_SEC)
+
+
+def restore_loop(cfg, stop_event, rng=random):
+    """Background NAS -> R2 restore worker; never raises and never blocks updates."""
+    wait = rng.uniform(*RESTORE_STARTUP_DELAY_SEC)
+    while not stop_event.wait(wait):
+        try:
+            wait = restore_wait(restore_once(cfg))
+        except Exception as exc:
+            log("WARN", "nas restore deferred: %s" % exc)
+            wait = RESTORE_ERROR_WAIT_SEC
+
+
 def drain_page(cfg, runtime, inventory=None):
     require_storage_capacity(cfg, runtime)
     page = request_json(
@@ -5987,6 +6233,10 @@ def run(cfg):
     heartbeat.start()
     storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
     storage_probe.start()
+    if not cfg.dry_run:
+        # Daemon thread: an update or shutdown may cut a restore short; its
+        # lease expires and the create-only PUT makes the retry safe.
+        threading.Thread(target=restore_loop, args=(cfg, stop_event), daemon=True).start()
     updater = threading.Thread(
         target=update_loop,
         args=(cfg, runtime, stop_event, inventory_stop_event, update_ready, joined_stop_event),

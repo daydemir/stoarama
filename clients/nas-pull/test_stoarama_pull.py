@@ -3524,5 +3524,145 @@ class UploadProbeTests(unittest.TestCase):
         self.assertEqual(runtime.upload_probe_activity(), ("draining", 77, False))
 
 
+class RestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = SimpleNamespace(output_dir=self.root, restore_workers=2)
+        self.body = b"clip bytes " * 1000
+        (self.root / "Rec" / "July").mkdir(parents=True)
+        (self.root / "Rec" / "July" / "a.mp4").write_bytes(self.body)
+
+    def task(self, **overrides):
+        raw = {
+            "task_id": 7, "attempt": 1, "clip_id": 42, "relative_path": "Rec/July/a.mp4",
+            "size_bytes": len(self.body), "sha256": hashlib.sha256(self.body).hexdigest(),
+            "put": {"url": "https://bucket.example.test/stoarama/managed/a.mp4?X-Amz-Signature=abc", "method": "PUT",
+                    "headers": {"Content-Type": "video/mp4", "If-None-Match": "*", "Content-Length": str(len(self.body))}},
+        }
+        raw.update(overrides)
+        return raw
+
+    def serve(self, status=200):
+        import http.server
+        import socketserver
+
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                data = self.rfile.read(int(self.headers["Content-Length"]))
+                received.append((self.path, data, self.headers.get("If-None-Match"), self.headers.get("Content-Type")))
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        class LocalServer(http.server.ThreadingHTTPServer):
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+
+        server = LocalServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        real = pull.http.client.HTTPConnection
+
+        def local_connection(netloc, timeout, blocksize):
+            self.assertEqual(netloc, "bucket.example.test")
+            return real("127.0.0.1", port, timeout=timeout, blocksize=blocksize)
+
+        patcher = mock.patch.object(pull.http.client, "HTTPSConnection", side_effect=local_connection)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return received
+
+    def test_valid_restore_task_rejects_unsafe_tasks(self):
+        task = pull.valid_restore_task(self.task())
+        self.assertEqual(str(task["relative_path"]), "Rec/July/a.mp4")
+        for bad in (
+            {"relative_path": "../etc/passwd"}, {"relative_path": "joined/x.mp4"}, {"relative_path": ""},
+            {"sha256": "A" * 64}, {"size_bytes": 0}, {"attempt": "1"}, {"task_id": True},
+            {"size_bytes": pull.RESTORE_MAX_BYTES + 1},
+            {"put": {"url": "http://bucket.example.test/x", "method": "PUT", "headers": {}}},
+            {"put": {"url": "https://bucket.example.test/x", "method": "POST", "headers": {}}},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                pull.valid_restore_task(self.task(**bad))
+
+    def test_run_restore_task_uploads_exact_verified_bytes(self):
+        received = self.serve(200)
+        result = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task()))
+        self.assertEqual(result["outcome"], "uploaded", result)
+        self.assertEqual(result["bytes_uploaded"], len(self.body))
+        self.assertEqual(result["attempt"], 1)
+        self.assertEqual(len(received), 1)
+        path, data, if_none_match, content_type = received[0]
+        self.assertEqual((path.split("?")[0], data, if_none_match, content_type), ("/stoarama/managed/a.mp4", self.body, "*", "video/mp4"))
+
+    def test_run_restore_task_maps_existing_key_and_http_failure(self):
+        self.serve(412)
+        self.assertEqual(pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task()))["outcome"], "exists")
+
+    def test_run_restore_task_retries_http_failure(self):
+        self.serve(503)
+        result = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task()))
+        self.assertEqual((result["outcome"], result["error"]), ("upload_failed", "restore PUT returned HTTP 503"))
+
+    def test_run_restore_task_never_uploads_unproven_local_bytes(self):
+        received = self.serve(200)
+        missing = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task(relative_path="Rec/July/none.mp4")))
+        self.assertEqual(missing["outcome"], "local_missing")
+        wrong_sha = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task(sha256="0" * 64)))
+        self.assertEqual(wrong_sha["outcome"], "local_mismatch")
+        wrong_size = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task(size_bytes=len(self.body) + 1)))
+        self.assertEqual(wrong_size["outcome"], "local_mismatch")
+        os.symlink(self.root / "Rec" / "July" / "a.mp4", self.root / "Rec" / "July" / "link.mp4")
+        linked = pull.run_restore_task(self.cfg, pull.valid_restore_task(self.task(relative_path="Rec/July/link.mp4")))
+        self.assertEqual(linked["outcome"], "local_missing")
+        self.assertEqual(received, [])
+
+    def test_restore_once_leases_runs_and_reports_each_task(self):
+        second = self.task(task_id=8, attempt=2)
+        calls = []
+
+        def fake_request(cfg, method, path, body=None, timeout=None, **_kw):
+            calls.append((method, path, body))
+            if path.endswith("/lease"):
+                return {"retry_after_sec": 1, "tasks": [self.task(), second, {"task_id": 9, "attempt": 1, "relative_path": "../x"}]}
+            return {"ok": True, "state": "verified"}
+
+        results = {7: {"attempt": 1, "outcome": "uploaded", "error": "", "bytes_uploaded": 5, "duration_ms": 1},
+                   8: {"attempt": 2, "outcome": "exists", "error": "", "bytes_uploaded": 0, "duration_ms": 1}}
+        with mock.patch.object(pull, "request_json", side_effect=fake_request), \
+                mock.patch.object(pull, "run_restore_task", side_effect=lambda cfg, task: results[task["task_id"]]):
+            self.assertEqual(pull.restore_once(self.cfg), 1)
+        lease = calls[0]
+        self.assertEqual((lease[1], lease[2]["max_tasks"]), ("/account/connections/nas-restore/lease", 2))
+        reported = sorted((path, body["attempt"], body["outcome"]) for _m, path, body in calls[1:])
+        self.assertEqual(reported, [
+            ("/account/connections/nas-restore/7/result", 1, "uploaded"),
+            ("/account/connections/nas-restore/8/result", 2, "exists"),
+            ("/account/connections/nas-restore/9/result", 1, "local_missing"),
+        ])
+
+    def test_restore_once_idle_returns_server_wait_and_report_treats_409_as_stale(self):
+        with mock.patch.object(pull, "request_json", return_value={"retry_after_sec": 120, "tasks": []}):
+            self.assertEqual(pull.restore_once(self.cfg), 120)
+        self.assertEqual(pull.restore_wait(99999), pull.RESTORE_MAX_WAIT_SEC)
+        self.assertEqual(pull.restore_wait("x"), pull.RESTORE_ERROR_WAIT_SEC)
+        conflict = urllib.error.HTTPError("u", 409, "conflict", {}, None)
+        with mock.patch.object(pull, "request_json", side_effect=conflict):
+            self.assertEqual(pull.report_restore(self.cfg, 7, {}), {"state": "stale"})
+        flaky = [urllib.error.HTTPError("u", 503, "busy", {}, None), {"state": "verified"}]
+        with mock.patch.object(pull, "request_json", side_effect=flaky):
+            self.assertEqual(pull.report_restore(self.cfg, 7, {}, sleep=lambda _s: None), {"state": "verified"})
+
+
 if __name__ == "__main__":
     unittest.main()

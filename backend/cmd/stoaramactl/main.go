@@ -113,6 +113,10 @@ func main() {
 		runJoinedSourcePurge(ctx, cfg, os.Args[2:])
 	case "do-spend":
 		runDOSpend(ctx, cfg, os.Args[2:])
+	case "nas-restore":
+		runNASRestore(ctx, cfg, os.Args[2:])
+	case "nas-verified-purge":
+		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -228,6 +232,9 @@ func usage() {
 	  stoaramactl joined-source-purge hold --hour-record-id N --reason CODE [--note TEXT] | holds [--json]
 	  stoaramactl do-spend report [--json]
 	  stoaramactl do-spend check [--dry-run]
+	  stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
+	  stoaramactl nas-restore status [--label L --json] | cancel --label L
+	  stoaramactl nas-verified-purge run [--apply --grace 168h --head sample|all --exclude-clip-ids-file F --exclude-recording-ids L --after-clip-id N --until-clip-id N --limit N --rate 200 --log PATH --json]
 `)
 }
 
