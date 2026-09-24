@@ -27,6 +27,10 @@ Build it with `recordingnaming.BuildCollatedPath` /
   part. `HHMMSS-HHMMSS` is the local wall-clock range of the part's first and
   last presented frame. The end may run up to 15 minutes past the hour and wraps
   past midnight for hour 23; the day folder is always the hour's own day.
+- Recordings with `stoarama_v1` naming (no plaza metadata) mirror their raw
+  `<folder>/<recording>/…` tree instead:
+  `<folder>/<recording>/joined/<YYYY-MM-DD>/<recording>_<YYYY-MM-DD>_hour_<HH>[_part_NN]_<HHMMSS>-<HHMMSS>.mp4`.
+  The server and client both reject any other shape.
 - The R2 key prefix (`managed/acct-47/…`) is never part of a NAS path. R2 object
   keys for joined media stay content-addressed.
 
@@ -56,10 +60,10 @@ broken file:
   8 MiB range, and every 32 MiB of hashing, it lists the raw feed and gives up if
   any raw clip is pending. With about 20 live recordings the raw feed is almost
   never empty, so joined work rarely gets past the first boundary.
-- The `io_error` blocker is only the last transient failure of that raw-feed
-  poll (for example the API restart during the 12:35 UTC deploy on 2026-09-24).
-  The failure happens before the client records transfer progress, which is why
-  the server's transfer telemetry still shows 2026-09-11.
+- The `io_error` blocker is only the most recent transient network failure
+  (an `OSError`) at that yield boundary. It happens before the client records
+  transfer progress, so the server's transfer telemetry still shows 2026-09-11
+  even though the client restarted on 2026-09-24.
 - Even fair-share mode grants one 8 MiB range per raw page, about 11 GB/day,
   and the download rate is hard-coded at 8 MiB/s.
 
@@ -79,6 +83,11 @@ pulls those rows directly:
 3. The client downloads to a hidden partial beside the final path, verifies
    size and SHA-256, fsyncs, links it into place without overwriting, and
    `POST /api/v1/account/collated/ack` records the exact identity.
+
+Scope: only outputs collated from clips held for collated-only delivery
+(storage contract mode `nas_collated_hold`, see docs/NAS_COLLATED_DELIVERY.md)
+are offered. Outputs of raw-delivered footage, such as the good+ backfill,
+stay in R2 because the NAS already has their raw clips.
 
 The policy (per connection, server-controlled): enabled, bytes/s budget,
 parallel downloads. It runs concurrently with raw delivery, so neither lane can

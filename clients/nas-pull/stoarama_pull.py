@@ -5465,19 +5465,372 @@ def joined_errno_class(exc):
 
 
 def joined_loop(cfg, runtime, stop_event):
-    """Drain one joined artifact at a time without blocking the raw cursor loop."""
+    """Drain collated outputs and generation-1 joined artifacts beside the raw loop."""
     while not stop_event.is_set():
-        if not runtime.joined_background_enabled():
-            stop_event.wait(min(cfg.poll_interval_sec, 10))
-            continue
+        progress = False
         try:
-            progress = drain_joined(cfg, runtime, stop_event, report_phase=False)
+            progress = drain_collated(cfg, runtime, stop_event)
         except Exception as exc:
-            log("WARN", "joined delivery deferred: %s" % exc)
-            stop_event.wait(min(cfg.poll_interval_sec, 10))
-            continue
+            log("WARN", "collated delivery deferred: %s" % exc)
+        if stop_event.is_set():
+            break
+        if runtime.joined_background_enabled():
+            try:
+                progress = drain_joined(cfg, runtime, stop_event, report_phase=False) or progress
+            except Exception as exc:
+                log("WARN", "joined delivery deferred: %s" % exc)
+                progress = False
         if not progress:
             stop_event.wait(min(cfg.poll_interval_sec, 10))
+
+
+# ---------------------------------------------------------------------------
+# Generation-2 collated hour delivery (docs/NAS_JOINED_DELIVERY.md).
+#
+# The server hands out exact collated outputs with a per-connection policy
+# (enabled, bytes/s, parallel downloads). Each output lands at
+# /clips/joined/<nas_relative_path>, a mirror of the raw <folder>/<Month>/
+# <DD-Weekday>/ tree. The lane runs beside raw delivery with its own budget and
+# never yields to it. Partials resume by byte offset; a final is only ever
+# created by a no-overwrite link after its size and SHA-256 are verified, and an
+# existing final with different bytes is never touched.
+
+COLLATED_PAGE_LIMIT = 50
+COLLATED_CHUNK_BYTES = 1024 * 1024
+COLLATED_MAX_PARALLEL = 32
+COLLATED_MIN_BYTES_PER_SEC = 1 << 20
+COLLATED_MAX_BYTES_PER_SEC = 1 << 30
+COLLATED_MAX_BYTES = 64 * 1024 * 1024 * 1024
+COLLATED_PATH_RE = re.compile(
+    r"^[^/]+/(January|February|March|April|May|June|July|August|September|October|November|December)/"
+    r"(0[1-9]|[12][0-9]|3[01])-(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/"
+    r"[^/]+_hour_([01][0-9]|2[0-3])(_dst2)?((_part_[0-9]{2})?_[0-9]{6}-[0-9]{6}\.mp4|\.manifest\.json)$"
+)
+
+
+COLLATED_V1_PATH_RE = re.compile(
+    r"^[^/]+/([1-9][0-9]*)/joined/([0-9]{4}-[0-9]{2}-[0-9]{2})/([1-9][0-9]*)_([0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"_hour_([01][0-9]|2[0-3])(_part_[0-9]{2})?_[0-9]{6}-[0-9]{6}\.mp4$"
+)
+
+
+def collated_path_matches_contract(value):
+    if COLLATED_PATH_RE.match(value):
+        return True
+    match = COLLATED_V1_PATH_RE.match(value)
+    return bool(match) and match.group(1) == match.group(3) and match.group(2) == match.group(4)
+
+
+class CollatedDownloadStopped(RuntimeError):
+    """The lane stopped at a chunk boundary; the partial resumes later."""
+
+
+def valid_collated_relative_path(value):
+    if not isinstance(value, str) or value != value.strip() or len(value.encode("utf-8")) > 1024:
+        raise ValueError("collated item has invalid nas_relative_path")
+    parts = value.split("/")
+    if (
+        value.startswith("/") or "\\" in value or "\0" in value
+        or any(part in ("", ".", "..") or part.startswith(".") for part in parts)
+        or parts[0] == JOINED_ROOT or not collated_path_matches_contract(value)
+    ):
+        raise ValueError("collated item has invalid nas_relative_path")
+    return value
+
+
+def valid_collated_policy(raw):
+    if not isinstance(raw, dict) or set(raw) != {"enabled", "download_bytes_per_sec", "download_parallel"}:
+        raise ValueError("collated policy is invalid")
+    enabled, rate, parallel = raw["enabled"], raw["download_bytes_per_sec"], raw["download_parallel"]
+    if (
+        type(enabled) is not bool or type(rate) is not int or type(parallel) is not int
+        or not COLLATED_MIN_BYTES_PER_SEC <= rate <= COLLATED_MAX_BYTES_PER_SEC
+        or not 1 <= parallel <= COLLATED_MAX_PARALLEL
+    ):
+        raise ValueError("collated policy is invalid")
+    return {"enabled": enabled, "download_bytes_per_sec": rate, "download_parallel": parallel}
+
+
+def valid_collated_item(raw):
+    if not isinstance(raw, dict) or set(raw) != {"output_id", "nas_relative_path", "size_bytes", "sha256", "download_path"}:
+        raise ValueError("collated item has invalid fields")
+    output_id, size = raw["output_id"], raw["size_bytes"]
+    if type(output_id) is not int or output_id < 1:
+        raise ValueError("collated item has invalid output_id")
+    if type(size) is not int or not 1 <= size <= COLLATED_MAX_BYTES:
+        raise ValueError("collated item has invalid size_bytes")
+    if raw["download_path"] != "/api/v1/account/collated/%d/download" % output_id:
+        raise ValueError("collated item has invalid download_path")
+    return {
+        "output_id": output_id, "nas_relative_path": valid_collated_relative_path(raw["nas_relative_path"]),
+        "size_bytes": size, "sha256": valid_sha256(raw["sha256"], "collated item"), "download_path": raw["download_path"],
+    }
+
+
+class ByteRateLimiter:
+    """One shared bytes/second budget across every collated download worker."""
+
+    def __init__(self, bytes_per_sec):
+        self.bytes_per_sec = float(bytes_per_sec)
+        self.lock = threading.Lock()
+        self.next_free = time.monotonic()
+
+    def acquire(self, size, stop_event):
+        with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next_free)
+            self.next_free = start + size / self.bytes_per_sec
+            delay = start - now
+        if delay > 0 and stop_event.wait(delay):
+            raise CollatedDownloadStopped("collated download stopped")
+
+
+def open_collated_dir(cfg, relative_path, create=True):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(cfg.output_dir), flags)
+    try:
+        for part in (JOINED_ROOT, *relative_path.split("/")[:-1]):
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                os.fsync(descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def hash_collated_entry(directory_fd, name, stop_event):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        if not stat_module.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ExistingFileMismatch("collated entry is not a regular file")
+        while True:
+            if stop_event.is_set():
+                raise CollatedDownloadStopped("collated hashing stopped")
+            chunk = os.read(descriptor, COLLATED_CHUNK_BYTES * 8)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return size, digest.hexdigest()
+
+
+def collated_entry_stat(directory_fd, name):
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat_module.S_ISREG(current.st_mode):
+        raise ExistingFileMismatch("collated entry is not a regular file")
+    return current
+
+
+def prepare_collated_download(cfg, item):
+    prepared = request_json(cfg, "GET", item["download_path"], base=cfg.origin)
+    if not isinstance(prepared, dict) or set(prepared) != {"url", "etag", "if_match", "size_bytes", "sha256", "expires_in_sec"}:
+        raise RuntimeError("collated download response has invalid fields")
+    url = prepared["url"]
+    parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+    if parsed is None or parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.fragment:
+        raise RuntimeError("collated download returned invalid URL")
+    if prepared["size_bytes"] != item["size_bytes"] or prepared["sha256"] != item["sha256"]:
+        raise ExistingFileMismatch("collated prepared bytes changed")
+    etag = normalized_etag(prepared["etag"])
+    if prepared["if_match"] != '"%s"' % etag:
+        raise RuntimeError("collated download returned invalid If-Match")
+    return {"url": url, "if_match": prepared["if_match"], "etag": etag}
+
+
+def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, stop_event):
+    headers = {"User-Agent": USER_AGENT, "If-Match": prepared["if_match"], "Range": "bytes=%d-" % start}
+    request = urllib.request.Request(prepared["url"], method="GET", headers=headers)
+    with open_joined_url(request) as response:
+        status = getattr(response, "status", None) or response.getcode()
+        if status == 206:
+            expected = "bytes %d-%d/%d" % (start, item["size_bytes"] - 1, item["size_bytes"])
+            if response.headers.get("Content-Range") != expected:
+                raise RuntimeError("collated range returned invalid Content-Range")
+        elif not (status == 200 and start == 0):
+            raise RuntimeError("collated download returned HTTP %s" % status)
+        if normalized_etag(response.headers.get("ETag")) != prepared["etag"]:
+            raise ExistingFileMismatch("collated object identity drifted")
+        written = start
+        while written < item["size_bytes"]:
+            if stop_event.is_set():
+                raise CollatedDownloadStopped("collated download stopped at a chunk boundary")
+            want = min(COLLATED_CHUNK_BYTES, item["size_bytes"] - written)
+            limiter.acquire(want, stop_event)
+            block = response.read(want)
+            if not block:
+                break
+            offset = 0
+            while offset < len(block):
+                offset += os.write(descriptor, block[offset:])
+            digest.update(block)
+            written += len(block)
+        if written != item["size_bytes"] or response.read(1):
+            raise RuntimeError("collated body length mismatch")
+
+
+def download_collated_item(cfg, item, limiter, stop_event):
+    """Place one output at its contract path. Returns True when bytes were fetched."""
+    relative = item["nas_relative_path"]
+    name = relative.split("/")[-1]
+    part_name = ".%s.collated-%d.part" % (name, item["output_id"])
+    directory_fd = open_collated_dir(cfg, relative)
+    try:
+        if collated_entry_stat(directory_fd, name) is not None:
+            size, digest = hash_collated_entry(directory_fd, name, stop_event)
+            if size != item["size_bytes"] or digest != item["sha256"]:
+                raise ExistingFileMismatch("existing collated file differs; it is never overwritten: %s" % relative)
+            part = collated_entry_stat(directory_fd, part_name)
+            if part is not None:
+                os.unlink(part_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            return False
+        prepared = prepare_collated_download(cfg, item)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(part_name, flags, 0o644, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ExistingFileMismatch("collated partial is not a private regular file")
+            start = opened.st_size
+            if start >= item["size_bytes"]:
+                os.ftruncate(descriptor, 0)
+                start = 0
+            digest = hashlib.sha256()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            remaining = start
+            while remaining:
+                chunk = os.read(descriptor, min(COLLATED_CHUNK_BYTES * 8, remaining))
+                if not chunk:
+                    raise ExistingFileMismatch("collated partial shrank while resuming")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            try:
+                append_collated_bytes(prepared, descriptor, digest, start, item, limiter, stop_event)
+            finally:
+                os.fsync(descriptor)
+            if digest.hexdigest() != item["sha256"] or os.fstat(descriptor).st_size != item["size_bytes"]:
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+                raise RuntimeError("collated checksum mismatch; partial restarted")
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(part_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        except FileExistsError:
+            size, digest = hash_collated_entry(directory_fd, name, stop_event)
+            if size != item["size_bytes"] or digest != item["sha256"]:
+                raise ExistingFileMismatch("collated final appeared with different bytes: %s" % relative)
+        os.unlink(part_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        return True
+    finally:
+        os.close(directory_fd)
+
+
+def collated_bytes_needed(cfg, item):
+    """Bytes still to be written for item: 0 when its final exists, the rest of a partial."""
+    relative = item["nas_relative_path"]
+    name = relative.split("/")[-1]
+    try:
+        directory_fd = open_collated_dir(cfg, relative, create=False)
+    except FileNotFoundError:
+        return item["size_bytes"]
+    try:
+        if collated_entry_stat(directory_fd, name) is not None:
+            return 0
+        part = collated_entry_stat(directory_fd, ".%s.collated-%d.part" % (name, item["output_id"]))
+        if part is None or part.st_size >= item["size_bytes"]:
+            return item["size_bytes"]
+        return item["size_bytes"] - part.st_size
+    finally:
+        os.close(directory_fd)
+
+
+def ack_collated_item(cfg, item):
+    request_json(cfg, "POST", "/account/collated/ack", body={
+        "output_id": item["output_id"], "nas_relative_path": item["nas_relative_path"],
+        "size_bytes": item["size_bytes"], "sha256": item["sha256"],
+    })
+
+
+def report_collated_error(cfg, output_id, exc):
+    try:
+        request_json(cfg, "POST", "/account/collated/error", body={
+            "output_id": int(output_id), "error": ("%s: %s" % (type(exc).__name__, exc))[:1000],
+        })
+    except Exception as report_exc:
+        log("WARN", "collated error report failed: %s" % report_exc)
+
+
+def drain_collated(cfg, runtime, stop_event):
+    """Deliver one page of collated outputs. Returns True when any output landed."""
+    if cfg.dry_run:
+        return False
+    page = request_json(cfg, "GET", "/account/collated?limit=%d" % COLLATED_PAGE_LIMIT)
+    if not isinstance(page, dict) or set(page) != {"policy", "items"} or not isinstance(page["items"], list):
+        raise RuntimeError("collated response is invalid")
+    policy = valid_collated_policy(page["policy"])
+    if not policy["enabled"] or not page["items"]:
+        return False
+    items = [valid_collated_item(raw) for raw in page["items"]]
+    limiter = ByteRateLimiter(policy["download_bytes_per_sec"])
+    delivered = []
+
+    def deliver(item):
+        if stop_event.is_set():
+            return
+        # Reserve the whole output in the shared runtime ledger so parallel
+        # collated downloads and raw delivery never overcommit the same bytes.
+        needed = collated_bytes_needed(cfg, item)
+        if not runtime.reserve_joined_storage(cfg, storage_status(cfg), needed):
+            raise CollatedDownloadStopped("collated delivery yielded to the NAS free-space reserve")
+        try:
+            fetched = download_collated_item(cfg, item, limiter, stop_event)
+            ack_collated_item(cfg, item)
+        except CollatedDownloadStopped:
+            raise
+        except Exception as exc:
+            log("WARN", "collated output_id=%d deferred: %s" % (item["output_id"], exc))
+            report_collated_error(cfg, item["output_id"], exc)
+            return
+        finally:
+            runtime.release_storage_reservation(needed)
+        delivered.append(item["output_id"])
+        log("INFO", "collated output_id=%d bytes=%d saved=%s%s" % (
+            item["output_id"], item["size_bytes"], cfg.output_dir / JOINED_ROOT / item["nas_relative_path"],
+            "" if fetched else " existing"))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=policy["download_parallel"]) as executor:
+        futures = [executor.submit(deliver, item) for item in items]
+        stopped = None
+        for future in futures:
+            try:
+                future.result()
+            except CollatedDownloadStopped as exc:
+                stopped = exc
+    if stopped is not None and not delivered:
+        log("INFO", "collated delivery paused: %s" % stopped)
+    return bool(delivered)
 
 
 def release_clip(cfg, recording_id, clip_id):

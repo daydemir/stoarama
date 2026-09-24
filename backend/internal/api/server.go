@@ -316,6 +316,10 @@ func (s *Server) router() http.Handler {
 			account.Get("/joined", s.handleAccountJoined)
 			account.Get("/joined/{joinedId}/download", s.handleAccountJoinedDownload)
 			account.Post("/joined/ack", s.handleAccountJoinedAck)
+			account.Get("/collated", s.handleAccountCollated)
+			account.Get("/collated/{outputId}/download", s.handleAccountCollatedDownload)
+			account.Post("/collated/ack", s.handleAccountCollatedAck)
+			account.Post("/collated/error", s.handleAccountCollatedError)
 			// Heartbeat is called by the pull client with its scoped key, so it lives
 			// in the key-OR-session group and is allowlisted in pullPathAllowed.
 			account.Post("/connections/heartbeat", s.handleAccountConnectionHeartbeat)
@@ -492,6 +496,8 @@ func (s *Server) router() http.Handler {
 			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
 			admin.Post("/recordings/nas-delivery-mode", s.handleAdminRecordingNASDeliveryMode)
 			admin.Get("/recordings/nas-delivery-mode", s.handleAdminRecordingNASDeliveryStatus)
+			admin.Get("/connections/{id}/collated-delivery", s.handleAdminConnectionCollatedDelivery)
+			admin.Post("/connections/{id}/collated-delivery", s.handleAdminConnectionCollatedDelivery)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
 			admin.Post("/pipeline-runs", s.handlePipelineRunsCreate)
