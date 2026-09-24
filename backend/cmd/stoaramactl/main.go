@@ -109,6 +109,8 @@ func main() {
 		runNASInventory(ctx, cfg, os.Args[2:])
 	case "nas-upload-probe":
 		runNASUploadProbe(ctx, cfg, os.Args[2:])
+	case "joined-source-purge":
+		runJoinedSourcePurge(ctx, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -220,6 +222,8 @@ func usage() {
 	  stoaramactl recordings campaign-tracks report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nas-inventory report --connection-id ID [--limit 50 --json]
 	  stoaramactl nas-upload-probe report --connection-id ID [--limit 20 --json]
+	  stoaramactl joined-source-purge run [--batch-id ID --hour-record-id N --apply --check-r2 --limit N --rate 10 --require-nas=true --sha-every 50 --log PATH --json]
+	  stoaramactl joined-source-purge hold --hour-record-id N --reason CODE [--note TEXT] | holds [--json]
 `)
 }
 
