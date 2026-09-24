@@ -42,6 +42,11 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/connections/upload-probe", false},
 		{http.MethodPost, "/api/v1/account/connections/upload-probe/x/result", false},
 		{http.MethodPost, "/api/v1/account/connections/upload-probe/7/result/extra", false},
+		{http.MethodPost, "/api/v1/account/connections/nas-restore/lease", true},
+		{http.MethodPost, "/api/v1/account/connections/nas-restore/9/result", true},
+		{http.MethodGet, "/api/v1/account/connections/nas-restore/lease", false},
+		{http.MethodPost, "/api/v1/account/connections/nas-restore/x/result", false},
+		{http.MethodPost, "/api/v1/account/connections/nas-restore/9/result/extra", false},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 

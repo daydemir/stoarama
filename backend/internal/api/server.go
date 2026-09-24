@@ -324,6 +324,8 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/stitch-certifications/complete", s.handleAccountNativeStitchComplete)
 			account.Post("/connections/upload-probe", s.handleAccountConnectionUploadProbe)
 			account.Post("/connections/upload-probe/{probeId}/result", s.handleAccountConnectionUploadProbeResult)
+			account.Post("/connections/nas-restore/lease", s.handleAccountConnectionRestoreLease)
+			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
 			account.Get("/recordings/{id}", s.handleAccountRecordingGet)
 			account.Get("/recordings/{id}/capture-health", s.handleAccountRecordingCaptureHealth)
 			account.Get("/recordings/{id}/clips", s.handleAccountRecordingClips)
