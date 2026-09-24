@@ -119,13 +119,13 @@ func TestNASVerifiedPurgeEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx, `
 ALTER TABLE recording_joined_snapshot_scopes ADD COLUMN scheduled_start_at timestamptz, ADD COLUMN scheduled_end_at timestamptz;
-CREATE TABLE recordings(id bigint PRIMARY KEY, account_id bigint NOT NULL, status text NOT NULL, delivery text NOT NULL);
+CREATE TABLE recordings(id bigint PRIMARY KEY, account_id bigint NOT NULL, status text NOT NULL, delivery text NOT NULL, nas_delivery_mode text NOT NULL DEFAULT 'raw');
 CREATE TABLE connections(id bigint PRIMARY KEY, account_id bigint NOT NULL, kind text NOT NULL);
 CREATE TABLE nas_inventory_unmatched_files(connection_id bigint NOT NULL, relative_path text NOT NULL, state text NOT NULL, PRIMARY KEY(connection_id, relative_path));
 CREATE TABLE recording_qualification_runs(id bigint PRIMARY KEY, status text NOT NULL);
 CREATE TABLE recording_qualification_windows(run_id bigint NOT NULL, recording_id bigint NOT NULL, window_start_at timestamptz NOT NULL, window_end_at timestamptz NOT NULL);
 INSERT INTO connections VALUES (13,47,'nas_pull'),(14,48,'nas_pull');
-INSERT INTO recordings VALUES (1,47,'completed','nas_pull'),(52,47,'completed','nas_pull'),(50,47,'completed','nas_pull'),(51,47,'active','nas_pull'),(60,48,'completed','nas_pull');
+INSERT INTO recordings VALUES (53,47,'completed','nas_pull','raw'),(54,47,'completed','nas_pull','raw'),(55,47,'completed','nas_pull','collated_only'),(1,47,'completed','nas_pull','raw'),(52,47,'completed','nas_pull','raw'),(50,47,'completed','nas_pull','raw'),(51,47,'active','nas_pull','raw'),(60,48,'completed','nas_pull','raw');
 INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 `); err != nil {
 		t.Fatal(err)
@@ -164,12 +164,20 @@ INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 		{121, 51, 5100, 20, 0, "ok", "ok"},
 		{115, 50, 5000, 20, 0, "ok", "ok"}, // eligible, but R2 refuses its delete
 		{116, 50, 5000, 20, 0, "ok", "ok"}, // listed in the exclusion file
-		{140, 52, 5200, 20, 0, "ok", "ok"}, // excluded recording                  // active recording, old clip: eligible
+		{140, 52, 5200, 20, 0, "ok", "ok"}, // excluded recording
+		{160, 53, 5300, 20, 0, "ok", "ok"}, // protected candidate recording (code-derived)
+		{161, 54, 5400, 20, 0, "ok", "ok"}, // inside a cohort window
+		{162, 54, 5400, 20, 0, "ok", "ok"}, // same recording, outside its cohort window: eligible
+		{163, 50, 5000, 20, 0, "ok", "ok"}, // unplayable size signature
+		{164, 55, 5500, 20, 0, "ok", "ok"}, // collated_only recording                  // active recording, old clip: eligible
 		{130, 60, 6000, 20, 0, "ok", "ok"}, // another account's recording
 	}
 	bodies := map[int64][]byte{}
 	for _, s := range specs {
 		body := []byte(fmt.Sprintf("clip-body-%d", s.id))
+		if s.id == 163 {
+			body = bytes.Repeat([]byte("u"), 262144+48)
+		}
 		bodies[s.id] = body
 		end := old.Add(time.Duration(s.id) * time.Hour)
 		if s.endAgo > 0 {
@@ -221,6 +229,15 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	base := nasPurgeOptions{connectionID: 13, grace: 48 * time.Hour, pageSize: 4, batchSize: 3, workers: 4, rate: 500,
 		shaEvery: 1, maxErrors: 5, logPath: logPath, logSkips: true, headMode: "all",
 		excludeClips: map[int64]bool{116: true}, excludeRecs: map[int64]bool{52: true}}
+	var c161, c162 time.Time
+	if err := pool.QueryRow(ctx, `SELECT (SELECT clip_start_at FROM recording_clips WHERE id=161),(SELECT clip_start_at FROM recording_clips WHERE id=162)`).Scan(&c161, &c162); err != nil {
+		t.Fatal(err)
+	}
+	base.protections = nasPurgeProtections{Recordings: []int64{53},
+		CohortRecs: []int64{54}, CohortFrom: []time.Time{c161.Add(-time.Hour)}, CohortTo: []time.Time{c161.Add(2 * time.Minute)}}
+	if !c162.After(c161.Add(2 * time.Minute)) {
+		t.Fatalf("fixture: clip 162 (%v) must start after clip 161's window (%v)", c162, c161)
+	}
 	run := func(opts nasPurgeOptions) nasPurgeSummary {
 		t.Helper()
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -238,9 +255,10 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		"nas_unverified": 3, "within_grace": 1, "qualification_window": 1, "joined_window": 1, "not_managed_storage": 1,
 		"restore_recent": 1, "joined_scope": 1, "active_recording_recent": 1, "joined_snapshot": 9,
 		"excluded_clip": 1, "excluded_recording": 1,
+		"candidate_recording": 1, "cohort_window": 1, "unplayable_signature": 1, "collated_only_delivery": 1,
 	}
 	dry := run(base)
-	if dry.Mode != "dry_run" || dry.Eligible != 7 || dry.Purged != 0 || len(store.deleted) != 0 {
+	if dry.Mode != "dry_run" || dry.Eligible != 8 || dry.Purged != 0 || len(store.deleted) != 0 {
 		t.Fatalf("dry run summary %+v", dry)
 	}
 	for reason, n := range wantSkips {
@@ -266,7 +284,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	apply.apply = true
 	got := run(apply)
 	store.beforeHead = nil
-	if got.Purged != 3 || got.SourceAbsent != 1 || got.Skipped["source_size_mismatch"] != 1 || got.Skipped["source_sha_mismatch"] != 1 ||
+	if got.Purged != 4 || got.SourceAbsent != 1 || got.Skipped["source_size_mismatch"] != 1 || got.Skipped["source_sha_mismatch"] != 1 ||
 		got.Skipped["changed_before_lock"] != 1 || got.DeleteFailed != 1 || got.Errors != 1 || got.ShaChecks < 3 {
 		t.Fatalf("apply summary %+v", got)
 	}
@@ -281,14 +299,14 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		purged = append(purged, id)
 	}
 	rows.Close()
-	if fmt.Sprint(purged) != "[101 102 121]" {
+	if fmt.Sprint(purged) != "[101 102 121 162]" {
 		t.Fatalf("purged clips %v", purged)
 	}
 	sort.Strings(store.deleted)
-	if fmt.Sprint(store.deleted) != "[managed/acct-47/101.mp4 managed/acct-47/102.mp4 managed/acct-47/121.mp4]" {
+	if fmt.Sprint(store.deleted) != "[managed/acct-47/101.mp4 managed/acct-47/102.mp4 managed/acct-47/121.mp4 managed/acct-47/162.mp4]" {
 		t.Fatalf("deleted objects %v", store.deleted)
 	}
-	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140} {
+	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140, 160, 161, 163, 164} {
 		if _, ok := store.objects[fmt.Sprintf("managed/acct-47/%d.mp4", id)]; !ok {
 			t.Fatalf("object of protected clip %d was deleted", id)
 		}
@@ -302,7 +320,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	// the store accepts it, purged.
 	store.failKeys = nil
 	again := run(apply)
-	if again.Purged != 1 || len(store.deleted) != 4 {
+	if again.Purged != 1 || len(store.deleted) != 5 {
 		t.Fatalf("rerun summary %+v deleted=%v", again, store.deleted)
 	}
 	// Sample mode purges without a HEAD per clip.
@@ -325,5 +343,30 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	// too: the NAS holds the exact recorded bytes, so no good copy is lost.
 	if s := run(sample); s.Purged != 3 || store.heads != 0 {
 		t.Fatalf("sample mode summary %+v heads=%d", s, store.heads)
+	}
+}
+
+func TestNASPurgeCohortWindowsCoverTheApprovedFourteenDays(t *testing.T) {
+	recs, from, to, err := nasPurgeCohortWindows()
+	if err != nil || len(recs) != 9 || len(from) != 9 || len(to) != 9 {
+		t.Fatalf("recs=%v err=%v", recs, err)
+	}
+	// 417 first date 2026-08-15: protected from 08-14 through 08-29 inclusive.
+	for i, id := range recs {
+		if id == 417 && (from[i].Format("2006-01-02") != "2026-08-14" || to[i].Format("2006-01-02") != "2026-08-30") {
+			t.Fatalf("417 window %v..%v", from[i], to[i])
+		}
+	}
+}
+
+func TestNASPurgeBindProtectionsNumbersPlaceholders(t *testing.T) {
+	for _, sql := range []string{nasPurgeCandidatesSQL, nasPurgeLockSQL} {
+		if strings.Contains(sql, "{PROT_RECS}") || strings.Contains(sql, "{COH_") {
+			t.Fatal("unbound protection placeholder")
+		}
+	}
+	if !strings.Contains(nasPurgeCandidatesSQL, "$11::bigint[]") || !strings.Contains(nasPurgeLockSQL, "$6::bigint[]") ||
+		!strings.Contains(nasPurgeLockSQL, "$9::timestamptz[]") {
+		t.Fatal("protection placeholders misnumbered")
 	}
 }
