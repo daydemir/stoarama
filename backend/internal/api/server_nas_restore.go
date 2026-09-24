@@ -31,15 +31,19 @@ import (
 // soon as it is verified (and swept again once its PUT capability expired).
 
 const (
-	nasRestoreTestPrefix     = "nas-restore-test/"
-	nasRestoreLeaseTTL       = 30 * time.Minute
-	nasRestoreMaxLeaseTasks  = 64
-	nasRestoreIdleRetrySec   = 120
-	nasRestoreBusyRetrySec   = 1
-	nasRestoreSweepGrace     = 30 * time.Minute
-	nasRestoreSweepLimit     = 50
-	nasRestoreMaxError       = 500
-	nasRestoreVerifyTimeout  = 10 * time.Minute
+	nasRestoreTestPrefix    = "nas-restore-test/"
+	nasRestoreLeaseTTL      = 30 * time.Minute
+	nasRestoreMaxLeaseTasks = 64
+	nasRestoreIdleRetrySec  = 120
+	nasRestoreBusyRetrySec  = 1
+	nasRestoreSweepGrace    = 30 * time.Minute
+	nasRestoreSweepLimit    = 50
+	nasRestoreMaxError      = 500
+	// The API's WriteTimeout is 60s. Clips are at most ~85 MB, which R2 serves
+	// to the API in a few seconds; the verify and the write must both finish
+	// inside the one report request.
+	nasRestoreVerifyTimeout  = 40 * time.Second
+	nasRestoreRecordTimeout  = 10 * time.Second
 	nasRestoreMaxObjectBytes = r2.MaxConditionalPutBytes
 )
 
@@ -321,7 +325,10 @@ func (s *Server) handleAccountConnectionRestoreResult(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ctx := r.Context()
+	// Detached from the request: a client that disconnects mid-verify must not
+	// leave a verified upload unrecorded. Bounded so it ends before WriteTimeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), nasRestoreVerifyTimeout+nasRestoreRecordTimeout)
+	defer cancel()
 	connectionID, ok := s.nasRestoreConnection(ctx, w, r)
 	if !ok {
 		return

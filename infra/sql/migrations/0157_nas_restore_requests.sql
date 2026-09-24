@@ -1,5 +1,3 @@
-BEGIN;
-
 -- Additive: NAS -> R2 restore queue. An operator (stoaramactl nas-restore
 -- request) asks for specific clips to be uploaded back from the NAS. The NAS
 -- pull client leases pending rows, verifies its local bytes against the
@@ -63,4 +61,3 @@ CREATE INDEX IF NOT EXISTS nas_restore_requests_test_cleanup_idx
   ON nas_restore_requests (put_expires_at)
   WHERE target = 'test' AND object_deleted_at IS NULL AND state IN ('verified','failed','canceled');
 
-COMMIT;

@@ -471,6 +471,11 @@ func runNASVerifiedPurgePass(ctx context.Context, pool *pgxpool.Pool, store nasP
 		if err := flush(); err != nil {
 			return summary, err
 		}
+		if ctx.Err() != nil {
+			// The last batch may be unsettled: keep the previous resume point.
+			summary.Interrupted = true
+			return summary, nil
+		}
 		summary.LastClipID = after
 	}
 }

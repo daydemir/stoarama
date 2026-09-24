@@ -99,7 +99,6 @@ UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
 # uploaded object before a restore counts.
 DEFAULT_RESTORE_WORKERS = 8
 MAX_RESTORE_WORKERS = 16
-RESTORE_LEASE_PER_WORKER = 4
 RESTORE_MAX_LEASE = 64
 RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
 RESTORE_BLOCK_BYTES = 1024 * 1024
@@ -5759,7 +5758,7 @@ def restore_once(cfg):
     """Lease one batch of restores, run it in parallel, report each. Returns the wait."""
     lease = request_json(
         cfg, "POST", "/account/connections/nas-restore/lease",
-        body={"client_version": CLIENT_VERSION, "max_tasks": min(RESTORE_MAX_LEASE, cfg.restore_workers * RESTORE_LEASE_PER_WORKER)},
+        body={"client_version": CLIENT_VERSION, "max_tasks": min(RESTORE_MAX_LEASE, cfg.restore_workers)},
         timeout=HTTP_TIMEOUT_SEC,
     )
     if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):

@@ -3643,7 +3643,7 @@ class RestoreTests(unittest.TestCase):
                 mock.patch.object(pull, "run_restore_task", side_effect=lambda cfg, task: results[task["task_id"]]):
             self.assertEqual(pull.restore_once(self.cfg), 1)
         lease = calls[0]
-        self.assertEqual((lease[1], lease[2]["max_tasks"]), ("/account/connections/nas-restore/lease", 8))
+        self.assertEqual((lease[1], lease[2]["max_tasks"]), ("/account/connections/nas-restore/lease", 2))
         reported = sorted((path, body["attempt"], body["outcome"]) for _m, path, body in calls[1:])
         self.assertEqual(reported, [
             ("/account/connections/nas-restore/7/result", 1, "uploaded"),
