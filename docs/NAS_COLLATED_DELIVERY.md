@@ -20,7 +20,7 @@ It refuses recordings from another account, `managed` recordings, and
 
 The mode is frozen onto each clip when it is inserted, as storage billing
 contract mode `nas_collated_hold` (`clip_storage_billing_contracts`, migration
-0158). Consequences:
+0159). Consequences:
 
 - Only clips recorded after the switch are held. Clips already offered to the
   NAS keep flowing raw, and held clips stay held if the recording switches back.

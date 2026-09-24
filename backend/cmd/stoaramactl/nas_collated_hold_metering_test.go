@@ -56,7 +56,7 @@ func TestCollatedHoldClipsAreNeverMeteredAsStorage(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0103_billing_meter_report_ledger.sql", "0107_billing_period_ledger.sql", "0158_nas_collated_only_hold.sql"} {
+	for _, name := range []string{"0103_billing_meter_report_ledger.sql", "0107_billing_period_ledger.sql", "0159_nas_collated_only_hold.sql"} {
 		body, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
