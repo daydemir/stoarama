@@ -5508,6 +5508,19 @@ COLLATED_PATH_RE = re.compile(
 )
 
 
+COLLATED_V1_PATH_RE = re.compile(
+    r"^[^/]+/([1-9][0-9]*)/joined/([0-9]{4}-[0-9]{2}-[0-9]{2})/([1-9][0-9]*)_([0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"_hour_([01][0-9]|2[0-3])(_part_[0-9]{2})?_[0-9]{6}-[0-9]{6}\.mp4$"
+)
+
+
+def collated_path_matches_contract(value):
+    if COLLATED_PATH_RE.match(value):
+        return True
+    match = COLLATED_V1_PATH_RE.match(value)
+    return bool(match) and match.group(1) == match.group(3) and match.group(2) == match.group(4)
+
+
 class CollatedDownloadStopped(RuntimeError):
     """The lane stopped at a chunk boundary; the partial resumes later."""
 
@@ -5519,7 +5532,7 @@ def valid_collated_relative_path(value):
     if (
         value.startswith("/") or "\\" in value or "\0" in value
         or any(part in ("", ".", "..") or part.startswith(".") for part in parts)
-        or parts[0] == JOINED_ROOT or not COLLATED_PATH_RE.match(value)
+        or parts[0] == JOINED_ROOT or not collated_path_matches_contract(value)
     ):
         raise ValueError("collated item has invalid nas_relative_path")
     return value

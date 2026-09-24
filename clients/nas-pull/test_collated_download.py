@@ -85,6 +85,9 @@ class CollatedDownloadTests(unittest.TestCase):
 
     def test_contract_validation(self):
         pull.valid_collated_relative_path(REL)
+        pull.valid_collated_relative_path("recordings/339/joined/2026-09-24/339_2026-09-24_hour_16_161446-170012.mp4")
+        with self.assertRaises(ValueError):
+            pull.valid_collated_relative_path("recordings/339/joined/2026-09-24/338_2026-09-24_hour_16_161446-170012.mp4")
         for bad in ("joined/" + REL, "managed/acct-47/" + REL, REL.replace("26-Sunday", "Sunday"), REL.replace("hour_13", "hour_24"),
                     "../" + REL, "/" + REL, REL.replace("100000_Duval", ".100000_Duval"), REL.replace("part_04", "part_4")):
             with self.assertRaises(ValueError, msg=bad):

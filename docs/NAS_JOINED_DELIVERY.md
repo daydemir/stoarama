@@ -27,6 +27,10 @@ Build it with `recordingnaming.BuildCollatedPath` /
   part. `HHMMSS-HHMMSS` is the local wall-clock range of the part's first and
   last presented frame. The end may run up to 15 minutes past the hour and wraps
   past midnight for hour 23; the day folder is always the hour's own day.
+- Recordings with `stoarama_v1` naming (no plaza metadata) mirror their raw
+  `<folder>/<recording>/…` tree instead:
+  `<folder>/<recording>/joined/<YYYY-MM-DD>/<recording>_<YYYY-MM-DD>_hour_<HH>[_part_NN]_<HHMMSS>-<HHMMSS>.mp4`.
+  The server and client both reject any other shape.
 - The R2 key prefix (`managed/acct-47/…`) is never part of a NAS path. R2 object
   keys for joined media stay content-addressed.
 

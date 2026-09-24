@@ -46,6 +46,7 @@ func TestValidCollatedNASPathPinsContract(t *testing.T) {
 		"f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_00_000001-005959.mp4",
 		"f/November/01-Sunday/01_P_2026_November_W1_Sunday_hour_01_dst2_010001-015959.mp4",
 		"f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_23.manifest.json",
+		"recordings/339/joined/2026-09-24/339_2026-09-24_hour_16_part_02_161446-170012.mp4",
 	}
 	bad := []string{
 		"joined/f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_13_130027-140016.mp4",
@@ -56,6 +57,8 @@ func TestValidCollatedNASPathPinsContract(t *testing.T) {
 		"/f/July/26-Sunday/01_P_hour_13_130027-140016.mp4",
 		"f/July/26-Sunday/.01_P_hour_13_130027-140016.mp4",
 		"f/July/26-Sunday/01_P_hour_13_part_4_130027-140016.mp4",
+		"recordings/339/joined/2026-09-24/338_2026-09-24_hour_16_161446-170012.mp4",
+		"recordings/339/joined/2026-09-24/339_2026-09-25_hour_16_161446-170012.mp4",
 	}
 	for _, p := range good {
 		if !validCollatedNASPath(p) {

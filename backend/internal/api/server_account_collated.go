@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"path"
 	"regexp"
@@ -36,6 +37,11 @@ var collatedNASPathRe = regexp.MustCompile(
 		`(0[1-9]|[12][0-9]|3[01])-(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/` +
 		`[^/]+_hour_([01][0-9]|2[0-3])(_dst2)?((_part_[0-9]{2})?_[0-9]{6}-[0-9]{6}\.mp4|\.manifest\.json)$`)
 
+// collatedV1NASPathRe is the stoarama_v1 (non-plaza) shape:
+// <folder>/<recording>/joined/<YYYY-MM-DD>/<recording>_<YYYY-MM-DD>_hour_<HH>[_part_NN]_<HHMMSS>-<HHMMSS>.mp4
+var collatedV1NASPathRe = regexp.MustCompile(
+	`^[^/]+/([1-9][0-9]*)/joined/([0-9]{4}-[0-9]{2}-[0-9]{2})/([1-9][0-9]*)_([0-9]{4}-[0-9]{2}-[0-9]{2})_hour_([01][0-9]|2[0-3])(_part_[0-9]{2})?_[0-9]{6}-[0-9]{6}\.mp4$`)
+
 // validCollatedNASPath reports whether rel is a safe relative path that obeys
 // the collated NAS path contract.
 func validCollatedNASPath(rel string) bool {
@@ -48,7 +54,11 @@ func validCollatedNASPath(rel string) bool {
 			return false
 		}
 	}
-	return collatedNASPathRe.MatchString(rel)
+	if collatedNASPathRe.MatchString(rel) {
+		return true
+	}
+	m := collatedV1NASPathRe.FindStringSubmatch(rel)
+	return m != nil && m[1] == m[3] && m[2] == m[4]
 }
 
 type collatedPolicy struct {
@@ -129,6 +139,7 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 			}
 			if !validCollatedNASPath(item.NASRelativePath) {
 				// A contract violation is a collation bug; never hand the NAS a path it must refuse.
+				log.Printf("collated output %d violates the NAS path contract; withheld", item.OutputID)
 				continue
 			}
 			item.DownloadPath = fmt.Sprintf("/api/v1/account/collated/%d/download", item.OutputID)
