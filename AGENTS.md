@@ -138,6 +138,17 @@ And the newest deploy is not necessarily the running one — it may be failed or
 still building — so filter for `status == "live"` rather than taking the first
 element.
 
+## DigitalOcean Spend Guard
+
+The DO token lives on Render as `DO_API_TOKEN`: on `stoarama-recorder-control` (pool autoscaler + scale-up spend guard), `stoarama-recording-health` (hourly spend alerts), and `stoarama-recording-health-summary` (digest section). `stoarama-api` has no DO token. Locally it is `DIGITALOCEAN_TOKEN` in `local/do-capture.env`.
+
+- `stoaramactl do-spend report [--json]` shows month-to-date usage, current burn at list price, the breakdown by tag/name prefix, and every droplet/volume nobody owns. It needs `DATABASE_URL` (prod: `local/recording-supervisor.env`) and `DO_API_TOKEN`.
+- Settings: code defaults are warn $5/day, critical $10/day, budget $150, allowlist `stoarama-survey-*,copresence-*,stoarama-collate-*=15`. Deployed on all three services (collation week, Sep-Oct 2026): warn $20/day, critical $30/day, budget $500, same allowlist. Read the live Render env before trusting either.
+- The hourly `recording-health run` emails operators (deduped in `ops_alert_episodes`, daily reminders) when burn exceeds `DO_SPEND_WARN_USD_PER_DAY` / `DO_SPEND_CRITICAL_USD_PER_DAY`, month to date exceeds `DO_SPEND_MONTHLY_BUDGET_USD`, a droplet/volume outside the recorder pool and `DO_SPEND_ALLOWLIST` has run over an hour, an allowlist entry with a cap (`glob=USD`, e.g. `stoarama-collate-*=15`) costs more than that per day across its droplets and their volumes, or the pool controller blocked a scale-up. Allowlisted resources always count toward burn.
+- Create hand-made DO resources knowing the tripwire pages at the first hourly sweep after the resource is an hour old (up to about two hours); add long-lived ones to `DO_SPEND_ALLOWLIST` instead of ignoring the mail.
+- The pool controller skips any scale-up whose projected account burn exceeds the critical ceiling. At the default $10/day with the current ~$4.6/day baseline that caps the pool near 10 s-2vcpu-4gb droplets; raise `DO_SPEND_CRITICAL_USD_PER_DAY` before planned growth.
+- `DO_SPEND_*` keys are read independently by `stoarama-recorder-control`, `stoarama-recording-health`, and `stoarama-recording-health-summary`: change them on all three (one key at a time), then redeploy recorder-control (the crons pick them up on their next run).
+
 `AUTO_MIGRATE=true` on `stoarama-api`, so a deploy runs migrations on boot. Before deploying, confirm `origin/main` matches the live commit and that no migration is unapplied, or you will ship more than the env change.
 
 `.api.key` is short-lived; `expires_at` sits beside it in the same file, so check there rather than trusting a date written down here. Re-read it from the file on each use rather than caching it; on a 401 refresh it with the CLI instead of asking Deniz for a dashboard value.

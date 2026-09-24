@@ -172,7 +172,13 @@ type Config struct {
 
 	// Standalone stream recorder: droplet-pool autoscaler (runs on the dedicated
 	// control service alongside the scheduler). Empty/disabled by default.
-	DOAPIToken                      string
+	DOAPIToken string
+	// DigitalOcean account spend guard (internal/dospend). Thresholds are USD.
+	DOSpendWarnUSDPerDay            float64
+	DOSpendCriticalUSDPerDay        float64
+	DOSpendMonthlyBudgetUSD         float64
+	DOSpendAllowlist                string
+	DOSpendScaleUpGuard             bool
 	DropletPoolEnabled              bool
 	DropletPoolTickSec              int
 	DropletPoolLookaheadSec         int
@@ -322,6 +328,11 @@ func Load() (Config, error) {
 		JoinedRecordingWorkerToken:                          strings.TrimSpace(os.Getenv("STOARAMA_JOINED_WORKER_TOKEN")),
 
 		DOAPIToken:                      strings.TrimSpace(os.Getenv("DO_API_TOKEN")),
+		DOSpendWarnUSDPerDay:            floatEnv("DO_SPEND_WARN_USD_PER_DAY", 5),
+		DOSpendCriticalUSDPerDay:        floatEnv("DO_SPEND_CRITICAL_USD_PER_DAY", 10),
+		DOSpendMonthlyBudgetUSD:         floatEnv("DO_SPEND_MONTHLY_BUDGET_USD", 150),
+		DOSpendAllowlist:                strEnv("DO_SPEND_ALLOWLIST", "stoarama-survey-*,copresence-*,stoarama-collate-*=15"),
+		DOSpendScaleUpGuard:             boolEnv("DO_SPEND_SCALEUP_GUARD_ENABLED", true),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
 		DropletPoolTickSec:              intEnv("DROPLET_POOL_TICK_SEC", 30),
 		DropletPoolLookaheadSec:         intEnv("DROPLET_POOL_LOOKAHEAD_SEC", 1800),

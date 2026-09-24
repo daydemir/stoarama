@@ -264,6 +264,22 @@ services:
         fromDatabase:
           name: stoarama-db
           property: connectionString
+      # Read-only DigitalOcean access for the hourly account spend guard
+      # (burn/budget/unmanaged-resource alerts). Same token as recorder-control.
+      - key: DO_API_TOKEN
+        sync: false
+      # Keep DO_SPEND_* identical on recorder-control, recording-health, and
+      # recording-health-summary; each service reads them independently.
+      # Raised for the Sep-Oct 2026 collation week + 60-stream pool (code
+      # defaults are 5/10/150). stoarama-collate-*=15 caps that fleet at $15/day.
+      - key: DO_SPEND_WARN_USD_PER_DAY
+        value: "20"
+      - key: DO_SPEND_CRITICAL_USD_PER_DAY
+        value: "30"
+      - key: DO_SPEND_MONTHLY_BUDGET_USD
+        value: "500"
+      - key: DO_SPEND_ALLOWLIST
+        value: "stoarama-survey-*,copresence-*,stoarama-collate-*=15"
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -319,6 +335,21 @@ services:
         fromDatabase:
           name: stoarama-db
           property: connectionString
+      # DigitalOcean spend section of the digest.
+      - key: DO_API_TOKEN
+        sync: false
+      # Keep DO_SPEND_* identical on recorder-control, recording-health, and
+      # recording-health-summary; each service reads them independently.
+      # Raised for the Sep-Oct 2026 collation week + 60-stream pool (code
+      # defaults are 5/10/150). stoarama-collate-*=15 caps that fleet at $15/day.
+      - key: DO_SPEND_WARN_USD_PER_DAY
+        value: "20"
+      - key: DO_SPEND_CRITICAL_USD_PER_DAY
+        value: "30"
+      - key: DO_SPEND_MONTHLY_BUDGET_USD
+        value: "500"
+      - key: DO_SPEND_ALLOWLIST
+        value: "stoarama-survey-*,copresence-*,stoarama-collate-*=15"
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -519,6 +550,22 @@ services:
       # (C-cap invariant), so changing it needs a droplet image rebuild.
       - key: DO_API_TOKEN
         sync: false
+      # Account-wide spend guard: a pool scale-up that would push the whole DO
+      # account burn (list price of every droplet, volume, snapshot) past
+      # DO_SPEND_CRITICAL_USD_PER_DAY is skipped and alerted. Unset = defaults
+      # (warn 5, critical 10, budget 150); the hourly recording-health cron reads
+      # the same keys, so change them on all three services together.
+      # Kill switch: DO_SPEND_SCALEUP_GUARD_ENABLED=false.
+      # Raised for the Sep-Oct 2026 collation week + 60-stream pool (code
+      # defaults are 5/10/150). stoarama-collate-*=15 caps that fleet at $15/day.
+      - key: DO_SPEND_WARN_USD_PER_DAY
+        value: "20"
+      - key: DO_SPEND_CRITICAL_USD_PER_DAY
+        value: "30"
+      - key: DO_SPEND_MONTHLY_BUDGET_USD
+        value: "500"
+      - key: DO_SPEND_ALLOWLIST
+        value: "stoarama-survey-*,copresence-*,stoarama-collate-*=15"
       - key: BOOTSTRAP_ADMIN_EMAIL
         sync: false
       - key: DROPLET_POOL_ENABLED

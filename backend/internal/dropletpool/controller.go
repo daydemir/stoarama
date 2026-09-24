@@ -55,6 +55,39 @@ type Config struct {
 	// each tick. Set true only when the scheduler is NOT running on this service
 	// (otherwise the scheduler owns reclaim, C8).
 	ReclaimLeases bool
+
+	// SpendGuard, when set, vetoes any scale-up that would push the whole DO
+	// account burn past its critical $/day ceiling. Max bounds this pool; the
+	// guard bounds the account, which Max cannot see.
+	SpendGuard SpendGuard
+}
+
+// SpendGuard prices a prospective scale-up against account-wide DO spend.
+type SpendGuard interface {
+	// Quote returns the account's current $/day burn and the $/day list price
+	// of one more droplet of size.
+	Quote(ctx context.Context, size string) (burnUSDPerDay, sizeUSDPerDay float64, err error)
+	// Critical is the $/day ceiling a scale-up must stay at or under.
+	Critical() float64
+}
+
+// ErrSpendBudget is returned by scaleUp when the spend guard vetoes it.
+var ErrSpendBudget = errors.New("scale-up blocked by DO spend guard")
+
+// SpendBlockedSignal is the ops_alert_episodes signal (and key) the controller
+// opens when the spend guard blocks a scale-up; the hourly recording-health
+// cron emails operators about it and resolves it once it stops recurring.
+const SpendBlockedSignal = "do_spend_scaleup_blocked"
+
+// spendQuoteTimeout bounds the guard's account read so a stalled DO API
+// cannot wedge the tick; a timeout fails open like any other quote error.
+const spendQuoteTimeout = time.Minute
+
+// spendQuote caches one guard quote per tick and accumulates the droplets this
+// tick has already added, so a batch cannot step past the ceiling one by one.
+type spendQuote struct {
+	burn, size  float64
+	unavailable bool
 }
 
 // Controller is the droplet-pool autoscaler.
@@ -68,6 +101,8 @@ type Controller struct {
 	fleetReadSuccessSince time.Time
 	fleetReadFailures     int
 	fleetReadAlerted      bool
+
+	spend *spendQuote // reset every tick
 }
 
 const fleetReadSustainedFailureThreshold = 5 * time.Minute
@@ -119,6 +154,7 @@ func (c *Controller) Run(ctx context.Context) error {
 // own errors; a single failed DO call must not wedge the loop.
 func (c *Controller) tick(ctx context.Context) error {
 	now := time.Now().UTC()
+	c.spend = nil
 
 	// (0) reclaim expired leases when the scheduler is not co-running (C8).
 	if c.cfg.ReclaimLeases {
@@ -641,6 +677,9 @@ func dropletName(now time.Time, batchIndex int) string {
 // position within this tick's scale-up batch; it keeps names unique within a
 // single tick (where `now` is shared across the batch loop).
 func (c *Controller) scaleUp(ctx context.Context, now time.Time, batchIndex int) error {
+	if err := c.checkSpendBudget(ctx, now); err != nil {
+		return err
+	}
 	name := dropletName(now, batchIndex)
 
 	token, nodeID, nodeTokenID, err := c.store.MintNodeToken(ctx, c.cfg.OperatorAccountID, name)
@@ -694,8 +733,47 @@ func (c *Controller) scaleUp(ctx context.Context, now time.Time, batchIndex int)
 	if err := c.store.StampScaleUp(ctx, now); err != nil {
 		log.Printf("droplet pool: stamp scale up: %v", err)
 	}
+	if c.spend != nil {
+		c.spend.burn += c.spend.size
+	}
 	log.Printf("droplet pool: provisioned droplet name=%s do_id=%d", name, droplet.ID)
 	return nil
+}
+
+// checkSpendBudget vetoes a scale-up whose projected account burn (current burn
+// plus one droplet of the pool size) would exceed the guard's critical ceiling.
+// A failed quote does not block: the fleet read that gates every scale-up has
+// already succeeded this tick, and the hard cap Max still bounds the pool, so a
+// transient billing-API failure must not strand scheduled recordings.
+func (c *Controller) checkSpendBudget(ctx context.Context, now time.Time) error {
+	g := c.cfg.SpendGuard
+	if g == nil {
+		return nil
+	}
+	if c.spend == nil {
+		quoteCtx, cancel := context.WithTimeout(ctx, spendQuoteTimeout)
+		burn, size, err := g.Quote(quoteCtx, c.cfg.Size)
+		cancel()
+		if err != nil {
+			log.Printf("droplet pool: DO spend guard quote failed; scale-up limited by hard cap max=%d only this tick: %v", c.cfg.Max, err)
+			c.spend = &spendQuote{unavailable: true}
+			return nil
+		}
+		c.spend = &spendQuote{burn: burn, size: size}
+	}
+	if c.spend.unavailable {
+		return nil
+	}
+	projected := c.spend.burn + c.spend.size
+	if projected <= g.Critical() {
+		return nil
+	}
+	log.Printf("droplet pool: SPEND GUARD blocked scale-up: account burn $%.2f/day + $%.2f/day for one %s = $%.2f/day exceeds critical $%.2f/day (DO_SPEND_CRITICAL_USD_PER_DAY); run stoaramactl do-spend report",
+		c.spend.burn, c.spend.size, c.cfg.Size, projected, g.Critical())
+	if err := c.store.NoteOpsAlert(ctx, SpendBlockedSignal, SpendBlockedSignal, now); err != nil {
+		log.Printf("droplet pool: record spend guard alert: %v", err)
+	}
+	return ErrSpendBudget
 }
 
 // failProvision marks a provisioning row failed and revokes its node token after

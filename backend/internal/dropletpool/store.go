@@ -568,3 +568,18 @@ func (s *Store) StampScaleDown(ctx context.Context, at time.Time) error {
 	}
 	return nil
 }
+
+// NoteOpsAlert opens (or refreshes) one ops_alert_episodes row without touching
+// any other episode of the signal. A resolved episode reopens as a new one so
+// the operator alert fires again.
+func (s *Store) NoteOpsAlert(ctx context.Context, alertKey, signal string, now time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO ops_alert_episodes (alert_key, signal, first_detected_at, last_detected_at)
+		VALUES ($1, $2, $3, $3)
+		ON CONFLICT (alert_key) DO UPDATE SET
+		  first_detected_at = CASE WHEN ops_alert_episodes.resolved_at IS NOT NULL THEN EXCLUDED.first_detected_at ELSE ops_alert_episodes.first_detected_at END,
+		  last_alerted_at = CASE WHEN ops_alert_episodes.resolved_at IS NOT NULL THEN NULL ELSE ops_alert_episodes.last_alerted_at END,
+		  last_detected_at = EXCLUDED.last_detected_at,
+		  resolved_at = NULL`, alertKey, signal, now)
+	return err
+}
