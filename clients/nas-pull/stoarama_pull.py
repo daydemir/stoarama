@@ -97,12 +97,13 @@ UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
 # NAS -> R2 restore: the server queues clips and signs one create-only PUT per
 # clip; the client proves its local bytes first and the server re-hashes the
 # uploaded object before a restore counts.
-DEFAULT_RESTORE_WORKERS = 12
-MAX_RESTORE_WORKERS = 16
+DEFAULT_RESTORE_WORKERS = 16
+MAX_RESTORE_WORKERS = 32
 RESTORE_MAX_LEASE = 64
 RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
 RESTORE_BLOCK_BYTES = 1024 * 1024
 RESTORE_SOCKET_TIMEOUT_SEC = 120
+RESTORE_KEEPALIVE_IDLE_SEC = 30
 RESTORE_STARTUP_DELAY_SEC = (30, 120)
 RESTORE_MIN_WAIT_SEC = 1
 RESTORE_MAX_WAIT_SEC = 30 * 60
@@ -5685,19 +5686,85 @@ def open_restore_source(cfg, task):
         raise
 
 
+# Restores make three requests per clip (lease share, PUT, report). Opening a
+# fresh connection for each costs a DNS lookup and a TLS handshake; on NAS
+# hosts with a slow first resolver that was ~4 s per request and dominated
+# restore time. Each thread therefore keeps one connection per host alive.
+_restore_http = threading.local()
+_RESTORE_STALE_ERRORS = (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError)
+
+
+def reset_restore_connections():
+    for conn in getattr(_restore_http, "conns", {}).values():
+        conn.close()
+    _restore_http.conns = {}
+
+
+def restore_https(netloc, method, target, body, headers, timeout, read_limit=None):
+    """One request on this thread's keep-alive connection to netloc.
+
+    With read_limit, at most that many response bytes are read; a longer
+    response closes the connection instead of being buffered."""
+    conns = getattr(_restore_http, "conns", None)
+    if conns is None:
+        conns = _restore_http.conns = {}
+    conn = conns.get(netloc)
+    if conn is not None and time.monotonic() - getattr(conn, "stoarama_last_used", 0) > RESTORE_KEEPALIVE_IDLE_SEC:
+        conn.close()
+        conn = None
+    if conn is None:
+        conn = http.client.HTTPSConnection(netloc, timeout=timeout, blocksize=RESTORE_BLOCK_BYTES)
+        conns[netloc] = conn
+    try:
+        conn.request(method, target, body=body, headers=headers)
+        response = conn.getresponse()
+        data = response.read() if read_limit is None else response.read(read_limit + 1)
+    except BaseException:
+        conns.pop(netloc, None)
+        conn.close()
+        raise
+    if read_limit is not None and len(data) > read_limit:
+        data = data[:read_limit]
+        conns.pop(netloc, None)
+        conn.close()
+    elif response.will_close:
+        conns.pop(netloc, None)
+        conn.close()
+    else:
+        conn.stoarama_last_used = time.monotonic()
+    return response.status, data
+
+
+def restore_api(cfg, path, body, retry_stale=False):
+    """POST JSON to the API over a keep-alive connection; request_json semantics."""
+    base = getattr(cfg, "api_base", "")
+    parsed = urllib.parse.urlsplit(base + path)
+    proxied = bool(urllib.request.getproxies().get("https")) and not urllib.request.proxy_bypass(parsed.netloc)
+    if parsed.scheme != "https" or proxied:
+        # Plain HTTP (tests) and proxied installs keep urllib's transport.
+        return request_json(cfg, "POST", path, body=body, timeout=HTTP_TIMEOUT_SEC)
+    data = json.dumps(body).encode("utf-8")
+    headers = {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"}
+    target = parsed.path + ("?" + parsed.query if parsed.query else "")
+    try:
+        status, raw = restore_https(parsed.netloc, "POST", target, data, headers, HTTP_TIMEOUT_SEC)
+    except _RESTORE_STALE_ERRORS:
+        if not retry_stale:
+            raise
+        status, raw = restore_https(parsed.netloc, "POST", target, data, headers, HTTP_TIMEOUT_SEC)
+    if status >= 400:
+        raise urllib.error.HTTPError(base + path, status, "HTTP %d" % status, {}, None)
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
 def restore_put(task, body):
     url = task["url"]
-    connection = http.client.HTTPSConnection(url.netloc, timeout=RESTORE_SOCKET_TIMEOUT_SEC, blocksize=RESTORE_BLOCK_BYTES)
-    try:
-        headers = dict(task["headers"])
-        headers["Content-Length"] = str(task["size_bytes"])
-        headers["User-Agent"] = USER_AGENT
-        connection.request("PUT", url.path + ("?" + url.query if url.query else ""), body=body, headers=headers)
-        response = connection.getresponse()
-        response.read(64 * 1024)
-        return response.status
-    finally:
-        connection.close()
+    headers = dict(task["headers"])
+    headers["Content-Length"] = str(task["size_bytes"])
+    headers["User-Agent"] = USER_AGENT
+    status, _ = restore_https(url.netloc, "PUT", url.path + ("?" + url.query if url.query else ""), body, headers,
+                              RESTORE_SOCKET_TIMEOUT_SEC, read_limit=64 * 1024)
+    return status
 
 
 def run_restore_task(cfg, task):
@@ -5712,7 +5779,15 @@ def run_restore_task(cfg, task):
         fd = open_restore_source(cfg, task)
         upload_started = time.monotonic()
         body = RestoreBody(fd, task["size_bytes"])
-        status = restore_put(task, body)
+        try:
+            status = restore_put(task, body)
+        except _RESTORE_STALE_ERRORS:
+            # A kept-alive connection the peer already closed: rewind the
+            # proven descriptor and retry once on a fresh connection. If the
+            # first attempt had landed, this one gets 412 and reports exists.
+            os.lseek(fd, 0, os.SEEK_SET)
+            body = RestoreBody(fd, task["size_bytes"])
+            status = restore_put(task, body)
         result["duration_ms"] = max(0, round((time.monotonic() - upload_started) * 1000))
         if status == 412:
             # The key already exists (an earlier attempt landed): the server
@@ -5740,9 +5815,8 @@ def report_restore(cfg, task_id, result, sleep=time.sleep):
     """Report once, retrying transient failures; 409 means the lease moved on."""
     for attempt in range(1, RESTORE_REPORT_ATTEMPTS + 1):
         try:
-            return request_json(
-                cfg, "POST", "/account/connections/nas-restore/%d/result" % task_id, body=result, timeout=HTTP_TIMEOUT_SEC,
-            )
+            # A replay after a stale connection is safe: a duplicate report is a 409.
+            return restore_api(cfg, "/account/connections/nas-restore/%d/result" % task_id, result, retry_stale=True)
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
                 return {"state": "stale"}
@@ -5771,11 +5845,9 @@ def restore_task_and_report(cfg, task):
 
 def lease_restores(cfg, max_tasks):
     """Lease up to max_tasks restores; returns (valid tasks, server retry_after)."""
-    lease = request_json(
-        cfg, "POST", "/account/connections/nas-restore/lease",
-        body={"client_version": CLIENT_VERSION, "max_tasks": max(1, min(RESTORE_MAX_LEASE, max_tasks))},
-        timeout=HTTP_TIMEOUT_SEC,
-    )
+    # Never replayed: a lease whose response was lost just expires.
+    lease = restore_api(cfg, "/account/connections/nas-restore/lease",
+                        {"client_version": CLIENT_VERSION, "max_tasks": max(1, min(RESTORE_MAX_LEASE, max_tasks))})
     if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
         raise RuntimeError("invalid restore lease response")
     tasks = []
