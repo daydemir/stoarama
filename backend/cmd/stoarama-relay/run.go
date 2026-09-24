@@ -166,7 +166,7 @@ func runRelay(ctx context.Context) error {
 		}
 		os.Setenv("YT_DLP_BIN", next)
 		configureYTDLPJSRuntime(bd, next)
-		pr.setYtdlpVersion(readYtdlpVersion(next))
+		pr.refreshYtdlpVersion()
 		log.Printf("stoarama-relay yt-dlp layout=%s (activated without restart)", ytdlpLayout(bd, next))
 	}()
 	selfUpdatesEnabled, err := prepareSelfUpdates(cfg)

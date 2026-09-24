@@ -154,3 +154,29 @@ func TestYTDLPBinaryChangedRequiresRestartOnlyForADifferentBuild(t *testing.T) {
 		t.Fatal("switch from single-file to one-directory build did not request a restart")
 	}
 }
+
+func TestProbeVersionKeepsNewestRead(t *testing.T) {
+	t.Setenv(capture.YTDLPRuntimeTempRootEnv, t.TempDir())
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	slowOld := write("old", "sleep 1\necho 2026.07.04\n")
+	fastNew := write("new", "echo 2026.08.19\n")
+	p := newProbe(slowOld)
+	t.Setenv("YT_DLP_BIN", slowOld)
+	done := make(chan struct{})
+	go func() { p.refreshYtdlpVersion(); close(done) }()
+	for p.versionGeneration.Load() == 0 {
+	}
+	t.Setenv("YT_DLP_BIN", fastNew)
+	p.refreshYtdlpVersion()
+	<-done
+	if got := p.snapshot().version; got != "2026.08.19" {
+		t.Fatalf("slow earlier read overwrote newer version: %q", got)
+	}
+}
