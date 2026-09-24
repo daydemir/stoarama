@@ -62,7 +62,9 @@ func runRelay(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ytdlp := filepath.Join(bd, "yt-dlp")
+	ensureYTDLPDistForRunningRelease(cfg)
+	ytdlp := installedYTDLPPath(bd)
+	log.Printf("stoarama-relay yt-dlp layout=%s", ytdlpLayout(bd, ytdlp))
 	tempRoot, err := relayCaptureTempRoot()
 	if err != nil {
 		return err

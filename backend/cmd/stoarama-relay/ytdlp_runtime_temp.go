@@ -10,14 +10,10 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/capture"
 )
 
-func privateYTDLPTempEnabled() bool {
-	return os.Getenv(capture.YTDLPPrivateTempEnv) == "1"
-}
-
+// prepareYTDLPPrivateTemp points every yt-dlp invocation of the long-running
+// relay commands at a private, app-owned temp root. Each invocation then gets
+// its own directory beneath it, removed after the process group exits.
 func prepareYTDLPPrivateTemp(command string) error {
-	if !privateYTDLPTempEnabled() {
-		return nil
-	}
 	switch command {
 	case "run", "link-youtube", "canary":
 	default:

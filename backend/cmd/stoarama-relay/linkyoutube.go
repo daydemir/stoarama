@@ -41,7 +41,7 @@ func runLinkYouTube(_ []string) error {
 	if err != nil {
 		return err
 	}
-	ytdlp := filepath.Join(bd, "yt-dlp")
+	ytdlp := installedYTDLPPath(bd)
 	if !fileExists(ytdlp) {
 		// Fall back to a PATH yt-dlp for a bare `link-youtube` before install.
 		ytdlp = "yt-dlp"

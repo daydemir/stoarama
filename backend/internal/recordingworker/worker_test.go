@@ -27,11 +27,11 @@ import (
 
 func TestContinuousCaptureForJobRoutesCanaryExplicitly(t *testing.T) {
 	legacy := continuousCaptureForJob(recordingapi.RecordingJob{})
-	if reflect.ValueOf(legacy).Pointer() != reflect.ValueOf(capture.CaptureContinuousWithHeaders).Pointer() {
+	if reflect.ValueOf(legacy).Pointer() != reflect.ValueOf(capture.CaptureContinuousInput).Pointer() {
 		t.Fatal("default job did not select the legacy continuous capture path")
 	}
 	canary := continuousCaptureForJob(recordingapi.RecordingJob{TimestampContractSupported: true})
-	if reflect.ValueOf(canary).Pointer() != reflect.ValueOf(capture.CaptureContinuousWithTimestampContract).Pointer() {
+	if reflect.ValueOf(canary).Pointer() != reflect.ValueOf(capture.CaptureContinuousInputWithTimestampContract).Pointer() {
 		t.Fatal("eligible job did not select the timestamp-contract capture path")
 	}
 }

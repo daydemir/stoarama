@@ -899,6 +899,9 @@ func relayHeartbeatLoop(ctx context.Context, client *recordingapi.Client, pr *pr
 		if probe.version != "" {
 			caps["ytdlp_version"] = probe.version
 		}
+		if ytdlp := strings.TrimSpace(os.Getenv("YT_DLP_BIN")); ytdlp != "" && bd != "" {
+			caps["ytdlp_layout"] = ytdlpLayout(bd, ytdlp)
+		}
 		if info := ffmpegInfo.Load(); info != nil {
 			caps["ffmpeg_version"] = info.version
 			caps["ffmpeg_network_probe"] = info.networkProbe

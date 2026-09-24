@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -23,7 +26,7 @@ func TestYTDLPResolveArgs(t *testing.T) {
 		t.Setenv("YT_DLP_FORMAT_SORT", "")
 		t.Setenv("YT_DLP_JS_RUNTIME", "")
 		got := YTDLPResolveArgs("https://www.youtube.com/watch?v=abc123")
-		want := []string{"-g", "--no-warnings", "--no-playlist", "https://www.youtube.com/watch?v=abc123"}
+		want := []string{"-g", "--no-warnings", "--no-playlist", "-f", DefaultYouTubeFormat, "https://www.youtube.com/watch?v=abc123"}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("ytDLPResolveArgs()=%v want=%v", got, want)
 		}
@@ -47,10 +50,114 @@ func TestYTDLPResolveArgs(t *testing.T) {
 	})
 }
 
-func TestFirstHTTPURLFromTimedOutYTDLPOutput(t *testing.T) {
-	got := firstHTTPURL("signal: killed\nhttps://manifest.googlevideo.com/live/index.m3u8\n")
-	if want := "https://manifest.googlevideo.com/live/index.m3u8"; got != want {
-		t.Fatalf("firstHTTPURL()=%q want=%q", got, want)
+func TestDefaultYouTubeFormatPrefersMuxedHLSThenSplitHLS(t *testing.T) {
+	want := "b[protocol^=m3u8]/bv*[protocol^=m3u8][height<=1080]+ba[protocol^=m3u8]"
+	if DefaultYouTubeFormat != want {
+		t.Fatalf("DefaultYouTubeFormat=%q want %q", DefaultYouTubeFormat, want)
+	}
+}
+
+func TestParseYTDLPStreamURLs(t *testing.T) {
+	const video = "https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/270/index.m3u8"
+	const audio = "https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/234/index.m3u8"
+	for _, test := range []struct {
+		name    string
+		out     string
+		want    YouTubeStream
+		wantErr bool
+	}{
+		{name: "muxed", out: video + "\n", want: YouTubeStream{VideoURL: video}},
+		{name: "muxed after noise", out: "signal: killed\n" + video + "\n", want: YouTubeStream{VideoURL: video}},
+		{name: "split video then audio", out: video + "\n" + audio + "\n", want: YouTubeStream{VideoURL: video, AudioURL: audio}},
+		{name: "split with CRLF", out: video + "\r\n" + audio + "\r\n", want: YouTubeStream{VideoURL: video, AudioURL: audio}},
+		{name: "none", out: "ERROR: something\n", wantErr: true},
+		{name: "too many", out: video + "\n" + audio + "\n" + video + "\n", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseYTDLPStreamURLs(test.out)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("parse=%+v, want error", got)
+				}
+				return
+			}
+			if err != nil || got != test.want {
+				t.Fatalf("parse=%+v err=%v want %+v", got, err, test.want)
+			}
+		})
+	}
+}
+
+func writeFakeYTDLP(t *testing.T, body string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "yt-dlp")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("YT_DLP_BIN", script)
+	t.Setenv(YTDLPRuntimeTempRootEnv, t.TempDir())
+	t.Setenv("YT_DLP_FORMAT", "")
+	t.Setenv("YT_DLP_JS_RUNTIME", "")
+	t.Setenv("YT_DLP_COOKIES_FILE", "")
+	t.Setenv("YT_DLP_COOKIES_FROM_BROWSER", "")
+	return script
+}
+
+func TestResolveCaptureYouTubeSplitReturnsVideoAndAudio(t *testing.T) {
+	argsFile := filepath.Join(t.TempDir(), "args")
+	writeFakeYTDLP(t, `printf '%s\n' "$@" > "`+argsFile+`"
+printf 'https://rr1.googlevideo.com/video/index.m3u8\nhttps://rr1.googlevideo.com/audio/index.m3u8\n'
+`)
+	got, err := ResolveCapture(context.Background(), "YOUTUBE", "https://www.youtube.com/watch?v=abc123", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CaptureInput{URL: "https://rr1.googlevideo.com/video/index.m3u8", AudioURL: "https://rr1.googlevideo.com/audio/index.m3u8"}
+	if got != want {
+		t.Fatalf("ResolveCapture()=%+v want %+v", got, want)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "-f\n"+DefaultYouTubeFormat+"\n") {
+		t.Fatalf("yt-dlp was not given the explicit HLS format: %q", args)
+	}
+	// Single-input consumers get the video rendition only.
+	single, _, _, err := ResolveCaptureInputWithHeaders(context.Background(), "YOUTUBE", "https://www.youtube.com/watch?v=abc123", "")
+	if err != nil || single != want.URL {
+		t.Fatalf("ResolveCaptureInputWithHeaders()=%q err=%v", single, err)
+	}
+}
+
+func TestResolveCaptureYouTubeMuxedHasNoAudioURL(t *testing.T) {
+	writeFakeYTDLP(t, `printf 'https://rr1.googlevideo.com/muxed/index.m3u8\n'
+`)
+	got, err := ResolveCapture(context.Background(), "YOUTUBE", "https://www.youtube.com/watch?v=abc123", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URL != "https://rr1.googlevideo.com/muxed/index.m3u8" || got.AudioURL != "" {
+		t.Fatalf("ResolveCapture()=%+v", got)
+	}
+}
+
+func TestResolveCaptureYouTubeFormatUnavailableIsHardError(t *testing.T) {
+	calls := filepath.Join(t.TempDir(), "calls")
+	writeFakeYTDLP(t, `echo call >> "`+calls+`"
+echo "ERROR: [youtube] abc123: Requested format is not available. Use --list-formats for a list of available formats" >&2
+exit 1
+`)
+	_, err := ResolveCapture(context.Background(), "YOUTUBE", "https://www.youtube.com/watch?v=abc123", "")
+	if !errors.Is(err, ErrYouTubeFormatUnavailable) {
+		t.Fatalf("err=%v, want ErrYouTubeFormatUnavailable", err)
+	}
+	data, readErr := os.ReadFile(calls)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if n := strings.Count(string(data), "call"); n != 1 {
+		t.Fatalf("format-unavailable resolve retried: %d calls", n)
 	}
 }
 

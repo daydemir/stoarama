@@ -46,6 +46,7 @@ type latestJSON struct {
 	Version         string                    `json:"version"`
 	Relay           map[string]latestArtifact `json:"relay"`
 	Ytdlp           map[string]latestArtifact `json:"ytdlp"`
+	YtdlpDist       map[string]latestArtifact `json:"ytdlp_dist"`
 	Deno            map[string]latestArtifact `json:"deno"`
 	PreviousVersion string                    `json:"previous_version"`
 	PreviousRelay   map[string]latestArtifact `json:"previous_relay"`
@@ -151,6 +152,9 @@ func runSelfUpdate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("refresh yt-dlp before relay activation: %w", err)
 	}
+	if _, _, err := refreshYTDLPDist(base, lj.YtdlpDist, target); err != nil {
+		return fmt.Errorf("refresh yt-dlp one-directory build before relay activation: %w", err)
+	}
 	denoPresent, _, err := refreshExecutableDependency(base, lj.Deno, target, "deno")
 	if err != nil {
 		return fmt.Errorf("refresh Deno before relay activation: %w", err)
@@ -174,7 +178,7 @@ func runSelfUpdate(args []string) error {
 
 	runtimeActivationNeeded := false
 	if denoPresent && strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")) == "" {
-		if bd, pathErr := binDir(); pathErr == nil && ytdlpJSRuntimeReady(bd, filepath.Join(bd, "yt-dlp")) {
+		if bd, pathErr := binDir(); pathErr == nil && ytdlpJSRuntimeReady(bd, installedYTDLPPath(bd)) {
 			runtimeActivationNeeded = true
 		} else {
 			fmt.Fprintln(os.Stderr, "Deno runtime activation held: installed dependencies failed capability checks")
@@ -240,6 +244,10 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 		log.Printf("relay self-update: yt-dlp refresh failed; relay activation held: %v", err)
 		return false
 	}
+	if _, _, err := refreshYTDLPDist(base, lj.YtdlpDist, target); err != nil {
+		log.Printf("relay self-update: yt-dlp one-directory refresh failed; relay activation held: %v", err)
+		return false
+	}
 	denoPresent, _, err := refreshExecutableDependency(base, lj.Deno, target, "deno")
 	if err != nil {
 		log.Printf("relay self-update: Deno refresh failed; relay activation held: %v", err)
@@ -251,11 +259,18 @@ func checkAndApplyUpdate(base string, manifest releaseManifest, activeJobs *atom
 	}
 	runtimeActivationNeeded := false
 	if denoPresent && strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")) == "" {
-		if bd, pathErr := binDir(); pathErr == nil && ytdlpJSRuntimeReady(bd, filepath.Join(bd, "yt-dlp")) {
+		if bd, pathErr := binDir(); pathErr == nil && ytdlpJSRuntimeReady(bd, installedYTDLPPath(bd)) {
 			runtimeActivationNeeded = true
 		} else {
 			log.Printf("relay self-update: Deno runtime activation held; installed dependencies failed capability checks")
 		}
+	}
+	if bd, pathErr := binDir(); pathErr == nil && ytdlpBinaryChanged(os.Getenv("YT_DLP_BIN"), installedYTDLPPath(bd)) {
+		// This process selected its yt-dlp at start (e.g. the legacy single-file
+		// build before the one-directory build was installed). Restart once
+		// drained so resolves move to the newly installed build.
+		log.Printf("relay self-update: yt-dlp build changed; restart needed to activate it")
+		runtimeActivationNeeded = true
 	}
 
 	relayUpdated := false
@@ -322,6 +337,11 @@ func waitForSelfUpdateDrain(ctx context.Context, activeJobs *atomic.Int64, lease
 			return
 		}
 	}
+}
+
+func ytdlpBinaryChanged(running, installed string) bool {
+	running = strings.TrimSpace(running)
+	return running != "" && running != installed
 }
 
 func refreshExecutableDependency(base string, artifacts map[string]latestArtifact, target, name string) (bool, bool, error) {

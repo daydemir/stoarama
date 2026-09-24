@@ -2,17 +2,27 @@
 set -euo pipefail
 
 # Cross-compiles the stoarama-relay binary for all supported targets, packages each
-# as a tar.gz, pulls the pinned yt-dlp static builds, computes sha256 for every
+# as a tar.gz, pulls the pinned yt-dlp builds, computes sha256 for every
 # artifact, writes latest.json, and uploads everything to the R2 bucket under
 # relay-releases/. The API serves these at <api>/relay/install.sh and
 # <api>/relay/download/{artifact}.
+#
+# yt-dlp is published twice per target, both pinned by version AND upstream sha256:
+#   "ytdlp_dist" (YTDLP_VERSION): the PyInstaller one-directory zip. Relays that
+#       understand it unpack it once into ~/.stoarama/bin/yt-dlp-dist/ and run its
+#       entrypoint directly, so no resolve pays the one-file self-extraction cost
+#       (8-11s on macOS) or leaks a _MEI* directory when it is killed.
+#   "ytdlp" (YTDLP_LEGACY_VERSION): the single-file build that older relay
+#       binaries self-update to bin/yt-dlp. It stays at the version those binaries
+#       were validated with, so an old relay (mid-upgrade or after a rollback)
+#       never runs a newer yt-dlp whose split audio/video output it would
+#       silently truncate to video only.
 #
 # Required env:
 #   R2_ACCOUNT_ID        Cloudflare account id (endpoint https://<id>.r2.cloudflarestorage.com)
 #   R2_BUCKET            target bucket
 #   AWS_ACCESS_KEY_ID    R2 access key id
 #   AWS_SECRET_ACCESS_KEY R2 secret access key
-#   YTDLP_VERSION        pinned yt-dlp release tag
 #   DENO_VERSION         pinned Deno release tag, including the leading v
 #   RELAY_SIGNING_PRIVATE_KEY_FILE file containing a base64 Ed25519 private key
 # Optional env:
@@ -36,7 +46,16 @@ trap 'rm -rf "${BUILD_DIR}"' EXIT
 RELAY_VERSION="${RELAY_VERSION:-$(git -C "${ROOT_DIR}" rev-parse --short=8 HEAD)}"
 SOURCE_REVISION="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
 "${ROOT_DIR}/scripts/relay-release-provenance.sh" version "${SOURCE_REVISION}" "${RELAY_VERSION}"
-: "${YTDLP_VERSION:?YTDLP_VERSION must be an explicit release tag}"
+# Pinned yt-dlp builds. Changing a version means updating every digest below from
+# the upstream release's SHA2-256SUMS; a caller cannot override them from the env.
+YTDLP_PINNED_VERSION="2026.08.19"
+YTDLP_LEGACY_PINNED_VERSION="2026.07.04"
+if [[ -n "${YTDLP_VERSION:-}" && "${YTDLP_VERSION}" != "${YTDLP_PINNED_VERSION}" ]]; then
+  echo "error: yt-dlp is pinned to ${YTDLP_PINNED_VERSION} with checksums in this script; got YTDLP_VERSION=${YTDLP_VERSION}" >&2
+  exit 1
+fi
+YTDLP_VERSION="${YTDLP_PINNED_VERSION}"
+YTDLP_LEGACY_VERSION="${YTDLP_LEGACY_PINNED_VERSION}"
 : "${DENO_VERSION:?DENO_VERSION must be an explicit release tag}"
 : "${RELAY_SIGNING_PRIVATE_KEY_FILE:?RELAY_SIGNING_PRIVATE_KEY_FILE is required}"
 [[ -f "${RELAY_SIGNING_PRIVATE_KEY_FILE}" ]] || {
@@ -139,13 +158,46 @@ sha256_of() {
   fi
 }
 
-# yt-dlp pinned asset names by target (stable yt-dlp release asset names).
+# Legacy single-file yt-dlp asset names by target (YTDLP_LEGACY_VERSION).
 ytdlp_asset() {
   case "$1" in
     darwin/arm64|darwin/amd64) echo "yt-dlp_macos" ;;
     linux/amd64)               echo "yt-dlp" ;;
     linux/arm64)               echo "yt-dlp_linux_aarch64" ;;
   esac
+}
+# One-directory yt-dlp zip asset names by target (YTDLP_VERSION). The macOS zip
+# is a universal2 build. Each zip holds one yt-dlp* entrypoint plus _internal/.
+ytdlp_dist_asset() {
+  case "$1" in
+    darwin/arm64|darwin/amd64) echo "yt-dlp_macos.zip" ;;
+    linux/amd64)               echo "yt-dlp_linux.zip" ;;
+    linux/arm64)               echo "yt-dlp_linux_aarch64.zip" ;;
+  esac
+}
+# Upstream SHA2-256SUMS digests for exactly the assets above.
+ytdlp_upstream_sha256() {
+  case "$1/$2" in
+    2026.07.04/yt-dlp_macos)             echo "498bd0dae17855c599d371d68ec5bafc439a9d8640e838be25c765a9792f261b" ;;
+    2026.07.04/yt-dlp)                   echo "495be29ff4d9d4e9be7eabdfef225221e5d5282e77f2f505abc6dca80349f3fd" ;;
+    2026.07.04/yt-dlp_linux_aarch64)     echo "b6ce97646773070d7a7ffd6bbbdcaecb47c48483909c54c915bf08a7a9b5e0b1" ;;
+    2026.08.19/yt-dlp_macos.zip)         echo "07e54b0865303c864006925913bce2604f8ee8cc6f18699bac9c309f9328a6d8" ;;
+    2026.08.19/yt-dlp_linux.zip)         echo "32e72032766bef9199d99d15beb69fd52e46df8f8b06f0d8745db59e04d339e9" ;;
+    2026.08.19/yt-dlp_linux_aarch64.zip) echo "4e27ad43f3a34bacffd078694eb3edbb4e3b378e7da44edab2be02e98555516e" ;;
+    *) echo "error: no pinned sha256 for yt-dlp $1 $2" >&2; return 1 ;;
+  esac
+}
+# fetch_ytdlp <version> <asset> <dest>: downloads one pinned upstream asset and
+# refuses it unless its sha256 matches the digest pinned above.
+fetch_ytdlp() {
+  local version="$1" asset="$2" dest="$3" want got
+  want="$(ytdlp_upstream_sha256 "${version}" "${asset}")"
+  curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${version}/${asset}" -o "${dest}"
+  got="$(sha256_of "${dest}")"
+  if [[ "${got}" != "${want}" ]]; then
+    echo "error: yt-dlp ${version} ${asset} sha256 ${got} does not match pinned ${want}" >&2
+    return 1
+  fi
 }
 deno_asset() {
   case "$1" in
@@ -212,6 +264,7 @@ build_ffmpeg() {
 echo "Building stoarama-relay ${RELAY_VERSION}"
 RELAY_JSON=""
 YTDLP_JSON=""
+YTDLP_DIST_JSON=""
 DENO_JSON=""
 FFMPEG_JSON=""
 for t in "${TARGETS[@]}"; do
@@ -232,12 +285,20 @@ for t in "${TARGETS[@]}"; do
   r2_put "${BUILD_DIR}/${tarball}" "${tarball}" "application/gzip"
   RELAY_JSON="${RELAY_JSON}    \"${key}\": {\"artifact\": \"${tarball}\", \"sha256\": \"${relay_sha}\"},\n"
 
-  # pinned yt-dlp for this target
+  # legacy single-file yt-dlp for this target (older relay binaries + rollback)
   yt_name="yt-dlp-${RELAY_VERSION}-${key}"
-  curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/$(ytdlp_asset "${t}")" -o "${BUILD_DIR}/${yt_name}"
+  fetch_ytdlp "${YTDLP_LEGACY_VERSION}" "$(ytdlp_asset "${t}")" "${BUILD_DIR}/${yt_name}"
   yt_sha="$(sha256_of "${BUILD_DIR}/${yt_name}")"
   r2_put "${BUILD_DIR}/${yt_name}" "${yt_name}" "application/octet-stream"
   YTDLP_JSON="${YTDLP_JSON}    \"${key}\": {\"artifact\": \"${yt_name}\", \"sha256\": \"${yt_sha}\"},\n"
+
+  # one-directory yt-dlp for this target, republished byte-identical to upstream
+  yt_dist_name="yt-dlp-dist-${RELAY_VERSION}-${key}.zip"
+  fetch_ytdlp "${YTDLP_VERSION}" "$(ytdlp_dist_asset "${t}")" "${BUILD_DIR}/${yt_dist_name}"
+  yt_dist_sha="$(sha256_of "${BUILD_DIR}/${yt_dist_name}")"
+  r2_put "${BUILD_DIR}/${yt_dist_name}" "${yt_dist_name}" "application/zip"
+  rm -f "${BUILD_DIR}/${yt_dist_name}"
+  YTDLP_DIST_JSON="${YTDLP_DIST_JSON}    \"${key}\": {\"artifact\": \"${yt_dist_name}\", \"sha256\": \"${yt_dist_sha}\"},\n"
 
   # Pinned JavaScript runtime for yt-dlp challenge solving. Publish the extracted
   # executable so install and self-update can use the same atomic verified path.
@@ -282,6 +343,9 @@ latest="${BUILD_DIR}/latest.json"
   echo "  },"
   echo "  \"ytdlp\": {"
   printf "%b" "${YTDLP_JSON}" | sed '$ s/,$//'
+  echo "  },"
+  echo "  \"ytdlp_dist\": {"
+  printf "%b" "${YTDLP_DIST_JSON}" | sed '$ s/,$//'
   echo "  },"
   echo "  \"deno\": {"
   printf "%b" "${DENO_JSON}" | sed '$ s/,$//'
