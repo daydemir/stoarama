@@ -63,7 +63,12 @@ func runRecordingHealthSummary(ctx context.Context, cfg config.Config) {
 	if err != nil {
 		log.Fatalf("load digest NAS telemetry: %v", err)
 	}
-	body := composeHealthDigest(cfg.AppBaseURL, now, items, nas)
+	stability, err := loadDigestStability(ctx, pool, now)
+	if err != nil {
+		// The grade/fleet section is additive; never withhold the digest for it.
+		log.Printf("digest stability section skipped: %v", err)
+	}
+	body := composeHealthDigest(cfg.AppBaseURL, now, items, nas, stability)
 	recipients := operatorRecipients(ctx, pool)
 	if len(recipients) == 0 {
 		log.Fatalf("no operator recipients")
@@ -219,7 +224,7 @@ func digestCounts(items []digestRecording) string {
 	return fmt.Sprintf("%d stable, %d degraded, %d failing, %d unknown (of %d live)", c["stable"], c["degraded"], c["failing"], c["unknown"], c["stable"]+c["degraded"]+c["failing"]+c["unknown"])
 }
 
-func composeHealthDigest(base string, now time.Time, items []digestRecording, nas digestNAS) string {
+func composeHealthDigest(base string, now time.Time, items []digestRecording, nas digestNAS, stability *digestStability) string {
 	base = strings.TrimRight(base, "/")
 	scheduled := 0
 	current := map[string]int{}
@@ -257,6 +262,9 @@ func composeHealthDigest(base string, now time.Time, items []digestRecording, na
 	}
 	sort.Slice(stable, func(i, j int) bool { return stable[i] < stable[j] })
 	fmt.Fprintf(&b, "CURRENT STABLE (%d)\n  IDs: %v\n\n", len(stable), stable)
+	if stability != nil {
+		composeDigestStability(&b, *stability, now)
+	}
 	b.WriteString("NAS\n")
 	state := nasStorageStateAt(nas.Total, nas.Free, nas.ReportedAt, now)
 	if state == nasStorageUnknown {

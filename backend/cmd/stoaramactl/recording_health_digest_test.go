@@ -141,7 +141,7 @@ func TestLoadDigestNASUsesOnlyPersistedBoundedTelemetry(t *testing.T) {
 }
 
 func TestComposeHealthDigestDoesNotClaimExactServerOnlyCount(t *testing.T) {
-	body := composeHealthDigest("", time.Now(), nil, digestNAS{})
+	body := composeHealthDigest("", time.Now(), nil, digestNAS{}, nil)
 	if !strings.Contains(body, "server_only=not_computed") {
 		t.Fatalf("digest must disclose that exact server-only reconciliation is omitted:\n%s", body)
 	}
@@ -157,7 +157,7 @@ func TestComposeHealthDigestSeparatesCurrentAndHistorical(t *testing.T) {
 		{ID: 2, Name: "off window", Scheduled: false, Bucket: "unknown", CurrentCause: "off-window / not currently assessed", HistoryBucket: "stable", HistoryNote: "latest completed 99.9%"},
 		{ID: 3, Name: "live failure", Scheduled: true, Bucket: "failing", CurrentCause: "no fresh ingest", HistoryBucket: "degraded", HistoryNote: "latest completed 96%"},
 	}
-	body := composeHealthDigest("https://stoarama.com", now, items, digestNAS{})
+	body := composeHealthDigest("https://stoarama.com", now, items, digestNAS{}, nil)
 	for _, want := range []string{
 		"Active fleet: 3 total; 2 currently scheduled/live; 1 off-window/not assessed.",
 		"Current operational health: 1 stable, 0 degraded, 1 failing, 0 unknown (of 2 live).",
@@ -215,7 +215,7 @@ func TestComposeHealthDigestNASCurrentAndRecoveredAreDistinct(t *testing.T) {
 	body := composeHealthDigest("", now, nil, digestNAS{
 		Label: "NAS", Phase: "idle", Free: &free, Total: &total,
 		ReportedAt: &reported, Blocked: true, CapacityTransitionState: "unknown", CapacityTransitionAt: &recovered,
-	})
+	}, nil)
 	if !strings.Contains(body, "Current: state=healthy") || !strings.Contains(body, "Latest historical storage-capacity transition: unknown") || !strings.Contains(body, "not the current derived state") {
 		t.Fatalf("NAS current/recovered wording missing:\n%s", body)
 	}

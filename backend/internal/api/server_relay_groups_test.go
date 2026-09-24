@@ -155,6 +155,7 @@ func TestRelayLeaseRequiresYouTubeReadinessOnlyForYouTube(t *testing.T) {
 		CREATE TABLE recording_bandwidth_observations (recording_id BIGINT PRIMARY KEY, observed_bandwidth_bps BIGINT NOT NULL, observed_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
 		`+testRecordingCanaryReservationsTableDDL+`;
+		`+testRecordingJobNodeFailuresTableDDL+`;
 		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups VALUES (1,47,4,NULL);
 		INSERT INTO nodes (id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,relay_group_id,capabilities_jsonb)
@@ -237,6 +238,7 @@ func TestRelayGroupLeaseCapConcurrent(t *testing.T) {
 		CREATE TABLE recording_bandwidth_observations (recording_id BIGINT PRIMARY KEY, observed_bandwidth_bps BIGINT NOT NULL, observed_at TIMESTAMPTZ NOT NULL DEFAULT now());
 		CREATE TABLE recording_jobs (id BIGINT PRIMARY KEY, recording_id BIGINT NOT NULL, status TEXT NOT NULL, scheduled_for TIMESTAMPTZ NOT NULL, kind TEXT NOT NULL, fire_at TIMESTAMPTZ NOT NULL, clip_duration_sec INT NOT NULL, lease_owner TEXT, lease_expires_at TIMESTAMPTZ, lease_token UUID, attempt_count INT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), window_end_at TIMESTAMPTZ, handoff_owner TEXT, handoff_until TIMESTAMPTZ, relay_fairness_started_at TIMESTAMPTZ);
 		`+testRecordingCanaryReservationsTableDDL+`;
+		`+testRecordingJobNodeFailuresTableDDL+`;
 		INSERT INTO accounts VALUES (47);
 		INSERT INTO relay_groups (id,account_id,max_streams) VALUES (1, 47, 1);
 		INSERT INTO nodes (id,account_id,node_type,status,last_heartbeat_at,relay_max_streams,relay_group_id)

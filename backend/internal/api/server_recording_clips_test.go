@@ -47,6 +47,14 @@ const testRecordingCanaryReservationsTableDDL = `CREATE TABLE recording_canary_r
 	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )`
 
+const testRecordingJobNodeFailuresTableDDL = `CREATE TABLE recording_job_node_failures (
+	recording_job_id BIGINT NOT NULL,
+	node_id BIGINT NOT NULL,
+	failure_count INTEGER NOT NULL CHECK (failure_count > 0),
+	last_failed_at TIMESTAMPTZ NOT NULL,
+	PRIMARY KEY (recording_job_id, node_id)
+)`
+
 func TestRecordingJobsLeaseSQLLocksDropletCapacityGate(t *testing.T) {
 	for _, want := range []string{"node_id = $2", "state IN ('provisioning', 'active')", "FOR UPDATE"} {
 		if !strings.Contains(cloudRecorderLockSQL, want) {
@@ -204,7 +212,7 @@ func TestRelaySurrenderHandsJobToDifferentOwner(t *testing.T) {
 	}
 
 	var handoffUntil time.Time
-	if err := pool.QueryRow(ctx, recordingJobSurrenderSQL, 1, "node:1", string(recordingJobSurrenderNoProgress), nil).Scan(&handoffUntil); err != nil {
+	if err := pool.QueryRow(ctx, recordingJobSurrenderSQL, 1, "node:1", string(recordingJobSurrenderNoProgress), nil, int64(1), true).Scan(&handoffUntil); err != nil {
 		t.Fatal(err)
 	}
 	if !handoffUntil.After(time.Now()) {
@@ -1518,6 +1526,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			capture_sequence BIGINT
 		)`,
 		testRecordingCanaryReservationsTableDDL,
+		testRecordingJobNodeFailuresTableDDL,
 		`CREATE TABLE storage_destinations (
 			id BIGINT PRIMARY KEY,
 			account_id BIGINT NOT NULL,

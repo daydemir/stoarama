@@ -301,6 +301,7 @@ func (s *Server) router() http.Handler {
 			account.Get("/recordings/joined/folder", s.handleAccountJoinedFolderRoot)
 			account.Get("/recordings/qualification", s.handleAccountRecordingQualification)
 			account.Get("/recordings/streak-priority", s.handleAccountRecordingStreakPriority)
+			account.Get("/recordings/quality-grades", s.handleAccountRecordingQualityGrades)
 			account.Get("/recordings/campaign-tracks", s.handleAccountRecordingCampaignTracks)
 			account.Post("/recordings/qualification/scene-attest", s.handleAccountRecordingSceneAttest)
 			account.Post("/recordings/qualification/build", s.handleAccountRecordingQualificationBuild)

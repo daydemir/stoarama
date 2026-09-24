@@ -75,6 +75,8 @@ var healthSignalLabels = map[string]string{
 	signalContinuousLayoutChange:     "Adjacent native clips changed media layout and may not losslessly stitch",
 	signalStoredClipInvalid:          "Latest stored clip is missing, truncated, or not decodable",
 	signalPreopenQualityGate:         "Pre-open source validation needs attention",
+	signalWindowGradePoor:            "Completed daily window graded E, F, or unknown (tier progress at risk)",
+	signalRelayResolveRate:           "Relay is re-resolving a stream source unusually often",
 }
 
 var healthSignalSeverity = map[string]string{
@@ -90,6 +92,8 @@ var healthSignalSeverity = map[string]string{
 	signalContinuousFragmented:       "HIGH",
 	signalContinuousLayoutChange:     "HIGH",
 	signalStoredClipInvalid:          "CRITICAL",
+	signalWindowGradePoor:            "HIGH",
+	signalRelayResolveRate:           "HIGH",
 }
 
 // healthIncident is one detected recording-health problem, enriched with the
@@ -167,18 +171,26 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		bySignal[inc.Signal]++
 	}
 
+	// Fleet checks that are not scoped to one recording ride every timeline
+	// sweep; failures there are logged and never suppress recording alerts.
+	staleDroplets, staleEmailed := 0, 0
+	if !*verifyMedia {
+		staleDroplets, staleEmailed = runStaleRecorderDropletAlerts(ctx, pool, cfg, *dryRun)
+	}
+
 	if *dryRun {
 		for _, inc := range incidents {
 			fmt.Printf("[dry-run] recording=%d signal=%s severity=%s org=%q name=%q since=%q diag=%q\n",
 				inc.RecordingID, inc.Signal, inc.Severity, inc.OrgName, inc.RecName, inc.SinceText, inc.Diag)
 		}
 		printJSON(map[string]any{
-			"dry_run":   true,
-			"run_class": healthRunClass(*verifyMedia, *liveOnly),
-			"detected":  len(incidents),
-			"by_signal": bySignal,
-			"notified":  0,
-			"emailed":   0,
+			"dry_run":                 true,
+			"run_class":               healthRunClass(*verifyMedia, *liveOnly),
+			"detected":                len(incidents),
+			"by_signal":               bySignal,
+			"notified":                0,
+			"emailed":                 0,
+			"stale_recorder_droplets": staleDroplets,
 		})
 		return
 	}
@@ -239,6 +251,8 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		"emailed":                  emailed,
 		"upload_intents_deleted":   maintenance.UploadIntentsDeleted,
 		"idempotency_keys_deleted": maintenance.IdempotencyKeysDeleted,
+		"stale_recorder_droplets":  staleDroplets,
+		"stale_droplet_emailed":    staleEmailed,
 	})
 }
 
@@ -510,13 +524,13 @@ const (
 
 var completedWindowHealthSignals = []string{
 	signalContinuousCoverageLow, signalContinuousOverlap, signalContinuousLongGap,
-	signalContinuousFragmented, signalContinuousLayoutChange,
+	signalContinuousFragmented, signalContinuousLayoutChange, signalWindowGradePoor,
 }
 
 var fullCurrentHealthSignals = []string{
 	signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
 	signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
-	signalClipTimestampDrift,
+	signalClipTimestampDrift, signalRelayResolveRate,
 }
 
 func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, freshnessMin int) recordingHealthDetection {
@@ -527,11 +541,20 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	incidents = append(incidents, detectStuckLease(ctx, pool)...)
 	incidents = append(incidents, detectSampledOverdue(ctx, pool)...)
 	incidents = append(incidents, detectClipTimestampDrift(ctx, pool)...)
+	incidents = append(incidents, detectRelayResolveChurn(ctx, pool, freshnessMin)...)
 	baseSignals := append([]string(nil), fullCurrentHealthSignals...)
 	historicalCtx, cancel := context.WithTimeout(ctx, completedWindowHealthTimeout)
 	defer cancel()
 	result := runCompletedWindowHealthStage(historicalCtx, incidents, func(stageCtx context.Context) ([]healthIncident, error) {
-		return detectCompletedWindowHealth(stageCtx, pool)
+		windows, err := detectCompletedWindowHealth(stageCtx, pool)
+		if err != nil {
+			return nil, err
+		}
+		grades, err := detectPoorWindowGrades(stageCtx, pool, time.Now().UTC())
+		if err != nil {
+			return nil, err
+		}
+		return append(windows, grades...), nil
 	})
 	result.evaluatedSignals = append(baseSignals, result.evaluatedSignals...)
 	incidents = result.incidents
@@ -616,6 +639,7 @@ func liveRecordingHealthDetectors() []liveHealthDetector {
 		{signalClipTimestampDrift, func(ctx context.Context, pool *pgxpool.Pool, _ int) []healthIncident {
 			return detectClipTimestampDrift(ctx, pool)
 		}},
+		{signalRelayResolveRate, detectRelayResolveChurn},
 	}
 }
 
