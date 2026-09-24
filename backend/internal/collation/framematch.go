@@ -21,6 +21,9 @@ func ExtractWindow(ctx context.Context, tools Tools, policy SeamPolicy, path str
 	w, h := policy.FrameWidth, policy.FrameHeight
 	window := strconv.FormatFloat(policy.WindowSeconds, 'f', -1, 64)
 	args := []string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1", "-filter_threads", "1", "-skip_loop_filter", "all"}
+	// passthrough: exactly one output frame per decoded source frame (VFR
+	// sources would otherwise be resampled to CFR with duplicated frames,
+	// misaligning frames with their packets' keyframe flags).
 	if tail {
 		args = append(args, "-sseof", "-"+window, "-i", path)
 	} else {
@@ -30,14 +33,14 @@ func ExtractWindow(ctx context.Context, tools Tools, policy SeamPolicy, path str
 	if policy.BlurSigma > 0 {
 		filter += fmt.Sprintf(",gblur=sigma=%g", policy.BlurSigma)
 	}
-	args = append(args, "-map", "0:v:0", "-an", "-vf", filter+",format=gray", "-f", "rawvideo", "-")
+	args = append(args, "-map", "0:v:0", "-an", "-vf", filter+",format=gray", "-fps_mode", "passthrough", "-f", "rawvideo", "-")
 	cmd := exec.CommandContext(ctx, tools.FFmpeg, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("decode %s window: %w: %s", map[bool]string{true: "tail", false: "head"}[tail], err, trimStderr(stderr.String()))
 	}
-	if s := strings.TrimSpace(stderr.String()); s != "" {
+	if s := decoderComplaints(stderr.String()); s != "" {
 		return nil, fmt.Errorf("decode window reported errors: %s", trimStderr(s))
 	}
 	raw := stdout.Bytes()

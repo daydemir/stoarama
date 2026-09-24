@@ -40,24 +40,16 @@ type nasUploadProbeRow struct {
 	JoinedTransferActive bool       `json:"joined_transfer_active"`
 	BytesPulledDuring    int64      `json:"bytes_pulled_during"`
 	ObjectsDeleted       bool       `json:"objects_deleted"`
-	BytesDownloaded      *int64     `json:"bytes_downloaded"`
-	DownloadDurationMS   *int64     `json:"download_duration_ms"`
-	DownloadMbps         *float64   `json:"download_mbps"`
-	DownloadError        string     `json:"download_error"`
 }
 
 type nasUploadProbeReport struct {
-	ConnectionID int64    `json:"connection_id"`
-	Label        string   `json:"label"`
-	OKCount      int      `json:"ok_count"`
-	MedianMbps   *float64 `json:"median_mbps"`
-	MinMbps      *float64 `json:"min_mbps"`
-	MaxMbps      *float64 `json:"max_mbps"`
-	// Downlink: complete probe downloads only. TB/day is the median sustained.
-	DownloadOKCount        int                 `json:"download_ok_count"`
-	DownloadMedianMbps     *float64            `json:"download_median_mbps"`
-	DownloadMedianTBPerDay *float64            `json:"download_median_tb_per_day"`
-	Probes                 []nasUploadProbeRow `json:"probes"`
+	ConnectionID int64               `json:"connection_id"`
+	Label        string              `json:"label"`
+	OKCount      int                 `json:"ok_count"`
+	MedianMbps   *float64            `json:"median_mbps"`
+	MinMbps      *float64            `json:"min_mbps"`
+	MaxMbps      *float64            `json:"max_mbps"`
+	Probes       []nasUploadProbeRow `json:"probes"`
 }
 
 func parseNASUploadProbeArgs(args []string) (nasUploadProbeOptions, error) {
@@ -115,8 +107,7 @@ func loadNASUploadProbeReport(ctx context.Context, pool *pgxpool.Pool, opts nasU
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT id,created_at,expires_at,reported_at,size_bytes,streams,bytes_uploaded,duration_ms,error,client_version,
-		       client_phase_start,client_phase_end,joined_transfer_active,bytes_pulled_during,objects_deleted_at IS NOT NULL,
-		       bytes_downloaded,download_duration_ms,download_error
+		       client_phase_start,client_phase_end,joined_transfer_active,bytes_pulled_during,objects_deleted_at IS NOT NULL
 		FROM nas_upload_probes WHERE connection_id=$1 ORDER BY created_at DESC, id DESC LIMIT $2`,
 		opts.connectionID, opts.limit)
 	if err != nil {
@@ -128,8 +119,7 @@ func loadNASUploadProbeReport(ctx context.Context, pool *pgxpool.Pool, opts nasU
 		var expiresAt time.Time
 		if err := rows.Scan(&row.ID, &row.CreatedAt, &expiresAt, &row.ReportedAt, &row.SizeBytes, &row.Streams,
 			&row.BytesUploaded, &row.DurationMS, &row.Error, &row.ClientVersion, &row.ClientPhaseStart,
-			&row.ClientPhaseEnd, &row.JoinedTransferActive, &row.BytesPulledDuring, &row.ObjectsDeleted,
-			&row.BytesDownloaded, &row.DownloadDurationMS, &row.DownloadError); err != nil {
+			&row.ClientPhaseEnd, &row.JoinedTransferActive, &row.BytesPulledDuring, &row.ObjectsDeleted); err != nil {
 			return report, err
 		}
 		row.Status = nasUploadProbeStatus(row, expiresAt, now)
@@ -137,17 +127,12 @@ func loadNASUploadProbeReport(ctx context.Context, pool *pgxpool.Pool, opts nasU
 			mbps := float64(*row.BytesUploaded) * 8 / (float64(*row.DurationMS) / 1000) / 1e6
 			row.Mbps = &mbps
 		}
-		if row.BytesDownloaded != nil && row.DownloadDurationMS != nil && *row.DownloadDurationMS > 0 {
-			mbps := float64(*row.BytesDownloaded) * 8 / (float64(*row.DownloadDurationMS) / 1000) / 1e6
-			row.DownloadMbps = &mbps
-		}
 		report.Probes = append(report.Probes, row)
 	}
 	if err := rows.Err(); err != nil {
 		return report, err
 	}
 	summarizeNASUploadProbes(&report)
-	summarizeNASDownloadProbes(&report)
 	return report, nil
 }
 
@@ -187,26 +172,6 @@ func summarizeNASUploadProbes(report *nasUploadProbeReport) {
 	report.MedianMbps, report.MinMbps, report.MaxMbps = &median, &minimum, &maximum
 }
 
-func summarizeNASDownloadProbes(report *nasUploadProbeReport) {
-	var values []float64
-	for _, row := range report.Probes {
-		if row.DownloadMbps != nil && row.DownloadError == "" && row.BytesDownloaded != nil && *row.BytesDownloaded == row.SizeBytes {
-			values = append(values, *row.DownloadMbps)
-		}
-	}
-	report.DownloadOKCount = len(values)
-	if len(values) == 0 {
-		return
-	}
-	sort.Float64s(values)
-	median := values[len(values)/2]
-	if len(values)%2 == 0 {
-		median = (values[len(values)/2-1] + values[len(values)/2]) / 2
-	}
-	tbPerDay := median * 1e6 / 8 * 86400 / 1e12
-	report.DownloadMedianMbps, report.DownloadMedianTBPerDay = &median, &tbPerDay
-}
-
 func writeNASUploadProbeReport(out io.Writer, report nasUploadProbeReport, asJSON bool) error {
 	if asJSON {
 		enc := json.NewEncoder(out)
@@ -227,10 +192,6 @@ func writeNASUploadProbeReport(out io.Writer, report nasUploadProbeReport, asJSO
 	if report.MedianMbps != nil {
 		fmt.Fprintf(out, "Complete uploads shown: %d  median %.1f Mbps  min %.1f  max %.1f\n",
 			report.OKCount, *report.MedianMbps, *report.MinMbps, *report.MaxMbps)
-	}
-	if report.DownloadMedianMbps != nil {
-		fmt.Fprintf(out, "Complete downloads shown: %d  median %.1f Mbps (%.2f TB/day sustained)\n",
-			report.DownloadOKCount, *report.DownloadMedianMbps, *report.DownloadMedianTBPerDay)
 	}
 	fmt.Fprintf(out, "%-7s %-20s %-9s %9s %7s %9s %10s %-17s %-6s %s\n",
 		"ID", "CREATED_UTC", "STATUS", "MIB", "STREAMS", "SECONDS", "MBPS", "PHASE", "JOINED", "ERROR")

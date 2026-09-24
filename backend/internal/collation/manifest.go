@@ -189,9 +189,8 @@ func (m HourManifest) Validate() error {
 	}
 	for _, s := range m.Seams {
 		pp, np := partOf[s.PrevClipID], partOf[s.NextClipID]
-		// Seams touching a clip excluded after the decision (duplicate capture)
-		// carry no part relation; every other seam must match the parts.
-		if pp != 0 && np != 0 && (pp == np) != (s.Decision == DecisionJoin) {
+		// A seam is a join exactly when both clips sit in the same output.
+		if (pp == np && pp != 0) != (s.Decision == DecisionJoin) {
 			return fmt.Errorf("seam %d->%d decision differs from parts", s.PrevClipID, s.NextClipID)
 		}
 		if s.Decision == DecisionJoin && (s.Match == nil || s.Match.Verdict != MatchContinuous) {

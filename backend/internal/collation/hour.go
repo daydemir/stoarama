@@ -340,8 +340,19 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 			finalPart[clips[i].ClipID] = p + 1
 		}
 	}
+	dispOf := map[int64]ClipDisposition{}
+	for _, d := range disp {
+		dispOf[d.Clip.ClipID] = d
+	}
 	for k := range seams {
-		if seams[k].Decision == DecisionJoin && finalPart[seams[k].PrevClipID] != finalPart[seams[k].NextClipID] {
+		if seams[k].Decision != DecisionJoin {
+			continue
+		}
+		pp, np := finalPart[seams[k].PrevClipID], finalPart[seams[k].NextClipID]
+		switch {
+		case dispOf[seams[k].PrevClipID].Reason == "duplicate_capture_chain" || dispOf[seams[k].NextClipID].Reason == "duplicate_capture_chain":
+			seams[k].Decision, seams[k].Reason = DecisionSplit, "duplicate_capture_chain"
+		case pp == 0 || np == 0 || pp != np:
 			seams[k].Decision, seams[k].Reason = DecisionSplit, "isolated_after_verify_failure"
 		}
 	}
