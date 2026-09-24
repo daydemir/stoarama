@@ -79,6 +79,10 @@ var ErrSpendBudget = errors.New("scale-up blocked by DO spend guard")
 // cron emails operators about it and resolves it once it stops recurring.
 const SpendBlockedSignal = "do_spend_scaleup_blocked"
 
+// spendQuoteTimeout bounds the guard's account read so a stalled DO API
+// cannot wedge the tick; a timeout fails open like any other quote error.
+const spendQuoteTimeout = time.Minute
+
 // spendQuote caches one guard quote per tick and accumulates the droplets this
 // tick has already added, so a batch cannot step past the ceiling one by one.
 type spendQuote struct {
@@ -747,7 +751,9 @@ func (c *Controller) checkSpendBudget(ctx context.Context, now time.Time) error 
 		return nil
 	}
 	if c.spend == nil {
-		burn, size, err := g.Quote(ctx, c.cfg.Size)
+		quoteCtx, cancel := context.WithTimeout(ctx, spendQuoteTimeout)
+		burn, size, err := g.Quote(quoteCtx, c.cfg.Size)
+		cancel()
 		if err != nil {
 			log.Printf("droplet pool: DO spend guard quote failed; scale-up limited by hard cap max=%d only this tick: %v", c.cfg.Max, err)
 			c.spend = &spendQuote{unavailable: true}

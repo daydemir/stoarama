@@ -268,6 +268,16 @@ services:
       # (burn/budget/unmanaged-resource alerts). Same token as recorder-control.
       - key: DO_API_TOKEN
         sync: false
+      # Keep DO_SPEND_* identical on recorder-control, recording-health, and
+      # recording-health-summary; each service reads them independently.
+      - key: DO_SPEND_WARN_USD_PER_DAY
+        value: "5"
+      - key: DO_SPEND_CRITICAL_USD_PER_DAY
+        value: "10"
+      - key: DO_SPEND_MONTHLY_BUDGET_USD
+        value: "150"
+      - key: DO_SPEND_ALLOWLIST
+        value: "stoarama-survey-*,copresence-*"
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -326,6 +336,16 @@ services:
       # DigitalOcean spend section of the digest.
       - key: DO_API_TOKEN
         sync: false
+      # Keep DO_SPEND_* identical on recorder-control, recording-health, and
+      # recording-health-summary; each service reads them independently.
+      - key: DO_SPEND_WARN_USD_PER_DAY
+        value: "5"
+      - key: DO_SPEND_CRITICAL_USD_PER_DAY
+        value: "10"
+      - key: DO_SPEND_MONTHLY_BUDGET_USD
+        value: "150"
+      - key: DO_SPEND_ALLOWLIST
+        value: "stoarama-survey-*,copresence-*"
       - key: APP_BASE_URL
         value: https://stoarama.com
       - key: EMAIL_PROVIDER
@@ -530,7 +550,16 @@ services:
       # account burn (list price of every droplet, volume, snapshot) past
       # DO_SPEND_CRITICAL_USD_PER_DAY is skipped and alerted. Unset = defaults
       # (warn 5, critical 10, budget 150); the hourly recording-health cron reads
-      # the same keys. Kill switch: DO_SPEND_SCALEUP_GUARD_ENABLED=false.
+      # the same keys, so change them on all three services together.
+      # Kill switch: DO_SPEND_SCALEUP_GUARD_ENABLED=false.
+      - key: DO_SPEND_WARN_USD_PER_DAY
+        value: "5"
+      - key: DO_SPEND_CRITICAL_USD_PER_DAY
+        value: "10"
+      - key: DO_SPEND_MONTHLY_BUDGET_USD
+        value: "150"
+      - key: DO_SPEND_ALLOWLIST
+        value: "stoarama-survey-*,copresence-*"
       - key: BOOTSTRAP_ADMIN_EMAIL
         sync: false
       - key: DROPLET_POOL_ENABLED

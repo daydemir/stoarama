@@ -11,6 +11,7 @@ package dospend
 
 import (
 	"fmt"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -94,6 +95,16 @@ func ParseAllowlist(raw string) []string {
 
 // Validate rejects nonsensical thresholds so a typo cannot disable the guard.
 func (c Config) Validate() error {
+	// strconv.ParseFloat accepts NaN and Inf; either would silently disable or
+	// wedge every comparison below.
+	for _, t := range []struct {
+		name string
+		v    float64
+	}{{"warn", c.WarnUSDPerDay}, {"critical", c.CriticalUSDPerDay}, {"monthly budget", c.MonthlyBudgetUSD}} {
+		if math.IsNaN(t.v) || math.IsInf(t.v, 0) {
+			return fmt.Errorf("DO spend %s threshold must be finite, got %v", t.name, t.v)
+		}
+	}
 	if c.WarnUSDPerDay <= 0 || c.CriticalUSDPerDay <= 0 || c.MonthlyBudgetUSD <= 0 {
 		return fmt.Errorf("DO spend thresholds must be > 0 (warn=%v critical=%v budget=%v)", c.WarnUSDPerDay, c.CriticalUSDPerDay, c.MonthlyBudgetUSD)
 	}

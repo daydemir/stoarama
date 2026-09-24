@@ -38,6 +38,11 @@ const (
 // tripwire; anything left running past it pages.
 const doUnmanagedMinAge = time.Hour
 
+// doSpendReadTimeout bounds one full account read (balance plus paginated
+// inventory), so a stalled DO API cannot hold the recording-health timeline
+// lock or withhold the digest.
+const doSpendReadTimeout = 2 * time.Minute
+
 // doSpendBlockedStaleAfter resolves the controller's scale-up-blocked episode
 // once the controller has not re-noted it for this long.
 const doSpendBlockedStaleAfter = 2 * time.Hour
@@ -87,7 +92,9 @@ func buildDOSpendReport(ctx context.Context, cfg config.Config, pool *pgxpool.Po
 	if err != nil {
 		return dospend.Report{}, fmt.Errorf("DO_API_TOKEN: %w", err)
 	}
-	inv, err := client.Inventory(ctx, true)
+	readCtx, cancel := context.WithTimeout(ctx, doSpendReadTimeout)
+	defer cancel()
+	inv, err := client.Inventory(readCtx, true)
 	if err != nil {
 		return dospend.Report{}, err
 	}
@@ -287,7 +294,7 @@ func composeDOSpendEmail(r dospend.Report, blocked bool) (string, string) {
 	subject := "[Stoarama] DigitalOcean spend: " + strings.Join(parts, "; ")
 	var b strings.Builder
 	if blocked {
-		b.WriteString("The recorder pool controller BLOCKED a scale-up because the account burn plus one more droplet would exceed the critical ceiling.\nScheduled recordings may be short of capacity. Remove the spend that is not the pool, or raise DO_SPEND_CRITICAL_USD_PER_DAY on stoarama-recorder-control and redeploy.\n\n")
+		b.WriteString("The recorder pool controller BLOCKED a scale-up because the account burn plus one more droplet would exceed the critical ceiling.\nScheduled recordings may be short of capacity. Remove the spend that is not the pool, or raise DO_SPEND_CRITICAL_USD_PER_DAY on stoarama-recorder-control, stoarama-recording-health, and stoarama-recording-health-summary, then redeploy recorder-control.\n\n")
 	}
 	if len(r.Unmanaged) > 0 {
 		b.WriteString("Droplets/volumes below are not owned by the recorder pool and not in DO_SPEND_ALLOWLIST. Destroy them if nobody claims them, or add them to the allowlist.\n\n")

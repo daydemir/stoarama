@@ -108,6 +108,13 @@ func TestConfigValidate(t *testing.T) {
 	if bad.Validate() == nil {
 		t.Fatal("zero critical accepted")
 	}
+	for _, v := range []float64{math.NaN(), math.Inf(1)} {
+		bad = testConfig()
+		bad.CriticalUSDPerDay = v
+		if bad.Validate() == nil {
+			t.Fatalf("non-finite critical %v accepted", v)
+		}
+	}
 	bad = testConfig()
 	bad.Allowlist = []string{"["}
 	if bad.Validate() == nil {
