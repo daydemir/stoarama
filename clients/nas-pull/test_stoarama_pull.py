@@ -3482,6 +3482,7 @@ class UploadProbeTests(unittest.TestCase):
             def request(self, method, path, headers):
                 assert method == "GET" and headers["User-Agent"] == pull.USER_AGENT
                 self.path = path
+            sock = None
             def getresponse(self):
                 return Response(*Connection.sizes[self.path])
             def close(self):
@@ -3497,6 +3498,21 @@ class UploadProbeTests(unittest.TestCase):
         with mock.patch.object(pull.http.client, "HTTPSConnection", Connection):
             total, _, error = pull.run_download_probe(parts)
         self.assertIn("received", error)
+        self.assertEqual(total, parts[0]["size_bytes"] + 10 + parts[2]["size_bytes"])
+        # Bytes read before a failure still count toward the reported total.
+        original = Response.read
+        def failing_read(self, n):
+            if self.remaining < 1024 * 1024:
+                raise OSError("reset")
+            return original(self, n)
+        Connection.sizes["/p1?sig"] = (3 * 1024 * 1024 + 1,)
+        with mock.patch.object(pull.http.client, "HTTPSConnection", Connection), mock.patch.object(Response, "read", failing_read):
+            total, _, error = pull.run_download_probe(parts[1:2])
+        self.assertIn("reset", error)
+        self.assertEqual(total, 3 * 1024 * 1024)
+        with mock.patch.object(pull, "UPLOAD_PROBE_MAX_SEC", -1):
+            _, _, error = pull.run_download_probe(parts[:1])
+        self.assertIn("time cap", error)
         Connection.sizes["/p1?sig"] = (0, 403)
         with mock.patch.object(pull.http.client, "HTTPSConnection", Connection):
             _, _, error = pull.run_download_probe(parts)

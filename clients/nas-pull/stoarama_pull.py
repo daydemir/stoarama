@@ -6032,27 +6032,35 @@ def valid_download_probe_parts(target, upload_parts):
     return valid
 
 
-def download_probe_part(part, deadline):
-    """Read one probe object and discard it. Returns the bytes received."""
+def download_probe_part(part, deadline, progress):
+    """Read one probe object and discard it, counting bytes into progress[0].
+
+    Every blocking call gets the remaining overall deadline as its socket
+    timeout, so a stalled GET ends near the probe's time cap."""
     url = part["url"]
-    connection = http.client.HTTPSConnection(
-        url.netloc, timeout=UPLOAD_PROBE_SOCKET_TIMEOUT_SEC, blocksize=UPLOAD_PROBE_BLOCK_BYTES,
-    )
-    received = 0
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise RuntimeError("download probe exceeded its time cap")
+        return min(UPLOAD_PROBE_SOCKET_TIMEOUT_SEC, left)
+    connection = http.client.HTTPSConnection(url.netloc, timeout=remaining(), blocksize=UPLOAD_PROBE_BLOCK_BYTES)
     try:
         connection.request("GET", url.path + ("?" + url.query if url.query else ""), headers={"User-Agent": USER_AGENT})
+        if connection.sock is not None:
+            connection.sock.settimeout(remaining())
         response = connection.getresponse()
         if response.status != 200:
-            response.read(64 * 1024)
             raise RuntimeError("download probe GET returned HTTP %d" % response.status)
-        while received < part["size_bytes"]:
-            if time.monotonic() > deadline:
-                raise RuntimeError("download probe exceeded its time cap")
-            block = response.read(min(UPLOAD_PROBE_BLOCK_BYTES, part["size_bytes"] - received))
+        while progress[0] < part["size_bytes"]:
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining())
+            else:
+                remaining()
+            block = response.read(min(UPLOAD_PROBE_BLOCK_BYTES, part["size_bytes"] - progress[0]))
             if not block:
                 break
-            received += len(block)
-        return received
+            progress[0] += len(block)
     finally:
         connection.close()
 
@@ -6061,10 +6069,10 @@ def run_download_probe(parts):
     """Download all parts concurrently; returns (bytes, duration_ms, error)."""
     started = time.monotonic()
     deadline = started + UPLOAD_PROBE_MAX_SEC
-    received, errors = [0] * len(parts), []
+    progress, errors = [[0] for _ in parts], []
 
     def fetch(index, part):
-        received[index] = download_probe_part(part, deadline)
+        download_probe_part(part, deadline, progress[index])
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(parts)) as pool:
         futures = [pool.submit(fetch, i, part) for i, part in enumerate(parts)]
         for future in futures:
@@ -6074,7 +6082,7 @@ def run_download_probe(parts):
                 errors.append(exc)
     duration_ms = max(1, round((time.monotonic() - started) * 1000))
     size = sum(part["size_bytes"] for part in parts)
-    total = min(size, sum(received))
+    total = min(size, sum(p[0] for p in progress))
     error = ""
     if errors:
         error = ("%s: %s" % (type(errors[0]).__name__, errors[0]))[:500]
