@@ -116,6 +116,20 @@ type recordingLeaseResponse struct {
 // statement. Heartbeats intentionally retain only node/group locks, so a slow job
 // row cannot couple independent internet groups. Params: $1=NodeID,
 // $2=billingDisabled, $3=margin, $4=freshnessGrace.
+//
+// Placement stability. A continuous window is sticky to the node that completed
+// the recording's previous window (its affinity node): that node may take the
+// window without waiting for group or machine balancing, and every other node
+// defers to it for the bounded 12-second fairness turn while it is online, has
+// node capacity, and has not failed this window. Balancing therefore applies to
+// new placements and contention, not to a stream that already has a healthy
+// home. Conversely, a node that surrendered this window for lack of progress
+// (recording_job_node_failures) yields it to nodes that have not failed it: it
+// waits an extra 30 seconds per recorded failure, capped at two minutes, after
+// the turn starts, but only while an online peer with capacity that has not
+// failed the window could take it. A node that cannot capture a source (for
+// example a TLS chain its FFmpeg rejects) thus stops receiving that window while
+// a peer can take it, and retries immediately when no such peer exists.
 const relayLeaseSQL = `
 	WITH cte AS (
 	  SELECT j.id
@@ -126,6 +140,18 @@ const relayLeaseSQL = `
 	    AND n.node_type = 'relay'
 	    AND n.status = 'active'
 	    AND n.last_heartbeat_at >= now() - interval '120 seconds'
+	  LEFT JOIN recording_job_node_failures own_failure
+	    ON own_failure.recording_job_id = j.id AND own_failure.node_id = n.id
+	  LEFT JOIN LATERAL (
+	    SELECT prev.lease_owner
+	    FROM recording_jobs prev
+	    WHERE prev.recording_id = j.recording_id
+	      AND prev.kind = 'continuous_window'
+	      AND prev.status = 'done'
+	      AND prev.fire_at < j.fire_at
+	    ORDER BY prev.fire_at DESC
+	    LIMIT 1
+	  ) affinity ON j.kind = 'continuous_window'
 	  WHERE j.status = 'pending'
 	    AND j.scheduled_for <= now()
 	    AND ((j.kind = 'continuous_window' AND j.window_end_at > now())
@@ -157,6 +183,65 @@ const relayLeaseSQL = `
 	         WHERE aj.status = 'leased'
 	           AND aj.lease_owner = 'node:' || $1::text
 	           AND aj.lease_expires_at > now()) < n.relay_max_streams
+	    -- Failure yield: a node that already surrendered this window for lack of
+	    -- progress waits behind nodes that have not (see the header comment).
+	    AND (own_failure.node_id IS NULL
+	         OR j.relay_fairness_started_at <= now() - make_interval(secs => 12 + 30 * LEAST(own_failure.failure_count, 4))
+	         OR NOT EXISTS (
+	              SELECT 1 FROM nodes fresh_peer
+	              WHERE fresh_peer.account_id = rec.account_id
+	                AND fresh_peer.id <> n.id
+	                AND fresh_peer.node_type = 'relay'
+	                AND fresh_peer.status = 'active'
+	                AND fresh_peer.last_heartbeat_at >= now()-interval '120 seconds'
+	                AND (NOT EXISTS (
+	                       SELECT 1 FROM streams fresh_peer_stream
+	                       WHERE fresh_peer_stream.id=rec.stream_id AND fresh_peer_stream.execution_class='youtube_direct')
+	                     OR (jsonb_typeof(fresh_peer.capabilities_jsonb->'youtube_ready') = 'boolean'
+	                         AND (fresh_peer.capabilities_jsonb->>'youtube_ready')::boolean))
+	                AND (j.handoff_owner IS DISTINCT FROM 'node:' || fresh_peer.id::text OR j.handoff_until <= now())
+	                AND NOT EXISTS (
+	                     SELECT 1 FROM recording_job_node_failures peer_failure
+	                     WHERE peer_failure.recording_job_id = j.id AND peer_failure.node_id = fresh_peer.id)
+	                AND (SELECT COUNT(*) FROM recording_jobs fresh_peer_jobs
+	                     WHERE fresh_peer_jobs.status = 'leased'
+	                       AND fresh_peer_jobs.lease_owner = 'node:' || fresh_peer.id::text
+	                       AND fresh_peer_jobs.lease_expires_at > now()) < fresh_peer.relay_max_streams
+	                AND (fresh_peer.relay_group_id IS NULL OR (
+	                     SELECT COUNT(*)
+	                     FROM recording_jobs fresh_group_jobs
+	                     JOIN nodes fresh_group_nodes ON fresh_group_jobs.lease_owner='node:'||fresh_group_nodes.id::text
+	                     WHERE fresh_group_nodes.account_id = rec.account_id
+	                       AND fresh_group_nodes.relay_group_id = fresh_peer.relay_group_id
+	                       AND fresh_group_jobs.status = 'leased'
+	                       AND fresh_group_jobs.lease_expires_at > now()) < (
+	                     SELECT fresh_group.max_streams FROM relay_groups fresh_group
+	                     WHERE fresh_group.id = fresh_peer.relay_group_id AND fresh_group.account_id = rec.account_id))))
+	    -- Affinity: while the previous window's node can take this window, other
+	    -- nodes wait for the fairness turn instead of pulling the stream away.
+	    AND (affinity.lease_owner IS NULL
+	         OR affinity.lease_owner = 'node:' || n.id::text
+	         OR j.relay_fairness_started_at <= now()-interval '12 seconds'
+	         OR NOT EXISTS (
+	              SELECT 1 FROM nodes sticky
+	              WHERE 'node:' || sticky.id::text = affinity.lease_owner
+	                AND sticky.account_id = rec.account_id
+	                AND sticky.node_type = 'relay'
+	                AND sticky.status = 'active'
+	                AND sticky.last_heartbeat_at >= now()-interval '120 seconds'
+	                AND (NOT EXISTS (
+	                       SELECT 1 FROM streams sticky_stream
+	                       WHERE sticky_stream.id=rec.stream_id AND sticky_stream.execution_class='youtube_direct')
+	                     OR (jsonb_typeof(sticky.capabilities_jsonb->'youtube_ready') = 'boolean'
+	                         AND (sticky.capabilities_jsonb->>'youtube_ready')::boolean))
+	                AND (j.handoff_owner IS DISTINCT FROM affinity.lease_owner OR j.handoff_until <= now())
+	                AND NOT EXISTS (
+	                     SELECT 1 FROM recording_job_node_failures sticky_failure
+	                     WHERE sticky_failure.recording_job_id = j.id AND sticky_failure.node_id = sticky.id)
+	                AND (SELECT COUNT(*) FROM recording_jobs sticky_jobs
+	                     WHERE sticky_jobs.status = 'leased'
+	                       AND sticky_jobs.lease_owner = affinity.lease_owner
+	                       AND sticky_jobs.lease_expires_at > now()) < sticky.relay_max_streams))
 	    -- A recording may softly prefer one internet group. The preferred group gets
 	    -- the same bounded 12-second first opportunity as ordinary fairness, but an
 	    -- unavailable/full/non-polling preferred group can never strand capture.
@@ -201,6 +286,7 @@ const relayLeaseSQL = `
 	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds'
 	         OR n.relay_group_id IS NULL
 	         OR n.relay_group_id=rec.preferred_relay_group_id
+	         OR (affinity.lease_owner = 'node:' || n.id::text AND own_failure.node_id IS NULL)
 	         OR NOT EXISTS (
 	         SELECT 1
 	         FROM relay_groups peer_group
@@ -254,7 +340,9 @@ const relayLeaseSQL = `
 	    -- The surrounding group row lock makes this comparison authoritative, so
 	    -- simultaneous pollers converge on an even distribution instead of the
 	    -- fastest poller monopolizing long continuous-window leases.
-	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds' OR n.relay_group_id IS NULL OR NOT EXISTS (
+	    AND (j.relay_fairness_started_at <= now()-interval '12 seconds' OR n.relay_group_id IS NULL
+	         OR (affinity.lease_owner = 'node:' || n.id::text AND own_failure.node_id IS NULL)
+	         OR NOT EXISTS (
 	         SELECT 1 FROM nodes peer
 	         WHERE peer.account_id=n.account_id
 	           AND peer.relay_group_id=n.relay_group_id
@@ -286,7 +374,7 @@ const relayLeaseSQL = `
 	         WHERE g.id=n.relay_group_id AND g.account_id=n.account_id))
 	  ORDER BY j.scheduled_for ASC, j.id ASC
 	  LIMIT 1
-	  FOR UPDATE SKIP LOCKED
+	  FOR UPDATE OF j, rec, n SKIP LOCKED
 	), cleared_canaries AS (
 	  -- Production always outranks a diagnostic canary. The surrounding
 	  -- account/node/group locks serialize this with reservation creation; once a
@@ -1656,7 +1744,13 @@ func sanitizeRecordingSurrenderError(raw, fallback string) string {
 	return string(runes)
 }
 
+// recordingJobSurrenderSQL releases a relay's continuous lease. $5 is the
+// surrendering node id and $6 whether the surrender is a no-progress failure;
+// only such failures are remembered for failure-yield placement. Disk pressure
+// and self-update are node conditions, not evidence the node cannot capture the
+// source.
 const recordingJobSurrenderSQL = `
+	WITH surrendered AS (
 	UPDATE recording_jobs j
 	SET status = 'pending',
 	    scheduled_for = now(),
@@ -1676,7 +1770,15 @@ const recordingJobSurrenderSQL = `
 	  AND j.lease_owner=$2
 	  AND j.lease_token IS NOT DISTINCT FROM $4
 	  AND j.lease_expires_at > now()
-	RETURNING j.handoff_until
+	RETURNING j.id, j.handoff_until
+	), failure AS (
+	  INSERT INTO recording_job_node_failures (recording_job_id, node_id, failure_count, last_failed_at)
+	  SELECT surrendered.id, $5, 1, now() FROM surrendered WHERE $6
+	  ON CONFLICT (recording_job_id, node_id) DO UPDATE
+	    SET failure_count = recording_job_node_failures.failure_count + 1,
+	        last_failed_at = EXCLUDED.last_failed_at
+	)
+	SELECT handoff_until FROM surrendered
 `
 
 const recordingJobCloudSurrenderSQL = `
@@ -1776,6 +1878,8 @@ func (s *Server) handleRecordingJobSurrender(w http.ResponseWriter, r *http.Requ
 			recorderWorkerID(principal),
 			errorText,
 			leaseToken,
+			principal.NodeID,
+			req.Reason == recordingJobSurrenderNoProgress,
 		).Scan(&handoffUntil)
 		nextRetryAt = time.Now()
 	}

@@ -259,3 +259,38 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// WorkerLastLiveAt is the freshest liveness evidence for a worker: its droplet
+// heartbeat (last_seen_at) or its node heartbeat, whichever is newer. A row with
+// neither falls back to its creation instant, so an active row that never
+// reported in still ages toward the stale threshold instead of living forever.
+func WorkerLastLiveAt(d Droplet) time.Time {
+	last := d.CreatedAt
+	for _, t := range []*time.Time{d.LastSeenAt, d.NodeHeartbeatAt} {
+		if t != nil && t.After(last) {
+			last = *t
+		}
+	}
+	return last
+}
+
+// UnresponsiveDroplets returns the active droplets whose worker has not proven
+// liveness for at least staleAfter. Provisioning rows are excluded: reconcile
+// already reaps them at ProvisionTimeout. A non-positive staleAfter disables the
+// check. Lease safety is not decided here; the caller must still retire each
+// candidate through the atomic idle-verified transition.
+func UnresponsiveDroplets(droplets []Droplet, now time.Time, staleAfter time.Duration) []Droplet {
+	if staleAfter <= 0 {
+		return nil
+	}
+	out := make([]Droplet, 0)
+	for _, d := range droplets {
+		if d.State != "active" {
+			continue
+		}
+		if now.Sub(WorkerLastLiveAt(d)) >= staleAfter {
+			out = append(out, d)
+		}
+	}
+	return out
+}

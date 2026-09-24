@@ -26,9 +26,15 @@ type Config struct {
 	DrainTimeout      time.Duration
 	ScaleUpCooldown   time.Duration
 	ScaleDownCooldown time.Duration
-	Min               int
-	Max               int
-	MaxScaleUpBatch   int
+	// StaleHeartbeatTimeout retires an active shared worker whose droplet and
+	// node heartbeats are both older than this, once it holds no live lease.
+	// A dead worker otherwise counts as live capacity and bills indefinitely,
+	// because reconcile only notices droplets that vanished from the provider.
+	// Zero disables the check.
+	StaleHeartbeatTimeout time.Duration
+	Min                   int
+	Max                   int
+	MaxScaleUpBatch       int
 
 	Region     string
 	Size       string
@@ -86,9 +92,9 @@ func NewController(pool *pgxpool.Pool, doClient DOClient, cfg Config) *Controlle
 
 // Run drives the autoscaler tick loop until ctx is canceled.
 func (c *Controller) Run(ctx context.Context) error {
-	log.Printf("droplet pool start tick=%s lookahead=%s capacity=%d min=%d max=%d lead=%s idle_grace=%s drain_timeout=%s reclaim=%t",
+	log.Printf("droplet pool start tick=%s lookahead=%s capacity=%d min=%d max=%d lead=%s idle_grace=%s drain_timeout=%s stale_heartbeat=%s reclaim=%t",
 		c.cfg.TickInterval, c.cfg.Lookahead, c.cfg.Capacity, c.cfg.Min, c.cfg.Max,
-		c.cfg.ProvisionLead, c.cfg.IdleGrace, c.cfg.DrainTimeout, c.cfg.ReclaimLeases)
+		c.cfg.ProvisionLead, c.cfg.IdleGrace, c.cfg.DrainTimeout, c.cfg.StaleHeartbeatTimeout, c.cfg.ReclaimLeases)
 	ticker := time.NewTicker(c.cfg.TickInterval)
 	defer ticker.Stop()
 	if err := c.tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -151,6 +157,10 @@ func (c *Controller) tick(ctx context.Context) error {
 				fleetReadRecoveryDwell, outageDuration.Truncate(time.Second), failures)
 		}
 	}
+
+	// Retire workers that stopped heartbeating before counting capacity, so the
+	// same tick's scale decision replaces them instead of trusting dead slots.
+	c.reapUnresponsive(ctx, now)
 
 	// Refresh per-droplet idle tracking before deciding.
 	if err := c.refreshIdle(ctx); err != nil {
@@ -752,13 +762,47 @@ func (c *Controller) progressDrains(ctx context.Context, now time.Time) {
 		if busy && forced {
 			log.Printf("droplet pool: drain timeout exceeded for id=%d name=%s; forcing destroy", d.ID, d.Name)
 		}
-		c.destroyDraining(ctx, d)
+		c.destroyWorker(ctx, d)
 	}
 }
 
-// destroyDraining deletes a draining droplet's DO instance, revokes its node
-// token, and marks the row destroyed.
-func (c *Controller) destroyDraining(ctx context.Context, d Droplet) {
+// reapUnresponsive retires active shared workers whose heartbeats went stale.
+// It runs only after a fresh fleet reconcile and never bypasses lease safety:
+// BeginDestroyIfIdle locks the row the lease path locks, proves no live lease,
+// and moves it to destroying atomically. A worker that still holds a live lease
+// is retained; its lease expires without renewal, reclaim requeues the job, and
+// a later tick retires the worker. The same transaction re-proves the silence,
+// so a worker that heartbeats after this tick's snapshot is never retired. A provider delete failure leaves the row in
+// destroying, which reconcile resumes idempotently.
+func (c *Controller) reapUnresponsive(ctx context.Context, now time.Time) {
+	if c.cfg.StaleHeartbeatTimeout <= 0 {
+		return
+	}
+	active, err := c.store.ListSharedByStates(ctx, "active")
+	if err != nil {
+		log.Printf("droplet pool: list active for heartbeat check: %v", err)
+		return
+	}
+	for _, d := range UnresponsiveDroplets(active, now, c.cfg.StaleHeartbeatTimeout) {
+		silent := now.Sub(WorkerLastLiveAt(d)).Truncate(time.Second)
+		retired, err := c.store.BeginDestroyIfIdleAndSilent(ctx, d.ID, now.Add(-c.cfg.StaleHeartbeatTimeout))
+		if err != nil {
+			log.Printf("droplet pool: CRITICAL cannot atomically verify idle before retiring unresponsive droplet id=%d name=%s silent=%s; teardown skipped: %v", d.ID, d.Name, silent, err)
+			continue
+		}
+		if !retired {
+			log.Printf("droplet pool: WARNING unresponsive droplet id=%d name=%s silent=%s holds a live lease, heartbeated again, or changed state; retained", d.ID, d.Name, silent)
+			continue
+		}
+		log.Printf("droplet pool: WARNING retiring unresponsive droplet id=%d name=%s silent=%s threshold=%s", d.ID, d.Name, silent, c.cfg.StaleHeartbeatTimeout)
+		c.destroyWorker(ctx, d)
+	}
+}
+
+// destroyWorker deletes a worker's DO instance, revokes its node token, and
+// marks the row destroyed. Callers have already removed the worker from lease
+// eligibility (draining, or destroying via the idle-verified transition).
+func (c *Controller) destroyWorker(ctx context.Context, d Droplet) {
 	if err := c.store.MarkDestroying(ctx, d.ID); err != nil {
 		log.Printf("droplet pool: mark destroying %s: %v", d.Name, err)
 		return

@@ -13,22 +13,26 @@ import (
 
 // Droplet is the controller's view of a recorder_droplets row.
 type Droplet struct {
-	ID             int64
-	Name           string
-	NodeID         *int64
-	NodeTokenID    *int64
-	DODropletID    *int64
-	Region         string
-	Size           string
-	Capacity       int
-	State          string
-	PoolRole       string
-	IPAddress      string
-	BuildSHA       string
-	LastSeenAt     *time.Time
-	IdleSince      *time.Time
-	DrainStartedAt *time.Time
-	CreatedAt      time.Time
+	ID          int64
+	Name        string
+	NodeID      *int64
+	NodeTokenID *int64
+	DODropletID *int64
+	Region      string
+	Size        string
+	Capacity    int
+	State       string
+	PoolRole    string
+	IPAddress   string
+	BuildSHA    string
+	LastSeenAt  *time.Time
+	// NodeHeartbeatAt is the bound node's last authenticated heartbeat. Worker
+	// liveness is the fresher of this and LastSeenAt, so a worker alive by
+	// either signal is never treated as unresponsive.
+	NodeHeartbeatAt *time.Time
+	IdleSince       *time.Time
+	DrainStartedAt  *time.Time
+	CreatedAt       time.Time
 }
 
 // Store is the recorder_droplets + recorder_pool_state + node-token data access
@@ -230,6 +234,18 @@ func (s *Store) MarkActive(ctx context.Context, id int64) (bool, error) {
 // live lease and moves the worker out of lease-eligible states before any
 // provider deletion or credential revocation can occur.
 func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) {
+	return s.beginDestroy(ctx, id, nil)
+}
+
+// BeginDestroyIfIdleAndSilent is BeginDestroyIfIdle for an unresponsive worker:
+// inside the same locked transaction it also re-proves that neither the droplet
+// nor its node has heartbeated since silentBefore, so a worker that recovered
+// after the controller's snapshot is left untouched.
+func (s *Store) BeginDestroyIfIdleAndSilent(ctx context.Context, id int64, silentBefore time.Time) (bool, error) {
+	return s.beginDestroy(ctx, id, &silentBefore)
+}
+
+func (s *Store) beginDestroy(ctx context.Context, id int64, silentBefore *time.Time) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -252,6 +268,18 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 	}
 	if busy {
 		return false, nil
+	}
+	if silentBefore != nil {
+		var silent bool
+		if err := tx.QueryRow(ctx, `
+			SELECT GREATEST(d.created_at, d.last_seen_at, n.last_heartbeat_at) < $2
+			FROM recorder_droplets d LEFT JOIN nodes n ON n.id=d.node_id
+			WHERE d.id=$1`, id, *silentBefore).Scan(&silent); err != nil {
+			return false, err
+		}
+		if !silent {
+			return false, nil
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying', updated_at=now() WHERE id=$1`, id); err != nil {
 		return false, err
@@ -386,14 +414,15 @@ func (s *Store) CountLiveByRole(ctx context.Context, role string) (int, error) {
 
 // ListByStates returns droplets in the given states.
 func (s *Store) ListByStates(ctx context.Context, states ...string) ([]Droplet, error) {
-	return s.listDroplets(ctx, "state = ANY($1)", states)
+	return s.listDroplets(ctx, "d.state = ANY($1)", states)
 }
 
 func (s *Store) listDroplets(ctx context.Context, predicate string, states []string) ([]Droplet, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state, pool_role,
-		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
-		FROM recorder_droplets WHERE `+predicate+` ORDER BY id ASC
+		SELECT `+dropletColumns+`
+		FROM recorder_droplets d
+		LEFT JOIN nodes n ON n.id = d.node_id
+		WHERE `+predicate+` ORDER BY d.id ASC
 	`, states)
 	if err != nil {
 		return nil, fmt.Errorf("list droplets by state: %w", err)
@@ -402,8 +431,7 @@ func (s *Store) listDroplets(ctx context.Context, predicate string, states []str
 	out := make([]Droplet, 0, 16)
 	for rows.Next() {
 		var d Droplet
-		if err := rows.Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-			&d.Capacity, &d.State, &d.PoolRole, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt); err != nil {
+		if err := rows.Scan(d.scanTargets()...); err != nil {
 			return nil, fmt.Errorf("scan droplet: %w", err)
 		}
 		out = append(out, d)
@@ -414,11 +442,22 @@ func (s *Store) listDroplets(ctx context.Context, predicate string, states []str
 	return out, nil
 }
 
+// dropletColumns is the single projection behind every Droplet read; keep it
+// in lockstep with scanTargets.
+const dropletColumns = `d.id, d.name, d.node_id, d.do_droplet_id, d.region, d.size, d.capacity, d.state, d.pool_role,
+		       d.ip_address, d.build_sha, d.last_seen_at, n.last_heartbeat_at, d.idle_since, d.drain_started_at, d.created_at`
+
+func (d *Droplet) scanTargets() []any {
+	return []any{&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
+		&d.Capacity, &d.State, &d.PoolRole, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.NodeHeartbeatAt,
+		&d.IdleSince, &d.DrainStartedAt, &d.CreatedAt}
+}
+
 // ListSharedByStates is the shared autoscaler's view. Dedicated canary workers
 // remain visible to reconciliation through ListByStates, but never influence
 // shared capacity, idle drains, or build rollouts.
 func (s *Store) ListSharedByStates(ctx context.Context, states ...string) ([]Droplet, error) {
-	return s.listDroplets(ctx, "pool_role='shared' AND state = ANY($1)", states)
+	return s.listDroplets(ctx, "d.pool_role='shared' AND d.state = ANY($1)", states)
 }
 
 // FindByDODropletID returns the droplet row for a DO droplet id, or (nil) if no
@@ -426,12 +465,11 @@ func (s *Store) ListSharedByStates(ctx context.Context, states ...string) ([]Dro
 func (s *Store) FindByDODropletID(ctx context.Context, doDropletID int64) (*Droplet, error) {
 	var d Droplet
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, name, node_id, do_droplet_id, region, size, capacity, state, pool_role,
-		       ip_address, build_sha, last_seen_at, idle_since, drain_started_at, created_at
-		FROM recorder_droplets
-		WHERE do_droplet_id=$1
-	`, doDropletID).Scan(&d.ID, &d.Name, &d.NodeID, &d.DODropletID, &d.Region, &d.Size,
-		&d.Capacity, &d.State, &d.PoolRole, &d.IPAddress, &d.BuildSHA, &d.LastSeenAt, &d.IdleSince, &d.DrainStartedAt, &d.CreatedAt)
+		SELECT `+dropletColumns+`
+		FROM recorder_droplets d
+		LEFT JOIN nodes n ON n.id = d.node_id
+		WHERE d.do_droplet_id=$1
+	`, doDropletID).Scan(d.scanTargets()...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

@@ -244,7 +244,7 @@ func TestEvaluatedHealthSignalsAreDisjointByRunClass(t *testing.T) {
 	}
 	live := evaluatedHealthSignals(false, true)
 	wantLive := liveRecordingHealthSignals()
-	if fmt.Sprint(live) != fmt.Sprint(wantLive) || len(live) != 5 {
+	if fmt.Sprint(live) != fmt.Sprint(wantLive) || len(live) != 6 {
 		t.Fatalf("live signals=%v want=%v", live, wantLive)
 	}
 	driftDetectorFound := false
@@ -329,8 +329,9 @@ func TestCompletedWindowHealthStageMarksSignalsEvaluatedAfterSuccess(t *testing.
 	full := append([]string{
 		signalContinuousSilentDeath, signalContinuousWindowEndedEarly,
 		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
-		signalClipTimestampDrift,
+		signalClipTimestampDrift, signalRelayResolveRate,
 	}, result.evaluatedSignals...)
+	full = append(full, signalWindowGradePoor)
 	if fmt.Sprint(full) != fmt.Sprint(evaluatedHealthSignals(false, false)) {
 		t.Fatalf("successful full-sweep signal registry=%v want=%v", full, evaluatedHealthSignals(false, false))
 	}
