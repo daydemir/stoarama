@@ -28,6 +28,7 @@ func TestAnalyzeFlagsTheCollationFleetAndSparesThePool(t *testing.T) {
 		{Kind: KindDroplet, ID: "7", Name: "stoarama-rec-9-0", Size: "s-2vcpu-4gb", CreatedAt: old, USDPerDay: DropletUSDPerDay(0.03571)}, // row destroyed: orphan
 		{Kind: KindVolume, ID: "v1", Name: "rec-scratch", Size: "100GiB", CreatedAt: old, DropletIDs: []string{"1"}, USDPerDay: StorageUSDPerDay(100, VolumeUSDPerGiBMonth)},
 		{Kind: KindVolume, ID: "v2", Name: "collate-vol-7", Size: "500GiB", CreatedAt: old, DropletIDs: []string{"4"}, USDPerDay: StorageUSDPerDay(500, VolumeUSDPerGiBMonth)},
+		{Kind: KindVolume, ID: "v3", Name: "pgdata", Size: "10GiB", CreatedAt: old, DropletIDs: []string{"3"}, USDPerDay: StorageUSDPerDay(10, VolumeUSDPerGiBMonth)},
 		{Kind: KindSnapshot, ID: "s1", Name: "stoarama-recorder-20260704", Size: "4.69GiB", CreatedAt: old, USDPerDay: StorageUSDPerDay(4.69, SnapshotUSDPerGiBMonth)},
 	}}
 	managed := ManagedSet{DropletIDs: map[string]bool{"1": true}, Names: map[string]bool{"stoarama-rec-2-0": true}}
@@ -38,7 +39,7 @@ func TestAnalyzeFlagsTheCollationFleetAndSparesThePool(t *testing.T) {
 		owners[res.ID] = res.Owner
 	}
 	want := map[string]string{"1": OwnerPool, "2": OwnerPool, "3": OwnerAllowlist, "4": OwnerUnmanaged, "5": OwnerUnmanaged,
-		"6": OwnerUnmanaged, "7": OwnerUnmanaged, "v1": OwnerPool, "v2": OwnerUnmanaged, "s1": OwnerNA}
+		"6": OwnerUnmanaged, "7": OwnerUnmanaged, "v1": OwnerPool, "v2": OwnerUnmanaged, "v3": OwnerAllowlist, "s1": OwnerNA}
 	for id, o := range want {
 		if owners[id] != o {
 			t.Errorf("owner[%s]=%q want %q", id, owners[id], o)

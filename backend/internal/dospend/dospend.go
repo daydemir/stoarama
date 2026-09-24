@@ -159,11 +159,17 @@ func Analyze(inv Inventory, managed ManagedSet, cfg Config, now time.Time) Repor
 		WarnUSDPerDay:     cfg.WarnUSDPerDay,
 		CriticalUSDPerDay: cfg.CriticalUSDPerDay,
 	}
-	// A volume attached to a pool droplet belongs to the pool.
-	poolDroplets := map[string]bool{}
+	// A volume inherits its droplet's ownership: attached to a pool droplet it
+	// belongs to the pool, attached to an allowlisted droplet it is allowlisted.
+	poolDroplets, allowedDroplets := map[string]bool{}, map[string]bool{}
 	for _, res := range inv.Resources {
-		if res.Kind == KindDroplet && (managed.DropletIDs[res.ID] || managed.Names[res.Name]) {
+		if res.Kind != KindDroplet {
+			continue
+		}
+		if managed.DropletIDs[res.ID] || managed.Names[res.Name] {
 			poolDroplets[res.ID] = true
+		} else if cfg.Allowlisted(res.Name) {
+			allowedDroplets[res.ID] = true
 		}
 	}
 	groups := map[string]*GroupTotal{}
@@ -175,11 +181,15 @@ func Analyze(inv Inventory, managed ManagedSet, cfg Config, now time.Time) Repor
 		case KindDroplet:
 			res.Owner = classify(poolDroplets[res.ID], res.Name, cfg)
 		case KindVolume:
-			attached := false
+			res.Owner = classify(false, res.Name, cfg)
 			for _, id := range res.DropletIDs {
-				attached = attached || poolDroplets[id]
+				switch {
+				case poolDroplets[id]:
+					res.Owner = OwnerPool
+				case allowedDroplets[id] && res.Owner == OwnerUnmanaged:
+					res.Owner = OwnerAllowlist
+				}
 			}
-			res.Owner = classify(attached, res.Name, cfg)
 		}
 		r.BurnUSDPerDay += res.USDPerDay
 		g := groups[res.Group]
