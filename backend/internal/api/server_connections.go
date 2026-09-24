@@ -23,11 +23,12 @@ import (
 // param routes and literal+method checks for the rest. Default is DENY: any account
 // route not in this allowlist is 403d for a pull-scoped key automatically.
 var (
-	pullDownloadPathRe       = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/download$`)
-	pullReleasePathRe        = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
-	pullJoinedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
-	pullUploadProbeResultRe  = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
-	pullRestoreResultRe      = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
+	pullDownloadPathRe         = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/download$`)
+	pullReleasePathRe          = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
+	pullJoinedDownloadPathRe   = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
+	pullUploadProbeResultRe    = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
+	pullRestoreResultRe        = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
+	pullCollatedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/collated/\d+/download$`)
 )
 
 // pullPathAllowed reports whether a pull-scoped key may call (method, path). It is
@@ -63,6 +64,12 @@ func pullPathAllowed(method, path string) bool {
 	case method == http.MethodPost && path == "/api/v1/account/connections/nas-restore/lease":
 		return true
 	case method == http.MethodPost && pullRestoreResultRe.MatchString(path):
+		return true
+	case method == http.MethodGet && path == "/api/v1/account/collated":
+		return true
+	case method == http.MethodPost && (path == "/api/v1/account/collated/ack" || path == "/api/v1/account/collated/error"):
+		return true
+	case method == http.MethodGet && pullCollatedDownloadPathRe.MatchString(path):
 		return true
 	case method == http.MethodGet && path == "/api/v1/account/joined":
 		return true

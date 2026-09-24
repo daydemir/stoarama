@@ -109,6 +109,8 @@ func main() {
 		runNASInventory(ctx, cfg, os.Args[2:])
 	case "nas-upload-probe":
 		runNASUploadProbe(ctx, cfg, os.Args[2:])
+	case "nas-collated-delivery":
+		runNASCollatedDelivery(ctx, cfg, os.Args[2:])
 	case "joined-source-purge":
 		runJoinedSourcePurge(ctx, cfg, os.Args[2:])
 	case "do-spend":

@@ -76,6 +76,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./internal/api ./cmd/stoaramactl -run 'Test(NASCollatedHoldSkipsRawFeedAndBacklog|AdminRecordingNASDeliveryModeFencesAndReportsHolds|AccountClipsCursorEndpoint|CollatedHoldClipsAreNeverMeteredAsStorage)' -count=1
+      - name: Test collated NAS delivery lane
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run 'Test(ValidCollatedNASPathPinsContract|CollatedDeliveryFeedDownloadAckAndPolicy)' -count=1
       - name: Test batch Plaza naming
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
@@ -240,5 +244,8 @@ jobs:
       - name: Test NAS pull joined download
         working-directory: .
         run: python3 -m unittest -q clients/nas-pull/test_joined_download.py
+      - name: Test NAS collated delivery client
+        working-directory: .
+        run: python3 -m unittest -q clients/nas-pull/test_collated_download.py
       - name: Vet
         run: go vet ./...
