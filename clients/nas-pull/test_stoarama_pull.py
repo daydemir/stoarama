@@ -3748,7 +3748,8 @@ class RestoreTests(unittest.TestCase):
 
         with mock.patch.object(pull, "request_json", side_effect=fake_request), \
                 mock.patch.object(pull, "run_restore_task", side_effect=fake_run):
-            self.assertEqual(pull.restore_once(self.cfg), 120)
+            # The all-invalid second lease ends the run with its retry_after.
+            self.assertEqual(pull.restore_once(self.cfg), 1)
         lease_sizes = [body["max_tasks"] for _m, path, body in calls if path.endswith("/lease")]
         self.assertEqual(lease_sizes[0], 2)
         self.assertNotIn(main_thread, (report_threads[7], report_threads[8]))
