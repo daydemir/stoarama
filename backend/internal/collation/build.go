@@ -226,10 +226,24 @@ func strictDecode(ctx context.Context, tools Tools, path string, pre ...string) 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%w: %s", err, trimStderr(stderr.String()))
 	}
-	if s := strings.TrimSpace(stderr.String()); s != "" {
+	if s := decoderComplaints(stderr.String()); s != "" {
 		return fmt.Errorf("decoder reported: %s", trimStderr(s))
 	}
 	return nil
+}
+
+// decoderComplaints drops the null muxer's notes about repeated source
+// timestamps (a timing property, verified from packets, not a decode error).
+func decoderComplaints(stderr string) string {
+	var kept []string
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "non monotonically increasing dts to muxer") || strings.HasPrefix(line, "Last message repeated") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
 }
 
 // endTime is the latest presentation end (pts + duration) over the file's tracks.

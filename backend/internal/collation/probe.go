@@ -93,7 +93,10 @@ type ffPacket struct {
 // payload). A file without a moov atom or with unusable timing is reported as
 // unplayable rather than as an error: the caller quarantines it.
 func ProbeFile(ctx context.Context, tools Tools, path string) (Probe, error) {
-	cmd := exec.CommandContext(ctx, tools.FFprobe, "-v", "error", "-show_data_hash", "sha256",
+	// murmur3 (128-bit) per packet: identity of our own stream copies and of
+	// replayed capture segments, several times cheaper than SHA-256. Whole
+	// files are still identified by SHA-256.
+	cmd := exec.CommandContext(ctx, tools.FFprobe, "-v", "error", "-show_data_hash", "murmur3",
 		"-show_entries", "stream=index,codec_type,codec_name,profile,level,width,height,pix_fmt,sample_rate,channels,channel_layout,time_base,extradata_hash:packet=stream_index,pts,dts,duration,flags,data_hash",
 		"-of", "json", path)
 	var stdout, stderr bytes.Buffer

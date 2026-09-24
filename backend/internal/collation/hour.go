@@ -177,7 +177,7 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 	claimed := map[int]bool{}
 	for k := 1; k < len(idx); k++ {
 		next := idx[k]
-		prev := idx[k-1]
+		prev, chained := idx[k-1], false
 		for j := k - 1; j >= 0; j-- {
 			cand := idx[j]
 			if claimed[cand] || locals[cand].Clip.JobID != locals[next].Clip.JobID {
@@ -185,11 +185,13 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 			}
 			frame := math.Max(locals[cand].Probe.Media.FrameSeconds, locals[next].Probe.Media.FrameSeconds)
 			if math.Abs(locals[next].Clip.StartUTC.Sub(locals[cand].Clip.EndUTC).Seconds()) <= env.Policy.GapFrameSlack*frame {
-				prev = cand
+				prev, chained = cand, true
 				break
 			}
 		}
-		claimed[prev] = true
+		if chained {
+			claimed[prev] = true
+		}
 		pairs = append(pairs, seamPair{prev, next})
 	}
 	seams := make([]SeamDecision, len(pairs))
@@ -432,11 +434,25 @@ func matchSeam(ctx context.Context, env Env, a, b LocalClip) MatchEvidence {
 		}
 		ev = EvaluateFrames(policy, tail, head, a.Probe.Video.WindowKeys(len(tail), true), b.Probe.Video.WindowKeys(len(head), false), frame)
 		ev.WindowSeconds = window
-		if ev.Verdict == MatchContinuous {
+		if !needsFullWindow(env.Policy, ev) {
 			return ev
 		}
 	}
 	return ev
+}
+
+// needsFullWindow: a short-window verdict is final when it joined, or when it
+// is a clear discontinuity (boundary step far beyond a normal keyframe step);
+// anything borderline is re-examined on the full window.
+func needsFullWindow(policy SeamPolicy, ev MatchEvidence) bool {
+	if ev.WindowSeconds >= policy.WindowSeconds || ev.Verdict == MatchContinuous || ev.Verdict == MatchDecodeFail {
+		return false
+	}
+	// Only a window that contains keyframe steps knows how large a normal
+	// boundary (keyframe) step is; without one, always take the second look.
+	clearJump := ev.Verdict == MatchJump && ev.KeyStepMedianMAD > 0 &&
+		ev.BoundaryMAD > policy.ClearJumpStepFactor*ev.KeyStepMedianMAD+policy.StepSlackMAD
+	return !clearJump
 }
 
 // dropDuplicateCaptures keeps one capture where two chains of one recording

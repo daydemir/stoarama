@@ -44,9 +44,12 @@ type SeamPolicy struct {
 	// The boundary step must look like an ordinary step into a keyframe:
 	// MAD(A[-1],B[0]) <= factor x median(key steps) + slack.
 	BoundaryStepFactor float64 `json:"boundary_step_factor"`
-	StepSlackMAD       float64 `json:"step_slack_mad"`
-	MinFrames          int     `json:"min_frames"`
-	GapFrameSlack      float64 `json:"db_gap_tolerance_frames"`
+	// A short-window jump whose boundary step exceeds this factor needs no
+	// full-window second look (it can only split).
+	ClearJumpStepFactor float64 `json:"clear_jump_step_factor"`
+	StepSlackMAD        float64 `json:"step_slack_mad"`
+	MinFrames           int     `json:"min_frames"`
+	GapFrameSlack       float64 `json:"db_gap_tolerance_frames"`
 	// Decoded content duration must match the stamped span within this many frames.
 	SpanFrameSlack float64 `json:"content_span_tolerance_frames"`
 	// A previous clip shorter than the recording's nominal clip length by more
@@ -75,6 +78,7 @@ func DefaultSeamPolicy() SeamPolicy {
 		HeadSharpRatio:        0.70,
 		MinSceneMedianMAD:     0.8,
 		BoundaryStepFactor:    2.0,
+		ClearJumpStepFactor:   4.0,
 		StepSlackMAD:          0.05,
 		MinFrames:             10,
 		GapFrameSlack:         1,

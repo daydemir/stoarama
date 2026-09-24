@@ -20,7 +20,7 @@ type Frame []byte
 func ExtractWindow(ctx context.Context, tools Tools, policy SeamPolicy, path string, tail bool) ([]Frame, error) {
 	w, h := policy.FrameWidth, policy.FrameHeight
 	window := strconv.FormatFloat(policy.WindowSeconds, 'f', -1, 64)
-	args := []string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1", "-skip_loop_filter", "all"}
+	args := []string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1", "-filter_threads", "1", "-skip_loop_filter", "all"}
 	if tail {
 		args = append(args, "-sseof", "-"+window, "-i", path)
 	} else {

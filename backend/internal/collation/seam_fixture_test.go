@@ -104,7 +104,7 @@ func evaluateEscalating(policy SeamPolicy, c windowCurves, frame float64) MatchE
 	short.WindowSeconds = policy.ShortWindowSeconds
 	ev := EvaluateCurves(short, c.Short, frame)
 	ev.WindowSeconds = policy.ShortWindowSeconds
-	if ev.Verdict == MatchContinuous {
+	if !needsFullWindow(policy, ev) {
 		return ev
 	}
 	ev = EvaluateCurves(policy, c.Full, frame)
@@ -283,7 +283,7 @@ var replayFixtureSeams = []struct {
 func toFixture(sp *StreamPackets) []fixturePack {
 	out := make([]fixturePack, len(sp.Packets))
 	for i, pk := range sp.Packets {
-		out[i] = fixturePack{PTS: pk.PTS.RatString(), Dur: pk.Dur.RatString(), Key: pk.Key, Hash: pk.Hash[:16]}
+		out[i] = fixturePack{PTS: pk.PTS.RatString(), Dur: pk.Dur.RatString(), Key: pk.Key, Hash: pk.Hash[len(pk.Hash)-16:]}
 	}
 	return out
 }
