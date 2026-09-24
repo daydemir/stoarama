@@ -1,0 +1,260 @@
+package collation
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"math/big"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// LocalClip is one downloaded, probed source ready to be built into a part.
+type LocalClip struct {
+	Clip  Clip
+	Path  string
+	Probe Probe
+}
+
+// Verification records how an output was proven to be exactly its sources.
+type Verification struct {
+	VideoPackets        int      `json:"video_packets"`
+	AudioPackets        int      `json:"audio_packets"`
+	PayloadChainMatches bool     `json:"payload_chain_matches"`
+	VideoTimingMatches  bool     `json:"video_timing_matches"`
+	MaxTimingErrorMicro int64    `json:"max_timing_error_us"`
+	KeyframeDecodeOK    bool     `json:"keyframe_decode_ok"`
+	SeamDecodesOK       int      `json:"seam_decodes_ok"`
+	OutputSeconds       float64  `json:"output_seconds"`
+	Notes               []string `json:"notes,omitempty"`
+}
+
+// Built is one verified joined part on local disk.
+type Built struct {
+	Path         string
+	SizeBytes    int64
+	SHA256       string
+	Verification Verification
+}
+
+// concatOffsets returns each clip's exact start offset in the output, derived
+// from exact video packet durations rounded to microseconds against the running
+// total (so VFR rounding never accumulates), plus the per-entry duration lines.
+func concatOffsets(clips []LocalClip) (offsets []*big.Rat, durationsMicro []int64) {
+	cum := new(big.Rat)
+	var prevMicro int64
+	for _, c := range clips {
+		offsets = append(offsets, new(big.Rat).SetFrac64(prevMicro, 1_000_000))
+		cum.Add(cum, c.Probe.Video.Duration())
+		now := roundRatMicro(cum)
+		durationsMicro = append(durationsMicro, now-prevMicro)
+		prevMicro = now
+	}
+	return offsets, durationsMicro
+}
+
+func roundRatMicro(r *big.Rat) int64 {
+	scaled := new(big.Rat).Mul(r, big.NewRat(1_000_000, 1))
+	num, den := scaled.Num(), scaled.Denom()
+	q, m := new(big.Int).QuoRem(num, den, new(big.Int))
+	if new(big.Int).Mul(m, big.NewInt(2)).Cmp(den) >= 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	return q.Int64()
+}
+
+// BuildPart stream-copies clips into one MP4 and verifies it. The concat demuxer
+// runs with auto_convert disabled and exact per-file durations so VFR sources
+// keep their exact packet timing.
+func BuildPart(ctx context.Context, tools Tools, clips []LocalClip, outPath string) (Built, error) {
+	if len(clips) == 0 {
+		return Built{}, fmt.Errorf("empty part")
+	}
+	_, durations := concatOffsets(clips)
+	var list strings.Builder
+	for i, c := range clips {
+		if strings.ContainsAny(c.Path, "\r\n'") {
+			return Built{}, fmt.Errorf("unsafe source path")
+		}
+		fmt.Fprintf(&list, "file '%s'\nduration %dus\n", c.Path, durations[i])
+	}
+	listPath := outPath + ".concat.txt"
+	if err := os.WriteFile(listPath, []byte(list.String()), 0o600); err != nil {
+		return Built{}, err
+	}
+	defer os.Remove(listPath)
+	_ = os.Remove(outPath)
+	cmd := exec.CommandContext(ctx, tools.FFmpeg, "-nostdin", "-v", "error", "-f", "concat", "-safe", "0", "-auto_convert", "0",
+		"-i", listPath, "-copyts", "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", outPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return Built{}, fmt.Errorf("concat: %w: %s", err, trimStderr(stderr.String()))
+	}
+	v, err := VerifyPart(ctx, tools, clips, outPath)
+	if err != nil {
+		return Built{}, err
+	}
+	size, sha, err := fileIdentity(outPath)
+	if err != nil {
+		return Built{}, err
+	}
+	return Built{Path: outPath, SizeBytes: size, SHA256: sha, Verification: v}, nil
+}
+
+// VerifyPart proves the output is exactly the sources' packets in order:
+//  1. per-track payload hash chain and packet counts are identical;
+//  2. every output video packet's pts/dts equals its source timing shifted by
+//     the clip's concat offset (within 1 ms), and output dts strictly increases;
+//  3. a keyframe-only decode of the whole output is clean;
+//  4. a strict decode of the first second after every internal seam is clean.
+func VerifyPart(ctx context.Context, tools Tools, clips []LocalClip, outPath string) (Verification, error) {
+	out, err := ProbeFile(ctx, tools, outPath)
+	if err != nil {
+		return Verification{}, err
+	}
+	if !out.Media.Playable {
+		return Verification{}, fmt.Errorf("output unplayable: %s", out.Media.FailReason)
+	}
+	v := Verification{VideoPackets: len(out.Video.Packets)}
+	if out.Audio != nil {
+		v.AudioPackets = len(out.Audio.Packets)
+	}
+	for _, kind := range []string{"video", "audio"} {
+		want, got := sha256.New(), sha256.New()
+		n := 0
+		for _, c := range clips {
+			sp := c.Probe.track(kind)
+			if sp == nil {
+				continue
+			}
+			for _, pk := range sp.Packets {
+				io.WriteString(want, pk.Hash+"\n")
+				n++
+			}
+		}
+		if sp := out.track(kind); sp != nil {
+			if len(sp.Packets) != n {
+				return v, fmt.Errorf("%s packet count differs: out %d src %d", kind, len(sp.Packets), n)
+			}
+			for _, pk := range sp.Packets {
+				io.WriteString(got, pk.Hash+"\n")
+			}
+		} else if n != 0 {
+			return v, fmt.Errorf("%s track missing from output", kind)
+		}
+		if !bytes.Equal(want.Sum(nil), got.Sum(nil)) {
+			return v, fmt.Errorf("%s payload chain differs", kind)
+		}
+	}
+	v.PayloadChainMatches = true
+
+	// The concat demuxer places each file at its offset minus the file's start
+	// time (the earliest pts over its tracks), preserving A/V alignment.
+	offsets, _ := concatOffsets(clips)
+	outBase := out.startTime()
+	tol := big.NewRat(1, 1000)
+	i := 0
+	var maxErr *big.Rat = new(big.Rat)
+	var prevDTS *big.Rat
+	for ci, c := range clips {
+		srcBase := c.Probe.startTime()
+		for _, pk := range c.Probe.Video.Packets {
+			o := out.Video.Packets[i]
+			i++
+			for _, pair := range [][2]*big.Rat{{pk.PTS, o.PTS}, {pk.DTS, o.DTS}} {
+				want := new(big.Rat).Add(offsets[ci], new(big.Rat).Sub(pair[0], srcBase))
+				got := new(big.Rat).Sub(pair[1], outBase)
+				diff := new(big.Rat).Abs(new(big.Rat).Sub(want, got))
+				if diff.Cmp(maxErr) > 0 {
+					maxErr = diff
+				}
+				if diff.Cmp(tol) > 0 {
+					return v, fmt.Errorf("video timing differs at clip %d", c.Clip.ClipID)
+				}
+			}
+			if prevDTS != nil && o.DTS.Cmp(prevDTS) <= 0 {
+				return v, fmt.Errorf("output video dts not strictly increasing")
+			}
+			prevDTS = o.DTS
+		}
+	}
+	v.VideoTimingMatches = true
+	v.MaxTimingErrorMicro = roundRatMicro(maxErr)
+	total, _ := out.Video.Duration().Float64()
+	v.OutputSeconds = round6(total)
+
+	if err := strictDecode(ctx, tools, outPath, "-skip_frame", "nokey"); err != nil {
+		return v, fmt.Errorf("keyframe decode: %w", err)
+	}
+	v.KeyframeDecodeOK = true
+	for ci := 1; ci < len(clips); ci++ {
+		at, _ := offsets[ci].Float64()
+		if err := strictDecode(ctx, tools, outPath, "-ss", fmt.Sprintf("%.6f", at), "-t", "1"); err != nil {
+			return v, fmt.Errorf("seam decode at clip %d: %w", clips[ci].Clip.ClipID, err)
+		}
+		v.SeamDecodesOK++
+	}
+	return v, nil
+}
+
+func strictDecode(ctx context.Context, tools Tools, path string, pre ...string) error {
+	args := append([]string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode"}, pre...)
+	args = append(args, "-i", path, "-map", "0:v:0", "-f", "null", "-")
+	cmd := exec.CommandContext(ctx, tools.FFmpeg, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, trimStderr(stderr.String()))
+	}
+	if s := strings.TrimSpace(stderr.String()); s != "" {
+		return fmt.Errorf("decoder reported: %s", trimStderr(s))
+	}
+	return nil
+}
+
+// startTime is the earliest presentation time over the file's tracks.
+func (p Probe) startTime() *big.Rat {
+	var start *big.Rat
+	for _, sp := range []*StreamPackets{p.Video, p.Audio} {
+		if sp == nil {
+			continue
+		}
+		for _, pk := range sp.Packets {
+			if start == nil || pk.PTS.Cmp(start) < 0 {
+				start = pk.PTS
+			}
+		}
+	}
+	return start
+}
+
+func (p Probe) track(kind string) *StreamPackets {
+	if kind == "video" {
+		return p.Video
+	}
+	return p.Audio
+}
+
+func fileIdentity(path string) (int64, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func partPath(dir string, part int) string {
+	return filepath.Join(dir, fmt.Sprintf("part-%02d.mp4", part))
+}
