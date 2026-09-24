@@ -3872,6 +3872,9 @@ class NASBenchmarkTests(unittest.TestCase):
         self.assertEqual(pull.meminfo_bytes(None), (0, 0))
         self.assertEqual(pull.cpu_model("processor: 0\nmodel name\t: AMD Ryzen Embedded V1500B\n"), "AMD Ryzen Embedded V1500B")
         self.assertEqual(pull.cpu_model(""), "")
+        clipped = pull._host_text("\u00e9" * 200)
+        self.assertLessEqual(len(clipped.encode("utf-8")), 256)
+        self.assertEqual(clipped, "\u00e9" * 128)
 
     def test_host_facts_match_server_fields_and_probe_exec(self):
         with tempfile.TemporaryDirectory() as tmp:

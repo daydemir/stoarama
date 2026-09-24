@@ -45,8 +45,8 @@ func TestValidateNASHostFacts(t *testing.T) {
 	}
 	started := time.Now()
 	heartbeat := connectionHeartbeatRequest{ClientStartedAt: &started, Host: &nasHostFacts{Machine: "bad machine"}}
-	if err := validateConnectionHeartbeat(heartbeat); err == nil || !strings.Contains(err.Error(), "host") {
-		t.Fatalf("heartbeat with invalid host err=%v", err)
+	if err := validateConnectionHeartbeat(heartbeat); err != nil {
+		t.Fatalf("invalid optional host facts must not reject the heartbeat: %v", err)
 	}
 }
 

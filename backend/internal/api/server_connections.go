@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -767,9 +768,6 @@ var inventorySkipReasons = map[string]bool{
 const connectionHeartbeatFutureSkew = 5 * time.Minute
 
 func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
-	if err := validateNASHostFacts(req.Host); err != nil {
-		return err
-	}
 	if req.CursorID < 0 || req.ClipsPulled < 0 || req.BytesPulled < 0 {
 		return errors.New("cursor_id, clips_pulled, and bytes_pulled must be non-negative")
 	}
@@ -893,6 +891,12 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	if err := validateConnectionHeartbeat(req); err != nil {
 		util.WriteError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// Host facts are optional diagnostics: a bad value must never cost the
+	// NAS its heartbeat, so it is dropped rather than rejected.
+	if err := validateNASHostFacts(req.Host); err != nil {
+		log.Printf("nas heartbeat: dropping invalid host facts: %v", err)
+		req.Host = nil
 	}
 	var frozenScopeSHA string
 	if req.JoinedDelivery != nil || req.JoinedTransfer != nil {

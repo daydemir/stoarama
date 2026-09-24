@@ -6767,7 +6767,9 @@ def _host_token(value):
 
 
 def _host_text(value):
-    return "".join(ch for ch in str(value or "") if 32 <= ord(ch) != 127)[:256].strip()
+    cleaned = "".join(ch for ch in str(value or "") if 32 <= ord(ch) != 127).strip()
+    # The server bounds these strings in bytes; never split a UTF-8 sequence.
+    return cleaned.encode("utf-8")[:256].decode("utf-8", "ignore").strip()
 
 
 def cgroup_cpu_limit(root="/sys/fs/cgroup"):
@@ -7527,10 +7529,13 @@ def run(cfg):
         # Daemon thread: a self-update or shutdown may cut a probe short; the
         # API sweeps any unreported probe objects after their target expires.
         threading.Thread(target=upload_probe_loop, args=(cfg, runtime, stop_event), daemon=True).start()
+    self_update_failed = False
+    benchmark_worker = None
+    if not cfg.dry_run:
         # Daemon thread: a staged self-update waits while BENCHMARK_ACTIVE is
         # set; shutdown kills the benchmark children via stop_event.
-        threading.Thread(target=benchmark_loop, args=(cfg, runtime, stop_event), daemon=True).start()
-    self_update_failed = False
+        benchmark_worker = threading.Thread(target=benchmark_loop, args=(cfg, runtime, stop_event), daemon=True)
+        benchmark_worker.start()
     try:
         while not stop_event.is_set():
             # No delivery page is active at this boundary. A staged candidate
@@ -7597,6 +7602,10 @@ def run(cfg):
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
         joined_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
+        if benchmark_worker is not None:
+            # The watchdog kills benchmark children within a second of stop;
+            # wait for its temp-output cleanup before the process exits.
+            benchmark_worker.join(timeout=15)
         joined_stuck = joined_worker.is_alive()
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
