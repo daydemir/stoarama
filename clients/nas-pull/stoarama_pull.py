@@ -5469,7 +5469,7 @@ def joined_loop(cfg, runtime, stop_event):
     while not stop_event.is_set():
         progress = False
         try:
-            progress = drain_collated(cfg, stop_event)
+            progress = drain_collated(cfg, runtime, stop_event)
         except Exception as exc:
             log("WARN", "collated delivery deferred: %s" % exc)
         if stop_event.is_set():
@@ -5763,14 +5763,7 @@ def report_collated_error(cfg, output_id, exc):
         log("WARN", "collated error report failed: %s" % report_exc)
 
 
-def collated_has_room(cfg, size_bytes):
-    storage = storage_status(cfg)
-    return bool(storage.get("available")) and (
-        storage["free_bytes"] >= cfg.min_free_bytes + JOINED_RAW_HEADROOM_BYTES + size_bytes
-    )
-
-
-def drain_collated(cfg, stop_event):
+def drain_collated(cfg, runtime, stop_event):
     """Deliver one page of collated outputs. Returns True when any output landed."""
     if cfg.dry_run:
         return False
@@ -5787,7 +5780,9 @@ def drain_collated(cfg, stop_event):
     def deliver(item):
         if stop_event.is_set():
             return
-        if not collated_has_room(cfg, item["size_bytes"]):
+        # Reserve the whole output in the shared runtime ledger so parallel
+        # collated downloads and raw delivery never overcommit the same bytes.
+        if not runtime.reserve_joined_storage(cfg, storage_status(cfg), item["size_bytes"]):
             raise CollatedDownloadStopped("collated delivery yielded to the NAS free-space reserve")
         try:
             fetched = download_collated_item(cfg, item, limiter, stop_event)
@@ -5798,6 +5793,8 @@ def drain_collated(cfg, stop_event):
             log("WARN", "collated output_id=%d deferred: %s" % (item["output_id"], exc))
             report_collated_error(cfg, item["output_id"], exc)
             return
+        finally:
+            runtime.release_storage_reservation(item["size_bytes"])
         delivered.append(item["output_id"])
         log("INFO", "collated output_id=%d bytes=%d saved=%s%s" % (
             item["output_id"], item["size_bytes"], cfg.output_dir / JOINED_ROOT / item["nas_relative_path"],

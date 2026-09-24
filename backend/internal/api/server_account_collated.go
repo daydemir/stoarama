@@ -96,6 +96,12 @@ const collatedEligibleSQL = `
 	  AND NOT EXISTS (SELECT 1 FROM recording_collation_output_acks ack
 	    WHERE ack.output_id=o.id AND ack.connection_id=$1)`
 
+// collatedNotBackedOffSQL withholds outputs whose last delivery failed until
+// their backoff expires.
+const collatedNotBackedOffSQL = `
+	  AND NOT EXISTS (SELECT 1 FROM recording_collation_output_errors e
+	    WHERE e.output_id=o.id AND e.connection_id=$1 AND e.next_attempt_at>now())`
+
 func (s *Server) collatedPullConnection(w http.ResponseWriter, r *http.Request) (int64, accountPrincipal, bool) {
 	principal, ok := accountPrincipalFromContext(r.Context())
 	if !ok {
@@ -130,7 +136,7 @@ func (s *Server) handleAccountCollated(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]collatedItem, 0, limit)
 	if policy.Enabled {
-		rows, err := s.pool.Query(r.Context(), `SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256 `+collatedEligibleSQL+`
+		rows, err := s.pool.Query(r.Context(), `SELECT o.id,o.nas_relative_path,o.size_bytes,o.sha256 `+collatedEligibleSQL+collatedNotBackedOffSQL+`
 			ORDER BY h.local_date,h.delivery_hour,h.recording_id,o.part,o.id LIMIT $2`, connectionID, limit)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("list collated outputs: %v", err))
@@ -307,6 +313,20 @@ func (s *Server) handleAccountCollatedError(w http.ResponseWriter, r *http.Reque
 		util.WriteError(w, http.StatusInternalServerError, "record collated error")
 		return
 	}
+	if req.OutputID > 0 {
+		// Back off 2, 4, 8 ... minutes, capped at six hours.
+		if _, err := s.pool.Exec(r.Context(), `
+			INSERT INTO recording_collation_output_errors(output_id,connection_id,failure_count,last_error,last_error_at,next_attempt_at)
+			SELECT o.id,$1,1,$3,now(),now()+interval '2 minutes' FROM recording_collation_outputs o WHERE o.id=$2
+			ON CONFLICT (output_id,connection_id) DO UPDATE SET
+			  failure_count=recording_collation_output_errors.failure_count+1,last_error=EXCLUDED.last_error,last_error_at=now(),
+			  next_attempt_at=now()+LEAST(interval '6 hours',
+			    interval '1 minute'*power(2,LEAST(recording_collation_output_errors.failure_count+1,9)))`,
+			connectionID, req.OutputID, msg); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "record collated backoff")
+			return
+		}
+	}
 	util.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -365,6 +385,7 @@ func (s *Server) handleAdminConnectionCollatedDelivery(w http.ResponseWriter, r 
 		LastErrorOutput *int64         `json:"last_error_output_id"`
 		LastErrorAt     *time.Time     `json:"last_error_at"`
 		PendingFiles    int64          `json:"pending_files"`
+		BackedOffFiles  int64          `json:"backed_off_files"`
 		PendingBytes    int64          `json:"pending_bytes"`
 	}
 	out.ConnectionID = connectionID
@@ -385,6 +406,11 @@ func (s *Server) handleAdminConnectionCollatedDelivery(w http.ResponseWriter, r 
 	if err := s.pool.QueryRow(r.Context(), `SELECT count(*),COALESCE(SUM(o.size_bytes),0) `+
 		strings.Replace(collatedEligibleSQL, " AND conn.collated_delivery_enabled", "", 1), connectionID).Scan(&out.PendingFiles, &out.PendingBytes); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "count pending collated outputs")
+		return
+	}
+	if err := s.pool.QueryRow(r.Context(), `SELECT count(*) FROM recording_collation_output_errors WHERE connection_id=$1 AND next_attempt_at>now()`,
+		connectionID).Scan(&out.BackedOffFiles); err != nil {
+		util.WriteError(w, http.StatusInternalServerError, "count backed-off collated outputs")
 		return
 	}
 	util.WriteJSON(w, http.StatusOK, out)

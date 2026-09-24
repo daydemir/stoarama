@@ -231,10 +231,27 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if code, _ := do(s.handleAccountCollatedError, http.MethodPost, "/x", map[string]any{"output_id": 102, "error": "boom"}, nil); code != 200 {
 		t.Fatalf("error report code=%d", code)
 	}
-	if _, out := adminDo(http.MethodGet, nil); out["last_error"] != "boom" || out["files_pulled"].(float64) != 1 || out["pending_files"].(float64) != 2 {
+	if _, out := adminDo(http.MethodGet, nil); out["last_error"] != "boom" || out["files_pulled"].(float64) != 1 ||
+		out["pending_files"].(float64) != 2 || out["backed_off_files"].(float64) != 1 {
 		t.Fatalf("status after ack=%v", out)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[103]" {
+		t.Fatalf("failed output 102 was not backed off: feed=%v", ids)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE recording_collation_output_errors SET next_attempt_at=now()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102 103]" {
+		t.Fatalf("expired backoff not retried: feed=%v", ids)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_output_acks`); err == nil {
 		t.Fatal("ack rows are not append-only")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM connections WHERE id=13`); err != nil {
+		t.Fatalf("connection removal blocked by its acks: %v", err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_collation_output_acks`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("acks left after connection removal=%d err=%v", left, err)
 	}
 }

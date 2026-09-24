@@ -48,6 +48,10 @@ class CollatedDownloadTests(unittest.TestCase):
         }
         self.final = self.cfg.output_dir / "joined" / REL
         self.part = self.final.with_name(".%s.collated-7.part" % self.final.name)
+        self.runtime = pull.Runtime.__new__(pull.Runtime)
+        self.runtime.lock = threading.Lock()
+        self.runtime.capacity_reserved_bytes = 0
+        self.runtime.capacity_blocked = False
         self.requests = []
         self.acks = []
         self.errors = []
@@ -81,7 +85,7 @@ class CollatedDownloadTests(unittest.TestCase):
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(**kwargs)), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}):
-            return pull.drain_collated(self.cfg, threading.Event())
+            return pull.drain_collated(self.cfg, self.runtime, threading.Event())
 
     def test_contract_validation(self):
         pull.valid_collated_relative_path(REL)
@@ -149,7 +153,7 @@ class CollatedDownloadTests(unittest.TestCase):
         with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json()), \
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**6, "free_bytes": 10**6}):
-            self.assertFalse(pull.drain_collated(self.cfg, threading.Event()))
+            self.assertFalse(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
         self.assertEqual(self.requests, [])
 
     def test_stop_keeps_partial_for_resume(self):
@@ -166,10 +170,31 @@ class CollatedDownloadTests(unittest.TestCase):
                 mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
                 mock.patch.object(pull.ByteRateLimiter, "acquire", acquire), \
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": 10**13}):
-            self.assertFalse(pull.drain_collated(self.cfg, stop))
+            self.assertFalse(pull.drain_collated(self.cfg, self.runtime, stop))
         self.assertFalse(self.final.exists())
         self.assertGreater(self.part.stat().st_size, 0)
         self.assertEqual(self.acks, [])
+
+    def test_parallel_downloads_share_one_space_reservation(self):
+        # Room for exactly one output above the raw headroom: the second parallel
+        # item must yield instead of passing the same free-space check.
+        free = self.cfg.min_free_bytes + pull.JOINED_RAW_HEADROOM_BYTES + self.item["size_bytes"]
+        second = dict(self.item, output_id=8, download_path="/api/v1/account/collated/8/download",
+                      nas_relative_path=REL.replace("part_04", "part_05"))
+        gate = threading.Event()
+        original = pull.download_collated_item
+
+        def slow(cfg, item, limiter, stop_event):
+            gate.wait(2)
+            return original(cfg, item, limiter, stop_event)
+        with mock.patch.object(pull, "request_json", side_effect=self.fake_request_json(items=[dict(self.item), second])), \
+                mock.patch.object(pull, "open_joined_url", side_effect=self.fake_open), \
+                mock.patch.object(pull, "download_collated_item", side_effect=slow), \
+                mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": free}):
+            threading.Timer(0.3, gate.set).start()
+            self.assertTrue(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
+        self.assertEqual([a["output_id"] for a in self.acks], [7])
+        self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
 
     def test_rate_limiter_shares_one_budget(self):
         limiter = pull.ByteRateLimiter(10 * 1024 * 1024)

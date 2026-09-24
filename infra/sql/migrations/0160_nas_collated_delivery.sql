@@ -20,7 +20,7 @@ ALTER TABLE connections
 
 CREATE TABLE recording_collation_output_acks (
   output_id BIGINT NOT NULL REFERENCES recording_collation_outputs(id) ON DELETE RESTRICT,
-  connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE RESTRICT,
+  connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
   nas_relative_path TEXT NOT NULL,
   size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
   sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
@@ -29,11 +29,29 @@ CREATE TABLE recording_collation_output_acks (
 );
 CREATE INDEX recording_collation_output_acks_connection_idx ON recording_collation_output_acks (connection_id, output_id);
 
+-- Append-only, except that removing a NAS connection removes its acks (the
+-- cascade runs as a nested trigger).
 CREATE FUNCTION recording_collation_output_acks_append_only() RETURNS trigger AS $$
 BEGIN
+  IF TG_OP = 'DELETE' AND pg_trigger_depth() > 1 THEN
+    RETURN OLD;
+  END IF;
   RAISE EXCEPTION 'recording_collation_output_acks is append-only';
 END;
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_recording_collation_output_acks_append_only
 BEFORE UPDATE OR DELETE ON recording_collation_output_acks
 FOR EACH ROW EXECUTE FUNCTION recording_collation_output_acks_append_only();
+
+-- Per-output failure backoff: a failing output (e.g. a conflicting file already
+-- at its NAS path) is withheld from the feed until next_attempt_at, so it is
+-- neither re-hashed every poll nor able to fill every feed page.
+CREATE TABLE recording_collation_output_errors (
+  output_id BIGINT NOT NULL REFERENCES recording_collation_outputs(id) ON DELETE RESTRICT,
+  connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+  failure_count INTEGER NOT NULL CHECK (failure_count > 0),
+  last_error TEXT NOT NULL CHECK (octet_length(last_error) <= 1000),
+  last_error_at TIMESTAMPTZ NOT NULL,
+  next_attempt_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (output_id, connection_id)
+);
