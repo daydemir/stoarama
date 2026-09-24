@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"net/http"
 	"regexp"
 	"strings"
@@ -190,6 +191,7 @@ const connectionPendingLateralSQL = `
 			  AND candidate.size_bytes > 0
 			  AND candidate.created_at < now() - ` + accountClipsCommitWatermark + `
 			  AND candidate.id > conn.last_cursor_id
+			  AND ` + nasdelivery.NotHeldCandidate + `
 			OFFSET 0
 		) c
 		JOIN recordings rec ON rec.id = c.recording_id

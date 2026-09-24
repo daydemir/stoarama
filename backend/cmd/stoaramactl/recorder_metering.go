@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"log"
 	"math"
 	"strconv"
@@ -492,7 +493,7 @@ func reconstructStorageDailyFacts(ctx context.Context, pool *pgxpool.Pool, accou
 		         FROM recording_clips c
 		         JOIN recordings r ON r.id=c.recording_id
 		         JOIN clip_storage_billing_contracts bc ON bc.clip_id=c.id
-		         WHERE r.account_id=$1 AND bc.mode <> 'excluded'
+		         WHERE r.account_id=$1 AND bc.mode NOT IN ('excluded','`+nasdelivery.HoldContractMode+`')
 		           AND c.created_at < ((day_date + 1)::timestamp AT TIME ZONE 'UTC')
 		           AND (c.released_at IS NULL OR c.released_at >= ((day_date + 1)::timestamp AT TIME ZONE 'UTC'))
 		           AND (c.purged_at IS NULL OR c.purged_at >= ((day_date + 1)::timestamp AT TIME ZONE 'UTC'))
@@ -539,6 +540,7 @@ const snapshotManagedStorageSQL = `
 		WHERE sd.managed AND c.purged_at IS NULL AND c.released_at IS NULL
 		  AND r.storage_retention_tier <> 'yearly_prepaid'
 		  AND (r.delivery <> 'nas_pull' OR c.created_at < now() - ($1::interval))
+		  AND ` + nasdelivery.NotHeldC + `
 		GROUP BY r.account_id
 	)
 	INSERT INTO account_storage_snapshots (account_id, snapshot_date, bytes_stored, stream_hours_stored)

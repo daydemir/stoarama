@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"log"
 	"net/http"
 	"strconv"
@@ -672,7 +673,7 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		if err := tx.QueryRow(r.Context(), `
 			SELECT count(*) FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
 			WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL
-			  AND c.size_bytes>0
+			  AND c.size_bytes>0 AND `+nasdelivery.NotHeldC+`
 			  AND NOT EXISTS (
 			    SELECT 1 FROM nas_inventory_files i
 				    WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present'
@@ -763,7 +764,7 @@ func (s *Server) handleAccountConnectionInventoryList(w http.ResponseWriter, r *
 	if err := s.pool.QueryRow(r.Context(), `
 		SELECT count(*) FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
 		WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL
-		  AND c.size_bytes>0
+		  AND c.size_bytes>0 AND `+nasdelivery.NotHeldC+`
 		  AND NOT EXISTS (SELECT 1 FROM nas_inventory_files i WHERE i.connection_id=$2 AND i.clip_id=c.id AND i.state='present')
 	`, principal.AccountID, connectionID).Scan(&serverOnly); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("count server-only clips: %v", err))
@@ -1057,7 +1058,7 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 			         SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
 			         WHERE rec.account_id=conn.account_id AND rec.delivery='nas_pull'
 			           AND c.purged_at IS NULL AND c.released_at IS NULL
-			           AND c.size_bytes>0
+			           AND c.size_bytes>0 AND `+nasdelivery.NotHeldC+`
 			           AND NOT EXISTS (
 			             SELECT 1 FROM nas_inventory_files i
 			             WHERE i.connection_id=conn.id AND i.clip_id=c.id AND i.state='present'

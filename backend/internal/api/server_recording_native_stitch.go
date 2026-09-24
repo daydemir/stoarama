@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"io"
 	"math"
 	"net/http"
@@ -146,7 +147,7 @@ func (s *Server) handleAccountNativeStitchClaim(w http.ResponseWriter, r *http.R
 		return
 	}
 	var backlog bool
-	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL AND c.size_bytes>0 AND c.created_at<now()-`+accountClipsCommitWatermark+`)`, p.AccountID).Scan(&backlog); err != nil {
+	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id WHERE rec.account_id=$1 AND rec.delivery='nas_pull' AND c.purged_at IS NULL AND c.released_at IS NULL AND c.size_bytes>0 AND `+nasdelivery.NotHeldC+` AND c.created_at<now()-`+accountClipsCommitWatermark+`)`, p.AccountID).Scan(&backlog); err != nil {
 		util.WriteError(w, 500, "check delivery backlog")
 		return
 	}

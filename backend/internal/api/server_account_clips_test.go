@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +26,7 @@ func TestAccountClipsCursorSQLShape(t *testing.T) {
 		"c.released_at IS NULL",
 		"c.size_bytes > 0",
 		"r.delivery = 'nas_pull'",
+		nasdelivery.NotHeldC,
 		"c.created_at < now() - ",
 		"c.id > $2",
 		"c.recording_job_id",
@@ -356,6 +358,14 @@ func equalInt64(a, b []int64) bool {
 	return true
 }
 
+// testClipStorageBillingContractsDDL mirrors the production contract table the
+// NAS queries consult to skip clips held for collated-only delivery.
+const testClipStorageBillingContractsDDL = `CREATE TABLE clip_storage_billing_contracts (
+	clip_id BIGINT PRIMARY KEY,
+	mode TEXT NOT NULL,
+	authoritative BOOLEAN NOT NULL DEFAULT true
+)`
+
 func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 	t.Helper()
 
@@ -507,6 +517,7 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			timestamp_contract_status TEXT,
 			timestamp_contract_reason TEXT
 		)`,
+		testClipStorageBillingContractsDDL,
 		`CREATE TABLE nas_inventory_files (
 			connection_id BIGINT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
 			clip_id BIGINT NOT NULL,

@@ -18,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | reconcile-upload-intents | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report | quality-grades report"
+const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | reconcile-upload-intents | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report | quality-grades report | nas-delivery status|set"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
@@ -62,6 +62,10 @@ func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if args[0] == "quality-grades" {
 		runRecordingQualityGrades(ctx, cfg, args[1:])
+		return
+	}
+	if args[0] == "nas-delivery" {
+		runRecordingNASDelivery(ctx, cfg, args[1:])
 		return
 	}
 	if args[0] == "campaign-tracks" {
