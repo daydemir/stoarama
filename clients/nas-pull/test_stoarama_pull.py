@@ -3716,26 +3716,42 @@ class RestoreTests(unittest.TestCase):
 
     def test_restore_once_leases_runs_and_reports_each_task(self):
         second = self.task(task_id=8, attempt=2)
+        leases = [
+            [self.task(), second],
+            [{"task_id": 9, "attempt": 1, "relative_path": "../x"}],
+        ]
         calls = []
-        leased = []
+        report_threads = {}
+        reported_7 = threading.Event()
+        main_thread = threading.current_thread()
 
         def fake_request(cfg, method, path, body=None, timeout=None, **_kw):
             calls.append((method, path, body))
             if path.endswith("/lease"):
-                leased.append(body["max_tasks"])
-                if len(leased) > 1:
-                    return {"retry_after_sec": 120, "tasks": []}
-                return {"retry_after_sec": 1, "tasks": [self.task(), second, {"task_id": 9, "attempt": 1, "relative_path": "../x"}]}
+                self.assertLessEqual(body["max_tasks"], 2)
+                if leases:
+                    return {"retry_after_sec": 1, "tasks": leases.pop(0)}
+                return {"retry_after_sec": 120, "tasks": []}
+            task_id = int(path.split("/")[-2])
+            report_threads[task_id] = threading.current_thread()
+            if task_id == 7:
+                reported_7.set()
             return {"ok": True, "state": "verified"}
 
-        results = {7: {"attempt": 1, "outcome": "uploaded", "error": "", "bytes_uploaded": 5, "duration_ms": 1},
-                   8: {"attempt": 2, "outcome": "exists", "error": "", "bytes_uploaded": 0, "duration_ms": 1}}
+        def fake_run(cfg, task):
+            if task["task_id"] == 8:
+                # Task 8's upload is still running when task 7 is reported:
+                # reporting must happen in the worker, not after the batch.
+                self.assertTrue(reported_7.wait(5))
+            return {7: {"attempt": 1, "outcome": "uploaded", "error": "", "bytes_uploaded": 5, "duration_ms": 1},
+                    8: {"attempt": 2, "outcome": "exists", "error": "", "bytes_uploaded": 0, "duration_ms": 1}}[task["task_id"]]
+
         with mock.patch.object(pull, "request_json", side_effect=fake_request), \
-                mock.patch.object(pull, "run_restore_task", side_effect=lambda cfg, task: results[task["task_id"]]):
+                mock.patch.object(pull, "run_restore_task", side_effect=fake_run):
             self.assertEqual(pull.restore_once(self.cfg), 120)
-        leases = [(path, body["max_tasks"]) for _m, path, body in calls if path.endswith("/lease")]
-        self.assertEqual(leases[0], ("/account/connections/nas-restore/lease", 2))
-        self.assertTrue(all(1 <= n <= 2 for _p, n in leases))
+        lease_sizes = [body["max_tasks"] for _m, path, body in calls if path.endswith("/lease")]
+        self.assertEqual(lease_sizes[0], 2)
+        self.assertNotIn(main_thread, (report_threads[7], report_threads[8]))
         reported = sorted((path, body["attempt"], body["outcome"]) for _m, path, body in calls if not path.endswith("/lease"))
         self.assertEqual(reported, [
             ("/account/connections/nas-restore/7/result", 1, "uploaded"),
