@@ -228,6 +228,9 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if ids := feedIDs(); fmt.Sprint(ids) != "[102 103]" {
 		t.Fatalf("feed after ack=%v", ids)
 	}
+	if code, _ := do(s.handleAccountCollatedError, http.MethodPost, "/x", map[string]any{"output_id": 105, "error": "foreign"}, nil); code != 404 {
+		t.Fatalf("foreign error report code=%d", code)
+	}
 	if code, _ := do(s.handleAccountCollatedError, http.MethodPost, "/x", map[string]any{"output_id": 102, "error": "boom"}, nil); code != 200 {
 		t.Fatalf("error report code=%d", code)
 	}

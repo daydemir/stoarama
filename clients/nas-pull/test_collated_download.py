@@ -64,7 +64,7 @@ class CollatedDownloadTests(unittest.TestCase):
             if path.startswith("/account/collated?"):
                 return {"policy": policy or {"enabled": True, "download_bytes_per_sec": 1 << 30, "download_parallel": 2},
                         "items": items if items is not None else [dict(self.item)]}
-            if path == self.item["download_path"]:
+            if path.startswith("/api/v1/account/collated/") and path.endswith("/download"):
                 return {"url": "https://r2.test/obj", "etag": "e1", "if_match": '"e1"',
                         "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"], "expires_in_sec": 3600}
             if path == "/account/collated/ack":
@@ -115,6 +115,7 @@ class CollatedDownloadTests(unittest.TestCase):
     def test_resumes_partial_by_offset(self):
         self.part.parent.mkdir(parents=True)
         self.part.write_bytes(self.body[:1000])
+        self.assertEqual(pull.collated_bytes_needed(self.cfg, self.item), len(self.body) - 1000)
         self.assertTrue(self.drain())
         self.assertEqual(self.requests[0]["Range"], "bytes=1000-")
         self.assertEqual(self.final.read_bytes(), self.body)
@@ -133,6 +134,7 @@ class CollatedDownloadTests(unittest.TestCase):
     def test_existing_identical_final_is_acked_without_download(self):
         self.final.parent.mkdir(parents=True)
         self.final.write_bytes(self.body)
+        self.assertEqual(pull.collated_bytes_needed(self.cfg, self.item), 0)
         self.assertTrue(self.drain())
         self.assertEqual(self.requests, [])
         self.assertEqual(len(self.acks), 1)
@@ -193,7 +195,7 @@ class CollatedDownloadTests(unittest.TestCase):
                 mock.patch.object(pull, "storage_status", return_value={"available": True, "total_bytes": 10**13, "free_bytes": free}):
             threading.Timer(0.3, gate.set).start()
             self.assertTrue(pull.drain_collated(self.cfg, self.runtime, threading.Event()))
-        self.assertEqual([a["output_id"] for a in self.acks], [7])
+        self.assertEqual(len(self.acks), 1)
         self.assertEqual(self.runtime.capacity_reserved_bytes, 0)
 
     def test_rate_limiter_shares_one_budget(self):

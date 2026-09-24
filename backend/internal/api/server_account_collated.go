@@ -306,6 +306,17 @@ func (s *Server) handleAccountCollatedError(w http.ResponseWriter, r *http.Reque
 	}
 	var outputID any
 	if req.OutputID > 0 {
+		// Only an output this connection may currently receive can carry an error.
+		var eligible bool
+		if err := s.pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 `+collatedEligibleSQL+` AND o.id=$2)`,
+			connectionID, req.OutputID).Scan(&eligible); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, "check collated output")
+			return
+		}
+		if !eligible {
+			util.WriteError(w, http.StatusNotFound, "collated output not found")
+			return
+		}
 		outputID = req.OutputID
 	}
 	if _, err := s.pool.Exec(r.Context(), `UPDATE connections SET collated_last_error=$2,collated_last_error_output_id=$3,
@@ -408,7 +419,10 @@ func (s *Server) handleAdminConnectionCollatedDelivery(w http.ResponseWriter, r 
 		util.WriteError(w, http.StatusInternalServerError, "count pending collated outputs")
 		return
 	}
-	if err := s.pool.QueryRow(r.Context(), `SELECT count(*) FROM recording_collation_output_errors WHERE connection_id=$1 AND next_attempt_at>now()`,
+	if err := s.pool.QueryRow(r.Context(), `SELECT count(*) `+
+		strings.Replace(collatedEligibleSQL, " AND conn.collated_delivery_enabled", "", 1)+`
+		  AND EXISTS (SELECT 1 FROM recording_collation_output_errors e
+		    WHERE e.output_id=o.id AND e.connection_id=$1 AND e.next_attempt_at>now())`,
 		connectionID).Scan(&out.BackedOffFiles); err != nil {
 		util.WriteError(w, http.StatusInternalServerError, "count backed-off collated outputs")
 		return

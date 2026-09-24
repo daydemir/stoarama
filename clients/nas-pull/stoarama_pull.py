@@ -5747,6 +5747,25 @@ def download_collated_item(cfg, item, limiter, stop_event):
         os.close(directory_fd)
 
 
+def collated_bytes_needed(cfg, item):
+    """Bytes still to be written for item: 0 when its final exists, the rest of a partial."""
+    relative = item["nas_relative_path"]
+    name = relative.split("/")[-1]
+    try:
+        directory_fd = open_collated_dir(cfg, relative, create=False)
+    except FileNotFoundError:
+        return item["size_bytes"]
+    try:
+        if collated_entry_stat(directory_fd, name) is not None:
+            return 0
+        part = collated_entry_stat(directory_fd, ".%s.collated-%d.part" % (name, item["output_id"]))
+        if part is None or part.st_size >= item["size_bytes"]:
+            return item["size_bytes"]
+        return item["size_bytes"] - part.st_size
+    finally:
+        os.close(directory_fd)
+
+
 def ack_collated_item(cfg, item):
     request_json(cfg, "POST", "/account/collated/ack", body={
         "output_id": item["output_id"], "nas_relative_path": item["nas_relative_path"],
@@ -5782,7 +5801,8 @@ def drain_collated(cfg, runtime, stop_event):
             return
         # Reserve the whole output in the shared runtime ledger so parallel
         # collated downloads and raw delivery never overcommit the same bytes.
-        if not runtime.reserve_joined_storage(cfg, storage_status(cfg), item["size_bytes"]):
+        needed = collated_bytes_needed(cfg, item)
+        if not runtime.reserve_joined_storage(cfg, storage_status(cfg), needed):
             raise CollatedDownloadStopped("collated delivery yielded to the NAS free-space reserve")
         try:
             fetched = download_collated_item(cfg, item, limiter, stop_event)
@@ -5794,7 +5814,7 @@ def drain_collated(cfg, runtime, stop_event):
             report_collated_error(cfg, item["output_id"], exc)
             return
         finally:
-            runtime.release_storage_reservation(item["size_bytes"])
+            runtime.release_storage_reservation(needed)
         delivered.append(item["output_id"])
         log("INFO", "collated output_id=%d bytes=%d saved=%s%s" % (
             item["output_id"], item["size_bytes"], cfg.output_dir / JOINED_ROOT / item["nas_relative_path"],
