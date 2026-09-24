@@ -331,7 +331,7 @@ func Load() (Config, error) {
 		DOSpendWarnUSDPerDay:            floatEnv("DO_SPEND_WARN_USD_PER_DAY", 5),
 		DOSpendCriticalUSDPerDay:        floatEnv("DO_SPEND_CRITICAL_USD_PER_DAY", 10),
 		DOSpendMonthlyBudgetUSD:         floatEnv("DO_SPEND_MONTHLY_BUDGET_USD", 150),
-		DOSpendAllowlist:                strEnv("DO_SPEND_ALLOWLIST", "stoarama-survey-*,copresence-*"),
+		DOSpendAllowlist:                strEnv("DO_SPEND_ALLOWLIST", "stoarama-survey-*,copresence-*,stoarama-collate-*=15"),
 		DOSpendScaleUpGuard:             boolEnv("DO_SPEND_SCALEUP_GUARD_ENABLED", true),
 		DropletPoolEnabled:              boolEnv("DROPLET_POOL_ENABLED", false),
 		DropletPoolTickSec:              intEnv("DROPLET_POOL_TICK_SEC", 30),

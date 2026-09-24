@@ -32,6 +32,7 @@ const (
 	signalDOSpendBurn = "do_spend_burn"
 	signalDOSpendMTD  = "do_spend_mtd"
 	signalDOUnmanaged = "do_unmanaged"
+	signalDOAllowCap  = "do_allowlist_over_cap"
 )
 
 // doUnmanagedMinAge keeps a resource an operator just created out of the
@@ -155,7 +156,7 @@ type doSpendAlertResult struct {
 // doSpendAlertKeys maps a report onto the episode keys of each signal. An
 // empty slice for a signal resolves its open episodes.
 func doSpendAlertKeys(r dospend.Report) map[string][]string {
-	keys := map[string][]string{signalDOSpendBurn: {}, signalDOSpendMTD: {}, signalDOUnmanaged: {}}
+	keys := map[string][]string{signalDOSpendBurn: {}, signalDOSpendMTD: {}, signalDOUnmanaged: {}, signalDOAllowCap: {}}
 	if r.Level != dospend.LevelOK {
 		keys[signalDOSpendBurn] = append(keys[signalDOSpendBurn], signalDOSpendBurn+":"+r.Level)
 	}
@@ -164,6 +165,9 @@ func doSpendAlertKeys(r dospend.Report) map[string][]string {
 	}
 	for _, res := range r.Unmanaged {
 		keys[signalDOUnmanaged] = append(keys[signalDOUnmanaged], signalDOUnmanaged+":"+res.Kind+":"+res.ID)
+	}
+	for _, a := range r.OverCap() {
+		keys[signalDOAllowCap] = append(keys[signalDOAllowCap], signalDOAllowCap+":"+a.Pattern)
 	}
 	return keys
 }
@@ -282,6 +286,9 @@ func composeDOSpendEmail(r dospend.Report, blocked bool) (string, string) {
 	if len(r.Unmanaged) > 0 {
 		parts = append(parts, fmt.Sprintf("%d unmanaged resource(s) $%.2f/day", len(r.Unmanaged), r.UnmanagedUSDPerDay))
 	}
+	for _, a := range r.OverCap() {
+		parts = append(parts, fmt.Sprintf("%s $%.2f/day over its $%.2f cap", a.Pattern, a.USDPerDay, a.CapUSDPerDay))
+	}
 	if r.OverBudget {
 		parts = append(parts, fmt.Sprintf("MTD $%.2f over $%.0f budget", r.MonthToDateUSD, r.MonthlyBudgetUSD))
 	}
@@ -325,6 +332,14 @@ func composeDOSpendReport(r dospend.Report, withInventory bool) string {
 	for _, res := range r.Unmanaged {
 		fmt.Fprintf(&b, "  %s %s (id %s) %s $%.2f/day created %s\n", res.Kind, res.Name, res.ID, res.Size, res.USDPerDay, res.CreatedAt.UTC().Format(time.RFC3339))
 	}
+	b.WriteString("\nALLOWLISTED (DO_SPEND_ALLOWLIST; cap 0 = none)\n")
+	for _, a := range r.Allowlisted {
+		flag := ""
+		if a.OverCap {
+			flag = "  OVER CAP"
+		}
+		fmt.Fprintf(&b, "  %-28s %3d  $%.2f/day  cap $%.2f%s\n", a.Pattern, a.Count, a.USDPerDay, a.CapUSDPerDay, flag)
+	}
 	if withInventory {
 		b.WriteString("\nINVENTORY\n")
 		for _, res := range r.Resources {
@@ -353,6 +368,9 @@ func composeDigestDOSpend(r *dospend.Report, readErr error) string {
 	}
 	for _, res := range r.Unmanaged {
 		fmt.Fprintf(&b, "  UNMANAGED %s %s %s $%.2f/day\n", res.Kind, res.Name, res.Size, res.USDPerDay)
+	}
+	for _, a := range r.OverCap() {
+		fmt.Fprintf(&b, "  OVER CAP %s $%.2f/day > $%.2f/day\n", a.Pattern, a.USDPerDay, a.CapUSDPerDay)
 	}
 	return b.String()
 }

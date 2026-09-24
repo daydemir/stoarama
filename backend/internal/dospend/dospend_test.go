@@ -12,7 +12,7 @@ func near(a, b float64) bool { return math.Abs(a-b) < 1e-6 }
 
 func testConfig() Config {
 	return Config{WarnUSDPerDay: 5, CriticalUSDPerDay: 10, MonthlyBudgetUSD: 150,
-		Allowlist: ParseAllowlist("stoarama-survey-*, copresence-*"), UnmanagedMinAge: time.Hour}
+		Allowlist: ParseAllowlist("stoarama-survey-*, copresence-*,stoarama-collate-*=15"), UnmanagedMinAge: time.Hour}
 }
 
 func TestAnalyzeFlagsTheCollationFleetAndSparesThePool(t *testing.T) {
@@ -116,7 +116,17 @@ func TestConfigValidate(t *testing.T) {
 		}
 	}
 	bad = testConfig()
-	bad.Allowlist = []string{"["}
+	bad.Allowlist = ParseAllowlist("x-*=fifteen")
+	if bad.Validate() == nil {
+		t.Fatal("malformed cap accepted")
+	}
+	bad = testConfig()
+	bad.Allowlist = ParseAllowlist("x-*=-1")
+	if bad.Validate() == nil {
+		t.Fatal("negative cap accepted")
+	}
+	bad = testConfig()
+	bad.Allowlist = []AllowEntry{{Pattern: "["}}
 	if bad.Validate() == nil {
 		t.Fatal("malformed glob accepted")
 	}
@@ -152,5 +162,44 @@ func TestGuardQuotePricesFromInventoryThenSizes(t *testing.T) {
 	fc = &fakeClient{inv: inv, sizeErr: errors.New("unknown size")}
 	if _, _, err = (Guard{Client: fc}).Quote(context.Background(), "nope"); err == nil {
 		t.Fatal("unknown size priced")
+	}
+}
+
+func TestAllowlistCapCountsDropletAndAttachedVolumes(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-2 * time.Hour)
+	cfg := testConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	collate := func(dropletPerHour float64, volGiB float64) Inventory {
+		return Inventory{Resources: []Resource{
+			{Kind: KindDroplet, ID: "10", Name: "stoarama-collate-01", Size: "c-16", CreatedAt: old, USDPerDay: DropletUSDPerDay(dropletPerHour)},
+			{Kind: KindVolume, ID: "v10", Name: "scratch-200", Size: "200GiB", CreatedAt: old, DropletIDs: []string{"10"}, USDPerDay: StorageUSDPerDay(volGiB, VolumeUSDPerGiBMonth)},
+			{Kind: KindDroplet, ID: "11", Name: "copresence-api-01", CreatedAt: old, USDPerDay: 0.21},
+		}}
+	}
+	// c-8 ($0.25/h = $6/day) + 200 GiB ($0.66/day) stays under $15.
+	r := Analyze(collate(0.25, 200), ManagedSet{}, cfg, now)
+	if len(r.Unmanaged) != 0 || len(r.OverCap()) != 0 {
+		t.Fatalf("authorized collation flagged: unmanaged=%v over=%v", r.Unmanaged, r.OverCap())
+	}
+	var got AllowSpend
+	for _, a := range r.Allowlisted {
+		if a.Pattern == "stoarama-collate-*" {
+			got = a
+		}
+	}
+	if got.Count != 2 || got.CapUSDPerDay != 15 || !near(got.USDPerDay, 6+StorageUSDPerDay(200, VolumeUSDPerGiBMonth)) {
+		t.Fatalf("collate spend=%+v", got)
+	}
+	// c-32 ($1.19/h = $28.56/day) breaches the $15 cap; burn counts it either way.
+	r = Analyze(collate(1.19, 200), ManagedSet{}, cfg, now)
+	over := r.OverCap()
+	if len(over) != 1 || over[0].Pattern != "stoarama-collate-*" {
+		t.Fatalf("over cap=%+v", over)
+	}
+	if r.BurnUSDPerDay < 28.56 {
+		t.Fatalf("burn %v excludes allowlisted spend", r.BurnUSDPerDay)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"math"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -60,6 +61,8 @@ type Resource struct {
 	USDPerDay  float64   `json:"usd_per_day"`
 	Owner      string    `json:"owner"`
 	Group      string    `json:"group"`
+	// AllowEntry is the allowlist pattern that owns an allowlisted resource.
+	AllowEntry string `json:"allow_entry,omitempty"`
 }
 
 // Inventory is one complete read of the account.
@@ -75,20 +78,41 @@ type Config struct {
 	CriticalUSDPerDay float64
 	MonthlyBudgetUSD  float64
 	// Allowlist holds path.Match globs of droplet/volume names that are known
-	// and intentionally outside the recorder pool (e.g. "copresence-*").
-	Allowlist []string
+	// and intentionally outside the recorder pool (e.g. "copresence-*"), each
+	// with an optional $/day cap on its combined cost.
+	Allowlist []AllowEntry
 	// UnmanagedMinAge keeps a freshly created resource out of the tripwire so a
 	// short-lived operator action does not page.
 	UnmanagedMinAge time.Duration
 }
 
-// ParseAllowlist splits a comma-separated glob list.
-func ParseAllowlist(raw string) []string {
-	out := []string{}
+// AllowEntry is one allowlist glob. CapUSDPerDay > 0 alerts when everything
+// the entry owns (matching droplets and volumes, plus volumes attached to
+// matching droplets) costs more than that per day; 0 means no cap.
+type AllowEntry struct {
+	Pattern      string  `json:"pattern"`
+	CapUSDPerDay float64 `json:"cap_usd_per_day,omitempty"`
+}
+
+// ParseAllowlist splits a comma-separated list of "glob" or "glob=capUSDPerDay"
+// entries, e.g. "copresence-*,stoarama-collate-*=15". A malformed cap parses as
+// NaN so Validate rejects it instead of silently dropping the cap.
+func ParseAllowlist(raw string) []AllowEntry {
+	out := []AllowEntry{}
 	for _, p := range strings.Split(raw, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
+		if p = strings.TrimSpace(p); p == "" {
+			continue
 		}
+		e := AllowEntry{Pattern: p}
+		if i := strings.LastIndex(p, "="); i >= 0 {
+			e.Pattern = strings.TrimSpace(p[:i])
+			capUSD, err := strconv.ParseFloat(strings.TrimSpace(p[i+1:]), 64)
+			if err != nil {
+				capUSD = math.NaN()
+			}
+			e.CapUSDPerDay = capUSD
+		}
+		out = append(out, e)
 	}
 	return out
 }
@@ -111,22 +135,42 @@ func (c Config) Validate() error {
 	if c.WarnUSDPerDay > c.CriticalUSDPerDay {
 		return fmt.Errorf("DO spend warn threshold %v exceeds critical %v", c.WarnUSDPerDay, c.CriticalUSDPerDay)
 	}
-	for _, p := range c.Allowlist {
-		if _, err := path.Match(p, ""); err != nil {
-			return fmt.Errorf("DO spend allowlist pattern %q: %w", p, err)
+	for _, e := range c.Allowlist {
+		if e.Pattern == "" {
+			return fmt.Errorf("DO spend allowlist has an empty pattern")
+		}
+		if _, err := path.Match(e.Pattern, ""); err != nil {
+			return fmt.Errorf("DO spend allowlist pattern %q: %w", e.Pattern, err)
+		}
+		if math.IsNaN(e.CapUSDPerDay) || math.IsInf(e.CapUSDPerDay, 0) || e.CapUSDPerDay < 0 {
+			return fmt.Errorf("DO spend allowlist %q cap must be a finite number >= 0", e.Pattern)
 		}
 	}
 	return nil
 }
 
-// Allowlisted reports whether name matches any allowlist glob.
-func (c Config) Allowlisted(name string) bool {
-	for _, p := range c.Allowlist {
-		if ok, _ := path.Match(p, name); ok {
-			return true
+// AllowEntryFor returns the first allowlist pattern matching name.
+func (c Config) AllowEntryFor(name string) (string, bool) {
+	for _, e := range c.Allowlist {
+		if ok, _ := path.Match(e.Pattern, name); ok {
+			return e.Pattern, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// Allowlisted reports whether name matches any allowlist glob.
+func (c Config) Allowlisted(name string) bool {
+	_, ok := c.AllowEntryFor(name)
+	return ok
+}
+
+// AllowSpend is the combined cost of what one allowlist entry owns.
+type AllowSpend struct {
+	AllowEntry
+	Count     int     `json:"count"`
+	USDPerDay float64 `json:"usd_per_day"`
+	OverCap   bool    `json:"over_cap"`
 }
 
 // ManagedSet is what the recorder pool claims: DO droplet ids with a live
@@ -157,7 +201,19 @@ type Report struct {
 	Groups             []GroupTotal `json:"groups"`
 	Unmanaged          []Resource   `json:"unmanaged"`
 	UnmanagedUSDPerDay float64      `json:"unmanaged_usd_per_day"`
+	Allowlisted        []AllowSpend `json:"allowlisted"`
 	Resources          []Resource   `json:"resources"`
+}
+
+// OverCap returns the allowlist entries whose combined cost exceeds their cap.
+func (r Report) OverCap() []AllowSpend {
+	out := []AllowSpend{}
+	for _, a := range r.Allowlisted {
+		if a.OverCap {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // Analyze classifies and totals an inventory. It is pure so every branch is
@@ -172,15 +228,15 @@ func Analyze(inv Inventory, managed ManagedSet, cfg Config, now time.Time) Repor
 	}
 	// A volume inherits its droplet's ownership: attached to a pool droplet it
 	// belongs to the pool, attached to an allowlisted droplet it is allowlisted.
-	poolDroplets, allowedDroplets := map[string]bool{}, map[string]bool{}
+	poolDroplets, allowedDroplets := map[string]bool{}, map[string]string{}
 	for _, res := range inv.Resources {
 		if res.Kind != KindDroplet {
 			continue
 		}
 		if managed.DropletIDs[res.ID] || managed.Names[res.Name] {
 			poolDroplets[res.ID] = true
-		} else if cfg.Allowlisted(res.Name) {
-			allowedDroplets[res.ID] = true
+		} else if pattern, ok := cfg.AllowEntryFor(res.Name); ok {
+			allowedDroplets[res.ID] = pattern
 		}
 	}
 	groups := map[string]*GroupTotal{}
@@ -191,14 +247,20 @@ func Analyze(inv Inventory, managed ManagedSet, cfg Config, now time.Time) Repor
 			res.Owner = OwnerNA
 		case KindDroplet:
 			res.Owner = classify(poolDroplets[res.ID], res.Name, cfg)
+			if res.Owner == OwnerAllowlist {
+				res.AllowEntry = allowedDroplets[res.ID]
+			}
 		case KindVolume:
 			res.Owner = classify(false, res.Name, cfg)
+			if res.Owner == OwnerAllowlist {
+				res.AllowEntry, _ = cfg.AllowEntryFor(res.Name)
+			}
 			for _, id := range res.DropletIDs {
 				switch {
 				case poolDroplets[id]:
-					res.Owner = OwnerPool
-				case allowedDroplets[id] && res.Owner == OwnerUnmanaged:
-					res.Owner = OwnerAllowlist
+					res.Owner, res.AllowEntry = OwnerPool, ""
+				case allowedDroplets[id] != "" && res.Owner == OwnerUnmanaged:
+					res.Owner, res.AllowEntry = OwnerAllowlist, allowedDroplets[id]
 				}
 			}
 		}
@@ -231,6 +293,17 @@ func Analyze(inv Inventory, managed ManagedSet, cfg Config, now time.Time) Repor
 		}
 		return r.Unmanaged[i].Name < r.Unmanaged[j].Name
 	})
+	for _, e := range cfg.Allowlist {
+		a := AllowSpend{AllowEntry: e}
+		for _, res := range r.Resources {
+			if res.AllowEntry == e.Pattern {
+				a.Count++
+				a.USDPerDay += res.USDPerDay
+			}
+		}
+		a.OverCap = e.CapUSDPerDay > 0 && a.USDPerDay > e.CapUSDPerDay
+		r.Allowlisted = append(r.Allowlisted, a)
+	}
 	r.Level = BurnLevel(r.BurnUSDPerDay, cfg)
 	r.OverBudget = r.MonthToDateUSD > cfg.MonthlyBudgetUSD
 	r.ProjectedMonthUSD = r.MonthToDateUSD + r.BurnUSDPerDay*daysLeftInMonth(now)

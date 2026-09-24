@@ -25,9 +25,15 @@ func TestDOSpendAlertKeys(t *testing.T) {
 	if got := keys[signalDOUnmanaged]; len(got) != 2 || got[0] != "do_unmanaged:droplet:4" || got[1] != "do_unmanaged:volume:v2" {
 		t.Fatalf("unmanaged keys=%v", got)
 	}
+	capped := doSpendAlertKeys(dospend.Report{GeneratedAt: now, Level: dospend.LevelOK, Allowlisted: []dospend.AllowSpend{
+		{AllowEntry: dospend.AllowEntry{Pattern: "stoarama-collate-*", CapUSDPerDay: 15}, USDPerDay: 28.6, OverCap: true},
+		{AllowEntry: dospend.AllowEntry{Pattern: "copresence-*"}, USDPerDay: 0.2}}})
+	if got := capped[signalDOAllowCap]; len(got) != 1 || got[0] != "do_allowlist_over_cap:stoarama-collate-*" {
+		t.Fatalf("allowlist cap keys=%v", got)
+	}
 	// A healthy report still names every signal so open episodes resolve.
 	ok := doSpendAlertKeys(dospend.Report{GeneratedAt: now, Level: dospend.LevelOK})
-	for _, s := range []string{signalDOSpendBurn, signalDOSpendMTD, signalDOUnmanaged} {
+	for _, s := range []string{signalDOSpendBurn, signalDOSpendMTD, signalDOUnmanaged, signalDOAllowCap} {
 		if keys, present := ok[s]; !present || len(keys) != 0 {
 			t.Fatalf("healthy report signal %s keys=%v present=%t", s, keys, present)
 		}
