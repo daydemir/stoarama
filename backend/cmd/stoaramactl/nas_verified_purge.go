@@ -175,7 +175,7 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 // age seconds. The candidate scan classifies with them; the locked re-check
 // requires all of them.
 const nasPurgeFactsSQL = `
-  (c.size_bytes>0 AND lower(COALESCE(c.sha256,'')) ~ '^[0-9a-f]{64}$' AND COALESCE(c.object_key,'')<>'' AND COALESCE(c.display_path,'')<>'') AS identity_ok,
+  (c.size_bytes>0 AND lower(COALESCE(c.sha256,'')) ~ '^[0-9a-f]{64}$' AND COALESCE(c.object_key,'')<>'' AND c.object_key=btrim(c.object_key) AND COALESCE(c.display_path,'')<>'') AS identity_ok,
   (COALESCE(sd.managed,false) AND COALESCE(c.bucket,'')=$2 AND COALESCE(sd.bucket,'')=$2) AS managed_ok,
   EXISTS(SELECT 1 FROM nas_inventory_files n
     WHERE n.connection_id=$1 AND n.clip_id=c.id AND n.state='present'
