@@ -895,3 +895,24 @@ func TestJoinedArchiveConfigurationIsShipDarkAndCredentialIsolated(t *testing.T)
 		}
 	}
 }
+
+func TestValidateNASUploadProbeBounds(t *testing.T) {
+	valid := Config{NASUploadProbeBytes: 256 << 20, NASUploadProbeStreams: 4, NASUploadProbeInterval: 6 * time.Hour}
+	if err := valid.ValidateNASUploadProbe(); err != nil {
+		t.Fatalf("default probe config rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"tiny":       func(c *Config) { c.NASUploadProbeBytes = 1024 },
+		"huge":       func(c *Config) { c.NASUploadProbeBytes = 5 << 30 },
+		"no streams": func(c *Config) { c.NASUploadProbeStreams = 0 },
+		"too many":   func(c *Config) { c.NASUploadProbeStreams = 17 },
+		"too often":  func(c *Config) { c.NASUploadProbeInterval = time.Minute },
+		"too rare":   func(c *Config) { c.NASUploadProbeInterval = 8 * 24 * time.Hour },
+	} {
+		c := valid
+		mutate(&c)
+		if err := c.ValidateNASUploadProbe(); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}

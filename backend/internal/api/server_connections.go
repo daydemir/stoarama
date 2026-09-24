@@ -25,6 +25,7 @@ var (
 	pullDownloadPathRe       = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/download$`)
 	pullReleasePathRe        = regexp.MustCompile(`^/api/v1/account/recordings/\d+/clips/\d+/release$`)
 	pullJoinedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
+	pullUploadProbeResultRe  = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
 )
 
 // pullPathAllowed reports whether a pull-scoped key may call (method, path). It is
@@ -52,6 +53,10 @@ func pullPathAllowed(method, path string) bool {
 	case method == http.MethodPost && path == "/api/v1/account/connections/stitch-certifications/complete":
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/clips/release":
+		return true
+	case method == http.MethodPost && path == "/api/v1/account/connections/upload-probe":
+		return true
+	case method == http.MethodPost && pullUploadProbeResultRe.MatchString(path):
 		return true
 	case method == http.MethodGet && path == "/api/v1/account/joined":
 		return true

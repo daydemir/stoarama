@@ -7,10 +7,12 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import http.client
 import json
 import math
 import os
 import posixpath
+import random
 import re
 import signal
 import socket
@@ -78,6 +80,20 @@ NATIVE_STITCH_TEMP_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 NATIVE_STITCH_ATTEMPT_SEC = 35 * 60
 NATIVE_STITCH_DELIVERY_POLL_SEC = 5
 NATIVE_STITCH_COMPLETION_MARGIN_SEC = 5 * 60
+# Upload speed probe: the server owns enablement, size, streams and interval.
+# The client only bounds what it will do with whatever the server sends.
+UPLOAD_PROBE_BLOCK_BYTES = 1024 * 1024
+UPLOAD_PROBE_MAX_BYTES = 4 * 1024 * 1024 * 1024
+UPLOAD_PROBE_MAX_STREAMS = 16
+UPLOAD_PROBE_MAX_SEC = 20 * 60
+UPLOAD_PROBE_SOCKET_TIMEOUT_SEC = 60
+UPLOAD_PROBE_STARTUP_DELAY_SEC = (120, 900)
+UPLOAD_PROBE_MIN_WAIT_SEC = 300
+UPLOAD_PROBE_MAX_WAIT_SEC = 24 * 60 * 60
+UPLOAD_PROBE_ERROR_WAIT_SEC = 60 * 60
+UPLOAD_PROBE_JITTER = 0.1
+UPLOAD_PROBE_REPORT_ATTEMPTS = 3
+UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
 
 
 class ExistingFileMismatch(RuntimeError):
@@ -119,6 +135,10 @@ class ToolProcessError(MediaCertificationError):
 
 
 class DeterministicMediaError(MediaCertificationError):
+    pass
+
+
+class UploadProbeTimeout(RuntimeError):
     pass
 
 
@@ -1193,6 +1213,10 @@ class Runtime:
     def release_storage_reservation(self, expected_bytes):
         with self.lock:
             self.capacity_reserved_bytes = max(0, self.capacity_reserved_bytes - max(0, int(expected_bytes)))
+
+    def upload_probe_activity(self):
+        with self.lock:
+            return self.phase.value, self.bytes_pulled, self.joined_transfer is not None
 
     def heartbeat_payload(self, outage):
         with self.lock:
@@ -5685,6 +5709,183 @@ def heartbeat_loop(cfg, runtime, stop_event):
         stop_event.wait(HEARTBEAT_INTERVAL_SEC)
 
 
+class UploadProbeBody:
+    """Streams size bytes by repeating one random block; nothing touches disk.
+
+    R2 neither compresses nor deduplicates, so a repeated block measures the
+    link exactly like unique data while keeping memory at one block.
+    """
+
+    def __init__(self, size, block, deadline):
+        self.remaining = size
+        self.block = block
+        self.deadline = deadline
+        self.sent = 0
+
+    def read(self, amount=-1):
+        if self.remaining <= 0:
+            return b""
+        if time.monotonic() > self.deadline:
+            raise UploadProbeTimeout("upload probe exceeded %d seconds" % UPLOAD_PROBE_MAX_SEC)
+        count = len(self.block) if amount is None or amount < 0 else min(amount, len(self.block))
+        count = min(count, self.remaining)
+        self.remaining -= count
+        self.sent += count
+        return self.block if count == len(self.block) else self.block[:count]
+
+
+def valid_upload_probe_target(target):
+    if not isinstance(target, dict):
+        raise RuntimeError("invalid upload probe response")
+    probe_id = target.get("probe_id")
+    size = target.get("size_bytes")
+    streams = target.get("streams")
+    parts = target.get("parts")
+    if type(probe_id) is not int or probe_id <= 0:
+        raise RuntimeError("invalid upload probe id")
+    if type(size) is not int or not 0 < size <= UPLOAD_PROBE_MAX_BYTES:
+        raise RuntimeError("invalid upload probe size")
+    if type(streams) is not int or not 1 <= streams <= UPLOAD_PROBE_MAX_STREAMS:
+        raise RuntimeError("invalid upload probe streams")
+    if not isinstance(parts, list) or len(parts) != streams:
+        raise RuntimeError("invalid upload probe parts")
+    valid = []
+    for part in parts:
+        if not isinstance(part, dict):
+            raise RuntimeError("invalid upload probe part")
+        url = urllib.parse.urlsplit(str(part.get("url", "")))
+        part_size = part.get("size_bytes")
+        headers = part.get("headers") or {}
+        if url.scheme != "https" or not url.hostname or part.get("method") != "PUT":
+            raise RuntimeError("upload probe target must be an https PUT")
+        if type(part_size) is not int or part_size <= 0 or not isinstance(headers, dict):
+            raise RuntimeError("invalid upload probe part")
+        valid.append({"url": url, "size_bytes": part_size, "headers": {str(k): str(v) for k, v in headers.items()}})
+    if sum(part["size_bytes"] for part in valid) != size:
+        raise RuntimeError("upload probe parts do not sum to the probe size")
+    return probe_id, valid
+
+
+def upload_probe_part(part, body):
+    url = part["url"]
+    connection = http.client.HTTPSConnection(
+        url.netloc, timeout=UPLOAD_PROBE_SOCKET_TIMEOUT_SEC, blocksize=UPLOAD_PROBE_BLOCK_BYTES,
+    )
+    try:
+        headers = dict(part["headers"])
+        headers["Content-Length"] = str(part["size_bytes"])
+        headers["User-Agent"] = USER_AGENT
+        connection.request("PUT", url.path + ("?" + url.query if url.query else ""), body=body, headers=headers)
+        response = connection.getresponse()
+        response.read(64 * 1024)
+        if not 200 <= response.status < 300:
+            raise RuntimeError("upload probe PUT returned HTTP %d" % response.status)
+    finally:
+        connection.close()
+
+
+def run_upload_probe(runtime, target):
+    """Upload all parts concurrently and measure wall time end to end."""
+    probe_id, parts = valid_upload_probe_target(target)
+    block = os.urandom(UPLOAD_PROBE_BLOCK_BYTES)
+    phase_start, pulled_start, joined_start = runtime.upload_probe_activity()
+    started_at = utc_now_precise()
+    started = time.monotonic()
+    bodies = [UploadProbeBody(part["size_bytes"], block, started + UPLOAD_PROBE_MAX_SEC) for part in parts]
+    errors = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        futures = [pool.submit(upload_probe_part, part, body) for part, body in zip(parts, bodies)]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(exc)
+    duration_ms = max(1, round((time.monotonic() - started) * 1000))
+    phase_end, pulled_end, joined_end = runtime.upload_probe_activity()
+    size = sum(part["size_bytes"] for part in parts)
+    uploaded = min(size, sum(body.sent for body in bodies))
+    error = ""
+    if errors:
+        error = ("%s: %s" % (type(errors[0]).__name__, errors[0]))[:500]
+    elif uploaded != size:
+        error = "upload probe sent %d of %d bytes" % (uploaded, size)
+    return probe_id, {
+        "bytes_uploaded": uploaded,
+        "duration_ms": duration_ms,
+        "started_at": started_at,
+        "error": error,
+        "client_version": CLIENT_VERSION,
+        "client_phase_start": phase_start,
+        "client_phase_end": phase_end,
+        "joined_transfer_active": bool(joined_start or joined_end),
+        "bytes_pulled_during": max(0, pulled_end - pulled_start),
+    }
+
+
+def upload_probe_wait(seconds, rng=random):
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        seconds = UPLOAD_PROBE_ERROR_WAIT_SEC
+    seconds = min(max(seconds, UPLOAD_PROBE_MIN_WAIT_SEC), UPLOAD_PROBE_MAX_WAIT_SEC)
+    return seconds * rng.uniform(1 - UPLOAD_PROBE_JITTER, 1 + UPLOAD_PROBE_JITTER)
+
+
+def upload_probe_once(cfg, runtime):
+    """Ask the API whether a probe is due, run it, report it. Returns the wait."""
+    target = request_json(
+        cfg, "POST", "/account/connections/upload-probe",
+        body={"client_version": CLIENT_VERSION}, timeout=HEARTBEAT_TIMEOUT_SEC,
+    )
+    if not isinstance(target, dict):
+        raise RuntimeError("invalid upload probe response")
+    retry_after = target.get("retry_after_sec", UPLOAD_PROBE_ERROR_WAIT_SEC)
+    if target.get("enabled") is not True or target.get("due") is not True:
+        return retry_after
+    probe_id, result = run_upload_probe(runtime, target)
+    report_upload_probe(cfg, probe_id, result)
+    seconds = result["duration_ms"] / 1000.0
+    log(
+        "INFO" if not result["error"] else "WARN",
+        "upload probe id=%d bytes=%d seconds=%.1f mbps=%.1f streams=%d%s" % (
+            probe_id, result["bytes_uploaded"], seconds, result["bytes_uploaded"] * 8 / seconds / 1e6,
+            len(target["parts"]), (" error=%s" % result["error"]) if result["error"] else "",
+        ),
+    )
+    return retry_after
+
+
+def report_upload_probe(cfg, probe_id, result, sleep=time.sleep):
+    """Report once, retrying transient failures; 409 means already recorded."""
+    for attempt in range(1, UPLOAD_PROBE_REPORT_ATTEMPTS + 1):
+        try:
+            request_json(
+                cfg, "POST", "/account/connections/upload-probe/%d/result" % probe_id,
+                body=result, timeout=HEARTBEAT_TIMEOUT_SEC,
+            )
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                return
+            if not transient_error(exc) or attempt == UPLOAD_PROBE_REPORT_ATTEMPTS:
+                raise
+        except Exception as exc:
+            if not transient_error(exc) or attempt == UPLOAD_PROBE_REPORT_ATTEMPTS:
+                raise
+        sleep(UPLOAD_PROBE_REPORT_BACKOFF_SEC * attempt)
+
+
+def upload_probe_loop(cfg, runtime, stop_event, rng=random):
+    """Background upload speed probe; never raises and never blocks updates."""
+    wait = rng.uniform(*UPLOAD_PROBE_STARTUP_DELAY_SEC)
+    while not stop_event.wait(wait):
+        try:
+            wait = upload_probe_wait(upload_probe_once(cfg, runtime), rng)
+        except Exception as exc:
+            log("WARN", "upload probe deferred: %s" % exc)
+            wait = upload_probe_wait(UPLOAD_PROBE_ERROR_WAIT_SEC, rng)
+
+
 def validate_manifest(manifest):
     version = str(manifest.get("version", ""))
     artifact = str(manifest.get("artifact", ""))
@@ -5800,6 +6001,10 @@ def run(cfg):
         target=joined_loop, args=(cfg, runtime, joined_stop_event), daemon=True,
     )
     joined_worker.start()
+    if not cfg.dry_run:
+        # Daemon thread: a self-update or shutdown may cut a probe short; the
+        # API sweeps any unreported probe objects after their target expires.
+        threading.Thread(target=upload_probe_loop, args=(cfg, runtime, stop_event), daemon=True).start()
     self_update_failed = False
     try:
         while not stop_event.is_set():

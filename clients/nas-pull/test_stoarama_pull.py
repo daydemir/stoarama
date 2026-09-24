@@ -3341,5 +3341,188 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
                 pull.valid_hour_manifest_schema(schema_version, has_aac_padding)
 
 
+class UploadProbeTests(unittest.TestCase):
+    def runtime(self):
+        return SimpleNamespace(upload_probe_activity=mock.Mock(side_effect=[("draining", 100, False), ("idle", 250, True)]))
+
+    def serve(self, status=200):
+        import http.server
+        import socketserver
+
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_PUT(self):
+                length = int(self.headers["Content-Length"])
+                remaining, digest = length, hashlib.sha256()
+                while remaining:
+                    chunk = self.rfile.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                received.append((self.path, length, length - remaining, self.headers.get("X-Signed"), self.headers.get("User-Agent")))
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        class LocalServer(http.server.ThreadingHTTPServer):
+            def server_bind(self):
+                # HTTPServer.server_bind resolves the FQDN, which can stall for
+                # tens of seconds on hosts with slow reverse DNS.
+                socketserver.TCPServer.server_bind(self)
+                self.server_name, self.server_port = self.server_address[:2]
+
+        server = LocalServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        real = pull.http.client.HTTPConnection
+
+        def local_connection(netloc, timeout, blocksize):
+            self.assertEqual(netloc, "bucket.example.test")
+            return real("127.0.0.1", port, timeout=timeout, blocksize=blocksize)
+
+        patcher = mock.patch.object(pull.http.client, "HTTPSConnection", side_effect=local_connection)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return received
+
+    def target(self, sizes, probe_id=9):
+        return {
+            "enabled": True, "due": True, "retry_after_sec": 21600, "probe_id": probe_id,
+            "size_bytes": sum(sizes), "streams": len(sizes),
+            "parts": [
+                {"url": "https://bucket.example.test/bucket/nas-probes/13/x-%d/part-%d?X-Amz-Signature=abc" % (probe_id, i),
+                 "method": "PUT", "size_bytes": size, "headers": {"Content-Length": str(size), "X-Signed": "yes"}}
+                for i, size in enumerate(sizes)
+            ],
+        }
+
+    def test_body_streams_exact_size_from_one_block(self):
+        body = pull.UploadProbeBody(2500, b"x" * 1000, time.monotonic() + 60)
+        chunks = []
+        while True:
+            chunk = body.read(4096)
+            if not chunk:
+                break
+            chunks.append(len(chunk))
+        self.assertEqual(chunks, [1000, 1000, 500])
+        self.assertEqual(body.sent, 2500)
+        expired = pull.UploadProbeBody(10, b"x", time.monotonic() - 1)
+        with self.assertRaises(pull.UploadProbeTimeout):
+            expired.read(1)
+
+    def test_target_validation_fails_closed(self):
+        pull.valid_upload_probe_target(self.target([10, 20]))
+        bad = [
+            dict(self.target([10]), probe_id=0),
+            dict(self.target([10]), size_bytes=11),
+            dict(self.target([10]), streams=2),
+            dict(self.target([10]), size_bytes=pull.UPLOAD_PROBE_MAX_BYTES + 1),
+        ]
+        insecure = self.target([10])
+        insecure["parts"][0]["url"] = "http://bucket.example.test/x"
+        wrong_method = self.target([10])
+        wrong_method["parts"][0]["method"] = "POST"
+        for target in bad + [insecure, wrong_method, None]:
+            with self.assertRaises(RuntimeError):
+                pull.valid_upload_probe_target(target)
+
+    def test_run_upload_probe_uploads_all_parts_concurrently_and_reports_activity(self):
+        received = self.serve()
+        sizes = [3 * 1024 * 1024 + 7, 3 * 1024 * 1024, 5]
+        probe_id, result = pull.run_upload_probe(self.runtime(), self.target(sizes))
+        self.assertEqual(probe_id, 9)
+        self.assertEqual(result["error"], "")
+        self.assertEqual(result["bytes_uploaded"], sum(sizes))
+        self.assertGreaterEqual(result["duration_ms"], 1)
+        self.assertEqual(result["client_phase_start"], "draining")
+        self.assertEqual(result["client_phase_end"], "idle")
+        self.assertTrue(result["joined_transfer_active"])
+        self.assertEqual(result["bytes_pulled_during"], 150)
+        self.assertEqual(sorted((r[1], r[2], r[3]) for r in received), sorted((s, s, "yes") for s in sizes))
+        self.assertTrue(all(r[0].startswith("/bucket/nas-probes/13/") and "X-Amz-Signature=abc" in r[0] for r in received))
+        self.assertTrue(all(r[4] == pull.USER_AGENT for r in received))
+
+    def test_run_upload_probe_reports_http_failure(self):
+        self.serve(status=403)
+        _, result = pull.run_upload_probe(self.runtime(), self.target([1000]))
+        self.assertIn("HTTP 403", result["error"])
+        self.assertEqual(result["bytes_uploaded"], 1000)
+
+    def test_upload_probe_once_respects_disabled_and_not_due(self):
+        for response in ({"enabled": False, "due": False, "retry_after_sec": 3600}, {"enabled": True, "due": False, "retry_after_sec": 500}):
+            with mock.patch.object(pull, "request_json", return_value=response) as request, mock.patch.object(pull, "run_upload_probe") as run_probe:
+                self.assertEqual(pull.upload_probe_once(SimpleNamespace(), None), response["retry_after_sec"])
+            run_probe.assert_not_called()
+            request.assert_called_once()
+            self.assertEqual(request.call_args.args[2], "/account/connections/upload-probe")
+
+    def test_upload_probe_once_reports_result_to_probe_path(self):
+        target = self.target([10], probe_id=42)
+        result = {"bytes_uploaded": 10, "duration_ms": 1000, "error": ""}
+        with mock.patch.object(pull, "request_json", side_effect=[target, {"ok": True}]) as request, mock.patch.object(
+            pull, "run_upload_probe", return_value=(42, result)
+        ):
+            self.assertEqual(pull.upload_probe_once(SimpleNamespace(), None), 21600)
+        self.assertEqual(request.call_args_list[1].args[2], "/account/connections/upload-probe/42/result")
+        self.assertIs(request.call_args_list[1].kwargs["body"], result)
+
+    def test_report_upload_probe_retries_transient_and_accepts_duplicate(self):
+        def http_error(code):
+            return urllib.error.HTTPError("https://stoarama.test", code, "x", {}, None)
+
+        sleeps = []
+        with mock.patch.object(pull, "request_json", side_effect=[urllib.error.URLError(ConnectionResetError()), http_error(409)]) as request:
+            pull.report_upload_probe(SimpleNamespace(), 5, {"x": 1}, sleep=sleeps.append)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(sleeps, [pull.UPLOAD_PROBE_REPORT_BACKOFF_SEC])
+        with mock.patch.object(pull, "request_json", side_effect=http_error(400)) as request, self.assertRaises(urllib.error.HTTPError):
+            pull.report_upload_probe(SimpleNamespace(), 5, {"x": 1}, sleep=sleeps.append)
+        self.assertEqual(request.call_count, 1)
+        with mock.patch.object(pull, "request_json", side_effect=http_error(503)) as request, self.assertRaises(urllib.error.HTTPError):
+            pull.report_upload_probe(SimpleNamespace(), 5, {"x": 1}, sleep=lambda _s: None)
+        self.assertEqual(request.call_count, pull.UPLOAD_PROBE_REPORT_ATTEMPTS)
+
+    def test_upload_probe_wait_is_bounded_and_jittered(self):
+        low, high = SimpleNamespace(uniform=lambda a, b: a), SimpleNamespace(uniform=lambda a, b: b)
+        self.assertAlmostEqual(pull.upload_probe_wait(21600, low), 21600 * 0.9)
+        self.assertAlmostEqual(pull.upload_probe_wait(21600, high), 21600 * 1.1)
+        self.assertAlmostEqual(pull.upload_probe_wait(1, low), pull.UPLOAD_PROBE_MIN_WAIT_SEC * 0.9)
+        self.assertAlmostEqual(pull.upload_probe_wait(10**9, high), pull.UPLOAD_PROBE_MAX_WAIT_SEC * 1.1)
+        self.assertAlmostEqual(pull.upload_probe_wait("junk", low), pull.UPLOAD_PROBE_ERROR_WAIT_SEC * 0.9)
+
+    def test_upload_probe_loop_survives_failures(self):
+        stop = threading.Event()
+        waits = []
+
+        def fake_wait(timeout):
+            waits.append(timeout)
+            return len(waits) > 2
+
+        stop.wait = fake_wait
+        rng = SimpleNamespace(uniform=lambda a, b: a)
+        with mock.patch.object(pull, "upload_probe_once", side_effect=[RuntimeError("boom"), 21600]) as once, mock.patch.object(pull, "log"):
+            pull.upload_probe_loop(SimpleNamespace(), None, stop, rng)
+        self.assertEqual(once.call_count, 2)
+        self.assertEqual(waits[0], pull.UPLOAD_PROBE_STARTUP_DELAY_SEC[0])
+        self.assertAlmostEqual(waits[1], pull.UPLOAD_PROBE_ERROR_WAIT_SEC * 0.9)
+        self.assertAlmostEqual(waits[2], 21600 * 0.9)
+
+    def test_runtime_reports_probe_activity(self):
+        runtime = pull.Runtime.__new__(pull.Runtime)
+        runtime.lock = threading.Lock()
+        runtime.phase = pull.Phase.DRAINING
+        runtime.bytes_pulled = 77
+        runtime.joined_transfer = None
+        self.assertEqual(runtime.upload_probe_activity(), ("draining", 77, False))
+
+
 if __name__ == "__main__":
     unittest.main()
