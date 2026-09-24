@@ -3474,6 +3474,22 @@ class UploadProbeTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[1].args[2], "/account/connections/upload-probe/42/result")
         self.assertIs(request.call_args_list[1].kwargs["body"], result)
 
+    def test_report_upload_probe_retries_transient_and_accepts_duplicate(self):
+        def http_error(code):
+            return urllib.error.HTTPError("https://stoarama.test", code, "x", {}, None)
+
+        sleeps = []
+        with mock.patch.object(pull, "request_json", side_effect=[urllib.error.URLError(ConnectionResetError()), http_error(409)]) as request:
+            pull.report_upload_probe(SimpleNamespace(), 5, {"x": 1}, sleep=sleeps.append)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(sleeps, [pull.UPLOAD_PROBE_REPORT_BACKOFF_SEC])
+        with mock.patch.object(pull, "request_json", side_effect=http_error(400)) as request, self.assertRaises(urllib.error.HTTPError):
+            pull.report_upload_probe(SimpleNamespace(), 5, {"x": 1}, sleep=sleeps.append)
+        self.assertEqual(request.call_count, 1)
+        with mock.patch.object(pull, "request_json", side_effect=http_error(503)) as request, self.assertRaises(urllib.error.HTTPError):
+            pull.report_upload_probe(SimpleNamespace(), 5, {"x": 1}, sleep=lambda _s: None)
+        self.assertEqual(request.call_count, pull.UPLOAD_PROBE_REPORT_ATTEMPTS)
+
     def test_upload_probe_wait_is_bounded_and_jittered(self):
         low, high = SimpleNamespace(uniform=lambda a, b: a), SimpleNamespace(uniform=lambda a, b: b)
         self.assertAlmostEqual(pull.upload_probe_wait(21600, low), 21600 * 0.9)

@@ -295,8 +295,10 @@ func (s *Server) handleAccountConnectionUploadProbeResult(w http.ResponseWriter,
 	var sizeBytes int64
 	var reportedAt *time.Time
 	var now time.Time
-	err = tx.QueryRow(ctx, `SELECT size_bytes,reported_at,now() FROM nas_upload_probes WHERE id=$1 AND connection_id=$2 FOR UPDATE`,
-		probeID, connectionID).Scan(&sizeBytes, &reportedAt, &now)
+	var prefix string
+	var streams int
+	err = tx.QueryRow(ctx, `SELECT size_bytes,reported_at,now(),object_prefix,streams FROM nas_upload_probes WHERE id=$1 AND connection_id=$2 FOR UPDATE`,
+		probeID, connectionID).Scan(&sizeBytes, &reportedAt, &now, &prefix, &streams)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "upload probe not found")
 		return
@@ -327,15 +329,22 @@ func (s *Server) handleAccountConnectionUploadProbeResult(w http.ResponseWriter,
 		util.WriteError(w, http.StatusInternalServerError, "commit upload probe result failed")
 		return
 	}
+	// Delete now so a finished probe does not hold storage for the TTL, but do
+	// not mark it: its presigned URLs can still write until expiry (a stream
+	// cut short by the client's time cap may even land later). The sweep marks
+	// it only once no URL can write any more.
+	if err := s.r2.DeleteObjects(ctx, nasUploadProbeKeys(prefix, streams)); err != nil {
+		log.Printf("nas upload probe %d: delete after report: %v", probeID, err)
+	}
 	s.sweepNASUploadProbes(ctx)
 	util.WriteJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "mbps": nasUploadProbeMbps(req.BytesUploaded, req.DurationMS),
 	})
 }
 
-// sweepNASUploadProbes deletes the objects of reported probes and of probes
-// whose target expired unreported (after a grace period covering an upload
-// still in flight at expiry). It is best effort: a failure leaves the row for
+// sweepNASUploadProbes deletes, and marks deleted, the objects of every probe
+// whose presigned targets expired more than a grace period ago, reported or
+// not. Only then can no URL write the keys again, so the mark is final. It is best effort: a failure leaves the row for
 // the next sweep and never fails the caller's request.
 func (s *Server) sweepNASUploadProbes(ctx context.Context) {
 	if s.r2 == nil {
@@ -343,7 +352,7 @@ func (s *Server) sweepNASUploadProbes(ctx context.Context) {
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id,object_prefix,streams FROM nas_upload_probes
-		WHERE objects_deleted_at IS NULL AND (reported_at IS NOT NULL OR expires_at < now() - $1::interval)
+		WHERE objects_deleted_at IS NULL AND expires_at < now() - $1::interval
 		ORDER BY id LIMIT $2`, fmt.Sprintf("%d seconds", int(nasUploadProbeSweepGrace.Seconds())), nasUploadProbeSweepLimit)
 	if err != nil {
 		log.Printf("nas upload probe sweep: list: %v", err)

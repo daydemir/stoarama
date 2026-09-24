@@ -92,6 +92,8 @@ UPLOAD_PROBE_MIN_WAIT_SEC = 300
 UPLOAD_PROBE_MAX_WAIT_SEC = 24 * 60 * 60
 UPLOAD_PROBE_ERROR_WAIT_SEC = 60 * 60
 UPLOAD_PROBE_JITTER = 0.1
+UPLOAD_PROBE_REPORT_ATTEMPTS = 3
+UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
 
 
 class ExistingFileMismatch(RuntimeError):
@@ -5841,10 +5843,7 @@ def upload_probe_once(cfg, runtime):
     if target.get("enabled") is not True or target.get("due") is not True:
         return retry_after
     probe_id, result = run_upload_probe(runtime, target)
-    request_json(
-        cfg, "POST", "/account/connections/upload-probe/%d/result" % probe_id,
-        body=result, timeout=HEARTBEAT_TIMEOUT_SEC,
-    )
+    report_upload_probe(cfg, probe_id, result)
     seconds = result["duration_ms"] / 1000.0
     log(
         "INFO" if not result["error"] else "WARN",
@@ -5854,6 +5853,26 @@ def upload_probe_once(cfg, runtime):
         ),
     )
     return retry_after
+
+
+def report_upload_probe(cfg, probe_id, result, sleep=time.sleep):
+    """Report once, retrying transient failures; 409 means already recorded."""
+    for attempt in range(1, UPLOAD_PROBE_REPORT_ATTEMPTS + 1):
+        try:
+            request_json(
+                cfg, "POST", "/account/connections/upload-probe/%d/result" % probe_id,
+                body=result, timeout=HEARTBEAT_TIMEOUT_SEC,
+            )
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                return
+            if not transient_error(exc) or attempt == UPLOAD_PROBE_REPORT_ATTEMPTS:
+                raise
+        except Exception as exc:
+            if not transient_error(exc) or attempt == UPLOAD_PROBE_REPORT_ATTEMPTS:
+                raise
+        sleep(UPLOAD_PROBE_REPORT_BACKOFF_SEC * attempt)
 
 
 def upload_probe_loop(cfg, runtime, stop_event, rng=random):

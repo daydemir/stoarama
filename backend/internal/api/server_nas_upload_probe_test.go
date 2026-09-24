@@ -229,7 +229,9 @@ func TestNASUploadProbeLifecycle(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT objects_deleted_at IS NOT NULL, reported_at IS NOT NULL, client_phase_start FROM nas_upload_probes WHERE id=$1`, first.ProbeID).Scan(&objectsDeleted, &reported, &phaseStart); err != nil {
 		t.Fatal(err)
 	}
-	if !objectsDeleted || !reported || phaseStart != "draining" {
+	// Its URLs can still write until expiry, so the report deletes the objects
+	// without marking them; only the post-expiry sweep marks them final.
+	if objectsDeleted || !reported || phaseStart != "draining" {
 		t.Fatalf("reported probe deleted=%v reported=%v phase=%q", objectsDeleted, reported, phaseStart)
 	}
 	if code, _ := call(apiKeyID, resultPath, result); code != http.StatusConflict {
@@ -240,12 +242,18 @@ func TestNASUploadProbeLifecycle(t *testing.T) {
 	}
 
 	// An unreported probe whose target expired is swept on the next request.
-	if _, err := pool.Exec(ctx, `UPDATE nas_upload_probes SET created_at=created_at-interval '7 hours'`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nas_upload_probes SET created_at=created_at-interval '7 hours', expires_at=expires_at-interval '7 hours'`); err != nil {
 		t.Fatal(err)
 	}
 	orphan := probe()
 	if !orphan.Due || orphan.ProbeID == first.ProbeID {
 		t.Fatalf("second probe response=%+v", orphan)
+	}
+	if deleted := bucket.take(); len(deleted) != 3 || !strings.Contains(deleted[0], fmt.Sprintf("-%d/part-0", first.ProbeID)) {
+		t.Fatalf("expired reported probe sweep deleted=%v", deleted)
+	}
+	if err := pool.QueryRow(ctx, `SELECT objects_deleted_at IS NOT NULL FROM nas_upload_probes WHERE id=$1`, first.ProbeID).Scan(&objectsDeleted); err != nil || !objectsDeleted {
+		t.Fatalf("expired reported probe not marked deleted=%v err=%v", objectsDeleted, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_upload_probes SET created_at=created_at-interval '7 hours', expires_at=now()-interval '2 hours' WHERE id=$1`, orphan.ProbeID); err != nil {
 		t.Fatal(err)
