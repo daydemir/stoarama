@@ -39,6 +39,15 @@ type probeSnapshot struct {
 	version string
 }
 
+// bin is the yt-dlp the resolver currently uses. The relay may switch
+// YT_DLP_BIN to a newly installed build while running.
+func (p *probe) bin() string {
+	if bin := strings.TrimSpace(os.Getenv("YT_DLP_BIN")); bin != "" {
+		return bin
+	}
+	return p.ytdlpBin
+}
+
 func newProbe(ytdlpBin string) *probe {
 	return &probe{
 		ytdlpBin: ytdlpBin,
@@ -79,7 +88,7 @@ func (p *probe) runOnce(ctx context.Context) {
 			args = append([]string{"--cookies", cp}, args...)
 		}
 	}
-	out, err := capture.RunYTDLPCommand(cctx, p.ytdlpBin, args...)
+	out, err := capture.RunYTDLPCommand(cctx, p.bin(), args...)
 
 	var class capture.YTDLPClass
 	switch {

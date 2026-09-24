@@ -278,9 +278,11 @@ func (d *RelayDiagnostics) Snapshot() map[string]any {
 		lastOut = diagnosticMap(d.last)
 	}
 	out := map[string]any{
-		"active":             active,
-		"last":               lastOut,
-		"resolves_last_hour": resolvesLastHour,
+		"active": active,
+		"last":   lastOut,
+		// Active jobs only: a finished job's resolves leave this sum (its own
+		// counts remain on "last"). Alert per job on active[].resolves_last_hour.
+		"active_resolves_last_hour": resolvesLastHour,
 	}
 	if !d.lastCaptureAt.IsZero() {
 		out["last_capture_at"] = d.lastCaptureAt.UTC().Format(time.RFC3339Nano)

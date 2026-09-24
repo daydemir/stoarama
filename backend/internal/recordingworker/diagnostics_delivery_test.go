@@ -48,7 +48,7 @@ func TestRelayDiagnosticsReportsResolvesPerHour(t *testing.T) {
 	d.Resolve(99, now) // unknown job is ignored
 
 	snapshot := d.Snapshot()
-	if got := snapshot["resolves_last_hour"]; got != 4 {
+	if got := snapshot["active_resolves_last_hour"]; got != 4 {
 		t.Fatalf("relay resolves_last_hour=%v want 4", got)
 	}
 	active := snapshot["active"].([]map[string]any)

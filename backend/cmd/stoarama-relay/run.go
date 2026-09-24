@@ -62,7 +62,6 @@ func runRelay(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ensureYTDLPDistForRunningRelease(cfg)
 	ytdlp := installedYTDLPPath(bd)
 	log.Printf("stoarama-relay yt-dlp layout=%s", ytdlpLayout(bd, ytdlp))
 	tempRoot, err := relayCaptureTempRoot()
@@ -151,6 +150,22 @@ func runRelay(ctx context.Context) error {
 	// update heartbeat visibility and do not touch the resolve env. A mode change takes
 	// effect only across a process restart.
 	pr := newProbe(ytdlp)
+	// Install this release's one-directory yt-dlp in the background: a slow or
+	// unavailable download must never delay the heartbeat or the worker. Once
+	// it is verified, later resolves switch to it without a restart.
+	go func() {
+		if !ensureYTDLPDistForRunningRelease(cfg) {
+			return
+		}
+		next := installedYTDLPPath(bd)
+		if next == os.Getenv("YT_DLP_BIN") {
+			return
+		}
+		os.Setenv("YT_DLP_BIN", next)
+		configureYTDLPJSRuntime(bd, next)
+		pr.setYtdlpVersion(readYtdlpVersion(next))
+		log.Printf("stoarama-relay yt-dlp layout=%s (activated without restart)", ytdlpLayout(bd, next))
+	}()
 	selfUpdatesEnabled, err := prepareSelfUpdates(cfg)
 	if err != nil {
 		return fmt.Errorf("establish rollback baseline: %w", err)
