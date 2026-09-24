@@ -155,8 +155,25 @@ func TestRelayLeaseFailedNodeYieldsToPeers(t *testing.T) {
 		t.Fatalf("failed node after yield lease=%+v err=%v want job 10", job, err)
 	}
 	// With no unfailed peer able to take it, the failed node retries at once
-	// rather than burning the rest of a closing window.
+	// rather than burning the rest of a closing window: first a peer whose
+	// group is full, then an offline peer.
 	resetWindow(t, pool, "")
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO relay_groups (id, account_id, max_streams) VALUES (5, 42, 1);
+		UPDATE nodes SET relay_group_id=5 WHERE id=2;
+		INSERT INTO recordings (id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (2, 42, 7, 'filler', 'https://example.test/filler.m3u8', 'active', now()-interval '1 hour', 'relay');
+		INSERT INTO recording_jobs (id, recording_id, fire_at, scheduled_for, clip_duration_sec, status, lease_owner, lease_expires_at, idempotency_key, kind, window_end_at)
+		VALUES (20, 2, now(), now(), 60, 'leased', 'node:2', now()+interval '3 minutes', 'filler', 'continuous_window', now()+interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	if job, err := leaseAs(t, s, 1); err != nil || job.JobID != 10 {
+		t.Fatalf("failed node with only a group-full peer lease=%+v err=%v want job 10", job, err)
+	}
+	resetWindow(t, pool, "")
+	if _, err := pool.Exec(ctx, `DELETE FROM recording_jobs WHERE id=20`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=now()-interval '10 minutes' WHERE id=2`); err != nil {
 		t.Fatal(err)
 	}

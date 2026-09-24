@@ -206,7 +206,17 @@ const relayLeaseSQL = `
 	                AND (SELECT COUNT(*) FROM recording_jobs fresh_peer_jobs
 	                     WHERE fresh_peer_jobs.status = 'leased'
 	                       AND fresh_peer_jobs.lease_owner = 'node:' || fresh_peer.id::text
-	                       AND fresh_peer_jobs.lease_expires_at > now()) < fresh_peer.relay_max_streams))
+	                       AND fresh_peer_jobs.lease_expires_at > now()) < fresh_peer.relay_max_streams
+	                AND (fresh_peer.relay_group_id IS NULL OR (
+	                     SELECT COUNT(*)
+	                     FROM recording_jobs fresh_group_jobs
+	                     JOIN nodes fresh_group_nodes ON fresh_group_jobs.lease_owner='node:'||fresh_group_nodes.id::text
+	                     WHERE fresh_group_nodes.account_id = rec.account_id
+	                       AND fresh_group_nodes.relay_group_id = fresh_peer.relay_group_id
+	                       AND fresh_group_jobs.status = 'leased'
+	                       AND fresh_group_jobs.lease_expires_at > now()) < (
+	                     SELECT fresh_group.max_streams FROM relay_groups fresh_group
+	                     WHERE fresh_group.id = fresh_peer.relay_group_id AND fresh_group.account_id = rec.account_id))))
 	    -- Affinity: while the previous window's node can take this window, other
 	    -- nodes wait for the fairness turn instead of pulling the stream away.
 	    AND (affinity.lease_owner IS NULL
