@@ -3450,6 +3450,77 @@ class UploadProbeTests(unittest.TestCase):
         self.assertTrue(all(r[0].startswith("/bucket/nas-probes/13/") and "X-Amz-Signature=abc" in r[0] for r in received))
         self.assertTrue(all(r[4] == pull.USER_AGENT for r in received))
 
+    def download_parts(self, target):
+        return [{"url": part["url"].replace("X-Amz-Signature=abc", "X-Amz-Signature=get"), "method": "GET",
+                 "size_bytes": part["size_bytes"]} for part in target["parts"]]
+
+    def test_download_probe_parts_are_optional_and_fail_closed(self):
+        target = self.target([10, 20])
+        _, parts = pull.valid_upload_probe_target(target)
+        self.assertEqual(pull.valid_download_probe_parts(target, parts), [])
+        target["download_parts"] = self.download_parts(target)
+        self.assertEqual([p["size_bytes"] for p in pull.valid_download_probe_parts(target, parts)], [10, 20])
+        for mutate in (lambda d: d.pop(), lambda d: d[0].update(method="PUT"), lambda d: d[0].update(size_bytes=11),
+                       lambda d: d[0].update(url="http://bucket.example.test/x")):
+            bad = dict(target, download_parts=self.download_parts(target))
+            mutate(bad["download_parts"])
+            with self.assertRaises(RuntimeError):
+                pull.valid_download_probe_parts(bad, parts)
+
+    def test_run_download_probe_measures_complete_and_partial_reads(self):
+        class Response:
+            def __init__(self, size, status=200):
+                self.status, self.remaining = status, size
+            def read(self, n):
+                n = min(n, self.remaining)
+                self.remaining -= n
+                return b"x" * n
+        class Connection:
+            sizes = {}
+            def __init__(self, netloc, timeout, blocksize):
+                self.path = None
+            def request(self, method, path, headers):
+                assert method == "GET" and headers["User-Agent"] == pull.USER_AGENT
+                self.path = path
+            def getresponse(self):
+                return Response(*Connection.sizes[self.path])
+            def close(self):
+                pass
+        parts = [{"url": pull.urllib.parse.urlsplit("https://bucket.example.test/p%d?sig" % i), "size_bytes": 3 * 1024 * 1024 + i}
+                 for i in range(3)]
+        Connection.sizes = {"/p%d?sig" % i: (3 * 1024 * 1024 + i,) for i in range(3)}
+        with mock.patch.object(pull.http.client, "HTTPSConnection", Connection):
+            total, duration_ms, error = pull.run_download_probe(parts)
+        self.assertEqual((total, error), (sum(p["size_bytes"] for p in parts), ""))
+        self.assertGreaterEqual(duration_ms, 1)
+        Connection.sizes["/p1?sig"] = (10,)
+        with mock.patch.object(pull.http.client, "HTTPSConnection", Connection):
+            total, _, error = pull.run_download_probe(parts)
+        self.assertIn("received", error)
+        Connection.sizes["/p1?sig"] = (0, 403)
+        with mock.patch.object(pull.http.client, "HTTPSConnection", Connection):
+            _, _, error = pull.run_download_probe(parts)
+        self.assertIn("HTTP 403", error)
+
+    def test_run_upload_probe_downloads_after_a_complete_upload_only(self):
+        self.serve()
+        target = self.target([1000, 24])
+        target["download_parts"] = self.download_parts(target)
+        with mock.patch.object(pull, "run_download_probe", return_value=(1024, 250, "")) as download:
+            _, result = pull.run_upload_probe(self.runtime(), target)
+        download.assert_called_once()
+        self.assertEqual((result["bytes_downloaded"], result["download_duration_ms"]), (1024, 250))
+        self.assertNotIn("download_error", result)
+
+    def test_run_upload_probe_skips_download_after_failed_upload(self):
+        self.serve(status=403)
+        target = self.target([1000])
+        target["download_parts"] = self.download_parts(target)
+        with mock.patch.object(pull, "run_download_probe") as download:
+            _, result = pull.run_upload_probe(self.runtime(), target)
+        download.assert_not_called()
+        self.assertNotIn("bytes_downloaded", result)
+
     def test_run_upload_probe_reports_http_failure(self):
         self.serve(status=403)
         _, result = pull.run_upload_probe(self.runtime(), self.target([1000]))
