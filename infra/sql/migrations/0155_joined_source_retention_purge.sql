@@ -55,8 +55,9 @@ FROM (VALUES
 ) AS x(hour_id, reason_code, note)
 JOIN recording_joined_hours h ON h.hour_id = x.hour_id;
 
--- An hour is retention-final when it is sealed, its manifest is published, all
--- of its media parts are published, and no hold covers it. Every lookup rides
+-- An hour is retention-final when it has been sealed for at least an hour, its
+-- manifest is published, all of its media parts are published, and no hold
+-- covers it. Every lookup rides
 -- an existing unique index (hours pkey, one_manifest_root, the artifact scope
 -- key, holds pkey).
 CREATE FUNCTION recording_joined_hour_retention_final(p_hour_record_id BIGINT) RETURNS boolean
@@ -64,6 +65,9 @@ LANGUAGE sql STABLE AS $$
   SELECT EXISTS(
     SELECT 1 FROM recording_joined_hours h
     WHERE h.id = p_hour_record_id AND h.state = 'sealed' AND h.sealed_at IS NOT NULL
+      -- Settle time: any presigned source PUT (R2SignPutTTL, 15 min) issued
+      -- before ingest has long expired before a source can be purged.
+      AND h.sealed_at <= now() - interval '1 hour'
       AND EXISTS(SELECT 1 FROM recording_joined_artifacts manifest
         WHERE manifest.hour_record_id = h.id AND manifest.artifact_kind = 'hour_manifest'
           AND manifest.publication_state = 'published' AND manifest.published_at IS NOT NULL)

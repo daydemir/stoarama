@@ -155,7 +155,7 @@ CREATE TABLE nas_inventory_files(connection_id bigint NOT NULL, clip_id bigint N
 	// Seed hour that the migration's hold backfill must pick up by hour_id.
 	if _, err := pool.Exec(ctx, `
 INSERT INTO recording_joined_batches VALUES (99,'goodplus-20260821-generation-1',13,1,'frozen');
-INSERT INTO recording_joined_hours VALUES (990,99,'goodplus-20260821-generation-1__recording-382__date-2026-08-01__hour-09__generation-1','sealed',now());`); err != nil {
+INSERT INTO recording_joined_hours VALUES (990,99,'goodplus-20260821-generation-1__recording-382__date-2026-08-01__hour-09__generation-1','sealed',now()-interval '2 hours');`); err != nil {
 		t.Fatal(err)
 	}
 	migration, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), joinedPurgeMigration))
@@ -190,10 +190,11 @@ INSERT INTO recording_joined_dry_runs VALUES ('00000000-0000-0000-0000-000000000
 INSERT INTO recording_joined_dry_run_scopes VALUES ('00000000-0000-0000-0000-00000000000a',1,100,1000),('00000000-0000-0000-0000-00000000000b',2,200,1000);
 INSERT INTO recording_joined_snapshot_scopes(batch_record_id,recording_id,recording_job_id,high_water_clip_id) VALUES (2,3,300,1000);
 INSERT INTO recording_joined_hours VALUES
-  (11,1,'h1','sealed',now()),   -- final
-  (12,1,'h2','sealed',now()),   -- held
-  (13,1,'h3','sealed',now()),   -- one media part unpublished
-  (14,1,'h4','sealed',now());   -- manifest still sealed, not published
+  (11,1,'h1','sealed',now()-interval '2 hours'),   -- final
+  (12,1,'h2','sealed',now()-interval '2 hours'),   -- held
+  (13,1,'h3','sealed',now()-interval '2 hours'),   -- one media part unpublished
+  (14,1,'h4','sealed',now()-interval '2 hours'),   -- manifest still sealed, not published
+  (15,1,'h5','sealed',now()-interval '5 minutes'); -- final but sealed too recently
 INSERT INTO recording_joined_source_retention_holds(hour_record_id,reason_code) VALUES (12,'dual_recorder_overlap');
 INSERT INTO recording_joined_artifacts VALUES
   (111,1,'hour','h1',11,'hour_manifest','published',now(),'joined/h1.json','e',  '',10,repeat('0',64)),
@@ -205,7 +206,9 @@ INSERT INTO recording_joined_artifacts VALUES
   (132,1,'hour','h3',13,'media',NULL,now(),'joined/m4.mp4','etag-m4','',7,'`+joinedPurgeSHA("media-4")+`'),
   (133,1,'hour','h3',13,'media',NULL,NULL,'joined/m5.mp4',NULL,NULL,7,'`+joinedPurgeSHA("media-5")+`'),
   (141,1,'hour','h4',14,'hour_manifest','sealed',NULL,'joined/h4.json',NULL,NULL,10,repeat('0',64)),
-  (142,1,'hour','h4',14,'media',NULL,now(),'joined/m6.mp4','etag-m6','',7,'`+joinedPurgeSHA("media-6")+`');
+  (142,1,'hour','h4',14,'media',NULL,now(),'joined/m6.mp4','etag-m6','',7,'`+joinedPurgeSHA("media-6")+`'),
+  (151,1,'hour','h5',15,'hour_manifest','published',now(),'joined/h5.json','e','',10,repeat('0',64)),
+  (152,1,'hour','h5',15,'media',NULL,now(),'joined/m7.mp4','etag-m7','',7,'`+joinedPurgeSHA("media-7")+`');
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -227,6 +230,7 @@ INSERT INTO recording_joined_artifacts VALUES
 		{8, 2, 200, 11, "included", 112, true},  // unconsumed dry-run scope
 		{10, 3, 300, 11, "included", 113, true}, // active snapshotting scope
 		{12, 1, 100, 14, "included", 142, true}, // manifest not published
+		{13, 1, 100, 15, "included", 152, true}, // sealed under an hour ago
 	}
 	for i, s := range specs {
 		snap, src := 500+int64(i), 700+int64(i)
@@ -311,7 +315,7 @@ func TestJoinedSourcePurgeTriggerAllowsOnlyVerifiedEligibleSources(t *testing.T)
 		}
 	}
 	for id, why := range map[int64]string{3: "quarantined", 4: "held hour", 5: "unpublished media part", 6: "unallocated second snapshot",
-		8: "unconsumed dry-run scope", 10: "snapshotting scope", 12: "manifest not published"} {
+		8: "unconsumed dry-run scope", 10: "snapshotting scope", 12: "manifest not published", 13: "sealed under an hour ago"} {
 		if err := joinedPurgeTryPurge(ctx, pool, id, true, pgx.ReadCommitted); err == nil || !strings.Contains(err.Error(), "retention protected") {
 			t.Fatalf("clip %d (%s) was purgeable: %v", id, why, err)
 		}
@@ -395,7 +399,7 @@ func newFakePurgeStore() *fakePurgeStore {
 		s.objects[key] = []byte(fmt.Sprintf("media-%d", i))
 		s.etags[key] = fmt.Sprintf("etag-m%d", i)
 	}
-	for _, id := range []int64{1, 2, 3, 4, 5, 6, 7, 8, 10, 12} {
+	for _, id := range []int64{1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13} {
 		s.objects[joinedPurgeSourceKey(id)] = []byte(fmt.Sprintf("src-%d", id%10))
 	}
 	return s
@@ -437,7 +441,7 @@ func TestJoinedSourcePurgeRunDryRunThenApplyIsResumable(t *testing.T) {
 	if dry.Eligible != 2 || dry.EligibleBytes != 10 || len(store.deleted) != 0 {
 		t.Fatalf("dry run: %+v deleted=%v", dry, store.deleted)
 	}
-	want := map[string]int64{"not_included": 1, "hour_held": 1, "hour_not_final": 2, "structurally_ineligible": 3, "nas_unverified": 1}
+	want := map[string]int64{"not_included": 1, "hour_held": 1, "hour_not_final": 3, "structurally_ineligible": 3, "nas_unverified": 1}
 	for k, v := range want {
 		if dry.Skipped[k] != v {
 			t.Fatalf("dry-run skipped[%s]=%d want %d (all=%v)", k, dry.Skipped[k], v, dry.Skipped)
