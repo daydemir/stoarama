@@ -46,6 +46,8 @@ const (
 	joinedSourcePurgeAppName    = "stoarama-joined-source-purge"
 	joinedSourcePurgeShaTimeout = 10 * time.Minute
 	joinedSourcePurgeUSDPerGB   = 0.015
+	// joinedSourcePurgeFinishTimeout bounds the uncancellable delete+commit tail.
+	joinedSourcePurgeFinishTimeout = 60 * time.Second
 )
 
 var joinedHoldReasonRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,79}$`)
@@ -482,6 +484,7 @@ func (r *joinedPurgeRunner) process(ctx context.Context, c joinedPurgeCandidate)
 	purged, skip, err := purgeJoinedSourceClip(ctx, r.pool, r.store, c, r.opts)
 	if err != nil {
 		if ctx.Err() != nil {
+			r.logLine(c, "error", "interrupted: "+err.Error())
 			return nil
 		}
 		return r.clipError(c, "purge_failed", err)
@@ -615,10 +618,14 @@ func purgeJoinedSourceClip(ctx context.Context, pool *pgxpool.Pool, store purgeO
 	if tag.RowsAffected() != 1 {
 		return false, "already_purged", nil
 	}
-	if err := store.DeleteObjects(ctx, []string{c.ObjectKey}); err != nil {
+	// Past this point the delete and the commit must finish together: an
+	// interrupt between them would leave an absent object behind a live row.
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), joinedSourcePurgeFinishTimeout)
+	defer cancel()
+	if err := store.DeleteObjects(finishCtx, []string{c.ObjectKey}); err != nil {
 		return false, "", fmt.Errorf("delete source object: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(finishCtx); err != nil {
 		return false, "", fmt.Errorf("commit after delete (a rerun completes it): %w", err)
 	}
 	return true, "", nil
@@ -630,7 +637,7 @@ func (r *joinedPurgeRunner) logLine(c joinedPurgeCandidate, action, reason strin
 	}
 	line := joinedPurgeLogLine{At: time.Now().UTC(), Mode: r.summary.Mode, ClipID: c.ClipID, RecordingID: c.RecordingID,
 		HourRecordID: c.HourRecordID, SizeBytes: c.SizeBytes, Action: action, Reason: reason}
-	if action == "purged" {
+	if action == "purged" || action == "error" {
 		line.ObjectKey = c.ObjectKey
 	}
 	b, _ := json.Marshal(line)
