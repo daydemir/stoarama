@@ -45,6 +45,7 @@ go run -C "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
 jq -e --arg version "${VERSION}" '
   .version == $version and
   ([.relay, .ytdlp] | all(type == "object" and length == 4)) and
+  (.ytdlp_dist == null or (.ytdlp_dist | type == "object" and length == 4)) and
   (.ffmpeg | type == "object" and length == 3)
 ' "${candidate}" >/dev/null
 candidate_revision="$(jq -er '.source_revision // empty' "${candidate}")"
@@ -58,7 +59,7 @@ fi
 
 while IFS= read -r artifact; do
   require_object "${artifact}"
-done < <(jq -er '.relay[], .ytdlp[], .ffmpeg[] | .artifact' "${candidate}")
+done < <(jq -er '.relay[], .ytdlp[], (.ytdlp_dist // {})[], .ffmpeg[] | .artifact' "${candidate}")
 require_object "install-${VERSION}.sh"
 require_object "uninstall-${VERSION}.sh"
 

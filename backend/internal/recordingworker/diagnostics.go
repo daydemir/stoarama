@@ -12,6 +12,15 @@ import (
 
 const relayDiagnosticActiveLimit = 20
 
+// relayResolveWindow is the trailing window for the per-job resolve rate. A
+// healthy long-lived source resolves a few times per hour; a source whose signed
+// URLs expire every minute resolves dozens of times, which the server can alert on.
+const relayResolveWindow = time.Hour
+
+// relayResolveTimesLimit bounds per-job resolve history. It exceeds any plausible
+// resolve rate (one per second for the whole window).
+const relayResolveTimesLimit = 3600
+
 var (
 	diagnosticURLRe        = regexp.MustCompile(`https?://\S+`)
 	diagnosticBearerRe     = regexp.MustCompile(`(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]+=*`)
@@ -41,6 +50,8 @@ type jobDiagnostic struct {
 	DeliveryQueueDepth int
 	DeliveryQueueMax   int
 	DeliveryRetries    int
+	ResolvesTotal      int
+	resolveTimes       []time.Time
 }
 
 type phaseDiagnostic struct {
@@ -106,6 +117,38 @@ func (d *RelayDiagnostics) DeliveryRetry(jobID int64) {
 	if j := d.current[jobID]; j != nil && j.DeliveryRetries < 1000000 {
 		j.DeliveryRetries++
 	}
+}
+
+// Resolve records one source resolution attempt (successful or not) for a job.
+func (d *RelayDiagnostics) Resolve(jobID int64, at time.Time) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	j := d.current[jobID]
+	if j == nil {
+		return
+	}
+	if j.ResolvesTotal < 1000000000 {
+		j.ResolvesTotal++
+	}
+	j.resolveTimes = pruneResolveTimes(append(j.resolveTimes, at.UTC()), at)
+}
+
+func pruneResolveTimes(times []time.Time, now time.Time) []time.Time {
+	cutoff := now.Add(-relayResolveWindow)
+	first := 0
+	for first < len(times) && !times[first].After(cutoff) {
+		first++
+	}
+	if len(times)-first > relayResolveTimesLimit {
+		first = len(times) - relayResolveTimesLimit
+	}
+	if first == 0 {
+		return times
+	}
+	return append(times[:0], times[first:]...)
 }
 
 func (d *RelayDiagnostics) Start(job recordingapi.RecordingJob) {
@@ -217,6 +260,15 @@ func (d *RelayDiagnostics) Snapshot() map[string]any {
 	if total > relayDiagnosticActiveLimit {
 		jobs = jobs[:relayDiagnosticActiveLimit]
 	}
+	now := time.Now().UTC()
+	resolvesLastHour := 0
+	for _, job := range d.current {
+		job.resolveTimes = pruneResolveTimes(job.resolveTimes, now)
+		resolvesLastHour += len(job.resolveTimes)
+	}
+	if d.last != nil {
+		d.last.resolveTimes = pruneResolveTimes(d.last.resolveTimes, now)
+	}
 	active := make([]map[string]any, len(jobs))
 	for i, job := range jobs {
 		active[i] = diagnosticMap(job)
@@ -228,6 +280,9 @@ func (d *RelayDiagnostics) Snapshot() map[string]any {
 	out := map[string]any{
 		"active": active,
 		"last":   lastOut,
+		// Active jobs only: a finished job's resolves leave this sum (its own
+		// counts remain on "last"). Alert per job on active[].resolves_last_hour.
+		"active_resolves_last_hour": resolvesLastHour,
 	}
 	if !d.lastCaptureAt.IsZero() {
 		out["last_capture_at"] = d.lastCaptureAt.UTC().Format(time.RFC3339Nano)
@@ -271,6 +326,11 @@ func diagnosticMap(j *jobDiagnostic) map[string]any {
 	out["delivery_queue_depth"] = j.DeliveryQueueDepth
 	out["delivery_queue_max"] = j.DeliveryQueueMax
 	out["delivery_retries"] = j.DeliveryRetries
+	out["resolves_total"] = j.ResolvesTotal
+	// resolve_count + started_at are the server's relay_resolve_churn contract
+	// (resolves since the job started on this relay).
+	out["resolve_count"] = j.ResolvesTotal
+	out["resolves_last_hour"] = len(j.resolveTimes)
 	return out
 }
 

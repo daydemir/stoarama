@@ -356,21 +356,20 @@ func newServiceInstanceID() string {
 
 type launchdPlistData struct {
 	Label, ExePath, LogPath, InstanceID string
-	UserDomain, PrivateYTDLPTemp        bool
+	UserDomain                          bool
 }
 
 func launchdTemplateData(label, exePath, logPath, instanceID string, userDomain bool) launchdPlistData {
 	escape := html.EscapeString
-	return launchdPlistData{escape(label), escape(exePath), escape(logPath), escape(instanceID), userDomain, privateYTDLPTempEnabled()}
+	return launchdPlistData{escape(label), escape(exePath), escape(logPath), escape(instanceID), userDomain}
 }
 
 type systemdUnitData struct {
-	ExePath          string
-	PrivateYTDLPTemp bool
+	ExePath string
 }
 
 func systemdTemplateData(exePath string) systemdUnitData {
-	return systemdUnitData{ExePath: exePath, PrivateYTDLPTemp: privateYTDLPTempEnabled()}
+	return systemdUnitData{ExePath: exePath}
 }
 
 func readPriorFile(path string) ([]byte, os.FileMode, bool, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -23,16 +24,47 @@ func ResolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL
 	return resolvedURL, isImage, err
 }
 
-// ResolveCaptureInputWithHeaders converts provider/page URLs into a direct
-// capture input URL plus any HTTP headers ffmpeg needs to open it.
+// CaptureInput is one resolved capture source. Most providers resolve to one
+// muxed URL. YouTube can instead resolve to separate video-only and audio-only
+// HLS renditions; AudioURL then names the audio rendition, which a recorder must
+// open as a second FFmpeg input to keep the source's audio.
+type CaptureInput struct {
+	URL      string
+	AudioURL string
+	IsImage  bool
+	Headers  string
+}
+
+// ResolveCaptureInputWithHeaders is the single-input view of ResolveCapture for
+// probes, previews, and players that open exactly one URL. For a split YouTube
+// resolve it returns the video rendition only; recorders that keep audio must
+// use ResolveCapture.
 func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, sourcePageURL string) (resolvedURL string, isImage bool, inputHeaders string, err error) {
+	input, err := ResolveCapture(ctx, provider, streamURL, sourcePageURL)
+	if err != nil {
+		return "", false, "", err
+	}
+	return input.URL, input.IsImage, input.Headers, nil
+}
+
+// ResolveCapture converts provider/page URLs into direct capture inputs plus any
+// HTTP headers FFmpeg needs to open them.
+func ResolveCapture(ctx context.Context, provider, streamURL, sourcePageURL string) (CaptureInput, error) {
+	resolvedURL, isImage, inputHeaders, audioURL, err := resolveCaptureInput(ctx, provider, streamURL, sourcePageURL)
+	if err != nil {
+		return CaptureInput{}, err
+	}
+	return CaptureInput{URL: resolvedURL, AudioURL: audioURL, IsImage: isImage, Headers: inputHeaders}, nil
+}
+
+func resolveCaptureInput(ctx context.Context, provider, streamURL, sourcePageURL string) (resolvedURL string, isImage bool, inputHeaders string, audioURL string, err error) {
 	provider = strings.ToUpper(strings.TrimSpace(provider))
 	streamURL = strings.TrimSpace(streamURL)
 	sourcePageURL = strings.TrimSpace(sourcePageURL)
 
 	if streamURL == "" {
 		if sourcePageURL == "" {
-			return "", false, "", fmt.Errorf("stream has no capture URL")
+			return "", false, "", "", fmt.Errorf("stream has no capture URL")
 		}
 		streamURL = sourcePageURL
 	}
@@ -40,66 +72,66 @@ func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, so
 	if isSkylineStream(provider, streamURL, sourcePageURL) && sourcePageURL != "" {
 		u, err := resolveSkylineManifestURL(ctx, sourcePageURL, 20*time.Second)
 		if err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		}
 		if u == "" {
-			return "", false, "", fmt.Errorf("skyline source page did not contain a playable manifest")
+			return "", false, "", "", fmt.Errorf("skyline source page did not contain a playable manifest")
 		}
-		return u, false, skylineInputHeaders(sourcePageURL), nil
+		return u, false, skylineInputHeaders(sourcePageURL), "", nil
 	}
 
 	if shouldResolveEarthCamPage(provider, streamURL, sourcePageURL) {
 		u, err := resolveEarthCamManifestURL(ctx, sourcePageURL, 20*time.Second)
 		if err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		}
 		if u == "" {
-			return "", false, "", fmt.Errorf("earthcam source page did not contain a playable manifest")
+			return "", false, "", "", fmt.Errorf("earthcam source page did not contain a playable manifest")
 		}
-		return u, false, earthCamInputHeaders(sourcePageURL), nil
+		return u, false, earthCamInputHeaders(sourcePageURL), "", nil
 	}
 
 	if host := sourcePageHost(sourcePageURL); hostMatches(host, "worldcam.eu") || hostMatches(host, "worldcam.live") {
 		u, referer, err := resolveWorldCamCaptureInput(ctx, sourcePageURL, 20*time.Second)
 		if err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		}
-		return u, false, worldCamInputHeaders(referer), nil
+		return u, false, worldCamInputHeaders(referer), "", nil
 	}
 
 	if IsResolvableSourcePage(provider, sourcePageURL) {
 		u, err := resolveKnownSourcePage(ctx, sourcePageURL, 20*time.Second)
 		if err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		}
-		return u, false, "", nil
+		return u, false, "", "", nil
 	}
 
 	if provider == "KBS" && strings.Contains(streamURL, "!hls") {
 		if u, ok, err := resolveIndirectURL(ctx, streamURL, 20*time.Second); err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		} else if ok {
-			return u, false, "", nil
+			return u, false, "", "", nil
 		}
 	}
 
 	if isYouTubeURL(streamURL) {
-		u, err := resolveYouTubeStreamURL(ctx, streamURL)
+		stream, err := resolveYouTubeStream(ctx, streamURL)
 		if err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		}
-		return u, false, "", nil
+		return stream.VideoURL, false, "", stream.AudioURL, nil
 	}
 
 	if looksLikeImageURL(streamURL) {
-		return streamURL, true, "", nil
+		return streamURL, true, "", "", nil
 	}
 
 	if strings.Contains(streamURL, "!hls") {
 		if u, ok, err := resolveIndirectURL(ctx, streamURL, 20*time.Second); err != nil {
-			return "", false, "", err
+			return "", false, "", "", err
 		} else if ok {
-			return u, false, "", nil
+			return u, false, "", "", nil
 		}
 	}
 
@@ -108,10 +140,10 @@ func ResolveCaptureInputWithHeaders(ctx context.Context, provider, streamURL, so
 	// (exit 183), so reject it here exactly as the survey path's
 	// hlsLiveAdapter.Resolve does, rather than silently passing the raw marker.
 	if hasIndirectMarker(streamURL) {
-		return "", false, "", fmt.Errorf("indirect stream reference did not resolve to a playable URL: %s", streamURL)
+		return "", false, "", "", fmt.Errorf("indirect stream reference did not resolve to a playable URL: %s", streamURL)
 	}
 
-	return streamURL, false, "", nil
+	return streamURL, false, "", "", nil
 }
 
 // IsResolvableSourcePage reports whether capture has a stable runtime resolver
@@ -816,7 +848,33 @@ func hasIndirectMarker(streamURL string) bool {
 	return strings.Contains(strings.ToLower(streamURL), "!hls")
 }
 
+// DefaultYouTubeFormat selects a live HLS rendition. A muxed HLS rendition is
+// preferred. When YouTube offers only split renditions (the visionos player
+// client commonly does), take the best video-only HLS rendition up to 1080p plus
+// the best audio-only HLS rendition; yt-dlp -g then prints two URLs, video first.
+// If neither alternative exists yt-dlp fails with "Requested format is not
+// available", which is surfaced as ErrYouTubeFormatUnavailable rather than
+// silently falling back to a non-HLS or audio-less selection.
+const DefaultYouTubeFormat = "b[protocol^=m3u8]/bv*[protocol^=m3u8][height<=1080]+ba[protocol^=m3u8]"
+
+// ErrYouTubeFormatUnavailable reports that yt-dlp found no HLS rendition matching
+// DefaultYouTubeFormat (or the operator's YT_DLP_FORMAT override).
+var ErrYouTubeFormatUnavailable = errors.New("youtube requested HLS format is not available")
+
+// YouTubeStream is a resolved YouTube live source. AudioURL is empty when the
+// selected rendition is muxed; otherwise VideoURL is video-only and AudioURL is
+// the matching audio-only rendition.
+type YouTubeStream struct {
+	VideoURL string
+	AudioURL string
+}
+
 func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, error) {
+	stream, err := resolveYouTubeStream(ctx, watchURL)
+	return stream.VideoURL, err
+}
+
+func resolveYouTubeStream(ctx context.Context, watchURL string) (YouTubeStream, error) {
 	resolveCtx := ctx
 	cancel := func() {}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
@@ -837,48 +895,81 @@ func resolveYouTubeStreamURL(ctx context.Context, watchURL string) (string, erro
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
 		out, err := RunYTDLPCommand(resolveCtx, bin, args...)
-		if streamURL := firstHTTPURL(string(out)); streamURL != "" {
-			return streamURL, nil
+		stream, parseErr := parseYTDLPStreamURLs(string(out))
+		if parseErr == nil {
+			return stream, nil
 		}
-		if err == nil {
-			lastErr = fmt.Errorf("yt-dlp returned no stream URL for %s", watchURL)
-		} else {
+		if ytdlpFormatUnavailable(string(out)) {
+			// Deterministic for this stream and client: retrying cannot help, and
+			// any looser selection would silently change what is recorded.
+			return YouTubeStream{}, fmt.Errorf("%w for %s (%s)", ErrYouTubeFormatUnavailable, watchURL, strings.TrimSpace(string(out)))
+		}
+		switch {
+		case err != nil:
 			lastErr = fmt.Errorf("yt-dlp failed for %s: %w (%s)", watchURL, err, strings.TrimSpace(string(out)))
+		case errors.Is(parseErr, errYTDLPNoStreamURL):
+			lastErr = fmt.Errorf("yt-dlp returned no stream URL for %s", watchURL)
+		default:
+			lastErr = fmt.Errorf("yt-dlp output for %s: %w", watchURL, parseErr)
 		}
 		if attempt == 2 {
 			break
 		}
 		select {
 		case <-resolveCtx.Done():
-			return "", lastErr
+			return YouTubeStream{}, lastErr
 		case <-time.After(2 * time.Second):
 		}
 	}
-	return "", lastErr
+	return YouTubeStream{}, lastErr
 }
 
-func firstHTTPURL(out string) string {
+var errYTDLPNoStreamURL = errors.New("no stream URL")
+
+// parseYTDLPStreamURLs reads yt-dlp -g output. One URL is a muxed rendition; two
+// URLs are the video and audio halves of a "bv+ba" selection, in that order.
+// Anything else is rejected so a partial split resolve can never be recorded as
+// a silent video-only capture.
+func parseYTDLPStreamURLs(out string) (YouTubeStream, error) {
+	var urls []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
-			return line
+			urls = append(urls, line)
 		}
 	}
-	return ""
+	switch len(urls) {
+	case 0:
+		return YouTubeStream{}, errYTDLPNoStreamURL
+	case 1:
+		return YouTubeStream{VideoURL: urls[0]}, nil
+	case 2:
+		return YouTubeStream{VideoURL: urls[0], AudioURL: urls[1]}, nil
+	default:
+		return YouTubeStream{}, fmt.Errorf("expected one muxed or two split stream URLs, got %d", len(urls))
+	}
+}
+
+func ytdlpFormatUnavailable(out string) bool {
+	return strings.Contains(strings.ToLower(out), "requested format is not available")
 }
 
 // YTDLPResolveArgs returns the common, non-authenticated yt-dlp arguments used by
 // both the capture resolver and the relay health probe. A release-bundled runtime
 // is supplied explicitly because yt-dlp does not enable Node automatically and
 // some otherwise-public live streams now require JavaScript challenge solving.
+// The format is always explicit (DefaultYouTubeFormat unless YT_DLP_FORMAT
+// overrides it) so the printed URL count is predictable.
 func YTDLPResolveArgs(watchURL string) []string {
 	args := []string{"-g", "--no-warnings", "--no-playlist"}
 	if runtimeSpec := strings.TrimSpace(os.Getenv("YT_DLP_JS_RUNTIME")); runtimeSpec != "" {
 		args = append(args, "--js-runtimes", runtimeSpec)
 	}
-	if format := strings.TrimSpace(os.Getenv("YT_DLP_FORMAT")); format != "" {
-		args = append(args, "-f", format)
+	format := strings.TrimSpace(os.Getenv("YT_DLP_FORMAT"))
+	if format == "" {
+		format = DefaultYouTubeFormat
 	}
+	args = append(args, "-f", format)
 	if sortExpr := strings.TrimSpace(os.Getenv("YT_DLP_FORMAT_SORT")); sortExpr != "" {
 		args = append(args, "-S", sortExpr)
 	}

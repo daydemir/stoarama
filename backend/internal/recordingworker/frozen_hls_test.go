@@ -541,7 +541,7 @@ func TestContinuousJobRetainsLeaseAcrossFrozenHLSForcedCaptureCycles(t *testing.
 	launches := make(chan int64, 4)
 	jobCtx, cancelJob := context.WithCancel(context.Background())
 	defer cancelJob()
-	w.continuousCapture = func(ctx context.Context, _ string, _ time.Duration, _ string, _ *int, _ string, _ func(capture.Segment) error, _ string) error {
+	w.continuousCapture = func(ctx context.Context, _ capture.CaptureInput, _ time.Duration, _ string, _ *int, _ string, _ func(capture.Segment) error) error {
 		call := captureCalls.Add(1)
 		if call == 3 {
 			changed.Store(true)

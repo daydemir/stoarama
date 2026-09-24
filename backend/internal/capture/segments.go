@@ -123,6 +123,11 @@ const (
 	// advancing manifest. Confirm that output stayed still before replacing the
 	// process and its resolved manifest.
 	continuousExpiredFragmentConfirmationWindow = 5 * time.Second
+	// One failed fragment request makes FFmpeg log the 403 more than once (the
+	// HTTP error, then the HLS keepalive retry). Only a 403 that arrives at least
+	// this long after the first one counts as a repeat; an echo of the same
+	// failure must not skip the confirmation window.
+	continuousExpiredFragmentRepeatMinInterval = time.Second
 )
 
 type Segment struct {
@@ -221,17 +226,30 @@ func CaptureSegmentWithHeaders(ctx context.Context, sourceURL string, duration t
 // can be scavenged on restart; an empty parent preserves the cloud worker's
 // OS-temporary behavior.
 func CaptureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, tempDir, inputHeaders string) (Segment, error) {
-	return captureSegmentInDirWithHeaders(ctx, sourceURL, duration, pinHost, targetFPS, tempDir, inputHeaders, true)
+	return captureSegmentInDir(ctx, CaptureInput{URL: sourceURL, Headers: inputHeaders}, duration, pinHost, targetFPS, tempDir, true)
+}
+
+// CaptureSegmentInputInDir captures one clip from a resolved CaptureInput. A
+// split input (AudioURL set) is opened as two FFmpeg inputs so the clip keeps
+// the source's audio.
+func CaptureSegmentInputInDir(ctx context.Context, input CaptureInput, duration time.Duration, targetFPS *int, tempDir string) (Segment, error) {
+	return captureSegmentInDir(ctx, input, duration, "", targetFPS, tempDir, true)
 }
 
 // CaptureSegmentInDirWithHeadersNoThumbnail is the source-native canary path.
 // It skips thumbnail extraction entirely, so no video or image encoding occurs.
 func CaptureSegmentInDirWithHeadersNoThumbnail(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, tempDir, inputHeaders string) (Segment, error) {
-	return captureSegmentInDirWithHeaders(ctx, sourceURL, duration, pinHost, nil, tempDir, inputHeaders, false)
+	return captureSegmentInDir(ctx, CaptureInput{URL: sourceURL, Headers: inputHeaders}, duration, pinHost, nil, tempDir, false)
 }
 
-func captureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, duration time.Duration, pinHost string, targetFPS *int, tempDir, inputHeaders string, createThumbnail bool) (Segment, error) {
-	if strings.TrimSpace(sourceURL) == "" {
+// CaptureSegmentInputInDirNoThumbnail is the source-native canary path for a
+// resolved CaptureInput.
+func CaptureSegmentInputInDirNoThumbnail(ctx context.Context, input CaptureInput, duration time.Duration, tempDir string) (Segment, error) {
+	return captureSegmentInDir(ctx, input, duration, "", nil, tempDir, false)
+}
+
+func captureSegmentInDir(ctx context.Context, input CaptureInput, duration time.Duration, pinHost string, targetFPS *int, tempDir string, createThumbnail bool) (Segment, error) {
+	if strings.TrimSpace(input.URL) == "" {
 		return Segment{}, fmt.Errorf("source_url is empty")
 	}
 	if duration <= 0 {
@@ -245,7 +263,7 @@ func captureSegmentInDirWithHeaders(ctx context.Context, sourceURL string, durat
 
 	startAt := time.Now().UTC()
 	outPath := filepath.Join(tmpDir, "segment.mp4")
-	args := buildFFmpegSegmentArgsWithHeaders(sourceURL, outPath, duration, pinHost, targetFPS, inputHeaders)
+	args := buildFFmpegSegmentInputArgs(input, outPath, duration, pinHost, targetFPS)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -355,14 +373,26 @@ func CaptureContinuous(ctx context.Context, sourceURL string, clipDuration time.
 }
 
 func CaptureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), false)
+	return CaptureContinuousInput(ctx, CaptureInput{URL: sourceURL, Headers: inputHeaders}, clipDuration, pinHost, targetFPS, outDir, onSegment)
 }
 
 func CaptureContinuousWithTimestampContract(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string) error {
+	return CaptureContinuousInputWithTimestampContract(ctx, CaptureInput{URL: sourceURL, Headers: inputHeaders}, clipDuration, pinHost, targetFPS, outDir, onSegment)
+}
+
+// CaptureContinuousInput is CaptureContinuous for a resolved CaptureInput. A
+// split input (AudioURL set) is recorded by one FFmpeg process with two inputs,
+// each carrying the same live-edge options, mapped to one video and one audio
+// track.
+func CaptureContinuousInput(ctx context.Context, input CaptureInput, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error) error {
+	return captureContinuousInputMode(ctx, input, clipDuration, pinHost, targetFPS, outDir, onSegment, continuousStartupTimeout, continuousProgressTimeout(input.URL, clipDuration), false)
+}
+
+func CaptureContinuousInputWithTimestampContract(ctx context.Context, input CaptureInput, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error) error {
 	if targetFPS != nil {
 		return fmt.Errorf("timestamp contract requires native source-copy capture")
 	}
-	return captureContinuousWithHeadersMode(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, continuousStartupTimeout, continuousProgressTimeout(sourceURL, clipDuration), true)
+	return captureContinuousInputMode(ctx, input, clipDuration, pinHost, targetFPS, outDir, onSegment, continuousStartupTimeout, continuousProgressTimeout(input.URL, clipDuration), true)
 }
 
 func continuousProgressTimeout(sourceURL string, clipDuration time.Duration) time.Duration {
@@ -378,7 +408,11 @@ func captureContinuousWithHeaders(ctx context.Context, sourceURL string, clipDur
 }
 
 func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, timestampContract bool) error {
-	if strings.TrimSpace(sourceURL) == "" {
+	return captureContinuousInputMode(ctx, CaptureInput{URL: sourceURL, Headers: inputHeaders}, clipDuration, pinHost, targetFPS, outDir, onSegment, startupTimeout, progressTimeout, timestampContract)
+}
+
+func captureContinuousInputMode(ctx context.Context, input CaptureInput, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, startupTimeout, progressTimeout time.Duration, timestampContract bool) error {
+	if strings.TrimSpace(input.URL) == "" {
 		return fmt.Errorf("source_url is empty")
 	}
 	if clipDuration <= 0 {
@@ -393,7 +427,7 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	if startupTimeout <= 0 || progressTimeout <= 0 {
 		return fmt.Errorf("continuous watchdog timeouts must be > 0")
 	}
-	err := captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, true, timestampContract)
+	err := captureContinuousAttempt(ctx, input, clipDuration, pinHost, targetFPS, outDir, onSegment, startupTimeout, progressTimeout, true, timestampContract)
 	if !isMalformedAudioMuxError(err) {
 		return err
 	}
@@ -416,10 +450,11 @@ func captureContinuousWithHeadersMode(ctx context.Context, sourceURL string, cli
 	// write that track and exits before producing any video. Retry once without
 	// audio; video remains a lossless stream copy and healthy audio is preserved
 	// on every source that did not hit this exact muxer failure.
-	return captureContinuousAttempt(ctx, sourceURL, clipDuration, pinHost, targetFPS, outDir, onSegment, inputHeaders, startupTimeout, progressTimeout, false, timestampContract)
+	return captureContinuousAttempt(ctx, input, clipDuration, pinHost, targetFPS, outDir, onSegment, startupTimeout, progressTimeout, false, timestampContract)
 }
 
-func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, inputHeaders string, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool) error {
+func captureContinuousAttempt(ctx context.Context, input CaptureInput, clipDuration time.Duration, pinHost string, targetFPS *int, outDir string, onSegment func(Segment) error, startupTimeout, progressTimeout time.Duration, includeAudio, timestampContract bool) error {
+	sourceURL := input.URL
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -429,7 +464,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 	if timestampContract {
 		captureAttemptID = uuid.NewString()
 	}
-	args := buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL, outPattern, clipDuration, pinHost, targetFPS, inputHeaders, includeAudio, timestampContract)
+	args := buildFFmpegContinuousInputArgs(input, outPattern, clipDuration, pinHost, targetFPS, includeAudio, timestampContract)
 	cmd := exec.Command(ffmpegBin(), args...)
 	stderr := newContinuousStderrObserver(
 		isHLSInputURL(sourceURL) && (isGooglevideoURL(sourceURL) || isGooglevideoHost(pinHost)),
@@ -460,6 +495,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 	var expiredFragmentTimer *time.Timer
 	var expiredFragmentConfirmation <-chan time.Time
 	var expiredFragmentBaseline map[string]int64
+	var expiredFragmentBaselineAt time.Time
 	stopExpiredFragmentTimer := func() {
 		if expiredFragmentTimer != nil && !expiredFragmentTimer.Stop() {
 			select {
@@ -535,6 +571,9 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 		select {
 		case <-stderr.expiredGooglevideo:
 			if expiredFragmentTimer != nil {
+				if time.Since(expiredFragmentBaselineAt) < continuousExpiredFragmentRepeatMinInterval {
+					continue
+				}
 				outputSizes, err := continuousOutputSizes(outDir)
 				if err != nil {
 					stopFFmpeg(continuousShutdownGrace)
@@ -545,6 +584,7 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 				}
 				stopExpiredFragmentTimer()
 				expiredFragmentBaseline = outputSizes
+				expiredFragmentBaselineAt = time.Now()
 				expiredFragmentTimer = time.NewTimer(continuousExpiredFragmentConfirmationWindow)
 				expiredFragmentConfirmation = expiredFragmentTimer.C
 				continue
@@ -555,6 +595,15 @@ func captureContinuousAttempt(ctx context.Context, sourceURL string, clipDuratio
 				stopFFmpeg(continuousShutdownGrace)
 				return err
 			}
+			if !continuousOutputStarted(expiredFragmentBaseline) {
+				// A 403 before the first packet means this resolved URL has produced
+				// no media, so there is no seam to protect: re-resolve immediately
+				// instead of spending the confirmation window (or the startup
+				// watchdog) on a URL that is already expiring. The confirmation below
+				// still guards transient 403s once media is flowing (#267).
+				return returnExpiredFragment()
+			}
+			expiredFragmentBaselineAt = time.Now()
 			expiredFragmentTimer = time.NewTimer(continuousExpiredFragmentConfirmationWindow)
 			expiredFragmentConfirmation = expiredFragmentTimer.C
 		case <-expiredFragmentConfirmation:
@@ -724,6 +773,13 @@ func continuousOutputSizes(outDir string) (map[string]int64, error) {
 		sizes[entry.Name()] = info.Size()
 	}
 	return sizes, nil
+}
+
+// continuousOutputStarted reports whether FFmpeg has opened any output segment.
+// The segment muxer writes its first header only after the input produced media,
+// so an empty map means this resolved URL has not yielded a single packet.
+func continuousOutputStarted(sizes map[string]int64) bool {
+	return len(sizes) > 0
 }
 
 func continuousOutputAdvanced(previous, current map[string]int64) bool {
@@ -970,21 +1026,41 @@ func buildFFmpegContinuousArgsWithHeadersAndAudio(sourceURL string, outPattern s
 }
 
 func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, inputHeaders string, includeAudio, timestampContractEnabled bool) []string {
+	return buildFFmpegContinuousInputArgs(CaptureInput{URL: sourceURL, Headers: inputHeaders}, outPattern, clipDuration, pinHost, targetFPS, includeAudio, timestampContractEnabled)
+}
+
+// appendContinuousFFmpegInput appends one live input with its input-scoped
+// options. Split inputs call it once per rendition so the video and audio
+// playlists start at the same live edge with the same recovery behavior.
+func appendContinuousFFmpegInput(args []string, inputURL, pinHost, inputHeaders string) []string {
+	args = appendFFmpegHTTPInputArgsWithHeaders(args, inputURL, true, 10, pinHost, inputHeaders)
+	args = appendHLSLiveEdgeInputArgs(args, inputURL)
+	args = appendGooglevideoHLSRecoveryInputArgs(args, inputURL, pinHost)
+	return append(args,
+		"-fflags", "+discardcorrupt",
+		"-i", inputURL,
+	)
+}
+
+func buildFFmpegContinuousInputArgs(input CaptureInput, outPattern string, clipDuration time.Duration, pinHost string, targetFPS *int, includeAudio, timestampContractEnabled bool) []string {
+	sourceURL := input.URL
 	seconds := strconv.FormatFloat(clipDuration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
 		"-nostdin",
 		"-loglevel", continuousFFmpegLogLevel(sourceURL, pinHost),
 	}
-	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, true, 10, pinHost, inputHeaders)
-	args = appendHLSLiveEdgeInputArgs(args, sourceURL)
-	args = appendGooglevideoHLSRecoveryInputArgs(args, sourceURL, pinHost)
-	args = append(args,
-		"-fflags", "+discardcorrupt",
-		"-i", sourceURL,
-		"-map", "0:v:0",
-	)
-	if includeAudio {
+	args = appendContinuousFFmpegInput(args, sourceURL, pinHost, input.Headers)
+	splitAudio := includeAudio && input.AudioURL != ""
+	if splitAudio {
+		args = appendContinuousFFmpegInput(args, input.AudioURL, pinHost, input.Headers)
+	}
+	args = append(args, "-map", "0:v:0")
+	if splitAudio {
+		// The audio rendition is its own input with exactly one audio track, which
+		// also satisfies the timestamp contract's single audio timing domain.
+		args = append(args, "-map", "1:a:0")
+	} else if includeAudio {
 		if timestampContractEnabled {
 			// The v1 contract carries exactly one optional audio timing domain.
 			// Never capture extra tracks that its COMPLETE evidence cannot represent.
@@ -1257,20 +1333,35 @@ func buildFFmpegSegmentArgs(sourceURL string, outPath string, duration time.Dura
 }
 
 func buildFFmpegSegmentArgsWithHeaders(sourceURL string, outPath string, duration time.Duration, pinHost string, targetFPS *int, inputHeaders string) []string {
+	return buildFFmpegSegmentInputArgs(CaptureInput{URL: sourceURL, Headers: inputHeaders}, outPath, duration, pinHost, targetFPS)
+}
+
+func buildFFmpegSegmentInputArgs(input CaptureInput, outPath string, duration time.Duration, pinHost string, targetFPS *int) []string {
 	seconds := strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)
 	args := []string{
 		"-y",
 		"-nostdin",
 		"-loglevel", "error",
 	}
-	args = appendFFmpegHTTPInputArgsWithHeaders(args, sourceURL, true, 10, pinHost, inputHeaders)
+	for _, inputURL := range []string{input.URL, input.AudioURL} {
+		if inputURL == "" {
+			continue
+		}
+		args = appendFFmpegHTTPInputArgsWithHeaders(args, inputURL, true, 10, pinHost, input.Headers)
+		args = append(args,
+			"-fflags", "+discardcorrupt",
+			"-i", inputURL,
+		)
+	}
 	args = append(args,
-		"-fflags", "+discardcorrupt",
-		"-i", sourceURL,
 		"-t", seconds,
 		"-map", "0:v:0",
-		"-map", "0:a?",
 	)
+	if input.AudioURL != "" {
+		args = append(args, "-map", "1:a:0")
+	} else {
+		args = append(args, "-map", "0:a?")
+	}
 	if targetFPS != nil && *targetFPS > 0 {
 		// Fixed-fps path: normalize the clip to the chosen rate. Changing fps
 		// requires a re-encode (-c copy cannot), so transcode video with the

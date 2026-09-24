@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,9 @@ import (
 )
 
 func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
+	previousGrace := ytdlpTerminateGrace
+	ytdlpTerminateGrace = 300 * time.Millisecond
+	t.Cleanup(func() { ytdlpTerminateGrace = previousGrace })
 	for _, test := range []struct {
 		name     string
 		behavior string
@@ -35,7 +39,6 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 			parentTemp := t.TempDir()
 			t.Setenv("TMPDIR", parentTemp)
 			t.Setenv(YTDLPRuntimeTempRootEnv, root)
-			t.Setenv(YTDLPPrivateTempEnv, "1")
 			t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", test.behavior)
 			ctx, cancel := context.WithTimeout(context.Background(), test.timeout)
 			defer cancel()
@@ -60,27 +63,11 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 				if len(lines) < 2 {
 					t.Fatalf("stubborn helper output=%q", output)
 				}
-				childPID, err := strconv.Atoi(lines[len(lines)-1])
-				if err != nil {
-					t.Fatal(err)
-				}
-				groupPID, err := syscall.Getpgid(childPID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := os.Lstat(lines[0]); err != nil {
-					t.Fatalf("live cancelled descendant's temp directory was removed: %v", err)
-				}
-				if err := syscall.Kill(-groupPID, syscall.SIGKILL); err != nil {
-					t.Fatal(err)
-				}
+				// A TERM-ignoring descendant of a cancelled resolve is SIGKILLed after
+				// the grace period so its private temp directory is reclaimed.
 				if err := waitForProcessExit(lines[len(lines)-1]); err != nil {
-					t.Fatal(err)
+					t.Fatalf("cancelled descendant survived: %v", err)
 				}
-				if got := os.Getenv("TMPDIR"); got != parentTemp {
-					t.Fatalf("parent TMPDIR changed to %q", got)
-				}
-				return
 			}
 			entries, readErr := os.ReadDir(root)
 			if readErr != nil {
@@ -99,7 +86,6 @@ func TestRunYTDLPCommandCleansPrivateTempAfterExitAndTimeout(t *testing.T) {
 func TestRunYTDLPCommandRetainsTempWhileNormalExitGrandchildLives(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(YTDLPRuntimeTempRootEnv, root)
-	t.Setenv(YTDLPPrivateTempEnv, "1")
 	t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "orphan")
 
 	output, err := RunYTDLPCommand(context.Background(), os.Args[0], "-test.run=TestYTDLPCommandHelperProcess")
@@ -130,7 +116,6 @@ func TestRunYTDLPCommandRetainsTempWhileNormalExitGrandchildLives(t *testing.T) 
 
 func TestRunYTDLPCommandCleanupFailurePreservesSuccessfulResult(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv(YTDLPPrivateTempEnv, "1")
 	t.Setenv(YTDLPRuntimeTempRootEnv, root)
 	t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "swap")
 
@@ -150,10 +135,9 @@ func TestRunYTDLPCommandCleanupFailurePreservesSuccessfulResult(t *testing.T) {
 	}
 }
 
-func TestRunYTDLPCommandDefaultOffPreservesParentEnvironment(t *testing.T) {
+func TestRunYTDLPCommandUsesPrivateTempWithoutConfiguredRoot(t *testing.T) {
 	parentTemp := t.TempDir()
 	t.Setenv("TMPDIR", parentTemp)
-	t.Setenv(YTDLPPrivateTempEnv, "0")
 	t.Setenv(YTDLPRuntimeTempRootEnv, "")
 	t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "report")
 
@@ -161,19 +145,60 @@ func TestRunYTDLPCommandDefaultOffPreservesParentEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(string(output)); got != parentTemp {
-		t.Fatalf("child TMPDIR=%q want parent value %q", got, parentTemp)
+	root := filepath.Join(parentTemp, fmt.Sprintf("stoarama-ytdlp-%d", os.Getuid()))
+	child := strings.TrimSpace(string(output))
+	if filepath.Dir(child) != root || !strings.HasPrefix(filepath.Base(child), "stoarama-ytdlp-") {
+		t.Fatalf("child TMPDIR=%q, want a private directory under %q", child, root)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("default root kept invocation temp: %v", entries)
 	}
 	if got := os.Getenv("TMPDIR"); got != parentTemp {
 		t.Fatalf("parent TMPDIR changed to %q", got)
 	}
 }
 
+func TestRunYTDLPCommandCancelSendsSIGTERMToGroupBeforeKill(t *testing.T) {
+	root := t.TempDir()
+	markerDir := t.TempDir()
+	t.Setenv(YTDLPRuntimeTempRootEnv, root)
+	t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "term")
+	t.Setenv("STOARAMA_YTDLP_TERM_MARKER_DIR", markerDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := RunYTDLPCommand(ctx, os.Args[0], "-test.run=TestYTDLPCommandHelperProcess"); err == nil {
+		t.Fatal("cancelled command returned no error")
+	}
+	if elapsed := time.Since(started); elapsed >= ytdlpTerminateGrace {
+		t.Fatalf("SIGTERM-handling child waited for the kill grace: %s", elapsed)
+	}
+	for _, name := range []string{"leader", "child"} {
+		if _, err := os.Stat(filepath.Join(markerDir, name)); err != nil {
+			t.Fatalf("%s did not observe SIGTERM: %v", name, err)
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("cancelled invocation left temp entries: %v", entries)
+	}
+}
+
 func TestRunYTDLPCommandOutputPreservesStdoutOnly(t *testing.T) {
-	for _, gate := range []string{"0", "1"} {
-		t.Run(gate, func(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprint(configured), func(t *testing.T) {
 			root := t.TempDir()
-			t.Setenv(YTDLPPrivateTempEnv, gate)
+			if !configured {
+				t.Setenv("TMPDIR", root)
+				root = ""
+			}
 			t.Setenv(YTDLPRuntimeTempRootEnv, root)
 			t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "split")
 			output, err := RunYTDLPCommandOutput(context.Background(), os.Args[0], "-test.run=TestYTDLPCommandHelperProcess")
@@ -189,7 +214,6 @@ func TestRunYTDLPCommandOutputPreservesStdoutOnly(t *testing.T) {
 
 func TestRunYTDLPCommandConcurrentInvocationsAreIsolated(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv(YTDLPPrivateTempEnv, "1")
 	t.Setenv(YTDLPRuntimeTempRootEnv, root)
 	t.Setenv("STOARAMA_YTDLP_COMMAND_HELPER", "success")
 	const count = 8
@@ -272,7 +296,6 @@ func TestResolveYouTubeStreamURLCleansPrivateTemp(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("YT_DLP_BIN", script)
-	t.Setenv(YTDLPPrivateTempEnv, "1")
 	t.Setenv(YTDLPRuntimeTempRootEnv, root)
 
 	got, err := resolveYouTubeStreamURL(context.Background(), "https://www.youtube.com/watch?v=test")
@@ -298,7 +321,6 @@ func TestRunYTDLPCommandRefusesSymlinkTempRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv(YTDLPRuntimeTempRootEnv, link)
-	t.Setenv(YTDLPPrivateTempEnv, "1")
 	if _, err := RunYTDLPCommand(context.Background(), os.Args[0], "-test.run=TestYTDLPCommandHelperProcess"); err == nil {
 		t.Fatal("symlink temp root accepted")
 	}
@@ -317,6 +339,19 @@ func TestYTDLPCommandHelperProcess(t *testing.T) {
 	if behavior == "split" {
 		fmt.Println("stdout")
 		fmt.Fprintln(os.Stderr, "stderr")
+		os.Exit(0)
+	}
+	if behavior == "term" {
+		markerDir := os.Getenv("STOARAMA_YTDLP_TERM_MARKER_DIR")
+		child := exec.Command("/bin/sh", "-c", `trap 'touch "$0/child"; exit 0' TERM; while :; do sleep 0.05; done`, markerDir)
+		if err := child.Start(); err != nil {
+			os.Exit(98)
+		}
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		<-signals
+		_ = os.WriteFile(filepath.Join(markerDir, "leader"), nil, 0o600)
+		_ = child.Wait()
 		os.Exit(0)
 	}
 	root := os.Getenv(YTDLPRuntimeTempRootEnv)
