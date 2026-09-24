@@ -6012,6 +6012,85 @@ def valid_upload_probe_target(target):
     return probe_id, valid
 
 
+def valid_download_probe_parts(target, upload_parts):
+    """Optional presigned GETs of the uploaded objects; [] when the API sends none."""
+    parts = target.get("download_parts")
+    if parts is None:
+        return []
+    if not isinstance(parts, list) or len(parts) != len(upload_parts):
+        raise RuntimeError("invalid download probe parts")
+    valid = []
+    for part, upload in zip(parts, upload_parts):
+        if not isinstance(part, dict):
+            raise RuntimeError("invalid download probe part")
+        url = urllib.parse.urlsplit(str(part.get("url", "")))
+        if url.scheme != "https" or not url.hostname or part.get("method") != "GET":
+            raise RuntimeError("download probe target must be an https GET")
+        if part.get("size_bytes") != upload["size_bytes"]:
+            raise RuntimeError("download probe part size differs from its upload")
+        valid.append({"url": url, "size_bytes": upload["size_bytes"]})
+    return valid
+
+
+def download_probe_part(part, deadline, progress):
+    """Read one probe object and discard it, counting bytes into progress[0].
+
+    Every blocking call gets the remaining overall deadline as its socket
+    timeout, so a stalled GET ends near the probe's time cap."""
+    url = part["url"]
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise RuntimeError("download probe exceeded its time cap")
+        return min(UPLOAD_PROBE_SOCKET_TIMEOUT_SEC, left)
+    connection = http.client.HTTPSConnection(url.netloc, timeout=remaining(), blocksize=UPLOAD_PROBE_BLOCK_BYTES)
+    try:
+        connection.request("GET", url.path + ("?" + url.query if url.query else ""), headers={"User-Agent": USER_AGENT})
+        if connection.sock is not None:
+            connection.sock.settimeout(remaining())
+        response = connection.getresponse()
+        if response.status != 200:
+            raise RuntimeError("download probe GET returned HTTP %d" % response.status)
+        while progress[0] < part["size_bytes"]:
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining())
+            else:
+                remaining()
+            block = response.read(min(UPLOAD_PROBE_BLOCK_BYTES, part["size_bytes"] - progress[0]))
+            if not block:
+                break
+            progress[0] += len(block)
+    finally:
+        connection.close()
+
+
+def run_download_probe(parts):
+    """Download all parts concurrently; returns (bytes, duration_ms, error)."""
+    started = time.monotonic()
+    deadline = started + UPLOAD_PROBE_MAX_SEC
+    progress, errors = [[0] for _ in parts], []
+
+    def fetch(index, part):
+        download_probe_part(part, deadline, progress[index])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(parts)) as pool:
+        futures = [pool.submit(fetch, i, part) for i, part in enumerate(parts)]
+        for future in futures:
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(exc)
+    duration_ms = max(1, round((time.monotonic() - started) * 1000))
+    size = sum(part["size_bytes"] for part in parts)
+    total = min(size, sum(p[0] for p in progress))
+    error = ""
+    if errors:
+        error = ("%s: %s" % (type(errors[0]).__name__, errors[0]))[:500]
+    elif total != size:
+        error = "download probe received %d of %d bytes" % (total, size)
+    return total, duration_ms, error
+
+
 def upload_probe_part(part, body):
     url = part["url"]
     connection = http.client.HTTPSConnection(
@@ -6033,6 +6112,7 @@ def upload_probe_part(part, body):
 def run_upload_probe(runtime, target):
     """Upload all parts concurrently and measure wall time end to end."""
     probe_id, parts = valid_upload_probe_target(target)
+    download_parts = valid_download_probe_parts(target, parts)
     block = os.urandom(UPLOAD_PROBE_BLOCK_BYTES)
     phase_start, pulled_start, joined_start = runtime.upload_probe_activity()
     started_at = utc_now_precise()
@@ -6055,7 +6135,7 @@ def run_upload_probe(runtime, target):
         error = ("%s: %s" % (type(errors[0]).__name__, errors[0]))[:500]
     elif uploaded != size:
         error = "upload probe sent %d of %d bytes" % (uploaded, size)
-    return probe_id, {
+    result = {
         "bytes_uploaded": uploaded,
         "duration_ms": duration_ms,
         "started_at": started_at,
@@ -6066,6 +6146,15 @@ def run_upload_probe(runtime, target):
         "joined_transfer_active": bool(joined_start or joined_end),
         "bytes_pulled_during": max(0, pulled_end - pulled_start),
     }
+    # Measure the downlink on the objects just uploaded, before the report lets
+    # the API delete them. Only a complete upload leaves complete objects.
+    if download_parts and not error:
+        downloaded, download_ms, download_error = run_download_probe(download_parts)
+        result["bytes_downloaded"] = downloaded
+        result["download_duration_ms"] = download_ms
+        if download_error:
+            result["download_error"] = download_error
+    return probe_id, result
 
 
 def upload_probe_wait(seconds, rng=random):
@@ -6090,6 +6179,16 @@ def upload_probe_once(cfg, runtime):
         return retry_after
     probe_id, result = run_upload_probe(runtime, target)
     report_upload_probe(cfg, probe_id, result)
+    if "bytes_downloaded" in result:
+        download_seconds = result["download_duration_ms"] / 1000.0
+        log(
+            "INFO" if not result.get("download_error") else "WARN",
+            "download probe id=%d bytes=%d seconds=%.1f mbps=%.1f%s" % (
+                probe_id, result["bytes_downloaded"], download_seconds,
+                result["bytes_downloaded"] * 8 / download_seconds / 1e6,
+                (" error=%s" % result["download_error"]) if result.get("download_error") else "",
+            ),
+        )
     seconds = result["duration_ms"] / 1000.0
     log(
         "INFO" if not result["error"] else "WARN",

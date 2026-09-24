@@ -145,6 +145,13 @@ func TestNASUploadProbeLifecycle(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
+	downloadMigration, err := os.ReadFile("../../../infra/sql/migrations/0161_nas_download_probe.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(downloadMigration)); err != nil {
+		t.Fatalf("apply download migration: %v", err)
+	}
 	const accountID, apiKeyID, otherKeyID = int64(47), int64(123), int64(124)
 	var connectionID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,api_key_id) VALUES($1,'nas_pull',$2) RETURNING id`, accountID, apiKeyID).Scan(&connectionID); err != nil {
@@ -206,12 +213,21 @@ func TestNASUploadProbeLifecycle(t *testing.T) {
 	if total != 1000 {
 		t.Fatalf("parts total=%d", total)
 	}
+	if len(first.DownloadParts) != 3 {
+		t.Fatalf("download parts=%+v", first.DownloadParts)
+	}
+	for i, part := range first.DownloadParts {
+		if part.Method != http.MethodGet || part.SizeBytes != first.Parts[i].SizeBytes || !strings.Contains(part.URL, fmt.Sprintf("/part-%d?", i)) {
+			t.Fatalf("download part %d=%+v", i, part)
+		}
+	}
 	if again := probe(); !again.Enabled || again.Due || again.RetryAfterSec < 1 || again.RetryAfterSec > int(nasUploadProbeTTL.Seconds())+1 {
 		t.Fatalf("pending probe response=%+v", again)
 	}
 
 	result := fmt.Sprintf(`{"bytes_uploaded":1000,"duration_ms":2000,"started_at":%q,"error":"","client_version":"abc123",
-		"client_phase_start":"draining","client_phase_end":"idle","joined_transfer_active":false,"bytes_pulled_during":5}`,
+		"client_phase_start":"draining","client_phase_end":"idle","joined_transfer_active":false,"bytes_pulled_during":5,
+		"bytes_downloaded":1000,"download_duration_ms":500}`,
 		time.Now().UTC().Format(time.RFC3339))
 	resultPath := fmt.Sprintf("/probe/%d/result", first.ProbeID)
 	if code, body := call(otherKeyID, resultPath, result); code != http.StatusNotFound {
@@ -228,6 +244,10 @@ func TestNASUploadProbeLifecycle(t *testing.T) {
 	var phaseStart string
 	if err := pool.QueryRow(ctx, `SELECT objects_deleted_at IS NOT NULL, reported_at IS NOT NULL, client_phase_start FROM nas_upload_probes WHERE id=$1`, first.ProbeID).Scan(&objectsDeleted, &reported, &phaseStart); err != nil {
 		t.Fatal(err)
+	}
+	var downloaded, downloadMS int64
+	if err := pool.QueryRow(ctx, `SELECT bytes_downloaded,download_duration_ms FROM nas_upload_probes WHERE id=$1`, first.ProbeID).Scan(&downloaded, &downloadMS); err != nil || downloaded != 1000 || downloadMS != 500 {
+		t.Fatalf("download result=%d/%d err=%v", downloaded, downloadMS, err)
 	}
 	// Its URLs can still write until expiry, so the report deletes the objects
 	// without marking them; only the post-expiry sweep marks them final.
