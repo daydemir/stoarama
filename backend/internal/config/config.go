@@ -45,6 +45,7 @@ type Config struct {
 	NASUploadProbeBytes              int
 	NASUploadProbeStreams            int
 	NASUploadProbeInterval           time.Duration
+	NASBenchmarkEnabled              bool
 	StorageCredKey                   string
 	AppBaseURL                       string
 	MagicLinkTTL                     time.Duration
@@ -235,6 +236,7 @@ func Load() (Config, error) {
 		NASUploadProbeBytes:              intEnv("NAS_UPLOAD_PROBE_BYTES", 256*1024*1024),
 		NASUploadProbeStreams:            intEnv("NAS_UPLOAD_PROBE_STREAMS", 4),
 		NASUploadProbeInterval:           durEnv("NAS_UPLOAD_PROBE_INTERVAL", 6*time.Hour),
+		NASBenchmarkEnabled:              boolEnv("NAS_BENCHMARK_ENABLED", true),
 		StorageCredKey:                   strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
 		AppBaseURL:                       strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
 		MagicLinkTTL:                     durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 60*time.Minute)),

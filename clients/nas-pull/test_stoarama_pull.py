@@ -3830,6 +3830,252 @@ class RestoreTests(unittest.TestCase):
         flaky = [urllib.error.HTTPError("u", 503, "busy", {}, None), {"state": "verified"}]
         with mock.patch.object(pull, "request_json", side_effect=flaky):
             self.assertEqual(pull.report_restore(self.cfg, 7, {}, sleep=lambda _s: None), {"state": "verified"})
+class NASBenchmarkTests(unittest.TestCase):
+    SERVER_HOST_FIELDS = {
+        "machine", "system", "kernel_release", "python_version", "cpu_model", "cpu_count", "affinity_cpus",
+        "cgroup_cpu_limit", "mem_total_bytes", "mem_available_bytes", "cgroup_memory_limit_bytes",
+        "state_exec_allowed", "load1",
+    }
+
+    def config(self, root):
+        return NASPullTests.config(self, root)
+
+    def test_cgroup_limits_v2_v1_and_unlimited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cpu.max").write_text("max 100000\n")
+            (root / "memory.max").write_text("max\n")
+            self.assertIsNone(pull.cgroup_cpu_limit(str(root)))
+            self.assertIsNone(pull.cgroup_memory_limit(str(root)))
+            (root / "cpu.max").write_text("250000 100000\n")
+            (root / "memory.max").write_text("4294967296\n")
+            self.assertEqual(pull.cgroup_cpu_limit(str(root)), 2.5)
+            self.assertEqual(pull.cgroup_memory_limit(str(root)), 4294967296)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cpu").mkdir()
+            (root / "memory").mkdir()
+            (root / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+            (root / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+            (root / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+            self.assertIsNone(pull.cgroup_cpu_limit(str(root)))
+            self.assertIsNone(pull.cgroup_memory_limit(str(root)))
+            (root / "cpu" / "cpu.cfs_quota_us").write_text("200000\n")
+            self.assertEqual(pull.cgroup_cpu_limit(str(root)), 2.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(pull.cgroup_cpu_limit(tmp))
+            self.assertIsNone(pull.cgroup_memory_limit(tmp))
+
+    def test_meminfo_and_cpu_model(self):
+        self.assertEqual(pull.meminfo_bytes("MemTotal:  8000 kB\nMemFree: 1 kB\nMemAvailable: 2000 kB\n"),
+                         (8000 * 1024, 2000 * 1024))
+        self.assertEqual(pull.meminfo_bytes(None), (0, 0))
+        self.assertEqual(pull.cpu_model("processor: 0\nmodel name\t: AMD Ryzen Embedded V1500B\n"), "AMD Ryzen Embedded V1500B")
+        self.assertEqual(pull.cpu_model(""), "")
+
+    def test_host_facts_match_server_fields_and_probe_exec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            facts = pull.HostFacts(Path(tmp))()
+            self.assertEqual(set(facts), self.SERVER_HOST_FIELDS)
+            self.assertTrue(facts["state_exec_allowed"])
+            self.assertGreaterEqual(facts["cpu_count"], 1)
+            self.assertEqual(list((Path(tmp) / "tools").iterdir()), [])
+            json.dumps(facts)
+
+    def test_heartbeat_carries_host_facts_and_survives_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.config(Path(tmp))
+            runtime = pull.Runtime(cfg)
+            self.assertNotIn("host", runtime.heartbeat_payload(None))
+            runtime.host_facts = lambda: {"machine": "x86_64"}
+            self.assertEqual(runtime.heartbeat_payload(None)["host"], {"machine": "x86_64"})
+
+            def broken():
+                raise OSError("no proc")
+            runtime.host_facts = broken
+            self.assertNotIn("host", runtime.heartbeat_payload(None))
+
+    def test_update_waits_for_active_benchmark(self):
+        ready = threading.Event()
+        ready.set()
+        worker = SimpleNamespace(is_alive=lambda: False)
+        self.assertTrue(pull.update_can_exec(ready, worker))
+        pull.BENCHMARK_ACTIVE.set()
+        try:
+            self.assertFalse(pull.update_can_exec(ready, worker))
+        finally:
+            pull.BENCHMARK_ACTIVE.clear()
+
+    def test_valid_benchmark_task(self):
+        clip = {"clip_id": 1, "relative_path": "a/b.mp4", "size_bytes": 5, "sha256": "a" * 64}
+        task = {"benchmark_id": 3, "deadline_sec": 99999, "clips": [clip]}
+        benchmark_id, deadline, clips = pull.valid_benchmark_task(task)
+        self.assertEqual((benchmark_id, deadline, len(clips)), (3, pull.BENCHMARK_MAX_DEADLINE_SEC, 1))
+        for broken in (
+            {**task, "benchmark_id": 0}, {**task, "deadline_sec": 0}, {**task, "clips": []},
+            {**task, "clips": [{**clip, "sha256": "A" * 64}]}, {**task, "clips": [{**clip, "size_bytes": 0}]},
+            {**task, "clips": [clip] * (pull.BENCHMARK_MAX_CLIPS + 1)},
+        ):
+            with self.assertRaises(pull.BenchmarkError):
+                pull.valid_benchmark_task(broken)
+
+    def test_parse_framehash_chain_ignores_timestamps_and_checks_dts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second, joined = Path(tmp) / "1", Path(tmp) / "2", Path(tmp) / "j"
+            first.write_text("#format: frame checksums\n0, 0, 0, 1, 10, aa\n1, 0, 0, 1, 4, bb\n")
+            second.write_text("0, 0, 0, 1, 11, cc\n")
+            joined.write_text("0, 0, 0, 1, 10, aa\n1, 0, 0, 1, 4, bb\n0, 5, 5, 1, 11, cc\n")
+            digests, counts = {}, {}
+            pull.parse_framehash(first, digests, counts)
+            pull.parse_framehash(second, digests, counts)
+            out_digests, out_counts, violations = pull.parse_framehash(joined, check_timing=True)
+            self.assertEqual(counts, out_counts)
+            self.assertEqual({k: v.hexdigest() for k, v in digests.items()}, {k: v.hexdigest() for k, v in out_digests.items()})
+            self.assertEqual(violations, 0)
+            joined.write_text("0, 5, 5, 1, 10, aa\n0, 5, 6, 1, 11, cc\n")
+            self.assertEqual(pull.parse_framehash(joined, check_timing=True)[2], 1)
+
+    def fake_tool_archive(self, root, ffmpeg=b"ffmpeg-binary", ffprobe=b"ffprobe-binary"):
+        import tarfile
+        archive = root / "tools.tar.xz"
+        with tarfile.open(archive, "w:xz") as bundle:
+            for name, data in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe), ("README", b"x")):
+                info = tarfile.TarInfo("ffmpeg-build/bin/%s" % name if name != "README" else "ffmpeg-build/README")
+                info.size = len(data)
+                bundle.addfile(info, io.BytesIO(data))
+        spec = {"url": "https://example.test/tools.tar.xz",
+                "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "ffmpeg_sha256": hashlib.sha256(ffmpeg).hexdigest(),
+                "ffprobe_sha256": hashlib.sha256(ffprobe).hexdigest()}
+        return archive, spec
+
+    def test_tool_install_verifies_archive_and_binaries_then_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            state.mkdir()
+            archive, spec = self.fake_tool_archive(root)
+            opens = []
+
+            def opener(request, timeout):
+                opens.append(request.full_url)
+                return open(archive, "rb")
+            with mock.patch.dict(pull.BENCHMARK_TOOLS, {"x86_64": spec}, clear=True):
+                info = pull.ensure_benchmark_tools(state, "AMD64", time.monotonic() + 60, opener=opener)
+                self.assertEqual(info["source"], "downloaded")
+                self.assertEqual(Path(info["ffmpeg"]).read_bytes(), b"ffmpeg-binary")
+                self.assertTrue(os.access(info["ffprobe"], os.X_OK))
+                self.assertEqual(sorted(p.name for p in Path(info["ffmpeg"]).parent.iterdir()), ["ffmpeg", "ffprobe"])
+                again = pull.ensure_benchmark_tools(state, "x86_64", time.monotonic() + 60, opener=opener)
+                self.assertEqual((again["source"], len(opens)), ("cached", 1))
+                with self.assertRaises(pull.BenchmarkUnsupported):
+                    pull.ensure_benchmark_tools(state, "aarch64", time.monotonic() + 60, opener=opener)
+
+    def test_tool_install_rejects_tampered_bytes_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            state.mkdir()
+            archive, spec = self.fake_tool_archive(root)
+            opener = lambda request, timeout: open(archive, "rb")
+            for field in ("archive_sha256", "ffprobe_sha256"):
+                with mock.patch.dict(pull.BENCHMARK_TOOLS, {"x86_64": {**spec, field: "0" * 64}}, clear=True):
+                    with self.assertRaises(pull.BenchmarkError):
+                        pull.ensure_benchmark_tools(state, "x86_64", time.monotonic() + 60, opener=opener)
+                tools = state / "tools" / ("ffmpeg-%s-x86_64" % pull.BENCHMARK_TOOL_VERSION)
+                self.assertFalse(any(p.name.startswith(".") for p in tools.iterdir()))
+                self.assertFalse((tools / "ffprobe").exists())
+
+    def test_benchmark_once_claims_runs_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.config(Path(tmp))
+            calls = []
+            task = {"benchmark_id": 9, "deadline_sec": 60, "clips": []}
+
+            def fake_request(cfg_, method, path, body=None, timeout=None, **kwargs):
+                calls.append((method, path, body))
+                if path.endswith("/claim"):
+                    return {"enabled": True, "retry_after_sec": 1800, "task": task if len(calls) == 1 else None}
+                return {"ok": True}
+            with mock.patch.object(pull, "request_json", side_effect=fake_request), \
+                    mock.patch.object(pull, "run_benchmark", return_value=("ok", "", {"media_seconds": 1})) as run:
+                facts = lambda: {"machine": "x86_64"}
+                self.assertEqual(pull.benchmark_once(cfg, threading.Event(), facts), 1800)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(calls[1][1], "/account/connections/benchmark/9/result")
+                self.assertEqual(calls[1][2]["status"], "ok")
+                self.assertEqual(calls[1][2]["host"], {"machine": "x86_64"})
+                self.assertFalse(pull.BENCHMARK_ACTIVE.is_set())
+                self.assertEqual(pull.benchmark_once(cfg, threading.Event(), facts), 1800)
+                self.assertEqual(run.call_count, 1)
+
+    def test_unsupported_arch_reports_without_touching_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.config(Path(tmp))
+            task = {"benchmark_id": 4, "deadline_sec": 60,
+                    "clips": [{"clip_id": 1, "relative_path": "a.mp4", "size_bytes": 1, "sha256": "a" * 64}]}
+
+            def unsupported(state_dir, machine, deadline):
+                raise pull.BenchmarkUnsupported("no pinned FFmpeg build for architecture 'aarch64'")
+            status, error, result = pull.run_benchmark(cfg, task, threading.Event(), {"machine": "aarch64"}, tool_installer=unsupported)
+            self.assertEqual(status, "unsupported_arch")
+            self.assertIn("aarch64", error)
+            self.assertFalse((cfg.state_dir / pull.BENCHMARK_ROOT).exists())
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "system FFmpeg required")
+    def test_benchmark_end_to_end_on_real_clips_is_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.config(Path(tmp))
+            folder = cfg.output_dir / "rec" / "September"
+            folder.mkdir(parents=True)
+            clips = []
+            for index in range(3):
+                path = folder / ("clip_%d.mp4" % index)
+                subprocess.run([
+                    "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=15",
+                    "-f", "lavfi", "-i", "sine=frequency=%d:sample_rate=44100" % (300 + 100 * index),
+                    "-t", "2", "-c:v", "libx264", "-g", "15", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                    "-y", str(path)], check=True)
+                data = path.read_bytes()
+                clips.append({"clip_id": index + 1, "relative_path": str(path.relative_to(cfg.output_dir)),
+                              "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            before = {p: p.stat().st_mtime_ns for p in cfg.output_dir.rglob("*")}
+            system_tools = lambda state_dir, machine, deadline: {
+                "source": "system", "ffmpeg": shutil.which("ffmpeg"), "ffprobe": shutil.which("ffprobe")}
+            task = {"benchmark_id": 12, "deadline_sec": 600, "clips": clips}
+            status, error, result = pull.run_benchmark(cfg, task, threading.Event(), {"machine": "x86_64"},
+                                                       tool_installer=system_tools)
+            self.assertEqual(status, "ok", error)
+            stages = result["stages"]
+            for name in ("tool_install", "hash_inputs", "probe", "remux", "packet_chain", "seam_decode", "full_decode"):
+                self.assertIn(name, stages)
+                self.assertGreaterEqual(stages[name]["wall_s"], 0)
+            self.assertTrue(stages["remux"]["ok"])
+            self.assertTrue(stages["packet_chain"]["match"], stages["packet_chain"])
+            self.assertEqual(stages["seam_decode"]["seams"], 2)
+            self.assertTrue(stages["full_decode"]["ok"])
+            self.assertGreater(stages["full_decode"]["cpu_s"], 0)
+            self.assertAlmostEqual(result["media_seconds"], 6, delta=0.5)
+            self.assertTrue(result["temp_removed"])
+            self.assertEqual(list((cfg.state_dir / pull.BENCHMARK_ROOT).iterdir()), [])
+            self.assertEqual({p: p.stat().st_mtime_ns for p in cfg.output_dir.rglob("*")}, before)
+            json.dumps(result)
+
+            clips[1] = {**clips[1], "sha256": "b" * 64}
+            status, error, _ = pull.run_benchmark(cfg, {**task, "clips": clips}, threading.Event(), {"machine": "x86_64"},
+                                                  tool_installer=system_tools)
+            self.assertEqual((status, error), ("error", "input sha256 mismatch"))
+            self.assertEqual(list((cfg.state_dir / pull.BENCHMARK_ROOT).iterdir()), [])
+
+    def test_deadline_kills_child_and_reports_partial(self):
+        stop = threading.Event()
+        started = time.monotonic()
+        with self.assertRaises(pull.BenchmarkDeadline):
+            pull.run_measured(["sleep", "30"], time.monotonic() + 1, stop, niced=False)
+        self.assertLess(time.monotonic() - started, 10)
+        measured = pull.run_measured(["sh", "-c", "exit 3"], time.monotonic() + 30, stop)
+        self.assertEqual(measured["returncode"], 3)
+        self.assertGreaterEqual(measured["cpu_s"], 0)
 
 
 if __name__ == "__main__":

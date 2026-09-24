@@ -29,6 +29,7 @@ var (
 	pullUploadProbeResultRe    = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
 	pullRestoreResultRe        = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
 	pullCollatedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/collated/\d+/download$`)
+	pullBenchmarkResultRe      = regexp.MustCompile(`^/api/v1/account/connections/benchmark/\d+/result$`)
 )
 
 // pullPathAllowed reports whether a pull-scoped key may call (method, path). It is
@@ -70,6 +71,10 @@ func pullPathAllowed(method, path string) bool {
 	case method == http.MethodPost && (path == "/api/v1/account/collated/ack" || path == "/api/v1/account/collated/error"):
 		return true
 	case method == http.MethodGet && pullCollatedDownloadPathRe.MatchString(path):
+		return true
+	case method == http.MethodPost && path == "/api/v1/account/connections/benchmark/claim":
+		return true
+	case method == http.MethodPost && pullBenchmarkResultRe.MatchString(path):
 		return true
 	case method == http.MethodGet && path == "/api/v1/account/joined":
 		return true
@@ -661,6 +666,7 @@ type connectionHeartbeatRequest struct {
 	JoinedProtocol     int                        `json:"joined_protocol_version"`
 	JoinedDelivery     *connectionJoinedDelivery  `json:"joined_delivery,omitempty"`
 	JoinedTransfer     *connectionJoinedTransfer  `json:"joined_transfer,omitempty"`
+	Host               *nasHostFacts              `json:"host,omitempty"`
 }
 
 type connectionHeartbeatResponse struct {
@@ -761,6 +767,9 @@ var inventorySkipReasons = map[string]bool{
 const connectionHeartbeatFutureSkew = 5 * time.Minute
 
 func validateConnectionHeartbeat(req connectionHeartbeatRequest) error {
+	if err := validateNASHostFacts(req.Host); err != nil {
+		return err
+	}
 	if req.CursorID < 0 || req.ClipsPulled < 0 || req.BytesPulled < 0 {
 		return errors.New("cursor_id, clips_pulled, and bytes_pulled must be non-negative")
 	}
@@ -1019,6 +1028,17 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	if ct.RowsAffected() == 0 {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
+	}
+	if req.Host != nil {
+		host, err := json.Marshal(req.Host)
+		if err != nil {
+			util.WriteError(w, http.StatusBadRequest, "invalid NAS host facts")
+			return
+		}
+		if _, err := tx.Exec(r.Context(), `UPDATE connections SET nas_host=$2,nas_host_reported_at=now() WHERE id=$1`, connectionID, host); err != nil {
+			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("heartbeat host facts: %v", err))
+			return
+		}
 	}
 	joinedDeliveryAccepted := true
 	if joined := req.JoinedDelivery; joined != nil {
