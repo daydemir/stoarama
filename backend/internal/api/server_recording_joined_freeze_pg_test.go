@@ -53,6 +53,7 @@ var joinedMigrationNames = []string{
 	"0152_joined_additive_cohort_authority.sql",
 	"0155_joined_source_retention_purge.sql",
 	"0158_recording_collation_v2.sql",
+	"0160_nas_collated_delivery.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {
