@@ -277,6 +277,10 @@ fi
 download "${RELAY_TARBALL}" "${RELAY_ARCHIVE}"
 verify_sha "${RELAY_ARCHIVE}" "${RELAY_TARBALL}"
 
+# bin/yt-dlp is the single-file build older relay binaries use (and the fallback
+# after a rollback). Relays that understand the manifest's "ytdlp_dist" entry
+# install the one-directory build themselves on first start, before leasing work,
+# into ~/.stoarama/bin/yt-dlp-dist/ and run that instead.
 YTDLP_ARTIFACT="yt-dlp-${RELEASE_VERSION}-${KEY}"
 if [[ -z "$(sha_for_artifact "${YTDLP_ARTIFACT}")" ]]; then
   YTDLP_ARTIFACT="yt-dlp-${KEY}"

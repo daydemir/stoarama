@@ -333,8 +333,10 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	// is SSRF-guarded inside ResolveCaptureInput.
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "resolving")
 	resolveCtx, resolveCancel := context.WithTimeout(jobCtx, 30*time.Second)
-	sourceURL, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
+	input, err := capture.ResolveCapture(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
 	resolveCancel()
+	w.cfg.RelayDiagnostics.Resolve(job.JobID, time.Now())
+	sourceURL, isImage := input.URL, input.IsImage
 	if err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("resolve source url: %w", err))
 		w.fail(ctx, job.JobID, job.LeaseToken, fmt.Errorf("resolve source url: %w", err))
@@ -355,7 +357,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	// covered by the droplet egress firewall, which REJECTs all traffic to
 	// private/metadata ranges.
 	w.cfg.RelayDiagnostics.Stage(job.JobID, "ssrf_check")
-	if _, err := netguard.ValidatePublicURL(sourceURL); err != nil {
+	if err := validateCaptureInputPublic(input); err != nil {
 		w.cfg.RelayDiagnostics.Finish(job.JobID, "failed", fmt.Errorf("ssrf guard rejected source url: %w", err))
 		w.fail(ctx, job.JobID, job.LeaseToken, fmt.Errorf("ssrf guard rejected source url: %w", err))
 		return
@@ -367,7 +369,7 @@ func (w *Worker) processJob(ctx context.Context, job recordingapi.RecordingJob) 
 	// Recording footage is always captured source-native. TargetFPS is retained in
 	// the wire shape only for compatibility with older API/relay versions; never
 	// allow it to select FFmpeg's re-encode branch.
-	seg, err := capture.CaptureSegmentInDirWithHeaders(captureCtx, sourceURL, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), w.cfg.CaptureTempDir, inputHeaders)
+	seg, err := capture.CaptureSegmentInputInDir(captureCtx, input, clipDuration, recordingCaptureTargetFPS(job.TargetFPS), w.cfg.CaptureTempDir)
 	captureCancel()
 	if err != nil {
 		if canceled() {
@@ -633,8 +635,10 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// job mid-window.
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_resolving")
 		resolveCtx, resolveCancel := context.WithTimeout(windowCtx, 30*time.Second)
-		resolved, isImage, inputHeaders, err := capture.ResolveCaptureInputWithHeaders(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
+		resolved, err := capture.ResolveCapture(resolveCtx, job.StreamProvider, job.SourceURL, job.SourcePageURL)
 		resolveCancel()
+		w.cfg.RelayDiagnostics.Resolve(job.JobID, time.Now())
+		isImage := resolved.IsImage
 		if err != nil {
 			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 				break
@@ -659,7 +663,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		// S-1: re-check the resolved URL right before ffmpeg (DNS-rebinding gate),
 		// same call and same transient treatment as a resolve error.
 		w.cfg.RelayDiagnostics.Stage(job.JobID, "continuous_ssrf_check")
-		if _, err := netguard.ValidatePublicURL(resolved); err != nil {
+		if err := validateCaptureInputPublic(resolved); err != nil {
 			if continuousShouldStop(canceled(), windowCtx.Err() != nil) {
 				break
 			}
@@ -713,7 +717,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 			// capture is control flow only: this segment and the rest of the accepted
 			// spool still drain normally on jobCtx.
 			mediaLagFence.observe(seg.CaptureSequence, seg.EndAt, time.Now(), w.cfg.ContinuousMaxMediaLag, abortAttempt)
-			return deliverSegment(resolved, seg)
+			return deliverSegment(resolved.URL, seg)
 		}, func(depth int) { w.cfg.RelayDiagnostics.DeliveryQueue(job.JobID, depth) })
 		var diskPressure atomic.Bool
 		stopDiskMonitor := make(chan struct{})
@@ -763,7 +767,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if captureContinuous == nil {
 			captureContinuous = continuousCaptureForJob(job)
 		}
-		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder, inputHeaders)
+		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
@@ -822,7 +826,7 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 				)
 			}
 			cycleResult, observeErr := w.handleFrozenHLSCycle(
-				windowCtx, job, resolved, inputHeaders, &frozenHLSState, forcedLaunchDeadline,
+				windowCtx, job, resolved.URL, resolved.Headers, &frozenHLSState, forcedLaunchDeadline,
 			)
 			switch {
 			case errors.Is(observeErr, errDiskPressure):
@@ -891,13 +895,27 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 	log.Printf("recording worker job=%d recording=%d continuous window complete", job.JobID, job.RecordingID)
 }
 
-type continuousCaptureFunc func(context.Context, string, time.Duration, string, *int, string, func(capture.Segment) error, string) error
+type continuousCaptureFunc func(context.Context, capture.CaptureInput, time.Duration, string, *int, string, func(capture.Segment) error) error
+
+// validateCaptureInputPublic applies the DNS-rebinding SSRF gate to every URL
+// FFmpeg will open, including a split audio rendition.
+func validateCaptureInputPublic(input capture.CaptureInput) error {
+	if _, err := netguard.ValidatePublicURL(input.URL); err != nil {
+		return err
+	}
+	if input.AudioURL != "" {
+		if _, err := netguard.ValidatePublicURL(input.AudioURL); err != nil {
+			return fmt.Errorf("audio rendition: %w", err)
+		}
+	}
+	return nil
+}
 
 func continuousCaptureForJob(job recordingapi.RecordingJob) continuousCaptureFunc {
 	if job.TimestampContractSupported {
-		return capture.CaptureContinuousWithTimestampContract
+		return capture.CaptureContinuousInputWithTimestampContract
 	}
-	return capture.CaptureContinuousWithHeaders
+	return capture.CaptureContinuousInput
 }
 
 func continuousSelfUpdateCanSurrender(draining bool, deliveryErr error, windowClosed bool) bool {

@@ -12,12 +12,19 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
-const (
-	YTDLPPrivateTempEnv     = "STOARAMA_YTDLP_PRIVATE_TMP"
-	YTDLPRuntimeTempRootEnv = "STOARAMA_YTDLP_RUNTIME_TMP_ROOT"
-)
+// YTDLPRuntimeTempRootEnv names the directory under which every yt-dlp
+// invocation receives its own private TMPDIR. The relay points it at an
+// app-owned directory; when unset, a per-user directory under the OS temp dir
+// is used.
+const YTDLPRuntimeTempRootEnv = "STOARAMA_YTDLP_RUNTIME_TMP_ROOT"
+
+// ytdlpTerminateGrace is how long a cancelled yt-dlp process group has to exit
+// after SIGTERM before it is SIGKILLed. SIGTERM lets a PyInstaller bootloader
+// remove its own extraction directory; SIGKILL alone leaks it.
+var ytdlpTerminateGrace = 5 * time.Second
 
 type ytdlpInvocationTemp struct {
 	rootDevice uint64
@@ -28,9 +35,11 @@ type ytdlpInvocationTemp struct {
 	path       string
 }
 
-// RunYTDLPCommand gives each opted-in relay invocation its own private temp
-// directory and removes that exact directory only after the child is reaped.
-// Cleanup failure is logged but never replaces the resolver's output or error.
+// RunYTDLPCommand runs yt-dlp in its own process group with its own private
+// TMPDIR, and removes that exact directory only after the whole group is gone.
+// Cancellation sends SIGTERM to the group, then SIGKILL after
+// ytdlpTerminateGrace. Cleanup failure is logged but never replaces the
+// resolver's output or error.
 func RunYTDLPCommand(ctx context.Context, bin string, args ...string) ([]byte, error) {
 	return runYTDLPCommand(ctx, true, bin, args...)
 }
@@ -42,17 +51,24 @@ func RunYTDLPCommandOutput(ctx context.Context, bin string, args ...string) ([]b
 }
 
 func runYTDLPCommand(ctx context.Context, combined bool, bin string, args ...string) ([]byte, error) {
-	if os.Getenv(YTDLPPrivateTempEnv) != "1" {
-		return commandOutput(exec.CommandContext(ctx, bin, args...), combined)
+	root, err := ytdlpRuntimeTempRoot()
+	if err != nil {
+		return nil, err
 	}
-	invocation, err := newYTDLPInvocationTemp(os.Getenv(YTDLPRuntimeTempRootEnv))
+	invocation, err := newYTDLPInvocationTemp(root)
 	if err != nil {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = replaceCommandEnvironment(os.Environ(), "TMPDIR", invocation.path)
-	configureYTDLPProcessGroup(cmd)
+	configureYTDLPProcessGroup(cmd, ytdlpTerminateGrace)
 	output, runErr := commandOutput(cmd, combined)
+	if ctx.Err() != nil {
+		// A cancelled resolve had its SIGTERM grace; anything still alive in the
+		// owned group (a TERM-ignoring descendant) is killed so its temp directory
+		// can be reclaimed instead of leaking on every timeout.
+		killYTDLPProcessGroup(cmd)
+	}
 	if groupErr := waitForYTDLPProcessGroupExit(cmd); groupErr != nil {
 		log.Printf("yt-dlp private temp cleanup skipped; owned process group may still be active")
 		return output, runErr
@@ -61,6 +77,20 @@ func runYTDLPCommand(ctx context.Context, combined bool, bin string, args ...str
 		log.Printf("yt-dlp private temp cleanup failed; owned invocation retained")
 	}
 	return output, runErr
+}
+
+// ytdlpRuntimeTempRoot returns the configured private temp root, or a per-user
+// directory under the OS temp dir. The root must be a real directory owned by
+// this user; anything else fails closed.
+func ytdlpRuntimeTempRoot() (string, error) {
+	if root := strings.TrimSpace(os.Getenv(YTDLPRuntimeTempRootEnv)); root != "" {
+		return root, nil
+	}
+	root := filepath.Join(os.TempDir(), fmt.Sprintf("stoarama-ytdlp-%d", os.Getuid()))
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create yt-dlp temp root: %w", err)
+	}
+	return root, nil
 }
 
 func commandOutput(cmd *exec.Cmd, combined bool) ([]byte, error) {

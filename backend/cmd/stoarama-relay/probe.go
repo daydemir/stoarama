@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
@@ -23,7 +24,8 @@ const (
 // All state access is mutex-guarded because the heartbeat and probe goroutines share
 // it.
 type probe struct {
-	ytdlpBin string
+	ytdlpBin          string
+	versionGeneration atomic.Uint64
 
 	mu       sync.Mutex
 	class    capture.YTDLPClass
@@ -39,6 +41,15 @@ type probeSnapshot struct {
 	version string
 }
 
+// bin is the yt-dlp the resolver currently uses. The relay may switch
+// YT_DLP_BIN to a newly installed build while running.
+func (p *probe) bin() string {
+	if bin := strings.TrimSpace(os.Getenv("YT_DLP_BIN")); bin != "" {
+		return bin
+	}
+	return p.ytdlpBin
+}
+
 func newProbe(ytdlpBin string) *probe {
 	return &probe{
 		ytdlpBin: ytdlpBin,
@@ -47,7 +58,7 @@ func newProbe(ytdlpBin string) *probe {
 }
 
 func (p *probe) runLoop(ctx context.Context) {
-	p.setYtdlpVersion(readYtdlpVersion(p.ytdlpBin))
+	p.refreshYtdlpVersion()
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -79,7 +90,7 @@ func (p *probe) runOnce(ctx context.Context) {
 			args = append([]string{"--cookies", cp}, args...)
 		}
 	}
-	out, err := capture.RunYTDLPCommand(cctx, p.ytdlpBin, args...)
+	out, err := capture.RunYTDLPCommand(cctx, p.bin(), args...)
 
 	var class capture.YTDLPClass
 	switch {
@@ -148,10 +159,17 @@ func (p *probe) snapshot() probeSnapshot {
 	return result
 }
 
-func (p *probe) setYtdlpVersion(version string) {
+// refreshYtdlpVersion reads the active yt-dlp's version. Reads can overlap (the
+// startup read and a later activation); only the most recently started read
+// is recorded, so a slow earlier read never overwrites a newer build's version.
+func (p *probe) refreshYtdlpVersion() {
+	generation := p.versionGeneration.Add(1)
+	version := readYtdlpVersion(p.bin())
 	p.mu.Lock()
-	p.ytdlpVer = version
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	if p.versionGeneration.Load() == generation {
+		p.ytdlpVer = version
+	}
 }
 
 // applyCookieEnv sets the cookie source the shared capture/resolve.go reads. In the

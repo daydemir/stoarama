@@ -1414,3 +1414,73 @@ func TestValidateConcatFilesRejectsTooFewClips(t *testing.T) {
 		t.Fatal("expected fewer than two clips to be rejected")
 	}
 }
+
+func TestBuildFFmpegContinuousInputArgsSplitYouTubeUsesTwoLiveEdgeInputs(t *testing.T) {
+	const video = "https://rr1.googlevideo.com/api/manifest/hls_playlist/itag/270/index.m3u8"
+	const audio = "https://rr1.googlevideo.com/api/manifest/hls_playlist/itag/234/index.m3u8"
+	for _, timestampContract := range []bool{false, true} {
+		got := buildFFmpegContinuousInputArgs(CaptureInput{URL: video, AudioURL: audio}, "/out/seg-%Y%m%d-%H%M%S.mp4", 60*time.Second, "", nil, true, timestampContract)
+		perInput := []string{
+			"-rw_timeout", "15000000", "-timeout", "15000000",
+			"-protocol_whitelist", "https,tls,tcp,http,crypto,data",
+			"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+			"-reconnect_on_http_error", "4xx,5xx", "-reconnect_delay_max", "10",
+			"-live_start_index", "-1", "-m3u8_hold_counters", "4",
+			"-fflags", "+discardcorrupt",
+		}
+		want := []string{"-y", "-nostdin", "-loglevel", "warning"}
+		want = append(want, perInput...)
+		want = append(want, "-i", video)
+		want = append(want, perInput...)
+		want = append(want, "-i", audio, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-f", "segment", "-segment_time", "60")
+		if timestampContract {
+			want = append(want, "-reset_timestamps", "0", "-avoid_negative_ts", "disabled")
+		} else {
+			want = append(want, "-reset_timestamps", "1")
+		}
+		want = append(want, "-segment_format", "mp4", "-strftime", "1", "/out/seg-%Y%m%d-%H%M%S.mp4")
+		if !slices.Equal(got, want) {
+			t.Fatalf("timestampContract=%t split args\n got: %q\nwant: %q", timestampContract, got, want)
+		}
+	}
+}
+
+func TestBuildFFmpegContinuousInputArgsSingleInputUnchanged(t *testing.T) {
+	for _, includeAudio := range []bool{false, true} {
+		for _, timestampContract := range []bool{false, true} {
+			legacy := buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps("https://example.com/live.m3u8", "/out/seg.mp4", 60*time.Second, "", nil, "Referer: https://example.com/\r\n", includeAudio, timestampContract)
+			typed := buildFFmpegContinuousInputArgs(CaptureInput{URL: "https://example.com/live.m3u8", Headers: "Referer: https://example.com/\r\n"}, "/out/seg.mp4", 60*time.Second, "", nil, includeAudio, timestampContract)
+			if !slices.Equal(legacy, typed) {
+				t.Fatalf("single-input args differ\nlegacy: %q\n typed: %q", legacy, typed)
+			}
+			if strings.Count(strings.Join(typed, " "), " -i ") != 1 {
+				t.Fatalf("single input opened more than once: %q", typed)
+			}
+		}
+	}
+}
+
+func TestBuildFFmpegContinuousInputArgsMalformedAudioRetryDropsAudioInput(t *testing.T) {
+	got := buildFFmpegContinuousInputArgs(CaptureInput{URL: "https://rr1.googlevideo.com/v/index.m3u8", AudioURL: "https://rr1.googlevideo.com/a/index.m3u8"}, "/out/seg.mp4", 60*time.Second, "", nil, false, false)
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, "/a/index.m3u8") || strings.Contains(joined, "1:a") || strings.Contains(joined, "0:a") {
+		t.Fatalf("video-only retry still opened or mapped audio: %s", joined)
+	}
+}
+
+func TestBuildFFmpegSegmentInputArgsSplitMapsVideoAndAudioInputs(t *testing.T) {
+	got := buildFFmpegSegmentInputArgs(CaptureInput{URL: "https://rr1.googlevideo.com/v/index.m3u8", AudioURL: "https://rr1.googlevideo.com/a/index.m3u8"}, "/out/segment.mp4", 30*time.Second, "", nil)
+	joined := strings.Join(got, " ")
+	for _, want := range []string{
+		"-fflags +discardcorrupt -i https://rr1.googlevideo.com/v/index.m3u8",
+		"-fflags +discardcorrupt -i https://rr1.googlevideo.com/a/index.m3u8",
+		"-t 30 -map 0:v:0 -map 1:a:0 -c copy /out/segment.mp4",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in split segment args: %s", want, joined)
+		}
+	}
+	if single := buildFFmpegSegmentInputArgs(CaptureInput{URL: "https://example.com/live.m3u8"}, "/out/segment.mp4", 30*time.Second, "", nil); !slices.Equal(single, buildFFmpegSegmentArgs("https://example.com/live.m3u8", "/out/segment.mp4", 30*time.Second, "", nil)) {
+		t.Fatalf("single-input segment args changed: %q", single)
+	}
+}
