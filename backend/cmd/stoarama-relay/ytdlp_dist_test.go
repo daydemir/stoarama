@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/capture"
 )
@@ -165,13 +166,19 @@ func TestProbeVersionKeepsNewestRead(t *testing.T) {
 		}
 		return path
 	}
-	slowOld := write("old", "sleep 1\necho 2026.07.04\n")
+	started := filepath.Join(dir, "old-started")
+	slowOld := write("old", "touch '"+started+"'\nsleep 1\necho 2026.07.04\n")
 	fastNew := write("new", "echo 2026.08.19\n")
 	p := newProbe(slowOld)
 	t.Setenv("YT_DLP_BIN", slowOld)
 	done := make(chan struct{})
 	go func() { p.refreshYtdlpVersion(); close(done) }()
-	for p.versionGeneration.Load() == 0 {
+	// Switch only once the slow read has actually launched the old binary.
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	t.Setenv("YT_DLP_BIN", fastNew)
 	p.refreshYtdlpVersion()
