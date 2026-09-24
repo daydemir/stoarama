@@ -16,6 +16,7 @@ import (
 
 	"github.com/daydemir/stoarama/backend/internal/billing"
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/dospend"
 	"github.com/daydemir/stoarama/backend/internal/dropletpool"
 	"github.com/daydemir/stoarama/backend/internal/recsched"
 	"github.com/daydemir/stoarama/backend/internal/secretbox"
@@ -406,6 +407,23 @@ func mustBuildDropletPool(ctx context.Context, cfg config.Config, pool *pgxpool.
 	if err != nil {
 		log.Fatalf("resolve droplet pool operator account: %v", err)
 	}
+	// Account-wide spend guard: veto scale-ups that would push total DO burn
+	// past DO_SPEND_CRITICAL_USD_PER_DAY. Kill switch: DO_SPEND_SCALEUP_GUARD_ENABLED=false.
+	var spendGuard dropletpool.SpendGuard
+	if cfg.DOSpendScaleUpGuard {
+		spendCfg := doSpendConfig(cfg)
+		if err := spendCfg.Validate(); err != nil {
+			log.Fatalf("invalid DO spend guard config: %v", err)
+		}
+		spendClient, err := dospend.NewGodoClient(cfg.DOAPIToken)
+		if err != nil {
+			log.Fatalf("init DO spend client: %v", err)
+		}
+		spendGuard = dospend.Guard{Client: spendClient, CriticalUSDPerDay: spendCfg.CriticalUSDPerDay}
+		log.Printf("droplet pool: DO spend guard on; scale-up blocked above $%.2f/day account burn", spendCfg.CriticalUSDPerDay)
+	} else {
+		log.Printf("droplet pool: WARNING DO spend guard disabled (DO_SPEND_SCALEUP_GUARD_ENABLED=false)")
+	}
 	return dropletpool.NewController(pool, doClient, dropletpool.Config{
 		OperatorAccountID:     operatorAccountID,
 		BillingEnabled:        billingEnabled,
@@ -436,6 +454,7 @@ func mustBuildDropletPool(ctx context.Context, cfg config.Config, pool *pgxpool.
 		RepoRef:               cfg.DropletPoolRepoRef,
 		RepoCloneToken:        cfg.DropletPoolRepoCloneToken,
 		ReclaimLeases:         !cfg.RecSchedEnabled,
+		SpendGuard:            spendGuard,
 	})
 }
 

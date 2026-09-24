@@ -179,6 +179,13 @@ jobs:
           go test ./internal/qualitygrade -count=1 -v
           go test ./internal/api -run 'Test(RelayLeaseKeepsWindowOnPreviousNode|RelayLeaseAffinityYieldsWhenStickyNodeFailedWindow|RelayLeaseFailedNodeYieldsToPeers|AccountRecordingQualityGradesTenantWallAndGrades)' -count=1 -v
           go test ./cmd/stoaramactl -run 'Test(OpsAlertEpisodeLifecycle|LoadStaleRecorderDroplets)' -count=1 -v
+      - name: Test DigitalOcean spend guard
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          go test ./internal/dospend -count=1 -v
+          go test ./internal/dropletpool -run 'Test(ScaleUpSpendGuardBlocksPastCriticalAndOpensEpisode|NoteOpsAlertReopensResolvedEpisode)' -count=1 -v
+          go test ./cmd/stoaramactl -run 'Test(DOSpendAlertKeys|ComposeDOSpendEmailNamesEveryCondition|DOSpendBlockedEpisodeLifecycle)' -count=1 -v
       # Backtested against the Zanzibar drift; DB-backed, so it needs naming here
       # or it silently skips like the rest of this suite did.
       - name: Test clip timestamp drift signal

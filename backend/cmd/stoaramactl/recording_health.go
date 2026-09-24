@@ -177,6 +177,12 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 	if !*verifyMedia {
 		staleDroplets, staleEmailed = runStaleRecorderDropletAlerts(ctx, pool, cfg, *dryRun)
 	}
+	// Account-wide DigitalOcean spend rides the hourly full sweep only.
+	var doSpend *doSpendAlertResult
+	if !*verifyMedia && !*liveOnly {
+		result := runDOSpendAlerts(ctx, pool, cfg, *dryRun)
+		doSpend = &result
+	}
 
 	if *dryRun {
 		for _, inc := range incidents {
@@ -191,6 +197,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 			"notified":                0,
 			"emailed":                 0,
 			"stale_recorder_droplets": staleDroplets,
+			"do_spend":                doSpend,
 		})
 		return
 	}
@@ -253,6 +260,7 @@ func runRecordingHealthRun(ctx context.Context, cfg config.Config, args []string
 		"idempotency_keys_deleted": maintenance.IdempotencyKeysDeleted,
 		"stale_recorder_droplets":  staleDroplets,
 		"stale_droplet_emailed":    staleEmailed,
+		"do_spend":                 doSpend,
 	})
 }
 

@@ -69,6 +69,8 @@ func runRecordingHealthSummary(ctx context.Context, cfg config.Config) {
 		log.Printf("digest stability section skipped: %v", err)
 	}
 	body := composeHealthDigest(cfg.AppBaseURL, now, items, nas, stability)
+	// Additive: a DO read failure is reported inside the section, never withheld.
+	body += loadDigestDOSpend(ctx, cfg, pool, now)
 	recipients := operatorRecipients(ctx, pool)
 	if len(recipients) == 0 {
 		log.Fatalf("no operator recipients")
