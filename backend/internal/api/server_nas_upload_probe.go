@@ -333,7 +333,9 @@ func (s *Server) handleAccountConnectionUploadProbeResult(w http.ResponseWriter,
 	// not mark it: its presigned URLs can still write until expiry (a stream
 	// cut short by the client's time cap may even land later). The sweep marks
 	// it only once no URL can write any more.
-	if err := s.r2.DeleteObjects(ctx, nasUploadProbeKeys(prefix, streams)); err != nil {
+	if s.r2 == nil {
+		log.Printf("nas upload probe %d: storage unavailable; sweep will delete objects", probeID)
+	} else if err := s.r2.DeleteObjects(ctx, nasUploadProbeKeys(prefix, streams)); err != nil {
 		log.Printf("nas upload probe %d: delete after report: %v", probeID, err)
 	}
 	s.sweepNASUploadProbes(ctx)
