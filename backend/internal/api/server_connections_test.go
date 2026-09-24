@@ -37,6 +37,11 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/joined", true},
 		{http.MethodGet, "/api/v1/account/joined/34/download", true},
 		{http.MethodPost, "/api/v1/account/joined/ack", true},
+		{http.MethodPost, "/api/v1/account/connections/upload-probe", true},
+		{http.MethodPost, "/api/v1/account/connections/upload-probe/7/result", true},
+		{http.MethodGet, "/api/v1/account/connections/upload-probe", false},
+		{http.MethodPost, "/api/v1/account/connections/upload-probe/x/result", false},
+		{http.MethodPost, "/api/v1/account/connections/upload-probe/7/result/extra", false},
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 

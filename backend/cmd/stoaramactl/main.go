@@ -107,6 +107,8 @@ func main() {
 		runRecordings(ctx, cfg, os.Args[2:])
 	case "nas-inventory":
 		runNASInventory(ctx, cfg, os.Args[2:])
+	case "nas-upload-probe":
+		runNASUploadProbe(ctx, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -216,6 +218,7 @@ func usage() {
 	  stoaramactl recordings streak-priority report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-tracks report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nas-inventory report --connection-id ID [--limit 50 --json]
+	  stoaramactl nas-upload-probe report --connection-id ID [--limit 20 --json]
 `)
 }
 

@@ -284,3 +284,21 @@ func TestPutReaderIfAbsentVerifiedRejectsUnconditionalPutCeiling(t *testing.T) {
 		t.Fatal("oversized single-part object was accepted")
 	}
 }
+
+func TestPresignPutSizedRequestSignsExactLength(t *testing.T) {
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: "https://storage.example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.PresignPutSizedRequest(context.Background(), "nas-probes/13/x/part-0", "application/octet-stream", 1234, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Method != http.MethodPut || got.Headers.Get("Content-Length") != "1234" ||
+		!strings.Contains(got.URL, "content-length") || !strings.Contains(got.URL, "/bucket/nas-probes/13/x/part-0") {
+		t.Fatalf("sized put capability=%+v", got)
+	}
+	if _, err := client.PresignPutSizedRequest(context.Background(), "k", "application/octet-stream", 0, time.Minute); err == nil {
+		t.Fatal("zero-length sized put accepted")
+	}
+}

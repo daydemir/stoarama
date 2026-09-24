@@ -41,6 +41,10 @@ type Config struct {
 	R2Endpoint                       string
 	R2SignGetTTL                     time.Duration
 	R2SignPutTTL                     time.Duration
+	NASUploadProbeEnabled            bool
+	NASUploadProbeBytes              int
+	NASUploadProbeStreams            int
+	NASUploadProbeInterval           time.Duration
 	StorageCredKey                   string
 	AppBaseURL                       string
 	MagicLinkTTL                     time.Duration
@@ -220,6 +224,10 @@ func Load() (Config, error) {
 		R2Endpoint:                       os.Getenv("R2_ENDPOINT"),
 		R2SignGetTTL:                     durEnv("R2_SIGN_GET_TTL", 10*time.Minute),
 		R2SignPutTTL:                     durEnv("R2_SIGN_PUT_TTL", 15*time.Minute),
+		NASUploadProbeEnabled:            boolEnv("NAS_UPLOAD_PROBE_ENABLED", true),
+		NASUploadProbeBytes:              intEnv("NAS_UPLOAD_PROBE_BYTES", 256*1024*1024),
+		NASUploadProbeStreams:            intEnv("NAS_UPLOAD_PROBE_STREAMS", 4),
+		NASUploadProbeInterval:           durEnv("NAS_UPLOAD_PROBE_INTERVAL", 6*time.Hour),
 		StorageCredKey:                   strings.TrimSpace(os.Getenv("STORAGE_CRED_KEY")),
 		AppBaseURL:                       strings.TrimRight(strEnv("APP_BASE_URL", strEnv("RESEARCH_APP_BASE_URL", "")), "/"),
 		MagicLinkTTL:                     durEnv("MAGIC_LINK_TTL", durEnv("RESEARCH_MAGIC_LINK_TTL", 60*time.Minute)),
@@ -399,10 +407,29 @@ func (c Config) ValidateAPI() error {
 	if err := c.ValidateR2(); err != nil {
 		return err
 	}
+	if err := c.ValidateNASUploadProbe(); err != nil {
+		return err
+	}
 	if err := c.ValidateJoined(); err != nil {
 		return err
 	}
 	return c.ValidateStripe()
+}
+
+// ValidateNASUploadProbe bounds the probe so a typo cannot turn it into a
+// sustained upload from the NAS. Values are checked even while disabled so a
+// later enable cannot start from an invalid shape.
+func (c Config) ValidateNASUploadProbe() error {
+	if c.NASUploadProbeBytes < 1024*1024 || c.NASUploadProbeBytes > 4*1024*1024*1024 {
+		return fmt.Errorf("NAS_UPLOAD_PROBE_BYTES must be between 1 MiB and 4 GiB")
+	}
+	if c.NASUploadProbeStreams < 1 || c.NASUploadProbeStreams > 16 {
+		return fmt.Errorf("NAS_UPLOAD_PROBE_STREAMS must be between 1 and 16")
+	}
+	if c.NASUploadProbeInterval < 15*time.Minute || c.NASUploadProbeInterval > 7*24*time.Hour {
+		return fmt.Errorf("NAS_UPLOAD_PROBE_INTERVAL must be between 15m and 168h")
+	}
+	return nil
 }
 
 func (c Config) ValidateJoined() error {

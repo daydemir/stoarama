@@ -197,6 +197,26 @@ func (c *Client) PresignPutCreateOnlyRequest(ctx context.Context, key, contentTy
 	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
 }
 
+// PresignPutSizedRequest permits one PUT of exactly sizeBytes to key. The
+// length is signed, so the holder cannot stretch the capability into a larger
+// upload. Used for disposable objects such as NAS upload speed probes.
+func (c *Client) PresignPutSizedRequest(ctx context.Context, key, contentType string, sizeBytes int64, ttl time.Duration) (PresignedRequest, error) {
+	if sizeBytes <= 0 {
+		return PresignedRequest{}, errors.New("presign sized put: size must be positive")
+	}
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(c.bucket),
+		Key:           aws.String(key),
+		ContentLength: aws.Int64(sizeBytes),
+		ContentType:   aws.String(contentType),
+	}
+	out, err := c.presigner.PresignPutObject(ctx, in, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return PresignedRequest{}, fmt.Errorf("presign sized put %s: %w", key, err)
+	}
+	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
+}
+
 // PresignGetDownload presigns a GET that sets Content-Disposition: attachment so
 // the browser saves the object as filename instead of rendering it inline. The
 // filename is quoted into the response-content-disposition query param, honored
