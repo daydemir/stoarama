@@ -35,6 +35,8 @@ type Env struct {
 	MediaTool   string
 	// CPU bounds concurrent ffmpeg/ffprobe processes across all hours.
 	CPU chan struct{}
+	// KeepScratch keeps each hour's downloaded sources (canary review only).
+	KeepScratch bool
 	// Net bounds concurrent downloads across all hours.
 	Net chan struct{}
 	Now func() time.Time
@@ -75,7 +77,9 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return m, err
 	}
-	defer os.RemoveAll(dir)
+	if !env.KeepScratch {
+		defer os.RemoveAll(dir)
+	}
 
 	clips := append([]Clip(nil), w.Clips...)
 	sort.SliceStable(clips, func(i, j int) bool {

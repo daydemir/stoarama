@@ -27,7 +27,7 @@ import (
 
 const collationV2Usage = `usage:
   stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD]
-  stoaramactl collation-v2 run --worklist FILE|r2:KEY --scratch DIR --results FILE [--hour-workers N --cpu N --net N]
+  stoaramactl collation-v2 run --worklist FILE|r2:KEY --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch]
   stoaramactl collation-v2 register --worklist FILE|r2:KEY [--dry-run]
   stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
 
@@ -94,6 +94,7 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		cpu := fs.Int("cpu", runtime.NumCPU(), "concurrent ffmpeg/ffprobe processes")
 		net := fs.Int("net", 32, "concurrent downloads")
 		publishDir := fs.String("publish-dir", "", "publish outputs and manifests to this local dir instead of R2 (canary/dry run)")
+		keepScratch := fs.Bool("keep-scratch", false, "keep downloaded sources per hour (canary review)")
 		_ = fs.Parse(args[1:])
 		if *worklist == "" || *scratch == "" || *results == "" || *hourWorkers < 1 || *cpu < 1 || *net < 1 {
 			log.Fatal(collationV2Usage)
@@ -118,7 +119,7 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		}
 		defer rf.Close()
 		env := collation.Env{Tools: tools, Policy: collation.DefaultSeamPolicy(), ScratchRoot: *scratch, Store: store, MediaTool: version,
-			CPU: make(chan struct{}, *cpu), Net: make(chan struct{}, *net), Now: time.Now}
+			CPU: make(chan struct{}, *cpu), Net: make(chan struct{}, *net), Now: time.Now, KeepScratch: *keepScratch}
 		var existence collation.ExistenceChecker = store
 		if *publishDir != "" {
 			local := collation.LocalPublishStore{R2Store: store, Dir: *publishDir}
