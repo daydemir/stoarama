@@ -144,7 +144,7 @@ The DO token lives on Render as `DO_API_TOKEN`: on `stoarama-recorder-control` (
 
 - `stoaramactl do-spend report [--json]` shows month-to-date usage, current burn at list price, the breakdown by tag/name prefix, and every droplet/volume nobody owns. It needs `DATABASE_URL` (prod: `local/recording-supervisor.env`) and `DO_API_TOKEN`.
 - The hourly `recording-health run` emails operators (deduped in `ops_alert_episodes`, daily reminders) when burn exceeds `DO_SPEND_WARN_USD_PER_DAY` (5) / `DO_SPEND_CRITICAL_USD_PER_DAY` (10), month to date exceeds `DO_SPEND_MONTHLY_BUDGET_USD` (150), a droplet/volume outside the recorder pool and `DO_SPEND_ALLOWLIST` (`stoarama-survey-*,copresence-*`) has run over an hour, or the pool controller blocked a scale-up.
-- Create hand-made DO resources knowing the tripwire will page within the hour; add long-lived ones to `DO_SPEND_ALLOWLIST` instead of ignoring the mail.
+- Create hand-made DO resources knowing the tripwire pages at the first hourly sweep after the resource is an hour old (up to about two hours); add long-lived ones to `DO_SPEND_ALLOWLIST` instead of ignoring the mail.
 - The pool controller skips any scale-up whose projected account burn exceeds the critical ceiling. At the default $10/day with the current ~$4.6/day baseline that caps the pool near 10 s-2vcpu-4gb droplets; raise `DO_SPEND_CRITICAL_USD_PER_DAY` before planned growth.
 - `DO_SPEND_*` keys are read independently by `stoarama-recorder-control`, `stoarama-recording-health`, and `stoarama-recording-health-summary`: change them on all three (one key at a time), then redeploy recorder-control (the crons pick them up on their next run).
 
