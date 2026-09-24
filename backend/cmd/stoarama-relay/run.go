@@ -154,11 +154,14 @@ func runRelay(ctx context.Context) error {
 	// unavailable download must never delay the heartbeat or the worker. Once
 	// it is verified, later resolves switch to it without a restart.
 	go func() {
-		if !ensureYTDLPDistForRunningRelease(cfg) {
+		installed, updated := ensureYTDLPDistForRunningRelease(cfg)
+		if !installed {
 			return
 		}
 		next := installedYTDLPPath(bd)
-		if next == os.Getenv("YT_DLP_BIN") {
+		// The path is stable across releases (current/<entry>), so a release
+		// swapped behind the same path must still refresh runtime and version.
+		if next == os.Getenv("YT_DLP_BIN") && !updated {
 			return
 		}
 		os.Setenv("YT_DLP_BIN", next)

@@ -56,7 +56,7 @@ func newProbe(ytdlpBin string) *probe {
 }
 
 func (p *probe) runLoop(ctx context.Context) {
-	p.setYtdlpVersion(readYtdlpVersion(p.ytdlpBin))
+	p.setYtdlpVersion(readYtdlpVersion(p.bin()))
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {

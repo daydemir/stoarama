@@ -333,31 +333,31 @@ func pruneYTDLPDist(root string) {
 // ensureYTDLPDistForRunningRelease installs the one-directory yt-dlp that this
 // relay binary's own immutable release manifest pins, so a relay that just
 // self-updated from a pre-dist release switches to it on its first start. It
-// reports whether a one-directory build is installed and current. Failure is
-// logged and leaves the installed build in place; the heartbeat's ytdlp_layout
-// reports which build runs.
-func ensureYTDLPDistForRunningRelease(cfg relayConfig) bool {
+// reports whether a one-directory build is installed and current, and whether
+// this call changed it. Failure is logged and leaves the installed build in
+// place; the heartbeat's ytdlp_layout reports which build runs.
+func ensureYTDLPDistForRunningRelease(cfg relayConfig) (installed, updated bool) {
 	if strings.TrimSpace(releasePublicKeyBase64) == "" {
-		return false
+		return false, false
 	}
 	manifest, err := immutableReleaseManifest(version)
 	if err != nil {
-		return false
+		return false, false
 	}
 	lj, err := fetchLatest(cfg.APIURL, manifest)
 	if err != nil {
 		log.Printf("relay yt-dlp one-directory install skipped: fetch %s: %v", manifest, err)
-		return false
+		return false, false
 	}
 	target := runtime.GOOS + "-" + runtime.GOARCH
-	present, _, err := refreshYTDLPDist(cfg.APIURL, lj.YtdlpDist, target)
+	present, updated, err := refreshYTDLPDist(cfg.APIURL, lj.YtdlpDist, target)
 	switch {
 	case err != nil:
 		log.Printf("relay yt-dlp one-directory install failed; running installed yt-dlp: %v", err)
-		return false
+		return false, false
 	case !present:
 		log.Printf("relay release %s has no one-directory yt-dlp for %s; running installed yt-dlp", version, target)
-		return false
+		return false, false
 	}
-	return true
+	return true, updated
 }
