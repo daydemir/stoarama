@@ -161,3 +161,23 @@ func insertActiveWorkerFixture(t *testing.T, pool *pgxpool.Pool, now time.Time, 
 	}
 	return rowID, nodeID
 }
+
+func TestBeginDestroyIfIdleAndSilentRechecksHeartbeatInsideTransaction(t *testing.T) {
+	pool, cleanup := testDropletPoolDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	// The controller's snapshot saw a stale worker, but it heartbeated since.
+	rowID, _ := insertActiveWorkerFixture(t, pool, now, sharedPoolRole, now.Add(-time.Hour), now.Add(-time.Hour), false)
+	if _, err := pool.Exec(ctx, `UPDATE recorder_droplets SET last_seen_at=now() WHERE id=$1`, rowID); err != nil {
+		t.Fatal(err)
+	}
+	retired, err := NewStore(pool).BeginDestroyIfIdleAndSilent(ctx, rowID, now.Add(-15*time.Minute))
+	if err != nil || retired {
+		t.Fatalf("recovered worker retired=%t err=%v", retired, err)
+	}
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM recorder_droplets WHERE id=$1`, rowID).Scan(&state); err != nil || state != "active" {
+		t.Fatalf("state=%q err=%v want active", state, err)
+	}
+}

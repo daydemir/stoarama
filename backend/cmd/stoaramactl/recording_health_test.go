@@ -331,6 +331,7 @@ func TestCompletedWindowHealthStageMarksSignalsEvaluatedAfterSuccess(t *testing.
 		signalJobRetriesExhausted, signalStuckLease, signalSampledOverdue,
 		signalClipTimestampDrift, signalRelayResolveRate,
 	}, result.evaluatedSignals...)
+	full = append(full, signalWindowGradePoor)
 	if fmt.Sprint(full) != fmt.Sprint(evaluatedHealthSignals(false, false)) {
 		t.Fatalf("successful full-sweep signal registry=%v want=%v", full, evaluatedHealthSignals(false, false))
 	}

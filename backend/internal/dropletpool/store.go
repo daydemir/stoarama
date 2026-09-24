@@ -234,6 +234,18 @@ func (s *Store) MarkActive(ctx context.Context, id int64) (bool, error) {
 // live lease and moves the worker out of lease-eligible states before any
 // provider deletion or credential revocation can occur.
 func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) {
+	return s.beginDestroy(ctx, id, nil)
+}
+
+// BeginDestroyIfIdleAndSilent is BeginDestroyIfIdle for an unresponsive worker:
+// inside the same locked transaction it also re-proves that neither the droplet
+// nor its node has heartbeated since silentBefore, so a worker that recovered
+// after the controller's snapshot is left untouched.
+func (s *Store) BeginDestroyIfIdleAndSilent(ctx context.Context, id int64, silentBefore time.Time) (bool, error) {
+	return s.beginDestroy(ctx, id, &silentBefore)
+}
+
+func (s *Store) beginDestroy(ctx context.Context, id int64, silentBefore *time.Time) (bool, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -256,6 +268,18 @@ func (s *Store) BeginDestroyIfIdle(ctx context.Context, id int64) (bool, error) 
 	}
 	if busy {
 		return false, nil
+	}
+	if silentBefore != nil {
+		var silent bool
+		if err := tx.QueryRow(ctx, `
+			SELECT GREATEST(d.created_at, d.last_seen_at, n.last_heartbeat_at) < $2
+			FROM recorder_droplets d LEFT JOIN nodes n ON n.id=d.node_id
+			WHERE d.id=$1`, id, *silentBefore).Scan(&silent); err != nil {
+			return false, err
+		}
+		if !silent {
+			return false, nil
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE recorder_droplets SET state='destroying', updated_at=now() WHERE id=$1`, id); err != nil {
 		return false, err

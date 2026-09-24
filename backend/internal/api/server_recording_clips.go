@@ -126,9 +126,10 @@ type recordingLeaseResponse struct {
 // home. Conversely, a node that surrendered this window for lack of progress
 // (recording_job_node_failures) yields it to nodes that have not failed it: it
 // waits an extra 30 seconds per recorded failure, capped at two minutes, after
-// the turn starts. A node that cannot capture a source (for example a TLS chain
-// its FFmpeg rejects) thus stops receiving that window while a peer can take
-// it, yet no window is ever stranded when every eligible node has failed it.
+// the turn starts, but only while an online peer with capacity that has not
+// failed the window could take it. A node that cannot capture a source (for
+// example a TLS chain its FFmpeg rejects) thus stops receiving that window while
+// a peer can take it, and retries immediately when no such peer exists.
 const relayLeaseSQL = `
 	WITH cte AS (
 	  SELECT j.id
@@ -185,7 +186,27 @@ const relayLeaseSQL = `
 	    -- Failure yield: a node that already surrendered this window for lack of
 	    -- progress waits behind nodes that have not (see the header comment).
 	    AND (own_failure.node_id IS NULL
-	         OR j.relay_fairness_started_at <= now() - make_interval(secs => 12 + 30 * LEAST(own_failure.failure_count, 4)))
+	         OR j.relay_fairness_started_at <= now() - make_interval(secs => 12 + 30 * LEAST(own_failure.failure_count, 4))
+	         OR NOT EXISTS (
+	              SELECT 1 FROM nodes fresh_peer
+	              WHERE fresh_peer.account_id = rec.account_id
+	                AND fresh_peer.id <> n.id
+	                AND fresh_peer.node_type = 'relay'
+	                AND fresh_peer.status = 'active'
+	                AND fresh_peer.last_heartbeat_at >= now()-interval '120 seconds'
+	                AND (NOT EXISTS (
+	                       SELECT 1 FROM streams fresh_peer_stream
+	                       WHERE fresh_peer_stream.id=rec.stream_id AND fresh_peer_stream.execution_class='youtube_direct')
+	                     OR (jsonb_typeof(fresh_peer.capabilities_jsonb->'youtube_ready') = 'boolean'
+	                         AND (fresh_peer.capabilities_jsonb->>'youtube_ready')::boolean))
+	                AND (j.handoff_owner IS DISTINCT FROM 'node:' || fresh_peer.id::text OR j.handoff_until <= now())
+	                AND NOT EXISTS (
+	                     SELECT 1 FROM recording_job_node_failures peer_failure
+	                     WHERE peer_failure.recording_job_id = j.id AND peer_failure.node_id = fresh_peer.id)
+	                AND (SELECT COUNT(*) FROM recording_jobs fresh_peer_jobs
+	                     WHERE fresh_peer_jobs.status = 'leased'
+	                       AND fresh_peer_jobs.lease_owner = 'node:' || fresh_peer.id::text
+	                       AND fresh_peer_jobs.lease_expires_at > now()) < fresh_peer.relay_max_streams))
 	    -- Affinity: while the previous window's node can take this window, other
 	    -- nodes wait for the fairness turn instead of pulling the stream away.
 	    AND (affinity.lease_owner IS NULL
@@ -198,6 +219,11 @@ const relayLeaseSQL = `
 	                AND sticky.node_type = 'relay'
 	                AND sticky.status = 'active'
 	                AND sticky.last_heartbeat_at >= now()-interval '120 seconds'
+	                AND (NOT EXISTS (
+	                       SELECT 1 FROM streams sticky_stream
+	                       WHERE sticky_stream.id=rec.stream_id AND sticky_stream.execution_class='youtube_direct')
+	                     OR (jsonb_typeof(sticky.capabilities_jsonb->'youtube_ready') = 'boolean'
+	                         AND (sticky.capabilities_jsonb->>'youtube_ready')::boolean))
 	                AND (j.handoff_owner IS DISTINCT FROM affinity.lease_owner OR j.handoff_until <= now())
 	                AND NOT EXISTS (
 	                     SELECT 1 FROM recording_job_node_failures sticky_failure

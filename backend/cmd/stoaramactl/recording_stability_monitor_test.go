@@ -214,3 +214,22 @@ func TestLoadStaleRecorderDroplets(t *testing.T) {
 		t.Fatalf("stale=%+v want only droplet 1132 with its live lease", stale)
 	}
 }
+
+func TestWindowGradeStageFailureIsolatedFromOtherSignals(t *testing.T) {
+	base := recordingHealthDetection{
+		incidents:        []healthIncident{{RecordingID: 1, Signal: signalContinuousLongGap}},
+		evaluatedSignals: []string{signalContinuousLongGap},
+	}
+	failed := runWindowGradeStage(context.Background(), base, func(context.Context) ([]healthIncident, error) {
+		return nil, fmt.Errorf("statement timeout")
+	})
+	if len(failed.incidents) != 1 || fmt.Sprint(failed.evaluatedSignals) != fmt.Sprint([]string{signalContinuousLongGap}) {
+		t.Fatalf("failed grade stage changed other signals: %+v", failed)
+	}
+	ok := runWindowGradeStage(context.Background(), base, func(context.Context) ([]healthIncident, error) {
+		return []healthIncident{{RecordingID: 2, Signal: signalWindowGradePoor}}, nil
+	})
+	if len(ok.incidents) != 2 || ok.evaluatedSignals[len(ok.evaluatedSignals)-1] != signalWindowGradePoor {
+		t.Fatalf("successful grade stage=%+v", ok)
+	}
+}

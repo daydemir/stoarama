@@ -175,7 +175,7 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: |
-          go test ./internal/dropletpool -run TestReapUnresponsiveRetiresOnlyIdleStaleSharedWorkers -count=1 -v
+          go test ./internal/dropletpool -run "Test(ReapUnresponsiveRetiresOnlyIdleStaleSharedWorkers|BeginDestroyIfIdleAndSilentRechecksHeartbeatInsideTransaction)" -count=1 -v
           go test ./internal/qualitygrade -count=1 -v
           go test ./internal/api -run 'Test(RelayLeaseKeepsWindowOnPreviousNode|RelayLeaseAffinityYieldsWhenStickyNodeFailedWindow|RelayLeaseFailedNodeYieldsToPeers|AccountRecordingQualityGradesTenantWallAndGrades)' -count=1 -v
           go test ./cmd/stoaramactl -run 'Test(OpsAlertEpisodeLifecycle|LoadStaleRecorderDroplets)' -count=1 -v

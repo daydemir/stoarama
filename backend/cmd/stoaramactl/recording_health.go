@@ -385,6 +385,7 @@ func evaluatedHealthSignals(verifyMedia, liveOnly bool) []string {
 	}
 	signals := append([]string(nil), fullCurrentHealthSignals...)
 	signals = append(signals, completedWindowHealthSignals...)
+	signals = append(signals, signalWindowGradePoor)
 	return signals
 }
 
@@ -524,7 +525,7 @@ const (
 
 var completedWindowHealthSignals = []string{
 	signalContinuousCoverageLow, signalContinuousOverlap, signalContinuousLongGap,
-	signalContinuousFragmented, signalContinuousLayoutChange, signalWindowGradePoor,
+	signalContinuousFragmented, signalContinuousLayoutChange,
 }
 
 var fullCurrentHealthSignals = []string{
@@ -546,17 +547,16 @@ func detectRecordingHealthIncidents(ctx context.Context, pool *pgxpool.Pool, fre
 	historicalCtx, cancel := context.WithTimeout(ctx, completedWindowHealthTimeout)
 	defer cancel()
 	result := runCompletedWindowHealthStage(historicalCtx, incidents, func(stageCtx context.Context) ([]healthIncident, error) {
-		windows, err := detectCompletedWindowHealth(stageCtx, pool)
-		if err != nil {
-			return nil, err
-		}
-		grades, err := detectPoorWindowGrades(stageCtx, pool, time.Now().UTC())
-		if err != nil {
-			return nil, err
-		}
-		return append(windows, grades...), nil
+		return detectCompletedWindowHealth(stageCtx, pool)
 	})
 	result.evaluatedSignals = append(baseSignals, result.evaluatedSignals...)
+	// The grade stage is independent: its failure withholds only its own signal
+	// from evaluation and never the completed-window alerts above.
+	gradeCtx, cancelGrades := context.WithTimeout(ctx, windowGradeStageTimeout)
+	defer cancelGrades()
+	result = runWindowGradeStage(gradeCtx, result, func(stageCtx context.Context) ([]healthIncident, error) {
+		return detectPoorWindowGrades(stageCtx, pool, time.Now().UTC())
+	})
 	incidents = result.incidents
 
 	severityRank := map[string]int{"CRITICAL": 0, "HIGH": 1}

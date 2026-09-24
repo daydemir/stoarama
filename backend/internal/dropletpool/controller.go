@@ -771,7 +771,8 @@ func (c *Controller) progressDrains(ctx context.Context, now time.Time) {
 // BeginDestroyIfIdle locks the row the lease path locks, proves no live lease,
 // and moves it to destroying atomically. A worker that still holds a live lease
 // is retained; its lease expires without renewal, reclaim requeues the job, and
-// a later tick retires the worker. A provider delete failure leaves the row in
+// a later tick retires the worker. The same transaction re-proves the silence,
+// so a worker that heartbeats after this tick's snapshot is never retired. A provider delete failure leaves the row in
 // destroying, which reconcile resumes idempotently.
 func (c *Controller) reapUnresponsive(ctx context.Context, now time.Time) {
 	if c.cfg.StaleHeartbeatTimeout <= 0 {
@@ -784,13 +785,13 @@ func (c *Controller) reapUnresponsive(ctx context.Context, now time.Time) {
 	}
 	for _, d := range UnresponsiveDroplets(active, now, c.cfg.StaleHeartbeatTimeout) {
 		silent := now.Sub(WorkerLastLiveAt(d)).Truncate(time.Second)
-		retired, err := c.store.BeginDestroyIfIdle(ctx, d.ID)
+		retired, err := c.store.BeginDestroyIfIdleAndSilent(ctx, d.ID, now.Add(-c.cfg.StaleHeartbeatTimeout))
 		if err != nil {
 			log.Printf("droplet pool: CRITICAL cannot atomically verify idle before retiring unresponsive droplet id=%d name=%s silent=%s; teardown skipped: %v", d.ID, d.Name, silent, err)
 			continue
 		}
 		if !retired {
-			log.Printf("droplet pool: WARNING unresponsive droplet id=%d name=%s silent=%s still holds a live lease or changed state; retained until the lease expires", d.ID, d.Name, silent)
+			log.Printf("droplet pool: WARNING unresponsive droplet id=%d name=%s silent=%s holds a live lease, heartbeated again, or changed state; retained", d.ID, d.Name, silent)
 			continue
 		}
 		log.Printf("droplet pool: WARNING retiring unresponsive droplet id=%d name=%s silent=%s threshold=%s", d.ID, d.Name, silent, c.cfg.StaleHeartbeatTimeout)

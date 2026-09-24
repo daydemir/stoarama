@@ -154,4 +154,13 @@ func TestRelayLeaseFailedNodeYieldsToPeers(t *testing.T) {
 	if job, err := leaseAs(t, s, 1); err != nil || job.JobID != 10 {
 		t.Fatalf("failed node after yield lease=%+v err=%v want job 10", job, err)
 	}
+	// With no unfailed peer able to take it, the failed node retries at once
+	// rather than burning the rest of a closing window.
+	resetWindow(t, pool, "")
+	if _, err := pool.Exec(ctx, `UPDATE nodes SET last_heartbeat_at=now()-interval '10 minutes' WHERE id=2`); err != nil {
+		t.Fatal(err)
+	}
+	if job, err := leaseAs(t, s, 1); err != nil || job.JobID != 10 {
+		t.Fatalf("failed node without an unfailed peer lease=%+v err=%v want job 10", job, err)
+	}
 }

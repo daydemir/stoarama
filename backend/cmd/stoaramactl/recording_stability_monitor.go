@@ -36,6 +36,25 @@ const windowGradeAlertHorizon = 36 * time.Hour
 // windowGradeHistoryDays is enough history to evaluate any 14-day tier run.
 const windowGradeHistoryDays = 45
 
+// windowGradeStageTimeout bounds the grade scan so it can never stall the
+// hourly sweep's alert delivery.
+const windowGradeStageTimeout = time.Minute
+
+// runWindowGradeStage appends the grade incidents and marks the grade signal
+// evaluated only when the scan succeeded, so a failed scan neither raises nor
+// resolves grade alerts and leaves every other signal untouched.
+func runWindowGradeStage(ctx context.Context, base recordingHealthDetection, detect func(context.Context) ([]healthIncident, error)) recordingHealthDetection {
+	incidents, err := detect(ctx)
+	if err != nil {
+		log.Printf("recording health: window grade stage skipped: %v", err)
+		return base
+	}
+	return recordingHealthDetection{
+		incidents:        append(base.incidents, incidents...),
+		evaluatedSignals: append(base.evaluatedSignals, signalWindowGradePoor),
+	}
+}
+
 // detectPoorWindowGrades raises one incident per paying active continuous
 // recording whose latest completed window graded E, F, or unknown.
 func detectPoorWindowGrades(ctx context.Context, pool *pgxpool.Pool, now time.Time) ([]healthIncident, error) {
