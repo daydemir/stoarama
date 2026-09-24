@@ -221,6 +221,16 @@ func TestManifestValidateRejectsInconsistentAccounting(t *testing.T) {
 	if bad.Validate() == nil {
 		t.Fatal("clip accounted twice accepted")
 	}
+	bad = good
+	bad.Outputs = []Output{good.Outputs[0]}
+	bad.Outputs[0].SourceClipIDs = []int64{1}
+	if bad.Validate() == nil {
+		t.Fatal("included clip missing from its output accepted")
+	}
+	bad.Outputs[0].SourceClipIDs = []int64{1, 2, 2}
+	if bad.Validate() == nil {
+		t.Fatal("repeated output source accepted")
+	}
 }
 
 // --- end-to-end on synthetic media (skipped without ffmpeg) ---

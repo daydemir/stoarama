@@ -144,6 +144,9 @@ type ExistenceChecker interface {
 }
 
 func RunWorklist(ctx context.Context, env Env, store ExistenceChecker, work []HourWork, hourWorkers int, results io.Writer) error {
+	if hourWorkers <= 0 {
+		return fmt.Errorf("hourWorkers must be > 0, got %d", hourWorkers)
+	}
 	jobs := make(chan HourWork)
 	var mu sync.Mutex
 	enc := json.NewEncoder(results)

@@ -149,15 +149,9 @@ func TestGenerateSeamCurves(t *testing.T) {
 	tools := ToolsFromEnv()
 	ctx := context.Background()
 	out := map[string]Curves{}
-	probe := func(cid string) Probe {
-		p, err := ProbeFile(ctx, tools, filepath.Join(dir, cid+".mp4"))
-		if err != nil || !p.Media.Playable {
-			t.Fatalf("probe %s: %v %+v", cid, err, p.Media)
-		}
-		return p
-	}
 	cases := loadSeamCases(t)
 	results := make([]Curves, len(cases))
+	errs := make([]error, len(cases))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 12)
 	for i, c := range cases {
@@ -172,14 +166,29 @@ func TestGenerateSeamCurves(t *testing.T) {
 				head, err = ExtractWindow(ctx, tools, policy, filepath.Join(dir, c.Next.CID+".mp4"), false)
 			}
 			if err != nil {
+				// A seam region that does not decode is itself a proof case.
 				results[i] = Curves{DecodeError: trimStderr(err.Error())}
 				return
 			}
-			tk, hk := probe(c.Prev.CID).Video.WindowKeys(len(tail), true), probe(c.Next.CID).Video.WindowKeys(len(head), false)
-			results[i] = roundCurves(framesToCurves(policy, tail, head, tk, hk))
+			pa, err := ProbeFile(ctx, tools, filepath.Join(dir, c.Prev.CID+".mp4"))
+			if err != nil || !pa.Media.Playable {
+				errs[i] = fmt.Errorf("%s: probe prev: %v %+v", c.key(), err, pa.Media)
+				return
+			}
+			pb, err := ProbeFile(ctx, tools, filepath.Join(dir, c.Next.CID+".mp4"))
+			if err != nil || !pb.Media.Playable {
+				errs[i] = fmt.Errorf("%s: probe next: %v %+v", c.key(), err, pb.Media)
+				return
+			}
+			results[i] = roundCurves(framesToCurves(policy, tail, head, pa.Video.WindowKeys(len(tail), true), pb.Video.WindowKeys(len(head), false)))
 		}(i, c)
 	}
 	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	for i, c := range cases {
 		out[c.key()] = results[i]
 	}

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -431,8 +432,14 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				continue
 			}
 			dayStart := time.Date(date.Year(), date.Month(), date.Day(), 8, 0, 0, 0, loc)
-			if opts.scope == "nightly" && !opts.now.After(time.Date(date.Year(), date.Month(), date.Day(), 20, 0, 0, 0, loc).Add(15*time.Minute)) {
-				return nil, fmt.Errorf("recording %d day %s is not closed yet", recordingID, d.localDate)
+			// A day that has not closed would freeze a partial clip set into a
+			// create-only manifest; never plan it.
+			if !opts.now.After(time.Date(date.Year(), date.Month(), date.Day(), 20, 0, 0, 0, loc).Add(15 * time.Minute)) {
+				if opts.scope == "nightly" {
+					return nil, fmt.Errorf("recording %d day %s is not closed yet", recordingID, d.localDate)
+				}
+				log.Printf("collation-v2 plan: skipping open day recording=%d date=%s", recordingID, d.localDate)
+				continue
 			}
 			clips, err := loadCollationClips(ctx, pool, recordingID, dayStart, dayStart.Add(12*time.Hour), opts.broken, rec.clipSeconds)
 			if err != nil {
@@ -573,7 +580,11 @@ func registerCollation(ctx context.Context, pool *pgxpool.Pool, store collation.
 		}
 		body, err := store.Client.Get(ctx, key)
 		if err != nil {
-			if ok, _ := store.Exists(ctx, key); !ok {
+			ok, existsErr := store.Exists(ctx, key)
+			if existsErr != nil {
+				return s, fmt.Errorf("%s: %w", key, errors.Join(err, existsErr))
+			}
+			if !ok {
 				s.Missing++
 				continue
 			}

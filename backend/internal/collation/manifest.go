@@ -169,18 +169,23 @@ func (m HourManifest) Validate() error {
 			return fmt.Errorf("clip %d disposition invalid", c.Clip.ClipID)
 		}
 	}
+	covered := map[int64]bool{}
 	for i, o := range m.Outputs {
 		if o.Part != i+1 || o.Parts != len(m.Outputs) || len(o.SourceClipIDs) == 0 || len(o.SHA256) != 64 || o.SizeBytes <= 0 {
 			return fmt.Errorf("output %d invalid", i+1)
 		}
 		for _, id := range o.SourceClipIDs {
-			if partOf[id] != o.Part {
+			if partOf[id] != o.Part || covered[id] {
 				return fmt.Errorf("output %d source %d differs", o.Part, id)
 			}
+			covered[id] = true
 		}
 		if !o.Verification.PayloadChainMatches || !o.Verification.VideoTimingMatches || !o.Verification.KeyframeDecodeOK {
 			return fmt.Errorf("output %d not verified", o.Part)
 		}
+	}
+	if len(covered) != len(partOf) {
+		return fmt.Errorf("an included clip is missing from its output")
 	}
 	for _, s := range m.Seams {
 		pp, np := partOf[s.PrevClipID], partOf[s.NextClipID]
