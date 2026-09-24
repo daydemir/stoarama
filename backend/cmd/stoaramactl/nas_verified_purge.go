@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,7 +51,7 @@ import (
 const (
 	nasPurgeAppName     = "stoarama-nas-verified-purge"
 	nasPurgeUSDPerGB    = 0.015
-	nasPurgeMaxBatch    = 1000
+	nasPurgeMaxBatch    = r2.MaxDeleteBatch
 	nasPurgeMaxWorkers  = 32
 	nasPurgeShaTimeout  = 10 * time.Minute
 	nasPurgeFinishLimit = 2 * time.Minute
@@ -61,6 +62,10 @@ type nasPurgeOptions struct {
 	recordingID  int64
 	from, to     time.Time
 	afterClipID  int64
+	untilClipID  int64
+	headMode     string
+	excludeClips map[int64]bool
+	excludeRecs  map[int64]bool
 	grace        time.Duration
 	nasMaxAge    time.Duration
 	apply        bool
@@ -87,6 +92,10 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 	from := fs.String("from", "", "only clips starting at or after (RFC3339 or YYYY-MM-DD, UTC)")
 	to := fs.String("to", "", "only clips starting before (RFC3339 or YYYY-MM-DD, UTC)")
 	fs.Int64Var(&opts.afterClipID, "after-clip-id", 0, "resume the scan after this clip id")
+	fs.Int64Var(&opts.untilClipID, "until-clip-id", 0, "stop the scan at this clip id, inclusive (0 = no bound; partitions parallel runs)")
+	fs.StringVar(&opts.headMode, "head", "sample", "R2 HEAD policy: sample (only --sha-every clips, fully hashed) or all (exact size check on every clip)")
+	excludeClipsFile := fs.String("exclude-clip-ids-file", "", "file of clip ids (one per line) that are never purged")
+	excludeRecs := fs.String("exclude-recording-ids", "", "comma separated recording ids that are never purged")
 	fs.DurationVar(&opts.grace, "grace", 7*24*time.Hour, "minimum clip age (end and ingest)")
 	fs.DurationVar(&opts.nasMaxAge, "nas-max-age", 0, "also require the NAS copy to be verified within this age (0 = any age)")
 	fs.BoolVar(&opts.apply, "apply", false, "delete objects and set purged_at (default is a dry run)")
@@ -94,10 +103,10 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 	fs.Int64Var(&opts.limit, "limit", 0, "stop after this many eligible clips (0 = no limit)")
 	fs.Int64Var(&opts.maxBytes, "max-bytes", 0, "stop after this many eligible bytes (0 = no limit)")
 	fs.IntVar(&opts.pageSize, "page-size", 1000, "candidate rows per database page")
-	fs.IntVar(&opts.batchSize, "batch-size", 200, "clips per purge transaction and multi-delete")
+	fs.IntVar(&opts.batchSize, "batch-size", 1000, "clips per purge transaction and multi-delete")
 	fs.IntVar(&opts.workers, "workers", 16, "concurrent HEAD requests")
-	fs.Float64Var(&opts.rate, "rate", 50, "maximum clips purged per second")
-	fs.IntVar(&opts.shaEvery, "sha-every", 500, "fully sha256-verify every Nth R2 source object (0 = never)")
+	fs.Float64Var(&opts.rate, "rate", 200, "maximum clips purged per second")
+	fs.IntVar(&opts.shaEvery, "sha-every", 1000, "HEAD and fully sha256-verify every Nth R2 source object (0 = never)")
 	fs.IntVar(&opts.maxErrors, "max-errors", 50, "abort after this many errors")
 	fs.StringVar(&opts.logPath, "log", "", "JSONL log path (default ~/.stoarama/tmp/nas-verified-purge-YYYYMMDD.log)")
 	fs.BoolVar(&opts.logSkips, "log-skips", false, "also log every skipped clip")
@@ -109,6 +118,12 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 		return opts, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
 	var err error
+	if opts.excludeClips, err = readNASPurgeIDFile(*excludeClipsFile); err != nil {
+		return opts, err
+	}
+	if opts.excludeRecs, err = parseNASPurgeIDList(*excludeRecs); err != nil {
+		return opts, err
+	}
 	if *from != "" {
 		if opts.from, err = parseNASRestoreTime(*from); err != nil {
 			return opts, err
@@ -120,6 +135,10 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 		}
 	}
 	switch {
+	case opts.headMode != "sample" && opts.headMode != "all":
+		return opts, errors.New("--head must be sample or all")
+	case opts.untilClipID < 0 || (opts.untilClipID > 0 && opts.untilClipID <= opts.afterClipID):
+		return opts, errors.New("--until-clip-id must be above --after-clip-id")
 	case opts.connectionID < 0 || opts.recordingID < 0 || opts.afterClipID < 0:
 		return opts, errors.New("ids must be positive")
 	case !opts.from.IsZero() && !opts.to.IsZero() && !opts.to.After(opts.from):
@@ -203,6 +222,7 @@ LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id
 WHERE c.purged_at IS NULL AND c.id>$5
   AND ($6::bigint=0 OR c.recording_id=$6)
   AND ($7::timestamptz IS NULL OR c.clip_start_at>=$7) AND ($8::timestamptz IS NULL OR c.clip_start_at<$8)
+  AND ($10::bigint=0 OR c.id<=$10)
 ORDER BY c.id
 LIMIT $9`
 
@@ -247,6 +267,7 @@ type nasPurgeSummary struct {
 	PurgedBytes     int64            `json:"purged_bytes"`
 	SourceAbsent    int64            `json:"source_already_absent"`
 	ShaChecks       int64            `json:"sha_checks"`
+	DeleteFailed    int64            `json:"delete_failed"`
 	Skipped         map[string]int64 `json:"skipped"`
 	Errors          int64            `json:"errors"`
 	LastClipID      int64            `json:"last_clip_id"`
@@ -272,7 +293,7 @@ type nasPurgeStore interface {
 	Bucket() string
 	Head(ctx context.Context, key string) (r2.ObjectHead, error)
 	OpenExact(ctx context.Context, key, etag, versionID string) (io.ReadCloser, error)
-	DeleteObjects(ctx context.Context, keys []string) error
+	DeleteObjectsEach(ctx context.Context, keys []string) (map[string]string, error)
 }
 
 var _ nasPurgeStore = (*r2.Client)(nil)
@@ -325,7 +346,7 @@ func loadNASPurgeCandidates(ctx context.Context, pool *pgxpool.Pool, bucket stri
 		to = opts.to
 	}
 	rows, err := pool.Query(ctx, nasPurgeCandidatesSQL, opts.connectionID, bucket, int64(opts.grace/time.Second),
-		int64(opts.nasMaxAge/time.Second), after, opts.recordingID, from, to, opts.pageSize)
+		int64(opts.nasMaxAge/time.Second), after, opts.recordingID, from, to, opts.pageSize, opts.untilClipID)
 	if err != nil {
 		return nil, fmt.Errorf("load purge candidates: %w", err)
 	}
@@ -438,7 +459,15 @@ func runNASVerifiedPurgePass(ctx context.Context, pool *pgxpool.Pool, store nasP
 		for _, c := range page {
 			after = c.ClipID
 			summary.Scanned++
-			if reason := c.skipReason(); reason != "" {
+			reason := c.skipReason()
+			switch {
+			case reason != "":
+			case opts.excludeRecs[c.RecordingID]:
+				reason = "excluded_recording"
+			case opts.excludeClips[c.ClipID]:
+				reason = "excluded_clip"
+			}
+			if reason != "" {
 				r.skip(c, reason)
 				continue
 			}
@@ -486,7 +515,9 @@ type nasPurgeHead struct {
 	err    error
 }
 
-// headBatch HEADs every candidate (and fully hashes every Nth) concurrently.
+// headBatch HEADs (and fully hashes) only the sampled candidates; with
+// --head all it HEADs every candidate for an exact size check. The NAS proof
+// is what authorizes a purge, so unsampled clips need no R2 round trip.
 func (r *nasPurgeRunner) headBatch(ctx context.Context, batch []nasPurgeCandidate) []nasPurgeHead {
 	out := make([]nasPurgeHead, len(batch))
 	sem := make(chan struct{}, r.opts.workers)
@@ -494,6 +525,9 @@ func (r *nasPurgeRunner) headBatch(ctx context.Context, batch []nasPurgeCandidat
 	for i := range batch {
 		r.headN++
 		fullHash := r.opts.shaEvery > 0 && r.headN%int64(r.opts.shaEvery) == 1%int64(r.opts.shaEvery)
+		if !fullHash && r.opts.headMode != "all" {
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int, fullHash bool) {
@@ -556,6 +590,8 @@ func (r *nasPurgeRunner) processBatch(ctx context.Context, batch []nasPurgeCandi
 		case h.reason == "sha_checked":
 			r.summary.ShaChecks++
 		case h.reason == "source_sha_mismatch":
+			// R2 holds bytes that differ from the recorded sha (the NAS holds
+			// the recorded ones). Leave both copies alone and flag it.
 			r.summary.ShaChecks++
 			r.skip(c, h.reason)
 			r.log(c, "error", h.reason)
@@ -583,48 +619,47 @@ func (r *nasPurgeRunner) processBatch(ctx context.Context, batch []nasPurgeCandi
 		}
 		return nil
 	}
-	purged, skipped, err := r.purgeBatch(ctx, ready)
-	if err != nil && isRetentionProtected(err) && len(ready) > 1 {
-		// Isolate the protected clip(s): the rest of the batch is still valid.
-		for _, c := range ready {
-			if ctx.Err() != nil {
-				return nil
-			}
-			one, oneSkipped, oneErr := r.purgeBatch(ctx, []nasPurgeCandidate{c})
-			if oneErr != nil && isRetentionProtected(oneErr) {
-				r.skip(c, "trigger_refused")
-				continue
-			}
-			if oneErr != nil {
-				if err := r.fail(c, "purge_failed", oneErr); err != nil {
-					return err
-				}
-				continue
-			}
-			r.record(one, oneSkipped, absent)
+	return r.purgeSplitting(ctx, ready, absent)
+}
+
+// purgeSplitting purges a batch; if the retention trigger refuses any clip it
+// halves the batch until the refused clips are isolated and skipped.
+func (r *nasPurgeRunner) purgeSplitting(ctx context.Context, batch []nasPurgeCandidate, absent map[int64]bool) error {
+	res, err := r.purgeBatch(ctx, batch)
+	if err != nil && isRetentionProtected(err) {
+		if len(batch) == 1 {
+			r.skip(batch[0], "trigger_refused")
+			return nil
 		}
-		return nil
+		mid := len(batch) / 2
+		if err := r.purgeSplitting(ctx, batch[:mid], absent); err != nil {
+			return err
+		}
+		return r.purgeSplitting(ctx, batch[mid:], absent)
 	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
-		for _, c := range ready {
-			if ferr := r.fail(c, "purge_failed", err); ferr != nil {
-				return ferr
-			}
+		r.summary.Errors++
+		for _, c := range batch {
+			r.log(c, "error", "purge_batch_failed: "+err.Error())
+		}
+		if r.summary.Errors >= int64(r.opts.maxErrors) {
+			return fmt.Errorf("aborting after %d errors (last: %v)", r.summary.Errors, err)
 		}
 		return nil
 	}
-	r.record(purged, skipped, absent)
-	return nil
-}
-
-func (r *nasPurgeRunner) record(purged []nasPurgeCandidate, skipped map[int64]nasPurgeCandidate, absent map[int64]bool) {
-	for _, c := range skipped {
+	for _, c := range res.changed {
 		r.skip(c, "changed_before_lock")
 	}
-	for _, c := range purged {
+	for _, f := range res.deleteFailed {
+		r.summary.DeleteFailed++
+		if ferr := r.fail(f.c, "delete_failed", errors.New(f.msg)); ferr != nil {
+			return ferr
+		}
+	}
+	for _, c := range res.purged {
 		r.summary.Purged++
 		r.summary.PurgedBytes += c.SizeBytes
 		reason := ""
@@ -634,19 +669,36 @@ func (r *nasPurgeRunner) record(purged []nasPurgeCandidate, skipped map[int64]na
 		}
 		r.log(c, "purged", reason)
 	}
+	return nil
 }
 
 func isRetentionProtected(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "retention protected")
 }
 
-// purgeBatch is the single write path: lock and re-check every rule, set
-// purged_at, delete the objects, commit. Rows whose identity or eligibility
-// changed since the scan are returned in skipped and left alone.
-func (r *nasPurgeRunner) purgeBatch(ctx context.Context, batch []nasPurgeCandidate) ([]nasPurgeCandidate, map[int64]nasPurgeCandidate, error) {
+type nasPurgeDeleteFailure struct {
+	c   nasPurgeCandidate
+	msg string
+}
+
+type nasPurgeBatchResult struct {
+	purged       []nasPurgeCandidate
+	changed      []nasPurgeCandidate
+	deleteFailed []nasPurgeDeleteFailure
+}
+
+// purgeBatch is the single write path. In one read-committed transaction it
+// locks and re-checks every rule, sets purged_at on the survivors (the
+// retention trigger vetoes before anything is deleted), deletes their objects
+// in one multi-delete, puts purged_at back to NULL for every key the store
+// did not delete, and commits. If the commit fails after the delete, the
+// objects are gone but the rows are unpurged; the next run completes them
+// (deleting an absent key succeeds).
+func (r *nasPurgeRunner) purgeBatch(ctx context.Context, batch []nasPurgeCandidate) (nasPurgeBatchResult, error) {
+	res := nasPurgeBatchResult{}
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return nil, nil, err
+		return res, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	ids := make([]int64, len(batch))
@@ -658,59 +710,118 @@ func (r *nasPurgeRunner) purgeBatch(ctx context.Context, batch []nasPurgeCandida
 	rows, err := tx.Query(ctx, nasPurgeLockSQL, r.opts.connectionID, r.store.Bucket(), int64(r.opts.grace/time.Second),
 		int64(r.opts.nasMaxAge/time.Second), ids)
 	if err != nil {
-		return nil, nil, err
+		return res, err
 	}
 	var lockedIDs []int64
-	var purged []nasPurgeCandidate
 	for rows.Next() {
 		var id, size int64
 		var sha, key string
 		if err := rows.Scan(&id, &size, &sha, &key); err != nil {
 			rows.Close()
-			return nil, nil, err
+			return res, err
 		}
 		c := byID[id]
 		if c.SizeBytes != size || c.SHA256 != sha || c.ObjectKey != key {
 			continue
 		}
 		lockedIDs = append(lockedIDs, id)
-		purged = append(purged, c)
+		res.purged = append(res.purged, c)
 		delete(byID, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return res, err
+	}
+	for _, c := range byID {
+		res.changed = append(res.changed, c)
 	}
 	if len(lockedIDs) == 0 {
-		return nil, byID, nil
+		return res, nil
 	}
 	tag, err := tx.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=ANY($1) AND purged_at IS NULL`, lockedIDs)
 	if err != nil {
-		return nil, nil, err
+		return nasPurgeBatchResult{}, err
 	}
 	if tag.RowsAffected() != int64(len(lockedIDs)) {
-		return nil, nil, fmt.Errorf("purged %d rows, locked %d", tag.RowsAffected(), len(lockedIDs))
+		return nasPurgeBatchResult{}, fmt.Errorf("purged %d rows, locked %d", tag.RowsAffected(), len(lockedIDs))
 	}
 	// Past this point the delete and the commit must finish together.
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nasPurgeFinishLimit)
 	defer cancel()
-	keys := make([]string, len(purged))
-	for i, c := range purged {
+	keys := make([]string, len(res.purged))
+	for i, c := range res.purged {
 		keys[i] = c.ObjectKey
 	}
-	if err := r.store.DeleteObjects(finishCtx, keys); err != nil {
-		return nil, nil, fmt.Errorf("delete source objects: %w", err)
+	failed, err := r.store.DeleteObjectsEach(finishCtx, keys)
+	if err != nil {
+		return nasPurgeBatchResult{}, fmt.Errorf("delete source objects: %w", err)
+	}
+	if len(failed) > 0 {
+		var keep []int64
+		var purged []nasPurgeCandidate
+		for _, c := range res.purged {
+			if msg, bad := failed[c.ObjectKey]; bad {
+				keep = append(keep, c.ClipID)
+				res.deleteFailed = append(res.deleteFailed, nasPurgeDeleteFailure{c, msg})
+				continue
+			}
+			purged = append(purged, c)
+		}
+		if _, err := tx.Exec(finishCtx, `UPDATE recording_clips SET purged_at=NULL WHERE id=ANY($1)`, keep); err != nil {
+			return nasPurgeBatchResult{}, fmt.Errorf("revert purged_at for undeleted keys: %w", err)
+		}
+		res.purged = purged
 	}
 	if err := tx.Commit(finishCtx); err != nil {
-		return nil, nil, fmt.Errorf("commit after delete (a rerun completes it): %w", err)
+		return nasPurgeBatchResult{}, fmt.Errorf("commit after delete (a rerun completes it): %w", err)
 	}
-	return purged, byID, nil
+	return res, nil
+}
+
+func parseNASPurgeIDList(raw string) (map[int64]bool, error) {
+	out := map[int64]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid id %q", part)
+		}
+		out[id] = true
+	}
+	return out, nil
+}
+
+func readNASPurgeIDFile(path string) (map[int64]bool, error) {
+	if path == "" {
+		return map[int64]bool{}, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read exclusion file: %w", err)
+	}
+	out := map[int64]bool{}
+	for n, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		id, err := strconv.ParseInt(line, 10, 64)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("%s:%d: invalid clip id %q", path, n+1, line)
+		}
+		out[id] = true
+	}
+	return out, nil
 }
 
 func runNASVerifiedPurge(ctx context.Context, cfg config.Config, args []string) {
-	const usage = `usage: stoaramactl nas-verified-purge run [--apply --connection-id N --recording-id N --from TIME --to TIME --after-clip-id N
-    --grace 168h --nas-max-age 0 --limit N --max-bytes N --page-size 1000 --batch-size 200 --workers 16 --rate 50
-    --sha-every 500 --max-errors 50 --log PATH --log-skips --check-r2 --json]`
+	const usage = `usage: stoaramactl nas-verified-purge run [--apply --connection-id N --recording-id N --from TIME --to TIME --after-clip-id N --until-clip-id N --head sample|all
+    --exclude-clip-ids-file PATH --exclude-recording-ids 1,2
+    --grace 168h --nas-max-age 0 --limit N --max-bytes N --page-size 1000 --batch-size 1000 --workers 16 --rate 200
+    --sha-every 1000 --max-errors 50 --log PATH --log-skips --check-r2 --json]`
 	if len(args) < 1 || args[0] != "run" {
 		log.Fatal(usage)
 	}

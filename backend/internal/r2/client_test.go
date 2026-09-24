@@ -302,3 +302,31 @@ func TestPresignPutSizedRequestSignsExactLength(t *testing.T) {
 		t.Fatal("zero-length sized put accepted")
 	}
 }
+
+func TestDeleteObjectsEachReportsPerKeyFailures(t *testing.T) {
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		got = string(body)
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`+
+			`<Error><Key>b.mp4</Key><Code>InternalError</Code><Message>try again</Message></Error></DeleteResult>`)
+	}))
+	defer server.Close()
+	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := c.DeleteObjectsEach(context.Background(), []string{"a.mp4", "b.mp4"})
+	if err != nil || len(failed) != 1 || failed["b.mp4"] != "InternalError try again" {
+		t.Fatalf("failed=%v err=%v", failed, err)
+	}
+	if !strings.Contains(got, "<Key>a.mp4</Key>") || !strings.Contains(got, "<Key>b.mp4</Key>") {
+		t.Fatalf("request body %s", got)
+	}
+	for _, bad := range [][]string{{" a.mp4"}, {""}, make([]string, MaxDeleteBatch+1)} {
+		if _, err := c.DeleteObjectsEach(context.Background(), bad); err == nil {
+			t.Fatalf("accepted %q", bad[0])
+		}
+	}
+}

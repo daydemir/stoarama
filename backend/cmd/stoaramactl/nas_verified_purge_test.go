@@ -23,8 +23,8 @@ func TestParseNASPurgeArgsDefaultsToSafeDryRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opts.apply || opts.checkR2 || opts.grace != 7*24*time.Hour || opts.batchSize != 200 || opts.workers != 16 ||
-		opts.rate != 50 || opts.shaEvery != 500 || opts.limit != 0 || opts.logPath != "/tmp/x.log" {
+	if opts.apply || opts.checkR2 || opts.grace != 7*24*time.Hour || opts.batchSize != 1000 || opts.workers != 16 ||
+		opts.rate != 200 || opts.shaEvery != 1000 || opts.headMode != "sample" || opts.limit != 0 || opts.logPath != "/tmp/x.log" {
 		t.Fatalf("unexpected defaults: %+v", opts)
 	}
 	opts, err = parseNASPurgeArgs([]string{"--from", "2026-08-01", "--to", "2026-08-02T00:00:00Z", "--recording-id", "7"})
@@ -32,7 +32,7 @@ func TestParseNASPurgeArgsDefaultsToSafeDryRun(t *testing.T) {
 		t.Fatalf("range parse %+v err=%v", opts, err)
 	}
 	for _, bad := range [][]string{
-		{"--grace", "1h"}, {"--rate", "0"}, {"--batch-size", "0"}, {"--batch-size", "5000"}, {"--workers", "99"},
+		{"--grace", "1h"}, {"--head", "none"}, {"--after-clip-id", "5", "--until-clip-id", "5"}, {"--exclude-recording-ids", "x"}, {"--exclude-clip-ids-file", "/nonexistent"}, {"--rate", "0"}, {"--batch-size", "0"}, {"--batch-size", "5000"}, {"--workers", "99"},
 		{"--apply", "--check-r2"}, {"--from", "2026-08-02", "--to", "2026-08-01"}, {"--from", "yesterday"},
 		{"--limit", "-1"}, {"--sha-every", "-1"}, {"extra"},
 	} {
@@ -68,6 +68,8 @@ type fakeNASPurgeStore struct {
 	mu         sync.Mutex
 	objects    map[string][]byte
 	deleted    []string
+	failKeys   map[string]bool
+	heads      int
 	beforeHead func(key string)
 }
 
@@ -79,6 +81,7 @@ func (f *fakeNASPurgeStore) Head(_ context.Context, key string) (r2.ObjectHead, 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.heads++
 	b, ok := f.objects[key]
 	if !ok {
 		return r2.ObjectHead{}, &smithy.GenericAPIError{Code: "NotFound"}
@@ -96,14 +99,19 @@ func (f *fakeNASPurgeStore) OpenExact(_ context.Context, key, etag, _ string) (i
 	return io.NopCloser(bytes.NewReader(b)), nil
 }
 
-func (f *fakeNASPurgeStore) DeleteObjects(_ context.Context, keys []string) error {
+func (f *fakeNASPurgeStore) DeleteObjectsEach(_ context.Context, keys []string) (map[string]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	failed := map[string]string{}
 	for _, k := range keys {
+		if f.failKeys[k] {
+			failed[k] = "InternalError try again"
+			continue
+		}
 		delete(f.objects, k)
 		f.deleted = append(f.deleted, k)
 	}
-	return nil
+	return failed, nil
 }
 
 func TestNASVerifiedPurgeEndToEnd(t *testing.T) {
@@ -117,7 +125,7 @@ CREATE TABLE nas_inventory_unmatched_files(connection_id bigint NOT NULL, relati
 CREATE TABLE recording_qualification_runs(id bigint PRIMARY KEY, status text NOT NULL);
 CREATE TABLE recording_qualification_windows(run_id bigint NOT NULL, recording_id bigint NOT NULL, window_start_at timestamptz NOT NULL, window_end_at timestamptz NOT NULL);
 INSERT INTO connections VALUES (13,47,'nas_pull'),(14,48,'nas_pull');
-INSERT INTO recordings VALUES (1,47,'completed','nas_pull'),(50,47,'completed','nas_pull'),(51,47,'active','nas_pull'),(60,48,'completed','nas_pull');
+INSERT INTO recordings VALUES (1,47,'completed','nas_pull'),(52,47,'completed','nas_pull'),(50,47,'completed','nas_pull'),(51,47,'active','nas_pull'),(60,48,'completed','nas_pull');
 INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 `); err != nil {
 		t.Fatal(err)
@@ -129,7 +137,7 @@ INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatalf("apply 0157: %v", err)
 	}
-	store := &fakeNASPurgeStore{objects: map[string][]byte{}}
+	store := &fakeNASPurgeStore{objects: map[string][]byte{}, failKeys: map[string]bool{"managed/acct-47/115.mp4": true}}
 	old := time.Now().Add(-30 * 24 * time.Hour)
 	type spec struct {
 		id, rec, job, dest int64
@@ -153,8 +161,11 @@ INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 		{113, 50, 5000, 20, 0, "ok", "wrongsha"},            // R2 bytes differ from the recorded sha
 		{114, 50, 5003, 20, 0, "ok", "ok"},                  // snapshotting scope appears before the lock
 		{120, 51, 5100, 20, 3 * 24 * time.Hour, "ok", "ok"}, // last 7 days of an active recording
-		{121, 51, 5100, 20, 0, "ok", "ok"},                  // active recording, old clip: eligible
-		{130, 60, 6000, 20, 0, "ok", "ok"},                  // another account's recording
+		{121, 51, 5100, 20, 0, "ok", "ok"},
+		{115, 50, 5000, 20, 0, "ok", "ok"}, // eligible, but R2 refuses its delete
+		{116, 50, 5000, 20, 0, "ok", "ok"}, // listed in the exclusion file
+		{140, 52, 5200, 20, 0, "ok", "ok"}, // excluded recording                  // active recording, old clip: eligible
+		{130, 60, 6000, 20, 0, "ok", "ok"}, // another account's recording
 	}
 	bodies := map[int64][]byte{}
 	for _, s := range specs {
@@ -208,7 +219,8 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 
 	logPath := filepath.Join(t.TempDir(), "purge.log")
 	base := nasPurgeOptions{connectionID: 13, grace: 48 * time.Hour, pageSize: 4, batchSize: 3, workers: 4, rate: 500,
-		shaEvery: 1, maxErrors: 5, logPath: logPath, logSkips: true}
+		shaEvery: 1, maxErrors: 5, logPath: logPath, logSkips: true, headMode: "all",
+		excludeClips: map[int64]bool{116: true}, excludeRecs: map[int64]bool{52: true}}
 	run := func(opts nasPurgeOptions) nasPurgeSummary {
 		t.Helper()
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -225,9 +237,10 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	wantSkips := map[string]int64{
 		"nas_unverified": 3, "within_grace": 1, "qualification_window": 1, "joined_window": 1, "not_managed_storage": 1,
 		"restore_recent": 1, "joined_scope": 1, "active_recording_recent": 1, "joined_snapshot": 9,
+		"excluded_clip": 1, "excluded_recording": 1,
 	}
 	dry := run(base)
-	if dry.Mode != "dry_run" || dry.Eligible != 6 || dry.Purged != 0 || len(store.deleted) != 0 {
+	if dry.Mode != "dry_run" || dry.Eligible != 7 || dry.Purged != 0 || len(store.deleted) != 0 {
 		t.Fatalf("dry run summary %+v", dry)
 	}
 	for reason, n := range wantSkips {
@@ -236,6 +249,12 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		}
 	}
 
+	// --limit stops early; the resume point never skips unsettled clips.
+	limited := base
+	limited.limit = 1
+	if s := run(limited); !s.LimitReached || s.Eligible != 1 {
+		t.Fatalf("limited summary %+v", s)
+	}
 	// Between the scan and the lock, a joined batch starts snapshotting clip
 	// 114's job; the locked re-check must leave it alone.
 	store.beforeHead = func(key string) {
@@ -248,7 +267,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	got := run(apply)
 	store.beforeHead = nil
 	if got.Purged != 3 || got.SourceAbsent != 1 || got.Skipped["source_size_mismatch"] != 1 || got.Skipped["source_sha_mismatch"] != 1 ||
-		got.Skipped["changed_before_lock"] != 1 || got.Errors != 0 || got.ShaChecks < 3 {
+		got.Skipped["changed_before_lock"] != 1 || got.DeleteFailed != 1 || got.Errors != 1 || got.ShaChecks < 3 {
 		t.Fatalf("apply summary %+v", got)
 	}
 	var purged []int64
@@ -269,7 +288,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	if fmt.Sprint(store.deleted) != "[managed/acct-47/101.mp4 managed/acct-47/102.mp4 managed/acct-47/121.mp4]" {
 		t.Fatalf("deleted objects %v", store.deleted)
 	}
-	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 120, 130} {
+	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140} {
 		if _, ok := store.objects[fmt.Sprintf("managed/acct-47/%d.mp4", id)]; !ok {
 			t.Fatalf("object of protected clip %d was deleted", id)
 		}
@@ -279,15 +298,32 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		t.Fatalf("log missing purge lines: %v", err)
 	}
 
-	// Reruns are idempotent.
+	// Reruns are idempotent; a key whose delete failed is retried and, once
+	// the store accepts it, purged.
+	store.failKeys = nil
 	again := run(apply)
-	if again.Purged != 0 || len(store.deleted) != 3 {
+	if again.Purged != 1 || len(store.deleted) != 4 {
 		t.Fatalf("rerun summary %+v deleted=%v", again, store.deleted)
 	}
-	// --limit stops early; the resume point never skips unsettled clips.
-	limited := base
-	limited.limit = 1
-	if s := run(limited); !s.LimitReached || s.Eligible != 1 {
-		t.Fatalf("limited summary %+v", s)
+	// Sample mode purges without a HEAD per clip.
+	var pre int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM recording_clips WHERE id=115 AND purged_at IS NOT NULL`).Scan(&pre); err != nil || pre != 1 {
+		t.Fatalf("clip 115 not purged after retry: %d %v", pre, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,recording_job_id,storage_destination_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at)
+		VALUES (150,50,5000,20,'stoarama','managed/acct-47/150.mp4',3,$1,'r/150.mp4',now()-interval '20 days',now()-interval '20 days',now()-interval '20 days')`, joinedPurgeSHA("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,state,sha256,size_bytes,relative_path) VALUES (13,150,'present',$1,3,'r/150.mp4')`, joinedPurgeSHA("abc")); err != nil {
+		t.Fatal(err)
+	}
+	store.objects["managed/acct-47/150.mp4"] = []byte("abc")
+	sample := apply
+	sample.headMode, sample.shaEvery = "sample", 0
+	store.heads = 0
+	// Without a HEAD, 111 (short R2 copy) and 113 (R2 bytes differ) are purged
+	// too: the NAS holds the exact recorded bytes, so no good copy is lost.
+	if s := run(sample); s.Purged != 3 || store.heads != 0 {
+		t.Fatalf("sample mode summary %+v heads=%d", s, store.heads)
 	}
 }
