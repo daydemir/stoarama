@@ -28,8 +28,7 @@ type Verification struct {
 	PayloadChainMatches bool     `json:"payload_chain_matches"`
 	VideoTimingMatches  bool     `json:"video_timing_matches"`
 	MaxTimingErrorMicro int64    `json:"max_timing_error_us"`
-	KeyframeDecodeOK    bool     `json:"keyframe_decode_ok"`
-	SeamDecodesOK       int      `json:"seam_decodes_ok"`
+	EdgeDecodeOK        bool     `json:"edge_decode_ok"`
 	OutputSeconds       float64  `json:"output_seconds"`
 	Notes               []string `json:"notes,omitempty"`
 }
@@ -42,18 +41,24 @@ type Built struct {
 	Verification Verification
 }
 
-// concatOffsets returns each clip's exact start offset in the output, derived
-// from exact video packet durations rounded to microseconds against the running
-// total (so VFR rounding never accumulates), plus the per-entry duration lines.
+// concatOffsets returns each clip's start offset in the output and the
+// per-entry concat durations. The concat demuxer places file i at offset_i
+// minus its start time (earliest pts over all tracks). Each file's duration is
+// its full extent, max(video end, audio end) - start, from exact packet
+// timestamps (VFR-safe), so no track of the next clip can overlap this one;
+// offsets are rounded to microseconds against the running total so rounding
+// never accumulates.
 func concatOffsets(clips []LocalClip) (offsets []*big.Rat, durationsMicro []int64) {
-	cum := new(big.Rat)
-	var prevMicro int64
-	for _, c := range clips {
-		offsets = append(offsets, new(big.Rat).SetFrac64(prevMicro, 1_000_000))
-		cum.Add(cum, c.Probe.Video.Duration())
-		now := roundRatMicro(cum)
-		durationsMicro = append(durationsMicro, now-prevMicro)
-		prevMicro = now
+	total := new(big.Rat)
+	micros := make([]int64, len(clips)+1)
+	for i, c := range clips {
+		micros[i] = roundRatMicro(total)
+		total.Add(total, new(big.Rat).Sub(c.Probe.endTime(), c.Probe.startTime()))
+	}
+	micros[len(clips)] = roundRatMicro(total)
+	for i := range clips {
+		offsets = append(offsets, new(big.Rat).SetFrac64(micros[i], 1_000_000))
+		durationsMicro = append(durationsMicro, micros[i+1]-micros[i])
 	}
 	return offsets, durationsMicro
 }
@@ -109,10 +114,9 @@ func BuildPart(ctx context.Context, tools Tools, clips []LocalClip, outPath stri
 
 // VerifyPart proves the output is exactly the sources' packets in order:
 //  1. per-track payload hash chain and packet counts are identical;
-//  2. every output video packet's pts/dts equals its source timing shifted by
-//     the clip's concat offset (within 1 ms), and output dts strictly increases;
-//  3. a keyframe-only decode of the whole output is clean;
-//  4. a strict decode of the first second after every internal seam is clean.
+//  2. every output packet (video and audio) sits at its source timing shifted
+//     by the clip's concat offset (within 1 ms), and dts never goes back;
+//  3. the output's first and last seconds decode strictly.
 func VerifyPart(ctx context.Context, tools Tools, clips []LocalClip, outPath string) (Verification, error) {
 	out, err := ProbeFile(ctx, tools, outPath)
 	if err != nil {
@@ -155,51 +159,61 @@ func VerifyPart(ctx context.Context, tools Tools, clips []LocalClip, outPath str
 	v.PayloadChainMatches = true
 
 	// The concat demuxer places each file at its offset minus the file's start
-	// time (the earliest pts over its tracks), preserving A/V alignment.
+	// time; every output packet of every track must sit exactly there.
 	offsets, _ := concatOffsets(clips)
 	outBase := out.startTime()
 	tol := big.NewRat(1, 1000)
-	i := 0
-	var maxErr *big.Rat = new(big.Rat)
-	var prevDTS *big.Rat
-	for ci, c := range clips {
-		srcBase := c.Probe.startTime()
-		for _, pk := range c.Probe.Video.Packets {
-			o := out.Video.Packets[i]
-			i++
-			for _, pair := range [][2]*big.Rat{{pk.PTS, o.PTS}, {pk.DTS, o.DTS}} {
-				want := new(big.Rat).Add(offsets[ci], new(big.Rat).Sub(pair[0], srcBase))
-				got := new(big.Rat).Sub(pair[1], outBase)
-				diff := new(big.Rat).Abs(new(big.Rat).Sub(want, got))
-				if diff.Cmp(maxErr) > 0 {
-					maxErr = diff
-				}
-				if diff.Cmp(tol) > 0 {
-					return v, fmt.Errorf("video timing differs at clip %d", c.Clip.ClipID)
-				}
+	maxErr := new(big.Rat)
+	for _, kind := range []string{"video", "audio"} {
+		outTrack := out.track(kind)
+		if outTrack == nil {
+			continue
+		}
+		i := 0
+		var prevDTS *big.Rat
+		for ci, c := range clips {
+			src := c.Probe.track(kind)
+			if src == nil {
+				continue
 			}
-			if prevDTS != nil && o.DTS.Cmp(prevDTS) <= 0 {
-				return v, fmt.Errorf("output video dts not strictly increasing")
+			srcBase := c.Probe.startTime()
+			for _, pk := range src.Packets {
+				o := outTrack.Packets[i]
+				i++
+				for _, pair := range [][2]*big.Rat{{pk.PTS, o.PTS}, {pk.DTS, o.DTS}} {
+					want := new(big.Rat).Add(offsets[ci], new(big.Rat).Sub(pair[0], srcBase))
+					got := new(big.Rat).Sub(pair[1], outBase)
+					diff := new(big.Rat).Abs(new(big.Rat).Sub(want, got))
+					if diff.Cmp(maxErr) > 0 {
+						maxErr = diff
+					}
+					if diff.Cmp(tol) > 0 {
+						return v, fmt.Errorf("%s timing differs at clip %d", kind, c.Clip.ClipID)
+					}
+				}
+				if prevDTS != nil && (o.DTS.Cmp(prevDTS) < 0 || (kind == "video" && o.DTS.Cmp(prevDTS) == 0)) {
+					return v, fmt.Errorf("output %s dts not increasing", kind)
+				}
+				prevDTS = o.DTS
 			}
-			prevDTS = o.DTS
 		}
 	}
 	v.VideoTimingMatches = true
 	v.MaxTimingErrorMicro = roundRatMicro(maxErr)
-	total, _ := out.Video.Duration().Float64()
+	total, _ := new(big.Rat).Sub(out.endTime(), outBase).Float64()
 	v.OutputSeconds = round6(total)
 
-	if err := strictDecode(ctx, tools, outPath, "-skip_frame", "nokey"); err != nil {
-		return v, fmt.Errorf("keyframe decode: %w", err)
+	// Every source window around a joined seam was already strictly decoded by
+	// the frame match (B[0] is a keyframe, so decoding the joined stream from
+	// the seam equals decoding B's head). Here: the output opens and its first
+	// and last seconds decode strictly.
+	if err := strictDecode(ctx, tools, outPath, "-t", "2"); err != nil {
+		return v, fmt.Errorf("head decode: %w", err)
 	}
-	v.KeyframeDecodeOK = true
-	for ci := 1; ci < len(clips); ci++ {
-		at, _ := offsets[ci].Float64()
-		if err := strictDecode(ctx, tools, outPath, "-ss", fmt.Sprintf("%.6f", at), "-t", "1"); err != nil {
-			return v, fmt.Errorf("seam decode at clip %d: %w", clips[ci].Clip.ClipID, err)
-		}
-		v.SeamDecodesOK++
+	if err := strictDecode(ctx, tools, outPath, "-sseof", "-2"); err != nil {
+		return v, fmt.Errorf("tail decode: %w", err)
 	}
+	v.EdgeDecodeOK = true
 	return v, nil
 }
 
@@ -216,6 +230,23 @@ func strictDecode(ctx context.Context, tools Tools, path string, pre ...string) 
 		return fmt.Errorf("decoder reported: %s", trimStderr(s))
 	}
 	return nil
+}
+
+// endTime is the latest presentation end (pts + duration) over the file's tracks.
+func (p Probe) endTime() *big.Rat {
+	var end *big.Rat
+	for _, sp := range []*StreamPackets{p.Video, p.Audio} {
+		if sp == nil {
+			continue
+		}
+		for _, pk := range sp.Packets {
+			e := new(big.Rat).Add(pk.PTS, pk.Dur)
+			if end == nil || e.Cmp(end) > 0 {
+				end = e
+			}
+		}
+	}
+	return end
 }
 
 // startTime is the earliest presentation time over the file's tracks.

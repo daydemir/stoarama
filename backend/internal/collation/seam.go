@@ -22,9 +22,14 @@ const (
 // SeamPolicy holds every threshold that decides a join. It is written into each
 // hour manifest so a decision can be re-audited against the rule that made it.
 type SeamPolicy struct {
-	WindowSeconds float64 `json:"window_seconds"`
-	FrameWidth    int     `json:"frame_width"`
-	FrameHeight   int     `json:"frame_height"`
+	// ShortWindowSeconds is tried first; a seam that does not prove continuous
+	// there is re-examined on WindowSeconds.
+	ShortWindowSeconds float64 `json:"short_window_seconds"`
+	WindowSeconds      float64 `json:"window_seconds"`
+	FrameWidth         int     `json:"frame_width"`
+	FrameHeight        int     `json:"frame_height"`
+	// BlurSigma is the gaussian blur applied after downscaling (0 = none).
+	BlurSigma float64 `json:"blur_sigma"`
 	// Share of pixels (highest temporal variance) the distances are measured on.
 	MotionPixelShare float64 `json:"motion_pixel_share"`
 	// A continuous seam has B[0]'s best match within this many frames of A's end
@@ -49,11 +54,20 @@ type SeamPolicy struct {
 	ShortClipSlackSeconds float64 `json:"short_clip_slack_seconds"`
 }
 
+func (p SeamPolicy) windows() []float64 {
+	if p.ShortWindowSeconds > 0 && p.ShortWindowSeconds < p.WindowSeconds {
+		return []float64{p.ShortWindowSeconds, p.WindowSeconds}
+	}
+	return []float64{p.WindowSeconds}
+}
+
 func DefaultSeamPolicy() SeamPolicy {
 	return SeamPolicy{
+		ShortWindowSeconds:    4,
 		WindowSeconds:         10,
 		FrameWidth:            96,
 		FrameHeight:           64,
+		BlurSigma:             0,
 		MotionPixelShare:      0.10,
 		MaxTailOffsetFrames:   3,
 		MaxHeadOffsetFrames:   10,
@@ -105,6 +119,7 @@ type ClipMedia struct {
 // clip's tail window, B the next clip's head window.
 type MatchEvidence struct {
 	Verdict          string  `json:"verdict"`
+	WindowSeconds    float64 `json:"window_seconds"`
 	TailFrames       int     `json:"tail_frames"`
 	HeadFrames       int     `json:"head_frames"`
 	BoundaryMAD      float64 `json:"boundary_mad"`

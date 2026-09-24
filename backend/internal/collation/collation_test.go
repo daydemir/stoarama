@@ -177,20 +177,39 @@ func TestHourIDAndKeys(t *testing.T) {
 }
 
 func TestConcatOffsetsRoundAgainstRunningTotal(t *testing.T) {
-	mk := func(num, den int64, n int) LocalClip {
+	// mk builds a clip whose video starts lead seconds after its audio.
+	mk := func(num, den int64, n int, lead *big.Rat) LocalClip {
 		sp := &StreamPackets{Kind: "video"}
+		at := new(big.Rat).Set(lead)
 		for i := 0; i < n; i++ {
-			sp.Packets = append(sp.Packets, Packet{Dur: big.NewRat(num, den)})
+			sp.Packets = append(sp.Packets, Packet{PTS: new(big.Rat).Set(at), Dur: big.NewRat(num, den)})
+			at.Add(at, big.NewRat(num, den))
 		}
-		return LocalClip{Probe: Probe{Video: sp}}
+		audio := &StreamPackets{Kind: "audio", Packets: []Packet{{PTS: new(big.Rat), Dur: big.NewRat(1, 50)}}}
+		return LocalClip{Probe: Probe{Video: sp, Audio: audio}}
 	}
-	clips := []LocalClip{mk(1, 30, 1), mk(1, 30, 1), mk(1, 30, 1)}
+	zero := new(big.Rat)
+	clips := []LocalClip{mk(1, 30, 1, zero), mk(1, 30, 1, zero), mk(1, 30, 1, zero)}
 	offsets, durs := concatOffsets(clips)
 	if fmt.Sprint(durs) != "[33333 33334 33333]" {
 		t.Fatalf("durations %v", durs)
 	}
 	if f, _ := offsets[2].Float64(); f != 0.066667 {
 		t.Fatalf("offset %v", f)
+	}
+	// Video starting 0.1 s after audio in clip 1: its extent is 0.1 + 1/30.
+	clips = []LocalClip{mk(1, 30, 1, big.NewRat(1, 10)), mk(1, 30, 1, zero)}
+	offsets, durs = concatOffsets(clips)
+	if f, _ := offsets[1].Float64(); f != 0.133333 || fmt.Sprint(durs) != "[133333 33334]" {
+		t.Fatalf("lead offsets %v %v", f, durs)
+	}
+	// Audio outlasting video: the next clip starts after the audio, never
+	// overlapping it.
+	long := mk(1, 30, 1, zero)
+	long.Probe.Audio.Packets[0].Dur = big.NewRat(1, 10)
+	offsets, durs = concatOffsets([]LocalClip{long, mk(1, 30, 1, zero)})
+	if f, _ := offsets[1].Float64(); f != 0.1 || fmt.Sprint(durs) != "[100000 33333]" {
+		t.Fatalf("audio extent offsets %v %v", f, durs)
 	}
 }
 
@@ -202,7 +221,7 @@ func TestManifestValidateRejectsInconsistentAccounting(t *testing.T) {
 			{Clip: Clip{ClipID: 3}, Disposition: "quarantined", Reason: "unplayable"}},
 		Seams: []SeamDecision{{PrevClipID: 1, NextClipID: 2, Decision: DecisionJoin, Match: &MatchEvidence{Verdict: MatchContinuous}}},
 		Outputs: []Output{{Part: 1, Parts: 1, SHA256: strings.Repeat("a", 64), SizeBytes: 1, SourceClipIDs: []int64{1, 2},
-			Verification: Verification{PayloadChainMatches: true, VideoTimingMatches: true, KeyframeDecodeOK: true}}}}
+			Verification: Verification{PayloadChainMatches: true, VideoTimingMatches: true, EdgeDecodeOK: true}}}}
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -349,6 +368,25 @@ func TestProcessHourSyntheticContinuousJumpOverlap(t *testing.T) {
 		t.Fatalf("A->E: %+v", ev)
 	}
 
+	// A single changed payload byte inside the joined output fails verification.
+	ab := []LocalClip{{Clip: Clip{ClipID: 1}, Path: filepath.Join(dir, "a.mp4"), Probe: probe("a.mp4")}, {Clip: Clip{ClipID: 2}, Path: filepath.Join(dir, "b.mp4"), Probe: probe("b.mp4")}}
+	built, err := BuildPart(ctx, tools, ab, filepath.Join(dir, "ab.mp4"))
+	if err != nil {
+		t.Fatalf("build a+b: %v", err)
+	}
+	raw, err := os.ReadFile(built.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)*3/4] ^= 0x5a // inside mdat (faststart puts moov first)
+	corrupt := filepath.Join(dir, "corrupt.mp4")
+	if err := os.WriteFile(corrupt, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyPart(ctx, tools, ab, corrupt); err == nil || !strings.Contains(err.Error(), "payload chain differs") {
+		t.Fatalf("corrupted payload byte not caught: %v", err)
+	}
+
 	// Full hour: A,B continuous (join) then C with forged contiguous stamps
 	// and consecutive sequence (must still split on pixels).
 	t0 := time.Date(2026, 8, 13, 17, 0, 0, 0, time.UTC)
@@ -378,9 +416,9 @@ func TestProcessHourSyntheticContinuousJumpOverlap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.MarshalIndent(m.Seams, "", " ")
+	seamJSON, _ := json.MarshalIndent(m.Seams, "", " ")
 	if len(m.Outputs) != 2 || fmt.Sprint(m.Outputs[0].SourceClipIDs) != "[1 2]" || fmt.Sprint(m.Outputs[1].SourceClipIDs) != "[3]" {
-		t.Fatalf("parts %+v seams %s", m.Outputs, raw)
+		t.Fatalf("parts %+v seams %s", m.Outputs, seamJSON)
 	}
 	if m.Clips[2].Disposition != "duplicate" && m.Clips[3].Disposition != "duplicate" {
 		t.Fatalf("duplicate not dropped: %+v", m.Clips)
@@ -393,5 +431,31 @@ func TestProcessHourSyntheticContinuousJumpOverlap(t *testing.T) {
 	}
 	if _, ok := store.published[ManifestKey(w.BatchID, w.HourID)]; !ok {
 		t.Fatal("manifest not published")
+	}
+}
+
+func TestReplayOverlapDetectsRepeatedLeadingPackets(t *testing.T) {
+	mk := func(hashes ...string) Probe {
+		sp := &StreamPackets{Kind: "video"}
+		for i, h := range hashes {
+			sp.Packets = append(sp.Packets, Packet{PTS: big.NewRat(int64(i), 10), DTS: big.NewRat(int64(i), 10), Dur: big.NewRat(1, 10), Key: i%5 == 0, Hash: h})
+		}
+		return Probe{Video: sp}
+	}
+	a := mk("k0", "p1", "p2", "p3", "p4", "k5", "p6", "p7", "p8", "p9")
+	// B starts by replaying A from its keyframe k5 (0.5 s of overlap).
+	if sec, ok := ReplayOverlap(a, mk("k5", "p6", "p7", "p8", "p9", "kX")); !ok || sec != 0.5 {
+		t.Fatalf("keyframe replay: %v %v", sec, ok)
+	}
+	// A run of three repeated packets further in is a replay too.
+	if _, ok := ReplayOverlap(a, mk("kA", "p6", "p7", "p8")); !ok {
+		t.Fatal("repeated run missed")
+	}
+	// Isolated identical P-frames (static scene) are not.
+	if _, ok := ReplayOverlap(a, mk("kA", "p6", "pB", "p8", "pC")); ok {
+		t.Fatal("isolated identical packets flagged")
+	}
+	if _, ok := ReplayOverlap(a, mk("kA", "pB", "pC")); ok {
+		t.Fatal("fresh packets flagged")
 	}
 }

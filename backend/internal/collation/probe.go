@@ -215,3 +215,50 @@ func (s *StreamPackets) WindowKeys(n int, tail bool) []bool {
 	}
 	return flags[:n]
 }
+
+// replayScanPackets bounds how far into B a replayed run is searched for.
+const replayScanPackets = 600
+
+// ReplayOverlap detects a rewound capture: B's leading video packets are
+// byte-identical to packets already in A (same payload SHA-256). B's first
+// packet is a keyframe, which never repeats by chance, so one match there is
+// proof; further in, a run of 3 consecutive identical packets is required
+// (all-skip P-frames of a static scene can repeat by chance). It returns the
+// duplicated seconds (how far B's start lies before A's end).
+func ReplayOverlap(a, b Probe) (float64, bool) {
+	if a.Video == nil || b.Video == nil || len(b.Video.Packets) == 0 {
+		return 0, false
+	}
+	index := make(map[string]int, len(a.Video.Packets))
+	for i, pk := range a.Video.Packets {
+		index[pk.Hash] = i
+	}
+	aEnd := new(big.Rat)
+	for _, pk := range a.Video.Packets {
+		if e := new(big.Rat).Add(pk.PTS, pk.Dur); e.Cmp(aEnd) > 0 {
+			aEnd = e
+		}
+	}
+	bStart := b.Video.Packets[0].PTS
+	overlap := func(ai, bj int) float64 {
+		// B's start corresponds to A time pts(A[ai]) - (pts(B[bj]) - bStart).
+		start := new(big.Rat).Sub(a.Video.Packets[ai].PTS, new(big.Rat).Sub(b.Video.Packets[bj].PTS, bStart))
+		f, _ := new(big.Rat).Sub(aEnd, start).Float64()
+		return round4(f)
+	}
+	run := 0
+	for j := 0; j < len(b.Video.Packets) && j < replayScanPackets; j++ {
+		ai, ok := index[b.Video.Packets[j].Hash]
+		if !ok {
+			run = 0
+			continue
+		}
+		if j == 0 || b.Video.Packets[j].Key {
+			return overlap(ai, j), true
+		}
+		if run++; run >= 3 {
+			return overlap(ai, j), true
+		}
+	}
+	return 0, false
+}

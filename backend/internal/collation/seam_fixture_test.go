@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,7 +75,13 @@ func loadSeamCases(t *testing.T) []seamCase {
 	return cases
 }
 
-func loadSeamCurves(t *testing.T) map[string]Curves {
+// windowCurves holds a seam's curves at the short and the full window.
+type windowCurves struct {
+	Short Curves `json:"short"`
+	Full  Curves `json:"full"`
+}
+
+func loadSeamCurves(t *testing.T) map[string]windowCurves {
 	f, err := os.Open("testdata/seam_curves.json.gz")
 	if err != nil {
 		t.Fatal(err)
@@ -84,11 +91,25 @@ func loadSeamCurves(t *testing.T) map[string]Curves {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := map[string]Curves{}
+	out := map[string]windowCurves{}
 	if err := json.NewDecoder(zr).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// evaluateEscalating mirrors matchSeam: short window first, full on failure.
+func evaluateEscalating(policy SeamPolicy, c windowCurves, frame float64) MatchEvidence {
+	short := policy
+	short.WindowSeconds = policy.ShortWindowSeconds
+	ev := EvaluateCurves(short, c.Short, frame)
+	ev.WindowSeconds = policy.ShortWindowSeconds
+	if ev.Verdict == MatchContinuous {
+		return ev
+	}
+	ev = EvaluateCurves(policy, c.Full, frame)
+	ev.WindowSeconds = policy.WindowSeconds
+	return ev
 }
 
 // TestSeamProofCases replays every proof seam through the full join rule.
@@ -105,7 +126,7 @@ func TestSeamProofCases(t *testing.T) {
 		}
 		prev, pm := c.Prev.clip(t)
 		next, nm := c.Next.clip(t)
-		ev := EvaluateCurves(policy, cv, pm.FrameSeconds)
+		ev := evaluateEscalating(policy, cv, pm.FrameSeconds)
 		d := DecideSeam(policy, prev, next, pm, nm, &ev)
 		truthFalse := c.TruthContinuous != nil && !*c.TruthContinuous
 		if truthFalse && d.Decision == DecisionJoin {
@@ -113,7 +134,7 @@ func TestSeamProofCases(t *testing.T) {
 		}
 		// Adversarial seams must also fail on pixels alone, independent of the
 		// metadata gates (the attack can forge stamps and sequence numbers).
-		if strings.HasPrefix(c.Case, "A") && truthFalse && ev.Verdict == MatchContinuous {
+		if strings.HasPrefix(c.Case, "A") && truthFalse && (EvaluateCurves(policy, cv.Full, pm.FrameSeconds).Verdict == MatchContinuous || ev.Verdict == MatchContinuous) {
 			t.Errorf("adversarial seam %s passes the frame match alone: %+v", c.key(), ev)
 		}
 		if c.TruthContinuous != nil && *c.TruthContinuous {
@@ -148,10 +169,31 @@ func TestGenerateSeamCurves(t *testing.T) {
 	policy := DefaultSeamPolicy()
 	tools := ToolsFromEnv()
 	ctx := context.Background()
-	out := map[string]Curves{}
 	cases := loadSeamCases(t)
-	results := make([]Curves, len(cases))
+	results := make([]windowCurves, len(cases))
 	errs := make([]error, len(cases))
+	curvesAt := func(c seamCase, window float64) (Curves, error) {
+		p := policy
+		p.WindowSeconds = window
+		tail, err := ExtractWindow(ctx, tools, p, filepath.Join(dir, c.Prev.CID+".mp4"), true)
+		var head []Frame
+		if err == nil {
+			head, err = ExtractWindow(ctx, tools, p, filepath.Join(dir, c.Next.CID+".mp4"), false)
+		}
+		if err != nil {
+			// A seam region that does not decode is itself a proof case.
+			return Curves{DecodeError: trimStderr(err.Error())}, nil
+		}
+		pa, err := ProbeFile(ctx, tools, filepath.Join(dir, c.Prev.CID+".mp4"))
+		if err != nil || !pa.Media.Playable {
+			return Curves{}, fmt.Errorf("%s: probe prev: %v %+v", c.key(), err, pa.Media)
+		}
+		pb, err := ProbeFile(ctx, tools, filepath.Join(dir, c.Next.CID+".mp4"))
+		if err != nil || !pb.Media.Playable {
+			return Curves{}, fmt.Errorf("%s: probe next: %v %+v", c.key(), err, pb.Media)
+		}
+		return roundCurves(framesToCurves(p, tail, head, pa.Video.WindowKeys(len(tail), true), pb.Video.WindowKeys(len(head), false))), nil
+	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 12)
 	for i, c := range cases {
@@ -160,27 +202,14 @@ func TestGenerateSeamCurves(t *testing.T) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			tail, err := ExtractWindow(ctx, tools, policy, filepath.Join(dir, c.Prev.CID+".mp4"), true)
-			var head []Frame
-			if err == nil {
-				head, err = ExtractWindow(ctx, tools, policy, filepath.Join(dir, c.Next.CID+".mp4"), false)
-			}
+			short, err := curvesAt(c, policy.ShortWindowSeconds)
 			if err != nil {
-				// A seam region that does not decode is itself a proof case.
-				results[i] = Curves{DecodeError: trimStderr(err.Error())}
+				errs[i] = err
 				return
 			}
-			pa, err := ProbeFile(ctx, tools, filepath.Join(dir, c.Prev.CID+".mp4"))
-			if err != nil || !pa.Media.Playable {
-				errs[i] = fmt.Errorf("%s: probe prev: %v %+v", c.key(), err, pa.Media)
-				return
-			}
-			pb, err := ProbeFile(ctx, tools, filepath.Join(dir, c.Next.CID+".mp4"))
-			if err != nil || !pb.Media.Playable {
-				errs[i] = fmt.Errorf("%s: probe next: %v %+v", c.key(), err, pb.Media)
-				return
-			}
-			results[i] = roundCurves(framesToCurves(policy, tail, head, pa.Video.WindowKeys(len(tail), true), pb.Video.WindowKeys(len(head), false)))
+			full, err := curvesAt(c, policy.WindowSeconds)
+			errs[i] = err
+			results[i] = windowCurves{Short: short, Full: full}
 		}(i, c)
 	}
 	wg.Wait()
@@ -189,6 +218,7 @@ func TestGenerateSeamCurves(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	out := map[string]windowCurves{}
 	for i, c := range cases {
 		out[c.key()] = results[i]
 	}
@@ -218,4 +248,122 @@ func roundCurves(c Curves) Curves {
 	}
 	return Curves{TailToHead0: r(c.TailToHead0), TailLastToHead: r(c.TailLastToHead), Steps: r(c.Steps), KeySteps: r(c.KeySteps), BoundaryMAD: round4(c.BoundaryMAD),
 		TailKeys: c.TailKeys, HeadKeys: c.HeadKeys, DecodeError: c.DecodeError}
+}
+
+// replaySeam is a seam from the 2026-09-24 old-vs-new comparison where B's
+// first packets are byte-identical repeats of A's tail (zero DB gap), or a
+// continuous control seam that must not be flagged.
+type replaySeam struct {
+	Name   string        `json:"name"`
+	Replay bool          `json:"replay"`
+	A      []fixturePack `json:"a"`
+	B      []fixturePack `json:"b"`
+}
+
+type fixturePack struct {
+	PTS  string `json:"pts"`
+	Dur  string `json:"dur"`
+	Key  bool   `json:"key,omitempty"`
+	Hash string `json:"hash"`
+}
+
+var replayFixtureSeams = []struct {
+	name   string
+	a, b   string
+	replay bool
+}{
+	{"rec406/483362-483405", "483362", "483405", true}, {"rec406/483449-483488", "483449", "483488", true},
+	{"rec409/528721-528761", "528721", "528761", true}, {"rec401/572194-572231", "572194", "572231", true},
+	{"rec401/572531-572570", "572531", "572570", true}, {"rec406/488141-488145", "488141", "488145", true},
+	{"rec406/488153-488157", "488153", "488157", true},
+	{"C1/1", "1594350", "1594369", false}, {"C1/2", "1594369", "1594388", false}, {"C1/3", "1594388", "1594405", false},
+	{"C1/4", "1594405", "1594422", false}, {"C3/2", "1590458", "1590471", false}, {"C3/10", "1590599", "1590610", false},
+}
+
+func toFixture(sp *StreamPackets) []fixturePack {
+	out := make([]fixturePack, len(sp.Packets))
+	for i, pk := range sp.Packets {
+		out[i] = fixturePack{PTS: pk.PTS.RatString(), Dur: pk.Dur.RatString(), Key: pk.Key, Hash: pk.Hash[:16]}
+	}
+	return out
+}
+
+func fromFixture(t *testing.T, packs []fixturePack) Probe {
+	sp := &StreamPackets{Kind: "video"}
+	for _, p := range packs {
+		pts, ok1 := new(big.Rat).SetString(p.PTS)
+		dur, ok2 := new(big.Rat).SetString(p.Dur)
+		if !ok1 || !ok2 {
+			t.Fatalf("bad fixture packet %+v", p)
+		}
+		sp.Packets = append(sp.Packets, Packet{PTS: pts, DTS: pts, Dur: dur, Key: p.Key, Hash: p.Hash})
+	}
+	return Probe{Video: sp}
+}
+
+// TestReplaySeamsNeverJoin: every recorded replay seam is detected from packet
+// hashes alone, and continuous controls are not.
+func TestReplaySeamsNeverJoin(t *testing.T) {
+	f, err := os.Open("testdata/replay_seams.json.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seams []replaySeam
+	if err := json.NewDecoder(zr).Decode(&seams); err != nil {
+		t.Fatal(err)
+	}
+	if len(seams) != len(replayFixtureSeams) {
+		t.Fatalf("fixture has %d seams", len(seams))
+	}
+	for _, s := range seams {
+		sec, found := ReplayOverlap(fromFixture(t, s.A), fromFixture(t, s.B))
+		if found != s.Replay {
+			t.Errorf("%s: replay=%v want %v", s.Name, found, s.Replay)
+		}
+		if s.Replay && (sec <= 0 || sec > 10) {
+			t.Errorf("%s: overlap %.2f s is not a plausible replay", s.Name, sec)
+		}
+		t.Logf("%s replay=%v overlap=%.2fs", s.Name, found, sec)
+	}
+}
+
+// TestGenerateReplaySeams regenerates testdata/replay_seams.json.gz from clips
+// in COLLATION_FIXTURE_CLIPS. Not run in CI.
+func TestGenerateReplaySeams(t *testing.T) {
+	dir := os.Getenv("COLLATION_FIXTURE_CLIPS")
+	if dir == "" {
+		t.Skip("COLLATION_FIXTURE_CLIPS not set")
+	}
+	tools := ToolsFromEnv()
+	var out []replaySeam
+	for _, s := range replayFixtureSeams {
+		pa, err := ProbeFile(context.Background(), tools, filepath.Join(dir, s.a+".mp4"))
+		if err != nil || !pa.Media.Playable {
+			t.Fatalf("%s: %v", s.name, err)
+		}
+		pb, err := ProbeFile(context.Background(), tools, filepath.Join(dir, s.b+".mp4"))
+		if err != nil || !pb.Media.Playable {
+			t.Fatalf("%s: %v", s.name, err)
+		}
+		out = append(out, replaySeam{Name: s.name, Replay: s.replay, A: toFixture(pa.Video), B: toFixture(pb.Video)})
+	}
+	fh, err := os.Create("testdata/replay_seams.json.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := gzip.NewWriter(fh)
+	if err := json.NewEncoder(zw).Encode(out); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Close(); err != nil {
+		t.Fatal(err)
+	}
 }

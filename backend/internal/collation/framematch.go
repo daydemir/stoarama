@@ -26,7 +26,11 @@ func ExtractWindow(ctx context.Context, tools Tools, policy SeamPolicy, path str
 	} else {
 		args = append(args, "-i", path, "-t", window)
 	}
-	args = append(args, "-map", "0:v:0", "-an", "-vf", fmt.Sprintf("scale=%d:%d:flags=area,gblur=sigma=1,format=gray", w, h), "-f", "rawvideo", "-")
+	filter := fmt.Sprintf("scale=%d:%d:flags=area", w, h)
+	if policy.BlurSigma > 0 {
+		filter += fmt.Sprintf(",gblur=sigma=%g", policy.BlurSigma)
+	}
+	args = append(args, "-map", "0:v:0", "-an", "-vf", filter+",format=gray", "-f", "rawvideo", "-")
 	cmd := exec.CommandContext(ctx, tools.FFmpeg, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

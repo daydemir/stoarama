@@ -180,7 +180,7 @@ func (m HourManifest) Validate() error {
 			}
 			covered[id] = true
 		}
-		if !o.Verification.PayloadChainMatches || !o.Verification.VideoTimingMatches || !o.Verification.KeyframeDecodeOK {
+		if !o.Verification.PayloadChainMatches || !o.Verification.VideoTimingMatches || !o.Verification.EdgeDecodeOK {
 			return fmt.Errorf("output %d not verified", o.Part)
 		}
 	}
@@ -189,8 +189,9 @@ func (m HourManifest) Validate() error {
 	}
 	for _, s := range m.Seams {
 		pp, np := partOf[s.PrevClipID], partOf[s.NextClipID]
-		joined := pp != 0 && pp == np
-		if joined != (s.Decision == DecisionJoin) {
+		// Seams touching a clip excluded after the decision (duplicate capture)
+		// carry no part relation; every other seam must match the parts.
+		if pp != 0 && np != 0 && (pp == np) != (s.Decision == DecisionJoin) {
 			return fmt.Errorf("seam %d->%d decision differs from parts", s.PrevClipID, s.NextClipID)
 		}
 		if s.Decision == DecisionJoin && (s.Match == nil || s.Match.Verdict != MatchContinuous) {

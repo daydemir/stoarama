@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -106,6 +107,11 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 		}
 	}
 
+	stageStart := time.Now()
+	stage := func(name string) {
+		log.Printf("collation stage hour=%s stage=%s secs=%.1f", w.HourID, name, time.Since(stageStart).Seconds())
+		stageStart = time.Now()
+	}
 	// Download and probe every candidate.
 	locals := make([]LocalClip, len(clips))
 	var wg sync.WaitGroup
@@ -154,20 +160,49 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 	if err := errors.Join(errs...); err != nil {
 		return m, err
 	}
+	stage("download_probe")
 
-	// Seams between time-adjacent included clips.
+	// Each included clip gets exactly one seam to its predecessor: the earlier
+	// clip of the same job that ends where it starts (its capture chain; two
+	// recorders writing one job interleave in time), or else simply the
+	// time-previous clip. A clip can continue at most one successor.
 	idx := []int{}
 	for i := range disp {
 		if disp[i].Disposition == "included" {
 			idx = append(idx, i)
 		}
 	}
-	seams := make([]SeamDecision, max(len(idx)-1, 0))
+	type seamPair struct{ prev, next int }
+	pairs := make([]seamPair, 0, len(idx))
+	claimed := map[int]bool{}
+	for k := 1; k < len(idx); k++ {
+		next := idx[k]
+		prev := idx[k-1]
+		for j := k - 1; j >= 0; j-- {
+			cand := idx[j]
+			if claimed[cand] || locals[cand].Clip.JobID != locals[next].Clip.JobID {
+				continue
+			}
+			frame := math.Max(locals[cand].Probe.Media.FrameSeconds, locals[next].Probe.Media.FrameSeconds)
+			if math.Abs(locals[next].Clip.StartUTC.Sub(locals[cand].Clip.EndUTC).Seconds()) <= env.Policy.GapFrameSlack*frame {
+				prev = cand
+				break
+			}
+		}
+		claimed[prev] = true
+		pairs = append(pairs, seamPair{prev, next})
+	}
+	seams := make([]SeamDecision, len(pairs))
 	for s := range seams {
 		wg.Add(1)
 		go func(s int) {
 			defer wg.Done()
-			a, b := locals[idx[s]], locals[idx[s+1]]
+			a, b := locals[pairs[s].prev], locals[pairs[s].next]
+			if overlap, ok := ReplayOverlap(a.Probe, b.Probe); ok {
+				seams[s] = DecideSeam(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media, nil)
+				seams[s].Decision, seams[s].Reason, seams[s].OverlapSeconds = DecisionSplit, "packet_replay", overlap
+				return
+			}
 			var match *MatchEvidence
 			if MetadataGate(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media) == "" {
 				ev := matchSeam(ctx, env, a, b)
@@ -181,64 +216,176 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 		return m, err
 	}
 	m.Seams = seams
+	stage("seams")
 
-	// Group into parts.
+	// Group into parts: a joined seam extends its predecessor's part, anything
+	// else starts a new one.
+	partOf := map[int]int{}
 	var parts [][]int
-	for k, i := range idx {
-		if k == 0 || seams[k-1].Decision != DecisionJoin {
-			parts = append(parts, nil)
-		}
-		parts[len(parts)-1] = append(parts[len(parts)-1], i)
-		disp[i].Part = len(parts)
+	if len(idx) > 0 {
+		parts = append(parts, []int{idx[0]})
+		partOf[idx[0]] = 0
 	}
-	for i := range disp {
-		if disp[i].Disposition != "included" {
-			disp[i].Part = 0
+	for s, pr := range pairs {
+		if seams[s].Decision == DecisionJoin {
+			p := partOf[pr.prev]
+			parts[p] = append(parts[p], pr.next)
+			partOf[pr.next] = p
+			continue
 		}
+		parts = append(parts, []int{pr.next})
+		partOf[pr.next] = len(parts) - 1
 	}
-	m.Clips = disp
+	parts = dropDuplicateCaptures(parts, clips, disp)
 
-	outputs := make([]Output, len(parts))
+	// Build and verify every part. A part that fails verification is isolated:
+	// clips that do not strictly decode on their own are quarantined and the
+	// rest is rebuilt as separate pieces (never joined across a removed clip);
+	// a piece that still fails is split into single clips. The hour never fails
+	// because of one bad clip.
+	type builtPart struct {
+		members []int
+		built   Built
+	}
+	var mu sync.Mutex
+	var done []builtPart
 	buildErrs := make([]error, len(parts))
+	var build func(members []int) error
+	build = func(members []int) error {
+		local := make([]LocalClip, len(members))
+		for k, i := range members {
+			local[k] = locals[i]
+		}
+		if err := acquire(ctx, env.CPU); err != nil {
+			return err
+		}
+		out := filepath.Join(dir, fmt.Sprintf("out-%d.mp4", clips[members[0]].ClipID))
+		built, err := BuildPart(ctx, env.Tools, local, out)
+		<-env.CPU
+		if err == nil {
+			mu.Lock()
+			done = append(done, builtPart{members: members, built: built})
+			mu.Unlock()
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		_ = os.Remove(out)
+		log.Printf("collation isolate hour=%s first_clip=%d clips=%d err=%v", w.HourID, clips[members[0]].ClipID, len(members), err)
+		var pieces [][]int
+		var piece []int
+		for _, i := range members {
+			if err := acquire(ctx, env.CPU); err != nil {
+				return err
+			}
+			decodeErr := strictDecode(ctx, env.Tools, locals[i].Path)
+			<-env.CPU
+			if decodeErr != nil {
+				mu.Lock()
+				disp[i].Disposition, disp[i].Reason = "quarantined", "strict_decode_failed"
+				mu.Unlock()
+				if len(piece) > 0 {
+					pieces = append(pieces, piece)
+					piece = nil
+				}
+				continue
+			}
+			piece = append(piece, i)
+		}
+		if len(piece) > 0 {
+			pieces = append(pieces, piece)
+		}
+		if len(pieces) == 1 && len(pieces[0]) == len(members) {
+			// Every clip decodes alone: the join itself is the problem.
+			if len(members) == 1 {
+				mu.Lock()
+				disp[members[0]].Disposition, disp[members[0]].Reason = "quarantined", "build_verify_failed"
+				mu.Unlock()
+				return nil
+			}
+			pieces = nil
+			for _, i := range members {
+				pieces = append(pieces, []int{i})
+			}
+		}
+		for _, pc := range pieces {
+			if err := build(pc); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for p := range parts {
 		wg.Add(1)
 		go func(p int) {
 			defer wg.Done()
-			buildErrs[p] = func() error {
-				members := make([]LocalClip, len(parts[p]))
-				ids := make([]int64, len(parts[p]))
-				for k, i := range parts[p] {
-					members[k], ids[k] = locals[i], clips[i].ClipID
-				}
-				if err := acquire(ctx, env.CPU); err != nil {
-					return err
-				}
-				built, err := BuildPart(ctx, env.Tools, members, partPath(dir, p+1))
-				<-env.CPU
-				if err != nil {
-					return fmt.Errorf("part %d: %w", p+1, err)
-				}
-				start, end := members[0].Clip.StartUTC, members[len(members)-1].Clip.EndUTC
-				rel, err := DeliveryPath(w, start, end, p+1, len(parts))
-				if err != nil {
-					return fmt.Errorf("part %d delivery path: %w", p+1, err)
-				}
-				key := ObjectKey(w.BatchID, built.SHA256)
-				if err := env.Store.PublishVerified(ctx, key, "video/mp4", built.Path, built.SizeBytes, built.SHA256); err != nil {
-					return fmt.Errorf("part %d publish: %w", p+1, err)
-				}
-				_ = os.Remove(built.Path)
-				outputs[p] = Output{Part: p + 1, Parts: len(parts), ObjectKey: key, NASRelativePath: rel, SizeBytes: built.SizeBytes,
-					SHA256: built.SHA256, StartUTC: start, EndUTC: end, SourceClipIDs: ids, Verification: built.Verification, R2VerifiedAt: env.Now().UTC()}
-				return nil
-			}()
+			buildErrs[p] = build(parts[p])
 		}(p)
 	}
 	wg.Wait()
 	if err := errors.Join(buildErrs...); err != nil {
 		return m, err
 	}
+	sort.Slice(done, func(i, j int) bool {
+		return clips[done[i].members[0]].StartUTC.Before(clips[done[j].members[0]].StartUTC) ||
+			(clips[done[i].members[0]].StartUTC.Equal(clips[done[j].members[0]].StartUTC) && clips[done[i].members[0]].ClipID < clips[done[j].members[0]].ClipID)
+	})
+	// Seams whose clips no longer share a part after isolation become splits.
+	finalPart := map[int64]int{}
+	for p, bp := range done {
+		for _, i := range bp.members {
+			finalPart[clips[i].ClipID] = p + 1
+		}
+	}
+	for k := range seams {
+		if seams[k].Decision == DecisionJoin && finalPart[seams[k].PrevClipID] != finalPart[seams[k].NextClipID] {
+			seams[k].Decision, seams[k].Reason = DecisionSplit, "isolated_after_verify_failure"
+		}
+	}
+	m.Seams = seams
+	for i := range disp {
+		disp[i].Part = 0
+		if disp[i].Disposition == "included" {
+			disp[i].Part = finalPart[clips[i].ClipID]
+		}
+	}
+	m.Clips = disp
+
+	outputs := make([]Output, len(done))
+	pubErrs := make([]error, len(done))
+	for p := range done {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			pubErrs[p] = func() error {
+				bp := done[p]
+				ids := make([]int64, len(bp.members))
+				for k, i := range bp.members {
+					ids[k] = clips[i].ClipID
+				}
+				start, end := clips[bp.members[0]].StartUTC, clips[bp.members[len(bp.members)-1]].EndUTC
+				rel, err := DeliveryPath(w, start, end, p+1, len(done))
+				if err != nil {
+					return fmt.Errorf("part %d delivery path: %w", p+1, err)
+				}
+				key := ObjectKey(w.BatchID, bp.built.SHA256)
+				if err := env.Store.PublishVerified(ctx, key, "video/mp4", bp.built.Path, bp.built.SizeBytes, bp.built.SHA256); err != nil {
+					return fmt.Errorf("part %d publish: %w", p+1, err)
+				}
+				_ = os.Remove(bp.built.Path)
+				outputs[p] = Output{Part: p + 1, Parts: len(done), ObjectKey: key, NASRelativePath: rel, SizeBytes: bp.built.SizeBytes,
+					SHA256: bp.built.SHA256, StartUTC: start, EndUTC: end, SourceClipIDs: ids, Verification: bp.built.Verification, R2VerifiedAt: env.Now().UTC()}
+				return nil
+			}()
+		}(p)
+	}
+	wg.Wait()
+	if err := errors.Join(pubErrs...); err != nil {
+		return m, err
+	}
 	m.Outputs = outputs
+	stage("build_verify_publish")
 	switch {
 	case len(outputs) > 0:
 		m.Status = StatusCollated
@@ -261,19 +408,76 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 	return m, nil
 }
 
+// matchSeam proves continuity on a short window first (cheap); only a seam
+// that does not pass there is re-examined on the full window, which is also
+// what measures longer overlaps. A join always passes the full rule on the
+// window that produced it.
 func matchSeam(ctx context.Context, env Env, a, b LocalClip) MatchEvidence {
-	if err := acquire(ctx, env.CPU); err != nil {
-		return MatchEvidence{Verdict: MatchDecodeFail, DecodeError: err.Error()}
+	frame := math.Max(a.Probe.Media.FrameSeconds, b.Probe.Media.FrameSeconds)
+	var ev MatchEvidence
+	for _, window := range env.Policy.windows() {
+		policy := env.Policy
+		policy.WindowSeconds = window
+		if err := acquire(ctx, env.CPU); err != nil {
+			return MatchEvidence{Verdict: MatchDecodeFail, DecodeError: err.Error()}
+		}
+		tail, err := ExtractWindow(ctx, env.Tools, policy, a.Path, true)
+		var head []Frame
+		if err == nil {
+			head, err = ExtractWindow(ctx, env.Tools, policy, b.Path, false)
+		}
+		<-env.CPU
+		if err != nil {
+			return MatchEvidence{Verdict: MatchDecodeFail, DecodeError: trimStderr(err.Error()), WindowSeconds: window}
+		}
+		ev = EvaluateFrames(policy, tail, head, a.Probe.Video.WindowKeys(len(tail), true), b.Probe.Video.WindowKeys(len(head), false), frame)
+		ev.WindowSeconds = window
+		if ev.Verdict == MatchContinuous {
+			return ev
+		}
 	}
-	tail, err := ExtractWindow(ctx, env.Tools, env.Policy, a.Path, true)
-	var head []Frame
-	if err == nil {
-		head, err = ExtractWindow(ctx, env.Tools, env.Policy, b.Path, false)
+	return ev
+}
+
+// dropDuplicateCaptures keeps one capture where two chains of one recording
+// cover the same time (two recorders on one job): a part that overlaps longer
+// kept parts for more than half of its own span is dropped as a duplicate
+// capture. Short overlaps (a rewound restart) keep both parts.
+func dropDuplicateCaptures(parts [][]int, clips []Clip, disp []ClipDisposition) [][]int {
+	span := func(p []int) (time.Time, time.Time) { return clips[p[0]].StartUTC, clips[p[len(p)-1]].EndUTC }
+	order := make([]int, len(parts))
+	for i := range order {
+		order[i] = i
 	}
-	<-env.CPU
-	if err != nil {
-		return MatchEvidence{Verdict: MatchDecodeFail, DecodeError: trimStderr(err.Error())}
+	sort.SliceStable(order, func(i, j int) bool {
+		si, ei := span(parts[order[i]])
+		sj, ej := span(parts[order[j]])
+		return ei.Sub(si) > ej.Sub(sj)
+	})
+	var kept [][]int
+	for _, pi := range order {
+		s, e := span(parts[pi])
+		var overlap time.Duration
+		for _, k := range kept {
+			ks, ke := span(k)
+			lo, hi := s, e
+			if ks.After(lo) {
+				lo = ks
+			}
+			if ke.Before(hi) {
+				hi = ke
+			}
+			if hi.After(lo) {
+				overlap += hi.Sub(lo)
+			}
+		}
+		if overlap*2 > e.Sub(s) {
+			for _, i := range parts[pi] {
+				disp[i].Disposition, disp[i].Reason = "duplicate", "duplicate_capture_chain"
+			}
+			continue
+		}
+		kept = append(kept, parts[pi])
 	}
-	return EvaluateFrames(env.Policy, tail, head, a.Probe.Video.WindowKeys(len(tail), true), b.Probe.Video.WindowKeys(len(head), false),
-		math.Max(a.Probe.Media.FrameSeconds, b.Probe.Media.FrameSeconds))
+	return kept
 }
