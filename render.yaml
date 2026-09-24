@@ -451,6 +451,43 @@ services:
       - key: EMAIL_RESEND_API_KEY
         sync: false
 
+  # Daily NAS-verified R2 purge of raw 1-minute clips (stoaramactl
+  # nas-verified-purge). Deletes an R2 object only when the NAS holds the exact
+  # recorded bytes and every code-level protection passes (joined snapshots and
+  # scopes, qualification and September-cohort windows, Good+ candidate
+  # recordings, the unplayable size signature, collated-only delivery, 7-day
+  # grace, pending restores). DISABLED: --cron is a no-op until
+  # NAS_VERIFIED_PURGE_ENABLED is "true". To enable: set the R2_* secrets on this
+  # cron in the dashboard, then change the value below in a reviewed PR.
+  - type: cron
+    name: stoarama-nas-verified-purge
+    env: go
+    rootDir: backend
+    plan: starter
+    schedule: "45 5 * * *"
+    autoDeployTrigger: commit
+    buildCommand: go build -o bin/stoaramactl ./cmd/stoaramactl
+    startCommand: ./bin/stoaramactl nas-verified-purge run --cron --apply --log none
+    envVars:
+      - key: NAS_VERIFIED_PURGE_ENABLED
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: stoarama-db
+          property: connectionString
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_REGION
+        value: auto
+      - key: APP_BASE_URL
+        value: https://stoarama.com
+
   # Minute-level relay connectivity monitor. The CLI persists one state machine
   # per active relay and emails operators only on online/offline transitions;
   # the initial observation is a silent baseline.

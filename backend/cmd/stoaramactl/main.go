@@ -239,7 +239,7 @@ func usage() {
 	  stoaramactl do-spend check [--dry-run]
 	  stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L
-	  stoaramactl nas-verified-purge run [--apply --grace 168h --head sample|all --exclude-clip-ids-file F --exclude-recording-ids L --after-clip-id N --until-clip-id N --limit N --rate 200 --log PATH --json]
+	  stoaramactl nas-verified-purge run [--apply --cron --grace 168h --head sample|all --exclude-clip-ids-file F --exclude-recording-ids L --after-clip-id N --until-clip-id N --limit N --rate 200 --log PATH --json]
 `)
 }
 

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/joinedrecording"
+	"github.com/daydemir/stoarama/backend/internal/qualitygrade"
 	"github.com/daydemir/stoarama/backend/internal/r2"
 )
 
@@ -55,6 +58,10 @@ const (
 	nasPurgeMaxWorkers  = 32
 	nasPurgeShaTimeout  = 10 * time.Minute
 	nasPurgeFinishLimit = 2 * time.Minute
+	// nasPurgeGradeDays is the quality-grade history that decides candidates.
+	nasPurgeGradeDays = 60
+	// nasPurgeEnabledEnv gates --cron runs; anything but "true" is a no-op.
+	nasPurgeEnabledEnv = "NAS_VERIFIED_PURGE_ENABLED"
 )
 
 type nasPurgeOptions struct {
@@ -66,6 +73,8 @@ type nasPurgeOptions struct {
 	headMode     string
 	excludeClips map[int64]bool
 	excludeRecs  map[int64]bool
+	protections  nasPurgeProtections
+	cron         bool
 	grace        time.Duration
 	nasMaxAge    time.Duration
 	apply        bool
@@ -111,6 +120,7 @@ func parseNASPurgeArgs(args []string) (nasPurgeOptions, error) {
 	fs.StringVar(&opts.logPath, "log", "", "JSONL log path (default ~/.stoarama/tmp/nas-verified-purge-YYYYMMDD.log)")
 	fs.BoolVar(&opts.logSkips, "log-skips", false, "also log every skipped clip")
 	fs.BoolVar(&opts.asJSON, "json", false, "print the summary as JSON")
+	fs.BoolVar(&opts.cron, "cron", false, "scheduled run: a no-op unless "+nasPurgeEnabledEnv+"=true")
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
@@ -207,12 +217,18 @@ const nasPurgeFactsSQL = `
   NOT EXISTS(SELECT 1 FROM recording_qualification_windows w
       JOIN recording_qualification_runs run ON run.id=w.run_id AND run.status<>'canceled'
       WHERE w.recording_id=c.recording_id AND w.window_start_at<c.clip_end_at AND w.window_end_at>c.clip_start_at) AS no_qualification_window,
+  (c.size_bytes % 262144 <> 48) AS playable_signature,
+  (COALESCE(rec.nas_delivery_mode,'raw')='raw') AS raw_delivery,
+  NOT (c.recording_id = ANY({PROT_RECS}::bigint[])) AS not_candidate_recording,
+  NOT EXISTS(SELECT 1 FROM unnest({COH_RECS}::bigint[], {COH_FROM}::timestamptz[], {COH_TO}::timestamptz[]) AS w(rid, wfrom, wto)
+      WHERE w.rid=c.recording_id AND w.wfrom<c.clip_end_at AND w.wto>c.clip_start_at) AS no_cohort_window,
   NOT EXISTS(SELECT 1 FROM nas_restore_requests q WHERE q.clip_id=c.id
       AND (q.state IN ('pending','leased') OR (q.target='original' AND q.state='verified' AND q.completed_at>now()-interval '30 days'))) AS no_restore`
 
 var nasPurgeFactNames = []string{
 	"identity_ok", "managed_ok", "nas_ok", "aged", "schedule_ok", "no_snapshot", "no_scope",
 	"no_joined_window", "no_qualification_window", "no_restore",
+	"playable_signature", "raw_delivery", "not_candidate_recording", "no_cohort_window",
 }
 
 // nasPurgeFactReasons maps a failing fact to its skip reason, in check order.
@@ -220,32 +236,118 @@ var nasPurgeFactReasons = map[string]string{
 	"identity_ok": "clip_identity_incomplete", "managed_ok": "not_managed_storage", "no_snapshot": "joined_snapshot",
 	"no_scope": "joined_scope", "no_joined_window": "joined_window", "no_qualification_window": "qualification_window",
 	"aged": "within_grace", "schedule_ok": "active_recording_recent", "no_restore": "restore_recent", "nas_ok": "nas_unverified",
+	"playable_signature": "unplayable_signature", "raw_delivery": "collated_only_delivery",
+	"not_candidate_recording": "candidate_recording", "no_cohort_window": "cohort_window",
 }
 
-var nasPurgeCandidatesSQL = `
-SELECT c.id, c.recording_id, c.size_bytes, lower(COALESCE(c.sha256,'')), COALESCE(c.object_key,''), ` + nasPurgeFactsSQL + `
+var nasPurgeCandidatesSQL = nasPurgeBindProtections(11, `
+SELECT c.id, c.recording_id, c.size_bytes, lower(COALESCE(c.sha256,'')), COALESCE(c.object_key,''), `+nasPurgeFactsSQL+`
 FROM recording_clips c
 JOIN recordings rec ON rec.id=c.recording_id AND rec.delivery='nas_pull'
 JOIN connections conn ON conn.id=$1 AND conn.account_id=rec.account_id AND conn.kind='nas_pull'
-LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id` + nasPurgeNASLateral + `
+LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id`+nasPurgeNASLateral+`
 WHERE c.purged_at IS NULL AND c.id>$5
   AND ($6::bigint=0 OR c.recording_id=$6)
   AND ($7::timestamptz IS NULL OR c.clip_start_at>=$7) AND ($8::timestamptz IS NULL OR c.clip_start_at<$8)
   AND ($10::bigint=0 OR c.id<=$10)
 ORDER BY c.id
-LIMIT $9`
+LIMIT $9`)
 
-var nasPurgeLockSQL = `
+var nasPurgeLockSQL = nasPurgeBindProtections(6, `
 SELECT c.id, c.size_bytes, lower(COALESCE(c.sha256,'')), COALESCE(c.object_key,'')
-FROM (SELECT c.id, c.size_bytes, c.sha256, c.object_key, ` + nasPurgeFactsSQL + `
+FROM (SELECT c.id, c.size_bytes, c.sha256, c.object_key, `+nasPurgeFactsSQL+`
       FROM recording_clips c
       JOIN recordings rec ON rec.id=c.recording_id AND rec.delivery='nas_pull'
       JOIN connections conn ON conn.id=$1 AND conn.account_id=rec.account_id AND conn.kind='nas_pull'
-      LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id` + nasPurgeNASLateral + `
+      LEFT JOIN storage_destinations sd ON sd.id=c.storage_destination_id`+nasPurgeNASLateral+`
       WHERE c.id=ANY($5) AND c.purged_at IS NULL) f
 JOIN recording_clips c ON c.id=f.id
-WHERE f.` + strings.Join(nasPurgeFactNames, " AND f.") + `
-FOR UPDATE OF c`
+WHERE f.`+strings.Join(nasPurgeFactNames, " AND f.")+`
+FOR UPDATE OF c`)
+
+// nasPurgeBindProtections numbers the protection placeholders from first.
+func nasPurgeBindProtections(first int, sql string) string {
+	for i, token := range []string{"{PROT_RECS}", "{COH_RECS}", "{COH_FROM}", "{COH_TO}"} {
+		sql = strings.ReplaceAll(sql, token, fmt.Sprintf("$%d", first+i))
+	}
+	return sql
+}
+
+// nasPurgeProtections are the code-derived exclusions evaluated in SQL by
+// both the candidate scan and the locked re-check:
+//   - Recordings: every recording with Good+ progress in the quality-grade
+//     definition (completed, or a current run of at least one day) plus
+//     --exclude-recording-ids. Their raw clips feed collation-v2 recollation.
+//   - Cohort windows: each approved September-cohort recording's 14 local
+//     days, padded one day on each side (UTC), the collation-v2 backfill scope
+//     not covered by qualification windows.
+type nasPurgeProtections struct {
+	Recordings []int64     `json:"protected_recordings"`
+	CohortRecs []int64     `json:"cohort_recordings"`
+	CohortFrom []time.Time `json:"cohort_from"`
+	CohortTo   []time.Time `json:"cohort_to"`
+}
+
+func (p nasPurgeProtections) args() []any {
+	recs := p.Recordings
+	if recs == nil {
+		recs = []int64{}
+	}
+	cr, cf, ct := p.CohortRecs, p.CohortFrom, p.CohortTo
+	if cr == nil {
+		cr, cf, ct = []int64{}, []time.Time{}, []time.Time{}
+	}
+	return []any{recs, cr, cf, ct}
+}
+
+func nasPurgeCohortWindows() (recs []int64, from, to []time.Time, err error) {
+	cohort := joinedrecording.CohortForBatch(joinedrecording.SeptemberBatchID)
+	if len(cohort.FirstDates) != len(cohort.RecordingIDs) {
+		return nil, nil, nil, errors.New("september cohort first dates do not match its recordings")
+	}
+	for i, id := range cohort.RecordingIDs {
+		first, err := time.Parse("2006-01-02", cohort.FirstDates[i])
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("cohort first date: %w", err)
+		}
+		recs = append(recs, id)
+		from = append(from, first.AddDate(0, 0, -1))
+		to = append(to, first.AddDate(0, 0, qualitygrade.RunLength+1))
+	}
+	return recs, from, to, nil
+}
+
+// loadNASPurgeProtections fails closed: any error aborts the run.
+func loadNASPurgeProtections(ctx context.Context, pool *pgxpool.Pool, connectionID int64, extra map[int64]bool, now time.Time) (nasPurgeProtections, error) {
+	var accountID int64
+	if err := pool.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1`, connectionID).Scan(&accountID); err != nil {
+		return nasPurgeProtections{}, fmt.Errorf("load connection account: %w", err)
+	}
+	recs, err := qualitygrade.Load(ctx, pool, accountID, now, nasPurgeGradeDays)
+	if err != nil {
+		return nasPurgeProtections{}, fmt.Errorf("load quality grades: %w", err)
+	}
+	set := map[int64]bool{}
+	for id := range extra {
+		set[id] = true
+	}
+	for _, r := range recs {
+		for _, t := range r.Tiers {
+			if t.Tier == qualitygrade.TierGood && (t.Completed || t.RunDays > 0) {
+				set[r.RecordingID] = true
+			}
+		}
+	}
+	p := nasPurgeProtections{}
+	for id := range set {
+		p.Recordings = append(p.Recordings, id)
+	}
+	sort.Slice(p.Recordings, func(i, j int) bool { return p.Recordings[i] < p.Recordings[j] })
+	if p.CohortRecs, p.CohortFrom, p.CohortTo, err = nasPurgeCohortWindows(); err != nil {
+		return nasPurgeProtections{}, err
+	}
+	return p, nil
+}
 
 type nasPurgeCandidate struct {
 	ClipID      int64
@@ -257,8 +359,9 @@ type nasPurgeCandidate struct {
 }
 
 func (c nasPurgeCandidate) skipReason() string {
-	for _, name := range []string{"identity_ok", "managed_ok", "no_snapshot", "no_scope", "no_joined_window",
-		"no_qualification_window", "aged", "schedule_ok", "no_restore", "nas_ok"} {
+	for _, name := range []string{"identity_ok", "managed_ok", "raw_delivery", "no_snapshot", "no_scope", "no_joined_window",
+		"no_qualification_window", "no_cohort_window", "not_candidate_recording", "playable_signature",
+		"aged", "schedule_ok", "no_restore", "nas_ok"} {
 		if !c.Facts[name] {
 			return nasPurgeFactReasons[name]
 		}
@@ -267,24 +370,25 @@ func (c nasPurgeCandidate) skipReason() string {
 }
 
 type nasPurgeSummary struct {
-	Mode            string           `json:"mode"`
-	ConnectionID    int64            `json:"connection_id"`
-	Scanned         int64            `json:"scanned"`
-	Eligible        int64            `json:"eligible"`
-	EligibleBytes   int64            `json:"eligible_bytes"`
-	Purged          int64            `json:"purged"`
-	PurgedBytes     int64            `json:"purged_bytes"`
-	SourceAbsent    int64            `json:"source_already_absent"`
-	ShaChecks       int64            `json:"sha_checks"`
-	DeleteFailed    int64            `json:"delete_failed"`
-	Skipped         map[string]int64 `json:"skipped"`
-	Errors          int64            `json:"errors"`
-	LastClipID      int64            `json:"last_clip_id"`
-	LimitReached    bool             `json:"limit_reached"`
-	Interrupted     bool             `json:"interrupted"`
-	ElapsedSec      float64          `json:"elapsed_sec"`
-	LogPath         string           `json:"log_path"`
-	MonthlySavedUSD float64          `json:"monthly_saved_usd"`
+	Mode            string              `json:"mode"`
+	ConnectionID    int64               `json:"connection_id"`
+	Protections     nasPurgeProtections `json:"protections"`
+	Scanned         int64               `json:"scanned"`
+	Eligible        int64               `json:"eligible"`
+	EligibleBytes   int64               `json:"eligible_bytes"`
+	Purged          int64               `json:"purged"`
+	PurgedBytes     int64               `json:"purged_bytes"`
+	SourceAbsent    int64               `json:"source_already_absent"`
+	ShaChecks       int64               `json:"sha_checks"`
+	DeleteFailed    int64               `json:"delete_failed"`
+	Skipped         map[string]int64    `json:"skipped"`
+	Errors          int64               `json:"errors"`
+	LastClipID      int64               `json:"last_clip_id"`
+	LimitReached    bool                `json:"limit_reached"`
+	Interrupted     bool                `json:"interrupted"`
+	ElapsedSec      float64             `json:"elapsed_sec"`
+	LogPath         string              `json:"log_path"`
+	MonthlySavedUSD float64             `json:"monthly_saved_usd"`
 }
 
 type nasPurgeLogLine struct {
@@ -354,8 +458,9 @@ func loadNASPurgeCandidates(ctx context.Context, pool *pgxpool.Pool, bucket stri
 	if !opts.to.IsZero() {
 		to = opts.to
 	}
-	rows, err := pool.Query(ctx, nasPurgeCandidatesSQL, opts.connectionID, bucket, int64(opts.grace/time.Second),
-		int64(opts.nasMaxAge/time.Second), after, opts.recordingID, from, to, opts.pageSize, opts.untilClipID)
+	args := append([]any{opts.connectionID, bucket, int64(opts.grace / time.Second),
+		int64(opts.nasMaxAge / time.Second), after, opts.recordingID, from, to, opts.pageSize, opts.untilClipID}, opts.protections.args()...)
+	rows, err := pool.Query(ctx, nasPurgeCandidatesSQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("load purge candidates: %w", err)
 	}
@@ -411,7 +516,7 @@ func resolveNASPurgeConnection(ctx context.Context, pool *pgxpool.Pool, id int64
 
 func runNASVerifiedPurgePass(ctx context.Context, pool *pgxpool.Pool, store nasPurgeStore, opts nasPurgeOptions, logw io.Writer) (summary nasPurgeSummary, err error) {
 	started := time.Now()
-	summary = nasPurgeSummary{Mode: "dry_run", ConnectionID: opts.connectionID, Skipped: map[string]int64{}, LogPath: opts.logPath, LastClipID: opts.afterClipID}
+	summary = nasPurgeSummary{Mode: "dry_run", ConnectionID: opts.connectionID, Protections: opts.protections, Skipped: map[string]int64{}, LogPath: opts.logPath, LastClipID: opts.afterClipID}
 	if opts.apply {
 		summary.Mode = "apply"
 	}
@@ -716,8 +821,9 @@ func (r *nasPurgeRunner) purgeBatch(ctx context.Context, batch []nasPurgeCandida
 		ids[i] = c.ClipID
 		byID[c.ClipID] = c
 	}
-	rows, err := tx.Query(ctx, nasPurgeLockSQL, r.opts.connectionID, r.store.Bucket(), int64(r.opts.grace/time.Second),
-		int64(r.opts.nasMaxAge/time.Second), ids)
+	lockArgs := append([]any{r.opts.connectionID, r.store.Bucket(), int64(r.opts.grace / time.Second),
+		int64(r.opts.nasMaxAge / time.Second), ids}, r.opts.protections.args()...)
+	rows, err := tx.Query(ctx, nasPurgeLockSQL, lockArgs...)
 	if err != nil {
 		return res, err
 	}
@@ -838,6 +944,10 @@ func runNASVerifiedPurge(ctx context.Context, cfg config.Config, args []string) 
 	if err != nil {
 		log.Fatalf("%v\n%s", err, usage)
 	}
+	if opts.cron && os.Getenv(nasPurgeEnabledEnv) != "true" {
+		fmt.Printf("nas-verified-purge: disabled (%s is not true); nothing done\n", nasPurgeEnabledEnv)
+		return
+	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
@@ -858,13 +968,20 @@ func runNASVerifiedPurge(ctx context.Context, cfg config.Config, args []string) 
 	if opts.connectionID, err = resolveNASPurgeConnection(ctx, pool, opts.connectionID); err != nil {
 		log.Fatal(err)
 	}
-	store := mustArchiveR2Client(ctx, cfg)
-	logFile, err := openJoinedPurgeLog(opts.logPath)
-	if err != nil {
-		log.Fatal(err)
+	if opts.protections, err = loadNASPurgeProtections(ctx, pool, opts.connectionID, opts.excludeRecs, time.Now().UTC()); err != nil {
+		log.Fatalf("nas-verified-purge: %v", err)
 	}
-	defer logFile.Close()
-	summary, err := runNASVerifiedPurgePass(ctx, pool, store, opts, logFile)
+	store := mustArchiveR2Client(ctx, cfg)
+	var logw io.Writer
+	if opts.logPath != "none" {
+		logFile, err := openJoinedPurgeLog(opts.logPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer logFile.Close()
+		logw = logFile
+	}
+	summary, err := runNASVerifiedPurgePass(ctx, pool, store, opts, logw)
 	if opts.asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
