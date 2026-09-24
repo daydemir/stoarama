@@ -490,6 +490,8 @@ func (s *Server) router() http.Handler {
 			admin.Post("/recording/joined/batches/final-freeze", s.handleAdminJoinedFinalFreeze)
 			admin.Post("/recording/joined/batches/index/seal", s.handleAdminJoinedSealBatchIndex)
 			admin.Post("/recordings/{id}/repair-source", s.handleAdminRecordingSourceRepair)
+			admin.Post("/recordings/nas-delivery-mode", s.handleAdminRecordingNASDeliveryMode)
+			admin.Get("/recordings/nas-delivery-mode", s.handleAdminRecordingNASDeliveryStatus)
 			admin.Post("/pipelines/sync", s.handlePipelinesSync)
 			admin.Post("/pipeline-versions/sync", s.handlePipelineVersionsSync)
 			admin.Post("/pipeline-runs", s.handlePipelineRunsCreate)

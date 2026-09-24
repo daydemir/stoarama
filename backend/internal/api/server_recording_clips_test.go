@@ -1537,6 +1537,7 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			access_key_id TEXT NOT NULL,
 			secret_access_key_enc BYTEA NOT NULL
 		)`,
+		testClipStorageBillingContractsDDL,
 		`CREATE TABLE recording_upload_intents (
 			id UUID PRIMARY KEY,
 			recording_id BIGINT NOT NULL,

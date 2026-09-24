@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"io"
 	"log"
 	"net/http"
@@ -2089,6 +2090,9 @@ const accountClipsCursorSQL = `
 	  -- Retain zero-byte rows for audit, but never let one poison the forward
 	  -- cursor page and block every later valid clip.
 	  AND c.size_bytes > 0
+	  -- Clips of collated_only recordings stay in R2 until collated; the NAS
+	  -- receives them only as joined hours.
+	  AND ` + nasdelivery.NotHeldC + `
 	  AND c.created_at < now() - ` + accountClipsCommitWatermark + `
 	  AND c.id > $2
 	ORDER BY c.id ASC
