@@ -97,7 +97,7 @@ UPLOAD_PROBE_REPORT_BACKOFF_SEC = 10
 # NAS -> R2 restore: the server queues clips and signs one create-only PUT per
 # clip; the client proves its local bytes first and the server re-hashes the
 # uploaded object before a restore counts.
-DEFAULT_RESTORE_WORKERS = 8
+DEFAULT_RESTORE_WORKERS = 12
 MAX_RESTORE_WORKERS = 16
 RESTORE_MAX_LEASE = 64
 RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024 - 5 * 1024 * 1024
@@ -5754,16 +5754,30 @@ def report_restore(cfg, task_id, result, sleep=time.sleep):
         sleep(RESTORE_REPORT_BACKOFF_SEC * attempt)
 
 
-def restore_once(cfg):
-    """Lease one batch of restores, run it in parallel, report each. Returns the wait."""
+def restore_task_and_report(cfg, task):
+    """Run one restore and report it from the same worker thread, so the
+    server's full re-hash of one object overlaps the other uploads."""
+    result = run_restore_task(cfg, task)
+    try:
+        state = (report_restore(cfg, task["task_id"], result) or {}).get("state", "unknown")
+    except Exception as exc:
+        state = "unreported"
+        log("WARN", "restore %d report failed: %s" % (task["task_id"], exc))
+    if state != "verified":
+        log("WARN", "restore %d clip=%d outcome=%s state=%s %s" % (
+            task["task_id"], task["clip_id"], result["outcome"], state, result["error"]))
+    return result, state
+
+
+def lease_restores(cfg, max_tasks):
+    """Lease up to max_tasks restores; returns (valid tasks, server retry_after)."""
     lease = request_json(
         cfg, "POST", "/account/connections/nas-restore/lease",
-        body={"client_version": CLIENT_VERSION, "max_tasks": min(RESTORE_MAX_LEASE, cfg.restore_workers)},
+        body={"client_version": CLIENT_VERSION, "max_tasks": max(1, min(RESTORE_MAX_LEASE, max_tasks))},
         timeout=HTTP_TIMEOUT_SEC,
     )
     if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
         raise RuntimeError("invalid restore lease response")
-    retry_after = lease.get("retry_after_sec", RESTORE_ERROR_WAIT_SEC)
     tasks = []
     for raw in lease.get("tasks") or []:
         try:
@@ -5779,30 +5793,49 @@ def restore_once(cfg):
                     report_restore(cfg, task_id, bad)
                 except Exception as report_exc:
                     log("WARN", "restore %d report failed: %s" % (task_id, report_exc))
-    if not tasks:
-        return retry_after
+    return tasks, lease.get("retry_after_sec", RESTORE_ERROR_WAIT_SEC)
+
+
+def restore_once(cfg, stop_event=None):
+    """Keep restore_workers restores in flight until the queue is empty.
+
+    A task is leased only when a worker is free to start it, so no lease or
+    PUT capability ages in a local queue. Returns the server's idle wait.
+    """
+    in_flight = set()
+    retry_after = RESTORE_ERROR_WAIT_SEC
+    exhausted = False
     started = time.monotonic()
     counts = {}
     uploaded_bytes = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.restore_workers) as pool:
-        futures = {pool.submit(run_restore_task, cfg, task): task for task in tasks}
-        for future in concurrent.futures.as_completed(futures):
-            task = futures[future]
-            result = future.result()
-            uploaded_bytes += result["bytes_uploaded"]
-            try:
-                state = (report_restore(cfg, task["task_id"], result) or {}).get("state", "unknown")
-            except Exception as exc:
-                state = "unreported"
-                log("WARN", "restore %d report failed: %s" % (task["task_id"], exc))
-            counts[state] = counts.get(state, 0) + 1
-            if state != "verified":
-                log("WARN", "restore %d clip=%d outcome=%s state=%s %s" % (
-                    task["task_id"], task["clip_id"], result["outcome"], state, result["error"]))
-    seconds = max(time.monotonic() - started, 0.001)
-    log("INFO", "nas restore batch tasks=%d bytes=%d seconds=%.1f mbps=%.1f %s" % (
-        len(tasks), uploaded_bytes, seconds, uploaded_bytes * 8 / seconds / 1e6,
-        " ".join("%s=%d" % item for item in sorted(counts.items()))))
+        while True:
+            free = cfg.restore_workers - len(in_flight)
+            if free > 0 and not exhausted and not (stop_event is not None and stop_event.is_set()):
+                try:
+                    tasks, retry_after = lease_restores(cfg, free)
+                except Exception as exc:
+                    if not in_flight and not counts:
+                        raise
+                    log("WARN", "nas restore lease failed: %s" % exc)
+                    tasks, retry_after = [], RESTORE_ERROR_WAIT_SEC
+                if not tasks:
+                    exhausted = True
+                for task in tasks:
+                    in_flight.add(pool.submit(restore_task_and_report, cfg, task))
+            if not in_flight:
+                break
+            done, _ = concurrent.futures.wait(in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                in_flight.discard(future)
+                result, state = future.result()
+                uploaded_bytes += result["bytes_uploaded"]
+                counts[state] = counts.get(state, 0) + 1
+    if counts:
+        seconds = max(time.monotonic() - started, 0.001)
+        log("INFO", "nas restore run tasks=%d bytes=%d seconds=%.1f mbps=%.1f %s" % (
+            sum(counts.values()), uploaded_bytes, seconds, uploaded_bytes * 8 / seconds / 1e6,
+            " ".join("%s=%d" % item for item in sorted(counts.items()))))
     return retry_after
 
 
@@ -5819,7 +5852,7 @@ def restore_loop(cfg, stop_event, rng=random):
     wait = rng.uniform(*RESTORE_STARTUP_DELAY_SEC)
     while not stop_event.wait(wait):
         try:
-            wait = restore_wait(restore_once(cfg))
+            wait = restore_wait(restore_once(cfg, stop_event))
         except Exception as exc:
             log("WARN", "nas restore deferred: %s" % exc)
             wait = RESTORE_ERROR_WAIT_SEC

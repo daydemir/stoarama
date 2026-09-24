@@ -3717,10 +3717,14 @@ class RestoreTests(unittest.TestCase):
     def test_restore_once_leases_runs_and_reports_each_task(self):
         second = self.task(task_id=8, attempt=2)
         calls = []
+        leased = []
 
         def fake_request(cfg, method, path, body=None, timeout=None, **_kw):
             calls.append((method, path, body))
             if path.endswith("/lease"):
+                leased.append(body["max_tasks"])
+                if len(leased) > 1:
+                    return {"retry_after_sec": 120, "tasks": []}
                 return {"retry_after_sec": 1, "tasks": [self.task(), second, {"task_id": 9, "attempt": 1, "relative_path": "../x"}]}
             return {"ok": True, "state": "verified"}
 
@@ -3728,10 +3732,11 @@ class RestoreTests(unittest.TestCase):
                    8: {"attempt": 2, "outcome": "exists", "error": "", "bytes_uploaded": 0, "duration_ms": 1}}
         with mock.patch.object(pull, "request_json", side_effect=fake_request), \
                 mock.patch.object(pull, "run_restore_task", side_effect=lambda cfg, task: results[task["task_id"]]):
-            self.assertEqual(pull.restore_once(self.cfg), 1)
-        lease = calls[0]
-        self.assertEqual((lease[1], lease[2]["max_tasks"]), ("/account/connections/nas-restore/lease", 2))
-        reported = sorted((path, body["attempt"], body["outcome"]) for _m, path, body in calls[1:])
+            self.assertEqual(pull.restore_once(self.cfg), 120)
+        leases = [(path, body["max_tasks"]) for _m, path, body in calls if path.endswith("/lease")]
+        self.assertEqual(leases[0], ("/account/connections/nas-restore/lease", 2))
+        self.assertTrue(all(1 <= n <= 2 for _p, n in leases))
+        reported = sorted((path, body["attempt"], body["outcome"]) for _m, path, body in calls if not path.endswith("/lease"))
         self.assertEqual(reported, [
             ("/account/connections/nas-restore/7/result", 1, "uploaded"),
             ("/account/connections/nas-restore/8/result", 2, "exists"),
