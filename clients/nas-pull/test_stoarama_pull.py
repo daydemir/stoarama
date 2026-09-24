@@ -3617,6 +3617,8 @@ class RestoreTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.cfg = SimpleNamespace(output_dir=self.root, restore_workers=2)
+        pull.reset_restore_connections()
+        self.addCleanup(pull.reset_restore_connections)
         self.body = b"clip bytes " * 1000
         (self.root / "Rec" / "July").mkdir(parents=True)
         (self.root / "Rec" / "July" / "a.mp4").write_bytes(self.body)
@@ -3638,6 +3640,8 @@ class RestoreTests(unittest.TestCase):
         received = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_PUT(self):
                 data = self.rfile.read(int(self.headers["Content-Length"]))
                 received.append((self.path, data, self.headers.get("If-None-Match"), self.headers.get("Content-Type")))
@@ -3691,6 +3695,22 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(len(received), 1)
         path, data, if_none_match, content_type = received[0]
         self.assertEqual((path.split("?")[0], data, if_none_match, content_type), ("/stoarama/managed/a.mp4", self.body, "*", "video/mp4"))
+
+    def test_restore_connections_are_reused_per_host(self):
+        received = self.serve(200)
+        opened = []
+        real_factory = pull.http.client.HTTPSConnection.side_effect
+
+        def counting(netloc, timeout, blocksize):
+            opened.append(netloc)
+            return real_factory(netloc, timeout, blocksize)
+
+        pull.http.client.HTTPSConnection.side_effect = counting
+        task = pull.valid_restore_task(self.task())
+        for _ in range(3):
+            self.assertEqual(pull.run_restore_task(self.cfg, task)["outcome"], "uploaded")
+        self.assertEqual(len(received), 3)
+        self.assertEqual(opened, ["bucket.example.test"])
 
     def test_run_restore_task_maps_existing_key_and_http_failure(self):
         self.serve(412)
