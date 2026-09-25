@@ -370,26 +370,40 @@ write_files:
       # heartbeat). Allow DNS (port 53 ONLY) to exactly those configured upstream
       # addresses. They are persisted so a reboot, where this unit runs before the
       # network is up and resolv.conf does not exist yet, keeps the same allowance.
+      # The upstreams can also change after boot (DHCP renewal, systemd-resolved
+      # reconfiguration), so stoarama-egress-firewall-refresh.path re-runs this
+      # script whenever resolved rewrites its resolv.conf.
       # Loopback and link-local/metadata entries are never allowlisted here.
       UPSTREAM_FILE=/etc/stoarama/dns-upstreams
+      RESOLV_CONF=/run/systemd/resolve/resolv.conf
       mkdir -p /etc/stoarama
+      # Serialize runs: the boot unit and a resolver-change refresh can overlap,
+      # and interleaved flush/append would leave a torn chain.
+      exec 9>/run/stoarama-egress-firewall.lock
+      flock 9
       UPSTREAM4=()
       UPSTREAM6=()
-      # The live resolv.conf is authoritative; the persisted list is only the
-      # fallback for early boot, so a removed resolver never stays allowed.
-      if [ -r /run/systemd/resolve/resolv.conf ]; then
-        RESOLVERS="$(awk '$1 == "nameserver" {print $2}' /run/systemd/resolve/resolv.conf || true)"
-      else
-        RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"
+      load_resolvers() {
+        while read -r ns; do
+          case "$ns" in
+            ""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;
+            *:*) UPSTREAM6+=("$ns") ;;
+            *[!0-9.]*) continue ;;
+            *) UPSTREAM4+=("$ns") ;;
+          esac
+        done < <(printf '%s\n' "$1" | sed 's/%.*//' | tr 'A-F' 'a-f' | sort -u)
+      }
+      # The live resolv.conf is authoritative whenever it names an eligible
+      # upstream, so a removed resolver never stays allowed. The persisted list is
+      # only the fallback for early boot (no resolv.conf yet) or a transient
+      # resolv.conf with no eligible upstream, so a refresh never drops the VPC
+      # resolver allowance and blacks out DNS.
+      if [ -r "$RESOLV_CONF" ]; then
+        load_resolvers "$(awk '$1 == "nameserver" {print $2}' "$RESOLV_CONF" || true)"
       fi
-      while read -r ns; do
-        case "$ns" in
-          ""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;
-          *:*) UPSTREAM6+=("$ns") ;;
-          *[!0-9.]*) continue ;;
-          *) UPSTREAM4+=("$ns") ;;
-        esac
-      done < <(printf '%s\n' "$RESOLVERS" | sed 's/%.*//' | tr 'A-F' 'a-f' | sort -u)
+      if [ "${#UPSTREAM4[@]}" -eq 0 ] && [ "${#UPSTREAM6[@]}" -eq 0 ]; then
+        load_resolvers "$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"
+      fi
       if [ "${#UPSTREAM4[@]}" -gt 0 ] || [ "${#UPSTREAM6[@]}" -gt 0 ]; then
         printf '%s\n' ${UPSTREAM4[@]+"${UPSTREAM4[@]}"} ${UPSTREAM6[@]+"${UPSTREAM6[@]}"} | sed '/^$/d' > "$UPSTREAM_FILE"
       fi
@@ -448,6 +462,31 @@ write_files:
       Type=oneshot
       RemainAfterExit=yes
       ExecStart=/usr/local/sbin/stoarama-egress-firewall.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/stoarama-egress-firewall-refresh.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Stoarama Recorder Egress Firewall refresh (DNS upstream change)
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/stoarama-egress-firewall.sh
+
+  - path: /etc/systemd/system/stoarama-egress-firewall-refresh.path
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Watch systemd-resolved upstreams for the Stoarama egress firewall
+
+      [Path]
+      PathChanged=/run/systemd/resolve/resolv.conf
+      Unit=stoarama-egress-firewall-refresh.service
 
       [Install]
       WantedBy=multi-user.target
@@ -556,6 +595,7 @@ runcmd:
   - chmod +x /opt/stoarama/backend/scripts/start-recording-worker.sh
   - systemctl daemon-reload
   - systemctl enable --now stoarama-egress-firewall.service
+  - systemctl enable --now stoarama-egress-firewall-refresh.path
   - systemctl enable --now stoarama-recording.service
 `))
 

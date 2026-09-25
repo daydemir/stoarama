@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -447,8 +449,8 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 	if !strings.Contains(script, "/run/systemd/resolve/resolv.conf") {
 		t.Fatalf("firewall must read the upstream resolvers from systemd-resolved's resolv.conf")
 	}
-	if !strings.Contains(script, `RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"`) {
-		t.Fatalf("persisted upstreams must be the fallback only when resolv.conf is unavailable")
+	if !strings.Contains(script, `load_resolvers "$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"`) {
+		t.Fatalf("persisted upstreams must be the fallback when resolv.conf yields no eligible upstream")
 	}
 	if !strings.Contains(script, "UPSTREAM_FILE=/etc/stoarama/dns-upstreams") {
 		t.Fatalf("firewall must persist upstream resolvers for early-boot reruns")
@@ -484,6 +486,182 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 		if msg, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("firewall script does not parse: %v\n%s", err, msg)
 		}
+	}
+}
+
+// TestBuildUserData_RefreshesFirewallWhenDNSUpstreamChanges guards CodeRabbit's
+// follow-up on #374: the DNS allowance is derived from resolved's upstreams at
+// run time, so a later upstream change (DHCP renewal, resolved reconfiguration,
+// or resolv.conf appearing after an early-boot run) must re-run the firewall.
+func TestBuildUserData_RefreshesFirewallWhenDNSUpstreamChanges(t *testing.T) {
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-dns-refresh",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		BuildSHA:      strings.Repeat("d", 40),
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+	for _, want := range []string{
+		"path: /etc/systemd/system/stoarama-egress-firewall-refresh.path",
+		"PathChanged=/run/systemd/resolve/resolv.conf",
+		"Unit=stoarama-egress-firewall-refresh.service",
+		"path: /etc/systemd/system/stoarama-egress-firewall-refresh.service",
+		"systemctl enable --now stoarama-egress-firewall-refresh.path",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("cloud-init missing resolver-change refresh wiring %q", want)
+		}
+	}
+	// The refresh unit must actually re-run the same firewall script on every
+	// trigger; RemainAfterExit would make a second start a no-op.
+	start := strings.Index(out, "path: /etc/systemd/system/stoarama-egress-firewall-refresh.service")
+	end := strings.Index(out, "path: /etc/systemd/system/stoarama-egress-firewall-refresh.path")
+	if start < 0 || end < start {
+		t.Fatalf("refresh service must be rendered before its path unit")
+	}
+	refresh := out[start:end]
+	if strings.Contains(refresh, "RemainAfterExit") || !strings.Contains(refresh, "ExecStart=/usr/local/sbin/stoarama-egress-firewall.sh") {
+		t.Fatalf("refresh unit must re-run the firewall script on every trigger:\n%s", refresh)
+	}
+	if !strings.Contains(extractEgressFirewallScript(t, out), "flock 9") {
+		t.Fatalf("firewall runs must be serialized so boot and refresh cannot interleave")
+	}
+}
+
+// TestEgressFirewallScript_DNSUpstreamSelection executes the rendered firewall
+// script against stubbed iptables to pin which resolvers get a port-53 allowance.
+func TestEgressFirewallScript_DNSUpstreamSelection(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-dns-exec",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		BuildSHA:      strings.Repeat("e", 40),
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+	script := extractEgressFirewallScript(t, out)
+
+	const vpc = "10.116.15.254"
+	const vpcNew = "10.116.15.253"
+	strPtr := func(s string) *string { return &s }
+	cases := []struct {
+		name      string
+		live      *string // nil: resolv.conf absent (early boot)
+		persisted *string // nil: no persisted list
+		allowed   []string
+		denied    []string
+		persist   string
+	}{
+		{
+			name:    "live VPC upstream allowed and persisted; stub, metadata, link-local skipped",
+			live:    strPtr("nameserver 127.0.0.53\nnameserver " + vpc + "\nnameserver 169.254.169.254\nnameserver FE90::1\n"),
+			allowed: []string{vpc + "/32"},
+			denied:  []string{"127.0.0.53/32", "169.254.169.254/32", "fe90::1/128"},
+			persist: vpc + "\n",
+		},
+		{
+			name:      "early boot without resolv.conf uses persisted list",
+			persisted: strPtr(vpc + "\n"),
+			allowed:   []string{vpc + "/32"},
+			persist:   vpc + "\n",
+		},
+		{
+			name:      "readable resolv.conf with no eligible upstream falls back to persisted",
+			live:      strPtr("nameserver 127.0.0.53\n"),
+			persisted: strPtr(vpc + "\n"),
+			allowed:   []string{vpc + "/32"},
+			persist:   vpc + "\n",
+		},
+		{
+			name:      "changed upstream replaces the old one",
+			live:      strPtr("nameserver " + vpcNew + "\n"),
+			persisted: strPtr(vpc + "\n"),
+			allowed:   []string{vpcNew + "/32"},
+			denied:    []string{vpc + "/32"},
+			persist:   vpcNew + "\n",
+		},
+		{
+			name:    "no upstream anywhere allows none",
+			live:    strPtr("nameserver 127.0.0.53\n"),
+			denied:  []string{vpc + "/32"},
+			persist: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			if err := os.MkdirAll(bin, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			calls := filepath.Join(dir, "calls")
+			for _, name := range []string{"iptables", "ip6tables"} {
+				stub := "#!/bin/sh\necho \"" + name + " $*\" >> '" + calls + "'\n"
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(stub), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(bin, "flock"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stateDir := filepath.Join(dir, "etc")
+			resolv := filepath.Join(dir, "resolv.conf")
+			upstreamFile := filepath.Join(stateDir, "dns-upstreams")
+			if tc.live != nil {
+				if err := os.WriteFile(resolv, []byte(*tc.live), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.persisted != nil {
+				if err := os.MkdirAll(stateDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(upstreamFile, []byte(*tc.persisted), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := strings.NewReplacer(
+				"/run/systemd/resolve/resolv.conf", resolv,
+				"/run/stoarama-egress-firewall.lock", filepath.Join(dir, "lock"),
+				"/etc/stoarama", stateDir,
+			).Replace(script)
+			cmd := exec.Command(bash, "-c", s)
+			cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if msg, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("firewall script failed: %v\n%s", err, msg)
+			}
+			rulesRaw, _ := os.ReadFile(calls)
+			rules := string(rulesRaw)
+			for _, ns := range tc.allowed {
+				for _, proto := range []string{"udp", "tcp"} {
+					want := "-p " + proto + " --dport 53 -d " + ns + " -j RETURN"
+					if !strings.Contains(rules, want) {
+						t.Fatalf("missing DNS allowance %q in:\n%s", want, rules)
+					}
+				}
+			}
+			for _, ns := range tc.denied {
+				if strings.Contains(rules, "--dport 53 -d "+ns+" ") {
+					t.Fatalf("unexpected DNS allowance for %s in:\n%s", ns, rules)
+				}
+			}
+			if !strings.Contains(rules, "iptables -A STOARAMA_EGRESS -d 10.0.0.0/8 -j REJECT") {
+				t.Fatalf("private-range REJECT missing:\n%s", rules)
+			}
+			got, _ := os.ReadFile(upstreamFile)
+			if string(got) != tc.persist {
+				t.Fatalf("persisted upstreams = %q, want %q", got, tc.persist)
+			}
+		})
 	}
 }
 
