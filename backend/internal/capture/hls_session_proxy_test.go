@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -305,6 +306,23 @@ func TestHLSSessionProxyKeepsSequenceMonotonicAcrossStreamRestart(t *testing.T) 
 	}
 	if !strings.Contains(body, "seq=1&") {
 		t.Fatalf("restarted stream segments should keep their upstream numbering in the proxy URL:\n%s", body)
+	}
+}
+
+func TestHLSSessionProxyRoutesSameOriginKeyAndMapThroughProxy(t *testing.T) {
+	master, _ := url.Parse("https://61e0c5d388c2e.streamlock.net/live/a.stream/playlist.m3u8")
+	p := &hlsSessionProxy{master: master}
+	base, _ := url.Parse("https://61e0c5d388c2e.streamlock.net/live/a.stream/chunklist_w1.m3u8")
+	body := "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXT-X-KEY:METHOD=AES-128,URI=\"key_w1.key\"\n#EXT-X-MAP:URI=\"https://other.example/init.mp4\"\n#EXTINF:1,\nmedia_w1_5.ts\n"
+	out := string(p.rewriteMediaPlaylist(base, 1, 0, 0, []byte(body)))
+	if !strings.Contains(out, `#EXT-X-KEY:METHOD=AES-128,URI="/segment?u=https%3A%2F%2F61e0c5d388c2e.streamlock.net%2Flive%2Fa.stream%2Fkey_w1.key"`) {
+		t.Fatalf("same-origin key was not routed through the proxy:\n%s", out)
+	}
+	if !strings.Contains(out, `#EXT-X-MAP:URI="https://other.example/init.mp4"`) {
+		t.Fatalf("off-origin map URI changed:\n%s", out)
+	}
+	if !strings.Contains(out, "/segment?epoch=0&gen=1&seq=5&u=") {
+		t.Fatalf("segment was not routed through the proxy with its sequence:\n%s", out)
 	}
 }
 

@@ -307,7 +307,8 @@ var hlsSessionURIAttr = regexp.MustCompile(`URI="([^"]*)"`)
 
 // rewriteMediaPlaylist points every segment at the proxy, carrying its
 // upstream media sequence number so an expired segment URL can be re-found in
-// the next session. Tag URIs (keys, init maps) are made absolute on the origin.
+// the next session. Same-origin tag URIs (keys, init maps) are proxied too;
+// off-origin URIs are left absolute, exactly as FFmpeg would read them directly.
 func (p *hlsSessionProxy) rewriteMediaPlaylist(base *url.URL, generation, epoch, offset int64, body []byte) []byte {
 	var out strings.Builder
 	seq := int64(0)
@@ -327,7 +328,15 @@ func (p *hlsSessionProxy) rewriteMediaPlaylist(base *url.URL, generation, epoch,
 				if err != nil {
 					return attr
 				}
-				return `URI="` + base.ResolveReference(ref).String() + `"`
+				abs := base.ResolveReference(ref)
+				if !p.sameOrigin(abs) {
+					return `URI="` + abs.String() + `"`
+				}
+				// Keys and init maps go through the same origin-pinned, dial-guarded
+				// handler as segments. Without a sequence they are fetched as-is.
+				q := url.Values{}
+				q.Set("u", abs.String())
+				return `URI="` + hlsSessionSegmentPath + "?" + q.Encode() + `"`
 			})
 		default:
 			if ref, err := url.Parse(line); err == nil {
