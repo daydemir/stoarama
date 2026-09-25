@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -292,7 +293,8 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 		}
 	}
 
-	// DNS must be allowed only to the loopback stub resolver, never blanket to any
+	// DNS must be allowed only to the loopback stub resolver (and its configured
+	// upstreams, see TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly), never blanket to any
 	// destination (a blanket dport-53 RETURN before the REJECTs let DNS reach the
 	// metadata IP / internal resolvers, S-1).
 	if strings.Contains(out, "--dport 53 -j RETURN") {
@@ -420,4 +422,104 @@ func TestHashNodeSecret_MatchesSHA256Hex(t *testing.T) {
 	if len(want) != 64 {
 		t.Fatalf("sha256 hex must be 64 chars, got %d", len(want))
 	}
+}
+
+// TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly guards the 2026-09-25
+// outage: new DO droplets got a private VPC upstream resolver (10.116.15.254)
+// behind the systemd-resolved stub, the RFC1918 REJECT blocked it, nothing
+// resolved, git fetch failed, and the worker never heartbeated. The firewall must
+// allow port 53 to exactly the configured upstream resolvers (read from
+// resolved's resolv.conf, persisted for reboots) before the private-range
+// REJECTs, and still never allow blanket DNS or metadata/link-local upstreams.
+func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-dns",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		BuildSHA:      strings.Repeat("b", 40),
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+	script := extractEgressFirewallScript(t, out)
+
+	if !strings.Contains(script, "/run/systemd/resolve/resolv.conf") {
+		t.Fatalf("firewall must read the upstream resolvers from systemd-resolved's resolv.conf")
+	}
+	if !strings.Contains(script, "UPSTREAM_FILE=/etc/stoarama/dns-upstreams") {
+		t.Fatalf("firewall must persist upstream resolvers for early-boot reruns")
+	}
+	for _, rule := range []string{
+		`iptables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/32" -j RETURN`,
+		`iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/32" -j RETURN`,
+		`ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/128" -j RETURN`,
+		`ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/128" -j RETURN`,
+	} {
+		if !strings.Contains(script, rule) {
+			t.Fatalf("firewall missing upstream DNS allowance %q", rule)
+		}
+	}
+	// The upstream allowance must precede the private-range REJECTs, otherwise a
+	// VPC resolver in 10.0.0.0/8 is still rejected.
+	allowIdx := strings.Index(script, `-d "$ns/32" -j RETURN`)
+	rejectIdx := strings.Index(script, `iptables -A STOARAMA_EGRESS -d "$cidr" -j REJECT`)
+	if allowIdx < 0 || rejectIdx < 0 || allowIdx > rejectIdx {
+		t.Fatalf("upstream DNS allowance must come before the private-range REJECTs")
+	}
+	// Metadata / link-local / loopback nameserver entries are never allowlisted.
+	if !strings.Contains(script, `""|127.*|169.254.*|::1|fe80:*|FE80:*) continue ;;`) {
+		t.Fatalf("firewall must skip loopback and link-local/metadata nameserver entries")
+	}
+	if strings.Contains(script, "--dport 53 -j RETURN") {
+		t.Fatalf("firewall must never allow DNS to any destination")
+	}
+
+	if bash, err := exec.LookPath("bash"); err == nil {
+		cmd := exec.Command(bash, "-n")
+		cmd.Stdin = strings.NewReader(script)
+		if msg, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("firewall script does not parse: %v\n%s", err, msg)
+		}
+	}
+}
+
+// TestBuildUserData_FailsFastWhenSourceFetchFails guards the silent-stale-binary
+// failure: a failed git fetch must abort cloud-init runcmd, not fall through to
+// the snapshot's baked binary.
+func TestBuildUserData_FailsFastWhenSourceFetchFails(t *testing.T) {
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-failfast",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		BuildSHA:      strings.Repeat("c", 40),
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+	runcmd := out[strings.Index(out, "\nruncmd:\n"):]
+	setIdx := strings.Index(runcmd, "set -e")
+	fetchIdx := strings.Index(runcmd, "git -C /opt/stoarama fetch --depth 1 origin")
+	cloneIdx := strings.Index(runcmd, "git clone")
+	if setIdx < 0 || fetchIdx < 0 || cloneIdx < 0 || setIdx > cloneIdx || setIdx > fetchIdx {
+		t.Fatalf("runcmd must enable set -e before cloning/fetching the build commit")
+	}
+}
+
+// extractEgressFirewallScript returns the de-indented firewall script body from
+// the rendered cloud-init.
+func extractEgressFirewallScript(t *testing.T, cloudInit string) string {
+	t.Helper()
+	start := strings.Index(cloudInit, "#!/usr/bin/env bash\n")
+	end := strings.Index(cloudInit, "netfilter-persistent save")
+	if start < 0 || end < start {
+		t.Fatalf("rendered cloud-init has no egress firewall script")
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(cloudInit[start:end], "\n") {
+		b.WriteString(strings.TrimPrefix(line, "      "))
+		b.WriteString("\n")
+	}
+	return b.String()
 }
