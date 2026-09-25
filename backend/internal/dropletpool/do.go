@@ -375,19 +375,23 @@ write_files:
       mkdir -p /etc/stoarama
       UPSTREAM4=()
       UPSTREAM6=()
+      # The live resolv.conf is authoritative; the persisted list is only the
+      # fallback for early boot, so a removed resolver never stays allowed.
+      if [ -r /run/systemd/resolve/resolv.conf ]; then
+        RESOLVERS="$(awk '$1 == "nameserver" {print $2}' /run/systemd/resolve/resolv.conf || true)"
+      else
+        RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"
+      fi
       while read -r ns; do
         case "$ns" in
-          ""|127.*|169.254.*|::1|fe80:*|FE80:*) continue ;;
+          ""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;
           *:*) UPSTREAM6+=("$ns") ;;
           *[!0-9.]*) continue ;;
           *) UPSTREAM4+=("$ns") ;;
         esac
-      done < <(
-        { awk '$1 == "nameserver" {print $2}' /run/systemd/resolve/resolv.conf 2>/dev/null || true
-          cat "$UPSTREAM_FILE" 2>/dev/null || true; } | sed 's/%.*//' | sort -u
-      )
+      done < <(printf '%s\n' "$RESOLVERS" | sed 's/%.*//' | tr 'A-F' 'a-f' | sort -u)
       if [ "${#UPSTREAM4[@]}" -gt 0 ] || [ "${#UPSTREAM6[@]}" -gt 0 ]; then
-        printf '%s\n' "${UPSTREAM4[@]}" "${UPSTREAM6[@]}" | sed '/^$/d' > "$UPSTREAM_FILE"
+        printf '%s\n' ${UPSTREAM4[@]+"${UPSTREAM4[@]}"} ${UPSTREAM6[@]+"${UPSTREAM6[@]}"} | sed '/^$/d' > "$UPSTREAM_FILE"
       fi
       echo "stoarama-egress: DNS upstreams allowed: ${UPSTREAM4[*]:-none} ${UPSTREAM6[*]:-}"
 
@@ -402,7 +406,7 @@ write_files:
       iptables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
       iptables -A STOARAMA_EGRESS -p udp --dport 53 -d 127.0.0.0/8 -j RETURN
       iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
-      for ns in "${UPSTREAM4[@]}"; do
+      for ns in ${UPSTREAM4[@]+"${UPSTREAM4[@]}"}; do
         iptables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/32" -j RETURN
         iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/32" -j RETURN
       done
@@ -418,7 +422,7 @@ write_files:
       ip6tables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
       ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d ::1/128 -j RETURN
       ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d ::1/128 -j RETURN
-      for ns in "${UPSTREAM6[@]}"; do
+      for ns in ${UPSTREAM6[@]+"${UPSTREAM6[@]}"}; do
         ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/128" -j RETURN
         ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/128" -j RETURN
       done

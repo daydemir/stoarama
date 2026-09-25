@@ -447,6 +447,9 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 	if !strings.Contains(script, "/run/systemd/resolve/resolv.conf") {
 		t.Fatalf("firewall must read the upstream resolvers from systemd-resolved's resolv.conf")
 	}
+	if !strings.Contains(script, `RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"`) {
+		t.Fatalf("persisted upstreams must be the fallback only when resolv.conf is unavailable")
+	}
 	if !strings.Contains(script, "UPSTREAM_FILE=/etc/stoarama/dns-upstreams") {
 		t.Fatalf("firewall must persist upstream resolvers for early-boot reruns")
 	}
@@ -468,7 +471,7 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 		t.Fatalf("upstream DNS allowance must come before the private-range REJECTs")
 	}
 	// Metadata / link-local / loopback nameserver entries are never allowlisted.
-	if !strings.Contains(script, `""|127.*|169.254.*|::1|fe80:*|FE80:*) continue ;;`) {
+	if !strings.Contains(script, `""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;`) || !strings.Contains(script, `tr 'A-F' 'a-f'`) {
 		t.Fatalf("firewall must skip loopback and link-local/metadata nameserver entries")
 	}
 	if strings.Contains(script, "--dport 53 -j RETURN") {
