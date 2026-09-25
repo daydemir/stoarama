@@ -315,14 +315,86 @@ func TestHLSSessionProxyRoutesSameOriginKeyAndMapThroughProxy(t *testing.T) {
 	base, _ := url.Parse("https://61e0c5d388c2e.streamlock.net/live/a.stream/chunklist_w1.m3u8")
 	body := "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:5\n#EXT-X-KEY:METHOD=AES-128,URI=\"key_w1.key\"\n#EXT-X-MAP:URI=\"https://other.example/init.mp4\"\n#EXTINF:1,\nmedia_w1_5.ts\n"
 	out := string(p.rewriteMediaPlaylist(base, 1, 0, 0, []byte(body)))
-	if !strings.Contains(out, `#EXT-X-KEY:METHOD=AES-128,URI="/segment?u=https%3A%2F%2F61e0c5d388c2e.streamlock.net%2Flive%2Fa.stream%2Fkey_w1.key"`) {
-		t.Fatalf("same-origin key was not routed through the proxy:\n%s", out)
+	if !strings.Contains(out, `#EXT-X-KEY:METHOD=AES-128,URI="/segment?epoch=0&gen=1&seq=5&tag=EXT-X-KEY&u=https%3A%2F%2F61e0c5d388c2e.streamlock.net%2Flive%2Fa.stream%2Fkey_w1.key"`) {
+		t.Fatalf("same-origin key was not routed through the proxy with its sequence:\n%s", out)
 	}
-	if !strings.Contains(out, `#EXT-X-MAP:URI="https://other.example/init.mp4"`) {
-		t.Fatalf("off-origin map URI changed:\n%s", out)
+	// Off-origin URIs are routed through the proxy too, whose handler refuses
+	// them: nothing in the playlist bypasses the origin pin and dial guard.
+	if !strings.Contains(out, `#EXT-X-MAP:URI="/segment?epoch=0&gen=1&seq=5&tag=EXT-X-MAP&u=https%3A%2F%2Fother.example%2Finit.mp4"`) {
+		t.Fatalf("off-origin map URI was not routed through the proxy:\n%s", out)
+	}
+	if strings.Contains(out, "https://") {
+		t.Fatalf("rewritten playlist still has a direct URL:\n%s", out)
 	}
 	if !strings.Contains(out, "/segment?epoch=0&gen=1&seq=5&u=") {
 		t.Fatalf("segment was not routed through the proxy with its sequence:\n%s", out)
+	}
+}
+
+func TestHLSURIForSequenceFindsKeyInEffect(t *testing.T) {
+	body := []byte("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-KEY:METHOD=AES-128,URI=\"k1_w2.key\"\n#EXTINF:1,\nm_w2_10.ts\n#EXT-X-KEY:METHOD=AES-128,URI=\"k2_w2.key\"\n#EXTINF:1,\nm_w2_11.ts\n")
+	for _, tc := range []struct {
+		seq  int64
+		tag  string
+		want string
+		ok   bool
+	}{
+		{10, "EXT-X-KEY", "k1_w2.key", true},
+		{11, "EXT-X-KEY", "k2_w2.key", true},
+		{11, "", "m_w2_11.ts", true},
+		{11, "EXT-X-MAP", "", false},
+		{12, "", "", false},
+	} {
+		got, ok := hlsURIForSequence(body, tc.seq, tc.tag)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("hlsURIForSequence(seq=%d tag=%q)=(%q,%v) want (%q,%v)", tc.seq, tc.tag, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// A session-scoped key whose session expired is re-found for the same media
+// sequence in a fresh session.
+func TestHLSSessionProxyRefetchesExpiredKeyFromFreshSession(t *testing.T) {
+	allowLoopbackHLSSessionOrigin(t)
+	var masters atomic.Int64
+	var fresh atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live/a.stream/playlist.m3u8":
+			n := masters.Add(1)
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nchunklist_w%d.m3u8\n", n)
+		case "/live/a.stream/chunklist_w1.m3u8", "/live/a.stream/chunklist_w2.m3u8":
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/live/a.stream/chunklist_w"), ".m3u8")
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"key_w%s.key\"\n#EXTINF:1,\nmedia_w%s_7.ts\n", id, id)
+		case "/live/a.stream/key_w1.key":
+			http.Error(w, "expired", http.StatusForbidden)
+		case "/live/a.stream/key_w2.key":
+			fresh.Store(true)
+			_, _ = w.Write([]byte("0123456789abcdef"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	proxy, err := startHLSSessionProxy(CaptureInput{URL: server.URL + "/live/a.stream/playlist.m3u8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	_, body := fetchProxyPlaylist(t, proxy.URL())
+	m := hlsSessionURIAttr.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("no key URI in proxy playlist:\n%s", body)
+	}
+	resp, err := http.Get("http://" + proxy.listener.Addr().String() + m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(key) != "0123456789abcdef" || !fresh.Load() {
+		t.Fatalf("expired key status=%d body=%q fresh=%v, want the fresh session's key", resp.StatusCode, key, fresh.Load())
 	}
 }
 

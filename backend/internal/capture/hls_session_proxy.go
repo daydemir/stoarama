@@ -305,13 +305,25 @@ func (p *hlsSessionProxy) observe(generation int64, body []byte) (int64, int64) 
 
 var hlsSessionURIAttr = regexp.MustCompile(`URI="([^"]*)"`)
 
-// rewriteMediaPlaylist points every segment at the proxy, carrying its
-// upstream media sequence number so an expired segment URL can be re-found in
-// the next session. Same-origin tag URIs (keys, init maps) are proxied too;
-// off-origin URIs are left absolute, exactly as FFmpeg would read them directly.
+// rewriteMediaPlaylist points every URI FFmpeg would fetch at the proxy, so
+// all of them are origin-pinned and dial-guarded (an off-origin URI is refused
+// by serveSegment rather than fetched). Each carries the upstream media
+// sequence it belongs to (a tag URI such as a key or init map: the next
+// segment's), so an expired session URL can be re-found in the next session.
 func (p *hlsSessionProxy) rewriteMediaPlaylist(base *url.URL, generation, epoch, offset int64, body []byte) []byte {
 	var out strings.Builder
 	seq := int64(0)
+	proxied := func(abs *url.URL, tag string) string {
+		q := url.Values{}
+		q.Set("seq", strconv.FormatInt(seq, 10))
+		q.Set("gen", strconv.FormatInt(generation, 10))
+		q.Set("epoch", strconv.FormatInt(epoch, 10))
+		if tag != "" {
+			q.Set("tag", tag)
+		}
+		q.Set("u", abs.String())
+		return hlsSessionSegmentPath + "?" + q.Encode()
+	}
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
 		switch {
@@ -323,34 +335,17 @@ func (p *hlsSessionProxy) rewriteMediaPlaylist(base *url.URL, generation, epoch,
 				line = "#EXT-X-MEDIA-SEQUENCE:" + strconv.FormatInt(n+offset, 10)
 			}
 		case strings.HasPrefix(line, "#"):
+			tag := hlsTagName(line)
 			line = hlsSessionURIAttr.ReplaceAllStringFunc(line, func(attr string) string {
 				ref, err := url.Parse(strings.TrimSuffix(strings.TrimPrefix(attr, `URI="`), `"`))
 				if err != nil {
 					return attr
 				}
-				abs := base.ResolveReference(ref)
-				if !p.sameOrigin(abs) {
-					return `URI="` + abs.String() + `"`
-				}
-				// Keys and init maps go through the same origin-pinned, dial-guarded
-				// handler as segments. Without a sequence they are fetched as-is.
-				q := url.Values{}
-				q.Set("u", abs.String())
-				return `URI="` + hlsSessionSegmentPath + "?" + q.Encode() + `"`
+				return `URI="` + proxied(base.ResolveReference(ref), tag) + `"`
 			})
 		default:
 			if ref, err := url.Parse(line); err == nil {
-				abs := base.ResolveReference(ref)
-				if p.sameOrigin(abs) {
-					q := url.Values{}
-					q.Set("seq", strconv.FormatInt(seq, 10))
-					q.Set("gen", strconv.FormatInt(generation, 10))
-					q.Set("epoch", strconv.FormatInt(epoch, 10))
-					q.Set("u", abs.String())
-					line = hlsSessionSegmentPath + "?" + q.Encode()
-				} else {
-					line = abs.String()
-				}
+				line = proxied(base.ResolveReference(ref), "")
 			}
 			seq++
 		}
@@ -370,6 +365,7 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 	seq, seqErr := strconv.ParseInt(query.Get("seq"), 10, 64)
 	generation, genErr := strconv.ParseInt(query.Get("gen"), 10, 64)
 	epoch, epochErr := strconv.ParseInt(query.Get("epoch"), 10, 64)
+	tag := query.Get("tag")
 	byteRange := r.Header.Get("Range")
 	resp, err := p.get(r.Context(), target.String(), byteRange)
 	if err != nil {
@@ -377,11 +373,12 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if hlsSessionExpiredStatus(resp.StatusCode) && seqErr == nil && genErr == nil && epochErr == nil {
-		// The session expired between the playlist read and this segment. Find the
-		// same media sequence number in a fresh session instead of dropping it.
+		// The session expired between the playlist read and this request. Find the
+		// same segment (or the key/map applying to it) by media sequence number in
+		// a fresh session instead of dropping it.
 		resp.Body.Close()
 		resp = nil
-		if fresh, ok := p.segmentInFreshSession(r.Context(), generation, epoch, seq); ok {
+		if fresh, ok := p.segmentInFreshSession(r.Context(), generation, epoch, seq, tag); ok {
 			resp, err = p.get(r.Context(), fresh, byteRange)
 			if err != nil {
 				writeHLSSessionError(w, err)
@@ -403,7 +400,7 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation, epoch, seq int64) (string, bool) {
+func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation, epoch, seq int64, tag string) (string, bool) {
 	mediaURL, freshGeneration, err := p.refresh(ctx, generation)
 	if err != nil {
 		return "", false
@@ -421,7 +418,7 @@ func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation,
 	if err != nil {
 		return "", false
 	}
-	uri, ok := hlsSegmentURIForSequence(body, seq)
+	uri, ok := hlsURIForSequence(body, seq, tag)
 	if !ok {
 		return "", false
 	}
@@ -462,8 +459,18 @@ func hlsSessionExpiredStatus(status int) bool {
 	return status == http.StatusForbidden || status == http.StatusNotFound
 }
 
-func hlsSegmentURIForSequence(body []byte, want int64) (string, bool) {
+// hlsTagName returns "EXT-X-KEY" for "#EXT-X-KEY:METHOD=...".
+func hlsTagName(line string) string {
+	name, _, _ := strings.Cut(strings.TrimPrefix(line, "#"), ":")
+	return name
+}
+
+// hlsURIForSequence finds the URI of media sequence want in a media playlist.
+// With a tag name it instead returns the URI of the last such tag (a key or
+// init map) in effect for that segment.
+func hlsURIForSequence(body []byte, want int64, tag string) (string, bool) {
 	seq := int64(0)
+	tagURI := ""
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
 		switch {
@@ -473,9 +480,17 @@ func hlsSegmentURIForSequence(body []byte, want int64) (string, bool) {
 				seq = n
 			}
 		case strings.HasPrefix(line, "#"):
+			if tag != "" && hlsTagName(line) == tag {
+				if m := hlsSessionURIAttr.FindStringSubmatch(line); m != nil {
+					tagURI = m[1]
+				}
+			}
 		default:
 			if seq == want {
-				return line, true
+				if tag == "" {
+					return line, true
+				}
+				return tagURI, tagURI != ""
 			}
 			seq++
 		}
