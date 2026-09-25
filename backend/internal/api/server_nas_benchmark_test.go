@@ -77,7 +77,7 @@ func TestNASBenchmarkLifecycle(t *testing.T) {
 	pool, cleanup := testAccountClipsPool(t)
 	defer cleanup()
 	ctx := context.Background()
-	migration, err := os.ReadFile("../../../infra/sql/migrations/0156_nas_benchmarks.sql")
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0162_nas_benchmarks.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

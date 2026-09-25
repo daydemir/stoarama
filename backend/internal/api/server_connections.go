@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"log"
 	"net/http"
 	"regexp"
@@ -15,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
+	"github.com/daydemir/stoarama/backend/internal/nasdelivery"
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
