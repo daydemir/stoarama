@@ -940,3 +940,10 @@ func TestClassifyOfflineError(t *testing.T) {
 		}
 	}
 }
+
+func TestRelayLogCategorySegmentStall(t *testing.T) {
+	line := "recording worker job=8069157 recording=434 continuous segment stall: no segment closed for 3m0s; restarting capture"
+	if got := relayLogCategory(line); got != "recording_worker.segment_stall" {
+		t.Fatalf("category=%q", got)
+	}
+}
