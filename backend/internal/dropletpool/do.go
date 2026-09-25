@@ -363,17 +363,53 @@ write_files:
         fe80::/10
         ::1/128
       )
-      # Allow established/related and loopback (stub-resolver) DNS first, then drop
-      # the private ranges; public DNS and everything else fall through to the
-      # final RETURN. DNS is scoped to loopback so a query cannot be aimed at the
-      # metadata IP or an internal resolver (the earlier blanket dport-53 RETURN
-      # let DNS reach any address before the REJECT rules, S-1).
+      # The systemd-resolved stub (127.0.0.53) forwards to the droplet's upstream
+      # resolver. On current DO networking that upstream is a private VPC address
+      # (e.g. 10.116.15.254), which the RFC1918 REJECT below would otherwise block,
+      # leaving the droplet unable to resolve anything (no git fetch, no API
+      # heartbeat). Allow DNS (port 53 ONLY) to exactly those configured upstream
+      # addresses. They are persisted so a reboot, where this unit runs before the
+      # network is up and resolv.conf does not exist yet, keeps the same allowance.
+      # Loopback and link-local/metadata entries are never allowlisted here.
+      UPSTREAM_FILE=/etc/stoarama/dns-upstreams
+      mkdir -p /etc/stoarama
+      UPSTREAM4=()
+      UPSTREAM6=()
+      # The live resolv.conf is authoritative; the persisted list is only the
+      # fallback for early boot, so a removed resolver never stays allowed.
+      if [ -r /run/systemd/resolve/resolv.conf ]; then
+        RESOLVERS="$(awk '$1 == "nameserver" {print $2}' /run/systemd/resolve/resolv.conf || true)"
+      else
+        RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"
+      fi
+      while read -r ns; do
+        case "$ns" in
+          ""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;
+          *:*) UPSTREAM6+=("$ns") ;;
+          *[!0-9.]*) continue ;;
+          *) UPSTREAM4+=("$ns") ;;
+        esac
+      done < <(printf '%s\n' "$RESOLVERS" | sed 's/%.*//' | tr 'A-F' 'a-f' | sort -u)
+      if [ "${#UPSTREAM4[@]}" -gt 0 ] || [ "${#UPSTREAM6[@]}" -gt 0 ]; then
+        printf '%s\n' ${UPSTREAM4[@]+"${UPSTREAM4[@]}"} ${UPSTREAM6[@]+"${UPSTREAM6[@]}"} | sed '/^$/d' > "$UPSTREAM_FILE"
+      fi
+      echo "stoarama-egress: DNS upstreams allowed: ${UPSTREAM4[*]:-none} ${UPSTREAM6[*]:-}"
+
+      # Allow established/related, loopback (stub-resolver) DNS, and DNS to the
+      # configured upstream resolvers first, then drop the private ranges; public
+      # DNS and everything else fall through to the final RETURN. DNS is never a
+      # blanket dport-53 RETURN, so a query cannot be aimed at the metadata IP or
+      # an arbitrary internal address (S-1).
       iptables -F STOARAMA_EGRESS 2>/dev/null || true
       iptables -N STOARAMA_EGRESS 2>/dev/null || true
       iptables -F STOARAMA_EGRESS
       iptables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
       iptables -A STOARAMA_EGRESS -p udp --dport 53 -d 127.0.0.0/8 -j RETURN
       iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
+      for ns in ${UPSTREAM4[@]+"${UPSTREAM4[@]}"}; do
+        iptables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/32" -j RETURN
+        iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/32" -j RETURN
+      done
       for cidr in "${BLOCKED4[@]}"; do
         iptables -A STOARAMA_EGRESS -d "$cidr" -j REJECT
       done
@@ -386,6 +422,10 @@ write_files:
       ip6tables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
       ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d ::1/128 -j RETURN
       ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d ::1/128 -j RETURN
+      for ns in ${UPSTREAM6[@]+"${UPSTREAM6[@]}"}; do
+        ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/128" -j RETURN
+        ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/128" -j RETURN
+      done
       for cidr in "${BLOCKED6[@]}"; do
         ip6tables -A STOARAMA_EGRESS -d "$cidr" -j REJECT
       done
@@ -442,6 +482,10 @@ runcmd:
   - mkdir -p /opt /opt/stoarama/bin
   - /usr/local/sbin/stoarama-egress-firewall.sh
   - |
+    # Fail fast: a failed clone/fetch must abort provisioning, never fall through
+    # to booting the snapshot's stale baked binary. cloud-init runs runcmd as one
+    # sh script, so this also covers every later step.
+    set -e
     clone_url='{{.RepoURL}}'
     if [ -n '{{.RepoCloneToken}}' ]; then
       clone_url="$(printf '%s' '{{.RepoURL}}' | sed 's#^https://#https://x-access-token:{{.RepoCloneToken}}@#')"
