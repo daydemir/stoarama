@@ -105,6 +105,7 @@ type Worker struct {
 	frozenHLSWait           func(context.Context, time.Duration) error
 	frozenHLSProofSpan      func(time.Duration) time.Duration
 	continuousCapture       continuousCaptureFunc
+	segmentStallTimeout     time.Duration
 }
 
 var (
@@ -137,6 +138,46 @@ const diskErrorLogInterval = 5 * time.Minute
 const continuousTimelineLeadAllowance = 5 * time.Second
 
 var continuousUpdateDrainPollInterval = time.Second
+
+// A live ffmpeg that keeps one output segment open never exits, so the
+// no-progress surrender (judged only after capture returns) and capture's own
+// output-growth timeout (a trickle still grows the file) both miss it. On
+// 2026-09-25 recordings 433 and 434 each wrote one 32-minute and one 4-hour
+// "segment" this way. The watchdog aborts the attempt when no segment closes
+// within continuousSegmentStallFactor clip durations (never under the floor);
+// the ordinary reconnect/no-progress path then takes over.
+const (
+	continuousSegmentStallFactor = 3
+	continuousSegmentStallFloor  = 2 * time.Minute
+)
+
+var continuousSegmentStallPollInterval = 5 * time.Second
+
+func continuousSegmentStallTimeout(clipDuration time.Duration) time.Duration {
+	return max(continuousSegmentStallFactor*clipDuration, continuousSegmentStallFloor)
+}
+
+// monitorContinuousSegmentStall aborts the attempt once lastSegment (unix nanos,
+// the attempt start until a segment closes) is older than timeout.
+func monitorContinuousSegmentStall(stop <-chan struct{}, lastSegment *atomic.Int64, timeout time.Duration, stalled *atomic.Bool, abort func()) {
+	if timeout <= 0 {
+		return
+	}
+	ticker := time.NewTicker(continuousSegmentStallPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if time.Since(time.Unix(0, lastSegment.Load())) >= timeout {
+				stalled.Store(true)
+				abort()
+				return
+			}
+		}
+	}
+}
 
 func NewWorker(cfg Config) (*Worker, error) {
 	if cfg.Client == nil {
@@ -726,7 +767,17 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		if w.cfg.DrainForUpdate != nil {
 			go monitorContinuousUpdateDrain(stopUpdateMonitor, w.cfg.DrainForUpdate, abortAttempt)
 		}
+		var lastSegmentClosed atomic.Int64
+		var segmentStalled atomic.Bool
+		lastSegmentClosed.Store(time.Now().UnixNano())
+		stopStallMonitor := make(chan struct{})
+		stallTimeout := w.segmentStallTimeout
+		if stallTimeout == 0 {
+			stallTimeout = continuousSegmentStallTimeout(clipDuration)
+		}
+		go monitorContinuousSegmentStall(stopStallMonitor, &lastSegmentClosed, stallTimeout, &segmentStalled, abortAttempt)
 		submitInCaptureOrder := func(seg capture.Segment) error {
+			lastSegmentClosed.Store(time.Now().UnixNano())
 			if _, duplicate := seenSegmentSHA[seg.SHA256]; seg.SHA256 != "" && duplicate {
 				// A reconnect may replay the tail of an HLS playlist. Do not enqueue,
 				// sequence, or advance either media clock for exact bytes already
@@ -770,6 +821,12 @@ func (w *Worker) processContinuousJob(ctx context.Context, job recordingapi.Reco
 		captureErr := captureContinuous(attemptCtx, resolved, clipDuration, "", recordingCaptureTargetFPS(job.TargetFPS), outDir, submitInCaptureOrder)
 		close(stopDiskMonitor)
 		close(stopUpdateMonitor)
+		close(stopStallMonitor)
+		if segmentStalled.Load() {
+			w.cfg.RelayDiagnostics.Error(job.JobID, "segment_stall", fmt.Errorf("no segment closed for %s", stallTimeout))
+			log.Printf("recording worker job=%d recording=%d continuous segment stall: no segment closed for %s; restarting capture",
+				job.JobID, job.RecordingID, stallTimeout)
+		}
 		// Join every outstanding upload BEFORE the attempt is judged, so the window
 		// never closes (and outDir is never removed) with an upload still running.
 		delivery := pool.close()

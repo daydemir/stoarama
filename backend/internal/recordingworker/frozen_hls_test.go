@@ -736,3 +736,67 @@ func TestFrozenHLSObservationRequiresCleanDeliveryAndPreservesPartialSpool(t *te
 func fmtNoOutput() error {
 	return capture.ErrContinuousNoOutput
 }
+
+// A capture that never closes a segment (ffmpeg alive, one output file open for
+// hours) must be restarted by the segment-stall watchdog, not held until the
+// window closes.
+func TestContinuousJobRestartsCaptureWhenNoSegmentCloses(t *testing.T) {
+	oldInterval := continuousSegmentStallPollInterval
+	continuousSegmentStallPollInterval = time.Millisecond
+	t.Cleanup(func() { continuousSegmentStallPollInterval = oldInterval })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			fmt.Fprintf(w, `{"cancel":false,"lease_expires_at":%q}`, time.Now().Add(5*time.Second).Format(time.RFC3339Nano))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	client, err := recordingapi.NewClient(recordingapi.ClientConfig{BaseURL: server.URL, NodeToken: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := newFrozenHLSTestWorker()
+	w.cfg.Client = client
+	w.cfg.CaptureTempDir = t.TempDir()
+	w.cfg.HeartbeatSec = 1
+	w.cfg.UploadWorkers = 1
+	w.cfg.ContinuousNoProgressTimeout = time.Minute
+	w.heartbeatInt = 2 * time.Millisecond
+	w.leaseSafetyMargin = time.Millisecond
+	w.segmentStallTimeout = 30 * time.Millisecond
+	w.reconnectDelay = func(int64, int) time.Duration { return time.Millisecond }
+	launches := make(chan int64, 4)
+	var calls atomic.Int64
+	w.continuousCapture = func(ctx context.Context, _ capture.CaptureInput, _ time.Duration, _ string, _ *int, _ string, _ func(capture.Segment) error) error {
+		launches <- calls.Add(1)
+		<-ctx.Done() // ffmpeg holds one segment open
+		return nil
+	}
+	jobCtx, cancelJob := context.WithCancel(context.Background())
+	defer cancelJob()
+	windowEnd := time.Now().Add(30 * time.Second)
+	job := recordingapi.RecordingJob{
+		JobID: 434, RecordingID: 434, SourceURL: "https://192.0.2.1/live.m3u8",
+		ClipDurationSec: 60, Kind: "continuous_window", WindowEndAt: &windowEnd,
+		LeaseToken: "lease", LeaseExpiresAt: time.Now().Add(5 * time.Second),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.processContinuousJob(jobCtx, job)
+	}()
+	for want := int64(1); want <= 2; want++ {
+		select {
+		case got := <-launches:
+			if got != want {
+				t.Fatalf("launch=%d want %d", got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("capture launch %d never happened: a held-open segment was not restarted", want)
+		}
+	}
+	cancelJob()
+	<-done
+}

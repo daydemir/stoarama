@@ -1077,6 +1077,7 @@ func relayLogCategory(line string) string {
 		{"segment delivery failed", "recording_worker.segment_delivery_failed"},
 		{"continuous resolve failed", "recording_worker.resolve_failed"},
 		{"continuous source dropped", "recording_worker.source_dropped"},
+		{"continuous segment stall", "recording_worker.segment_stall"},
 		{"continuous ssrf guard rejected", "recording_worker.ssrf_rejected"},
 		{"lease paused", "recording_worker.lease_paused"},
 		{"lease expired", "recording_worker.lease_expired"},
