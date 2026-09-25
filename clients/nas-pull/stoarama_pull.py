@@ -1273,6 +1273,12 @@ class Runtime:
             inventory = self.inventory.summary()
             if inventory is not None:
                 payload["inventory"] = inventory
+        host_facts = getattr(self, "host_facts", None)
+        if host_facts is not None:
+            try:
+                payload["host"] = host_facts()
+            except Exception as exc:
+                log("WARN", "host facts unavailable: %s" % exc)
         return payload
 
 
@@ -6689,6 +6695,721 @@ def upload_probe_loop(cfg, runtime, stop_event, rng=random):
             wait = upload_probe_wait(UPLOAD_PROBE_ERROR_WAIT_SEC, rng)
 
 
+# ---------------------------------------------------------------------------
+# NAS host facts and one-shot media benchmark
+#
+# Measures what NAS-side collation would cost on this NAS. The server hands out
+# one real hour of clips already on the NAS (exact path, size, sha256). The
+# benchmark reads them read-only, remuxes them into one temp file under
+# /state, checks a per-stream packet hash chain, decodes around every seam and
+# then the whole output, records wall and CPU seconds, deletes its temp output
+# and reports. It never writes to, renames or deletes anything under /clips.
+# ---------------------------------------------------------------------------
+
+BENCHMARK_TOOL_VERSION = "N-126239-g88ae625e69"
+# The same pinned FFmpeg the cloud joined pipeline uses (batch media_tool
+# identity), mirrored as a repository release. Only x86_64 is published; other
+# architectures report unsupported_arch with their host facts.
+BENCHMARK_TOOLS = {
+    "x86_64": {
+        "url": "https://github.com/daydemir/stoarama/releases/download/joined-media-tools-ffmpeg-N-126239-g88ae625e69/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz",
+        "archive_sha256": "b7d2cf59ccb19372f6ee0198a938ccc1b6654d8704d056f8c72b82fda30af34f",
+        "ffmpeg_sha256": "eab722b24d599876819f89f503cc142b39a096a971d7d7913a0282b0484b9d5e",
+        "ffprobe_sha256": "95cda0f6de6e2d0c48cc2afe24e8ef9bcb8b4ffc5897af77158b1a59b303a97a",
+    },
+}
+BENCHMARK_MACHINE_ALIASES = {"amd64": "x86_64", "x86-64": "x86_64"}
+BENCHMARK_TOOL_MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+BENCHMARK_TOOL_MAX_BINARY_BYTES = 512 * 1024 * 1024
+BENCHMARK_TOOL_INSTALL_SEC = 15 * 60
+BENCHMARK_MAX_DEADLINE_SEC = 30 * 60
+BENCHMARK_THREADS = 2
+BENCHMARK_NICE = 15
+BENCHMARK_SEAM_HALF_WINDOW_SEC = 2.0
+BENCHMARK_MAX_CLIPS = 200
+BENCHMARK_STATE_HEADROOM_BYTES = 2 * 1024 * 1024 * 1024
+BENCHMARK_STARTUP_DELAY_SEC = (60, 300)
+BENCHMARK_MIN_WAIT_SEC = 300
+BENCHMARK_MAX_WAIT_SEC = 24 * 60 * 60
+BENCHMARK_ERROR_WAIT_SEC = 60 * 60
+BENCHMARK_REPORT_ATTEMPTS = 3
+BENCHMARK_REPORT_BACKOFF_SEC = 10
+BENCHMARK_ROOT = "benchmark"
+HOST_TOKEN = re.compile(r"[A-Za-z0-9_.+-]{1,64}\Z")
+# Set while a benchmark runs so a staged self-update waits for it (bounded by
+# the benchmark deadline) instead of orphaning niced FFmpeg children.
+BENCHMARK_ACTIVE = threading.Event()
+
+
+class BenchmarkError(RuntimeError):
+    pass
+
+
+class BenchmarkDeadline(BenchmarkError):
+    pass
+
+
+class BenchmarkUnsupported(BenchmarkError):
+    pass
+
+
+def _read_text(path, limit=64 * 1024):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as source:
+            return source.read(limit)
+    except OSError:
+        return None
+
+
+def _host_token(value):
+    value = str(value or "").strip()
+    return value if HOST_TOKEN.match(value) else ""
+
+
+def _host_text(value):
+    cleaned = "".join(ch for ch in str(value or "") if 32 <= ord(ch) != 127).strip()
+    # The server bounds these strings in bytes; never split a UTF-8 sequence.
+    return cleaned.encode("utf-8")[:256].decode("utf-8", "ignore").strip()
+
+
+def cgroup_cpu_limit(root="/sys/fs/cgroup"):
+    """CPUs granted by the container cgroup, or None when unlimited/unknown."""
+    raw = _read_text(os.path.join(root, "cpu.max"))
+    if raw is not None:
+        parts = raw.split()
+        if len(parts) == 2 and parts[0] != "max":
+            try:
+                quota, period = int(parts[0]), int(parts[1])
+                if quota > 0 and period > 0:
+                    return _cpu_ratio(quota, period)
+            except ValueError:
+                return None
+        return None
+    quota = _read_text(os.path.join(root, "cpu", "cpu.cfs_quota_us"))
+    period = _read_text(os.path.join(root, "cpu", "cpu.cfs_period_us"))
+    try:
+        quota, period = int((quota or "").strip()), int((period or "").strip())
+    except ValueError:
+        return None
+    return _cpu_ratio(quota, period) if quota > 0 and period > 0 else None
+
+
+def _cpu_ratio(quota, period):
+    # The server rejects a non-positive limit; a sub-0.0005 CPU quota rounds to 0.
+    ratio = round(quota / period, 3)
+    return ratio if ratio > 0 else None
+
+
+def cgroup_memory_limit(root="/sys/fs/cgroup"):
+    """Bytes granted by the container cgroup, or None when unlimited/unknown."""
+    for relative in ("memory.max", os.path.join("memory", "memory.limit_in_bytes")):
+        raw = _read_text(os.path.join(root, relative))
+        if raw is None:
+            continue
+        raw = raw.strip()
+        if raw == "max":
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        # cgroup v1 reports "unlimited" as a page-rounded near-2^63 value.
+        return value if 0 < value < (1 << 60) else None
+    return None
+
+
+def meminfo_bytes(text):
+    values = {}
+    for line in (text or "").splitlines():
+        name, _, rest = line.partition(":")
+        fields = rest.split()
+        if name in ("MemTotal", "MemAvailable") and fields:
+            try:
+                values[name] = int(fields[0]) * 1024
+            except ValueError:
+                pass
+    return values.get("MemTotal", 0), values.get("MemAvailable", 0)
+
+
+def cpu_model(text):
+    for line in (text or "").splitlines():
+        name, _, value = line.partition(":")
+        if name.strip() in ("model name", "Hardware", "Model") and value.strip():
+            return _host_text(value)
+    return ""
+
+
+def state_exec_allowed(state_dir):
+    """True when a binary on the state volume can execute (not noexec)."""
+    tools = Path(state_dir) / "tools"
+    probe = tools / (".exec-probe-%d" % os.getpid())
+    try:
+        tools.mkdir(parents=True, exist_ok=True)
+        with open(probe, "w", encoding="ascii") as output:
+            output.write("#!/bin/sh\nexit 0\n")
+        os.chmod(probe, 0o700)
+        completed = subprocess.run([str(probe)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return completed.returncode == 0
+    except PermissionError:
+        return False
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+class HostFacts:
+    """Static facts are gathered once; memory and load refresh per call."""
+
+    def __init__(self, state_dir):
+        self.state_dir = state_dir
+        self.static = None
+        self.lock = threading.Lock()
+
+    def _gather_static(self):
+        import platform
+        try:
+            affinity = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            affinity = 0
+        return {
+            "machine": _host_token(platform.machine()),
+            "system": _host_token(platform.system()),
+            "kernel_release": _host_text(platform.release()),
+            "python_version": _host_token(platform.python_version()),
+            "cpu_model": cpu_model(_read_text("/proc/cpuinfo", 256 * 1024)),
+            "cpu_count": max(0, int(os.cpu_count() or 0)),
+            "affinity_cpus": affinity,
+            "cgroup_cpu_limit": cgroup_cpu_limit(),
+            "cgroup_memory_limit_bytes": cgroup_memory_limit(),
+            "state_exec_allowed": state_exec_allowed(self.state_dir),
+        }
+
+    def __call__(self):
+        with self.lock:
+            if self.static is None:
+                self.static = self._gather_static()
+            facts = dict(self.static)
+        total, available = meminfo_bytes(_read_text("/proc/meminfo"))
+        facts["mem_total_bytes"] = total
+        facts["mem_available_bytes"] = available
+        try:
+            facts["load1"] = round(max(0.0, os.getloadavg()[0]), 2)
+        except (AttributeError, OSError):
+            facts["load1"] = None
+        return facts
+
+
+def benchmark_tool_arch(machine):
+    machine = str(machine or "").strip().lower()
+    return BENCHMARK_MACHINE_ALIASES.get(machine, machine)
+
+
+def _verified_binary(path, expected_sha):
+    try:
+        size, digest = sha256_file(path)
+    except OSError:
+        return False
+    return size > 0 and digest == expected_sha
+
+
+def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
+    """Install the pinned FFmpeg/ffprobe under /state/tools; verify every byte."""
+    arch = benchmark_tool_arch(machine)
+    spec = BENCHMARK_TOOLS.get(arch)
+    if spec is None:
+        raise BenchmarkUnsupported("no pinned FFmpeg build for architecture %r" % (machine or "unknown"))
+    tools_dir = Path(state_dir) / "tools" / ("ffmpeg-%s-%s" % (BENCHMARK_TOOL_VERSION, arch))
+    binaries = {"ffmpeg": spec["ffmpeg_sha256"], "ffprobe": spec["ffprobe_sha256"]}
+    info = {"version": BENCHMARK_TOOL_VERSION, "arch": arch,
+            "ffmpeg_sha256": spec["ffmpeg_sha256"], "ffprobe_sha256": spec["ffprobe_sha256"]}
+    if all(_verified_binary(tools_dir / name, sha) for name, sha in binaries.items()):
+        info.update({"source": "cached", "ffmpeg": str(tools_dir / "ffmpeg"), "ffprobe": str(tools_dir / "ffprobe")})
+        return info
+    import tarfile
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    archive = tools_dir / (".archive-%d.tar.xz" % os.getpid())
+    partials = []
+    try:
+        request = urllib.request.Request(spec["url"], headers={"User-Agent": USER_AGENT})
+        digest = hashlib.sha256()
+        size = 0
+        with (opener or urllib.request.urlopen)(request, timeout=60) as response, open(archive, "wb") as output:
+            while True:
+                if time.monotonic() > deadline:
+                    raise BenchmarkDeadline("tool download exceeded its time cap")
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > BENCHMARK_TOOL_MAX_ARCHIVE_BYTES:
+                    raise BenchmarkError("tool archive is larger than expected")
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != spec["archive_sha256"]:
+            raise BenchmarkError("tool archive sha256 mismatch")
+        found = set()
+        with tarfile.open(archive, "r:xz") as bundle:
+            for member in bundle:
+                if time.monotonic() > deadline:
+                    raise BenchmarkDeadline("tool extraction exceeded its time cap")
+                parts = member.name.split("/")
+                name = parts[-1]
+                if name not in binaries or name in found or len(parts) < 2 or parts[-2] != "bin" or not member.isfile():
+                    continue
+                if member.size <= 0 or member.size > BENCHMARK_TOOL_MAX_BINARY_BYTES:
+                    raise BenchmarkError("tool binary has an unexpected size")
+                partial = tools_dir / (".%s.partial-%d" % (name, os.getpid()))
+                partials.append(partial)
+                binary_digest = hashlib.sha256()
+                source = bundle.extractfile(member)
+                with source, open(partial, "wb") as output:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        binary_digest.update(chunk)
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if binary_digest.hexdigest() != binaries[name]:
+                    raise BenchmarkError("%s sha256 mismatch" % name)
+                os.chmod(partial, 0o755)
+                os.replace(partial, tools_dir / name)
+                found.add(name)
+                if found == set(binaries):
+                    break
+        if found != set(binaries):
+            raise BenchmarkError("tool archive lacks ffmpeg/ffprobe")
+        fsync_dir(tools_dir)
+    finally:
+        for path in [archive] + partials:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    info.update({"source": "downloaded", "archive_bytes": size,
+                 "ffmpeg": str(tools_dir / "ffmpeg"), "ffprobe": str(tools_dir / "ffprobe")})
+    return info
+
+
+def _niced(command):
+    import shutil
+    prefix = []
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", str(BENCHMARK_NICE)]
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-t", "-c", "2", "-n", "7"]
+    return prefix + list(command)
+
+
+def run_measured(command, deadline, stop_event, stdout_path=None, niced=True):
+    """Run one child to completion; return wall, CPU and peak RSS from wait4.
+
+    The child gets its own process group and is killed at the deadline or on
+    shutdown, so no FFmpeg descendant outlives the benchmark.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BenchmarkDeadline("benchmark deadline reached")
+    stderr_file = tempfile.TemporaryFile()
+    stdout_file = open(stdout_path, "wb") if stdout_path else subprocess.DEVNULL
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(_niced(command) if niced else list(command), stdin=subprocess.DEVNULL,
+                                   stdout=stdout_file, stderr=stderr_file, start_new_session=True)
+    except BaseException:
+        stderr_file.close()
+        if stdout_path:
+            stdout_file.close()
+        raise
+    killed = {"reason": ""}
+    done = threading.Event()
+
+    def watchdog():
+        while not done.wait(0.5):
+            reason = "deadline" if time.monotonic() >= deadline else ("shutdown" if stop_event.is_set() else "")
+            if reason:
+                killed["reason"] = reason
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                return
+
+    guard = threading.Thread(target=watchdog, name="benchmark-watchdog", daemon=True)
+    guard.start()
+    try:
+        _, status, usage = os.wait4(process.pid, 0)
+        process.returncode = os.waitstatus_to_exitcode(status)
+    finally:
+        done.set()
+        guard.join(timeout=2)
+        if stdout_path:
+            stdout_file.close()
+    stderr_file.seek(0)
+    stderr_tail = stderr_file.read()[-400:].decode("utf-8", "replace").strip()
+    stderr_file.close()
+    wall = time.monotonic() - started
+    measured = {
+        "wall_s": wall, "cpu_s": usage.ru_utime + usage.ru_stime,
+        "max_rss_kb": int(usage.ru_maxrss if sys.platform != "darwin" else usage.ru_maxrss // 1024),
+        "returncode": process.returncode, "stderr": stderr_tail,
+    }
+    if killed["reason"] == "deadline":
+        raise BenchmarkDeadline("benchmark deadline reached")
+    if killed["reason"] == "shutdown":
+        raise BenchmarkError("client shutting down")
+    return measured
+
+
+class StageMeter:
+    """Accumulates children (and optionally this thread) into one stage."""
+
+    def __init__(self):
+        self.wall = 0.0
+        self.cpu = 0.0
+        self.rss = 0
+        self.started = time.monotonic()
+        self.thread_cpu = time.thread_time()
+
+    def add(self, measured):
+        self.cpu += measured["cpu_s"]
+        self.rss = max(self.rss, measured["max_rss_kb"])
+
+    def finish(self, include_thread=False, **extra):
+        stage = {"wall_s": round(time.monotonic() - self.started, 3),
+                 "cpu_s": round(self.cpu + ((time.thread_time() - self.thread_cpu) if include_thread else 0.0), 3),
+                 "max_rss_kb": self.rss}
+        stage.update(extra)
+        return stage
+
+
+def parse_framehash(path, digests=None, counts=None, check_timing=False):
+    """Fold framehash lines into a per-stream sha256 chain of (size, hash).
+
+    Timestamps are excluded from the chain (concat rebases them); with
+    check_timing, output DTS must be strictly increasing per stream.
+    """
+    digests = {} if digests is None else digests
+    counts = {} if counts is None else counts
+    last_dts, violations = {}, 0
+    with open(path, "r", encoding="ascii", errors="replace") as source:
+        for line in source:
+            if not line or line.startswith("#"):
+                continue
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) < 6:
+                continue
+            stream, dts, size, frame_hash = fields[0], fields[1], fields[4], fields[5]
+            digests.setdefault(stream, hashlib.sha256()).update(("%s:%s\n" % (size, frame_hash)).encode("ascii"))
+            counts[stream] = counts.get(stream, 0) + 1
+            if check_timing:
+                try:
+                    value = int(dts)
+                except ValueError:
+                    violations += 1
+                    continue
+                if stream in last_dts and value <= last_dts[stream]:
+                    violations += 1
+                last_dts[stream] = value
+    return digests, counts, violations
+
+
+def benchmark_concat_manifest(paths, durations):
+    lines = ["ffconcat version 1.0\n"]
+    for path, duration in zip(paths, durations):
+        lines.append(concat_manifest_line(path))
+        if duration is not None and duration > 0:
+            lines.append("duration %.6f\n" % duration)
+    return "".join(lines)
+
+
+def clean_benchmark_root(state_dir):
+    """Remove leftovers of this client's own benchmark temp dirs (flat, files only)."""
+    root = Path(state_dir) / BENCHMARK_ROOT
+    if not root.is_dir() or root.is_symlink():
+        return True
+    clean = True
+    for entry in os.scandir(root):
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        for child in os.scandir(entry.path):
+            if child.is_file(follow_symlinks=False) or child.is_symlink():
+                try:
+                    os.unlink(child.path)
+                except OSError:
+                    clean = False
+            else:
+                clean = False
+        try:
+            os.rmdir(entry.path)
+        except OSError:
+            clean = False
+    return clean
+
+
+def valid_benchmark_task(task):
+    if not isinstance(task, dict):
+        raise BenchmarkError("invalid benchmark task")
+    benchmark_id = task.get("benchmark_id")
+    clips = task.get("clips")
+    deadline = task.get("deadline_sec")
+    if type(benchmark_id) is not int or benchmark_id <= 0:
+        raise BenchmarkError("invalid benchmark id")
+    if type(deadline) is not int or deadline <= 0:
+        raise BenchmarkError("invalid benchmark deadline")
+    if not isinstance(clips, list) or not 1 <= len(clips) <= BENCHMARK_MAX_CLIPS:
+        raise BenchmarkError("invalid benchmark clip list")
+    valid = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            raise BenchmarkError("invalid benchmark clip")
+        size, sha = clip.get("size_bytes"), str(clip.get("sha256", ""))
+        if type(size) is not int or size <= 0 or len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            raise BenchmarkError("invalid benchmark clip identity")
+        valid.append({"clip_id": clip.get("clip_id"), "relative_path": str(clip.get("relative_path", "")),
+                      "size_bytes": size, "sha256": sha})
+    return benchmark_id, min(deadline, BENCHMARK_MAX_DEADLINE_SEC), valid
+
+
+def run_benchmark(cfg, task, stop_event, host_facts, tool_installer=ensure_benchmark_tools):
+    """Execute one benchmark task. Returns (status, error, result)."""
+    benchmark_id, deadline_sec, clips = valid_benchmark_task(task)
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), BENCHMARK_NICE)
+    except (AttributeError, OSError):
+        pass
+    started = time.monotonic()
+    result = {"schema_version": 1, "benchmark_id": benchmark_id, "threads": BENCHMARK_THREADS,
+              "nice": BENCHMARK_NICE, "clips": len(clips), "input_bytes": sum(c["size_bytes"] for c in clips),
+              "media_seconds": 0.0, "deadline_sec": deadline_sec, "deadline_hit": False,
+              "tool": {}, "stages": {}, "temp_removed": None}
+    stages = result["stages"]
+    status, error = "ok", ""
+    work = Path(cfg.state_dir) / BENCHMARK_ROOT / str(benchmark_id)
+    try:
+        # Tool install: once per NAS, with its own cap; it is not collation cost.
+        meter = StageMeter()
+        try:
+            tools = tool_installer(cfg.state_dir, host_facts.get("machine"), time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC)
+        except BenchmarkUnsupported as exc:
+            stages["tool_install"] = meter.finish(include_thread=True, ok=False, error=str(exc)[:300])
+            return "unsupported_arch", str(exc)[:1000], result
+        except Exception as exc:
+            stages["tool_install"] = meter.finish(include_thread=True, ok=False, error=str(exc)[:300])
+            return "error", ("tool install failed: %s" % exc)[:1000], result
+        stages["tool_install"] = meter.finish(include_thread=True, ok=True, source=tools.get("source", ""))
+        result["tool"] = {key: value for key, value in tools.items() if key not in ("ffmpeg", "ffprobe")}
+        ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
+        version = run_measured([ffmpeg, "-hide_banner", "-version"], time.monotonic() + 60, stop_event, niced=False)
+        result["tool"]["exec_ok"] = version["returncode"] == 0
+        if version["returncode"] != 0:
+            return "error", ("pinned ffmpeg does not execute: %s" % version["stderr"])[:1000], result
+
+        deadline = time.monotonic() + deadline_sec
+        import shutil as shutil_module
+        clean_benchmark_root(cfg.state_dir)
+        free = shutil_module.disk_usage(str(cfg.state_dir)).free
+        needed = int(result["input_bytes"] * 1.1) + BENCHMARK_STATE_HEADROOM_BYTES
+        if free < needed:
+            return "error", "state volume has %d free bytes; benchmark needs %d" % (free, needed), result
+        work.mkdir(parents=True, exist_ok=False)
+
+        # 1. Read and hash every input exactly as collation would.
+        meter = StageMeter()
+        paths = []
+        for clip in clips:
+            if time.monotonic() > deadline:
+                raise BenchmarkDeadline("benchmark deadline reached")
+            if stop_event.is_set():
+                raise BenchmarkError("client shutting down")
+            path, file_stat = confined_regular_file(cfg.output_dir, clip["relative_path"])
+            if file_stat.st_size != clip["size_bytes"]:
+                stages["hash_inputs"] = meter.finish(include_thread=True, ok=False, error="size mismatch clip %s" % clip["clip_id"])
+                return "error", "input size mismatch", result
+            _, digest = sha256_file(path)
+            if digest != clip["sha256"]:
+                stages["hash_inputs"] = meter.finish(include_thread=True, ok=False, error="sha256 mismatch clip %s" % clip["clip_id"])
+                return "error", "input sha256 mismatch", result
+            paths.append(path)
+        stages["hash_inputs"] = meter.finish(include_thread=True, ok=True, bytes=result["input_bytes"])
+
+        # 2. Exact per-clip durations (what the concat manifest will pin).
+        meter = StageMeter()
+        durations, audio_clips = [], 0
+        for index, path in enumerate(paths):
+            probe_out = work / ("probe-%d.json" % index)
+            measured = run_measured([ffprobe, "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+                                     "-of", "json", str(path)], deadline, stop_event, stdout_path=probe_out)
+            meter.add(measured)
+            try:
+                parsed = json.loads(probe_out.read_text(encoding="utf-8"))
+                durations.append(float(parsed["format"]["duration"]))
+                audio_clips += any(s.get("codec_type") == "audio" for s in parsed.get("streams", []))
+            except (ValueError, KeyError, TypeError, OSError):
+                durations.append(None)
+            probe_out.unlink()
+        known = [d for d in durations if d]
+        result["media_seconds"] = round(sum(known), 3)
+        stages["probe"] = meter.finish(ok=len(known) == len(paths), clips_with_audio=audio_clips)
+
+        # 3. Remux: concat demuxer, stream copy, no timestamp auto-conversion.
+        meter = StageMeter()
+        manifest = work / "concat.txt"
+        manifest.write_text(benchmark_concat_manifest(paths, durations), encoding="utf-8")
+        output = work / "joined.mp4"
+        measured = run_measured([ffmpeg, "-nostdin", "-v", "error", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+                                 "-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", str(manifest),
+                                 "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-threads", str(BENCHMARK_THREADS),
+                                 "-y", str(output)], deadline, stop_event)
+        meter.add(measured)
+        output_bytes = output.stat().st_size if output.exists() else 0
+        stages["remux"] = meter.finish(ok=measured["returncode"] == 0 and output_bytes > 0, output_bytes=output_bytes,
+                                       error=measured["stderr"][:300] if measured["returncode"] else "")
+        if not stages["remux"]["ok"]:
+            return "error", "remux failed", result
+
+        # 4. Packet hash chain: every source packet payload, in order, per stream.
+        meter = StageMeter()
+        source_digests, source_counts = {}, {}
+        hash_out = work / "framehash.txt"
+        for path in paths:
+            measured = run_measured([ffmpeg, "-nostdin", "-v", "error", "-i", str(path), "-map", "0:v:0", "-map", "0:a?",
+                                     "-c", "copy", "-f", "framehash", "-hash", "sha256", "-y", str(hash_out)],
+                                    deadline, stop_event)
+            meter.add(measured)
+            if measured["returncode"] != 0:
+                stages["packet_chain"] = meter.finish(ok=False, error=measured["stderr"][:300])
+                return "error", "source packet hash failed", result
+            parse_framehash(hash_out, source_digests, source_counts)
+            hash_out.unlink()
+        measured = run_measured([ffmpeg, "-nostdin", "-v", "error", "-i", str(output), "-map", "0:v:0", "-map", "0:a?",
+                                 "-c", "copy", "-f", "framehash", "-hash", "sha256", "-y", str(hash_out)],
+                                deadline, stop_event)
+        meter.add(measured)
+        output_digests, output_counts, violations = parse_framehash(hash_out, check_timing=True)
+        hash_out.unlink()
+        match = (measured["returncode"] == 0 and source_counts == output_counts and
+                 {k: v.hexdigest() for k, v in source_digests.items()} == {k: v.hexdigest() for k, v in output_digests.items()})
+        stages["packet_chain"] = meter.finish(ok=measured["returncode"] == 0, match=match,
+                                              source_packets=source_counts, output_packets=output_counts,
+                                              dts_violations=violations)
+
+        # 5. Seam-only decode: a short strict decode around every clip boundary.
+        meter = StageMeter()
+        seams, failures, offset = 0, 0, 0.0
+        for duration in durations[:-1]:
+            if not duration:
+                break
+            offset += duration
+            start = max(0.0, offset - BENCHMARK_SEAM_HALF_WINDOW_SEC)
+            measured = run_measured([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-threads", str(BENCHMARK_THREADS),
+                                     "-ss", "%.3f" % start, "-i", str(output), "-t", "%.3f" % (2 * BENCHMARK_SEAM_HALF_WINDOW_SEC),
+                                     "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"], deadline, stop_event)
+            meter.add(measured)
+            seams += 1
+            failures += measured["returncode"] != 0
+        stages["seam_decode"] = meter.finish(ok=failures == 0, seams=seams, failures=failures)
+
+        # 6. Full strict decode of the whole output.
+        meter = StageMeter()
+        measured = run_measured([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+                                 "-threads", str(BENCHMARK_THREADS), "-i", str(output),
+                                 "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"], deadline, stop_event)
+        meter.add(measured)
+        stages["full_decode"] = meter.finish(ok=measured["returncode"] == 0,
+                                             error=measured["stderr"][:300] if measured["returncode"] else "")
+        if not (stages["packet_chain"]["match"] and stages["seam_decode"]["ok"] and stages["full_decode"]["ok"]):
+            error = "verification findings: packet_match=%s seam_failures=%d full_decode_ok=%s" % (
+                match, failures, stages["full_decode"]["ok"])
+        return status, error, result
+    except BenchmarkDeadline as exc:
+        result["deadline_hit"] = True
+        return "partial", str(exc), result
+    except MediaCertificationError as exc:
+        return "error", ("input path rejected: %s" % exc)[:1000], result
+    except Exception as exc:
+        return "error", ("%s: %s" % (type(exc).__name__, exc))[:1000], result
+    finally:
+        if work.exists():
+            clean_benchmark_root(cfg.state_dir)
+            result["temp_removed"] = not work.exists()
+        elif "hash_inputs" in stages:
+            result["temp_removed"] = True
+        result["total_wall_s"] = round(time.monotonic() - started, 3)
+
+
+def report_benchmark(cfg, benchmark_id, body, sleep=time.sleep):
+    for attempt in range(1, BENCHMARK_REPORT_ATTEMPTS + 1):
+        try:
+            request_json(cfg, "POST", "/account/connections/benchmark/%d/result" % benchmark_id,
+                         body=body, timeout=HEARTBEAT_TIMEOUT_SEC)
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                return
+            if not transient_error(exc) or attempt == BENCHMARK_REPORT_ATTEMPTS:
+                raise
+        except Exception as exc:
+            if not transient_error(exc) or attempt == BENCHMARK_REPORT_ATTEMPTS:
+                raise
+        sleep(BENCHMARK_REPORT_BACKOFF_SEC * attempt)
+
+
+def benchmark_once(cfg, stop_event, host_facts):
+    """Claim a benchmark if one is requested, run it, report it. Returns the wait."""
+    facts = host_facts()
+    claimed = request_json(cfg, "POST", "/account/connections/benchmark/claim",
+                           body={"client_version": CLIENT_VERSION, "host": facts}, timeout=HEARTBEAT_TIMEOUT_SEC)
+    if not isinstance(claimed, dict):
+        raise BenchmarkError("invalid benchmark claim response")
+    retry_after = claimed.get("retry_after_sec", BENCHMARK_ERROR_WAIT_SEC)
+    task = claimed.get("task")
+    if claimed.get("enabled") is not True or not isinstance(task, dict):
+        return retry_after
+    BENCHMARK_ACTIVE.set()
+    try:
+        status, error, result = run_benchmark(cfg, task, stop_event, facts)
+    finally:
+        BENCHMARK_ACTIVE.clear()
+    if stop_event.is_set() and status != "ok":
+        # A shutdown cut it short; the lease expires and the server re-offers it.
+        return retry_after
+    report_benchmark(cfg, task["benchmark_id"], {
+        "client_version": CLIENT_VERSION, "status": status, "error": error[:1000], "host": host_facts(),
+        "result": result,
+    })
+    log("INFO" if status == "ok" else "WARN", "benchmark id=%d status=%s media=%.0fs wall=%.0fs%s" % (
+        task["benchmark_id"], status, result.get("media_seconds", 0), result.get("total_wall_s", 0),
+        (" error=%s" % error) if error else ""))
+    return retry_after
+
+
+def benchmark_wait(seconds, rng=random):
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        seconds = BENCHMARK_ERROR_WAIT_SEC
+    return min(max(seconds, BENCHMARK_MIN_WAIT_SEC), BENCHMARK_MAX_WAIT_SEC) * rng.uniform(0.9, 1.1)
+
+
+def benchmark_loop(cfg, runtime, stop_event, rng=random):
+    """Background benchmark poller; never raises."""
+    wait = rng.uniform(*BENCHMARK_STARTUP_DELAY_SEC)
+    while not stop_event.wait(wait):
+        try:
+            wait = benchmark_wait(benchmark_once(cfg, stop_event, runtime.host_facts), rng)
+        except Exception as exc:
+            log("WARN", "benchmark deferred: %s" % exc)
+            wait = benchmark_wait(BENCHMARK_ERROR_WAIT_SEC, rng)
+
+
+
 def validate_manifest(manifest):
     version = str(manifest.get("version", ""))
     artifact = str(manifest.get("artifact", ""))
@@ -6765,6 +7486,7 @@ def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_work
         and (stop_event is None or not stop_event.is_set())
         and not inventory_worker.is_alive()
         and (joined_worker is None or not joined_worker.is_alive())
+        and not BENCHMARK_ACTIVE.is_set()
     )
 
 
@@ -6773,6 +7495,7 @@ def run(cfg):
     lock_handle = acquire_lock(cfg)
     inventory = Inventory(cfg)
     runtime = Runtime(cfg, inventory)
+    runtime.host_facts = HostFacts(cfg.state_dir)
     mark_runtime(cfg, runtime)
     stop_event = threading.Event()
     inventory_stop_event = threading.Event()
@@ -6813,6 +7536,12 @@ def run(cfg):
         # API sweeps any unreported probe objects after their target expires.
         threading.Thread(target=upload_probe_loop, args=(cfg, runtime, stop_event), daemon=True).start()
     self_update_failed = False
+    benchmark_worker = None
+    if not cfg.dry_run:
+        # Daemon thread: a staged self-update waits while BENCHMARK_ACTIVE is
+        # set; shutdown kills the benchmark children via stop_event.
+        benchmark_worker = threading.Thread(target=benchmark_loop, args=(cfg, runtime, stop_event), daemon=True)
+        benchmark_worker.start()
     try:
         while not stop_event.is_set():
             # No delivery page is active at this boundary. A staged candidate
@@ -6879,6 +7608,10 @@ def run(cfg):
         storage_probe.join(timeout=1)
         inventory_worker.join(timeout=INVENTORY_SHUTDOWN_TIMEOUT_SEC)
         joined_worker.join(timeout=HTTP_TIMEOUT_SEC + 1)
+        if benchmark_worker is not None:
+            # The watchdog kills benchmark children within a second of stop;
+            # wait for its temp-output cleanup before the process exits.
+            benchmark_worker.join(timeout=15)
         joined_stuck = joined_worker.is_alive()
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
