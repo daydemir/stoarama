@@ -83,7 +83,7 @@ jobs:
       - name: Test NAS benchmark and upload probe lifecycle
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api -run '^Test(NASBenchmarkLifecycle|NASUploadProbeLifecycle)$' -count=1 -v
+        run: go test ./internal/api -run '^Test(NASBenchmarkLifecycle|NASUploadProbeLifecycle|HeartbeatDropsInvalidHostFactsKeepsTelemetry)$' -count=1 -v
       - name: Test batch Plaza naming
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

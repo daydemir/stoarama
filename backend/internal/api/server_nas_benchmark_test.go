@@ -50,6 +50,61 @@ func TestValidateNASHostFacts(t *testing.T) {
 	}
 }
 
+// An invalid host fact must cost the NAS neither its heartbeat nor the rest of
+// the telemetry it carried: the handler drops only the host facts.
+func TestHeartbeatDropsInvalidHostFactsKeepsTelemetry(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	migration, err := os.ReadFile("../../../infra/sql/migrations/0162_nas_benchmarks.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("apply migration: %v", err)
+	}
+	const accountID, apiKeyID = int64(47), int64(123)
+	if _, err := pool.Exec(ctx, `INSERT INTO connections(account_id,kind,api_key_id) VALUES($1,'nas_pull',$2)`, accountID, apiKeyID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	call := func(body string) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", strings.NewReader(body))
+		req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey,
+			accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
+		rec := httptest.NewRecorder()
+		s.handleAccountConnectionHeartbeat(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("heartbeat status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	read := func() (total, free *int64, host []byte) {
+		if err := pool.QueryRow(ctx, `SELECT nas_storage_total_bytes,nas_storage_free_bytes,nas_host FROM connections WHERE api_key_id=$1`, apiKeyID).Scan(&total, &free, &host); err != nil {
+			t.Fatal(err)
+		}
+		return total, free, host
+	}
+
+	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":250},"host":{"machine":"bad machine","cpu_count":4}}`)
+	total, free, host := read()
+	if total == nil || *total != 1000 || free == nil || *free != 250 {
+		t.Fatalf("storage telemetry not persisted with invalid host: total=%v free=%v", total, free)
+	}
+	if host != nil {
+		t.Fatalf("invalid host facts persisted: %s", host)
+	}
+
+	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":200},"host":{"machine":"x86_64","cpu_count":4}}`)
+	if _, _, host = read(); !strings.Contains(string(host), `"x86_64"`) {
+		t.Fatalf("valid host facts not persisted: %s", host)
+	}
+	// A later invalid report must not erase the last good facts.
+	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":150},"host":{"machine":"x86 64"}}`)
+	if _, free, host = read(); free == nil || *free != 150 || !strings.Contains(string(host), `"x86_64"`) {
+		t.Fatalf("invalid host report clobbered state: free=%v host=%s", free, host)
+	}
+}
+
 func TestValidateNASBenchmarkResult(t *testing.T) {
 	ok := nasBenchmarkResultRequest{Status: "ok", Result: json.RawMessage(`{"stages":{}}`), ClientVersion: "abc12345"}
 	if err := validateNASBenchmarkResult(ok); err != nil {
