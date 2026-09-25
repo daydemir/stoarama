@@ -110,6 +110,8 @@ func runNASBenchmark(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal("invalid database configuration")
 	}
 	poolConfig.ConnConfig.RuntimeParams["application_name"] = "stoarama-nas-benchmark"
+	// The shared inventory-report pool is read-only; only the report is.
+	poolConfig.ConnConfig.RuntimeParams["default_transaction_read_only"] = nasBenchmarkReadOnly(opts.command)
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Fatalf("connect database: %v", err)
@@ -130,6 +132,13 @@ func runNASBenchmark(ctx context.Context, cfg config.Config, args []string) {
 	if err := writeNASBenchmarkReport(os.Stdout, report, opts.asJSON); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func nasBenchmarkReadOnly(command string) string {
+	if command == "request" {
+		return "off"
+	}
+	return "on"
 }
 
 func requestNASBenchmark(ctx context.Context, pool *pgxpool.Pool, opts nasBenchmarkOptions) (int64, error) {

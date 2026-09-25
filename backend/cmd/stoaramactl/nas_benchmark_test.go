@@ -63,3 +63,12 @@ func TestWriteNASBenchmarkReportShowsPerStageCost(t *testing.T) {
 		t.Fatalf("json report err=%v out=%s", err, out.String())
 	}
 }
+
+func TestNASBenchmarkRequestPoolIsWritable(t *testing.T) {
+	if got := nasBenchmarkReadOnly("request"); got != "off" {
+		t.Fatalf("request pool read-only=%q, want off", got)
+	}
+	if got := nasBenchmarkReadOnly("report"); got != "on" {
+		t.Fatalf("report pool read-only=%q, want on", got)
+	}
+}

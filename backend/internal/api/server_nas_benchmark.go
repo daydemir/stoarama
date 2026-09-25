@@ -31,6 +31,7 @@ const (
 	nasBenchmarkIdleRetrySec   = 1800
 	nasBenchmarkDisabledSec    = 3600
 	nasBenchmarkMaxClips       = 200
+	nasBenchmarkMaxAge         = 4 * 24 * time.Hour
 	nasBenchmarkMaxResultBytes = 256 * 1024
 	nasBenchmarkMaxError       = 1000
 	nasHostMaxString           = 256
@@ -310,24 +311,36 @@ func selectNASBenchmarkPlan(ctx context.Context, q pgx.Tx, accountID, connection
 	if pinnedRecording != nil && pinnedStart != nil {
 		plan.RecordingID, plan.WindowStartAt = *pinnedRecording, pinnedStart.UTC()
 	} else {
-		err := q.QueryRow(ctx, `
-			SELECT r.id, x.h FROM recordings r
-			CROSS JOIN LATERAL (
-			  SELECT date_trunc('hour', c.clip_start_at) AS h FROM recording_clips c
-			  LEFT JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id AND n.state='present'
-			    AND n.size_bytes=c.size_bytes AND lower(n.sha256)=lower(c.sha256)
-			  WHERE c.recording_id=r.id AND c.purged_at IS NULL
-			    AND c.clip_start_at >= now()-interval '4 days' AND c.clip_start_at < now()-interval '1 day'
-			  GROUP BY 1
-			  HAVING count(*) BETWEEN 55 AND 61 AND count(n.clip_id)=count(*) AND count(DISTINCT c.recording_job_id)=1
-			) x
-			WHERE r.account_id=$1
-			ORDER BY x.h DESC, r.id LIMIT 1`, accountID, connectionID).Scan(&plan.RecordingID, &plan.WindowStartAt)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return plan, errors.New("no complete hour on the NAS in the last four days")
+		// Search one hour at a time, newest first, and stop at the first complete
+		// one. A single query over the whole window scanned every recording's
+		// clips (21 s on prod), past the client's 20 s claim timeout, so the
+		// claim rolled back on every attempt and no benchmark ever started.
+		newest := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Hour).Add(-time.Hour)
+		found := false
+		for h := newest; !h.Before(time.Now().UTC().Add(-nasBenchmarkMaxAge)); h = h.Add(-time.Hour) {
+			err := q.QueryRow(ctx, `
+				SELECT r.id FROM recordings r
+				CROSS JOIN LATERAL (
+				  SELECT 1 FROM recording_clips c
+				  LEFT JOIN nas_inventory_files n ON n.connection_id=$2 AND n.clip_id=c.id AND n.state='present'
+				    AND n.size_bytes=c.size_bytes AND lower(n.sha256)=lower(c.sha256)
+				  WHERE c.recording_id=r.id AND c.purged_at IS NULL
+				    AND c.clip_start_at >= $3 AND c.clip_start_at < $3 + interval '1 hour'
+				  HAVING count(*) BETWEEN 55 AND 61 AND count(n.clip_id)=count(*) AND count(DISTINCT c.recording_job_id)=1
+				) x
+				WHERE r.account_id=$1
+				ORDER BY r.id LIMIT 1`, accountID, connectionID, h).Scan(&plan.RecordingID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return plan, fmt.Errorf("select benchmark hour: %w", err)
+			}
+			plan.WindowStartAt, found = h, true
+			break
 		}
-		if err != nil {
-			return plan, fmt.Errorf("select benchmark hour: %w", err)
+		if !found {
+			return plan, errors.New("no complete hour on the NAS in the last four days")
 		}
 		plan.WindowStartAt = plan.WindowStartAt.UTC()
 	}
