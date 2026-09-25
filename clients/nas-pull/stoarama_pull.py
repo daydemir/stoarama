@@ -6781,7 +6781,7 @@ def cgroup_cpu_limit(root="/sys/fs/cgroup"):
             try:
                 quota, period = int(parts[0]), int(parts[1])
                 if quota > 0 and period > 0:
-                    return round(quota / period, 3)
+                    return _cpu_ratio(quota, period)
             except ValueError:
                 return None
         return None
@@ -6791,7 +6791,13 @@ def cgroup_cpu_limit(root="/sys/fs/cgroup"):
         quota, period = int((quota or "").strip()), int((period or "").strip())
     except ValueError:
         return None
-    return round(quota / period, 3) if quota > 0 and period > 0 else None
+    return _cpu_ratio(quota, period) if quota > 0 and period > 0 else None
+
+
+def _cpu_ratio(quota, period):
+    # The server rejects a non-positive limit; a sub-0.0005 CPU quota rounds to 0.
+    ratio = round(quota / period, 3)
+    return ratio if ratio > 0 else None
 
 
 def cgroup_memory_limit(root="/sys/fs/cgroup"):

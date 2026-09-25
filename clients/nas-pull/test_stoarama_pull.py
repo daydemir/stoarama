@@ -3850,6 +3850,8 @@ class NASBenchmarkTests(unittest.TestCase):
             (root / "cpu.max").write_text("250000 100000\n")
             (root / "memory.max").write_text("4294967296\n")
             self.assertEqual(pull.cgroup_cpu_limit(str(root)), 2.5)
+            (root / "cpu.max").write_text("40 100000\n")  # rounds to 0.0
+            self.assertIsNone(pull.cgroup_cpu_limit(str(root)))
             self.assertEqual(pull.cgroup_memory_limit(str(root)), 4294967296)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
