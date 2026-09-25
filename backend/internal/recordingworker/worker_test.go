@@ -1308,3 +1308,58 @@ func TestSanitizeDiagnosticURLRemovesProviderAndSourceIdentity(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+func TestContinuousSegmentStallTimeout(t *testing.T) {
+	for clip, want := range map[time.Duration]time.Duration{
+		10 * time.Second: 2 * time.Minute,
+		60 * time.Second: 3 * time.Minute,
+		5 * time.Minute:  15 * time.Minute,
+	} {
+		if got := continuousSegmentStallTimeout(clip); got != want {
+			t.Fatalf("clip %s: stall timeout=%s want %s", clip, got, want)
+		}
+	}
+}
+
+func TestSegmentStallMonitorAbortsOnlyWithoutClosedSegments(t *testing.T) {
+	oldInterval := continuousSegmentStallPollInterval
+	continuousSegmentStallPollInterval = time.Millisecond
+	t.Cleanup(func() { continuousSegmentStallPollInterval = oldInterval })
+
+	// Segments keep closing: no abort.
+	var last atomic.Int64
+	var stalled atomic.Bool
+	var aborts atomic.Int64
+	last.Store(time.Now().UnixNano())
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		monitorContinuousSegmentStall(stop, &last, 40*time.Millisecond, &stalled, func() { aborts.Add(1) })
+	}()
+	for i := 0; i < 10; i++ {
+		time.Sleep(10 * time.Millisecond)
+		last.Store(time.Now().UnixNano())
+	}
+	close(stop)
+	<-done
+	if stalled.Load() || aborts.Load() != 0 {
+		t.Fatalf("healthy cadence aborted: stalled=%v aborts=%d", stalled.Load(), aborts.Load())
+	}
+
+	// One segment held open: abort once.
+	last.Store(time.Now().UnixNano())
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		monitorContinuousSegmentStall(make(chan struct{}), &last, 20*time.Millisecond, &stalled, func() { aborts.Add(1) })
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("held-open segment was not aborted")
+	}
+	if !stalled.Load() || aborts.Load() != 1 {
+		t.Fatalf("stalled=%v aborts=%d want true/1", stalled.Load(), aborts.Load())
+	}
+}

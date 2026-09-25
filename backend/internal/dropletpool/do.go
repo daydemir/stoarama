@@ -370,67 +370,139 @@ write_files:
       # heartbeat). Allow DNS (port 53 ONLY) to exactly those configured upstream
       # addresses. They are persisted so a reboot, where this unit runs before the
       # network is up and resolv.conf does not exist yet, keeps the same allowance.
-      # Loopback and link-local/metadata entries are never allowlisted here.
+      # The upstreams can also change after boot (DHCP renewal, systemd-resolved
+      # reconfiguration), so stoarama-egress-firewall-refresh.path re-runs this
+      # script whenever resolved rewrites its resolv.conf.
+      # Only syntactically valid unicast addresses are allowlisted; loopback,
+      # unspecified and link-local/metadata entries never are.
       UPSTREAM_FILE=/etc/stoarama/dns-upstreams
+      RESOLV_CONF=/run/systemd/resolve/resolv.conf
       mkdir -p /etc/stoarama
-      UPSTREAM4=()
-      UPSTREAM6=()
-      # The live resolv.conf is authoritative; the persisted list is only the
-      # fallback for early boot, so a removed resolver never stays allowed.
-      if [ -r /run/systemd/resolve/resolv.conf ]; then
-        RESOLVERS="$(awk '$1 == "nameserver" {print $2}' /run/systemd/resolve/resolv.conf || true)"
-      else
-        RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"
-      fi
-      while read -r ns; do
-        case "$ns" in
-          ""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;
-          *:*) UPSTREAM6+=("$ns") ;;
-          *[!0-9.]*) continue ;;
-          *) UPSTREAM4+=("$ns") ;;
-        esac
-      done < <(printf '%s\n' "$RESOLVERS" | sed 's/%.*//' | tr 'A-F' 'a-f' | sort -u)
-      if [ "${#UPSTREAM4[@]}" -gt 0 ] || [ "${#UPSTREAM6[@]}" -gt 0 ]; then
-        printf '%s\n' ${UPSTREAM4[@]+"${UPSTREAM4[@]}"} ${UPSTREAM6[@]+"${UPSTREAM6[@]}"} | sed '/^$/d' > "$UPSTREAM_FILE"
-      fi
-      echo "stoarama-egress: DNS upstreams allowed: ${UPSTREAM4[*]:-none} ${UPSTREAM6[*]:-}"
+      # Serialize runs: the boot unit and a resolver-change refresh can overlap.
+      exec 9>/run/stoarama-egress-firewall.lock
+      flock 9
+
+      valid4() {
+        local re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$' o
+        [[ $1 =~ $re ]] || return 1
+        for o in "${BASH_REMATCH[@]:1}"; do
+          [ "$((10#$o))" -le 255 ] || return 1
+        done
+      }
+      valid6() {
+        local a=$1 re='^[0-9a-f:]{2,39}$' g groups=0 compressed=0
+        [[ $a =~ $re ]] || return 1
+        case "$a" in *:::*) return 1 ;; esac
+        if [[ $a == *::* ]]; then
+          [[ ${a#*::} == *::* ]] && return 1
+          compressed=1
+        fi
+        [[ $a == :* && $a != ::* ]] && return 1
+        [[ $a == *: && $a != *:: ]] && return 1
+        local IFS=:
+        for g in $a; do
+          [ -z "$g" ] && continue
+          [ "${#g}" -le 4 ] || return 1
+          groups=$((groups + 1))
+        done
+        if [ "$compressed" -eq 1 ]; then [ "$groups" -le 7 ]; else [ "$groups" -eq 8 ]; fi
+      }
+      load_resolvers() {
+        local ns
+        while read -r ns; do
+          case "$ns" in
+            ""|0.*|127.*|169.254.*|::|::1|fe[89ab]?:*) continue ;;
+            *:*) valid6 "$ns" && UPSTREAM6+=("$ns") ;;
+            *) valid4 "$ns" && UPSTREAM4+=("$ns") ;;
+          esac
+        done < <(printf '%s\n' "$1" | sed 's/%.*//' | tr 'A-F' 'a-f' | sort -u)
+        return 0
+      }
+      # The live resolv.conf is authoritative whenever it names an eligible
+      # upstream, so a removed resolver never stays allowed. The persisted list is
+      # only the fallback for early boot (no resolv.conf yet) or a transient
+      # resolv.conf with no eligible upstream, so a refresh never drops the VPC
+      # resolver allowance and blacks out DNS.
+      select_upstreams() {
+        UPSTREAM4=()
+        UPSTREAM6=()
+        if [ -r "$RESOLV_CONF" ]; then
+          load_resolvers "$(awk '$1 == "nameserver" {print $2}' "$RESOLV_CONF" || true)"
+        fi
+        if [ "${#UPSTREAM4[@]}" -eq 0 ] && [ "${#UPSTREAM6[@]}" -eq 0 ]; then
+          load_resolvers "$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"
+        fi
+        UPSTREAMS="$(printf '%s\n' ${UPSTREAM4[@]+"${UPSTREAM4[@]}"} ${UPSTREAM6[@]+"${UPSTREAM6[@]}"} | sed '/^$/d')"
+      }
 
       # Allow established/related, loopback (stub-resolver) DNS, and DNS to the
       # configured upstream resolvers first, then drop the private ranges; public
       # DNS and everything else fall through to the final RETURN. DNS is never a
       # blanket dport-53 RETURN, so a query cannot be aimed at the metadata IP or
-      # an arbitrary internal address (S-1).
-      iptables -F STOARAMA_EGRESS 2>/dev/null || true
-      iptables -N STOARAMA_EGRESS 2>/dev/null || true
-      iptables -F STOARAMA_EGRESS
-      iptables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
-      iptables -A STOARAMA_EGRESS -p udp --dport 53 -d 127.0.0.0/8 -j RETURN
-      iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN
-      for ns in ${UPSTREAM4[@]+"${UPSTREAM4[@]}"}; do
-        iptables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/32" -j RETURN
-        iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/32" -j RETURN
-      done
-      for cidr in "${BLOCKED4[@]}"; do
-        iptables -A STOARAMA_EGRESS -d "$cidr" -j REJECT
-      done
-      iptables -A STOARAMA_EGRESS -j RETURN
-      iptables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || iptables -I OUTPUT 1 -j STOARAMA_EGRESS
+      # an arbitrary internal address (S-1). Each family's chain is replaced in one
+      # iptables-restore transaction while OUTPUT keeps jumping to it, so no packet
+      # ever sees a half-built chain, and a rejected transaction leaves the previous
+      # chain in force.
+      apply_rules() {
+        {
+          echo "*filter"
+          echo ":STOARAMA_EGRESS - [0:0]"
+          echo "-F STOARAMA_EGRESS"
+          echo "-A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN"
+          echo "-A STOARAMA_EGRESS -p udp --dport 53 -d 127.0.0.0/8 -j RETURN"
+          echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d 127.0.0.0/8 -j RETURN"
+          for ns in ${UPSTREAM4[@]+"${UPSTREAM4[@]}"}; do
+            echo "-A STOARAMA_EGRESS -p udp --dport 53 -d $ns/32 -j RETURN"
+            echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d $ns/32 -j RETURN"
+          done
+          for cidr in "${BLOCKED4[@]}"; do
+            echo "-A STOARAMA_EGRESS -d $cidr -j REJECT"
+          done
+          echo "-A STOARAMA_EGRESS -j RETURN"
+          echo "COMMIT"
+        } | iptables-restore --noflush
+        iptables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || iptables -I OUTPUT 1 -j STOARAMA_EGRESS
 
-      ip6tables -F STOARAMA_EGRESS 2>/dev/null || true
-      ip6tables -N STOARAMA_EGRESS 2>/dev/null || true
-      ip6tables -F STOARAMA_EGRESS
-      ip6tables -A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN
-      ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d ::1/128 -j RETURN
-      ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d ::1/128 -j RETURN
-      for ns in ${UPSTREAM6[@]+"${UPSTREAM6[@]}"}; do
-        ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/128" -j RETURN
-        ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/128" -j RETURN
+        {
+          echo "*filter"
+          echo ":STOARAMA_EGRESS - [0:0]"
+          echo "-F STOARAMA_EGRESS"
+          echo "-A STOARAMA_EGRESS -m state --state ESTABLISHED,RELATED -j RETURN"
+          echo "-A STOARAMA_EGRESS -p udp --dport 53 -d ::1/128 -j RETURN"
+          echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d ::1/128 -j RETURN"
+          for ns in ${UPSTREAM6[@]+"${UPSTREAM6[@]}"}; do
+            echo "-A STOARAMA_EGRESS -p udp --dport 53 -d $ns/128 -j RETURN"
+            echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d $ns/128 -j RETURN"
+          done
+          for cidr in "${BLOCKED6[@]}"; do
+            echo "-A STOARAMA_EGRESS -d $cidr -j REJECT"
+          done
+          echo "-A STOARAMA_EGRESS -j RETURN"
+          echo "COMMIT"
+        } | ip6tables-restore --noflush
+        ip6tables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || ip6tables -I OUTPUT 1 -j STOARAMA_EGRESS
+      }
+
+      # resolv.conf can be rewritten while a refresh is applying, and the path unit
+      # does not re-trigger an already-active run. So, still holding the lock,
+      # re-select after applying and repeat until the applied set is current.
+      attempt=0
+      while :; do
+        select_upstreams
+        APPLIED="$UPSTREAMS"
+        apply_rules
+        if [ -n "$APPLIED" ]; then
+          printf '%s\n' "$APPLIED" > "$UPSTREAM_FILE"
+        fi
+        echo "stoarama-egress: DNS upstreams allowed: $(printf '%s' "${APPLIED:-none}" | tr '\n' ' ')"
+        select_upstreams
+        [ "$UPSTREAMS" = "$APPLIED" ] && break
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 5 ]; then
+          echo "stoarama-egress: DNS upstreams still changing after $attempt refreshes; the path unit will refresh again" >&2
+          break
+        fi
       done
-      for cidr in "${BLOCKED6[@]}"; do
-        ip6tables -A STOARAMA_EGRESS -d "$cidr" -j REJECT
-      done
-      ip6tables -A STOARAMA_EGRESS -j RETURN
-      ip6tables -C OUTPUT -j STOARAMA_EGRESS 2>/dev/null || ip6tables -I OUTPUT 1 -j STOARAMA_EGRESS
 
       netfilter-persistent save || true
 
@@ -448,6 +520,37 @@ write_files:
       Type=oneshot
       RemainAfterExit=yes
       ExecStart=/usr/local/sbin/stoarama-egress-firewall.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/stoarama-egress-firewall-refresh.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Stoarama Recorder Egress Firewall refresh (DNS upstream change)
+      # Also runs once per boot, after the watcher is armed, so an upstream change
+      # between the early-boot firewall run and arming the path is never missed.
+      After=stoarama-egress-firewall.service stoarama-egress-firewall-refresh.path systemd-resolved.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/stoarama-egress-firewall.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/stoarama-egress-firewall-refresh.path
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Watch systemd-resolved upstreams for the Stoarama egress firewall
+
+      [Path]
+      PathChanged=/run/systemd/resolve/resolv.conf
+      Unit=stoarama-egress-firewall-refresh.service
 
       [Install]
       WantedBy=multi-user.target
@@ -556,6 +659,9 @@ runcmd:
   - chmod +x /opt/stoarama/backend/scripts/start-recording-worker.sh
   - systemctl daemon-reload
   - systemctl enable --now stoarama-egress-firewall.service
+  - systemctl enable --now stoarama-egress-firewall-refresh.path
+  - systemctl enable stoarama-egress-firewall-refresh.service
+  - systemctl start stoarama-egress-firewall-refresh.service
   - systemctl enable --now stoarama-recording.service
 `))
 

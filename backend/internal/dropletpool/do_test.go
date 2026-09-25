@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -447,17 +449,17 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 	if !strings.Contains(script, "/run/systemd/resolve/resolv.conf") {
 		t.Fatalf("firewall must read the upstream resolvers from systemd-resolved's resolv.conf")
 	}
-	if !strings.Contains(script, `RESOLVERS="$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"`) {
-		t.Fatalf("persisted upstreams must be the fallback only when resolv.conf is unavailable")
+	if !strings.Contains(script, `load_resolvers "$(cat "$UPSTREAM_FILE" 2>/dev/null || true)"`) {
+		t.Fatalf("persisted upstreams must be the fallback when resolv.conf yields no eligible upstream")
 	}
 	if !strings.Contains(script, "UPSTREAM_FILE=/etc/stoarama/dns-upstreams") {
 		t.Fatalf("firewall must persist upstream resolvers for early-boot reruns")
 	}
 	for _, rule := range []string{
-		`iptables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/32" -j RETURN`,
-		`iptables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/32" -j RETURN`,
-		`ip6tables -A STOARAMA_EGRESS -p udp --dport 53 -d "$ns/128" -j RETURN`,
-		`ip6tables -A STOARAMA_EGRESS -p tcp --dport 53 -d "$ns/128" -j RETURN`,
+		`echo "-A STOARAMA_EGRESS -p udp --dport 53 -d $ns/32 -j RETURN"`,
+		`echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d $ns/32 -j RETURN"`,
+		`echo "-A STOARAMA_EGRESS -p udp --dport 53 -d $ns/128 -j RETURN"`,
+		`echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d $ns/128 -j RETURN"`,
 	} {
 		if !strings.Contains(script, rule) {
 			t.Fatalf("firewall missing upstream DNS allowance %q", rule)
@@ -465,13 +467,13 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 	}
 	// The upstream allowance must precede the private-range REJECTs, otherwise a
 	// VPC resolver in 10.0.0.0/8 is still rejected.
-	allowIdx := strings.Index(script, `-d "$ns/32" -j RETURN`)
-	rejectIdx := strings.Index(script, `iptables -A STOARAMA_EGRESS -d "$cidr" -j REJECT`)
+	allowIdx := strings.Index(script, `-d $ns/32 -j RETURN`)
+	rejectIdx := strings.Index(script, `echo "-A STOARAMA_EGRESS -d $cidr -j REJECT"`)
 	if allowIdx < 0 || rejectIdx < 0 || allowIdx > rejectIdx {
 		t.Fatalf("upstream DNS allowance must come before the private-range REJECTs")
 	}
 	// Metadata / link-local / loopback nameserver entries are never allowlisted.
-	if !strings.Contains(script, `""|127.*|169.254.*|::1|fe[89ab]?:*) continue ;;`) || !strings.Contains(script, `tr 'A-F' 'a-f'`) {
+	if !strings.Contains(script, `""|0.*|127.*|169.254.*|::|::1|fe[89ab]?:*) continue ;;`) || !strings.Contains(script, `tr 'A-F' 'a-f'`) {
 		t.Fatalf("firewall must skip loopback and link-local/metadata nameserver entries")
 	}
 	if strings.Contains(script, "--dport 53 -j RETURN") {
@@ -484,6 +486,291 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 		if msg, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("firewall script does not parse: %v\n%s", err, msg)
 		}
+	}
+}
+
+// TestBuildUserData_RefreshesFirewallWhenDNSUpstreamChanges guards CodeRabbit's
+// follow-up on #374: the DNS allowance is derived from resolved's upstreams at
+// run time, so a later upstream change (DHCP renewal, resolved reconfiguration,
+// or resolv.conf appearing after an early-boot run) must re-run the firewall.
+func TestBuildUserData_RefreshesFirewallWhenDNSUpstreamChanges(t *testing.T) {
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-dns-refresh",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		BuildSHA:      strings.Repeat("d", 40),
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+	for _, want := range []string{
+		"path: /etc/systemd/system/stoarama-egress-firewall-refresh.path",
+		"PathChanged=/run/systemd/resolve/resolv.conf",
+		"Unit=stoarama-egress-firewall-refresh.service",
+		"path: /etc/systemd/system/stoarama-egress-firewall-refresh.service",
+		"systemctl enable --now stoarama-egress-firewall-refresh.path",
+		// Refresh once right after arming the watcher, and once per boot after it.
+		"  - systemctl enable --now stoarama-egress-firewall-refresh.path\n  - systemctl enable stoarama-egress-firewall-refresh.service\n  - systemctl start stoarama-egress-firewall-refresh.service\n",
+		"After=stoarama-egress-firewall.service stoarama-egress-firewall-refresh.path systemd-resolved.service",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("cloud-init missing resolver-change refresh wiring %q", want)
+		}
+	}
+	// The refresh unit must actually re-run the same firewall script on every
+	// trigger; RemainAfterExit would make a second start a no-op.
+	start := strings.Index(out, "path: /etc/systemd/system/stoarama-egress-firewall-refresh.service")
+	end := strings.Index(out, "path: /etc/systemd/system/stoarama-egress-firewall-refresh.path")
+	if start < 0 || end < start {
+		t.Fatalf("refresh service must be rendered before its path unit")
+	}
+	refresh := out[start:end]
+	if strings.Contains(refresh, "RemainAfterExit") || !strings.Contains(refresh, "ExecStart=/usr/local/sbin/stoarama-egress-firewall.sh") {
+		t.Fatalf("refresh unit must re-run the firewall script on every trigger:\n%s", refresh)
+	}
+	if !strings.Contains(refresh, "WantedBy=multi-user.target") {
+		t.Fatalf("refresh unit must also run once per boot:\n%s", refresh)
+	}
+	if !strings.Contains(extractEgressFirewallScript(t, out), "flock 9") {
+		t.Fatalf("firewall runs must be serialized so boot and refresh cannot interleave")
+	}
+}
+
+// firewallRun is the observable result of executing the rendered egress
+// firewall script against stubbed iptables tooling.
+type firewallRun struct {
+	v4, v6    string // last iptables-restore / ip6tables-restore transaction
+	v4Commits int
+	persisted string
+	output    string
+	err       error
+}
+
+// firewallFixture sets up the droplet-side files the firewall script reads.
+type firewallFixture struct {
+	live         *string // resolv.conf contents; nil: absent (early boot)
+	persisted    *string // /etc/stoarama/dns-upstreams; nil: absent
+	onFirstApply string  // shell run once inside the first iptables-restore
+	failRestore  bool    // iptables-restore rejects the transaction
+}
+
+func runEgressFirewall(t *testing.T, fx firewallFixture) firewallRun {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	out, err := BuildUserData(UserDataConfig{
+		ServerID:      "stoarama-rec-dns-exec",
+		NodeToken:     "sin_token",
+		BackendAPIURL: "https://stoarama-api.onrender.com",
+		RepoURL:       "https://github.com/daydemir/stoarama.git",
+		BuildSHA:      strings.Repeat("e", 40),
+	})
+	if err != nil {
+		t.Fatalf("BuildUserData: %v", err)
+	}
+	script := extractEgressFirewallScript(t, out)
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	stateDir := filepath.Join(dir, "etc")
+	resolv := filepath.Join(dir, "resolv.conf")
+	upstreamFile := filepath.Join(stateDir, "dns-upstreams")
+	for _, d := range []string{bin, stateDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, body string, mode os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, fam := range []string{"iptables", "ip6tables"} {
+		log := filepath.Join(dir, fam+".restore")
+		write(filepath.Join(bin, fam), "#!/bin/sh\nexit 0\n", 0o755)
+		write(filepath.Join(bin, fam+"-restore"), "#!/bin/sh\n"+
+			"body=$(cat)\n"+
+			"hook='"+filepath.Join(dir, "hook")+"'\n"+
+			"if [ -f \"$hook\" ]; then sh \"$hook\"; rm -f \"$hook\"; fi\n"+
+			"if [ -f '"+filepath.Join(dir, "fail")+"' ]; then exit 1; fi\n"+
+			"printf '%s\\n@@COMMIT@@\\n' \"$body\" >> '"+log+"'\n", 0o755)
+	}
+	write(filepath.Join(bin, "flock"), "#!/bin/sh\nexit 0\n", 0o755)
+	if fx.live != nil {
+		write(resolv, *fx.live, 0o644)
+	}
+	if fx.persisted != nil {
+		write(upstreamFile, *fx.persisted, 0o644)
+	}
+	if fx.onFirstApply != "" {
+		write(filepath.Join(dir, "hook"), strings.ReplaceAll(fx.onFirstApply, "$RESOLV", resolv), 0o644)
+	}
+	if fx.failRestore {
+		write(filepath.Join(dir, "fail"), "", 0o644)
+	}
+	s := strings.NewReplacer(
+		"/run/systemd/resolve/resolv.conf", resolv,
+		"/run/stoarama-egress-firewall.lock", filepath.Join(dir, "lock"),
+		"/etc/stoarama", stateDir,
+	).Replace(script)
+	cmd := exec.Command(bash, "-c", s)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	msg, runErr := cmd.CombinedOutput()
+
+	var res firewallRun
+	res.err = runErr
+	res.output = string(msg)
+	last := func(fam string) (string, int) {
+		raw, _ := os.ReadFile(filepath.Join(dir, fam+".restore"))
+		commits := strings.Split(strings.TrimSuffix(string(raw), "@@COMMIT@@\n"), "@@COMMIT@@\n")
+		if len(raw) == 0 {
+			return "", 0
+		}
+		return commits[len(commits)-1], len(commits)
+	}
+	res.v4, res.v4Commits = last("iptables")
+	res.v6, _ = last("ip6tables")
+	got, _ := os.ReadFile(upstreamFile)
+	res.persisted = string(got)
+	return res
+}
+
+// TestEgressFirewallScript_DNSUpstreamSelection executes the rendered firewall
+// script against stubbed iptables to pin which resolvers get a port-53 allowance.
+func TestEgressFirewallScript_DNSUpstreamSelection(t *testing.T) {
+	const vpc = "10.116.15.254"
+	const vpcNew = "10.116.15.253"
+	strPtr := func(s string) *string { return &s }
+	cases := []struct {
+		name      string
+		fx        firewallFixture
+		allowed   []string
+		denied    []string
+		persist   string
+		v4Commits int // 0: don't check
+	}{
+		{
+			name:    "live VPC upstream allowed and persisted; stub, metadata, link-local skipped",
+			fx:      firewallFixture{live: strPtr("nameserver 127.0.0.53\nnameserver " + vpc + "\nnameserver 169.254.169.254\nnameserver FE90::1\n")},
+			allowed: []string{vpc + "/32"},
+			denied:  []string{"127.0.0.53/32", "169.254.169.254/32", "fe90::1/128"},
+			persist: vpc + "\n",
+		},
+		{
+			name:    "early boot without resolv.conf uses persisted list",
+			fx:      firewallFixture{persisted: strPtr(vpc + "\n")},
+			allowed: []string{vpc + "/32"},
+			persist: vpc + "\n",
+		},
+		{
+			name:    "readable resolv.conf with no eligible upstream falls back to persisted",
+			fx:      firewallFixture{live: strPtr("nameserver 127.0.0.53\n"), persisted: strPtr(vpc + "\n")},
+			allowed: []string{vpc + "/32"},
+			persist: vpc + "\n",
+		},
+		{
+			name:    "changed upstream replaces the old one",
+			fx:      firewallFixture{live: strPtr("nameserver " + vpcNew + "\n"), persisted: strPtr(vpc + "\n")},
+			allowed: []string{vpcNew + "/32"},
+			denied:  []string{vpc + "/32"},
+			persist: vpcNew + "\n",
+		},
+		{
+			name:    "no upstream anywhere allows none",
+			fx:      firewallFixture{live: strPtr("nameserver 127.0.0.53\n")},
+			denied:  []string{vpc + "/32"},
+			persist: "",
+		},
+		{
+			name:    "live IPv6 upstream allowed with scope id stripped and lowercased",
+			fx:      firewallFixture{live: strPtr("nameserver FD00::53%eth1\nnameserver ::1\n")},
+			allowed: []string{"fd00::53/128"},
+			persist: "fd00::53\n", // ::1 is only the fixed loopback-stub rule, never an upstream
+		},
+		{
+			name: "malformed resolver values are skipped, never abort the rebuild",
+			fx: firewallFixture{live: strPtr("nameserver 10.0.0.256\nnameserver 1.2.3\nnameserver fd00::zz\n" +
+				"nameserver 1:2:3:4:5:6:7:8:9\nnameserver fd00:::1\nnameserver 10.0.0.1/8\nnameserver " + vpc + "\n")},
+			allowed: []string{vpc + "/32"},
+			denied:  []string{"10.0.0.256/32", "1.2.3/32", "fd00::zz/128", "1:2:3:4:5:6:7:8:9/128", "fd00:::1/128"},
+			persist: vpc + "\n",
+		},
+		{
+			name: "resolver change during a refresh is re-applied before exiting",
+			fx: firewallFixture{
+				live:         strPtr("nameserver " + vpc + "\n"),
+				onFirstApply: "printf 'nameserver " + vpcNew + "\\n' > '$RESOLV'\n",
+			},
+			allowed:   []string{vpcNew + "/32"},
+			denied:    []string{vpc + "/32"},
+			persist:   vpcNew + "\n",
+			v4Commits: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runEgressFirewall(t, tc.fx)
+			if res.err != nil {
+				t.Fatalf("firewall script failed: %v\n%s", res.err, res.output)
+			}
+			rules := res.v4 + res.v6
+			for _, ns := range tc.allowed {
+				for _, proto := range []string{"udp", "tcp"} {
+					want := "-A STOARAMA_EGRESS -p " + proto + " --dport 53 -d " + ns + " -j RETURN"
+					if !strings.Contains(rules, want) {
+						t.Fatalf("missing DNS allowance %q in:\n%s", want, rules)
+					}
+				}
+			}
+			for _, ns := range tc.denied {
+				if strings.Contains(rules, "--dport 53 -d "+ns+" ") {
+					t.Fatalf("unexpected DNS allowance for %s in:\n%s", ns, rules)
+				}
+			}
+			// Each family is one complete transaction: allowances precede the
+			// private-range REJECTs and the chain ends in COMMIT.
+			for fam, tx := range map[string]string{"v4": res.v4, "v6": res.v6} {
+				reject := "-A STOARAMA_EGRESS -d 10.0.0.0/8 -j REJECT"
+				if fam == "v6" {
+					reject = "-A STOARAMA_EGRESS -d fc00::/7 -j REJECT"
+				}
+				rejectIdx := strings.Index(tx, reject)
+				if !strings.HasPrefix(tx, "*filter\n") || rejectIdx < 0 || !strings.HasSuffix(tx, "COMMIT\n") {
+					t.Fatalf("%s transaction incomplete:\n%s", fam, tx)
+				}
+				if i := strings.LastIndex(tx, "--dport 53"); i > rejectIdx {
+					t.Fatalf("%s DNS allowance after the private-range REJECT:\n%s", fam, tx)
+				}
+			}
+			if res.persisted != tc.persist {
+				t.Fatalf("persisted upstreams = %q, want %q", res.persisted, tc.persist)
+			}
+			if tc.v4Commits != 0 && res.v4Commits != tc.v4Commits {
+				t.Fatalf("iptables-restore commits = %d, want %d", res.v4Commits, tc.v4Commits)
+			}
+		})
+	}
+}
+
+// TestEgressFirewallScript_FailedRestoreKeepsPreviousState: a rejected
+// iptables-restore transaction commits nothing (the previous chain stays in
+// force), so the script must fail loudly and not persist the unapplied set.
+func TestEgressFirewallScript_FailedRestoreKeepsPreviousState(t *testing.T) {
+	live := "nameserver 10.116.15.253\n"
+	persisted := "10.116.15.254\n"
+	res := runEgressFirewall(t, firewallFixture{live: &live, persisted: &persisted, failRestore: true})
+	if res.err == nil {
+		t.Fatalf("firewall script must fail when iptables-restore rejects the transaction:\n%s", res.output)
+	}
+	if res.v4Commits != 0 {
+		t.Fatalf("no transaction may be recorded as committed, got %d", res.v4Commits)
+	}
+	if res.persisted != persisted {
+		t.Fatalf("persisted upstreams changed after failed apply: %q", res.persisted)
 	}
 }
 
