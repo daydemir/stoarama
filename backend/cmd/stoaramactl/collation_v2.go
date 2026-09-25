@@ -578,17 +578,13 @@ func registerCollation(ctx context.Context, pool *pgxpool.Pool, store collation.
 			s.Already++
 			continue
 		}
-		body, err := store.Client.Get(ctx, key)
+		body, found, err := fetchCollationManifest(ctx, key, store.Client.Get, store.Exists)
 		if err != nil {
-			ok, existsErr := store.Exists(ctx, key)
-			if existsErr != nil {
-				return s, fmt.Errorf("%s: %w", key, errors.Join(err, existsErr))
-			}
-			if !ok {
-				s.Missing++
-				continue
-			}
 			return s, err
+		}
+		if !found {
+			s.Missing++
+			continue
 		}
 		var m collation.HourManifest
 		if err := json.Unmarshal(body, &m); err != nil {
@@ -617,6 +613,33 @@ func registerCollation(ctx context.Context, pool *pgxpool.Pool, store collation.
 		s.Registered++
 	}
 	return s, nil
+}
+
+// fetchCollationManifest reads one hour manifest. The nightly droplet publishes
+// manifests while the hourly register runs, so a Get can 404 and the object can
+// appear an instant later: that is retried once, and a manifest still not
+// readable is reported missing (the next hourly run picks it up) rather than
+// aborting every remaining hour.
+func fetchCollationManifest(ctx context.Context, key string, get func(context.Context, string) ([]byte, error), exists func(context.Context, string) (bool, error)) ([]byte, bool, error) {
+	body, err := get(ctx, key)
+	if err == nil {
+		return body, true, nil
+	}
+	ok, existsErr := exists(ctx, key)
+	if existsErr != nil {
+		return nil, false, fmt.Errorf("%s: %w", key, errors.Join(err, existsErr))
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	body, retryErr := get(ctx, key)
+	if retryErr == nil {
+		return body, true, nil
+	}
+	if r2.IsNotFound(err) && r2.IsNotFound(retryErr) {
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("%s: %w", key, retryErr)
 }
 
 func insertCollationHour(ctx context.Context, pool *pgxpool.Pool, w collation.HourWork, m collation.HourManifest, key string, body []byte) error {
