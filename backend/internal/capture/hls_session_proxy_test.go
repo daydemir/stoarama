@@ -467,3 +467,58 @@ func TestContinuousCaptureSurvivesWowzaSessionExpiry(t *testing.T) {
 		t.Fatalf("FFmpeg consumed only sequences %d..%d", lowest, highest)
 	}
 }
+
+// Relay path regression (recording 352 on ffmpeg 7.1): the timestamp-contract
+// capture that relays use must keep one FFmpeg attempt and one continuous
+// media timeline across repeated session expiries, with every clip closing on
+// time rather than stalling until a watchdog restarts the attempt.
+func TestContinuousTimestampContractCaptureSurvivesWowzaSessionExpiry(t *testing.T) {
+	ffmpeg, err := exec.LookPath(ffmpegBin())
+	if err != nil {
+		t.Skipf("ffmpeg unavailable: %v", err)
+	}
+	allowLoopbackHLSSessionOrigin(t)
+	segments := generateHLSFixtureSegments(t, ffmpeg, t.TempDir(), 30)
+	origin, server := newFakeWowzaOrigin(t, 2500*time.Millisecond, time.Second, segments)
+
+	var clips []Segment
+	var lastClosed time.Time
+	var maxClipGap time.Duration
+	captureCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// onSegment runs on the capture goroutine, so no locking is needed.
+	err = CaptureContinuousInputWithTimestampContract(captureCtx, CaptureInput{URL: server.URL + "/live/7_Bell.stream/playlist.m3u8"}, 2*time.Second, "", nil, t.TempDir(), func(seg Segment) error {
+		now := time.Now()
+		if len(clips) > 0 { // the first clip also carries FFmpeg startup
+			maxClipGap = max(maxClipGap, now.Sub(lastClosed))
+		}
+		lastClosed = now
+		clips = append(clips, seg)
+		return nil
+	})
+	if captureCtx.Err() == nil {
+		t.Fatalf("FFmpeg exited before the window closed (err=%v); master=%d forbidden=%d", err, origin.masterRequests.Load(), origin.forbiddenRequests.Load())
+	}
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capture returned %v", err)
+	}
+	if origin.masterRequests.Load() < 3 {
+		t.Fatalf("expected at least two session refreshes: master=%d forbidden=%d", origin.masterRequests.Load(), origin.forbiddenRequests.Load())
+	}
+	if len(clips) < 3 {
+		t.Fatalf("closed %d clips across session expiries, want at least 3", len(clips))
+	}
+	// A clip waiting on a stale playlist shows up as a long close interval.
+	if maxClipGap > 5*time.Second {
+		t.Fatalf("a 2s clip took %s to close across a session refresh", maxClipGap)
+	}
+	attempt := clips[0].CaptureAttemptID
+	for i, clip := range clips {
+		if clip.CaptureAttemptID != attempt {
+			t.Fatalf("clip %d came from a new capture attempt; session refresh restarted FFmpeg", i)
+		}
+		if i > 0 && !clip.StartAt.Equal(clips[i-1].EndAt) {
+			t.Fatalf("clip %d starts %s, previous ends %s: media timeline broke across a session refresh", i, clip.StartAt, clips[i-1].EndAt)
+		}
+	}
+}
