@@ -464,7 +464,18 @@ func captureContinuousAttempt(ctx context.Context, input CaptureInput, clipDurat
 	if timestampContract {
 		captureAttemptID = uuid.NewString()
 	}
-	args := buildFFmpegContinuousInputArgs(input, outPattern, clipDuration, pinHost, targetFPS, includeAudio, timestampContract)
+	ffmpegInput := input
+	if hlsSessionRefreshApplies(input, pinHost) {
+		// Session-expiring origin: FFmpeg reads a stable local playlist while the
+		// proxy re-reads the master playlist on each 403 (see hls_session_proxy.go).
+		proxy, err := startHLSSessionProxy(input)
+		if err != nil {
+			return fmt.Errorf("start hls session proxy: %w", err)
+		}
+		defer proxy.Close()
+		ffmpegInput = CaptureInput{URL: proxy.URL()}
+	}
+	args := buildFFmpegContinuousInputArgs(ffmpegInput, outPattern, clipDuration, pinHost, targetFPS, includeAudio, timestampContract)
 	cmd := exec.Command(ffmpegBin(), args...)
 	stderr := newContinuousStderrObserver(
 		isHLSInputURL(sourceURL) && (isGooglevideoURL(sourceURL) || isGooglevideoHost(pinHost)),
