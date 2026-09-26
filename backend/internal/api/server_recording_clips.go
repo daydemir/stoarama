@@ -1782,6 +1782,14 @@ const recordingJobSurrenderSQL = `
 	SELECT handoff_until FROM surrendered
 `
 
+// recordingJobCloudSurrenderSQL requeues a no-progress cloud lease. The
+// attempt-count penalty exists so a persistently dead source is not re-leased in
+// a tight loop, but attempt_count accumulates across a whole 12-hour window. A
+// window that landed any clip in the last 30 minutes is a live source in a brief
+// origin outage (e.g. kamery24 publisher reconnects that 404 the playlist for
+// several minutes), so it is requeued immediately rather than sitting unleased
+// while the source may already be back. Leasing still skips the surrendering
+// droplet via handoff_owner.
 const recordingJobCloudSurrenderSQL = `
 	WITH eligible AS (
 	  SELECT j.id, j.attempt_count,
@@ -1789,7 +1797,12 @@ const recordingJobCloudSurrenderSQL = `
 	           SELECT 1 FROM recording_clips c
 	           WHERE c.recording_job_id=j.id
 	             AND c.capture_lease_token IS NOT DISTINCT FROM j.lease_token
-	         ) AS had_clips
+	         ) AS had_clips,
+	         EXISTS (
+	           SELECT 1 FROM recording_clips c
+	           WHERE c.recording_job_id=j.id
+	             AND c.created_at > now() - interval '30 minutes'
+	         ) AS recently_healthy
 	  FROM recording_jobs j
 	  JOIN recorder_droplets d ON d.name=$2 AND d.node_id=$5
 	    AND d.state IN ('provisioning', 'active')
@@ -1806,7 +1819,7 @@ const recordingJobCloudSurrenderSQL = `
 	UPDATE recording_jobs j
 	SET status='pending',
 	    scheduled_for=now() + CASE
-	      WHEN eligible.had_clips THEN interval '0'
+	      WHEN eligible.had_clips OR eligible.recently_healthy THEN interval '0'
 	      WHEN eligible.attempt_count <= 1 THEN interval '1 minute'
 	      WHEN eligible.attempt_count = 2 THEN interval '2 minutes'
 	      ELSE interval '5 minutes'
