@@ -137,9 +137,7 @@ func allowLoopbackHLSSessionOrigin(t *testing.T) {
 	hlsSessionRefreshHost = func(host string) bool { return host == "127.0.0.1" }
 	hlsSessionDialControl = func(string, string, syscall.RawConn) error { return nil }
 	t.Cleanup(func() {
-		hlsSessionRefreshHost = func(host string) bool {
-			return strings.EqualFold(strings.TrimSuffix(host, "."), seattleStreamLockHost)
-		}
+		hlsSessionRefreshHost = productionHLSSessionRefreshHost
 		hlsSessionDialControl = netguard.ControlReject
 	})
 }
@@ -181,6 +179,8 @@ func TestHLSSessionRefreshAppliesOnlyToSeattleStreamLock(t *testing.T) {
 	}{
 		{"sdot master", CaptureInput{URL: "https://61e0c5d388c2e.streamlock.net/live/7_Bell.stream/playlist.m3u8"}, "", true},
 		{"sdot legacy port", CaptureInput{URL: "https://61e0c5d388c2e.streamlock.net:443/live/7_Bell.stream/playlist.m3u8"}, "", true},
+		{"kbs loomex cdn", CaptureInput{URL: "https://kbscctv-cache.loomex.net/lowStream/_definst_/9996_low.stream/playlist.m3u8?wowzatokenendtime=1&wowzatokenstarttime=0&wowzatokenhash=x"}, "", true},
+		{"kbs loomex api", CaptureInput{URL: "https://kbsapi.loomex.net/v1/api/cctvRequest/9996/abc!hls"}, "", false},
 		{"other wowza", CaptureInput{URL: "https://example.streamlock.net/live/x.stream/playlist.m3u8"}, "", false},
 		{"googlevideo", CaptureInput{URL: "https://manifest.googlevideo.com/api/manifest/hls_playlist/index.m3u8"}, "", false},
 		{"sdot image", CaptureInput{URL: "https://61e0c5d388c2e.streamlock.net/live/7_Bell.jpg"}, "", false},
