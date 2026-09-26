@@ -1046,7 +1046,6 @@ func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string,
 func appendContinuousFFmpegInput(args []string, inputURL, pinHost, inputHeaders string) []string {
 	args = appendFFmpegHTTPInputArgsWithHeaders(args, inputURL, true, 10, pinHost, inputHeaders)
 	args = appendHLSLiveEdgeInputArgs(args, inputURL)
-	args = appendGooglevideoHLSRecoveryInputArgs(args, inputURL, pinHost)
 	return append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", inputURL,
@@ -1137,6 +1136,13 @@ func continuousFFmpegLogLevel(sourceURL, pinHost string) string {
 // The continuous HLS progress watchdog is capped at 30 seconds so a persistently
 // dead or expired signed URL returns to recordingworker's outer loop, which
 // re-resolves a fresh URL, rather than retrying the stale URL indefinitely.
+// Do not cap stale playlist reloads (-m3u8_hold_counters) either. YouTube
+// playlists routinely stop advancing for 15-20 seconds and then resume; a cap
+// of four stale reloads turned each such stall into a clean FFmpeg exit and a
+// ~20-second re-resolve gap (recording 445 lost ~13% of its window this way).
+// A playlist that never resumes is bounded by the output-progress watchdog, and
+// an expired Googlevideo URL is caught sooner by the stderr 403 observer.
+//
 // Do not set reconnect_at_eof for HLS. EOF is the normal end of each finite
 // playlist HTTP response; reconnecting that response prevents FFmpeg's HLS
 // demuxer from completing the manifest and can produce zero media forever.
@@ -1150,18 +1156,6 @@ func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
 		return args
 	}
 	return append(args, "-live_start_index", "-1")
-}
-
-func appendGooglevideoHLSRecoveryInputArgs(args []string, sourceURL, pinHost string) []string {
-	if !isHLSInputURL(sourceURL) || (!isGooglevideoURL(sourceURL) && !isGooglevideoHost(pinHost)) {
-		return args
-	}
-	// Googlevideo rotates signed media URLs. When a child fragment expires,
-	// FFmpeg's HLS demuxer skips it and can otherwise poll the unchanged playlist
-	// until our 30-second watchdog fires. Four counts tolerate normal publication
-	// just beyond one target duration while returning an expired manifest to the
-	// worker's fresh resolver within about two target durations.
-	return append(args, "-m3u8_hold_counters", "4")
 }
 
 func isGooglevideoURL(sourceURL string) bool {

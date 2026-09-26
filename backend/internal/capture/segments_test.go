@@ -1276,45 +1276,22 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 	}
 }
 
-func TestAppendGooglevideoHLSRecoveryInputArgs(t *testing.T) {
-	tests := []struct {
-		name, sourceURL, pinHost string
-		want                     bool
-	}{
-		{name: "manifest host", sourceURL: "https://manifest.googlevideo.com/live.m3u8", want: true},
-		{name: "media subdomain", sourceURL: "https://rr1.sn-x.googlevideo.com/live.m3u8", want: true},
-		{name: "uppercase host", sourceURL: "https://MANIFEST.GOOGLEVIDEO.COM/live.m3u8", want: true},
-		{name: "trailing dot", sourceURL: "https://manifest.googlevideo.com./live.m3u8", want: true},
-		{name: "pinned original host", sourceURL: "https://203.0.113.10/live.m3u8", pinHost: "manifest.googlevideo.com", want: true},
-		{name: "non HLS googlevideo", sourceURL: "https://rr1.sn-x.googlevideo.com/video.mp4", want: false},
-		{name: "deceptive suffix", sourceURL: "https://evilgooglevideo.com/live.m3u8", want: false},
-		{name: "deceptive parent", sourceURL: "https://googlevideo.com.evil/live.m3u8", want: false},
-		{name: "unrelated HLS", sourceURL: "https://example.com/live.m3u8", want: false},
-	}
-	for _, tt := range tests {
+// TestContinuousHLSInputsDoNotCapStaleReloads guards recording 445's fix: a
+// stale-reload cap turns an ordinary YouTube publication stall into a clean
+// FFmpeg exit and a re-resolve gap. The output watchdog bounds real stalls.
+func TestContinuousHLSInputsDoNotCapStaleReloads(t *testing.T) {
+	for _, tt := range []struct{ name, sourceURL, pinHost string }{
+		{name: "manifest host", sourceURL: "https://manifest.googlevideo.com/live.m3u8"},
+		{name: "media subdomain", sourceURL: "https://rr1.sn-x.googlevideo.com/live.m3u8"},
+		{name: "pinned original host", sourceURL: "https://203.0.113.10/live.m3u8", pinHost: "manifest.googlevideo.com"},
+		{name: "unrelated HLS", sourceURL: "https://example.com/live.m3u8"},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			args := appendGooglevideoHLSRecoveryInputArgs([]string{"-nostdin"}, tt.sourceURL, tt.pinHost)
-			got := slices.Contains(args, "-m3u8_hold_counters")
-			if got != tt.want {
-				t.Fatalf("recovery option presence=%t want=%t: %v", got, tt.want, args)
-			}
-			if got {
-				requireArgPair(t, args, "-m3u8_hold_counters", "4")
+			args := buildFFmpegContinuousInputArgs(CaptureInput{URL: tt.sourceURL, AudioURL: tt.sourceURL}, "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, tt.pinHost, nil, true, false)
+			if slices.Contains(args, "-m3u8_hold_counters") {
+				t.Fatalf("continuous HLS input caps stale playlist reloads: %v", args)
 			}
 		})
-	}
-}
-
-func TestGooglevideoHLSRecoveryOptionIsInputScoped(t *testing.T) {
-	args := buildFFmpegContinuousArgs("https://manifest.googlevideo.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, "", nil)
-	recovery := slices.Index(args, "-m3u8_hold_counters")
-	input := slices.Index(args, "-i")
-	if recovery < 0 || input < 0 || recovery > input {
-		t.Fatalf("Googlevideo HLS recovery option must be input-scoped before -i: %v", args)
-	}
-	requireArgPair(t, args, "-m3u8_hold_counters", "4")
-	if slices.Contains(buildFFmpegContinuousArgs("https://example.com/live.m3u8", "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, "", nil), "-m3u8_hold_counters") {
-		t.Fatal("non-Google HLS input received Googlevideo recovery option")
 	}
 }
 
@@ -1425,7 +1402,7 @@ func TestBuildFFmpegContinuousInputArgsSplitYouTubeUsesTwoLiveEdgeInputs(t *test
 			"-protocol_whitelist", "https,tls,tcp,http,crypto,data",
 			"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
 			"-reconnect_on_http_error", "4xx,5xx", "-reconnect_delay_max", "10",
-			"-live_start_index", "-1", "-m3u8_hold_counters", "4",
+			"-live_start_index", "-1",
 			"-fflags", "+discardcorrupt",
 		}
 		want := []string{"-y", "-nostdin", "-loglevel", "warning"}

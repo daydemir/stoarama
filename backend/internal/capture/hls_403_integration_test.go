@@ -17,10 +17,10 @@ import (
 
 // TestContinuousHLSExpiredFragmentFailsFast replays the Googlevideo failure
 // shape seen by relays: FFmpeg consumes media, then a signed child fragment
-// returns 403. The worker can re-resolve a fresh manifest only after FFmpeg
-// exits. FFmpeg skips the failed fragment, then normally holds the unchanged
-// live playlist until our 30-second watchdog fires. This test requires that
-// stale-manifest wait to end in a few seconds instead.
+// returns 403 and the playlist stops advancing. FFmpeg skips the failed
+// fragment and keeps polling the unchanged playlist, so the recorder must
+// recognize the expired fragment and return to the worker's fresh resolver
+// well before the 30-second output watchdog would.
 func TestContinuousHLSExpiredFragmentFailsFast(t *testing.T) {
 	ffmpeg, err := exec.LookPath(ffmpegBin())
 	if err != nil {
@@ -48,28 +48,38 @@ func TestContinuousHLSExpiredFragmentFailsFast(t *testing.T) {
 	}))
 	defer server.Close()
 
-	outPattern := filepath.Join(temp, "seg-%Y%m%d-%H%M%S.mp4")
-	args := buildFFmpegContinuousArgs(server.URL+"/live.m3u8", outPattern, time.Second, "manifest.googlevideo.com", nil)
-	captureCtx, captureCancel := context.WithTimeout(context.Background(), 4*time.Second)
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer captureCancel()
 	started := time.Now()
-	cmd := exec.CommandContext(captureCtx, ffmpeg, args...)
-	output, _ := cmd.CombinedOutput()
+	err = captureContinuousWithHeaders(
+		captureCtx,
+		server.URL+"/live.m3u8",
+		time.Second,
+		"manifest.googlevideo.com",
+		nil,
+		temp,
+		func(Segment) error { return nil },
+		"",
+		30*time.Second,
+		30*time.Second,
+	)
 	elapsed := time.Since(started)
 	if captureCtx.Err() == context.DeadlineExceeded {
-		t.Fatalf("FFmpeg held an unchanged HLS playlist past 4s after an expired fragment; requests=%d stderr=%s", forbiddenRequests.Load(), strings.TrimSpace(string(output)))
+		t.Fatalf("capture held an unchanged playlist with an expired fragment past 20s; forbidden=%d", forbiddenRequests.Load())
 	}
-	if elapsed > 3500*time.Millisecond {
-		t.Fatalf("expired HLS fragment took %s to fail; requests=%d", elapsed, forbiddenRequests.Load())
+	if !errors.Is(err, ErrContinuousExpiredGooglevideoFragment) {
+		t.Fatalf("capture error=%v, want expired Googlevideo HLS fragment; forbidden=%d", err, forbiddenRequests.Load())
 	}
-	if forbiddenRequests.Load() != 1 {
-		t.Fatalf("expired HLS fragment requests=%d want=1", forbiddenRequests.Load())
+	if limit := continuousExpiredFragmentConfirmationWindow + 3*time.Second; elapsed > limit {
+		t.Fatalf("expired HLS fragment took %s to fail, want <= %s", elapsed, limit)
+	}
+	if forbiddenRequests.Load() == 0 {
+		t.Fatal("fixture never served an expired fragment")
 	}
 }
 
 // TestContinuousGooglevideoHLSAdvancingManifestExpiredFragments replays the
-// production shape that the stale-playlist counter cannot catch: the manifest
-// sequence keeps advancing, but its signed child fragments have already expired.
+// production shape where the manifest sequence keeps advancing, but its signed child fragments have already expired.
 // FFmpeg logs each 403 and remains alive while producing no media, so the relay
 // must return to the worker's fresh resolver without waiting for the watchdog.
 func TestContinuousGooglevideoHLSAdvancingManifestExpiredFragments(t *testing.T) {
@@ -346,12 +356,7 @@ func TestContinuousGooglevideoHLSSurvivesSustainedHealthyPublication(t *testing.
 
 	captureCtx, captureCancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer captureCancel()
-	args := []string{"-nostdin", "-loglevel", "error"}
-	args = appendGooglevideoHLSRecoveryInputArgs(args, "https://manifest.googlevideo.com/live.m3u8", "")
-	args = append(args,
-		"-i", server.URL+"/live.m3u8",
-		"-map", "0:v:0", "-c", "copy", "-f", "null", "-",
-	)
+	args := buildFFmpegContinuousArgs(server.URL+"/live.m3u8", filepath.Join(temp, "seg-%Y%m%d-%H%M%S.mp4"), time.Second, "manifest.googlevideo.com", nil)
 	cmd := exec.CommandContext(captureCtx, ffmpeg, args...)
 	output, runErr := cmd.CombinedOutput()
 	if captureCtx.Err() != context.DeadlineExceeded {
@@ -362,7 +367,13 @@ func TestContinuousGooglevideoHLSSurvivesSustainedHealthyPublication(t *testing.
 	}
 }
 
-func TestContinuousGooglevideoHLSToleratesOneStaleReload(t *testing.T) {
+// TestContinuousGooglevideoHLSSurvivesPublicationStall replays recording 445
+// (YouTube "Wolsztyn - Fountain"): about every five minutes the live playlist
+// stops advancing for 15-20 seconds, several times its target duration, and
+// then resumes with no ENDLIST. FFmpeg must keep polling through that stall.
+// A stale-reload cap made it exit cleanly instead, and every restart cost a
+// re-resolve plus the segments published meanwhile (about 13% of the day).
+func TestContinuousGooglevideoHLSSurvivesPublicationStall(t *testing.T) {
 	ffmpeg, err := exec.LookPath(ffmpegBin())
 	if err != nil {
 		t.Skipf("ffmpeg unavailable: %v", err)
@@ -370,14 +381,20 @@ func TestContinuousGooglevideoHLSToleratesOneStaleReload(t *testing.T) {
 	temp := t.TempDir()
 	segment := generateHLSFixtureSegment(t, ffmpeg, temp)
 
+	// Twelve target durations of silence: FFmpeg re-polls an unchanged playlist
+	// every half target duration, so this is about 24 stale reloads.
+	const stall = 12 * time.Second
+	var stallStarted atomic.Int64
 	var playlistRequests atomic.Int64
 	freshRequested := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/live.m3u8":
-			request := playlistRequests.Add(1)
+			playlistRequests.Add(1)
+			now := time.Now().UnixNano()
+			stallStarted.CompareAndSwap(0, now)
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-			if request <= 2 {
+			if time.Duration(now-stallStarted.Load()) < stall {
 				fmt.Fprint(w, "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,\n/segment.ts\n")
 				return
 			}
@@ -398,7 +415,7 @@ func TestContinuousGooglevideoHLSToleratesOneStaleReload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	captureCtx, captureCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	captureCtx, captureCancel := context.WithTimeout(context.Background(), stall+10*time.Second)
 	defer captureCancel()
 	args := buildFFmpegContinuousArgs(server.URL+"/live.m3u8", filepath.Join(temp, "seg-%Y%m%d-%H%M%S.mp4"), time.Second, "manifest.googlevideo.com", nil)
 	cmd := exec.CommandContext(captureCtx, ffmpeg, args...)
@@ -414,10 +431,10 @@ func TestContinuousGooglevideoHLSToleratesOneStaleReload(t *testing.T) {
 		captureCancel()
 		<-waitErr
 	case err := <-waitErr:
-		t.Fatalf("FFmpeg exited before the playlist advanced after one stale reload: %v (%s)", err, strings.TrimSpace(output.String()))
+		t.Fatalf("FFmpeg exited during a %s playlist publication stall: %v; reloads=%d stderr=%s", stall, err, playlistRequests.Load(), strings.TrimSpace(output.String()))
 	case <-captureCtx.Done():
 		<-waitErr
-		t.Fatalf("FFmpeg never consumed the advanced playlist; reloads=%d stderr=%s", playlistRequests.Load(), strings.TrimSpace(output.String()))
+		t.Fatalf("FFmpeg never consumed the playlist after the stall; reloads=%d stderr=%s", playlistRequests.Load(), strings.TrimSpace(output.String()))
 	}
 }
 
