@@ -313,13 +313,18 @@ func (p *hlsSessionProxy) mediaPlaylist(ctx context.Context) (string, int64, []b
 
 // recordGoodPlaylist remembers a successfully fetched playlist for replay and
 // returns the playlist to serve. A playlist from a session that has since been
-// replaced is served but never cached. A stale CDN copy whose sequence went
+// replaced is never cached, and yields to the current session's cached one. A stale CDN copy whose sequence went
 // backwards within the same session is neither cached nor served: FFmpeg gets
 // the newer last good playlist instead of a regressed media sequence.
 func (p *hlsSessionProxy) recordGoodPlaylist(playlist *hlsSessionPlaylist) *hlsSessionPlaylist {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if playlist.generation != p.generation {
+		// A concurrent refresh replaced the session mid-fetch. Serve the current
+		// session's playlist when one is cached; otherwise this one, as before.
+		if p.lastGood != nil && p.lastGood.generation == p.generation {
+			return p.lastGood
+		}
 		return playlist
 	}
 	if first, count := hlsMediaSequenceRange(playlist.body); p.lastGood != nil && count > 0 &&
