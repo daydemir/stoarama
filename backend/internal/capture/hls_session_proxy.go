@@ -445,9 +445,10 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 	byteRange := r.Header.Get("Range")
 	var resp *http.Response
 	located := seqErr == nil && genErr == nil && epochErr == nil
+	segment := hlsSegmentRequest{target: target, seq: seq, generation: generation, epoch: epoch, tag: tag}
 	for attempt := 0; ; attempt++ {
 		var sessionConfirmed bool
-		resp, sessionConfirmed, err = p.fetchSegment(r.Context(), target, byteRange, seq, generation, epoch, tag, located)
+		resp, sessionConfirmed, err = p.fetchSegment(r.Context(), &segment, byteRange, located)
 		if sessionConfirmed {
 			// A completed lookup showed the session URL is unchanged, so the
 			// refusal is the CDN's: later attempts retry the segment alone
@@ -488,25 +489,43 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// hlsSegmentRequest is the segment (or key/map) FFmpeg asked for: the
+// upstream URL, its media sequence, and the session generation and numbering
+// epoch of the playlist that listed it.
+type hlsSegmentRequest struct {
+	target     *url.URL
+	seq        int64
+	generation int64
+	epoch      int64
+	tag        string
+}
+
 // fetchSegment is one attempt at a segment (or key/map). A request whose
 // session expired between the playlist read and this fetch is re-found by
-// media sequence in a fresh session instead of being dropped. A nil response
-// with a nil error means the segment no longer exists in any session.
-// sessionConfirmed reports a completed fresh-session lookup that found the
-// session URL unchanged, so the refusal was not an expiry.
-func (p *hlsSessionProxy) fetchSegment(ctx context.Context, target *url.URL, byteRange string, seq, generation, epoch int64, tag string, located bool) (resp *http.Response, sessionConfirmed bool, err error) {
-	resp, err = p.get(ctx, target.String(), byteRange)
+// media sequence in a fresh session instead of being dropped; the request then
+// follows that session's URL, so later attempts retry the replacement rather
+// than the expired URL. A nil response with a nil error means the segment no
+// longer exists in any session. sessionConfirmed reports a completed
+// fresh-session lookup that found the session URL unchanged, so the refusal
+// was not an expiry.
+func (p *hlsSessionProxy) fetchSegment(ctx context.Context, segment *hlsSegmentRequest, byteRange string, located bool) (resp *http.Response, sessionConfirmed bool, err error) {
+	resp, err = p.get(ctx, segment.target.String(), byteRange)
 	if err != nil {
 		return nil, false, err
 	}
 	if !hlsSessionExpiredStatus(resp.StatusCode) || !located {
 		return resp, false, nil
 	}
-	fresh, ok, complete := p.segmentInFreshSession(ctx, generation, epoch, seq, tag)
-	stable := p.stableSession(generation)
+	fresh, freshGeneration, ok, complete := p.segmentInFreshSession(ctx, segment.generation, segment.epoch, segment.seq, segment.tag)
+	stable := p.stableSession(segment.generation)
 	switch {
-	case ok && fresh != target.String():
+	case ok && fresh != segment.target.String():
+		replacement, parseErr := url.Parse(fresh)
+		if parseErr != nil {
+			return resp, false, nil
+		}
 		resp.Body.Close()
+		segment.target, segment.generation = replacement, freshGeneration
 		resp, err = p.get(ctx, fresh, byteRange)
 		return resp, false, err
 	case !ok && !stable:
@@ -530,39 +549,39 @@ func (p *hlsSessionProxy) stableSession(generation int64) bool {
 }
 
 // segmentInFreshSession looks the segment up by media sequence in the current
-// (refreshed) session. complete is false when the refresh or the playlist read
+// (refreshed) session and returns its URL with that session's generation. complete is false when the refresh or the playlist read
 // failed, so the lookup told us nothing and may be repeated.
-func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation, epoch, seq int64, tag string) (uri string, ok, complete bool) {
+func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation, epoch, seq int64, tag string) (uri string, freshGeneration int64, ok, complete bool) {
 	mediaURL, freshGeneration, err := p.refresh(ctx, generation)
 	if err != nil {
-		return "", false, false
+		return "", 0, false, false
 	}
 	body, status, err := p.fetchPlaylist(ctx, mediaURL)
 	if err != nil || status != http.StatusOK {
-		return "", false, false
+		return "", 0, false, false
 	}
 	if freshEpoch, _ := p.observe(freshGeneration, body); freshEpoch != epoch {
 		// The camera stream restarted: this sequence number now names different
 		// media, so let FFmpeg skip the segment instead of splicing wrong footage.
-		return "", false, true
+		return "", 0, false, true
 	}
 	base, err := url.Parse(mediaURL)
 	if err != nil {
-		return "", false, true
+		return "", 0, false, true
 	}
 	found, ok := hlsURIForSequence(body, seq, tag)
 	if !ok {
-		return "", false, true
+		return "", 0, false, true
 	}
 	ref, err := url.Parse(found)
 	if err != nil {
-		return "", false, true
+		return "", 0, false, true
 	}
 	abs := base.ResolveReference(ref)
 	if !p.sameOrigin(abs) {
-		return "", false, true
+		return "", 0, false, true
 	}
-	return abs.String(), true, true
+	return abs.String(), freshGeneration, true, true
 }
 
 // hlsMediaSequenceRange returns a media playlist's first sequence number and
