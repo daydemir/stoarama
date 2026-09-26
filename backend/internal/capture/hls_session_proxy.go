@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/netguard"
@@ -32,17 +33,39 @@ import (
 // playlist whenever the session URL returns 403 and continues from the fresh
 // session. Wowza keeps media sequence numbers across sessions, so FFmpeg sees
 // an uninterrupted live playlist and keeps its single persistent muxer.
-const seattleStreamLockHost = "61e0c5d388c2e.streamlock.net"
-
-// hlsSessionRefreshHost and hlsSessionDialControl are package vars so tests
-// can point the proxy at a loopback httptest server. Production matches only
-// the Seattle DOT StreamLock host and rejects private/metadata dials.
-var (
-	hlsSessionRefreshHost = func(host string) bool {
-		return strings.EqualFold(strings.TrimSuffix(host, "."), seattleStreamLockHost)
-	}
-	hlsSessionDialControl = netguard.ControlReject
+//
+// KBS's Korean road cameras (kbsapi.loomex.net '!hls' references) resolve to a
+// Wowza origin behind the NCE CDN at kbscctv-cache.loomex.net. The token is in
+// the path and lasts 24 hours, but the CDN answers a bare 403 to a fraction of
+// cache-miss and revalidation requests for some cameras (9996 in 2026-09: about
+// one chunklist request in five, in bursts of a few seconds). FFmpeg ends the
+// whole process on a single failed playlist reload and skips a segment after a
+// single failed fetch, so recording 337 restarted every couple of minutes and
+// lost ~18% of its window. The same proxy absorbs those transient failures: it
+// retries briefly and, if the chunklist is still refused, serves the last good
+// chunklist so FFmpeg simply polls again instead of exiting.
+const (
+	seattleStreamLockHost = "61e0c5d388c2e.streamlock.net"
+	kbsLoomexCDNHost      = "kbscctv-cache.loomex.net"
 )
+
+// hlsSessionRefreshHost, hlsSessionDialControl, and hlsSessionRetryDelays are
+// package vars so tests can point the proxy at a loopback httptest server and
+// shorten its retry schedule. Production matches only the listed origins and
+// rejects private/metadata dials.
+var (
+	hlsSessionRefreshHost = productionHLSSessionRefreshHost
+	hlsSessionDialControl = netguard.ControlReject
+	// hlsSessionRetryDelays is the backoff between attempts at one upstream
+	// request that failed transiently. Its ~7s total stays well inside FFmpeg's
+	// 15s rw_timeout and a 10s HLS target duration.
+	hlsSessionRetryDelays = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 3 * time.Second}
+)
+
+func productionHLSSessionRefreshHost(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	return strings.EqualFold(host, seattleStreamLockHost) || strings.EqualFold(host, kbsLoomexCDNHost)
+}
 
 const (
 	hlsSessionPlaylistTimeout = 15 * time.Second
@@ -85,6 +108,41 @@ type hlsSessionProxy struct {
 	offset         int64
 	lastUpstream   int64
 	lastGeneration int64
+
+	// lastGood is the most recent media playlist the origin served, replayed
+	// when a reload keeps failing so FFmpeg polls again instead of exiting.
+	lastGood *hlsSessionPlaylist
+}
+
+// HLSSessionProxyPortMin and HLSSessionProxyPortMax bound the loopback ports
+// the session proxy listens on. Cloud recorder droplets REJECT all egress to
+// 127.0.0.0/8 except DNS and exactly this TCP range (dropletpool's
+// STOARAMA_EGRESS chain), so FFmpeg can reach the proxy without opening
+// loopback in general. A redirect into the range only reaches a session proxy,
+// which forwards solely to its fixed allowlisted origin hosts.
+const (
+	HLSSessionProxyPortMin = 47100
+	HLSSessionProxyPortMax = 47355
+)
+
+var hlsSessionProxyPortOffset atomic.Uint32
+
+// listenHLSSessionProxy binds the first free port in the allowed range,
+// starting from a rotating offset so concurrent captures do not all probe the
+// same low ports first.
+func listenHLSSessionProxy() (net.Listener, error) {
+	span := HLSSessionProxyPortMax - HLSSessionProxyPortMin + 1
+	start := int(hlsSessionProxyPortOffset.Add(1)) % span
+	var lastErr error
+	for i := 0; i < span; i++ {
+		port := HLSSessionProxyPortMin + (start+i)%span
+		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err == nil {
+			return listener, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("no free port in %d-%d: %w", HLSSessionProxyPortMin, HLSSessionProxyPortMax, lastErr)
 }
 
 func startHLSSessionProxy(input CaptureInput) (*hlsSessionProxy, error) {
@@ -92,7 +150,7 @@ func startHLSSessionProxy(input CaptureInput) (*hlsSessionProxy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse hls session master url: %w", err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := listenHLSSessionProxy()
 	if err != nil {
 		return nil, fmt.Errorf("listen hls session proxy: %w", err)
 	}
@@ -188,8 +246,15 @@ func (p *hlsSessionProxy) refresh(ctx context.Context, stale int64) (string, int
 	if err != nil {
 		return "", p.generation, err
 	}
-	p.mediaURL = mediaURL
-	p.generation++
+	if mediaURL != p.mediaURL {
+		// Only a new session URL is a new generation. An origin whose variant URL
+		// is stable (token in the path) must not look like a new session, or a
+		// briefly stale CDN copy would be mistaken for a camera restart.
+		p.mediaURL = mediaURL
+		p.generation++
+		// The last good playlist lists the old session's URLs; never replay it.
+		p.lastGood = nil
+	}
 	return p.mediaURL, p.generation, nil
 }
 
@@ -237,9 +302,79 @@ func (p *hlsSessionProxy) get(ctx context.Context, rawURL, byteRange string) (*h
 	return p.client.Do(req)
 }
 
-// mediaPlaylist fetches the current session's media playlist, re-reading the
-// master playlist once when the session has expired.
+type hlsSessionPlaylist struct {
+	mediaURL   string
+	generation int64
+	body       []byte
+}
+
+// mediaPlaylist fetches the current session's media playlist. An expired
+// session re-reads the master playlist; a transient refusal is retried on a
+// short backoff. When every attempt fails, the last good playlist is replayed:
+// FFmpeg sees no new segments and reloads again, rather than treating one
+// failed reload as the end of the stream. A source that stays dead still
+// reaches the recorder's no-progress watchdog and a fresh resolve.
 func (p *hlsSessionProxy) mediaPlaylist(ctx context.Context) (string, int64, []byte, int, error) {
+	var lastErr error
+	lastStatus := 0
+	for attempt := 0; ; attempt++ {
+		mediaURL, generation, body, status, err := p.fetchMediaPlaylist(ctx)
+		if err == nil && status == http.StatusOK {
+			playlist := p.recordGoodPlaylist(&hlsSessionPlaylist{mediaURL: mediaURL, generation: generation, body: body})
+			return playlist.mediaURL, playlist.generation, playlist.body, status, nil
+		}
+		lastErr, lastStatus = err, status
+		if err == nil && !hlsSessionTransientStatus(status) {
+			return mediaURL, generation, body, status, nil
+		}
+		if attempt >= len(hlsSessionRetryDelays) || !sleepContext(ctx, hlsSessionRetryDelays[attempt]) {
+			break
+		}
+	}
+	p.mu.Lock()
+	lastGood := p.lastGood
+	p.mu.Unlock()
+	if lastGood != nil && ctx.Err() == nil {
+		return lastGood.mediaURL, lastGood.generation, lastGood.body, http.StatusOK, nil
+	}
+	if lastErr != nil {
+		return "", 0, nil, 0, lastErr
+	}
+	return "", 0, nil, lastStatus, nil
+}
+
+// recordGoodPlaylist remembers a successfully fetched playlist for replay and
+// returns the playlist to serve. A playlist from a session that has since been
+// replaced is never cached, and yields to the current session's cached one. A stale CDN copy whose sequence went
+// backwards within the same session is neither cached nor served: FFmpeg gets
+// the newer last good playlist instead of a regressed media sequence.
+func (p *hlsSessionProxy) recordGoodPlaylist(playlist *hlsSessionPlaylist) *hlsSessionPlaylist {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if playlist.generation != p.generation {
+		// A concurrent refresh replaced the session mid-fetch. Serve the current
+		// session's playlist when one is cached; otherwise this one, as before.
+		if p.lastGood != nil && p.lastGood.generation == p.generation {
+			return p.lastGood
+		}
+		return playlist
+	}
+	if p.lastGood != nil && p.lastGood.generation == playlist.generation {
+		first, count := hlsMediaSequenceRange(playlist.body)
+		cachedFirst, cachedCount := hlsMediaSequenceRange(p.lastGood.body)
+		last, cachedLast := first+count-1, cachedFirst+cachedCount-1
+		// Overlapping fetches can finish out of order; keep the newest.
+		if count > 0 && (last < cachedLast || (playlist.generation == p.lastGeneration && last < p.lastUpstream)) {
+			return p.lastGood
+		}
+	}
+	p.lastGood = playlist
+	return playlist
+}
+
+// fetchMediaPlaylist is one attempt: read the session's media playlist, and on
+// an expired-session status re-read the master playlist once and try again.
+func (p *hlsSessionProxy) fetchMediaPlaylist(ctx context.Context) (string, int64, []byte, int, error) {
 	mediaURL, generation, err := p.session(ctx)
 	if err != nil {
 		return "", 0, nil, 0, err
@@ -367,28 +502,41 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 	epoch, epochErr := strconv.ParseInt(query.Get("epoch"), 10, 64)
 	tag := query.Get("tag")
 	byteRange := r.Header.Get("Range")
-	resp, err := p.get(r.Context(), target.String(), byteRange)
+	var resp *http.Response
+	located := seqErr == nil && genErr == nil && epochErr == nil
+	segment := hlsSegmentRequest{target: target, seq: seq, generation: generation, epoch: epoch, tag: tag}
+	for attempt := 0; ; attempt++ {
+		var sessionConfirmed bool
+		resp, sessionConfirmed, err = p.fetchSegment(r.Context(), &segment, byteRange, located)
+		if sessionConfirmed {
+			// A completed lookup showed the session URL is unchanged, so the
+			// refusal is the CDN's: later attempts retry the segment alone
+			// instead of re-reading the master and media playlists each time.
+			located = false
+		}
+		if err == nil && (resp == nil || !hlsSessionTransientStatus(resp.StatusCode)) {
+			break
+		}
+		if attempt >= len(hlsSessionRetryDelays) {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+			resp = nil
+		}
+		// The CDN refuses some cache-miss requests for a few seconds. A brief
+		// retry keeps the segment; FFmpeg would otherwise skip it after one 403.
+		if !sleepContext(r.Context(), hlsSessionRetryDelays[attempt]) {
+			break
+		}
+	}
 	if err != nil {
 		writeHLSSessionError(w, err)
 		return
 	}
-	if hlsSessionExpiredStatus(resp.StatusCode) && seqErr == nil && genErr == nil && epochErr == nil {
-		// The session expired between the playlist read and this request. Find the
-		// same segment (or the key/map applying to it) by media sequence number in
-		// a fresh session instead of dropping it.
-		resp.Body.Close()
-		resp = nil
-		if fresh, ok := p.segmentInFreshSession(r.Context(), generation, epoch, seq, tag); ok {
-			resp, err = p.get(r.Context(), fresh, byteRange)
-			if err != nil {
-				writeHLSSessionError(w, err)
-				return
-			}
-		}
-		if resp == nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
+	if resp == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 	defer resp.Body.Close()
 	for _, key := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
@@ -400,37 +548,99 @@ func (p *hlsSessionProxy) serveSegment(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation, epoch, seq int64, tag string) (string, bool) {
+// hlsSegmentRequest is the segment (or key/map) FFmpeg asked for: the
+// upstream URL, its media sequence, and the session generation and numbering
+// epoch of the playlist that listed it.
+type hlsSegmentRequest struct {
+	target     *url.URL
+	seq        int64
+	generation int64
+	epoch      int64
+	tag        string
+}
+
+// fetchSegment is one attempt at a segment (or key/map). A request whose
+// session expired between the playlist read and this fetch is re-found by
+// media sequence in a fresh session instead of being dropped; the request then
+// follows that session's URL, so later attempts retry the replacement rather
+// than the expired URL. A nil response with a nil error means the segment no
+// longer exists in any session. sessionConfirmed reports a completed
+// fresh-session lookup that found the session URL unchanged, so the refusal
+// was not an expiry.
+func (p *hlsSessionProxy) fetchSegment(ctx context.Context, segment *hlsSegmentRequest, byteRange string, located bool) (resp *http.Response, sessionConfirmed bool, err error) {
+	resp, err = p.get(ctx, segment.target.String(), byteRange)
+	if err != nil {
+		return nil, false, err
+	}
+	if !hlsSessionExpiredStatus(resp.StatusCode) || !located {
+		return resp, false, nil
+	}
+	fresh, freshGeneration, ok, complete := p.segmentInFreshSession(ctx, segment.generation, segment.epoch, segment.seq, segment.tag)
+	stable := p.stableSession(segment.generation)
+	switch {
+	case ok && fresh != segment.target.String():
+		replacement, parseErr := url.Parse(fresh)
+		if parseErr != nil {
+			return resp, false, nil
+		}
+		resp.Body.Close()
+		segment.target, segment.generation = replacement, freshGeneration
+		resp, err = p.get(ctx, fresh, byteRange)
+		return resp, false, err
+	case !ok && !stable:
+		// A new session no longer lists this media (the camera stream restarted),
+		// so let FFmpeg skip it rather than splice different footage.
+		resp.Body.Close()
+		return nil, false, nil
+	default:
+		// The session URL is unchanged (a path-token origin), so the refusal was
+		// not an expiry: return it for the caller to retry.
+		return resp, complete && stable, nil
+	}
+}
+
+// stableSession reports whether the session the segment was listed in is
+// still current, i.e. the origin did not hand out a new session URL.
+func (p *hlsSessionProxy) stableSession(generation int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.generation == generation
+}
+
+// segmentInFreshSession looks the segment up by media sequence in the current
+// (refreshed) session and returns its URL with that session's generation. complete is false when the refresh or the playlist read
+// failed, so the lookup told us nothing and may be repeated.
+func (p *hlsSessionProxy) segmentInFreshSession(ctx context.Context, generation, epoch, seq int64, tag string) (uri string, freshGeneration int64, ok, complete bool) {
 	mediaURL, freshGeneration, err := p.refresh(ctx, generation)
 	if err != nil {
-		return "", false
+		return "", 0, false, false
 	}
 	body, status, err := p.fetchPlaylist(ctx, mediaURL)
 	if err != nil || status != http.StatusOK {
-		return "", false
+		return "", 0, false, false
 	}
 	if freshEpoch, _ := p.observe(freshGeneration, body); freshEpoch != epoch {
 		// The camera stream restarted: this sequence number now names different
 		// media, so let FFmpeg skip the segment instead of splicing wrong footage.
-		return "", false
+		return "", 0, false, true
 	}
 	base, err := url.Parse(mediaURL)
 	if err != nil {
-		return "", false
+		return "", 0, false, true
 	}
-	uri, ok := hlsURIForSequence(body, seq, tag)
+	found, ok := hlsURIForSequence(body, seq, tag)
 	if !ok {
-		return "", false
+		return "", 0, false, true
 	}
-	ref, err := url.Parse(uri)
+	ref, err := url.Parse(found)
 	if err != nil {
-		return "", false
+		return "", 0, false, true
 	}
 	abs := base.ResolveReference(ref)
 	if !p.sameOrigin(abs) {
-		return "", false
+		return "", 0, false, true
 	}
-	return abs.String(), true
+	return abs.String(), freshGeneration, true, true
 }
 
 // hlsMediaSequenceRange returns a media playlist's first sequence number and
@@ -457,6 +667,24 @@ func hlsMediaSequenceRange(body []byte) (int64, int64) {
 // session: 403, or 404 once the camera stream restarted under a new session.
 func hlsSessionExpiredStatus(status int) bool {
 	return status == http.StatusForbidden || status == http.StatusNotFound
+}
+
+// hlsSessionTransientStatus is a refusal worth retrying briefly: an expired
+// or CDN-refused request, a throttle, or an upstream server error.
+func hlsSessionTransientStatus(status int) bool {
+	return hlsSessionExpiredStatus(status) || status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // hlsTagName returns "EXT-X-KEY" for "#EXT-X-KEY:METHOD=...".

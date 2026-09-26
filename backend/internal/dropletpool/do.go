@@ -455,6 +455,10 @@ write_files:
             echo "-A STOARAMA_EGRESS -p udp --dport 53 -d $ns/32 -j RETURN"
             echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d $ns/32 -j RETURN"
           done
+          # FFmpeg reaches the capture HLS session proxy over loopback. Allow
+          # exactly its TCP port range on 127.0.0.1 (capture.HLSSessionProxyPort*);
+          # the rest of 127.0.0.0/8 stays rejected below.
+          echo "-A STOARAMA_EGRESS -o lo -p tcp -d 127.0.0.1/32 --dport 47100:47355 -j RETURN"
           for cidr in "${BLOCKED4[@]}"; do
             echo "-A STOARAMA_EGRESS -d $cidr -j REJECT"
           done
