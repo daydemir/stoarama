@@ -58,14 +58,14 @@ func (c *fakeRefusingCDN) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	n := c.requests.Add(1)
 	path := strings.TrimPrefix(r.URL.Path, "/lowStream/_definst_/9996_low.stream/")
 	c.mu.Lock()
-	refuse := c.refuse
+	refuse, started := c.refuse, c.started
 	c.mu.Unlock()
 	if refuse != nil && refuse(path, n) {
 		c.forbiddenRequests.Add(1)
 		w.WriteHeader(http.StatusForbidden) // the CDN's refusal has no body
 		return
 	}
-	edge := int64(time.Since(c.started) / c.publishEvery)
+	edge := int64(time.Since(started) / c.publishEvery)
 	switch {
 	case path == "playlist.m3u8":
 		c.masterRequests.Add(1)
@@ -350,5 +350,35 @@ func TestHLSSessionProxyRetriesReplacementSegmentURL(t *testing.T) {
 	}
 	if got := expiredFetches.Load(); got != 1 {
 		t.Fatalf("expired session URL fetched %d times, want 1 (retries must use the replacement)", got)
+	}
+}
+
+// A stale CDN copy of the same session's chunklist whose sequence went
+// backwards is not served to FFmpeg, and does not replace the newer playlist
+// kept for replay.
+func TestHLSSessionProxyServesNewestPlaylistOverStaleCDNCopy(t *testing.T) {
+	allowLoopbackHLSSessionOrigin(t)
+	fastHLSSessionRetries(t, 5*time.Millisecond)
+	cdn, server := newFakeRefusingCDN(t, 50*time.Millisecond, nil, nil)
+	time.Sleep(300 * time.Millisecond) // the live edge is now past sequence 5
+	proxy, err := startHLSSessionProxy(CaptureInput{URL: cdn.masterURL(server)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	_, newest := fetchProxyPlaylist(t, proxy.URL())
+	newestFirst, _ := proxyPlaylistSequence(t, newest)
+	cdn.mu.Lock()
+	cdn.started = cdn.started.Add(250 * time.Millisecond) // serve an older window
+	cdn.mu.Unlock()
+	_, served := fetchProxyPlaylist(t, proxy.URL())
+	if servedFirst, _ := proxyPlaylistSequence(t, served); servedFirst < newestFirst {
+		t.Fatalf("proxy served a regressed media sequence %d after %d", servedFirst, newestFirst)
+	}
+	cdn.setRefuse(func(string, int64) bool { return true })
+	_, replayed := fetchProxyPlaylist(t, proxy.URL())
+	if replayFirst, _ := proxyPlaylistSequence(t, replayed); replayFirst < newestFirst {
+		t.Fatalf("proxy replayed a regressed media sequence %d after %d", replayFirst, newestFirst)
 	}
 }
