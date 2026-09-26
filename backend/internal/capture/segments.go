@@ -1046,7 +1046,7 @@ func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string,
 func appendContinuousFFmpegInput(args []string, inputURL, pinHost, inputHeaders string) []string {
 	args = appendFFmpegHTTPInputArgsWithHeaders(args, inputURL, true, 10, pinHost, inputHeaders)
 	args = appendHLSLiveEdgeInputArgs(args, inputURL)
-	args = appendGooglevideoHLSRecoveryInputArgs(args, inputURL, pinHost)
+	args = appendHLSStallToleranceInputArgs(args, inputURL)
 	return append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", inputURL,
@@ -1152,16 +1152,22 @@ func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
 	return append(args, "-live_start_index", "-1")
 }
 
-func appendGooglevideoHLSRecoveryInputArgs(args []string, sourceURL, pinHost string) []string {
-	if !isHLSInputURL(sourceURL) || (!isGooglevideoURL(sourceURL) && !isGooglevideoHost(pinHost)) {
+// appendHLSStallToleranceInputArgs keeps FFmpeg polling a live playlist that
+// stops advancing for a while and then resumes. YouTube playlists routinely
+// stall for 15-20 seconds (several target durations) with no ENDLIST. Any
+// stale-reload cap turns that into a clean FFmpeg exit and a ~20-second
+// re-resolve gap: -m3u8_hold_counters 4 cost recording 445 ~13% of its window.
+// So set no -m3u8_hold_counters (FFmpeg's default is 1000), and raise
+// -max_reload from its default of 3. FFmpeg 6.x applies that per-read cap to
+// the same stale-playlist loop and exits after a few seconds of stall; 7.x and
+// later happen to tolerate it. A playlist that never resumes is bounded by the
+// continuous output-progress watchdog, and an expired Googlevideo URL is caught
+// sooner by the stderr 403 observer.
+func appendHLSStallToleranceInputArgs(args []string, sourceURL string) []string {
+	if !isHLSInputURL(sourceURL) {
 		return args
 	}
-	// Googlevideo rotates signed media URLs. When a child fragment expires,
-	// FFmpeg's HLS demuxer skips it and can otherwise poll the unchanged playlist
-	// until our 30-second watchdog fires. Four counts tolerate normal publication
-	// just beyond one target duration while returning an expired manifest to the
-	// worker's fresh resolver within about two target durations.
-	return append(args, "-m3u8_hold_counters", "4")
+	return append(args, "-max_reload", "1000")
 }
 
 func isGooglevideoURL(sourceURL string) bool {
