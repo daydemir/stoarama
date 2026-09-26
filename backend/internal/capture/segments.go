@@ -1046,6 +1046,7 @@ func buildFFmpegContinuousArgsWithHeadersAndAudioAndTimestamps(sourceURL string,
 func appendContinuousFFmpegInput(args []string, inputURL, pinHost, inputHeaders string) []string {
 	args = appendFFmpegHTTPInputArgsWithHeaders(args, inputURL, true, 10, pinHost, inputHeaders)
 	args = appendHLSLiveEdgeInputArgs(args, inputURL)
+	args = appendHLSStallToleranceInputArgs(args, inputURL)
 	return append(args,
 		"-fflags", "+discardcorrupt",
 		"-i", inputURL,
@@ -1136,13 +1137,6 @@ func continuousFFmpegLogLevel(sourceURL, pinHost string) string {
 // The continuous HLS progress watchdog is capped at 30 seconds so a persistently
 // dead or expired signed URL returns to recordingworker's outer loop, which
 // re-resolves a fresh URL, rather than retrying the stale URL indefinitely.
-// Do not cap stale playlist reloads (-m3u8_hold_counters) either. YouTube
-// playlists routinely stop advancing for 15-20 seconds and then resume; a cap
-// of four stale reloads turned each such stall into a clean FFmpeg exit and a
-// ~20-second re-resolve gap (recording 445 lost ~13% of its window this way).
-// A playlist that never resumes is bounded by the output-progress watchdog, and
-// an expired Googlevideo URL is caught sooner by the stderr 403 observer.
-//
 // Do not set reconnect_at_eof for HLS. EOF is the normal end of each finite
 // playlist HTTP response; reconnecting that response prevents FFmpeg's HLS
 // demuxer from completing the manifest and can produce zero media forever.
@@ -1156,6 +1150,24 @@ func appendHLSLiveEdgeInputArgs(args []string, sourceURL string) []string {
 		return args
 	}
 	return append(args, "-live_start_index", "-1")
+}
+
+// appendHLSStallToleranceInputArgs keeps FFmpeg polling a live playlist that
+// stops advancing for a while and then resumes. YouTube playlists routinely
+// stall for 15-20 seconds (several target durations) with no ENDLIST. Any
+// stale-reload cap turns that into a clean FFmpeg exit and a ~20-second
+// re-resolve gap: -m3u8_hold_counters 4 cost recording 445 ~13% of its window.
+// So set no -m3u8_hold_counters (FFmpeg's default is 1000), and raise
+// -max_reload from its default of 3. FFmpeg 6.x applies that per-read cap to
+// the same stale-playlist loop and exits after a few seconds of stall; 7.x and
+// later happen to tolerate it. A playlist that never resumes is bounded by the
+// continuous output-progress watchdog, and an expired Googlevideo URL is caught
+// sooner by the stderr 403 observer.
+func appendHLSStallToleranceInputArgs(args []string, sourceURL string) []string {
+	if !isHLSInputURL(sourceURL) {
+		return args
+	}
+	return append(args, "-max_reload", "1000")
 }
 
 func isGooglevideoURL(sourceURL string) bool {

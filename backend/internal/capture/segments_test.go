@@ -1276,20 +1276,44 @@ func TestAppendHLSLiveEdgeInputArgsURLClassification(t *testing.T) {
 	}
 }
 
-// TestContinuousHLSInputsDoNotCapStaleReloads guards recording 445's fix: a
+// TestContinuousHLSInputsTolerateStalledPlaylists guards recording 445's fix: a
 // stale-reload cap turns an ordinary YouTube publication stall into a clean
 // FFmpeg exit and a re-resolve gap. The output watchdog bounds real stalls.
-func TestContinuousHLSInputsDoNotCapStaleReloads(t *testing.T) {
-	for _, tt := range []struct{ name, sourceURL, pinHost string }{
-		{name: "manifest host", sourceURL: "https://manifest.googlevideo.com/live.m3u8"},
-		{name: "media subdomain", sourceURL: "https://rr1.sn-x.googlevideo.com/live.m3u8"},
-		{name: "pinned original host", sourceURL: "https://203.0.113.10/live.m3u8", pinHost: "manifest.googlevideo.com"},
-		{name: "unrelated HLS", sourceURL: "https://example.com/live.m3u8"},
+func TestContinuousHLSInputsTolerateStalledPlaylists(t *testing.T) {
+	for _, tt := range []struct {
+		name, sourceURL, pinHost string
+		hls                      bool
+	}{
+		{name: "manifest host", sourceURL: "https://manifest.googlevideo.com/live.m3u8", hls: true},
+		{name: "media subdomain", sourceURL: "https://rr1.sn-x.googlevideo.com/live.m3u8", hls: true},
+		{name: "pinned original host", sourceURL: "https://203.0.113.10/live.m3u8", pinHost: "manifest.googlevideo.com", hls: true},
+		{name: "unrelated HLS", sourceURL: "https://example.com/live.m3u8", hls: true},
+		{name: "query declared HLS", sourceURL: "https://example.com/stream?format=m3u8", hls: true},
+		{name: "plain HTTP video", sourceURL: "https://example.com/video.mp4"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			args := buildFFmpegContinuousInputArgs(CaptureInput{URL: tt.sourceURL, AudioURL: tt.sourceURL}, "/out/seg-%Y%m%d-%H%M%S.mp4", time.Minute, tt.pinHost, nil, true, false)
 			if slices.Contains(args, "-m3u8_hold_counters") {
-				t.Fatalf("continuous HLS input caps stale playlist reloads: %v", args)
+				t.Fatalf("continuous input caps stale playlist reloads: %v", args)
+			}
+			var maxReload []string
+			for i, arg := range args {
+				if arg == "-max_reload" && i+1 < len(args) {
+					maxReload = append(maxReload, args[i+1])
+				}
+			}
+			if !tt.hls {
+				if len(maxReload) != 0 {
+					t.Fatalf("non-HLS input received HLS reload option: %v", args)
+				}
+				return
+			}
+			// One per input (video and audio), each before its own -i.
+			if !slices.Equal(maxReload, []string{"1000", "1000"}) {
+				t.Fatalf("HLS inputs max_reload=%v want [1000 1000]: %v", maxReload, args)
+			}
+			if first, input := slices.Index(args, "-max_reload"), slices.Index(args, "-i"); first > input {
+				t.Fatalf("max_reload must be input-scoped before -i: %v", args)
 			}
 		})
 	}
@@ -1402,7 +1426,7 @@ func TestBuildFFmpegContinuousInputArgsSplitYouTubeUsesTwoLiveEdgeInputs(t *test
 			"-protocol_whitelist", "https,tls,tcp,http,crypto,data",
 			"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
 			"-reconnect_on_http_error", "4xx,5xx", "-reconnect_delay_max", "10",
-			"-live_start_index", "-1",
+			"-live_start_index", "-1", "-max_reload", "1000",
 			"-fflags", "+discardcorrupt",
 		}
 		want := []string{"-y", "-nostdin", "-loglevel", "warning"}
