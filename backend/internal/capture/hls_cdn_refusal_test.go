@@ -303,3 +303,52 @@ func TestContinuousCaptureSurvivesCDNRefusalBursts(t *testing.T) {
 		t.Fatalf("FFmpeg consumed only sequences %d..%d", lowest, highest)
 	}
 }
+
+// Once a fresh session supplies the replacement URL for an expired segment,
+// a transient failure on that replacement is retried on the replacement, not
+// on the expired URL.
+func TestHLSSessionProxyRetriesReplacementSegmentURL(t *testing.T) {
+	allowLoopbackHLSSessionOrigin(t)
+	fastHLSSessionRetries(t, 5*time.Millisecond, 5*time.Millisecond)
+	origin := &fakeWowzaOrigin{
+		t: t, sessionTTL: 300 * time.Millisecond, publishEvery: time.Hour, window: 3,
+		started: time.Now(), sessions: map[string]time.Time{}, nextSession: 1000,
+	}
+	var expiredFetches, replacementFailures atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "media_w1001_"):
+			expiredFetches.Add(1)
+		case strings.Contains(r.URL.Path, "media_w1002_") && replacementFailures.Add(1) == 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		origin.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	proxy, err := startHLSSessionProxy(CaptureInput{URL: server.URL + "/live/7_Bell.stream/playlist.m3u8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	status, body := fetchProxyPlaylist(t, proxy.URL())
+	if status != http.StatusOK {
+		t.Fatalf("proxy playlist status=%d", status)
+	}
+	_, uris := proxyPlaylistSequence(t, body)
+	time.Sleep(400 * time.Millisecond) // session 1001 is now expired
+
+	resp, err := http.Get("http://" + proxy.listener.Addr().String() + uris[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(segment) != "segment-0" {
+		t.Fatalf("segment status=%d body=%q, want segment-0 from the replacement session", resp.StatusCode, segment)
+	}
+	if got := expiredFetches.Load(); got != 1 {
+		t.Fatalf("expired session URL fetched %d times, want 1 (retries must use the replacement)", got)
+	}
+}
