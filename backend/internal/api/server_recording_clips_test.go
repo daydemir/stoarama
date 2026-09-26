@@ -487,8 +487,8 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 			 lease_owner, lease_expires_at, lease_token, attempt_count, idempotency_key, kind, window_end_at)
 		VALUES (1, 1, now(), now(), 60, 'leased',
 		        'cloud-a', now()+interval '3 minutes', '00000000-0000-0000-0000-000000000001', 1, 'cloud-handoff', 'continuous_window', now()+interval '1 hour');
-		INSERT INTO recording_clips (recording_job_id, capture_lease_token)
-		VALUES (1, '00000000-0000-0000-0000-000000000099')
+		INSERT INTO recording_clips (recording_job_id, capture_lease_token, created_at)
+		VALUES (1, '00000000-0000-0000-0000-000000000099', now()-interval '45 minutes')
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -631,6 +631,65 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 	)
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("expired cloud window lease err=%v, want pgx.ErrNoRows", err)
+	}
+}
+
+// A continuous window whose source was healthy moments ago must not sit idle
+// for the attempt-count penalty just because the replacement lease saw only the
+// same origin outage. Recording 438 (kamery24) surrendered zero-clip leases late
+// in a 12-hour window with attempt_count>=3 and lost five extra minutes each time.
+func TestCloudSurrenderRetriesRecentlyHealthyWindowImmediately(t *testing.T) {
+	pool, cleanup := testRecordingLeasePool(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id) VALUES (42);
+		INSERT INTO nodes (id, account_id, node_type, status, last_heartbeat_at, relay_max_streams)
+		VALUES (10, 42, 'local_recorder', 'active', now(), 1);
+		INSERT INTO recorder_droplets (name, node_id, state, capacity)
+		VALUES ('cloud-a', 10, 'active', 1);
+		INSERT INTO recordings
+			(id, account_id, storage_destination_id, name, stream_url, status, start_at, capture_via)
+		VALUES (1, 42, 7, 'recent', 'https://example.test/recent.m3u8', 'active', now()-interval '1 hour', 'cloud'),
+		       (2, 42, 7, 'stale', 'https://example.test/stale.m3u8', 'active', now()-interval '1 hour', 'cloud');
+		INSERT INTO recording_jobs
+			(id, recording_id, fire_at, scheduled_for, clip_duration_sec, status,
+			 lease_owner, lease_expires_at, lease_token, attempt_count, idempotency_key, kind, window_end_at)
+		VALUES (1, 1, now(), now(), 60, 'leased',
+		        'cloud-a', now()+interval '3 minutes', '00000000-0000-0000-0000-000000000001', 16, 'recent-window', 'continuous_window', now()+interval '6 hours'),
+		       (2, 2, now(), now(), 60, 'leased',
+		        'cloud-a', now()+interval '3 minutes', '00000000-0000-0000-0000-000000000002', 16, 'stale-window', 'continuous_window', now()+interval '6 hours');
+		INSERT INTO recording_clips (recording_job_id, capture_lease_token, created_at)
+		VALUES (1, '00000000-0000-0000-0000-000000000098', now()-interval '6 minutes'),
+		       (2, '00000000-0000-0000-0000-000000000099', now()-interval '45 minutes')
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	surrender := func(jobID int64, token string) (time.Time, bool) {
+		t.Helper()
+		var handoffUntil, nextRetryAt time.Time
+		var hadClips bool
+		if err := pool.QueryRow(ctx, recordingJobCloudSurrenderSQL, jobID, "cloud-a", "Server returned 404 Not Found", token, 10).Scan(
+			&handoffUntil, &nextRetryAt, &hadClips,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return nextRetryAt, hadClips
+	}
+
+	recentRetry, recentHadClips := surrender(1, "00000000-0000-0000-0000-000000000001")
+	if recentHadClips {
+		t.Fatal("prior-generation clip was reported as landed by the surrendering lease")
+	}
+	if delay := time.Until(recentRetry); delay < -5*time.Second || delay > 5*time.Second {
+		t.Fatalf("recently healthy window retry delay=%s want immediate", delay)
+	}
+
+	staleRetry, _ := surrender(2, "00000000-0000-0000-0000-000000000002")
+	if delay := time.Until(staleRetry); delay < 290*time.Second || delay > 310*time.Second {
+		t.Fatalf("long-dead window retry delay=%s want the 5m penalty", delay)
 	}
 }
 
@@ -1171,7 +1230,7 @@ func TestAccountClipsFeedPreservesTimestampContractTriState(t *testing.T) {
 	ctx := context.Background()
 	for _, ddl := range []string{
 		`ALTER TABLE recordings ADD COLUMN delivery text NOT NULL DEFAULT 'nas_pull'`,
-		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz, ADD COLUMN display_path text, ADD COLUMN purged_at timestamptz, ADD COLUMN released_at timestamptz, ADD COLUMN created_at timestamptz NOT NULL DEFAULT now()`,
+		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz, ADD COLUMN display_path text, ADD COLUMN purged_at timestamptz, ADD COLUMN released_at timestamptz`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
@@ -1523,7 +1582,8 @@ func testRecordingLeasePool(t *testing.T) (*pgxpool.Pool, func()) {
 			id BIGSERIAL PRIMARY KEY,
 			recording_job_id BIGINT NOT NULL,
 			capture_lease_token UUID,
-			capture_sequence BIGINT
+			capture_sequence BIGINT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		testRecordingCanaryReservationsTableDDL,
 		testRecordingJobNodeFailuresTableDDL,
