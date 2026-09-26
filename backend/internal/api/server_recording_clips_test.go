@@ -487,8 +487,8 @@ func TestCloudSurrenderExcludesPriorOwnerAndPreservesClips(t *testing.T) {
 			 lease_owner, lease_expires_at, lease_token, attempt_count, idempotency_key, kind, window_end_at)
 		VALUES (1, 1, now(), now(), 60, 'leased',
 		        'cloud-a', now()+interval '3 minutes', '00000000-0000-0000-0000-000000000001', 1, 'cloud-handoff', 'continuous_window', now()+interval '1 hour');
-		INSERT INTO recording_clips (recording_job_id, capture_lease_token)
-		VALUES (1, '00000000-0000-0000-0000-000000000099')
+		INSERT INTO recording_clips (recording_job_id, capture_lease_token, created_at)
+		VALUES (1, '00000000-0000-0000-0000-000000000099', now()-interval '45 minutes')
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -1230,7 +1230,7 @@ func TestAccountClipsFeedPreservesTimestampContractTriState(t *testing.T) {
 	ctx := context.Background()
 	for _, ddl := range []string{
 		`ALTER TABLE recordings ADD COLUMN delivery text NOT NULL DEFAULT 'nas_pull'`,
-		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz, ADD COLUMN display_path text, ADD COLUMN purged_at timestamptz, ADD COLUMN released_at timestamptz, ADD COLUMN created_at timestamptz NOT NULL DEFAULT now()`,
+		`ALTER TABLE recording_clips ADD COLUMN recording_id bigint, ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text, ADD COLUMN clip_start_at timestamptz, ADD COLUMN clip_end_at timestamptz, ADD COLUMN display_path text, ADD COLUMN purged_at timestamptz, ADD COLUMN released_at timestamptz`,
 	} {
 		if _, err := pool.Exec(ctx, ddl); err != nil {
 			t.Fatal(err)
