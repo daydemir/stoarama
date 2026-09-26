@@ -327,10 +327,14 @@ func (p *hlsSessionProxy) recordGoodPlaylist(playlist *hlsSessionPlaylist) *hlsS
 		}
 		return playlist
 	}
-	if first, count := hlsMediaSequenceRange(playlist.body); p.lastGood != nil && count > 0 &&
-		p.lastGood.generation == playlist.generation && playlist.generation == p.lastGeneration &&
-		first+count-1 < p.lastUpstream {
-		return p.lastGood
+	if p.lastGood != nil && p.lastGood.generation == playlist.generation {
+		first, count := hlsMediaSequenceRange(playlist.body)
+		cachedFirst, cachedCount := hlsMediaSequenceRange(p.lastGood.body)
+		last, cachedLast := first+count-1, cachedFirst+cachedCount-1
+		// Overlapping fetches can finish out of order; keep the newest.
+		if count > 0 && (last < cachedLast || (playlist.generation == p.lastGeneration && last < p.lastUpstream)) {
+			return p.lastGood
+		}
 	}
 	p.lastGood = playlist
 	return playlist
