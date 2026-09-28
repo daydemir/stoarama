@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -137,9 +138,7 @@ func allowLoopbackHLSSessionOrigin(t *testing.T) {
 	hlsSessionRefreshHost = func(host string) bool { return host == "127.0.0.1" }
 	hlsSessionDialControl = func(string, string, syscall.RawConn) error { return nil }
 	t.Cleanup(func() {
-		hlsSessionRefreshHost = func(host string) bool {
-			return strings.EqualFold(strings.TrimSuffix(host, "."), seattleStreamLockHost)
-		}
+		hlsSessionRefreshHost = productionHLSSessionRefreshHost
 		hlsSessionDialControl = netguard.ControlReject
 	})
 }
@@ -181,6 +180,8 @@ func TestHLSSessionRefreshAppliesOnlyToSeattleStreamLock(t *testing.T) {
 	}{
 		{"sdot master", CaptureInput{URL: "https://61e0c5d388c2e.streamlock.net/live/7_Bell.stream/playlist.m3u8"}, "", true},
 		{"sdot legacy port", CaptureInput{URL: "https://61e0c5d388c2e.streamlock.net:443/live/7_Bell.stream/playlist.m3u8"}, "", true},
+		{"kbs loomex cdn", CaptureInput{URL: "https://kbscctv-cache.loomex.net/lowStream/_definst_/9996_low.stream/playlist.m3u8?wowzatokenendtime=1&wowzatokenstarttime=0&wowzatokenhash=x"}, "", true},
+		{"kbs loomex api", CaptureInput{URL: "https://kbsapi.loomex.net/v1/api/cctvRequest/9996/abc!hls"}, "", false},
 		{"other wowza", CaptureInput{URL: "https://example.streamlock.net/live/x.stream/playlist.m3u8"}, "", false},
 		{"googlevideo", CaptureInput{URL: "https://manifest.googlevideo.com/api/manifest/hls_playlist/index.m3u8"}, "", false},
 		{"sdot image", CaptureInput{URL: "https://61e0c5d388c2e.streamlock.net/live/7_Bell.jpg"}, "", false},
@@ -519,6 +520,26 @@ func TestContinuousTimestampContractCaptureSurvivesWowzaSessionExpiry(t *testing
 		}
 		if i > 0 && !clip.StartAt.Equal(clips[i-1].EndAt) {
 			t.Fatalf("clip %d starts %s, previous ends %s: media timeline broke across a session refresh", i, clip.StartAt, clips[i-1].EndAt)
+		}
+	}
+}
+
+func TestHLSSessionProxyListensInsideFirewallPortRange(t *testing.T) {
+	listeners := make([]net.Listener, 0, 3)
+	defer func() {
+		for _, l := range listeners {
+			l.Close()
+		}
+	}()
+	for i := 0; i < 3; i++ {
+		l, err := listenHLSSessionProxy()
+		if err != nil {
+			t.Fatalf("listenHLSSessionProxy: %v", err)
+		}
+		listeners = append(listeners, l)
+		addr := l.Addr().(*net.TCPAddr)
+		if !addr.IP.Equal(net.IPv4(127, 0, 0, 1)) || addr.Port < HLSSessionProxyPortMin || addr.Port > HLSSessionProxyPortMax {
+			t.Fatalf("proxy listens on %s, want 127.0.0.1:%d-%d (the droplet firewall allows only that range)", addr, HLSSessionProxyPortMin, HLSSessionProxyPortMax)
 		}
 	}
 }

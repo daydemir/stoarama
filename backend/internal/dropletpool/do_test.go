@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/capture"
 	"github.com/digitalocean/godo"
 )
 
@@ -478,6 +479,21 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 	}
 	if strings.Contains(script, "--dport 53 -j RETURN") {
 		t.Fatalf("firewall must never allow DNS to any destination")
+	}
+	// FFmpeg reaches the capture HLS session proxy over loopback; exactly the
+	// proxy's port range must be allowed, before the 127.0.0.0/8 REJECT.
+	proxyRule := fmt.Sprintf(`echo "-A STOARAMA_EGRESS -o lo -p tcp -d 127.0.0.1/32 --dport %d:%d -j RETURN"`,
+		capture.HLSSessionProxyPortMin, capture.HLSSessionProxyPortMax)
+	proxyIdx := strings.Index(script, proxyRule)
+	if proxyIdx < 0 || proxyIdx > rejectIdx {
+		t.Fatalf("firewall must allow the HLS session proxy port range %q before the REJECTs", proxyRule)
+	}
+	if strings.Contains(script, `"-A STOARAMA_EGRESS -d 127.0.0.0/8 -j RETURN"`) || strings.Contains(script, `"-A STOARAMA_EGRESS -o lo -j RETURN"`) {
+		t.Fatalf("firewall must not open loopback beyond DNS and the session proxy range")
+	}
+	reserve := fmt.Sprintf(`net.ipv4.ip_local_reserved_ports="${RESERVED:+$RESERVED,}%d-%d"`, capture.HLSSessionProxyPortMin, capture.HLSSessionProxyPortMax)
+	if !strings.Contains(script, reserve) {
+		t.Fatalf("firewall must reserve the session proxy port range (%s) so no ephemeral socket lands in it", reserve)
 	}
 
 	if bash, err := exec.LookPath("bash"); err == nil {

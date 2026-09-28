@@ -444,6 +444,14 @@ write_files:
       # ever sees a half-built chain, and a rejected transaction leaves the previous
       # chain in force.
       apply_rules() {
+        # Reserve the session proxy's port range so the kernel never hands it
+        # out as an ephemeral port; only an explicit bind (the proxy) holds it.
+        # Merge with any reservations the image already defines.
+        RESERVED="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+        case ",$RESERVED," in
+          *,47100-47355,*) ;;
+          *) sysctl -q -w net.ipv4.ip_local_reserved_ports="${RESERVED:+$RESERVED,}47100-47355" || true ;;
+        esac
         {
           echo "*filter"
           echo ":STOARAMA_EGRESS - [0:0]"
@@ -455,6 +463,10 @@ write_files:
             echo "-A STOARAMA_EGRESS -p udp --dport 53 -d $ns/32 -j RETURN"
             echo "-A STOARAMA_EGRESS -p tcp --dport 53 -d $ns/32 -j RETURN"
           done
+          # FFmpeg reaches the capture HLS session proxy over loopback. Allow
+          # exactly its TCP port range on 127.0.0.1 (capture.HLSSessionProxyPort*);
+          # the rest of 127.0.0.0/8 stays rejected below.
+          echo "-A STOARAMA_EGRESS -o lo -p tcp -d 127.0.0.1/32 --dport 47100:47355 -j RETURN"
           for cidr in "${BLOCKED4[@]}"; do
             echo "-A STOARAMA_EGRESS -d $cidr -j REJECT"
           done
