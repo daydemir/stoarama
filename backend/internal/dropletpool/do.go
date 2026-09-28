@@ -446,7 +446,12 @@ write_files:
       apply_rules() {
         # Reserve the session proxy's port range so the kernel never hands it
         # out as an ephemeral port; only an explicit bind (the proxy) holds it.
-        sysctl -q -w net.ipv4.ip_local_reserved_ports=47100-47355 || true
+        # Merge with any reservations the image already defines.
+        RESERVED="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+        case ",$RESERVED," in
+          *,47100-47355,*) ;;
+          *) sysctl -q -w net.ipv4.ip_local_reserved_ports="${RESERVED:+$RESERVED,}47100-47355" || true ;;
+        esac
         {
           echo "*filter"
           echo ":STOARAMA_EGRESS - [0:0]"
