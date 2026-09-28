@@ -314,7 +314,15 @@ type hlsSessionPlaylist struct {
 // FFmpeg sees no new segments and reloads again, rather than treating one
 // failed reload as the end of the stream. A source that stays dead still
 // reaches the recorder's no-progress watchdog and a fresh resolve.
-func (p *hlsSessionProxy) mediaPlaylist(ctx context.Context) (string, int64, []byte, int, error) {
+// hlsSessionReloadBudget bounds one proxied playlist reload (upstream fetches
+// plus retry backoff) below FFmpeg's 15-second -rw_timeout, so a slow or hung
+// origin still ends in a last-good replay FFmpeg receives instead of FFmpeg
+// abandoning the request. A package var so tests can shorten it.
+var hlsSessionReloadBudget = 10 * time.Second
+
+func (p *hlsSessionProxy) mediaPlaylist(parent context.Context) (string, int64, []byte, int, error) {
+	ctx, cancel := context.WithTimeout(parent, hlsSessionReloadBudget)
+	defer cancel()
 	var lastErr error
 	lastStatus := 0
 	for attempt := 0; ; attempt++ {
@@ -334,7 +342,9 @@ func (p *hlsSessionProxy) mediaPlaylist(ctx context.Context) (string, int64, []b
 	p.mu.Lock()
 	lastGood := p.lastGood
 	p.mu.Unlock()
-	if lastGood != nil && ctx.Err() == nil {
+	// Replay when our own reload budget ran out, but not once FFmpeg itself
+	// has abandoned the request.
+	if lastGood != nil && parent.Err() == nil {
 		return lastGood.mediaURL, lastGood.generation, lastGood.body, http.StatusOK, nil
 	}
 	if lastErr != nil {

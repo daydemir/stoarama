@@ -491,6 +491,10 @@ func TestBuildUserData_AllowsDNSToConfiguredUpstreamOnly(t *testing.T) {
 	if strings.Contains(script, `"-A STOARAMA_EGRESS -d 127.0.0.0/8 -j RETURN"`) || strings.Contains(script, `"-A STOARAMA_EGRESS -o lo -j RETURN"`) {
 		t.Fatalf("firewall must not open loopback beyond DNS and the session proxy range")
 	}
+	reserve := fmt.Sprintf("net.ipv4.ip_local_reserved_ports=%d-%d", capture.HLSSessionProxyPortMin, capture.HLSSessionProxyPortMax)
+	if !strings.Contains(script, reserve) {
+		t.Fatalf("firewall must reserve the session proxy port range (%s) so no ephemeral socket lands in it", reserve)
+	}
 
 	if bash, err := exec.LookPath("bash"); err == nil {
 		cmd := exec.Command(bash, "-n")

@@ -167,6 +167,41 @@ func TestHLSSessionProxyReplaysLastGoodChunklistWhileRefused(t *testing.T) {
 	}
 }
 
+// A hung origin is bounded by the reload budget and still ends in a last-good
+// replay, rather than outlasting FFmpeg's read timeout.
+func TestHLSSessionProxyReplaysLastGoodWhenReloadBudgetExpires(t *testing.T) {
+	allowLoopbackHLSSessionOrigin(t)
+	fastHLSSessionRetries(t, 5*time.Millisecond)
+	previous := hlsSessionReloadBudget
+	hlsSessionReloadBudget = 150 * time.Millisecond
+	t.Cleanup(func() { hlsSessionReloadBudget = previous })
+	cdn, server := newFakeRefusingCDN(t, time.Hour, nil, nil)
+	proxy, err := startHLSSessionProxy(CaptureInput{URL: cdn.masterURL(server)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Close()
+
+	status, before := fetchProxyPlaylist(t, proxy.URL())
+	if status != http.StatusOK {
+		t.Fatalf("initial proxy playlist status=%d", status)
+	}
+	cdn.setRefuse(func(path string, _ int64) bool {
+		if strings.HasPrefix(path, "chunklist_") {
+			time.Sleep(2 * time.Second) // hung origin
+		}
+		return false
+	})
+	started := time.Now()
+	status, during := fetchProxyPlaylist(t, proxy.URL())
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("reload took %s, want it bounded by the reload budget", elapsed)
+	}
+	if status != http.StatusOK || during != before {
+		t.Fatalf("hung reload status=%d body=%q, want the last good playlist %q", status, during, before)
+	}
+}
+
 // Without any good chunklist yet, a refusal is still reported to FFmpeg.
 func TestHLSSessionProxyReportsRefusalWithoutLastGood(t *testing.T) {
 	allowLoopbackHLSSessionOrigin(t)
