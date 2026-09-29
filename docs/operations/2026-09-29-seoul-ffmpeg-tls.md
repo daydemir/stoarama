@@ -112,7 +112,9 @@ intermediates. Supplemental CAs must first verify to the selected existing roots
 invalid explicit root bundles fail closed. `SSL_CERT_FILE` changes only on the
 child command, never in the relay process environment or system CA store.
 Capture paths use their existing owned temp directory and remove the file on
-return. No trust file, running service, or binary is modified by this PR.
+return. Persistent frame sessions also honor `FFMPEG_BIN`, so the selected TLS
+backend is consistent with the other capture paths. No existing trust file,
+running service, or binary is modified by this PR.
 
 TLS verification settings remain unchanged, including the existing defaults
 of older builds. No `tls_verify=0`, leaf certificate pin, live AIA fetch, global
@@ -139,7 +141,8 @@ with `FFMPEG_BIN="$HOME/.stoarama/bin/ffmpeg" go test ./internal/capture -run Te
 The regression reproduces the option-only child-playlist failure, succeeds with
 per-child trust, and rejects expired leaves and wrong hostnames. Unit tests cover
 exact host matching, original-root preservation, untrusted CA rejection,
-malformed explicit roots, immutable parent environment, fingerprints, and cleanup.
+malformed explicit roots, immutable parent environment, fingerprints, configured
+FFmpeg selection over PATH in persistent sessions, and cleanup.
 
 ## Primary references / certificate provenance
 

@@ -170,6 +170,38 @@ func TestCaptureEntryPointsUseTLSBundle(t *testing.T) {
 	}
 }
 
+func TestFFmpegSessionHonorsConfiguredBinary(t *testing.T) {
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "roots.pem")
+	if err := os.WriteFile(rootPath, publicTestRoots(t), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSL_CERT_FILE", rootPath)
+	marker := filepath.Join(dir, "selected-binary")
+	t.Setenv("FF_SELECTED_BINARY", marker)
+	for _, name := range []string{"configured-ffmpeg", "ffmpeg"} {
+		script := "#!/bin/sh\nprintf '%s' '" + name + "' > \"$FF_SELECTED_BINARY\"\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("FFMPEG_BIN", filepath.Join(dir, "configured-ffmpeg"))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := startFFmpegSession(ctx, StreamSpec{}, ResolvedSource{URL: "https://topiscctv1.eseoul.go.kr/live.m3u8"}, func(context.Context, Frame, time.Time) error {
+		t.Error("unexpected frame from fake binary")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("fake binary's failure missing")
+	}
+	selected, err := os.ReadFile(marker)
+	if err != nil || string(selected) != "configured-ffmpeg" {
+		t.Fatalf("session selected %q, err=%v", selected, err)
+	}
+}
+
 func TestBundledIntermediateFingerprints(t *testing.T) {
 	for name, fixture := range map[string]struct {
 		pem    []byte
