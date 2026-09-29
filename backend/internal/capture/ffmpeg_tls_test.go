@@ -106,7 +106,7 @@ func TestSupplementalCAsRequireTrustedRoots(t *testing.T) {
 	}
 }
 
-func TestFFmpegTLSExplicitBundleFailsClosed(t *testing.T) {
+func TestFFmpegTLSInvalidExplicitBundleFailsOpenUntouched(t *testing.T) {
 	for _, content := range []string{"", "not a PEM"} {
 		path := filepath.Join(t.TempDir(), "invalid.pem")
 		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
@@ -116,8 +116,11 @@ func TestFFmpegTLSExplicitBundleFailsClosed(t *testing.T) {
 		cmd.Env = []string{"SSL_CERT_FILE=" + path}
 		cleanup, err := configureFFmpegInputTLS(cmd, "https://topiscctv1.eseoul.go.kr/live.m3u8", t.TempDir())
 		cleanup()
-		if err == nil {
-			t.Fatal("invalid explicit CA bundle replaced with system roots")
+		if err != nil {
+			t.Fatalf("supplement failure must fail open, got %v", err)
+		}
+		if len(cmd.Env) != 1 || cmd.Env[0] != "SSL_CERT_FILE="+path {
+			t.Fatalf("invalid explicit CA bundle must be left untouched (never replaced with system roots), env=%v", cmd.Env)
 		}
 	}
 }

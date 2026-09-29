@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -40,7 +41,14 @@ func configureFFmpegInputTLS(cmd *exec.Cmd, sourceURL, tempDir string) (func(), 
 	default:
 		return cleanup, nil
 	}
-	return configureFFmpegCABundle(cmd, intermediate, tempDir)
+	cleanup, err = configureFFmpegCABundle(cmd, intermediate, tempDir)
+	if err != nil {
+		// Fail open: the supplement only ever helps. Without it FFmpeg keeps its
+		// existing trust behavior, which must never be worse than no capture.
+		log.Printf("ffmpeg TLS: capturing %s without supplemental CAs: %v", u.Hostname(), err)
+		return func() {}, nil
+	}
+	return cleanup, nil
 }
 
 func configureFFmpegCABundle(cmd *exec.Cmd, intermediate []byte, tempDir string) (func(), error) {
