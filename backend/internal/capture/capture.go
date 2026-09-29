@@ -114,6 +114,11 @@ func captureWithFFmpeg(ctx context.Context, sourceURL, inputHeaders string) ([]b
 		outPath,
 	)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	cleanupTLS, err := configureFFmpegInputTLS(cmd, sourceURL, tmpDir)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupTLS()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("ffmpeg capture failed: %w (%s)", err, strings.TrimSpace(string(out)))
