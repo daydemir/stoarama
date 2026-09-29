@@ -265,6 +265,12 @@ func captureSegmentInDir(ctx context.Context, input CaptureInput, duration time.
 	outPath := filepath.Join(tmpDir, "segment.mp4")
 	args := buildFFmpegSegmentInputArgs(input, outPath, duration, pinHost, targetFPS)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	cleanupTLS, tlsErr := configureFFmpegInputTLS(cmd, input.URL, tmpDir)
+	if tlsErr != nil {
+		_ = os.RemoveAll(tmpDir)
+		return Segment{}, tlsErr
+	}
+	defer cleanupTLS()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
@@ -477,6 +483,11 @@ func captureContinuousAttempt(ctx context.Context, input CaptureInput, clipDurat
 	}
 	args := buildFFmpegContinuousInputArgs(ffmpegInput, outPattern, clipDuration, pinHost, targetFPS, includeAudio, timestampContract)
 	cmd := exec.Command(ffmpegBin(), args...)
+	cleanupTLS, err := configureFFmpegInputTLS(cmd, sourceURL, outDir)
+	if err != nil {
+		return err
+	}
+	defer cleanupTLS()
 	stderr := newContinuousStderrObserver(
 		isHLSInputURL(sourceURL) && (isGooglevideoURL(sourceURL) || isGooglevideoHost(pinHost)),
 	)
@@ -1234,6 +1245,11 @@ func ProbeReachableWithHeaders(ctx context.Context, sourceURL string, pinHost st
 		"-",
 	)
 	cmd := exec.CommandContext(ctx, ffmpegBin(), args...)
+	cleanupTLS, err := configureFFmpegInputTLS(cmd, sourceURL, "")
+	if err != nil {
+		return sanitizeProbeError(err)
+	}
+	defer cleanupTLS()
 	if err := cmd.Run(); err != nil {
 		return sanitizeProbeError(err)
 	}
@@ -1281,6 +1297,11 @@ func CaptureSingleFrameWithHeaders(ctx context.Context, sourceURL string, pinHos
 	segPath := filepath.Join(tmpDir, "segment.mp4")
 	segArgs := buildFFmpegSegmentArgsWithHeaders(sourceURL, segPath, SingleFrameSegmentDuration, pinHost, nil, inputHeaders)
 	segCmd := exec.CommandContext(ctx, ffmpegBin(), segArgs...)
+	cleanupTLS, err := configureFFmpegInputTLS(segCmd, sourceURL, tmpDir)
+	if err != nil {
+		return Frame{}, err
+	}
+	defer cleanupTLS()
 	if out, err := segCmd.CombinedOutput(); err != nil {
 		return Frame{}, fmt.Errorf("record single-frame segment: %w (%s)", err, strings.TrimSpace(string(out)))
 	}

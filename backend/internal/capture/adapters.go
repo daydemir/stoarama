@@ -211,6 +211,11 @@ func startFFmpegSession(ctx context.Context, spec StreamSpec, src ResolvedSource
 	defer cancelSession()
 	cmdArgs := buildFFmpegSessionArgsWithHeaders(spec, src.URL, targetFPS, src.InputHeaders)
 	cmd := exec.CommandContext(sessionCtx, "ffmpeg", cmdArgs...)
+	cleanupTLS, err := configureFFmpegInputTLS(cmd, src.URL, "")
+	if err != nil {
+		return err
+	}
+	defer cleanupTLS()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
