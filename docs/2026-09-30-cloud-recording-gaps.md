@@ -113,10 +113,12 @@ accepted clips. Times in the table omit fractional seconds; durations retain the
   was destroyed in the incident hour. Build rollout only drains idle workers;
   expired-only reclaim cannot evict healthy leases.
 - **Provisioned capacity:** 33 overlapping cloud jobs, of which 23 start at
-  06:00, fit seven active capacity-5 workers (35 slots). No kernel OOM evidence
-  was found in the inspected upgrade logs. Nominal capacity alone does not prove
-  unlimited CPU/network headroom, but these gaps have explicit service-stop
-  evidence. Additional droplets do not fix that trigger. Recommended pool
+  06:00, fit seven active capacity-5 workers (35 slots). All seven workers'
+  retained `sar` ten-minute samples show substantial CPU headroom: minimum idle
+  50.79% on 2478 during its upgrade, with hour averages 84.25–96.66% idle.
+  No kernel OOM records were found in their 06:00-hour syslogs. These averages
+  do not exclude brief CPU or network spikes, but the gaps have explicit
+  service-stop evidence. Additional droplets do not fix that trigger. Recommended pool
   configuration change: none; additional daily droplet spend: $0.
 - **No-progress surrender / #384 / handoff_owner:** the clustered jobs were
   interrupted externally. Their 210-second recovery boundary matches expiry,
