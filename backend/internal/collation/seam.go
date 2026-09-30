@@ -8,6 +8,7 @@ package collation
 
 import (
 	"math"
+	"math/big"
 	"time"
 )
 
@@ -33,8 +34,8 @@ type SeamPolicy struct {
 	// Share of pixels (highest temporal variance) the distances are measured on.
 	MotionPixelShare float64 `json:"motion_pixel_share"`
 	// A sharper tail match beyond this offset is an overlap. The default
-	// requires the endpoint itself (exact equal minima resolve to the endpoint).
-	// A[-1]'s head match must be within MaxHeadOffsetFrames or tied at B[0].
+	// requires the endpoint itself; equal earlier minima are overlap evidence.
+	// A[-1]'s head match must be within MaxHeadOffsetFrames.
 	MaxTailOffsetFrames int `json:"max_tail_offset_frames"`
 	MaxHeadOffsetFrames int `json:"max_head_offset_frames"`
 	// ...and each best match is sharp: min MAD <= ratio x window median MAD.
@@ -43,7 +44,8 @@ type SeamPolicy struct {
 	// Below this (masked) window median there is too little motion to prove anything.
 	MinSceneMedianMAD float64 `json:"min_scene_median_mad"`
 	// The boundary step must look like an ordinary step into a keyframe:
-	// MAD(A[-1],B[0]) <= factor x max(median(key steps), p95(non-key steps)) + slack.
+	// MAD(A[-1],B[0]) <= factor x median(key steps) + slack.
+	// Missing internal keyframe steps cannot establish a calibrated boundary.
 	BoundaryStepFactor float64 `json:"boundary_step_factor"`
 	// A short-window jump whose boundary step exceeds this factor needs no
 	// full-window second look (it can only split).
@@ -54,15 +56,9 @@ type SeamPolicy struct {
 	// Decoded content duration must match the stamped span within this many frames.
 	SpanFrameSlack float64 `json:"content_span_tolerance_frames"`
 	// A previous clip this far below nominal length needs an identified,
-	// consecutive capture chain in addition to every other gate and pixel proof.
+	// consecutive timestamp-contract attempt plus exact source-PTS adjacency
+	// in addition to every other gate and pixel proof.
 	ShortClipSlackSeconds float64 `json:"short_clip_slack_seconds"`
-	// Boundary endpoints may be less sharp only when their step is within
-	// BoundaryBaselineFactor times the local baseline.
-	BoundarySharpRatio float64 `json:"boundary_sharp_ratio"`
-	// The relaxed endpoint route uses a tighter local-step limit.
-	BoundaryBaselineFactor float64 `json:"boundary_baseline_factor"`
-	// Endpoint distances within this MAD of a shallow minimum are tied.
-	EndpointSlackMAD float64 `json:"endpoint_slack_mad"`
 }
 
 func (p SeamPolicy) windows() []float64 {
@@ -74,27 +70,24 @@ func (p SeamPolicy) windows() []float64 {
 
 func DefaultSeamPolicy() SeamPolicy {
 	return SeamPolicy{
-		ShortWindowSeconds:     4,
-		WindowSeconds:          10,
-		FrameWidth:             96,
-		FrameHeight:            64,
-		BlurSigma:              0,
-		MotionPixelShare:       0.10,
-		MaxTailOffsetFrames:    0,
-		MaxHeadOffsetFrames:    10,
-		TailSharpRatio:         0.60,
-		HeadSharpRatio:         0.70,
-		MinSceneMedianMAD:      0.8,
-		BoundaryStepFactor:     2.0,
-		ClearJumpStepFactor:    4.0,
-		StepSlackMAD:           0.05,
-		MinFrames:              10,
-		GapFrameSlack:          1,
-		SpanFrameSlack:         2,
-		ShortClipSlackSeconds:  2,
-		BoundarySharpRatio:     0.8,
-		BoundaryBaselineFactor: 1.2,
-		EndpointSlackMAD:       0.05,
+		ShortWindowSeconds:    4,
+		WindowSeconds:         10,
+		FrameWidth:            96,
+		FrameHeight:           64,
+		BlurSigma:             0,
+		MotionPixelShare:      0.10,
+		MaxTailOffsetFrames:   0,
+		MaxHeadOffsetFrames:   10,
+		TailSharpRatio:        0.60,
+		HeadSharpRatio:        0.70,
+		MinSceneMedianMAD:     0.8,
+		BoundaryStepFactor:    2.0,
+		ClearJumpStepFactor:   4.0,
+		StepSlackMAD:          0.05,
+		MinFrames:             10,
+		GapFrameSlack:         1,
+		SpanFrameSlack:        2,
+		ShortClipSlackSeconds: 2,
 	}
 }
 
@@ -128,6 +121,9 @@ type ClipMedia struct {
 	VideoPackets   int     `json:"video_packets"`
 	ContentSeconds float64 `json:"content_seconds"`
 	FrameSeconds   float64 `json:"frame_seconds"`
+	// Exact rational seconds from source video packets, never DB stamps.
+	VideoStartPTS string `json:"video_start_pts,omitempty"`
+	VideoEndPTS   string `json:"video_end_pts,omitempty"`
 }
 
 // MatchEvidence is the frame-match proof for one seam. A is the previous
@@ -151,12 +147,13 @@ type MatchEvidence struct {
 }
 
 const (
-	MatchContinuous = "continuous"
-	MatchOverlap    = "overlap"
-	MatchJump       = "jump"
-	MatchLowMotion  = "low_motion"
-	MatchTooShort   = "insufficient_frames"
-	MatchDecodeFail = "seam_decode_failed"
+	MatchContinuous     = "continuous"
+	MatchKeyStepMissing = "key_step_missing"
+	MatchOverlap        = "overlap"
+	MatchJump           = "jump"
+	MatchLowMotion      = "low_motion"
+	MatchTooShort       = "insufficient_frames"
+	MatchDecodeFail     = "seam_decode_failed"
 )
 
 type SeamDecision struct {
@@ -199,7 +196,7 @@ func MetadataGate(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia) string {
 		return "codec_params_differ"
 	}
 	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds &&
-		(prev.CaptureSequence <= 0 || (prev.CaptureAttemptID == "" && prev.CaptureLeaseToken == "")) {
+		(prev.CaptureSequence <= 0 || prev.CaptureAttemptID == "") {
 		return "prev_clip_cut_short"
 	}
 	frame := math.Max(pm.FrameSeconds, nm.FrameSeconds)
@@ -220,6 +217,27 @@ func MetadataGate(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia) string {
 		span := c.clip.EndUTC.Sub(c.clip.StartUTC).Seconds()
 		if math.Abs(c.media.ContentSeconds-span) > policy.SpanFrameSlack*frame {
 			return "content_span_mismatch"
+		}
+	}
+	if prev.CaptureAttemptID != "" {
+		// Attempt IDs identify one FFmpeg process, but original packet timing
+		// must also show adjacency. Restamping DB spans/sequence cannot fill a
+		// source skip or rewind. Fail closed on absent/invalid timing summaries.
+		var prevEnd, nextStart *big.Rat
+		for i, m := range []ClipMedia{pm, nm} {
+			start, okStart := new(big.Rat).SetString(m.VideoStartPTS)
+			end, okEnd := new(big.Rat).SetString(m.VideoEndPTS)
+			if !okStart || !okEnd || end.Cmp(start) <= 0 {
+				return "source_pts_missing_or_invalid"
+			}
+			if i == 0 {
+				prevEnd = end
+			} else {
+				nextStart = start
+			}
+		}
+		if prevEnd.Cmp(nextStart) != 0 {
+			return "source_pts_not_consecutive"
 		}
 	}
 	return ""
@@ -243,16 +261,6 @@ func DecideSeam(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia, match *Mat
 		d.Reason = "frame_" + match.Verdict
 		d.OverlapSeconds = match.OverlapSeconds
 		return d
-	}
-	// Short clips need positive continuity at B[0], rather than merely an
-	// acceptable nearby head match, and an ordinary local boundary step.
-	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds {
-		baseline := math.Max(match.KeyStepMedianMAD, match.StepP95MAD)
-		if match.BoundaryMAD > match.HeadMinMAD+policy.EndpointSlackMAD ||
-			match.BoundaryMAD > policy.BoundaryBaselineFactor*baseline+policy.StepSlackMAD {
-			d.Reason = "short_clip_continuity_unproven"
-			return d
-		}
 	}
 	d.Decision, d.Reason = DecisionJoin, "continuous"
 	return d

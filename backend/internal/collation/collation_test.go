@@ -98,7 +98,7 @@ func TestEvaluateCurvesVerdicts(t *testing.T) {
 	steps := curve(2*n-2, func(int) float64 { return 0.4 })
 	// Continuous: distance grows with temporal distance from the boundary.
 	cont := Curves{TailToHead0: curve(n, func(k int) float64 { return 0.45 + 0.02*float64(n-1-k) }),
-		TailLastToHead: curve(n, func(j int) float64 { return 0.45 + 0.02*float64(j) }), Steps: steps, BoundaryMAD: 0.45}
+		TailLastToHead: curve(n, func(j int) float64 { return 0.45 + 0.02*float64(j) }), Steps: steps, KeySteps: []float64{0.4}, BoundaryMAD: 0.45}
 	if ev := EvaluateCurves(policy, cont, 0.04); ev.Verdict != MatchContinuous {
 		t.Fatalf("continuous: %+v", ev)
 	}
@@ -116,7 +116,7 @@ func TestEvaluateCurvesVerdicts(t *testing.T) {
 	}
 	// Jump: no sharp minimum anywhere.
 	jump := Curves{TailToHead0: curve(n, func(k int) float64 { return 5 + 0.1*math.Sin(float64(k)) }),
-		TailLastToHead: curve(n, func(j int) float64 { return 5 + 0.1*math.Cos(float64(j)) }), Steps: steps, BoundaryMAD: 5}
+		TailLastToHead: curve(n, func(j int) float64 { return 5 + 0.1*math.Cos(float64(j)) }), Steps: steps, KeySteps: []float64{0.4}, BoundaryMAD: 5}
 	if ev := EvaluateCurves(policy, jump, 0.04); ev.Verdict != MatchJump {
 		t.Fatalf("jump: %+v", ev)
 	}

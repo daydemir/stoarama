@@ -249,42 +249,27 @@ func EvaluateCurves(policy SeamPolicy, c Curves, frameSeconds float64) MatchEvid
 	// keyframes other than the boundary frames themselves.
 	kA := argminExcluding(dA, c.TailKeys, len(dA)-1)
 	jB := argminExcluding(dB, c.HeadKeys, 0)
-	// VFR can contain identical consecutive decoded frames; an exact tie is
-	// evidence at the endpoint, rather than an artificial overlap offset.
-	if dA[len(dA)-1] <= dA[kA] {
-		kA = len(dA) - 1
-	}
 	ev.BoundaryMAD = round4(c.BoundaryMAD)
 	ev.TailMinMAD, ev.TailMinOffset, ev.TailMedianMAD = round4(dA[kA]), len(dA)-1-kA, round4(median(dA))
 	ev.HeadMinMAD, ev.HeadMinOffset, ev.HeadMedianMAD = round4(dB[jB]), jB, round4(median(dB))
 	ev.StepP95MAD = round4(percentile(c.Steps, 0.95))
-	// The expected boundary step: B[0] is a keyframe, so compare against steps
-	// into keyframes and ordinary local motion. A quiet GOP transition must
-	// not cap a genuinely moving scene's normal frame-to-frame variation.
+	// Never increase the keyframe baseline using ordinary-step p95. A seam
+	// with no internal keyframe-step sample lacks a calibrated boundary proof.
 	ev.KeyStepMedianMAD = round4(median(c.KeySteps))
-	expected := math.Max(ev.KeyStepMedianMAD, ev.StepP95MAD)
-	tailAtBoundary := ev.BoundaryMAD <= ev.TailMinMAD
+	expected := ev.KeyStepMedianMAD
 	tailSharp := ev.TailMinMAD <= policy.TailSharpRatio*ev.TailMedianMAD
 	headSharp := ev.HeadMinMAD <= policy.HeadSharpRatio*ev.HeadMedianMAD
-	// Resolve near-tied head minima in favor of the actual boundary, without
-	// widening the allowed offset or suppressing the tail overlap test.
-	headAtBoundary := ev.BoundaryMAD <= ev.HeadMinMAD+policy.EndpointSlackMAD
-	headPosition := ev.HeadMinOffset <= policy.MaxHeadOffsetFrames || headAtBoundary
-	// A keyframe can dominate the cross-window MAD in a slow-moving scene.
-	// Require endpoints to be near minima and the step to be ordinary before
-	// relaxing sharpness; low motion and overlap still split first.
-	boundaryTail := tailAtBoundary || (!tailSharp && ev.BoundaryMAD <= ev.TailMinMAD+policy.EndpointSlackMAD)
-	boundarySharp := boundaryTail && headAtBoundary &&
-		ev.BoundaryMAD <= policy.BoundarySharpRatio*math.Min(ev.TailMedianMAD, ev.HeadMedianMAD) &&
-		ev.BoundaryMAD <= policy.BoundaryBaselineFactor*expected+policy.StepSlackMAD
 	lowMotion := ev.TailMedianMAD < policy.MinSceneMedianMAD || ev.HeadMedianMAD < policy.MinSceneMedianMAD
 	switch {
-	case tailSharp && ev.TailMinOffset > policy.MaxTailOffsetFrames && !tailAtBoundary && !lowMotion:
+	case tailSharp && ev.TailMinOffset > policy.MaxTailOffsetFrames && !lowMotion:
 		ev.Verdict = MatchOverlap
 		ev.OverlapSeconds = round4(float64(ev.TailMinOffset) * frameSeconds)
 	case lowMotion:
 		ev.Verdict = MatchLowMotion
-	case ((tailSharp && headSharp && headPosition && tailAtBoundary) || boundarySharp) &&
+	case len(c.KeySteps) == 0 || expected <= 0:
+		ev.Verdict = MatchKeyStepMissing
+	case tailSharp && headSharp &&
+		ev.TailMinOffset <= policy.MaxTailOffsetFrames && ev.HeadMinOffset <= policy.MaxHeadOffsetFrames &&
 		ev.BoundaryMAD <= policy.BoundaryStepFactor*expected+policy.StepSlackMAD:
 		ev.Verdict = MatchContinuous
 	default:

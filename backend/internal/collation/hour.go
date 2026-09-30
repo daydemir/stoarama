@@ -462,7 +462,7 @@ func needsFullWindow(policy SeamPolicy, ev MatchEvidence) bool {
 	// Only a window that contains keyframe steps knows how large a normal
 	// boundary (keyframe) step is; without one, always take the second look.
 	clearJump := ev.Verdict == MatchJump && ev.KeyStepMedianMAD > 0 &&
-		ev.BoundaryMAD > policy.ClearJumpStepFactor*math.Max(ev.KeyStepMedianMAD, ev.StepP95MAD)+policy.StepSlackMAD
+		ev.BoundaryMAD > policy.ClearJumpStepFactor*ev.KeyStepMedianMAD+policy.StepSlackMAD
 	return !clearJump
 }
 

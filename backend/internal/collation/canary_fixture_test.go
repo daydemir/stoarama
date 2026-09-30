@@ -212,7 +212,8 @@ func TestLiveReviewProof(t *testing.T) {
 func TestLabeledCanarySeams(t *testing.T) {
 	p := DefaultSeamPolicy()
 	counts := map[string]int{}
-	fixed := map[string]bool{"canary-s27": true, "canary-s33": true, "canary-s35": true, "canary-s36": true, "canary-s38": true}
+	// All eight false negatives stay split; s09 additionally lacks a
+	// sampled source keyframe step, so its boundary cannot be calibrated.
 	rows := loadCanaryFixtures(t, "canary_seams.json.gz")
 	if len(rows) != 40 {
 		t.Fatalf("got %d canaries", len(rows))
@@ -224,7 +225,7 @@ func TestLabeledCanarySeams(t *testing.T) {
 			d.Decision, d.Reason = DecisionSplit, "packet_replay"
 		}
 		want := DecisionSplit
-		if r.Before == DecisionJoin || fixed[r.ID] {
+		if r.Before == DecisionJoin && r.ID != "canary-s09" {
 			want = DecisionJoin
 		}
 		if d.Decision != want {
@@ -240,7 +241,7 @@ func TestLabeledCanarySeams(t *testing.T) {
 		t.Logf("%s %s -> %s (%s)", r.ID, r.Before, d.Decision, d.Reason)
 	}
 	t.Logf("confusion matrix: %v", counts)
-	if counts["continuous_join"] != 25 || counts["continuous_split"] != 3 || counts["broken_join"] != 0 || counts["broken_split"] != 8 || counts["unknown_split"] != 4 {
+	if counts["continuous_join"] != 19 || counts["continuous_split"] != 9 || counts["broken_join"] != 0 || counts["broken_split"] != 8 || counts["unknown_split"] != 4 {
 		t.Errorf("unexpected matrix %v", counts)
 	}
 }
@@ -264,6 +265,21 @@ func TestShortClipRequiresIdentifiedConsecutiveCaptureAndPixelProof(t *testing.T
 	if ev.Verdict != MatchContinuous {
 		t.Fatalf("fixture lacks pixel continuity: %+v", ev)
 	}
+	// This legacy seam lacks an attempt ID and must remain split. Use a
+	// separate positive contract control to exercise the guarded exception.
+	if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, &ev); d.Decision != DecisionSplit || d.Reason != "prev_clip_cut_short" {
+		t.Fatalf("lease-only legacy clip admitted: %+v", d)
+	}
+	// Synthetic unbroken-process control; source PTS and clip durations agree.
+	r.Prev, r.Next, r.PrevMedia, r.NextMedia = baseClips()
+	r.Prev.EndUTC = r.Prev.StartUTC.Add(56 * time.Second)
+	r.Next.StartUTC = r.Prev.EndUTC
+	r.Next.EndUTC = r.Next.StartUTC.Add(60 * time.Second)
+	r.PrevMedia.ContentSeconds = 56
+	ev = EvaluateCurves(p, adversarialEndpointCurves(250, 0.4), 0.04)
+	r.Prev.CaptureAttemptID, r.Next.CaptureAttemptID = "contract-control", "contract-control"
+	r.PrevMedia.VideoStartPTS, r.PrevMedia.VideoEndPTS = "0", "56"
+	r.NextMedia.VideoStartPTS, r.NextMedia.VideoEndPTS = "56", "116"
 	if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, &ev); d.Decision != DecisionJoin {
 		t.Fatalf("positive short-clip fixture rejected before mutations: %+v", d)
 	}
@@ -277,18 +293,6 @@ func TestShortClipRequiresIdentifiedConsecutiveCaptureAndPixelProof(t *testing.T
 			t.Errorf("joined short clip with %s", v)
 		}
 	}
-	for name, mutate := range map[string]func(*MatchEvidence){
-		"remote head minimum":    func(m *MatchEvidence) { m.HeadMinMAD = m.BoundaryMAD - 1 },
-		"abnormal boundary step": func(m *MatchEvidence) { m.StepP95MAD, m.KeyStepMedianMAD = 0, 0 },
-	} {
-		t.Run(name, func(t *testing.T) {
-			bad := ev
-			mutate(&bad)
-			if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, &bad); d.Decision != DecisionSplit || d.Reason != "short_clip_continuity_unproven" {
-				t.Fatalf("short-clip endpoint proof not enforced: %+v", d)
-			}
-		})
-	}
 	if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, nil); d.Decision != DecisionSplit {
 		t.Fatal("joined without pixels")
 	}
@@ -297,10 +301,12 @@ func TestShortClipRequiresIdentifiedConsecutiveCaptureAndPixelProof(t *testing.T
 		"missing identity": func(a, b *Clip) {
 			a.CaptureAttemptID, b.CaptureAttemptID, a.CaptureLeaseToken, b.CaptureLeaseToken = "", "", "", ""
 		},
-		"different identity": func(a, b *Clip) { b.CaptureLeaseToken = "other" },
-		"nonconsecutive":     func(a, b *Clip) { b.CaptureSequence++ },
-		"gap":                func(a, b *Clip) { b.StartUTC = b.StartUTC.Add(time.Second) },
-		"overlap":            func(a, b *Clip) { b.StartUTC = b.StartUTC.Add(-time.Second) },
+		"different identity":    func(a, b *Clip) { b.CaptureLeaseToken = "other" },
+		"different attempt":     func(a, b *Clip) { b.CaptureAttemptID = "other-attempt" },
+		"lease without attempt": func(a, b *Clip) { a.CaptureAttemptID, b.CaptureAttemptID = "", "" },
+		"nonconsecutive":        func(a, b *Clip) { b.CaptureSequence++ },
+		"gap":                   func(a, b *Clip) { b.StartUTC = b.StartUTC.Add(time.Second) },
+		"overlap":               func(a, b *Clip) { b.StartUTC = b.StartUTC.Add(-time.Second) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			a, b := r.Prev, r.Next
