@@ -241,8 +241,21 @@ func TestLabeledCanarySeams(t *testing.T) {
 		t.Logf("%s %s -> %s (%s)", r.ID, r.Before, d.Decision, d.Reason)
 	}
 	t.Logf("confusion matrix: %v", counts)
-	if counts["continuous_join"] != 19 || counts["continuous_split"] != 9 || counts["broken_join"] != 0 || counts["broken_split"] != 8 || counts["unknown_split"] != 4 {
-		t.Errorf("unexpected matrix %v", counts)
+	// Deniz labeled 28 continuous, 8 broken and 4 unsure seams. All eight
+	// original false negatives stay split, plus s09 without a keyframe baseline.
+	wantCounts := map[string]int{
+		"continuous_join": 19, "continuous_split": 9,
+		"broken_join": 0, "broken_split": 8, "unknown_split": 4,
+	}
+	for key, want := range wantCounts {
+		if got := counts[key]; got != want {
+			t.Errorf("matrix[%s]=%d want=%d (all: %v)", key, got, want, counts)
+		}
+	}
+	for key := range counts {
+		if _, expected := wantCounts[key]; !expected {
+			t.Errorf("unexpected matrix key %q (all: %v)", key, counts)
+		}
 	}
 }
 
