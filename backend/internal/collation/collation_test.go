@@ -469,3 +469,18 @@ func TestReplayOverlapDetectsRepeatedLeadingPackets(t *testing.T) {
 		t.Fatal("fresh packets flagged")
 	}
 }
+
+func TestProbeRecordsOriginalVideoPTSWithoutAudioPadding(t *testing.T) {
+	tools := requireFFmpeg(t)
+	src := synth(t, tools, t.TempDir()) // video is exactly 1000 frames at 25 fps
+	p, err := ProbeFile(context.Background(), tools, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Media.Playable || p.Audio == nil {
+		t.Fatal("expected playable audiovisual probe")
+	}
+	if p.Media.VideoStartPTS != "0" || p.Media.VideoEndPTS != "40" {
+		t.Fatalf("source video PTS contaminated by audio or DB timing: %s -> %s", p.Media.VideoStartPTS, p.Media.VideoEndPTS)
+	}
+}
