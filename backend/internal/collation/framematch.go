@@ -253,13 +253,10 @@ func EvaluateCurves(policy SeamPolicy, c Curves, frameSeconds float64) MatchEvid
 	ev.TailMinMAD, ev.TailMinOffset, ev.TailMedianMAD = round4(dA[kA]), len(dA)-1-kA, round4(median(dA))
 	ev.HeadMinMAD, ev.HeadMinOffset, ev.HeadMedianMAD = round4(dB[jB]), jB, round4(median(dB))
 	ev.StepP95MAD = round4(percentile(c.Steps, 0.95))
-	// The expected boundary step: B[0] is a keyframe, so compare against steps
-	// into keyframes when the windows contain any, else ordinary steps.
+	// Never increase the keyframe baseline using ordinary-step p95. A seam
+	// with no internal keyframe-step sample lacks a calibrated boundary proof.
 	ev.KeyStepMedianMAD = round4(median(c.KeySteps))
 	expected := ev.KeyStepMedianMAD
-	if len(c.KeySteps) == 0 {
-		expected = ev.StepP95MAD
-	}
 	tailSharp := ev.TailMinMAD <= policy.TailSharpRatio*ev.TailMedianMAD
 	headSharp := ev.HeadMinMAD <= policy.HeadSharpRatio*ev.HeadMedianMAD
 	lowMotion := ev.TailMedianMAD < policy.MinSceneMedianMAD || ev.HeadMedianMAD < policy.MinSceneMedianMAD
@@ -269,6 +266,8 @@ func EvaluateCurves(policy SeamPolicy, c Curves, frameSeconds float64) MatchEvid
 		ev.OverlapSeconds = round4(float64(ev.TailMinOffset) * frameSeconds)
 	case lowMotion:
 		ev.Verdict = MatchLowMotion
+	case len(c.KeySteps) == 0 || expected <= 0:
+		ev.Verdict = MatchKeyStepMissing
 	case tailSharp && headSharp &&
 		ev.TailMinOffset <= policy.MaxTailOffsetFrames && ev.HeadMinOffset <= policy.MaxHeadOffsetFrames &&
 		ev.BoundaryMAD <= policy.BoundaryStepFactor*expected+policy.StepSlackMAD:

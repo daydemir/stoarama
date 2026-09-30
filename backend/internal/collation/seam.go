@@ -8,11 +8,12 @@ package collation
 
 import (
 	"math"
+	"math/big"
 	"time"
 )
 
 const (
-	PolicyVersion = "collation-v2"
+	PolicyVersion = "collation-v2.1"
 	Generation    = 2
 
 	DecisionJoin  = "join"
@@ -32,8 +33,9 @@ type SeamPolicy struct {
 	BlurSigma float64 `json:"blur_sigma"`
 	// Share of pixels (highest temporal variance) the distances are measured on.
 	MotionPixelShare float64 `json:"motion_pixel_share"`
-	// A continuous seam has B[0]'s best match within this many frames of A's end
-	// and A[-1]'s best match within this many frames of B's start...
+	// A sharper tail match beyond this offset is an overlap. The default
+	// requires the endpoint itself; equal earlier minima are overlap evidence.
+	// A[-1]'s head match must be within MaxHeadOffsetFrames.
 	MaxTailOffsetFrames int `json:"max_tail_offset_frames"`
 	MaxHeadOffsetFrames int `json:"max_head_offset_frames"`
 	// ...and each best match is sharp: min MAD <= ratio x window median MAD.
@@ -43,6 +45,7 @@ type SeamPolicy struct {
 	MinSceneMedianMAD float64 `json:"min_scene_median_mad"`
 	// The boundary step must look like an ordinary step into a keyframe:
 	// MAD(A[-1],B[0]) <= factor x median(key steps) + slack.
+	// Missing internal keyframe steps cannot establish a calibrated boundary.
 	BoundaryStepFactor float64 `json:"boundary_step_factor"`
 	// A short-window jump whose boundary step exceeds this factor needs no
 	// full-window second look (it can only split).
@@ -52,8 +55,9 @@ type SeamPolicy struct {
 	GapFrameSlack       float64 `json:"db_gap_tolerance_frames"`
 	// Decoded content duration must match the stamped span within this many frames.
 	SpanFrameSlack float64 `json:"content_span_tolerance_frames"`
-	// A previous clip shorter than the recording's nominal clip length by more
-	// than this was cut early: a capture restart indicator.
+	// A previous clip this far below nominal length needs an identified,
+	// consecutive timestamp-contract attempt plus exact source-PTS adjacency
+	// in addition to every other gate and pixel proof.
 	ShortClipSlackSeconds float64 `json:"short_clip_slack_seconds"`
 }
 
@@ -72,7 +76,7 @@ func DefaultSeamPolicy() SeamPolicy {
 		FrameHeight:           64,
 		BlurSigma:             0,
 		MotionPixelShare:      0.10,
-		MaxTailOffsetFrames:   3,
+		MaxTailOffsetFrames:   0,
 		MaxHeadOffsetFrames:   10,
 		TailSharpRatio:        0.60,
 		HeadSharpRatio:        0.70,
@@ -117,6 +121,9 @@ type ClipMedia struct {
 	VideoPackets   int     `json:"video_packets"`
 	ContentSeconds float64 `json:"content_seconds"`
 	FrameSeconds   float64 `json:"frame_seconds"`
+	// Exact rational seconds from source video packets, never DB stamps.
+	VideoStartPTS string `json:"video_start_pts,omitempty"`
+	VideoEndPTS   string `json:"video_end_pts,omitempty"`
 }
 
 // MatchEvidence is the frame-match proof for one seam. A is the previous
@@ -140,12 +147,13 @@ type MatchEvidence struct {
 }
 
 const (
-	MatchContinuous = "continuous"
-	MatchOverlap    = "overlap"
-	MatchJump       = "jump"
-	MatchLowMotion  = "low_motion"
-	MatchTooShort   = "insufficient_frames"
-	MatchDecodeFail = "seam_decode_failed"
+	MatchContinuous     = "continuous"
+	MatchKeyStepMissing = "key_step_missing"
+	MatchOverlap        = "overlap"
+	MatchJump           = "jump"
+	MatchLowMotion      = "low_motion"
+	MatchTooShort       = "insufficient_frames"
+	MatchDecodeFail     = "seam_decode_failed"
 )
 
 type SeamDecision struct {
@@ -187,7 +195,8 @@ func MetadataGate(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia) string {
 	case pm.CodecSignature == "" || pm.CodecSignature != nm.CodecSignature:
 		return "codec_params_differ"
 	}
-	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds {
+	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds &&
+		(prev.CaptureSequence <= 0 || prev.CaptureAttemptID == "") {
 		return "prev_clip_cut_short"
 	}
 	frame := math.Max(pm.FrameSeconds, nm.FrameSeconds)
@@ -208,6 +217,27 @@ func MetadataGate(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia) string {
 		span := c.clip.EndUTC.Sub(c.clip.StartUTC).Seconds()
 		if math.Abs(c.media.ContentSeconds-span) > policy.SpanFrameSlack*frame {
 			return "content_span_mismatch"
+		}
+	}
+	if prev.CaptureAttemptID != "" {
+		// Attempt IDs identify one FFmpeg process, but original packet timing
+		// must also show adjacency. Restamping DB spans/sequence cannot fill a
+		// source skip or rewind. Fail closed on absent/invalid timing summaries.
+		var prevEnd, nextStart *big.Rat
+		for i, m := range []ClipMedia{pm, nm} {
+			start, okStart := new(big.Rat).SetString(m.VideoStartPTS)
+			end, okEnd := new(big.Rat).SetString(m.VideoEndPTS)
+			if !okStart || !okEnd || end.Cmp(start) <= 0 {
+				return "source_pts_missing_or_invalid"
+			}
+			if i == 0 {
+				prevEnd = end
+			} else {
+				nextStart = start
+			}
+		}
+		if prevEnd.Cmp(nextStart) != 0 {
+			return "source_pts_not_consecutive"
 		}
 	}
 	return ""

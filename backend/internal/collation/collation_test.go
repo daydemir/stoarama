@@ -97,8 +97,8 @@ func TestEvaluateCurvesVerdicts(t *testing.T) {
 	n := 250
 	steps := curve(2*n-2, func(int) float64 { return 0.4 })
 	// Continuous: distance grows with temporal distance from the boundary.
-	cont := Curves{TailToHead0: curve(n, func(k int) float64 { return 0.4 + 0.02*float64(n-1-k) }),
-		TailLastToHead: curve(n, func(j int) float64 { return 0.4 + 0.02*float64(j) }), Steps: steps, BoundaryMAD: 0.45}
+	cont := Curves{TailToHead0: curve(n, func(k int) float64 { return 0.45 + 0.02*float64(n-1-k) }),
+		TailLastToHead: curve(n, func(j int) float64 { return 0.45 + 0.02*float64(j) }), Steps: steps, KeySteps: []float64{0.4}, BoundaryMAD: 0.45}
 	if ev := EvaluateCurves(policy, cont, 0.04); ev.Verdict != MatchContinuous {
 		t.Fatalf("continuous: %+v", ev)
 	}
@@ -116,7 +116,7 @@ func TestEvaluateCurvesVerdicts(t *testing.T) {
 	}
 	// Jump: no sharp minimum anywhere.
 	jump := Curves{TailToHead0: curve(n, func(k int) float64 { return 5 + 0.1*math.Sin(float64(k)) }),
-		TailLastToHead: curve(n, func(j int) float64 { return 5 + 0.1*math.Cos(float64(j)) }), Steps: steps, BoundaryMAD: 5}
+		TailLastToHead: curve(n, func(j int) float64 { return 5 + 0.1*math.Cos(float64(j)) }), Steps: steps, KeySteps: []float64{0.4}, BoundaryMAD: 5}
 	if ev := EvaluateCurves(policy, jump, 0.04); ev.Verdict != MatchJump {
 		t.Fatalf("jump: %+v", ev)
 	}
@@ -225,7 +225,17 @@ func TestManifestValidateRejectsInconsistentAccounting(t *testing.T) {
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	legacy := good
+	legacy.PolicyVersion = "collation-v2"
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("legacy manifest rejected: %v", err)
+	}
 	bad := good
+	bad.PolicyVersion = "collation-v3"
+	if bad.Validate() == nil {
+		t.Fatal("unknown policy version accepted")
+	}
+	bad = good
 	bad.Seams = []SeamDecision{{PrevClipID: 1, NextClipID: 2, Decision: DecisionJoin, Match: &MatchEvidence{Verdict: MatchJump}}}
 	if bad.Validate() == nil {
 		t.Fatal("join without continuity proof accepted")
@@ -457,5 +467,20 @@ func TestReplayOverlapDetectsRepeatedLeadingPackets(t *testing.T) {
 	}
 	if _, ok := ReplayOverlap(a, mk("kA", "pB", "pC")); ok {
 		t.Fatal("fresh packets flagged")
+	}
+}
+
+func TestProbeRecordsOriginalVideoPTSWithoutAudioPadding(t *testing.T) {
+	tools := requireFFmpeg(t)
+	src := synth(t, tools, t.TempDir()) // video is exactly 1000 frames at 25 fps
+	p, err := ProbeFile(context.Background(), tools, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Media.Playable || p.Audio == nil {
+		t.Fatal("expected playable audiovisual probe")
+	}
+	if p.Media.VideoStartPTS != "0" || p.Media.VideoEndPTS != "40" {
+		t.Fatalf("source video PTS contaminated by audio or DB timing: %s -> %s", p.Media.VideoStartPTS, p.Media.VideoEndPTS)
 	}
 }
