@@ -327,6 +327,17 @@ packages:
   - jq
 
 write_files:
+  - path: /etc/needrestart/conf.d/stoarama-recording.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # FFmpeg is part of the recording service's cgroup. Ubuntu's daily
+      # unattended upgrades otherwise restart the entire worker when FFmpeg
+      # holds a replaced library, abandoning every live recording lease.
+      # Keep updates enabled; new capture processes use the updated libraries.
+      # The pool controller owns worker replacement after its leases are idle.
+      $nrconf{override_rc}->{qr(^stoarama-recording\.service$)} = 0;
+
   - path: /etc/stoarama/recorder.env
     permissions: "0600"
     owner: root:root

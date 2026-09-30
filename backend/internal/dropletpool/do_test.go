@@ -350,6 +350,71 @@ func TestBuildUserData_EgressFirewallAndEnv(t *testing.T) {
 	}
 }
 
+func TestBuildUserData_DefersOnlyRecordingServiceNeedrestart(t *testing.T) {
+	perl, err := exec.LookPath("perl")
+	if err != nil {
+		t.Skip("perl unavailable")
+	}
+	out, err := BuildUserData(UserDataConfig{
+		ServerID: "stoarama-rec-42", NodeToken: "test-token",
+		BackendAPIURL: "https://example.com", Capacity: 5,
+		HeartbeatSec: 15, PollSec: 5,
+		RepoURL: "https://github.com/daydemir/stoarama.git", RepoRef: "main",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Evaluate the generated drop-in as Perl, as needrestart does. Verify that it
+	// extends the image's existing overrides and matches only the worker unit.
+	_, file, ok := strings.Cut(out, "  - path: /etc/needrestart/conf.d/stoarama-recording.conf\n")
+	if !ok {
+		t.Fatal("cloud-init missing needrestart drop-in")
+	}
+	file, _, _ = strings.Cut(file, "\n  - path:")
+	_, content, ok := strings.Cut(file, "    content: |\n")
+	if !ok {
+		t.Fatal("drop-in missing content")
+	}
+	var snippet strings.Builder
+	for _, line := range strings.Split(content, "\n") {
+		snippet.WriteString(strings.TrimPrefix(line, "      ") + "\n")
+	}
+	path := filepath.Join(t.TempDir(), "stoarama-recording.conf")
+	if err := os.WriteFile(path, []byte(snippet.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(perl, "-e", `
+use strict;
+use warnings;
+our %nrconf = (override_rc => { qr(^dbus\.service$) => 0 });
+my $loaded = do $ARGV[0];
+die "invalid drop-in: $@ $!" unless defined $loaded;
+sub selected {
+    my ($rc) = @_;
+    foreach my $re (keys %{$nrconf{override_rc}}) {
+        return $nrconf{override_rc}->{$re} if $rc =~ /$re/;
+    }
+    return 1;
+}
+die "recording worker would restart" if selected('stoarama-recording.service');
+die "existing override lost" if selected('dbus.service');
+for my $rc ('ssh.service', 'systemd-resolved.service',
+            'stoarama-recordingXservice', 'other-stoarama-recording.service',
+            'stoarama-recording.service.extra') {
+    die "unrelated unit $rc excluded" unless selected($rc);
+}
+`, path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("needrestart drop-in: %v\n%s", err, output)
+	}
+	if !strings.Contains(out, "package_update: true\npackage_upgrade: false") {
+		t.Fatal("explicit provisioning package policy changed")
+	}
+	if strings.Contains(out, "systemctl mask") || strings.Contains(out, "APT::Periodic") {
+		t.Fatal("worker exception must preserve automatic OS updates")
+	}
+}
+
 func TestBuildUserData_SkipsBuildWhenBakedBinaryMatchesHEAD(t *testing.T) {
 	// With DROPLET_POOL_MIN=0 the pool is cold between fires, so the cold boot must
 	// fit inside ProvisionLead. A from-scratch go build measured ~13-15 min on the
