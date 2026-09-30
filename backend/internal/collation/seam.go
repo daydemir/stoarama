@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	PolicyVersion = "collation-v2"
+	PolicyVersion = "collation-v2.1"
 	Generation    = 2
 
 	DecisionJoin  = "join"
@@ -32,8 +32,9 @@ type SeamPolicy struct {
 	BlurSigma float64 `json:"blur_sigma"`
 	// Share of pixels (highest temporal variance) the distances are measured on.
 	MotionPixelShare float64 `json:"motion_pixel_share"`
-	// A continuous seam has B[0]'s best match within this many frames of A's end
-	// and A[-1]'s best match within this many frames of B's start...
+	// A sharper tail match beyond this offset is an overlap. The default
+	// requires the endpoint itself (exact equal minima resolve to the endpoint).
+	// A[-1]'s head match must be within MaxHeadOffsetFrames or tied at B[0].
 	MaxTailOffsetFrames int `json:"max_tail_offset_frames"`
 	MaxHeadOffsetFrames int `json:"max_head_offset_frames"`
 	// ...and each best match is sharp: min MAD <= ratio x window median MAD.
@@ -42,7 +43,7 @@ type SeamPolicy struct {
 	// Below this (masked) window median there is too little motion to prove anything.
 	MinSceneMedianMAD float64 `json:"min_scene_median_mad"`
 	// The boundary step must look like an ordinary step into a keyframe:
-	// MAD(A[-1],B[0]) <= factor x median(key steps) + slack.
+	// MAD(A[-1],B[0]) <= factor x max(median(key steps), p95(non-key steps)) + slack.
 	BoundaryStepFactor float64 `json:"boundary_step_factor"`
 	// A short-window jump whose boundary step exceeds this factor needs no
 	// full-window second look (it can only split).
@@ -52,9 +53,16 @@ type SeamPolicy struct {
 	GapFrameSlack       float64 `json:"db_gap_tolerance_frames"`
 	// Decoded content duration must match the stamped span within this many frames.
 	SpanFrameSlack float64 `json:"content_span_tolerance_frames"`
-	// A previous clip shorter than the recording's nominal clip length by more
-	// than this was cut early: a capture restart indicator.
+	// A previous clip this far below nominal length needs an identified,
+	// consecutive capture chain in addition to every other gate and pixel proof.
 	ShortClipSlackSeconds float64 `json:"short_clip_slack_seconds"`
+	// Boundary endpoints may be less sharp only when their step is within
+	// BoundaryBaselineFactor times the local baseline.
+	BoundarySharpRatio float64 `json:"boundary_sharp_ratio"`
+	// The relaxed endpoint route uses a tighter local-step limit.
+	BoundaryBaselineFactor float64 `json:"boundary_baseline_factor"`
+	// Endpoint distances within this MAD of a shallow minimum are tied.
+	EndpointSlackMAD float64 `json:"endpoint_slack_mad"`
 }
 
 func (p SeamPolicy) windows() []float64 {
@@ -66,24 +74,27 @@ func (p SeamPolicy) windows() []float64 {
 
 func DefaultSeamPolicy() SeamPolicy {
 	return SeamPolicy{
-		ShortWindowSeconds:    4,
-		WindowSeconds:         10,
-		FrameWidth:            96,
-		FrameHeight:           64,
-		BlurSigma:             0,
-		MotionPixelShare:      0.10,
-		MaxTailOffsetFrames:   3,
-		MaxHeadOffsetFrames:   10,
-		TailSharpRatio:        0.60,
-		HeadSharpRatio:        0.70,
-		MinSceneMedianMAD:     0.8,
-		BoundaryStepFactor:    2.0,
-		ClearJumpStepFactor:   4.0,
-		StepSlackMAD:          0.05,
-		MinFrames:             10,
-		GapFrameSlack:         1,
-		SpanFrameSlack:        2,
-		ShortClipSlackSeconds: 2,
+		ShortWindowSeconds:     4,
+		WindowSeconds:          10,
+		FrameWidth:             96,
+		FrameHeight:            64,
+		BlurSigma:              0,
+		MotionPixelShare:       0.10,
+		MaxTailOffsetFrames:    0,
+		MaxHeadOffsetFrames:    10,
+		TailSharpRatio:         0.60,
+		HeadSharpRatio:         0.70,
+		MinSceneMedianMAD:      0.8,
+		BoundaryStepFactor:     2.0,
+		ClearJumpStepFactor:    4.0,
+		StepSlackMAD:           0.05,
+		MinFrames:              10,
+		GapFrameSlack:          1,
+		SpanFrameSlack:         2,
+		ShortClipSlackSeconds:  2,
+		BoundarySharpRatio:     0.8,
+		BoundaryBaselineFactor: 1.2,
+		EndpointSlackMAD:       0.05,
 	}
 }
 
@@ -187,7 +198,8 @@ func MetadataGate(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia) string {
 	case pm.CodecSignature == "" || pm.CodecSignature != nm.CodecSignature:
 		return "codec_params_differ"
 	}
-	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds {
+	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds &&
+		(prev.CaptureSequence <= 0 || (prev.CaptureAttemptID == "" && prev.CaptureLeaseToken == "")) {
 		return "prev_clip_cut_short"
 	}
 	frame := math.Max(pm.FrameSeconds, nm.FrameSeconds)

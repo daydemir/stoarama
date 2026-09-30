@@ -97,8 +97,8 @@ func TestEvaluateCurvesVerdicts(t *testing.T) {
 	n := 250
 	steps := curve(2*n-2, func(int) float64 { return 0.4 })
 	// Continuous: distance grows with temporal distance from the boundary.
-	cont := Curves{TailToHead0: curve(n, func(k int) float64 { return 0.4 + 0.02*float64(n-1-k) }),
-		TailLastToHead: curve(n, func(j int) float64 { return 0.4 + 0.02*float64(j) }), Steps: steps, BoundaryMAD: 0.45}
+	cont := Curves{TailToHead0: curve(n, func(k int) float64 { return 0.45 + 0.02*float64(n-1-k) }),
+		TailLastToHead: curve(n, func(j int) float64 { return 0.45 + 0.02*float64(j) }), Steps: steps, BoundaryMAD: 0.45}
 	if ev := EvaluateCurves(policy, cont, 0.04); ev.Verdict != MatchContinuous {
 		t.Fatalf("continuous: %+v", ev)
 	}
@@ -225,7 +225,17 @@ func TestManifestValidateRejectsInconsistentAccounting(t *testing.T) {
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	legacy := good
+	legacy.PolicyVersion = "collation-v2"
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("legacy manifest rejected: %v", err)
+	}
 	bad := good
+	bad.PolicyVersion = "collation-v3"
+	if bad.Validate() == nil {
+		t.Fatal("unknown policy version accepted")
+	}
+	bad = good
 	bad.Seams = []SeamDecision{{PrevClipID: 1, NextClipID: 2, Decision: DecisionJoin, Match: &MatchEvidence{Verdict: MatchJump}}}
 	if bad.Validate() == nil {
 		t.Fatal("join without continuity proof accepted")
