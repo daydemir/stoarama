@@ -254,6 +254,18 @@ func TestShortClipRequiresIdentifiedConsecutiveCaptureAndPixelProof(t *testing.T
 			t.Errorf("joined short clip with %s", v)
 		}
 	}
+	for name, mutate := range map[string]func(*MatchEvidence){
+		"remote head minimum":    func(m *MatchEvidence) { m.HeadMinMAD = m.BoundaryMAD - 1 },
+		"abnormal boundary step": func(m *MatchEvidence) { m.StepP95MAD, m.KeyStepMedianMAD = 0, 0 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := ev
+			mutate(&bad)
+			if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, &bad); d.Decision != DecisionSplit || d.Reason != "short_clip_continuity_unproven" {
+				t.Fatalf("short-clip endpoint proof not enforced: %+v", d)
+			}
+		})
+	}
 	if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, nil); d.Decision != DecisionSplit {
 		t.Fatal("joined without pixels")
 	}

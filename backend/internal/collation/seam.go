@@ -244,6 +244,16 @@ func DecideSeam(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia, match *Mat
 		d.OverlapSeconds = match.OverlapSeconds
 		return d
 	}
+	// Short clips need positive continuity at B[0], rather than merely an
+	// acceptable nearby head match, and an ordinary local boundary step.
+	if prev.NominalSeconds > 0 && prev.EndUTC.Sub(prev.StartUTC).Seconds() < prev.NominalSeconds-policy.ShortClipSlackSeconds {
+		baseline := math.Max(match.KeyStepMedianMAD, match.StepP95MAD)
+		if match.BoundaryMAD > match.HeadMinMAD+policy.EndpointSlackMAD ||
+			match.BoundaryMAD > policy.BoundaryBaselineFactor*baseline+policy.StepSlackMAD {
+			d.Reason = "short_clip_continuity_unproven"
+			return d
+		}
+	}
 	d.Decision, d.Reason = DecisionJoin, "continuous"
 	return d
 }
