@@ -98,6 +98,12 @@ func TestRestampedContractAdversarialSeamsNeverJoin(t *testing.T) {
 		found++
 		r.Next.CaptureSequence = r.Prev.CaptureSequence + 1
 		ev := evaluateEscalating(p, r.Curves, math.Max(r.PrevMedia.FrameSeconds, r.NextMedia.FrameSeconds))
+		if reason := MetadataGate(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia); reason != "" {
+			t.Fatalf("%s pixel regression hidden by metadata: %s", r.ID, reason)
+		}
+		if ev.Verdict == MatchContinuous {
+			t.Errorf("%s falsely passes pixels independent of metadata: %+v", r.ID, ev)
+		}
 		if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, &ev); d.Decision != DecisionSplit {
 			t.Errorf("%s restamped sequence hides forward skip: %+v", r.ID, d)
 		}
