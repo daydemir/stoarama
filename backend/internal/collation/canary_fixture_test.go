@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -195,7 +196,11 @@ func TestLiveReviewProof(t *testing.T) {
 		if r.TruthContinuous != nil && !*r.TruthContinuous && d.Decision != DecisionSplit {
 			t.Errorf("broken review seam %s joined: %+v", r.ID, ev)
 		}
-		t.Logf("%s truth=%v decision=%s reason=%s match=%+v", r.ID, *r.TruthContinuous, d.Decision, d.Reason, ev)
+		truth := "unknown"
+		if r.TruthContinuous != nil {
+			truth = strconv.FormatBool(*r.TruthContinuous)
+		}
+		t.Logf("%s truth=%s decision=%s reason=%s match=%+v", r.ID, truth, d.Decision, d.Reason, ev)
 	}
 	if broken != 8 {
 		t.Fatalf("got %d supplemental broken seams", broken)
@@ -242,8 +247,26 @@ func TestLabeledCanarySeams(t *testing.T) {
 
 func TestShortClipRequiresIdentifiedConsecutiveCaptureAndPixelProof(t *testing.T) {
 	p := DefaultSeamPolicy()
-	r := loadCanaryFixtures(t, "canary_seams.json.gz")[33]
-	ev := evaluateEscalating(p, r.Curves, r.PrevMedia.FrameSeconds)
+	var r canarySeam
+	for _, row := range loadCanaryFixtures(t, "canary_seams.json.gz") {
+		if row.ID == "canary-s33" {
+			r = row
+			break
+		}
+	}
+	if r.ID == "" {
+		t.Fatal("short-clip fixture canary-s33 missing")
+	}
+	if span := r.Prev.EndUTC.Sub(r.Prev.StartUTC).Seconds(); r.Prev.NominalSeconds <= 0 || span >= r.Prev.NominalSeconds-p.ShortClipSlackSeconds {
+		t.Fatalf("fixture %s is not a short clip", r.ID)
+	}
+	ev := evaluateEscalating(p, r.Curves, math.Max(r.PrevMedia.FrameSeconds, r.NextMedia.FrameSeconds))
+	if ev.Verdict != MatchContinuous {
+		t.Fatalf("fixture lacks pixel continuity: %+v", ev)
+	}
+	if d := DecideSeam(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia, &ev); d.Decision != DecisionJoin {
+		t.Fatalf("positive short-clip fixture rejected before mutations: %+v", d)
+	}
 	if MetadataGate(p, r.Prev, r.Next, r.PrevMedia, r.NextMedia) != "" {
 		t.Fatal("identified short clip never reaches pixel proof")
 	}
