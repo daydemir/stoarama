@@ -21,6 +21,8 @@ type mp4Video struct {
 
 var errNoAVCTrack = errors.New("no avc1/avc3 video track")
 
+const maxMP4Samples = 1 << 22
+
 type mp4Box struct {
 	typ         string
 	start, data int64 // box start and payload start
@@ -199,6 +201,11 @@ func parseSampleTable(f *os.File, stbl mp4Box) (*mp4Video, error) {
 	}
 	fixed := int64(binary.BigEndian.Uint32(sz[4:8]))
 	count := int(binary.BigEndian.Uint32(sz[8:12]))
+	// A fixed sample size leaves the count unbounded by the payload; no clip
+	// comes near this many samples (38 h at 30 fps).
+	if count > maxMP4Samples {
+		return nil, fmt.Errorf("stsz sample count %d exceeds %d", count, maxMP4Samples)
+	}
 	if fixed == 0 && len(sz) < 12+4*count {
 		return nil, errors.New("stsz truncated")
 	}

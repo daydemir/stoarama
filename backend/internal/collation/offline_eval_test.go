@@ -92,3 +92,44 @@ func TestOfflineSeamEval(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestOfflineHRDEval computes only the HRD source evidence of seams. Inputs
+// may be sparse copies holding just the moov box, the previous clip's last
+// TailUnits samples and the next clip's first sample (COLLATION_HRD_IN JSONL:
+// id, prev_path, next_path, prev_tail_units; results to COLLATION_HRD_OUT).
+// Not run in CI.
+func TestOfflineHRDEval(t *testing.T) {
+	in, outPath := os.Getenv("COLLATION_HRD_IN"), os.Getenv("COLLATION_HRD_OUT")
+	if in == "" || outPath == "" {
+		t.Skip("COLLATION_HRD_IN/COLLATION_HRD_OUT not set")
+	}
+	f, err := os.Open(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	out, err := os.Create(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	enc := json.NewEncoder(out)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var p struct {
+			ID        string `json:"id"`
+			PrevPath  string `json:"prev_path"`
+			NextPath  string `json:"next_path"`
+			TailUnits int    `json:"prev_tail_units"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &p); err != nil {
+			t.Fatal(err)
+		}
+		pol := DefaultHRDPolicy()
+		pol.TailUnits = min(pol.TailUnits, p.TailUnits)
+		ev := hrdSeamEvidence(pol, p.PrevPath, p.NextPath)
+		if err := enc.Encode(map[string]any{"id": p.ID, "source": ev}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
