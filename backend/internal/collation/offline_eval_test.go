@@ -115,6 +115,7 @@ func TestOfflineHRDEval(t *testing.T) {
 	defer out.Close()
 	enc := json.NewEncoder(out)
 	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	for sc.Scan() {
 		var p struct {
 			ID        string `json:"id"`
@@ -131,5 +132,8 @@ func TestOfflineHRDEval(t *testing.T) {
 		if err := enc.Encode(map[string]any{"id": p.ID, "source": ev}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
