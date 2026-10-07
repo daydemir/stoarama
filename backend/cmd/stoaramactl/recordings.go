@@ -18,11 +18,15 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/recordingnaming"
 )
 
-const recordingsUsage = "usage: stoaramactl recordings naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | reconcile-upload-intents | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report | quality-grades report | nas-delivery status|set"
+const recordingsUsage = "usage: stoaramactl recordings pause | naming allocate|get|set|preview | schedule-batch | campaign-postflight | capture-health | repair-source | reconcile-upload-intents | authoritative-frame | scene-attest | qualification build|freeze|report | streak-priority report | quality-grades report | nas-delivery status|set"
 
 func runRecordings(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
 		log.Fatal(recordingsUsage)
+	}
+	if args[0] == "pause" {
+		runRecordingPause(ctx, cfg, args[1:])
+		return
 	}
 	if args[0] == "schedule-batch" {
 		runRecordingScheduleBatch(ctx, cfg, args[1:])
