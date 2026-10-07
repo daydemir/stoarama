@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/daydemir/stoarama/backend/internal/config"
 )
 
 func TestRecordingPausePreflight(t *testing.T) {
@@ -55,6 +59,9 @@ func TestRecordingPausePreflight(t *testing.T) {
 			} else if err == nil || !strings.Contains(err.Error(), tc.wantError) {
 				t.Fatalf("error=%v", err)
 			}
+			if report.PreflightVerified != (tc.wantError == "") {
+				t.Fatalf("preflight=%v error=%v", report.PreflightVerified, err)
+			}
 			if posts != 0 || len(report.PausedIDs) != 0 {
 				t.Fatal("preflight/dry run mutated recordings")
 			}
@@ -67,7 +74,7 @@ func TestRecordingPauseStopsOnForbidden(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/account/me":
-			json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"id": 47}})
+			json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"id": 47, "auth_type": "api_key"}})
 		case "/api/v1/account/recordings":
 			json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"id": 1, "status": "active", "stream_url": "https://youtu.be/public"}, {"id": 2, "status": "active", "stream_url": "https://youtu.be/public"}, {"id": 3, "status": "active", "stream_url": "https://youtu.be/public"}}})
 		case "/api/v1/account/recordings/1/pause":
@@ -88,7 +95,7 @@ func TestRecordingPauseStopsOnForbidden(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "HTTP 403") || strings.Contains(err.Error(), "test-key") {
 		t.Fatalf("error=%v", err)
 	}
-	if !reflect.DeepEqual(posts, []int64{1, 2}) || !reflect.DeepEqual(report.PausedIDs, []int64{1}) || report.Verified {
+	if !reflect.DeepEqual(report.AttemptedIDs, []int64{1, 2}) || !reflect.DeepEqual(posts, []int64{1, 2}) || !reflect.DeepEqual(report.PausedIDs, []int64{1}) || report.Verified {
 		t.Fatalf("posts=%v report=%+v", posts, report)
 	}
 }
@@ -99,7 +106,7 @@ func TestRecordingPauseApplyVerifiesAndRetainsOtherSources(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/account/me":
-			json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"id": 47}})
+			json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"id": 47, "auth_type": "api_key"}})
 		case "/api/v1/account/recordings":
 			listReads++
 			status := "active"
@@ -125,7 +132,7 @@ func TestRecordingPauseApplyVerifiesAndRetainsOtherSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.Verified || !report.PreservesExistingMedia || listReads != 2 || !reflect.DeepEqual(report.PausedIDs, []int64{1}) || !reflect.DeepEqual(report.AlreadyPausedIDs, []int64{2}) {
+	if report.AuthType != "api_key" || !report.PreflightVerified || !reflect.DeepEqual(report.AttemptedIDs, []int64{1}) || !report.Verified || !report.PreservesExistingMedia || listReads != 2 || !reflect.DeepEqual(report.PausedIDs, []int64{1}) || !reflect.DeepEqual(report.AlreadyPausedIDs, []int64{2}) {
 		t.Fatalf("report=%+v reads=%d", report, listReads)
 	}
 }
@@ -133,7 +140,7 @@ func TestRecordingPauseApplyVerifiesAndRetainsOtherSources(t *testing.T) {
 func TestRecordingPauseRejectsAdmissionStillScheduled(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/account/me" {
-			json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"id": 47}})
+			json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"id": 47, "auth_type": "api_key"}})
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{{"id": 1, "status": "paused", "next_fire_at": "2026-10-08T06:00:00Z", "stream_url": "https://youtu.be/public"}}})
@@ -155,7 +162,7 @@ func TestRecordingPauseIDsAndYouTubeHosts(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(ids, []int64{1, 2, 3}) {
 		t.Fatal(ids, err)
 	}
-	for _, u := range []string{"https://youtube.com.evil.test/watch", "https://notyoutube.com/watch", "file://youtube.com/watch", "https://evil.test/?next=youtube.com"} {
+	for _, u := range []string{"https://youtube.com.evil.test/watch", "https://notyoutube.com/watch", "file://youtube.com/watch", "https://evil.test/?next=youtube.com", "https://user:pass@youtube.com/watch"} {
 		if isRecordingPauseYouTubeURL(u) {
 			t.Errorf("accepted source %q", u)
 		}
@@ -171,5 +178,62 @@ func TestRecordingPauseNeverFollowsAuthRedirect(t *testing.T) {
 	_, err := executeRecordingPause(context.Background(), recordingPauseHTTPClient(), recordingPauseOptions{47, []int64{1}, true, true, origin.URL, "test-key"})
 	if err == nil || !strings.Contains(err.Error(), "HTTP 302") || called {
 		t.Fatalf("error=%v destination called=%v", err, called)
+	}
+}
+
+func TestRecordingPauseHelpAndJSONFlag(t *testing.T) {
+	secret := "fake-sensitive-default-not-a-real-key"
+	cfg := config.Config{APIToken: secret}
+	var help bytes.Buffer
+	_, _, err := parseRecordingPauseOptions(cfg, []string{"--help"}, &help)
+	if err != flag.ErrHelp || strings.Contains(help.String(), secret) || !strings.Contains(help.String(), "account-id") {
+		t.Fatalf("help error=%v leaked token=%v", err, strings.Contains(help.String(), secret))
+	}
+	var output bytes.Buffer
+	options, jsonOutput, err := parseRecordingPauseOptions(cfg, []string{"--account-id", "47", "--recording-ids", "2,1", "--json=false"}, &output)
+	if err != nil || jsonOutput || options.apply || options.accountID != 47 || options.token != secret || !reflect.DeepEqual(options.ids, []int64{1, 2}) {
+		t.Fatalf("parse error=%v", err)
+	}
+	if strings.Contains(output.String(), secret) {
+		t.Fatal("credential printed")
+	}
+}
+
+func TestRecordingPauseInvalidInputsMakeNoRequest(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) }))
+	defer server.Close()
+	valid := recordingPauseOptions{accountID: 47, ids: []int64{1}, apply: true, youtubeOnly: true, baseURL: server.URL, token: "test-key"}
+	for _, tc := range []struct {
+		name   string
+		change func(*recordingPauseOptions)
+	}{
+		{"missing account", func(o *recordingPauseOptions) { o.accountID = 0 }},
+		{"missing cohort", func(o *recordingPauseOptions) { o.ids = nil }},
+		{"duplicate cohort", func(o *recordingPauseOptions) { o.ids = []int64{1, 1} }},
+		{"negative cohort", func(o *recordingPauseOptions) { o.ids = []int64{-1} }},
+		{"too many", func(o *recordingPauseOptions) {
+			o.ids = make([]int64, 51)
+			for i := range o.ids {
+				o.ids[i] = int64(i + 1)
+			}
+		}},
+		{"missing auth", func(o *recordingPauseOptions) { o.token = "" }},
+		{"plain remote HTTP", func(o *recordingPauseOptions) { o.baseURL = "http://example.org" }},
+		{"embedded credentials", func(o *recordingPauseOptions) { o.baseURL = "https://user:secret@example.org" }},
+		{"query", func(o *recordingPauseOptions) { o.baseURL = server.URL + "?token=secret" }},
+		{"fragment", func(o *recordingPauseOptions) { o.baseURL = server.URL + "#fragment" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := valid
+			tc.change(&o)
+			_, err := executeRecordingPause(context.Background(), server.Client(), o)
+			if err == nil {
+				t.Fatal("invalid options accepted")
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("%d requests before validation", calls)
 	}
 }

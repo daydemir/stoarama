@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +36,9 @@ type recordingPauseItem struct {
 
 type recordingPauseReport struct {
 	AccountID              int64   `json:"account_id"`
+	AuthType               string  `json:"auth_type,omitempty"`
+	PreflightVerified      bool    `json:"preflight_verified"`
+	AttemptedIDs           []int64 `json:"attempted_ids"`
 	Apply                  bool    `json:"apply"`
 	RecordingIDs           []int64 `json:"recording_ids"`
 	PausedIDs              []int64 `json:"paused_ids"`
@@ -42,32 +48,51 @@ type recordingPauseReport struct {
 }
 
 func runRecordingPause(ctx context.Context, cfg config.Config, args []string) {
-	fs := flag.NewFlagSet("recordings pause", flag.ExitOnError)
+	options, jsonOutput, err := parseRecordingPauseOptions(cfg, args, os.Stderr)
+	if err == flag.ErrHelp {
+		return
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	report, err := executeRecordingPause(ctx, recordingPauseHTTPClient(), options)
+	if jsonOutput {
+		printJSON(report)
+	} else {
+		fmt.Printf("Account %d: %d selected, %d paused, %d already paused; apply=%t preflight=%t verified=%t\n", report.AccountID, len(report.RecordingIDs), len(report.PausedIDs), len(report.AlreadyPausedIDs), report.Apply, report.PreflightVerified, report.Verified)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func parseRecordingPauseOptions(cfg config.Config, args []string, output io.Writer) (recordingPauseOptions, bool, error) {
+	fs := flag.NewFlagSet("recordings pause", flag.ContinueOnError)
+	fs.SetOutput(output)
 	accountID := fs.Int64("account-id", 0, "required authenticated account id")
 	idsRaw := fs.String("recording-ids", "", "required exact comma-separated recording ids (maximum 50)")
 	apply := fs.Bool("apply", false, "pause the reviewed recordings; default is read-only")
 	youtubeOnly := fs.Bool("youtube-only", false, "reject any selected recording whose binding is not a YouTube URL")
-	baseURL := fs.String("backend-api-url", defaultBackendAPIURL(), "backend API base URL")
+	baseURL := fs.String("backend-api-url", "", "backend API base URL (defaults to BACKEND_API_URL)")
 	token := fs.String("api-token", "", "existing account API token (defaults to API_TOKEN)")
-	_ = fs.Bool("json", true, "emit a JSON report")
-	_ = fs.Parse(args)
+	jsonOutput := fs.Bool("json", true, "emit a JSON report")
+	if err := fs.Parse(args); err != nil {
+		return recordingPauseOptions{}, *jsonOutput, err
+	}
 	if len(fs.Args()) != 0 {
-		log.Fatal("unexpected positional arguments")
+		return recordingPauseOptions{}, *jsonOutput, fmt.Errorf("unexpected positional arguments")
 	}
 	if strings.TrimSpace(*token) == "" {
 		*token = cfg.APIToken
 	}
+	if strings.TrimSpace(*baseURL) == "" {
+		*baseURL = defaultBackendAPIURL()
+	}
 	ids, err := parseRecordingPauseIDs(*idsRaw)
 	if err != nil {
-		log.Fatal(err)
+		return recordingPauseOptions{}, *jsonOutput, err
 	}
-	options := recordingPauseOptions{*accountID, ids, *apply, *youtubeOnly, *baseURL, *token}
-	client := recordingPauseHTTPClient()
-	report, err := executeRecordingPause(ctx, client, options)
-	printJSON(report)
-	if err != nil {
-		log.Fatal(err)
-	}
+	return recordingPauseOptions{accountID: *accountID, ids: ids, apply: *apply, youtubeOnly: *youtubeOnly, baseURL: *baseURL, token: *token}, *jsonOutput, nil
 }
 
 func recordingPauseHTTPClient() *http.Client {
@@ -114,7 +139,7 @@ func recordingPauseRequest(ctx context.Context, client *http.Client, options rec
 		}
 		return fmt.Errorf("%s %s returned HTTP %d (%s); stopped without retry", method, path, resp.StatusCode, kind)
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(nil, resp.Body, 8<<20)).Decode(out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(out); err != nil {
 		return fmt.Errorf("%s %s: invalid account API JSON", method, path)
 	}
 	return nil
@@ -122,7 +147,7 @@ func recordingPauseRequest(ctx context.Context, client *http.Client, options rec
 
 func isRecordingPauseYouTubeURL(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
@@ -130,10 +155,17 @@ func isRecordingPauseYouTubeURL(raw string) bool {
 }
 
 func executeRecordingPause(ctx context.Context, client *http.Client, options recordingPauseOptions) (recordingPauseReport, error) {
-	report := recordingPauseReport{AccountID: options.accountID, Apply: options.apply, RecordingIDs: options.ids, PausedIDs: []int64{}, AlreadyPausedIDs: []int64{}, PreservesExistingMedia: true}
+	report := recordingPauseReport{AccountID: options.accountID, Apply: options.apply, RecordingIDs: options.ids, PausedIDs: []int64{}, AlreadyPausedIDs: []int64{}, AttemptedIDs: []int64{}, PreservesExistingMedia: true}
 	u, err := url.Parse(options.baseURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return report, fmt.Errorf("a plain HTTP(S) --backend-api-url is required")
+	}
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return report, fmt.Errorf("HTTPS is required except for a loopback API")
+		}
 	}
 	if options.accountID <= 0 || len(options.ids) == 0 || len(options.ids) > 50 || strings.TrimSpace(options.token) == "" {
 		return report, fmt.Errorf("--account-id, exact recording ids, and account API authentication are required")
@@ -147,7 +179,8 @@ func executeRecordingPause(ctx context.Context, client *http.Client, options rec
 	}
 	var me struct {
 		Account struct {
-			ID int64 `json:"id"`
+			ID       int64  `json:"id"`
+			AuthType string `json:"auth_type"`
 		} `json:"account"`
 	}
 	if err := recordingPauseRequest(ctx, client, options, http.MethodGet, "/api/v1/account/me", &me); err != nil {
@@ -156,6 +189,7 @@ func executeRecordingPause(ctx context.Context, client *http.Client, options rec
 	if me.Account.ID != options.accountID {
 		return report, fmt.Errorf("authenticated account %d does not match required account %d", me.Account.ID, options.accountID)
 	}
+	report.AuthType = me.Account.AuthType
 	load := func() (map[int64]recordingPauseItem, error) {
 		var list struct {
 			Items []recordingPauseItem `json:"items"`
@@ -190,6 +224,7 @@ func executeRecordingPause(ctx context.Context, client *http.Client, options rec
 			report.AlreadyPausedIDs = append(report.AlreadyPausedIDs, id)
 		}
 	}
+	report.PreflightVerified = true
 	if !options.apply {
 		return report, nil
 	}
@@ -202,6 +237,7 @@ func executeRecordingPause(ctx context.Context, client *http.Client, options rec
 			Status string `json:"status"`
 		}
 		path := fmt.Sprintf("/api/v1/account/recordings/%d/pause", id)
+		report.AttemptedIDs = append(report.AttemptedIDs, id)
 		if err := recordingPauseRequest(ctx, client, options, http.MethodPost, path, &result); err != nil {
 			return report, err
 		}
