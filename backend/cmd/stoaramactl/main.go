@@ -224,6 +224,7 @@ func usage() {
 	  stoaramactl relay-connectivity run [--dry-run]
 	  stoaramactl relay-routing set-group-bandwidth --account-id ID --group-id ID --expected-name NAME --bandwidth-mbps N [--apply]
 	  stoaramactl recordings naming allocate|get|set|preview
+	  stoaramactl recordings pause --account-id ID --recording-ids IDS [--youtube-only --apply --json --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings schedule-batch --spec FILE [--dry-run --json --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-postflight (--recording-ids IDS | --batch-response FILE | --spec FILE) --session-cookie-file FILE [--max-nas-pending-clips N --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings capture-health --id ID [--from YYYY-MM-DD --to YYYY-MM-DD --backend-api-url URL --api-token TOKEN]
