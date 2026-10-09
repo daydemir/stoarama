@@ -248,8 +248,8 @@ func (s *Server) handleGlobalDeliveryTicket(w http.ResponseWriter, r *http.Reque
 	pathSHA := sha256.Sum256([]byte(storageURL.EscapedPath()))
 	headers := map[string]string{}
 	for k, v := range capability.Headers {
-		if len(v) > 0 {
-			headers[k] = v[0]
+		if strings.EqualFold(k, "If-Match") && len(v) > 0 {
+			headers["If-Match"] = v[0]
 		}
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
