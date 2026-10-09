@@ -188,3 +188,48 @@ func TestGlobalDeliveryApprovedCohortExpansion(t *testing.T) {
 		t.Fatal("outside approved cohort size accepted")
 	}
 }
+
+func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
+	reg := globalDeliveryTestRegistry()
+	reg.PublicDelivery = true
+	reg.SelectionScope = "available"
+	reg.Assets["/public/catalog.json"] = reg.Assets["/fixture.txt"]
+	delete(reg.Assets, "/fixture.txt")
+	m := &globalDeliveryTestStore{body: []byte("hello")}
+	s := &Server{globalDeliveryStore: m, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now()}
+	w := httptest.NewRecorder()
+	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/public/catalog.json", "", nil))
+	if w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/metadata?path=/private/audit.json", "", nil))
+	if w.Code != 404 {
+		t.Fatal("private asset exposed", w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/2?sha256="+reg.Files["1"].SHA256, "2", nil))
+	if w.Code != 404 {
+		t.Fatal("unselected output exposed", w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256+"&path=other.mp4", "1", nil))
+	if w.Code != 409 || m.presigned != 0 {
+		t.Fatal("arbitrary presentation accepted", w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.handleGlobalDeliveryTicket(w, globalDeliveryTestRequest("GET", publicGlobalDeliveryAPI+"/ticket/1?sha256="+reg.Files["1"].SHA256, "1", nil))
+	if w.Code != 200 {
+		t.Fatal(w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.handleGlobalDeliveryAsset(w, globalDeliveryTestRequest("GET", globalDeliveryAPI+"/metadata?path=/public/catalog.json", "", nil))
+	if w.Code != 401 {
+		t.Fatal("private auth changed", w.Code)
+	}
+	for _, name := range []string{"/api/coverage-delivery/manifest?stream=1&scope=best", "/private/audit.json", "/public/../secret", "/api/coverage-delivery/manifest?stream=999&scope=available"} {
+		if publicGlobalDeliveryAsset(name, reg.RecordingIDs) {
+			t.Fatal("unsafe public asset", name)
+		}
+	}
+}

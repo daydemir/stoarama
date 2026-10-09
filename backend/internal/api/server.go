@@ -41,10 +41,12 @@ import (
 )
 
 type Server struct {
-	globalDeliveryStore      globalDeliveryObjectStore
-	globalDeliveryMu         sync.Mutex
-	globalDeliveryRegistry   *globalDeliveryRegistry
-	globalDeliveryRegistryAt time.Time
+	globalDeliveryStore            globalDeliveryObjectStore
+	globalDeliveryMu               sync.Mutex
+	globalDeliveryRegistry         *globalDeliveryRegistry
+	globalDeliveryRegistryAt       time.Time
+	publicGlobalDeliveryRegistry   *globalDeliveryRegistry
+	publicGlobalDeliveryRegistryAt time.Time
 
 	cfg                      config.Config
 	pool                     *pgxpool.Pool
@@ -282,6 +284,11 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
 			})
 		})
+		api.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
+		api.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
+		api.Get("/global-street-scores-delivery/ticket/{fileID}", s.handleGlobalDeliveryTicket)
+		api.Get("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
+		api.Head("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {

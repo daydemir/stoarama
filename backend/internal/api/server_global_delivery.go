@@ -23,6 +23,7 @@ import (
 )
 
 const globalDeliveryPrefix = "datasets/global-street-scores-delivery/47/"
+const publicGlobalDeliveryAPI = "/api/v1/global-street-scores-delivery"
 const globalDeliveryAPI = "/api/v1/account/global-street-scores-delivery"
 
 type globalDeliveryObject struct {
@@ -37,11 +38,13 @@ type globalDeliveryObject struct {
 	Verified    bool   `json:"verified"`
 }
 type globalDeliveryRegistry struct {
-	SchemaVersion int                             `json:"schema_version"`
-	AccountID     int64                           `json:"account_id"`
-	RecordingIDs  []int64                         `json:"recording_ids"`
-	Assets        map[string]globalDeliveryObject `json:"assets"`
-	Files         map[string]globalDeliveryObject `json:"files"`
+	PublicDelivery bool                            `json:"public_delivery,omitempty"`
+	SelectionScope string                          `json:"selection_scope,omitempty"`
+	SchemaVersion  int                             `json:"schema_version"`
+	AccountID      int64                           `json:"account_id"`
+	RecordingIDs   []int64                         `json:"recording_ids"`
+	Assets         map[string]globalDeliveryObject `json:"assets"`
+	Files          map[string]globalDeliveryObject `json:"files"`
 }
 type globalDeliveryObjectStore interface {
 	Head(context.Context, string) (r2.ObjectHead, error)
@@ -101,9 +104,15 @@ func validateGlobalDeliveryRegistry(x *globalDeliveryRegistry) error {
 	return nil
 }
 func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliveryRegistry, error) {
+	return s.loadGlobalDeliveryRegistryScope(ctx, false)
+}
+func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool) (*globalDeliveryRegistry, error) {
 	s.globalDeliveryMu.Lock()
 	defer s.globalDeliveryMu.Unlock()
-	if s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
+	if public && s.publicGlobalDeliveryRegistry != nil && time.Since(s.publicGlobalDeliveryRegistryAt) < 15*time.Second {
+		return s.publicGlobalDeliveryRegistry, nil
+	}
+	if !public && s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
 		return s.globalDeliveryRegistry, nil
 	}
 	store := s.globalDeliveryObjectStore()
@@ -111,6 +120,9 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 		return nil, errors.New("dataset storage unavailable")
 	}
 	key := globalDeliveryPrefix + "latest.json"
+	if public {
+		key = globalDeliveryPrefix + "public/current.json"
+	}
 	head, err := store.Head(ctx, key)
 	if err != nil || head.SizeBytes <= 0 || head.SizeBytes > 64<<20 {
 		return nil, errors.New("dataset registry unavailable")
@@ -131,8 +143,21 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	if err = validateGlobalDeliveryRegistry(&result); err != nil {
 		return nil, err
 	}
-	s.globalDeliveryRegistry = &result
-	s.globalDeliveryRegistryAt = time.Now()
+	if public {
+		if !result.PublicDelivery || result.SelectionScope != "available" {
+			return nil, errors.New("dataset is not published")
+		}
+		for name := range result.Assets {
+			if !publicGlobalDeliveryAsset(name, result.RecordingIDs) {
+				return nil, errors.New("private asset in public dataset")
+			}
+		}
+		s.publicGlobalDeliveryRegistry = &result
+		s.publicGlobalDeliveryRegistryAt = time.Now()
+	} else {
+		s.globalDeliveryRegistry = &result
+		s.globalDeliveryRegistryAt = time.Now()
+	}
 	return &result, nil
 }
 func (s *Server) handleGlobalDeliveryPage(w http.ResponseWriter, r *http.Request) {
@@ -169,10 +194,11 @@ func (s *Server) handleGlobalDeliveryStatic(w http.ResponseWriter, r *http.Reque
 	_, _ = w.Write(data)
 }
 func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Request) {
-	if !authorizeGlobalDelivery(w, r) {
+	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
+	if !public && !authorizeGlobalDelivery(w, r) {
 		return
 	}
-	registry, err := s.loadGlobalDeliveryRegistry(r.Context())
+	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified dataset metadata is temporarily unavailable. Reload to retry.")
 		return
@@ -202,10 +228,11 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 }
 func globalDeliveryFileID(r *http.Request) string { return chi.URLParam(r, "fileID") }
 func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (globalDeliveryObject, bool) {
-	if !authorizeGlobalDelivery(w, r) {
+	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
+	if !public && !authorizeGlobalDelivery(w, r) {
 		return globalDeliveryObject{}, false
 	}
-	registry, err := s.loadGlobalDeliveryRegistry(r.Context())
+	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public)
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified file registry unavailable.")
 		return globalDeliveryObject{}, false
@@ -217,6 +244,10 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	}
 	if expected := r.URL.Query().Get("sha256"); expected != "" && expected != object.SHA256 {
 		util.WriteError(w, http.StatusConflict, "Manifest file identity differs.")
+		return globalDeliveryObject{}, false
+	}
+	if presentation := r.URL.Query().Get("path"); presentation != "" && presentation != object.Path {
+		util.WriteError(w, http.StatusConflict, "Download presentation path differs.")
 		return globalDeliveryObject{}, false
 	}
 	head, err := s.globalDeliveryObjectStore().HeadExact(r.Context(), object.Key, object.ETag, object.VersionID)
@@ -308,4 +339,19 @@ func (s *Server) handleGlobalDeliveryFile(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Length", strconv.FormatInt(responseBytes, 10))
 	w.WriteHeader(status)
 	_, _ = io.CopyN(w, body, responseBytes)
+}
+
+func publicGlobalDeliveryAsset(name string, ids []int64) bool {
+	if strings.HasPrefix(name, "/public/") && !strings.Contains(name, "..") && !strings.ContainsAny(name, "?\\") {
+		return true
+	}
+	if name == "/download-script.py" {
+		return true
+	}
+	for _, id := range ids {
+		if name == fmt.Sprintf("/api/coverage-delivery/manifest?stream=%d&scope=available", id) {
+			return true
+		}
+	}
+	return false
 }
