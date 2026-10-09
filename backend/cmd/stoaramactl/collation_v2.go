@@ -26,7 +26,7 @@ import (
 )
 
 const collationV2Usage = `usage:
-  stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N]
+  stoaramactl collation-v2 plan --scope backfill|nightly --out worklist.jsonl [--policy collation-v2|collation-v3] [--broken-ids FILE] [--recordings 1,2] [--hour-ids FILE] [--date YYYY-MM-DD | --days N]
   stoaramactl collation-v2 run --worklist FILE|r2:KEY|r2prefix:PREFIX --scratch DIR --results FILE [--hour-workers N --cpu N --net N --publish-dir DIR --keep-scratch]
   stoaramactl collation-v2 register --worklist FILE|r2:KEY|r2prefix:PREFIX [--dry-run]
   stoaramactl collation-v2 put-worklist --worklist FILE --key r2-key`
@@ -50,14 +50,15 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		hourIDs := fs.String("hour-ids", "", "optional file of hour ids to keep")
 		date := fs.String("date", "", "nightly: local date to plan (default: the last --days closed days in each recording's timezone)")
 		days := fs.Int("days", 2, "nightly: how many closed local days to (re)plan; published hours are skipped by run")
+		policy := fs.String("policy", collation.PolicyVersion, "seam policy: collation-v2 (default) or collation-v3 (review only: generation-3 hours are not registered)")
 		_ = fs.Parse(args[1:])
-		if *out == "" || (*scope != "backfill" && *scope != "nightly") {
+		spec, err := collation.SpecFor(*policy)
+		if *out == "" || (*scope != "backfill" && *scope != "nightly") || err != nil {
 			log.Fatal(collationV2Usage)
 		}
 		pool := mustCollationPool(ctx, cfg)
 		defer pool.Close()
-		opts := collationPlanOptions{scope: *scope, date: *date, days: *days, now: time.Now()}
-		var err error
+		opts := collationPlanOptions{scope: *scope, date: *date, days: *days, now: time.Now(), spec: spec}
 		if opts.broken, err = readIDSet(*broken); err != nil {
 			log.Fatal(err)
 		}
@@ -119,14 +120,18 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 			log.Fatal(err)
 		}
 		defer rf.Close()
-		env := collation.Env{Tools: tools, Policy: collation.DefaultSeamPolicy(), ScratchRoot: *scratch, Store: store, MediaTool: version,
+		spec, err := worklistPolicy(work)
+		if err != nil {
+			log.Fatal(err)
+		}
+		env := collation.Env{Tools: tools, Policy: collation.SeamPolicyFor(spec), ScratchRoot: *scratch, Store: store, MediaTool: version,
 			CPU: make(chan struct{}, *cpu), Net: make(chan struct{}, *net), Now: time.Now, KeepScratch: *keepScratch}
 		var existence collation.ExistenceChecker = store
 		if *publishDir != "" {
 			local := collation.LocalPublishStore{R2Store: store, Dir: *publishDir}
 			env.Store, existence = local, local
 		}
-		log.Printf("collation-v2 run: hours=%d hour_workers=%d cpu=%d net=%d publish_dir=%q tool=%q", len(work), *hourWorkers, *cpu, *net, *publishDir, version)
+		log.Printf("collation-v2 run: policy=%s hours=%d hour_workers=%d cpu=%d net=%d publish_dir=%q tool=%q", spec.Version, len(work), *hourWorkers, *cpu, *net, *publishDir, version)
 		if err := collation.RunWorklist(ctx, env, existence, work, *hourWorkers, rf); err != nil {
 			log.Fatal(err)
 		}
@@ -142,6 +147,9 @@ func runCollationV2(ctx context.Context, cfg config.Config, args []string) {
 		work, err := loadWorklist(ctx, store, *worklist)
 		if err != nil {
 			log.Fatal(err)
+		}
+		if spec, err := worklistPolicy(work); err != nil || spec != collation.PolicyV2 {
+			log.Fatalf("register: only %s worklists can be registered (generation-3 hours are review-only until their supersession is designed)", collation.PolicyVersion)
 		}
 		pool := mustCollationPool(ctx, cfg)
 		defer pool.Close()
@@ -308,6 +316,7 @@ type collationPlanOptions struct {
 	broken     map[int64]bool
 	recordings map[int64]bool
 	hourIDs    map[string]bool
+	spec       collation.PolicySpec
 }
 
 // collationDay is one planned local day for one recording.
@@ -446,7 +455,7 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				return nil, err
 			}
 			for h := 1; h <= 12; h++ {
-				hourID, err := collation.HourIDFor(d.batchID, recordingID, d.localDate, h)
+				hourID, err := collation.HourIDForGeneration(d.batchID, recordingID, d.localDate, h, opts.spec.Generation)
 				if err != nil {
 					return nil, err
 				}
@@ -458,6 +467,9 @@ func planCollation(ctx context.Context, pool *pgxpool.Pool, opts collationPlanOp
 				w := collation.HourWork{BatchID: d.batchID, HourID: hourID, RecordingID: recordingID, Timezone: rec.timezone, LocalDate: d.localDate,
 					DeliveryHour: h, ScheduledStart: start.UTC(), ScheduledEnd: end.UTC(), NamingProfile: rec.namingProfile, FolderName: rec.folderName,
 					Metadata: rec.metadata, Clips: []collation.Clip{}}
+				if opts.spec != collation.PolicyV2 {
+					w.PolicyVersion = opts.spec.Version
+				}
 				for _, c := range clips {
 					if !c.StartUTC.Before(start) && c.StartUTC.Before(end) {
 						w.Clips = append(w.Clips, c)
@@ -483,6 +495,22 @@ type collationGen1Key struct {
 type collationGen1Hour struct {
 	id     int64
 	hourID string
+}
+
+// worklistPolicy returns the one seam policy every hour of a worklist uses.
+func worklistPolicy(work []collation.HourWork) (collation.PolicySpec, error) {
+	spec := collation.PolicyV2
+	for i, w := range work {
+		s, err := collation.SpecFor(w.PolicyVersion)
+		if err != nil {
+			return spec, err
+		}
+		if i > 0 && s != spec {
+			return spec, fmt.Errorf("worklist mixes seam policies %s and %s", spec.Version, s.Version)
+		}
+		spec = s
+	}
+	return spec, nil
 }
 
 // loadGen1Hours maps every generation-1 joined hour of a recording to its row.
@@ -592,6 +620,9 @@ func registerCollation(ctx context.Context, pool *pgxpool.Pool, store collation.
 		}
 		if err := m.Validate(); err != nil {
 			return s, fmt.Errorf("%s: %w", key, err)
+		}
+		if m.PolicyVersion != collation.PolicyVersion || m.Generation != collation.Generation {
+			return s, fmt.Errorf("%s: only %s manifests are registered", key, collation.PolicyVersion)
 		}
 		if m.HourID != w.HourID || m.SupersedesHourID != w.SupersedesHourID {
 			return s, fmt.Errorf("%s: manifest differs from worklist", key)
