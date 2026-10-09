@@ -54,7 +54,7 @@ func (m *globalDeliveryTestStore) OpenExactRange(_ context.Context, _ string, _ 
 }
 func (m *globalDeliveryTestStore) PresignGetExactDownloadRequest(context.Context, string, string, string, string, time.Duration) (r2.PresignedRequest, error) {
 	m.presigned++
-	return r2.PresignedRequest{URL: "https://test.r2.cloudflarestorage.com/bucket/a%20b.mp4?X-Amz-Expires=300", Method: "GET", Headers: http.Header{"If-Match": {`"etag"`}}}, nil
+	return r2.PresignedRequest{URL: "https://test.r2.cloudflarestorage.com/bucket/a%20b.mp4?X-Amz-Expires=300", Method: "GET", Headers: http.Header{"If-Match": {`"etag"`}, "Host": {"test.r2.cloudflarestorage.com"}}}, nil
 }
 func globalDeliveryTestRequest(method, target, id string, p *accountPrincipal) *http.Request {
 	r := httptest.NewRequest(method, target, nil)
@@ -152,7 +152,7 @@ func TestGlobalDeliveryTicketExpectedSHAAndScopedCapability(t *testing.T) {
 		t.Fatal(out)
 	}
 	headers := out["required_headers"].(map[string]any)
-	if headers["If-Match"] != `"etag"` || headers["Authorization"] != nil {
+	if headers["If-Match"] != `"etag"` || headers["Authorization"] != nil || len(headers) != 1 {
 		t.Fatal(headers)
 	}
 }
