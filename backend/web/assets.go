@@ -2,7 +2,7 @@ package web
 
 import "embed"
 
-//go:embed *.html dashboard.js
+//go:embed *.html dashboard.js global-delivery
 var assets embed.FS
 
 func ReadHTML(name string) ([]byte, error) {
