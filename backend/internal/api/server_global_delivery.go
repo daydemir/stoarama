@@ -112,6 +112,9 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
 	s.globalDeliveryMu.Lock()
 	defer s.globalDeliveryMu.Unlock()
+	if public && generation != "" && s.publicGlobalDeliveryRegistry != nil && s.publicGlobalDeliveryRegistry.Generation == generation {
+		return s.publicGlobalDeliveryRegistry, nil
+	}
 	if public && generation != "" && s.publicPinnedDeliveryRegistry != nil && s.publicPinnedDeliveryRegistry.Generation == generation {
 		return s.publicPinnedDeliveryRegistry, nil
 	}
