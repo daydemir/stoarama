@@ -293,6 +293,7 @@ func (s *Server) router() http.Handler {
 			account.Use(s.confineAccountScope)
 			account.Get("/me", s.handleAccountMe)
 			account.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
+			account.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
 			account.Get("/global-street-scores-delivery/ticket/{fileID}", s.handleGlobalDeliveryTicket)
 			account.Get("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
 			account.Head("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
