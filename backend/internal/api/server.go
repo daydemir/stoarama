@@ -45,6 +45,7 @@ type Server struct {
 	globalDeliveryMu               sync.Mutex
 	globalDeliveryRegistry         *globalDeliveryRegistry
 	globalDeliveryRegistryAt       time.Time
+	publicPinnedDeliveryRegistry   *globalDeliveryRegistry
 	publicGlobalDeliveryRegistry   *globalDeliveryRegistry
 	publicGlobalDeliveryRegistryAt time.Time
 

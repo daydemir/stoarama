@@ -38,6 +38,7 @@ type globalDeliveryObject struct {
 	Verified    bool   `json:"verified"`
 }
 type globalDeliveryRegistry struct {
+	Generation     string                          `json:"generation,omitempty"`
 	PublicDelivery bool                            `json:"public_delivery,omitempty"`
 	SelectionScope string                          `json:"selection_scope,omitempty"`
 	SchemaVersion  int                             `json:"schema_version"`
@@ -104,12 +105,15 @@ func validateGlobalDeliveryRegistry(x *globalDeliveryRegistry) error {
 	return nil
 }
 func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliveryRegistry, error) {
-	return s.loadGlobalDeliveryRegistryScope(ctx, false)
+	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
-func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool) (*globalDeliveryRegistry, error) {
+func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
 	s.globalDeliveryMu.Lock()
 	defer s.globalDeliveryMu.Unlock()
-	if public && s.publicGlobalDeliveryRegistry != nil && time.Since(s.publicGlobalDeliveryRegistryAt) < 15*time.Second {
+	if public && generation != "" && s.publicPinnedDeliveryRegistry != nil && s.publicPinnedDeliveryRegistry.Generation == generation {
+		return s.publicPinnedDeliveryRegistry, nil
+	}
+	if public && generation == "" && s.publicGlobalDeliveryRegistry != nil && time.Since(s.publicGlobalDeliveryRegistryAt) < 15*time.Second {
 		return s.publicGlobalDeliveryRegistry, nil
 	}
 	if !public && s.globalDeliveryRegistry != nil && time.Since(s.globalDeliveryRegistryAt) < 15*time.Second {
@@ -122,6 +126,13 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	key := globalDeliveryPrefix + "latest.json"
 	if public {
 		key = globalDeliveryPrefix + "public/current.json"
+		if generation != "" {
+			decoded, e := hex.DecodeString(generation)
+			if e != nil || len(decoded) != 16 {
+				return nil, errors.New("invalid published generation")
+			}
+			key = globalDeliveryPrefix + "public/generations/" + generation + ".json"
+		}
 	}
 	head, err := store.Head(ctx, key)
 	if err != nil || head.SizeBytes <= 0 || head.SizeBytes > 64<<20 {
@@ -144,7 +155,7 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 		return nil, err
 	}
 	if public {
-		if !result.PublicDelivery || result.SelectionScope != "available" {
+		if !result.PublicDelivery || result.SelectionScope != "available" || (generation != "" && result.Generation != generation) {
 			return nil, errors.New("dataset is not published")
 		}
 		for name := range result.Assets {
@@ -152,8 +163,12 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 				return nil, errors.New("private asset in public dataset")
 			}
 		}
-		s.publicGlobalDeliveryRegistry = &result
-		s.publicGlobalDeliveryRegistryAt = time.Now()
+		if generation != "" {
+			s.publicPinnedDeliveryRegistry = &result
+		} else {
+			s.publicGlobalDeliveryRegistry = &result
+			s.publicGlobalDeliveryRegistryAt = time.Now()
+		}
 	} else {
 		s.globalDeliveryRegistry = &result
 		s.globalDeliveryRegistryAt = time.Now()
@@ -198,7 +213,7 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	if !public && !authorizeGlobalDelivery(w, r) {
 		return
 	}
-	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public)
+	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified dataset metadata is temporarily unavailable. Reload to retry.")
 		return
@@ -221,6 +236,26 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 		util.WriteError(w, http.StatusConflict, "Dataset asset verification failed.")
 		return
 	}
+	if public && (strings.HasPrefix(name, "/api/coverage-delivery/manifest?") || (strings.HasPrefix(name, "/public/manifest/") && strings.HasSuffix(name, ".json"))) {
+		var manifest map[string]any
+		if json.Unmarshal(data, &manifest) != nil {
+			util.WriteError(w, http.StatusConflict, "Manifest payload invalid.")
+			return
+		}
+		manifest["generation"] = registry.Generation
+		if outputs, ok := manifest["outputs"].([]any); ok {
+			for _, entry := range outputs {
+				if output, ok := entry.(map[string]any); ok {
+					output["delivery_generation"] = registry.Generation
+				}
+			}
+		}
+		data, err = json.Marshal(manifest)
+		if err != nil {
+			util.WriteError(w, http.StatusConflict, "Manifest generation unavailable.")
+			return
+		}
+	}
 	w.Header().Set("Content-Type", object.ContentType)
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -232,7 +267,7 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 	if !public && !authorizeGlobalDelivery(w, r) {
 		return globalDeliveryObject{}, false
 	}
-	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public)
+	registry, err := s.loadGlobalDeliveryRegistryScope(r.Context(), public, r.URL.Query().Get("generation"))
 	if err != nil {
 		util.WriteError(w, http.StatusServiceUnavailable, "Verified file registry unavailable.")
 		return globalDeliveryObject{}, false
