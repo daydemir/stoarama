@@ -6,7 +6,7 @@ const add=(s,n)=>new Date(Date.parse(s+'T12:00:00Z')+n*86400000).toISOString().s
 const label=s=>new Intl.DateTimeFormat('en-GB',{timeZone:'UTC',day:'numeric',month:'short'}).format(new Date(s+'T12:00:00Z'));
 const range=(r,w)=>w?label(add(r.start,(w-1)*7))+'–'+label(add(r.start,w*7-1)):label(r.start)+'–'+label(r.end);
 const reviewed=(r,scope)=>(kinds.get(r.id)||'reviewed')==='reviewed';
-const command=(r,scope,w)=>'python3 '+(reviewed(r,scope)?'reviewed_downloader.py --stream '+r.id+' --scope '+scope:'coverage_downloader.py --stream '+r.id+' --scope '+scope)+(w?' --week '+w:'')+' --destination ./stitched --server '+location.origin;
+const command=(r,scope,w)=>'python3 '+(reviewed(r,scope)?'reviewed_downloader.py --stream '+r.id+' --scope '+scope:'coverage_downloader.py --stream '+r.id+' --scope '+scope)+(w?' --week '+w:'')+' --jobs 4 --destination ./stitched --server '+location.origin;
 const script=(r,scope)=>reviewed(r,scope)?'/vid/jaworzno-reviewed-repairs-20261009/reviewed_downloader.py':'/api/coverage-downloads/downloader.py';
 const help=(r,context)=>'<span class="weekly-help"><button type="button" class="weekly-help-toggle" aria-expanded="false" aria-describedby="weekly-help-'+r.id+'-'+context+'">ⓘ Setup</button><span id="weekly-help-'+r.id+'-'+context+'" role="tooltip" hidden>Python 3.9+ only; no extra packages. Download the script, then run the command in Terminal. Choose a destination with room for the GB shown. Rerun to resume; existing files are verified and kept. On Windows, <code>py -3</code> can replace <code>python3</code>.</span></span>';
 function rowMarkup(r,scope,comparison){

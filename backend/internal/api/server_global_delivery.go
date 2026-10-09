@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -147,6 +149,10 @@ func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public boo
 	if err != nil || int64(len(bytes)) != head.SizeBytes {
 		return nil, errors.New("dataset registry length differs")
 	}
+	bytes, err = decodeGlobalDeliveryRegistry(bytes)
+	if err != nil {
+		return nil, err
+	}
 	var result globalDeliveryRegistry
 	if err = json.Unmarshal(bytes, &result); err != nil {
 		return nil, errors.New("dataset registry unreadable")
@@ -285,6 +291,9 @@ func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (glo
 		util.WriteError(w, http.StatusConflict, "Download presentation path differs.")
 		return globalDeliveryObject{}, false
 	}
+	if public && strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/ticket/") {
+		return object, true
+	}
 	head, err := s.globalDeliveryObjectStore().HeadExact(r.Context(), object.Key, object.ETag, object.VersionID)
 	if err != nil || head.SizeBytes != object.SizeBytes {
 		util.WriteError(w, http.StatusConflict, "The recorded R2 file is unavailable or changed.")
@@ -389,4 +398,20 @@ func publicGlobalDeliveryAsset(name string, ids []int64) bool {
 		}
 	}
 	return false
+}
+
+func decodeGlobalDeliveryRegistry(raw []byte) ([]byte, error) {
+	if len(raw) < 2 || raw[0] != 0x1f || raw[1] != 0x8b {
+		return raw, nil
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, errors.New("dataset registry compression invalid")
+	}
+	defer reader.Close()
+	decoded, err := io.ReadAll(io.LimitReader(reader, (64<<20)+1))
+	if err != nil || len(decoded) > 64<<20 {
+		return nil, errors.New("dataset registry decompression failed")
+	}
+	return decoded, nil
 }
