@@ -174,3 +174,17 @@ func TestGlobalDeliveryRangeAndHEADPreserveGeneration(t *testing.T) {
 		t.Fatal("HEAD opened payload")
 	}
 }
+
+func TestGlobalDeliveryApprovedCohortExpansion(t *testing.T) {
+	reg := globalDeliveryTestRegistry()
+	for id := int64(50); id <= 60; id++ {
+		reg.RecordingIDs = append(reg.RecordingIDs, id)
+	}
+	if err := validateGlobalDeliveryRegistry(reg); err != nil {
+		t.Fatal(err)
+	}
+	reg.RecordingIDs = append(reg.RecordingIDs, 61)
+	if err := validateGlobalDeliveryRegistry(reg); err == nil {
+		t.Fatal("outside approved cohort size accepted")
+	}
+}

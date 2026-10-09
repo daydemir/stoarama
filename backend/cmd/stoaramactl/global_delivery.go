@@ -48,7 +48,7 @@ func runGlobalDelivery(ctx context.Context, cfg config.Config, args []string) {
 	var catalog struct {
 		Streams []json.RawMessage `json:"streams"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&catalog); err != nil || len(catalog.Streams) != 49 {
+	if err := json.NewDecoder(response.Body).Decode(&catalog); err != nil || (len(catalog.Streams) < 49 || len(catalog.Streams) > 60) {
 		fmt.Fprintln(os.Stderr, "dataset cohort validation failed")
 		os.Exit(1)
 	}
