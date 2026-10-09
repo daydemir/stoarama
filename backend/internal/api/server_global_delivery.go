@@ -249,6 +249,9 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		manifest["generation"] = registry.Generation
+		if script, ok := registry.Assets["/download-script.py"]; ok {
+			manifest["download_script_sha256"] = script.SHA256
+		}
 		if outputs, ok := manifest["outputs"].([]any); ok {
 			for _, entry := range outputs {
 				if output, ok := entry.(map[string]any); ok {
