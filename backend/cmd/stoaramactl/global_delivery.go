@@ -52,5 +52,5 @@ func runGlobalDelivery(ctx context.Context, cfg config.Config, args []string) {
 		fmt.Fprintln(os.Stderr, "dataset cohort validation failed")
 		os.Exit(1)
 	}
-	fmt.Println(`{"available":true,"stream_count":49,"organization_id":47}`)
+	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"available": true, "stream_count": len(catalog.Streams), "organization_id": 47})
 }

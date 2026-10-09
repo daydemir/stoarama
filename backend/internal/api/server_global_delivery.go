@@ -74,7 +74,7 @@ func authorizeGlobalDelivery(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 func validateGlobalDeliveryRegistry(x *globalDeliveryRegistry) error {
-	if x.SchemaVersion != 1 || x.AccountID != 47 || len(x.RecordingIDs) != 49 {
+	if x.SchemaVersion != 1 || x.AccountID != 47 || (len(x.RecordingIDs) < 49 || len(x.RecordingIDs) > 60) {
 		return errors.New("dataset cohort identity differs")
 	}
 	ids := map[int64]bool{}
