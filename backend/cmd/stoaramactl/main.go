@@ -55,6 +55,8 @@ func main() {
 	case "-h", "--help", "help":
 		usage()
 		return
+	case "global-street-scores-delivery":
+		runGlobalDelivery(ctx, cfg, os.Args[2:])
 	case "migrate":
 		runMigrate(ctx, cfg, os.Args[2:])
 	case "capture":

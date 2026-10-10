@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -148,6 +150,27 @@ func (c *Client) PresignGetExactRequest(ctx context.Context, key, etag, versionI
 	out, err := c.presigner.PresignGetObject(ctx, in, s3.WithPresignExpires(ttl))
 	if err != nil {
 		return PresignedRequest{}, fmt.Errorf("presign exact get %s: %w", key, err)
+	}
+	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
+}
+
+// PresignGetExactDownloadRequest preserves exact-generation If-Match while
+// binding the download presentation name. Range remains unsigned for resume.
+func (c *Client) PresignGetExactDownloadRequest(ctx context.Context, key, etag, versionID, filename string, ttl time.Duration) (PresignedRequest, error) {
+	clean := cleanETag(etag)
+	if clean == "" {
+		return PresignedRequest{}, errors.New("presign exact download: etag is required")
+	}
+	if filename == "" || strings.ContainsAny(filename, "\r\n\\") || path.Base(filename) != filename {
+		return PresignedRequest{}, errors.New("presign exact download: invalid filename")
+	}
+	in := &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + clean + `"`), ResponseContentDisposition: aws.String(mime.FormatMediaType("attachment", map[string]string{"filename": filename}))}
+	if strings.TrimSpace(versionID) != "" {
+		in.VersionId = aws.String(strings.TrimSpace(versionID))
+	}
+	out, err := c.presigner.PresignGetObject(ctx, in, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return PresignedRequest{}, fmt.Errorf("presign exact download: %w", err)
 	}
 	return PresignedRequest{URL: out.URL, Method: out.Method, Headers: out.SignedHeader.Clone()}, nil
 }

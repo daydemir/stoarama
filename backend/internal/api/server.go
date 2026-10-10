@@ -41,6 +41,14 @@ import (
 )
 
 type Server struct {
+	globalDeliveryStore            globalDeliveryObjectStore
+	globalDeliveryMu               sync.Mutex
+	globalDeliveryRegistry         *globalDeliveryRegistry
+	globalDeliveryRegistryAt       time.Time
+	publicPinnedDeliveryRegistry   *globalDeliveryRegistry
+	publicGlobalDeliveryRegistry   *globalDeliveryRegistry
+	publicGlobalDeliveryRegistryAt time.Time
+
 	cfg                      config.Config
 	pool                     *pgxpool.Pool
 	r2                       *r2.Client
@@ -219,6 +227,9 @@ func (s *Server) router() http.Handler {
 	r := chi.NewRouter()
 
 	r.Get("/healthz", s.handleHealth)
+	r.Get("/global-street-scores-delivery", s.handleGlobalDeliveryPage)
+	r.Get("/global-street-scores-delivery/files", s.handleGlobalDeliveryPage)
+	r.Get("/global-street-scores-delivery/static/*", s.handleGlobalDeliveryStatic)
 	r.Get("/static/{asset}", s.handleDashboardStatic)
 	r.Get("/", s.handleStreamsApp)
 	r.Get("/streams", s.handleStreamsApp)
@@ -274,6 +285,11 @@ func (s *Server) router() http.Handler {
 				read.Get("/recordings/{id}/clips/{clipId}/download", s.handleSharedRecordingClipDownload)
 			})
 		})
+		api.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
+		api.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
+		api.Get("/global-street-scores-delivery/ticket/{fileID}", s.handleGlobalDeliveryTicket)
+		api.Get("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
+		api.Head("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
 		api.Post("/auth/request-link", s.handleAccountAuthRequestLink)
 		api.Post("/nodes/enroll", s.handleNodeEnroll)
 		api.Route("/account", func(account chi.Router) {
@@ -284,6 +300,11 @@ func (s *Server) router() http.Handler {
 			// route 403s a pull key.
 			account.Use(s.confineAccountScope)
 			account.Get("/me", s.handleAccountMe)
+			account.Get("/global-street-scores-delivery/asset", s.handleGlobalDeliveryAsset)
+			account.Get("/global-street-scores-delivery/metadata", s.handleGlobalDeliveryAsset)
+			account.Get("/global-street-scores-delivery/ticket/{fileID}", s.handleGlobalDeliveryTicket)
+			account.Get("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
+			account.Head("/global-street-scores-delivery/file/{fileID}", s.handleGlobalDeliveryFile)
 			account.Post("/logout", s.handleAccountLogout)
 			account.Get("/api-keys", s.handleAccountAPIKeysList)
 			account.Post("/api-keys", s.handleAccountAPIKeysCreate)
