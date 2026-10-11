@@ -273,7 +273,18 @@ func (s *Server) handleGlobalDeliveryAsset(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(data)
 }
-func globalDeliveryFileID(r *http.Request) string { return chi.URLParam(r, "fileID") }
+func globalDeliveryFileID(r *http.Request) string {
+	id := chi.URLParam(r, "fileID")
+	// Chi matches RawPath when present; otherwise URL.Path is already decoded.
+	if r.URL.RawPath == "" {
+		return id
+	}
+	id, err := url.PathUnescape(id)
+	if err != nil {
+		return ""
+	}
+	return id
+}
 func (s *Server) globalDeliveryFile(w http.ResponseWriter, r *http.Request) (globalDeliveryObject, bool) {
 	public := strings.HasPrefix(r.URL.Path, publicGlobalDeliveryAPI+"/")
 	if !public && !authorizeGlobalDelivery(w, r) {

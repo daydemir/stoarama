@@ -233,3 +233,33 @@ func TestPublicGlobalDeliveryScopedAnonymousAndPresentation(t *testing.T) {
 		}
 	}
 }
+
+func TestPublicGlobalDeliveryEncodedFileIDThroughRouter(t *testing.T) {
+	reg := globalDeliveryTestRegistry()
+	reg.PublicDelivery = true
+	reg.SelectionScope = "available"
+	file := reg.Files["1"]
+	delete(reg.Files, "1")
+	reg.Files["sha256:"+file.SHA256] = file
+	store := &globalDeliveryTestStore{body: []byte("hello")}
+	s := &Server{globalDeliveryStore: store, publicGlobalDeliveryRegistry: reg, publicGlobalDeliveryRegistryAt: time.Now()}
+	router := chi.NewRouter()
+	router.Get(publicGlobalDeliveryAPI+"/ticket/{fileID}", s.handleGlobalDeliveryTicket)
+	for _, tc := range []struct {
+		id     string
+		status int
+	}{
+		{"sha256:" + file.SHA256, http.StatusOK},
+		{"sha256%3A" + file.SHA256, http.StatusOK},
+		{"sha256%253A" + file.SHA256, http.StatusNotFound},
+		{"sha256%2F" + file.SHA256, http.StatusNotFound},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, publicGlobalDeliveryAPI+"/ticket/"+tc.id+"?sha256="+file.SHA256, nil))
+			if w.Code != tc.status {
+				t.Fatalf("ticket status = %d, want %d", w.Code, tc.status)
+			}
+		})
+	}
+}
