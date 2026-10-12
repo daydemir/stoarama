@@ -102,6 +102,23 @@ func TestGlobalDeliveryRegistryRejectsCohortAndTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobalDeliveryRegistryAcceptsGrowingPublishedMetadata(t *testing.T) {
+	for _, size := range []int64{10_674_456, 64 << 20, (64 << 20) + 1} {
+		x := globalDeliveryTestRegistry()
+		o := x.Assets["/fixture.txt"]
+		o.Key = globalDeliveryPrefix + "assets/growth.json"
+		o.SizeBytes = size
+		x.Assets["/public/growth.json"] = o
+		err := validateGlobalDeliveryRegistry(x)
+		if size <= 64<<20 && err != nil {
+			t.Fatalf("published growth asset with %d bytes rejected: %v", size, err)
+		}
+		if size > 64<<20 && err == nil {
+			t.Fatalf("oversized growth asset with %d bytes accepted", size)
+		}
+	}
+}
 func TestGlobalDeliveryAssetSHAGuardAndExactLookup(t *testing.T) {
 	p := &accountPrincipal{AccountID: 47}
 	m := &globalDeliveryTestStore{body: []byte("hello")}

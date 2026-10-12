@@ -94,8 +94,9 @@ func validateGlobalDeliveryRegistry(x *globalDeliveryRegistry) error {
 		_, err := hex.DecodeString(o.SHA256)
 		return o.Key != "" && len(o.SHA256) == 64 && err == nil && o.SizeBytes > 0 && o.ETag != "" && o.Verified
 	}
+	assetPrefix := globalDeliveryPrefix + "assets/"
 	for name, o := range x.Assets {
-		if !strings.HasPrefix(name, "/") || strings.Contains(name, "..") || !strings.HasPrefix(o.Key, globalDeliveryPrefix+"assets/") || !valid(o) || o.SizeBytes > 10<<20 {
+		if !strings.HasPrefix(name, "/") || strings.Contains(name, "..") || !strings.HasPrefix(o.Key, assetPrefix) || !valid(o) || o.SizeBytes > 64<<20 {
 			return errors.New("invalid dataset asset")
 		}
 	}
