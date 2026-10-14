@@ -22,4 +22,9 @@ for(const invalid of [{status:'pending'},{scope:'file'},{artifact_sha256:'c'.rep
 assert.equal(ui.modelLabel({production_version:'85'}),'V85');
 assert.equal(ui.audioLabel({production_version:'85',temporary_no_audio:true,original_source_audio_present:true,audio_delivery_status:'pending_source_bound_audio_fill'}),'Video only · audio pending');
 assert.equal(ui.modelLabel({production_version:'clock-prestitched'}),'Clock-prestitched');
+const clockAudio={production_version:'clock-prestitched',temporary_no_audio:true,original_source_audio_present:true,audio_delivery_status:'pending_source_bound_audio_fill'};
+assert.equal(ui.audioLabel(clockAudio),'Video only · audio pending');
+for(const unsupported of [{original_source_audio_present:null},{original_source_audio_present:false},{temporary_no_audio:false},{audio_delivery_status:'unknown'},{production_version:'unqualified'}]){
+ assert.equal(ui.audioLabel({...clockAudio,...unsupported}),'','An audio warning requires the exact published pending-audio facts');
+}
 console.log('CLOCK boundary labels: provenance, ordering, deduplication, and negative evidence PASS');
