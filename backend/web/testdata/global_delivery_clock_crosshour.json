@@ -1,0 +1,339 @@
+{
+  "hours": [
+    [
+      [
+        90757,
+        1,
+        120.021,
+        6.0,
+        126.02099990844727,
+        120.021,
+        2,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_01.mp4",
+        1,
+        null
+      ],
+      [
+        90758,
+        2,
+        180.031,
+        126.02099990844727,
+        306.05200004577637,
+        180.031,
+        3,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_02.mp4",
+        1,
+        null
+      ],
+      [
+        90759,
+        3,
+        60.01,
+        306.05200004577637,
+        366.0620000362396,
+        60.01,
+        1,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_03.mp4",
+        1,
+        null
+      ],
+      [
+        90760,
+        4,
+        60.011,
+        366.0620000362396,
+        426.07299995422363,
+        60.011,
+        1,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_04.mp4",
+        1,
+        null
+      ],
+      [
+        90761,
+        5,
+        240.041,
+        426.07299995422363,
+        666.114000082016,
+        240.041,
+        4,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_05.mp4",
+        1,
+        null
+      ],
+      [
+        90762,
+        6,
+        60.011,
+        666.114000082016,
+        726.125,
+        60.011,
+        1,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_06.mp4",
+        1,
+        null
+      ],
+      [
+        90763,
+        7,
+        120.02,
+        726.125,
+        846.1449999809265,
+        120.02,
+        2,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_07.mp4",
+        1,
+        null
+      ],
+      [
+        90764,
+        8,
+        60.011,
+        846.1449999809265,
+        906.1559998989105,
+        60.011,
+        1,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_08.mp4",
+        1,
+        null
+      ],
+      [
+        90765,
+        9,
+        780.136,
+        906.1559998989105,
+        1686.292000055313,
+        780.136,
+        13,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_09.mp4",
+        1,
+        null
+      ],
+      [
+        90766,
+        10,
+        1920.333,
+        1686.292000055313,
+        3606.625,
+        1920.3329999999996,
+        32,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_01_part_10.mp4",
+        1,
+        null
+      ]
+    ],
+    [
+      [
+        90767,
+        1,
+        60.011,
+        6.625,
+        66.63599991798401,
+        60.011,
+        1,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_02_part_01.mp4",
+        1,
+        null
+      ],
+      [
+        90768,
+        2,
+        1800.312,
+        66.63599991798401,
+        1866.9479999542236,
+        1800.3119999999997,
+        30,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_02_part_02.mp4",
+        1,
+        null
+      ],
+      [
+        90769,
+        3,
+        1740.303,
+        1866.9479999542236,
+        3607.2509999275208,
+        1740.3029999999997,
+        29,
+        3,
+        "427_Jaworzno_-_Market_square_2026_August_W4_Sunday_hour_02_part_03.mp4",
+        1,
+        null
+      ]
+    ]
+  ],
+  "assembly": {
+    "sha256": "14016bb9645e9a16d9161e6d2e8acc6d9799bcb082d04db5f0910f80e62a0c3f",
+    "seconds": 7201.251,
+    "input_ids": [
+      90757,
+      90758,
+      90759,
+      90760,
+      90761,
+      90762,
+      90763,
+      90764,
+      90765,
+      90766,
+      90767,
+      90768,
+      90769
+    ],
+    "input_parts": 13,
+    "production_version": "clock-prestitched",
+    "original_source_audio_present": null,
+    "audio_delivery_status": "pending_logical_original_source_audio_qualification_or_fill",
+    "clock_boundary_annotations": [
+      {
+        "Original_independent_decoded_EOF_N_NOT_claimed": true,
+        "Original_internal_seam_PASS_NOT_claimed": true,
+        "actual_physical_source_decoded_EOF_N": [
+          72000,
+          72000
+        ],
+        "artifact_sha256": "14016bb9645e9a16d9161e6d2e8acc6d9799bcb082d04db5f0910f80e62a0c3f",
+        "maximum_relative_fps_error": 0.02040816326530612,
+        "method": "CLOCK_20",
+        "physical_source_input_original_ids": [
+          [
+            90757,
+            90758,
+            90759,
+            90760,
+            90761,
+            90762,
+            90763,
+            90764,
+            90765,
+            90766
+          ],
+          [
+            90767,
+            90768,
+            90769
+          ]
+        ],
+        "scope": "boundary",
+        "source_input_ids": [
+          90766,
+          90767
+        ],
+        "status": "verified",
+        "proof_sha256": "2fa68ed45ecc2c358a42a2c4627a8b3696f6432c991ede404fec1de0d9a61688"
+      }
+    ]
+  },
+  "sameHour419": {
+    "parts": [
+      [
+        72081,
+        28,
+        60.007,
+        2768.494999885559,
+        2828.50200009346,
+        60.007,
+        1,
+        2,
+        "419_Vrchlabi_-_N\u00e1m\u011bst\u00ed_T.G._Masaryka_2026_August_W3_Sunday_hour_12_part_28.mp4",
+        1,
+        null
+      ],
+      [
+        72082,
+        29,
+        60.008,
+        2828.50200009346,
+        2888.5099999904633,
+        60.008,
+        1,
+        2,
+        "419_Vrchlabi_-_N\u00e1m\u011bst\u00ed_T.G._Masaryka_2026_August_W3_Sunday_hour_12_part_29.mp4",
+        1,
+        null
+      ],
+      [
+        72083,
+        30,
+        60.007,
+        2888.5099999904633,
+        2948.5169999599457,
+        60.007,
+        1,
+        2,
+        "419_Vrchlabi_-_N\u00e1m\u011bst\u00ed_T.G._Masaryka_2026_August_W3_Sunday_hour_12_part_30.mp4",
+        1,
+        null
+      ],
+      [
+        72084,
+        31,
+        60.008,
+        2948.5169999599457,
+        3008.5250000953674,
+        60.008,
+        1,
+        2,
+        "419_Vrchlabi_-_N\u00e1m\u011bst\u00ed_T.G._Masaryka_2026_August_W3_Sunday_hour_12_part_31.mp4",
+        1,
+        null
+      ]
+    ],
+    "assembly": {
+      "sha256": "6931604d718a8915100ec5dc8d2a80c892b9a9b016d2e7f3e001ddee8e0519da",
+      "seconds": 240.03,
+      "input_ids": [
+        72081,
+        72082,
+        72083,
+        72084
+      ],
+      "input_parts": 4,
+      "production_version": "clock-prestitched",
+      "original_source_audio_present": null,
+      "audio_delivery_status": "pending_logical_original_source_audio_qualification_or_fill",
+      "clock_boundary_annotations": [
+        {
+          "Original_independent_decoded_EOF_N_NOT_claimed": true,
+          "Original_internal_seam_PASS_NOT_claimed": true,
+          "actual_physical_source_decoded_EOF_N": [
+            3000,
+            3000
+          ],
+          "artifact_sha256": "6931604d718a8915100ec5dc8d2a80c892b9a9b016d2e7f3e001ddee8e0519da",
+          "maximum_relative_fps_error": 0.014198782961460446,
+          "method": "CLOCK_20",
+          "physical_source_input_original_ids": [
+            [
+              72081,
+              72082
+            ],
+            [
+              72083,
+              72084
+            ]
+          ],
+          "scope": "boundary",
+          "source_input_ids": [
+            72082,
+            72083
+          ],
+          "status": "verified",
+          "proof_sha256": "e4b6dcc213986747363a280ef079f916b84ca279cba07e3111e57878e6e579f4"
+        }
+      ]
+    }
+  }
+}

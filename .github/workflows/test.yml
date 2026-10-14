@@ -239,6 +239,8 @@ jobs:
         run: go test ./...
       - name: Test recordings detail browser resilience
         run: node --test web/recordings_resilience_test.mjs
+      - name: Test current source-once delivery projection
+        run: node --test web/global_delivery_current_parts_test.cjs
       - name: Test exact-commit worker artifact workflow
         working-directory: .
         run: python3 backend/scripts/test_worker_artifact_workflow.py
