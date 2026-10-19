@@ -2,6 +2,7 @@
 """Stoarama NAS pull client. Python standard library only."""
 
 import argparse
+import base64
 import concurrent.futures
 import datetime
 import errno
@@ -9,6 +10,7 @@ import fcntl
 import gzip
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -7494,6 +7496,7 @@ def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_work
 
 SPACE_AUDIT_SCHEMA = "nas-space-stat-v1-20261019"
 SPACE_AUDIT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+SPACE_AUDIT_STATE_RESERVE = 256 * 1024 * 1024
 
 
 class SpaceAudit:
@@ -7506,23 +7509,62 @@ class SpaceAudit:
     def __init__(self, cfg):
         self.cfg = cfg
         self.root = cfg.output_dir
-        self.path = cfg.state_dir / (SPACE_AUDIT_SCHEMA + ".sqlite3")
-        self.artifact = cfg.state_dir / (SPACE_AUDIT_SCHEMA + ".jsonl.gz")
+        self.root_fd = self.state_fd = None
+        self.db = None
+        try:
+            self._initialize()
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize(self):
+        for path in (self.root, self.cfg.state_dir):
+            if not stat_module.S_ISDIR(os.lstat(path).st_mode) or not os.path.ismount(str(path)):
+                raise RuntimeError("space audit requires mounted directories")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        self.root_fd = os.open(str(self.root), flags)
+        self.state_fd = os.open(str(self.cfg.state_dir), flags)
+        info, state = os.fstat(self.root_fd), os.fstat(self.state_fd)
+        self.root_identity = (info.st_dev, info.st_ino)
+        self.state_identity = (state.st_dev, state.st_ino)
+        if self.root_identity == self.state_identity:
+            raise RuntimeError("space audit clips and state mounts must differ")
+        self.device = info.st_dev
+        self.check_scope()
+        self.require_state_capacity()
+        identity = "%d:%d" % self.root_identity
+        # A remounted/replaced root starts a new generation, preserving every
+        # prior checkpoint/report instead of declaring the detached root current.
+        generation = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
+        prefix = SPACE_AUDIT_SCHEMA + "-" + generation
+        self.path = self.cfg.state_dir / (prefix + ".sqlite3")
+        self.artifact = self.cfg.state_dir / (prefix + ".jsonl.gz")
+        # SQLite must not be handed a preexisting link to media either.
+        try:
+            self.check_regular_file(self.path.name)
+        except FileNotFoundError:
+            fd = os.open(self.path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.state_fd)
+            os.close(fd)
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                self.check_regular_file(self.path.name + suffix)
+            except FileNotFoundError:
+                pass
         self.db = sqlite3.connect(str(self.path), timeout=30)
+        self.check_scope()
+        self.check_regular_file(self.path.name)
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dirs (path TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS dirs_pending_idx ON dirs(done,path);
             CREATE TABLE IF NOT EXISTS entries (
                 path TEXT PRIMARY KEY, folder TEXT NOT NULL, kind TEXT NOT NULL,
                 category TEXT NOT NULL, size INTEGER NOT NULL, allocated INTEGER NOT NULL,
                 device INTEGER NOT NULL, inode INTEGER NOT NULL, links INTEGER NOT NULL,
                 mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, error TEXT NOT NULL,
                 observed_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS entries_inode_idx ON entries(device,inode,size,allocated) WHERE kind='file';
         """)
-        info = os.lstat(self.root)
-        if not stat_module.S_ISDIR(info.st_mode):
-            raise RuntimeError("space audit clips root must be a real directory")
-        identity = "%d:%d" % (info.st_dev, info.st_ino)
         if self.get("root_identity") not in (None, identity):
             raise RuntimeError("space audit root identity changed; previous report retained")
         if not self.get("audit_id"):
@@ -7530,18 +7572,55 @@ class SpaceAudit:
                                "started_at": utc_now(), "root_identity": identity,
                                "client_version": CLIENT_VERSION}.items():
                 self.set(key, value)
-            self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES ('')")
+            self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(""),))
             self.db.commit()
-        self.root_fd = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        opened = os.fstat(self.root_fd)
-        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-            os.close(self.root_fd)
-            raise RuntimeError("space audit root changed while opening")
-        self.device = info.st_dev
 
     def close(self):
-        os.close(self.root_fd)
-        self.db.close()
+        if self.db is not None:
+            self.db.close()
+            self.db = None
+        for name in ("root_fd", "state_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def check_scope(self):
+        for path, fd, identity in ((self.root, self.root_fd, self.root_identity),
+                                   (self.cfg.state_dir, self.state_fd, self.state_identity)):
+            current, opened = os.lstat(path), os.fstat(fd)
+            if (not stat_module.S_ISDIR(current.st_mode) or not os.path.ismount(str(path))
+                    or (current.st_dev, current.st_ino) != identity
+                    or (opened.st_dev, opened.st_ino) != identity):
+                raise RuntimeError("space audit mount identity changed")
+
+    def require_state_capacity(self):
+        volume = os.fstatvfs(self.state_fd)
+        if volume.f_bavail * (volume.f_frsize or volume.f_bsize) < SPACE_AUDIT_STATE_RESERVE:
+            raise RuntimeError("space audit state-volume reserve reached")
+
+    def check_regular_file(self, name):
+        info = os.stat(name, dir_fd=self.state_fd, follow_symlinks=False)
+        if not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != self.state_identity[0]:
+            raise RuntimeError("space audit metadata path is not a private regular file")
+        return info
+
+    @staticmethod
+    def path_key(path):
+        # SQLite TEXT cannot encode surrogateescape. JSON ASCII is reversible,
+        # including literal backslashes, so descriptor traversal keeps exact bytes.
+        return json.dumps(path, ensure_ascii=True)
+
+    @staticmethod
+    def display_path(path):
+        return path.encode("utf-8", "backslashreplace").decode("utf-8")
+
+    @staticmethod
+    def path_fields(path, key):
+        fields = {key: SpaceAudit.display_path(path)}
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in path):
+            fields[key + "_bytes_b64"] = base64.b64encode(os.fsencode(path)).decode("ascii")
+        return fields
 
     def get(self, key):
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -7575,7 +7654,7 @@ class SpaceAudit:
     def record(self, path, info=None, error=""):
         mode = info.st_mode if info else 0
         kind = "directory" if stat_module.S_ISDIR(mode) else "file" if stat_module.S_ISREG(mode) else "other"
-        values = (path, self.folder(path), kind, self.category(path, mode) if info else "scan_error",
+        values = (self.path_key(path), self.path_key(self.folder(path)), kind, self.category(path, mode) if info else "scan_error",
                   info.st_size if info and kind != "directory" else 0,
                   getattr(info, "st_blocks", 0) * 512 if info else 0,
                   info.st_dev if info else 0, info.st_ino if info else 0,
@@ -7601,14 +7680,16 @@ class SpaceAudit:
         count = 0
         last_report = 0.0
         while not stop_event.is_set():
+            self.check_scope()
             row = self.db.execute("SELECT path FROM dirs WHERE done=0 LIMIT 1").fetchone()
             if not row:
+                self.check_scope()
                 self.set("scan_completed_at", utc_now())
                 self.set("final_summary", json.dumps(self.summary()))
                 self.set("state", "exporting")
                 self.db.commit()
                 return True
-            relative = row[0]
+            relative = json.loads(row[0])
             fd = None
             try:
                 fd = self.open_directory(relative)
@@ -7623,13 +7704,15 @@ class SpaceAudit:
                             self.record(path, info)
                             if stat_module.S_ISDIR(info.st_mode):
                                 if info.st_dev == self.device:
-                                    self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (path,))
+                                    self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(path),))
                                 else:
                                     self.record(path, info, "nested filesystem excluded")
-                        except OSError as exc:
-                            self.record(path, error="stat errno=%s" % exc.errno)
+                        except (OSError, OverflowError, UnicodeError) as exc:
+                            self.record(path, error="stat %s errno=%s" % (type(exc).__name__, getattr(exc, "errno", None)))
                         count += 1
                         if count % 100 == 0:
+                            self.check_scope()
+                            self.require_state_capacity()
                             self.db.commit()
                             # About 2,000 stats/s maximum, below normal network delivery work.
                             if stop_event.wait(0.05):
@@ -7638,10 +7721,10 @@ class SpaceAudit:
                             self.db.commit()
                             progress()
                             last_report = time.monotonic()
-                self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (relative,))
+                self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
             except OSError as exc:
                 self.record(relative or ".", error="scandir errno=%s" % exc.errno)
-                self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (relative,))
+                self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
             finally:
                 if fd is not None:
                     os.close(fd)
@@ -7649,6 +7732,7 @@ class SpaceAudit:
         return False
 
     def summary(self):
+        self.check_scope()
         frozen = self.get("final_summary")
         if frozen:
             return json.loads(frozen)
@@ -7657,13 +7741,15 @@ class SpaceAudit:
                       for r in self.db.execute("SELECT " + columns + " FROM entries GROUP BY category")]
         folders = [dict(zip(("folder", "category", "entries", "logical_bytes", "allocated_bytes_sum"), r))
                    for r in self.db.execute("SELECT folder," + columns + " FROM entries GROUP BY folder,category ORDER BY folder,category LIMIT 2001")]
+        for folder in folders:
+            folder.update(self.path_fields(json.loads(folder["folder"]), "folder"))
         errors = self.db.execute("SELECT count(*) FROM entries WHERE error<>''").fetchone()[0]
         pending = self.db.execute("SELECT count(*) FROM dirs WHERE done=0").fetchone()[0]
         unique = self.db.execute("SELECT coalesce(sum(a),0),coalesce(sum(s),0),count(*) FROM (SELECT max(allocated) a,max(size) s FROM entries WHERE kind='file' GROUP BY device,inode)").fetchone()
         volume = os.statvfs(self.root_fd)
         result = {"schema": SPACE_AUDIT_SCHEMA, "root": str(self.root), "root_identity": self.get("root_identity"),
                 "started_at": self.get("started_at"), "scan_completed_at": self.get("scan_completed_at"),
-                "scope": "All entries under the app clips mount, including hidden files and joined/. No symlinks or nested filesystems followed. Other NAS shares, snapshots and host-only folders are not observable.",
+                "scope": "All entries under the app clips mount, including hidden files and joined/. No symlinks or cross-device directories followed. Other NAS shares, host-only folders and snapshots outside this mount are not observable.",
                 "consistency": "Live non-atomic metadata walk; entries may change after observation. Incomplete directory scans are repeated after restart.",
                 "classification": "Media classification is by location and extension; unstitched media duration is not measured. Allocated blocks are not unique physical extents or guaranteed reclaimable space.",
                 "categories": categories, "folders": folders[:2000], "folders_truncated": len(folders) > 2000,
@@ -7688,32 +7774,103 @@ class SpaceAudit:
             body.update(artifact_sha256=self.get("artifact_sha256"), artifact_size_bytes=int(self.get("artifact_size_bytes")))
         return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
 
+    def report_failure(self, exc):
+        # Report loss of scope/headroom without reading the suspect mount or
+        # presenting a stale frozen success summary as current evidence.
+        body = {"audit_id": self.get("audit_id"), "state": "failed",
+                "client_version": self.get("client_version") or CLIENT_VERSION,
+                "summary": {"schema": SPACE_AUDIT_SCHEMA, "scan_complete": False,
+                            "scope_complete_without_errors": False,
+                            "error_class": type(exc).__name__, "errno": getattr(exc, "errno", None),
+                            "observed_at": utc_now(), "checkpoint_retained": True}}
+        return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
+
     def export(self, stop_event):
         # Only app-owned report metadata is written/read. No media is opened.
-        with gzip.open(self.artifact, "wt", encoding="utf-8") as stream:
-            stream.write(json.dumps({"type": "summary", "audit_id": self.get("audit_id"), "summary": self.summary()}) + "\n")
-            names = [r[1] for r in self.db.execute("PRAGMA table_info(entries)")]
-            for row in self.db.execute("SELECT * FROM entries ORDER BY path"):
-                if stop_event.is_set():
-                    return False
-                stream.write(json.dumps(dict(zip(names, row)), ensure_ascii=True, separators=(",", ":")) + "\n")
-                if stream.tell() > 16 * SPACE_AUDIT_MAX_BYTES:
-                    raise RuntimeError("space audit metadata exceeds report limit")
-        if not 0 < self.artifact.stat().st_size <= SPACE_AUDIT_MAX_BYTES:
-            raise RuntimeError("space audit compressed report exceeds upload limit")
-        digest = hashlib.sha256()
-        with self.artifact.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                if stop_event.is_set():
-                    return False
-                digest.update(block)
-        self.set("artifact_sha256", digest.hexdigest())
-        self.set("artifact_size_bytes", self.artifact.stat().st_size)
+        self.check_scope()
+        self.require_state_capacity()
+        temporary = self.artifact.name + "." + uuid.uuid4().hex + ".tmp"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.state_fd)
+        try:
+            with os.fdopen(fd, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                    with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as stream:
+                        stream.write(json.dumps({"type": "summary", "audit_id": self.get("audit_id"), "summary": self.summary()}) + "\n")
+                        names = [r[1] for r in self.db.execute("PRAGMA table_info(entries)")]
+                        for count, row in enumerate(self.db.execute("SELECT * FROM entries ORDER BY path")):
+                            if stop_event.is_set():
+                                return False
+                            entry = dict(zip(names, row))
+                            for key in ("path", "folder"):
+                                entry.update(self.path_fields(json.loads(entry[key]), key))
+                            stream.write(json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n")
+                            if count % 100 == 0:
+                                self.check_scope()
+                                self.require_state_capacity()
+                                stream.flush()
+                                if raw.tell() > SPACE_AUDIT_MAX_BYTES:
+                                    raise RuntimeError("space audit compressed report exceeds upload limit")
+                # Finish the gzip trailer before making its identity durable.
+                raw.flush()
+                os.fsync(raw.fileno())
+            fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+            with os.fdopen(fd, "rb") as source:
+                size, digest = self.hash_report(source, stop_event)
+            if not 0 < size <= SPACE_AUDIT_MAX_BYTES:
+                raise RuntimeError("space audit compressed report exceeds upload limit")
+            if self.get("artifact_sha256") and (size != int(self.get("artifact_size_bytes")) or digest != self.get("artifact_sha256")):
+                raise RuntimeError("regenerated space audit differs from its frozen declaration")
+            self.check_scope()
+            os.replace(temporary, self.artifact.name, src_dir_fd=self.state_fd, dst_dir_fd=self.state_fd)
+            os.fsync(self.state_fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=self.state_fd)
+            except FileNotFoundError:
+                pass
+        self.set("artifact_sha256", digest)
+        self.set("artifact_size_bytes", size)
         self.set("state", "uploading")
         self.db.commit()
         return True
 
-    def upload(self, target):
+    @staticmethod
+    def hash_report(source, stop_event):
+        size, digest = 0, hashlib.sha256()
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            if stop_event.is_set():
+                raise RuntimeError("space audit metadata hashing stopped")
+            size += len(block)
+            if size > SPACE_AUDIT_MAX_BYTES:
+                raise RuntimeError("space audit metadata exceeds upload limit")
+            digest.update(block)
+        return size, digest.hexdigest()
+
+    def open_verified_artifact(self, stop_event):
+        self.check_scope()
+        # Refuse links before opening. A pinned descriptor is hashed and then
+        # handed directly to PUT; a later pathname swap cannot redirect reads.
+        before = self.check_regular_file(self.artifact.name)
+        fd = os.open(self.artifact.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.state_fd)
+        source = os.fdopen(fd, "rb")
+        try:
+            opened = os.fstat(fd)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) or not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise RuntimeError("space audit artifact identity changed")
+            size, digest = self.hash_report(source, stop_event)
+            after = self.check_regular_file(self.artifact.name)
+            if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                    or size != int(self.get("artifact_size_bytes")) or digest != self.get("artifact_sha256")):
+                raise RuntimeError("space audit artifact size or SHA differs from its declaration")
+            source.seek(0)
+            return source
+        except BaseException:
+            source.close()
+            raise
+
+    def upload(self, target, source):
+        self.check_scope()
         if not isinstance(target, dict):
             raise RuntimeError("space audit upload target missing")
         url = urllib.parse.urlsplit(str(target.get("url", "")))
@@ -7725,13 +7882,12 @@ class SpaceAudit:
         headers["Content-Length"] = self.get("artifact_size_bytes")
         connection = http.client.HTTPSConnection(url.netloc, timeout=60, blocksize=1024 * 1024)
         try:
-            with self.artifact.open("rb") as stream:
-                connection.request("PUT", url.path + "?" + url.query, body=stream, headers=headers)
-                response = connection.getresponse()
-                if response.status not in (200, 201, 204, 412):
-                    raise RuntimeError("space audit upload HTTP %d" % response.status)
-                # 412 is an idempotent create-only retry; the API checks exact HEAD identity.
-                response.read(4096)
+            connection.request("PUT", url.path + "?" + url.query, body=source, headers=headers)
+            response = connection.getresponse()
+            if response.status not in (200, 201, 204, 412):
+                raise RuntimeError("space audit upload HTTP %d" % response.status)
+            # 412 is an idempotent create-only retry; the API checks exact HEAD identity.
+            response.read(4096)
         finally:
             connection.close()
 
@@ -7760,21 +7916,30 @@ def space_audit_loop(cfg, stop_event, reported):
             if audit.get("state") == "exporting" and not audit.export(stop_event):
                 return
             try:
-                target = audit.report("uploading")
-            except Exception as intent_error:
+                source = audit.open_verified_artifact(stop_event)
+            except (OSError, RuntimeError):
+                audit.set("state", "exporting")
+                audit.db.commit()
+                continue
+            try:
+                try:
+                    target = audit.report("uploading")
+                except Exception as intent_error:
                 # Completion may have committed before its HTTP response was
                 # lost. Reconcile that exact declaration instead of downgrading
                 # a completed server row or uploading again indefinitely.
-                try:
-                    audit.report("complete")
-                except Exception:
-                    raise intent_error
+                    try:
+                        audit.report("complete")
+                    except Exception:
+                        raise intent_error
+                    reported.set()
+                    audit.set("state", "complete")
+                    audit.db.commit()
+                    return
                 reported.set()
-                audit.set("state", "complete")
-                audit.db.commit()
-                return
-            reported.set()
-            audit.upload(target.get("upload"))
+                audit.upload(target.get("upload"), source)
+            finally:
+                source.close()
             audit.report("complete")
             audit.set("state", "complete")
             audit.db.commit()
@@ -7783,6 +7948,11 @@ def space_audit_loop(cfg, stop_event, reported):
         except Exception as exc:
             # Never log presigned URLs, request headers or authentication data.
             log("WARN", "space audit deferred (%s); checkpoint retained" % type(exc).__name__)
+            if audit is not None:
+                try:
+                    audit.report_failure(exc)
+                except Exception:
+                    pass
         finally:
             if audit is not None:
                 audit.close()

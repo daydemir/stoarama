@@ -1,12 +1,20 @@
 The NAS space audit scans all entries visible under the app's clips mount,
 including hidden files and joined/. It never opens media payloads, deletes media,
-moves media, follows symlinks, or crosses nested filesystems. Other shares,
+moves media, follows symlinks, or crosses filesystem devices. Other shares,
 host-only folders, snapshots and recycle bins outside this mount are unobservable.
 
 The one-shot `nas-space-stat-v1-20261019` audit starts after the client update,
 resumes from a separate SQLite checkpoint under the app state directory, and
-reports progress about once per minute. Its rate is capped near 2,000 stats/s.
+reports progress about once per minute. Mounted root/state identities are checked
+before scanning and before sealing/reporting; a changed root gets a new audit
+generation while prior checkpoints remain intact. Its rate is capped near 2,000 stats/s.
 The app state directory also holds its compressed per-entry metadata report.
+Export uses an exclusive temporary file and atomic replacement, so preexisting
+report symlinks/hardlinks cannot redirect writes into media. Deterministic gzip
+bytes are fsynced before the report identity is committed; missing/corrupted
+reports are regenerated and verified before upload. Upload reads the same pinned
+descriptor that was size/SHA checked. A 256 MiB state-volume reserve protects
+control metadata; audit errors are reported without claiming completeness.
 This is a live, non-atomic observation; per-entry times, scan errors/exclusions,
 and the total observation window must accompany any cleanup decision.
 
@@ -29,3 +37,9 @@ Join its per-file paths and lengths against current R2 listings/HEAD responses;
 keep unknown mappings, mismatches and scope gaps explicit. Existing raw inventory
 and stitched acknowledgements provide expected keys, not current existence proof.
 No cleanup is enabled by this update.
+
+SQLite path keys use reversible ASCII JSON strings. Report paths with invalid
+UTF-8 filesystem bytes are displayed with escaped surrogate bytes and carry
+`path_bytes_b64` (and `folder_bytes_b64` when needed) as their lossless identity.
+Normal paths remain UTF-8 strings. Never use an escaped display path alone as a
+delete target. No deletion is authorized or implemented by this audit.

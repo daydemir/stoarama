@@ -4084,6 +4084,196 @@ class NASBenchmarkTests(unittest.TestCase):
 
 
 class SpaceAuditTests(unittest.TestCase):
+    def setUp(self):
+        # Test fixtures are ordinary temporary directories; production requires
+        # actual mounts. Individual mount-failure tests override this explicitly.
+        patcher = mock.patch.object(pull.os.path, "ismount", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_export_replaces_symlinks_and_hardlinks_without_changing_media(self):
+        for link in ("symlink", "hardlink"):
+            with self.subTest(link=link), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+                cfg.output_dir.mkdir()
+                cfg.state_dir.mkdir()
+                media = cfg.output_dir / "victim.mp4"
+                media.write_bytes(b"ORIGINAL MEDIA PAYLOAD")
+                audit = pull.SpaceAudit(cfg)
+                try:
+                    audit.scan(threading.Event(), lambda: None)
+                    if link == "symlink":
+                        audit.artifact.symlink_to(media)
+                    else:
+                        os.link(media, audit.artifact)
+                    self.assertTrue(audit.export(threading.Event()))
+                    first = audit.artifact.read_bytes()
+                    with mock.patch.object(pull.time, "time", return_value=123456):
+                        self.assertTrue(audit.export(threading.Event()))
+                    self.assertEqual(first, audit.artifact.read_bytes())
+                    self.assertEqual(first[4:8], b"\x00" * 4)
+                    self.assertFalse(audit.artifact.is_symlink())
+                    self.assertEqual(audit.artifact.stat().st_nlink, 1)
+                    self.assertEqual(media.read_bytes(), b"ORIGINAL MEDIA PAYLOAD")
+                finally:
+                    audit.close()
+
+    def test_corrupt_or_missing_export_is_regenerated_before_upload(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+                cfg.output_dir.mkdir()
+                cfg.state_dir.mkdir()
+                (cfg.output_dir / "clip.mp4").write_bytes(b"unchanged media")
+                audit = pull.SpaceAudit(cfg)
+                try:
+                    audit.scan(threading.Event(), lambda: None)
+                    audit.export(threading.Event())
+                    expected = audit.artifact.read_bytes()
+                    if missing:
+                        audit.artifact.unlink()
+                    else:
+                        audit.artifact.write_bytes(b"power-loss truncation")
+                finally:
+                    audit.close()
+                def request(_cfg, _method, _path, body, timeout):
+                    self.assertEqual(body["artifact_sha256"], hashlib.sha256(expected).hexdigest())
+                    return {"ok": True, "upload": {}}
+                def upload(_audit, _target, source):
+                    self.assertEqual(source.read(), expected)
+                stop = mock.Mock()
+                stop.wait.return_value = False
+                stop.is_set.return_value = False
+                with mock.patch.object(pull, "request_json", side_effect=request) as api, mock.patch.object(pull.SpaceAudit, "upload", autospec=True, side_effect=upload) as put:
+                    pull.space_audit_loop(cfg, stop, threading.Event())
+                    self.assertEqual([c.kwargs["body"]["state"] for c in api.call_args_list], ["uploading", "complete"])
+                    self.assertEqual(put.call_count, 1)
+                audit = pull.SpaceAudit(cfg)
+                try:
+                    self.assertEqual(audit.get("state"), "complete")
+                finally:
+                    audit.close()
+
+    def test_upload_uses_verified_descriptor_after_report_path_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            media = cfg.output_dir / "victim.mp4"
+            media.write_bytes(b"DO NOT READ OR MODIFY THIS MEDIA")
+            audit = pull.SpaceAudit(cfg)
+            try:
+                audit.scan(threading.Event(), lambda: None)
+                audit.export(threading.Event())
+                expected = audit.artifact.read_bytes()
+                with audit.open_verified_artifact(threading.Event()) as source:
+                    audit.artifact.unlink()
+                    audit.artifact.symlink_to(media)
+                    connection = mock.Mock()
+                    connection.getresponse.return_value.status = 200
+                    def request(_method, _path, body, headers):
+                        self.assertEqual(body.read(), expected)
+                    connection.request.side_effect = request
+                    with mock.patch.object(pull.http.client, "HTTPSConnection", return_value=connection):
+                        audit.upload({"url": "https://fixture.r2.cloudflarestorage.com/report?sig=fixture", "method": "PUT", "size_bytes": len(expected)}, source)
+                self.assertEqual(media.read_bytes(), b"DO NOT READ OR MODIFY THIS MEDIA")
+            finally:
+                audit.close()
+
+    def test_unmounted_and_replaced_roots_cannot_report_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            with mock.patch.object(pull.os.path, "ismount", return_value=False):
+                with self.assertRaises(RuntimeError):
+                    pull.SpaceAudit(cfg)
+            self.assertEqual(list(cfg.state_dir.iterdir()), [])
+            audit = pull.SpaceAudit(cfg)
+            old_id, old_path = audit.get("audit_id"), audit.path
+            try:
+                cfg.output_dir.rename(base / "detached")
+                cfg.output_dir.mkdir()
+                (cfg.output_dir / "missed.mp4").write_bytes(b"new root")
+                with self.assertRaises(RuntimeError):
+                    audit.scan(threading.Event(), lambda: None)
+                self.assertIsNone(audit.get("scan_completed_at"))
+                with mock.patch.object(pull, "request_json") as api:
+                    with self.assertRaises(RuntimeError):
+                        audit.report("complete")
+                    api.assert_not_called()
+            finally:
+                audit.close()
+            audit = pull.SpaceAudit(cfg)
+            try:
+                self.assertNotEqual(audit.get("audit_id"), old_id)
+                self.assertNotEqual(audit.path, old_path)
+                self.assertTrue(old_path.exists())
+                self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                self.assertEqual(audit.summary()["categories"][0]["entries"], 1)
+            finally:
+                audit.close()
+
+    def test_byte_filenames_are_lossless_and_do_not_stall_or_break_json(self):
+        import base64
+        import gzip
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            files = [cfg.output_dir / "fixture1", cfg.output_dir / "fixture2"]
+            for file in files:
+                file.write_bytes(b"data")
+            names = ["bad-\udcff.mp4", "bad-\\udcff.mp4"]
+            entries = [SimpleNamespace(name=name, stat=lambda follow_symlinks, f=file: f.stat()) for name, file in zip(names, files)]
+            scan = mock.MagicMock()
+            scan.__enter__.return_value = iter(entries)
+            audit = pull.SpaceAudit(cfg)
+            try:
+                with mock.patch.object(pull.os, "scandir", return_value=scan):
+                    self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                stored = [json.loads(r[0]) for r in audit.db.execute("SELECT path FROM entries")]
+                self.assertEqual(set(stored), set(names))
+                summary = audit.summary()
+                json.dumps(summary, ensure_ascii=False).encode("utf-8")
+                self.assertTrue(summary["scope_complete_without_errors"])
+                self.assertTrue(audit.export(threading.Event()))
+                with gzip.open(audit.artifact, "rt") as stream:
+                    report = [json.loads(line) for line in stream][1:]
+                encoded = [r for r in report if "path_bytes_b64" in r]
+                self.assertEqual(len(encoded), 1)
+                self.assertEqual(base64.b64decode(encoded[0]["path_bytes_b64"]), b"bad-\xff.mp4")
+                for row in report:
+                    json.dumps(row, ensure_ascii=False).encode("utf-8")
+            finally:
+                audit.close()
+
+    def test_state_reserve_and_database_links_fail_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            with mock.patch.object(pull.os, "fstatvfs", return_value=SimpleNamespace(f_bavail=0, f_frsize=4096, f_bsize=4096)):
+                with self.assertRaises(RuntimeError):
+                    pull.SpaceAudit(cfg)
+            self.assertEqual(list(cfg.state_dir.iterdir()), [])
+            audit = pull.SpaceAudit(cfg)
+            path = audit.path
+            audit.close()
+            path.unlink()
+            media = cfg.output_dir / "victim.mp4"
+            media.write_bytes(b"media kept")
+            path.symlink_to(media)
+            with self.assertRaises(RuntimeError):
+                pull.SpaceAudit(cfg)
+            self.assertEqual(media.read_bytes(), b"media kept")
+
     def test_lost_completion_ack_reconciles_without_reuploading(self):
         fake = mock.Mock()
         fake.get.return_value = "uploading"
