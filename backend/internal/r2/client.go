@@ -47,9 +47,10 @@ type Config struct {
 }
 
 type ObjectHead struct {
-	ETag      string
-	SizeBytes int64
-	VersionID string
+	SHA256Metadata string
+	ETag           string
+	SizeBytes      int64
+	VersionID      string
 }
 
 type ObjectInfo struct {
@@ -198,6 +199,16 @@ func (c *Client) PresignHeadExactRequest(ctx context.Context, key, etag, version
 // PresignPutCreateOnlyRequest permits one exact immutable object creation. The
 // key, media type, length, checksum, and no-overwrite precondition are signed.
 func (c *Client) PresignPutCreateOnlyRequest(ctx context.Context, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration) (PresignedRequest, error) {
+	return c.presignPutCreateOnly(ctx, key, contentType, sizeBytes, sha256Hex, ttl, false)
+}
+
+// PresignPutCreateOnlyMetadataRequest also signs the uploader-declared SHA metadata.
+// HEAD can corroborate that declaration, but cannot freshly hash the payload.
+func (c *Client) PresignPutCreateOnlyMetadataRequest(ctx context.Context, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration) (PresignedRequest, error) {
+	return c.presignPutCreateOnly(ctx, key, contentType, sizeBytes, sha256Hex, ttl, true)
+}
+
+func (c *Client) presignPutCreateOnly(ctx context.Context, key, contentType string, sizeBytes int64, sha256Hex string, ttl time.Duration, metadata bool) (PresignedRequest, error) {
 	if sizeBytes <= 0 {
 		return PresignedRequest{}, errors.New("presign create-only put: size must be positive")
 	}
@@ -212,6 +223,9 @@ func (c *Client) PresignPutCreateOnlyRequest(ctx context.Context, key, contentTy
 		ContentType:    aws.String(contentType),
 		ChecksumSHA256: aws.String(base64.StdEncoding.EncodeToString(digest)),
 		IfNoneMatch:    aws.String("*"),
+	}
+	if metadata {
+		in.Metadata = map[string]string{"sha256": strings.ToLower(strings.TrimSpace(sha256Hex))}
 	}
 	out, err := c.presigner.PresignPutObject(ctx, in, s3.WithPresignExpires(ttl))
 	if err != nil {
@@ -408,7 +422,7 @@ func (c *Client) Head(ctx context.Context, key string) (ObjectHead, error) {
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId))}, nil
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
 }
 
 // HeadExact resolves one immutable generation and refuses a changed ETag.
@@ -425,7 +439,7 @@ func (c *Client) HeadExact(ctx context.Context, key, etag, versionID string) (Ob
 	if err != nil {
 		return ObjectHead{}, fmt.Errorf("head exact object %s: %w", key, err)
 	}
-	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId))}, nil
+	return ObjectHead{ETag: cleanETag(aws.ToString(out.ETag)), SizeBytes: aws.ToInt64(out.ContentLength), VersionID: strings.TrimSpace(aws.ToString(out.VersionId)), SHA256Metadata: strings.TrimSpace(out.Metadata["sha256"])}, nil
 }
 
 // OpenExact returns the exact object generation observed by Head. If the store

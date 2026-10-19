@@ -4083,5 +4083,142 @@ class NASBenchmarkTests(unittest.TestCase):
         self.assertGreaterEqual(measured["cpu_s"], 0)
 
 
+class SpaceAuditTests(unittest.TestCase):
+    def test_lost_completion_ack_reconciles_without_reuploading(self):
+        fake = mock.Mock()
+        fake.get.return_value = "uploading"
+        fake.report.side_effect = [RuntimeError("completed row refuses downgrade"), {"ok": True}]
+        stop = mock.Mock()
+        stop.wait.return_value = False
+        stop.is_set.return_value = False
+        reported = threading.Event()
+        with mock.patch.object(pull, "SpaceAudit", return_value=fake):
+            pull.space_audit_loop(SimpleNamespace(), stop, reported)
+        self.assertEqual(fake.report.call_args_list, [mock.call("uploading"), mock.call("complete")])
+        fake.upload.assert_not_called()
+        fake.set.assert_called_once_with("state", "complete")
+        fake.close.assert_called_once()
+        self.assertTrue(reported.is_set())
+
+    def test_capacity_blocked_update_requires_mount_heartbeat_and_live_audit(self):
+        for mounted, heartbeat, reported, capacity in ((False, True, True, True), (True, False, True, True), (True, True, False, True), (True, True, True, False), (True, True, True, True)):
+            with self.subTest(mounted=mounted, heartbeat=heartbeat, reported=reported, capacity=capacity):
+                event = threading.Event()
+                if reported:
+                    event.set()
+                runtime = SimpleNamespace(is_capacity_blocked=lambda: capacity, heartbeat_succeeded=heartbeat, stable_marked=False)
+                with mock.patch.object(pull, "promote_candidate") as promote, mock.patch.object(pull, "mark_runtime") as mark:
+                    success = pull.mark_capacity_blocked_audit_healthy(SimpleNamespace(is_candidate=True), runtime, mounted, event)
+                    self.assertEqual(success, mounted and heartbeat and reported and capacity)
+                    self.assertEqual(runtime.stable_marked, success)
+                    self.assertEqual(promote.called, success)
+                    self.assertEqual(mark.called, success)
+                    if success:
+                        self.assertFalse(pull.mark_capacity_blocked_audit_healthy(SimpleNamespace(is_candidate=True), runtime, mounted, event))
+                        self.assertEqual(promote.call_count, 1)
+
+    def test_readonly_walk_and_export_include_hidden_joined_and_hardlinks(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            raw = cfg.output_dir / "stream/August/raw.mp4"
+            raw.parent.mkdir(parents=True)
+            raw.write_bytes(b"rawdata")
+            os.link(raw, raw.with_name("hardlink.mp4"))
+            joined = cfg.output_dir / "joined/stream/August/stitched.mp4"
+            joined.parent.mkdir(parents=True)
+            joined.write_bytes(b"joineddata")
+            (cfg.output_dir / ".hidden").write_bytes(b"hidden")
+            outside = base / "outside.mp4"
+            outside.write_bytes(b"must not traverse")
+            (cfg.output_dir / "external-link").symlink_to(outside)
+            (cfg.output_dir / "linked-directory").symlink_to(base, target_is_directory=True)
+            audit = pull.SpaceAudit(cfg)
+            try:
+                with mock.patch.object(Path, "open", side_effect=AssertionError("scanner opened payload")):
+                    self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                summary = audit.summary()
+                categories = {r["category"]: r for r in summary["categories"]}
+                self.assertEqual(categories["unstitched_media"]["logical_bytes"], 14)
+                self.assertEqual(categories["stitched_media"]["logical_bytes"], 10)
+                self.assertEqual(categories["symlink_not_followed"]["entries"], 2)
+                self.assertEqual(summary["unique_inode_logical_bytes"], 23)
+                self.assertTrue(summary["scope_complete_without_errors"])
+                self.assertTrue(audit.export(threading.Event()))
+                with gzip.open(audit.artifact, "rt") as f:
+                    report = [json.loads(line) for line in f]
+                self.assertEqual(report[0]["summary"], summary)
+                paths = {r["path"] for r in report[1:]}
+                self.assertIn(".hidden", paths)
+                self.assertIn("joined/stream/August/stitched.mp4", paths)
+                self.assertFalse(any(p.startswith("linked-directory/") for p in paths))
+                with mock.patch.object(pull, "request_json", return_value={"ok": True}) as request:
+                    audit.report("complete")
+                    first = request.call_args.kwargs["body"]
+            finally:
+                audit.close()
+            audit = pull.SpaceAudit(cfg)
+            try:
+                with mock.patch.object(pull, "CLIENT_VERSION", "upgraded"), mock.patch.object(pull, "request_json", return_value={"ok": True}) as request:
+                    audit.report("complete")
+                    self.assertEqual(request.call_args.kwargs["body"], first)
+            finally:
+                audit.close()
+            self.assertEqual(raw.read_bytes(), b"rawdata")
+            self.assertEqual(outside.read_bytes(), b"must not traverse")
+
+    def test_resume_and_unreadable_directory_are_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(output_dir=Path(tmp) / "clips", state_dir=Path(tmp) / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            (cfg.output_dir / "unreadable").mkdir()
+            (cfg.output_dir / "clip.mp4").write_bytes(b"x")
+            audit = pull.SpaceAudit(cfg)
+            stopped = threading.Event()
+            stopped.set()
+            try:
+                self.assertFalse(audit.scan(stopped, lambda: None))
+                self.assertFalse(audit.summary()["scan_complete"])
+                audit_id = audit.get("audit_id")
+            finally:
+                audit.close()
+            audit = pull.SpaceAudit(cfg)
+            original = audit.open_directory
+            def deny(relative):
+                if relative == "unreadable":
+                    raise PermissionError(13, "denied")
+                return original(relative)
+            try:
+                self.assertEqual(audit.get("audit_id"), audit_id)
+                with mock.patch.object(audit, "open_directory", side_effect=deny):
+                    self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                self.assertTrue(audit.summary()["scan_complete"])
+                self.assertFalse(audit.summary()["scope_complete_without_errors"])
+                self.assertEqual(audit.summary()["errors_or_exclusions"], 1)
+            finally:
+                audit.close()
+
+    def test_queued_directory_replaced_by_link_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "secret.mp4").write_bytes(b"private")
+            (cfg.output_dir / "swapped").symlink_to(outside, target_is_directory=True)
+            audit = pull.SpaceAudit(cfg)
+            try:
+                with self.assertRaises(OSError):
+                    audit.open_directory("swapped")
+            finally:
+                audit.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -109,6 +109,8 @@ func main() {
 		runRecordings(ctx, cfg, os.Args[2:])
 	case "nas-inventory":
 		runNASInventory(ctx, cfg, os.Args[2:])
+	case "nas-space-audit":
+		runNASSpaceAudit(ctx, cfg, os.Args[2:])
 	case "nas-upload-probe":
 		runNASUploadProbe(ctx, cfg, os.Args[2:])
 	case "nas-collated-delivery":
@@ -236,6 +238,7 @@ func usage() {
 	  stoaramactl recordings quality-grades report [--days 30 --json --backend-api-url URL --api-token TOKEN]
 	  stoaramactl recordings campaign-tracks report [--backend-api-url URL --api-token TOKEN]
 	  stoaramactl nas-inventory report --connection-id ID [--limit 50 --json]
+	  stoaramactl nas-space-audit report --connection-id ID [--limit 5 --json --download PATH]
 	  stoaramactl nas-upload-probe report --connection-id ID [--limit 20 --json]
 	  stoaramactl nas-benchmark report --connection-id ID [--limit 5 --json]
 	  stoaramactl nas-benchmark request --connection-id ID [--recording-id ID --window-start RFC3339]

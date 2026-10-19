@@ -330,3 +330,35 @@ func TestDeleteObjectsEachReportsPerKeyFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestNASSpaceAuditMetadataPresignAndHead(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("unexpected payload read %s", r.Method)
+		}
+		w.Header().Set("Content-Length", "1234")
+		w.Header().Set("X-Amz-Meta-Sha256", sha)
+	}))
+	defer fake.Close()
+	client, err := New(context.Background(), Config{AccessKey: "key", SecretKey: "secret", Region: "auto", Bucket: "bucket", Endpoint: fake.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap, err := client.PresignPutCreateOnlyMetadataRequest(context.Background(), "nas-space-audits/13/a/"+sha+".jsonl.gz", "application/gzip", 1234, sha, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := mustURL(t, cap.URL)
+	if cap.Method != "PUT" || cap.Headers.Get("If-None-Match") != "*" || cap.Headers.Get("X-Amz-Meta-Sha256") != sha || !strings.Contains(u.Query().Get("X-Amz-SignedHeaders"), "x-amz-meta-sha256") || u.Query().Get("X-Amz-Expires") != "1800" {
+		t.Fatalf("unbound metadata capability: %v %v", cap.Headers, u.Query())
+	}
+	old, err := client.PresignPutCreateOnlyRequest(context.Background(), "other", "application/gzip", 1234, sha, time.Minute)
+	if err != nil || old.Headers.Get("X-Amz-Meta-Sha256") != "" {
+		t.Fatal("existing caller behavior changed")
+	}
+	head, err := client.Head(context.Background(), "audit")
+	if err != nil || head.SizeBytes != 1234 || head.SHA256Metadata != sha {
+		t.Fatalf("head=%+v err=%v", head, err)
+	}
+}
