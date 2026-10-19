@@ -151,13 +151,13 @@ func downloadNASSpaceAuditArtifact(ctx context.Context, rawURL, target string, r
 	if err != nil {
 		return fmt.Errorf("create audit download: %w", err)
 	}
-	complete := false
-	defer func() {
-		f.Close()
-		if !complete {
-			os.Remove(target)
-		}
-	}()
+	// Keep failed/partial output: its pathname may have been replaced by an
+	// unrelated file while the request was in flight. Never unlink by that name.
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect audit output: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return fmt.Errorf("create audit artifact request failed")
@@ -190,7 +190,10 @@ func downloadNASSpaceAuditArtifact(ctx context.Context, rawURL, target string, r
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close audit artifact: %w", err)
 	}
-	complete = true
+	current, err := os.Lstat(target)
+	if err != nil || !os.SameFile(opened, current) {
+		return fmt.Errorf("audit output path changed during download; output paths preserved")
+	}
 	return nil
 }
 

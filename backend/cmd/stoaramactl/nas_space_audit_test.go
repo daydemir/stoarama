@@ -101,7 +101,43 @@ func TestNASSpaceAuditDownloadVerifiesAndNeverOverwrites(t *testing.T) {
 	if err := downloadNASSpaceAuditArtifact(context.Background(), server.URL, bad, row); err == nil {
 		t.Fatal("accepted wrong digest")
 	}
-	if _, err := os.Stat(bad); !os.IsNotExist(err) {
-		t.Fatal("failed download left file")
+	if info, err := os.Stat(bad); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("failed download must retain its private output")
+	}
+}
+
+func TestNASSpaceAuditDownloadPreservesConcurrentReplacement(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusOK} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			data := []byte("compressed metadata fixture")
+			row := spaceAuditArtifact(data)
+			target := filepath.Join(t.TempDir(), "audit.jsonl.gz")
+			moved := target + ".moved"
+			sentinel := []byte("UNRELATED MEDIA MUST SURVIVE")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := os.Rename(target, moved); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				if err := os.WriteFile(target, sentinel, 0600); err != nil {
+					t.Error(err)
+				}
+				w.WriteHeader(status)
+				if status == http.StatusOK {
+					w.Write(data)
+				}
+			}))
+			defer server.Close()
+			if err := downloadNASSpaceAuditArtifact(context.Background(), server.URL, target, row); err == nil {
+				t.Fatal("accepted replaced output as a verified download")
+			}
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, sentinel) {
+				t.Fatalf("unrelated replacement changed or deleted: %q %v", got, err)
+			}
+			if _, err := os.Stat(moved); err != nil {
+				t.Fatalf("original output path was removed: %v", err)
+			}
+		})
 	}
 }

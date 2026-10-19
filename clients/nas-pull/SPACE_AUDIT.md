@@ -37,6 +37,11 @@ hash. The report command downloads the report with an independent size/SHA check
     stoaramactl nas-space-audit report --connection-id 13 --json
     stoaramactl nas-space-audit report --connection-id 13 --download /new/path/report.jsonl.gz
 
+The CLI creates a private output file exclusively and verifies its size/SHA and
+path identity before success. A failed download leaves its partial output in place;
+retry with a new destination. Failure cleanup never removes output paths that may
+have been replaced concurrently.
+
 An uploaded report is not a statement that every NAS file has an R2 media copy.
 Join its per-file paths and lengths against current R2 listings/HEAD responses;
 keep unknown mappings, mismatches and scope gaps explicit. Existing raw inventory
