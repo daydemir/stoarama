@@ -4091,6 +4091,106 @@ class SpaceAuditTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_checkpoint_is_scoped_to_authenticated_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state",
+                                  api_base="https://first.test/api", api_key="test-first")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            audit = pull.SpaceAudit(cfg)
+            original_id, original_path = audit.get("audit_id"), audit.path
+            audit.set("state", "complete")
+            audit.db.commit()
+            audit.close()
+            for origin, key in (("https://second.test/api", "test-first"),
+                                ("https://first.test/api", "test-second")):
+                cfg.api_base, cfg.api_key = origin, key
+                audit = pull.SpaceAudit(cfg)
+                try:
+                    self.assertNotEqual(audit.get("audit_id"), original_id)
+                    self.assertEqual(audit.get("state"), "scanning")
+                    self.assertNotEqual(audit.path, original_path)
+                finally:
+                    audit.close()
+            cfg.api_base, cfg.api_key = "https://first.test/api", "test-first"
+            audit = pull.SpaceAudit(cfg)
+            try:
+                self.assertEqual(audit.get("audit_id"), original_id)
+                self.assertEqual(audit.get("state"), "complete")
+            finally:
+                audit.close()
+
+    def test_crashed_exports_reclaim_only_registered_private_temporary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            (cfg.output_dir / "clip.mp4").write_bytes(b"original media")
+            audit = pull.SpaceAudit(cfg)
+            audit.scan(threading.Event(), lambda: None)
+            artifact = audit.artifact
+            audit.close()
+            unrelated = cfg.state_dir / (artifact.name + "." + "a" * 32 + ".tmp")
+            unrelated.write_bytes(b"unregistered user file")
+            script = """
+import importlib.util, os, sys, threading
+from pathlib import Path
+from types import SimpleNamespace
+spec = importlib.util.spec_from_file_location('pull', sys.argv[1])
+pull = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pull)
+pull.os.path.ismount = lambda path: True
+audit = pull.SpaceAudit(SimpleNamespace(output_dir=Path(sys.argv[2]), state_dir=Path(sys.argv[3])))
+pull.SpaceAudit.hash_report = staticmethod(lambda *args: os._exit(73))
+audit.export(threading.Event())
+"""
+            for _ in range(3):
+                child = subprocess.run([os.sys.executable, "-B", "-c", script, str(MODULE_PATH),
+                                        str(cfg.output_dir), str(cfg.state_dir)], timeout=20)
+                self.assertEqual(child.returncode, 73)
+                self.assertEqual(len(list(cfg.state_dir.glob("*.tmp"))), 2)
+            audit = pull.SpaceAudit(cfg)
+            try:
+                self.assertIsNone(audit.get("export_temporary"))
+                self.assertTrue(audit.export(threading.Event()))
+                self.assertEqual(list(cfg.state_dir.glob("*.tmp")), [unrelated])
+                self.assertEqual(unrelated.read_bytes(), b"unregistered user file")
+                self.assertEqual((cfg.output_dir / "clip.mp4").read_bytes(), b"original media")
+            finally:
+                audit.close()
+
+    def test_temporary_recovery_preserves_replaced_paths_and_link_targets(self):
+        for replacement in ("symlink", "hardlink", "different_inode"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+                cfg.output_dir.mkdir()
+                cfg.state_dir.mkdir()
+                media = cfg.output_dir / "victim.mp4"
+                media.write_bytes(b"original media")
+                audit = pull.SpaceAudit(cfg)
+                name = audit.artifact.name + "." + "b" * 32 + ".tmp"
+                temporary = cfg.state_dir / name
+                temporary.write_bytes(b"owned temporary")
+                info = temporary.stat()
+                audit.set("export_temporary", json.dumps({"name": name, "device": info.st_dev, "inode": info.st_ino}))
+                audit.db.commit()
+                # Retain the registered inode, preventing filesystem inode reuse.
+                temporary.rename(cfg.state_dir / "retained-owned-inode")
+                if replacement == "symlink":
+                    temporary.symlink_to(media)
+                elif replacement == "hardlink":
+                    os.link(media, temporary)
+                else:
+                    temporary.write_bytes(b"unrelated replacement")
+                audit.close()
+                with self.assertRaises(RuntimeError):
+                    pull.SpaceAudit(cfg)
+                self.assertTrue(temporary.exists())
+                self.assertEqual(media.read_bytes(), b"original media")
+
     def test_export_replaces_symlinks_and_hardlinks_without_changing_media(self):
         for link in ("symlink", "hardlink"):
             with self.subTest(link=link), tempfile.TemporaryDirectory() as tmp:

@@ -8,6 +8,8 @@ resumes from a separate SQLite checkpoint under the app state directory, and
 reports progress about once per minute. Mounted root/state identities are checked
 before scanning and before sealing/reporting; a changed root gets a new audit
 generation while prior checkpoints remain intact. Its rate is capped near 2,000 stats/s.
+Checkpoints are also scoped to a digest of the API origin and authentication key;
+re-enrollment or key rotation starts a fresh generation without storing credentials.
 The app state directory also holds its compressed per-entry metadata report.
 Export uses an exclusive temporary file and atomic replacement, so preexisting
 report symlinks/hardlinks cannot redirect writes into media. Deterministic gzip
@@ -15,6 +17,9 @@ bytes are fsynced before the report identity is committed; missing/corrupted
 reports are regenerated and verified before upload. Upload reads the same pinned
 descriptor that was size/SHA checked. A 256 MiB state-volume reserve protects
 control metadata; audit errors are reported without claiming completeness.
+Interrupted export recovery reclaims only a temporary file whose private inode
+was recorded in the checkpoint before writing. Unregistered lookalike files and
+replaced paths are preserved.
 This is a live, non-atomic observation; per-entry times, scan errors/exclusions,
 and the total observation window must accompany any cleanup decision.
 

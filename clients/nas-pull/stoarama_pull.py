@@ -7531,11 +7531,15 @@ class SpaceAudit:
             raise RuntimeError("space audit clips and state mounts must differ")
         self.device = info.st_dev
         self.check_scope()
-        self.require_state_capacity()
         identity = "%d:%d" % self.root_identity
         # A remounted/replaced root starts a new generation, preserving every
         # prior checkpoint/report instead of declaring the detached root current.
-        generation = hashlib.sha256(identity.encode("ascii")).hexdigest()[:16]
+        # Bind checkpoints to this authenticated origin too. Re-enrollment or
+        # key rotation may start a fresh audit, but cannot reuse another account's
+        # completion. Credentials are never persisted in the checkpoint.
+        context = json.dumps([identity, getattr(self.cfg, "api_base", ""),
+                              getattr(self.cfg, "api_key", "")], ensure_ascii=True)
+        generation = hashlib.sha256(context.encode("ascii")).hexdigest()[:24]
         prefix = SPACE_AUDIT_SCHEMA + "-" + generation
         self.path = self.cfg.state_dir / (prefix + ".sqlite3")
         self.artifact = self.cfg.state_dir / (prefix + ".jsonl.gz")
@@ -7543,6 +7547,7 @@ class SpaceAudit:
         try:
             self.check_regular_file(self.path.name)
         except FileNotFoundError:
+            self.require_state_capacity()
             fd = os.open(self.path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.state_fd)
             os.close(fd)
         for suffix in ("-journal", "-wal", "-shm"):
@@ -7574,6 +7579,8 @@ class SpaceAudit:
                 self.set(key, value)
             self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(""),))
             self.db.commit()
+        self.cleanup_export_temporary()
+        self.require_state_capacity()
 
     def close(self):
         if self.db is not None:
@@ -7785,14 +7792,44 @@ class SpaceAudit:
                             "observed_at": utc_now(), "checkpoint_retained": True}}
         return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
 
+    def cleanup_export_temporary(self):
+        # Recover only the exact private inode registered before report bytes
+        # were written. Never glob/delete lookalike files or link targets.
+        pending = self.get("export_temporary")
+        if not pending:
+            return
+        record = json.loads(pending)
+        name = record["name"]
+        prefix = self.artifact.name + "."
+        if not name.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}\.tmp", name[len(prefix):]):
+            raise RuntimeError("space audit temporary ownership record invalid")
+        self.check_scope()
+        try:
+            info = self.check_regular_file(name)
+        except FileNotFoundError:
+            pass  # An atomic report replacement may precede checkpoint commit.
+        else:
+            if (info.st_dev, info.st_ino) != (record["device"], record["inode"]):
+                raise RuntimeError("space audit temporary ownership changed")
+            os.unlink(name, dir_fd=self.state_fd)
+            os.fsync(self.state_fd)
+        self.db.execute("DELETE FROM meta WHERE key='export_temporary'")
+        self.db.commit()
+
     def export(self, stop_event):
         # Only app-owned report metadata is written/read. No media is opened.
         self.check_scope()
+        self.cleanup_export_temporary()
         self.require_state_capacity()
         temporary = self.artifact.name + "." + uuid.uuid4().hex + ".tmp"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.state_fd)
         try:
             with os.fdopen(fd, "wb") as raw:
+                info = os.fstat(raw.fileno())
+                os.fsync(self.state_fd)
+                self.set("export_temporary", json.dumps({"name": temporary,
+                         "device": info.st_dev, "inode": info.st_ino}))
+                self.db.commit()
                 with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
                     with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as stream:
                         stream.write(json.dumps({"type": "summary", "audit_id": self.get("audit_id"), "summary": self.summary()}) + "\n")
@@ -7824,10 +7861,7 @@ class SpaceAudit:
             os.replace(temporary, self.artifact.name, src_dir_fd=self.state_fd, dst_dir_fd=self.state_fd)
             os.fsync(self.state_fd)
         finally:
-            try:
-                os.unlink(temporary, dir_fd=self.state_fd)
-            except FileNotFoundError:
-                pass
+            self.cleanup_export_temporary()
         self.set("artifact_sha256", digest)
         self.set("artifact_size_bytes", size)
         self.set("state", "uploading")
