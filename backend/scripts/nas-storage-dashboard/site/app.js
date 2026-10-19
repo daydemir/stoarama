@@ -20,7 +20,7 @@ async function load(){
   if(audit)notice+=' '+num(countScan(s))+' entries examined; '+num(s.errors_or_exclusions)+' errors/exclusions.';
   if(run.state==='failed')notice='Refresh failed; the last good snapshot is preserved. Next scheduled run will retry. '+notice;
   else if(Date.now()-Date.parse(data.generated_at)>45*60000)notice='Snapshot is stale (over 45 minutes). '+notice;
-  if(run.r2_error)notice+=' R2 listing refresh failed; previously checked metadata remains dated below.';
+  if(run.r2_error)notice+=run.r2_error==='LocalHeadroom'?' R2 listing paused to reserve local space for the completed NAS report.':' R2 listing refresh failed; previously checked metadata remains dated below.';
   if(run.state==='refreshing')notice+=' Refresh in progress.';
   $('notice').textContent=notice;$('notice').classList.toggle('ok',fresh&&s.scope_complete_without_errors&&run.state==='ok');
   const media=(s.categories||[]).filter(x=>['unstitched_media','stitched_media'].includes(x.category)).reduce((n,x)=>n+x.logical_bytes,0);

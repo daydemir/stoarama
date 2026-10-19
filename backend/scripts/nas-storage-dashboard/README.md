@@ -35,7 +35,10 @@ retention evidence; they are not deletion rules.
 R2 evidence is key+size metadata with check timestamps, never a fresh content
 hash. A bounded listing resumes its cursor each refresh. Absence stays unchecked
 until its prefix has completed and the NAS evidence predates that crawl’s start.
-Completed prefix indexes are rebuilt after 24 hours. Large indexes can take
+Completed prefix indexes are rebuilt after 24 hours. R2 indexing pauses below
+6.25 GiB of local free space to preserve import headroom; NAS progress still
+publishes. The local report index stores media candidates only; other entries
+remain in the verified full artifact and scan summary. Large indexes can take
 multiple refreshes to finish. Old matches are explicitly dated; neither a
 listing absence nor a size match proves a safe cleanup operation.
 
@@ -50,5 +53,11 @@ Use the existing Hermes scheduler's script-only `--no-agent` mode, schedule
 an actual execution record and the next scheduled run. The browser polls the
 static snapshot every minute and flags age over 45 minutes. Host/network failure
 can delay updates; previous data remains dated rather than appearing current.
+
+The one-time owner command `--retire-obsolete-cache-sha256 SHA256` retires only
+`state/metadata.sqlite3`, the v1 preview's generated index, while holding the
+collector lock. Obtain its digest from the positively identified preview artifact.
+Unknown/changed files, symlinks, hardlinks and SQLite companions are retained.
+This flag is never part of the recurring job and never touches NAS files.
 
 Tests: `python3 -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -v`.

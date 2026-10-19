@@ -44,6 +44,34 @@ class CoverageTests(unittest.TestCase):
         m.save_facts(self.db, [row])
         self.assertEqual(self.db.execute('SELECT path FROM facts').fetchall(), [('new.mp4',)])
 
+    def test_r2_headroom_pause_retains_cursor_without_network(self):
+        self.fact('a', 'clips', 100, [[0, 60]])
+        with patch.object(m.shutil, 'disk_usage', return_value=m.shutil._ntuple_diskusage(10, 4, 6*1024**3)), patch.object(m, 'r2_list') as request:
+            with self.assertRaises(m.LocalHeadroom):
+                m.refresh_r2(self.db, state=self.state)
+            request.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT cursor,complete_at FROM prefixes').fetchone(), (None, None))
+
+    def test_owner_cleanup_only_retires_exact_obsolete_cache(self):
+        target = self.state / 'metadata.sqlite3'
+        target.write_bytes(b'generated-preview-index')
+        with self.assertRaises(RuntimeError):
+            m.retire_obsolete_cache(self.state, '0'*64)
+        self.assertTrue(target.exists())
+        digest = m.hashlib.sha256(target.read_bytes()).hexdigest()
+        companion = self.state / 'metadata.sqlite3-journal'
+        companion.symlink_to(self.state / 'missing')
+        with self.assertRaises(RuntimeError):
+            m.retire_obsolete_cache(self.state, digest)
+        self.assertTrue(target.exists())
+        companion.unlink()
+        m.retire_obsolete_cache(self.state, digest)
+        self.assertFalse(target.exists())
+        target.symlink_to(self.state / 'metadata-v2.sqlite3')
+        with self.assertRaises(OSError):
+            m.retire_obsolete_cache(self.state, digest)
+        self.assertTrue(target.is_symlink())
+
     def test_unknown_database_is_preserved(self):
         self.db.close()
         target = self.state / 'metadata-v2.sqlite3'

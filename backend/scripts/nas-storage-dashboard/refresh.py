@@ -198,6 +198,10 @@ def import_report(db, state, audit):
         batch = []
         for line in stream:
             row = json.loads(line)
+            # Non-media metadata remains in the verified artifact and summary;
+            # the local day-map index only needs media candidates.
+            if row["category"] not in ("unstitched_media", "stitched_media"):
+                continue
             if "path_bytes_b64" in row:
                 # Do not confuse escaped display names with usable path identities.
                 row["error"] = "non-UTF8 path; mapping unavailable"
@@ -258,7 +262,11 @@ def r2_prefix(key):
     return "/".join(key.split("/")[:2]) + "/" if key else ""
 
 
-def refresh_r2(db, budget=100):
+class LocalHeadroom(RuntimeError):
+    pass
+
+
+def refresh_r2(db, budget=100, state=None):
     prefixes = {r2_prefix(key) for (key,) in db.execute("SELECT DISTINCT r2_key FROM facts WHERE r2_key<>''")}
     db.executemany("INSERT OR IGNORE INTO prefixes(prefix) VALUES (?)", [(x,) for x in prefixes])
     stale = (dt.datetime.now(UTC) - dt.timedelta(hours=24)).isoformat()
@@ -270,6 +278,8 @@ def refresh_r2(db, budget=100):
     deadline = time.monotonic() + budget
     for prefix, cursor in db.execute("SELECT prefix,cursor FROM prefixes WHERE complete_at IS NULL ORDER BY prefix").fetchall():
         while time.monotonic() < deadline:
+            if state is not None and shutil.disk_usage(state).free < (6 * 1024**3 + 256 * 1024**2):
+                raise LocalHeadroom("R2 metadata paused to reserve NAS report import space")
             if not cursor:
                 db.execute("UPDATE prefixes SET started_at=? WHERE prefix=?", (now(), prefix))
                 db.commit()
@@ -427,11 +437,42 @@ def publish(db, snapshot, directory):
         retention_snapshot="2026-10-19", cleanup_enabled=False))
 
 
+def retire_obsolete_cache(state, expected_sha256):
+    """Owner cleanup for the exact generated v1 preview index, never source data."""
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+        raise RuntimeError("invalid obsolete-cache digest")
+    target = state / "metadata.sqlite3"
+    fd = os.open(str(target), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.getuid():
+            raise RuntimeError("unsafe obsolete cache preserved")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        current = target.lstat()
+        identity = lambda x: (x.st_dev, x.st_ino, x.st_size, x.st_mtime_ns, x.st_ctime_ns, x.st_nlink)
+        if digest.hexdigest() != expected_sha256 or identity(before) != identity(current) or identity(before) != identity(os.fstat(fd)):
+            raise RuntimeError("changed obsolete cache preserved")
+        # The private directory and collector lock serialize this owner operation.
+        # Refuse any SQLite companions: an active/recoverable v1 index is retained.
+        if any(Path(str(target) + suffix).exists() or Path(str(target) + suffix).is_symlink()
+               for suffix in ("-journal", "-wal", "-shm")):
+            raise RuntimeError("obsolete cache with companions preserved")
+        target.unlink()
+    finally:
+        os.close(fd)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--publish", type=Path, required=True)
     parser.add_argument("--r2-budget", type=int, default=100)
+    parser.add_argument("--retire-obsolete-cache-sha256")
     args = parser.parse_args()
     private_directory(args.state)
     private_directory(args.publish)
@@ -439,7 +480,16 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        if args.retire_obsolete_cache_sha256:
+            print("NAS dashboard owner cleanup busy; obsolete cache preserved", file=sys.stderr)
+            return 2
         return 0
+    if args.retire_obsolete_cache_sha256:
+        try:
+            retire_obsolete_cache(args.state, args.retire_obsolete_cache_sha256)
+            return 0
+        finally:
+            lock.close()
     start = now()
     write_json(args.publish / "refresh-status.json", dict(state="refreshing", started_at=start))
     db = None
@@ -451,7 +501,7 @@ def main():
         # Publish useful progress before the bounded R2 metadata work.
         publish(db, snapshot, args.publish)
         try:
-            refresh_r2(db, args.r2_budget)
+            refresh_r2(db, args.r2_budget, args.state)
             r2_error = None
         except Exception as exc:
             r2_error = type(exc).__name__
