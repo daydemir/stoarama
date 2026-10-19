@@ -7661,7 +7661,7 @@ class SpaceAudit:
         pending = self.db.execute("SELECT count(*) FROM dirs WHERE done=0").fetchone()[0]
         unique = self.db.execute("SELECT coalesce(sum(a),0),coalesce(sum(s),0),count(*) FROM (SELECT max(allocated) a,max(size) s FROM entries WHERE kind='file' GROUP BY device,inode)").fetchone()
         volume = os.statvfs(self.root_fd)
-        return {"schema": SPACE_AUDIT_SCHEMA, "root": str(self.root), "root_identity": self.get("root_identity"),
+        result = {"schema": SPACE_AUDIT_SCHEMA, "root": str(self.root), "root_identity": self.get("root_identity"),
                 "started_at": self.get("started_at"), "scan_completed_at": self.get("scan_completed_at"),
                 "scope": "All entries under the app clips mount, including hidden files and joined/. No symlinks or nested filesystems followed. Other NAS shares, snapshots and host-only folders are not observable.",
                 "consistency": "Live non-atomic metadata walk; entries may change after observation. Incomplete directory scans are repeated after restart.",
@@ -7674,6 +7674,12 @@ class SpaceAudit:
                 "unique_inode_logical_bytes": unique[1],
                 "filesystem_total_bytes": volume.f_blocks * volume.f_frsize,
                 "filesystem_available_bytes": volume.f_bavail * volume.f_frsize}
+        # Long Unicode names must not make the bounded API summary unreportable.
+        # The compressed artifact still contains every per-file path and stat.
+        while len(json.dumps(result).encode("utf-8")) > 900_000 and result["folders"]:
+            result["folders"] = result["folders"][:len(result["folders"]) // 2]
+            result["folders_truncated"] = True
+        return result
 
     def report(self, state=None):
         body = {"audit_id": self.get("audit_id"), "state": state or self.get("state"),
