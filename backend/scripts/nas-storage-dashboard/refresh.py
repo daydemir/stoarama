@@ -123,6 +123,10 @@ def cache(state):
     """)
     if "started_at" not in {r[1] for r in db.execute("PRAGMA table_info(prefixes)")}:
         db.execute("ALTER TABLE prefixes ADD COLUMN started_at TEXT")
+    if "known_at" not in {r[1] for r in db.execute("PRAGMA table_info(facts)")}:
+        db.execute("ALTER TABLE facts ADD COLUMN known_at TEXT")
+        set_meta(db, "legacy_facts_known_at", now())
+        db.commit()
     return db
 
 
@@ -157,12 +161,14 @@ def refresh_facts(db, state, stamp):
 
 
 def save_facts(db, rows):
+    rows = [tuple(row[:9]) + (now(),) for row in rows]
     # Inventory is keyed upstream by clip ID; a rename must retire its old path.
     db.executemany("DELETE FROM facts WHERE source_id=? AND path<>? AND observed_at<=?",
                    [(row[8], row[0], row[7]) for row in rows])
-    db.executemany("""INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+    db.executemany("""INSERT INTO facts VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
         recording_id=excluded.recording_id,kind=excluded.kind,bytes=excluded.bytes,ranges=excluded.ranges,
-        r2_key=excluded.r2_key,present=excluded.present,observed_at=excluded.observed_at,source_id=excluded.source_id
+        r2_key=excluded.r2_key,present=excluded.present,observed_at=excluded.observed_at,source_id=excluded.source_id,
+        known_at=CASE WHEN facts.r2_key IS excluded.r2_key THEN coalesce(facts.known_at,excluded.known_at) ELSE excluded.known_at END
         WHERE excluded.observed_at >= facts.observed_at
         ON CONFLICT(source_id) DO NOTHING""", rows)
 
@@ -267,7 +273,12 @@ class LocalHeadroom(RuntimeError):
 
 
 def refresh_r2(db, budget=100, state=None):
-    prefixes = {r2_prefix(key) for (key,) in db.execute("SELECT DISTINCT r2_key FROM facts WHERE r2_key<>''")}
+    expected_keys = {key for (key,) in db.execute("SELECT DISTINCT r2_key FROM facts WHERE r2_key<>''")}
+    prefixes = {r2_prefix(key) for key in expected_keys}
+    # Cache expected NAS keys only; unrelated R2 objects need no local row.
+    # This prunes only this app's disposable metadata index, never R2 objects.
+    irrelevant = [(key,) for (key,) in db.execute("SELECT key FROM r2") if key not in expected_keys]
+    db.executemany("DELETE FROM r2 WHERE key=?", irrelevant)
     db.executemany("INSERT OR IGNORE INTO prefixes(prefix) VALUES (?)", [(x,) for x in prefixes])
     stale = (dt.datetime.now(UTC) - dt.timedelta(hours=24)).isoformat()
     for (prefix,) in db.execute("SELECT prefix FROM prefixes WHERE complete_at < ?", (stale,)).fetchall():
@@ -278,14 +289,15 @@ def refresh_r2(db, budget=100, state=None):
     deadline = time.monotonic() + budget
     for prefix, cursor in db.execute("SELECT prefix,cursor FROM prefixes WHERE complete_at IS NULL ORDER BY prefix").fetchall():
         while time.monotonic() < deadline:
-            if state is not None and shutil.disk_usage(state).free < (6 * 1024**3 + 256 * 1024**2):
+            reserve = (5 * 1024**3 + 128 * 1024**2) if get_meta(db, "report_id") else (6 * 1024**3 + 256 * 1024**2)
+            if state is not None and shutil.disk_usage(state).free < reserve:
                 raise LocalHeadroom("R2 metadata paused to reserve NAS report import space")
             if not cursor:
                 db.execute("UPDATE prefixes SET started_at=? WHERE prefix=?", (now(), prefix))
                 db.commit()
             objects, next_cursor = r2_list(prefix, cursor)
             stamp = now()
-            db.executemany("INSERT OR REPLACE INTO r2 VALUES (?,?,?)", [(k, n, stamp) for k, n in objects])
+            db.executemany("INSERT OR REPLACE INTO r2 VALUES (?,?,?)", [(k, n, stamp) for k, n in objects if k in expected_keys])
             db.execute("UPDATE prefixes SET cursor=?,complete_at=? WHERE prefix=?",
                        (next_cursor, None if next_cursor else stamp, prefix))
             db.commit()
@@ -355,16 +367,16 @@ def assemble(db, snapshot):
     fresh = bool(get_meta(db, "report_id"))
     if fresh:
         rows = db.execute("""SELECT o.path,f.recording_id,f.kind,o.bytes,f.ranges,f.r2_key,o.observed_at,r.bytes,
-                  CASE WHEN o.path LIKE '#recycle/%' THEN 'recycle' ELSE 'active' END,p.complete_at,p.started_at,r.checked_at
+                  CASE WHEN o.path LIKE '#recycle/%' THEN 'recycle' ELSE 'active' END,p.complete_at,p.started_at,r.checked_at,coalesce(f.known_at,(SELECT value FROM meta WHERE key='legacy_facts_known_at'))
                 FROM observed o JOIN facts f ON f.path=CASE WHEN o.path LIKE '#recycle/%' THEN substr(o.path,10) ELSE o.path END
                 LEFT JOIN r2 r ON r.key=f.r2_key LEFT JOIN prefixes p ON p.prefix=r2_prefix(f.r2_key)
                 WHERE o.kind IN ('unstitched_media','stitched_media') AND o.error=''
                   AND o.bytes=f.bytes""")
     else:
-        rows = db.execute("""SELECT f.path,f.recording_id,f.kind,f.bytes,f.ranges,f.r2_key,f.observed_at,r.bytes,'active',p.complete_at,p.started_at,r.checked_at
+        rows = db.execute("""SELECT f.path,f.recording_id,f.kind,f.bytes,f.ranges,f.r2_key,f.observed_at,r.bytes,'active',p.complete_at,p.started_at,r.checked_at,coalesce(f.known_at,(SELECT value FROM meta WHERE key='legacy_facts_known_at'))
                               FROM facts f LEFT JOIN r2 r ON r.key=f.r2_key LEFT JOIN prefixes p ON p.prefix=r2_prefix(f.r2_key) WHERE f.present=1""")
     totals = defaultdict(int)
-    for path, rid, kind, size, encoded, key, observed_at, r2_size, area, r2_complete, r2_started, r2_checked in rows:
+    for path, rid, kind, size, encoded, key, observed_at, r2_size, area, r2_complete, r2_started, r2_checked, known_at in rows:
         meta = recordings.get(rid)
         if not meta:
             continue
@@ -388,7 +400,8 @@ def assemble(db, snapshot):
         day[kind + "_files"] += 1
         day[kind + "_bytes"] += size
         if r2_size is None:
-            absent = key and r2_complete and r2_started and parse_time(r2_started) >= parse_time(observed_at)
+            absent = (key and r2_complete and r2_started and known_at
+                      and parse_time(r2_started) >= max(parse_time(observed_at), parse_time(known_at)))
             day["r2_not_found_files" if absent else "r2_unchecked_files"] += 1
         elif r2_size == size:
             day["r2_size_matched_files"] += 1

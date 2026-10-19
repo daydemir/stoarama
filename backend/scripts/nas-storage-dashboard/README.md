@@ -34,9 +34,11 @@ retention evidence; they are not deletion rules.
 
 R2 evidence is key+size metadata with check timestamps, never a fresh content
 hash. A bounded listing resumes its cursor each refresh. Absence stays unchecked
-until its prefix has completed and the NAS evidence predates that crawl’s start.
+until its prefix has completed and both the NAS evidence and local discovery
+of the expected key predate that crawl’s start. Only expected NAS object keys
+are cached; unrelated objects are listed but not indexed into the day map.
 Completed prefix indexes are rebuilt after 24 hours. R2 indexing pauses below
-6.25 GiB of local free space to preserve import headroom; NAS progress still
+6.25 GiB of local free space before import (5.125 GiB after import); NAS progress still
 publishes. The local report index stores media candidates only; other entries
 remain in the verified full artifact and scan summary. Large indexes can take
 multiple refreshes to finish. Old matches are explicitly dated; neither a

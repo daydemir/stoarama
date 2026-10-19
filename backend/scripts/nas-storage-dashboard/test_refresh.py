@@ -26,6 +26,7 @@ class CoverageTests(unittest.TestCase):
     def fact(self, name, kind, size, ranges, present=1):
         m.save_facts(self.db, [(name, 1, kind, size, json.dumps(ranges), 'managed/acct-47/'+name,
                                present, '2026-10-18T12:00:00+00:00', 'source:'+name)])
+        self.db.execute("UPDATE facts SET known_at='2026-10-18T12:00:00+00:00' WHERE path=?", (name,))
 
     def assemble(self):
         with patch.object(m, 'retention', return_value=m.defaultdict(set)):
@@ -133,6 +134,20 @@ class CoverageTests(unittest.TestCase):
         self.db.execute("UPDATE prefixes SET complete_at='2026-10-19T00:00:00+00:00',started_at='2026-10-19T00:00:00+00:00'")
         day = self.assemble()[0]['12']['days'][0]
         self.assertEqual((day['r2_unchecked_files'], day['r2_not_found_files']), (0, 1))
+
+    def test_key_first_indexed_during_crawl_stays_unchecked(self):
+        self.fact('a', 'clips', 100, [[0, 60]])
+        self.db.execute("UPDATE facts SET known_at='2026-10-19T00:30:00Z'")
+        self.db.execute("INSERT INTO prefixes VALUES ('managed/acct-47/',NULL,'2026-10-19T01:00:00Z','2026-10-19T00:00:00Z')")
+        day = self.assemble()[0]['12']['days'][0]
+        self.assertEqual((day['r2_unchecked_files'], day['r2_not_found_files']), (1, 0))
+
+    def test_r2_stores_only_expected_keys_but_completes_listing(self):
+        self.fact('a', 'clips', 100, [[0, 60]])
+        with patch.object(m, 'r2_list', return_value=([('managed/acct-47/a', 100), ('managed/acct-47/unrelated', 500)], None)):
+            m.refresh_r2(self.db)
+        self.assertEqual(self.db.execute('SELECT key,bytes FROM r2').fetchall(), [('managed/acct-47/a', 100)])
+        self.assertTrue(self.db.execute('SELECT complete_at FROM prefixes').fetchone()[0])
 
     def test_r2_crawl_start_fences_absence_for_files_observed_during_crawl(self):
         self.fact('a', 'clips', 100, [[0, 60]])
