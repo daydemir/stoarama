@@ -2,12 +2,16 @@
 """Stoarama NAS pull client. Python standard library only."""
 
 import argparse
+import base64
 import concurrent.futures
 import datetime
 import errno
 import fcntl
+import gzip
 import hashlib
+import hmac
 import http.client
+import io
 import json
 import math
 import os
@@ -27,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from enum import Enum
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -7490,6 +7495,639 @@ def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_work
     )
 
 
+SPACE_AUDIT_SCHEMA = "nas-space-stat-v1-20261019"
+SPACE_AUDIT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+SPACE_AUDIT_STATE_RESERVE = 256 * 1024 * 1024
+SPACE_AUDIT_SQLITE_APPLICATION_ID = 0x53534131
+
+
+class SpaceAudit:
+    """One resumable metadata walk; never opens media files or follows links.
+
+    The SQLite checkpoint and compressed report live on the app state volume.
+    They are separate from the existing raw inventory, which skips joined/.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.root = cfg.output_dir
+        self.root_fd = self.state_fd = self.checkpoint_fd = None
+        self.db = None
+        try:
+            self._initialize()
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize(self):
+        for path in (self.root, self.cfg.state_dir):
+            if not stat_module.S_ISDIR(os.lstat(path).st_mode) or not os.path.ismount(str(path)):
+                raise RuntimeError("space audit requires mounted directories")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        self.root_fd = os.open(str(self.root), flags)
+        self.state_fd = os.open(str(self.cfg.state_dir), flags)
+        info, state = os.fstat(self.root_fd), os.fstat(self.state_fd)
+        self.root_identity = (info.st_dev, info.st_ino)
+        self.state_identity = (state.st_dev, state.st_ino)
+        if self.root_identity == self.state_identity:
+            raise RuntimeError("space audit clips and state mounts must differ")
+        self.device = info.st_dev
+        self.check_scope()
+        identity = "%d:%d" % self.root_identity
+        # A remounted/replaced root starts a new generation, preserving every
+        # prior checkpoint/report instead of declaring the detached root current.
+        # Bind checkpoints to this authenticated origin too. Re-enrollment or
+        # key rotation may start a fresh audit, but cannot reuse another account's
+        # completion. Credentials are never persisted in the checkpoint.
+        context = json.dumps([identity, getattr(self.cfg, "api_base", ""),
+                              getattr(self.cfg, "api_key", "")], ensure_ascii=True)
+        generation = hashlib.sha256(context.encode("ascii")).hexdigest()[:24]
+        prefix = SPACE_AUDIT_SCHEMA + "-" + generation
+        self.checkpoint_owner_key = hashlib.sha256(("checkpoint-owner:" + context).encode("ascii")).digest()
+        self.artifact_base = prefix + ".jsonl.gz"
+        self.artifact = self.cfg.state_dir / (prefix + ".jsonl.gz")
+        self.open_checkpoint(prefix)
+        # Linux can anchor SQLite and its journal to the already-pinned private
+        # directory even if a configured pathname changes concurrently.
+        sqlite_path = ("/proc/self/fd/%d/checkpoint.sqlite3" % self.checkpoint_fd
+                       if sys.platform.startswith("linux") else str(self.path))
+        self.db = sqlite3.connect(sqlite_path, timeout=30)
+        self.db.execute("PRAGMA locking_mode=EXCLUSIVE")
+        if self.db.execute("PRAGMA journal_mode=PERSIST").fetchone()[0] != "persist":
+            raise RuntimeError("space audit persistent journal unavailable")
+        self.db.execute("PRAGMA application_id=%d" % SPACE_AUDIT_SQLITE_APPLICATION_ID)
+        self.check_scope()
+        self.check_checkpoint_files()
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS dirs (path TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS dirs_pending_idx ON dirs(done,path);
+            CREATE TABLE IF NOT EXISTS entries (
+                path TEXT PRIMARY KEY, folder TEXT NOT NULL, kind TEXT NOT NULL,
+                category TEXT NOT NULL, size INTEGER NOT NULL, allocated INTEGER NOT NULL,
+                device INTEGER NOT NULL, inode INTEGER NOT NULL, links INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, error TEXT NOT NULL,
+                observed_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS entries_inode_idx ON entries(device,inode,size,allocated) WHERE kind='file';
+        """)
+        if self.get("root_identity") not in (None, identity):
+            raise RuntimeError("space audit root identity changed; previous report retained")
+        if not self.get("audit_id"):
+            for key, value in {"audit_id": str(uuid.uuid4()), "state": "scanning",
+                               "started_at": utc_now(), "root_identity": identity,
+                               "client_version": CLIENT_VERSION}.items():
+                self.set(key, value)
+            self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(""),))
+            self.db.commit()
+        self.check_checkpoint_files()
+        if self.get("artifact_name"):
+            self.validate_report_name(self.get("artifact_name"))
+            self.artifact = self.cfg.state_dir / self.get("artifact_name")
+        if self.get("export_temporary"):
+            # Recover capacity by truncating only the registered inode through
+            # its verified descriptor. Never unlink or replace a report path.
+            _, fd = self.open_export_temporary()
+            os.close(fd)
+        self.require_state_capacity()
+
+    def close(self):
+        if self.db is not None:
+            self.db.close()
+            self.db = None
+        for name in ("checkpoint_fd", "root_fd", "state_fd"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def check_scope(self):
+        scopes = [(self.root, self.root_fd, self.root_identity),
+                  (self.cfg.state_dir, self.state_fd, self.state_identity)]
+        if self.checkpoint_fd is not None:
+            current = os.lstat(self.path.parent)
+            opened = os.fstat(self.checkpoint_fd)
+            if not stat_module.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RuntimeError("space audit checkpoint directory changed")
+        for path, fd, identity in scopes:
+            current, opened = os.lstat(path), os.fstat(fd)
+            if (not stat_module.S_ISDIR(current.st_mode) or not os.path.ismount(str(path))
+                    or (current.st_dev, current.st_ino) != identity
+                    or (opened.st_dev, opened.st_ino) != identity):
+                raise RuntimeError("space audit mount identity changed")
+
+    def checkpoint_signature(self, record):
+        return hmac.new(self.checkpoint_owner_key,
+                        json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii"),
+                        hashlib.sha256).hexdigest()
+
+    def check_checkpoint_files(self):
+        for name, identity in self.checkpoint_record["files"].items():
+            info = os.stat(name, dir_fd=self.checkpoint_fd, follow_symlinks=False)
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or [info.st_dev, info.st_ino] != identity):
+                raise RuntimeError("space audit checkpoint ownership changed")
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.checkpoint_fd)
+            with os.fdopen(fd, "rb") as source:
+                opened = os.fstat(source.fileno())
+                if [opened.st_dev, opened.st_ino] != identity or opened.st_nlink != 1:
+                    raise RuntimeError("space audit checkpoint identity changed")
+                header = source.read(100 if name == "checkpoint.sqlite3" else 8)
+            if name == "checkpoint.sqlite3":
+                if header and (len(header) < 100 or header[:16] != b"SQLite format 3\x00"
+                               or int.from_bytes(header[68:72], "big") != SPACE_AUDIT_SQLITE_APPLICATION_ID):
+                    raise RuntimeError("space audit unknown database preserved")
+            elif header not in (b"", b"\x00" * 8, bytes.fromhex("d9d505f920a163d7")):
+                raise RuntimeError("space audit unknown journal preserved")
+        # This checkpoint uses PERSIST rollback journaling, never WAL/shm.
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.stat("checkpoint.sqlite3" + suffix, dir_fd=self.checkpoint_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise RuntimeError("space audit unknown SQLite sidecar preserved")
+
+    def open_checkpoint(self, prefix):
+        # A private allocation and authenticated inode record establish ownership
+        # before SQLite can write or clean up journals. Unknown files/directories
+        # are bypassed intact, including interrupted allocations without a record.
+        pattern = re.compile(re.escape(prefix) + r"\.checkpoint\.[0-9a-f]{32}")
+        candidates = []
+        for name in os.listdir(self.state_fd):
+            if not pattern.fullmatch(name):
+                continue
+            directory_fd = None
+            try:
+                directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+                directory = os.fstat(directory_fd)
+                if directory.st_dev != self.state_identity[0] or directory.st_mode & 0o077:
+                    continue
+                fd = os.open("owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+                with os.fdopen(fd, "rb") as source:
+                    info = os.fstat(source.fileno())
+                    if not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 8192:
+                        continue
+                    envelope = json.loads(source.read(8193))
+                record = envelope["record"]
+                if (record["context"] != prefix or record["schema"] != 1
+                        or set(record["files"]) != {"checkpoint.sqlite3", "checkpoint.sqlite3-journal"}
+                        or not hmac.compare_digest(envelope["signature"], self.checkpoint_signature(record))):
+                    continue
+                self.checkpoint_fd, self.checkpoint_record = directory_fd, record
+                try:
+                    self.check_checkpoint_files()
+                finally:
+                    self.checkpoint_fd = None
+                candidates.append((int(record["created_at_ns"]), name, record))
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                continue
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+        if candidates:
+            _, name, self.checkpoint_record = max(candidates, key=lambda item: item[0])
+            self.checkpoint_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+        else:
+            self.require_state_capacity()
+            name = prefix + ".checkpoint." + uuid.uuid4().hex
+            os.mkdir(name, 0o700, dir_fd=self.state_fd)
+            self.checkpoint_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+            files = {}
+            for filename in ("checkpoint.sqlite3", "checkpoint.sqlite3-journal"):
+                fd = os.open(filename, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.checkpoint_fd)
+                with os.fdopen(fd, "wb") as output:
+                    info = os.fstat(output.fileno())
+                    files[filename] = [info.st_dev, info.st_ino]
+                    os.fsync(output.fileno())
+            self.checkpoint_record = {"schema": 1, "context": prefix,
+                                      "created_at_ns": time.time_ns(), "files": files}
+            envelope = {"record": self.checkpoint_record,
+                        "signature": self.checkpoint_signature(self.checkpoint_record)}
+            fd = os.open("owner.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.checkpoint_fd)
+            with os.fdopen(fd, "w", encoding="ascii") as output:
+                json.dump(envelope, output, ensure_ascii=True)
+                output.flush()
+                os.fsync(output.fileno())
+            os.fsync(self.checkpoint_fd)
+            os.fsync(self.state_fd)
+        self.path = self.cfg.state_dir / name / "checkpoint.sqlite3"
+        self.check_checkpoint_files()
+
+    def require_state_capacity(self):
+        volume = os.fstatvfs(self.state_fd)
+        if volume.f_bavail * (volume.f_frsize or volume.f_bsize) < SPACE_AUDIT_STATE_RESERVE:
+            raise RuntimeError("space audit state-volume reserve reached")
+
+    def check_regular_file(self, name):
+        info = os.stat(name, dir_fd=self.state_fd, follow_symlinks=False)
+        if not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != self.state_identity[0]:
+            raise RuntimeError("space audit metadata path is not a private regular file")
+        return info
+
+    @staticmethod
+    def path_key(path):
+        # SQLite TEXT cannot encode surrogateescape. JSON ASCII is reversible,
+        # including literal backslashes, so descriptor traversal keeps exact bytes.
+        return json.dumps(path, ensure_ascii=True)
+
+    @staticmethod
+    def display_path(path):
+        return path.encode("utf-8", "backslashreplace").decode("utf-8")
+
+    @staticmethod
+    def path_fields(path, key):
+        fields = {key: SpaceAudit.display_path(path)}
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in path):
+            fields[key + "_bytes_b64"] = base64.b64encode(os.fsencode(path)).decode("ascii")
+        return fields
+
+    def get(self, key):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
+
+    @staticmethod
+    def folder(path):
+        parts = path.split("/")
+        return "/".join(parts[:3 if parts[0] == JOINED_ROOT else 2])
+
+    @staticmethod
+    def category(path, mode):
+        if stat_module.S_ISLNK(mode):
+            return "symlink_not_followed"
+        if stat_module.S_ISDIR(mode):
+            return "directory"
+        if not stat_module.S_ISREG(mode):
+            return "special_file"
+        name = path.rsplit("/", 1)[-1].lower()
+        if name.endswith((".part", ".partial", ".tmp", ".download")):
+            return "temporary"
+        if name.endswith((".mp4", ".mkv", ".mov", ".ts", ".webm", ".m4v", ".avi")):
+            return "stitched_media" if path.startswith(JOINED_ROOT + "/") else "unstitched_media"
+        if name.endswith((".json", ".jsonl", ".sqlite", ".sqlite3", ".db", ".txt", ".log", ".csv", ".sha256")):
+            return "metadata"
+        return "unknown"
+
+    def record(self, path, info=None, error=""):
+        mode = info.st_mode if info else 0
+        kind = "directory" if stat_module.S_ISDIR(mode) else "file" if stat_module.S_ISREG(mode) else "other"
+        values = (self.path_key(path), self.path_key(self.folder(path)), kind, self.category(path, mode) if info else "scan_error",
+                  info.st_size if info and kind != "directory" else 0,
+                  getattr(info, "st_blocks", 0) * 512 if info else 0,
+                  info.st_dev if info else 0, info.st_ino if info else 0,
+                  info.st_nlink if info else 0, info.st_mtime_ns if info else 0,
+                  info.st_ctime_ns if info else 0, error, utc_now())
+        self.db.execute("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+
+    def open_directory(self, relative):
+        fd = os.dup(self.root_fd)
+        try:
+            for part in relative.split("/") if relative else []:
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+            if os.fstat(fd).st_dev != self.device:
+                raise OSError(errno.EXDEV, "nested filesystem excluded")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def scan(self, stop_event, progress):
+        count = 0
+        last_report = 0.0
+        while not stop_event.is_set():
+            self.check_scope()
+            row = self.db.execute("SELECT path FROM dirs WHERE done=0 LIMIT 1").fetchone()
+            if not row:
+                self.check_scope()
+                self.set("scan_completed_at", utc_now())
+                self.set("final_summary", json.dumps(self.summary()))
+                self.set("state", "exporting")
+                self.db.commit()
+                return True
+            relative = json.loads(row[0])
+            fd = None
+            try:
+                fd = self.open_directory(relative)
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        if stop_event.is_set():
+                            self.db.commit()
+                            return False
+                        path = relative + "/" + entry.name if relative else entry.name
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                            self.record(path, info)
+                            if stat_module.S_ISDIR(info.st_mode):
+                                if info.st_dev == self.device:
+                                    self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(path),))
+                                else:
+                                    self.record(path, info, "nested filesystem excluded")
+                        except (OSError, OverflowError, UnicodeError) as exc:
+                            self.record(path, error="stat %s errno=%s" % (type(exc).__name__, getattr(exc, "errno", None)))
+                        count += 1
+                        if count % 100 == 0:
+                            self.check_scope()
+                            self.require_state_capacity()
+                            self.db.commit()
+                            # About 2,000 stats/s maximum, below normal network delivery work.
+                            if stop_event.wait(0.05):
+                                return False
+                        if time.monotonic() - last_report >= 60:
+                            self.db.commit()
+                            progress()
+                            last_report = time.monotonic()
+                self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
+            except OSError as exc:
+                self.record(relative or ".", error="scandir errno=%s" % exc.errno)
+                self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                self.db.commit()
+        return False
+
+    def summary(self):
+        self.check_scope()
+        frozen = self.get("final_summary")
+        if frozen:
+            return json.loads(frozen)
+        columns = "category,count(*),coalesce(sum(size),0),coalesce(sum(allocated),0)"
+        categories = [dict(zip(("category", "entries", "logical_bytes", "allocated_bytes_sum"), r))
+                      for r in self.db.execute("SELECT " + columns + " FROM entries GROUP BY category")]
+        folders = [dict(zip(("folder", "category", "entries", "logical_bytes", "allocated_bytes_sum"), r))
+                   for r in self.db.execute("SELECT folder," + columns + " FROM entries GROUP BY folder,category ORDER BY folder,category LIMIT 2001")]
+        for folder in folders:
+            folder.update(self.path_fields(json.loads(folder["folder"]), "folder"))
+        errors = self.db.execute("SELECT count(*) FROM entries WHERE error<>''").fetchone()[0]
+        pending = self.db.execute("SELECT count(*) FROM dirs WHERE done=0").fetchone()[0]
+        unique = self.db.execute("SELECT coalesce(sum(a),0),coalesce(sum(s),0),count(*) FROM (SELECT max(allocated) a,max(size) s FROM entries WHERE kind='file' GROUP BY device,inode)").fetchone()
+        volume = os.statvfs(self.root_fd)
+        result = {"schema": SPACE_AUDIT_SCHEMA, "root": str(self.root), "root_identity": self.get("root_identity"),
+                "started_at": self.get("started_at"), "scan_completed_at": self.get("scan_completed_at"),
+                "scope": "All entries under the app clips mount, including hidden files and joined/. No symlinks or cross-device directories followed. Other NAS shares, host-only folders and snapshots outside this mount are not observable.",
+                "consistency": "Live non-atomic metadata walk; entries may change after observation. Incomplete directory scans are repeated after restart.",
+                "classification": "Media classification is by location and extension; unstitched media duration is not measured. Allocated blocks are not unique physical extents or guaranteed reclaimable space.",
+                "categories": categories, "folders": folders[:2000], "folders_truncated": len(folders) > 2000,
+                "errors_or_exclusions": errors, "pending_directories": pending,
+                "scan_complete": bool(self.get("scan_completed_at")) and pending == 0,
+                "scope_complete_without_errors": bool(self.get("scan_completed_at")) and pending == 0 and errors == 0,
+                "unique_regular_file_inodes": unique[2], "unique_inode_allocated_bytes": unique[0],
+                "unique_inode_logical_bytes": unique[1],
+                "filesystem_total_bytes": volume.f_blocks * volume.f_frsize,
+                "filesystem_available_bytes": volume.f_bavail * volume.f_frsize}
+        # Long Unicode names must not make the bounded API summary unreportable.
+        # The compressed artifact still contains every per-file path and stat.
+        while len(json.dumps(result).encode("utf-8")) > 900_000 and result["folders"]:
+            result["folders"] = result["folders"][:len(result["folders"]) // 2]
+            result["folders_truncated"] = True
+        return result
+
+    def report(self, state=None):
+        body = {"audit_id": self.get("audit_id"), "state": state or self.get("state"),
+                "client_version": self.get("client_version") or CLIENT_VERSION, "summary": self.summary()}
+        if self.get("artifact_sha256"):
+            body.update(artifact_sha256=self.get("artifact_sha256"), artifact_size_bytes=int(self.get("artifact_size_bytes")))
+        return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
+
+    def report_failure(self, exc):
+        # Report loss of scope/headroom without reading the suspect mount or
+        # presenting a stale frozen success summary as current evidence.
+        body = {"audit_id": self.get("audit_id"), "state": "failed",
+                "client_version": self.get("client_version") or CLIENT_VERSION,
+                "summary": {"schema": SPACE_AUDIT_SCHEMA, "scan_complete": False,
+                            "scope_complete_without_errors": False,
+                            "error_class": type(exc).__name__, "errno": getattr(exc, "errno", None),
+                            "observed_at": utc_now(), "checkpoint_retained": True}}
+        return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
+
+    def validate_report_name(self, name):
+        prefix = self.artifact_base + "."
+        if not name.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}\.tmp", name[len(prefix):]):
+            raise RuntimeError("space audit report ownership record invalid")
+
+    def open_export_temporary(self):
+        # One pending inode is reused after interruption. Check the opened fd
+        # before truncation; pathname swaps cannot redirect writes or deletion.
+        pending = self.get("export_temporary")
+        record = json.loads(pending) if pending else None
+        name = record["name"] if record else self.artifact_base + "." + uuid.uuid4().hex + ".tmp"
+        self.validate_report_name(name)
+        self.check_scope()
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        if not record:
+            flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(name, flags, 0o600, dir_fd=self.state_fd)
+        try:
+            info = os.fstat(fd)
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_dev != self.state_identity[0]
+                    or (record and (info.st_dev, info.st_ino) != (record["device"], record["inode"]))):
+                raise RuntimeError("space audit temporary ownership changed")
+            if not record:
+                os.fsync(self.state_fd)
+                self.set("export_temporary", json.dumps({"name": name,
+                         "device": info.st_dev, "inode": info.st_ino}))
+                self.db.commit()
+            self.check_scope()
+            os.ftruncate(fd, 0)
+            os.fsync(fd)
+            return name, fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def export(self, stop_event):
+        # Only app-owned report metadata is written/read. No media is opened.
+        self.check_scope()
+        self.require_state_capacity()
+        temporary, fd = self.open_export_temporary()
+        with os.fdopen(fd, "w+b") as raw:
+            info = os.fstat(raw.fileno())
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as stream:
+                    stream.write(json.dumps({"type": "summary", "audit_id": self.get("audit_id"), "summary": self.summary()}) + "\n")
+                    names = [r[1] for r in self.db.execute("PRAGMA table_info(entries)")]
+                    for count, row in enumerate(self.db.execute("SELECT * FROM entries ORDER BY path")):
+                        if stop_event.is_set():
+                            return False
+                        entry = dict(zip(names, row))
+                        for key in ("path", "folder"):
+                            entry.update(self.path_fields(json.loads(entry[key]), key))
+                        stream.write(json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n")
+                        if count % 100 == 0:
+                            self.check_scope()
+                            self.require_state_capacity()
+                            stream.flush()
+                            if raw.tell() > SPACE_AUDIT_MAX_BYTES:
+                                raise RuntimeError("space audit compressed report exceeds upload limit")
+            # Finish the gzip trailer before making its identity durable.
+            raw.flush()
+            os.fsync(raw.fileno())
+            raw.seek(0)
+            size, digest = self.hash_report(raw, stop_event)
+        if not 0 < size <= SPACE_AUDIT_MAX_BYTES:
+            raise RuntimeError("space audit compressed report exceeds upload limit")
+        if self.get("artifact_sha256") and (size != int(self.get("artifact_size_bytes")) or digest != self.get("artifact_sha256")):
+            raise RuntimeError("regenerated space audit differs from its frozen declaration")
+        self.check_scope()
+        current = self.check_regular_file(temporary)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise RuntimeError("space audit report pathname changed")
+        self.set("artifact_name", temporary)
+        self.set("artifact_device", info.st_dev)
+        self.set("artifact_inode", info.st_ino)
+        self.set("artifact_sha256", digest)
+        self.set("artifact_size_bytes", size)
+        self.set("state", "uploading")
+        self.db.execute("DELETE FROM meta WHERE key='export_temporary'")
+        self.db.commit()
+        self.artifact = self.cfg.state_dir / temporary
+        return True
+
+    @staticmethod
+    def hash_report(source, stop_event):
+        size, digest = 0, hashlib.sha256()
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            if stop_event.is_set():
+                raise RuntimeError("space audit metadata hashing stopped")
+            size += len(block)
+            if size > SPACE_AUDIT_MAX_BYTES:
+                raise RuntimeError("space audit metadata exceeds upload limit")
+            digest.update(block)
+        return size, digest.hexdigest()
+
+    def open_verified_artifact(self, stop_event):
+        self.check_scope()
+        # Refuse links before opening. A pinned descriptor is hashed and then
+        # handed directly to PUT; a later pathname swap cannot redirect reads.
+        before = self.check_regular_file(self.artifact.name)
+        if (str(before.st_dev), str(before.st_ino)) != (self.get("artifact_device"), self.get("artifact_inode")):
+            raise RuntimeError("space audit artifact ownership changed")
+        fd = os.open(self.artifact.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.state_fd)
+        source = os.fdopen(fd, "rb")
+        try:
+            opened = os.fstat(fd)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) or not stat_module.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise RuntimeError("space audit artifact identity changed")
+            size, digest = self.hash_report(source, stop_event)
+            after = self.check_regular_file(self.artifact.name)
+            if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                    or size != int(self.get("artifact_size_bytes")) or digest != self.get("artifact_sha256")):
+                raise RuntimeError("space audit artifact size or SHA differs from its declaration")
+            source.seek(0)
+            return source
+        except BaseException:
+            source.close()
+            raise
+
+    def upload(self, target, source):
+        self.check_scope()
+        if not isinstance(target, dict):
+            raise RuntimeError("space audit upload target missing")
+        url = urllib.parse.urlsplit(str(target.get("url", "")))
+        if (url.scheme != "https" or not url.hostname or not url.hostname.endswith(".r2.cloudflarestorage.com")
+                or url.username or url.password or url.port not in (None, 443) or target.get("method") != "PUT"
+                or target.get("size_bytes") != int(self.get("artifact_size_bytes"))):
+            raise RuntimeError("invalid space audit upload target")
+        headers = dict(target.get("headers") or {})
+        headers["Content-Length"] = self.get("artifact_size_bytes")
+        connection = http.client.HTTPSConnection(url.netloc, timeout=60, blocksize=1024 * 1024)
+        try:
+            connection.request("PUT", url.path + "?" + url.query, body=source, headers=headers)
+            response = connection.getresponse()
+            if response.status not in (200, 201, 204, 412):
+                raise RuntimeError("space audit upload HTTP %d" % response.status)
+            # 412 is an idempotent create-only retry; the API checks exact HEAD identity.
+            response.read(4096)
+        finally:
+            connection.close()
+
+
+def space_audit_loop(cfg, stop_event, reported):
+    if stop_event.wait(10):
+        return
+    while not stop_event.is_set():
+        audit = None
+        try:
+            audit = SpaceAudit(cfg)
+            if audit.get("state") == "complete":
+                audit.report("complete")
+                reported.set()
+                return
+            if audit.get("state") == "scanning":
+                def progress():
+                    try:
+                        audit.report("scanning")
+                        reported.set()
+                    except Exception:
+                        log("WARN", "space audit progress report deferred; local checkpoint retained")
+                progress()
+                if not audit.scan(stop_event, progress):
+                    return
+            if audit.get("state") == "exporting" and not audit.export(stop_event):
+                return
+            try:
+                source = audit.open_verified_artifact(stop_event)
+            except (OSError, RuntimeError):
+                audit.set("state", "exporting")
+                audit.db.commit()
+                continue
+            try:
+                try:
+                    target = audit.report("uploading")
+                except Exception as intent_error:
+                # Completion may have committed before its HTTP response was
+                # lost. Reconcile that exact declaration instead of downgrading
+                # a completed server row or uploading again indefinitely.
+                    try:
+                        audit.report("complete")
+                    except Exception:
+                        raise intent_error
+                    reported.set()
+                    audit.set("state", "complete")
+                    audit.db.commit()
+                    return
+                reported.set()
+                audit.upload(target.get("upload"), source)
+            finally:
+                source.close()
+            audit.report("complete")
+            audit.set("state", "complete")
+            audit.db.commit()
+            log("INFO", "space audit metadata report complete")
+            return
+        except Exception as exc:
+            # Never log presigned URLs, request headers or authentication data.
+            log("WARN", "space audit deferred (%s); checkpoint retained" % type(exc).__name__)
+            if audit is not None:
+                try:
+                    audit.report_failure(exc)
+                except Exception:
+                    pass
+        finally:
+            if audit is not None:
+                audit.close()
+        stop_event.wait(60)
+
+
+def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_reported):
+    # A full, correctly mounted NAS still needs audit updates. Promote only at
+    # this main-thread safe boundary after two live authenticated API probes.
+    if (not storage_checked or not runtime.is_capacity_blocked()
+            or not runtime.heartbeat_succeeded or not audit_reported.is_set()
+            or runtime.stable_marked):
+        return False
+    if cfg.is_candidate:
+        promote_candidate(cfg)
+    mark_runtime(cfg, runtime, "healthy")
+    runtime.stable_marked = True
+    return True
+
+
 def run(cfg):
     cfg.validate()
     lock_handle = acquire_lock(cfg)
@@ -7513,6 +8151,9 @@ def run(cfg):
     heartbeat.start()
     storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
     storage_probe.start()
+    space_audit_reported = threading.Event()
+    if not cfg.dry_run:
+        threading.Thread(target=space_audit_loop, args=(cfg, stop_event, space_audit_reported), daemon=True).start()
     if not cfg.dry_run:
         # Daemon thread: an update or shutdown may cut a restore short; its
         # lease expires and the create-only PUT makes the retry safe.
@@ -7560,10 +8201,16 @@ def run(cfg):
                     target=joined_loop, args=(cfg, runtime, joined_stop_event), daemon=True,
                 )
                 joined_worker.start()
+            storage_checked = False
             try:
                 check_storage(cfg)
+                storage_checked = True
                 require_storage_capacity(cfg, runtime)
             except (RuntimeError, OSError) as exc:
+                try:
+                    mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, space_audit_reported)
+                except (RuntimeError, OSError):
+                    log("WARN", "capacity-blocked audit release stability mark deferred")
                 runtime.set_phase(Phase.BLOCKED)
                 log("ERROR", "storage blocked: %s" % exc)
                 stop_event.wait(cfg.poll_interval_sec)

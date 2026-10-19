@@ -59,6 +59,8 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/clips/release":
 		return true
+	case method == http.MethodPost && path == "/api/v1/account/connections/space-audit":
+		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/upload-probe":
 		return true
 	case method == http.MethodPost && pullUploadProbeResultRe.MatchString(path):

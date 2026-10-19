@@ -224,6 +224,10 @@ jobs:
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
         run: go test ./cmd/stoaramactl -run '^Test(JoinedSourcePurge|ParseJoinedSourcePurge|ClassifyJoinedPurge)' -count=1 -v
+      - name: Test metadata-only NAS space audit lifecycle
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: go test ./internal/api -run '^TestNASSpaceAudit' -count=1 -v
       - name: Test NAS restore queue and NAS-verified raw purge
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
