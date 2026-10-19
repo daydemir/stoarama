@@ -11,15 +11,17 @@ generation while prior checkpoints remain intact. Its rate is capped near 2,000 
 Checkpoints are also scoped to a digest of the API origin and authentication key;
 re-enrollment or key rotation starts a fresh generation without storing credentials.
 The app state directory also holds its compressed per-entry metadata report.
-Export uses an exclusive temporary file and atomic replacement, so preexisting
-report symlinks/hardlinks cannot redirect writes into media. Deterministic gzip
+Export creates an exclusive private file and commits its name/inode in SQLite;
+it never replaces or unlinks a report pathname. Existing unrelated files and
+report symlinks/hardlinks are preserved. Deterministic gzip
 bytes are fsynced before the report identity is committed; missing/corrupted
 reports are regenerated and verified before upload. Upload reads the same pinned
 descriptor that was size/SHA checked. A 256 MiB state-volume reserve protects
 control metadata; audit errors are reported without claiming completeness.
-Interrupted export recovery reclaims only a temporary file whose private inode
-was recorded in the checkpoint before writing. Unregistered lookalike files and
-replaced paths are preserved.
+Interrupted export recovery reuses one registered temporary inode, opening and
+verifying its descriptor before truncation. Unregistered lookalike files and
+replaced paths are preserved. Missing/corrupt committed reports are regenerated
+into a new private file; prior files remain intact.
 This is a live, non-atomic observation; per-entry times, scan errors/exclusions,
 and the total observation window must accompany any cleanup decision.
 

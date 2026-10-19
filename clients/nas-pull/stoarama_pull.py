@@ -7542,6 +7542,7 @@ class SpaceAudit:
         generation = hashlib.sha256(context.encode("ascii")).hexdigest()[:24]
         prefix = SPACE_AUDIT_SCHEMA + "-" + generation
         self.path = self.cfg.state_dir / (prefix + ".sqlite3")
+        self.artifact_base = prefix + ".jsonl.gz"
         self.artifact = self.cfg.state_dir / (prefix + ".jsonl.gz")
         # SQLite must not be handed a preexisting link to media either.
         try:
@@ -7579,7 +7580,14 @@ class SpaceAudit:
                 self.set(key, value)
             self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(""),))
             self.db.commit()
-        self.cleanup_export_temporary()
+        if self.get("artifact_name"):
+            self.validate_report_name(self.get("artifact_name"))
+            self.artifact = self.cfg.state_dir / self.get("artifact_name")
+        if self.get("export_temporary"):
+            # Recover capacity by truncating only the registered inode through
+            # its verified descriptor. Never unlink or replace a report path.
+            _, fd = self.open_export_temporary()
+            os.close(fd)
         self.require_state_capacity()
 
     def close(self):
@@ -7792,80 +7800,88 @@ class SpaceAudit:
                             "observed_at": utc_now(), "checkpoint_retained": True}}
         return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
 
-    def cleanup_export_temporary(self):
-        # Recover only the exact private inode registered before report bytes
-        # were written. Never glob/delete lookalike files or link targets.
-        pending = self.get("export_temporary")
-        if not pending:
-            return
-        record = json.loads(pending)
-        name = record["name"]
-        prefix = self.artifact.name + "."
+    def validate_report_name(self, name):
+        prefix = self.artifact_base + "."
         if not name.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}\.tmp", name[len(prefix):]):
-            raise RuntimeError("space audit temporary ownership record invalid")
+            raise RuntimeError("space audit report ownership record invalid")
+
+    def open_export_temporary(self):
+        # One pending inode is reused after interruption. Check the opened fd
+        # before truncation; pathname swaps cannot redirect writes or deletion.
+        pending = self.get("export_temporary")
+        record = json.loads(pending) if pending else None
+        name = record["name"] if record else self.artifact_base + "." + uuid.uuid4().hex + ".tmp"
+        self.validate_report_name(name)
         self.check_scope()
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        if not record:
+            flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(name, flags, 0o600, dir_fd=self.state_fd)
         try:
-            info = self.check_regular_file(name)
-        except FileNotFoundError:
-            pass  # An atomic report replacement may precede checkpoint commit.
-        else:
-            if (info.st_dev, info.st_ino) != (record["device"], record["inode"]):
+            info = os.fstat(fd)
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_dev != self.state_identity[0]
+                    or (record and (info.st_dev, info.st_ino) != (record["device"], record["inode"]))):
                 raise RuntimeError("space audit temporary ownership changed")
-            os.unlink(name, dir_fd=self.state_fd)
-            os.fsync(self.state_fd)
-        self.db.execute("DELETE FROM meta WHERE key='export_temporary'")
-        self.db.commit()
+            if not record:
+                os.fsync(self.state_fd)
+                self.set("export_temporary", json.dumps({"name": name,
+                         "device": info.st_dev, "inode": info.st_ino}))
+                self.db.commit()
+            self.check_scope()
+            os.ftruncate(fd, 0)
+            os.fsync(fd)
+            return name, fd
+        except BaseException:
+            os.close(fd)
+            raise
 
     def export(self, stop_event):
         # Only app-owned report metadata is written/read. No media is opened.
         self.check_scope()
-        self.cleanup_export_temporary()
         self.require_state_capacity()
-        temporary = self.artifact.name + "." + uuid.uuid4().hex + ".tmp"
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.state_fd)
-        try:
-            with os.fdopen(fd, "wb") as raw:
-                info = os.fstat(raw.fileno())
-                os.fsync(self.state_fd)
-                self.set("export_temporary", json.dumps({"name": temporary,
-                         "device": info.st_dev, "inode": info.st_ino}))
-                self.db.commit()
-                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
-                    with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as stream:
-                        stream.write(json.dumps({"type": "summary", "audit_id": self.get("audit_id"), "summary": self.summary()}) + "\n")
-                        names = [r[1] for r in self.db.execute("PRAGMA table_info(entries)")]
-                        for count, row in enumerate(self.db.execute("SELECT * FROM entries ORDER BY path")):
-                            if stop_event.is_set():
-                                return False
-                            entry = dict(zip(names, row))
-                            for key in ("path", "folder"):
-                                entry.update(self.path_fields(json.loads(entry[key]), key))
-                            stream.write(json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n")
-                            if count % 100 == 0:
-                                self.check_scope()
-                                self.require_state_capacity()
-                                stream.flush()
-                                if raw.tell() > SPACE_AUDIT_MAX_BYTES:
-                                    raise RuntimeError("space audit compressed report exceeds upload limit")
-                # Finish the gzip trailer before making its identity durable.
-                raw.flush()
-                os.fsync(raw.fileno())
-            fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.state_fd)
-            with os.fdopen(fd, "rb") as source:
-                size, digest = self.hash_report(source, stop_event)
-            if not 0 < size <= SPACE_AUDIT_MAX_BYTES:
-                raise RuntimeError("space audit compressed report exceeds upload limit")
-            if self.get("artifact_sha256") and (size != int(self.get("artifact_size_bytes")) or digest != self.get("artifact_sha256")):
-                raise RuntimeError("regenerated space audit differs from its frozen declaration")
-            self.check_scope()
-            os.replace(temporary, self.artifact.name, src_dir_fd=self.state_fd, dst_dir_fd=self.state_fd)
-            os.fsync(self.state_fd)
-        finally:
-            self.cleanup_export_temporary()
+        temporary, fd = self.open_export_temporary()
+        with os.fdopen(fd, "w+b") as raw:
+            info = os.fstat(raw.fileno())
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                with io.TextIOWrapper(compressed, encoding="utf-8", newline="\n") as stream:
+                    stream.write(json.dumps({"type": "summary", "audit_id": self.get("audit_id"), "summary": self.summary()}) + "\n")
+                    names = [r[1] for r in self.db.execute("PRAGMA table_info(entries)")]
+                    for count, row in enumerate(self.db.execute("SELECT * FROM entries ORDER BY path")):
+                        if stop_event.is_set():
+                            return False
+                        entry = dict(zip(names, row))
+                        for key in ("path", "folder"):
+                            entry.update(self.path_fields(json.loads(entry[key]), key))
+                        stream.write(json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n")
+                        if count % 100 == 0:
+                            self.check_scope()
+                            self.require_state_capacity()
+                            stream.flush()
+                            if raw.tell() > SPACE_AUDIT_MAX_BYTES:
+                                raise RuntimeError("space audit compressed report exceeds upload limit")
+            # Finish the gzip trailer before making its identity durable.
+            raw.flush()
+            os.fsync(raw.fileno())
+            raw.seek(0)
+            size, digest = self.hash_report(raw, stop_event)
+        if not 0 < size <= SPACE_AUDIT_MAX_BYTES:
+            raise RuntimeError("space audit compressed report exceeds upload limit")
+        if self.get("artifact_sha256") and (size != int(self.get("artifact_size_bytes")) or digest != self.get("artifact_sha256")):
+            raise RuntimeError("regenerated space audit differs from its frozen declaration")
+        self.check_scope()
+        current = self.check_regular_file(temporary)
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise RuntimeError("space audit report pathname changed")
+        self.set("artifact_name", temporary)
+        self.set("artifact_device", info.st_dev)
+        self.set("artifact_inode", info.st_ino)
         self.set("artifact_sha256", digest)
         self.set("artifact_size_bytes", size)
         self.set("state", "uploading")
+        self.db.execute("DELETE FROM meta WHERE key='export_temporary'")
         self.db.commit()
+        self.artifact = self.cfg.state_dir / temporary
         return True
 
     @staticmethod
@@ -7885,6 +7901,8 @@ class SpaceAudit:
         # Refuse links before opening. A pinned descriptor is hashed and then
         # handed directly to PUT; a later pathname swap cannot redirect reads.
         before = self.check_regular_file(self.artifact.name)
+        if (str(before.st_dev), str(before.st_ino)) != (self.get("artifact_device"), self.get("artifact_inode")):
+            raise RuntimeError("space audit artifact ownership changed")
         fd = os.open(self.artifact.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.state_fd)
         source = os.fdopen(fd, "rb")
         try:

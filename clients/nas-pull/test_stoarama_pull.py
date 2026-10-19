@@ -4121,7 +4121,7 @@ class SpaceAuditTests(unittest.TestCase):
             finally:
                 audit.close()
 
-    def test_crashed_exports_reclaim_only_registered_private_temporary(self):
+    def test_crashed_exports_reuse_only_registered_private_temporary(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
@@ -4153,9 +4153,11 @@ audit.export(threading.Event())
                 self.assertEqual(len(list(cfg.state_dir.glob("*.tmp"))), 2)
             audit = pull.SpaceAudit(cfg)
             try:
-                self.assertIsNone(audit.get("export_temporary"))
+                pending = json.loads(audit.get("export_temporary"))
+                self.assertEqual((cfg.state_dir / pending["name"]).stat().st_size, 0)
                 self.assertTrue(audit.export(threading.Event()))
-                self.assertEqual(list(cfg.state_dir.glob("*.tmp")), [unrelated])
+                self.assertIsNone(audit.get("export_temporary"))
+                self.assertEqual(set(cfg.state_dir.glob("*.tmp")), {unrelated, audit.artifact})
                 self.assertEqual(unrelated.read_bytes(), b"unregistered user file")
                 self.assertEqual((cfg.output_dir / "clip.mp4").read_bytes(), b"original media")
             finally:
@@ -4186,13 +4188,13 @@ audit.export(threading.Event())
                 else:
                     temporary.write_bytes(b"unrelated replacement")
                 audit.close()
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises((OSError, RuntimeError)):
                     pull.SpaceAudit(cfg)
                 self.assertTrue(temporary.exists())
                 self.assertEqual(media.read_bytes(), b"original media")
 
-    def test_export_replaces_symlinks_and_hardlinks_without_changing_media(self):
-        for link in ("symlink", "hardlink"):
+    def test_export_preserves_existing_files_and_link_targets(self):
+        for link in ("symlink", "hardlink", "regular"):
             with self.subTest(link=link), tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp)
                 cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
@@ -4205,8 +4207,11 @@ audit.export(threading.Event())
                     audit.scan(threading.Event(), lambda: None)
                     if link == "symlink":
                         audit.artifact.symlink_to(media)
-                    else:
+                    elif link == "hardlink":
                         os.link(media, audit.artifact)
+                    else:
+                        audit.artifact.write_bytes(b"UNRELATED FILE")
+                    original_path = audit.artifact
                     self.assertTrue(audit.export(threading.Event()))
                     first = audit.artifact.read_bytes()
                     with mock.patch.object(pull.time, "time", return_value=123456):
@@ -4215,7 +4220,48 @@ audit.export(threading.Event())
                     self.assertEqual(first[4:8], b"\x00" * 4)
                     self.assertFalse(audit.artifact.is_symlink())
                     self.assertEqual(audit.artifact.stat().st_nlink, 1)
+                    self.assertNotEqual(audit.artifact, original_path)
+                    self.assertEqual(original_path.read_bytes(), b"UNRELATED FILE" if link == "regular" else b"ORIGINAL MEDIA PAYLOAD")
                     self.assertEqual(media.read_bytes(), b"ORIGINAL MEDIA PAYLOAD")
+                finally:
+                    audit.close()
+
+    def test_temporary_path_swap_cannot_redirect_truncation_or_delete(self):
+        for swap_before_open in (False, True):
+            with self.subTest(swap_before_open=swap_before_open), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+                cfg.output_dir.mkdir()
+                cfg.state_dir.mkdir()
+                audit = pull.SpaceAudit(cfg)
+                name, fd = audit.open_export_temporary()
+                os.write(fd, b"owned partial report")
+                os.close(fd)
+                temporary = cfg.state_dir / name
+                moved = cfg.state_dir / "retained-owned-inode"
+                original_open = os.open
+                def swap():
+                    temporary.rename(moved)
+                    temporary.write_bytes(b"UNRELATED REPLACEMENT")
+                def racing_open(path, flags, *args, **kwargs):
+                    if path != name:
+                        return original_open(path, flags, *args, **kwargs)
+                    if swap_before_open:
+                        swap()
+                    result = original_open(path, flags, *args, **kwargs)
+                    if not swap_before_open:
+                        swap()
+                    return result
+                try:
+                    with mock.patch.object(pull.os, "open", side_effect=racing_open):
+                        if swap_before_open:
+                            with self.assertRaises(RuntimeError):
+                                audit.open_export_temporary()
+                        else:
+                            _, recovered = audit.open_export_temporary()
+                            os.close(recovered)
+                    self.assertEqual(temporary.read_bytes(), b"UNRELATED REPLACEMENT")
+                    self.assertEqual(moved.read_bytes(), b"owned partial report" if swap_before_open else b"")
                 finally:
                     audit.close()
 
