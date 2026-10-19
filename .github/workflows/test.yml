@@ -248,6 +248,9 @@ jobs:
       - name: Test exact-commit worker artifact workflow
         working-directory: .
         run: python3 backend/scripts/test_worker_artifact_workflow.py
+      - name: Test NAS storage dashboard coverage and evidence
+        working-directory: .
+        run: python3 -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
       - name: Test NAS pull client
         working-directory: .
         run: python3 -m unittest -q clients/nas-pull/test_stoarama_pull.py
