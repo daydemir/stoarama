@@ -9,6 +9,7 @@ import errno
 import fcntl
 import gzip
 import hashlib
+import hmac
 import http.client
 import io
 import json
@@ -7497,6 +7498,7 @@ def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_work
 SPACE_AUDIT_SCHEMA = "nas-space-stat-v1-20261019"
 SPACE_AUDIT_MAX_BYTES = 2 * 1024 * 1024 * 1024
 SPACE_AUDIT_STATE_RESERVE = 256 * 1024 * 1024
+SPACE_AUDIT_SQLITE_APPLICATION_ID = 0x53534131
 
 
 class SpaceAudit:
@@ -7509,7 +7511,7 @@ class SpaceAudit:
     def __init__(self, cfg):
         self.cfg = cfg
         self.root = cfg.output_dir
-        self.root_fd = self.state_fd = None
+        self.root_fd = self.state_fd = self.checkpoint_fd = None
         self.db = None
         try:
             self._initialize()
@@ -7541,24 +7543,21 @@ class SpaceAudit:
                               getattr(self.cfg, "api_key", "")], ensure_ascii=True)
         generation = hashlib.sha256(context.encode("ascii")).hexdigest()[:24]
         prefix = SPACE_AUDIT_SCHEMA + "-" + generation
-        self.path = self.cfg.state_dir / (prefix + ".sqlite3")
+        self.checkpoint_owner_key = hashlib.sha256(("checkpoint-owner:" + context).encode("ascii")).digest()
         self.artifact_base = prefix + ".jsonl.gz"
         self.artifact = self.cfg.state_dir / (prefix + ".jsonl.gz")
-        # SQLite must not be handed a preexisting link to media either.
-        try:
-            self.check_regular_file(self.path.name)
-        except FileNotFoundError:
-            self.require_state_capacity()
-            fd = os.open(self.path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.state_fd)
-            os.close(fd)
-        for suffix in ("-journal", "-wal", "-shm"):
-            try:
-                self.check_regular_file(self.path.name + suffix)
-            except FileNotFoundError:
-                pass
-        self.db = sqlite3.connect(str(self.path), timeout=30)
+        self.open_checkpoint(prefix)
+        # Linux can anchor SQLite and its journal to the already-pinned private
+        # directory even if a configured pathname changes concurrently.
+        sqlite_path = ("/proc/self/fd/%d/checkpoint.sqlite3" % self.checkpoint_fd
+                       if sys.platform.startswith("linux") else str(self.path))
+        self.db = sqlite3.connect(sqlite_path, timeout=30)
+        self.db.execute("PRAGMA locking_mode=EXCLUSIVE")
+        if self.db.execute("PRAGMA journal_mode=PERSIST").fetchone()[0] != "persist":
+            raise RuntimeError("space audit persistent journal unavailable")
+        self.db.execute("PRAGMA application_id=%d" % SPACE_AUDIT_SQLITE_APPLICATION_ID)
         self.check_scope()
-        self.check_regular_file(self.path.name)
+        self.check_checkpoint_files()
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dirs (path TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0);
@@ -7580,6 +7579,7 @@ class SpaceAudit:
                 self.set(key, value)
             self.db.execute("INSERT OR IGNORE INTO dirs(path) VALUES (?)", (self.path_key(""),))
             self.db.commit()
+        self.check_checkpoint_files()
         if self.get("artifact_name"):
             self.validate_report_name(self.get("artifact_name"))
             self.artifact = self.cfg.state_dir / self.get("artifact_name")
@@ -7594,20 +7594,123 @@ class SpaceAudit:
         if self.db is not None:
             self.db.close()
             self.db = None
-        for name in ("root_fd", "state_fd"):
+        for name in ("checkpoint_fd", "root_fd", "state_fd"):
             fd = getattr(self, name, None)
             if fd is not None:
                 os.close(fd)
                 setattr(self, name, None)
 
     def check_scope(self):
-        for path, fd, identity in ((self.root, self.root_fd, self.root_identity),
-                                   (self.cfg.state_dir, self.state_fd, self.state_identity)):
+        scopes = [(self.root, self.root_fd, self.root_identity),
+                  (self.cfg.state_dir, self.state_fd, self.state_identity)]
+        if self.checkpoint_fd is not None:
+            current = os.lstat(self.path.parent)
+            opened = os.fstat(self.checkpoint_fd)
+            if not stat_module.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RuntimeError("space audit checkpoint directory changed")
+        for path, fd, identity in scopes:
             current, opened = os.lstat(path), os.fstat(fd)
             if (not stat_module.S_ISDIR(current.st_mode) or not os.path.ismount(str(path))
                     or (current.st_dev, current.st_ino) != identity
                     or (opened.st_dev, opened.st_ino) != identity):
                 raise RuntimeError("space audit mount identity changed")
+
+    def checkpoint_signature(self, record):
+        return hmac.new(self.checkpoint_owner_key,
+                        json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii"),
+                        hashlib.sha256).hexdigest()
+
+    def check_checkpoint_files(self):
+        for name, identity in self.checkpoint_record["files"].items():
+            info = os.stat(name, dir_fd=self.checkpoint_fd, follow_symlinks=False)
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or [info.st_dev, info.st_ino] != identity):
+                raise RuntimeError("space audit checkpoint ownership changed")
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.checkpoint_fd)
+            with os.fdopen(fd, "rb") as source:
+                opened = os.fstat(source.fileno())
+                if [opened.st_dev, opened.st_ino] != identity or opened.st_nlink != 1:
+                    raise RuntimeError("space audit checkpoint identity changed")
+                header = source.read(100 if name == "checkpoint.sqlite3" else 8)
+            if name == "checkpoint.sqlite3":
+                if header and (len(header) < 100 or header[:16] != b"SQLite format 3\x00"
+                               or int.from_bytes(header[68:72], "big") != SPACE_AUDIT_SQLITE_APPLICATION_ID):
+                    raise RuntimeError("space audit unknown database preserved")
+            elif header not in (b"", b"\x00" * 8, bytes.fromhex("d9d505f920a163d7")):
+                raise RuntimeError("space audit unknown journal preserved")
+        # This checkpoint uses PERSIST rollback journaling, never WAL/shm.
+        for suffix in ("-wal", "-shm"):
+            try:
+                os.stat("checkpoint.sqlite3" + suffix, dir_fd=self.checkpoint_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise RuntimeError("space audit unknown SQLite sidecar preserved")
+
+    def open_checkpoint(self, prefix):
+        # A private allocation and authenticated inode record establish ownership
+        # before SQLite can write or clean up journals. Unknown files/directories
+        # are bypassed intact, including interrupted allocations without a record.
+        pattern = re.compile(re.escape(prefix) + r"\.checkpoint\.[0-9a-f]{32}")
+        candidates = []
+        for name in os.listdir(self.state_fd):
+            if not pattern.fullmatch(name):
+                continue
+            directory_fd = None
+            try:
+                directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+                directory = os.fstat(directory_fd)
+                if directory.st_dev != self.state_identity[0] or directory.st_mode & 0o077:
+                    continue
+                fd = os.open("owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+                with os.fdopen(fd, "rb") as source:
+                    info = os.fstat(source.fileno())
+                    if not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 8192:
+                        continue
+                    envelope = json.loads(source.read(8193))
+                record = envelope["record"]
+                if (record["context"] != prefix or record["schema"] != 1
+                        or set(record["files"]) != {"checkpoint.sqlite3", "checkpoint.sqlite3-journal"}
+                        or not hmac.compare_digest(envelope["signature"], self.checkpoint_signature(record))):
+                    continue
+                self.checkpoint_fd, self.checkpoint_record = directory_fd, record
+                try:
+                    self.check_checkpoint_files()
+                finally:
+                    self.checkpoint_fd = None
+                candidates.append((int(record["created_at_ns"]), name, record))
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                continue
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+        if candidates:
+            _, name, self.checkpoint_record = max(candidates, key=lambda item: item[0])
+            self.checkpoint_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+        else:
+            self.require_state_capacity()
+            name = prefix + ".checkpoint." + uuid.uuid4().hex
+            os.mkdir(name, 0o700, dir_fd=self.state_fd)
+            self.checkpoint_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.state_fd)
+            files = {}
+            for filename in ("checkpoint.sqlite3", "checkpoint.sqlite3-journal"):
+                fd = os.open(filename, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.checkpoint_fd)
+                with os.fdopen(fd, "wb") as output:
+                    info = os.fstat(output.fileno())
+                    files[filename] = [info.st_dev, info.st_ino]
+                    os.fsync(output.fileno())
+            self.checkpoint_record = {"schema": 1, "context": prefix,
+                                      "created_at_ns": time.time_ns(), "files": files}
+            envelope = {"record": self.checkpoint_record,
+                        "signature": self.checkpoint_signature(self.checkpoint_record)}
+            fd = os.open("owner.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.checkpoint_fd)
+            with os.fdopen(fd, "w", encoding="ascii") as output:
+                json.dump(envelope, output, ensure_ascii=True)
+                output.flush()
+                os.fsync(output.fileno())
+            os.fsync(self.checkpoint_fd)
+            os.fsync(self.state_fd)
+        self.path = self.cfg.state_dir / name / "checkpoint.sqlite3"
+        self.check_checkpoint_files()
 
     def require_state_capacity(self):
         volume = os.fstatvfs(self.state_fd)

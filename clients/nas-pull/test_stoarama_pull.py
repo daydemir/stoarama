@@ -4416,9 +4416,72 @@ audit.export(threading.Event())
             media = cfg.output_dir / "victim.mp4"
             media.write_bytes(b"media kept")
             path.symlink_to(media)
-            with self.assertRaises(RuntimeError):
-                pull.SpaceAudit(cfg)
+            replacement = pull.SpaceAudit(cfg)
+            self.assertNotEqual(replacement.path, path)
+            replacement.close()
+            self.assertTrue(path.is_symlink())
             self.assertEqual(media.read_bytes(), b"media kept")
+
+    def test_checkpoint_bypasses_unknown_databases_and_sidecars_intact(self):
+        for unknown in ("database", "-journal", "-wal", "-shm"):
+            with self.subTest(unknown=unknown), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+                cfg.output_dir.mkdir()
+                cfg.state_dir.mkdir()
+                audit = pull.SpaceAudit(cfg)
+                original_path, original_id = audit.path, audit.get("audit_id")
+                audit.close()
+                victim = original_path if unknown == "database" else Path(str(original_path) + unknown)
+                if victim.exists():
+                    victim.rename(victim.with_name(victim.name + ".retained"))
+                if unknown == "database":
+                    other = sqlite3.connect(victim)
+                    other.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+                    other.execute("INSERT INTO meta VALUES('state','UNRELATED USER VALUE')")
+                    other.commit()
+                    other.close()
+                else:
+                    victim.write_bytes(b"UNRELATED SIDECAR SENTINEL")
+                before = victim.read_bytes()
+                audit = pull.SpaceAudit(cfg)
+                try:
+                    self.assertNotEqual(audit.path, original_path)
+                    self.assertNotEqual(audit.get("audit_id"), original_id)
+                    self.assertEqual(victim.read_bytes(), before)
+                finally:
+                    audit.close()
+
+    def test_owned_checkpoint_resumes_after_abrupt_transaction_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            audit = pull.SpaceAudit(cfg)
+            original_id, original_path = audit.get("audit_id"), audit.path
+            audit.close()
+            script = """
+import importlib.util, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+spec=importlib.util.spec_from_file_location('pull',sys.argv[1])
+pull=importlib.util.module_from_spec(spec);spec.loader.exec_module(pull)
+pull.os.path.ismount=lambda path: True
+a=pull.SpaceAudit(SimpleNamespace(output_dir=Path(sys.argv[2]),state_dir=Path(sys.argv[3])))
+a.set('durable_test','committed');a.db.commit()
+a.set('durable_test','UNCOMMITTED');os._exit(73)
+"""
+            child = subprocess.run([os.sys.executable, "-B", "-c", script, str(MODULE_PATH),
+                                    str(cfg.output_dir), str(cfg.state_dir)], timeout=20)
+            self.assertEqual(child.returncode, 73)
+            audit = pull.SpaceAudit(cfg)
+            try:
+                self.assertEqual(audit.path, original_path)
+                self.assertEqual(audit.get("audit_id"), original_id)
+                self.assertEqual(audit.get("durable_test"), "committed")
+            finally:
+                audit.close()
 
     def test_lost_completion_ack_reconciles_without_reuploading(self):
         fake = mock.Mock()

@@ -10,6 +10,11 @@ before scanning and before sealing/reporting; a changed root gets a new audit
 generation while prior checkpoints remain intact. Its rate is capped near 2,000 stats/s.
 Checkpoints are also scoped to a digest of the API origin and authentication key;
 re-enrollment or key rotation starts a fresh generation without storing credentials.
+SQLite checkpoints use exclusive private directories and an authenticated record
+of the database/journal inodes. Only recognized files are opened writable;
+unrecognized databases, journals, WAL/shm files and incomplete allocations are
+preserved and bypassed. PERSIST journaling keeps the owned rollback journal for
+normal crash recovery. On Linux, SQLite paths are anchored to the pinned directory.
 The app state directory also holds its compressed per-entry metadata report.
 Export creates an exclusive private file and commits its name/inode in SQLite;
 it never replaces or unlinks a report pathname. Existing unrelated files and
