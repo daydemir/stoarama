@@ -336,6 +336,10 @@ def parse_time(value):
     value = value.replace(" ", "T").replace("Z", "+00:00")
     if re.search(r"[+-]\d{2}$", value):
         value += ":00"
+    # Python 3.9 accepts only 3 or 6 fractional digits. PostgreSQL trims
+    # trailing zeroes, so valid timestamps can have any fractional width.
+    value = re.sub(r"\.(\d+)(?=[+-]\d{2}:\d{2}$|$)",
+                   lambda match: "." + match.group(1)[:6].ljust(6, "0"), value)
     return dt.datetime.fromisoformat(value)
 
 
@@ -436,12 +440,27 @@ def assemble(db, snapshot):
     return by_stream, dict(totals), fresh
 
 
+def publish_scan_progress(snapshot, directory):
+    """Keep scan/heartbeat evidence current even if a day-map stage fails."""
+    target = directory / "data.json"
+    if not target.exists():
+        return  # A first successful day-map publication supplies the full schema.
+    if target.is_symlink():
+        raise RuntimeError("dashboard output link preserved")
+    previous = json.loads(target.read_text())
+    if previous.get("app") != APP:
+        raise RuntimeError("unknown dashboard output preserved")
+    previous.update(audit=snapshot["audit"], connection=snapshot["connection"], scan_status_refreshed_at=now())
+    # generated_at continues to date the unchanged coverage and R2 map.
+    write_json(target, previous)
+
+
 def publish(db, snapshot, directory):
     streams, totals, fresh = assemble(db, snapshot)
     stamp = now()
     r2 = db.execute("SELECT count(*),min(checked_at),max(checked_at) FROM r2").fetchone()
     prefixes = db.execute("SELECT count(*),sum(complete_at IS NOT NULL) FROM prefixes").fetchone()
-    write_json(directory / "data.json", dict(generated_at=stamp, refresh_every_minutes=30,
+    write_json(directory / "data.json", dict(generated_at=stamp, scan_status_refreshed_at=stamp, refresh_every_minutes=30,
         basis="fresh_stat_report" if fresh else "last_reported_inventory_and_acknowledgements",
         imported_report_id=get_meta(db, "report_id"), imported_report_completed_at=get_meta(db, "report_completed_at"), totals=totals, connection=snapshot["connection"],
         audit=snapshot["audit"], streams=sorted(streams.values(), key=lambda x: x["name"].casefold()),
@@ -506,12 +525,18 @@ def main():
     start = now()
     write_json(args.publish / "refresh-status.json", dict(state="refreshing", started_at=start))
     db = None
+    stage = "scan_status"
     try:
-        db = cache(args.state)
         snapshot = query("snapshot.sql")
+        publish_scan_progress(snapshot, args.publish)
+        stage = "cache"
+        db = cache(args.state)
+        stage = "inventory"
         refresh_facts(db, args.state, start)
+        stage = "report_import"
         import_report(db, args.state, snapshot["audit"])
         # Publish useful progress before the bounded R2 metadata work.
+        stage = "day_map"
         publish(db, snapshot, args.publish)
         try:
             refresh_r2(db, args.r2_budget, args.state)
@@ -527,7 +552,7 @@ def main():
         if db is not None:
             db.rollback()
         write_json(args.publish / "refresh-status.json", dict(state="failed", failed_at=now(),
-                   error=type(exc).__name__, last_good_data_preserved=True))
+                   error=type(exc).__name__, stage=stage, last_good_data_preserved=True))
         print("NAS dashboard refresh failed (" + type(exc).__name__ + "); last good snapshot retained", file=sys.stderr)
         return 1
     finally:
