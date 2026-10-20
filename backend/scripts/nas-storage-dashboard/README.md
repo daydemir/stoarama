@@ -12,7 +12,11 @@ JSON. Python 3.9+, psql, the pinned audit-report CLI, and the existing scoped lo
 credential environment are required. `run_refresh.sh` is the installed Jelly
 entry point; keep scripts, credentials, and the SQLite cache outside the served
 folder. Both output directories are app-owned; nonempty unmarked directories and
-unknown output JSON are preserved. Refreshes are serialized with flock. The entire stream/day map is one atomic JSON publication. Failed
+unknown output JSON are preserved. Refreshes are serialized with flock. The entire stream/day map is one atomic JSON publication. Fresh scan/heartbeat
+metadata publishes before cache, inventory, report import, and coverage work;
+failures in those stages keep the scan status current while preserving the
+coverage generation timestamp. PostgreSQL fractional seconds are normalized for
+Apple Python 3.9, also exercised by a dedicated CI job. Failed
 refreshes retain the previous published snapshot and expose a failure status.
 
 The initial day map is explicitly provisional inventory/ACK evidence. After the

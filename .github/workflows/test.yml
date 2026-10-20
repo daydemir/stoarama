@@ -15,6 +15,18 @@ permissions:
   contents: read
 
 jobs:
+  nas-storage-dashboard-python39:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.9'
+      - name: Test dashboard on its deployed Python version
+        run: python -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
+
   joined-folder-zip-worker:
     runs-on: ubuntu-latest
     defaults:

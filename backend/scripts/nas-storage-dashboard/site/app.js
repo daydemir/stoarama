@@ -16,7 +16,7 @@ async function load(){
   $('freshness').textContent='Snapshot '+ago(data.generated_at)+' · every 30 min';
   $('footer-time').textContent=' · '+new Date(data.generated_at).toLocaleString();
   const fresh=data.basis==='fresh_stat_report';
-  let notice=fresh?'NAS stat report completed '+new Date(data.imported_report_completed_at).toLocaleString()+'. File presence was observed during that scan. Review errors and mapping gaps before planning cleanup.':'Day coverage below is provisional: older NAS inventory and delivery acknowledgements. The fresh filesystem audit is still running.';
+  let notice=fresh?'NAS stat report completed '+new Date(data.imported_report_completed_at).toLocaleString()+'. File presence was observed during that scan. Review errors and mapping gaps before planning cleanup.':'Day coverage below is provisional: older NAS inventory and delivery acknowledgements. '+(audit?.state==='complete'?'The completed NAS report is awaiting import.':'The fresh filesystem audit is still running.');
   if(audit)notice+=' '+num(countScan(s))+' entries examined; '+num(s.errors_or_exclusions)+' errors/exclusions.';
   if(run.state==='failed')notice='Refresh failed; the last good snapshot is preserved. Next scheduled run will retry. '+notice;
   else if(Date.now()-Date.parse(data.generated_at)>45*60000)notice='Snapshot is stale (over 45 minutes). '+notice;

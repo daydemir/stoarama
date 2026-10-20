@@ -166,6 +166,44 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.assemble()
 
+    def test_postgres_fractional_widths_on_deployment_python(self):
+        for width in range(1, 10):
+            fraction = '583391234'[:width]
+            for suffix in ('+00', '+00:00', 'Z'):
+                with self.subTest(width=width, suffix=suffix):
+                    parsed = m.parse_time('2026-08-21T13:02:51.' + fraction + suffix)
+                    self.assertEqual(parsed.microsecond, int(fraction[:6].ljust(6, '0')))
+                    self.assertEqual(parsed.utcoffset(), dt.timedelta(0))
+
+    def test_completed_r2_listing_handles_five_digit_postgres_evidence(self):
+        self.fact('a', 'clips', 100, [[0, 60]])
+        self.db.execute("UPDATE facts SET observed_at='2026-08-21 13:02:51.58339+00'")
+        self.db.execute("INSERT INTO prefixes VALUES ('managed/acct-47/',NULL,'2026-10-19T01:00:00Z','2026-10-19T00:00:00Z')")
+        day = self.assemble()[0]['12']['days'][0]
+        self.assertEqual(day['r2_not_found_files'], 1)
+
+    def test_scan_progress_advances_without_redating_or_changing_coverage(self):
+        target = self.state / 'data.json'
+        old = dict(generated_at='2026-10-19T02:00:00Z', streams=[{'id': '12', 'days': [{'date': '2026-08-21'}]}], r2={'objects_indexed': 123}, audit={'state': 'scanning'}, connection={})
+        m.write_json(target, old)
+        new = dict(audit={'state': 'scanning', 'summary': {'entries': 999}}, connection={'last_seen_at': '2026-10-20T11:00:00Z'})
+        m.publish_scan_progress(new, self.state)
+        after = json.loads(target.read_text())
+        self.assertEqual(after['generated_at'], old['generated_at'])
+        self.assertEqual(after['streams'], old['streams'])
+        self.assertEqual(after['r2'], old['r2'])
+        self.assertEqual(after['audit'], new['audit'])
+        self.assertEqual(after['connection'], new['connection'])
+        self.assertTrue(after['scan_status_refreshed_at'])
+
+    def test_scan_progress_preserves_unknown_output(self):
+        target = self.state / 'data.json'
+        target.write_text('{"owner":"someone else"}')
+        before = target.read_bytes()
+        with self.assertRaises(RuntimeError):
+            m.publish_scan_progress({'audit': {}, 'connection': {}}, self.state)
+        self.assertEqual(before, target.read_bytes())
+
     def test_postgres_short_timezone_offsets(self):
         self.assertEqual(m.parse_time('2026-07-23 06:00:00+00').utcoffset(), dt.timedelta(0))
 
