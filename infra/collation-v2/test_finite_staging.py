@@ -24,14 +24,15 @@ class ExecutorTest(unittest.TestCase):
         self.db.execute('CREATE TABLE deferred_jobs(id TEXT PRIMARY KEY,until REAL)')
         self.db.execute('CREATE TABLE export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
         self.db.execute('CREATE TABLE head_attempts(count INTEGER)')
+        self.db.execute('CREATE TABLE submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
 
     def test_confirmed_absent_submission_retries_same_identity(self):
-        row = {'id': 'same-frozen-hash'}
+        row = {'id': 'same-frozen-hash', 'attempt': 1}
         with mock.patch.object(finite, 'guest', side_effect=[finite.GuestStatus(404), {'active_jobs': 0, 'build_complete': True}]), \
                 mock.patch.object(finite, 'read_work', return_value={'frozen': True}), \
                 mock.patch.object(finite, 'submit') as submit:
             finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
-        submit.assert_called_once_with(self.db, {'id': 'owner'}, row, {'frozen': True})
+        submit.assert_called_once_with(self.db, {'id': 'owner'}, row, {'frozen': True}, media_attempt=1)
 
     def test_unknown_submission_is_not_repeated(self):
         with mock.patch.object(finite, 'guest', side_effect=RuntimeError('provider_transport_uncertain')), \
@@ -39,6 +40,32 @@ class ExecutorTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'same-frozen-hash'})
         submit.assert_not_called()
+
+    def test_capacity_rejection_refunds_attempt_and_defers(self):
+        for code in (409, 503, 507):
+            for prior_attempt in (0, 1):
+                with self.subTest(code=code, prior_attempt=prior_attempt):
+                    self.db.execute('DELETE FROM jobs')
+                    self.db.execute('DELETE FROM submission_attempts')
+                    self.db.execute('INSERT INTO jobs(id,state,attempt) VALUES(?,?,?)', ('job', 'queued' if prior_attempt == 0 else 'submitted', prior_attempt))
+                    row = self.db.execute('SELECT * FROM jobs').fetchone()
+                    work = {'clips': [{'clip_id': 1, 'bucket': 'b', 'object_key': 'k'}]}
+                    with mock.patch.object(finite, 'head', return_value='etag'), \
+                            mock.patch.object(finite, 'presign', return_value={}), \
+                            mock.patch.object(finite, 'guest', side_effect=[{'active_jobs': 0, 'build_complete': True}, finite.GuestStatus(code)]):
+                        self.assertFalse(finite.submit(self.db, {'id': 'owner'}, row, work, media_attempt=prior_attempt + 1))
+                    after = self.db.execute('SELECT state,attempt FROM jobs').fetchone()
+                    self.assertEqual(after['state'], row['state'])
+                    self.assertEqual(after['attempt'], prior_attempt)
+                    self.assertEqual(self.db.execute('SELECT count FROM submission_attempts').fetchone()[0], 0)
+
+    def test_interrupted_media_retry_uses_next_attempt(self):
+        row = {'id': 'frozen', 'attempt': 2}
+        with mock.patch.object(finite, 'guest', return_value={'job_id': 'frozen', 'attempt': 2, 'state': 'failed', 'failure': 'worker_restarted'}), \
+                mock.patch.object(finite, 'read_work', return_value={'frozen': True}), \
+                mock.patch.object(finite, 'submit') as submit:
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
+        self.assertEqual(submit.call_args.kwargs['media_attempt'], 3)
 
     def test_waiting_prefix_does_not_starve_ready_job(self):
         screen = sqlite3.connect(self.root / 'structure-screen.sqlite3')
@@ -84,6 +111,15 @@ class ExecutorTest(unittest.TestCase):
         with mock.patch.object(finite.time, 'time', return_value=1792635418):
             ledger = finite.budget(self.root, [worker], self.db)
         self.assertGreater(ledger['compute_and_disk_upper_bound_usd'], 0)
+
+    def test_uncertain_export_retains_storage_reservation(self):
+        worker = {'created_at': '2026-10-22T01:16:58.022515573Z', 'size': {'disk': 80}}
+        with mock.patch.object(finite.time, 'time', return_value=1792635418):
+            before = finite.budget(self.root, [worker], self.db)
+            self.db.execute('INSERT INTO jobs(id,state,attempt,source_bytes) VALUES(?,?,?,?)', ('export', 'held_export', 1, finite.GIB))
+            self.db.execute('INSERT INTO export_attempts VALUES(?,?)', ('export', 3))
+            after = finite.budget(self.root, [worker], self.db)
+        self.assertGreater(after['r2_storage_upper_bound_usd'], before['r2_storage_upper_bound_usd'])
 
     def test_archive_receipt_requires_complete_matching_readback(self):
         state = {'job_id': 'frozen-job', 'attempt': 1, 'result': {'manifest': {}},

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Private MicroVM staging endpoint. Gateway authenticates requests; no master keys here."""
-import base64,hashlib,http.server,json,os,pathlib,subprocess,threading,time,tarfile,io,urllib.parse
+import base64,hashlib,http.server,json,os,pathlib,signal,subprocess,threading,time,tarfile,io,urllib.parse
 import capability_export
 ROOT=pathlib.Path('/opt/best14');ROOT.mkdir(mode=0o700,exist_ok=True);LOCK=threading.Lock();ACTIVE=set()
 def write(path,value):
@@ -16,13 +16,62 @@ def execute(job,attempt):
  try:
   write(state,{'job_id':job,'state':'running','attempt':attempt,'started_at':time.time()})
   with (root/'worker.log').open('ab') as log:
-   result=subprocess.run([str(ROOT/'collation-job'),'--input',str(root/'request.json'),'--root',str(root/'staged')],stdout=log,stderr=log,timeout=1830,check=False)
-  if result.returncode:write(state,{'job_id':job,'state':'failed','attempt':attempt,'failure':'media_job_failed','finished_at':time.time()})
+   child=subprocess.Popen([str(ROOT/'collation-job'),'--input',str(root/'request.json'),'--root',str(root/'staged')],stdout=log,stderr=log,start_new_session=True)
+   try:code=child.wait(timeout=1830)
+   except subprocess.TimeoutExpired:
+    os.killpg(child.pid,signal.SIGKILL);child.wait();code=-1
+  if code:write(state,{'job_id':job,'state':'failed','attempt':attempt,'failure':'media_job_failed','finished_at':time.time()})
   else:
    result=json.loads((root/'staged'/'result.json').read_text());write(state,{'job_id':job,'state':'staged','attempt':attempt,'result':result,'finished_at':time.time()})
  except Exception:write(state,{'job_id':job,'state':'failed','attempt':attempt,'failure':'worker_execution_failure','finished_at':time.time()})
  finally:
   with LOCK:ACTIVE.discard(job)
+
+def live_runner(job,attempt):
+ root=job_root(job)/('attempt-'+str(attempt));wanted=[str(ROOT/'collation-job'),'--input',str(root/'request.json'),'--root',str(root/'staged')]
+ found=[]
+ for proc in pathlib.Path('/proc').iterdir():
+  if not proc.name.isdigit():continue
+  try:argv=[p.decode() for p in (proc/'cmdline').read_bytes().split(b'\0') if p]
+  except (OSError,UnicodeError):continue
+  if argv==wanted:found.append(int(proc.name))
+ if len(found)>1:raise RuntimeError('multiple matching job runners')
+ return found[0] if found else None
+
+def recover_execution(job,attempt,deadline):
+ owner=job_root(job);state=owner/'state.json';root=owner/('attempt-'+str(attempt))
+ try:
+  while True:
+   pid=live_runner(job,attempt)
+   if pid is None:break
+   if time.time()>=deadline:
+    # Newly started runners own their process group; never signal another
+    # group's processes or trust a stale PID after a restart.
+    if os.getpgid(pid)==pid:os.killpg(pid,signal.SIGKILL)
+    else:raise RuntimeError('legacy runner retained for owner recovery')
+   time.sleep(1)
+  result_path=root/'staged'/'result.json'
+  if result_path.exists():
+   result=json.loads(result_path.read_text());request=json.loads((root/'request.json').read_text())
+   if result.get('ready_to_publish') is not False or result['manifest']['hour_id']!=request['work']['hour_id']:raise ValueError('recovered result identity differs')
+   write(state,{'job_id':job,'attempt':attempt,'state':'staged','result':result,'finished_at':time.time()})
+  else:write(state,{'job_id':job,'attempt':attempt,'state':'failed','failure':'worker_restarted','finished_at':time.time()})
+ except Exception:
+  write(state,{'job_id':job,'attempt':attempt,'state':'failed','failure':'worker_recovery_hold','recovery_deadline':deadline,'finished_at':time.time()})
+  return  # Retain ACTIVE: uncertain live processes must block new assignments.
+ else:
+  with LOCK:ACTIVE.discard(job)
+
+def recover_orphans():
+ for path in (ROOT/'jobs').glob('*/state.json'):
+  old=json.loads(path.read_text());job=old['job_id'];assert path.parent==job_root(job)
+  if old['state'] in ('accepted','running') or (old['state']=='failed' and old.get('failure')=='worker_recovery_hold'):
+   deadline=old.get('recovery_deadline',old.get('started_at',old.get('accepted_at',time.time()))+1830)
+   ACTIVE.add(job);threading.Thread(target=recover_execution,args=(job,old['attempt'],deadline),daemon=True).start()
+  elif old['state']=='exporting':
+   # The previous PUT may have succeeded. Re-export uses create-only PUT plus
+   # full readback, so preserve artifacts and reconcile with fresh capabilities.
+   old.update(state='export_failed',failure='worker_restarted');write(path,old)
 
 def export_job(job,capabilities):
  owner=job_root(job);state=owner/'state.json';old=json.loads(state.read_text())
@@ -120,4 +169,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
    return self.answer(404,{'error':'route_missing'})
   except (KeyError,ValueError,TypeError):return self.answer(400,{'error':'invalid_request'})
   except Exception:return self.answer(500,{'error':'worker_internal_error'})
-if __name__=='__main__':http.server.ThreadingHTTPServer(('127.0.0.1',8080),Handler).serve_forever()
+if __name__=='__main__':
+ recover_orphans()
+ http.server.ThreadingHTTPServer(('127.0.0.1',8080),Handler).serve_forever()

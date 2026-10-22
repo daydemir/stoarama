@@ -34,6 +34,10 @@ class GuestStatus(RuntimeError):
         super().__init__('guest_status_' + str(status))
 
 
+class WorkerBusy(RuntimeError):
+    pass
+
+
 def write(path, data):
     temporary = path.with_suffix(path.suffix + '.pending')
     with temporary.open('w') as stream:
@@ -211,7 +215,7 @@ def reconcile(root, db, worker, row):
         # submission counter; never create a second media attempt on uncertainty.
         ready = guest(worker, '/ready')
         if ready['active_jobs'] == 0 and ready['build_complete']:
-            submit(db, worker, row, read_work(row))
+            submit(db, worker, row, read_work(row), media_attempt=row['attempt'])
         return
     if state.get('job_id') != row['id']:
         raise ValueError('remote_job_identity_differs')
@@ -219,6 +223,9 @@ def reconcile(root, db, worker, row):
     if remote in ('accepted', 'running', 'exporting'):
         return
     if remote == 'failed':
+        if state.get('failure') == 'worker_restarted' and row['attempt'] < 3:
+            submit(db, worker, row, read_work(row), media_attempt=row['attempt'] + 1)
+            return
         # Deterministic failures remain held for qualification/reselection.
         db.execute('UPDATE jobs SET state=?,finished_at=?,result=? WHERE id=?', ('held', time.time(), json.dumps(state), row['id']))
         db.commit()
@@ -283,13 +290,17 @@ def reconcile(root, db, worker, row):
         db.commit()
 
 
-def submit(db, worker, row, work):
+def submit(db, worker, row, work, media_attempt=1):
     prior = db.execute('SELECT count FROM submission_attempts WHERE id=?', (row['id'],)).fetchone()
     count = prior[0] if prior else 0
     if count >= 3:
         db.execute('UPDATE jobs SET state=?,result=? WHERE id=?', ('held_submission', 'confirmed_absent_after_bounded_submissions', row['id']))
         db.commit()
         return False
+    ready = guest(worker, '/ready')
+    if ready['active_jobs'] != 0 or not ready['build_complete']:
+        # Stop this worker's scan rather than probing every waiting candidate.
+        raise WorkerBusy('worker_not_idle')
     db.execute('INSERT INTO head_attempts(count) VALUES(?)', (len(work['clips']),))
     db.commit()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -299,15 +310,23 @@ def submit(db, worker, row, work):
         db.execute('INSERT OR REPLACE INTO deferred_jobs VALUES(?,?)', (row['id'], time.time() + 300))
         db.commit()
         return False
-    ready = guest(worker, '/ready')
-    if ready['active_jobs'] != 0 or not ready['build_complete']:
-        return False
     sources = {str(c['clip_id']): presign('GET', c['bucket'], c['object_key'], {'If-Match': etag}) for c, etag in zip(work['clips'], etags)}
-    payload = {'job_id': row['id'], 'attempt': 1, 'request': {'work': work, 'sources': sources, 'timeout_seconds': 1800}}
+    payload = {'job_id': row['id'], 'attempt': media_attempt, 'request': {'work': work, 'sources': sources, 'timeout_seconds': 1800}}
     db.execute('INSERT OR REPLACE INTO submission_attempts VALUES(?,?)', (row['id'], count + 1))
-    db.execute('UPDATE jobs SET state=?,worker_id=?,attempt=1,started_at=? WHERE id=?', ('submitted', worker['id'], time.time(), row['id']))
+    db.execute('UPDATE jobs SET state=?,worker_id=?,attempt=?,started_at=? WHERE id=?', ('submitted', worker['id'], media_attempt, time.time(), row['id']))
     db.commit()
-    accepted = guest(worker, '/job', payload)
+    try:
+        accepted = guest(worker, '/job', payload)
+    except GuestStatus as error:
+        if error.status not in (409, 503, 507):
+            raise
+        # These handler responses precede admission. Refund the transport
+        # attempt and defer the job; the exact same attempt remains reusable.
+        db.execute('INSERT OR REPLACE INTO submission_attempts VALUES(?,?)', (row['id'], count))
+        db.execute('UPDATE jobs SET state=?,attempt=?,result=? WHERE id=?', ('queued' if row['attempt'] == 0 else 'submitted', row['attempt'], 'worker_capacity_wait', row['id']))
+        db.execute('INSERT OR REPLACE INTO deferred_jobs VALUES(?,?)', (row['id'], time.time() + 300))
+        db.commit()
+        return False
     if accepted.get('job_id') != row['id']:
         raise ValueError('job_acceptance_identity_differs')
     return True
