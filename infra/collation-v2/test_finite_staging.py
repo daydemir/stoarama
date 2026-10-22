@@ -15,6 +15,51 @@ spec.loader.exec_module(finite)
 
 
 class ExecutorTest(unittest.TestCase):
+    def prepare_main(self):
+        (self.root / 'executor.lock').write_text('')
+        (self.root / 'run-authority.json').write_text(json.dumps({'additional_budget_usd': 100}))
+        (self.root / 'work-queue-summary.json').write_text(json.dumps({'selection_sha256': finite.SELECTION}))
+        workers = [{'id': x} for x in ('a', 'b', 'c', 'd')]
+        (self.root / 'execution-workers.json').write_text(json.dumps(workers))
+        return workers
+
+    def test_midpass_storage_errors_pause_all_workers_and_preserve_original_error(self):
+        self.prepare_main()
+        database = sqlite3.connect(self.root / 'execution.sqlite3')
+        self.db.backup(database)
+        database.close()
+        for target, error in [('dispatch', OSError('disk full during worker checkpoint')),
+                              ('budget', sqlite3.OperationalError('database or disk is full'))]:
+            with self.subTest(target=target), \
+                    mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                    mock.patch.object(finite, 'require_control_capacity'), \
+                    mock.patch.object(finite.time, 'monotonic', side_effect=[0, 1, 43]), \
+                    mock.patch.object(finite, 'budget', return_value={'upper_bound_usd': 1}), \
+                    mock.patch.object(finite, target, side_effect=error), \
+                    mock.patch.object(finite, 'provider', side_effect=[RuntimeError('offline'), {}, {}, {}]) as provider, \
+                    mock.patch.object(finite, 'write', side_effect=OSError('checkpoint also full')):
+                with self.assertRaises(type(error)) as caught:
+                    finite.main()
+                self.assertIs(caught.exception, error)
+                self.assertEqual([c.args[1] for c in provider.call_args_list], ['/a/pause', '/b/pause', '/c/pause', '/d/pause'])
+
+    def test_capacity_read_failure_also_pauses_all_workers(self):
+        self.prepare_main()
+        with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                mock.patch.object(finite.os, 'statvfs', side_effect=OSError('volume unavailable')), \
+                mock.patch.object(finite, 'provider', return_value={}) as provider:
+            with self.assertRaisesRegex(OSError, 'volume unavailable'):
+                finite.main()
+        self.assertEqual(provider.call_count, 4)
+
+    def test_precreated_lock_needs_no_write_permission(self):
+        self.prepare_main()
+        (self.root / 'executor.lock').chmod(0o400)
+        with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                mock.patch.object(finite, 'execute') as execute:
+            finite.main()
+        execute.assert_called_once()
+
     def test_low_storage_pauses_every_worker_even_if_checkpoint_cannot_be_written(self):
         space = mock.Mock(f_bavail=1, f_frsize=4096)
         with mock.patch.object(finite.os, 'statvfs', return_value=space), \
