@@ -4,11 +4,13 @@
 Run from the owning scheduler with scoped DO/R2 credentials on the control host.
 Guests receive expiring per-object capabilities only. All mutations have durable
 intents, and uncertain submissions are reconciled before any repeat dispatch.
+Run-root provisioning must create executor.lock before enrolling cloud workers.
 """
 import argparse
 import base64
 import concurrent.futures
 import datetime
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -38,14 +40,35 @@ class WorkerBusy(RuntimeError):
     pass
 
 
+class ControlStorageError(RuntimeError):
+    pass
+
+
+def is_control_storage_error(error):
+    if isinstance(error, ControlStorageError):
+        return True
+    if isinstance(error, OSError):
+        return error.errno in (errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.ENODEV)
+    if isinstance(error, sqlite3.OperationalError):
+        code = getattr(error, 'sqlite_errorcode', 0) & 255
+        # Python 3.9 lacks sqlite_errorcode, so retain its stable error messages.
+        return code in (8, 10, 13) or str(error).lower() in (
+            'database or disk is full', 'disk i/o error',
+            'attempt to write a readonly database')
+    return False
+
+
 def write(path, data):
-    temporary = path.with_suffix(path.suffix + '.pending')
-    with temporary.open('w') as stream:
-        os.chmod(temporary, 0o600)
-        json.dump(data, stream, separators=(',', ':'))
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        temporary = path.with_suffix(path.suffix + '.pending')
+        with temporary.open('w') as stream:
+            os.chmod(temporary, 0o600)
+            json.dump(data, stream, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as error:
+        raise ControlStorageError('control_checkpoint_write_unavailable') from error
 
 
 def provider(method, path, data=None):
@@ -405,64 +428,109 @@ def pause_workers(root, workers, ledger):
         write(root / 'STOP', {'reason': 'budget_admission_closed', 'submitted_intents_preserved': True})
 
 
+def pause_for_control_storage(root, workers):
+    outcomes = {}
+    for worker in workers:
+        try:
+            provider('POST', '/' + worker['id'] + '/pause', {})
+            outcomes[worker['id']] = 'pause_accepted'
+        except Exception:
+            outcomes[worker['id']] = 'pause_unconfirmed_retry_pending'
+    # Pausing compute must not depend on being able to write a checkpoint.
+    try:
+        write(root / 'storage-pause-outcomes.json', {'observed_at': time.time(), 'outcomes': outcomes,
+              'reason': 'control_checkpoint_storage_floor', 'submitted_intents_preserved': True})
+    except (OSError, ControlStorageError):
+        pass
+
+
+def require_control_capacity(root, workers):
+    try:
+        space = os.statvfs(root)
+    except OSError as error:
+        raise ControlStorageError('control_checkpoint_storage_unavailable') from error
+    if space.f_bavail * space.f_frsize >= 5 * GIB + 8 * 1024 ** 2:
+        return
+    raise ControlStorageError('control_checkpoint_storage_floor_pause_attempted')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run-root', required=True, type=pathlib.Path)
     args = parser.parse_args()
     root = args.run_root.resolve()
-    lock = (root / 'executor.lock').open('a+')
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return
-    authority = json.loads((root / 'run-authority.json').read_text())
-    if authority['additional_budget_usd'] != 100:
-        raise ValueError('additional_budget_authority_differs')
-    if json.loads((root / 'work-queue-summary.json').read_text())['selection_sha256'] != SELECTION:
-        raise ValueError('frozen_selection_differs')
-    if (root / 'STOP').exists():
-        return
-    if os.statvfs(root).f_bavail * os.statvfs(root).f_frsize < 5 * GIB + 8 * 1024 ** 2:
-        raise RuntimeError('control_checkpoint_storage_floor')
-    workers = json.loads((root / 'execution-workers.json').read_text())
-    # Provisioning/scaling is a separate admitted operation; this executor can
-    # only use the explicitly enrolled, source-pinned workers.
-    if not 1 <= len(workers) <= 4 or len({w['id'] for w in workers}) != len(workers):
-        raise ValueError('worker_scope_differs')
+    # The provisioning owner precreates this file before any VM can run.
+    # Opening read-only never needs to allocate a new inode on a full disk.
+    with (root / 'executor.lock').open('r') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        workers = json.loads((root / 'execution-workers.json').read_text())
+        # Only the validated enrolled roster grants pause authority.
+        if not 1 <= len(workers) <= 4 or len({w['id'] for w in workers}) != len(workers):
+            raise ValueError('worker_scope_differs')
+        try:
+            authority = json.loads((root / 'run-authority.json').read_text())
+            if authority['additional_budget_usd'] != 100:
+                raise ValueError('additional_budget_authority_differs')
+            if json.loads((root / 'work-queue-summary.json').read_text())['selection_sha256'] != SELECTION:
+                raise ValueError('frozen_selection_differs')
+            if (root / 'STOP').exists():
+                return
+            execute(root, workers)
+        except (ControlStorageError, OSError, sqlite3.OperationalError) as error:
+            if is_control_storage_error(error):
+                pause_for_control_storage(root, workers)
+            raise
+
+
+def execute(root, workers):
+    require_control_capacity(root, workers)
     (root / 'results').mkdir(mode=0o700, exist_ok=True)
-    db = sqlite3.connect(root / 'execution.sqlite3')
-    db.row_factory = sqlite3.Row
-    db.execute('CREATE TABLE IF NOT EXISTS export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
-    db.execute('CREATE TABLE IF NOT EXISTS submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
-    db.execute('CREATE TABLE IF NOT EXISTS deferred_jobs(id TEXT PRIMARY KEY,until REAL)')
-    db.execute('CREATE TABLE IF NOT EXISTS archive_attempts(id TEXT PRIMARY KEY,count INTEGER)')
-    db.execute('CREATE TABLE IF NOT EXISTS archive_receipts(id TEXT PRIMARY KEY,receipt TEXT)')
-    db.execute('CREATE TABLE IF NOT EXISTS head_attempts(count INTEGER)')
-    started = time.monotonic()
-    while time.monotonic() - started < 42:
-        ledger = budget(root, workers, db)
-        # Check the hard bound before guest queries can resume paused compute.
-        if must_pause(root, db, ledger):
-            pause_workers(root, workers, ledger)
-            break
-        for worker in workers:
-            try:
-                active = db.execute("SELECT * FROM jobs WHERE worker_id=? AND state='submitted'", (worker['id'],)).fetchall()
-                if len(active) > 1:
-                    raise ValueError('multiple_jobs_per_worker')
-                if active:
-                    reconcile(root, db, worker, active[0])
-                elif ledger['upper_bound_usd'] < 90:
-                    # Check local eligibility before touching the guest; an
-                    # idle worker stays paused while sources are unavailable.
-                    dispatch(root, db, worker, ledger)
-            except Exception as error:
-                # Persist only classified local messages, never remote URLs.
-                write(root / ('executor-error-' + worker['id'] + '.json'), {'observed_at': time.time(), 'class': type(error).__name__, 'detail': str(error) if isinstance(error, (ValueError, RuntimeError)) else 'transport_or_io_failure'})
-        counts = dict(db.execute('SELECT state,count(*) FROM jobs GROUP BY state'))
-        write(root / 'execution-status.json', {'observed_at': time.time(), 'counts': counts, 'workers': len(workers), 'new_publication_ready': False, 'public_changed': False, 'no_source_deletion': True})
-        time.sleep(5)
-    db.close()
+    try:
+        db = sqlite3.connect(root / 'execution.sqlite3')
+    except sqlite3.OperationalError as error:
+        if (getattr(error, 'sqlite_errorcode', 0) & 255) == 14 or str(error).lower() == 'unable to open database file':
+            raise ControlStorageError('control_database_open_unavailable') from error
+        raise
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute('CREATE TABLE IF NOT EXISTS export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        db.execute('CREATE TABLE IF NOT EXISTS submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        db.execute('CREATE TABLE IF NOT EXISTS deferred_jobs(id TEXT PRIMARY KEY,until REAL)')
+        db.execute('CREATE TABLE IF NOT EXISTS archive_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        db.execute('CREATE TABLE IF NOT EXISTS archive_receipts(id TEXT PRIMARY KEY,receipt TEXT)')
+        db.execute('CREATE TABLE IF NOT EXISTS head_attempts(count INTEGER)')
+        started = time.monotonic()
+        while time.monotonic() - started < 42:
+            require_control_capacity(root, workers)
+            ledger = budget(root, workers, db)
+            # Check the hard bound before guest queries can resume paused compute.
+            if must_pause(root, db, ledger):
+                pause_workers(root, workers, ledger)
+                break
+            for worker in workers:
+                try:
+                    active = db.execute("SELECT * FROM jobs WHERE worker_id=? AND state='submitted'", (worker['id'],)).fetchall()
+                    if len(active) > 1:
+                        raise ValueError('multiple_jobs_per_worker')
+                    if active:
+                        reconcile(root, db, worker, active[0])
+                    elif ledger['upper_bound_usd'] < 90:
+                        # Check local eligibility before touching the guest; an
+                        # idle worker stays paused while sources are unavailable.
+                        dispatch(root, db, worker, ledger)
+                except Exception as error:
+                    if is_control_storage_error(error):
+                        raise  # The outer storage handler pauses every enrolled VM.
+                    # Persist only classified local messages, never remote URLs.
+                    write(root / ('executor-error-' + worker['id'] + '.json'), {'observed_at': time.time(), 'class': type(error).__name__, 'detail': str(error) if isinstance(error, (ValueError, RuntimeError)) else 'transport_or_io_failure'})
+            counts = dict(db.execute('SELECT state,count(*) FROM jobs GROUP BY state'))
+            write(root / 'execution-status.json', {'observed_at': time.time(), 'counts': counts, 'workers': len(workers), 'new_publication_ready': False, 'public_changed': False, 'no_source_deletion': True})
+            time.sleep(5)
+    finally:
+        db.close()
 
 
 if __name__ == '__main__':
