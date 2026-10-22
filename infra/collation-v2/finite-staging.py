@@ -14,6 +14,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import math
 import os
 import pathlib
 import sqlite3
@@ -135,19 +136,60 @@ def budget(root, workers, db):
         return datetime.datetime.strptime(value[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=datetime.timezone.utc).timestamp()
     machine = sum(max(0, now - created(w)) / 3600 * (0.078 + w['size']['disk'] * 0.05 / 672) for w in workers)
     transfer = 0.0
-    for row in db.execute('SELECT j.state,j.source_bytes,j.result,coalesce(e.count,0) AS exports FROM jobs j LEFT JOIN export_attempts e ON e.id=j.id WHERE j.attempt>0'):
+    # R2 bills daily peak bytes. Charge the entire NAS restore cohort from run
+    # start, plus each verified staged output, rounding age up conservatively.
+    storage = 428364261889 / 1e9 * 0.015 / 30 * (math.ceil(max(0, now - min(created(w) for w in workers)) / 86400) + 1)
+    for row in db.execute('SELECT j.state,j.source_bytes,j.result,j.finished_at,coalesce(e.count,0) AS exports FROM jobs j LEFT JOIN export_attempts e ON e.id=j.id WHERE j.attempt>0'):
         if row['state'] == 'staged_verified':
             result = json.loads(row['result'])
-            transfer += sum(o['bytes'] for o in result['export_receipts']) / GIB * 0.01 * row['exports']
+            exported = result.get('export_bytes')
+            if exported is None:
+                exported = sum(o['bytes'] for o in result['export_receipts'])
+            transfer += exported / GIB * 0.01 * row['exports']
+            storage += exported / 1e9 * 0.015 / 30 * (math.ceil(max(0, now - row['finished_at']) / 86400) + 1)
         elif row['state'] not in ('held', 'held_structure'):
             # Three admitted exports, each capped at 2x source plus 128MiB.
             transfer += (6 * row['source_bytes'] + 384 * 1024 ** 2) / GIB * 0.01
     result = {'observed_at': now, 'additional_limit_usd': 100,
               'compute_and_disk_upper_bound_usd': machine,
-              'reserved_egress_usd': transfer, 'upper_bound_usd': machine + transfer,
+              'reserved_egress_usd': transfer, 'r2_storage_upper_bound_usd': storage,
+              'operations_reserve_usd': 7,
+              'upper_bound_usd': machine + transfer + storage + 7,
               'drain_reserve_usd': 5, 'public_changed': False}
     write(root / 'budget-ledger.json', result)
     return result
+
+
+def archive_receipt(state):
+    # Full manifests belong beside staged media. Keep only a small receipt on
+    # the control host, whose storage floor must also survive the entire run.
+    value = {key: state[key] for key in ('job_id', 'attempt', 'result', 'export_receipts')}
+    body = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+    sha = hashlib.sha256(body).hexdigest()
+    bucket = os.environ['R2_BUCKET']
+    key = 'staging/best14-20261021/receipts/' + state['job_id'] + '/' + sha + '.json'
+    cap = presign('PUT', bucket, key, {'If-None-Match': '*', 'Content-Length': str(len(body)), 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(cap['url'], data=body, headers=cap['headers'], method='PUT'), timeout=20) as response:
+            if response.status not in (200, 201):
+                raise ValueError('receipt_upload_status_differs')
+    except urllib.error.HTTPError as error:
+        if error.code != 412:
+            raise RuntimeError('receipt_upload_rejected') from None
+    except (OSError, TimeoutError):
+        pass
+    cap = presign('GET', bucket, key)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(cap['url'], method='GET'), timeout=20) as response:
+            downloaded = response.read(len(body) + 1)
+            if response.status != 200 or len(downloaded) != len(body) or hashlib.sha256(downloaded).hexdigest() != sha:
+                raise ValueError('receipt_readback_identity_differs')
+    except (OSError, TimeoutError):
+        raise RuntimeError('receipt_readback_unconfirmed') from None
+    return {'job_id': state['job_id'], 'receipt_bucket': bucket, 'receipt_key': key,
+            'receipt_sha256': sha, 'receipt_bytes': len(body),
+            'export_bytes': sum(o['bytes'] for o in state['export_receipts']),
+            'output_count': len(state['export_receipts']), 'ready_to_publish': False}
 
 
 def reconcile(root, db, worker, row):
@@ -217,10 +259,11 @@ def reconcile(root, db, worker, row):
         if actual != expected or len(receipts) != len(expected):
             raise ValueError('remote_readback_accounting_differs')
         # Durable local receipt precedes any guest scratch release.
-        write(root / 'results' / (row['id'] + '.json'), state)
+        receipt = archive_receipt(state)
+        write(root / 'results' / (row['id'] + '.json'), receipt)
         if remote != 'released':
             guest(worker, '/release', {'job_id': row['id']})
-        db.execute('UPDATE jobs SET state=?,finished_at=?,result=? WHERE id=?', ('staged_verified', time.time(), json.dumps(state), row['id']))
+        db.execute('UPDATE jobs SET state=?,finished_at=?,result=? WHERE id=?', ('staged_verified', time.time(), json.dumps(receipt), row['id']))
         db.commit()
 
 

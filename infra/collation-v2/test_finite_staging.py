@@ -1,4 +1,6 @@
 import importlib.util
+import io
+import os
 import pathlib
 import sqlite3
 import tempfile
@@ -81,6 +83,33 @@ class ExecutorTest(unittest.TestCase):
         with mock.patch.object(finite.time, 'time', return_value=1792635418):
             ledger = finite.budget(self.root, [worker], self.db)
         self.assertGreater(ledger['compute_and_disk_upper_bound_usd'], 0)
+
+    def test_archive_receipt_requires_complete_matching_readback(self):
+        state = {'job_id': 'frozen-job', 'attempt': 1, 'result': {'manifest': {}},
+                 'export_receipts': [{'bytes': 10}]}
+        uploaded = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+        def opened(request, timeout):
+            if request.get_method() == 'PUT':
+                uploaded.append(request.data)
+                self.assertEqual(request.get_header('If-none-match'), '*')
+                return Response()
+            return Response(uploaded[-1])
+
+        with mock.patch.dict(os.environ, {'R2_BUCKET': 'bucket'}), \
+                mock.patch.object(finite, 'presign', return_value={'url': 'https://example.invalid/receipt', 'headers': {'If-None-Match': '*'}}), \
+                mock.patch.object(finite.urllib.request, 'urlopen', side_effect=opened):
+            receipt = finite.archive_receipt(state)
+            self.assertEqual(receipt['export_bytes'], 10)
+            self.assertNotIn('result', receipt)
+        with mock.patch.dict(os.environ, {'R2_BUCKET': 'bucket'}), \
+                mock.patch.object(finite, 'presign', return_value={'url': 'https://example.invalid/receipt', 'headers': {}}), \
+                mock.patch.object(finite.urllib.request, 'urlopen', side_effect=[Response(), Response(b'corrupted')]):
+            with self.assertRaisesRegex(ValueError, 'readback_identity_differs'):
+                finite.archive_receipt(state)
 
 
 if __name__ == '__main__':
