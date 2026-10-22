@@ -15,6 +15,21 @@ spec.loader.exec_module(finite)
 
 
 class ExecutorTest(unittest.TestCase):
+    def test_low_storage_pauses_every_worker_even_if_checkpoint_cannot_be_written(self):
+        space = mock.Mock(f_bavail=1, f_frsize=4096)
+        with mock.patch.object(finite.os, 'statvfs', return_value=space), \
+                mock.patch.object(finite, 'provider', side_effect=[RuntimeError('offline'), {}, {}, {}]) as provider, \
+                mock.patch.object(finite, 'write', side_effect=OSError('disk_full')):
+            with self.assertRaisesRegex(RuntimeError, 'storage_floor_pause_attempted'):
+                finite.require_control_capacity(self.root, [{'id': x} for x in ('a', 'b', 'c', 'd')])
+        self.assertEqual([call.args[1] for call in provider.call_args_list], ['/a/pause', '/b/pause', '/c/pause', '/d/pause'])
+
+    def test_sufficient_control_storage_does_not_touch_workers(self):
+        space = mock.Mock(f_bavail=6 * finite.GIB, f_frsize=1)
+        with mock.patch.object(finite.os, 'statvfs', return_value=space), mock.patch.object(finite, 'provider') as provider:
+            finite.require_control_capacity(self.root, [{'id': 'a'}])
+        provider.assert_not_called()
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

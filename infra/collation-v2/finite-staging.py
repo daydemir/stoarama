@@ -405,6 +405,26 @@ def pause_workers(root, workers, ledger):
         write(root / 'STOP', {'reason': 'budget_admission_closed', 'submitted_intents_preserved': True})
 
 
+def require_control_capacity(root, workers):
+    space = os.statvfs(root)
+    if space.f_bavail * space.f_frsize >= 5 * GIB + 8 * 1024 ** 2:
+        return
+    outcomes = {}
+    for worker in workers:
+        try:
+            provider('POST', '/' + worker['id'] + '/pause', {})
+            outcomes[worker['id']] = 'pause_accepted'
+        except Exception:
+            outcomes[worker['id']] = 'pause_unconfirmed_retry_pending'
+    # Pausing compute must not depend on being able to write a checkpoint.
+    try:
+        write(root / 'storage-pause-outcomes.json', {'observed_at': time.time(), 'outcomes': outcomes,
+              'reason': 'control_checkpoint_storage_floor', 'submitted_intents_preserved': True})
+    except OSError:
+        pass
+    raise RuntimeError('control_checkpoint_storage_floor_pause_attempted')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run-root', required=True, type=pathlib.Path)
@@ -422,13 +442,12 @@ def main():
         raise ValueError('frozen_selection_differs')
     if (root / 'STOP').exists():
         return
-    if os.statvfs(root).f_bavail * os.statvfs(root).f_frsize < 5 * GIB + 8 * 1024 ** 2:
-        raise RuntimeError('control_checkpoint_storage_floor')
     workers = json.loads((root / 'execution-workers.json').read_text())
     # Provisioning/scaling is a separate admitted operation; this executor can
     # only use the explicitly enrolled, source-pinned workers.
     if not 1 <= len(workers) <= 4 or len({w['id'] for w in workers}) != len(workers):
         raise ValueError('worker_scope_differs')
+    require_control_capacity(root, workers)
     (root / 'results').mkdir(mode=0o700, exist_ok=True)
     db = sqlite3.connect(root / 'execution.sqlite3')
     db.row_factory = sqlite3.Row
@@ -440,6 +459,7 @@ def main():
     db.execute('CREATE TABLE IF NOT EXISTS head_attempts(count INTEGER)')
     started = time.monotonic()
     while time.monotonic() - started < 42:
+        require_control_capacity(root, workers)
         ledger = budget(root, workers, db)
         # Check the hard bound before guest queries can resume paused compute.
         if must_pause(root, db, ledger):
