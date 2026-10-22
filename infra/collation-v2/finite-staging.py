@@ -150,11 +150,19 @@ def budget(root, workers, db):
         elif row['state'] not in ('held', 'held_structure'):
             # Three admitted exports, each capped at 2x source plus 128MiB.
             transfer += (6 * row['source_bytes'] + 384 * 1024 ** 2) / GIB * 0.01
+            if row['exports']:
+                # A timed-out export can leave complete objects in R2. Retain
+                # their full output bound even when verification stays held.
+                storage += (2 * row['source_bytes'] + 128 * 1024 ** 2) / 1e9 * 0.015 / 30 * (math.ceil(max(0, now - min(created(w) for w in workers)) / 86400) + 1)
+    head_reads = db.execute('SELECT coalesce(sum(count),0) FROM head_attempts').fetchone()[0]
+    screen_status = root / 'structure-screen-status.json'
+    range_reads = json.loads(screen_status.read_text()).get('range_requests', 0) if screen_status.exists() else 0
+    operations = 7 + (head_reads + range_reads) / 1e6 * 0.36
     result = {'observed_at': now, 'additional_limit_usd': 100,
               'compute_and_disk_upper_bound_usd': machine,
               'reserved_egress_usd': transfer, 'r2_storage_upper_bound_usd': storage,
-              'operations_reserve_usd': 7,
-              'upper_bound_usd': machine + transfer + storage + 7,
+              'operations_reserve_usd': operations,
+              'upper_bound_usd': machine + transfer + storage + operations,
               'drain_reserve_usd': 5, 'public_changed': False}
     write(root / 'budget-ledger.json', result)
     return result
@@ -259,6 +267,14 @@ def reconcile(root, db, worker, row):
         if actual != expected or len(receipts) != len(expected):
             raise ValueError('remote_readback_accounting_differs')
         # Durable local receipt precedes any guest scratch release.
+        prior = db.execute('SELECT count FROM archive_attempts WHERE id=?', (row['id'],)).fetchone()
+        count = prior[0] if prior else 0
+        if count >= 3:
+            db.execute('UPDATE jobs SET state=? WHERE id=?', ('held_receipt', row['id']))
+            db.commit()
+            return
+        db.execute('INSERT OR REPLACE INTO archive_attempts VALUES(?,?)', (row['id'], count + 1))
+        db.commit()
         receipt = archive_receipt(state)
         write(root / 'results' / (row['id'] + '.json'), receipt)
         if remote != 'released':
@@ -274,6 +290,8 @@ def submit(db, worker, row, work):
         db.execute('UPDATE jobs SET state=?,result=? WHERE id=?', ('held_submission', 'confirmed_absent_after_bounded_submissions', row['id']))
         db.commit()
         return False
+    db.execute('INSERT INTO head_attempts(count) VALUES(?)', (len(work['clips']),))
+    db.commit()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         etags = list(pool.map(head, work['clips']))
     if not all(etags):
@@ -374,6 +392,8 @@ def main():
     db.execute('CREATE TABLE IF NOT EXISTS export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
     db.execute('CREATE TABLE IF NOT EXISTS submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
     db.execute('CREATE TABLE IF NOT EXISTS deferred_jobs(id TEXT PRIMARY KEY,until REAL)')
+    db.execute('CREATE TABLE IF NOT EXISTS archive_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+    db.execute('CREATE TABLE IF NOT EXISTS head_attempts(count INTEGER)')
     started = time.monotonic()
     while time.monotonic() - started < 42:
         ledger = budget(root, workers, db)

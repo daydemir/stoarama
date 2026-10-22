@@ -23,6 +23,7 @@ class ExecutorTest(unittest.TestCase):
         self.db.execute('CREATE TABLE jobs(id TEXT PRIMARY KEY,path TEXT,state TEXT,recording_id INT,local_date TEXT,hour INT,source_bytes INT,source_files INT,nas_sources INT,attempt INT,worker_id TEXT,started_at REAL,finished_at REAL,result TEXT)')
         self.db.execute('CREATE TABLE deferred_jobs(id TEXT PRIMARY KEY,until REAL)')
         self.db.execute('CREATE TABLE export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        self.db.execute('CREATE TABLE head_attempts(count INTEGER)')
 
     def test_confirmed_absent_submission_retries_same_identity(self):
         row = {'id': 'same-frozen-hash'}
