@@ -217,9 +217,24 @@ func VerifyPart(ctx context.Context, tools Tools, clips []LocalClip, outPath str
 	return v, nil
 }
 
+// VerifyFullDecode strictly decodes all video and audio in the complete output,
+// retaining the existing null-muxer diagnostic classification.
+// Packet identity and timing still require VerifyPart.
+func VerifyFullDecode(ctx context.Context, tools Tools, path string) error {
+	return strictDecodeStreams(ctx, tools, path, true, "-threads", "1")
+}
+
 func strictDecode(ctx context.Context, tools Tools, path string, pre ...string) error {
+	return strictDecodeStreams(ctx, tools, path, false, pre...)
+}
+
+func strictDecodeStreams(ctx context.Context, tools Tools, path string, audio bool, pre ...string) error {
 	args := append([]string{"-nostdin", "-v", "error", "-xerror", "-err_detect", "explode"}, pre...)
-	args = append(args, "-i", path, "-map", "0:v:0", "-f", "null", "-")
+	args = append(args, "-i", path, "-map", "0:v:0")
+	if audio {
+		args = append(args, "-map", "0:a?")
+	}
+	args = append(args, "-f", "null", "-")
 	cmd := exec.CommandContext(ctx, tools.FFmpeg, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
