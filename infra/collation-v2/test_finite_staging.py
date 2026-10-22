@@ -25,6 +25,60 @@ class ExecutorTest(unittest.TestCase):
         self.db.execute('CREATE TABLE export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
         self.db.execute('CREATE TABLE head_attempts(count INTEGER)')
         self.db.execute('CREATE TABLE submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        self.db.execute('CREATE TABLE archive_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        self.db.execute('CREATE TABLE archive_receipts(id TEXT PRIMARY KEY,receipt TEXT)')
+
+    def test_reconciliation_obeys_capacity_deferral_until_expiry(self):
+        self.db.execute('INSERT INTO deferred_jobs VALUES(?,?)', ('job', 200))
+        with mock.patch.object(finite.time, 'time', return_value=199), \
+                mock.patch.object(finite, 'guest') as guest:
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'job'})
+        guest.assert_not_called()
+        with mock.patch.object(finite.time, 'time', return_value=200), \
+                mock.patch.object(finite, 'guest', return_value={'job_id': 'job', 'state': 'running'}) as guest:
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'job'})
+        guest.assert_called_once()
+
+    def test_release_failures_reuse_archived_receipt_without_exhausting_attempts(self):
+        (self.root / 'results').mkdir()
+        self.db.execute("INSERT INTO jobs(id,state) VALUES('job','submitted')")
+        row = self.db.execute('SELECT * FROM jobs').fetchone()
+        output = {'object_key': 'object', 'size_bytes': 10, 'sha256': 'sha'}
+        state = {'job_id': 'job', 'state': 'exported',
+                 'result': {'ready_to_publish': False, 'manifest': {'hour_id': 'hour', 'outputs': [output]}},
+                 'export_receipts': [{'object_key': 'object', 'bytes': 10, 'sha256': 'sha', 'full_readback_verified': True}]}
+        receipt = {'job_id': 'job', 'receipt_sha256': 'verified', 'ready_to_publish': False}
+        def guest(worker, path, payload=None):
+            if path == '/release':
+                raise RuntimeError('release_transport_uncertain')
+            return state
+        with mock.patch.object(finite, 'read_work', return_value={'hour_id': 'hour'}), \
+                mock.patch.object(finite, 'archive_receipt', return_value=receipt) as archive, \
+                mock.patch.object(finite, 'guest', side_effect=guest):
+            for _ in range(4):
+                with self.assertRaisesRegex(RuntimeError, 'release_transport_uncertain'):
+                    finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
+            archive.assert_called_once()
+            state['state'] = 'released'
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
+        self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'staged_verified')
+        self.assertEqual(self.db.execute('SELECT count FROM archive_attempts').fetchone()[0], 1)
+
+    def test_stale_structure_failure_does_not_hold_current_payload(self):
+        screen = sqlite3.connect(self.root / 'structure-screen.sqlite3')
+        screen.execute('CREATE TABLE screened(clip_id INT PRIMARY KEY,sha256 BLOB,status INTEGER)')
+        screen.execute('INSERT INTO screened VALUES(?,?,?)', (1, bytes.fromhex('ab' * 32), 2))
+        screen.commit()
+        screen.close()
+        self.db.execute("INSERT INTO jobs(id,state,attempt,source_bytes,source_files) VALUES('job','queued',0,10,1)")
+        with mock.patch.object(finite, 'read_work', return_value={'clips': [{'clip_id': 1, 'sha256': 'cd' * 32}]}), \
+                mock.patch.object(finite, 'submit') as submit:
+            finite.dispatch(self.root, self.db, {'id': 'owner'}, {'upper_bound_usd': 1})
+        self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'queued')
+        submit.assert_not_called()
+        with mock.patch.object(finite, 'read_work', return_value={'clips': [{'clip_id': 1, 'sha256': 'ab' * 32}]}):
+            finite.dispatch(self.root, self.db, {'id': 'owner'}, {'upper_bound_usd': 1})
+        self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'held_structure')
 
     def test_confirmed_absent_submission_retries_same_identity(self):
         row = {'id': 'same-frozen-hash', 'attempt': 1}
