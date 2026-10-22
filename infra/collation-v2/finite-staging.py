@@ -340,6 +340,8 @@ def dispatch(root, db, worker, ledger):
     for row in rows:
         work = read_work(row)
         statuses = [screen.execute('SELECT sha256,status FROM screened WHERE clip_id=?', (c['clip_id'],)).fetchone() for c in work['clips']]
+        statuses = [(s[0].hex() if isinstance(s[0], bytes) else s[0],
+                     {1: 'structure_present', 2: 'structural_failure', 3: 'hold'}.get(s[1], s[1])) if s else None for s in statuses]
         if any(s and s[1] == 'structural_failure' for s in statuses):
             db.execute('UPDATE jobs SET state=?,result=? WHERE id=?', ('held_structure', 'source_structure_failure_requires_qualification', row['id']))
             db.commit()
@@ -398,7 +400,7 @@ def main():
         raise ValueError('frozen_selection_differs')
     if (root / 'STOP').exists():
         return
-    if os.statvfs(root).f_bavail * os.statvfs(root).f_frsize < 5 * GIB + 32 * 1024 ** 2:
+    if os.statvfs(root).f_bavail * os.statvfs(root).f_frsize < 5 * GIB + 8 * 1024 ** 2:
         raise RuntimeError('control_checkpoint_storage_floor')
     workers = json.loads((root / 'execution-workers.json').read_text())
     # Provisioning/scaling is a separate admitted operation; this executor can

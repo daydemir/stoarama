@@ -69,14 +69,14 @@ class ExecutorTest(unittest.TestCase):
 
     def test_waiting_prefix_does_not_starve_ready_job(self):
         screen = sqlite3.connect(self.root / 'structure-screen.sqlite3')
-        screen.execute('CREATE TABLE screened(clip_id INT PRIMARY KEY,sha256 TEXT,status TEXT)')
-        screen.execute("INSERT INTO screened VALUES(201,'sha','structure_present')")
+        screen.execute('CREATE TABLE screened(clip_id INT PRIMARY KEY,sha256 BLOB,status INTEGER)')
+        screen.execute('INSERT INTO screened VALUES(?,?,?)', (201, bytes.fromhex('ab' * 32), 1))
         screen.commit()
         screen.close()
         for n in range(1, 202):
             self.db.execute('INSERT INTO jobs(id,state,recording_id,local_date,hour,source_bytes,source_files,nas_sources,attempt) VALUES(?,?,?,?,?,?,?,?,?)', (str(n), 'queued', n, '2026-10-08', 1, 1000, 1, 0, 0))
         self.db.commit()
-        work = lambda row: {'clips': [{'clip_id': int(row['id']), 'sha256': 'sha'}]}
+        work = lambda row: {'clips': [{'clip_id': int(row['id']), 'sha256': 'ab' * 32}]}
         with mock.patch.object(finite, 'read_work', side_effect=work), mock.patch.object(finite, 'submit', return_value=True) as submit:
             finite.dispatch(self.root, self.db, {'id': 'owner'}, {'upper_bound_usd': 1})
         self.assertEqual(submit.call_args[0][2]['id'], '201')
