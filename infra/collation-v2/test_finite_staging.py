@@ -1,5 +1,7 @@
 import importlib.util
+import hashlib
 import io
+import json
 import os
 import pathlib
 import sqlite3
@@ -25,6 +27,116 @@ class ExecutorTest(unittest.TestCase):
         self.db.execute('CREATE TABLE export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
         self.db.execute('CREATE TABLE head_attempts(count INTEGER)')
         self.db.execute('CREATE TABLE submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        self.db.execute('CREATE TABLE archive_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+        self.db.execute('CREATE TABLE archive_receipts(id TEXT PRIMARY KEY,receipt TEXT)')
+
+    def test_reconciliation_obeys_capacity_deferral_until_expiry(self):
+        self.db.execute('INSERT INTO deferred_jobs VALUES(?,?)', ('job', 200))
+        with mock.patch.object(finite.time, 'time', return_value=199), \
+                mock.patch.object(finite, 'guest') as guest:
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'job'})
+        guest.assert_not_called()
+        with mock.patch.object(finite.time, 'time', return_value=200), \
+                mock.patch.object(finite, 'guest', return_value={'job_id': 'job', 'attempt': 1, 'state': 'running'}) as guest:
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'job', 'attempt': 1})
+        guest.assert_called_once()
+
+    def test_release_failures_reuse_archived_receipt_without_exhausting_attempts(self):
+        (self.root / 'results').mkdir()
+        self.db.execute("INSERT INTO jobs(id,state,attempt) VALUES('job','submitted',1)")
+        row = self.db.execute('SELECT * FROM jobs').fetchone()
+        output = {'object_key': 'object', 'size_bytes': 10, 'sha256': 'sha'}
+        state = {'job_id': 'job', 'attempt': 1, 'state': 'exported',
+                 'result': {'ready_to_publish': False, 'manifest': {'hour_id': 'hour', 'outputs': [output]}},
+                 'export_receipts': [{'object_key': 'object', 'bytes': 10, 'sha256': 'sha', 'full_readback_verified': True}]}
+        receipt = {'job_id': 'job', 'attempt': 1, 'receipt_sha256': 'verified', 'ready_to_publish': False,
+                   'export_receipts_sha256': hashlib.sha256(json.dumps(state['export_receipts'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+        def guest(worker, path, payload=None):
+            if path == '/release':
+                raise RuntimeError('release_transport_uncertain')
+            return state
+        with mock.patch.object(finite, 'read_work', return_value={'hour_id': 'hour'}), \
+                mock.patch.object(finite, 'archive_receipt', return_value=receipt) as archive, \
+                mock.patch.object(finite, 'guest', side_effect=guest):
+            for _ in range(4):
+                with self.assertRaisesRegex(RuntimeError, 'release_transport_uncertain'):
+                    finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
+            archive.assert_called_once()
+            state['state'] = 'released'
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
+        self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'staged_verified')
+        self.assertEqual(self.db.execute('SELECT count FROM archive_attempts').fetchone()[0], 1)
+
+    def test_stale_structure_failure_does_not_hold_current_payload(self):
+        screen = sqlite3.connect(self.root / 'structure-screen.sqlite3')
+        screen.execute('CREATE TABLE screened(clip_id INT PRIMARY KEY,sha256 BLOB,status INTEGER)')
+        screen.execute('INSERT INTO screened VALUES(?,?,?)', (1, bytes.fromhex('ab' * 32), 2))
+        screen.commit()
+        screen.close()
+        self.db.execute("INSERT INTO jobs(id,state,attempt,source_bytes,source_files) VALUES('job','queued',0,10,1)")
+        with mock.patch.object(finite, 'read_work', return_value={'clips': [{'clip_id': 1, 'sha256': 'cd' * 32}]}), \
+                mock.patch.object(finite, 'submit') as submit:
+            finite.dispatch(self.root, self.db, {'id': 'owner'}, {'upper_bound_usd': 1})
+        self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'queued')
+        submit.assert_not_called()
+        with mock.patch.object(finite, 'read_work', return_value={'clips': [{'clip_id': 1, 'sha256': 'ab' * 32}]}):
+            finite.dispatch(self.root, self.db, {'id': 'owner'}, {'upper_bound_usd': 1})
+        self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'held_structure')
+
+    def test_prior_attempt_or_changed_export_receipt_is_not_reused(self):
+        (self.root / 'results').mkdir()
+        output = {'object_key': 'new-object', 'size_bytes': 10, 'sha256': 'new-sha'}
+        exports = [{'object_key': 'new-object', 'bytes': 10, 'sha256': 'new-sha', 'full_readback_verified': True}]
+        state = {'job_id': 'job', 'attempt': 2, 'state': 'released',
+                 'result': {'ready_to_publish': False, 'manifest': {'hour_id': 'hour', 'outputs': [output]}},
+                 'export_receipts': exports}
+        current = {'job_id': 'job', 'attempt': 2, 'export_receipts_sha256': hashlib.sha256(json.dumps(exports, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+        for cached_attempt in (1, 2):
+            with self.subTest(cached_attempt=cached_attempt):
+                self.db.execute('DELETE FROM jobs')
+                self.db.execute('DELETE FROM archive_receipts')
+                self.db.execute('DELETE FROM archive_attempts')
+                self.db.execute("INSERT INTO jobs(id,state,attempt) VALUES('job','submitted',2)")
+                old = {'job_id': 'job', 'attempt': cached_attempt, 'export_receipts_sha256': 'different-export'}
+                self.db.execute('INSERT INTO archive_receipts VALUES(?,?)', ('job:attempt-' + str(cached_attempt), json.dumps(old)))
+                row = self.db.execute('SELECT * FROM jobs').fetchone()
+                with mock.patch.object(finite, 'read_work', return_value={'hour_id': 'hour'}), \
+                        mock.patch.object(finite, 'guest', return_value=state), \
+                        mock.patch.object(finite, 'archive_receipt', return_value=current) as archive:
+                    finite.reconcile(self.root, self.db, {'id': 'owner'}, row)
+                archive.assert_called_once_with(state)
+                self.assertEqual(self.db.execute('SELECT state FROM jobs').fetchone()[0], 'staged_verified')
+                stored = json.loads(self.db.execute("SELECT receipt FROM archive_receipts WHERE id='job:attempt-2'").fetchone()[0])
+                self.assertEqual(stored, current)
+
+    def test_remote_media_attempt_must_match_accepted_intent(self):
+        with mock.patch.object(finite, 'guest', return_value={'job_id': 'job', 'attempt': 1, 'state': 'released'}):
+            with self.assertRaisesRegex(ValueError, 'remote_media_attempt_differs'):
+                finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'job', 'attempt': 2})
+
+    def test_lost_retry_post_resends_same_pending_media_attempt(self):
+        self.db.execute("INSERT INTO jobs(id,state,attempt) VALUES('job','submitted',1)")
+        posts = []
+        def guest(worker, path, payload=None):
+            if path.startswith('/job?id='):
+                return {'job_id': 'job', 'attempt': 1, 'state': 'failed', 'failure': 'worker_restarted'}
+            if path == '/ready':
+                return {'active_jobs': 0, 'build_complete': True}
+            self.assertEqual(path, '/job')
+            posts.append(payload['attempt'])
+            if len(posts) == 1:
+                raise RuntimeError('transport_lost_before_acceptance')
+            return {'job_id': 'job', 'attempt': payload['attempt'], 'state': 'accepted'}
+        with mock.patch.object(finite, 'read_work', return_value={'clips': [{'clip_id': 1, 'bucket': 'b', 'object_key': 'k'}]}), \
+                mock.patch.object(finite, 'head', return_value='etag'), \
+                mock.patch.object(finite, 'presign', return_value={}), \
+                mock.patch.object(finite, 'guest', side_effect=guest):
+            with self.assertRaisesRegex(RuntimeError, 'transport_lost_before_acceptance'):
+                finite.reconcile(self.root, self.db, {'id': 'owner'}, self.db.execute('SELECT * FROM jobs').fetchone())
+            self.assertEqual(self.db.execute('SELECT attempt FROM jobs').fetchone()[0], 2)
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, self.db.execute('SELECT * FROM jobs').fetchone())
+        self.assertEqual(posts, [2, 2])
+        self.assertEqual(self.db.execute('SELECT attempt FROM jobs').fetchone()[0], 2)
 
     def test_confirmed_absent_submission_retries_same_identity(self):
         row = {'id': 'same-frozen-hash', 'attempt': 1}

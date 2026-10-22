@@ -198,13 +198,18 @@ def archive_receipt(state):
                 raise ValueError('receipt_readback_identity_differs')
     except (OSError, TimeoutError):
         raise RuntimeError('receipt_readback_unconfirmed') from None
-    return {'job_id': state['job_id'], 'receipt_bucket': bucket, 'receipt_key': key,
+    return {'job_id': state['job_id'], 'attempt': state['attempt'],
+            'export_receipts_sha256': hashlib.sha256(json.dumps(state['export_receipts'], sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+            'receipt_bucket': bucket, 'receipt_key': key,
             'receipt_sha256': sha, 'receipt_bytes': len(body),
             'export_bytes': sum(o['bytes'] for o in state['export_receipts']),
             'output_count': len(state['export_receipts']), 'ready_to_publish': False}
 
 
 def reconcile(root, db, worker, row):
+    deferred = db.execute('SELECT until FROM deferred_jobs WHERE id=?', (row['id'],)).fetchone()
+    if deferred and deferred[0] > time.time():
+        return
     try:
         state = guest(worker, '/job?id=' + row['id'])
     except GuestStatus as error:
@@ -219,6 +224,15 @@ def reconcile(root, db, worker, row):
         return
     if state.get('job_id') != row['id']:
         raise ValueError('remote_job_identity_differs')
+    if state.get('attempt') != row['attempt']:
+        # The local intent precedes dispatch. A lost retry POST can leave the
+        # previous failed attempt on the guest. Re-send the intended attempt;
+        # the worker serializes admission and returns any existing acceptance.
+        if (state.get('attempt') == row['attempt'] - 1 and state.get('state') == 'failed' and
+                state.get('failure') == 'worker_restarted'):
+            submit(db, worker, row, read_work(row), media_attempt=row['attempt'])
+            return
+        raise ValueError('remote_media_attempt_differs')
     remote = state['state']
     if remote in ('accepted', 'running', 'exporting'):
         return
@@ -274,15 +288,23 @@ def reconcile(root, db, worker, row):
         if actual != expected or len(receipts) != len(expected):
             raise ValueError('remote_readback_accounting_differs')
         # Durable local receipt precedes any guest scratch release.
-        prior = db.execute('SELECT count FROM archive_attempts WHERE id=?', (row['id'],)).fetchone()
-        count = prior[0] if prior else 0
-        if count >= 3:
-            db.execute('UPDATE jobs SET state=? WHERE id=?', ('held_receipt', row['id']))
+        archive_id = row['id'] + ':attempt-' + str(row['attempt'])
+        archived = db.execute('SELECT receipt FROM archive_receipts WHERE id=?', (archive_id,)).fetchone()
+        receipt = json.loads(archived[0]) if archived else None
+        export_hash = hashlib.sha256(json.dumps(receipts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if not (receipt and receipt.get('job_id') == row['id'] and receipt.get('attempt') == row['attempt'] and
+                receipt.get('export_receipts_sha256') == export_hash):
+            prior = db.execute('SELECT count FROM archive_attempts WHERE id=?', (row['id'],)).fetchone()
+            count = prior[0] if prior else 0
+            if count >= 3:
+                db.execute('UPDATE jobs SET state=? WHERE id=?', ('held_receipt', row['id']))
+                db.commit()
+                return
+            db.execute('INSERT OR REPLACE INTO archive_attempts VALUES(?,?)', (row['id'], count + 1))
             db.commit()
-            return
-        db.execute('INSERT OR REPLACE INTO archive_attempts VALUES(?,?)', (row['id'], count + 1))
-        db.commit()
-        receipt = archive_receipt(state)
+            receipt = archive_receipt(state)
+            db.execute('INSERT OR REPLACE INTO archive_receipts VALUES(?,?)', (archive_id, json.dumps(receipt)))
+            db.commit()
         write(root / 'results' / (row['id'] + '.json'), receipt)
         if remote != 'released':
             guest(worker, '/release', {'job_id': row['id']})
@@ -342,7 +364,7 @@ def dispatch(root, db, worker, ledger):
         statuses = [screen.execute('SELECT sha256,status FROM screened WHERE clip_id=?', (c['clip_id'],)).fetchone() for c in work['clips']]
         statuses = [(s[0].hex() if isinstance(s[0], bytes) else s[0],
                      {1: 'structure_present', 2: 'structural_failure', 3: 'hold'}.get(s[1], s[1])) if s else None for s in statuses]
-        if any(s and s[1] == 'structural_failure' for s in statuses):
+        if any(s and s[0] == c['sha256'] and s[1] == 'structural_failure' for s, c in zip(statuses, work['clips'])):
             db.execute('UPDATE jobs SET state=?,result=? WHERE id=?', ('held_structure', 'source_structure_failure_requires_qualification', row['id']))
             db.commit()
             continue
@@ -414,6 +436,7 @@ def main():
     db.execute('CREATE TABLE IF NOT EXISTS submission_attempts(id TEXT PRIMARY KEY,count INTEGER)')
     db.execute('CREATE TABLE IF NOT EXISTS deferred_jobs(id TEXT PRIMARY KEY,until REAL)')
     db.execute('CREATE TABLE IF NOT EXISTS archive_attempts(id TEXT PRIMARY KEY,count INTEGER)')
+    db.execute('CREATE TABLE IF NOT EXISTS archive_receipts(id TEXT PRIMARY KEY,receipt TEXT)')
     db.execute('CREATE TABLE IF NOT EXISTS head_attempts(count INTEGER)')
     started = time.monotonic()
     while time.monotonic() - started < 42:
