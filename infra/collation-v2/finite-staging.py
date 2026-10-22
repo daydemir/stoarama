@@ -225,6 +225,13 @@ def reconcile(root, db, worker, row):
     if state.get('job_id') != row['id']:
         raise ValueError('remote_job_identity_differs')
     if state.get('attempt') != row['attempt']:
+        # The local intent precedes dispatch. A lost retry POST can leave the
+        # previous failed attempt on the guest. Re-send the intended attempt;
+        # the worker serializes admission and returns any existing acceptance.
+        if (state.get('attempt') == row['attempt'] - 1 and state.get('state') == 'failed' and
+                state.get('failure') == 'worker_restarted'):
+            submit(db, worker, row, read_work(row), media_attempt=row['attempt'])
+            return
         raise ValueError('remote_media_attempt_differs')
     remote = state['state']
     if remote in ('accepted', 'running', 'exporting'):

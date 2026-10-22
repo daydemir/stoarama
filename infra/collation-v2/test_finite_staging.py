@@ -114,6 +114,30 @@ class ExecutorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'remote_media_attempt_differs'):
                 finite.reconcile(self.root, self.db, {'id': 'owner'}, {'id': 'job', 'attempt': 2})
 
+    def test_lost_retry_post_resends_same_pending_media_attempt(self):
+        self.db.execute("INSERT INTO jobs(id,state,attempt) VALUES('job','submitted',1)")
+        posts = []
+        def guest(worker, path, payload=None):
+            if path.startswith('/job?id='):
+                return {'job_id': 'job', 'attempt': 1, 'state': 'failed', 'failure': 'worker_restarted'}
+            if path == '/ready':
+                return {'active_jobs': 0, 'build_complete': True}
+            self.assertEqual(path, '/job')
+            posts.append(payload['attempt'])
+            if len(posts) == 1:
+                raise RuntimeError('transport_lost_before_acceptance')
+            return {'job_id': 'job', 'attempt': payload['attempt'], 'state': 'accepted'}
+        with mock.patch.object(finite, 'read_work', return_value={'clips': [{'clip_id': 1, 'bucket': 'b', 'object_key': 'k'}]}), \
+                mock.patch.object(finite, 'head', return_value='etag'), \
+                mock.patch.object(finite, 'presign', return_value={}), \
+                mock.patch.object(finite, 'guest', side_effect=guest):
+            with self.assertRaisesRegex(RuntimeError, 'transport_lost_before_acceptance'):
+                finite.reconcile(self.root, self.db, {'id': 'owner'}, self.db.execute('SELECT * FROM jobs').fetchone())
+            self.assertEqual(self.db.execute('SELECT attempt FROM jobs').fetchone()[0], 2)
+            finite.reconcile(self.root, self.db, {'id': 'owner'}, self.db.execute('SELECT * FROM jobs').fetchone())
+        self.assertEqual(posts, [2, 2])
+        self.assertEqual(self.db.execute('SELECT attempt FROM jobs').fetchone()[0], 2)
+
     def test_confirmed_absent_submission_retries_same_identity(self):
         row = {'id': 'same-frozen-hash', 'attempt': 1}
         with mock.patch.object(finite, 'guest', side_effect=[finite.GuestStatus(404), {'active_jobs': 0, 'build_complete': True}]), \
