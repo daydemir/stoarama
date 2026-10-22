@@ -265,6 +265,56 @@ func requireFFmpeg(t *testing.T) Tools {
 	return tools
 }
 
+func TestFullDecodeRejectsCorruptAudioWithValidVideo(t *testing.T) {
+	tools := requireFFmpeg(t)
+	path := filepath.Join(t.TempDir(), "audio-corrupt.mp4")
+	cmd := exec.Command(tools.FFmpeg, "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=2",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2", "-c:v", "libx264", "-c:a", "aac", "-shortest", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, out)
+	}
+	ctx := context.Background()
+	if err := VerifyFullDecode(ctx, tools, path); err != nil {
+		t.Fatalf("valid audio/video rejected: %v", err)
+	}
+	cmd = exec.Command(tools.FFprobe, "-v", "error", "-select_streams", "a:0", "-show_packets", "-show_entries", "packet=pos,size", "-of", "json", path)
+	body, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probe struct {
+		Packets []struct {
+			Pos  string `json:"pos"`
+			Size string `json:"size"`
+		} `json:"packets"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil || len(probe.Packets) < 5 {
+		t.Fatalf("missing audio packets: %v", err)
+	}
+	var pos, size int64
+	if _, err := fmt.Sscan(probe.Packets[len(probe.Packets)-5].Pos, &pos); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Sscan(probe.Packets[len(probe.Packets)-5].Size, &size); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteAt([]byte(strings.Repeat("\xff", int(size))), pos)
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("corrupt audio: %v %v", err, closeErr)
+	}
+	if err := strictDecode(ctx, tools, path); err != nil {
+		t.Fatalf("audio corruption changed video: %v", err)
+	}
+	if err := VerifyFullDecode(ctx, tools, path); err == nil {
+		t.Fatal("full decode accepted corrupt audio")
+	}
+}
+
 // synth renders a moving test pattern and cuts keyframe-aligned pieces.
 func synth(t *testing.T, tools Tools, dir string) string {
 	src := filepath.Join(dir, "src.mp4")

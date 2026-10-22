@@ -26,6 +26,8 @@ jobs:
           python-version: '3.9'
       - name: Test dashboard on its deployed Python version
         run: python -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
+      - name: Test finite capability staging on the control host Python version
+        run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
 
   joined-folder-zip-worker:
     runs-on: ubuntu-latest
