@@ -101,6 +101,64 @@ class ExecutorTest(unittest.TestCase):
         self.assertFalse(finite.is_control_storage_error(FileNotFoundError(errno.ENOENT, 'missing work')))
         self.assertFalse(finite.is_control_storage_error(sqlite3.OperationalError('no such table: jobs')))
 
+    def test_checkpoint_write_permission_or_missing_parent_pauses_workers(self):
+        self.prepare_main()
+        original_open = pathlib.Path.open
+        for code in (errno.EACCES, errno.ENOENT):
+            def opened(path, *args, **kwargs):
+                if path.name == 'budget-ledger.json.pending':
+                    raise OSError(code, 'checkpoint unavailable')
+                return original_open(path, *args, **kwargs)
+            with self.subTest(code=code), \
+                    mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                    mock.patch.object(finite, 'require_control_capacity'), \
+                    mock.patch.object(finite.time, 'monotonic', side_effect=[0, 1]), \
+                    mock.patch.object(finite, 'budget', side_effect=lambda *a: finite.write(self.root / 'budget-ledger.json', {})), \
+                    mock.patch.object(pathlib.Path, 'open', opened), \
+                    mock.patch.object(finite, 'provider', return_value={}) as provider:
+                with self.assertRaises(finite.ControlStorageError) as caught:
+                    finite.main()
+                self.assertEqual(caught.exception.__cause__.errno, code)
+                self.assertEqual(provider.call_count, 4)
+
+    def test_startup_read_io_error_pauses_validated_workers(self):
+        self.prepare_main()
+        original_read = pathlib.Path.read_text
+        def read(path, *args, **kwargs):
+            if path.name == 'run-authority.json':
+                raise OSError(errno.EIO, 'startup read unavailable')
+            return original_read(path, *args, **kwargs)
+        with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                mock.patch.object(pathlib.Path, 'read_text', read), \
+                mock.patch.object(finite, 'provider', return_value={}) as provider, \
+                mock.patch.object(finite, 'execute') as execute:
+            with self.assertRaises(OSError):
+                finite.main()
+            self.assertEqual(provider.call_count, 4)
+            execute.assert_not_called()
+
+    def test_missing_screen_database_keeps_workers_independent(self):
+        self.prepare_main()
+        with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                mock.patch.object(finite, 'require_control_capacity'), \
+                mock.patch.object(finite.time, 'monotonic', side_effect=[0, 1, 43]), \
+                mock.patch.object(finite.time, 'sleep'), \
+                mock.patch.object(finite, 'budget', return_value={'upper_bound_usd': 1}), \
+                mock.patch.object(finite, 'provider') as provider:
+            finite.main()
+            provider.assert_not_called()
+        self.assertEqual(len(list(self.root.glob('executor-error-*.json'))), 4)
+
+    def test_control_database_open_failure_pauses_workers(self):
+        self.prepare_main()
+        with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                mock.patch.object(finite, 'require_control_capacity'), \
+                mock.patch.object(finite.sqlite3, 'connect', side_effect=sqlite3.OperationalError('unable to open database file')), \
+                mock.patch.object(finite, 'provider', return_value={}) as provider:
+            with self.assertRaises(finite.ControlStorageError):
+                finite.main()
+            self.assertEqual(provider.call_count, 4)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

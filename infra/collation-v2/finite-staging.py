@@ -52,20 +52,23 @@ def is_control_storage_error(error):
     if isinstance(error, sqlite3.OperationalError):
         code = getattr(error, 'sqlite_errorcode', 0) & 255
         # Python 3.9 lacks sqlite_errorcode, so retain its stable error messages.
-        return code in (8, 10, 13, 14) or str(error).lower() in (
+        return code in (8, 10, 13) or str(error).lower() in (
             'database or disk is full', 'disk i/o error',
-            'attempt to write a readonly database', 'unable to open database file')
+            'attempt to write a readonly database')
     return False
 
 
 def write(path, data):
-    temporary = path.with_suffix(path.suffix + '.pending')
-    with temporary.open('w') as stream:
-        os.chmod(temporary, 0o600)
-        json.dump(data, stream, separators=(',', ':'))
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        temporary = path.with_suffix(path.suffix + '.pending')
+        with temporary.open('w') as stream:
+            os.chmod(temporary, 0o600)
+            json.dump(data, stream, separators=(',', ':'))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as error:
+        raise ControlStorageError('control_checkpoint_write_unavailable') from error
 
 
 def provider(method, path, data=None):
@@ -437,7 +440,7 @@ def pause_for_control_storage(root, workers):
     try:
         write(root / 'storage-pause-outcomes.json', {'observed_at': time.time(), 'outcomes': outcomes,
               'reason': 'control_checkpoint_storage_floor', 'submitted_intents_preserved': True})
-    except OSError:
+    except (OSError, ControlStorageError):
         pass
 
 
@@ -463,19 +466,18 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
-        authority = json.loads((root / 'run-authority.json').read_text())
-        if authority['additional_budget_usd'] != 100:
-            raise ValueError('additional_budget_authority_differs')
-        if json.loads((root / 'work-queue-summary.json').read_text())['selection_sha256'] != SELECTION:
-            raise ValueError('frozen_selection_differs')
-        if (root / 'STOP').exists():
-            return
         workers = json.loads((root / 'execution-workers.json').read_text())
-        # Provisioning/scaling is a separate admitted operation; this executor can
-        # only use the explicitly enrolled, source-pinned workers.
+        # Only the validated enrolled roster grants pause authority.
         if not 1 <= len(workers) <= 4 or len({w['id'] for w in workers}) != len(workers):
             raise ValueError('worker_scope_differs')
         try:
+            authority = json.loads((root / 'run-authority.json').read_text())
+            if authority['additional_budget_usd'] != 100:
+                raise ValueError('additional_budget_authority_differs')
+            if json.loads((root / 'work-queue-summary.json').read_text())['selection_sha256'] != SELECTION:
+                raise ValueError('frozen_selection_differs')
+            if (root / 'STOP').exists():
+                return
             execute(root, workers)
         except (ControlStorageError, OSError, sqlite3.OperationalError) as error:
             if is_control_storage_error(error):
@@ -486,7 +488,12 @@ def main():
 def execute(root, workers):
     require_control_capacity(root, workers)
     (root / 'results').mkdir(mode=0o700, exist_ok=True)
-    db = sqlite3.connect(root / 'execution.sqlite3')
+    try:
+        db = sqlite3.connect(root / 'execution.sqlite3')
+    except sqlite3.OperationalError as error:
+        if (getattr(error, 'sqlite_errorcode', 0) & 255) == 14 or str(error).lower() == 'unable to open database file':
+            raise ControlStorageError('control_database_open_unavailable') from error
+        raise
     try:
         db.row_factory = sqlite3.Row
         db.execute('CREATE TABLE IF NOT EXISTS export_attempts(id TEXT PRIMARY KEY,count INTEGER)')
