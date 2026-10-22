@@ -198,7 +198,9 @@ def archive_receipt(state):
                 raise ValueError('receipt_readback_identity_differs')
     except (OSError, TimeoutError):
         raise RuntimeError('receipt_readback_unconfirmed') from None
-    return {'job_id': state['job_id'], 'receipt_bucket': bucket, 'receipt_key': key,
+    return {'job_id': state['job_id'], 'attempt': state['attempt'],
+            'export_receipts_sha256': hashlib.sha256(json.dumps(state['export_receipts'], sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+            'receipt_bucket': bucket, 'receipt_key': key,
             'receipt_sha256': sha, 'receipt_bytes': len(body),
             'export_bytes': sum(o['bytes'] for o in state['export_receipts']),
             'output_count': len(state['export_receipts']), 'ready_to_publish': False}
@@ -222,6 +224,8 @@ def reconcile(root, db, worker, row):
         return
     if state.get('job_id') != row['id']:
         raise ValueError('remote_job_identity_differs')
+    if state.get('attempt') != row['attempt']:
+        raise ValueError('remote_media_attempt_differs')
     remote = state['state']
     if remote in ('accepted', 'running', 'exporting'):
         return
@@ -277,10 +281,12 @@ def reconcile(root, db, worker, row):
         if actual != expected or len(receipts) != len(expected):
             raise ValueError('remote_readback_accounting_differs')
         # Durable local receipt precedes any guest scratch release.
-        archived = db.execute('SELECT receipt FROM archive_receipts WHERE id=?', (row['id'],)).fetchone()
-        if archived:
-            receipt = json.loads(archived[0])
-        else:
+        archive_id = row['id'] + ':attempt-' + str(row['attempt'])
+        archived = db.execute('SELECT receipt FROM archive_receipts WHERE id=?', (archive_id,)).fetchone()
+        receipt = json.loads(archived[0]) if archived else None
+        export_hash = hashlib.sha256(json.dumps(receipts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if not (receipt and receipt.get('job_id') == row['id'] and receipt.get('attempt') == row['attempt'] and
+                receipt.get('export_receipts_sha256') == export_hash):
             prior = db.execute('SELECT count FROM archive_attempts WHERE id=?', (row['id'],)).fetchone()
             count = prior[0] if prior else 0
             if count >= 3:
@@ -290,7 +296,7 @@ def reconcile(root, db, worker, row):
             db.execute('INSERT OR REPLACE INTO archive_attempts VALUES(?,?)', (row['id'], count + 1))
             db.commit()
             receipt = archive_receipt(state)
-            db.execute('INSERT INTO archive_receipts VALUES(?,?)', (row['id'], json.dumps(receipt)))
+            db.execute('INSERT OR REPLACE INTO archive_receipts VALUES(?,?)', (archive_id, json.dumps(receipt)))
             db.commit()
         write(root / 'results' / (row['id'] + '.json'), receipt)
         if remote != 'released':
