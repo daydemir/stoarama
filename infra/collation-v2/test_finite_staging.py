@@ -1,4 +1,5 @@
 import importlib.util
+import errno
 import hashlib
 import io
 import json
@@ -21,14 +22,14 @@ class ExecutorTest(unittest.TestCase):
         (self.root / 'work-queue-summary.json').write_text(json.dumps({'selection_sha256': finite.SELECTION}))
         workers = [{'id': x} for x in ('a', 'b', 'c', 'd')]
         (self.root / 'execution-workers.json').write_text(json.dumps(workers))
+        database = sqlite3.connect(self.root / 'execution.sqlite3')
+        self.db.backup(database)
+        database.close()
         return workers
 
     def test_midpass_storage_errors_pause_all_workers_and_preserve_original_error(self):
         self.prepare_main()
-        database = sqlite3.connect(self.root / 'execution.sqlite3')
-        self.db.backup(database)
-        database.close()
-        for target, error in [('dispatch', OSError('disk full during worker checkpoint')),
+        for target, error in [('dispatch', OSError(errno.ENOSPC, 'disk full during worker checkpoint')),
                               ('budget', sqlite3.OperationalError('database or disk is full'))]:
             with self.subTest(target=target), \
                     mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
@@ -48,7 +49,7 @@ class ExecutorTest(unittest.TestCase):
         with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
                 mock.patch.object(finite.os, 'statvfs', side_effect=OSError('volume unavailable')), \
                 mock.patch.object(finite, 'provider', return_value={}) as provider:
-            with self.assertRaisesRegex(OSError, 'volume unavailable'):
+            with self.assertRaisesRegex(finite.ControlStorageError, 'storage_unavailable'):
                 finite.main()
         self.assertEqual(provider.call_count, 4)
 
@@ -61,12 +62,14 @@ class ExecutorTest(unittest.TestCase):
         execute.assert_called_once()
 
     def test_low_storage_pauses_every_worker_even_if_checkpoint_cannot_be_written(self):
+        self.prepare_main()
         space = mock.Mock(f_bavail=1, f_frsize=4096)
-        with mock.patch.object(finite.os, 'statvfs', return_value=space), \
+        with mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                mock.patch.object(finite.os, 'statvfs', return_value=space), \
                 mock.patch.object(finite, 'provider', side_effect=[RuntimeError('offline'), {}, {}, {}]) as provider, \
                 mock.patch.object(finite, 'write', side_effect=OSError('disk_full')):
             with self.assertRaisesRegex(RuntimeError, 'storage_floor_pause_attempted'):
-                finite.require_control_capacity(self.root, [{'id': x} for x in ('a', 'b', 'c', 'd')])
+                finite.main()
         self.assertEqual([call.args[1] for call in provider.call_args_list], ['/a/pause', '/b/pause', '/c/pause', '/d/pause'])
 
     def test_sufficient_control_storage_does_not_touch_workers(self):
@@ -74,6 +77,29 @@ class ExecutorTest(unittest.TestCase):
         with mock.patch.object(finite.os, 'statvfs', return_value=space), mock.patch.object(finite, 'provider') as provider:
             finite.require_control_capacity(self.root, [{'id': 'a'}])
         provider.assert_not_called()
+
+    def test_unrelated_worker_io_errors_do_not_pause_other_workers(self):
+        self.prepare_main()
+        for error in (FileNotFoundError(errno.ENOENT, 'one work file missing'),
+                      sqlite3.OperationalError('database is locked')):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch('sys.argv', ['finite', '--run-root', str(self.root)]), \
+                    mock.patch.object(finite, 'require_control_capacity'), \
+                    mock.patch.object(finite.time, 'monotonic', side_effect=[0, 1, 43]), \
+                    mock.patch.object(finite.time, 'sleep'), \
+                    mock.patch.object(finite, 'budget', return_value={'upper_bound_usd': 1}), \
+                    mock.patch.object(finite, 'dispatch', side_effect=[error, None, None, None]) as dispatch, \
+                    mock.patch.object(finite, 'provider') as provider, mock.patch.object(finite, 'write') as write:
+                finite.main()
+                self.assertEqual(dispatch.call_count, 4)
+                provider.assert_not_called()
+                self.assertIn('executor-error-a.json', [c.args[0].name for c in write.call_args_list])
+
+    def test_storage_error_classification_is_specific(self):
+        for code in (errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.ENODEV):
+            self.assertTrue(finite.is_control_storage_error(OSError(code, 'storage error')))
+        self.assertFalse(finite.is_control_storage_error(FileNotFoundError(errno.ENOENT, 'missing work')))
+        self.assertFalse(finite.is_control_storage_error(sqlite3.OperationalError('no such table: jobs')))
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

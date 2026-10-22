@@ -10,6 +10,7 @@ import argparse
 import base64
 import concurrent.futures
 import datetime
+import errno
 import fcntl
 import gzip
 import hashlib
@@ -37,6 +38,24 @@ class GuestStatus(RuntimeError):
 
 class WorkerBusy(RuntimeError):
     pass
+
+
+class ControlStorageError(RuntimeError):
+    pass
+
+
+def is_control_storage_error(error):
+    if isinstance(error, ControlStorageError):
+        return True
+    if isinstance(error, OSError):
+        return error.errno in (errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.ENODEV)
+    if isinstance(error, sqlite3.OperationalError):
+        code = getattr(error, 'sqlite_errorcode', 0) & 255
+        # Python 3.9 lacks sqlite_errorcode, so retain its stable error messages.
+        return code in (8, 10, 13, 14) or str(error).lower() in (
+            'database or disk is full', 'disk i/o error',
+            'attempt to write a readonly database', 'unable to open database file')
+    return False
 
 
 def write(path, data):
@@ -423,11 +442,13 @@ def pause_for_control_storage(root, workers):
 
 
 def require_control_capacity(root, workers):
-    space = os.statvfs(root)
+    try:
+        space = os.statvfs(root)
+    except OSError as error:
+        raise ControlStorageError('control_checkpoint_storage_unavailable') from error
     if space.f_bavail * space.f_frsize >= 5 * GIB + 8 * 1024 ** 2:
         return
-    pause_for_control_storage(root, workers)
-    raise RuntimeError('control_checkpoint_storage_floor_pause_attempted')
+    raise ControlStorageError('control_checkpoint_storage_floor_pause_attempted')
 
 
 def main():
@@ -456,8 +477,9 @@ def main():
             raise ValueError('worker_scope_differs')
         try:
             execute(root, workers)
-        except (OSError, sqlite3.OperationalError):
-            pause_for_control_storage(root, workers)
+        except (ControlStorageError, OSError, sqlite3.OperationalError) as error:
+            if is_control_storage_error(error):
+                pause_for_control_storage(root, workers)
             raise
 
 
@@ -492,9 +514,9 @@ def execute(root, workers):
                         # Check local eligibility before touching the guest; an
                         # idle worker stays paused while sources are unavailable.
                         dispatch(root, db, worker, ledger)
-                except (OSError, sqlite3.OperationalError):
-                    raise  # The outer storage handler pauses every enrolled VM.
                 except Exception as error:
+                    if is_control_storage_error(error):
+                        raise  # The outer storage handler pauses every enrolled VM.
                     # Persist only classified local messages, never remote URLs.
                     write(root / ('executor-error-' + worker['id'] + '.json'), {'observed_at': time.time(), 'class': type(error).__name__, 'detail': str(error) if isinstance(error, (ValueError, RuntimeError)) else 'transport_or_io_failure'})
             counts = dict(db.execute('SELECT state,count(*) FROM jobs GROUP BY state'))
