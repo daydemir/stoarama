@@ -165,6 +165,10 @@ func ProbeFile(ctx context.Context, tools Tools, path string) (Probe, error) {
 	contentF, _ := content.Float64()
 	p.Media = ClipMedia{Playable: true, CodecSignature: hex.EncodeToString(sum[:8]), HasAudio: p.Audio != nil,
 		VideoPackets: len(p.Video.Packets), ContentSeconds: round6(contentF), FrameSeconds: round6(p.Video.medianDur())}
+	// Audio can extend beyond video, so source seam timing uses video alone.
+	video := Probe{Video: p.Video}
+	p.Media.VideoStartPTS = video.startTime().RatString()
+	p.Media.VideoEndPTS = video.endTime().RatString()
 	return p, nil
 }
 
