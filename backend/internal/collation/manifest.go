@@ -28,19 +28,29 @@ type HourWork struct {
 	SupersedesHourID       string `json:"supersedes_hour_id,omitempty"`
 	SupersedesHourRecordID int64  `json:"supersedes_hour_record_id,omitempty"`
 	Clips                  []Clip `json:"clips"`
+	// PolicyVersion selects the seam policy ("" = collation-v2).
+	PolicyVersion string `json:"policy_version,omitempty"`
 }
 
 var safeBatch = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 // HourIDFor matches the generation-1 canonical hour identity, with generation 2.
 func HourIDFor(batchID string, recordingID int64, localDate string, deliveryHour int) (string, error) {
+	return HourIDForGeneration(batchID, recordingID, localDate, deliveryHour, Generation)
+}
+
+// HourIDForGeneration is HourIDFor for an explicit collation generation (2 or 3).
+func HourIDForGeneration(batchID string, recordingID int64, localDate string, deliveryHour, generation int) (string, error) {
+	if generation != Generation && generation != GenerationV3 {
+		return "", fmt.Errorf("invalid collation generation")
+	}
 	if !safeBatch.MatchString(batchID) || recordingID <= 0 || deliveryHour < 1 || deliveryHour > 12 {
 		return "", fmt.Errorf("invalid hour identity")
 	}
 	if _, err := time.Parse("2006-01-02", localDate); err != nil {
 		return "", fmt.Errorf("invalid local date")
 	}
-	return fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", batchID, recordingID, localDate, deliveryHour, Generation), nil
+	return fmt.Sprintf("%s__recording-%d__date-%s__hour-%02d__generation-%d", batchID, recordingID, localDate, deliveryHour, generation), nil
 }
 
 // ManifestKey is today's joined coverage layout.
@@ -141,10 +151,11 @@ type HourManifest struct {
 // registered: every clip once, parts contiguous, every seam inside a part a
 // join and every seam between parts a split.
 func (m HourManifest) Validate() error {
-	if m.SchemaVersion != 1 || m.PolicyVersion != PolicyVersion || m.Generation != Generation {
+	spec, err := SpecFor(m.PolicyVersion)
+	if m.SchemaVersion != 1 || err != nil || m.PolicyVersion != spec.Version || m.Generation != spec.Generation {
 		return fmt.Errorf("manifest version differs")
 	}
-	want, err := HourIDFor(m.BatchID, m.RecordingID, m.LocalDate, m.DeliveryHour)
+	want, err := HourIDForGeneration(m.BatchID, m.RecordingID, m.LocalDate, m.DeliveryHour, m.Generation)
 	if err != nil || want != m.HourID {
 		return fmt.Errorf("manifest hour identity differs")
 	}
@@ -193,7 +204,7 @@ func (m HourManifest) Validate() error {
 		if (pp == np && pp != 0) != (s.Decision == DecisionJoin) {
 			return fmt.Errorf("seam %d->%d decision differs from parts", s.PrevClipID, s.NextClipID)
 		}
-		if s.Decision == DecisionJoin && (s.Match == nil || s.Match.Verdict != MatchContinuous) {
+		if s.Decision == DecisionJoin && !joinProven(spec, s) {
 			return fmt.Errorf("seam %d->%d joined without continuity proof", s.PrevClipID, s.NextClipID)
 		}
 	}
@@ -215,4 +226,24 @@ func (m HourManifest) Validate() error {
 // MarshalManifest is the one serialization of a published manifest.
 func MarshalManifest(m HourManifest) ([]byte, error) {
 	return json.Marshal(m)
+}
+
+// joinProven: a v2 join needs a continuous frame match; a v3 join needs that
+// or proven source adjacency with a frame match showing no duplicated footage.
+// Any v3 join is void when the source evidence proves a discontinuity.
+func joinProven(spec PolicySpec, s SeamDecision) bool {
+	if s.Match == nil {
+		return false
+	}
+	if spec.Version == PolicyVersionV3 && s.Source != nil {
+		switch s.Source.Status {
+		case SourceContradicts:
+			return false
+		case SourceAdjacent:
+			if sourceJoinVerdicts[s.Match.Verdict] {
+				return true
+			}
+		}
+	}
+	return s.Match.Verdict == MatchContinuous
 }

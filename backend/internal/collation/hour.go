@@ -60,11 +60,18 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 			return HourManifest{}, ErrDeferred
 		}
 	}
-	m := HourManifest{SchemaVersion: 1, PolicyVersion: PolicyVersion, Generation: Generation, BatchID: w.BatchID, HourID: w.HourID,
+	spec, err := SpecFor(w.PolicyVersion)
+	if err != nil {
+		return HourManifest{}, err
+	}
+	if (spec.Version == PolicyVersionV3) != (env.Policy.HRD != nil) {
+		return HourManifest{}, fmt.Errorf("seam policy does not match %s", spec.Version)
+	}
+	m := HourManifest{SchemaVersion: 1, PolicyVersion: spec.Version, Generation: spec.Generation, BatchID: w.BatchID, HourID: w.HourID,
 		SupersedesHourID: w.SupersedesHourID, RecordingID: w.RecordingID, Timezone: w.Timezone, LocalDate: w.LocalDate,
 		DeliveryHour: w.DeliveryHour, ScheduledStart: w.ScheduledStart, ScheduledEnd: w.ScheduledEnd, SeamPolicy: env.Policy,
 		MediaTool: env.MediaTool, Clips: []ClipDisposition{}, Seams: []SeamDecision{}, Outputs: []Output{}}
-	if want, err := HourIDFor(w.BatchID, w.RecordingID, w.LocalDate, w.DeliveryHour); err != nil || want != w.HourID {
+	if want, err := HourIDForGeneration(w.BatchID, w.RecordingID, w.LocalDate, w.DeliveryHour, spec.Generation); err != nil || want != w.HourID {
 		return m, fmt.Errorf("work hour identity differs")
 	}
 	root, err := filepath.Abs(env.ScratchRoot)
@@ -199,18 +206,7 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 		wg.Add(1)
 		go func(s int) {
 			defer wg.Done()
-			a, b := locals[pairs[s].prev], locals[pairs[s].next]
-			if overlap, ok := ReplayOverlap(a.Probe, b.Probe); ok {
-				seams[s] = DecideSeam(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media, nil)
-				seams[s].Decision, seams[s].Reason, seams[s].OverlapSeconds = DecisionSplit, "packet_replay", overlap
-				return
-			}
-			var match *MatchEvidence
-			if MetadataGate(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media) == "" {
-				ev := matchSeam(ctx, env, a, b)
-				match = &ev
-			}
-			seams[s] = DecideSeam(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media, match)
+			seams[s] = DecideLocalSeam(ctx, env, locals[pairs[s].prev], locals[pairs[s].next])
 		}(s)
 	}
 	wg.Wait()
@@ -507,4 +503,58 @@ func dropDuplicateCaptures(parts [][]int, clips []Clip, disp []ClipDisposition) 
 		kept = append(kept, parts[pi])
 	}
 	return kept
+}
+
+// hrdSeamEvidence reads the HRD facts of a seam's two clip edges. A stream
+// without NAL HRD, or one that cannot be read, yields "unavailable": never a
+// join and never a split by itself.
+func hrdSeamEvidence(pol HRDPolicy, prevPath, nextPath string) SourceEvidence {
+	unavailable := func(reason string) SourceEvidence {
+		return SourceEvidence{Channel: "h264_hrd", Status: SourceUnavailable, Reason: reason}
+	}
+	prev, ok, err := ReadHRDTrack(prevPath, true, pol.TailUnits)
+	if err != nil {
+		return unavailable("prev_unreadable")
+	}
+	if !ok {
+		return unavailable("no_nal_hrd")
+	}
+	next, ok, err := ReadHRDTrack(nextPath, false, 1)
+	if err != nil {
+		return unavailable("next_unreadable")
+	}
+	if !ok {
+		return unavailable("no_nal_hrd")
+	}
+	return EvaluateHRDSeam(pol, prev, next)
+}
+
+// DecideLocalSeam decides one seam between two downloaded, probed clips under
+// env.Policy (v2, or v3 when env.Policy.HRD is set).
+func DecideLocalSeam(ctx context.Context, env Env, a, b LocalClip) SeamDecision {
+	var src *SourceEvidence
+	if env.Policy.HRD != nil {
+		ev := hrdSeamEvidence(*env.Policy.HRD, a.Path, b.Path)
+		src = &ev
+	}
+	if overlap, ok := ReplayOverlap(a.Probe, b.Probe); ok {
+		d := DecideSeam(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media, nil)
+		d.Decision, d.Reason, d.OverlapSeconds, d.Source = DecisionSplit, "packet_replay", overlap, src
+		if env.Policy.HRD != nil {
+			gop := EvaluateGOPLattice(a.Probe.Video, b.Probe.Video, 8, 3)
+			d.GOP = &gop
+		}
+		return d
+	}
+	var match *MatchEvidence
+	gate := MetadataGate(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media)
+	if gate == "" || (src != nil && src.Status == SourceAdjacent && SoftGate(gate)) {
+		ev := matchSeam(ctx, env, a, b)
+		match = &ev
+	}
+	if env.Policy.HRD != nil {
+		gop := EvaluateGOPLattice(a.Probe.Video, b.Probe.Video, 8, 3)
+		return DecideSeamV3(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media, match, src, &gop)
+	}
+	return DecideSeam(env.Policy, a.Clip, b.Clip, a.Probe.Media, b.Probe.Media, match)
 }
