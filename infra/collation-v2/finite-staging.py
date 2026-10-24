@@ -162,6 +162,21 @@ def budget(root, workers, db):
             raise ValueError('provider_creation_time_not_utc')
         return datetime.datetime.strptime(value[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=datetime.timezone.utc).timestamp()
     machine = sum(max(0, now - created(w)) / 3600 * (0.078 + w['size']['disk'] * 0.05 / 672) for w in workers)
+    controller_cost = 0.0
+    controller_file = root / 'controller-reservation.json'
+    if controller_file.exists():
+        controller = json.loads(controller_file.read_text())
+        if (controller.get('schema') != 'best14-cloud-controller-v1' or
+                not 0 < controller['hourly_usd'] <= 0.02 or
+                not math.isfinite(controller['created_at_unix']) or
+                controller['created_at_unix'] > now):
+            raise ValueError('controller_budget_scope_differs')
+        # Includes its entire lifetime and $1 for checkpoint storage/operations.
+        controller_cost = max(0, now - controller['created_at_unix']) / 3600 * controller['hourly_usd'] + 1
+        # Preserve worker disks for one billing month after control expiry.
+        # Their existing results are not destroyed merely to meet a deadline.
+        controller_cost += sum(w['size']['disk'] for w in workers) * 0.05
+        machine += controller_cost
     transfer = 0.0
     # R2 bills daily peak bytes. Charge the entire NAS restore cohort from run
     # start, plus each verified staged output, rounding age up conservatively.
@@ -187,6 +202,7 @@ def budget(root, workers, db):
     operations = 7 + (head_reads + range_reads) / 1e6 * 0.36
     result = {'observed_at': now, 'additional_limit_usd': 100,
               'compute_and_disk_upper_bound_usd': machine,
+              'controller_upper_bound_usd': controller_cost,
               'reserved_egress_usd': transfer, 'r2_storage_upper_bound_usd': storage,
               'operations_reserve_usd': operations,
               'upper_bound_usd': machine + transfer + storage + operations,
@@ -442,6 +458,7 @@ def pause_for_control_storage(root, workers):
               'reason': 'control_checkpoint_storage_floor', 'submitted_intents_preserved': True})
     except (OSError, ControlStorageError):
         pass
+    return outcomes
 
 
 def require_control_capacity(root, workers):
@@ -468,7 +485,7 @@ def main():
             return
         workers = json.loads((root / 'execution-workers.json').read_text())
         # Only the validated enrolled roster grants pause authority.
-        if not 1 <= len(workers) <= 4 or len({w['id'] for w in workers}) != len(workers):
+        if not 1 <= len(workers) <= 8 or len({w['id'] for w in workers}) != len(workers):
             raise ValueError('worker_scope_differs')
         try:
             authority = json.loads((root / 'run-authority.json').read_text())
