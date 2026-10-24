@@ -61,6 +61,12 @@ def copy_state(source, audit, output, target, controller):
                    'hourly_usd': controller['hourly_usd'], 'name': controller['name'], 'created_at_unix': created,
                    'max_runtime_seconds': 7 * 86400, 'monthly_usd': 12}
     (output / 'controller-reservation.json').write_text(json.dumps(reservation))
+    runtime = output / 'runtime-source'
+    runtime.mkdir(mode=0o700)
+    code = pathlib.Path(__file__).resolve().parent
+    for name in ('finite-staging.py', 'cloud-control.py', 'source-screen.py',
+                 'capability-worker.py', 'capability_export.py', 'stoarama-best14-cloud.service'):
+        shutil.copyfile(code / name, runtime / name)
     hashes = {str(p.relative_to(output)): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in output.rglob('*') if p.is_file()}
     manifest = {'schema': 'best14-cloud-state-v1', 'frozen_jobs': 4342, 'counts': counts,

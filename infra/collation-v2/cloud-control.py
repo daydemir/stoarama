@@ -47,6 +47,11 @@ def preflight(root):
         raise ValueError('cloud_controller_scope_differs')
     if not 3600 <= config['max_runtime_seconds'] <= 7 * 86400:
         raise ValueError('cloud_lifetime_differs')
+    if (not isinstance(config.get('droplet_id'), int) or config['droplet_id'] <= 0 or
+            config.get('name') != 'stoarama-best14-controller-20261024' or
+            not isinstance(config.get('created_at_unix'), (int, float)) or
+            not 0 < config['created_at_unix'] <= time.time()):
+        raise ValueError('cloud_controller_identity_differs')
     selection = root / 'audit' / 'selection-final-v2.json'
     if hashlib.sha256(selection.read_bytes()).hexdigest() != finite.SELECTION:
         raise ValueError('cloud_selection_bytes_differ')
