@@ -1,4 +1,5 @@
 import hashlib
+import fcntl
 import importlib.util
 import io
 import json
@@ -162,6 +163,25 @@ class CloudControlTest(unittest.TestCase):
             cloud.retire_controller(self.root, config)
             self.assertEqual(network.call_args_list[-1].args[0].get_method(), 'DELETE')
             self.assertTrue(all('/droplets/123' in call.args[0].full_url for call in network.call_args_list))
+
+    def test_snapshot_requires_stop_and_both_source_writer_locks(self):
+        spec = importlib.util.spec_from_file_location('prepare', pathlib.Path(__file__).with_name('prepare-cloud-state.py'))
+        prepare = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prepare)
+        for name in ('executor.lock', 'structure-screen.lock'):
+            (self.root / name).write_bytes(b'')
+        with mock.patch.object(prepare, '_copy_state_locked', return_value={'copied': True}) as copy:
+            with self.assertRaisesRegex(ValueError, 'source_not_stopped'):
+                prepare.copy_state(self.root, self.root, self.root / 'out', self.root, {})
+            (self.root / 'STOP').write_text('{}')
+            for name in ('executor.lock', 'structure-screen.lock'):
+                with (self.root / name).open('r') as owner:
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with self.assertRaisesRegex(ValueError, 'writer_active'):
+                        prepare.copy_state(self.root, self.root, self.root / 'out', self.root, {})
+            copy.assert_not_called()
+            self.assertEqual(prepare.copy_state(self.root, self.root, self.root / 'out', self.root, {}), {'copied': True})
+            copy.assert_called_once()
 
     def test_controller_lifetime_is_included_in_existing_budget(self):
         db = sqlite3.connect(self.root / 'execution.sqlite3')

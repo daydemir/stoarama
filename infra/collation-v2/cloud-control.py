@@ -26,7 +26,7 @@ JSON_FILES = ('run-authority.json', 'work-queue-summary.json', 'execution-worker
               'controller-reservation.json', 'execution-status.json', 'budget-ledger.json',
               'structure-screen-status.json', 'STOP', 'budget-draining.json',
               'budget-stopped.json', 'budget-pause-outcomes.json', 'cloud-stop-outcomes.json',
-              'static-archive-receipt.json', 'controller-retirement-intent.json')
+              'static-archive-receipt.json', 'controller-retirement-intent.json', 'cloud-error.json')
 
 
 def load_workers(root):
@@ -244,10 +244,17 @@ def main():
                     'jelly_required': False, 'checkpoint_at_monotonic': checkpoint_at,
                     'last_pass': 'completed', 'public_changed': False})
                 time.sleep(2)
-        except BaseException:
-            # No controller failure or interrupted service may strand running compute.
-            stop_screen(screen)
-            finite.pause_for_control_storage(root, workers)
+        except BaseException as error:
+            # Persist a bounded classification; never serialize remote errors or URLs.
+            try:
+                finite.write(root / 'cloud-error.json', {'observed_at': time.time(),
+                    'class': type(error).__name__, 'detail': 'controller_pass_failed'})
+            except Exception:
+                pass
+            try:
+                stop_screen(screen)
+            finally:
+                finite.pause_for_control_storage(root, workers)
             raise
         finally:
             stop_screen(screen)

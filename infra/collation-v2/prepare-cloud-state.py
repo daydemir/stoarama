@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import datetime
 import gzip
+import fcntl
 import hashlib
 import json
 import pathlib
@@ -12,7 +13,7 @@ import sqlite3
 import tarfile
 
 
-def copy_state(source, audit, output, target, controller):
+def _copy_state_locked(source, audit, output, target, controller):
     if output.exists():
         raise ValueError('cloud_snapshot_destination_exists')
     output.mkdir(mode=0o700, parents=True)
@@ -74,6 +75,20 @@ def copy_state(source, audit, output, target, controller):
                 'media_included': False, 'publication_changed': False}
     (output / 'migration-manifest.json').write_text(json.dumps(manifest, indent=2))
     return manifest
+
+
+def copy_state(source, audit, output, target, controller):
+    # Both writers must be stopped for a single-owner handoff. STOP is not
+    # copied into the new queue: its destination will become the new owner.
+    with (source / 'executor.lock').open('r') as executor, (source / 'structure-screen.lock').open('r') as screen:
+        try:
+            fcntl.flock(executor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(screen, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('snapshot_source_writer_active') from None
+        if not (source / 'STOP').is_file():
+            raise ValueError('snapshot_source_not_stopped')
+        return _copy_state_locked(source, audit, output, target, controller)
 
 
 def main():
