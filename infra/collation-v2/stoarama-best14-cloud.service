@@ -1,0 +1,29 @@
+[Unit]
+Description=Finite best14 cloud staging owner
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=stoarama
+Group=stoarama
+UMask=0077
+EnvironmentFile=/etc/stoarama-best14/controller.env
+WorkingDirectory=/var/lib/stoarama-best14
+ExecStart=/usr/bin/python3 /opt/stoarama-best14/cloud-control.py --run-root /var/lib/stoarama-best14
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=480
+KillMode=mixed
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/stoarama-best14
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
