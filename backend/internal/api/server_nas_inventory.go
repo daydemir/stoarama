@@ -50,6 +50,8 @@ type nasInventoryFileReport struct {
 
 type nasInventorySyncRequest struct {
 	Generation      string                   `json:"generation"`
+	DatasetSchema   string                   `json:"dataset_schema"`
+	RootExclusions  []string                 `json:"root_exclusions"`
 	ScanStartedAt   *time.Time               `json:"scan_started_at"`
 	ScanCompletedAt *time.Time               `json:"scan_completed_at"`
 	Digest          string                   `json:"digest"`
@@ -89,6 +91,9 @@ func nasInventoryTreeParts(path string) (string, string) {
 func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error {
 	if req.Generation == "" || len(req.Generation) > nasInventoryMaxGeneration || !relayArtifactName.MatchString(req.Generation) {
 		return errors.New("invalid inventory generation")
+	}
+	if req.DatasetSchema != "raw-dataset-v2" || len(req.RootExclusions) != 1 || req.RootExclusions[0] != "#recycle" {
+		return errors.New("inventory requires fixed raw-dataset-v2 scope")
 	}
 	if len(req.Files)+len(req.Unmatched) > nasInventoryMaxBatch {
 		return fmt.Errorf("inventory batch exceeds %d files", nasInventoryMaxBatch)

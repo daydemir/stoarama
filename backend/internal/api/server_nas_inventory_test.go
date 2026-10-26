@@ -60,7 +60,7 @@ func TestValidateNASInventorySync(t *testing.T) {
 	now := time.Now().UTC()
 	start := now.Add(-time.Minute)
 	valid := nasInventorySyncRequest{
-		Generation: "scan-20260806-abcd1234",
+		Generation: "scan-20260806-abcd1234", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"},
 		Files: []nasInventoryFileReport{{
 			ClipID: 1, RecordingID: 2, RelativePath: "recording/clip.mp4", SizeBytes: 3,
 			SHA256: strings.Repeat("a", 64), State: "present", VerifiedAt: &now, ClientUpdatedAt: now,
@@ -601,7 +601,7 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	sha := strings.Repeat("a", 64)
-	newer := nasInventorySyncRequest{Generation: "scan-new", Files: []nasInventoryFileReport{{
+	newer := nasInventorySyncRequest{Generation: "scan-new", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, Files: []nasInventoryFileReport{{
 		ClipID: 10, RecordingID: 20, RelativePath: "clips/new.mp4", SizeBytes: 3, SHA256: sha,
 		State: "present", VerifiedAt: &now, ClientUpdatedAt: now,
 	}}}
@@ -627,7 +627,7 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 		($1,12,20,'clips/inflight.mp4',3,$2,'present',$3,'prior',$5)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	complete := nasInventorySyncRequest{Generation: "scan-complete", ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
+	complete := nasInventorySyncRequest{Generation: "scan-complete", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
 	if rec := callSync(complete); rec.Code != http.StatusOK {
 		t.Fatalf("complete sync status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -642,7 +642,7 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	olderStart := olderComplete.Add(-time.Hour)
 	laterClientUpdate := now.Add(time.Minute)
 	stale := nasInventorySyncRequest{
-		Generation: "scan-stale", ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete,
+		Generation: "scan-stale", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete,
 		Digest: strings.Repeat("c", 64), Complete: true,
 		Files: []nasInventoryFileReport{{
 			ClipID: 10, RecordingID: 20, RelativePath: "clips/stale-completion-mutation.mp4",
