@@ -631,6 +631,9 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 		($1,13,20,'#recycle/retained.mp4',3,$2,'present',$3,'prior',$4)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,seen_generation,client_updated_at) VALUES($1,'#recycle/unmatched-retained.mp4',3,$2,'present','prior',$3)`, connectionID, sha, scanStart.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	complete := nasInventorySyncRequest{Generation: "scan-complete", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
 	if rec := callSync(complete); rec.Code != http.StatusOK {
 		t.Fatalf("complete sync status=%d body=%s", rec.Code, rec.Body.String())
@@ -641,6 +644,10 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	}
 	if oldState != "missing" || inflightState != "present" || recycleState != "present" {
 		t.Fatalf("completion sweep old=%q inflight=%q recycle=%q", oldState, inflightState, recycleState)
+	}
+	var recycleUnmatchedState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='#recycle/unmatched-retained.mp4'`, connectionID).Scan(&recycleUnmatchedState); err != nil || recycleUnmatchedState != "present" {
+		t.Fatalf("completion swept excluded unmatched recycle row state=%q err=%v", recycleUnmatchedState, err)
 	}
 	var datasetSchema string
 	var rootExclusions []byte

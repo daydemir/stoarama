@@ -664,7 +664,12 @@ class Inventory:
             values = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
         generation = values.get("generation", "")
         started_at = values.get("scan_started_at", "")
-        if generation.startswith("scan-") and started_at and not values.get("scan_completed_at"):
+        expected_exclusions = json.dumps(INVENTORY_ROOT_EXCLUSIONS, separators=(",", ":"))
+        scope_matches = (
+            values.get("dataset_schema") == INVENTORY_DATASET_SCHEMA
+            and values.get("root_exclusions") == expected_exclusions
+        )
+        if generation.startswith("scan-") and started_at and not values.get("scan_completed_at") and scope_matches:
             return generation, started_at
         return None
 
@@ -1459,6 +1464,8 @@ def walk_raw_files(root):
         if directory == root:
             dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS]
         for filename in filenames:
+            if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
+                continue
             yield directory / filename
 
 

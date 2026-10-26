@@ -940,6 +940,34 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(len(hashed), 1)
             resumed.close()
 
+    def test_full_scan_does_not_resume_generation_with_unknown_or_changed_scope(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            for scope in (
+                {},
+                {"dataset_schema": "raw-dataset-v1", "root_exclusions": '["#recycle"]'},
+                {"dataset_schema": "raw-dataset-v2", "root_exclusions": '["other"]'},
+            ):
+                inventory._meta_set({
+                    "generation": "scan-old-scope",
+                    "scan_started_at": "2026-10-25T00:00:00Z",
+                    "scan_completed_at": "",
+                    "dataset_schema": scope.get("dataset_schema", ""),
+                    "root_exclusions": scope.get("root_exclusions", ""),
+                })
+                calls = []
+                with mock.patch.object(
+                    pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}
+                ):
+                    inventory.full_scan(cfg, threading.Event())
+                complete = [body for body in calls if body.get("complete")]
+                self.assertEqual(len(complete), 1)
+                self.assertNotEqual(complete[0]["generation"], "scan-old-scope")
+                self.assertEqual(complete[0]["dataset_schema"], pull.INVENTORY_DATASET_SCHEMA)
+                self.assertEqual(complete[0]["root_exclusions"], list(pull.INVENTORY_ROOT_EXCLUSIONS))
+            inventory.close()
+
     def test_resumed_scan_reconciles_sidecar_removal_and_repair(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1101,7 +1129,14 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             generation = "scan-20260809-cached"
             started_at = "2026-08-09T00:00:00Z"
             inventory = pull.Inventory(cfg)
-            inventory._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+            inventory._meta_set({
+                "generation": generation,
+                "scan_started_at": started_at,
+                "scan_completed_at": "",
+                "digest": "",
+                "dataset_schema": pull.INVENTORY_DATASET_SCHEMA,
+                "root_exclusions": json.dumps(pull.INVENTORY_ROOT_EXCLUSIONS, separators=(",", ":")),
+            })
             sha = hashlib.sha256(b"x").hexdigest()
             for clip_id in range(1, 1001):
                 clip = {
