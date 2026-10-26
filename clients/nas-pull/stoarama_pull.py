@@ -775,7 +775,7 @@ class Inventory:
         clips = total_bytes = mismatches = unmatched = 0
         with self.lock:
             rows = self.db.execute(
-                "SELECT clip_id,relative_path,size_bytes,sha256,state FROM files WHERE relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' ORDER BY clip_id"
+                "SELECT clip_id,relative_path,size_bytes,sha256,state FROM files WHERE relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%' ORDER BY clip_id"
             )
             for clip_id, path, size_bytes, sha256, state in rows:
                 digest.update(("%d\0%s\0%d\0%s\0%s\n" % (clip_id, path, size_bytes, sha256, state)).encode("utf-8"))
@@ -785,7 +785,7 @@ class Inventory:
                 elif state == "mismatch":
                     mismatches += 1
             for path, size_bytes, sha256, state in self.db.execute(
-                "SELECT relative_path,size_bytes,sha256,state FROM unmatched_files WHERE relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' ORDER BY relative_path"
+                "SELECT relative_path,size_bytes,sha256,state FROM unmatched_files WHERE relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%' ORDER BY relative_path"
             ):
                 digest.update(("unmatched\0%s\0%d\0%s\0%s\n" % (path, size_bytes, sha256, state)).encode("utf-8"))
                 if state == "present":
@@ -958,13 +958,13 @@ class Inventory:
             self.db.execute(
                 """UPDATE files SET state='missing',verified_at=NULL,seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
                    WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
-                     AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'""",
+                     AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'""",
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.execute(
                 """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
                    WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
-                     AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'""",
+                     AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'""",
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.commit()

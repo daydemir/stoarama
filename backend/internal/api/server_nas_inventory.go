@@ -177,12 +177,12 @@ func rebuildNASInventoryTreeDirectories(ctx context.Context, tx pgx.Tx, connecti
 		  FROM nas_inventory_files i
 		  LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
 		  WHERE i.connection_id=$1 AND i.state IN('present','mismatch')
-	    AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%'
+	    AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%' AND i.relative_path<>'joined' AND i.relative_path NOT LIKE 'joined/%'
 		  UNION ALL
 		  SELECT u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
 		  FROM nas_inventory_unmatched_files u
 		  WHERE u.connection_id=$1 AND u.state='present'
-	    AND u.relative_path<>'#recycle' AND u.relative_path NOT LIKE '#recycle/%'
+	    AND u.relative_path<>'#recycle' AND u.relative_path NOT LIKE '#recycle/%' AND u.relative_path<>'joined' AND u.relative_path NOT LIKE 'joined/%'
 		), ranked AS (
 		  SELECT *,count(*) OVER(PARTITION BY relative_path) AS path_count,row_number() OVER(PARTITION BY relative_path ORDER BY
 		    CASE reconciliation WHEN 'mismatch' THEN 2 WHEN 'nas_only' THEN 1 ELSE 0 END DESC,
@@ -406,7 +406,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			UPDATE nas_inventory_files
 			SET state='missing', verified_at=NULL, client_updated_at=$3, server_received_at=now()
 			WHERE connection_id=$1 AND seen_generation<>$2 AND client_updated_at <= $4
-			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'
 		`, connectionID, req.Generation, req.ScanCompletedAt, req.ScanStartedAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("finalize inventory missing files: %v", err))
@@ -415,7 +415,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		_, err = tx.Exec(r.Context(), `
 			UPDATE nas_inventory_unmatched_files SET state='missing',client_updated_at=$3,server_received_at=now()
 			WHERE connection_id=$1 AND seen_generation<>$2 AND client_updated_at<=$4
-			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'
 		`, connectionID, req.Generation, req.ScanCompletedAt, req.ScanStartedAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("finalize unmatched inventory files: %v", err))
@@ -427,12 +427,12 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			       COALESCE(sum(size_bytes) FILTER (WHERE state='present'),0),
 			       count(*) FILTER (WHERE state='mismatch')
 			FROM nas_inventory_files WHERE connection_id=$1
-			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'
 		`, connectionID).Scan(&clips, &bytes, &mismatches); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize inventory: %v", err))
 			return
 		}
-		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present' AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'`, connectionID).Scan(&unmatched); err != nil {
+		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present' AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'`, connectionID).Scan(&unmatched); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize unmatched inventory: %v", err))
 			return
 		}
