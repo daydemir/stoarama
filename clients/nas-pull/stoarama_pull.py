@@ -391,6 +391,32 @@ def utc_now_precise():
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now_ns // 1000000000)) + (".%06dZ" % (now_ns // 1000 % 1000000))
 
 
+def post_inventory_scan_page(cfg, body, stop_event=None):
+    """Keep a scan's walker in place while its durable page is retried."""
+    delay = 1
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        try:
+            request_json(cfg, "POST", "/account/connections/inventory", body=body)
+            return True
+        except urllib.error.HTTPError as exc:
+            if stop_event is None or exc.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            reason = "HTTP %d" % exc.code
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if stop_event is None:
+                raise
+            reason = "transport error"
+        # The dirty SQLite row and client_updated_at token remain unchanged
+        # until an acknowledgement. Replaying an accepted-but-lost response is
+        # safe under the server's idempotent upsert; no local row is discarded.
+        log("WARN", "inventory upload retry in %ds after %s" % (delay, reason))
+        if stop_event.wait(delay):
+            return False
+        delay = min(delay * 2, 30)
+
+
 class Inventory:
     """Durable, locally authoritative NAS clip inventory.
 
@@ -587,10 +613,11 @@ class Inventory:
             rows = self._rows("dirty=1")
             if not rows:
                 break
-            request_json(cfg, "POST", "/account/connections/inventory", body={
+            if not post_inventory_scan_page(cfg, {
                 "generation": generation, "scan_started_at": scan_started_at,
                 "complete": False, "files": self._reports(rows),
-            })
+            }, stop_event):
+                return
             self._mark_clean(rows)
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -607,10 +634,11 @@ class Inventory:
                 "relative_path": row[0], "size_bytes": row[1], "sha256": row[2],
                 "state": row[3], "file_mtime_ns": row[4], "client_updated_at": row[5],
             } for row in rows]
-            request_json(cfg, "POST", "/account/connections/inventory", body={
+            if not post_inventory_scan_page(cfg, {
                 "generation": generation, "scan_started_at": scan_started_at,
                 "complete": False, "files": [], "unmatched_files": reports,
-            })
+            }, stop_event):
+                return
             with self.lock:
                 self.db.executemany(
                     "UPDATE unmatched_files SET dirty=0 WHERE relative_path=? AND client_updated_at=?",
@@ -932,10 +960,11 @@ class Inventory:
         digest, clips, total_bytes, mismatches, unmatched = self._digest_and_counts()
         if stop_event.is_set():
             return
-        request_json(cfg, "POST", "/account/connections/inventory", body={
+        if not post_inventory_scan_page(cfg, {
             "generation": generation, "scan_started_at": started_at,
             "scan_completed_at": completed_at, "digest": digest, "complete": True, "files": [],
-        })
+        }, stop_event):
+            return
         self._meta_set({
             "generation": generation, "scan_started_at": started_at,
             "scan_completed_at": completed_at, "digest": digest,
