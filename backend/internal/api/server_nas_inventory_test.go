@@ -32,6 +32,30 @@ func (r *firstWriteRecorder) Write(body []byte) (int, error) {
 	return r.ResponseRecorder.Write(body)
 }
 
+func TestValidateNASInventorySyncRequiresFixedRawDatasetV2Scope(t *testing.T) {
+	now := time.Now().UTC()
+	valid := nasInventorySyncRequest{
+		Generation:     "scan-scope",
+		DatasetSchema:  "raw-dataset-v2",
+		RootExclusions: []string{"#recycle"},
+	}
+	if err := validateNASInventorySync(valid, now); err != nil {
+		t.Fatalf("fixed raw dataset scope rejected: %v", err)
+	}
+	invalid := []nasInventorySyncRequest{
+		{Generation: "scan-scope"},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v1", RootExclusions: []string{"#recycle"}},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v2"},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle", "other"}},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"other"}},
+	}
+	for index, request := range invalid {
+		if err := validateNASInventorySync(request, now); err == nil {
+			t.Errorf("invalid dataset scope %d accepted: %+v", index, request)
+		}
+	}
+}
+
 func TestValidateNASInventorySync(t *testing.T) {
 	now := time.Now().UTC()
 	start := now.Add(-time.Minute)
