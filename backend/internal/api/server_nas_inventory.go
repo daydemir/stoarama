@@ -603,15 +603,16 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	var completedGeneration, treeGeneration, activeGeneration string
+	var completedGeneration, completedDatasetSchema, treeGeneration, activeGeneration, activeDatasetSchema string
+	var completedRootExclusions, activeRootExclusions []string
 	var liveRevision, treeRevision int64
 	var scanStartedAt, scanCompletedAt, reportedAt, activeStartedAt, activeReportedAt *time.Time
 	err = tx.QueryRow(r.Context(), `
-		SELECT inventory_generation,inventory_tree_generation,inventory_live_revision,inventory_tree_revision,inventory_scan_started_at,inventory_scan_completed_at,inventory_reported_at,
-		       inventory_in_progress_generation,inventory_in_progress_started_at,inventory_in_progress_reported_at
+		SELECT inventory_generation,inventory_dataset_schema,inventory_root_exclusions,inventory_tree_generation,inventory_live_revision,inventory_tree_revision,inventory_scan_started_at,inventory_scan_completed_at,inventory_reported_at,
+		       inventory_in_progress_generation,inventory_in_progress_dataset_schema,inventory_in_progress_root_exclusions,inventory_in_progress_started_at,inventory_in_progress_reported_at
 		FROM connections WHERE id=$1 AND account_id=$2
-	`, connectionID, principal.AccountID).Scan(&completedGeneration, &treeGeneration, &liveRevision, &treeRevision, &scanStartedAt, &scanCompletedAt, &reportedAt,
-		&activeGeneration, &activeStartedAt, &activeReportedAt)
+	`, connectionID, principal.AccountID).Scan(&completedGeneration, &completedDatasetSchema, &completedRootExclusions, &treeGeneration, &liveRevision, &treeRevision, &scanStartedAt, &scanCompletedAt, &reportedAt,
+		&activeGeneration, &activeDatasetSchema, &activeRootExclusions, &activeStartedAt, &activeReportedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "connection not found")
 		return
@@ -631,6 +632,7 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		time.Since(scanCompletedAt.UTC()) <= nasInventoryFreshness && time.Since(scanCompletedAt.UTC()) >= -nasInventoryMaxFutureSkew
 	if activeReportedAt != nil && time.Since(activeReportedAt.UTC()) > nasInventoryScanProgressTTL {
 		activeGeneration, activeStartedAt, activeReportedAt = "", nil, nil
+		activeDatasetSchema, activeRootExclusions = "", []string{}
 	}
 	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration
 	snapshotIdentity := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration, directory}, "|")
@@ -688,10 +690,10 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 	rows.Close()
 	response := map[string]any{
 		"path": directory, "entries": entries, "next_cursor": nextCursor,
-		"generation": completedGeneration, "scan_started_at": scanStartedAt, "scan_completed_at": scanCompletedAt,
+		"generation": completedGeneration, "dataset_schema": completedDatasetSchema, "root_exclusions": completedRootExclusions, "scan_started_at": scanStartedAt, "scan_completed_at": scanCompletedAt,
 		"reported_at": reportedAt, "fresh": fresh, "stale": !fresh,
 		"snapshot_available": snapshotAvailable, "snapshot_consistent": snapshotAvailable && activeGeneration == "" && liveRevision == treeRevision, "in_progress_generation": activeGeneration,
-		"in_progress_started_at": activeStartedAt, "in_progress_reported_at": activeReportedAt,
+		"in_progress_dataset_schema": activeDatasetSchema, "in_progress_root_exclusions": activeRootExclusions, "in_progress_started_at": activeStartedAt, "in_progress_reported_at": activeReportedAt,
 	}
 	if directory == "" && r.URL.Query().Get("cursor") == "" {
 		var serverOnly int64

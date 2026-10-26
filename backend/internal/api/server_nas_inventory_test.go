@@ -200,7 +200,7 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		if err := rebuildNASInventoryTreeDirectories(ctx, tx, connectionID, accountID, generation); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE connections SET inventory_generation=$1,inventory_tree_generation=$1,inventory_scan_started_at=now()-interval '1 minute',inventory_scan_completed_at=now(),inventory_reported_at=now(),inventory_in_progress_generation='' WHERE id=$2`, generation, connectionID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE connections SET inventory_generation=$1,inventory_tree_generation=$1,inventory_scan_started_at=now()-interval '1 minute',inventory_scan_completed_at=now(),inventory_reported_at=now(),inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_in_progress_generation='' WHERE id=$2`, generation, connectionID); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -267,6 +267,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if first["generation"] != "tree-one" || first["fresh"] != true || first["snapshot_consistent"] != true {
 		t.Fatalf("root snapshot metadata=%v", first)
 	}
+	if first["dataset_schema"] != "raw-dataset-v2" || fmt.Sprint(first["root_exclusions"]) != "[#recycle]" {
+		t.Fatalf("root snapshot scope=%v/%v", first["dataset_schema"], first["root_exclusions"])
+	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_live_revision=inventory_tree_revision+1 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +279,7 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_tree_revision=inventory_live_revision WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='tree-active',inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`, connectionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='tree-active',inventory_in_progress_dataset_schema='raw-dataset-v2',inventory_in_progress_root_exclusions='["#recycle"]'::jsonb,inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := call("", cursor, 2); status != http.StatusConflict {
