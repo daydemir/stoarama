@@ -177,10 +177,12 @@ func rebuildNASInventoryTreeDirectories(ctx context.Context, tx pgx.Tx, connecti
 		  FROM nas_inventory_files i
 		  LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
 		  WHERE i.connection_id=$1 AND i.state IN('present','mismatch')
+	    AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%'
 		  UNION ALL
 		  SELECT u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
 		  FROM nas_inventory_unmatched_files u
 		  WHERE u.connection_id=$1 AND u.state='present'
+	    AND u.relative_path<>'#recycle' AND u.relative_path NOT LIKE '#recycle/%'
 		), ranked AS (
 		  SELECT *,count(*) OVER(PARTITION BY relative_path) AS path_count,row_number() OVER(PARTITION BY relative_path ORDER BY
 		    CASE reconciliation WHEN 'mismatch' THEN 2 WHEN 'nas_only' THEN 1 ELSE 0 END DESC,
@@ -307,11 +309,23 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var connectionID int64
 	var existingCompletedAt *time.Time
-	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt); errors.Is(err, pgx.ErrNoRows) {
+	var activeGeneration, activeDatasetSchema string
+	var activeRootExclusions []byte
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at,inventory_in_progress_generation,inventory_in_progress_dataset_schema,inventory_in_progress_root_exclusions FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt, &activeGeneration, &activeDatasetSchema, &activeRootExclusions); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load inventory connection: %v", err))
+		return
+	}
+	wantedRootExclusions, _ := json.Marshal(req.RootExclusions)
+	if activeGeneration == req.Generation && activeGeneration != "" &&
+		(activeDatasetSchema != req.DatasetSchema || string(activeRootExclusions) != string(wantedRootExclusions)) {
+		util.WriteError(w, http.StatusConflict, "inventory dataset scope changed within generation")
+		return
+	}
+	if req.Complete && (existingCompletedAt == nil || req.ScanCompletedAt.After(*existingCompletedAt)) && activeGeneration != "" && activeGeneration != req.Generation {
+		util.WriteError(w, http.StatusConflict, "inventory completion does not match active generation")
 		return
 	}
 	if req.Complete && existingCompletedAt != nil && !req.ScanCompletedAt.After(*existingCompletedAt) {
@@ -329,9 +343,10 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			  inventory_in_progress_started_at=CASE
 			    WHEN inventory_in_progress_generation<>$1 THEN COALESCE($2,now())
 			    ELSE COALESCE(inventory_in_progress_started_at,$2,now()) END,
-			  inventory_in_progress_generation=$1,inventory_in_progress_reported_at=now(),updated_at=now()
+			  inventory_in_progress_generation=$1,inventory_in_progress_dataset_schema=$4,
+			  inventory_in_progress_root_exclusions=$5::jsonb,inventory_in_progress_reported_at=now(),updated_at=now()
 			WHERE id=$3
-		`, req.Generation, req.ScanStartedAt, connectionID)
+		`, req.Generation, req.ScanStartedAt, connectionID, req.DatasetSchema, wantedRootExclusions)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update inventory scan progress: %v", err))
 			return
@@ -391,6 +406,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			UPDATE nas_inventory_files
 			SET state='missing', verified_at=NULL, client_updated_at=$3, server_received_at=now()
 			WHERE connection_id=$1 AND seen_generation<>$2 AND client_updated_at <= $4
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'
 		`, connectionID, req.Generation, req.ScanCompletedAt, req.ScanStartedAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("finalize inventory missing files: %v", err))
@@ -399,6 +415,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		_, err = tx.Exec(r.Context(), `
 			UPDATE nas_inventory_unmatched_files SET state='missing',client_updated_at=$3,server_received_at=now()
 			WHERE connection_id=$1 AND seen_generation<>$2 AND client_updated_at<=$4
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'
 		`, connectionID, req.Generation, req.ScanCompletedAt, req.ScanStartedAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("finalize unmatched inventory files: %v", err))
@@ -410,11 +427,12 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			       COALESCE(sum(size_bytes) FILTER (WHERE state='present'),0),
 			       count(*) FILTER (WHERE state='mismatch')
 			FROM nas_inventory_files WHERE connection_id=$1
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'
 		`, connectionID).Scan(&clips, &bytes, &mismatches); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize inventory: %v", err))
 			return
 		}
-		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present'`, connectionID).Scan(&unmatched); err != nil {
+		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present' AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%'`, connectionID).Scan(&unmatched); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize unmatched inventory: %v", err))
 			return
 		}
@@ -426,10 +444,12 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			UPDATE connections SET inventory_generation=$1, inventory_scan_started_at=$2,
 			inventory_scan_completed_at=$3, inventory_reported_at=now(), inventory_clips=$4,
 			inventory_bytes=$5, inventory_mismatches=$6, inventory_unmatched=$7,
-			inventory_digest=$8,inventory_tree_generation=$1,inventory_tree_revision=inventory_live_revision,inventory_in_progress_generation='',
+			inventory_digest=$8,inventory_dataset_schema=$10,inventory_root_exclusions=$11::jsonb,
+			inventory_tree_generation=$1,inventory_tree_revision=inventory_live_revision,inventory_in_progress_generation='',
+			inventory_in_progress_dataset_schema='',inventory_in_progress_root_exclusions='[]'::jsonb,
 			inventory_in_progress_started_at=NULL,inventory_in_progress_reported_at=NULL,
 			updated_at=now() WHERE id=$9
-		`, req.Generation, req.ScanStartedAt, req.ScanCompletedAt, clips, bytes, mismatches, unmatched, req.Digest, connectionID)
+		`, req.Generation, req.ScanStartedAt, req.ScanCompletedAt, clips, bytes, mismatches, unmatched, req.Digest, connectionID, req.DatasetSchema, wantedRootExclusions)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update inventory summary: %v", err))
 			return

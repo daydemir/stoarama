@@ -218,6 +218,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             root = Path(raw)
             for relative in (
                 "joined/hidden.mp4", "joined/hidden.mp4.stoarama.json",
+                "#recycle/retained.mp4", "#recycle/retained.mp4.stoarama.json",
                 "joined-other/visible.mp4", "raw/joined/visible.mp4",
             ):
                 path = root / relative
@@ -251,6 +252,10 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             hidden.parent.mkdir(parents=True)
             hidden.write_bytes(b"hidden")
             hidden.with_name(hidden.name + ".stoarama.json").write_text("{broken", encoding="utf-8")
+            recycled = cfg.output_dir / "#recycle" / "retained.mp4"
+            recycled.parent.mkdir(parents=True)
+            recycled.write_bytes(b"retained")
+            recycled.with_name(recycled.name + ".stoarama.json").write_text("{broken", encoding="utf-8")
             visible = [
                 cfg.output_dir / "joined-other" / "one.mp4",
                 cfg.output_dir / "raw" / "joined" / "three.mp4",
@@ -284,7 +289,9 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ])
             reported = [row["relative_path"] for call in calls for row in call.get("unmatched_files", [])]
             self.assertNotIn("joined/hidden.mp4", reported)
+            self.assertNotIn("#recycle/retained.mp4", reported)
             self.assertNotIn("directory-link/symlink-only.mp4", reported)
+            self.assertTrue(all(call["dataset_schema"] == "raw-dataset-v2" and call["root_exclusions"] == ["#recycle"] for call in calls))
 
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))

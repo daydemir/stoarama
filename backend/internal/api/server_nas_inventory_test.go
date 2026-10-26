@@ -624,19 +624,25 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	scanStart := now.Add(-30 * time.Minute)
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation,client_updated_at) VALUES
 		($1,11,20,'clips/old.mp4',3,$2,'present',$3,'prior',$4),
-		($1,12,20,'clips/inflight.mp4',3,$2,'present',$3,'prior',$5)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
+		($1,12,20,'clips/inflight.mp4',3,$2,'present',$3,'prior',$5),
+		($1,13,20,'#recycle/retained.mp4',3,$2,'present',$3,'prior',$4)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	complete := nasInventorySyncRequest{Generation: "scan-complete", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
 	if rec := callSync(complete); rec.Code != http.StatusOK {
 		t.Fatalf("complete sync status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var oldState, inflightState string
-	if err := pool.QueryRow(ctx, `SELECT max(state) FILTER(WHERE clip_id=11),max(state) FILTER(WHERE clip_id=12) FROM nas_inventory_files WHERE connection_id=$1`, connectionID).Scan(&oldState, &inflightState); err != nil {
+	var oldState, inflightState, recycleState string
+	if err := pool.QueryRow(ctx, `SELECT max(state) FILTER(WHERE clip_id=11),max(state) FILTER(WHERE clip_id=12),max(state) FILTER(WHERE clip_id=13) FROM nas_inventory_files WHERE connection_id=$1`, connectionID).Scan(&oldState, &inflightState, &recycleState); err != nil {
 		t.Fatal(err)
 	}
-	if oldState != "missing" || inflightState != "present" {
-		t.Fatalf("completion sweep old=%q inflight=%q", oldState, inflightState)
+	if oldState != "missing" || inflightState != "present" || recycleState != "present" {
+		t.Fatalf("completion sweep old=%q inflight=%q recycle=%q", oldState, inflightState, recycleState)
+	}
+	var datasetSchema string
+	var rootExclusions []byte
+	if err := pool.QueryRow(ctx, `SELECT inventory_dataset_schema,inventory_root_exclusions FROM connections WHERE id=$1`, connectionID).Scan(&datasetSchema, &rootExclusions); err != nil || datasetSchema != "raw-dataset-v2" || string(rootExclusions) != `["#recycle"]` {
+		t.Fatalf("persisted scope schema=%q exclusions=%s err=%v", datasetSchema, rootExclusions, err)
 	}
 	olderComplete := scanStart.Add(-time.Minute)
 	olderStart := olderComplete.Add(-time.Hour)
