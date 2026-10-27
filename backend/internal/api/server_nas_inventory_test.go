@@ -483,10 +483,17 @@ func TestNASInventoryReleaseGateFailsClosed(t *testing.T) {
 	if err != nil || confirmed {
 		t.Fatalf("missing inventory confirmed=%v err=%v, want false/nil", confirmed, err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'safe/clip.mp4',3,$4,'present',now())`, connectionID, clipID, recordingID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation) VALUES($1,$2,$3,'safe/clip.mp4',3,$4,'present',now(),'scan-v2')`, connectionID, clipID, recordingID, sha); err != nil {
 		t.Fatal(err)
 	}
 	confirmed, reason, err := verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
+	if err != nil || confirmed || !strings.Contains(reason, "scoped") {
+		t.Fatalf("legacy-scope inventory confirmed=%v reason=%q err=%v, want fail closed", confirmed, reason, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_generation='scan-v2',inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_scan_completed_at=now() WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	confirmed, reason, err = verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
 	if err != nil || !confirmed || reason != "confirmed" {
 		t.Fatalf("exact inventory confirmed=%v reason=%q err=%v", confirmed, reason, err)
 	}
@@ -715,7 +722,7 @@ func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {
 	ctx := context.Background()
 	const accountID = int64(42)
 	var connectionID, recordingID, clipID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,inventory_scan_completed_at) VALUES($1,'nas_pull',now()) RETURNING id`, accountID).Scan(&connectionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,inventory_scan_completed_at,inventory_generation) VALUES($1,'nas_pull',now(),'scan-v2') RETURNING id`, accountID).Scan(&connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name,delivery) VALUES($1,'mode','nas_pull') RETURNING id`, accountID).Scan(&recordingID); err != nil {
@@ -741,7 +748,13 @@ func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {
 	if rec := callMode(); rec.Code != http.StatusConflict {
 		t.Fatalf("unconfirmed enforce status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'mode/clip.mp4',3,$4,'present',now())`, connectionID, clipID, recordingID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation) VALUES($1,$2,$3,'mode/clip.mp4',3,$4,'present',now(),'scan-v2')`, connectionID, clipID, recordingID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if rec := callMode(); rec.Code != http.StatusConflict {
+		t.Fatalf("legacy-scope enforce status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := callMode(); rec.Code != http.StatusOK {

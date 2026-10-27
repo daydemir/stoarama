@@ -237,12 +237,15 @@ func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRo
 	if principal.APIKeyID == nil {
 		return true, "non-pull caller", nil
 	}
-	var mode string
+	var mode, datasetSchema, inventoryGeneration, seenGeneration string
+	var rootExclusions []byte
 	var state, localPath, localSHA, serverPath, serverSHA string
 	var localSize, serverSize, duplicateClaims int64
 	var verifiedAt *time.Time
 	err := query.QueryRow(ctx, `
-		SELECT conn.inventory_mode, COALESCE(i.state,''), COALESCE(i.relative_path,''),
+		SELECT conn.inventory_mode, conn.inventory_dataset_schema, conn.inventory_root_exclusions,
+		       conn.inventory_generation, COALESCE(i.seen_generation,''),
+		       COALESCE(i.state,''), COALESCE(i.relative_path,''),
 		       COALESCE(i.size_bytes,0), COALESCE(i.sha256,''), i.verified_at,
 		       COALESCE(c.display_path,''), c.size_bytes, lower(COALESCE(c.sha256,'')),
 		       (SELECT count(*) FROM nas_inventory_files other
@@ -256,7 +259,8 @@ func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRo
 		LEFT JOIN nas_inventory_files i ON i.connection_id=conn.id AND i.clip_id=c.id
 		WHERE conn.api_key_id=$1 AND conn.account_id=$2
 	`, *principal.APIKeyID, principal.AccountID, clipID, recordingID).Scan(
-		&mode, &state, &localPath, &localSize, &localSHA, &verifiedAt,
+		&mode, &datasetSchema, &rootExclusions, &inventoryGeneration, &seenGeneration,
+		&state, &localPath, &localSize, &localSHA, &verifiedAt,
 		&serverPath, &serverSize, &serverSHA, &duplicateClaims)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return true, "non-pull caller", nil
@@ -266,6 +270,11 @@ func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRo
 	}
 	if mode != "enforce" {
 		return true, "observe mode", nil
+	}
+	if datasetSchema != "raw-dataset-v2" || string(rootExclusions) != `["#recycle"]` ||
+		inventoryGeneration == "" || seenGeneration != inventoryGeneration ||
+		nasInventoryExcludedPath(localPath) || nasInventoryExcludedPath(serverPath) {
+		return false, "clip is not confirmed by the completed scoped NAS inventory", nil
 	}
 	if state != "present" || verifiedAt == nil {
 		return false, "clip is not confirmed present in NAS inventory", nil
@@ -1088,6 +1097,9 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 		var ready bool
 		err := s.pool.QueryRow(r.Context(), `
 			SELECT COALESCE(conn.inventory_scan_completed_at >= now()-$3::interval, false)
+			       AND conn.inventory_dataset_schema='raw-dataset-v2'
+			       AND conn.inventory_root_exclusions='["#recycle"]'::jsonb
+			       AND conn.inventory_generation<>''
 			       AND conn.inventory_mismatches=0
 			       AND NOT EXISTS (
 			         SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
@@ -1097,7 +1109,10 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 			           AND NOT EXISTS (
 			             SELECT 1 FROM nas_inventory_files i
 			             WHERE i.connection_id=conn.id AND i.clip_id=c.id AND i.state='present'
+			               AND i.seen_generation=conn.inventory_generation
 			               AND i.relative_path=c.display_path AND i.size_bytes=c.size_bytes
+			               AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%'
+			               AND i.relative_path<>'joined' AND i.relative_path NOT LIKE 'joined/%'
 			               AND i.sha256=lower(c.sha256) AND i.verified_at>=now()-$3::interval
 			               AND i.verified_at<=now()+$4::interval
 			               AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other
