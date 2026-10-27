@@ -530,7 +530,7 @@ func TestProcessHourIsolatesCorruptAudioAndPublishesValidClip(t *testing.T) {
 	if len(m.Outputs) != 1 || fmt.Sprint(m.Outputs[0].SourceClipIDs) != "[1]" { t.Fatalf("outputs: %+v", m.Outputs) }
 	var goodDisposition, badDisposition *ClipDisposition
 	for i := range m.Clips {
-		switch m.Clips[i].ClipID { case 1: goodDisposition = &m.Clips[i]; case 2: badDisposition = &m.Clips[i] }
+		switch m.Clips[i].Clip.ClipID { case 1: goodDisposition = &m.Clips[i]; case 2: badDisposition = &m.Clips[i] }
 	}
 	if goodDisposition == nil || goodDisposition.Disposition != "included" { t.Fatalf("good clip: %+v", goodDisposition) }
 	if badDisposition == nil || badDisposition.Disposition != "quarantined" || badDisposition.Reason != "strict_decode_failed" { t.Fatalf("bad clip: %+v", badDisposition) }
