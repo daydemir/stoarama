@@ -50,6 +50,8 @@ type nasInventoryFileReport struct {
 
 type nasInventorySyncRequest struct {
 	Generation      string                   `json:"generation"`
+	DatasetSchema   string                   `json:"dataset_schema"`
+	RootExclusions  []string                 `json:"root_exclusions"`
 	ScanStartedAt   *time.Time               `json:"scan_started_at"`
 	ScanCompletedAt *time.Time               `json:"scan_completed_at"`
 	Digest          string                   `json:"digest"`
@@ -79,6 +81,11 @@ func validNASRelativePath(path string) bool {
 	return true
 }
 
+func nasInventoryExcludedPath(path string) bool {
+	return path == "#recycle" || strings.HasPrefix(path, "#recycle/") ||
+		path == "joined" || strings.HasPrefix(path, "joined/")
+}
+
 func nasInventoryTreeParts(path string) (string, string) {
 	if index := strings.LastIndexByte(path, '/'); index >= 0 {
 		return path[:index], path[index+1:]
@@ -90,6 +97,9 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 	if req.Generation == "" || len(req.Generation) > nasInventoryMaxGeneration || !relayArtifactName.MatchString(req.Generation) {
 		return errors.New("invalid inventory generation")
 	}
+	if req.DatasetSchema != "raw-dataset-v2" || len(req.RootExclusions) != 1 || req.RootExclusions[0] != "#recycle" {
+		return errors.New("inventory requires fixed raw-dataset-v2 scope")
+	}
 	if len(req.Files)+len(req.Unmatched) > nasInventoryMaxBatch {
 		return fmt.Errorf("inventory batch exceeds %d files", nasInventoryMaxBatch)
 	}
@@ -98,7 +108,7 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 	}
 	unmatchedSeen := make(map[string]bool, len(req.Unmatched))
 	for _, file := range req.Unmatched {
-		if !validNASRelativePath(file.RelativePath) || unmatchedSeen[file.RelativePath] || file.SizeBytes < 0 ||
+		if !validNASRelativePath(file.RelativePath) || nasInventoryExcludedPath(file.RelativePath) || unmatchedSeen[file.RelativePath] || file.SizeBytes < 0 ||
 			len(file.SHA256) != 64 || !lowerHex(file.SHA256) || file.FileMTimeNS < 0 ||
 			(file.State != "present" && file.State != "missing") || file.ClientUpdatedAt.IsZero() ||
 			file.ClientUpdatedAt.After(now.Add(nasInventoryMaxFutureSkew)) {
@@ -123,7 +133,7 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 			return errors.New("invalid or duplicate inventory file identity")
 		}
 		seen[file.ClipID] = true
-		if !validNASRelativePath(file.RelativePath) || len(file.SHA256) != 64 || !lowerHex(file.SHA256) {
+		if !validNASRelativePath(file.RelativePath) || nasInventoryExcludedPath(file.RelativePath) || len(file.SHA256) != 64 || !lowerHex(file.SHA256) {
 			return errors.New("invalid inventory file path or checksum")
 		}
 		if file.State != "present" && file.State != "missing" && file.State != "mismatch" {
@@ -172,10 +182,12 @@ func rebuildNASInventoryTreeDirectories(ctx context.Context, tx pgx.Tx, connecti
 		  FROM nas_inventory_files i
 		  LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
 		  WHERE i.connection_id=$1 AND i.state IN('present','mismatch')
+	    AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%' AND i.relative_path<>'joined' AND i.relative_path NOT LIKE 'joined/%'
 		  UNION ALL
 		  SELECT u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
 		  FROM nas_inventory_unmatched_files u
 		  WHERE u.connection_id=$1 AND u.state='present'
+	    AND u.relative_path<>'#recycle' AND u.relative_path NOT LIKE '#recycle/%' AND u.relative_path<>'joined' AND u.relative_path NOT LIKE 'joined/%'
 		), ranked AS (
 		  SELECT *,count(*) OVER(PARTITION BY relative_path) AS path_count,row_number() OVER(PARTITION BY relative_path ORDER BY
 		    CASE reconciliation WHEN 'mismatch' THEN 2 WHEN 'nas_only' THEN 1 ELSE 0 END DESC,
@@ -225,12 +237,15 @@ func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRo
 	if principal.APIKeyID == nil {
 		return true, "non-pull caller", nil
 	}
-	var mode string
+	var mode, datasetSchema, inventoryGeneration, seenGeneration string
+	var rootExclusions []byte
 	var state, localPath, localSHA, serverPath, serverSHA string
 	var localSize, serverSize, duplicateClaims int64
 	var verifiedAt *time.Time
 	err := query.QueryRow(ctx, `
-		SELECT conn.inventory_mode, COALESCE(i.state,''), COALESCE(i.relative_path,''),
+		SELECT conn.inventory_mode, conn.inventory_dataset_schema, conn.inventory_root_exclusions,
+		       conn.inventory_generation, COALESCE(i.seen_generation,''),
+		       COALESCE(i.state,''), COALESCE(i.relative_path,''),
 		       COALESCE(i.size_bytes,0), COALESCE(i.sha256,''), i.verified_at,
 		       COALESCE(c.display_path,''), c.size_bytes, lower(COALESCE(c.sha256,'')),
 		       (SELECT count(*) FROM nas_inventory_files other
@@ -244,7 +259,8 @@ func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRo
 		LEFT JOIN nas_inventory_files i ON i.connection_id=conn.id AND i.clip_id=c.id
 		WHERE conn.api_key_id=$1 AND conn.account_id=$2
 	`, *principal.APIKeyID, principal.AccountID, clipID, recordingID).Scan(
-		&mode, &state, &localPath, &localSize, &localSHA, &verifiedAt,
+		&mode, &datasetSchema, &rootExclusions, &inventoryGeneration, &seenGeneration,
+		&state, &localPath, &localSize, &localSHA, &verifiedAt,
 		&serverPath, &serverSize, &serverSHA, &duplicateClaims)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return true, "non-pull caller", nil
@@ -254,6 +270,11 @@ func verifyNASInventoryForRelease(ctx context.Context, query nasInventoryQueryRo
 	}
 	if mode != "enforce" {
 		return true, "observe mode", nil
+	}
+	if datasetSchema != "raw-dataset-v2" || string(rootExclusions) != `["#recycle"]` ||
+		inventoryGeneration == "" || seenGeneration != inventoryGeneration ||
+		nasInventoryExcludedPath(localPath) || nasInventoryExcludedPath(serverPath) {
+		return false, "clip is not confirmed by the completed scoped NAS inventory", nil
 	}
 	if state != "present" || verifiedAt == nil {
 		return false, "clip is not confirmed present in NAS inventory", nil
@@ -302,11 +323,23 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var connectionID int64
 	var existingCompletedAt *time.Time
-	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt); errors.Is(err, pgx.ErrNoRows) {
+	var activeGeneration, activeDatasetSchema string
+	var activeRootExclusions []byte
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_scan_completed_at,inventory_in_progress_generation,inventory_in_progress_dataset_schema,inventory_in_progress_root_exclusions FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &existingCompletedAt, &activeGeneration, &activeDatasetSchema, &activeRootExclusions); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load inventory connection: %v", err))
+		return
+	}
+	wantedRootExclusions, _ := json.Marshal(req.RootExclusions)
+	if activeGeneration == req.Generation && activeGeneration != "" &&
+		(activeDatasetSchema != req.DatasetSchema || string(activeRootExclusions) != string(wantedRootExclusions)) {
+		util.WriteError(w, http.StatusConflict, "inventory dataset scope changed within generation")
+		return
+	}
+	if req.Complete && (existingCompletedAt == nil || req.ScanCompletedAt.After(*existingCompletedAt)) && activeGeneration != req.Generation {
+		util.WriteError(w, http.StatusConflict, "inventory completion does not match active generation")
 		return
 	}
 	if req.Complete && existingCompletedAt != nil && !req.ScanCompletedAt.After(*existingCompletedAt) {
@@ -324,9 +357,10 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			  inventory_in_progress_started_at=CASE
 			    WHEN inventory_in_progress_generation<>$1 THEN COALESCE($2,now())
 			    ELSE COALESCE(inventory_in_progress_started_at,$2,now()) END,
-			  inventory_in_progress_generation=$1,inventory_in_progress_reported_at=now(),updated_at=now()
+			  inventory_in_progress_generation=$1,inventory_in_progress_dataset_schema=$4,
+			  inventory_in_progress_root_exclusions=$5::jsonb,inventory_in_progress_reported_at=now(),updated_at=now()
 			WHERE id=$3
-		`, req.Generation, req.ScanStartedAt, connectionID)
+		`, req.Generation, req.ScanStartedAt, connectionID, req.DatasetSchema, wantedRootExclusions)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update inventory scan progress: %v", err))
 			return
@@ -386,6 +420,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			UPDATE nas_inventory_files
 			SET state='missing', verified_at=NULL, client_updated_at=$3, server_received_at=now()
 			WHERE connection_id=$1 AND seen_generation<>$2 AND client_updated_at <= $4
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'
 		`, connectionID, req.Generation, req.ScanCompletedAt, req.ScanStartedAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("finalize inventory missing files: %v", err))
@@ -394,6 +429,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		_, err = tx.Exec(r.Context(), `
 			UPDATE nas_inventory_unmatched_files SET state='missing',client_updated_at=$3,server_received_at=now()
 			WHERE connection_id=$1 AND seen_generation<>$2 AND client_updated_at<=$4
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'
 		`, connectionID, req.Generation, req.ScanCompletedAt, req.ScanStartedAt)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("finalize unmatched inventory files: %v", err))
@@ -405,11 +441,12 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			       COALESCE(sum(size_bytes) FILTER (WHERE state='present'),0),
 			       count(*) FILTER (WHERE state='mismatch')
 			FROM nas_inventory_files WHERE connection_id=$1
+			  AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'
 		`, connectionID).Scan(&clips, &bytes, &mismatches); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize inventory: %v", err))
 			return
 		}
-		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present'`, connectionID).Scan(&unmatched); err != nil {
+		if err := tx.QueryRow(r.Context(), `SELECT count(*) FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present' AND relative_path<>'#recycle' AND relative_path NOT LIKE '#recycle/%' AND relative_path<>'joined' AND relative_path NOT LIKE 'joined/%'`, connectionID).Scan(&unmatched); err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("summarize unmatched inventory: %v", err))
 			return
 		}
@@ -421,10 +458,12 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 			UPDATE connections SET inventory_generation=$1, inventory_scan_started_at=$2,
 			inventory_scan_completed_at=$3, inventory_reported_at=now(), inventory_clips=$4,
 			inventory_bytes=$5, inventory_mismatches=$6, inventory_unmatched=$7,
-			inventory_digest=$8,inventory_tree_generation=$1,inventory_tree_revision=inventory_live_revision,inventory_in_progress_generation='',
+			inventory_digest=$8,inventory_dataset_schema=$10,inventory_root_exclusions=$11::jsonb,
+			inventory_tree_generation=$1,inventory_tree_revision=inventory_live_revision,inventory_in_progress_generation='',
+			inventory_in_progress_dataset_schema='',inventory_in_progress_root_exclusions='[]'::jsonb,
 			inventory_in_progress_started_at=NULL,inventory_in_progress_reported_at=NULL,
 			updated_at=now() WHERE id=$9
-		`, req.Generation, req.ScanStartedAt, req.ScanCompletedAt, clips, bytes, mismatches, unmatched, req.Digest, connectionID)
+		`, req.Generation, req.ScanStartedAt, req.ScanCompletedAt, clips, bytes, mismatches, unmatched, req.Digest, connectionID, req.DatasetSchema, wantedRootExclusions)
 		if err != nil {
 			util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("update inventory summary: %v", err))
 			return
@@ -510,11 +549,13 @@ const nasInventoryTreeSQL = `
 			FROM nas_inventory_files i
 			LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
 			WHERE i.connection_id=$1 AND i.tree_parent_path=$4 AND i.state IN('present','mismatch')
+			  AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%' AND i.relative_path<>'joined' AND i.relative_path NOT LIKE 'joined/%'
 			  AND ($5::int<1 OR i.tree_name>$6)
 			UNION ALL
 			SELECT u.tree_name,u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
 			FROM nas_inventory_unmatched_files u
 			WHERE u.connection_id=$1 AND u.tree_parent_path=$4 AND u.state='present'
+			  AND u.relative_path<>'#recycle' AND u.relative_path NOT LIKE '#recycle/%' AND u.relative_path<>'joined' AND u.relative_path NOT LIKE 'joined/%'
 			  AND ($5::int<1 OR u.tree_name>$6)
 		), ranked_files AS (
 			SELECT *,count(*) OVER(PARTITION BY name) AS path_count,row_number() OVER(PARTITION BY name ORDER BY
@@ -578,15 +619,16 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	var completedGeneration, treeGeneration, activeGeneration string
+	var completedGeneration, completedDatasetSchema, treeGeneration, activeGeneration, activeDatasetSchema string
+	var completedRootExclusions, activeRootExclusions []string
 	var liveRevision, treeRevision int64
 	var scanStartedAt, scanCompletedAt, reportedAt, activeStartedAt, activeReportedAt *time.Time
 	err = tx.QueryRow(r.Context(), `
-		SELECT inventory_generation,inventory_tree_generation,inventory_live_revision,inventory_tree_revision,inventory_scan_started_at,inventory_scan_completed_at,inventory_reported_at,
-		       inventory_in_progress_generation,inventory_in_progress_started_at,inventory_in_progress_reported_at
+		SELECT inventory_generation,inventory_dataset_schema,inventory_root_exclusions,inventory_tree_generation,inventory_live_revision,inventory_tree_revision,inventory_scan_started_at,inventory_scan_completed_at,inventory_reported_at,
+		       inventory_in_progress_generation,inventory_in_progress_dataset_schema,inventory_in_progress_root_exclusions,inventory_in_progress_started_at,inventory_in_progress_reported_at
 		FROM connections WHERE id=$1 AND account_id=$2
-	`, connectionID, principal.AccountID).Scan(&completedGeneration, &treeGeneration, &liveRevision, &treeRevision, &scanStartedAt, &scanCompletedAt, &reportedAt,
-		&activeGeneration, &activeStartedAt, &activeReportedAt)
+	`, connectionID, principal.AccountID).Scan(&completedGeneration, &completedDatasetSchema, &completedRootExclusions, &treeGeneration, &liveRevision, &treeRevision, &scanStartedAt, &scanCompletedAt, &reportedAt,
+		&activeGeneration, &activeDatasetSchema, &activeRootExclusions, &activeStartedAt, &activeReportedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusNotFound, "connection not found")
 		return
@@ -606,8 +648,10 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		time.Since(scanCompletedAt.UTC()) <= nasInventoryFreshness && time.Since(scanCompletedAt.UTC()) >= -nasInventoryMaxFutureSkew
 	if activeReportedAt != nil && time.Since(activeReportedAt.UTC()) > nasInventoryScanProgressTTL {
 		activeGeneration, activeStartedAt, activeReportedAt = "", nil, nil
+		activeDatasetSchema, activeRootExclusions = "", []string{}
 	}
-	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration
+	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration &&
+		completedDatasetSchema == "raw-dataset-v2" && len(completedRootExclusions) == 1 && completedRootExclusions[0] == "#recycle"
 	snapshotIdentity := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration, directory}, "|")
 	snapshotState := fmt.Sprintf("%x", sha256.Sum256([]byte(snapshotIdentity)))
 	if r.URL.Query().Get("cursor") != "" && cursor.State != snapshotState {
@@ -663,10 +707,10 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 	rows.Close()
 	response := map[string]any{
 		"path": directory, "entries": entries, "next_cursor": nextCursor,
-		"generation": completedGeneration, "scan_started_at": scanStartedAt, "scan_completed_at": scanCompletedAt,
+		"generation": completedGeneration, "dataset_schema": completedDatasetSchema, "root_exclusions": completedRootExclusions, "scan_started_at": scanStartedAt, "scan_completed_at": scanCompletedAt,
 		"reported_at": reportedAt, "fresh": fresh, "stale": !fresh,
 		"snapshot_available": snapshotAvailable, "snapshot_consistent": snapshotAvailable && activeGeneration == "" && liveRevision == treeRevision, "in_progress_generation": activeGeneration,
-		"in_progress_started_at": activeStartedAt, "in_progress_reported_at": activeReportedAt,
+		"in_progress_dataset_schema": activeDatasetSchema, "in_progress_root_exclusions": activeRootExclusions, "in_progress_started_at": activeStartedAt, "in_progress_reported_at": activeReportedAt,
 	}
 	if directory == "" && r.URL.Query().Get("cursor") == "" {
 		var serverOnly int64
@@ -965,12 +1009,17 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var connectionID int64
-	var mode string
-	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_mode FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &mode); errors.Is(err, pgx.ErrNoRows) {
+	var mode, datasetSchema, inventoryGeneration string
+	var rootExclusions []byte
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_mode,inventory_dataset_schema,inventory_root_exclusions,inventory_generation FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &mode, &datasetSchema, &rootExclusions, &inventoryGeneration); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load batch release connection: %v", err))
+		return
+	}
+	if mode == "enforce" && (datasetSchema != "raw-dataset-v2" || string(rootExclusions) != `["#recycle"]` || inventoryGeneration == "") {
+		util.WriteError(w, http.StatusConflict, "release retained: connection lacks a completed scoped NAS inventory")
 		return
 	}
 	for _, item := range req.Clips {
@@ -995,18 +1044,22 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 			continue
 		}
 		if mode == "enforce" {
+			if nasInventoryExcludedPath(path) {
+				util.WriteError(w, http.StatusConflict, fmt.Sprintf("release retained: clip %d is outside the scoped NAS inventory", item.ClipID))
+				return
+			}
 			var confirmed bool
 			if err := tx.QueryRow(r.Context(), `
 				SELECT EXISTS(SELECT 1 FROM nas_inventory_files i
 				WHERE i.connection_id=$1 AND i.clip_id=$2 AND i.state='present' AND i.relative_path=$3
-				  AND i.size_bytes=$4 AND i.sha256=$5 AND i.verified_at>=now()-$6::interval
-				  AND i.verified_at<=now()+$7::interval
+				  AND i.size_bytes=$4 AND i.sha256=$5 AND i.seen_generation=$6
+				  AND i.verified_at>=now()-$7::interval AND i.verified_at<=now()+$8::interval
 				  AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other
 				    WHERE other.connection_id=i.connection_id AND other.relative_path=i.relative_path
 				      AND other.clip_id<>i.clip_id AND other.state IN('present','mismatch'))
 				  AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched
 				    WHERE unmatched.connection_id=i.connection_id AND unmatched.relative_path=i.relative_path AND unmatched.state='present'))
-			`, connectionID, item.ClipID, path, size, sha, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&confirmed); err != nil {
+			`, connectionID, item.ClipID, path, size, sha, inventoryGeneration, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&confirmed); err != nil {
 				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("verify batch clip %d: %v", item.ClipID, err))
 				return
 			}
@@ -1053,6 +1106,9 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 		var ready bool
 		err := s.pool.QueryRow(r.Context(), `
 			SELECT COALESCE(conn.inventory_scan_completed_at >= now()-$3::interval, false)
+			       AND conn.inventory_dataset_schema='raw-dataset-v2'
+			       AND conn.inventory_root_exclusions='["#recycle"]'::jsonb
+			       AND conn.inventory_generation<>''
 			       AND conn.inventory_mismatches=0
 			       AND NOT EXISTS (
 			         SELECT 1 FROM recording_clips c JOIN recordings rec ON rec.id=c.recording_id
@@ -1062,7 +1118,10 @@ func (s *Server) handleAccountConnectionInventoryMode(w http.ResponseWriter, r *
 			           AND NOT EXISTS (
 			             SELECT 1 FROM nas_inventory_files i
 			             WHERE i.connection_id=conn.id AND i.clip_id=c.id AND i.state='present'
+			               AND i.seen_generation=conn.inventory_generation
 			               AND i.relative_path=c.display_path AND i.size_bytes=c.size_bytes
+			               AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%'
+			               AND i.relative_path<>'joined' AND i.relative_path NOT LIKE 'joined/%'
 			               AND i.sha256=lower(c.sha256) AND i.verified_at>=now()-$3::interval
 			               AND i.verified_at<=now()+$4::interval
 			               AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other

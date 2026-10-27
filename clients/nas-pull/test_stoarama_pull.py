@@ -218,6 +218,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             root = Path(raw)
             for relative in (
                 "joined/hidden.mp4", "joined/hidden.mp4.stoarama.json",
+                "#recycle/retained.mp4", "#recycle/retained.mp4.stoarama.json",
                 "joined-other/visible.mp4", "raw/joined/visible.mp4",
             ):
                 path = root / relative
@@ -251,6 +252,10 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             hidden.parent.mkdir(parents=True)
             hidden.write_bytes(b"hidden")
             hidden.with_name(hidden.name + ".stoarama.json").write_text("{broken", encoding="utf-8")
+            recycled = cfg.output_dir / "#recycle" / "retained.mp4"
+            recycled.parent.mkdir(parents=True)
+            recycled.write_bytes(b"retained")
+            recycled.with_name(recycled.name + ".stoarama.json").write_text("{broken", encoding="utf-8")
             visible = [
                 cfg.output_dir / "joined-other" / "one.mp4",
                 cfg.output_dir / "raw" / "joined" / "three.mp4",
@@ -284,7 +289,11 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ])
             reported = [row["relative_path"] for call in calls for row in call.get("unmatched_files", [])]
             self.assertNotIn("joined/hidden.mp4", reported)
+            self.assertNotIn("#recycle/retained.mp4", reported)
             self.assertNotIn("directory-link/symlink-only.mp4", reported)
+            self.assertIn("joined-other/one.mp4", reported)
+            self.assertIn("raw/joined/three.mp4", reported)
+            self.assertTrue(all(call["dataset_schema"] == "raw-dataset-v2" and call["root_exclusions"] == ["#recycle"] for call in calls))
 
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -297,8 +306,10 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             rows = inventory.db.execute(
                 "SELECT relative_path FROM unmatched_files WHERE state='present'"
             ).fetchall()
+            summary = inventory.summary()
             inventory.close()
             self.assertEqual(rows, [("Joined/visible.mp4",)])
+            self.assertEqual(summary["unmatched"], 1)
 
     def test_atomic_write_is_durable_and_replaces(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -335,6 +346,40 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             reopened = pull.Inventory(cfg)
             self.assertEqual(reopened._rows("clip_id=7")[0][2], clip["relative_path"])
             reopened.close()
+
+    def test_sync_dirty_retires_excluded_legacy_rows_without_upload_or_delete(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            now = "2026-10-27T01:00:00Z"
+            for clip_id, relative_path in ((1, "#recycle/retained.mp4"), (2, "joined/retained.mp4"), (3, "clips/visible.mp4"), (4, "Joined/visible.mp4")):
+                inventory.db.execute(
+                    """INSERT INTO files(clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at,dirty)
+                       VALUES(?,1,?,3,?,'present',?,1)""",
+                    (clip_id, relative_path, "a" * 64, now),
+                )
+            for relative_path in ("#recycle/unmatched.mp4", "joined/unmatched.mp4", "raw/visible.mp4", "#Recycle/visible.mp4"):
+                inventory.db.execute(
+                    """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,client_updated_at,dirty)
+                       VALUES(?,3,?,'present',?,1)""",
+                    (relative_path, "b" * 64, now),
+                )
+            inventory.db.commit()
+            calls = []
+            with mock.patch.object(pull, "post_inventory_scan_page", side_effect=lambda _cfg, body, _stop: calls.append(body) or True):
+                inventory.sync_dirty(cfg)
+            uploaded = {
+                row["relative_path"]
+                for call in calls
+                for key in ("files", "unmatched_files")
+                for row in call.get(key, [])
+            }
+            self.assertEqual(uploaded, {"clips/visible.mp4", "Joined/visible.mp4", "raw/visible.mp4", "#Recycle/visible.mp4"})
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM files").fetchone()[0], 4)
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM unmatched_files").fetchone()[0], 4)
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM files WHERE dirty=1").fetchone()[0], 0)
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM unmatched_files WHERE dirty=1").fetchone()[0], 0)
+            inventory.close()
 
     def test_inventory_adds_scan_pass_to_existing_sqlite_schema(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -933,6 +978,34 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(len(hashed), 1)
             resumed.close()
 
+    def test_full_scan_does_not_resume_generation_with_unknown_or_changed_scope(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            for scope in (
+                {},
+                {"dataset_schema": "raw-dataset-v1", "root_exclusions": '["#recycle"]'},
+                {"dataset_schema": "raw-dataset-v2", "root_exclusions": '["other"]'},
+            ):
+                inventory._meta_set({
+                    "generation": "scan-old-scope",
+                    "scan_started_at": "2026-10-25T00:00:00Z",
+                    "scan_completed_at": "",
+                    "dataset_schema": scope.get("dataset_schema", ""),
+                    "root_exclusions": scope.get("root_exclusions", ""),
+                })
+                calls = []
+                with mock.patch.object(
+                    pull, "request_json", side_effect=lambda *_a, **kw: calls.append(kw["body"]) or {}
+                ):
+                    inventory.full_scan(cfg, threading.Event())
+                complete = [body for body in calls if body.get("complete")]
+                self.assertEqual(len(complete), 1)
+                self.assertNotEqual(complete[0]["generation"], "scan-old-scope")
+                self.assertEqual(complete[0]["dataset_schema"], pull.INVENTORY_DATASET_SCHEMA)
+                self.assertEqual(complete[0]["root_exclusions"], list(pull.INVENTORY_ROOT_EXCLUSIONS))
+            inventory.close()
+
     def test_resumed_scan_reconciles_sidecar_removal_and_repair(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
@@ -1094,7 +1167,14 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             generation = "scan-20260809-cached"
             started_at = "2026-08-09T00:00:00Z"
             inventory = pull.Inventory(cfg)
-            inventory._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+            inventory._meta_set({
+                "generation": generation,
+                "scan_started_at": started_at,
+                "scan_completed_at": "",
+                "digest": "",
+                "dataset_schema": pull.INVENTORY_DATASET_SCHEMA,
+                "root_exclusions": json.dumps(pull.INVENTORY_ROOT_EXCLUSIONS, separators=(",", ":")),
+            })
             sha = hashlib.sha256(b"x").hexdigest()
             for clip_id in range(1, 1001):
                 clip = {
@@ -1754,6 +1834,25 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(len(calls), 1)
             remaining = inventory.db.execute("SELECT COUNT(*) FROM files WHERE dirty=1").fetchone()[0]
             self.assertEqual(remaining, 1)
+            inventory.close()
+
+    def test_inventory_empty_full_scan_establishes_generation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            calls = []
+
+            def publish(*_args, **kwargs):
+                calls.append(kwargs["body"])
+                return {}
+
+            with mock.patch.object(pull, "request_json", side_effect=publish):
+                inventory.sync_dirty(cfg, generation="scan-empty", scan_started_at="2026-10-27T00:00:00Z")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["generation"], "scan-empty")
+            self.assertFalse(calls[0]["complete"])
+            self.assertEqual(calls[0]["files"], [])
+            self.assertEqual(calls[0]["unmatched_files"], [])
             inventory.close()
 
     def test_run_activates_quiescent_update_before_storage_work(self):

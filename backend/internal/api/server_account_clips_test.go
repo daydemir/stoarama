@@ -428,6 +428,10 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 			inventory_live_revision BIGINT NOT NULL DEFAULT 0,
 			inventory_tree_revision BIGINT NOT NULL DEFAULT 0,
 			inventory_in_progress_generation TEXT NOT NULL DEFAULT '',
+			inventory_dataset_schema TEXT NOT NULL DEFAULT '',
+			inventory_root_exclusions JSONB NOT NULL DEFAULT '[]'::jsonb,
+			inventory_in_progress_dataset_schema TEXT NOT NULL DEFAULT '',
+			inventory_in_progress_root_exclusions JSONB NOT NULL DEFAULT '[]'::jsonb,
 			inventory_in_progress_started_at TIMESTAMPTZ,
 			inventory_in_progress_reported_at TIMESTAMPTZ,
 			inventory_scan_started_at TIMESTAMPTZ,
@@ -481,6 +485,14 @@ func testAccountClipsPool(t *testing.T) (*pgxpool.Pool, func()) {
 				(nas_storage_total_bytes IS NULL AND nas_storage_free_bytes IS NULL AND nas_storage_reported_at IS NULL)
 				OR (nas_storage_total_bytes IS NOT NULL AND nas_storage_free_bytes IS NOT NULL AND nas_storage_reported_at IS NOT NULL
 					AND nas_storage_total_bytes > 0 AND nas_storage_free_bytes >= 0 AND nas_storage_free_bytes <= nas_storage_total_bytes)
+			),
+			CONSTRAINT connections_inventory_scope_shape CHECK (
+				(inventory_dataset_schema = '' AND inventory_root_exclusions = '[]'::jsonb)
+				OR (inventory_dataset_schema = 'raw-dataset-v2' AND inventory_root_exclusions = '["#recycle"]'::jsonb)
+			),
+			CONSTRAINT connections_inventory_in_progress_scope_shape CHECK (
+				(inventory_in_progress_dataset_schema = '' AND inventory_in_progress_root_exclusions = '[]'::jsonb)
+				OR (inventory_in_progress_dataset_schema = 'raw-dataset-v2' AND inventory_in_progress_root_exclusions = '["#recycle"]'::jsonb)
 			)
 		)`,
 		`CREATE TABLE recordings (

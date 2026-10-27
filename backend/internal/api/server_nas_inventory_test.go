@@ -32,11 +32,53 @@ func (r *firstWriteRecorder) Write(body []byte) (int, error) {
 	return r.ResponseRecorder.Write(body)
 }
 
+func TestValidateNASInventorySyncRequiresFixedRawDatasetV2Scope(t *testing.T) {
+	now := time.Now().UTC()
+	valid := nasInventorySyncRequest{
+		Generation:     "scan-scope",
+		DatasetSchema:  "raw-dataset-v2",
+		RootExclusions: []string{"#recycle"},
+	}
+	if err := validateNASInventorySync(valid, now); err != nil {
+		t.Fatalf("fixed raw dataset scope rejected: %v", err)
+	}
+	invalid := []nasInventorySyncRequest{
+		{Generation: "scan-scope"},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v1", RootExclusions: []string{"#recycle"}},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v2"},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle", "other"}},
+		{Generation: "scan-scope", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"other"}},
+	}
+	for index, request := range invalid {
+		if err := validateNASInventorySync(request, now); err == nil {
+			t.Errorf("invalid dataset scope %d accepted: %+v", index, request)
+		}
+	}
+}
+
+func TestValidateNASInventorySyncRejectsExcludedPaths(t *testing.T) {
+	now := time.Now().UTC()
+	for _, path := range []string{"#recycle", "#recycle/old.mp4", "joined", "joined/export.mp4"} {
+		request := nasInventorySyncRequest{
+			Generation: "scan-scope", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"},
+			Files: []nasInventoryFileReport{{ClipID: 1, RecordingID: 2, RelativePath: path, SHA256: strings.Repeat("a", 64), State: "missing", ClientUpdatedAt: now}},
+		}
+		if err := validateNASInventorySync(request, now); err == nil {
+			t.Errorf("excluded linked path accepted: %q", path)
+		}
+		request.Files = nil
+		request.Unmatched = []nasUnmatchedFileReport{{RelativePath: path, SHA256: strings.Repeat("b", 64), State: "missing", ClientUpdatedAt: now}}
+		if err := validateNASInventorySync(request, now); err == nil {
+			t.Errorf("excluded unmatched path accepted: %q", path)
+		}
+	}
+}
+
 func TestValidateNASInventorySync(t *testing.T) {
 	now := time.Now().UTC()
 	start := now.Add(-time.Minute)
 	valid := nasInventorySyncRequest{
-		Generation: "scan-20260806-abcd1234",
+		Generation: "scan-20260806-abcd1234", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"},
 		Files: []nasInventoryFileReport{{
 			ClipID: 1, RecordingID: 2, RelativePath: "recording/clip.mp4", SizeBytes: 3,
 			SHA256: strings.Repeat("a", 64), State: "present", VerifiedAt: &now, ClientUpdatedAt: now,
@@ -116,7 +158,7 @@ func TestNASInventoryTreeQueryUsesExactParentIndexes(t *testing.T) {
 	if strings.Contains(direct, "GROUP BY") || strings.Contains(direct, "split_part") || strings.Contains(direct, "starts_with") {
 		t.Fatalf("browse query still aggregates or scans path prefixes:\n%s", direct)
 	}
-	for _, marker := range []string{"i.connection_id=$1 AND i.tree_parent_path=$4", "u.connection_id=$1 AND u.tree_parent_path=$4", "d.generation=$3", "row_number() OVER(PARTITION BY name"} {
+	for _, marker := range []string{"i.connection_id=$1 AND i.tree_parent_path=$4", "u.connection_id=$1 AND u.tree_parent_path=$4", "i.relative_path<>'#recycle'", "u.relative_path NOT LIKE 'joined/%'", "d.generation=$3", "row_number() OVER(PARTITION BY name"} {
 		if !strings.Contains(direct, marker) {
 			t.Fatalf("tree query missing bounded snapshot marker %q", marker)
 		}
@@ -176,7 +218,7 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 		if err := rebuildNASInventoryTreeDirectories(ctx, tx, connectionID, accountID, generation); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE connections SET inventory_generation=$1,inventory_tree_generation=$1,inventory_scan_started_at=now()-interval '1 minute',inventory_scan_completed_at=now(),inventory_reported_at=now(),inventory_in_progress_generation='' WHERE id=$2`, generation, connectionID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE connections SET inventory_generation=$1,inventory_tree_generation=$1,inventory_scan_started_at=now()-interval '1 minute',inventory_scan_completed_at=now(),inventory_reported_at=now(),inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_in_progress_generation='' WHERE id=$2`, generation, connectionID); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -243,6 +285,9 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if first["generation"] != "tree-one" || first["fresh"] != true || first["snapshot_consistent"] != true {
 		t.Fatalf("root snapshot metadata=%v", first)
 	}
+	if first["dataset_schema"] != "raw-dataset-v2" || fmt.Sprint(first["root_exclusions"]) != "[#recycle]" {
+		t.Fatalf("root snapshot scope=%v/%v", first["dataset_schema"], first["root_exclusions"])
+	}
 	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_live_revision=inventory_tree_revision+1 WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +297,7 @@ func TestNASInventoryTreeBrowsesImmediateChildrenWithKeysetPagination(t *testing
 	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_tree_revision=inventory_live_revision WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='tree-active',inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`, connectionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='tree-active',inventory_in_progress_dataset_schema='raw-dataset-v2',inventory_in_progress_root_exclusions='["#recycle"]'::jsonb,inventory_in_progress_started_at=now(),inventory_in_progress_reported_at=now() WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := call("", cursor, 2); status != http.StatusConflict {
@@ -438,10 +483,17 @@ func TestNASInventoryReleaseGateFailsClosed(t *testing.T) {
 	if err != nil || confirmed {
 		t.Fatalf("missing inventory confirmed=%v err=%v, want false/nil", confirmed, err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'safe/clip.mp4',3,$4,'present',now())`, connectionID, clipID, recordingID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation) VALUES($1,$2,$3,'safe/clip.mp4',3,$4,'present',now(),'scan-v2')`, connectionID, clipID, recordingID, sha); err != nil {
 		t.Fatal(err)
 	}
 	confirmed, reason, err := verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
+	if err != nil || confirmed || !strings.Contains(reason, "scoped") {
+		t.Fatalf("legacy-scope inventory confirmed=%v reason=%q err=%v, want fail closed", confirmed, reason, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_generation='scan-v2',inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_scan_completed_at=now() WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	confirmed, reason, err = verifyNASInventoryForRelease(r.Context(), s.pool, principal, recordingID, clipID)
 	if err != nil || !confirmed || reason != "confirmed" {
 		t.Fatalf("exact inventory confirmed=%v reason=%q err=%v", confirmed, reason, err)
 	}
@@ -512,6 +564,12 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 			}
 		}
 	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_generation='scan-v2',inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_scan_completed_at=now() WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET seen_generation='scan-v2' WHERE connection_id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{pool: pool}
 	call := func() *httptest.ResponseRecorder {
 		body := fmt.Sprintf(`{"clips":[{"clip_id":%d,"recording_id":%d},{"clip_id":%d,"recording_id":%d}]}`, firstID, recordingID, secondID, recordingID)
@@ -531,7 +589,7 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 	if released != 0 {
 		t.Fatalf("partial batch released %d clips, want 0", released)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'safe/2.mp4',3,$4,'present',now())`, connectionID, secondID, recordingID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation) VALUES($1,$2,$3,'safe/2.mp4',3,$4,'present',now(),'scan-v2')`, connectionID, secondID, recordingID, sha); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES($1,'safe/1.mp4',3,$2,'present',now())`, connectionID, sha); err != nil {
@@ -541,6 +599,15 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 		t.Fatalf("ambiguous proof status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='safe/1.mp4'`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_dataset_schema='',inventory_root_exclusions='[]'::jsonb WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(); rec.Code != http.StatusConflict {
+		t.Fatalf("legacy-scope batch status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := call(); rec.Code != http.StatusOK {
@@ -577,7 +644,7 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	sha := strings.Repeat("a", 64)
-	newer := nasInventorySyncRequest{Generation: "scan-new", Files: []nasInventoryFileReport{{
+	newer := nasInventorySyncRequest{Generation: "scan-new", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, Files: []nasInventoryFileReport{{
 		ClipID: 10, RecordingID: 20, RelativePath: "clips/new.mp4", SizeBytes: 3, SHA256: sha,
 		State: "present", VerifiedAt: &now, ClientUpdatedAt: now,
 	}}}
@@ -600,25 +667,51 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 	scanStart := now.Add(-30 * time.Minute)
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation,client_updated_at) VALUES
 		($1,11,20,'clips/old.mp4',3,$2,'present',$3,'prior',$4),
-		($1,12,20,'clips/inflight.mp4',3,$2,'present',$3,'prior',$5)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
+		($1,12,20,'clips/inflight.mp4',3,$2,'present',$3,'prior',$5),
+		($1,13,20,'#recycle/retained.mp4',3,$2,'present',$3,'prior',$4)`, connectionID, sha, now, scanStart.Add(-time.Minute), scanStart.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	complete := nasInventorySyncRequest{Generation: "scan-complete", ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,seen_generation,client_updated_at) VALUES($1,'#recycle/unmatched-retained.mp4',3,$2,'present','prior',$3)`, connectionID, sha, scanStart.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	complete := nasInventorySyncRequest{Generation: "scan-complete", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_in_progress_generation='',inventory_in_progress_dataset_schema='',inventory_in_progress_root_exclusions='[]'::jsonb WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if rec := callSync(complete); rec.Code != http.StatusConflict {
+		t.Fatalf("unestablished completion status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	progress := complete
+	progress.ScanCompletedAt = nil
+	progress.Digest = ""
+	progress.Complete = false
+	if rec := callSync(progress); rec.Code != http.StatusOK {
+		t.Fatalf("establish complete generation status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	if rec := callSync(complete); rec.Code != http.StatusOK {
 		t.Fatalf("complete sync status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var oldState, inflightState string
-	if err := pool.QueryRow(ctx, `SELECT max(state) FILTER(WHERE clip_id=11),max(state) FILTER(WHERE clip_id=12) FROM nas_inventory_files WHERE connection_id=$1`, connectionID).Scan(&oldState, &inflightState); err != nil {
+	var oldState, inflightState, recycleState string
+	if err := pool.QueryRow(ctx, `SELECT max(state) FILTER(WHERE clip_id=11),max(state) FILTER(WHERE clip_id=12),max(state) FILTER(WHERE clip_id=13) FROM nas_inventory_files WHERE connection_id=$1`, connectionID).Scan(&oldState, &inflightState, &recycleState); err != nil {
 		t.Fatal(err)
 	}
-	if oldState != "missing" || inflightState != "present" {
-		t.Fatalf("completion sweep old=%q inflight=%q", oldState, inflightState)
+	if oldState != "missing" || inflightState != "present" || recycleState != "present" {
+		t.Fatalf("completion sweep old=%q inflight=%q recycle=%q", oldState, inflightState, recycleState)
+	}
+	var recycleUnmatchedState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='#recycle/unmatched-retained.mp4'`, connectionID).Scan(&recycleUnmatchedState); err != nil || recycleUnmatchedState != "present" {
+		t.Fatalf("completion swept excluded unmatched recycle row state=%q err=%v", recycleUnmatchedState, err)
+	}
+	var datasetSchema string
+	var rootExclusions []byte
+	if err := pool.QueryRow(ctx, `SELECT inventory_dataset_schema,inventory_root_exclusions FROM connections WHERE id=$1`, connectionID).Scan(&datasetSchema, &rootExclusions); err != nil || datasetSchema != "raw-dataset-v2" || string(rootExclusions) != `["#recycle"]` {
+		t.Fatalf("persisted scope schema=%q exclusions=%s err=%v", datasetSchema, rootExclusions, err)
 	}
 	olderComplete := scanStart.Add(-time.Minute)
 	olderStart := olderComplete.Add(-time.Hour)
 	laterClientUpdate := now.Add(time.Minute)
 	stale := nasInventorySyncRequest{
-		Generation: "scan-stale", ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete,
+		Generation: "scan-stale", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &olderStart, ScanCompletedAt: &olderComplete,
 		Digest: strings.Repeat("c", 64), Complete: true,
 		Files: []nasInventoryFileReport{{
 			ClipID: 10, RecordingID: 20, RelativePath: "clips/stale-completion-mutation.mp4",
@@ -650,7 +743,7 @@ func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {
 	ctx := context.Background()
 	const accountID = int64(42)
 	var connectionID, recordingID, clipID int64
-	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,inventory_scan_completed_at) VALUES($1,'nas_pull',now()) RETURNING id`, accountID).Scan(&connectionID); err != nil {
+	if err := pool.QueryRow(ctx, `INSERT INTO connections(account_id,kind,inventory_scan_completed_at,inventory_generation) VALUES($1,'nas_pull',now(),'scan-v2') RETURNING id`, accountID).Scan(&connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `INSERT INTO recordings(account_id,name,delivery) VALUES($1,'mode','nas_pull') RETURNING id`, accountID).Scan(&recordingID); err != nil {
@@ -676,7 +769,13 @@ func TestNASInventoryModeRequiresCompleteExactCoverage(t *testing.T) {
 	if rec := callMode(); rec.Code != http.StatusConflict {
 		t.Fatalf("unconfirmed enforce status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'mode/clip.mp4',3,$4,'present',now())`, connectionID, clipID, recordingID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation) VALUES($1,$2,$3,'mode/clip.mp4',3,$4,'present',now(),'scan-v2')`, connectionID, clipID, recordingID, sha); err != nil {
+		t.Fatal(err)
+	}
+	if rec := callMode(); rec.Code != http.StatusConflict {
+		t.Fatalf("legacy-scope enforce status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := callMode(); rec.Code != http.StatusOK {

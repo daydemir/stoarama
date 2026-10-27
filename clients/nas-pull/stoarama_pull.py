@@ -51,6 +51,8 @@ UPDATE_INTERVAL_SEC = 600
 INVENTORY_SCAN_INTERVAL_SEC = 24 * 60 * 60
 INVENTORY_SYNC_BATCH = 200
 INVENTORY_SHUTDOWN_TIMEOUT_SEC = HTTP_TIMEOUT_SEC + 5
+INVENTORY_DATASET_SCHEMA = "raw-dataset-v2"
+INVENTORY_ROOT_EXCLUSIONS = ("#recycle",)
 ERROR_BACKOFF_SEC = 30
 USER_AGENT = "stoarama-nas-pull/%s" % CLIENT_VERSION
 JOINED_ROOT = "joined"
@@ -602,19 +604,56 @@ class Inventory:
         if not rows:
             return
         request_json(cfg, "POST", "/account/connections/inventory", body={
-            "generation": generation, "complete": False, "files": self._reports(rows),
+            "generation": generation, "dataset_schema": INVENTORY_DATASET_SCHEMA,
+            "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS), "complete": False, "files": self._reports(rows),
         })
         self._mark_clean(rows)
 
     def sync_dirty(self, cfg, generation="live", scan_started_at=None, stop_event=None):
+        # Establish a full-scan generation even when every local row is already
+        # clean (or the NAS contains only excluded roots).
+        if generation != "live" and not post_inventory_scan_page(cfg, {
+            "generation": generation, "scan_started_at": scan_started_at,
+            "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
+            "complete": False, "files": [], "unmatched_files": [],
+        }, stop_event):
+            return
+        # Legacy ledgers can retain rows from roots that are outside the v2
+        # dataset. Keep the evidence rows, but retire their dirty tokens so they
+        # cannot poison every later upload before a scoped full scan starts.
+        with self.lock:
+            excluded_dirty = self.db.execute(
+                """SELECT EXISTS(
+                       SELECT 1 FROM files WHERE dirty=1 AND (
+                           relative_path='joined' OR relative_path GLOB 'joined/*'
+                           OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')
+                       UNION ALL
+                       SELECT 1 FROM unmatched_files WHERE dirty=1 AND (
+                           relative_path='joined' OR relative_path GLOB 'joined/*'
+                           OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')
+                   )"""
+            ).fetchone()[0]
+            if excluded_dirty:
+                self.db.execute(
+                    """UPDATE files SET dirty=0
+                       WHERE dirty=1 AND (relative_path='joined' OR relative_path GLOB 'joined/*'
+                                          OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')"""
+                )
+                self.db.execute(
+                    """UPDATE unmatched_files SET dirty=0
+                       WHERE dirty=1 AND (relative_path='joined' OR relative_path GLOB 'joined/*'
+                                          OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')"""
+                )
+                self.db.commit()
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
-            rows = self._rows("dirty=1")
+            rows = self._rows("dirty=1 AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*' AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*'")
             if not rows:
                 break
             if not post_inventory_scan_page(cfg, {
                 "generation": generation, "scan_started_at": scan_started_at,
+                "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
                 "complete": False, "files": self._reports(rows),
             }, stop_event):
                 return
@@ -625,7 +664,10 @@ class Inventory:
             with self.lock:
                 rows = self.db.execute(
                     """SELECT relative_path,size_bytes,sha256,state,file_mtime_ns,client_updated_at
-                       FROM unmatched_files WHERE dirty=1 ORDER BY relative_path LIMIT ?""",
+                       FROM unmatched_files
+                       WHERE dirty=1 AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'
+                         AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*'
+                       ORDER BY relative_path LIMIT ?""",
                     (INVENTORY_SYNC_BATCH,),
                 ).fetchall()
             if not rows:
@@ -636,6 +678,7 @@ class Inventory:
             } for row in rows]
             if not post_inventory_scan_page(cfg, {
                 "generation": generation, "scan_started_at": scan_started_at,
+                "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
                 "complete": False, "files": [], "unmatched_files": reports,
             }, stop_event):
                 return
@@ -659,7 +702,12 @@ class Inventory:
             values = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
         generation = values.get("generation", "")
         started_at = values.get("scan_started_at", "")
-        if generation.startswith("scan-") and started_at and not values.get("scan_completed_at"):
+        expected_exclusions = json.dumps(INVENTORY_ROOT_EXCLUSIONS, separators=(",", ":"))
+        scope_matches = (
+            values.get("dataset_schema") == INVENTORY_DATASET_SCHEMA
+            and values.get("root_exclusions") == expected_exclusions
+        )
+        if generation.startswith("scan-") and started_at and not values.get("scan_completed_at") and scope_matches:
             return generation, started_at
         return None
 
@@ -765,7 +813,7 @@ class Inventory:
         clips = total_bytes = mismatches = unmatched = 0
         with self.lock:
             rows = self.db.execute(
-                "SELECT clip_id,relative_path,size_bytes,sha256,state FROM files ORDER BY clip_id"
+                "SELECT clip_id,relative_path,size_bytes,sha256,state FROM files WHERE relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*' ORDER BY clip_id"
             )
             for clip_id, path, size_bytes, sha256, state in rows:
                 digest.update(("%d\0%s\0%d\0%s\0%s\n" % (clip_id, path, size_bytes, sha256, state)).encode("utf-8"))
@@ -775,7 +823,7 @@ class Inventory:
                 elif state == "mismatch":
                     mismatches += 1
             for path, size_bytes, sha256, state in self.db.execute(
-                "SELECT relative_path,size_bytes,sha256,state FROM unmatched_files ORDER BY relative_path"
+                "SELECT relative_path,size_bytes,sha256,state FROM unmatched_files WHERE relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*' ORDER BY relative_path"
             ):
                 digest.update(("unmatched\0%s\0%d\0%s\0%s\n" % (path, size_bytes, sha256, state)).encode("utf-8"))
                 if state == "present":
@@ -792,7 +840,9 @@ class Inventory:
         if resumed is None:
             started_at = utc_now_precise()
             generation = "scan-%s-%s" % (time.strftime("%Y%m%dT%H%M%S", time.gmtime()), os.urandom(4).hex())
-            self._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": ""})
+            self._meta_set({"generation": generation, "scan_started_at": started_at, "scan_completed_at": "", "digest": "",
+                            "dataset_schema": INVENTORY_DATASET_SCHEMA,
+                            "root_exclusions": json.dumps(INVENTORY_ROOT_EXCLUSIONS, separators=(",", ":"))})
         else:
             generation, started_at = resumed
             log("INFO", "inventory resuming incomplete generation=%s started_at=%s" % (generation, started_at))
@@ -945,12 +995,14 @@ class Inventory:
         with self.lock:
             self.db.execute(
                 """UPDATE files SET state='missing',verified_at=NULL,seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
-                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
+                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
+                     AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'""",
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.execute(
                 """UPDATE unmatched_files SET state='missing',seen_generation=?,scan_pass=?,dirty=1,client_updated_at=?
-                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)""",
+                   WHERE state<>'missing' AND scan_pass<>? AND (seen_generation=? OR client_updated_at<=?)
+                     AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*' AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'""",
                 (generation, scan_pass, completed_at, scan_pass, generation, pass_started_at),
             )
             self.db.commit()
@@ -962,6 +1014,7 @@ class Inventory:
             return
         if not post_inventory_scan_page(cfg, {
             "generation": generation, "scan_started_at": started_at,
+            "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
             "scan_completed_at": completed_at, "digest": digest, "complete": True, "files": [],
         }, stop_event):
             return
@@ -1447,8 +1500,10 @@ def walk_raw_files(root):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
         directory = Path(dirpath)
         if directory == root:
-            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT]
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS]
         for filename in filenames:
+            if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
+                continue
             yield directory / filename
 
 

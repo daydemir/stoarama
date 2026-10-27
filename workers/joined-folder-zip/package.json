@@ -11,16 +11,16 @@
     "dry-run": "wrangler deploy --dry-run"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.1.4",
+    "@cloudflare/vitest-plugin": "1.4.8",
     "@types/node": "^24.3.0",
-    "@vitest/runner": "4.1.11",
-    "@vitest/snapshot": "4.1.11",
+    "@vitest/runner": "4.1.12",
+    "@vitest/snapshot": "4.1.12",
     "typescript": "^5.9.2",
-    "vitest": "4.1.11",
-    "wrangler": "^4.126.0"
+    "vitest": "4.1.12",
+    "wrangler": "4.153.0"
   },
   "overrides": {
     "sharp": "0.35.5",
-    "undici": "7.29.1"
+    "undici": "7.30.1"
   }
 }

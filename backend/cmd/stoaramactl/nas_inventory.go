@@ -24,42 +24,46 @@ type nasInventoryOptions struct {
 }
 
 type nasInventorySummary struct {
-	ConnectionID         int64            `json:"connection_id"`
-	Label                string           `json:"label"`
-	Mode                 string           `json:"mode"`
-	Generation           string           `json:"generation"`
-	TreeGeneration       string           `json:"tree_generation"`
-	LiveRevision         int64            `json:"live_revision"`
-	TreeRevision         int64            `json:"tree_revision"`
-	ScanStartedAt        *time.Time       `json:"scan_started_at"`
-	ScanCompletedAt      *time.Time       `json:"scan_completed_at"`
-	ReportedAt           *time.Time       `json:"reported_at"`
-	InProgressGeneration string           `json:"in_progress_generation"`
-	InProgressStartedAt  *time.Time       `json:"in_progress_started_at"`
-	InProgressReportedAt *time.Time       `json:"in_progress_reported_at"`
-	ScanPassStartedAt    *time.Time       `json:"scan_pass_started_at"`
-	ScanRowsVisited      int64            `json:"scan_rows_visited"`
-	ScanRowsSkipped      int64            `json:"scan_rows_skipped"`
-	ScanSkipReasons      map[string]int64 `json:"scan_skip_reasons"`
-	SnapshotAvailable    bool             `json:"snapshot_available"`
-	SnapshotConsistent   bool             `json:"snapshot_consistent"`
-	Clips                int64            `json:"clips"`
-	Bytes                int64            `json:"bytes"`
-	Mismatches           int64            `json:"mismatches"`
-	Unmatched            int64            `json:"unmatched"`
-	ServerOnly           int64            `json:"server_only"`
-	StorageTotalBytes    *int64           `json:"storage_total_bytes"`
-	StorageFreeBytes     *int64           `json:"storage_free_bytes"`
-	StorageReportedAt    *time.Time       `json:"storage_reported_at"`
-	LastBatchClips       int64            `json:"last_batch_clips"`
-	LastBatchBytes       int64            `json:"last_batch_bytes"`
-	LastBatchDurationMS  int64            `json:"last_batch_duration_ms"`
-	LastBatchWorkers     int              `json:"last_batch_workers"`
-	LastBatchRetries     int64            `json:"last_batch_retries"`
-	LastBatchFailures    int64            `json:"last_batch_failures"`
-	LastBatchCompletedAt *time.Time       `json:"last_batch_completed_at"`
-	ClientVersion        string           `json:"client_version"`
-	Items                []map[string]any `json:"items"`
+	ConnectionID             int64            `json:"connection_id"`
+	Label                    string           `json:"label"`
+	Mode                     string           `json:"mode"`
+	Generation               string           `json:"generation"`
+	DatasetSchema            string           `json:"dataset_schema"`
+	RootExclusions           []string         `json:"root_exclusions"`
+	TreeGeneration           string           `json:"tree_generation"`
+	LiveRevision             int64            `json:"live_revision"`
+	TreeRevision             int64            `json:"tree_revision"`
+	ScanStartedAt            *time.Time       `json:"scan_started_at"`
+	ScanCompletedAt          *time.Time       `json:"scan_completed_at"`
+	ReportedAt               *time.Time       `json:"reported_at"`
+	InProgressGeneration     string           `json:"in_progress_generation"`
+	InProgressDatasetSchema  string           `json:"in_progress_dataset_schema"`
+	InProgressRootExclusions []string         `json:"in_progress_root_exclusions"`
+	InProgressStartedAt      *time.Time       `json:"in_progress_started_at"`
+	InProgressReportedAt     *time.Time       `json:"in_progress_reported_at"`
+	ScanPassStartedAt        *time.Time       `json:"scan_pass_started_at"`
+	ScanRowsVisited          int64            `json:"scan_rows_visited"`
+	ScanRowsSkipped          int64            `json:"scan_rows_skipped"`
+	ScanSkipReasons          map[string]int64 `json:"scan_skip_reasons"`
+	SnapshotAvailable        bool             `json:"snapshot_available"`
+	SnapshotConsistent       bool             `json:"snapshot_consistent"`
+	Clips                    int64            `json:"clips"`
+	Bytes                    int64            `json:"bytes"`
+	Mismatches               int64            `json:"mismatches"`
+	Unmatched                int64            `json:"unmatched"`
+	ServerOnly               int64            `json:"server_only"`
+	StorageTotalBytes        *int64           `json:"storage_total_bytes"`
+	StorageFreeBytes         *int64           `json:"storage_free_bytes"`
+	StorageReportedAt        *time.Time       `json:"storage_reported_at"`
+	LastBatchClips           int64            `json:"last_batch_clips"`
+	LastBatchBytes           int64            `json:"last_batch_bytes"`
+	LastBatchDurationMS      int64            `json:"last_batch_duration_ms"`
+	LastBatchWorkers         int              `json:"last_batch_workers"`
+	LastBatchRetries         int64            `json:"last_batch_retries"`
+	LastBatchFailures        int64            `json:"last_batch_failures"`
+	LastBatchCompletedAt     *time.Time       `json:"last_batch_completed_at"`
+	ClientVersion            string           `json:"client_version"`
+	Items                    []map[string]any `json:"items"`
 }
 
 func parseNASInventoryArgs(args []string) (nasInventoryOptions, error) {
@@ -101,13 +105,15 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	defer pool.Close()
 	var summary nasInventorySummary
 	err = pool.QueryRow(ctx, `
-		SELECT c.id,c.label,c.inventory_mode,c.inventory_generation,c.inventory_tree_generation,
+		SELECT c.id,c.label,c.inventory_mode,c.inventory_generation,c.inventory_dataset_schema,c.inventory_root_exclusions,c.inventory_tree_generation,
 		       c.inventory_live_revision,c.inventory_tree_revision,c.inventory_scan_started_at,c.inventory_scan_completed_at,c.inventory_reported_at,
-		       c.inventory_in_progress_generation,c.inventory_in_progress_started_at,c.inventory_in_progress_reported_at,
+		       c.inventory_in_progress_generation,c.inventory_in_progress_dataset_schema,c.inventory_in_progress_root_exclusions,c.inventory_in_progress_started_at,c.inventory_in_progress_reported_at,
 		       c.inventory_scan_pass_started_at,c.inventory_scan_rows_visited,c.inventory_scan_rows_skipped,c.inventory_scan_skip_reasons,
 		       c.inventory_clips,c.inventory_bytes,c.inventory_mismatches,c.inventory_unmatched,
 		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
 		        WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
+		          AND rc.display_path <> 'joined' AND rc.display_path NOT LIKE 'joined/%'
+		          AND rc.display_path <> '#recycle' AND rc.display_path NOT LIKE '#recycle/%'
 		          AND rc.size_bytes>0 AND `+nasdelivery.NotHeldRC+`
 		          AND NOT EXISTS(SELECT 1 FROM nas_inventory_files i
 		            WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
@@ -122,9 +128,9 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 		       c.nas_batch_clips,c.nas_batch_bytes,c.nas_batch_duration_ms,c.nas_download_workers,
 		       c.nas_batch_retries,c.nas_batch_failures,c.nas_batch_completed_at,c.client_version
 		FROM connections c WHERE c.id=$1
-	`, opts.connectionID).Scan(&summary.ConnectionID, &summary.Label, &summary.Mode, &summary.Generation, &summary.TreeGeneration,
+	`, opts.connectionID).Scan(&summary.ConnectionID, &summary.Label, &summary.Mode, &summary.Generation, &summary.DatasetSchema, &summary.RootExclusions, &summary.TreeGeneration,
 		&summary.LiveRevision, &summary.TreeRevision, &summary.ScanStartedAt, &summary.ScanCompletedAt, &summary.ReportedAt,
-		&summary.InProgressGeneration, &summary.InProgressStartedAt, &summary.InProgressReportedAt,
+		&summary.InProgressGeneration, &summary.InProgressDatasetSchema, &summary.InProgressRootExclusions, &summary.InProgressStartedAt, &summary.InProgressReportedAt,
 		&summary.ScanPassStartedAt, &summary.ScanRowsVisited, &summary.ScanRowsSkipped, &summary.ScanSkipReasons,
 		&summary.Clips, &summary.Bytes, &summary.Mismatches, &summary.Unmatched, &summary.ServerOnly,
 		&summary.StorageTotalBytes, &summary.StorageFreeBytes, &summary.StorageReportedAt,
@@ -135,6 +141,8 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if summary.InProgressReportedAt != nil && time.Since(summary.InProgressReportedAt.UTC()) > 24*time.Hour {
 		summary.InProgressGeneration = ""
+		summary.InProgressDatasetSchema = ""
+		summary.InProgressRootExclusions = []string{}
 		summary.InProgressStartedAt = nil
 		summary.InProgressReportedAt = nil
 	}
@@ -150,7 +158,10 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 		FROM nas_inventory_files i
 		JOIN connections conn ON conn.id=i.connection_id
 		LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id) ON c.id=i.clip_id AND rec.account_id=conn.account_id
-		WHERE i.connection_id=$1 AND (
+		WHERE i.connection_id=$1
+		  AND i.relative_path <> 'joined' AND i.relative_path NOT LIKE 'joined/%'
+		  AND i.relative_path <> '#recycle' AND i.relative_path NOT LIKE '#recycle/%'
+		  AND (
 			c.id IS NULL OR i.state<>'present' OR c.size_bytes<>i.size_bytes OR
 			lower(c.sha256)<>i.sha256 OR c.display_path<>i.relative_path)
 		ORDER BY i.clip_id LIMIT $2
@@ -174,7 +185,11 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	rows.Close()
 	remaining := opts.limit - len(summary.Items)
 	if remaining > 0 {
-		unmatchedRows, err := pool.Query(ctx, `SELECT relative_path,state FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present' ORDER BY relative_path LIMIT $2`, opts.connectionID, remaining)
+		unmatchedRows, err := pool.Query(ctx, `SELECT relative_path,state FROM nas_inventory_unmatched_files
+			WHERE connection_id=$1 AND state='present'
+			  AND relative_path <> 'joined' AND relative_path NOT LIKE 'joined/%'
+			  AND relative_path <> '#recycle' AND relative_path NOT LIKE '#recycle/%'
+			ORDER BY relative_path LIMIT $2`, opts.connectionID, remaining)
 		if err != nil {
 			log.Fatalf("load unmatched inventory rows: %v", err)
 		}
@@ -219,7 +234,9 @@ func writeNASInventoryReport(out io.Writer, summary nasInventorySummary, asJSON 
 		return enc.Encode(summary)
 	}
 	reasons, _ := json.Marshal(summary.ScanSkipReasons)
-	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s tree_generation=%s revisions=%d/%d snapshot_available=%t snapshot_consistent=%t scan_started=%v scan_completed=%v reported=%v in_progress=%s in_progress_started=%v in_progress_reported=%v pass_started=%v rows_visited=%d rows_skipped=%d skip_reasons=%s clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d client_version=%s\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.TreeGeneration, summary.LiveRevision, summary.TreeRevision, summary.SnapshotAvailable, summary.SnapshotConsistent, summary.ScanStartedAt, summary.ScanCompletedAt, summary.ReportedAt, summary.InProgressGeneration, summary.InProgressStartedAt, summary.InProgressReportedAt, summary.ScanPassStartedAt, summary.ScanRowsVisited, summary.ScanRowsSkipped, reasons, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly, summary.ClientVersion); err != nil {
+	rootExclusions, _ := json.Marshal(summary.RootExclusions)
+	inProgressRootExclusions, _ := json.Marshal(summary.InProgressRootExclusions)
+	if _, err := fmt.Fprintf(out, "connection=%d label=%q mode=%s generation=%s dataset_schema=%s root_exclusions=%s tree_generation=%s revisions=%d/%d snapshot_available=%t snapshot_consistent=%t scan_started=%v scan_completed=%v reported=%v in_progress=%s in_progress_dataset_schema=%s in_progress_root_exclusions=%s in_progress_started=%v in_progress_reported=%v pass_started=%v rows_visited=%d rows_skipped=%d skip_reasons=%s clips=%d bytes=%d mismatches=%d unmatched=%d server_only=%d client_version=%s\n", summary.ConnectionID, summary.Label, summary.Mode, summary.Generation, summary.DatasetSchema, rootExclusions, summary.TreeGeneration, summary.LiveRevision, summary.TreeRevision, summary.SnapshotAvailable, summary.SnapshotConsistent, summary.ScanStartedAt, summary.ScanCompletedAt, summary.ReportedAt, summary.InProgressGeneration, summary.InProgressDatasetSchema, inProgressRootExclusions, summary.InProgressStartedAt, summary.InProgressReportedAt, summary.ScanPassStartedAt, summary.ScanRowsVisited, summary.ScanRowsSkipped, reasons, summary.Clips, summary.Bytes, summary.Mismatches, summary.Unmatched, summary.ServerOnly, summary.ClientVersion); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(out, "storage_total=%s storage_free=%s storage_reported=%v last_batch_clips=%d last_batch_bytes=%d last_batch_duration_ms=%d workers=%d retries=%d failures=%d completed=%v\n", optionalInt64Text(summary.StorageTotalBytes), optionalInt64Text(summary.StorageFreeBytes), summary.StorageReportedAt, summary.LastBatchClips, summary.LastBatchBytes, summary.LastBatchDurationMS, summary.LastBatchWorkers, summary.LastBatchRetries, summary.LastBatchFailures, summary.LastBatchCompletedAt); err != nil {
