@@ -347,6 +347,40 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(reopened._rows("clip_id=7")[0][2], clip["relative_path"])
             reopened.close()
 
+    def test_sync_dirty_retires_excluded_legacy_rows_without_upload_or_delete(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            now = "2026-10-27T01:00:00Z"
+            for clip_id, relative_path in ((1, "#recycle/retained.mp4"), (2, "joined/retained.mp4"), (3, "clips/visible.mp4"), (4, "Joined/visible.mp4")):
+                inventory.db.execute(
+                    """INSERT INTO files(clip_id,recording_id,relative_path,size_bytes,sha256,state,client_updated_at,dirty)
+                       VALUES(?,1,?,3,?,'present',?,1)""",
+                    (clip_id, relative_path, "a" * 64, now),
+                )
+            for relative_path in ("#recycle/unmatched.mp4", "joined/unmatched.mp4", "raw/visible.mp4", "#Recycle/visible.mp4"):
+                inventory.db.execute(
+                    """INSERT INTO unmatched_files(relative_path,size_bytes,sha256,state,client_updated_at,dirty)
+                       VALUES(?,3,?,'present',?,1)""",
+                    (relative_path, "b" * 64, now),
+                )
+            inventory.db.commit()
+            calls = []
+            with mock.patch.object(pull, "post_inventory_scan_page", side_effect=lambda _cfg, body, _stop: calls.append(body) or True):
+                inventory.sync_dirty(cfg)
+            uploaded = {
+                row["relative_path"]
+                for call in calls
+                for key in ("files", "unmatched_files")
+                for row in call.get(key, [])
+            }
+            self.assertEqual(uploaded, {"clips/visible.mp4", "Joined/visible.mp4", "raw/visible.mp4", "#Recycle/visible.mp4"})
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM files").fetchone()[0], 4)
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM unmatched_files").fetchone()[0], 4)
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM files WHERE dirty=1").fetchone()[0], 0)
+            self.assertEqual(inventory.db.execute("SELECT count(*) FROM unmatched_files WHERE dirty=1").fetchone()[0], 0)
+            inventory.close()
+
     def test_inventory_adds_scan_pass_to_existing_sqlite_schema(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))

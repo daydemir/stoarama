@@ -112,6 +112,8 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 		       c.inventory_clips,c.inventory_bytes,c.inventory_mismatches,c.inventory_unmatched,
 		       (SELECT count(*) FROM recording_clips rc JOIN recordings r ON r.id=rc.recording_id
 		        WHERE r.account_id=c.account_id AND r.delivery='nas_pull' AND rc.purged_at IS NULL AND rc.released_at IS NULL
+		          AND rc.display_path <> 'joined' AND rc.display_path NOT LIKE 'joined/%'
+		          AND rc.display_path <> '#recycle' AND rc.display_path NOT LIKE '#recycle/%'
 		          AND rc.size_bytes>0 AND `+nasdelivery.NotHeldRC+`
 		          AND NOT EXISTS(SELECT 1 FROM nas_inventory_files i
 		            WHERE i.connection_id=c.id AND i.clip_id=rc.id AND i.state='present'
@@ -156,7 +158,10 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 		FROM nas_inventory_files i
 		JOIN connections conn ON conn.id=i.connection_id
 		LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id) ON c.id=i.clip_id AND rec.account_id=conn.account_id
-		WHERE i.connection_id=$1 AND (
+		WHERE i.connection_id=$1
+		  AND i.relative_path <> 'joined' AND i.relative_path NOT LIKE 'joined/%'
+		  AND i.relative_path <> '#recycle' AND i.relative_path NOT LIKE '#recycle/%'
+		  AND (
 			c.id IS NULL OR i.state<>'present' OR c.size_bytes<>i.size_bytes OR
 			lower(c.sha256)<>i.sha256 OR c.display_path<>i.relative_path)
 		ORDER BY i.clip_id LIMIT $2
@@ -180,7 +185,11 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	rows.Close()
 	remaining := opts.limit - len(summary.Items)
 	if remaining > 0 {
-		unmatchedRows, err := pool.Query(ctx, `SELECT relative_path,state FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND state='present' ORDER BY relative_path LIMIT $2`, opts.connectionID, remaining)
+		unmatchedRows, err := pool.Query(ctx, `SELECT relative_path,state FROM nas_inventory_unmatched_files
+			WHERE connection_id=$1 AND state='present'
+			  AND relative_path <> 'joined' AND relative_path NOT LIKE 'joined/%'
+			  AND relative_path <> '#recycle' AND relative_path NOT LIKE '#recycle/%'
+			ORDER BY relative_path LIMIT $2`, opts.connectionID, remaining)
 		if err != nil {
 			log.Fatalf("load unmatched inventory rows: %v", err)
 		}

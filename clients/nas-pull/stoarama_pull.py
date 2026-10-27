@@ -618,10 +618,37 @@ class Inventory:
             "complete": False, "files": [], "unmatched_files": [],
         }, stop_event):
             return
+        # Legacy ledgers can retain rows from roots that are outside the v2
+        # dataset. Keep the evidence rows, but retire their dirty tokens so they
+        # cannot poison every later upload before a scoped full scan starts.
+        with self.lock:
+            excluded_dirty = self.db.execute(
+                """SELECT EXISTS(
+                       SELECT 1 FROM files WHERE dirty=1 AND (
+                           relative_path='joined' OR relative_path GLOB 'joined/*'
+                           OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')
+                       UNION ALL
+                       SELECT 1 FROM unmatched_files WHERE dirty=1 AND (
+                           relative_path='joined' OR relative_path GLOB 'joined/*'
+                           OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')
+                   )"""
+            ).fetchone()[0]
+            if excluded_dirty:
+                self.db.execute(
+                    """UPDATE files SET dirty=0
+                       WHERE dirty=1 AND (relative_path='joined' OR relative_path GLOB 'joined/*'
+                                          OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')"""
+                )
+                self.db.execute(
+                    """UPDATE unmatched_files SET dirty=0
+                       WHERE dirty=1 AND (relative_path='joined' OR relative_path GLOB 'joined/*'
+                                          OR relative_path='#recycle' OR relative_path GLOB '#recycle/*')"""
+                )
+                self.db.commit()
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
-            rows = self._rows("dirty=1")
+            rows = self._rows("dirty=1 AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*' AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*'")
             if not rows:
                 break
             if not post_inventory_scan_page(cfg, {
@@ -637,7 +664,10 @@ class Inventory:
             with self.lock:
                 rows = self.db.execute(
                     """SELECT relative_path,size_bytes,sha256,state,file_mtime_ns,client_updated_at
-                       FROM unmatched_files WHERE dirty=1 ORDER BY relative_path LIMIT ?""",
+                       FROM unmatched_files
+                       WHERE dirty=1 AND relative_path<>'joined' AND relative_path NOT GLOB 'joined/*'
+                         AND relative_path<>'#recycle' AND relative_path NOT GLOB '#recycle/*'
+                       ORDER BY relative_path LIMIT ?""",
                     (INVENTORY_SYNC_BATCH,),
                 ).fetchall()
             if not rows:

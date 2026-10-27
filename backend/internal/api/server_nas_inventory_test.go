@@ -653,6 +653,13 @@ func TestNASInventorySyncIsMonotonicAndCompletionSweepIsRaceSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	complete := nasInventorySyncRequest{Generation: "scan-complete", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"}, ScanStartedAt: &scanStart, ScanCompletedAt: &now, Digest: strings.Repeat("b", 64), Complete: true}
+	progress := complete
+	progress.ScanCompletedAt = nil
+	progress.Digest = ""
+	progress.Complete = false
+	if rec := callSync(progress); rec.Code != http.StatusOK {
+		t.Fatalf("establish complete generation status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	if rec := callSync(complete); rec.Code != http.StatusOK {
 		t.Fatalf("complete sync status=%d body=%s", rec.Code, rec.Body.String())
 	}
