@@ -610,6 +610,14 @@ class Inventory:
         self._mark_clean(rows)
 
     def sync_dirty(self, cfg, generation="live", scan_started_at=None, stop_event=None):
+        # Establish a full-scan generation even when every local row is already
+        # clean (or the NAS contains only excluded roots).
+        if generation != "live" and not post_inventory_scan_page(cfg, {
+            "generation": generation, "scan_started_at": scan_started_at,
+            "dataset_schema": INVENTORY_DATASET_SCHEMA, "root_exclusions": list(INVENTORY_ROOT_EXCLUSIONS),
+            "complete": False, "files": [], "unmatched_files": [],
+        }, stop_event):
+            return
         while True:
             if stop_event is not None and stop_event.is_set():
                 return

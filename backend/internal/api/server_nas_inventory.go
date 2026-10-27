@@ -81,6 +81,11 @@ func validNASRelativePath(path string) bool {
 	return true
 }
 
+func nasInventoryExcludedPath(path string) bool {
+	return path == "#recycle" || strings.HasPrefix(path, "#recycle/") ||
+		path == "joined" || strings.HasPrefix(path, "joined/")
+}
+
 func nasInventoryTreeParts(path string) (string, string) {
 	if index := strings.LastIndexByte(path, '/'); index >= 0 {
 		return path[:index], path[index+1:]
@@ -103,7 +108,7 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 	}
 	unmatchedSeen := make(map[string]bool, len(req.Unmatched))
 	for _, file := range req.Unmatched {
-		if !validNASRelativePath(file.RelativePath) || unmatchedSeen[file.RelativePath] || file.SizeBytes < 0 ||
+		if !validNASRelativePath(file.RelativePath) || nasInventoryExcludedPath(file.RelativePath) || unmatchedSeen[file.RelativePath] || file.SizeBytes < 0 ||
 			len(file.SHA256) != 64 || !lowerHex(file.SHA256) || file.FileMTimeNS < 0 ||
 			(file.State != "present" && file.State != "missing") || file.ClientUpdatedAt.IsZero() ||
 			file.ClientUpdatedAt.After(now.Add(nasInventoryMaxFutureSkew)) {
@@ -128,7 +133,7 @@ func validateNASInventorySync(req nasInventorySyncRequest, now time.Time) error 
 			return errors.New("invalid or duplicate inventory file identity")
 		}
 		seen[file.ClipID] = true
-		if !validNASRelativePath(file.RelativePath) || len(file.SHA256) != 64 || !lowerHex(file.SHA256) {
+		if !validNASRelativePath(file.RelativePath) || nasInventoryExcludedPath(file.RelativePath) || len(file.SHA256) != 64 || !lowerHex(file.SHA256) {
 			return errors.New("invalid inventory file path or checksum")
 		}
 		if file.State != "present" && file.State != "missing" && file.State != "mismatch" {
@@ -636,7 +641,8 @@ func (s *Server) handleAccountConnectionInventoryTree(w http.ResponseWriter, r *
 		activeGeneration, activeStartedAt, activeReportedAt = "", nil, nil
 		activeDatasetSchema, activeRootExclusions = "", []string{}
 	}
-	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration
+	snapshotAvailable := completedGeneration != "" && treeGeneration == completedGeneration &&
+		completedDatasetSchema == "raw-dataset-v2" && len(completedRootExclusions) == 1 && completedRootExclusions[0] == "#recycle"
 	snapshotIdentity := strings.Join([]string{completedGeneration, treeGeneration, strconv.FormatInt(liveRevision, 10), strconv.FormatInt(treeRevision, 10), timestampToken(scanCompletedAt), activeGeneration, directory}, "|")
 	snapshotState := fmt.Sprintf("%x", sha256.Sum256([]byte(snapshotIdentity)))
 	if r.URL.Query().Get("cursor") != "" && cursor.State != snapshotState {

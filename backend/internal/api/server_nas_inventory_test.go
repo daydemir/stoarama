@@ -56,6 +56,24 @@ func TestValidateNASInventorySyncRequiresFixedRawDatasetV2Scope(t *testing.T) {
 	}
 }
 
+func TestValidateNASInventorySyncRejectsExcludedPaths(t *testing.T) {
+	now := time.Now().UTC()
+	for _, path := range []string{"#recycle", "#recycle/old.mp4", "joined", "joined/export.mp4"} {
+		request := nasInventorySyncRequest{
+			Generation: "scan-scope", DatasetSchema: "raw-dataset-v2", RootExclusions: []string{"#recycle"},
+			Files: []nasInventoryFileReport{{ClipID: 1, RecordingID: 2, RelativePath: path, SHA256: strings.Repeat("a", 64), State: "missing", ClientUpdatedAt: now}},
+		}
+		if err := validateNASInventorySync(request, now); err == nil {
+			t.Errorf("excluded linked path accepted: %q", path)
+		}
+		request.Files = nil
+		request.Unmatched = []nasUnmatchedFileReport{{RelativePath: path, SHA256: strings.Repeat("b", 64), State: "missing", ClientUpdatedAt: now}}
+		if err := validateNASInventorySync(request, now); err == nil {
+			t.Errorf("excluded unmatched path accepted: %q", path)
+		}
+	}
+}
+
 func TestValidateNASInventorySync(t *testing.T) {
 	now := time.Now().UTC()
 	start := now.Add(-time.Minute)

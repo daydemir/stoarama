@@ -139,6 +139,8 @@ func runNASInventory(ctx context.Context, cfg config.Config, args []string) {
 	}
 	if summary.InProgressReportedAt != nil && time.Since(summary.InProgressReportedAt.UTC()) > 24*time.Hour {
 		summary.InProgressGeneration = ""
+		summary.InProgressDatasetSchema = ""
+		summary.InProgressRootExclusions = []string{}
 		summary.InProgressStartedAt = nil
 		summary.InProgressReportedAt = nil
 	}

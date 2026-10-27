@@ -1802,6 +1802,25 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertEqual(remaining, 1)
             inventory.close()
 
+    def test_inventory_empty_full_scan_establishes_generation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            inventory = pull.Inventory(cfg)
+            calls = []
+
+            def publish(*_args, **kwargs):
+                calls.append(kwargs["body"])
+                return {}
+
+            with mock.patch.object(pull, "request_json", side_effect=publish):
+                inventory.sync_dirty(cfg, generation="scan-empty", scan_started_at="2026-10-27T00:00:00Z")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["generation"], "scan-empty")
+            self.assertFalse(calls[0]["complete"])
+            self.assertEqual(calls[0]["files"], [])
+            self.assertEqual(calls[0]["unmatched_files"], [])
+            inventory.close()
+
     def test_run_activates_quiescent_update_before_storage_work(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
