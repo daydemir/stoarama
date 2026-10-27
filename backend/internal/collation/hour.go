@@ -263,6 +263,12 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 		}
 		out := filepath.Join(dir, fmt.Sprintf("out-%d.mp4", clips[members[0]].ClipID))
 		built, err := BuildPart(ctx, env.Tools, local, out)
+		if err == nil {
+			err = VerifyFullDecode(ctx, env.Tools, built.Path)
+			if err != nil {
+				err = fmt.Errorf("full decode: %w", err)
+			}
+		}
 		<-env.CPU
 		if err == nil {
 			mu.Lock()
@@ -281,7 +287,7 @@ func ProcessHour(ctx context.Context, env Env, w HourWork) (HourManifest, error)
 			if err := acquire(ctx, env.CPU); err != nil {
 				return err
 			}
-			decodeErr := strictDecode(ctx, env.Tools, locals[i].Path)
+			decodeErr := VerifyFullDecode(ctx, env.Tools, locals[i].Path)
 			<-env.CPU
 			if decodeErr != nil {
 				mu.Lock()
