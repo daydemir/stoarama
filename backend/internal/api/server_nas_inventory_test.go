@@ -595,6 +595,15 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DELETE FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='safe/1.mp4'`, connectionID); err != nil {
 		t.Fatal(err)
 	}
+	if rec := call(); rec.Code != http.StatusConflict {
+		t.Fatalf("legacy-scope batch status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_generation='scan-v2',inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_scan_completed_at=now() WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET seen_generation='scan-v2' WHERE connection_id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	if rec := call(); rec.Code != http.StatusOK {
 		t.Fatalf("complete proof status=%d body=%s", rec.Code, rec.Body.String())
 	}

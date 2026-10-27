@@ -1009,12 +1009,17 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
 	var connectionID int64
-	var mode string
-	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_mode FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &mode); errors.Is(err, pgx.ErrNoRows) {
+	var mode, datasetSchema, inventoryGeneration string
+	var rootExclusions []byte
+	if err := tx.QueryRow(r.Context(), `SELECT id,inventory_mode,inventory_dataset_schema,inventory_root_exclusions,inventory_generation FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`, *principal.APIKeyID, principal.AccountID).Scan(&connectionID, &mode, &datasetSchema, &rootExclusions, &inventoryGeneration); errors.Is(err, pgx.ErrNoRows) {
 		util.WriteError(w, http.StatusForbidden, "no connection for this key")
 		return
 	} else if err != nil {
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("load batch release connection: %v", err))
+		return
+	}
+	if mode == "enforce" && (datasetSchema != "raw-dataset-v2" || string(rootExclusions) != `["#recycle"]` || inventoryGeneration == "") {
+		util.WriteError(w, http.StatusConflict, "release retained: connection lacks a completed scoped NAS inventory")
 		return
 	}
 	for _, item := range req.Clips {
@@ -1039,18 +1044,22 @@ func (s *Server) handleAccountClipsReleaseBatch(w http.ResponseWriter, r *http.R
 			continue
 		}
 		if mode == "enforce" {
+			if nasInventoryExcludedPath(path) {
+				util.WriteError(w, http.StatusConflict, fmt.Sprintf("release retained: clip %d is outside the scoped NAS inventory", item.ClipID))
+				return
+			}
 			var confirmed bool
 			if err := tx.QueryRow(r.Context(), `
 				SELECT EXISTS(SELECT 1 FROM nas_inventory_files i
 				WHERE i.connection_id=$1 AND i.clip_id=$2 AND i.state='present' AND i.relative_path=$3
-				  AND i.size_bytes=$4 AND i.sha256=$5 AND i.verified_at>=now()-$6::interval
-				  AND i.verified_at<=now()+$7::interval
+				  AND i.size_bytes=$4 AND i.sha256=$5 AND i.seen_generation=$6
+				  AND i.verified_at>=now()-$7::interval AND i.verified_at<=now()+$8::interval
 				  AND NOT EXISTS (SELECT 1 FROM nas_inventory_files other
 				    WHERE other.connection_id=i.connection_id AND other.relative_path=i.relative_path
 				      AND other.clip_id<>i.clip_id AND other.state IN('present','mismatch'))
 				  AND NOT EXISTS (SELECT 1 FROM nas_inventory_unmatched_files unmatched
 				    WHERE unmatched.connection_id=i.connection_id AND unmatched.relative_path=i.relative_path AND unmatched.state='present'))
-			`, connectionID, item.ClipID, path, size, sha, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&confirmed); err != nil {
+			`, connectionID, item.ClipID, path, size, sha, inventoryGeneration, nasInventoryFreshness.String(), nasInventoryMaxFutureSkew.String()).Scan(&confirmed); err != nil {
 				util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("verify batch clip %d: %v", item.ClipID, err))
 				return
 			}
