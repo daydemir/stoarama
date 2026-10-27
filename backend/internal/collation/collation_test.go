@@ -484,6 +484,59 @@ func TestProcessHourSyntheticContinuousJumpOverlap(t *testing.T) {
 	}
 }
 
+func TestProcessHourIsolatesCorruptAudioAndPublishesValidClip(t *testing.T) {
+	tools := requireFFmpeg(t)
+	dir := t.TempDir()
+	src := synth(t, tools, dir)
+	for name, from := range map[string]float64{"good.mp4": 0, "bad.mp4": 10} {
+		cut(t, tools, src, filepath.Join(dir, name), from, 10)
+	}
+	bad := filepath.Join(dir, "bad.mp4")
+	cmd := exec.Command(tools.FFprobe, "-v", "error", "-select_streams", "a:0", "-show_packets", "-show_entries", "packet=pos,size", "-of", "json", bad)
+	body, err := cmd.Output()
+	if err != nil { t.Fatal(err) }
+	var packetProbe struct { Packets []struct { Pos string `json:"pos"`; Size string `json:"size"` } `json:"packets"` }
+	if err := json.Unmarshal(body, &packetProbe); err != nil || len(packetProbe.Packets) < 5 { t.Fatalf("audio packets: %v", err) }
+	var pos, size int64
+	if _, err := fmt.Sscan(packetProbe.Packets[len(packetProbe.Packets)-5].Pos, &pos); err != nil { t.Fatal(err) }
+	if _, err := fmt.Sscan(packetProbe.Packets[len(packetProbe.Packets)-5].Size, &size); err != nil { t.Fatal(err) }
+	f, err := os.OpenFile(bad, os.O_WRONLY, 0)
+	if err != nil { t.Fatal(err) }
+	_, writeErr := f.WriteAt([]byte(strings.Repeat("\xff", int(size))), pos)
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil { t.Fatalf("corrupt audio: %v %v", writeErr, closeErr) }
+	ctx := context.Background()
+	if err := strictDecode(ctx, tools, bad); err != nil { t.Fatalf("video-only decode rejected fixture: %v", err) }
+	if err := VerifyFullDecode(ctx, tools, bad); err == nil { t.Fatal("fixture full decode unexpectedly passed") }
+
+	w := testWork()
+	w.HourID, _ = HourIDFor(w.BatchID, w.RecordingID, w.LocalDate, w.DeliveryHour)
+	t0 := time.Date(2026, 8, 13, 17, 0, 0, 0, time.UTC)
+	w.ScheduledStart, w.ScheduledEnd = t0, t0.Add(time.Hour)
+	at := t0
+	for i, name := range []string{"good.mp4", "bad.mp4"} {
+		p, err := ProbeFile(ctx, tools, filepath.Join(dir, name))
+		if err != nil || !p.Media.Playable { t.Fatalf("probe %s: %v %+v", name, err, p.Media) }
+		n, sha, err := fileIdentity(filepath.Join(dir, name))
+		if err != nil { t.Fatal(err) }
+		dur := time.Duration(p.Media.ContentSeconds * float64(time.Second))
+		w.Clips = append(w.Clips, Clip{ClipID: int64(i+1), RecordingID: w.RecordingID, JobID: 9, CaptureSequence: int64(i+1), StartUTC: at, EndUTC: at.Add(dur), ObjectKey: name, SizeBytes: n, SHA256: sha})
+		at = at.Add(dur)
+	}
+	store := &dirStore{src: dir, published: map[string]string{}}
+	env := Env{Tools: tools, Policy: DefaultSeamPolicy(), ScratchRoot: filepath.Join(dir, "scratch"), Store: store, MediaTool: "test", CPU: make(chan struct{}, 2), Net: make(chan struct{}, 2), Now: time.Now}
+	m, err := ProcessHour(ctx, env, w)
+	if err != nil { t.Fatal(err) }
+	if len(m.Outputs) != 1 || fmt.Sprint(m.Outputs[0].SourceClipIDs) != "[1]" { t.Fatalf("outputs: %+v", m.Outputs) }
+	var goodDisposition, badDisposition *ClipDisposition
+	for i := range m.Clips {
+		switch m.Clips[i].ClipID { case 1: goodDisposition = &m.Clips[i]; case 2: badDisposition = &m.Clips[i] }
+	}
+	if goodDisposition == nil || goodDisposition.Disposition != "included" { t.Fatalf("good clip: %+v", goodDisposition) }
+	if badDisposition == nil || badDisposition.Disposition != "quarantined" || badDisposition.Reason != "strict_decode_failed" { t.Fatalf("bad clip: %+v", badDisposition) }
+	if _, ok := store.published[ManifestKey(w.BatchID, w.HourID)]; !ok { t.Fatal("manifest not published") }
+}
+
 func TestReplayOverlapDetectsRepeatedLeadingPackets(t *testing.T) {
 	mk := func(hashes ...string) Probe {
 		sp := &StreamPackets{Kind: "video"}
