@@ -338,7 +338,7 @@ func (s *Server) handleAccountConnectionInventorySync(w http.ResponseWriter, r *
 		util.WriteError(w, http.StatusConflict, "inventory dataset scope changed within generation")
 		return
 	}
-	if req.Complete && (existingCompletedAt == nil || req.ScanCompletedAt.After(*existingCompletedAt)) && activeGeneration != "" && activeGeneration != req.Generation {
+	if req.Complete && (existingCompletedAt == nil || req.ScanCompletedAt.After(*existingCompletedAt)) && activeGeneration != req.Generation {
 		util.WriteError(w, http.StatusConflict, "inventory completion does not match active generation")
 		return
 	}
