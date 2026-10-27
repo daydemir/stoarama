@@ -291,6 +291,8 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             self.assertNotIn("joined/hidden.mp4", reported)
             self.assertNotIn("#recycle/retained.mp4", reported)
             self.assertNotIn("directory-link/symlink-only.mp4", reported)
+            self.assertIn("joined-other/one.mp4", reported)
+            self.assertIn("raw/joined/three.mp4", reported)
             self.assertTrue(all(call["dataset_schema"] == "raw-dataset-v2" and call["root_exclusions"] == ["#recycle"] for call in calls))
 
         with tempfile.TemporaryDirectory() as raw:
@@ -304,8 +306,10 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             rows = inventory.db.execute(
                 "SELECT relative_path FROM unmatched_files WHERE state='present'"
             ).fetchall()
+            summary = inventory.summary()
             inventory.close()
             self.assertEqual(rows, [("Joined/visible.mp4",)])
+            self.assertEqual(summary["unmatched"], 1)
 
     def test_atomic_write_is_durable_and_replaces(self):
         with tempfile.TemporaryDirectory() as raw:

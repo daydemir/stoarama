@@ -140,7 +140,7 @@ func TestNASInventoryTreeQueryUsesExactParentIndexes(t *testing.T) {
 	if strings.Contains(direct, "GROUP BY") || strings.Contains(direct, "split_part") || strings.Contains(direct, "starts_with") {
 		t.Fatalf("browse query still aggregates or scans path prefixes:\n%s", direct)
 	}
-	for _, marker := range []string{"i.connection_id=$1 AND i.tree_parent_path=$4", "u.connection_id=$1 AND u.tree_parent_path=$4", "d.generation=$3", "row_number() OVER(PARTITION BY name"} {
+	for _, marker := range []string{"i.connection_id=$1 AND i.tree_parent_path=$4", "u.connection_id=$1 AND u.tree_parent_path=$4", "i.relative_path<>'#recycle'", "u.relative_path NOT LIKE 'joined/%'", "d.generation=$3", "row_number() OVER(PARTITION BY name"} {
 		if !strings.Contains(direct, marker) {
 			t.Fatalf("tree query missing bounded snapshot marker %q", marker)
 		}

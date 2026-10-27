@@ -535,11 +535,13 @@ const nasInventoryTreeSQL = `
 			FROM nas_inventory_files i
 			LEFT JOIN (recording_clips c JOIN recordings rec ON rec.id=c.recording_id AND rec.account_id=$2) ON c.id=i.clip_id
 			WHERE i.connection_id=$1 AND i.tree_parent_path=$4 AND i.state IN('present','mismatch')
+			  AND i.relative_path<>'#recycle' AND i.relative_path NOT LIKE '#recycle/%' AND i.relative_path<>'joined' AND i.relative_path NOT LIKE 'joined/%'
 			  AND ($5::int<1 OR i.tree_name>$6)
 			UNION ALL
 			SELECT u.tree_name,u.relative_path,NULL::bigint,NULL::bigint,u.size_bytes,u.sha256,u.state,NULL::timestamptz,'nas_only',false
 			FROM nas_inventory_unmatched_files u
 			WHERE u.connection_id=$1 AND u.tree_parent_path=$4 AND u.state='present'
+			  AND u.relative_path<>'#recycle' AND u.relative_path NOT LIKE '#recycle/%' AND u.relative_path<>'joined' AND u.relative_path NOT LIKE 'joined/%'
 			  AND ($5::int<1 OR u.tree_name>$6)
 		), ranked_files AS (
 			SELECT *,count(*) OVER(PARTITION BY name) AS path_count,row_number() OVER(PARTITION BY name ORDER BY
