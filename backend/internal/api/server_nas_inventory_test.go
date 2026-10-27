@@ -564,6 +564,12 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 			}
 		}
 	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_generation='scan-v2',inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_scan_completed_at=now() WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET seen_generation='scan-v2' WHERE connection_id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	s := &Server{pool: pool}
 	call := func() *httptest.ResponseRecorder {
 		body := fmt.Sprintf(`{"clips":[{"clip_id":%d,"recording_id":%d},{"clip_id":%d,"recording_id":%d}]}`, firstID, recordingID, secondID, recordingID)
@@ -583,7 +589,7 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 	if released != 0 {
 		t.Fatalf("partial batch released %d clips, want 0", released)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at) VALUES($1,$2,$3,'safe/2.mp4',3,$4,'present',now())`, connectionID, secondID, recordingID, sha); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files(connection_id,clip_id,recording_id,relative_path,size_bytes,sha256,state,verified_at,seen_generation) VALUES($1,$2,$3,'safe/2.mp4',3,$4,'present',now(),'scan-v2')`, connectionID, secondID, recordingID, sha); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_unmatched_files(connection_id,relative_path,size_bytes,sha256,state,client_updated_at) VALUES($1,'safe/1.mp4',3,$2,'present',now())`, connectionID, sha); err != nil {
@@ -595,13 +601,13 @@ func TestNASBatchReleaseIsAtomicAndInventoryGated(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DELETE FROM nas_inventory_unmatched_files WHERE connection_id=$1 AND relative_path='safe/1.mp4'`, connectionID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_dataset_schema='',inventory_root_exclusions='[]'::jsonb WHERE id=$1`, connectionID); err != nil {
+		t.Fatal(err)
+	}
 	if rec := call(); rec.Code != http.StatusConflict {
 		t.Fatalf("legacy-scope batch status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_generation='scan-v2',inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb,inventory_scan_completed_at=now() WHERE id=$1`, connectionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE nas_inventory_files SET seen_generation='scan-v2' WHERE connection_id=$1`, connectionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE connections SET inventory_dataset_schema='raw-dataset-v2',inventory_root_exclusions='["#recycle"]'::jsonb WHERE id=$1`, connectionID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := call(); rec.Code != http.StatusOK {
