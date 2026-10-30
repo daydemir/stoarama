@@ -6105,6 +6105,69 @@ class RestoreLocalError(RuntimeError):
         self.outcome = outcome
 
 
+def valid_selected_verify_task(task):
+    """Validate one immutable, server-derived selected-file manifest item."""
+    if not isinstance(task, dict):
+        raise ValueError("invalid selected verify task")
+    out = {}
+    for name in ("item_id", "attempt", "size_bytes"):
+        value = task.get(name)
+        if type(value) is not int or value <= 0:
+            raise ValueError("invalid selected verify task %s" % name)
+        out[name] = value
+    if task.get("kind") not in ("raw", "stitched"):
+        raise ValueError("invalid selected verify task kind")
+    out["kind"] = task["kind"]
+    for name in ("sha256", "plan_sha256"):
+        value = task.get(name)
+        if not isinstance(value, str) or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("invalid selected verify task %s" % name)
+        out[name] = value
+    out["relative_path"] = valid_relative_path({"clip_id": out["item_id"], "relative_path": task.get("relative_path")})
+    return out
+
+
+def run_selected_verify_task(cfg, task):
+    """Read-only direct check: confined regular file, exact size, then full SHA."""
+    started = time.monotonic()
+    result = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
+              "outcome": "conflict", "error": "", "duration_ms": 0}
+    candidate = Path(cfg.output_dir) / task["relative_path"]
+    try:
+        path, path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
+    except MediaCertificationError as exc:
+        result["outcome"] = "conflict" if os.path.lexists(str(candidate)) else "missing"
+        result["error"] = str(exc)
+    else:
+        fd = None
+        try:
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+            before = os.fstat(fd)
+            if certification_identity(before) != certification_identity(path_stat):
+                raise RuntimeError("local file changed while opening")
+            if before.st_size != task["size_bytes"]:
+                raise RuntimeError("local size %d differs from %d" % (before.st_size, task["size_bytes"]))
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, RESTORE_BLOCK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            if digest.hexdigest() != task["sha256"]:
+                raise RuntimeError("local sha256 differs from manifest")
+            if certification_identity(os.fstat(fd)) != certification_identity(before):
+                raise RuntimeError("local file changed while hashing")
+            result["outcome"] = "match"
+        except (OSError, RuntimeError) as exc:
+            result["error"] = str(exc)
+        finally:
+            if fd is not None:
+                os.close(fd)
+    result["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
+    result["error"] = result["error"][:500]
+    return result
+
+
 def valid_restore_task(task):
     if not isinstance(task, dict):
         raise ValueError("invalid restore task")
@@ -6416,6 +6479,34 @@ def restore_wait(seconds):
     except (TypeError, ValueError):
         seconds = RESTORE_ERROR_WAIT_SEC
     return min(max(seconds, RESTORE_MIN_WAIT_SEC), RESTORE_MAX_WAIT_SEC)
+
+
+def selected_verify_once(cfg):
+    """Lease a bounded batch and report direct read-only filesystem evidence."""
+    lease = restore_api(cfg, "/account/connections/selected-verify/lease",
+                        {"client_version": CLIENT_VERSION, "max_tasks": max(1, min(64, cfg.restore_workers))})
+    if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
+        raise RuntimeError("invalid selected verify lease response")
+    for raw in lease.get("tasks") or []:
+        try:
+            task = valid_selected_verify_task(raw)
+        except ValueError as exc:
+            log("WARN", "invalid selected verify task: %s" % exc)
+            continue
+        result = run_selected_verify_task(cfg, task)
+        result["client_version"] = CLIENT_VERSION
+        restore_api(cfg, "/account/connections/selected-verify/%d/result" % task["item_id"], result, retry_stale=True)
+    return lease.get("retry_after_sec", RESTORE_ERROR_WAIT_SEC)
+
+
+def selected_verify_loop(cfg, stop_event):
+    wait = 30
+    while not stop_event.wait(wait):
+        try:
+            wait = restore_wait(selected_verify_once(cfg))
+        except Exception as exc:
+            log("WARN", "selected NAS verify deferred: %s" % exc)
+            wait = RESTORE_ERROR_WAIT_SEC
 
 
 def restore_loop(cfg, stop_event, rng=random):
@@ -8293,6 +8384,9 @@ def run(cfg):
         # Daemon thread: an update or shutdown may cut a restore short; its
         # lease expires and the create-only PUT makes the retry safe.
         threading.Thread(target=restore_loop, args=(cfg, stop_event), daemon=True).start()
+        # Verify-only selected manifests are independent from the cursor feed and
+        # never write media bytes.
+        threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
     updater = threading.Thread(
         target=update_loop,
         args=(cfg, runtime, stop_event, inventory_stop_event, update_ready, joined_stop_event),

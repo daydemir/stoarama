@@ -123,6 +123,8 @@ func main() {
 		runDOSpend(ctx, cfg, os.Args[2:])
 	case "nas-restore":
 		runNASRestore(ctx, cfg, os.Args[2:])
+	case "nas-selected-verify":
+		runNASSelectedVerify(ctx, cfg, os.Args[2:])
 	case "nas-verified-purge":
 		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
 	case "collation-v2":
@@ -249,6 +251,7 @@ func usage() {
 	  stoaramactl do-spend check [--dry-run]
 	  stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L
+	  stoaramactl nas-selected-verify request --clip-ids IDS --label L [--dry-run | --expected-plan-sha256 SHA] [--json]
 	  stoaramactl nas-verified-purge run [--apply --cron --grace 168h --head sample|all --exclude-clip-ids-file F --exclude-recording-ids L --after-clip-id N --until-clip-id N --limit N --rate 200 --log PATH --json]
 `)
 }

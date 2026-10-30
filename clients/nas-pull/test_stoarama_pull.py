@@ -4718,5 +4718,68 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                 audit.close()
 
 
+    def test_selected_verify_matches_missing_and_conflict_without_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "clips"
+            root.mkdir()
+            cfg = SimpleNamespace(output_dir=root)
+            good = b"selected bytes"
+            path = cfg.output_dir / "recordings/good.mp4"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(good)
+            base = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "recordings/good.mp4",
+                    "size_bytes": len(good), "sha256": hashlib.sha256(good).hexdigest(), "plan_sha256": "a" * 64}
+            result = pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(base))
+            self.assertEqual(result["outcome"], "match")
+            self.assertEqual(path.read_bytes(), good)
+
+            missing = dict(base, item_id=2, relative_path="recordings/missing.mp4")
+            self.assertEqual(pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(missing))["outcome"], "missing")
+
+            wrong = dict(base, item_id=3, size_bytes=len(good) + 1)
+            result = pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(wrong))
+            self.assertEqual(result["outcome"], "conflict")
+            self.assertEqual(path.read_bytes(), good)
+
+    def test_selected_verify_rejects_symlink_and_invalid_manifest_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "clips"
+            root.mkdir()
+            cfg = SimpleNamespace(output_dir=root)
+            outside = Path(tmp) / "outside.mp4"
+            outside.write_bytes(b"outside")
+            link = cfg.output_dir / "link.mp4"
+            link.symlink_to(outside)
+            task = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "link.mp4",
+                    "size_bytes": 7, "sha256": hashlib.sha256(b"outside").hexdigest(), "plan_sha256": "a" * 64}
+            result = pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(task))
+            self.assertEqual(result["outcome"], "conflict")
+            self.assertEqual(outside.read_bytes(), b"outside")
+            for key, value in (("kind", "other"), ("plan_sha256", "bad"), ("relative_path", "../outside.mp4")):
+                bad = dict(task, **{key: value})
+                with self.assertRaises(ValueError):
+                    pull.valid_selected_verify_task(bad)
+
+
+    def test_selected_verify_once_leases_checks_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "clips"
+            root.mkdir()
+            cfg = SimpleNamespace(output_dir=root, restore_workers=2)
+            body = b"ok"
+            (root / "ok.mp4").write_bytes(body)
+            calls = []
+            lease = {"retry_after_sec": 99, "tasks": [{"item_id": 4, "attempt": 1, "kind": "raw",
+                "relative_path": "ok.mp4", "size_bytes": 2, "sha256": hashlib.sha256(body).hexdigest(),
+                "plan_sha256": "a" * 64}]}
+            def api(_cfg, path, payload, retry_stale=False):
+                calls.append((path, payload))
+                return lease if path.endswith("/lease") else {"state": "match"}
+            with mock.patch.object(pull, "restore_api", side_effect=api):
+                self.assertEqual(pull.selected_verify_once(cfg), 99)
+            self.assertEqual(calls[1][0], "/account/connections/selected-verify/4/result")
+            self.assertEqual(calls[1][1]["outcome"], "match")
+
+
 if __name__ == "__main__":
     unittest.main()
