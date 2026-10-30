@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
 
 func TestRequiredScratchBytesReservesLosslessFallbackAndMargin(t *testing.T) {
@@ -127,22 +125,40 @@ func TestEnsureScratchHeadroomRejectsSymlinkRoot(t *testing.T) {
 }
 
 func TestAvailableScratchBudgetLeavesFixedReserve(t *testing.T) {
+	// The reserve arithmetic uses one captured free-space reading. Comparing two
+	// live statfs calls races every other writer on the runner filesystem.
+	for _, tc := range []struct {
+		available uint64
+		want      int64
+	}{
+		{ScratchSafetyMarginBytes + 1, 1},
+		{ScratchSafetyMarginBytes + 4096, 4096},
+		{1 << 30, int64((1 << 30) - ScratchSafetyMarginBytes)},
+		{math.MaxUint64, math.MaxInt64},
+	} {
+		got, err := availableScratchBudgetAfterReserve(tc.available)
+		if err != nil || got != tc.want {
+			t.Fatalf("available=%d budget=%d want=%d err=%v", tc.available, got, tc.want, err)
+		}
+	}
+	for _, available := range []uint64{0, ScratchSafetyMarginBytes - 1, ScratchSafetyMarginBytes} {
+		if _, err := availableScratchBudgetAfterReserve(available); err == nil {
+			t.Fatalf("accepted exhausted free space %d", available)
+		}
+	}
+}
+
+func TestAvailableScratchBudgetReadsPrivateRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "scratch")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var stat unix.Statfs_t
-	if err := unix.Statfs(root, &stat); err != nil {
-		t.Fatal(err)
-	}
-	available := stat.Bavail * uint64(stat.Bsize)
 	got, err := AvailableScratchBudget(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := available - ScratchSafetyMarginBytes
-	if uint64(got) != want {
-		t.Fatalf("scratch budget=%d want %d", got, want)
+	if got <= 0 {
+		t.Fatalf("scratch budget=%d", got)
 	}
 }
 

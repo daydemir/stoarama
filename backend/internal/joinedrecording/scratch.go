@@ -19,7 +19,10 @@ func AvailableScratchBudget(root string) (int64, error) {
 	if err := unix.Statfs(root, &stat); err != nil {
 		return 0, fmt.Errorf("read joined scratch headroom: %w", err)
 	}
-	available := stat.Bavail * uint64(stat.Bsize)
+	return availableScratchBudgetAfterReserve(stat.Bavail * uint64(stat.Bsize))
+}
+
+func availableScratchBudgetAfterReserve(available uint64) (int64, error) {
 	if available <= ScratchSafetyMarginBytes {
 		return 0, &ScratchHeadroomError{Available: available, Required: ScratchSafetyMarginBytes + 1}
 	}
