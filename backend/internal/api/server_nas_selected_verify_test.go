@@ -141,7 +141,16 @@ func TestNASSelectedVerifyLifecycle(t *testing.T) {
 	}
 	var state string
 	_ = pool.QueryRow(ctx, `SELECT state FROM nas_selected_verify_items WHERE id=2`).Scan(&state)
-	if state != "conflict" {
+	if state != "unverified" {
 		t.Fatalf("exhausted=%s", state)
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_selected_verify_items(id,plan_id,ordinal,kind,source_id,relative_path,size_bytes,sha256) VALUES(3,1,3,'collated',3,'joined/f/large.mp4',34359738368,repeat('b',64))`); err != nil {
+		t.Fatal(err)
+	}
+	large := lease()
+	remaining := time.Until(large.ExpiresAt)
+	if remaining < 135*time.Minute || remaining > 140*time.Minute {
+		t.Fatalf("large-file lease=%s", remaining)
 	}
 }

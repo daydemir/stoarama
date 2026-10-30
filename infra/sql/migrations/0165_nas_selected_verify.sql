@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS nas_selected_verify_items (
   relative_path TEXT NOT NULL CHECK (relative_path <> '' AND left(relative_path,1) <> '/'),
   size_bytes BIGINT NOT NULL CHECK (size_bytes > 0 AND size_bytes <= 34359738368),
   sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','leased','match','missing','conflict')),
+  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','leased','match','missing','conflict','unverified')),
   attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0 AND attempts <= 3),
   leased_at TIMESTAMPTZ,
   lease_expires_at TIMESTAMPTZ,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS nas_selected_verify_items (
   client_version TEXT NOT NULL DEFAULT '',
   UNIQUE(plan_id,ordinal), UNIQUE(plan_id,kind,source_id), UNIQUE(plan_id,relative_path),
   CHECK ((state='leased')=(lease_expires_at IS NOT NULL)),
-  CHECK ((state IN ('match','missing','conflict'))=(completed_at IS NOT NULL))
+  CHECK ((state IN ('match','missing','conflict','unverified'))=(completed_at IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS nas_selected_verify_queue_idx
   ON nas_selected_verify_items(plan_id,id) WHERE state IN ('pending','leased');

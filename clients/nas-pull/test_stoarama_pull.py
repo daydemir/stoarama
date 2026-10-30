@@ -4793,7 +4793,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             self.assertTrue(replaced)
             self.assertEqual((original / "clip.mp4").read_bytes(), b"xyz")
             self.assertEqual((root / "recordings-old" / "clip.mp4").read_bytes(), b"abc")
-            self.assertEqual(result["outcome"], "conflict")
+            self.assertEqual(result["outcome"], "unverified")
 
     def test_selected_verify_once_leases_checks_and_reports(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
@@ -4825,11 +4825,11 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                    "plan_sha256": "a" * 64}
             task = pull.valid_selected_verify_task(raw)
             with mock.patch.object(pull.os.path, "ismount", return_value=False):
-                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
+                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "unverified")
                 missing = dict(task, relative_path=Path("absent.mp4"))
-                self.assertEqual(pull.run_selected_verify_task(cfg, missing)["outcome"], "conflict")
+                self.assertEqual(pull.run_selected_verify_task(cfg, missing)["outcome"], "unverified")
             with mock.patch.object(pull.os.path, "ismount", side_effect=[True, False]):
-                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
+                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "unverified")
             with mock.patch.object(pull.os.path, "ismount", return_value=True):
                 expired = dict(task, expires_at=datetime.datetime.now(datetime.timezone.utc))
                 with self.assertRaises(pull.SelectedVerifyAborted):
@@ -4840,7 +4840,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                 denied = pull.MediaCertificationError("permission denied")
                 denied.__cause__ = PermissionError("denied")
                 with mock.patch.object(pull, "confined_regular_file", side_effect=denied):
-                    self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
+                    self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "unverified")
             self.assertEqual((root / "clip.mp4").read_bytes(), b"abc")
 
     def test_selected_verify_stitched_namespace_and_joined_symlink(self):
@@ -4873,6 +4873,19 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             self.assertEqual(pull.selected_verify_once(cfg, stopped), pull.RESTORE_ERROR_WAIT_SEC)
             self.assertEqual(api.call_count, 1)
             self.assertTrue(api.call_args[0][1].endswith("/lease"))
+
+    def test_selected_verify_large_file_uses_server_lease_and_io_errors_stay_unverified(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); (root / "a.mp4").write_bytes(b"abc")
+            raw = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "a.mp4", "size_bytes": 3,
+                   "sha256": hashlib.sha256(b"abc").hexdigest(), "plan_sha256": "a" * 64,
+                   "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)).isoformat()}
+            task = pull.valid_selected_verify_task(raw)
+            # A file remains eligible beyond the old fixed 20-minute cap.
+            with mock.patch.object(pull.time, "monotonic", side_effect=[0, 1300, 1300, 1300, 1300, 1300]):
+                self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), task)["outcome"], "match")
+            with mock.patch.object(pull.os, "read", side_effect=OSError("temporary read failure")):
+                self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), task)["outcome"], "unverified")
 
 
 if __name__ == "__main__":

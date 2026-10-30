@@ -6153,8 +6153,8 @@ def run_selected_verify_task(cfg, task, stop_event=None):
     """Read-only direct check: confined regular file, exact size, then full SHA."""
     started = time.monotonic()
     result = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
-              "outcome": "conflict", "error": "", "duration_ms": 0}
-    deadline = started + min(1200, (task["expires_at"] - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 15)
+              "outcome": "unverified", "error": "", "duration_ms": 0}
+    deadline = started + min(3 * 3600, (task["expires_at"] - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 15)
     def check_active():
         if (stop_event is not None and stop_event.is_set()) or time.monotonic() >= deadline:
             raise SelectedVerifyAborted("selected verification cancelled or lease deadline reached")
@@ -6170,12 +6170,15 @@ def run_selected_verify_task(cfg, task, stop_event=None):
                     raise RuntimeError("selected verify NAS root changed")
                 check_active()
                 result["outcome"] = "missing"
+            if result["outcome"] != "missing" and exc.__cause__ is None:
+                result["outcome"] = "conflict"
             raise RuntimeError(str(exc)) from exc
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         before = os.fstat(fd)
         if certification_identity(before) != certification_identity(path_stat):
             raise RuntimeError("local file changed while opening")
         if before.st_size != task["size_bytes"]:
+            result["outcome"] = "conflict"
             raise RuntimeError("local size differs from manifest")
         digest = hashlib.sha256()
         while True:
@@ -6185,6 +6188,7 @@ def run_selected_verify_task(cfg, task, stop_event=None):
                 break
             digest.update(chunk)
         if digest.hexdigest() != task["sha256"]:
+            result["outcome"] = "conflict"
             raise RuntimeError("local sha256 differs from manifest")
         _, final_path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
         if (certification_identity(os.fstat(fd)) != certification_identity(before)

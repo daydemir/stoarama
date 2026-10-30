@@ -12,7 +12,7 @@ import (
 
 const nasSelectedVerifyLeaseTTL = 30 * time.Minute
 
-var nasSelectedVerifyOutcomes = map[string]bool{"match": true, "missing": true, "conflict": true}
+var nasSelectedVerifyOutcomes = map[string]bool{"match": true, "missing": true, "conflict": true, "unverified": true}
 
 type nasSelectedVerifyLeaseRequest struct {
 	ClientVersion string `json:"client_version"`
@@ -88,7 +88,7 @@ func (s *Server) handleAccountConnectionSelectedVerifyLease(w http.ResponseWrite
 		return
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err = tx.Exec(ctx, `UPDATE nas_selected_verify_items i SET state=CASE WHEN attempts>=3 THEN 'conflict' ELSE 'pending' END,
+	if _, err = tx.Exec(ctx, `UPDATE nas_selected_verify_items i SET state=CASE WHEN attempts>=3 THEN 'unverified' ELSE 'pending' END,
       completed_at=CASE WHEN attempts>=3 THEN now() END, lease_expires_at=NULL,
       outcome_error=CASE WHEN attempts>=3 THEN 'lease expired three times' ELSE outcome_error END
       FROM nas_selected_verify_plans p WHERE i.plan_id=p.id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now()`, connectionID); err != nil {
@@ -98,7 +98,7 @@ func (s *Server) handleAccountConnectionSelectedVerifyLease(w http.ResponseWrite
 	rows, err := tx.Query(ctx, `WITH picked AS (
       SELECT i.id FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id
       WHERE p.connection_id=$1 AND i.state='pending' ORDER BY i.id LIMIT $2 FOR UPDATE OF i SKIP LOCKED)
-      UPDATE nas_selected_verify_items i SET state='leased',attempts=attempts+1,leased_at=now(),lease_expires_at=now()+$3::interval,
+      UPDATE nas_selected_verify_items i SET state='leased',attempts=attempts+1,leased_at=now(),lease_expires_at=now()+greatest($3::interval,(i.size_bytes/4194304.0+120)*interval '1 second'),
         client_version=CASE WHEN $4<>'' THEN $4 ELSE client_version END
       FROM picked, nas_selected_verify_plans p WHERE i.id=picked.id AND p.id=i.plan_id
       RETURNING i.id,i.attempts,i.kind,i.relative_path,i.size_bytes,i.sha256,p.plan_sha256,i.lease_expires_at`,
