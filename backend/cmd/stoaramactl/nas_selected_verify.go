@@ -123,6 +123,14 @@ func validateNASSelectedVerifyIdentity(i nasSelectedVerifyManifestItem) error {
 	return nil
 }
 
+func nasSelectedVerifyCopySource(planID int64, items []nasSelectedVerifyManifestItem) pgx.CopyFromSource {
+	rows := make([][]any, len(items))
+	for n, i := range items {
+		rows[n] = []any{planID, int32(n + 1), i.Kind, i.SourceID, i.RelativePath, i.SizeBytes, i.SHA256}
+	}
+	return pgx.CopyFromRows(rows)
+}
+
 func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSelectedVerifyOptions) (nasSelectedVerifySummary, error) {
 	sum := nasSelectedVerifySummary{Label: o.label, AccountID: nasSelectedVerifyAccountID, ConnectionID: nasSelectedVerifyConnectionID, DryRun: o.dryRun}
 	items := []nasSelectedVerifyManifestItem{}
@@ -213,10 +221,12 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 		}
 		return sum, tx.Commit(ctx)
 	}
-	for n, i := range items {
-		if _, err := tx.Exec(ctx, `INSERT INTO nas_selected_verify_items(plan_id,ordinal,kind,source_id,relative_path,size_bytes,sha256) VALUES($1,$2,$3,$4,$5,$6,$7)`, planID, n+1, i.Kind, i.SourceID, i.RelativePath, i.SizeBytes, i.SHA256); err != nil {
-			return sum, err
-		}
+	copied, err := tx.CopyFrom(ctx, pgx.Identifier{"nas_selected_verify_items"}, []string{"plan_id", "ordinal", "kind", "source_id", "relative_path", "size_bytes", "sha256"}, nasSelectedVerifyCopySource(planID, items))
+	if err != nil {
+		return sum, err
+	}
+	if copied != int64(len(items)) {
+		return sum, fmt.Errorf("copied %d selected verify identities, expected %d", copied, len(items))
 	}
 	return sum, tx.Commit(ctx)
 }

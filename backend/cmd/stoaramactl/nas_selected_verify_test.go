@@ -3,9 +3,34 @@ package main
 import (
 	"context"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestNASSelectedVerifyCopyRowsPreserveTypedIdentityAndOrdinal(t *testing.T) {
+	items := []nasSelectedVerifyManifestItem{
+		{Kind: "raw", SourceID: 11, RelativePath: "folder/a.mp4", SizeBytes: 13, SHA256: strings.Repeat("a", 64)},
+		{Kind: "joined", SourceID: 17, RelativePath: "joined/folder/b.mp4", SizeBytes: 19, SHA256: strings.Repeat("b", 64)},
+	}
+	source := nasSelectedVerifyCopySource(23, items)
+	want := [][]any{
+		{int64(23), int32(1), "raw", int64(11), "folder/a.mp4", int64(13), strings.Repeat("a", 64)},
+		{int64(23), int32(2), "joined", int64(17), "joined/folder/b.mp4", int64(19), strings.Repeat("b", 64)},
+	}
+	for n := range want {
+		if !source.Next() {
+			t.Fatalf("row %d missing: %v", n, source.Err())
+		}
+		got, err := source.Values()
+		if err != nil || !reflect.DeepEqual(got, want[n]) {
+			t.Fatalf("row %d got=%#v want=%#v err=%v", n, got, want[n], err)
+		}
+	}
+	if source.Next() || source.Err() != nil {
+		t.Fatalf("unexpected trailing row/error: %v", source.Err())
+	}
+}
 
 func TestParseNASSelectedVerifyRequestArgs(t *testing.T) {
 	opts, err := parseNASSelectedVerifyRequestArgs([]string{"--clip-ids", "3,1", "--label", "chosen-28", "--expected-plan-sha256", strings.Repeat("a", 64)})
