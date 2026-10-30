@@ -716,18 +716,29 @@ class Inventory:
             row = self.db.execute(
                 """SELECT recording_id,relative_path,size_bytes,sha256,state,file_mtime_ns,seen_generation,
                           file_ctime_ns,file_inode,file_device,sidecar_relative_path,sidecar_size_bytes,sidecar_sha256,
-                          clip_start_us,clip_end_us
+                          clip_start_us,clip_end_us,verified_at
                    FROM files WHERE clip_id=?""",
                 (int(clip["clip_id"]),),
             ).fetchone()
-            if row is None or row[6] != generation:
+            if row is None:
                 return False
+            different_generation = row[6] != generation
+            if different_generation:
+                if (row[4] != "present" or not re.fullmatch(r"[0-9a-f]{64}", row[3])
+                        or row[13] <= 0 or row[14] <= row[13]):
+                    return False
+                try:
+                    verified = parse_certification_timestamp(row[15], "inventory verified_at")
+                except (ValueError, MediaCertificationError):
+                    return False
+                if verified > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
+                    return False
             if row[0] != int(clip["recording_id"]) or row[1] != str(clip["relative_path"]):
                 return False
             if row[2] != int(clip["size_bytes"]) or row[3] != str(clip["sha256"]).lower():
                 return False
             try:
-                stat = path.stat()
+                stat = self._cached_regular_stat(str(clip["relative_path"])) if different_generation else path.stat()
             except FileNotFoundError:
                 stat = None
             if stat is None:
@@ -744,25 +755,65 @@ class Inventory:
                     and row[14] == optional_certification_timestamp_microseconds(clip.get("clip_end_at"), "clip_end_at")
                 )
             if current:
-                self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
+                if different_generation:
+                    # A scope/generation change does not change immutable file
+                    # identity. Publish the observation in this generation but
+                    # retain the timestamp of the actual payload hash: this is
+                    # not a fresh hash or an extension of release eligibility.
+                    self.db.execute(
+                        "UPDATE files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE clip_id=?",
+                        (generation, scan_pass, utc_now_precise(), int(clip["clip_id"])),
+                    )
+                else:
+                    self.db.execute("UPDATE files SET scan_pass=? WHERE clip_id=?", (scan_pass, int(clip["clip_id"])))
             return current
+
+    def _cached_regular_stat(self, relative_path):
+        parts = Path(relative_path).parts
+        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS:
+            return None
+        descriptor = None
+        try:
+            path, before = confined_regular_file(self.cfg.output_dir, relative_path)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            opened = os.fstat(descriptor)
+            _, after = confined_regular_file(self.cfg.output_dir, relative_path)
+            if (certification_identity(before) == certification_identity(opened)
+                    == certification_identity(after)):
+                return after
+        except (OSError, MediaCertificationError):
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return None
 
     def _unmatched_scan_row_is_current(self, relative_path, generation, scan_pass, stat):
         with self.lock:
             row = self.db.execute(
-                """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device
+                """SELECT size_bytes,state,file_mtime_ns,seen_generation,file_ctime_ns,file_inode,file_device,sha256
                    FROM unmatched_files WHERE relative_path=?""",
                 (relative_path,),
             ).fetchone()
+            different_generation = row is not None and row[3] != generation
+            if different_generation:
+                stat = self._cached_regular_stat(relative_path)
             current = (
-                row is not None and row[3] == generation and row[1] == "present"
+                row is not None and stat is not None and row[1] == "present"
+                and re.fullmatch(r"[0-9a-f]{64}", row[7]) is not None
                 and row[0] == stat.st_size and row[2] == stat.st_mtime_ns
                 and row[4] != 0 and row[4] == stat.st_ctime_ns
                 and row[5] != 0 and row[5] == stat.st_ino
                 and row[6] != 0 and row[6] == stat.st_dev
             )
             if current:
-                self.db.execute("UPDATE unmatched_files SET scan_pass=? WHERE relative_path=?", (scan_pass, relative_path))
+                if different_generation:
+                    self.db.execute(
+                        "UPDATE unmatched_files SET seen_generation=?,scan_pass=?,client_updated_at=?,dirty=1 WHERE relative_path=?",
+                        (generation, scan_pass, utc_now_precise(), relative_path),
+                    )
+                else:
+                    self.db.execute("UPDATE unmatched_files SET scan_pass=? WHERE relative_path=?", (scan_pass, relative_path))
             return current
 
     def _retire_unmatched_linked_path(self, relative_path, generation, scan_pass):
