@@ -1,4 +1,5 @@
 import hashlib
+import datetime
 import json
 import os
 import tempfile
@@ -54,6 +55,20 @@ class InventoryGenerationCacheTests(unittest.TestCase):
         report = [f for body in calls for f in body.get("files", [])][0]
         self.assertEqual(report["verified_at"], self.old_verified)
         self.assertEqual(self.inventory.db.execute("SELECT dirty FROM files WHERE clip_id=1").fetchone()[0], 0)
+
+    def test_new_generation_pass_timestamp_is_not_before_generation_start(self):
+        tick = datetime.datetime(2026, 10, 30, 18, tzinfo=datetime.timezone.utc)
+        def precise_clock():
+            nonlocal tick
+            tick += datetime.timedelta(microseconds=1)
+            return tick.isoformat()
+        with mock.patch.object(pull, "utc_now_precise", side_effect=precise_clock), mock.patch.object(
+                pull, "request_json", return_value={}):
+            self.inventory.full_scan(self.cfg, threading.Event())
+        summary = self.inventory.summary()
+        started = pull.parse_certification_timestamp(summary["scan_started_at"], "started")
+        passed = pull.parse_certification_timestamp(summary["scan_pass_started_at"], "pass")
+        self.assertGreaterEqual(passed, started)
 
     def test_failed_ack_preserves_retagged_row_for_identical_retry(self):
         self.assertTrue(self.current())
