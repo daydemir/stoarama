@@ -886,7 +886,6 @@ class Inventory:
             return self._full_scan_locked(cfg, stop_event)
 
     def _full_scan_locked(self, cfg, stop_event):
-        pass_started_at = utc_now_precise()
         resumed = self._incomplete_scan()
         if resumed is None:
             started_at = utc_now_precise()
@@ -897,6 +896,7 @@ class Inventory:
         else:
             generation, started_at = resumed
             log("INFO", "inventory resuming incomplete generation=%s started_at=%s" % (generation, started_at))
+        pass_started_at = utc_now_precise()
         scan_pass = os.urandom(8).hex()
         scanned = 0
         skipped = 0
