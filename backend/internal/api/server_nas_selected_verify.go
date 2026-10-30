@@ -128,7 +128,7 @@ func (s *Server) handleAccountConnectionSelectedVerifyLease(w http.ResponseWrite
 	}
 	retry := 120
 	if len(tasks) > 0 {
-		retry = 1
+		retry = 0
 	}
 	util.WriteJSON(w, 200, nasSelectedVerifyLeaseResponse{RetryAfterSec: retry, Tasks: tasks})
 }

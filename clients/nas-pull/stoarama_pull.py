@@ -6535,7 +6535,10 @@ def selected_verify_loop(cfg, stop_event):
     wait = 30
     while not stop_event.wait(wait):
         try:
-            wait = restore_wait(selected_verify_once(cfg, stop_event))
+            retry = selected_verify_once(cfg, stop_event)
+            # Each completed file gets a fresh individual lease immediately.
+            # Do not add a second of idle time per file to a million-file audit.
+            wait = 0 if retry == 0 else restore_wait(retry)
         except Exception as exc:
             log("WARN", "selected NAS verify deferred: %s" % exc)
             wait = RESTORE_ERROR_WAIT_SEC
