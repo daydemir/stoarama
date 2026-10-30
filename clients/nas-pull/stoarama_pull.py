@@ -6105,6 +6105,10 @@ class RestoreLocalError(RuntimeError):
         self.outcome = outcome
 
 
+class SelectedVerifyAborted(Exception):
+    """No authoritative filesystem result; leave the lease available for retry."""
+
+
 def valid_selected_verify_task(task):
     """Validate one immutable, server-derived selected-file manifest item."""
     if not isinstance(task, dict):
@@ -6153,7 +6157,7 @@ def run_selected_verify_task(cfg, task, stop_event=None):
     deadline = started + min(1200, (task["expires_at"] - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 15)
     def check_active():
         if (stop_event is not None and stop_event.is_set()) or time.monotonic() >= deadline:
-            raise RuntimeError("selected verification cancelled or lease deadline reached")
+            raise SelectedVerifyAborted("selected verification cancelled or lease deadline reached")
     fd = None
     try:
         check_active()
@@ -6196,7 +6200,7 @@ def run_selected_verify_task(cfg, task, stop_event=None):
         if fd is not None:
             os.close(fd)
     result["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
-    result["error"] = result["error"][:500]
+    result["error"] = result["error"].encode("utf-8")[:500].decode("utf-8", "ignore")
     return result
 
 
@@ -6401,7 +6405,7 @@ def run_restore_task(cfg, task):
             os.close(fd)
     if not result["duration_ms"]:
         result["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
-    result["error"] = result["error"][:500]
+    result["error"] = result["error"].encode("utf-8")[:500].decode("utf-8", "ignore")
     return result
 
 
@@ -6525,7 +6529,12 @@ def selected_verify_once(cfg, stop_event=None):
         except ValueError as exc:
             log("WARN", "invalid selected verify task: %s" % exc)
             continue
-        result = run_selected_verify_task(cfg, task, stop_event)
+        try:
+            result = run_selected_verify_task(cfg, task, stop_event)
+        except SelectedVerifyAborted:
+            # Cancellation and time bounds do not say anything about the file.
+            # Do not turn them into a terminal integrity conflict.
+            return RESTORE_ERROR_WAIT_SEC
         result["client_version"] = CLIENT_VERSION
         restore_api(cfg, "/account/connections/selected-verify/%d/result" % task["item_id"], result, retry_stale=True)
     return lease.get("retry_after_sec", RESTORE_ERROR_WAIT_SEC)

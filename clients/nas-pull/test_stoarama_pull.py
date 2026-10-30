@@ -4832,9 +4832,11 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                 self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
             with mock.patch.object(pull.os.path, "ismount", return_value=True):
                 expired = dict(task, expires_at=datetime.datetime.now(datetime.timezone.utc))
-                self.assertEqual(pull.run_selected_verify_task(cfg, expired)["outcome"], "conflict")
+                with self.assertRaises(pull.SelectedVerifyAborted):
+                    pull.run_selected_verify_task(cfg, expired)
                 stopped = threading.Event(); stopped.set()
-                self.assertEqual(pull.run_selected_verify_task(cfg, task, stopped)["outcome"], "conflict")
+                with self.assertRaises(pull.SelectedVerifyAborted):
+                    pull.run_selected_verify_task(cfg, task, stopped)
                 denied = pull.MediaCertificationError("permission denied")
                 denied.__cause__ = PermissionError("denied")
                 with mock.patch.object(pull, "confined_regular_file", side_effect=denied):
@@ -4860,6 +4862,17 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             (root / "joined").rename(root / "original")
             (root / "joined").symlink_to(root / "original", target_is_directory=True)
             self.assertEqual(pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(raw))["outcome"], "conflict")
+
+    def test_selected_verify_cancellation_never_reports_filesystem_result(self):
+        cfg = SimpleNamespace(output_dir=Path("/unavailable"))
+        stopped = threading.Event(); stopped.set()
+        task = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "clip.mp4",
+                "size_bytes": 3, "sha256": "b" * 64, "plan_sha256": "a" * 64,
+                "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)).isoformat()}
+        with mock.patch.object(pull, "restore_api", return_value={"tasks": [task], "retry_after_sec": 0}) as api:
+            self.assertEqual(pull.selected_verify_once(cfg, stopped), pull.RESTORE_ERROR_WAIT_SEC)
+            self.assertEqual(api.call_count, 1)
+            self.assertTrue(api.call_args[0][1].endswith("/lease"))
 
 
 if __name__ == "__main__":
