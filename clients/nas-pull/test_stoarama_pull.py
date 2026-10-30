@@ -4887,6 +4887,26 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             with mock.patch.object(pull.os, "read", side_effect=OSError("temporary read failure")):
                 self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), task)["outcome"], "unverified")
 
+    def test_selected_verify_changed_bytes_are_unverified_not_a_stable_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); path = root / "a.mp4"; path.write_bytes(b"abc")
+            task = pull.valid_selected_verify_task({"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "a.mp4", "size_bytes": 3,
+                "sha256": hashlib.sha256(b"abc").hexdigest(), "plan_sha256": "a" * 64,
+                "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)).isoformat()})
+            original_read = os.read; changed = False
+            def change_then_read(fd, size):
+                nonlocal changed
+                if not changed:
+                    changed = True; path.write_bytes(b"xyz")
+                return original_read(fd, size)
+            with mock.patch.object(pull.os, "read", side_effect=change_then_read):
+                self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), task)["outcome"], "unverified")
+            self.assertTrue(changed)
+            self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), task)["outcome"], "conflict")
+            wrong_size = dict(task, size_bytes=4)
+            with mock.patch.object(pull, "selected_verify_root_identity", side_effect=[(1,2),(1,3)]):
+                self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), wrong_size)["outcome"], "unverified")
+
 
 if __name__ == "__main__":
     unittest.main()

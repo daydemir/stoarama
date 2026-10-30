@@ -6177,7 +6177,16 @@ def run_selected_verify_task(cfg, task, stop_event=None):
         before = os.fstat(fd)
         if certification_identity(before) != certification_identity(path_stat):
             raise RuntimeError("local file changed while opening")
+        def check_stable_identity():
+            _, final_path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
+            if (certification_identity(os.fstat(fd)) != certification_identity(before)
+                    or certification_identity(final_path_stat) != certification_identity(before)):
+                raise RuntimeError("local file or canonical path changed while hashing")
+            if selected_verify_root_identity(cfg.output_dir) != root_identity:
+                raise RuntimeError("selected verify NAS root changed")
+            check_active()
         if before.st_size != task["size_bytes"]:
+            check_stable_identity()
             result["outcome"] = "conflict"
             raise RuntimeError("local size differs from manifest")
         digest = hashlib.sha256()
@@ -6187,16 +6196,10 @@ def run_selected_verify_task(cfg, task, stop_event=None):
             if not chunk:
                 break
             digest.update(chunk)
+        check_stable_identity()
         if digest.hexdigest() != task["sha256"]:
             result["outcome"] = "conflict"
             raise RuntimeError("local sha256 differs from manifest")
-        _, final_path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
-        if (certification_identity(os.fstat(fd)) != certification_identity(before)
-                or certification_identity(final_path_stat) != certification_identity(before)):
-            raise RuntimeError("local file or canonical path changed while hashing")
-        if selected_verify_root_identity(cfg.output_dir) != root_identity:
-            raise RuntimeError("selected verify NAS root changed")
-        check_active()
         result["outcome"] = "match"
     except (OSError, RuntimeError, MediaCertificationError) as exc:
         result["error"] = str(exc)
