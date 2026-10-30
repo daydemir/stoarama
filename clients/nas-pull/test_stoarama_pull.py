@@ -4719,7 +4719,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
 
 
     def test_selected_verify_matches_missing_and_conflict_without_writes(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
             root = Path(tmp) / "clips"
             root.mkdir()
             cfg = SimpleNamespace(output_dir=root)
@@ -4728,7 +4728,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             path.parent.mkdir(parents=True)
             path.write_bytes(good)
             base = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "recordings/good.mp4",
-                    "size_bytes": len(good), "sha256": hashlib.sha256(good).hexdigest(), "plan_sha256": "a" * 64}
+                    "size_bytes": len(good), "sha256": hashlib.sha256(good).hexdigest(), "expires_at": (pull.datetime.datetime.now(pull.datetime.timezone.utc) + pull.datetime.timedelta(minutes=30)).isoformat(), "plan_sha256": "a" * 64}
             result = pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(base))
             self.assertEqual(result["outcome"], "match")
             self.assertEqual(path.read_bytes(), good)
@@ -4742,7 +4742,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             self.assertEqual(path.read_bytes(), good)
 
     def test_selected_verify_rejects_symlink_and_invalid_manifest_identity(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
             root = Path(tmp) / "clips"
             root.mkdir()
             cfg = SimpleNamespace(output_dir=root)
@@ -4751,7 +4751,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             link = cfg.output_dir / "link.mp4"
             link.symlink_to(outside)
             task = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "link.mp4",
-                    "size_bytes": 7, "sha256": hashlib.sha256(b"outside").hexdigest(), "plan_sha256": "a" * 64}
+                    "size_bytes": 7, "sha256": hashlib.sha256(b"outside").hexdigest(), "expires_at": (pull.datetime.datetime.now(pull.datetime.timezone.utc) + pull.datetime.timedelta(minutes=30)).isoformat(), "plan_sha256": "a" * 64}
             result = pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(task))
             self.assertEqual(result["outcome"], "conflict")
             self.assertEqual(outside.read_bytes(), b"outside")
@@ -4761,8 +4761,42 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                     pull.valid_selected_verify_task(bad)
 
 
+    def test_selected_verify_rejects_parent_directory_replacement_during_hash(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp) / "clips"
+            original = root / "recordings"
+            original.mkdir(parents=True)
+            (original / "clip.mp4").write_bytes(b"abc")
+            replacement = root / "replacement"
+            replacement.mkdir()
+            (replacement / "clip.mp4").write_bytes(b"xyz")
+            task = pull.valid_selected_verify_task({
+                "item_id": 1, "attempt": 1, "kind": "raw",
+                "relative_path": "recordings/clip.mp4", "size_bytes": 3,
+                "sha256": hashlib.sha256(b"abc").hexdigest(), "plan_sha256": "a" * 64,
+                "expires_at": (datetime.datetime.now(datetime.timezone.utc)
+                               + datetime.timedelta(minutes=5)).isoformat(),
+            })
+            original_read = os.read
+            replaced = False
+
+            def replace_parent_then_read(descriptor, size):
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    original.rename(root / "recordings-old")
+                    replacement.rename(original)
+                return original_read(descriptor, size)
+
+            with mock.patch.object(pull.os, "read", side_effect=replace_parent_then_read):
+                result = pull.run_selected_verify_task(SimpleNamespace(output_dir=root), task)
+            self.assertTrue(replaced)
+            self.assertEqual((original / "clip.mp4").read_bytes(), b"xyz")
+            self.assertEqual((root / "recordings-old" / "clip.mp4").read_bytes(), b"abc")
+            self.assertEqual(result["outcome"], "conflict")
+
     def test_selected_verify_once_leases_checks_and_reports(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
             root = Path(tmp) / "clips"
             root.mkdir()
             cfg = SimpleNamespace(output_dir=root, restore_workers=2)
@@ -4771,7 +4805,7 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
             calls = []
             lease = {"retry_after_sec": 99, "tasks": [{"item_id": 4, "attempt": 1, "kind": "raw",
                 "relative_path": "ok.mp4", "size_bytes": 2, "sha256": hashlib.sha256(body).hexdigest(),
-                "plan_sha256": "a" * 64}]}
+                "expires_at": (pull.datetime.datetime.now(pull.datetime.timezone.utc) + pull.datetime.timedelta(minutes=30)).isoformat(), "plan_sha256": "a" * 64}]}
             def api(_cfg, path, payload, retry_stale=False):
                 calls.append((path, payload))
                 return lease if path.endswith("/lease") else {"state": "match"}
@@ -4779,6 +4813,53 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                 self.assertEqual(pull.selected_verify_once(cfg), 99)
             self.assertEqual(calls[1][0], "/account/connections/selected-verify/4/result")
             self.assertEqual(calls[1][1]["outcome"], "match")
+
+    def test_selected_verify_mount_deadline_cancel_and_permission_holds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "clip.mp4").write_bytes(b"abc")
+            cfg = SimpleNamespace(output_dir=root)
+            raw = {"item_id": 1, "attempt": 1, "kind": "raw", "relative_path": "clip.mp4",
+                   "size_bytes": 3, "sha256": hashlib.sha256(b"abc").hexdigest(),
+                   "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)).isoformat(),
+                   "plan_sha256": "a" * 64}
+            task = pull.valid_selected_verify_task(raw)
+            with mock.patch.object(pull.os.path, "ismount", return_value=False):
+                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
+                missing = dict(task, relative_path=Path("absent.mp4"))
+                self.assertEqual(pull.run_selected_verify_task(cfg, missing)["outcome"], "conflict")
+            with mock.patch.object(pull.os.path, "ismount", side_effect=[True, False]):
+                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
+            with mock.patch.object(pull.os.path, "ismount", return_value=True):
+                expired = dict(task, expires_at=datetime.datetime.now(datetime.timezone.utc))
+                self.assertEqual(pull.run_selected_verify_task(cfg, expired)["outcome"], "conflict")
+                stopped = threading.Event(); stopped.set()
+                self.assertEqual(pull.run_selected_verify_task(cfg, task, stopped)["outcome"], "conflict")
+                denied = pull.MediaCertificationError("permission denied")
+                denied.__cause__ = PermissionError("denied")
+                with mock.patch.object(pull, "confined_regular_file", side_effect=denied):
+                    self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "conflict")
+            self.assertEqual((root / "clip.mp4").read_bytes(), b"abc")
+
+    def test_selected_verify_stitched_namespace_and_joined_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp) / "root"; root.mkdir()
+            cfg = SimpleNamespace(output_dir=root)
+            raw = {"item_id": 1, "attempt": 1, "kind": "collated", "relative_path": "joined/f/clip.mp4",
+                   "size_bytes": 3, "sha256": hashlib.sha256(b"abc").hexdigest(),
+                   "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)).isoformat(),
+                   "plan_sha256": "a" * 64}
+            (root / "joined/f").mkdir(parents=True)
+            (root / "joined/f/clip.mp4").write_bytes(b"abc")
+            for kind in ("collated", "joined"):
+                task = pull.valid_selected_verify_task(dict(raw, kind=kind))
+                self.assertEqual(pull.run_selected_verify_task(cfg, task)["outcome"], "match")
+            for bad in (dict(raw, kind="raw"), dict(raw, relative_path="raw/clip.mp4"),
+                        dict(raw, relative_path="#recycle/c.mp4"), dict(raw, relative_path="/joined/f/c.mp4")):
+                with self.assertRaises(ValueError): pull.valid_selected_verify_task(bad)
+            (root / "joined").rename(root / "original")
+            (root / "joined").symlink_to(root / "original", target_is_directory=True)
+            self.assertEqual(pull.run_selected_verify_task(cfg, pull.valid_selected_verify_task(raw))["outcome"], "conflict")
 
 
 if __name__ == "__main__":

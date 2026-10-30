@@ -249,6 +249,12 @@ jobs:
           go test ./internal/api -run '^Test(NASRestoreLifecycle|ValidateNASRestoreResult|PullPathAllowed)$' -count=1 -v
           go test ./cmd/stoaramactl -run '^Test(ParseNASRestoreRequestArgs|ClassifyNASRestoreCandidate|RequestNASRestoresQueuesOnlyVerifiedClips|ParseNASPurgeArgsDefaultsToSafeDryRun|NASPurgeSkipReasonOrder|NASVerifiedPurgeEndToEnd|NASPurgeCohortWindowsCoverTheApprovedFourteenDays|NASPurgeBindProtectionsNumbersPlaceholders)$' -count=1 -v
           go test ./internal/r2 -run '^TestDeleteObjectsEachReportsPerKeyFailures$' -count=1 -v
+      - name: Test selected-file NAS verification
+        env:
+          STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
+        run: |
+          go test ./internal/api -run '^TestNASSelectedVerifyLifecycle$' -count=1 -v
+          go test ./cmd/stoaramactl -run '^TestNASSelectedVerify' -count=1 -v
       - name: Test billing meter report ledger
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable

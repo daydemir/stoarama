@@ -155,14 +155,22 @@ func (s *Server) handleAccountConnectionSelectedVerifyResult(w http.ResponseWrit
 	tag, err := s.pool.Exec(ctx, `UPDATE nas_selected_verify_items i SET state=$4,completed_at=now(),lease_expires_at=NULL,
       outcome_error=$5,duration_ms=$6,client_version=CASE WHEN $7<>'' THEN $7 ELSE i.client_version END
       FROM nas_selected_verify_plans p WHERE i.id=$1 AND i.plan_id=p.id AND p.connection_id=$2 AND p.plan_sha256=$3
-        AND i.state='leased' AND i.attempts=$8`, itemID, connectionID, req.PlanSHA256, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS, req.ClientVersion, req.Attempt)
+        AND i.state='leased' AND i.lease_expires_at>=now() AND i.attempts=$8`, itemID, connectionID, req.PlanSHA256, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS, req.ClientVersion, req.Attempt)
 	if err != nil {
 		util.WriteError(w, 500, "record selected verify result failed")
 		return
 	}
 	if tag.RowsAffected() != 1 {
-		util.WriteError(w, 409, "selected verify lease is no longer current")
-		return
+		var same bool
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempts=$4 AND i.state=$5 AND i.outcome_error=$6 AND i.duration_ms=$7)`, itemID, connectionID, req.PlanSHA256, req.Attempt, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS).Scan(&same)
+		if err != nil {
+			util.WriteError(w, 500, "reconcile selected verify result failed")
+			return
+		}
+		if !same {
+			util.WriteError(w, 409, "selected verify lease is no longer current")
+			return
+		}
 	}
 	util.WriteJSON(w, 200, map[string]any{"ok": true, "state": req.Outcome})
 }

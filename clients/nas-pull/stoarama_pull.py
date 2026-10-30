@@ -6115,7 +6115,7 @@ def valid_selected_verify_task(task):
         if type(value) is not int or value <= 0:
             raise ValueError("invalid selected verify task %s" % name)
         out[name] = value
-    if task.get("kind") not in ("raw", "stitched"):
+    if task.get("kind") not in ("raw", "collated", "joined"):
         raise ValueError("invalid selected verify task kind")
     out["kind"] = task["kind"]
     for name in ("sha256", "plan_sha256"):
@@ -6123,46 +6123,78 @@ def valid_selected_verify_task(task):
         if not isinstance(value, str) or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
             raise ValueError("invalid selected verify task %s" % name)
         out[name] = value
-    out["relative_path"] = valid_relative_path({"clip_id": out["item_id"], "relative_path": task.get("relative_path")})
+    raw = task.get("relative_path")
+    if not isinstance(raw, str) or not raw or raw.startswith("/") or "\\" in raw or any(p in ("", ".", "..") for p in raw.split("/")):
+        raise ValueError("invalid selected verify path")
+    if raw.split("/")[0] in INVENTORY_ROOT_EXCLUSIONS or ((raw.split("/")[0] == JOINED_ROOT) != (out["kind"] != "raw")):
+        raise ValueError("selected verify path does not match kind")
+    out["relative_path"] = Path(raw)
+    try:
+        out["expires_at"] = parse_certification_timestamp(task.get("expires_at"), "expires_at")
+    except MediaCertificationError as exc:
+        raise ValueError(str(exc)) from exc
+    if out["size_bytes"] > 32 * 1024 ** 3:
+        raise ValueError("selected verify file exceeds 32 GiB bound")
     return out
 
 
-def run_selected_verify_task(cfg, task):
+def selected_verify_root_identity(root):
+    info = os.lstat(root)
+    if not stat_module.S_ISDIR(info.st_mode) or not os.path.ismount(str(root)):
+        raise RuntimeError("selected verify NAS root is not mounted")
+    return info.st_dev, info.st_ino
+
+
+def run_selected_verify_task(cfg, task, stop_event=None):
     """Read-only direct check: confined regular file, exact size, then full SHA."""
     started = time.monotonic()
     result = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
               "outcome": "conflict", "error": "", "duration_ms": 0}
-    candidate = Path(cfg.output_dir) / task["relative_path"]
+    deadline = started + min(1200, (task["expires_at"] - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 15)
+    def check_active():
+        if (stop_event is not None and stop_event.is_set()) or time.monotonic() >= deadline:
+            raise RuntimeError("selected verification cancelled or lease deadline reached")
+    fd = None
     try:
-        path, path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
-    except MediaCertificationError as exc:
-        result["outcome"] = "conflict" if os.path.lexists(str(candidate)) else "missing"
-        result["error"] = str(exc)
-    else:
-        fd = None
+        check_active()
+        root_identity = selected_verify_root_identity(cfg.output_dir)
         try:
-            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
-            before = os.fstat(fd)
-            if certification_identity(before) != certification_identity(path_stat):
-                raise RuntimeError("local file changed while opening")
-            if before.st_size != task["size_bytes"]:
-                raise RuntimeError("local size %d differs from %d" % (before.st_size, task["size_bytes"]))
-            digest = hashlib.sha256()
-            while True:
-                chunk = os.read(fd, RESTORE_BLOCK_BYTES)
-                if not chunk:
-                    break
-                digest.update(chunk)
-            if digest.hexdigest() != task["sha256"]:
-                raise RuntimeError("local sha256 differs from manifest")
-            if certification_identity(os.fstat(fd)) != certification_identity(before):
-                raise RuntimeError("local file changed while hashing")
-            result["outcome"] = "match"
-        except (OSError, RuntimeError) as exc:
-            result["error"] = str(exc)
-        finally:
-            if fd is not None:
-                os.close(fd)
+            path, path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
+        except MediaCertificationError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                if selected_verify_root_identity(cfg.output_dir) != root_identity:
+                    raise RuntimeError("selected verify NAS root changed")
+                check_active()
+                result["outcome"] = "missing"
+            raise RuntimeError(str(exc)) from exc
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        before = os.fstat(fd)
+        if certification_identity(before) != certification_identity(path_stat):
+            raise RuntimeError("local file changed while opening")
+        if before.st_size != task["size_bytes"]:
+            raise RuntimeError("local size differs from manifest")
+        digest = hashlib.sha256()
+        while True:
+            check_active()
+            chunk = os.read(fd, RESTORE_BLOCK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if digest.hexdigest() != task["sha256"]:
+            raise RuntimeError("local sha256 differs from manifest")
+        _, final_path_stat = confined_regular_file(cfg.output_dir, task["relative_path"])
+        if (certification_identity(os.fstat(fd)) != certification_identity(before)
+                or certification_identity(final_path_stat) != certification_identity(before)):
+            raise RuntimeError("local file or canonical path changed while hashing")
+        if selected_verify_root_identity(cfg.output_dir) != root_identity:
+            raise RuntimeError("selected verify NAS root changed")
+        check_active()
+        result["outcome"] = "match"
+    except (OSError, RuntimeError, MediaCertificationError) as exc:
+        result["error"] = str(exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
     result["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
     result["error"] = result["error"][:500]
     return result
@@ -6481,10 +6513,10 @@ def restore_wait(seconds):
     return min(max(seconds, RESTORE_MIN_WAIT_SEC), RESTORE_MAX_WAIT_SEC)
 
 
-def selected_verify_once(cfg):
+def selected_verify_once(cfg, stop_event=None):
     """Lease a bounded batch and report direct read-only filesystem evidence."""
     lease = restore_api(cfg, "/account/connections/selected-verify/lease",
-                        {"client_version": CLIENT_VERSION, "max_tasks": max(1, min(64, cfg.restore_workers))})
+                        {"client_version": CLIENT_VERSION, "max_tasks": 1})
     if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
         raise RuntimeError("invalid selected verify lease response")
     for raw in lease.get("tasks") or []:
@@ -6493,7 +6525,7 @@ def selected_verify_once(cfg):
         except ValueError as exc:
             log("WARN", "invalid selected verify task: %s" % exc)
             continue
-        result = run_selected_verify_task(cfg, task)
+        result = run_selected_verify_task(cfg, task, stop_event)
         result["client_version"] = CLIENT_VERSION
         restore_api(cfg, "/account/connections/selected-verify/%d/result" % task["item_id"], result, retry_stale=True)
     return lease.get("retry_after_sec", RESTORE_ERROR_WAIT_SEC)
@@ -6503,7 +6535,7 @@ def selected_verify_loop(cfg, stop_event):
     wait = 30
     while not stop_event.wait(wait):
         try:
-            wait = restore_wait(selected_verify_once(cfg))
+            wait = restore_wait(selected_verify_once(cfg, stop_event))
         except Exception as exc:
             log("WARN", "selected NAS verify deferred: %s" % exc)
             wait = RESTORE_ERROR_WAIT_SEC
