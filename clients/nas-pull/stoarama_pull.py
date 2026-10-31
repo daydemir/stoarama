@@ -7949,6 +7949,8 @@ def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_work
 
 
 SPACE_AUDIT_SCHEMA = "nas-space-stat-v1-20261019"
+# One new metadata walk; prior owned checkpoints and artifacts remain intact.
+SPACE_AUDIT_EPOCH = "folder-closure-20261031"
 SPACE_AUDIT_MAX_BYTES = 2 * 1024 * 1024 * 1024
 SPACE_AUDIT_STATE_RESERVE = 256 * 1024 * 1024
 SPACE_AUDIT_SQLITE_APPLICATION_ID = 0x53534131
@@ -7993,7 +7995,7 @@ class SpaceAudit:
         # key rotation may start a fresh audit, but cannot reuse another account's
         # completion. Credentials are never persisted in the checkpoint.
         context = json.dumps([identity, getattr(self.cfg, "api_base", ""),
-                              getattr(self.cfg, "api_key", "")], ensure_ascii=True)
+                              getattr(self.cfg, "api_key", ""), SPACE_AUDIT_EPOCH], ensure_ascii=True)
         generation = hashlib.sha256(context.encode("ascii")).hexdigest()[:24]
         prefix = SPACE_AUDIT_SCHEMA + "-" + generation
         self.checkpoint_owner_key = hashlib.sha256(("checkpoint-owner:" + context).encode("ascii")).digest()
@@ -8015,6 +8017,7 @@ class SpaceAudit:
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS dirs (path TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS dirs_pending_idx ON dirs(done,path);
+            CREATE TABLE IF NOT EXISTS directory_closure (path TEXT PRIMARY KEY, proof TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS entries (
                 path TEXT PRIMARY KEY, folder TEXT NOT NULL, kind TEXT NOT NULL,
                 category TEXT NOT NULL, size INTEGER NOT NULL, allocated INTEGER NOT NULL,
@@ -8247,6 +8250,47 @@ class SpaceAudit:
             os.close(fd)
             raise
 
+    @staticmethod
+    def directory_identity(info):
+        return [info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns]
+
+    def direct_children(self, relative):
+        # All keys are reversible ASCII JSON. A literal slash only separates
+        # components, so this bounded primary-key range excludes descendants.
+        prefix = self.path_key(relative + "/")[:-1] if relative else '"'
+        return ("path>=? AND path<? AND instr(substr(path,?),'/')=0",
+                (prefix, prefix + chr(127), len(prefix) + 1))
+
+    def clear_partial_directory(self, relative):
+        # Only this audit's metadata rows are replaced, never NAS entries.
+        condition, values = self.direct_children(relative)
+        self.db.execute("DELETE FROM entries WHERE " + condition, values)
+        self.db.execute("DELETE FROM directory_closure WHERE path=?", (self.path_key(relative),))
+
+    def finish_directory(self, relative, before, fd, started_at):
+        after = os.fstat(fd)
+        reopened = self.open_directory(relative)
+        try:
+            canonical = os.fstat(reopened)
+        finally:
+            os.close(reopened)
+        stable = (self.directory_identity(before) == self.directory_identity(after)
+                  == self.directory_identity(canonical))
+        condition, values = self.direct_children(relative)
+        digest, count = hashlib.sha256(), 0
+        for row in self.db.execute(
+                "SELECT path,kind,category,size,allocated,device,inode,links,mtime_ns,ctime_ns,error "
+                "FROM entries WHERE " + condition + " ORDER BY path", values):
+            digest.update(json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n")
+            count += 1
+        proof = {"policy": "directory-observation-v1", "status": "stable" if stable else "changed",
+                 "started_at": started_at, "completed_at": utc_now(), "direct_entries": count,
+                 "children_sha256": digest.hexdigest(),
+                 "before": self.directory_identity(before), "after": self.directory_identity(after),
+                 "canonical_after": self.directory_identity(canonical)}
+        self.db.execute("INSERT OR REPLACE INTO directory_closure VALUES (?,?)",
+                        (self.path_key(relative), json.dumps(proof, separators=(",", ":"))))
+
     def scan(self, stop_event, progress):
         count = 0
         last_report = 0.0
@@ -8264,6 +8308,14 @@ class SpaceAudit:
             fd = None
             try:
                 fd = self.open_directory(relative)
+                before, started_at = os.fstat(fd), utc_now()
+                # Failed parent enumeration may have discarded this queued
+                # directory's entry. Restore only an absent row: existing rows
+                # remain bound to the parent's observed-child digest.
+                if relative and not self.db.execute(
+                        "SELECT 1 FROM entries WHERE path=?", (self.path_key(relative),)).fetchone():
+                    self.record(relative, before)
+                self.clear_partial_directory(relative)
                 with os.scandir(fd) as entries:
                     for entry in entries:
                         if stop_event.is_set():
@@ -8292,8 +8344,10 @@ class SpaceAudit:
                             self.db.commit()
                             progress()
                             last_report = time.monotonic()
+                self.finish_directory(relative, before, fd, started_at)
                 self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
             except OSError as exc:
+                self.clear_partial_directory(relative)
                 self.record(relative or ".", error="scandir errno=%s" % exc.errno)
                 self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
             finally:
@@ -8318,10 +8372,16 @@ class SpaceAudit:
         pending = self.db.execute("SELECT count(*) FROM dirs WHERE done=0").fetchone()[0]
         unique = self.db.execute("SELECT coalesce(sum(a),0),coalesce(sum(s),0),count(*) FROM (SELECT max(allocated) a,max(size) s FROM entries WHERE kind='file' GROUP BY device,inode)").fetchone()
         volume = os.statvfs(self.root_fd)
-        result = {"schema": SPACE_AUDIT_SCHEMA, "root": str(self.root), "root_identity": self.get("root_identity"),
+        closure_counts = dict(self.db.execute(
+            "SELECT json_extract(proof,'$.status'),count(*) FROM directory_closure GROUP BY 1"))
+        root_closure = self.db.execute("SELECT proof FROM directory_closure WHERE path=?",
+                                       (self.path_key(""),)).fetchone()
+        result = {"audit_epoch": SPACE_AUDIT_EPOCH, "directory_closure_counts": closure_counts,
+                "root_directory_closure": json.loads(root_closure[0]) if root_closure else None,
+                "schema": SPACE_AUDIT_SCHEMA, "root": str(self.root), "root_identity": self.get("root_identity"),
                 "started_at": self.get("started_at"), "scan_completed_at": self.get("scan_completed_at"),
                 "scope": "All entries under the app clips mount, including hidden files and joined/. No symlinks or cross-device directories followed. Other NAS shares, host-only folders and snapshots outside this mount are not observable.",
-                "consistency": "Live non-atomic metadata walk; entries may change after observation. Incomplete directory scans are repeated after restart.",
+                "consistency": "Live non-atomic metadata walk. Directory closure binds direct-child observations only during each directory scan, not future contents or an atomic tree. Child payloads may change without changing directory timestamps. Changed/error/unobserved directories require KEEP. Incomplete scans replace their own partial child metadata on restart.",
                 "classification": "Media classification is by location and extension; unstitched media duration is not measured. Allocated blocks are not unique physical extents or guaranteed reclaimable space.",
                 "categories": categories, "folders": folders[:2000], "folders_truncated": len(folders) > 2000,
                 "errors_or_exclusions": errors, "pending_directories": pending,
@@ -8407,6 +8467,10 @@ class SpaceAudit:
                         if stop_event.is_set():
                             return False
                         entry = dict(zip(names, row))
+                        if entry["kind"] == "directory":
+                            closure = self.db.execute("SELECT proof FROM directory_closure WHERE path=?",
+                                                       (entry["path"],)).fetchone()
+                            entry["directory_closure"] = json.loads(closure[0]) if closure else None
                         for key in ("path", "folder"):
                             entry.update(self.path_fields(json.loads(entry[key]), key))
                         stream.write(json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n")
