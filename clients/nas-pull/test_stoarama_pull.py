@@ -4317,6 +4317,70 @@ class SpaceAuditTests(unittest.TestCase):
             finally:
                 audit.close()
 
+    def test_failed_parent_preserves_reachable_queued_child_observations(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            child = cfg.output_dir / "child"
+            child.mkdir()
+            (child / "clip.mp4").write_bytes(b"original")
+            audit = pull.SpaceAudit(cfg)
+            finish = audit.finish_directory
+            def fail_root(relative, before, fd, started_at):
+                if not relative:
+                    raise OSError(5, "directory iteration failed")
+                return finish(relative, before, fd, started_at)
+            try:
+                with mock.patch.object(audit, "finish_directory", side_effect=fail_root):
+                    self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                self.assertFalse(audit.summary()["scope_complete_without_errors"])
+                self.assertIsNone(audit.summary()["root_directory_closure"])
+                self.assertTrue(audit.export(threading.Event()))
+                with gzip.open(audit.artifact, "rt") as stream:
+                    rows = [json.loads(line) for line in stream][1:]
+                entries = {row["path"]: row for row in rows}
+                self.assertEqual(entries["."]["error"], "scandir errno=5")
+                self.assertEqual(entries["child"]["directory_closure"]["status"], "stable")
+                self.assertIn("child/clip.mp4", entries)
+            finally:
+                audit.close()
+
+    def test_child_scan_preserves_parent_observation_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            child = cfg.output_dir / "child"
+            child.mkdir()
+            audit = pull.SpaceAudit(cfg)
+            opened, changed = audit.open_directory, [False]
+            def change_child(relative):
+                if relative == "child" and not changed[0]:
+                    info = child.stat()
+                    os.utime(child, ns=(info.st_atime_ns, info.st_mtime_ns + 1000000000))
+                    changed[0] = True
+                return opened(relative)
+            try:
+                with mock.patch.object(audit, "open_directory", side_effect=change_child):
+                    self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                root = audit.summary()["root_directory_closure"]
+                digest = hashlib.sha256()
+                condition, values = audit.direct_children("")
+                for row in audit.db.execute(
+                        "SELECT path,kind,category,size,allocated,device,inode,links,mtime_ns,ctime_ns,error "
+                        "FROM entries WHERE " + condition + " ORDER BY path", values):
+                    digest.update(json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n")
+                self.assertEqual(digest.hexdigest(), root["children_sha256"])
+                entry_mtime = audit.db.execute("SELECT mtime_ns FROM entries WHERE path=?",
+                                               (audit.path_key("child"),)).fetchone()[0]
+                self.assertNotEqual(entry_mtime, child.stat().st_mtime_ns)
+            finally:
+                audit.close()
+
     def test_checkpoint_is_scoped_to_authenticated_origin(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

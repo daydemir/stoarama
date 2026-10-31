@@ -8309,6 +8309,12 @@ class SpaceAudit:
             try:
                 fd = self.open_directory(relative)
                 before, started_at = os.fstat(fd), utc_now()
+                # Failed parent enumeration may have discarded this queued
+                # directory's entry. Restore only an absent row: existing rows
+                # remain bound to the parent's observed-child digest.
+                if relative and not self.db.execute(
+                        "SELECT 1 FROM entries WHERE path=?", (self.path_key(relative),)).fetchone():
+                    self.record(relative, before)
                 self.clear_partial_directory(relative)
                 with os.scandir(fd) as entries:
                     for entry in entries:
