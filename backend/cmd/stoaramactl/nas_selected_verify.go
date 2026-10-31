@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/config"
 	"github.com/jackc/pgx/v5"
@@ -33,15 +34,39 @@ type nasSelectedVerifyOptions struct {
 	clipIDs, collatedIDs, joinedIDs []int64
 	label, expectedSHA              string
 	dryRun, asJSON                  bool
+	originalWitness                 bool
 }
 type nasSelectedVerifyManifestItem struct {
-	Kind         string `json:"kind"`
-	SourceID     int64  `json:"source_id"`
-	RelativePath string `json:"relative_path"`
-	SizeBytes    int64  `json:"size_bytes"`
-	SHA256       string `json:"sha256"`
-	R2Source     string `json:"r2_source"`
+	Kind            string                             `json:"kind"`
+	SourceID        int64                              `json:"source_id"`
+	RelativePath    string                             `json:"relative_path"`
+	SizeBytes       int64                              `json:"size_bytes"`
+	SHA256          string                             `json:"sha256"`
+	R2Source        string                             `json:"r2_source"`
+	OriginalWitness *nasSelectedOriginalWitnessContext `json:"original_witness,omitempty"`
 }
+type nasSelectedOriginalWitnessContext struct {
+	PolicyVersion      string    `json:"policy_version"`
+	RegisteredStartUTC time.Time `json:"registered_start_utc"`
+	RegisteredEndUTC   time.Time `json:"registered_end_utc"`
+	Timezone           string    `json:"timezone"`
+	LocalDate          string    `json:"local_date"`
+}
+
+const nasOriginalWitnessPolicy = "registered-day-presentation-v1"
+
+func originalWitnessContext(start, end time.Time, tz string) (*nasSelectedOriginalWitnessContext, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil || tz == "" || start.IsZero() || end.IsZero() || !end.After(start) || end.Sub(start) > 15*time.Minute || start.Nanosecond()%1000 != 0 || end.Nanosecond()%1000 != 0 {
+		return nil, errors.New("original witness needs a canonical timezone and a positive span of at most15minutes")
+	}
+	date := start.In(loc).Format("2006-01-02")
+	if end.Add(-time.Microsecond).In(loc).Format("2006-01-02") != date {
+		return nil, errors.New("original witness requires one registered local date")
+	}
+	return &nasSelectedOriginalWitnessContext{nasOriginalWitnessPolicy, start.UTC(), end.UTC(), tz, date}, nil
+}
+
 type nasSelectedVerifySummary struct {
 	Label        string `json:"label"`
 	AccountID    int64  `json:"account_id"`
@@ -62,6 +87,7 @@ func parseNASSelectedVerifyRequestArgs(args []string) (nasSelectedVerifyOptions,
 	fs.StringVar(&o.label, "label", "", "immutable plan label")
 	fs.StringVar(&o.expectedSHA, "expected-plan-sha256", "", "required on apply")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "print plan without inserting")
+	fs.BoolVar(&o.originalWitness, "original-witness", false, "measure raw original presentation on the NAS; no stitching or media copies")
 	fs.BoolVar(&o.asJSON, "json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		return o, err
@@ -85,6 +111,9 @@ func parseNASSelectedVerifyRequestArgs(args []string) (nasSelectedVerifyOptions,
 			seen[id] = true
 			*selection.dst = append(*selection.dst, id)
 		}
+	}
+	if o.originalWitness && (len(o.clipIDs) == 0 || len(o.collatedIDs) > 0 || len(o.joinedIDs) > 0) {
+		return o, errors.New("--original-witness supports raw clip IDs only")
 	}
 	count := len(o.clipIDs) + len(o.collatedIDs) + len(o.joinedIDs)
 	if count < 1 || count > 10000 {
@@ -133,6 +162,9 @@ func nasSelectedVerifyCopySource(planID int64, items []nasSelectedVerifyManifest
 
 func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSelectedVerifyOptions) (nasSelectedVerifySummary, error) {
 	sum := nasSelectedVerifySummary{Label: o.label, AccountID: nasSelectedVerifyAccountID, ConnectionID: nasSelectedVerifyConnectionID, DryRun: o.dryRun}
+	if o.originalWitness && (len(o.clipIDs) == 0 || len(o.collatedIDs) > 0 || len(o.joinedIDs) > 0) {
+		return sum, errors.New("original witnesses require raw clip IDs only")
+	}
 	items := []nasSelectedVerifyManifestItem{}
 	for _, selection := range []struct {
 		kind, query string
@@ -145,6 +177,11 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 		if len(selection.ids) == 0 {
 			continue
 		}
+		if selection.kind == "raw" && o.originalWitness {
+			selection.query = `SELECT c.id,c.display_path,c.size_bytes,lower(c.sha256),c.object_key,c.clip_start_at,c.clip_end_at,coalesce(nullif(s.local_timezone,''),r.cron_timezone)
+ FROM recording_clips c JOIN recordings r ON r.id=c.recording_id JOIN streams s ON s.id=r.stream_id
+ WHERE r.account_id=$1 AND c.id=ANY($2) ORDER BY c.id`
+		}
 		rows, err := pool.Query(ctx, selection.query, nasSelectedVerifyAccountID, selection.ids)
 		if err != nil {
 			return sum, err
@@ -152,9 +189,20 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 		count := 0
 		for rows.Next() {
 			i := nasSelectedVerifyManifestItem{Kind: selection.kind}
-			if err := rows.Scan(&i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.R2Source); err != nil {
+			var scanErr error
+			if o.originalWitness {
+				var start, end time.Time
+				var tz string
+				scanErr = rows.Scan(&i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.R2Source, &start, &end, &tz)
+				if scanErr == nil {
+					i.OriginalWitness, scanErr = originalWitnessContext(start, end, tz)
+				}
+			} else {
+				scanErr = rows.Scan(&i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.R2Source)
+			}
+			if scanErr != nil {
 				rows.Close()
-				return sum, err
+				return sum, scanErr
 			}
 			if err := validateNASSelectedVerifyIdentity(i); err != nil {
 				rows.Close()
@@ -208,7 +256,7 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 		return sum, fmt.Errorf("required account 47 NAS connection 13 is unavailable")
 	}
 	var planID int64
-	if err := tx.QueryRow(ctx, `INSERT INTO nas_selected_verify_plans(account_id,connection_id,label,manifest,plan_sha256) VALUES($1,$2,$3,$4,$5) ON CONFLICT(label) DO NOTHING RETURNING id`, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID, o.label, manifest, sum.PlanSHA256).Scan(&planID); err != nil {
+	if err := tx.QueryRow(ctx, `INSERT INTO nas_selected_verify_plans(account_id,connection_id,label,manifest,plan_sha256,original_witness) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(label) DO NOTHING RETURNING id`, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID, o.label, manifest, sum.PlanSHA256, o.originalWitness).Scan(&planID); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return sum, err
 		}
@@ -232,24 +280,27 @@ func requestNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, o nasSele
 }
 
 type nasSelectedVerifyReportItem struct {
-	ID           int64   `json:"item_id"`
-	Kind         string  `json:"kind"`
-	SourceID     int64   `json:"source_id"`
-	RelativePath string  `json:"relative_path"`
-	SizeBytes    int64   `json:"size_bytes"`
-	SHA256       string  `json:"sha256"`
-	State        string  `json:"state"`
-	Attempts     int     `json:"attempts"`
-	CompletedAt  *string `json:"completed_at"`
-	Error        string  `json:"error"`
+	ID              int64           `json:"item_id"`
+	Kind            string          `json:"kind"`
+	SourceID        int64           `json:"source_id"`
+	RelativePath    string          `json:"relative_path"`
+	SizeBytes       int64           `json:"size_bytes"`
+	SHA256          string          `json:"sha256"`
+	State           string          `json:"state"`
+	Attempts        int             `json:"attempts"`
+	CompletedAt     *string         `json:"completed_at"`
+	Error           string          `json:"error"`
+	OriginalWitness json.RawMessage `json:"original_witness,omitempty"`
 }
 
 func reportNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, label string) (map[string]any, error) {
 	var planSHA, createdAt string
-	if err := pool.QueryRow(ctx, `SELECT plan_sha256,created_at::text FROM nas_selected_verify_plans WHERE label=$1 AND account_id=$2 AND connection_id=$3`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID).Scan(&planSHA, &createdAt); err != nil {
+	var witnessMode bool
+	var manifest json.RawMessage
+	if err := pool.QueryRow(ctx, `SELECT plan_sha256,created_at::text,original_witness,manifest FROM nas_selected_verify_plans WHERE label=$1 AND account_id=$2 AND connection_id=$3`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID).Scan(&planSHA, &createdAt, &witnessMode, &manifest); err != nil {
 		return nil, err
 	}
-	rows, err := pool.Query(ctx, `SELECT i.id,i.kind,i.source_id,i.relative_path,i.size_bytes,i.sha256,i.state,i.attempts,i.completed_at::text,i.outcome_error FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE p.label=$1 AND p.account_id=$2 AND p.connection_id=$3 ORDER BY i.ordinal`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID)
+	rows, err := pool.Query(ctx, `SELECT i.id,i.kind,i.source_id,i.relative_path,i.size_bytes,i.sha256,i.state,i.attempts,i.completed_at::text,i.outcome_error,i.original_witness FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE p.label=$1 AND p.account_id=$2 AND p.connection_id=$3 ORDER BY i.ordinal`, label, nasSelectedVerifyAccountID, nasSelectedVerifyConnectionID)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +310,7 @@ func reportNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, label stri
 	var bytes int64
 	for rows.Next() {
 		var i nasSelectedVerifyReportItem
-		if err := rows.Scan(&i.ID, &i.Kind, &i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.State, &i.Attempts, &i.CompletedAt, &i.Error); err != nil {
+		if err := rows.Scan(&i.ID, &i.Kind, &i.SourceID, &i.RelativePath, &i.SizeBytes, &i.SHA256, &i.State, &i.Attempts, &i.CompletedAt, &i.Error, &i.OriginalWitness); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -269,7 +320,11 @@ func reportNASSelectedVerify(ctx context.Context, pool *pgxpool.Pool, label stri
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return map[string]any{"label": label, "plan_sha256": planSHA, "created_at": createdAt, "account_id": nasSelectedVerifyAccountID, "connection_id": nasSelectedVerifyConnectionID, "counts": counts, "bytes": bytes, "items": items}, nil
+	out := map[string]any{"label": label, "plan_sha256": planSHA, "created_at": createdAt, "account_id": nasSelectedVerifyAccountID, "connection_id": nasSelectedVerifyConnectionID, "counts": counts, "bytes": bytes, "items": items}
+	if witnessMode {
+		out["witness_manifest"] = manifest
+	}
+	return out, nil
 }
 func runNASSelectedVerify(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) > 0 && args[0] == "report" {
