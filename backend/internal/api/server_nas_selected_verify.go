@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
+	"github.com/jackc/pgx/v5"
 )
 
 const nasSelectedVerifyLeaseTTL = 30 * time.Minute
@@ -15,30 +17,33 @@ const nasSelectedVerifyLeaseTTL = 30 * time.Minute
 var nasSelectedVerifyOutcomes = map[string]bool{"match": true, "missing": true, "conflict": true, "unverified": true}
 
 type nasSelectedVerifyLeaseRequest struct {
-	ClientVersion string `json:"client_version"`
-	MaxTasks      int    `json:"max_tasks"`
+	ClientVersion   string `json:"client_version"`
+	MaxTasks        int    `json:"max_tasks"`
+	OriginalWitness bool   `json:"original_witness,omitempty"`
 }
 type nasSelectedVerifyTask struct {
-	ItemID       int64     `json:"item_id"`
-	Attempt      int       `json:"attempt"`
-	Kind         string    `json:"kind"`
-	RelativePath string    `json:"relative_path"`
-	SizeBytes    int64     `json:"size_bytes"`
-	SHA256       string    `json:"sha256"`
-	PlanSHA256   string    `json:"plan_sha256"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	ItemID          int64                      `json:"item_id"`
+	Attempt         int                        `json:"attempt"`
+	Kind            string                     `json:"kind"`
+	RelativePath    string                     `json:"relative_path"`
+	SizeBytes       int64                      `json:"size_bytes"`
+	SHA256          string                     `json:"sha256"`
+	PlanSHA256      string                     `json:"plan_sha256"`
+	ExpiresAt       time.Time                  `json:"expires_at"`
+	OriginalWitness *nasOriginalWitnessContext `json:"original_witness,omitempty"`
 }
 type nasSelectedVerifyLeaseResponse struct {
 	RetryAfterSec int                     `json:"retry_after_sec"`
 	Tasks         []nasSelectedVerifyTask `json:"tasks"`
 }
 type nasSelectedVerifyResultRequest struct {
-	Attempt       int    `json:"attempt"`
-	PlanSHA256    string `json:"plan_sha256"`
-	Outcome       string `json:"outcome"`
-	Error         string `json:"error"`
-	DurationMS    int64  `json:"duration_ms"`
-	ClientVersion string `json:"client_version"`
+	Attempt         int                      `json:"attempt"`
+	PlanSHA256      string                   `json:"plan_sha256"`
+	Outcome         string                   `json:"outcome"`
+	Error           string                   `json:"error"`
+	DurationMS      int64                    `json:"duration_ms"`
+	ClientVersion   string                   `json:"client_version"`
+	OriginalWitness *nasOriginalWitnessProof `json:"original_witness,omitempty"`
 }
 
 func validateNASSelectedVerifyResult(req nasSelectedVerifyResultRequest) error {
@@ -97,12 +102,12 @@ func (s *Server) handleAccountConnectionSelectedVerifyLease(w http.ResponseWrite
 	}
 	rows, err := tx.Query(ctx, `WITH picked AS (
       SELECT i.id FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id
-      WHERE p.connection_id=$1 AND i.state='pending' ORDER BY i.id LIMIT $2 FOR UPDATE OF i SKIP LOCKED)
+      WHERE p.connection_id=$1 AND i.state='pending' AND (NOT p.original_witness OR $5) ORDER BY p.original_witness DESC,i.id LIMIT $2 FOR UPDATE OF i SKIP LOCKED)
       UPDATE nas_selected_verify_items i SET state='leased',attempts=attempts+1,leased_at=now(),lease_expires_at=now()+greatest($3::interval,(i.size_bytes/4194304.0+120)*interval '1 second'),
         client_version=CASE WHEN $4<>'' THEN $4 ELSE client_version END
       FROM picked, nas_selected_verify_plans p WHERE i.id=picked.id AND p.id=i.plan_id
-      RETURNING i.id,i.attempts,i.kind,i.relative_path,i.size_bytes,i.sha256,p.plan_sha256,i.lease_expires_at`,
-		connectionID, req.MaxTasks, fmt.Sprintf("%d seconds", int(nasSelectedVerifyLeaseTTL.Seconds())), req.ClientVersion)
+      RETURNING i.id,i.attempts,i.kind,i.relative_path,i.size_bytes,i.sha256,p.plan_sha256,i.lease_expires_at,p.original_witness,p.manifest->(i.ordinal-1)`,
+		connectionID, req.MaxTasks, fmt.Sprintf("%d seconds", int(nasSelectedVerifyLeaseTTL.Seconds())), req.ClientVersion, req.OriginalWitness)
 	if err != nil {
 		util.WriteError(w, 500, "lease selected verify items failed")
 		return
@@ -110,10 +115,23 @@ func (s *Server) handleAccountConnectionSelectedVerifyLease(w http.ResponseWrite
 	tasks := []nasSelectedVerifyTask{}
 	for rows.Next() {
 		var task nasSelectedVerifyTask
-		if err := rows.Scan(&task.ItemID, &task.Attempt, &task.Kind, &task.RelativePath, &task.SizeBytes, &task.SHA256, &task.PlanSHA256, &task.ExpiresAt); err != nil {
+		var witnessMode bool
+		var manifest []byte
+		if err := rows.Scan(&task.ItemID, &task.Attempt, &task.Kind, &task.RelativePath, &task.SizeBytes, &task.SHA256, &task.PlanSHA256, &task.ExpiresAt, &witnessMode, &manifest); err != nil {
 			rows.Close()
 			util.WriteError(w, 500, "scan selected verify item failed")
 			return
+		}
+		if witnessMode {
+			var item struct {
+				OriginalWitness *nasOriginalWitnessContext `json:"original_witness"`
+			}
+			if err := json.Unmarshal(manifest, &item); err != nil || task.Kind != "raw" || validateNASOriginalWitnessContext(item.OriginalWitness) != nil {
+				rows.Close()
+				util.WriteError(w, 500, "invalid immutable original witness context")
+				return
+			}
+			task.OriginalWitness = item.OriginalWitness
 		}
 		tasks = append(tasks, task)
 	}
@@ -152,17 +170,43 @@ func (s *Server) handleAccountConnectionSelectedVerifyResult(w http.ResponseWrit
 	if !ok {
 		return
 	}
+	var witnessMode bool
+	var manifest []byte
+	err := s.pool.QueryRow(ctx, `SELECT p.original_witness,p.manifest->(i.ordinal-1) FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, itemID, connectionID).Scan(&witnessMode, &manifest)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			util.WriteError(w, 409, "selected verify item unavailable")
+		} else {
+			util.WriteError(w, 500, "load original witness context failed")
+		}
+		return
+	}
+	var proof any
+	if witnessMode && req.Outcome == "match" {
+		var item struct {
+			OriginalWitness *nasOriginalWitnessContext `json:"original_witness"`
+		}
+		if err := json.Unmarshal(manifest, &item); err != nil || validateNASOriginalWitness(req.OriginalWitness, item.OriginalWitness) != nil {
+			util.WriteError(w, 400, "valid original presentation evidence is required for this item")
+			return
+		}
+		encoded, _ := json.Marshal(req.OriginalWitness)
+		proof = string(encoded)
+	} else if req.OriginalWitness != nil {
+		util.WriteError(w, 400, "unexpected original witness evidence")
+		return
+	}
 	tag, err := s.pool.Exec(ctx, `UPDATE nas_selected_verify_items i SET state=$4,completed_at=now(),lease_expires_at=NULL,
-      outcome_error=$5,duration_ms=$6,client_version=CASE WHEN $7<>'' THEN $7 ELSE i.client_version END
+      outcome_error=$5,duration_ms=$6,client_version=CASE WHEN $7<>'' THEN $7 ELSE i.client_version END,original_witness=$9::jsonb
       FROM nas_selected_verify_plans p WHERE i.id=$1 AND i.plan_id=p.id AND p.connection_id=$2 AND p.plan_sha256=$3
-        AND i.state='leased' AND i.lease_expires_at>=now() AND i.attempts=$8`, itemID, connectionID, req.PlanSHA256, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS, req.ClientVersion, req.Attempt)
+        AND i.state='leased' AND i.lease_expires_at>=now() AND i.attempts=$8`, itemID, connectionID, req.PlanSHA256, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS, req.ClientVersion, req.Attempt, proof)
 	if err != nil {
 		util.WriteError(w, 500, "record selected verify result failed")
 		return
 	}
 	if tag.RowsAffected() != 1 {
 		var same bool
-		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempts=$4 AND i.state=$5 AND i.outcome_error=$6 AND i.duration_ms=$7)`, itemID, connectionID, req.PlanSHA256, req.Attempt, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS).Scan(&same)
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_selected_verify_items i JOIN nas_selected_verify_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempts=$4 AND i.state=$5 AND i.outcome_error=$6 AND i.duration_ms=$7 AND i.original_witness IS NOT DISTINCT FROM $8::jsonb)`, itemID, connectionID, req.PlanSHA256, req.Attempt, req.Outcome, strings.TrimSpace(req.Error), req.DurationMS, proof).Scan(&same)
 		if err != nil {
 			util.WriteError(w, 500, "reconcile selected verify result failed")
 			return
