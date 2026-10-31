@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNASSelectedVerifyCopyRowsPreserveTypedIdentityAndOrdinal(t *testing.T) {
@@ -100,6 +103,14 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0166_nas_original_witness.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+
 	o := nasSelectedVerifyOptions{clipIDs: []int64{1}, collatedIDs: []int64{1}, joinedIDs: []int64{1}, label: "first", dryRun: true}
 	dry, err := requestNASSelectedVerify(ctx, pool, o)
 	if err != nil || dry.Items != 3 || dry.Bytes != 33 {
@@ -140,5 +151,45 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_selected_verify_plans SET label='changed'`); err == nil {
 		t.Fatal("plan mutable")
+	}
+}
+
+func TestOriginalWitnessRequestModeAndBinding(t *testing.T) {
+	if _, err := parseNASSelectedVerifyRequestArgs([]string{"--original-witness", "--collated-ids", "1", "--label", "w", "--dry-run"}); err == nil {
+		t.Fatal("collated original witness accepted")
+	}
+	o, err := parseNASSelectedVerifyRequestArgs([]string{"--original-witness", "--clip-ids", "1", "--label", "w", "--dry-run"})
+	if err != nil || !o.originalWitness {
+		t.Fatalf("raw witness: %+v %v", o, err)
+	}
+	start := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	context, err := originalWitnessContext(start, start.Add(time.Minute), "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := originalWitnessContext(start, start.Add(time.Minute), ""); err == nil {
+		t.Fatal("empty timezone accepted")
+	}
+	if _, err := originalWitnessContext(start, start.Add(16*time.Minute), "UTC"); err == nil {
+		t.Fatal("oversized span accepted")
+	}
+	midnight := time.Date(2026, 7, 20, 23, 59, 30, 0, time.UTC)
+	if _, err := originalWitnessContext(midnight, midnight.Add(time.Minute), "UTC"); err == nil {
+		t.Fatal("cross-midnight attribution accepted")
+	}
+	plain := nasSelectedVerifyManifestItem{Kind: "raw", SourceID: 1, RelativePath: "f.mp4", SizeBytes: 3, SHA256: strings.Repeat("a", 64), R2Source: "raw"}
+	a, _ := json.Marshal(plain)
+	if strings.Contains(string(a), "original_witness") {
+		t.Fatal("legacy manifest hash would change")
+	}
+	plain.OriginalWitness = context
+	b, _ := json.Marshal(plain)
+	if sha256.Sum256(a) == sha256.Sum256(b) {
+		t.Fatal("mode absent from digest")
+	}
+	plain.OriginalWitness.Timezone = "Europe/London"
+	d, _ := json.Marshal(plain)
+	if sha256.Sum256(b) == sha256.Sum256(d) {
+		t.Fatal("timezone absent from digest")
 	}
 }
