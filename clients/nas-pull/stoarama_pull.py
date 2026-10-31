@@ -8235,6 +8235,8 @@ class SpaceAudit:
                   info.st_nlink if info else 0, info.st_mtime_ns if info else 0,
                   info.st_ctime_ns if info else 0, error, utc_now())
         self.db.execute("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+        if error:
+            self._progress_errors_after_snapshot = getattr(self, "_progress_errors_after_snapshot", 0) + 1
 
     def open_directory(self, relative):
         fd = os.dup(self.root_fd)
@@ -8360,6 +8362,51 @@ class SpaceAudit:
                 self.db.commit()
         return False
 
+    def progress_summary(self):
+        """Cheap live counts; detailed fields retain their explicit snapshot time.
+
+        Repeating category/folder/inode aggregation over a growing NAS SQLite
+        checkpoint can spend longer reporting progress than walking entries.
+        Only live scanning uses this cache. Final freezing/export still calls
+        summary(), which computes every detailed field from the full checkpoint.
+        """
+        self.check_scope()
+        frozen = self.get("final_summary")
+        if frozen:
+            return json.loads(frozen)
+        if getattr(self, "_progress_details_json", None) is None:
+            started = time.monotonic()
+            details = self.summary()
+            self._progress_details_json = json.dumps(details)
+            self._progress_details_at = utc_now_precise()
+            self._progress_details_seconds = max(0.0, time.monotonic() - started)
+            self._progress_errors_after_snapshot = 0
+        started = time.monotonic()
+        result = json.loads(self._progress_details_json)
+        entries = self.db.execute("SELECT count(*) FROM entries").fetchone()[0]
+        pending = self.db.execute("SELECT count(*) FROM dirs WHERE done=0").fetchone()[0]
+        closures = dict(self.db.execute(
+            "SELECT json_extract(proof,'$.status'),count(*) FROM directory_closure GROUP BY 1"))
+        errors = getattr(self, "_progress_errors_after_snapshot", 0)
+        result.update(pending_directories=pending, directory_closure_counts=closures,
+                      errors_or_exclusions=result["errors_or_exclusions"] + errors)
+        result["scan_progress"] = {
+            "policy": "checkpoint-count-v1", "checkpointed_entries": entries,
+            "detailed_snapshot_at": self._progress_details_at,
+            "detailed_snapshot_seconds": self._progress_details_seconds,
+            "live_count_seconds": max(0.0, time.monotonic() - started),
+            "errors_or_exclusions_is_upper_bound": True,
+            "errors_observed_after_snapshot": errors,
+            "cached_detailed_fields": [
+                "categories", "folders", "folders_truncated", "root_directory_closure",
+                "unique_regular_file_inodes", "unique_inode_allocated_bytes",
+                "unique_inode_logical_bytes", "filesystem_total_bytes",
+                "filesystem_available_bytes"],
+            "consistency": "Live checkpoint counts; named detailed fields are the last "
+                           "explicit snapshot, not current totals. Final artifact "
+                           "always recomputes complete detailed statistics."}
+        return result
+
     def summary(self):
         self.check_scope()
         frozen = self.get("final_summary")
@@ -8404,7 +8451,8 @@ class SpaceAudit:
 
     def report(self, state=None):
         body = {"audit_id": self.get("audit_id"), "state": state or self.get("state"),
-                "client_version": self.get("client_version") or CLIENT_VERSION, "summary": self.summary()}
+                "client_version": self.get("client_version") or CLIENT_VERSION,
+                "summary": self.progress_summary() if state == "scanning" else self.summary()}
         if self.get("artifact_sha256"):
             body.update(artifact_sha256=self.get("artifact_sha256"), artifact_size_bytes=int(self.get("artifact_size_bytes")))
         return request_json(self.cfg, "POST", "/account/connections/space-audit", body=body, timeout=30)
