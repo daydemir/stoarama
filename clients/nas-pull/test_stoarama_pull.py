@@ -4215,8 +4215,7 @@ class SpaceAuditTests(unittest.TestCase):
                     self.assertEqual(current["scan_progress"]["checkpointed_entries"], 2)
                     self.assertEqual(sum(c["entries"] for c in current["categories"]), 1)
                     self.assertEqual(detailed.call_count, 1)
-                    self.assertFalse(any("GROUP BY category" in q or "GROUP BY folder" in q
-                                         or "GROUP BY device,inode" in q for q in queries))
+                    self.assertFalse(any("FROM entries" in q for q in queries))
                     audit.record("lost", error="stat OSError errno=5")
                     self.assertEqual(audit.progress_summary()["errors_or_exclusions"], 1)
                     audit.clear_partial_directory("")
@@ -4225,6 +4224,52 @@ class SpaceAuditTests(unittest.TestCase):
                     self.assertEqual(current["errors_or_exclusions"], 1)
                     self.assertTrue(current["scan_progress"]["errors_or_exclusions_is_upper_bound"])
                 self.assertEqual(audit.summary()["errors_or_exclusions"], 0)
+                self.assertEqual(first.read_bytes(), b"first")
+                self.assertEqual(second.read_bytes(), b"second")
+            finally:
+                audit.close()
+
+    def test_live_entry_counter_handles_replace_clear_orphans_and_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            day = cfg.output_dir / "day"
+            child = day / "child"
+            child.mkdir(parents=True)
+            first, second = day / "first.mp4", child / "second.mp4"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            audit = pull.SpaceAudit(cfg)
+            try:
+                audit_id = audit.get("audit_id")
+                audit.progress_summary()
+                audit.record("day", day.stat())
+                audit.record("day/first.mp4", first.stat())
+                audit.record("day/first.mp4", first.stat(), error="replacement observation")
+                audit.record("day/child", child.stat())
+                audit.record("day/child/second.mp4", second.stat())
+                self.assertEqual(audit.progress_summary()["scan_progress"]["checkpointed_entries"], 4)
+                audit.clear_partial_directory("day")
+                self.assertEqual(audit.progress_summary()["scan_progress"]["checkpointed_entries"], 2)
+                audit.record("day/child", child.stat())
+                audit.clear_partial_directory("day/child")
+                audit.record("day/child/second.mp4", second.stat())
+                audit.clear_partial_directory("")
+                current = audit.progress_summary()["scan_progress"]["checkpointed_entries"]
+                self.assertEqual(current, 2)
+                self.assertEqual(current, audit.db.execute("SELECT count(*) FROM entries").fetchone()[0])
+                audit.db.commit()
+            finally:
+                audit.close()
+            audit = pull.SpaceAudit(cfg)
+            try:
+                self.assertEqual(audit.get("audit_id"), audit_id)
+                self.assertEqual(audit.progress_summary()["scan_progress"]["checkpointed_entries"], 2)
+                self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                self.assertEqual(sum(x["entries"] for x in audit.summary()["categories"]), 4)
+                self.assertNotIn("scan_progress", audit.summary())
                 self.assertEqual(first.read_bytes(), b"first")
                 self.assertEqual(second.read_bytes(), b"second")
             finally:
