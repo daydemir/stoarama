@@ -60,3 +60,18 @@ UTF-8 filesystem bytes are displayed with escaped surrogate bytes and carry
 `path_bytes_b64` (and `folder_bytes_b64` when needed) as their lossless identity.
 Normal paths remain UTF-8 strings. Never use an escaped display path alone as a
 delete target. No deletion is authorized or implemented by this audit.
+
+
+The folder-closure-20261031 audit epoch starts one fresh metadata-only walk in a
+new authenticated checkpoint generation, preserving all prior checkpoints and
+reports. Restarting this epoch resumes it rather than starting another walk.
+Directory entries include directory_closure; the root observation is in the
+summary. Each proof binds before/after/canonical directory identity and timestamps,
+direct-child count and SHA256 of sorted observed child stat rows. An interrupted
+directory replaces only its own partial checkpoint child metadata.
+
+A stable directory observation is not an atomic tree or payload snapshot.
+A changed, unreadable or unobserved directory stays protected; all descendants
+must be reconciled independently. Payload changes need not alter directory
+timestamps. Any later cleanup requires revalidation against the exact current
+directory and file identities; this update authorizes and performs no deletion.
