@@ -6203,16 +6203,6 @@ def measure_original_witness(cfg, task, source_fd, check_active, check_stable, t
              "intervals_us": [], "ffmpeg_sha256": "", "ffprobe_sha256": ""}
     try:
         check_active()
-        import platform
-        install_deadline = time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC
-        if deadline is not None:
-            install_deadline = min(install_deadline, deadline)
-        tools = (tool_installer or ensure_benchmark_tools)(
-            cfg.state_dir, platform.machine(), install_deadline
-        )
-        check_active()
-        check_stable()
-        tool_path = "/proc/self/fd/%d" % source_fd
         class LeaseCancellation:
             def __init__(self):
                 self.pause = threading.Event()
@@ -6225,6 +6215,17 @@ def measure_original_witness(cfg, task, source_fd, check_active, check_stable, t
                 check_active()
                 return False
         cancel = LeaseCancellation()
+        import platform
+        install_deadline = time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC
+        if deadline is not None:
+            install_deadline = min(install_deadline, deadline)
+        if tool_installer is None:
+            tools = ensure_benchmark_tools(cfg.state_dir, platform.machine(), install_deadline, cancel=cancel)
+        else:
+            tools = tool_installer(cfg.state_dir, platform.machine(), install_deadline)
+        check_active()
+        check_stable()
+        tool_path = "/proc/self/fd/%d" % source_fd
         strict_decode_media_cancellable(
             tool_path, tools["ffmpeg"], cancel, pass_fds=(source_fd,), threads=1
         )
@@ -7347,8 +7348,34 @@ def _verified_binary(path, expected_sha):
     return size > 0 and digest == expected_sha
 
 
-def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
+
+_BENCHMARK_TOOL_INSTALL_LOCK = threading.Lock()
+
+
+def _check_benchmark_tool_budget(deadline, cancel):
+    if cancel is not None and cancel.is_set():
+        raise BenchmarkDeadline("tool setup cancelled")
+    if time.monotonic() >= deadline:
+        raise BenchmarkDeadline("tool setup exceeded its time cap")
+
+
+def ensure_benchmark_tools(state_dir, machine, deadline, opener=None, cancel=None):
+    """Serialize the shared pinned cache across benchmark and witness lanes."""
+    _check_benchmark_tool_budget(deadline, cancel)
+    acquired = False
+    try:
+        while not acquired:
+            _check_benchmark_tool_budget(deadline, cancel)
+            acquired = _BENCHMARK_TOOL_INSTALL_LOCK.acquire(timeout=min(.1, max(0, deadline - time.monotonic())))
+        return _ensure_benchmark_tools_locked(state_dir, machine, deadline, opener=opener, cancel=cancel)
+    finally:
+        if acquired:
+            _BENCHMARK_TOOL_INSTALL_LOCK.release()
+
+
+def _ensure_benchmark_tools_locked(state_dir, machine, deadline, opener=None, cancel=None):
     """Install the pinned FFmpeg/ffprobe under /state/tools; verify every byte."""
+    _check_benchmark_tool_budget(deadline, cancel)
     arch = benchmark_tool_arch(machine)
     spec = BENCHMARK_TOOLS.get(arch)
     if spec is None:
@@ -7358,6 +7385,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
     info = {"version": BENCHMARK_TOOL_VERSION, "arch": arch,
             "ffmpeg_sha256": spec["ffmpeg_sha256"], "ffprobe_sha256": spec["ffprobe_sha256"]}
     if all(_verified_binary(tools_dir / name, sha) for name, sha in binaries.items()):
+        _check_benchmark_tool_budget(deadline, cancel)
         info.update({"source": "cached", "ffmpeg": str(tools_dir / "ffmpeg"), "ffprobe": str(tools_dir / "ffprobe")})
         return info
     import tarfile
@@ -7368,10 +7396,9 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
         request = urllib.request.Request(spec["url"], headers={"User-Agent": USER_AGENT})
         digest = hashlib.sha256()
         size = 0
-        with (opener or urllib.request.urlopen)(request, timeout=60) as response, open(archive, "wb") as output:
+        with (opener or urllib.request.urlopen)(request, timeout=min(60, max(.1, deadline-time.monotonic()))) as response, open(archive, "wb") as output:
             while True:
-                if time.monotonic() > deadline:
-                    raise BenchmarkDeadline("tool download exceeded its time cap")
+                _check_benchmark_tool_budget(deadline, cancel)
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
@@ -7385,8 +7412,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
         found = set()
         with tarfile.open(archive, "r:xz") as bundle:
             for member in bundle:
-                if time.monotonic() > deadline:
-                    raise BenchmarkDeadline("tool extraction exceeded its time cap")
+                _check_benchmark_tool_budget(deadline, cancel)
                 parts = member.name.split("/")
                 name = parts[-1]
                 if name not in binaries or name in found or len(parts) < 2 or parts[-2] != "bin" or not member.isfile():
@@ -7399,6 +7425,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
                 source = bundle.extractfile(member)
                 with source, open(partial, "wb") as output:
                     while True:
+                        _check_benchmark_tool_budget(deadline, cancel)
                         chunk = source.read(1024 * 1024)
                         if not chunk:
                             break
@@ -7408,6 +7435,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
                     os.fsync(output.fileno())
                 if binary_digest.hexdigest() != binaries[name]:
                     raise BenchmarkError("%s sha256 mismatch" % name)
+                _check_benchmark_tool_budget(deadline, cancel)
                 os.chmod(partial, 0o755)
                 os.replace(partial, tools_dir / name)
                 found.add(name)

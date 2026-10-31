@@ -4930,6 +4930,38 @@ class OriginalWitnessTests(unittest.TestCase):
         return {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe",
                 "ffmpeg_sha256": "b" * 64, "ffprobe_sha256": "c" * 64}
 
+
+    def test_shared_tool_setup_serializes_and_honors_waiting_deadline(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def install(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release absent")
+            return {"source": "cached"}
+        def first():
+            results.append(pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+5))
+        with mock.patch.object(pull, "_ensure_benchmark_tools_locked", side_effect=install) as locked:
+            worker = threading.Thread(target=first)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaises(pull.BenchmarkDeadline):
+                    pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+.02)
+                self.assertEqual(locked.call_count, 1)
+            finally:
+                release.set(); worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(results, [{"source": "cached"}])
+            self.assertEqual(pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+2), {"source": "cached"})
+
+    def test_shared_tool_setup_cancelled_before_cache_or_download(self):
+        stop = threading.Event(); stop.set()
+        with mock.patch.object(pull, "_ensure_benchmark_tools_locked") as install:
+            with self.assertRaises(pull.BenchmarkDeadline):
+                pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+2, cancel=stop)
+            install.assert_not_called()
+
     def test_fractional_union_merges_before_inward_rounding_and_caps(self):
         self.assertEqual(pull.original_presentation_intervals(self.frames(), 1000000), [[0, 100100]])
         self.assertEqual(pull.original_presentation_intervals(self.frames(), 100000), [[0, 100000]])
