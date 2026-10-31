@@ -4977,7 +4977,8 @@ class OriginalWitnessTests(unittest.TestCase):
                 self.assertEqual(threads, 1)
                 self.assertEqual(str(tool_path), "/proc/self/fd/%d" % pass_fds[0])
                 self.assertEqual(os.pread(pass_fds[0], len(body), 0), body)
-                self.assertFalse(cancel())
+                self.assertFalse(cancel.is_set())
+                self.assertFalse(cancel.wait(0))
             with mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=decode), mock.patch.object(
                 pull, "recompute_timestamp_contract", return_value=({}, {"_video_frames": self.frames()})
             ):

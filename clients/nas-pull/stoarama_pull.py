@@ -6209,9 +6209,18 @@ def measure_original_witness(cfg, task, source_fd, check_active, check_stable, t
         check_active()
         check_stable()
         tool_path = "/proc/self/fd/%d" % source_fd
-        def cancel():
-            check_active()
-            return False
+        class LeaseCancellation:
+            def __init__(self):
+                self.pause = threading.Event()
+            def is_set(self):
+                check_active()
+                return False
+            def wait(self, timeout):
+                check_active()
+                self.pause.wait(min(max(float(timeout), 0), .05))
+                check_active()
+                return False
+        cancel = LeaseCancellation()
         strict_decode_media_cancellable(
             tool_path, tools["ffmpeg"], cancel, pass_fds=(source_fd,), threads=1
         )
@@ -6228,7 +6237,7 @@ def measure_original_witness(cfg, task, source_fd, check_active, check_stable, t
                      intervals_us=intervals, ffmpeg_sha256=tools["ffmpeg_sha256"],
                      ffprobe_sha256=tools["ffprobe_sha256"])
         check_active()
-    except (OSError, RuntimeError, ValueError, MediaCertificationError) as exc:
+    except (OSError, RuntimeError, ValueError, KeyError, MediaCertificationError) as exc:
         proof["reason"] = str(exc).encode("utf-8")[:500].decode("utf-8", "ignore") or "original witness unsupported"
     return proof
 
