@@ -4381,6 +4381,38 @@ class SpaceAuditTests(unittest.TestCase):
             finally:
                 audit.close()
 
+    def test_stop_before_checkpoint_batch_resumes_without_losing_metadata_or_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            for number in range(125):
+                (cfg.output_dir / ("%03d.mp4" % number)).write_bytes(b"x")
+            audit = pull.SpaceAudit(cfg)
+            audit_id = audit.get("audit_id")
+            stopped = threading.Event()
+            def cancel(_seconds):
+                stopped.set()
+                return True
+            try:
+                with mock.patch.object(stopped, "wait", side_effect=cancel):
+                    self.assertFalse(audit.scan(stopped, lambda: None))
+                self.assertEqual(audit.db.execute("SELECT count(*) FROM entries").fetchone()[0], 100)
+                self.assertEqual(audit.db.execute("SELECT done FROM dirs").fetchone()[0], 0)
+            finally:
+                audit.close()
+            audit = pull.SpaceAudit(cfg)
+            try:
+                self.assertEqual(audit.get("audit_id"), audit_id)
+                self.assertEqual(audit.db.execute("SELECT count(*) FROM entries").fetchone()[0], 100)
+                self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                self.assertEqual(audit.db.execute("SELECT count(*) FROM entries").fetchone()[0], 125)
+                self.assertEqual(audit.summary()["root_directory_closure"]["direct_entries"], 125)
+                self.assertEqual([p.read_bytes() for p in sorted(cfg.output_dir.iterdir())], [b"x"] * 125)
+            finally:
+                audit.close()
+
     def test_checkpoint_is_scoped_to_authenticated_origin(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

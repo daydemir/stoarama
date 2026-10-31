@@ -75,3 +75,11 @@ A changed, unreadable or unobserved directory stays protected; all descendants
 must be reconciled independently. Payload changes need not alter directory
 timestamps. Any later cleanup requires revalidation against the exact current
 directory and file identities; this update authorizes and performs no deletion.
+
+
+Metadata transaction commits are batched every 1,000 observations, with additional
+commits at directory/progress/cancellation boundaries. The 100-entry scope and
+capacity checks and 2,000-stats/second rate cap are unchanged. This reduces NAS
+checkpoint fsync overhead. Interrupted directories still repeat their metadata
+enumeration; source files are never written. The audit epoch is unchanged, so an
+in-progress scan resumes its owned checkpoint after this performance update.
