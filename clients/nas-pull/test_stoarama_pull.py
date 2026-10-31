@@ -4212,6 +4212,7 @@ class SpaceAuditTests(unittest.TestCase):
                 audit.close()
 
     def test_directory_closure_is_exported_without_opening_media(self):
+        import gzip
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
