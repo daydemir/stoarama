@@ -6197,14 +6197,18 @@ def original_presentation_intervals(frames, registered_span_us):
     return out[:1024]
 
 
-def measure_original_witness(cfg, task, source_fd, check_active, check_stable, tool_installer=None):
+def measure_original_witness(cfg, task, source_fd, check_active, check_stable, tool_installer=None, deadline=None):
     proof = {"policy_version": ORIGINAL_WITNESS_POLICY, "status": "unverified",
              "reason": "", "video_frames": 0, "strict_full_decode": False,
              "intervals_us": [], "ffmpeg_sha256": "", "ffprobe_sha256": ""}
     try:
+        check_active()
         import platform
+        install_deadline = time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC
+        if deadline is not None:
+            install_deadline = min(install_deadline, deadline)
         tools = (tool_installer or ensure_benchmark_tools)(
-            cfg.state_dir, platform.machine(), time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC
+            cfg.state_dir, platform.machine(), install_deadline
         )
         check_active()
         check_stable()
@@ -6339,7 +6343,7 @@ def run_selected_verify_task(cfg, task, stop_event=None, tool_installer=None):
             raise RuntimeError("local sha256 differs from manifest")
         if task.get("original_witness") is not None:
             result["original_witness"] = measure_original_witness(
-                cfg, task, fd, check_active, check_stable_identity, tool_installer=tool_installer
+                cfg, task, fd, check_active, check_stable_identity, tool_installer=tool_installer, deadline=deadline
             )
             check_stable_identity()
         result["outcome"] = "match"

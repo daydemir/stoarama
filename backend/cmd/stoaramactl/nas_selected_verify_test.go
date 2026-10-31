@@ -146,6 +146,46 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 	if _, err := requestNASSelectedVerify(ctx, pool, o); err == nil {
 		t.Fatal("accepted foreign clip")
 	}
+	if _, err := pool.Exec(ctx, `
+ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);
+ INSERT INTO streams VALUES(1,'UTC');
+ ALTER TABLE recordings ADD COLUMN stream_id bigint,ADD COLUMN cron_timezone text;
+ UPDATE recordings SET stream_id=1,cron_timezone='UTC';
+ ALTER TABLE recording_clips ADD COLUMN clip_start_at timestamptz,ADD COLUMN clip_end_at timestamptz;
+ UPDATE recording_clips SET clip_start_at='2026-07-20T12:00:00Z',clip_end_at='2026-07-20T12:01:00Z';
+ `); err != nil {
+		t.Fatal(err)
+	}
+	witness := nasSelectedVerifyOptions{clipIDs: []int64{1}, label: "original", dryRun: true, originalWitness: true}
+	wd, err := requestNASSelectedVerify(ctx, pool, witness)
+	if err != nil {
+		t.Fatalf("original dry-run: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET local_timezone='Europe/London'`); err != nil {
+		t.Fatal(err)
+	}
+	shifted, err := requestNASSelectedVerify(ctx, pool, witness)
+	if err != nil || shifted.PlanSHA256 == wd.PlanSHA256 {
+		t.Fatalf("timezone not digest-bound: %+v %v", shifted, err)
+	}
+	witness.dryRun = false
+	witness.expectedSHA = wd.PlanSHA256
+	if _, err := requestNASSelectedVerify(ctx, pool, witness); err == nil {
+		t.Fatal("stale canonical timezone admitted")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET local_timezone='UTC'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := requestNASSelectedVerify(ctx, pool, witness); err != nil {
+		t.Fatalf("original admission: %v", err)
+	}
+	wr, err := reportNASSelectedVerify(ctx, pool, "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wr["witness_manifest"].(json.RawMessage)), "registered_start_utc") {
+		t.Fatal("immutable registered context absent from report")
+	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_selected_verify_items SET relative_path='other.mp4'`); err == nil {
 		t.Fatal("identity mutable")
 	}
