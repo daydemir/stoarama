@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNASSelectedVerifyCopyRowsPreserveTypedIdentityAndOrdinal(t *testing.T) {
@@ -100,6 +103,14 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0166_nas_original_witness.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+
 	o := nasSelectedVerifyOptions{clipIDs: []int64{1}, collatedIDs: []int64{1}, joinedIDs: []int64{1}, label: "first", dryRun: true}
 	dry, err := requestNASSelectedVerify(ctx, pool, o)
 	if err != nil || dry.Items != 3 || dry.Bytes != 33 {
@@ -135,10 +146,90 @@ func TestNASSelectedVerifyRequestAndReport(t *testing.T) {
 	if _, err := requestNASSelectedVerify(ctx, pool, o); err == nil {
 		t.Fatal("accepted foreign clip")
 	}
+	if _, err := pool.Exec(ctx, `
+ CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);
+ INSERT INTO streams VALUES(1,'UTC');
+ ALTER TABLE recordings ADD COLUMN stream_id bigint,ADD COLUMN cron_timezone text;
+ UPDATE recordings SET stream_id=1,cron_timezone='UTC';
+ ALTER TABLE recording_clips ADD COLUMN clip_start_at timestamptz,ADD COLUMN clip_end_at timestamptz;
+ UPDATE recording_clips SET clip_start_at='2026-07-20T12:00:00Z',clip_end_at='2026-07-20T12:01:00Z';
+ `); err != nil {
+		t.Fatal(err)
+	}
+	witness := nasSelectedVerifyOptions{clipIDs: []int64{1}, label: "original", dryRun: true, originalWitness: true}
+	wd, err := requestNASSelectedVerify(ctx, pool, witness)
+	if err != nil {
+		t.Fatalf("original dry-run: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET local_timezone='Europe/London'`); err != nil {
+		t.Fatal(err)
+	}
+	shifted, err := requestNASSelectedVerify(ctx, pool, witness)
+	if err != nil || shifted.PlanSHA256 == wd.PlanSHA256 {
+		t.Fatalf("timezone not digest-bound: %+v %v", shifted, err)
+	}
+	witness.dryRun = false
+	witness.expectedSHA = wd.PlanSHA256
+	if _, err := requestNASSelectedVerify(ctx, pool, witness); err == nil {
+		t.Fatal("stale canonical timezone admitted")
+	}
+	if _, err := pool.Exec(ctx, `UPDATE streams SET local_timezone='UTC'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := requestNASSelectedVerify(ctx, pool, witness); err != nil {
+		t.Fatalf("original admission: %v", err)
+	}
+	wr, err := reportNASSelectedVerify(ctx, pool, "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wr["witness_manifest"].(json.RawMessage)), "registered_start_utc") {
+		t.Fatal("immutable registered context absent from report")
+	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_selected_verify_items SET relative_path='other.mp4'`); err == nil {
 		t.Fatal("identity mutable")
 	}
 	if _, err := pool.Exec(ctx, `UPDATE nas_selected_verify_plans SET label='changed'`); err == nil {
 		t.Fatal("plan mutable")
+	}
+}
+
+func TestOriginalWitnessRequestModeAndBinding(t *testing.T) {
+	if _, err := parseNASSelectedVerifyRequestArgs([]string{"--original-witness", "--collated-ids", "1", "--label", "w", "--dry-run"}); err == nil {
+		t.Fatal("collated original witness accepted")
+	}
+	o, err := parseNASSelectedVerifyRequestArgs([]string{"--original-witness", "--clip-ids", "1", "--label", "w", "--dry-run"})
+	if err != nil || !o.originalWitness {
+		t.Fatalf("raw witness: %+v %v", o, err)
+	}
+	start := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	context, err := originalWitnessContext(start, start.Add(time.Minute), "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := originalWitnessContext(start, start.Add(time.Minute), ""); err == nil {
+		t.Fatal("empty timezone accepted")
+	}
+	if _, err := originalWitnessContext(start, start.Add(16*time.Minute), "UTC"); err == nil {
+		t.Fatal("oversized span accepted")
+	}
+	midnight := time.Date(2026, 7, 20, 23, 59, 30, 0, time.UTC)
+	if _, err := originalWitnessContext(midnight, midnight.Add(time.Minute), "UTC"); err == nil {
+		t.Fatal("cross-midnight attribution accepted")
+	}
+	plain := nasSelectedVerifyManifestItem{Kind: "raw", SourceID: 1, RelativePath: "f.mp4", SizeBytes: 3, SHA256: strings.Repeat("a", 64), R2Source: "raw"}
+	a, _ := json.Marshal(plain)
+	if strings.Contains(string(a), "original_witness") {
+		t.Fatal("legacy manifest hash would change")
+	}
+	plain.OriginalWitness = context
+	b, _ := json.Marshal(plain)
+	if sha256.Sum256(a) == sha256.Sum256(b) {
+		t.Fatal("mode absent from digest")
+	}
+	plain.OriginalWitness.Timezone = "Europe/London"
+	d, _ := json.Marshal(plain)
+	if sha256.Sum256(b) == sha256.Sum256(d) {
+		t.Fatal("timezone absent from digest")
 	}
 }

@@ -4908,5 +4908,168 @@ a.set('durable_test','UNCOMMITTED');os._exit(73)
                 self.assertEqual(pull.run_selected_verify_task(SimpleNamespace(output_dir=root), wrong_size)["outcome"], "unverified")
 
 
+
+class OriginalWitnessTests(unittest.TestCase):
+    def frames(self, pts=(90000, 93003, 96006), duration=3003, numerator=1, denominator=90000):
+        return [{"best_effort_timestamp": p, "duration_timestamp": duration,
+                 "time_base_numerator": numerator, "time_base_denominator": denominator} for p in pts]
+
+    def task(self, path, body):
+        return pull.valid_selected_verify_task({
+            "item_id": 1, "attempt": 1, "kind": "raw", "relative_path": path,
+            "size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+            "plan_sha256": "a" * 64,
+            "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)).isoformat(),
+            "original_witness": {"policy_version": pull.ORIGINAL_WITNESS_POLICY,
+                "registered_start_utc": "2026-07-20T12:00:00Z",
+                "registered_end_utc": "2026-07-20T12:01:00Z",
+                "timezone": "UTC", "local_date": "2026-07-20"},
+        })
+
+    def tools(self, *_args):
+        return {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe",
+                "ffmpeg_sha256": "b" * 64, "ffprobe_sha256": "c" * 64}
+
+
+    def test_shared_tool_setup_serializes_and_honors_waiting_deadline(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def install(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release absent")
+            return {"source": "cached"}
+        def first():
+            results.append(pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+5))
+        with mock.patch.object(pull, "_ensure_benchmark_tools_locked", side_effect=install) as locked:
+            worker = threading.Thread(target=first)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertRaises(pull.BenchmarkDeadline):
+                    pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+.02)
+                self.assertEqual(locked.call_count, 1)
+            finally:
+                release.set(); worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(results, [{"source": "cached"}])
+            self.assertEqual(pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+2), {"source": "cached"})
+
+    def test_shared_tool_setup_cancelled_before_cache_or_download(self):
+        stop = threading.Event(); stop.set()
+        with mock.patch.object(pull, "_ensure_benchmark_tools_locked") as install:
+            with self.assertRaises(pull.BenchmarkDeadline):
+                pull.ensure_benchmark_tools("unused", "x86_64", time.monotonic()+2, cancel=stop)
+            install.assert_not_called()
+
+    def test_fractional_union_merges_before_inward_rounding_and_caps(self):
+        self.assertEqual(pull.original_presentation_intervals(self.frames(), 1000000), [[0, 100100]])
+        self.assertEqual(pull.original_presentation_intervals(self.frames(), 100000), [[0, 100000]])
+        thirds = self.frames((0, 1), 1, 1, 3)
+        self.assertEqual(pull.original_presentation_intervals(thirds, 1000000), [[0, 666666]])
+
+    def test_presentation_gaps_and_duplicate_frames_do_not_inflate_union(self):
+        gaps = self.frames((0, 30), 1, 1, 10)
+        self.assertEqual(pull.original_presentation_intervals(gaps, 10000000), [[0, 100000], [3000000, 3100000]])
+        duplicates = self.frames((0, 0), 1, 1, 10)
+        self.assertEqual(pull.original_presentation_intervals(duplicates, 1000000), [[0, 100000]])
+        huge = self.frames((9000000000000000000,), 1, 1, 3)
+        self.assertEqual(pull.original_presentation_intervals(huge, 1000000), [[0, 333333]])
+
+    def test_unsupported_timing_never_becomes_zero_coverage_proof(self):
+        for frames in ([], self.frames((1, 0)), self.frames((0,), 0), self.frames((0,), 1, 1, 0)):
+            with self.subTest(frames=frames), self.assertRaises(pull.MediaCertificationError):
+                pull.original_presentation_intervals(frames, 1000000)
+        bad = self.frames()
+        bad[0]["duration_timestamp"] = True
+        with self.assertRaises(pull.MediaCertificationError):
+            pull.original_presentation_intervals(bad, 1000000)
+
+    def test_original_witness_rejects_cross_date_and_stitched_source(self):
+        task = self.task("f.mp4", b"abc")
+        raw = dict(task["original_witness"])
+        raw.pop("registered_span_us")
+        raw["registered_start_utc"] = "2026-07-20T23:59:30Z"
+        raw["registered_end_utc"] = "2026-07-21T00:00:30Z"
+        with self.assertRaises(ValueError):
+            pull.valid_original_witness_context(raw)
+        raw.update(timezone="Asia/Tokyo", local_date="2026-07-21")
+        self.assertEqual(pull.valid_original_witness_context(raw)["registered_span_us"], 60000000)
+        wrong = dict(task, kind="collated", relative_path="joined/f.mp4")
+        wrong["original_witness"] = raw
+        with self.assertRaises(ValueError):
+            pull.valid_selected_verify_task(wrong)
+
+    def test_original_proof_retains_one_descriptor_and_never_writes_media(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); path = root / "f.mp4"; body = b"original"
+            path.write_bytes(body); before = path.stat()
+            task = self.task("f.mp4", body)
+            def decode(tool_path, _binary, cancel, pass_fds=(), threads=None):
+                self.assertEqual(threads, 1)
+                self.assertEqual(str(tool_path), "/proc/self/fd/%d" % pass_fds[0])
+                self.assertEqual(os.pread(pass_fds[0], len(body), 0), body)
+                self.assertFalse(cancel.is_set())
+                self.assertFalse(cancel.wait(0))
+            with mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=decode), mock.patch.object(
+                pull, "recompute_timestamp_contract", return_value=({}, {"_video_frames": self.frames()})
+            ):
+                result = pull.run_selected_verify_task(SimpleNamespace(output_dir=root, state_dir=root), task, tool_installer=self.tools)
+            self.assertEqual(result["outcome"], "match")
+            proof = result["original_witness"]
+            self.assertEqual(proof["status"], "verified")
+            self.assertEqual(proof["intervals_us"], [[0, 100100]])
+            self.assertNotIn("timestamp_contract", proof)
+            self.assertEqual(path.read_bytes(), body)
+            self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertEqual(list(root.iterdir()), [path])
+
+    def test_decode_failure_is_unverified_not_a_zero_usable_claim(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); (root / "f.mp4").write_bytes(b"abc")
+            with mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=pull.MediaCertificationError("decode failed")):
+                result = pull.run_selected_verify_task(SimpleNamespace(output_dir=root, state_dir=root), self.task("f.mp4", b"abc"), tool_installer=self.tools)
+            self.assertEqual(result["outcome"], "match")
+            self.assertEqual(result["original_witness"]["status"], "unverified")
+            self.assertEqual(result["original_witness"]["intervals_us"], [])
+
+    def test_source_replacement_after_decode_cannot_produce_a_witness(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); path = root / "f.mp4"; path.write_bytes(b"abc")
+            def replace_source(*_args, **_kwargs):
+                replacement = root / "replacement.mp4"; replacement.write_bytes(b"abc"); os.replace(replacement, path)
+            with mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=replace_source):
+                result = pull.run_selected_verify_task(SimpleNamespace(output_dir=root, state_dir=root), self.task("f.mp4", b"abc"), tool_installer=self.tools)
+            self.assertEqual(result["outcome"], "unverified")
+            self.assertNotIn("original_witness", result)
+
+    def test_cancelled_decode_leaves_no_authoritative_result(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); (root / "f.mp4").write_bytes(b"abc")
+            with mock.patch.object(pull, "strict_decode_media_cancellable", side_effect=pull.SelectedVerifyAborted("cancelled")):
+                with self.assertRaises(pull.SelectedVerifyAborted):
+                    pull.run_selected_verify_task(SimpleNamespace(output_dir=root, state_dir=root), self.task("f.mp4", b"abc"), tool_installer=self.tools)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe") and Path("/proc/self/fd").exists(), "Linux FFmpeg fixture")
+    def test_real_mp4_original_is_decoded_without_a_native_ingest_contract(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pull.os.path, "ismount", return_value=True):
+            root = Path(tmp); path = root / "f.mp4"
+            made = subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+                "color=c=blue:s=64x64:r=5:d=1", "-c:v", "libx264", "-threads", "1", "-an", str(path)],
+                capture_output=True, timeout=30)
+            self.assertEqual(made.returncode, 0, made.stderr)
+            body = path.read_bytes()
+            def tools(*_args):
+                return {"ffmpeg": shutil.which("ffmpeg"), "ffprobe": shutil.which("ffprobe"),
+                    "ffmpeg_sha256": "b"*64, "ffprobe_sha256": "c"*64}
+            result = pull.run_selected_verify_task(SimpleNamespace(output_dir=root, state_dir=root), self.task("f.mp4", body), tool_installer=tools)
+            self.assertEqual(result["outcome"], "match")
+            proof = result["original_witness"]
+            self.assertEqual(proof["status"], "verified", proof)
+            self.assertTrue(proof["strict_full_decode"])
+            self.assertGreater(sum(b-a for a,b in proof["intervals_us"]), 0)
+            self.assertLessEqual(sum(b-a for a,b in proof["intervals_us"]), 1000000)
+
+
 if __name__ == "__main__":
     unittest.main()

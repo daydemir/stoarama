@@ -89,3 +89,31 @@ mutable evidence shows the complete small validation cohort is about 33.28 GB;
 that is useful to validate the workflow but does not solve current NAS runway.
 No candidate is called safe until the complete-scan, fresh-rehash and R2
 byte-restore gates pass.
+
+## Direct original presentation witnesses
+
+Use the existing selected-verification lane with `--original-witness` to measure
+raw originals on the NAS without copying, remuxing, stitching or deleting media:
+
+```sh
+stoaramactl nas-selected-verify request --clip-ids 123 --original-witness --label retention-witness-example --dry-run --json
+# Repeat the identical request with --expected-plan-sha256 <the dry-run SHA>.
+stoaramactl nas-selected-verify report --label retention-witness-example --json
+```
+
+The digest binds byte identity, witness policy, immutable registered UTC bounds,
+canonical timezone and one local date. Only clients advertising witness support
+lease these requests. A byte `MATCH` remains separate from the structured witness
+status. Successful witnesses retain one descriptor through SHA, complete strict
+video/optional-audio decode and bounded rational frame observations. Supported
+presentation intervals are normalized on the registered date, merged before
+inward microsecond rounding, and capped by the registered span. They are stored
+media lower bounds, not camera UTC or legacy ingest timestamp contracts.
+
+Start with decisive exclusive boundary dates, including one last-positive-date
+clip for each eligible sparse stream. A finished global NAS walk or native-stitch
+receipt is not a prerequisite. Unsupported timing, cross-date attribution,
+decode errors, cancellation or identity changes create no usable-coverage
+upgrade; they never establish a zero upper bound or permission to delete.
+Current public delivery, unknowns, alternative periods and original sources
+remain protected. This read-only mode cannot approve cleanup or backfill.

@@ -2370,8 +2370,12 @@ def snapshot_certification_run(paths, identities, clips, destination, cancel):
     return snapshots
 
 
-def strict_decode_media_cancellable(path, ffmpeg_bin, cancel, pass_fds=()):
+def strict_decode_media_cancellable(path, ffmpeg_bin, cancel, pass_fds=(), threads=None):
     command = [ffmpeg_bin, "-v", "error", "-xerror", "-err_detect", "explode", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS, "-enable_drefs", "0", "-use_absolute_path", "0", "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"]
+    if threads is not None:
+        if type(threads) is not int or threads != 1:
+            raise MediaCertificationError("invalid strict decode thread bound")
+        command[1:1] = ["-threads", "1"]
     run_media_validation_command(command, cancel, 600, "clip_decode_failed", pass_fds=pass_fds)
 
 
@@ -6109,6 +6113,140 @@ class SelectedVerifyAborted(Exception):
     """No authoritative filesystem result; leave the lease available for retry."""
 
 
+
+ORIGINAL_WITNESS_POLICY = "registered-day-presentation-v1"
+
+
+def valid_original_witness_context(raw):
+    if not isinstance(raw, dict) or set(raw) != {
+        "policy_version", "registered_start_utc", "registered_end_utc", "timezone", "local_date"
+    } or raw.get("policy_version") != ORIGINAL_WITNESS_POLICY:
+        raise ValueError("invalid original witness context")
+    try:
+        from zoneinfo import ZoneInfo
+        start = parse_certification_timestamp(raw["registered_start_utc"], "registered_start_utc")
+        end = parse_certification_timestamp(raw["registered_end_utc"], "registered_end_utc")
+        zone = ZoneInfo(raw["timezone"])
+        span = end - start
+        span_us = (span.days * 86400 + span.seconds) * 1000000 + span.microseconds
+        if not 0 < span_us <= 900000000:
+            raise ValueError("invalid original witness registered span")
+        if (start.astimezone(zone).date().isoformat() != raw["local_date"]
+                or (end - datetime.timedelta(microseconds=1)).astimezone(zone).date().isoformat() != raw["local_date"]):
+            raise ValueError("original witness crosses registered local dates")
+    except (ImportError, KeyError, TypeError, MediaCertificationError) as exc:
+        raise ValueError("invalid original witness registered date") from exc
+    return dict(raw, registered_span_us=span_us)
+
+
+def original_presentation_intervals(frames, registered_span_us):
+    """Conservative normalized presentation union on the registered date.
+    
+    This is a stored-media observation, never a camera UTC or ingest contract.
+    Merge exact rational intervals before inward microsecond quantization.
+    """
+    from fractions import Fraction
+    if not isinstance(frames, list) or not 1 <= len(frames) <= 120000:
+        raise MediaCertificationError("original presentation frame bound exceeded")
+    if type(registered_span_us) is not int or not 0 < registered_span_us <= 900000000:
+        raise MediaCertificationError("invalid registered presentation cap")
+    cap = Fraction(registered_span_us, 1000000)
+    origin = None
+    previous = None
+    spans = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            raise MediaCertificationError("invalid original frame observation")
+        values = [frame.get(k) for k in (
+            "best_effort_timestamp", "duration_timestamp", "time_base_numerator", "time_base_denominator"
+        )]
+        if any(type(v) is not int for v in values):
+            raise MediaCertificationError("missing original frame timing")
+        pts, duration, numerator, denominator = values
+        if duration <= 0 or numerator <= 0 or denominator <= 0:
+            raise MediaCertificationError("unsupported original frame timing")
+        at = Fraction(pts * numerator, denominator)
+        if previous is not None and at < previous:
+            raise MediaCertificationError("original presentation order is invalid")
+        if origin is None:
+            origin = at
+        previous = at
+        a, b = max(Fraction(0), at - origin), min(cap, at - origin + Fraction(duration * numerator, denominator))
+        if b > a:
+            spans.append((a, b))
+    merged = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    out = []
+    for a, b in merged:
+        a *= 1000000
+        b *= 1000000
+        lo = -((-a.numerator) // a.denominator)
+        hi = b.numerator // b.denominator
+        if hi > lo:
+            if out and lo <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], hi)
+            else:
+                out.append([lo, hi])
+    if not out:
+        raise MediaCertificationError("no supported positive original presentation")
+    # A bounded subset remains a lower bound; never fill omitted gaps.
+    return out[:1024]
+
+
+def measure_original_witness(cfg, task, source_fd, check_active, check_stable, tool_installer=None, deadline=None):
+    proof = {"policy_version": ORIGINAL_WITNESS_POLICY, "status": "unverified",
+             "reason": "", "video_frames": 0, "strict_full_decode": False,
+             "intervals_us": [], "ffmpeg_sha256": "", "ffprobe_sha256": ""}
+    try:
+        check_active()
+        class LeaseCancellation:
+            def __init__(self):
+                self.pause = threading.Event()
+            def is_set(self):
+                check_active()
+                return False
+            def wait(self, timeout):
+                check_active()
+                self.pause.wait(min(max(float(timeout), 0), .05))
+                check_active()
+                return False
+        cancel = LeaseCancellation()
+        import platform
+        install_deadline = time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC
+        if deadline is not None:
+            install_deadline = min(install_deadline, deadline)
+        if tool_installer is None:
+            tools = ensure_benchmark_tools(cfg.state_dir, platform.machine(), install_deadline, cancel=cancel)
+        else:
+            tools = tool_installer(cfg.state_dir, platform.machine(), install_deadline)
+        check_active()
+        check_stable()
+        tool_path = "/proc/self/fd/%d" % source_fd
+        strict_decode_media_cancellable(
+            tool_path, tools["ffmpeg"], cancel, pass_fds=(source_fd,), threads=1
+        )
+        check_stable()
+        _, observed = recompute_timestamp_contract(
+            tool_path, tools["ffprobe"], cancel, pass_fds=(source_fd,)
+        )
+        check_stable()
+        frames = observed.get("_video_frames")
+        intervals = original_presentation_intervals(
+            frames, task["original_witness"]["registered_span_us"]
+        )
+        proof.update(status="verified", strict_full_decode=True, video_frames=len(frames),
+                     intervals_us=intervals, ffmpeg_sha256=tools["ffmpeg_sha256"],
+                     ffprobe_sha256=tools["ffprobe_sha256"])
+        check_active()
+    except (OSError, RuntimeError, ValueError, KeyError, MediaCertificationError) as exc:
+        proof["reason"] = str(exc).encode("utf-8")[:500].decode("utf-8", "ignore") or "original witness unsupported"
+    return proof
+
+
 def valid_selected_verify_task(task):
     """Validate one immutable, server-derived selected-file manifest item."""
     if not isinstance(task, dict):
@@ -6139,6 +6277,10 @@ def valid_selected_verify_task(task):
         raise ValueError(str(exc)) from exc
     if out["size_bytes"] > 32 * 1024 ** 3:
         raise ValueError("selected verify file exceeds 32 GiB bound")
+    if task.get("original_witness") is not None:
+        if out["kind"] != "raw":
+            raise ValueError("original witnesses support raw clips only")
+        out["original_witness"] = valid_original_witness_context(task["original_witness"])
     return out
 
 
@@ -6149,7 +6291,7 @@ def selected_verify_root_identity(root):
     return info.st_dev, info.st_ino
 
 
-def run_selected_verify_task(cfg, task, stop_event=None):
+def run_selected_verify_task(cfg, task, stop_event=None, tool_installer=None):
     """Read-only direct check: confined regular file, exact size, then full SHA."""
     started = time.monotonic()
     result = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
@@ -6200,12 +6342,19 @@ def run_selected_verify_task(cfg, task, stop_event=None):
         if digest.hexdigest() != task["sha256"]:
             result["outcome"] = "conflict"
             raise RuntimeError("local sha256 differs from manifest")
+        if task.get("original_witness") is not None:
+            result["original_witness"] = measure_original_witness(
+                cfg, task, fd, check_active, check_stable_identity, tool_installer=tool_installer, deadline=deadline
+            )
+            check_stable_identity()
         result["outcome"] = "match"
     except (OSError, RuntimeError, MediaCertificationError) as exc:
         result["error"] = str(exc)
     finally:
         if fd is not None:
             os.close(fd)
+    if result["outcome"] != "match":
+        result.pop("original_witness", None)
     result["duration_ms"] = max(0, round((time.monotonic() - started) * 1000))
     result["error"] = result["error"].encode("utf-8")[:500].decode("utf-8", "ignore")
     return result
@@ -6527,7 +6676,7 @@ def restore_wait(seconds):
 def selected_verify_once(cfg, stop_event=None):
     """Lease a bounded batch and report direct read-only filesystem evidence."""
     lease = restore_api(cfg, "/account/connections/selected-verify/lease",
-                        {"client_version": CLIENT_VERSION, "max_tasks": 1})
+                        {"client_version": CLIENT_VERSION, "max_tasks": 1, "original_witness": True})
     if not isinstance(lease, dict) or not isinstance(lease.get("tasks", []), list):
         raise RuntimeError("invalid selected verify lease response")
     for raw in lease.get("tasks") or []:
@@ -7199,8 +7348,34 @@ def _verified_binary(path, expected_sha):
     return size > 0 and digest == expected_sha
 
 
-def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
+
+_BENCHMARK_TOOL_INSTALL_LOCK = threading.Lock()
+
+
+def _check_benchmark_tool_budget(deadline, cancel):
+    if cancel is not None and cancel.is_set():
+        raise BenchmarkDeadline("tool setup cancelled")
+    if time.monotonic() >= deadline:
+        raise BenchmarkDeadline("tool setup exceeded its time cap")
+
+
+def ensure_benchmark_tools(state_dir, machine, deadline, opener=None, cancel=None):
+    """Serialize the shared pinned cache across benchmark and witness lanes."""
+    _check_benchmark_tool_budget(deadline, cancel)
+    acquired = False
+    try:
+        while not acquired:
+            _check_benchmark_tool_budget(deadline, cancel)
+            acquired = _BENCHMARK_TOOL_INSTALL_LOCK.acquire(timeout=min(.1, max(0, deadline - time.monotonic())))
+        return _ensure_benchmark_tools_locked(state_dir, machine, deadline, opener=opener, cancel=cancel)
+    finally:
+        if acquired:
+            _BENCHMARK_TOOL_INSTALL_LOCK.release()
+
+
+def _ensure_benchmark_tools_locked(state_dir, machine, deadline, opener=None, cancel=None):
     """Install the pinned FFmpeg/ffprobe under /state/tools; verify every byte."""
+    _check_benchmark_tool_budget(deadline, cancel)
     arch = benchmark_tool_arch(machine)
     spec = BENCHMARK_TOOLS.get(arch)
     if spec is None:
@@ -7210,6 +7385,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
     info = {"version": BENCHMARK_TOOL_VERSION, "arch": arch,
             "ffmpeg_sha256": spec["ffmpeg_sha256"], "ffprobe_sha256": spec["ffprobe_sha256"]}
     if all(_verified_binary(tools_dir / name, sha) for name, sha in binaries.items()):
+        _check_benchmark_tool_budget(deadline, cancel)
         info.update({"source": "cached", "ffmpeg": str(tools_dir / "ffmpeg"), "ffprobe": str(tools_dir / "ffprobe")})
         return info
     import tarfile
@@ -7220,10 +7396,9 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
         request = urllib.request.Request(spec["url"], headers={"User-Agent": USER_AGENT})
         digest = hashlib.sha256()
         size = 0
-        with (opener or urllib.request.urlopen)(request, timeout=60) as response, open(archive, "wb") as output:
+        with (opener or urllib.request.urlopen)(request, timeout=min(60, max(.1, deadline-time.monotonic()))) as response, open(archive, "wb") as output:
             while True:
-                if time.monotonic() > deadline:
-                    raise BenchmarkDeadline("tool download exceeded its time cap")
+                _check_benchmark_tool_budget(deadline, cancel)
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
@@ -7237,8 +7412,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
         found = set()
         with tarfile.open(archive, "r:xz") as bundle:
             for member in bundle:
-                if time.monotonic() > deadline:
-                    raise BenchmarkDeadline("tool extraction exceeded its time cap")
+                _check_benchmark_tool_budget(deadline, cancel)
                 parts = member.name.split("/")
                 name = parts[-1]
                 if name not in binaries or name in found or len(parts) < 2 or parts[-2] != "bin" or not member.isfile():
@@ -7251,6 +7425,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
                 source = bundle.extractfile(member)
                 with source, open(partial, "wb") as output:
                     while True:
+                        _check_benchmark_tool_budget(deadline, cancel)
                         chunk = source.read(1024 * 1024)
                         if not chunk:
                             break
@@ -7260,6 +7435,7 @@ def ensure_benchmark_tools(state_dir, machine, deadline, opener=None):
                     os.fsync(output.fileno())
                 if binary_digest.hexdigest() != binaries[name]:
                     raise BenchmarkError("%s sha256 mismatch" % name)
+                _check_benchmark_tool_budget(deadline, cancel)
                 os.chmod(partial, 0o755)
                 os.replace(partial, tools_dir / name)
                 found.add(name)

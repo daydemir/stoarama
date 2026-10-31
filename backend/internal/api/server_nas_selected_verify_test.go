@@ -72,6 +72,14 @@ func TestNASSelectedVerifyLifecycle(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0166_nas_original_witness.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := pool.Exec(ctx, `INSERT INTO nas_selected_verify_plans(id,account_id,connection_id,label,manifest,plan_sha256) VALUES(1,47,13,'plan','[]',repeat('a',64));
  INSERT INTO nas_selected_verify_items(id,plan_id,ordinal,kind,source_id,relative_path,size_bytes,sha256) VALUES(1,1,1,'raw',1,'f/a.mp4',3,repeat('b',64));`); err != nil {
 		t.Fatal(err)
@@ -152,5 +160,49 @@ func TestNASSelectedVerifyLifecycle(t *testing.T) {
 	remaining := time.Until(large.ExpiresAt)
 	if remaining < 135*time.Minute || remaining > 140*time.Minute {
 		t.Fatalf("large-file lease=%s", remaining)
+	}
+
+	witnessContext := &nasOriginalWitnessContext{PolicyVersion: nasOriginalWitnessPolicy,
+		RegisteredStartUTC: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC),
+		RegisteredEndUTC:   time.Date(2026, 7, 20, 12, 1, 0, 0, time.UTC), Timezone: "UTC", LocalDate: "2026-07-20"}
+	manifest, _ := json.Marshal([]any{map[string]any{"original_witness": witnessContext}})
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_selected_verify_plans(id,account_id,connection_id,label,manifest,plan_sha256,original_witness) VALUES(2,47,13,'original',$1,repeat('c',64),true);
+ `, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_selected_verify_items(id,plan_id,ordinal,kind,source_id,relative_path,size_bytes,sha256) VALUES(4,2,1,'raw',4,'f/original.mp4',3,repeat('d',64))`); err != nil {
+		t.Fatal(err)
+	}
+	code, out := call(s.handleAccountConnectionSelectedVerifyLease, 47, 5, "", nasSelectedVerifyLeaseRequest{MaxTasks: 1})
+	if code != 200 || len(out["tasks"].([]any)) != 0 {
+		t.Fatalf("old client leased witness: %d %v", code, out)
+	}
+	code, out = call(s.handleAccountConnectionSelectedVerifyLease, 47, 5, "", nasSelectedVerifyLeaseRequest{MaxTasks: 1, OriginalWitness: true})
+	if code != 200 {
+		t.Fatalf("witness lease: %d %v", code, out)
+	}
+	encoded, _ := json.Marshal(out)
+	var leased nasSelectedVerifyLeaseResponse
+	if err := json.Unmarshal(encoded, &leased); err != nil || len(leased.Tasks) != 1 || leased.Tasks[0].OriginalWitness == nil {
+		t.Fatalf("witness context absent: %s", encoded)
+	}
+	task := leased.Tasks[0]
+	body := nasSelectedVerifyResultRequest{Attempt: task.Attempt, PlanSHA256: task.PlanSHA256, Outcome: "match", DurationMS: 3}
+	if code, _ := call(s.handleAccountConnectionSelectedVerifyResult, 47, 5, "4", body); code != 400 {
+		t.Fatalf("byte-only result promoted: %d", code)
+	}
+	body.OriginalWitness = &nasOriginalWitnessProof{PolicyVersion: nasOriginalWitnessPolicy, Status: "verified", VideoFrames: 2, StrictFullDecode: true, IntervalsUS: [][2]int64{{0, 60000000}}, FFmpegSHA256: strings.Repeat("e", 64), FFprobeSHA256: strings.Repeat("f", 64)}
+	if code, out := call(s.handleAccountConnectionSelectedVerifyResult, 47, 5, "4", body); code != 200 {
+		t.Fatalf("witness result: %d %v", code, out)
+	}
+	if code, _ := call(s.handleAccountConnectionSelectedVerifyResult, 47, 5, "4", body); code != 200 {
+		t.Fatalf("witness ACK retry: %d", code)
+	}
+	body.OriginalWitness.IntervalsUS = [][2]int64{{0, 59000000}}
+	if code, _ := call(s.handleAccountConnectionSelectedVerifyResult, 47, 5, "4", body); code != 409 {
+		t.Fatalf("terminal proof rewritten: %d", code)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_selected_verify_plans SET original_witness=false WHERE id=2`); err == nil {
+		t.Fatal("witness mode mutable")
 	}
 }
