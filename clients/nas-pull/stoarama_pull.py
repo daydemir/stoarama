@@ -8234,7 +8234,20 @@ class SpaceAudit:
                   info.st_dev if info else 0, info.st_ino if info else 0,
                   info.st_nlink if info else 0, info.st_mtime_ns if info else 0,
                   info.st_ctime_ns if info else 0, error, utc_now())
-        self.db.execute("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+        inserted = self.db.execute(
+            "INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(path) DO NOTHING", values).rowcount
+        if inserted not in (0, 1):
+            raise RuntimeError("space audit insert count unavailable")
+        if not inserted:
+            updated = self.db.execute(
+                "UPDATE entries SET folder=?,kind=?,category=?,size=?,allocated=?,device=?,"
+                "inode=?,links=?,mtime_ns=?,ctime_ns=?,error=?,observed_at=? WHERE path=?",
+                values[1:] + values[:1]).rowcount
+            if updated != 1:
+                raise RuntimeError("space audit replacement observation missing")
+        if hasattr(self, "_progress_entry_count"):
+            self._progress_entry_count += inserted
         if error:
             self._progress_errors_after_snapshot = getattr(self, "_progress_errors_after_snapshot", 0) + 1
 
@@ -8266,7 +8279,13 @@ class SpaceAudit:
     def clear_partial_directory(self, relative):
         # Only this audit's metadata rows are replaced, never NAS entries.
         condition, values = self.direct_children(relative)
-        self.db.execute("DELETE FROM entries WHERE " + condition, values)
+        removed = self.db.execute("DELETE FROM entries WHERE " + condition, values).rowcount
+        if removed < 0:
+            raise RuntimeError("space audit deletion count unavailable")
+        if hasattr(self, "_progress_entry_count"):
+            self._progress_entry_count -= removed
+            if self._progress_entry_count < 0:
+                raise RuntimeError("space audit progress count inconsistent")
         self.db.execute("DELETE FROM directory_closure WHERE path=?", (self.path_key(relative),))
 
     def finish_directory(self, relative, before, fd, started_at):
@@ -8377,13 +8396,14 @@ class SpaceAudit:
         if getattr(self, "_progress_details_json", None) is None:
             started = time.monotonic()
             details = self.summary()
+            self._progress_entry_count = sum(c["entries"] for c in details["categories"])
             self._progress_details_json = json.dumps(details)
             self._progress_details_at = utc_now_precise()
             self._progress_details_seconds = max(0.0, time.monotonic() - started)
             self._progress_errors_after_snapshot = 0
         started = time.monotonic()
         result = json.loads(self._progress_details_json)
-        entries = self.db.execute("SELECT count(*) FROM entries").fetchone()[0]
+        entries = self._progress_entry_count
         pending = self.db.execute("SELECT count(*) FROM dirs WHERE done=0").fetchone()[0]
         closures = dict(self.db.execute(
             "SELECT json_extract(proof,'$.status'),count(*) FROM directory_closure GROUP BY 1"))
