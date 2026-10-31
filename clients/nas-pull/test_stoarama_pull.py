@@ -1,4 +1,5 @@
 import importlib.util
+import gzip
 import hashlib
 import io
 import json
@@ -4189,6 +4190,92 @@ class SpaceAuditTests(unittest.TestCase):
         patcher = mock.patch.object(pull.os.path, "ismount", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_live_progress_avoids_repeated_detailed_aggregation_and_bounds_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            first = cfg.output_dir / "first.mp4"
+            first.write_bytes(b"first")
+            audit = pull.SpaceAudit(cfg)
+            try:
+                audit.record("first.mp4", first.stat())
+                with mock.patch.object(audit, "summary", wraps=audit.summary) as detailed:
+                    initial = audit.progress_summary()
+                    self.assertEqual(initial["scan_progress"]["checkpointed_entries"], 1)
+                    second = cfg.output_dir / "second.mp4"
+                    second.write_bytes(b"second")
+                    audit.record("second.mp4", second.stat())
+                    queries = []
+                    audit.db.set_trace_callback(queries.append)
+                    current = audit.progress_summary()
+                    audit.db.set_trace_callback(None)
+                    self.assertEqual(current["scan_progress"]["checkpointed_entries"], 2)
+                    self.assertEqual(sum(c["entries"] for c in current["categories"]), 1)
+                    self.assertEqual(detailed.call_count, 1)
+                    self.assertFalse(any("GROUP BY category" in q or "GROUP BY folder" in q
+                                         or "GROUP BY device,inode" in q for q in queries))
+                    audit.record("lost", error="stat OSError errno=5")
+                    self.assertEqual(audit.progress_summary()["errors_or_exclusions"], 1)
+                    audit.clear_partial_directory("")
+                    current = audit.progress_summary()
+                    self.assertEqual(current["scan_progress"]["checkpointed_entries"], 0)
+                    self.assertEqual(current["errors_or_exclusions"], 1)
+                    self.assertTrue(current["scan_progress"]["errors_or_exclusions_is_upper_bound"])
+                self.assertEqual(audit.summary()["errors_or_exclusions"], 0)
+                self.assertEqual(first.read_bytes(), b"first")
+                self.assertEqual(second.read_bytes(), b"second")
+            finally:
+                audit.close()
+
+    def test_final_freeze_export_and_report_bypass_live_progress_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            first = cfg.output_dir / "first.mp4"
+            first.write_bytes(b"first")
+            audit = pull.SpaceAudit(cfg)
+            try:
+                audit.record("first.mp4", first.stat())
+                audit.progress_summary()
+                second = cfg.output_dir / "second.mp4"
+                second.write_bytes(b"second")
+                self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                frozen = audit.summary()
+                self.assertEqual(sum(c["entries"] for c in frozen["categories"]), 2)
+                self.assertTrue(frozen["scope_complete_without_errors"])
+                self.assertNotIn("scan_progress", frozen)
+                self.assertEqual(audit.progress_summary(), frozen)
+                self.assertTrue(audit.export(threading.Event()))
+                with gzip.open(audit.artifact, "rt") as stream:
+                    header = json.loads(next(stream))
+                self.assertEqual(header["summary"], frozen)
+                with mock.patch.object(pull, "request_json", return_value={}) as request:
+                    audit.report("uploading")
+                self.assertEqual(request.call_args.kwargs["body"]["summary"], frozen)
+                self.assertEqual(first.read_bytes(), b"first")
+                self.assertEqual(second.read_bytes(), b"second")
+            finally:
+                audit.close()
+
+    def test_cached_progress_still_revalidates_mount_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            audit = pull.SpaceAudit(cfg)
+            try:
+                audit.progress_summary()
+                with mock.patch.object(audit, "check_scope", side_effect=RuntimeError("changed mount")):
+                    with self.assertRaisesRegex(RuntimeError, "changed mount"):
+                        audit.progress_summary()
+            finally:
+                audit.close()
 
     def test_audit_epoch_starts_fresh_and_preserves_previous_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
