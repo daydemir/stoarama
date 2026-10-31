@@ -4405,6 +4405,7 @@ class SpaceAuditTests(unittest.TestCase):
             audit = pull.SpaceAudit(cfg)
             try:
                 self.assertEqual(audit.get("audit_id"), audit_id)
+                self.assertEqual(audit.db.execute("SELECT count(*) FROM entries").fetchone()[0], 100)
                 self.assertTrue(audit.scan(threading.Event(), lambda: None))
                 self.assertEqual(audit.db.execute("SELECT count(*) FROM entries").fetchone()[0], 125)
                 self.assertEqual(audit.summary()["root_directory_closure"]["direct_entries"], 125)
