@@ -8336,7 +8336,11 @@ class SpaceAudit:
                         if count % 100 == 0:
                             self.check_scope()
                             self.require_state_capacity()
-                            self.db.commit()
+                            # NAS checkpoint fsync is expensive. Bound metadata
+                            # transactions to 1,000 observations; directory,
+                            # progress and cancellation exits still commit.
+                            if count % 1000 == 0:
+                                self.db.commit()
                             # About 2,000 stats/s maximum, below normal network delivery work.
                             if stop_event.wait(0.05):
                                 return False
