@@ -4295,6 +4295,28 @@ class SpaceAuditTests(unittest.TestCase):
             finally:
                 audit.close()
 
+    def test_failed_repeated_directory_discards_partial_child_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cfg = SimpleNamespace(output_dir=base / "clips", state_dir=base / "state")
+            cfg.output_dir.mkdir()
+            cfg.state_dir.mkdir()
+            media = cfg.output_dir / "keep.mp4"
+            media.write_bytes(b"original")
+            audit = pull.SpaceAudit(cfg)
+            try:
+                audit.record("ghost.mp4", media.stat())
+                audit.db.commit()
+                with mock.patch.object(audit, "open_directory", side_effect=PermissionError(13, "denied")):
+                    self.assertTrue(audit.scan(threading.Event(), lambda: None))
+                rows = audit.db.execute("SELECT path,error FROM entries").fetchall()
+                self.assertEqual([(json.loads(p), e) for p, e in rows], [(".", "scandir errno=13")])
+                self.assertFalse(audit.summary()["scope_complete_without_errors"])
+                self.assertIsNone(audit.summary()["root_directory_closure"])
+                self.assertEqual(media.read_bytes(), b"original")
+            finally:
+                audit.close()
+
     def test_checkpoint_is_scoped_to_authenticated_origin(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

@@ -8341,6 +8341,7 @@ class SpaceAudit:
                 self.finish_directory(relative, before, fd, started_at)
                 self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
             except OSError as exc:
+                self.clear_partial_directory(relative)
                 self.record(relative or ".", error="scandir errno=%s" % exc.errno)
                 self.db.execute("UPDATE dirs SET done=1 WHERE path=?", (row[0],))
             finally:
