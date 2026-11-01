@@ -51,6 +51,8 @@ CREATE TABLE nas_cleanup_source_holds (
  clip_id bigint NOT NULL REFERENCES recording_clips(id),
  PRIMARY KEY(plan_id,clip_id)
 );
+CREATE INDEX nas_cleanup_source_holds_clip_idx ON nas_cleanup_source_holds(clip_id,plan_id);
+CREATE INDEX nas_cleanup_issued_recent_idx ON nas_cleanup_items(updated_at) WHERE delete_ever_issued;
 CREATE FUNCTION nas_cleanup_clip_held(clip bigint) RETURNS boolean LANGUAGE sql VOLATILE AS $$
  SELECT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
  WHERE h.clip_id=clip AND (p.mode<>'paused' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued)))
