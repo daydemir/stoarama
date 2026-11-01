@@ -437,3 +437,80 @@ func TestNASCleanupReferenceAdmissionSerializesWithArmingButNotPermanentRecovery
 		t.Fatal("allowing future stitching released permanent R2 recovery hold")
 	}
 }
+
+func TestNASCleanupAdmissionPersistsExactItemsAndRecoveryHolds(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket')`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	id, sha, err := persistNASCleanupPlan(ctx, tx, "admission-fixture", []nasCleanupItem{{Kind: "raw", SourceID: 1, SourceIDs: []int64{1}, StreamID: 3, RecordingID: 2, RelativePath: "a/b.mp4", Bucket: "bucket"}})
+	if err != nil {
+		t.Fatalf("actual production persistence failed: %v", err)
+	}
+	if id <= 0 || len(sha) != 64 {
+		t.Fatal("invalid immutable admission identity")
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var items, holds int
+	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1),(SELECT count(*) FROM nas_cleanup_source_holds WHERE plan_id=$1)`, id).Scan(&items, &holds); err != nil || items != 1 || holds != 1 {
+		t.Fatalf("incomplete admission: items%d holds%d err%v", items, holds, err)
+	}
+}
+
+func TestNASCleanupAdmissionHeartbeatConcurrentParentRow(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket')`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.BeginTx(ctx, nasCleanupAdmissionOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var exists bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM connections WHERE id=13)`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer heartbeat.Rollback(ctx)
+	if _, err = heartbeat.Exec(ctx, `SELECT id FROM connections WHERE id=13 FOR UPDATE;UPDATE connections SET kind=kind WHERE id=13`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, e := persistNASCleanupPlan(ctx, tx, "heartbeat-fixture", []nasCleanupItem{{Kind: "raw", SourceID: 1, SourceIDs: []int64{1}}})
+		done <- e
+	}()
+	waiting := false
+	for n := 0; n < 100; n++ {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)`, tx.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("admission did not reach actual heartbeat FORUPDATE fence")
+	}
+	if err = heartbeat.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatalf("actual heartbeat interrupted production admission: %v", err)
+	}
+}

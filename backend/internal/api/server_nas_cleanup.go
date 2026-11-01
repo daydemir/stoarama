@@ -18,10 +18,17 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // This first cleanup policy is pinned to the independently reviewed report.
 // A different selection requires a new reviewed report, never a wider prefix.
+// Admission queues immutable proposals, not destructive grants. It spans audit
+// I/O while connection heartbeats keep updating the FK parent. READ COMMITTED
+// avoids false40001 failures; source locks and grant-time identity/policy checks
+// still fence every destructive operation.
+var nasCleanupAdmissionOptions = pgx.TxOptions{IsoLevel: pgx.ReadCommitted}
+
 const nasCleanupReportSHA = "64eee0bc589c9be4dcab5b5ea7668270291a07ce4fd0db98dcd0a484e19d84c1"
 const nasCleanupReportKey = "staging/best14-20261021/nas-retention-20261025/current-folder-preparation-20261031/" + nasCleanupReportSHA + "/retention-only-folder-report-109.json.gz"
 
@@ -158,7 +165,7 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, err.Error())
 		return
 	}
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		util.WriteError(w, 500, "begin cleanup plan failed")
 		return
@@ -184,43 +191,25 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, err.Error())
 		return
 	}
-	manifest, _ := json.Marshal(items)
-	sha := cleanupSHA(manifest)
-	var id int64
-	err = tx.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,$1,$2,$3,$4) ON CONFLICT(label) DO NOTHING RETURNING id`, req.Label, nasCleanupReportSHA, string(manifest), sha).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var old string
-		err = tx.QueryRow(ctx, `SELECT id,plan_sha256 FROM nas_cleanup_plans WHERE label=$1`, req.Label).Scan(&id, &old)
-		if err == nil && old != sha {
-			err = errors.New("label already has a different plan")
-		}
-	} else if err == nil {
-		_, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_items(plan_id,ordinal) SELECT $1,generate_series(1,$2::integer)`, id, len(items))
-	}
-	if err == nil {
-		for _, item := range items {
-			// Ordered source locks serialize admission against old purge binaries.
-			rows, e := tx.Query(ctx, `SELECT id FROM recording_clips WHERE id=ANY($1) ORDER BY id FOR UPDATE`, item.SourceIDs)
-			if e != nil {
-				err = e
-				break
-			}
-			for rows.Next() {
-			}
-			e = rows.Err()
-			rows.Close()
-			if e != nil {
-				err = e
-				break
-			}
-			_, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) SELECT $1,unnest($2::bigint[]) ON CONFLICT DO NOTHING`, id, item.SourceIDs)
-			if err != nil {
-				break
-			}
-		}
-	}
+	id, sha, err := persistNASCleanupPlan(ctx, tx, req.Label, items)
 	if err != nil {
-		util.WriteError(w, 409, "cleanup plan collision or insert failure")
+		detail := map[string]any{"error": "cleanup plan admission failed"}
+		var failure *cleanupPersistFailure
+		if errors.As(err, &failure) {
+			detail["stage"] = failure.stage
+		}
+		var databaseError *pgconn.PgError
+		status := 409
+		if errors.As(err, &databaseError) {
+			detail["database_code"] = databaseError.Code
+			detail["constraint"] = databaseError.ConstraintName
+			if databaseError.Code == "40001" || databaseError.Code == "40P01" || databaseError.Code == "55P03" {
+				status = 503
+				detail["retryable"] = true
+				w.Header().Set("Retry-After", "3")
+			}
+		}
+		util.WriteJSON(w, status, detail)
 		return
 	}
 	if tx.Commit(ctx) != nil {
@@ -683,3 +672,58 @@ func cleanupSameFileProof(a, b []byte) bool {
 	bb, _ := json.Marshal(y)
 	return nasSpaceAuditJSONEqual(aa, bb)
 }
+
+func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items []nasCleanupItem) (int64, string, error) {
+	stage := "plan_insert"
+	manifest, _ := json.Marshal(items)
+	sha := cleanupSHA(manifest)
+	var id int64
+	err := tx.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,$1,$2,$3,$4) ON CONFLICT(label) DO NOTHING RETURNING id`, label, nasCleanupReportSHA, string(manifest), sha).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var old string
+		stage = "plan_collision"
+		err = tx.QueryRow(ctx, `SELECT id,plan_sha256 FROM nas_cleanup_plans WHERE label=$1`, label).Scan(&id, &old)
+		if err == nil && old != sha {
+			err = errors.New("label already has a different plan")
+		}
+	} else if err == nil {
+		stage = "item_insert"
+		_, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_items(plan_id,ordinal) SELECT $1,generate_series(1,$2::integer)`, id, len(items))
+	}
+	if err == nil {
+		for _, item := range items {
+			// Ordered source locks serialize admission against old purge binaries.
+			stage = "source_lock"
+			rows, e := tx.Query(ctx, `SELECT id FROM recording_clips WHERE id=ANY($1) ORDER BY id FOR UPDATE`, item.SourceIDs)
+			if e != nil {
+				err = e
+				break
+			}
+			for rows.Next() {
+			}
+			e = rows.Err()
+			rows.Close()
+			if e != nil {
+				err = e
+				break
+			}
+			stage = "source_hold"
+			_, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_source_holds(plan_id,clip_id) SELECT $1,unnest($2::bigint[]) ON CONFLICT DO NOTHING`, id, item.SourceIDs)
+			if err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		return id, sha, &cleanupPersistFailure{stage: stage, err: err}
+	}
+	return id, sha, nil
+}
+
+type cleanupPersistFailure struct {
+	stage string
+	err   error
+}
+
+func (e *cleanupPersistFailure) Error() string { return e.stage + ": " + e.err.Error() }
+func (e *cleanupPersistFailure) Unwrap() error { return e.err }
