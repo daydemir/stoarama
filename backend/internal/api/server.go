@@ -41,6 +41,10 @@ import (
 )
 
 type Server struct {
+	nasCleanupMu                   sync.Mutex
+	nasCleanupReportCache          *nasCleanupReport
+	nasCleanupPolicyCache          *nasCleanupPolicy
+	nasCleanupPublicETag           string
 	globalDeliveryStore            globalDeliveryObjectStore
 	globalDeliveryMu               sync.Mutex
 	globalDeliveryRegistry         *globalDeliveryRegistry
@@ -352,6 +356,9 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/upload-probe/{probeId}/result", s.handleAccountConnectionUploadProbeResult)
 			account.Post("/connections/nas-restore/lease", s.handleAccountConnectionRestoreLease)
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
+			account.Post("/connections/cleanup/lease", s.handleAccountNASCleanupLease)
+			account.Post("/connections/cleanup/{itemId}/observe", s.handleAccountNASCleanupObserve)
+			account.Post("/connections/cleanup/{itemId}/result", s.handleAccountNASCleanupResult)
 			account.Post("/connections/selected-verify/lease", s.handleAccountConnectionSelectedVerifyLease)
 			account.Post("/connections/selected-verify/{itemId}/result", s.handleAccountConnectionSelectedVerifyResult)
 			account.Post("/connections/benchmark/claim", s.handleAccountConnectionBenchmarkClaim)
@@ -647,6 +654,9 @@ func (s *Server) router() http.Handler {
 
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
+			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
+			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
+			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)
 			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)

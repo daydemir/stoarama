@@ -111,6 +111,31 @@ func (s *Server) loadGlobalDeliveryRegistry(ctx context.Context) (*globalDeliver
 	return s.loadGlobalDeliveryRegistryScope(ctx, false, "")
 }
 func (s *Server) loadGlobalDeliveryRegistryScope(ctx context.Context, public bool, generation string) (*globalDeliveryRegistry, error) {
+	// While cleanup permits can be outstanding, serve the immutable reviewed
+	// public generation. A direct registry publication cannot introduce a new
+	// protected source midway through a separately approved deletion batch.
+	if public && s.pool != nil {
+		fence, err := s.pool.Begin(ctx)
+		if err != nil {
+			return nil, errors.New("public cleanup fence unavailable")
+		}
+		defer fence.Rollback(ctx)
+		if _, err = fence.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(7343226011101)`); err != nil {
+			return nil, errors.New("public cleanup fence unavailable")
+		}
+		var fenced bool
+		err = fence.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.mode='enabled' AND p.approved_until>now()) OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes')`).Scan(&fenced)
+		if err != nil {
+			return nil, errors.New("public cleanup fence unavailable")
+		}
+		if fenced {
+			const reviewed = "c4049f6dc0f940be8b7eb8b9bef6f42f"
+			if generation != "" && generation != reviewed {
+				return nil, errors.New("public publication deferred during NAS cleanup")
+			}
+			generation = reviewed
+		}
+	}
 	s.globalDeliveryMu.Lock()
 	defer s.globalDeliveryMu.Unlock()
 	if public && generation != "" && s.publicGlobalDeliveryRegistry != nil && s.publicGlobalDeliveryRegistry.Generation == generation {

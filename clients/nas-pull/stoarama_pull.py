@@ -1504,6 +1504,319 @@ def require_joined_storage_capacity(cfg, runtime, expected_bytes):
         raise JoinedDownloadYield("joined storage yielded to raw reserve")
 
 
+# Exact-file NAS cleanup. A backend dry-run decision never reaches unlink.
+class CleanupInterrupted(RuntimeError):
+    """Cancellation is not evidence of a file conflict."""
+
+
+class NASMediaFence:
+    """Allow concurrent delivery, then fence app writers for a deletion only."""
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.writers = 0
+        self.exclusive = False
+
+    def delivery(self, fn):
+        def wrapped(*args, **kwargs):
+            with self.condition:
+                while self.exclusive:
+                    self.condition.wait(1)
+                self.writers += 1
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                with self.condition:
+                    self.writers -= 1
+                    self.condition.notify_all()
+        return wrapped
+
+    def acquire_cleanup(self, stop_event, deadline):
+        with self.condition:
+            while self.exclusive or self.writers:
+                if stop_event.is_set() or time.monotonic() >= deadline:
+                    raise CleanupInterrupted("cleanup writer fence timed out or cancelled")
+                self.condition.wait(0.2)
+            self.exclusive = True
+
+    def release_cleanup(self):
+        with self.condition:
+            self.exclusive = False
+            self.condition.notify_all()
+
+
+NAS_MEDIA_FENCE = NASMediaFence()
+
+
+def cleanup_identity(info):
+    return [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev]
+
+
+def cleanup_json_bytes(payload):
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def cleanup_journal(inventory, item_id=None, phase=None, body=None):
+    with inventory.lock:
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_receipts(item_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
+        if item_id is not None:
+            if phase is None:
+                inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
+            else:
+                inventory.db.execute("INSERT OR REPLACE INTO cleanup_receipts VALUES(?,?,?)",
+                                     (item_id, phase, cleanup_json_bytes(body).decode()))
+        inventory.db.commit()
+        return inventory.db.execute("SELECT item_id,phase,body FROM cleanup_receipts ORDER BY item_id").fetchall()
+
+
+class CleanupFile:
+    """Directory-FD traversal; no symlinks, hardlinks or nested filesystems."""
+    def __init__(self, cfg, item, stop_event, deadline):
+        self.cfg, self.item, self.stop_event, self.deadline = cfg, item, stop_event, deadline
+        self.fds = []
+        self.files = []
+        self.ancestors = []
+        self.root_identity = None
+
+    def check_active(self):
+        if self.stop_event.is_set() or time.monotonic() >= self.deadline:
+            raise CleanupInterrupted("cleanup stopped or lease expired")
+
+    def __enter__(self):
+        try:
+            self.check_active()
+            raw = self.item["relative_path"]
+            if (not isinstance(raw, str) or not raw or len(raw.encode()) > 1024 or raw.startswith(("/", "#", "@"))
+                    or any(p in ("", ".", "..") for p in raw.split("/")) or any(c in raw for c in ("\\", "\0", "\r", "\n"))):
+                raise RuntimeError("unsafe cleanup path")
+            if not os.path.ismount(str(self.cfg.output_dir)):
+                raise RuntimeError("cleanup NAS root is not mounted")
+            root = os.open(str(self.cfg.output_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            self.fds.append(root)
+            info = os.fstat(root)
+            self.root_identity = [info.st_dev, info.st_ino]
+            for part in raw.split("/")[:-1]:
+                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fds[-1])
+                self.fds.append(fd)
+                info = os.fstat(fd)
+                if info.st_dev != self.root_identity[0]:
+                    raise RuntimeError("cleanup nested filesystem excluded")
+                self.ancestors.append([info.st_dev, info.st_ino])
+            self.name = raw.split("/")[-1]
+            self.open_file(self.name, self.item["frozen_identity"])
+            if self.item["sidecar_required"]:
+                self.open_file(self.name + ".stoarama.json", self.item["frozen_sidecar_identity"])
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def open_file(self, name, frozen):
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fds[-1])
+        self.files.append((name, fd, frozen))
+        info = os.fstat(fd)
+        if (not stat_module.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != self.root_identity[0]
+                or cleanup_identity(info) != frozen):
+            raise RuntimeError("cleanup file differs from exact audited identity")
+
+    def parent_members(self):
+        before = os.fstat(self.fds[-1])
+        entries = []
+        for name in os.listdir(self.fds[-1]):
+            self.check_active()
+            info = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
+            entries.append([name, info.st_mode, info.st_nlink, *cleanup_identity(info)])
+        after = os.fstat(self.fds[-1])
+        if cleanup_identity(before) != cleanup_identity(after):
+            raise RuntimeError("cleanup directory changed during enumeration")
+        return hashlib.sha256(cleanup_json_bytes(sorted(entries))).hexdigest()
+
+    def check_paths(self, skip_media=False):
+        self.check_active()
+        root = os.lstat(self.cfg.output_dir)
+        if not os.path.ismount(str(self.cfg.output_dir)) or [root.st_dev, root.st_ino] != self.root_identity:
+            raise RuntimeError("cleanup NAS mount changed")
+        parts = self.item["relative_path"].split("/")[:-1]
+        for n, part in enumerate(parts):
+            info = os.stat(part, dir_fd=self.fds[n], follow_symlinks=False)
+            opened = os.fstat(self.fds[n+1])
+            if not stat_module.S_ISDIR(info.st_mode) or [info.st_dev, info.st_ino] != self.ancestors[n] or [opened.st_dev, opened.st_ino] != self.ancestors[n]:
+                raise RuntimeError("cleanup ancestor changed")
+        for name, fd, frozen in (self.files[1:] if skip_media else self.files):
+            current = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
+            opened = os.fstat(fd)
+            if (not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1 or opened.st_nlink != 1
+                    or cleanup_identity(current) != frozen or cleanup_identity(opened) != frozen):
+                raise RuntimeError("cleanup file identity changed")
+
+    def proof(self):
+        before_members = self.parent_members()
+        hashes = []
+        sidecar_bytes = b""
+        for n, (_, fd, _) in enumerate(self.files):
+            os.lseek(fd, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            while True:
+                self.check_active()
+                block = os.read(fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                if n:
+                    sidecar_bytes += block
+                    if len(sidecar_bytes) > 1024 * 1024:
+                        raise RuntimeError("cleanup sidecar exceeds bound")
+            hashes.append(digest.hexdigest())
+        self.check_paths()
+        if hashes[0] != self.item["sha256"] or self.parent_members() != before_members:
+            raise RuntimeError("cleanup content or directory changed")
+        proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.item["frozen_identity"],
+                 "sha256": hashes[0], "parent_members_sha256": before_members}
+        if self.item["sidecar_required"]:
+            sidecar = json.loads(sidecar_bytes)
+            binding = {"clip_id": self.item["source_id"], "recording_id": self.item["recording_id"],
+                       "relative_path": self.item["relative_path"], "size_bytes": self.item["size_bytes"], "sha256": self.item["sha256"]}
+            if type(sidecar.get("schema_version")) is not int or sidecar["schema_version"] not in (1, 2) or any(type(sidecar.get(k)) is not type(v) or sidecar[k] != v for k, v in binding.items()):
+                raise RuntimeError("cleanup sidecar does not bind exact source identity")
+            for field in ("clip_start_at", "clip_end_at"):
+                actual = parse_certification_timestamp(sidecar.get(field), field)
+                expected = parse_certification_timestamp(self.item["start_at" if field == "clip_start_at" else "end_at"], field)
+                if actual != expected:
+                    raise RuntimeError("cleanup sidecar registered interval differs from catalog")
+                binding[field] = expected.isoformat()
+            proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
+        return proof
+
+    def delete_exact(self, proof):
+        # Only reached after a short-lived, exact backend permit and app writer
+        # fence. Directories and every unlisted entry are left intact.
+        self.check_paths()
+        if self.parent_members() != proof["parent_members_sha256"]:
+            raise RuntimeError("cleanup folder membership changed before unlink")
+        self.check_paths()
+        self.check_active()
+        os.unlink(self.name, dir_fd=self.fds[-1])
+        if self.item["sidecar_required"]:
+            self.check_paths(skip_media=True)
+            self.check_active()
+            os.unlink(self.files[1][0], dir_fd=self.fds[-1])
+        os.fsync(self.fds[-1])
+
+    def __exit__(self, *_args):
+        for _, fd, _ in reversed(self.files):
+            os.close(fd)
+        for fd in reversed(self.fds):
+            os.close(fd)
+        self.files, self.fds = [], []
+
+
+def cleanup_replay_receipts(cfg, inventory):
+    def replay(item_id, phase, body):
+        try:
+            return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                raise
+            # Preserve rejected evidence, then unblock unrelated leases. A stale
+            # observation/result must never be interpreted as a fresh permit.
+            with inventory.lock:
+                inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
+                inventory.db.execute("INSERT INTO cleanup_rejected_receipts VALUES(?,?,?,?)", (item_id, phase, cleanup_json_bytes(body).decode(), utc_now_precise()))
+                inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
+                inventory.db.commit()
+            log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
+            return None
+
+    for item_id, phase, encoded in cleanup_journal(inventory):
+        body = json.loads(encoded)
+        if phase == "intent":
+            body.update(outcome="unverified", error="client interrupted after permit; operator reconciliation required")
+            phase = "result"
+            cleanup_journal(inventory, item_id, phase, body)
+        response = replay(item_id, "observe" if phase == "observe" else "result", body)
+        if response is None:
+            continue
+        if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
+            body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
+                    "outcome": "unverified", "error": "recovered observation permit was not executed"}
+            cleanup_journal(inventory, item_id, "result", body)
+            replay(item_id, "result", body)
+        cleanup_journal(inventory, item_id)
+
+
+def cleanup_once(cfg, inventory, stop_event):
+    cleanup_replay_receipts(cfg, inventory)
+    lease = restore_api(cfg, "/account/connections/cleanup/lease", {"client_version": CLIENT_VERSION, "protocol": 1})
+    tasks = lease.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) > 1:
+        raise RuntimeError("invalid cleanup lease")
+    for task in tasks:
+        item_id, attempt = task["item_id"], task["attempt"]
+        if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
+            raise RuntimeError("invalid cleanup task identity")
+        deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
+        body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION}
+        fenced = False
+        try:
+            # A previously approved proof marks the execution phase. Dry runs
+            # never acquire the write fence and do not impede clip delivery.
+            if task.get("approved_proof") is not None:
+                NAS_MEDIA_FENCE.acquire_cleanup(stop_event, deadline)
+                fenced = True
+            with CleanupFile(cfg, task["item"], stop_event, deadline) as current:
+                proof = current.proof()
+                if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
+                    raise RuntimeError("cleanup dry-run proof changed; KEEP")
+                body.update(outcome="match", proof=proof)
+                cleanup_journal(inventory, item_id, "observe", body)
+                permit_request_started = time.monotonic()
+                decision = restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+                if decision.get("delete") is True:
+                    receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
+                    cleanup_journal(inventory, item_id, "intent", receipt)
+                    try:
+                        if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
+                                or decision.get("attempt") != attempt or decision.get("plan_sha256") != task["plan_sha256"]
+                                or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()
+                                or parse_certification_timestamp(decision.get("expires_at"), "cleanup permit") <= datetime.datetime.now(datetime.timezone.utc)):
+                            raise RuntimeError("cleanup deletion permit does not match exact current proof")
+                        permit_expiry = parse_certification_timestamp(decision["expires_at"], "cleanup permit")
+                        wall_remaining = (permit_expiry - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                        current.deadline = min(current.deadline, permit_request_started + 30, time.monotonic() + max(0, wall_remaining))
+                        current.delete_exact(proof)
+                        receipt["outcome"] = "deleted"
+                    except Exception as exc:
+                        receipt["error"] = str(exc)[:500]
+                    cleanup_journal(inventory, item_id, "result", receipt)
+                    restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, receipt)
+                cleanup_journal(inventory, item_id)
+        except Exception as exc:
+            # Never overwrite a durable intent/result with a speculative retry.
+            if any(row[0] == item_id for row in cleanup_journal(inventory)):
+                raise
+            if isinstance(exc, CleanupInterrupted):
+                raise
+            body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
+            cleanup_journal(inventory, item_id, "observe", body)
+            restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+            cleanup_journal(inventory, item_id)
+        finally:
+            if fenced:
+                NAS_MEDIA_FENCE.release_cleanup()
+    return lease.get("retry_after_sec", 120)
+
+
+def cleanup_loop(cfg, inventory, stop_event):
+    wait = 15
+    while not stop_event.wait(wait):
+        try:
+            retry = cleanup_once(cfg, inventory, stop_event)
+            wait = 0 if retry == 0 else restore_wait(retry)
+        except Exception as exc:
+            log("WARN", "NAS cleanup deferred: %s" % exc)
+            wait = RESTORE_ERROR_WAIT_SEC
+
+
+
 def prepare_clip_with_capacity(cfg, runtime, clip):
     expected_bytes = clip.get("size_bytes")
     if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes <= 0:
@@ -5372,6 +5685,7 @@ def joined_identity_step(reason_code, operation, *args):
         raise
 
 
+@NAS_MEDIA_FENCE.delivery
 def download_joined_item(cfg, runtime, item, stop_event):
     joined_raw_priority_boundary(cfg, runtime, stop_event)
     # Expose failures while opening or hashing prerequisite manifests. Offset
@@ -5837,6 +6151,7 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             raise RuntimeError("collated body length mismatch")
 
 
+@NAS_MEDIA_FENCE.delivery
 def download_collated_item(cfg, item, limiter, stop_event):
     """Place one output at its contract path. Returns True when bytes were fetched."""
     relative = item["nas_relative_path"]
@@ -6052,6 +6367,7 @@ def write_stitch_sidecar(clip_path, clip):
     atomic_write(stitch_sidecar_path(clip_path), (payload + "\n").encode("utf-8"))
 
 
+@NAS_MEDIA_FENCE.delivery
 def process_clip(cfg, clip, release=True):
     clip_id = int(clip["clip_id"])
     recording_id = int(clip["recording_id"])
@@ -7937,13 +8253,14 @@ def exec_candidate(cfg, runtime):
         raise SelfUpdateExecError("failed to activate staged NAS client") from exc
 
 
-def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_worker=None):
+def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_worker=None, cleanup_worker=None):
     """Process replacement is safe only between delivery pages and scans."""
     return (
         update_ready.is_set()
         and (stop_event is None or not stop_event.is_set())
         and not inventory_worker.is_alive()
         and (joined_worker is None or not joined_worker.is_alive())
+        and (cleanup_worker is None or not cleanup_worker.is_alive())
         and not BENCHMARK_ACTIVE.is_set()
     )
 
@@ -8750,6 +9067,10 @@ def run(cfg):
         # Verify-only selected manifests are independent from the cursor feed and
         # never write media bytes.
         threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
+    cleanup_worker = None
+    if not cfg.dry_run:
+        cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event), daemon=True)
+        cleanup_worker.start()
     updater = threading.Thread(
         target=update_loop,
         args=(cfg, runtime, stop_event, inventory_stop_event, update_ready, joined_stop_event),
@@ -8780,7 +9101,7 @@ def run(cfg):
             # No delivery page is active at this boundary. A staged candidate
             # may replace the process even when storage/list work is failing,
             # provided the inventory thread has reached its stop checkpoint.
-            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker):
+            if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker):
                 runtime.set_phase(Phase.UPDATING)
                 exec_candidate(cfg, runtime)
             if not heartbeat.is_alive():
@@ -8818,7 +9139,7 @@ def run(cfg):
                     # not resurrect the previous client indefinitely.
                     mark_runtime(cfg, runtime, "healthy")
                     runtime.stable_marked = True
-                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker):
+                if update_can_exec(update_ready, inventory_worker, stop_event, joined_worker, cleanup_worker):
                     runtime.set_phase(Phase.UPDATING)
                     exec_candidate(cfg, runtime)
                 set_idle_unless_capacity_blocked(runtime)
@@ -8851,7 +9172,10 @@ def run(cfg):
             # The watchdog kills benchmark children within a second of stop;
             # wait for its temp-output cleanup before the process exits.
             benchmark_worker.join(timeout=15)
-        joined_stuck = joined_worker.is_alive()
+        if cleanup_worker is not None:
+            cleanup_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
+        cleanup_stuck = cleanup_worker is not None and cleanup_worker.is_alive()
+        joined_stuck = joined_worker.is_alive() or cleanup_stuck
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
             mark_runtime(cfg, runtime, PreviousExit.UNCLEAN_PROCESS.value)

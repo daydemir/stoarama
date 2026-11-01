@@ -916,3 +916,14 @@ func TestValidateNASUploadProbeBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestNASCleanupDeletionDefaultsOff(t *testing.T) {
+	t.Setenv("NAS_CLEANUP_DELETION_ENABLED", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NASCleanupDeletionEnabled {
+		t.Fatal("NAS cleanup deletion must ship disabled")
+	}
+}
