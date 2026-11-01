@@ -378,3 +378,62 @@ func TestNASCleanupCollatedHoldAllowsNonIdentityBookkeeping(t *testing.T) {
 		t.Fatal("held output identity changed")
 	}
 }
+
+func TestNASCleanupReferenceAdmissionSerializesWithArmingButNotPermanentRecovery(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery) VALUES(1,1,1,'would_delete','{}','r2_sha_verified');`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reference.Rollback(ctx)
+	if _, err = reference.Exec(ctx, `INSERT INTO recording_joined_source_snapshots VALUES(1)`); err != nil {
+		t.Fatalf("dry run blocked new stitching: %v", err)
+	}
+	s := &Server{pool: pool}
+	s.cfg.NASCleanupDeletionEnabled = true
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "reason": "disposable concurrency fixture"})
+	}()
+	waiting := false
+	for n := 0; n < 100; n++ {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("arming did not wait for in-flight source-reference transaction")
+	}
+	if err = reference.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := <-done; w.Code != 200 {
+		t.Fatalf("arming failed after source transaction committed: %s", w.Body.String())
+	}
+	var referenced bool
+	if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=ANY($1))`, []int64{1}).Scan(&referenced); err != nil || !referenced {
+		t.Fatal("grant-side current-source check cannot see admitted reference")
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_joined_source_snapshots VALUES(1)`); err == nil {
+		t.Fatal("new stitching crossed active execution fence")
+	}
+	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL WHERE id=1;UPDATE nas_cleanup_items SET state='unverified',delete_ever_issued=true,updated_at=now()-interval '3 minutes' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_joined_source_snapshots VALUES(1)`); err != nil {
+		t.Fatalf("completed recovery hold permanently blocked future stitching: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET purged_at=now() WHERE id=1`); err == nil {
+		t.Fatal("allowing future stitching released permanent R2 recovery hold")
+	}
+}

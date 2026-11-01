@@ -154,7 +154,7 @@ func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 	if i.Kind == "raw" {
 		err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_collation_hours h JOIN recordings r ON r.id=h.recording_id CROSS JOIN LATERAL jsonb_array_elements(h.manifest->'clips') p(item) WHERE r.account_id=47 AND r.stream_id=$1 AND (p.item->'clip'->>'clip_id')::bigint=$2) OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$2)`, i.StreamID, i.SourceID).Scan(&protected)
 	} else {
-		err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_collation_hours h JOIN recordings r ON r.id=h.recording_id CROSS JOIN LATERAL jsonb_array_elements(h.manifest->'clips') p(item) WHERE r.account_id=47 AND r.stream_id=$1 AND p.item->>'disposition'='quarantined' AND (p.item->'clip'->>'clip_id')::bigint=ANY($2))`, i.StreamID, i.SourceIDs).Scan(&protected)
+		err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_collation_hours h JOIN recordings r ON r.id=h.recording_id CROSS JOIN LATERAL jsonb_array_elements(h.manifest->'clips') p(item) WHERE r.account_id=47 AND r.stream_id=$1 AND p.item->>'disposition'='quarantined' AND (p.item->'clip'->>'clip_id')::bigint=ANY($2)) OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=ANY($2))`, i.StreamID, i.SourceIDs).Scan(&protected)
 	}
 	if err != nil || protected {
 		return errors.New("current source/error protection; KEEP")

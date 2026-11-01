@@ -82,16 +82,24 @@ CREATE TRIGGER nas_cleanup_output_hold BEFORE UPDATE OR DELETE ON recording_coll
 
 -- Admission of a new source reference takes the same clip-row fence as cleanup
 -- admission. References cannot appear between the final policy check and unlink.
+-- Recovery retention remains permanent; read-use fencing lasts only through
+-- an active approval or its short outstanding-permit grace period.
+CREATE FUNCTION nas_cleanup_reference_fenced(clip bigint) RETURNS boolean LANGUAGE sql VOLATILE AS $$
+ SELECT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
+ WHERE h.clip_id=clip AND ((p.mode='enabled' AND p.approved_until>now())
+ OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued AND i.updated_at>now()-interval '2 minutes')))
+$$;
 CREATE FUNCTION guard_nas_cleanup_new_reference() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE source bigint;
 BEGIN
+ PERFORM pg_advisory_xact_lock_shared(7343226011101);
  IF TG_TABLE_NAME='recording_joined_source_snapshots' THEN
    PERFORM id FROM recording_clips WHERE id=NEW.clip_id FOR KEY SHARE;
-   IF nas_cleanup_clip_held(NEW.clip_id) THEN RAISE EXCEPTION 'retention protected: NAS cleanup source-reference fence'; END IF;
+   IF nas_cleanup_reference_fenced(NEW.clip_id) THEN RAISE EXCEPTION 'retention protected: NAS cleanup source-reference fence'; END IF;
  ELSE
    FOR source IN SELECT DISTINCT (p->'clip'->>'clip_id')::bigint FROM jsonb_array_elements(NEW.manifest->'clips') p ORDER BY 1 LOOP
      PERFORM id FROM recording_clips WHERE id=source FOR KEY SHARE;
-     IF nas_cleanup_clip_held(source) THEN RAISE EXCEPTION 'retention protected: NAS cleanup collation-reference fence'; END IF;
+     IF nas_cleanup_reference_fenced(source) THEN RAISE EXCEPTION 'retention protected: NAS cleanup collation-reference fence'; END IF;
    END LOOP;
  END IF;
  RETURN NEW;

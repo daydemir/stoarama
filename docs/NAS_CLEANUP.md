@@ -52,6 +52,9 @@ retried blindly. A monotonic ever-issued flag preserves recovery holds even afte
 uncertain outcomes and pauses. DB triggers fence old purge binaries, source/date/
 namespace changes and new joined/collation references. Successful NAS removal
 retains its R2 recovery copy; this workflow does not authorize R2 deletion.
+Source-reference fences end with approval and permit grace, so retained R2
+sources can be used for future stitching. Dry runs do not prohibit new source
+references; those references are rechecked before any deletion grant.
 
 While approval/permits can be outstanding, public delivery serves the immutable
 reviewed generation. A shared DB fence serializes public reads with enablement;
