@@ -342,3 +342,24 @@ func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 		t.Fatal("in-flight grace fence disappeared on pause")
 	}
 }
+
+func TestNASCleanupOperatorRoutesRequireServiceCredential(t *testing.T) {
+	s := &Server{}
+	s.cfg.ServiceToken = "fixture-service"
+	for _, token := range []string{"", "wrong", "fixture-service"} {
+		r := httptest.NewRequest("POST", "/api/v1/service/nas-cleanup/plans", strings.NewReader(`{"label":"","items":[]}`))
+		r.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		s.router().ServeHTTP(w, r)
+		want := http.StatusUnauthorized
+		if token == "fixture-service" {
+			want = http.StatusBadRequest
+		}
+		if w.Code != want {
+			t.Fatalf("service cleanup route token class=%t: got%d want%d", token == "fixture-service", w.Code, want)
+		}
+	}
+	if pullPathAllowed("POST", "/api/v1/service/nas-cleanup/plans") || pullPathAllowed("POST", "/api/v1/service/nas-cleanup/plans/1/control") {
+		t.Fatal("pull key can control cleanup")
+	}
+}

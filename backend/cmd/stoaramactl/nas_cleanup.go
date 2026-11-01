@@ -25,7 +25,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	reason := fs.String("reason", "", "audited approval/pause reason")
 	nasOnly := fs.Bool("allow-nas-only", false, "explicitly permit proven NAS-only content; default retain")
 	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend URL")
-	token := fs.String("api-token", cfg.APIToken, "admin API token")
+	token := fs.String("api-token", cfg.APIToken, "service operator API token")
 	_ = fs.Parse(args[1:])
 	if fs.NArg() != 0 {
 		log.Fatal("unexpected cleanup arguments")
@@ -43,12 +43,12 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		if json.Unmarshal(b, &body) != nil {
 			log.Fatal("invalid cleanup input JSON")
 		}
-		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, "/api/v1/admin/nas-cleanup/plans", body))
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, "/api/v1/service/nas-cleanup/plans", body))
 	case "report":
 		if *id <= 0 {
 			log.Fatal("--plan-id required")
 		}
-		printJSON(mustAPIGet(ctx, *base, *token, fmt.Sprintf("/api/v1/admin/nas-cleanup/plans/%d", *id)))
+		printJSON(mustAPIGet(ctx, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d", *id)))
 	case "pause", "enable":
 		if *id <= 0 || len(*sha) != 64 || *reason == "" {
 			log.Fatal("--plan-id,--expected-plan-sha256,--reason required")
@@ -57,7 +57,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		if args[0] == "enable" {
 			mode = "enabled"
 		}
-		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/admin/nas-cleanup/plans/%d/control", *id), map[string]any{"plan_sha256": *sha, "mode": mode, "reason": *reason, "allow_nas_only": *nasOnly}))
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/control", *id), map[string]any{"plan_sha256": *sha, "mode": mode, "reason": *reason, "allow_nas_only": *nasOnly}))
 	default:
 		log.Fatal("usage: nas-cleanup prepare|report|pause|enable")
 	}

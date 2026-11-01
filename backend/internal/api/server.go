@@ -443,9 +443,6 @@ func (s *Server) router() http.Handler {
 		})
 		api.Route("/admin", func(admin chi.Router) {
 			admin.Use(s.requireAdminAuth)
-			admin.Post("/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
-			admin.Get("/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
-			admin.Post("/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)
 			admin.Get("/accounts", s.handleAdminAccountsList)
 			admin.Post("/accounts/{id}/disable", s.handleAdminAccountDisable)
 			admin.Post("/accounts/{id}/enable", s.handleAdminAccountEnable)
@@ -657,6 +654,9 @@ func (s *Server) router() http.Handler {
 
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
+			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
+			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
+			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)
 			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)

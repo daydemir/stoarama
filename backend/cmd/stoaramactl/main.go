@@ -2300,6 +2300,7 @@ func mustAPIRequest(ctx context.Context, method string, baseURL string, apiToken
 		log.Fatalf("build api request: %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "Stoarama-Operator/1.0")
 	req.Header.Set("Accept", "application/json")
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")

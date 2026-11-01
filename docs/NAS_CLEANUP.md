@@ -1,5 +1,8 @@
 # NAS cleanup: preparation and explicit enablement
 
+Operator commands use the existing service credential, matching the other
+service control APIs. Account and NAS pull keys cannot create or enable plans.
+
 The NAS app polls the backend over its existing authenticated outbound channel.
 No SSH or new service is required. Preparing a plan never enables deletion.
 
