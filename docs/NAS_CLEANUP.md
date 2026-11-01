@@ -6,10 +6,10 @@ service control APIs. Account and NAS pull keys cannot create or enable plans.
 The NAS app polls the backend over its existing authenticated outbound channel.
 No SSH or new service is required. Preparing a plan never enables deletion.
 
-`stoaramactl nas-cleanup prepare --input plan.json` accepts a label and up to500
+`stoaramactl nas-cleanup prepare --input plan.json` accepts a label and up to 500
 explicit `{kind,source_id}` pairs. Supported media kinds are raw and collated;
 unknown/legacy joined artifacts remain retained. The backend derives identities
-from account47/connection13 catalog rows, requires their exact observed paths and
+from account 47/connection 13 catalog rows, requires their exact observed paths and
 fingerprints in the complete audit, and checks the independently reviewed folder
 policy. Import labels and manifests are immutable and idempotent.
 
@@ -20,27 +20,27 @@ measured root/ancestors/file/sidecar identities and current parent membership.
 Every outcome is durably journaled in the existing app-owned inventory database.
 App replacement waits for the cleanup worker to checkpoint and stop.
 
-The backend revalidates source identities, all185 older UTCwindows (221 dedup
-windows with newer buffers),31 whole-stream protections, allthree current
+The backend revalidates source identities, all 185 older UTC windows (221 deduplicated
+windows with newer buffers),31 whole-stream protections, all three current
 registered/availability/quarantine rankings, current source/error references and
 public delivery. Unknowns, changed metadata, shifted sensitivity windows and
 unsupported content stay retained. Historical inventory MATCH or download ACKs
 are never promoted into cleanup proof.
 
 Report a plan with `stoaramactl nas-cleanup report --plan-id ID`. Results separately
-show full R2 SHA verification, proven404 absence, unchecked/failed recovery,
+show full R2 SHA verification, proven 404 absence, unchecked/failed recovery,
 physical conflicts and policy holds. HEAD equality alone is not recovery proof.
 
 Two independent gates remain OFF during preparation:
 
 1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
 2. A plan defaults `dry_run`. Explicit `nas-cleanup enable` requires its exact
-   `--expected-plan-sha256`, `--reason`, a complete matching dry run less than24hours
+   `--expected-plan-sha256`, `--reason`, a complete matching dry run less than 24 hours
    old, and full R2 recovery. `--allow-nas-only` additionally permits only proven
-   R2absence; it never permits unchecked recovery. Approval expires after1hour.
+   R2absence; it never permits unchecked recovery. Approval expires after 1 hour.
 
 Enablement is a separate user decision. Do not change either gate while doing
-preparation or dry runs. A later exact-file permit expires after30seconds. The app
+preparation or dry runs. A later exact-file permit expires after 30 seconds. The app
 fences its delivery writers and re-hashes/rechecks each approved file before its
 final exact-name unlink. Directories and unlisted siblings are never removed.
 Changing sibling membership after one file finishes does not change another
@@ -60,10 +60,10 @@ Existing reviewed public downloads remain available. A changed registry prevents
 further cleanup permits until reviewed.
 
 `nas-cleanup pause --plan-id ID --expected-plan-sha256 SHA --reason TEXT` stops
-future grants. An already issued30second permit may finish. Recovery holds for any
+future grants. An already issued 30-second permit may finish. Recovery holds for any
 ever-issued operation remain; pausing never asserts that NAS bytes survived.
 
-The original430 folder roots /6.43TBlogical are policy candidates, not an executable
+The original 430 folder roots / 6.43 TB logical are policy candidates, not an executable
 recursive command or guaranteed reclaimed storage. This workflow materializes a
 narrower exact-file set. NAS-only treatment and the final selected batch are left
-for explicit approval. Full kept28 transfer and decoded optimality are separate.
+for explicit approval. Full kept 28-day transfer and decoded optimality are separate.

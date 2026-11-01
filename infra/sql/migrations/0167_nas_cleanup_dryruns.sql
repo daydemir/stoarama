@@ -74,7 +74,7 @@ CREATE FUNCTION guard_nas_cleanup_recording() RETURNS trigger LANGUAGE plpgsql A
 END $$;
 CREATE TRIGGER nas_cleanup_recording_hold BEFORE UPDATE ON recordings FOR EACH ROW EXECUTE FUNCTION guard_nas_cleanup_recording();
 CREATE FUNCTION guard_nas_cleanup_output() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
- IF EXISTS(SELECT 1 FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) i WHERE i->>'kind'='collated' AND (i->>'source_id')::bigint=OLD.id AND (p.mode<>'paused' OR EXISTS(SELECT 1 FROM nas_cleanup_items n WHERE n.plan_id=p.id AND n.delete_ever_issued))) THEN
+ IF (TG_OP='DELETE' OR ROW(NEW.nas_relative_path,NEW.object_key,NEW.sha256,NEW.size_bytes,NEW.start_at,NEW.end_at,NEW.source_clip_ids,NEW.collation_hour_id) IS DISTINCT FROM ROW(OLD.nas_relative_path,OLD.object_key,OLD.sha256,OLD.size_bytes,OLD.start_at,OLD.end_at,OLD.source_clip_ids,OLD.collation_hour_id)) AND EXISTS(SELECT 1 FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) i WHERE i->>'kind'='collated' AND (i->>'source_id')::bigint=OLD.id AND (p.mode<>'paused' OR EXISTS(SELECT 1 FROM nas_cleanup_items n WHERE n.plan_id=p.id AND n.delete_ever_issued))) THEN
  RAISE EXCEPTION 'retention protected: NAS cleanup collated identity hold'; END IF;
  IF TG_OP='DELETE' THEN RETURN OLD;END IF;RETURN NEW;
 END $$;

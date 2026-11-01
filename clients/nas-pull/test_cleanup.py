@@ -154,5 +154,62 @@ class CleanupTests(unittest.TestCase):
         release.set();thread.join(1)
         fence.acquire_cleanup(threading.Event(),time.monotonic()+1);fence.release_cleanup()
 
+    def test_stale_observe_and_result_receipts_are_archived_without_blocking(self):
+        import urllib.error
+        for phase in ('observe','result'):
+            with self.subTest(phase=phase):
+                body=dict(attempt=1,plan_sha256='a'*64,proof_sha256='b'*64,outcome='unverified')
+                pull.cleanup_journal(self.inventory,1,phase,body)
+                error=urllib.error.HTTPError('https://example.test',409,'stale',{},None)
+                with mock.patch.object(pull,'restore_api',side_effect=error):
+                    pull.cleanup_replay_receipts(self.cfg,self.inventory)
+                self.assertFalse(pull.cleanup_journal(self.inventory))
+        rows=self.inventory.db.execute('SELECT phase,body FROM cleanup_rejected_receipts').fetchall()
+        self.assertEqual(len(rows),2);self.assertEqual({r[0] for r in rows},{'observe','result'})
+        self.assertTrue(self.path.exists())
+
+    def test_cancelled_lease_is_not_reported_as_file_conflict(self):
+        event=threading.Event();event.set()
+        with mock.patch.object(pull,'restore_api',return_value=dict(tasks=[self.task],retry_after_sec=0)) as api:
+            with self.assertRaises(pull.CleanupInterrupted):pull.cleanup_once(self.cfg,self.inventory,event)
+        self.assertEqual(api.call_count,1)
+        self.assertFalse(pull.cleanup_journal(self.inventory));self.assertTrue(self.path.exists())
+
+    def test_late_permit_rejected_independently_of_wall_clock(self):
+        with self.opened() as f:self.task['approved_proof']=f.proof()
+        original=time.monotonic;offset=[0]
+        def api(cfg,path,body):
+            if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
+            if path.endswith('/observe'):
+                offset[0]=31
+                return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
+                            proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
+                            expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+        with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original()+offset[0]):
+            pull.cleanup_once(self.cfg,self.inventory,threading.Event())
+        self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
+
+
+    def test_permit_deadline_checked_after_slow_final_directory_walk(self):
+        with self.opened() as f:self.task['approved_proof']=f.proof()
+        original_clock=time.monotonic;original_members=pull.CleanupFile.parent_members
+        offset=[0];permit_seen=[False]
+        def members(current):
+            result=original_members(current)
+            if permit_seen[0]:offset[0]=31
+            return result
+        def api(cfg,path,body):
+            if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
+            if path.endswith('/observe'):
+                permit_seen[0]=True
+                return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
+                            proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
+                            expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+        with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original_clock()+offset[0]),mock.patch.object(pull.CleanupFile,'parent_members',members):
+            pull.cleanup_once(self.cfg,self.inventory,threading.Event())
+        self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
+
 
 if __name__=='__main__':unittest.main()

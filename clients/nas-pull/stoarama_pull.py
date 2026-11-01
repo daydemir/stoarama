@@ -1505,6 +1505,10 @@ def require_joined_storage_capacity(cfg, runtime, expected_bytes):
 
 
 # Exact-file NAS cleanup. A backend dry-run decision never reaches unlink.
+class CleanupInterrupted(RuntimeError):
+    """Cancellation is not evidence of a file conflict."""
+
+
 class NASMediaFence:
     """Allow concurrent delivery, then fence app writers for a deletion only."""
     def __init__(self):
@@ -1530,7 +1534,7 @@ class NASMediaFence:
         with self.condition:
             while self.exclusive or self.writers:
                 if stop_event.is_set() or time.monotonic() >= deadline:
-                    raise RuntimeError("cleanup writer fence timed out or cancelled")
+                    raise CleanupInterrupted("cleanup writer fence timed out or cancelled")
                 self.condition.wait(0.2)
             self.exclusive = True
 
@@ -1575,7 +1579,7 @@ class CleanupFile:
 
     def check_active(self):
         if self.stop_event.is_set() or time.monotonic() >= self.deadline:
-            raise RuntimeError("cleanup stopped or lease expired")
+            raise CleanupInterrupted("cleanup stopped or lease expired")
 
     def __enter__(self):
         try:
@@ -1626,7 +1630,7 @@ class CleanupFile:
             raise RuntimeError("cleanup directory changed during enumeration")
         return hashlib.sha256(cleanup_json_bytes(sorted(entries))).hexdigest()
 
-    def check_paths(self):
+    def check_paths(self, skip_media=False):
         self.check_active()
         root = os.lstat(self.cfg.output_dir)
         if not os.path.ismount(str(self.cfg.output_dir)) or [root.st_dev, root.st_ino] != self.root_identity:
@@ -1637,7 +1641,7 @@ class CleanupFile:
             opened = os.fstat(self.fds[n+1])
             if not stat_module.S_ISDIR(info.st_mode) or [info.st_dev, info.st_ino] != self.ancestors[n] or [opened.st_dev, opened.st_ino] != self.ancestors[n]:
                 raise RuntimeError("cleanup ancestor changed")
-        for name, fd, frozen in self.files:
+        for name, fd, frozen in (self.files[1:] if skip_media else self.files):
             current = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
             opened = os.fstat(fd)
             if (not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1 or opened.st_nlink != 1
@@ -1688,13 +1692,13 @@ class CleanupFile:
         self.check_paths()
         if self.parent_members() != proof["parent_members_sha256"]:
             raise RuntimeError("cleanup folder membership changed before unlink")
+        self.check_paths()
+        self.check_active()
         os.unlink(self.name, dir_fd=self.fds[-1])
         if self.item["sidecar_required"]:
-            name, fd, frozen = self.files[1]
-            info = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
-            if cleanup_identity(info) != frozen or cleanup_identity(os.fstat(fd)) != frozen:
-                raise RuntimeError("media removed but sidecar changed; preserved for reconciliation")
-            os.unlink(name, dir_fd=self.fds[-1])
+            self.check_paths(skip_media=True)
+            self.check_active()
+            os.unlink(self.files[1][0], dir_fd=self.fds[-1])
         os.fsync(self.fds[-1])
 
     def __exit__(self, *_args):
@@ -1706,20 +1710,36 @@ class CleanupFile:
 
 
 def cleanup_replay_receipts(cfg, inventory):
+    def replay(item_id, phase, body):
+        try:
+            return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                raise
+            # Preserve rejected evidence, then unblock unrelated leases. A stale
+            # observation/result must never be interpreted as a fresh permit.
+            with inventory.lock:
+                inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
+                inventory.db.execute("INSERT INTO cleanup_rejected_receipts VALUES(?,?,?,?)", (item_id, phase, cleanup_json_bytes(body).decode(), utc_now_precise()))
+                inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
+                inventory.db.commit()
+            log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
+            return None
+
     for item_id, phase, encoded in cleanup_journal(inventory):
         body = json.loads(encoded)
         if phase == "intent":
             body.update(outcome="unverified", error="client interrupted after permit; operator reconciliation required")
             phase = "result"
             cleanup_journal(inventory, item_id, phase, body)
-        # A replayed observation can recover a dry-run acknowledgement, but a
-        # deletion permit received here is NEVER executed without the open FDs.
-        response = restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, "observe" if phase == "observe" else "result"), body)
+        response = replay(item_id, "observe" if phase == "observe" else "result", body)
+        if response is None:
+            continue
         if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed"}
             cleanup_journal(inventory, item_id, "result", body)
-            restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, body)
+            replay(item_id, "result", body)
         cleanup_journal(inventory, item_id)
 
 
@@ -1748,16 +1768,20 @@ def cleanup_once(cfg, inventory, stop_event):
                     raise RuntimeError("cleanup dry-run proof changed; KEEP")
                 body.update(outcome="match", proof=proof)
                 cleanup_journal(inventory, item_id, "observe", body)
+                permit_request_started = time.monotonic()
                 decision = restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
                 if decision.get("delete") is True:
                     receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
                     cleanup_journal(inventory, item_id, "intent", receipt)
                     try:
-                        if (not fenced or cfg.dry_run or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
+                        if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
                                 or decision.get("attempt") != attempt or decision.get("plan_sha256") != task["plan_sha256"]
                                 or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()
                                 or parse_certification_timestamp(decision.get("expires_at"), "cleanup permit") <= datetime.datetime.now(datetime.timezone.utc)):
                             raise RuntimeError("cleanup deletion permit does not match exact current proof")
+                        permit_expiry = parse_certification_timestamp(decision["expires_at"], "cleanup permit")
+                        wall_remaining = (permit_expiry - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                        current.deadline = min(current.deadline, permit_request_started + 30, time.monotonic() + max(0, wall_remaining))
                         current.delete_exact(proof)
                         receipt["outcome"] = "deleted"
                     except Exception as exc:
@@ -1768,6 +1792,8 @@ def cleanup_once(cfg, inventory, stop_event):
         except Exception as exc:
             # Never overwrite a durable intent/result with a speculative retry.
             if any(row[0] == item_id for row in cleanup_journal(inventory)):
+                raise
+            if isinstance(exc, CleanupInterrupted):
                 raise
             body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
             cleanup_journal(inventory, item_id, "observe", body)

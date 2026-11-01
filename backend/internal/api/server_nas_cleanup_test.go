@@ -93,7 +93,7 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
  CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text);
  CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,purged_at timestamptz,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,bucket text);
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,excluded_clip_count integer,manifest jsonb);
- CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,nas_relative_path text,object_key text,sha256 text,size_bytes bigint,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[]);
+ CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,nas_relative_path text,object_key text,sha256 text,size_bytes bigint,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],created_at timestamptz DEFAULT now());
  CREATE TABLE recording_joined_source_snapshots(clip_id bigint);
  INSERT INTO accounts VALUES(47),(48);INSERT INTO connections VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);INSERT INTO streams VALUES(3,'UTC');INSERT INTO recordings VALUES(2,47,3,'UTC');`)
 	if err != nil {
@@ -361,5 +361,20 @@ func TestNASCleanupOperatorRoutesRequireServiceCredential(t *testing.T) {
 	}
 	if pullPathAllowed("POST", "/api/v1/service/nas-cleanup/plans") || pullPathAllowed("POST", "/api/v1/service/nas-cleanup/plans/1/control") {
 		t.Fatal("pull key can control cleanup")
+	}
+}
+
+func TestNASCleanupCollatedHoldAllowsNonIdentityBookkeeping(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO recording_collation_hours VALUES(1,2,0,'{"clips":[{"clip":{"clip_id":1}}]}');INSERT INTO recording_collation_outputs(id,collation_hour_id,nas_relative_path,object_key,sha256,size_bytes,start_at,end_at,source_clip_ids) VALUES(9,1,'a/b.mp4','joined/object',repeat('a',64),3,'2026-09-01','2026-09-01 00:01:00',ARRAY[1::bigint]);INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[{"kind":"collated","source_id":9}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_collation_outputs SET created_at=created_at+interval '1 hour' WHERE id=9`); err != nil {
+		t.Fatalf("nonidentity bookkeeping blocked: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_collation_outputs SET size_bytes=size_bytes+1 WHERE id=9`); err == nil {
+		t.Fatal("held output identity changed")
 	}
 }
