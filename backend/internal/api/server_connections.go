@@ -29,6 +29,7 @@ var (
 	pullJoinedDownloadPathRe   = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
 	pullUploadProbeResultRe    = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
 	pullRestoreResultRe        = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
+	pullCleanupResultRe        = regexp.MustCompile(`^/api/v1/account/connections/cleanup/\d+/(observe|result)$`)
 	pullSelectedVerifyResultRe = regexp.MustCompile(`^/api/v1/account/connections/selected-verify/\d+/result$`)
 	pullCollatedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/collated/\d+/download$`)
 	pullBenchmarkResultRe      = regexp.MustCompile(`^/api/v1/account/connections/benchmark/\d+/result$`)
@@ -69,6 +70,8 @@ func pullPathAllowed(method, path string) bool {
 	case method == http.MethodPost && path == "/api/v1/account/connections/nas-restore/lease":
 		return true
 	case method == http.MethodPost && pullRestoreResultRe.MatchString(path):
+		return true
+	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/lease" || pullCleanupResultRe.MatchString(path)):
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/selected-verify/lease":
 		return true
