@@ -442,6 +442,11 @@ func (s *Server) cleanupRecovery(ctx context.Context, i nasCleanupItem) string {
 	}
 	return "r2_sha_verified"
 }
+
+// Share the immutable plan/mode fence across independent preflights; control
+// still requires an exclusive parent lock and cannot overtake observations.
+const cleanupObservationLoadSQL = `SELECT p.manifest->(i.ordinal-1),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,p.allow_nas_only,i.outcome FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
+
 func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseInt64Path(w, r, "itemId")
 	if !ok {
@@ -483,7 +488,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	var attempt int
 	var lease *time.Time
 	var allow bool
-	err = tx.QueryRow(ctx, `SELECT p.manifest->(i.ordinal-1),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,p.allow_nas_only,i.outcome FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i,p`, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &allow, &oldOutcome)
+	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &allow, &oldOutcome)
 	if err != nil || sha != req.PlanSHA || attempt != req.Attempt {
 		util.WriteError(w, 409, "cleanup task identity differs")
 		return

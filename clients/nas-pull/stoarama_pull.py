@@ -1751,77 +1751,131 @@ def cleanup_replay_receipts(cfg, inventory):
         cleanup_journal(inventory, item_id)
 
 
-def cleanup_once(cfg, inventory, stop_event):
-    cleanup_replay_receipts(cfg, inventory)
+def cleanup_process_task(cfg, inventory, stop_event, task):
+    item_id, attempt = task["item_id"], task["attempt"]
+    if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
+        raise RuntimeError("invalid cleanup task identity")
+    deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
+    body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION}
+    fenced = False
+    try:
+        # A previously approved proof marks the execution phase. Dry runs
+        # never acquire the write fence and do not impede clip delivery.
+        if task.get("approved_proof") is not None:
+            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, deadline)
+            fenced = True
+        with CleanupFile(cfg, task["item"], stop_event, deadline) as current:
+            proof = current.proof()
+            if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
+                raise RuntimeError("cleanup dry-run proof changed; KEEP")
+            body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
+            cleanup_journal(inventory, item_id, "observe", body)
+            permit_request_started = time.monotonic()
+            decision = restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+            if decision.get("delete") is True:
+                receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
+                cleanup_journal(inventory, item_id, "intent", receipt)
+                try:
+                    if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
+                            or decision.get("attempt") != attempt or decision.get("plan_sha256") != task["plan_sha256"]
+                            or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()
+                            or parse_certification_timestamp(decision.get("expires_at"), "cleanup permit") <= datetime.datetime.now(datetime.timezone.utc)):
+                        raise RuntimeError("cleanup deletion permit does not match exact current proof")
+                    permit_expiry = parse_certification_timestamp(decision["expires_at"], "cleanup permit")
+                    wall_remaining = (permit_expiry - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                    current.deadline = min(current.deadline, permit_request_started + 30, time.monotonic() + max(0, wall_remaining))
+                    current.delete_exact(proof)
+                    receipt["outcome"] = "deleted"
+                except Exception as exc:
+                    receipt["error"] = str(exc)[:500]
+                cleanup_journal(inventory, item_id, "result", receipt)
+                restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, receipt)
+            cleanup_journal(inventory, item_id)
+    except Exception as exc:
+        # Never overwrite a durable intent/result with a speculative retry.
+        if any(row[0] == item_id for row in cleanup_journal(inventory)):
+            raise
+        if isinstance(exc, CleanupInterrupted):
+            raise
+        body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
+        cleanup_journal(inventory, item_id, "observe", body)
+        restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+        cleanup_journal(inventory, item_id)
+    finally:
+        if fenced:
+            NAS_MEDIA_FENCE.release_cleanup()
+
+
+def cleanup_lease(cfg):
     lease = restore_api(cfg, "/account/connections/cleanup/lease", {"client_version": CLIENT_VERSION, "protocol": 1})
     tasks = lease.get("tasks")
     if not isinstance(tasks, list) or len(tasks) > 1:
         raise RuntimeError("invalid cleanup lease")
-    for task in tasks:
-        item_id, attempt = task["item_id"], task["attempt"]
-        if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
-            raise RuntimeError("invalid cleanup task identity")
-        deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
-        body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION}
-        fenced = False
-        try:
-            # A previously approved proof marks the execution phase. Dry runs
-            # never acquire the write fence and do not impede clip delivery.
-            if task.get("approved_proof") is not None:
-                NAS_MEDIA_FENCE.acquire_cleanup(stop_event, deadline)
-                fenced = True
-            with CleanupFile(cfg, task["item"], stop_event, deadline) as current:
-                proof = current.proof()
-                if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
-                    raise RuntimeError("cleanup dry-run proof changed; KEEP")
-                body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
-                cleanup_journal(inventory, item_id, "observe", body)
-                permit_request_started = time.monotonic()
-                decision = restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
-                if decision.get("delete") is True:
-                    receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
-                    cleanup_journal(inventory, item_id, "intent", receipt)
-                    try:
-                        if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
-                                or decision.get("attempt") != attempt or decision.get("plan_sha256") != task["plan_sha256"]
-                                or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()
-                                or parse_certification_timestamp(decision.get("expires_at"), "cleanup permit") <= datetime.datetime.now(datetime.timezone.utc)):
-                            raise RuntimeError("cleanup deletion permit does not match exact current proof")
-                        permit_expiry = parse_certification_timestamp(decision["expires_at"], "cleanup permit")
-                        wall_remaining = (permit_expiry - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-                        current.deadline = min(current.deadline, permit_request_started + 30, time.monotonic() + max(0, wall_remaining))
-                        current.delete_exact(proof)
-                        receipt["outcome"] = "deleted"
-                    except Exception as exc:
-                        receipt["error"] = str(exc)[:500]
-                    cleanup_journal(inventory, item_id, "result", receipt)
-                    restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, receipt)
-                cleanup_journal(inventory, item_id)
-        except Exception as exc:
-            # Never overwrite a durable intent/result with a speculative retry.
-            if any(row[0] == item_id for row in cleanup_journal(inventory)):
-                raise
-            if isinstance(exc, CleanupInterrupted):
-                raise
-            body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
-            cleanup_journal(inventory, item_id, "observe", body)
-            restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
-            cleanup_journal(inventory, item_id)
-        finally:
-            if fenced:
-                NAS_MEDIA_FENCE.release_cleanup()
+    return lease
+
+
+def cleanup_once(cfg, inventory, stop_event):
+    cleanup_replay_receipts(cfg, inventory)
+    lease = cleanup_lease(cfg)
+    for task in lease["tasks"]:
+        cleanup_process_task(cfg, inventory, stop_event, task)
     return lease.get("retry_after_sec", 120)
+
+
+def cleanup_batch(cfg, inventory, stop_event, executor):
+    # The coordinator alone replays receipts, with no active worker. Replaying
+    # an in-flight intent must never race the owner currently handling it.
+    cleanup_replay_receipts(cfg, inventory)
+    pending = []
+    leased = 0
+    retry = 120
+    error = None
+    try:
+        for _ in range(4):
+            if stop_event.is_set():
+                break
+            lease = cleanup_lease(cfg)
+            retry = lease.get("retry_after_sec", 120)
+            if not lease["tasks"]:
+                break
+            task = lease["tasks"][0]
+            leased += 1
+            if task.get("approved_proof") is not None:
+                # Drain preflight workers before entering serial execution.
+                for future in pending:
+                    future.result()
+                pending.clear()
+                cleanup_process_task(cfg, inventory, stop_event, task)
+                break
+            pending.append(executor.submit(cleanup_process_task, cfg, inventory, stop_event, task))
+    except Exception as exc:
+        error = exc
+    finally:
+        # Also drain when a later lease or worker fails. No next replay, app
+        # replacement or shutdown can overtake these durable checkpoints.
+        for future in pending:
+            try:
+                future.result()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+    if error is not None:
+        raise error
+    return 0 if leased else retry
 
 
 def cleanup_loop(cfg, inventory, stop_event):
     wait = 15
-    while not stop_event.wait(wait):
-        try:
-            retry = cleanup_once(cfg, inventory, stop_event)
-            wait = 0 if retry == 0 else restore_wait(retry)
-        except Exception as exc:
-            log("WARN", "NAS cleanup deferred: %s" % exc)
-            wait = RESTORE_ERROR_WAIT_SEC
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="nas-cleanup") as executor:
+        while not stop_event.wait(wait):
+            try:
+                retry = cleanup_batch(cfg, inventory, stop_event, executor)
+                wait = 0 if retry == 0 else restore_wait(retry)
+            except Exception as exc:
+                log("WARN", "NAS cleanup deferred: %s" % exc)
+                # Reconcile durable receipts before retry; never repeat an
+                # uncertain unlink. A transient error need not idle five minutes.
+                wait = restore_wait(min(60, RESTORE_ERROR_WAIT_SEC))
 
 
 

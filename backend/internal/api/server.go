@@ -46,6 +46,7 @@ type Server struct {
 	nasCleanupPolicyCache          *nasCleanupPolicy
 	nasCleanupInventoryIndex       *cleanupFrozenIndex
 	nasCleanupRankingCache         map[int64]nasCleanupRankingsSnapshot
+	nasCleanupPublicVerifiedAt     time.Time
 	nasCleanupPublicETag           string
 	globalDeliveryStore            globalDeliveryObjectStore
 	globalDeliveryMu               sync.Mutex
