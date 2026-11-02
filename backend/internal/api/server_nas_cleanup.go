@@ -616,7 +616,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 			action = "conflict"
 		} else {
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyMode(ctx, tx, item, mode == "dry_run")
+			e = s.cleanupCurrentPolicyMode(ctx, tx, item, mode == "dry_run", stageTimings)
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"

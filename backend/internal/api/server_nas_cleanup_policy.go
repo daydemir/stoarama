@@ -101,11 +101,11 @@ const cleanupCurrentRankingsSQL = `WITH r AS (
 func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, i nasCleanupItem) error {
-	return s.cleanupCurrentPolicyMode(ctx, q, i, false)
+	return s.cleanupCurrentPolicyMode(ctx, q, i, false, nil)
 }
 func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}, i nasCleanupItem, dryRun bool) error {
+}, i nasCleanupItem, dryRun bool, stages map[string]any) error {
 	report, err := s.cleanupReport(ctx)
 	if err != nil || !report.permits(i) {
 		return errors.New("reviewed policy unavailable")
@@ -126,9 +126,13 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 			expected = stream.Rankings
 		}
 	}
-	rankings, _, err := s.cleanupRankings(ctx, q, i.StreamID, dryRun)
+	rankings, rankingsAt, err := s.cleanupRankings(ctx, q, i.StreamID, dryRun)
 	if err != nil {
 		return err
+	}
+	if stages != nil {
+		stages["rankings_snapshot_at"] = rankingsAt
+		stages["rankings_advisory"] = dryRun
 	}
 	encoded, _ := json.Marshal(expected)
 	if !nasSpaceAuditJSONEqual(rankings, encoded) {
