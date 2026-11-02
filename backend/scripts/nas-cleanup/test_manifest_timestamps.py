@@ -32,7 +32,7 @@ class TimestampTests(unittest.TestCase):
     def test_naive_malformed_and_overprecision_fail_closed(self):
         for name in ('compile_full_manifest_20261102.py','repair_manifest_timestamps.py'):
             parse=load_parser(name)
-            for value in (None,'','2026-11-02','2026-11-02T12:34:56','2026-11-02T12:34:56.1234567Z','2026-02-30T12:34:56Z','2026-11-02T12:34:56+99:00',' 2026-11-02T12:34:56Z'):
+            for value in (None,'','2026-11-02','2026-11-02T12:34:56','2026-11-02T12:34:56.1234567Z','2026-02-30T12:34:56Z','2026-11-02T12:34:56+99:00','2026-11-02T12:34:56+00:60','2026-11-02T12:34:56+01:99',' 2026-11-02T12:34:56Z'):
                 with self.assertRaises((TypeError,ValueError)):parse(value)
 
     def test_half_open_boundaries_preserve_protected_overlap(self):

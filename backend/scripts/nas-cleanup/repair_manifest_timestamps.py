@@ -54,6 +54,8 @@ def instant(x):
  match=re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})',x)
  if match is None:
   raise ValueError('timestamp must include an explicit timezone and at most six fractional digits')
+ if match[3]!='Z' and (int(match[3][1:3])>23 or int(match[3][4:6])>59):
+  raise ValueError('timestamp offset is outside RFC3339 bounds')
  fraction='.'+match[2].ljust(6,'0') if match[2] else ''
  offset='+00:00' if match[3]=='Z' else match[3]
  return datetime.datetime.fromisoformat(match[1]+fraction+offset).astimezone(datetime.timezone.utc)
