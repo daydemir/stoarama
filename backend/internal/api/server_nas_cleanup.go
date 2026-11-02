@@ -224,14 +224,15 @@ func (s *Server) handleAdminNASCleanupStatus(w http.ResponseWriter, r *http.Requ
 	}
 	var manifest, jsonStates, results []byte
 	var label, sha, mode, reason string
+	var priority int
 	var allow bool
 	var until *time.Time
-	err := s.pool.QueryRow(r.Context(), `SELECT label,plan_sha256,mode,allow_nas_only,approval_reason,approved_until,manifest,(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM nas_cleanup_items WHERE plan_id=p.id GROUP BY state) q),(SELECT coalesce(jsonb_agg(jsonb_build_object('item_id',id,'ordinal',ordinal,'state',state,'recovery',recovery,'policy_reason',policy_reason,'attempt',attempt,'proof',proof,'outcome',outcome,'delete_ever_issued',delete_ever_issued,'stage_timings',stage_timings,'updated_at',updated_at) ORDER BY ordinal),'[]') FROM nas_cleanup_items WHERE plan_id=p.id) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&label, &sha, &mode, &allow, &reason, &until, &manifest, &jsonStates, &results)
+	err := s.pool.QueryRow(r.Context(), `SELECT label,plan_sha256,mode,priority,allow_nas_only,approval_reason,approved_until,manifest,(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM nas_cleanup_items WHERE plan_id=p.id GROUP BY state) q),(SELECT coalesce(jsonb_agg(jsonb_build_object('item_id',id,'ordinal',ordinal,'state',state,'recovery',recovery,'policy_reason',policy_reason,'attempt',attempt,'proof',proof,'outcome',outcome,'delete_ever_issued',delete_ever_issued,'stage_timings',stage_timings,'updated_at',updated_at) ORDER BY ordinal),'[]') FROM nas_cleanup_items WHERE plan_id=p.id) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&label, &sha, &mode, &priority, &allow, &reason, &until, &manifest, &jsonStates, &results)
 	if err != nil {
 		util.WriteError(w, 404, "cleanup plan unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "results": json.RawMessage(results)})
+	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "results": json.RawMessage(results)})
 }
 
 // Arming is deliberately not automatic. It requires the exact digest and a
@@ -245,10 +246,15 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		PlanSHA      string `json:"plan_sha256"`
 		Mode         string `json:"mode"`
 		AllowNASOnly bool   `json:"allow_nas_only"`
+		Priority     *int   `json:"priority,omitempty"`
 		Reason       string `json:"reason"`
 	}
-	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused") || len(req.Reason) < 1 || len(req.Reason) > 500 {
+	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || len(req.Reason) < 1 || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact plan digest,mode and reason required")
+		return
+	}
+	if (req.Priority != nil && (req.Mode != "dry_run" || *req.Priority < -100 || *req.Priority > 100)) || (req.Mode == "dry_run" && req.AllowNASOnly) {
+		util.WriteError(w, 400, "bounded priority is read-only; NAS-only permission cannot accompany dry-run resume")
 		return
 	}
 	// Backend independent master switch defaults OFF even if an operator arms a
@@ -270,10 +276,39 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	var current string
-	if err = tx.QueryRow(ctx, `SELECT plan_sha256 FROM nas_cleanup_plans WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&current); err != nil || current != req.PlanSHA {
+	var current, currentMode string
+	if err = tx.QueryRow(ctx, `SELECT plan_sha256,mode FROM nas_cleanup_plans WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&current, &currentMode); err != nil || current != req.PlanSHA {
 		util.WriteError(w, 409, "plan identity differs")
 		return
+	}
+	if req.Mode == "dry_run" {
+		var issued bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND delete_ever_issued)`, id).Scan(&issued); err != nil {
+			util.WriteError(w, 500, "cleanup resume evidence unavailable")
+			return
+		}
+		if issued || (currentMode != "dry_run" && currentMode != "paused") {
+			util.WriteError(w, 409, "only nonexecuting plans with no issued deletion may resume; otherwise reconcile")
+			return
+		}
+		if currentMode == "paused" {
+			// Pausing releases unissued source holds. Take the original source-row
+			// fences again before restoring a read-only hold; never rewrite the manifest
+			// or turn terminal/conflicting observations back into pending work.
+			rows, e := tx.Query(ctx, `SELECT c.id FROM recording_clips c JOIN nas_cleanup_source_holds h ON h.clip_id=c.id WHERE h.plan_id=$1 ORDER BY c.id FOR UPDATE OF c`, id)
+			if e != nil {
+				util.WriteError(w, 500, "cleanup source resume fence unavailable")
+				return
+			}
+			for rows.Next() {
+			}
+			e = rows.Err()
+			rows.Close()
+			if e != nil {
+				util.WriteError(w, 500, "cleanup source resume fence unavailable")
+				return
+			}
+		}
 	}
 	if req.Mode == "enabled" {
 		var bad int
@@ -283,7 +318,7 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=$3,approval_reason=$4,approved_until=CASE WHEN $2='enabled' THEN now()+interval '1 hour' END WHERE id=$1`, id, req.Mode, req.AllowNASOnly, req.Reason)
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=$3,approval_reason=$4,approved_until=CASE WHEN $2='enabled' THEN now()+interval '1 hour' END,priority=coalesce($5,priority) WHERE id=$1`, id, req.Mode, req.AllowNASOnly, req.Reason, req.Priority)
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
 	}
@@ -311,6 +346,20 @@ type cleanupObserve struct {
 	ClientVersion string             `json:"client_version"`
 	Timings       map[string]float64 `json:"timings,omitempty"`
 }
+
+// Plans are ordered without sorting/locking the entire pending file backlog.
+// The lateral probe uses nas_cleanup_pending and skips locked rows before the
+// outer LIMIT; it can keep looking in the next eligible plan if one is busy.
+const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,p.manifest->(i.ordinal-1),i.proof,p.mode
+FROM nas_cleanup_plans p
+JOIN LATERAL (
+ SELECT candidate.* FROM nas_cleanup_items candidate
+ WHERE candidate.plan_id=p.id AND candidate.state='pending'
+ ORDER BY candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
+) i ON true
+WHERE p.connection_id=$1
+ AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2))
+ORDER BY p.priority DESC,p.id LIMIT 1`
 
 func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -341,7 +390,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	var raw []byte
 	var approved []byte
 	var mode string
-	err = tx.QueryRow(ctx, `SELECT i.id,i.attempt,p.plan_sha256,p.manifest->(i.ordinal-1),i.proof,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.connection_id=$1 AND i.state='pending' AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2)) ORDER BY i.id LIMIT 1 FOR UPDATE OF i SKIP LOCKED`, cid, s.cfg.NASCleanupDeletionEnabled).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+	err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, s.cfg.NASCleanupDeletionEnabled).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		util.WriteJSON(w, 200, map[string]any{"tasks": []any{}, "retry_after_sec": 120})
 		return
