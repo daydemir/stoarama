@@ -80,3 +80,12 @@ minute; enabled observations always query live rankings. Cached preflight eviden
 never authorizes a deletion. Both deletion gates remain OFF by default.
 
 The November2 policy refresh covers all109 NAS streams in one read-only repeatable-read snapshot. All221 previous UTC intervals and all31 whole-stream holds remain; two newer intervals are added. Unassigned catalog records remain retained. Source snapshot and policy gzip fixtures are pinned by their full SHA256 values and monotonic-protection tests.
+
+Full-manifest preparation uses a content-addressed folder index of the original
+immutable audit. Its pinned root binds all2,943,864 observations, the original
+audit SHA and reviewed folder ownership to3,918 fully verified shards. Admission
+fetches only the required folders, checks every referenced shard hash, and
+retains all original frozen-stat, sidecar, hardlink, owner and duplicate checks.
+A missing, corrupt or mismatched index fails closed. This index grants no
+deletion authority; both gates and fresh live checks remain unchanged.
+The metadata-only producer is backend/scripts/nas-cleanup/build_frozen_index.py.
