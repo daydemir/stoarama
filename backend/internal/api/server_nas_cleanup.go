@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -293,85 +292,6 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		return
 	}
 	util.WriteJSON(w, 200, map[string]any{"id": id, "mode": req.Mode, "plan_sha256": current})
-}
-
-// Verify the complete immutable audit while retaining only requested file stats.
-// A current catalog row at a previously unseen path can never enter this plan.
-func (s *Server) bindCleanupFrozenInventory(ctx context.Context, items []nasCleanupItem) error {
-	const auditSHA = "480d85a49288d79e201b14405dc72d0f6fc979a0fd06f1b7a95663053583865b"
-	key := "nas-space-audits/13/6cd48108-ca05-4df7-988b-0bd7e4d320fe/" + auditSHA + ".jsonl.gz"
-	source, err := s.r2.Open(ctx, key)
-	if err != nil {
-		return errors.New("frozen NAS observation unavailable")
-	}
-	defer source.Close()
-	digest := sha256.New()
-	z, err := gzip.NewReader(io.TeeReader(source, digest))
-	if err != nil {
-		return err
-	}
-	defer z.Close()
-	wanted := map[string]bool{}
-	for _, i := range items {
-		wanted[i.RelativePath] = true
-		if i.SidecarRequired {
-			wanted[i.RelativePath+".stoarama.json"] = true
-		}
-	}
-	found := map[string][5]int64{}
-	scan := bufio.NewScanner(z)
-	scan.Buffer(make([]byte, 65536), 2<<20)
-	for scan.Scan() {
-		var e struct {
-			Path   string `json:"path"`
-			Bytes  string `json:"path_bytes_b64"`
-			Kind   string `json:"kind"`
-			Error  string `json:"error"`
-			Size   int64  `json:"size"`
-			MTime  int64  `json:"mtime_ns"`
-			CTime  int64  `json:"ctime_ns"`
-			Inode  int64  `json:"inode"`
-			Device int64  `json:"device"`
-			Links  int64  `json:"links"`
-		}
-		if json.Unmarshal(scan.Bytes(), &e) != nil {
-			return errors.New("invalid frozen NAS observation")
-		}
-		if !wanted[e.Path] {
-			continue
-		}
-		if _, ok := found[e.Path]; ok || e.Bytes != "" || e.Kind != "file" || e.Error != "" || e.Links != 1 || e.Inode <= 0 || e.Device <= 0 {
-			return errors.New("ambiguous frozen NAS observation; KEEP")
-		}
-		found[e.Path] = [5]int64{e.Size, e.MTime, e.CTime, e.Inode, e.Device}
-	}
-	if err = scan.Err(); err != nil {
-		return err
-	}
-	// gzip buffers may consume the trailer; exhaust the underlying compressed
-	// stream too before comparing the content-addressed archive identity.
-	if _, err = io.Copy(digest, source); err != nil {
-		return err
-	}
-	if hex.EncodeToString(digest.Sum(nil)) != auditSHA {
-		return errors.New("frozen audit SHA mismatch")
-	}
-	for n := range items {
-		i := &items[n]
-		f, ok := found[i.RelativePath]
-		if !ok || f[0] != i.SizeBytes {
-			return errors.New("file absent or size changed since audited safe set; KEEP")
-		}
-		i.Frozen = f
-		if i.SidecarRequired {
-			f, ok = found[i.RelativePath+".stoarama.json"]
-			if !ok || f[0] < 1 || f[0] > 1<<20 {
-				return errors.New("bound sidecar unavailable; KEEP")
-			}
-			i.FrozenSidecar = f
-		}
-	}
-	return nil
 }
 
 type cleanupTask struct {
