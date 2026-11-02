@@ -101,6 +101,11 @@ const cleanupCurrentRankingsSQL = `WITH r AS (
 func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, i nasCleanupItem) error {
+	return s.cleanupCurrentPolicyMode(ctx, q, i, false)
+}
+func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, i nasCleanupItem, dryRun bool) error {
 	report, err := s.cleanupReport(ctx)
 	if err != nil || !report.permits(i) {
 		return errors.New("reviewed policy unavailable")
@@ -121,8 +126,8 @@ func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 			expected = stream.Rankings
 		}
 	}
-	var rankings []byte
-	if err = q.QueryRow(ctx, cleanupCurrentRankingsSQL, i.StreamID).Scan(&rankings); err != nil {
+	rankings, _, err := s.cleanupRankings(ctx, q, i.StreamID, dryRun)
+	if err != nil {
 		return err
 	}
 	encoded, _ := json.Marshal(expected)

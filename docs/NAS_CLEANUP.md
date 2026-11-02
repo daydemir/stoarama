@@ -70,3 +70,11 @@ The original 430 folder roots / 6.43 TB logical are policy candidates, not an ex
 recursive command or guaranteed reclaimed storage. This workflow materializes a
 narrower exact-file set. NAS-only treatment and the final selected batch are left
 for explicit approval. Full kept 28-day transfer and decoded optimality are separate.
+
+Bulk verification performance: parent fingerprints describe byte-exact entry
+names, not unrelated sibling metadata. Full target/sidecar hashes, inode/stat/
+hardlink checks, directory-FD confinement and final permit deadlines still apply.
+Client namespace/hash/proof durations and backend policy/recovery durations are
+reported separately. Dry-run ranking snapshots may be reused for at most one
+minute; enabled observations always query live rankings. Cached preflight evidence
+never authorizes a deletion. Both deletion gates remain OFF by default.
