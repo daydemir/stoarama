@@ -106,6 +106,13 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	if _, err = pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0168_nas_cleanup_stage_timings.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
 	return pool
 }
 func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any) *httptest.ResponseRecorder {
@@ -512,5 +519,40 @@ func TestNASCleanupAdmissionHeartbeatConcurrentParentRow(t *testing.T) {
 	}
 	if err = <-done; err != nil {
 		t.Fatalf("actual heartbeat interrupted production admission: %v", err)
+	}
+}
+
+// Prove a changed actual PG winner is visible on the enabled path after a
+// cached dry run. No cached-result stub stands in for the live ranking inputs.
+func TestNASCleanupDryRunCacheCannotAuthorizeEnabledPolicy(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx := context.Background()
+	s := &Server{}
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'o',repeat('a',64),3,'a/1.mp4','2026-09-01','2026-09-01 01:00','bucket')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, at, err := s.cleanupRankings(ctx, pool, 3, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET clip_start_at='2026-10-01',clip_end_at='2026-10-01 01:00' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	cached, cachedAt, err := s.cleanupRankings(ctx, pool, 3, true)
+	if err != nil || !bytes.Equal(cached, old) || !cachedAt.Equal(at) {
+		t.Fatal("dry-run snapshot was not explicitly bounded")
+	}
+	fresh, _, err := s.cleanupRankings(ctx, pool, 3, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(fresh, old) {
+		t.Fatal("enabled policy reused advisory dry-run rankings")
+	}
+	s.nasCleanupRankingCache[3] = nasCleanupRankingsSnapshot{Raw: old, At: time.Now().Add(-2 * time.Minute)}
+	refreshed, _, err := s.cleanupRankings(ctx, pool, 3, true)
+	if err != nil || !bytes.Equal(refreshed, fresh) {
+		t.Fatal("expired preflight snapshot did not refresh")
 	}
 }

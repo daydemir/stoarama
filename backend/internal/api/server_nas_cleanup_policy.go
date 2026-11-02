@@ -12,8 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const cleanupPolicySHA = "428620008349a12c468bd3663cf678a1047344c019ef9d53caa8adf6c6ad75a7"
-const cleanupPolicyKey = "staging/best14-20261021/nas-retention-20261025/cleanup-policy-20261101/" + cleanupPolicySHA + "/policy.json.gz"
+const cleanupPolicySHA = "8a733e625a159942632617131b1388e19ce385e770a00363a5f79165042c076d"
+const cleanupPolicyKey = "staging/best14-20261021/nas-retention-20261025/cleanup-policy-20261102/" + cleanupPolicySHA + "/policy.json.gz"
 
 type cleanupWindow struct {
 	StreamID int64     `json:"stream_id"`
@@ -53,7 +53,7 @@ func (s *Server) cleanupPolicy(ctx context.Context) (*nasCleanupPolicy, error) {
 		return nil, err
 	}
 	var p nasCleanupPolicy
-	if json.Unmarshal(b, &p) != nil || p.ReportSHA != nasCleanupReportSHA || len(p.Windows) != 221 || len(p.Streams) != 109 || len(p.Whole) != 31 {
+	if json.Unmarshal(b, &p) != nil || p.ReportSHA != nasCleanupReportSHA || len(p.Windows) != 223 || len(p.Streams) != 109 || len(p.Whole) != 31 {
 		return nil, errors.New("incomplete cleanup guards")
 	}
 	s.nasCleanupPolicyCache = &p
@@ -101,6 +101,11 @@ const cleanupCurrentRankingsSQL = `WITH r AS (
 func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, i nasCleanupItem) error {
+	return s.cleanupCurrentPolicyMode(ctx, q, i, false, nil)
+}
+func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, i nasCleanupItem, dryRun bool, stages map[string]any) error {
 	report, err := s.cleanupReport(ctx)
 	if err != nil || !report.permits(i) {
 		return errors.New("reviewed policy unavailable")
@@ -121,16 +126,20 @@ func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 			expected = stream.Rankings
 		}
 	}
-	var rankings []byte
-	if err = q.QueryRow(ctx, cleanupCurrentRankingsSQL, i.StreamID).Scan(&rankings); err != nil {
+	rankings, rankingsAt, err := s.cleanupRankings(ctx, q, i.StreamID, dryRun)
+	if err != nil {
 		return err
+	}
+	if stages != nil {
+		stages["rankings_snapshot_at"] = rankingsAt
+		stages["rankings_advisory"] = dryRun
 	}
 	encoded, _ := json.Marshal(expected)
 	if !nasSpaceAuditJSONEqual(rankings, encoded) {
 		return errors.New("current selection or sensitivity buffers changed; KEEP until reviewed")
 	}
 	// SourceMetadataSHA pins dates, source membership, canonical timezone and exact
-	// catalog source identity. Recheck every source against all221 protected UTC
+	// catalog source identity. Recheck every source against all223 protected UTC
 	// intervals, including the authoritative185 older windows.
 	var raw []byte
 	if err = q.QueryRow(ctx, cleanupSourceMetadataSQL, i.SourceIDs).Scan(&raw); err != nil || cleanupSHA(raw) != i.SourceManifestSHA {

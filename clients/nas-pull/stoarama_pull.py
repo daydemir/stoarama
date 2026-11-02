@@ -1576,6 +1576,7 @@ class CleanupFile:
         self.files = []
         self.ancestors = []
         self.root_identity = None
+        self.stage_timings = {}
 
     def check_active(self):
         if self.stop_event.is_set() or time.monotonic() >= self.deadline:
@@ -1619,16 +1620,19 @@ class CleanupFile:
             raise RuntimeError("cleanup file differs from exact audited identity")
 
     def parent_members(self):
+        started = time.monotonic()
         before = os.fstat(self.fds[-1])
         entries = []
+        # Entry names define the namespace. Unlisted sibling contents are never
+        # deletion authority. Target/sidecar hash and identity checks stay exact.
         for name in os.listdir(self.fds[-1]):
             self.check_active()
-            info = os.stat(name, dir_fd=self.fds[-1], follow_symlinks=False)
-            entries.append([name, info.st_mode, info.st_nlink, *cleanup_identity(info)])
+            entries.append(os.fsencode(name).hex())
         after = os.fstat(self.fds[-1])
         if cleanup_identity(before) != cleanup_identity(after):
             raise RuntimeError("cleanup directory changed during enumeration")
-        return hashlib.sha256(cleanup_json_bytes(sorted(entries))).hexdigest()
+        self.stage_timings["namespace_ms"] = self.stage_timings.get("namespace_ms", 0) + (time.monotonic() - started) * 1000
+        return hashlib.sha256(cleanup_json_bytes({"namespace_version": 2, "names": sorted(entries)})).hexdigest()
 
     def check_paths(self, skip_media=False):
         self.check_active()
@@ -1649,7 +1653,9 @@ class CleanupFile:
                 raise RuntimeError("cleanup file identity changed")
 
     def proof(self):
+        started = time.monotonic()
         before_members = self.parent_members()
+        hash_started = time.monotonic()
         hashes = []
         sidecar_bytes = b""
         for n, (_, fd, _) in enumerate(self.files):
@@ -1666,6 +1672,7 @@ class CleanupFile:
                     if len(sidecar_bytes) > 1024 * 1024:
                         raise RuntimeError("cleanup sidecar exceeds bound")
             hashes.append(digest.hexdigest())
+        self.stage_timings["hash_ms"] = (time.monotonic() - hash_started) * 1000
         self.check_paths()
         if hashes[0] != self.item["sha256"] or self.parent_members() != before_members:
             raise RuntimeError("cleanup content or directory changed")
@@ -1684,6 +1691,7 @@ class CleanupFile:
                     raise RuntimeError("cleanup sidecar registered interval differs from catalog")
                 binding[field] = expected.isoformat()
             proof["sidecar"] = {"identity": self.item["frozen_sidecar_identity"], "sha256": hashes[1], "binding": binding}
+        self.stage_timings["proof_ms"] = (time.monotonic() - started) * 1000
         return proof
 
     def delete_exact(self, proof):
@@ -1766,7 +1774,7 @@ def cleanup_once(cfg, inventory, stop_event):
                 proof = current.proof()
                 if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                     raise RuntimeError("cleanup dry-run proof changed; KEEP")
-                body.update(outcome="match", proof=proof)
+                body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
                 cleanup_journal(inventory, item_id, "observe", body)
                 permit_request_started = time.monotonic()
                 decision = restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)

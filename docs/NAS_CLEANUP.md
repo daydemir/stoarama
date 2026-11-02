@@ -20,8 +20,8 @@ measured root/ancestors/file/sidecar identities and current parent membership.
 Every outcome is durably journaled in the existing app-owned inventory database.
 App replacement waits for the cleanup worker to checkpoint and stop.
 
-The backend revalidates source identities, all 185 older UTC windows (221 deduplicated
-windows with newer buffers),31 whole-stream protections, all three current
+The backend revalidates source identities, all 221 previously protected UTC windows (223 deduplicated
+windows after the November2 refresh),31 whole-stream protections, all three current
 registered/availability/quarantine rankings, current source/error references and
 public delivery. Unknowns, changed metadata, shifted sensitivity windows and
 unsupported content stay retained. Historical inventory MATCH or download ACKs
@@ -70,3 +70,13 @@ The original 430 folder roots / 6.43 TB logical are policy candidates, not an ex
 recursive command or guaranteed reclaimed storage. This workflow materializes a
 narrower exact-file set. NAS-only treatment and the final selected batch are left
 for explicit approval. Full kept 28-day transfer and decoded optimality are separate.
+
+Bulk verification performance: parent fingerprints describe byte-exact entry
+names, not unrelated sibling metadata. Full target/sidecar hashes, inode/stat/
+hardlink checks, directory-FD confinement and final permit deadlines still apply.
+Client namespace/hash/proof durations and backend policy/recovery durations are
+reported separately. Dry-run ranking snapshots may be reused for at most one
+minute; enabled observations always query live rankings. Cached preflight evidence
+never authorizes a deletion. Both deletion gates remain OFF by default.
+
+The November2 policy refresh covers all109 NAS streams in one read-only repeatable-read snapshot. All221 previous UTC intervals and all31 whole-stream holds remain; two newer intervals are added. Unassigned catalog records remain retained. Source snapshot and policy gzip fixtures are pinned by their full SHA256 values and monotonic-protection tests.

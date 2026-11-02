@@ -227,7 +227,7 @@ func (s *Server) handleAdminNASCleanupStatus(w http.ResponseWriter, r *http.Requ
 	var label, sha, mode, reason string
 	var allow bool
 	var until *time.Time
-	err := s.pool.QueryRow(r.Context(), `SELECT label,plan_sha256,mode,allow_nas_only,approval_reason,approved_until,manifest,(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM nas_cleanup_items WHERE plan_id=p.id GROUP BY state) q),(SELECT coalesce(jsonb_agg(jsonb_build_object('item_id',id,'ordinal',ordinal,'state',state,'recovery',recovery,'policy_reason',policy_reason,'attempt',attempt,'proof',proof,'outcome',outcome,'delete_ever_issued',delete_ever_issued,'updated_at',updated_at) ORDER BY ordinal),'[]') FROM nas_cleanup_items WHERE plan_id=p.id) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&label, &sha, &mode, &allow, &reason, &until, &manifest, &jsonStates, &results)
+	err := s.pool.QueryRow(r.Context(), `SELECT label,plan_sha256,mode,allow_nas_only,approval_reason,approved_until,manifest,(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM nas_cleanup_items WHERE plan_id=p.id GROUP BY state) q),(SELECT coalesce(jsonb_agg(jsonb_build_object('item_id',id,'ordinal',ordinal,'state',state,'recovery',recovery,'policy_reason',policy_reason,'attempt',attempt,'proof',proof,'outcome',outcome,'delete_ever_issued',delete_ever_issued,'stage_timings',stage_timings,'updated_at',updated_at) ORDER BY ordinal),'[]') FROM nas_cleanup_items WHERE plan_id=p.id) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&label, &sha, &mode, &allow, &reason, &until, &manifest, &jsonStates, &results)
 	if err != nil {
 		util.WriteError(w, 404, "cleanup plan unavailable")
 		return
@@ -383,12 +383,13 @@ type cleanupTask struct {
 	ApprovedProof json.RawMessage `json:"approved_proof,omitempty"`
 }
 type cleanupObserve struct {
-	Attempt       int             `json:"attempt"`
-	PlanSHA       string          `json:"plan_sha256"`
-	Outcome       string          `json:"outcome"`
-	Proof         json.RawMessage `json:"proof"`
-	Error         string          `json:"error"`
-	ClientVersion string          `json:"client_version"`
+	Attempt       int                `json:"attempt"`
+	PlanSHA       string             `json:"plan_sha256"`
+	Outcome       string             `json:"outcome"`
+	Proof         json.RawMessage    `json:"proof"`
+	Error         string             `json:"error"`
+	ClientVersion string             `json:"client_version"`
+	Timings       map[string]float64 `json:"timings,omitempty"`
 }
 
 func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Request) {
@@ -531,6 +532,16 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		util.WriteError(w, 400, "invalid cleanup observation")
 		return
 	}
+	if len(req.Timings) > 3 {
+		util.WriteError(w, 400, "invalid cleanup timings")
+		return
+	}
+	for name, value := range req.Timings {
+		if (name != "namespace_ms" && name != "hash_ms" && name != "proof_ms") || value < 0 || value > 1800000 {
+			util.WriteError(w, 400, "invalid cleanup timings")
+			return
+		}
+	}
 	if req.Outcome != "match" && req.Outcome != "missing" && req.Outcome != "conflict" && req.Outcome != "unverified" {
 		util.WriteError(w, 400, "invalid cleanup outcome")
 		return
@@ -585,6 +596,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		util.WriteError(w, 500, "invalid cleanup manifest")
 		return
 	}
+	stageTimings := map[string]any{"client": req.Timings}
 	policyReason := ""
 	action := req.Outcome
 	recovery := "unchecked"
@@ -602,18 +614,25 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		b, _ := json.Marshal(bitem)
 		if e != nil || !bytes.Equal(a, b) {
 			action = "conflict"
-		} else if e = s.cleanupCurrentPolicy(ctx, tx, item); e != nil {
-			action = "keep"
-			policyReason = e.Error()
 		} else {
-			recovery = s.cleanupRecovery(ctx, item)
-			action = "would_delete"
-			if recovery == "conflict" {
-				action = "conflict"
-			}
-			if mode == "enabled" && s.cfg.NASCleanupDeletionEnabled && until != nil && until.After(time.Now()) && cleanupSameFileProof(oldProof, req.Proof) && (recovery == "r2_sha_verified" || (allow && recovery == "nas_only_at_check")) {
-				action = "delete_issued"
-				deletion = true
+			policyStarted := time.Now()
+			e = s.cleanupCurrentPolicyMode(ctx, tx, item, mode == "dry_run", stageTimings)
+			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
+			if e != nil {
+				action = "keep"
+				policyReason = e.Error()
+			} else {
+				recoveryStarted := time.Now()
+				recovery = s.cleanupRecovery(ctx, item)
+				stageTimings["recovery_ms"] = time.Since(recoveryStarted).Milliseconds()
+				action = "would_delete"
+				if recovery == "conflict" {
+					action = "conflict"
+				}
+				if mode == "enabled" && s.cfg.NASCleanupDeletionEnabled && until != nil && until.After(time.Now()) && cleanupSameFileProof(oldProof, req.Proof) && (recovery == "r2_sha_verified" || (allow && recovery == "nas_only_at_check")) {
+					action = "delete_issued"
+					deletion = true
+				}
 			}
 		}
 	}
@@ -622,7 +641,8 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		proof = string(req.Proof)
 	}
 	observed, _ := json.Marshal(req)
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,updated_at=now() WHERE id=$1`, id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason)
+	stages, _ := json.Marshal(stageTimings)
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,updated_at=now() WHERE id=$1`, id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages))
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "cleanup observation save failed")
 		return

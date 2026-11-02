@@ -212,4 +212,45 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
 
 
+    def test_many_unlisted_siblings_do_not_require_metadata_reads(self):
+        names=set()
+        for n in range(2000):
+            name="retained-%04d.txt" % n
+            (self.path.parent/name).write_bytes(b"keep")
+            names.add(name)
+        original=pull.os.stat
+        def checked(name,*args,**kwargs):
+            if isinstance(name,str) and name in names:
+                raise AssertionError("unrelated sibling metadata must not be read")
+            return original(name,*args,**kwargs)
+        with mock.patch.object(pull.os,"stat",side_effect=checked),self.opened() as current:
+            proof=current.proof()
+            self.assertGreaterEqual(current.stage_timings["namespace_ms"],0)
+            self.assertGreaterEqual(current.stage_timings["hash_ms"],0)
+            current.delete_exact(proof)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(len(list(self.path.parent.iterdir())),2000)
+
+    def test_sibling_content_changes_never_expand_exact_delete_scope(self):
+        sibling=self.path.parent/"retained.txt";sibling.write_text("old")
+        with self.opened() as current:
+            proof=current.proof()
+            sibling.write_text("changed retained content")
+            current.delete_exact(proof)
+        self.assertEqual(sibling.read_text(),"changed retained content")
+
+    def test_namespace_fingerprint_preserves_non_utf8_names(self):
+        parent=os.open(self.path.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try:
+            for name in (b"retained-\xff",b"retained-\xfe"):
+                fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=parent)
+                os.close(fd)
+            with self.opened() as current:
+                proof=current.proof()
+                os.unlink(b"retained-\xfe",dir_fd=parent)
+                with self.assertRaises(RuntimeError):current.delete_exact(proof)
+            self.assertTrue(self.path.exists())
+        finally:os.close(parent)
+
+
 if __name__=='__main__':unittest.main()
