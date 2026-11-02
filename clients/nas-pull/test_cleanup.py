@@ -253,4 +253,58 @@ class CleanupTests(unittest.TestCase):
         finally:os.close(parent)
 
 
+    def test_parallel_preflight_observations_never_unlink(self):
+        import copy
+        barrier=threading.Barrier(4)
+        calls=[];lock=threading.Lock();counter=[0]
+        def api(cfg,path,body):
+            with lock:
+                calls.append(path)
+                if path.endswith("/lease"):
+                    counter[0]+=1
+                    task=copy.deepcopy(self.task);task["item_id"]=counter[0]
+                    return dict(tasks=[task],retry_after_sec=0)
+            barrier.wait(4)
+            return dict(delete=False,action="would_delete",recovery="r2_sha_verified")
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull.os,"unlink",side_effect=AssertionError("preflight never unlinks")):
+                self.assertEqual(pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor),0)
+        self.assertEqual(len(calls),8)
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+        self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
+
+    def test_execution_drains_preflight_before_serial_processing(self):
+        order=[];counter=[0]
+        def api(cfg,path,body):
+            counter[0]+=1
+            task=dict(self.task,item_id=counter[0])
+            if counter[0]==2:task["approved_proof"]={}
+            return dict(tasks=[task],retry_after_sec=0)
+        def process(cfg,inventory,stop,task):
+            if task.get("approved_proof") is not None:
+                order.append("execute")
+            else:
+                order.append("preflight_start");time.sleep(0.03);order.append("preflight_end")
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull,"cleanup_process_task",side_effect=process):
+                pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor)
+        self.assertEqual(order,["preflight_start","preflight_end","execute"])
+        self.assertEqual(counter[0],2)
+
+    def test_lease_failure_drains_workers_before_next_receipt_replay(self):
+        finished=threading.Event();counter=[0]
+        def api(cfg,path,body):
+            counter[0]+=1
+            if counter[0]>1:raise OSError("transient lease failure")
+            return dict(tasks=[self.task],retry_after_sec=0)
+        def process(*args):
+            time.sleep(0.03);finished.set()
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull,"cleanup_process_task",side_effect=process),mock.patch.object(pull,"cleanup_replay_receipts") as replay:
+                with self.assertRaises(OSError):pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor)
+                self.assertTrue(finished.is_set())
+                self.assertEqual(replay.call_count,1)
+        self.assertTrue(self.path.exists())
+
+
 if __name__=='__main__':unittest.main()

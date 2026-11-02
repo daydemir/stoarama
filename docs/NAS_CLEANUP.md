@@ -89,3 +89,10 @@ retains all original frozen-stat, sidecar, hardlink, owner and duplicate checks.
 A missing, corrupt or mismatched index fails closed. This index grants no
 deletion authority; both gates and fresh live checks remain unchanged.
 The metadata-only producer is backend/scripts/nas-cleanup/build_frozen_index.py.
+
+Preflight is bounded to four concurrent read-only tasks. One coordinator owns
+receipt replay and drains every worker, including after a lease/worker failure,
+before replay, replacement or serial execution. Approved destructive tasks are
+never dispatched concurrently. Independent observations share a plan read lock;
+operator control still needs the exclusive parent lock. Public-registry evidence
+may be cached for one minute only in dry runs; enabled grants always check live.

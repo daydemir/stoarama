@@ -126,7 +126,11 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 			expected = stream.Rankings
 		}
 	}
+	rankingStarted := time.Now()
 	rankings, rankingsAt, err := s.cleanupRankings(ctx, q, i.StreamID, dryRun)
+	if stages != nil {
+		stages["rankings_ms"] = time.Since(rankingStarted).Milliseconds()
+	}
 	if err != nil {
 		return err
 	}
@@ -142,7 +146,12 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 	// catalog source identity. Recheck every source against all223 protected UTC
 	// intervals, including the authoritative185 older windows.
 	var raw []byte
-	if err = q.QueryRow(ctx, cleanupSourceMetadataSQL, i.SourceIDs).Scan(&raw); err != nil || cleanupSHA(raw) != i.SourceManifestSHA {
+	sourceStarted := time.Now()
+	err = q.QueryRow(ctx, cleanupSourceMetadataSQL, i.SourceIDs).Scan(&raw)
+	if stages != nil {
+		stages["source_metadata_ms"] = time.Since(sourceStarted).Milliseconds()
+	}
+	if err != nil || cleanupSHA(raw) != i.SourceManifestSHA {
 		return errors.New("source manifest changed")
 	}
 	var sources [][]json.RawMessage
@@ -160,22 +169,45 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 		}
 	}
 	var protected bool
+	referenceStarted := time.Now()
 	if i.Kind == "raw" {
 		err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_collation_hours h JOIN recordings r ON r.id=h.recording_id CROSS JOIN LATERAL jsonb_array_elements(h.manifest->'clips') p(item) WHERE r.account_id=47 AND r.stream_id=$1 AND (p.item->'clip'->>'clip_id')::bigint=$2) OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=$2)`, i.StreamID, i.SourceID).Scan(&protected)
 	} else {
 		err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM recording_collation_hours h JOIN recordings r ON r.id=h.recording_id CROSS JOIN LATERAL jsonb_array_elements(h.manifest->'clips') p(item) WHERE r.account_id=47 AND r.stream_id=$1 AND p.item->>'disposition'='quarantined' AND (p.item->'clip'->>'clip_id')::bigint=ANY($2)) OR EXISTS(SELECT 1 FROM recording_joined_source_snapshots WHERE clip_id=ANY($2))`, i.StreamID, i.SourceIDs).Scan(&protected)
 	}
+	if stages != nil {
+		stages["source_references_ms"] = time.Since(referenceStarted).Milliseconds()
+	}
 	if err != nil || protected {
 		return errors.New("current source/error protection; KEEP")
 	}
-	return s.cleanupPublicUnchanged(ctx)
+	publicStarted := time.Now()
+	err = s.cleanupPublicUnchangedMode(ctx, dryRun)
+	if stages != nil {
+		stages["public_registry_ms"] = time.Since(publicStarted).Milliseconds()
+	}
+	return err
 }
 func (s *Server) cleanupPublicUnchanged(ctx context.Context) error {
+	return s.cleanupPublicUnchangedMode(ctx, false)
+}
+func (s *Server) cleanupPublicUnchangedMode(ctx context.Context, dryRun bool) error {
 	s.nasCleanupMu.Lock()
 	defer s.nasCleanupMu.Unlock()
 	key := globalDeliveryPrefix + "public/current.json"
+	started := time.Now().UTC()
+	age := started.Sub(s.nasCleanupPublicVerifiedAt)
+	if dryRun && s.nasCleanupPublicETag != "" && age >= 0 && age < time.Minute {
+		return nil
+	}
+	if s.r2 == nil {
+		return errors.New("public registry store unavailable")
+	}
 	if s.nasCleanupPublicETag != "" {
 		_, err := s.r2.HeadExact(ctx, key, s.nasCleanupPublicETag, "")
+		if err == nil {
+			s.nasCleanupPublicVerifiedAt = started
+		}
 		return err
 	}
 	head, err := s.r2.Head(ctx, key)
@@ -194,5 +226,6 @@ func (s *Server) cleanupPublicUnchanged(ctx context.Context) error {
 		return err
 	}
 	s.nasCleanupPublicETag = head.ETag
+	s.nasCleanupPublicVerifiedAt = started
 	return nil
 }
