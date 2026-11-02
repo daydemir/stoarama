@@ -36,6 +36,17 @@ def get_json(key,sha):
 index=get_json(INDEX_KEY,INDEX_SHA);policy=get_json(POLICY_KEY,POLICY_SHA)
 assert index['source_audit_sha256']=='480d85a49288d79e201b14405dc72d0f6fc979a0fd06f1b7a95663053583865b'
 assert len(index['parents'])==935 and index['entry_totals']['entries']==2943864
+
+SUPPORTED_MANIFEST_COMPILERS=('full-cleanup-v1','full-cleanup-v2-strict-time')
+def cleanup_recipe(compiler):
+ if compiler not in SUPPORTED_MANIFEST_COMPILERS:
+  raise ValueError('unsupported manifest compiler')
+ return hashlib.sha256(json.dumps({'index':INDEX_SHA,'policy':POLICY_SHA,'compiler':compiler},sort_keys=True).encode()).hexdigest()
+def checked_manifest_recipe(manifest):
+ recipe=manifest.get('recipe')
+ if recipe not in {cleanup_recipe(c) for c in SUPPORTED_MANIFEST_COMPILERS}:
+  raise ValueError('manifest recipe is not bound to the reviewed index and policy')
+ return recipe
 whole=set(policy['whole_stream_keep']);stream_policy={x['stream_id']:x for x in policy['streams']}
 def instant(x):
  if not isinstance(x,str):
@@ -215,6 +226,7 @@ assert original['source_frozen_index_sha256']==INDEX_SHA and original['policy_sh
 assert original['execution_enabled'] is False and original['allow_nas_only'] is False and original['actual_deleted_files']==0
 assert len(original['folders'])==len(root_folders)
 assert {f['parent'] for f in original['folders']}==set(root_folders)
+checked_manifest_recipe(original)
 original_groups=original['dry_run_groups']
 original_ids={(i['kind'],i['source_id']) for g in original_groups for i in g['items']}
 ordinals={p:n for n,p in enumerate(sorted(root_folders),1)}

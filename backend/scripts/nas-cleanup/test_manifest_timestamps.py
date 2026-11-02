@@ -2,6 +2,8 @@
 """Pure timestamp regression checks; never reads credentials, NAS, R2 or PostgreSQL."""
 import ast
 import datetime
+import hashlib
+import json
 from pathlib import Path
 import re
 import unittest
@@ -43,5 +45,29 @@ class TimestampTests(unittest.TestCase):
             self.assertFalse(before_start<end and start>start)
             self.assertTrue(parse('2026-11-01T03:59:59.99999Z')<end and parse('2026-11-01T04:00:00.00001Z')>start)
             self.assertEqual(parse('2026-11-01T04:00:00.00001Z')-start,datetime.timedelta(microseconds=10))
+
+
+    def test_compiler_and_preparer_accept_same_content_bound_recipes(self):
+        def recipes(name):
+            tree=ast.parse((ROOT/name).read_text())
+            nodes=[n for n in tree.body if
+                (isinstance(n,ast.FunctionDef) and n.name in ('cleanup_recipe','checked_manifest_recipe')) or
+                (isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in ('SUPPORTED_MANIFEST_COMPILERS','INDEX_SHA','POLICY_SHA') for t in n.targets))]
+            scope={'hashlib':hashlib,'json':json}
+            exec(compile(ast.Module(body=nodes,type_ignores=[]),name,'exec'),scope)
+            return scope
+        compiler=recipes('compile_full_manifest_20261102.py')
+        preparer=recipes('prepare_full_manifest.py')
+        repair=recipes('repair_manifest_timestamps.py')
+        tree=ast.parse((ROOT/'compile_full_manifest_20261102.py').read_text())
+        assignment=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='recipe' for t in n.targets))
+        exec(compile(ast.Module(body=[assignment],type_ignores=[]),'compiler-recipe','exec'),compiler)
+        self.assertEqual(preparer['checked_manifest_recipe']({'recipe':compiler['recipe']}),compiler['recipe'])
+        for name in ('full-cleanup-v1','full-cleanup-v2-strict-time'):
+            digest=compiler['cleanup_recipe'](name)
+            self.assertEqual(preparer['checked_manifest_recipe']({'recipe':digest}),digest)
+            self.assertEqual(repair['checked_manifest_recipe']({'recipe':digest}),digest)
+        for invalid in ('',None,'f'*64):
+            with self.assertRaises(ValueError):preparer['checked_manifest_recipe']({'recipe':invalid})
 
 if __name__=='__main__':unittest.main()

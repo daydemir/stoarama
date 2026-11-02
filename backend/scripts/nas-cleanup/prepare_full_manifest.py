@@ -36,6 +36,17 @@ def get_json(key,sha):
 index=get_json(INDEX_KEY,INDEX_SHA);policy=get_json(POLICY_KEY,POLICY_SHA)
 assert index['source_audit_sha256']=='480d85a49288d79e201b14405dc72d0f6fc979a0fd06f1b7a95663053583865b'
 assert len(index['parents'])==935 and index['entry_totals']['entries']==2943864
+
+SUPPORTED_MANIFEST_COMPILERS=('full-cleanup-v1','full-cleanup-v2-strict-time')
+def cleanup_recipe(compiler):
+ if compiler not in SUPPORTED_MANIFEST_COMPILERS:
+  raise ValueError('unsupported manifest compiler')
+ return hashlib.sha256(json.dumps({'index':INDEX_SHA,'policy':POLICY_SHA,'compiler':compiler},sort_keys=True).encode()).hexdigest()
+def checked_manifest_recipe(manifest):
+ recipe=manifest.get('recipe')
+ if recipe not in {cleanup_recipe(c) for c in SUPPORTED_MANIFEST_COMPILERS}:
+  raise ValueError('manifest recipe is not bound to the reviewed index and policy')
+ return recipe
 whole=set(policy['whole_stream_keep']);stream_policy={x['stream_id']:x for x in policy['streams']}
 def instant(x):
  if not isinstance(x,str):
@@ -121,7 +132,6 @@ def valid_identity(row,sid,entry):
  return row['stream_id']==sid and row['timezone']==stream_policy[sid]['timezone'] and row['path']==entry['path'] and row['size_bytes']==entry['frozen'][0] and row['size_bytes']>0 and row['bucket']=='stoarama' and bool(row['object_key']) and bool(re.fullmatch('[a-f0-9]{64}',row['sha256'] or '')) and row['inventory_matches'] is True
 import urllib.request,urllib.error
 FULL_PREFIX='staging/best14-20261021/nas-retention-20261025/full-cleanup-20261102/'
-recipe=hashlib.sha256(json.dumps({'index':INDEX_SHA,'policy':POLICY_SHA,'compiler':'full-cleanup-v1'},sort_keys=True).encode()).hexdigest()
 ordinals={name:n for n,name in enumerate(sorted(x['path'] for x in index['folder_totals']),1)}
 folder_map={f['path']:f for f in index['folder_totals']}
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -133,8 +143,6 @@ def service(method,path,body=None):
   data=response.read(12*1024*1024+1);assert len(data)<=12*1024*1024
   return json.loads(data)
 assert service('GET','plans/6')['master_deletion_enabled'] is False
-existing=query("SELECT coalesce(json_agg(x),'[]') FROM(SELECT id,label,plan_sha256,mode FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 AND label LIKE 'nas-full-"+recipe[:12]+"-%')x")
-existing={p['label']:p for p in existing}
 receipts=[];retained=[];created=0
 def confirm(detail,rows):
  assert detail['mode']=='dry_run' and detail['master_deletion_enabled'] is False and detail['allow_nas_only'] is False
@@ -182,6 +190,9 @@ manifest=get_json(manifest_key,manifest_sha)
 assert manifest['schema']=='nas-cleanup-full-manifest-v1'
 assert manifest['policy_sha256']==POLICY_SHA and manifest['source_frozen_index_sha256']==INDEX_SHA
 assert manifest['execution_enabled'] is False and manifest['allow_nas_only'] is False and manifest['actual_deleted_files']==0
+recipe=checked_manifest_recipe(manifest)
+existing=query("SELECT coalesce(json_agg(x),'[]') FROM(SELECT id,label,plan_sha256,mode FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 AND label LIKE 'nas-full-"+recipe[:12]+"-%')x")
+existing={p['label']:p for p in existing}
 assert sum(f['files'] for f in manifest['folders'])==index['entry_totals']['file_entries']
 assert sum(f['logical_bytes'] for f in manifest['folders'])==index['entry_totals']['regular_file_bytes']
 folder_refs={f['parent']:f for f in manifest['folders']}

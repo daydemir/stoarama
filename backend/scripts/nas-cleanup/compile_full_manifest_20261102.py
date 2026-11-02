@@ -36,6 +36,17 @@ def get_json(key,sha):
 index=get_json(INDEX_KEY,INDEX_SHA);policy=get_json(POLICY_KEY,POLICY_SHA)
 assert index['source_audit_sha256']=='480d85a49288d79e201b14405dc72d0f6fc979a0fd06f1b7a95663053583865b'
 assert len(index['parents'])==935 and index['entry_totals']['entries']==2943864
+
+SUPPORTED_MANIFEST_COMPILERS=('full-cleanup-v1','full-cleanup-v2-strict-time')
+def cleanup_recipe(compiler):
+ if compiler not in SUPPORTED_MANIFEST_COMPILERS:
+  raise ValueError('unsupported manifest compiler')
+ return hashlib.sha256(json.dumps({'index':INDEX_SHA,'policy':POLICY_SHA,'compiler':compiler},sort_keys=True).encode()).hexdigest()
+def checked_manifest_recipe(manifest):
+ recipe=manifest.get('recipe')
+ if recipe not in {cleanup_recipe(c) for c in SUPPORTED_MANIFEST_COMPILERS}:
+  raise ValueError('manifest recipe is not bound to the reviewed index and policy')
+ return recipe
 whole=set(policy['whole_stream_keep']);stream_policy={x['stream_id']:x for x in policy['streams']}
 def instant(x):
  if not isinstance(x,str):
@@ -124,7 +135,7 @@ pool=concurrent.futures.ThreadPoolExecutor(max_workers=4)
 root_folders={f['path']:f for f in index['folder_totals']}
 global_counts=collections.defaultdict(lambda:{'files':0,'logical_bytes':0})
 results=[];candidate_groups=[];started_at=datetime.datetime.now(datetime.timezone.utc).isoformat()
-recipe=hashlib.sha256(json.dumps({'index':INDEX_SHA,'policy':POLICY_SHA,'compiler':'full-cleanup-v2-strict-time'},sort_keys=True).encode()).hexdigest()
+recipe=cleanup_recipe('full-cleanup-v2-strict-time')
 def add_count(counts,status,n,size):
  counts[status]['files']+=n;counts[status]['logical_bytes']+=size
 def read_parent(parent,info):
