@@ -424,7 +424,8 @@ class CleanupTests(unittest.TestCase):
                                   started_at="2026-11-03T00:00:00Z", phase=pull.Phase.DEGRADED,
                                   last_error="legacy cursor HTTP 502", last_success_at="old progress")
         event = threading.Event(); event.set()
-        self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+        with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", hashlib.sha256(b"new verified client").hexdigest()):
+            self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
         self.assertFalse(cfg.is_candidate); self.assertTrue(runtime.stable_marked)
         self.assertEqual(cfg.current_file.read_bytes(), b"new verified client")
         self.assertEqual(cfg.previous_file.read_bytes(), b"previous verified client")
@@ -450,6 +451,27 @@ class CleanupTests(unittest.TestCase):
                 pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor,
                                    workers=3, task_limit=3, verified_event=event)
         self.assertTrue(event.is_set())
+
+    def test_newer_staged_artifact_cannot_be_promoted_by_an_older_verified_boot(self):
+        from types import SimpleNamespace
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json")
+        cfg.current_file.write_bytes(b"known good client")
+        cfg.candidate_file.write_bytes(b"newer unexecuted candidate")
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False,
+                                  boot_id="fixture", started_at="2026-11-03T00:00:00Z")
+        event = threading.Event(); event.set()
+        executed = hashlib.sha256(b"currently executing candidate").hexdigest()
+        with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", executed):
+            with self.assertRaises(RuntimeError):
+                pull.mark_cleanup_verified_healthy(cfg, runtime, True, event)
+        self.assertTrue(cfg.is_candidate); self.assertFalse(runtime.stable_marked)
+        self.assertEqual(cfg.current_file.read_bytes(), b"known good client")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted candidate")
+        self.assertFalse(cfg.runtime_file.exists())
+        self.assertFalse(cfg.previous_file.exists())
 
 
 if __name__=='__main__':unittest.main()

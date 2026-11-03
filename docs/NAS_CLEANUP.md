@@ -75,8 +75,8 @@ Bulk verification performance: parent fingerprints describe byte-exact entry
 names, not unrelated sibling metadata. Full target/sidecar hashes, inode/stat/
 hardlink checks, directory-FD confinement and final permit deadlines still apply.
 Client namespace/hash/proof durations and backend policy/recovery durations are
-reported separately. Dry-run ranking snapshots may be reused for at most one
-minute; enabled observations always query live rankings. Cached preflight evidence
+reported separately. Dry-run ranking snapshots may be reused for at most five
+minutes; enabled observations always query live rankings. Cached preflight evidence
 never authorizes a deletion. Both deletion gates remain OFF by default.
 
 The November2 policy refresh covers all109 NAS streams in one read-only repeatable-read snapshot. All221 previous UTC intervals and all31 whole-stream holds remain; two newer intervals are added. Unassigned catalog records remain retained. Source snapshot and policy gzip fixtures are pinned by their full SHA256 values and monotonic-protection tests.
@@ -90,9 +90,20 @@ A missing, corrupt or mismatched index fails closed. This index grants no
 deletion authority; both gates and fresh live checks remain unchanged.
 The metadata-only producer is backend/scripts/nas-cleanup/build_frozen_index.py.
 
-Preflight is bounded to four concurrent read-only tasks. One coordinator owns
+Preflight is bounded to eight concurrent read-only tasks, with rolling refills
+and at most64 leases per drain/replay cycle. Batch requests lease only free slots,
+up to eight; legacy requests default to one task. One coordinator owns
 receipt replay and drains every worker, including after a lease/worker failure,
 before replay, replacement or serial execution. Approved destructive tasks are
 never dispatched concurrently. Independent observations share a plan read lock;
 operator control still needs the exclusive parent lock. Public-registry evidence
 may be cached for one minute only in dry runs; enabled grants always check live.
+
+A verifier release can become stable when a fresh full physical proof receives
+an exact matching nonexecuting backend acknowledgement with R2 SHA verification,
+and this boot has passed authenticated heartbeat and fresh mount checks. This
+does not clear legacy raw-feed errors or advance its progress. Replayed receipts,
+empty leases and mere thread liveness cannot qualify a release. Promotion checks
+the source SHA captured at boot and serializes the check/rename with update
+staging; a newer unexecuted candidate is deferred. Optional heartbeat host.release
+telemetry reports candidate/stable status through the existing connection API.

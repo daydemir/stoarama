@@ -37,6 +37,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
+# Captured before any updater thread can replace the executing candidate path.
+EXECUTING_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+CANDIDATE_UPDATE_LOCK = threading.Lock()
 LIST_PAGE_LIMIT = 200
 DEFAULT_DOWNLOAD_WORKERS = 12
 MAX_DOWNLOAD_WORKERS = 32
@@ -8326,7 +8329,8 @@ def stage_update(cfg):
     if hashlib.sha256(source).hexdigest() != expected_sha:
         raise RuntimeError("update artifact checksum mismatch")
     compile(source, artifact, "exec")
-    atomic_write(cfg.candidate_file, source, mode=0o700)
+    with CANDIDATE_UPDATE_LOCK:
+        atomic_write(cfg.candidate_file, source, mode=0o700)
     log("INFO", "staged NAS pull client version=%s" % version)
     return version
 
@@ -8350,14 +8354,20 @@ def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready, jo
 
 
 def promote_candidate(cfg):
-    if not cfg.is_candidate:
-        return
-    if cfg.current_file.exists():
-        atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
-    os.replace(str(cfg.candidate_file), str(cfg.current_file))
-    fsync_dir(cfg.state_dir)
-    cfg.is_candidate = False
-    log("INFO", "promoted candidate version=%s" % CLIENT_VERSION)
+    # The updater may already have staged another version at candidate_file.
+    # Bind promotion to the artifact this boot actually executed, and serialize
+    # its hash/rename with staging to close the check-to-rename race.
+    with CANDIDATE_UPDATE_LOCK:
+        if not cfg.is_candidate:
+            return
+        if hashlib.sha256(cfg.candidate_file.read_bytes()).hexdigest() != EXECUTING_SOURCE_SHA256:
+            raise RuntimeError("staged candidate differs from executing release; defer promotion")
+        if cfg.current_file.exists():
+            atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
+        os.replace(str(cfg.candidate_file), str(cfg.current_file))
+        fsync_dir(cfg.state_dir)
+        cfg.is_candidate = False
+        log("INFO", "promoted candidate version=%s" % CLIENT_VERSION)
 
 
 def exec_candidate(cfg, runtime):
