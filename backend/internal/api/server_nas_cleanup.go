@@ -365,10 +365,14 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	var req struct {
 		ClientVersion string `json:"client_version"`
 		Protocol      int    `json:"protocol"`
+		Limit         int    `json:"limit"`
 	}
-	if util.DecodeJSON(r, &req) != nil || req.Protocol != 1 || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 {
-		util.WriteError(w, 400, "cleanup protocol1 and client version required")
+	if util.DecodeJSON(r, &req) != nil || req.Protocol != 1 || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || req.Limit < 0 || req.Limit > 8 {
+		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
 		return
+	}
+	if req.Limit == 0 {
+		req.Limit = 1
 	}
 	ctx := r.Context()
 	cid, ok := s.nasRestoreConnection(ctx, w, r)
@@ -386,31 +390,50 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 500, "cleanup lease expiry failed")
 		return
 	}
-	var task cleanupTask
-	var raw []byte
-	var approved []byte
-	var mode string
-	err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, s.cfg.NASCleanupDeletionEnabled).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
-	if errors.Is(err, pgx.ErrNoRows) {
-		util.WriteJSON(w, 200, map[string]any{"tasks": []any{}, "retry_after_sec": 120})
-		return
+	tasks := make([]cleanupTask, 0, req.Limit)
+	for len(tasks) < req.Limit {
+		var task cleanupTask
+		var raw, approved []byte
+		var mode string
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, s.cfg.NASCleanupDeletionEnabled).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		if errors.Is(err, pgx.ErrNoRows) {
+			break
+		}
+		if err != nil || json.Unmarshal(raw, &task.Item) != nil {
+			util.WriteError(w, 500, "cleanup lease load failed")
+			return
+		}
+		// An execution lease is always alone. Leave it pending if this response
+		// already contains dry-run work; the client drains that work first.
+		if mode == "enabled" && len(tasks) != 0 {
+			break
+		}
+		task.Attempt++
+		task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute)
+		if mode == "enabled" {
+			task.ApprovedProof = approved
+		}
+		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=$2,lease_expires_at=$3,updated_at=now() WHERE id=$1`, task.ItemID, task.Attempt, task.ExpiresAt)
+		if err != nil {
+			util.WriteError(w, 500, "cleanup lease save failed")
+			return
+		}
+		tasks = append(tasks, task)
+		if mode == "enabled" {
+			break
+		}
 	}
-	if err != nil || json.Unmarshal(raw, &task.Item) != nil {
-		util.WriteError(w, 500, "cleanup lease load failed")
-		return
-	}
-	task.Attempt++
-	task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute)
-	if mode == "enabled" {
-		task.ApprovedProof = approved
-	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=$2,lease_expires_at=$3,updated_at=now() WHERE id=$1`, task.ItemID, task.Attempt, task.ExpiresAt)
-	if err != nil || tx.Commit(ctx) != nil {
+	if err = tx.Commit(ctx); err != nil {
 		util.WriteError(w, 500, "cleanup lease save failed")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"tasks": []cleanupTask{task}, "retry_after_sec": 0})
+	retry := 0
+	if len(tasks) == 0 {
+		retry = 120
+	}
+	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "retry_after_sec": retry})
 }
+
 func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 	var p struct {
 		Root          [2]int64   `json:"root"`

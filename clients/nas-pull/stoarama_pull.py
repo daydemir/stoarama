@@ -1806,11 +1806,26 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
             NAS_MEDIA_FENCE.release_cleanup()
 
 
-def cleanup_lease(cfg):
-    lease = restore_api(cfg, "/account/connections/cleanup/lease", {"client_version": CLIENT_VERSION, "protocol": 1})
+CLEANUP_PREFLIGHT_WORKERS = 8
+CLEANUP_PREFLIGHT_TASKS = 64
+
+
+def cleanup_lease(cfg, limit=1):
+    if type(limit) is not int or not 1 <= limit <= CLEANUP_PREFLIGHT_WORKERS:
+        raise ValueError("invalid cleanup lease bound")
+    lease = restore_api(cfg, "/account/connections/cleanup/lease",
+                        {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit})
     tasks = lease.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) > 1:
+    if not isinstance(tasks, list) or len(tasks) > limit:
         raise RuntimeError("invalid cleanup lease")
+    if any(not isinstance(task, dict) or type(task.get("item_id")) is not int
+           or task["item_id"] <= 0 or type(task.get("attempt")) is not int
+           or task["attempt"] <= 0 for task in tasks):
+        raise RuntimeError("invalid cleanup task identity")
+    if len({task["item_id"] for task in tasks}) != len(tasks):
+        raise RuntimeError("duplicate cleanup task identity")
+    if any(task.get("approved_proof") is not None for task in tasks) and len(tasks) != 1:
+        raise RuntimeError("execution cleanup lease must be serial")
     return lease
 
 
@@ -1822,37 +1837,55 @@ def cleanup_once(cfg, inventory, stop_event):
     return lease.get("retry_after_sec", 120)
 
 
-def cleanup_batch(cfg, inventory, stop_event, executor):
-    # The coordinator alone replays receipts, with no active worker. Replaying
-    # an in-flight intent must never race the owner currently handling it.
+def cleanup_batch(cfg, inventory, stop_event, executor,
+                  workers=CLEANUP_PREFLIGHT_WORKERS, task_limit=CLEANUP_PREFLIGHT_TASKS):
+    if type(workers) is not int or not 1 <= workers <= CLEANUP_PREFLIGHT_WORKERS:
+        raise ValueError("invalid cleanup worker bound")
+    if type(task_limit) is not int or not 1 <= task_limit <= CLEANUP_PREFLIGHT_TASKS:
+        raise ValueError("invalid cleanup cycle bound")
+    # Only the coordinator replays, after every worker from the prior cycle
+    # has drained. No replay can overtake an active durable receipt.
     cleanup_replay_receipts(cfg, inventory)
-    pending = []
+    pending = set()
     leased = 0
     retry = 120
+    exhausted = False
+    executing = False
     error = None
     try:
-        for _ in range(4):
-            if stop_event.is_set():
+        while not stop_event.is_set():
+            # Refill a bounded rolling window instead of idling fast workers
+            # behind the slowest file. Periodic drain/replay bounds each cycle.
+            while (not exhausted and not stop_event.is_set()
+                   and len(pending) < workers and leased < task_limit):
+                lease = cleanup_lease(cfg, min(workers - len(pending), task_limit - leased))
+                retry = lease.get("retry_after_sec", 120)
+                if not lease["tasks"]:
+                    exhausted = True
+                    break
+                for task in lease["tasks"]:
+                    leased += 1
+                    if task.get("approved_proof") is not None:
+                        for future in pending:
+                            future.result()
+                        pending.clear()
+                        cleanup_process_task(cfg, inventory, stop_event, task)
+                        executing = True
+                        break
+                    pending.add(executor.submit(cleanup_process_task, cfg, inventory, stop_event, task))
+                if executing:
+                    break
+            if executing or not pending:
                 break
-            lease = cleanup_lease(cfg)
-            retry = lease.get("retry_after_sec", 120)
-            if not lease["tasks"]:
-                break
-            task = lease["tasks"][0]
-            leased += 1
-            if task.get("approved_proof") is not None:
-                # Drain preflight workers before entering serial execution.
-                for future in pending:
-                    future.result()
-                pending.clear()
-                cleanup_process_task(cfg, inventory, stop_event, task)
-                break
-            pending.append(executor.submit(cleanup_process_task, cfg, inventory, stop_event, task))
+            done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                pending.remove(future)
+                future.result()
     except Exception as exc:
         error = exc
     finally:
-        # Also drain when a later lease or worker fails. No next replay, app
-        # replacement or shutdown can overtake these durable checkpoints.
+        # Failure, cancellation, execution, shutdown and app replacement must
+        # all observe every worker's durable checkpoint before replay.
         for future in pending:
             try:
                 future.result()
@@ -1866,17 +1899,14 @@ def cleanup_batch(cfg, inventory, stop_event, executor):
 
 def cleanup_loop(cfg, inventory, stop_event):
     wait = 15
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="nas-cleanup") as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_PREFLIGHT_WORKERS, thread_name_prefix="nas-cleanup") as executor:
         while not stop_event.wait(wait):
             try:
                 retry = cleanup_batch(cfg, inventory, stop_event, executor)
                 wait = 0 if retry == 0 else restore_wait(retry)
             except Exception as exc:
                 log("WARN", "NAS cleanup deferred: %s" % exc)
-                # Reconcile durable receipts before retry; never repeat an
-                # uncertain unlink. A transient error need not idle five minutes.
                 wait = restore_wait(min(60, RESTORE_ERROR_WAIT_SEC))
-
 
 
 def prepare_clip_with_capacity(cfg, runtime, clip):
