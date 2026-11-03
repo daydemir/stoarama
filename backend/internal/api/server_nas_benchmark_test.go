@@ -94,9 +94,13 @@ func TestHeartbeatDropsInvalidHostFactsKeepsTelemetry(t *testing.T) {
 		t.Fatalf("invalid host facts persisted: %s", host)
 	}
 
-	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":200},"host":{"machine":"x86_64","cpu_count":4}}`)
+	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":200},"host":{"machine":"x86_64","cpu_count":4,"release":{"candidate":false,"stable":true}}}`)
 	if _, _, host = read(); !strings.Contains(string(host), `"x86_64"`) {
 		t.Fatalf("valid host facts not persisted: %s", host)
+	}
+	var facts nasHostFacts
+	if json.Unmarshal(host, &facts) != nil || facts.Release == nil || facts.Release.Candidate || !facts.Release.Stable {
+		t.Fatalf("release stability telemetry not persisted: %s", host)
 	}
 	// A later invalid report must not erase the last good facts.
 	call(`{"storage":{"available":true,"total_bytes":1000,"free_bytes":150},"host":{"machine":"x86 64"}}`)

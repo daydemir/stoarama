@@ -37,6 +37,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
+CANDIDATE_UPDATE_LOCK = threading.Lock()
 LIST_PAGE_LIMIT = 200
 DEFAULT_DOWNLOAD_WORKERS = 12
 MAX_DOWNLOAD_WORKERS = 32
@@ -1117,6 +1118,7 @@ class Runtime:
         self.heartbeat_succeeded = False
         self.list_succeeded = False
         self.stable_marked = False
+        self.release_candidate_at_start = bool(getattr(cfg, "is_candidate", False))
         self.inventory = inventory
         # Remote authorization is process-local and fail-closed. A restart must
         # negotiate again; no manifest, environment, or progress file enables it.
@@ -1393,6 +1395,8 @@ class Runtime:
                 "capacity_blocked": self.capacity_blocked,
                 "joined_protocol_version": self.joined_protocol_version,
             }
+            release = {"candidate": self.release_candidate_at_start and not self.stable_marked,
+                       "stable": self.stable_marked}
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
             joined_delivery = self.joined_delivery.copy() if self.joined_delivery is not None else None
@@ -1414,7 +1418,8 @@ class Runtime:
         host_facts = getattr(self, "host_facts", None)
         if host_facts is not None:
             try:
-                payload["host"] = host_facts()
+                facts = host_facts()
+                payload["host"] = dict(facts, release=release) if isinstance(facts, dict) else facts
             except Exception as exc:
                 log("WARN", "host facts unavailable: %s" % exc)
         return payload
@@ -1751,6 +1756,23 @@ def cleanup_replay_receipts(cfg, inventory):
         cleanup_journal(inventory, item_id)
 
 
+def cleanup_verified_ack(task, proof, decision):
+    """Only a fresh, exact, nonexecuting full proof can qualify this boot."""
+    return (
+        task.get("approved_proof") is None
+        and isinstance(decision, dict)
+        and decision.get("delete") is False
+        and decision.get("action") == "would_delete"
+        and decision.get("recovery") == "r2_sha_verified"
+        and type(decision.get("item_id")) is int
+        and decision["item_id"] == task["item_id"]
+        and type(decision.get("attempt")) is int
+        and decision["attempt"] == task["attempt"]
+        and decision.get("plan_sha256") == task["plan_sha256"]
+        and decision.get("proof_sha256") == hashlib.sha256(json.dumps(proof).encode()).hexdigest()
+    )
+
+
 def cleanup_process_task(cfg, inventory, stop_event, task):
     item_id, attempt = task["item_id"], task["attempt"]
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
@@ -1791,6 +1813,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
                 cleanup_journal(inventory, item_id, "result", receipt)
                 restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, receipt)
             cleanup_journal(inventory, item_id)
+            return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
         # Never overwrite a durable intent/result with a speculative retry.
         if any(row[0] == item_id for row in cleanup_journal(inventory)):
@@ -1813,8 +1836,14 @@ CLEANUP_PREFLIGHT_TASKS = 64
 def cleanup_lease(cfg, limit=1):
     if type(limit) is not int or not 1 <= limit <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup lease bound")
-    lease = restore_api(cfg, "/account/connections/cleanup/lease",
-                        {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit})
+    body = {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit}
+    try:
+        lease = restore_api(cfg, "/account/connections/cleanup/lease", body)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 400:
+            raise
+        lease = restore_api(cfg, "/account/connections/cleanup/lease",
+                            {"client_version": CLIENT_VERSION, "protocol": 1})
     tasks = lease.get("tasks")
     if not isinstance(tasks, list) or len(tasks) > limit:
         raise RuntimeError("invalid cleanup lease")
@@ -1838,7 +1867,7 @@ def cleanup_once(cfg, inventory, stop_event):
 
 
 def cleanup_batch(cfg, inventory, stop_event, executor,
-                  workers=CLEANUP_PREFLIGHT_WORKERS, task_limit=CLEANUP_PREFLIGHT_TASKS):
+                  workers=CLEANUP_PREFLIGHT_WORKERS, task_limit=CLEANUP_PREFLIGHT_TASKS, verified_event=None):
     if type(workers) is not int or not 1 <= workers <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup worker bound")
     if type(task_limit) is not int or not 1 <= task_limit <= CLEANUP_PREFLIGHT_TASKS:
@@ -1852,6 +1881,9 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     exhausted = False
     executing = False
     error = None
+    def completed(future):
+        if future.result() is True and verified_event is not None:
+            verified_event.set()
     try:
         while not stop_event.is_set():
             # Refill a bounded rolling window instead of idling fast workers
@@ -1867,7 +1899,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                     leased += 1
                     if task.get("approved_proof") is not None:
                         for future in pending:
-                            future.result()
+                            completed(future)
                         pending.clear()
                         cleanup_process_task(cfg, inventory, stop_event, task)
                         executing = True
@@ -1880,7 +1912,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
             done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
                 pending.remove(future)
-                future.result()
+                completed(future)
     except Exception as exc:
         error = exc
     finally:
@@ -1888,7 +1920,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
         # all observe every worker's durable checkpoint before replay.
         for future in pending:
             try:
-                future.result()
+                completed(future)
             except Exception as exc:
                 if error is None:
                     error = exc
@@ -1897,12 +1929,12 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     return 0 if leased else retry
 
 
-def cleanup_loop(cfg, inventory, stop_event):
+def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
     with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_PREFLIGHT_WORKERS, thread_name_prefix="nas-cleanup") as executor:
         while not stop_event.wait(wait):
             try:
-                retry = cleanup_batch(cfg, inventory, stop_event, executor)
+                retry = cleanup_batch(cfg, inventory, stop_event, executor, verified_event=verified_event)
                 wait = 0 if retry == 0 else restore_wait(retry)
             except Exception as exc:
                 log("WARN", "NAS cleanup deferred: %s" % exc)
@@ -7211,28 +7243,33 @@ def load_outage(cfg):
     return read_json(cfg.outage_file, None)
 
 
+def send_heartbeat(cfg, runtime, outage):
+    payload = runtime.heartbeat_payload(outage)
+    try:
+        return request_json(cfg, "POST", "/account/connections/heartbeat",
+                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+    except urllib.error.HTTPError as exc:
+        host = payload.get("host")
+        if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
+            raise
+        # A rolled-back backend may not know this optional diagnostic field.
+        # Retry only without that field; authentication and all other telemetry
+        # stay exact, and any second rejection follows normal outage handling.
+        payload["host"] = {k: v for k, v in host.items() if k != "release"}
+        return request_json(cfg, "POST", "/account/connections/heartbeat",
+                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+
+
 def heartbeat_loop(cfg, runtime, stop_event):
     outage = load_outage(cfg)
     while not stop_event.is_set():
         try:
-            response = request_json(
-                cfg,
-                "POST",
-                "/account/connections/heartbeat",
-                body=runtime.heartbeat_payload(outage),
-                timeout=HEARTBEAT_TIMEOUT_SEC,
-            )
+            response = send_heartbeat(cfg, runtime, outage)
             runtime.apply_joined_protocol_response(response)
             runtime.heartbeat_succeeded = True
             if outage:
                 outage["recovered_at"] = utc_now()
-                response = request_json(
-                    cfg,
-                    "POST",
-                    "/account/connections/heartbeat",
-                    body=runtime.heartbeat_payload(outage),
-                    timeout=HEARTBEAT_TIMEOUT_SEC,
-                )
+                response = send_heartbeat(cfg, runtime, outage)
                 runtime.apply_joined_protocol_response(response)
                 outage = None
                 try:
@@ -8301,7 +8338,8 @@ def stage_update(cfg):
     if hashlib.sha256(source).hexdigest() != expected_sha:
         raise RuntimeError("update artifact checksum mismatch")
     compile(source, artifact, "exec")
-    atomic_write(cfg.candidate_file, source, mode=0o700)
+    with CANDIDATE_UPDATE_LOCK:
+        atomic_write(cfg.candidate_file, source, mode=0o700)
     log("INFO", "staged NAS pull client version=%s" % version)
     return version
 
@@ -8324,15 +8362,48 @@ def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready, jo
         stop_event.wait(UPDATE_INTERVAL_SEC)
 
 
+def executing_release_sha256(cfg):
+    # CLIENT_VERSION is a literal in the code this interpreter compiled.
+    # The immutable version-specific manifest binds that boot to its approved
+    # full source hash, even if an external stager replaced __file__ at startup.
+    expected = getattr(cfg, "executing_release_sha256", None)
+    if expected is not None:
+        return expected
+    url = cfg.update_manifest_url.rsplit("/", 1)[0] + "/latest-" + CLIENT_VERSION + ".json"
+    manifest = request_json(cfg, "GET", url, authenticate=False, timeout=10)
+    version, artifact, expected = validate_manifest(manifest)
+    if version != CLIENT_VERSION or artifact != "stoarama-pull-" + CLIENT_VERSION + ".py":
+        raise RuntimeError("executing release identity is unavailable")
+    cfg.executing_release_sha256 = expected
+    return expected
+
+
+class CandidateMismatch(RuntimeError):
+    """A newer staged artifact must be executed before it can be healthy."""
+
+
 def promote_candidate(cfg):
     if not cfg.is_candidate:
         return
-    if cfg.current_file.exists():
-        atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
-    os.replace(str(cfg.candidate_file), str(cfg.current_file))
-    fsync_dir(cfg.state_dir)
-    cfg.is_candidate = False
-    log("INFO", "promoted candidate version=%s" % CLIENT_VERSION)
+    expected = executing_release_sha256(cfg)
+    # The updater may already have staged another version at candidate_file.
+    # Bind promotion to the artifact this boot actually executed, and serialize
+    # its hash/rename with staging to close the check-to-rename race.
+    with CANDIDATE_UPDATE_LOCK:
+        if not cfg.is_candidate:
+            return
+        source = cfg.candidate_file.read_bytes()
+        if hashlib.sha256(source).hexdigest() != expected:
+            raise CandidateMismatch("staged candidate differs from executing release; defer promotion")
+        if cfg.current_file.exists():
+            atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
+        # Install the captured verified bytes, never a mutable path. A separate
+        # self-update process can replace candidate_file without our thread lock.
+        # Leave that path intact so its newer candidate is not lost or promoted.
+        atomic_write(cfg.current_file, source, mode=0o700)
+        fsync_dir(cfg.state_dir)
+        cfg.is_candidate = False
+        log("INFO", "promoted candidate version=%s" % CLIENT_VERSION)
 
 
 def exec_candidate(cfg, runtime):
@@ -9112,6 +9183,24 @@ def space_audit_loop(cfg, stop_event, reported):
         stop_event.wait(60)
 
 
+def mark_cleanup_verified_healthy(cfg, runtime, storage_checked, verified):
+    # A fresh per-boot full NAS/R2 acknowledgement and authenticated heartbeat
+    # can qualify this verifier even when the independent raw cursor feed fails.
+    # Keep that feed's phase, error and progress unchanged.
+    if (not storage_checked or not runtime.heartbeat_succeeded
+            or not verified.is_set() or runtime.stable_marked):
+        return False
+    try:
+        if cfg.is_candidate:
+            promote_candidate(cfg)
+        mark_runtime(cfg, runtime, "healthy")
+    except Exception as exc:
+        log("WARN", "cleanup verifier release stability mark deferred: %s" % exc)
+        return False
+    runtime.stable_marked = True
+    return True
+
+
 def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_reported):
     # A full, correctly mounted NAS still needs audit updates. Promote only at
     # this main-thread safe boundary after two live authenticated API probes.
@@ -9150,6 +9239,7 @@ def run(cfg):
     storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
     storage_probe.start()
     space_audit_reported = threading.Event()
+    cleanup_verified = threading.Event()
     if not cfg.dry_run:
         threading.Thread(target=space_audit_loop, args=(cfg, stop_event, space_audit_reported), daemon=True).start()
     if not cfg.dry_run:
@@ -9161,7 +9251,7 @@ def run(cfg):
         threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
     cleanup_worker = None
     if not cfg.dry_run:
-        cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event), daemon=True)
+        cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event, cleanup_verified), daemon=True)
         cleanup_worker.start()
     updater = threading.Thread(
         target=update_loop,
@@ -9210,6 +9300,7 @@ def run(cfg):
             try:
                 check_storage(cfg)
                 storage_checked = True
+                mark_cleanup_verified_healthy(cfg, runtime, storage_checked, cleanup_verified)
                 require_storage_capacity(cfg, runtime)
             except (RuntimeError, OSError) as exc:
                 try:

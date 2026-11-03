@@ -382,5 +382,193 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(counts["leases"], 1)
                 self.assertEqual(replay.call_count, 1)
 
+    def test_completed_exact_nas_r2_ack_qualifies_only_this_fresh_proof(self):
+        def api(cfg, path, body):
+            self.assertTrue(path.endswith("/observe"))
+            return dict(delete=False, action="would_delete", recovery="r2_sha_verified",
+                        item_id=self.task["item_id"], attempt=self.task["attempt"],
+                        plan_sha256=self.task["plan_sha256"],
+                        proof_sha256=hashlib.sha256(json.dumps(body["proof"]).encode()).hexdigest())
+        with mock.patch.object(pull, "restore_api", side_effect=api):
+            self.assertTrue(pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task))
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+        proof = {"sha256": "test"}
+        decision = api(None, "/observe", {"proof": proof})
+        self.assertTrue(pull.cleanup_verified_ack(self.task, proof, decision))
+        for key, value in [
+                ("delete", True), ("delete", 0), ("action", "delete_issued"),
+                ("recovery", "r2_present_unverified"), ("item_id", self.task["item_id"] + 1),
+                ("attempt", self.task["attempt"] + 1), ("plan_sha256", "f" * 64),
+                ("proof_sha256", "f" * 64)]:
+            self.assertFalse(pull.cleanup_verified_ack(self.task, proof, dict(decision, **{key: value})))
+        self.assertFalse(pull.cleanup_verified_ack(dict(self.task, approved_proof={}), proof, decision))
+        self.assertFalse(pull.cleanup_verified_ack(self.task, proof, {"delete": False, "action": "would_delete"}))
+
+    def test_cleanup_health_gate_requires_proof_heartbeat_mount_and_preserves_feed_error(self):
+        from types import SimpleNamespace
+        for mounted, heartbeat, complete in [(False, True, True), (True, False, True), (True, True, False)]:
+            event = threading.Event()
+            if complete: event.set()
+            runtime = SimpleNamespace(heartbeat_succeeded=heartbeat, stable_marked=False)
+            with mock.patch.object(pull, "promote_candidate") as promote, mock.patch.object(pull, "mark_runtime") as mark:
+                self.assertFalse(pull.mark_cleanup_verified_healthy(SimpleNamespace(is_candidate=True), runtime, mounted, event))
+                promote.assert_not_called(); mark.assert_not_called()
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json")
+        cfg.current_file.write_bytes(b"previous verified client")
+        cfg.candidate_file.write_bytes(b"new verified client")
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False, boot_id="fixture",
+                                  started_at="2026-11-03T00:00:00Z", phase=pull.Phase.DEGRADED,
+                                  last_error="legacy cursor HTTP 502", last_success_at="old progress")
+        event = threading.Event(); event.set()
+        with mock.patch.object(pull, "executing_release_sha256", return_value=hashlib.sha256(b"new verified client").hexdigest()):
+            self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+        self.assertFalse(cfg.is_candidate); self.assertTrue(runtime.stable_marked)
+        self.assertEqual(cfg.current_file.read_bytes(), b"new verified client")
+        self.assertEqual(cfg.previous_file.read_bytes(), b"previous verified client")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"new verified client")
+        self.assertEqual(json.loads(cfg.runtime_file.read_text())["exit"], "healthy")
+        self.assertEqual(runtime.phase, pull.Phase.DEGRADED)
+        self.assertEqual(runtime.last_error, "legacy cursor HTTP 502")
+        self.assertEqual(runtime.last_success_at, "old progress")
+        self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+
+    def test_rolling_coordinator_marks_health_only_for_completed_verified_result(self):
+        tasks = [dict(self.task, item_id=n) for n in range(1, 4)]
+        event = threading.Event()
+        def api(cfg, path, body):
+            count = min(body["limit"], len(tasks))
+            leased = tasks[:count]
+            del tasks[:count]
+            return dict(tasks=leased, retry_after_sec=120)
+        def process(cfg, inventory, stop, task):
+            return task["item_id"] == 2
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            with mock.patch.object(pull, "restore_api", side_effect=api), mock.patch.object(pull, "cleanup_process_task", side_effect=process), mock.patch.object(pull, "cleanup_replay_receipts"):
+                pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor,
+                                   workers=3, task_limit=3, verified_event=event)
+        self.assertTrue(event.is_set())
+
+    def test_newer_staged_artifact_cannot_be_promoted_by_an_older_verified_boot(self):
+        from types import SimpleNamespace
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json")
+        cfg.current_file.write_bytes(b"known good client")
+        cfg.candidate_file.write_bytes(b"newer unexecuted candidate")
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False,
+                                  boot_id="fixture", started_at="2026-11-03T00:00:00Z")
+        event = threading.Event(); event.set()
+        executed = hashlib.sha256(b"currently executing candidate").hexdigest()
+        with mock.patch.object(pull, "executing_release_sha256", return_value=executed):
+            self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+            with self.assertRaises(pull.CandidateMismatch):
+                pull.promote_candidate(cfg)
+        self.assertTrue(cfg.is_candidate); self.assertFalse(runtime.stable_marked)
+        self.assertEqual(cfg.current_file.read_bytes(), b"known good client")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted candidate")
+        self.assertFalse(cfg.runtime_file.exists())
+        self.assertFalse(cfg.previous_file.exists())
+
+    def test_external_stager_cannot_change_the_bytes_installed_after_hash_check(self):
+        from types import SimpleNamespace
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json")
+        cfg.current_file.write_bytes(b"known good A")
+        cfg.candidate_file.write_bytes(b"executing verified B")
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False,
+                                  boot_id="fixture", started_at="2026-11-03T00:00:00Z")
+        event = threading.Event(); event.set()
+        atomic = pull.atomic_write
+        def external_stage_during_install(path, data, **kwargs):
+            if path == cfg.current_file:
+                # A separate/older self-update process need not honor our
+                # in-process lock. Force its replacement after verification.
+                cfg.candidate_file.write_bytes(b"newer unexecuted C")
+            return atomic(path, data, **kwargs)
+        with mock.patch.object(pull, "executing_release_sha256", return_value=hashlib.sha256(b"executing verified B").hexdigest()), mock.patch.object(pull, "atomic_write", side_effect=external_stage_during_install):
+            self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+        self.assertEqual(cfg.current_file.read_bytes(), b"executing verified B")
+        self.assertEqual(cfg.previous_file.read_bytes(), b"known good A")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted C")
+        self.assertEqual(json.loads(cfg.runtime_file.read_text())["exit"], "healthy")
+        self.assertTrue(runtime.stable_marked); self.assertFalse(cfg.is_candidate)
+
+    def test_promotion_uses_the_executing_version_manifest_not_mutable_source_path(self):
+        from types import SimpleNamespace
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json",
+                              update_manifest_url="https://example.invalid/nas/download/latest.json")
+        cfg.current_file.write_bytes(b"known good A")
+        cfg.candidate_file.write_bytes(b"newer unexecuted C")
+        expected = hashlib.sha256(b"compiled approved B").hexdigest()
+        manifest = dict(version="compiled-B", artifact="stoarama-pull-compiled-B.py", sha256=expected)
+        with mock.patch.object(pull, "CLIENT_VERSION", "compiled-B"), mock.patch.object(pull, "request_json", return_value=manifest) as get:
+            self.assertEqual(pull.executing_release_sha256(cfg), expected)
+            self.assertEqual(get.call_args.args[2], "https://example.invalid/nas/download/latest-compiled-B.json")
+            with self.assertRaises(pull.CandidateMismatch):
+                pull.promote_candidate(cfg)
+            self.assertEqual(get.call_count, 1)
+        self.assertEqual(cfg.current_file.read_bytes(), b"known good A")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted C")
+        self.assertTrue(cfg.is_candidate)
+        bad = SimpleNamespace(update_manifest_url=cfg.update_manifest_url)
+        with mock.patch.object(pull, "CLIENT_VERSION", "compiled-B"), mock.patch.object(pull, "request_json", return_value=dict(manifest, version="newer-C")):
+            with self.assertRaises(RuntimeError):
+                pull.executing_release_sha256(bad)
+        self.assertFalse(hasattr(bad, "executing_release_sha256"))
+
+    def test_unavailable_release_metadata_defers_without_marking_storage_blocked(self):
+        from types import SimpleNamespace
+        cfg = SimpleNamespace(is_candidate=True)
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False, phase=pull.Phase.DEGRADED)
+        event = threading.Event(); event.set()
+        with mock.patch.object(pull, "promote_candidate", side_effect=ValueError("malformed release metadata")), mock.patch.object(pull, "mark_runtime") as mark:
+            self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+        mark.assert_not_called()
+        self.assertFalse(runtime.stable_marked)
+        self.assertEqual(runtime.phase, pull.Phase.DEGRADED)
+
+    def test_backend_rollback_retries_only_optional_telemetry_and_lease_fields(self):
+        from types import SimpleNamespace
+        payload = {"client_version": "new", "cursor_id": 42,
+                   "host": {"machine": "x86_64", "release": {"candidate": False, "stable": True}}}
+        runtime = SimpleNamespace(heartbeat_payload=lambda outage: dict(payload))
+        calls = []
+        def heartbeat(cfg, method, path, **kwargs):
+            import copy
+            calls.append(copy.deepcopy(kwargs["body"]))
+            if len(calls) == 1:
+                raise pull.urllib.error.HTTPError(path, 400, "unknown release field", {}, None)
+            return {"ok": True}
+        with mock.patch.object(pull, "request_json", side_effect=heartbeat):
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {"ok": True})
+        self.assertIn("release", calls[0]["host"])
+        self.assertEqual(calls[1], {"client_version": "new", "cursor_id": 42, "host": {"machine": "x86_64"}})
+        self.assertIn("release", payload["host"])
+        lease_calls = []
+        def lease(cfg, path, body):
+            lease_calls.append(dict(body))
+            if "limit" in body:
+                raise pull.urllib.error.HTTPError(path, 400, "unknown limit field", {}, None)
+            return {"tasks": [self.task], "retry_after_sec": 0}
+        with mock.patch.object(pull, "restore_api", side_effect=lease):
+            self.assertEqual(pull.cleanup_lease(self.cfg, 8)["tasks"], [self.task])
+        self.assertEqual(lease_calls[0]["limit"], 8)
+        self.assertNotIn("limit", lease_calls[1])
+        for code in (401, 403, 409, 500):
+            with mock.patch.object(pull, "restore_api", side_effect=pull.urllib.error.HTTPError("lease", code, "not compatibility", {}, None)) as request:
+                with self.assertRaises(pull.urllib.error.HTTPError):
+                    pull.cleanup_lease(self.cfg, 8)
+                self.assertEqual(request.call_count, 1)
+
 
 if __name__=='__main__':unittest.main()

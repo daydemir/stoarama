@@ -44,20 +44,26 @@ var nasHostToken = regexp.MustCompile(`^[A-Za-z0-9_.+-]{1,64}$`)
 // nasHostFacts is what the NAS client can observe about its own container.
 // Pointers are "not observable" (for example no cgroup limit file), which is
 // different from zero.
+type nasReleaseHealth struct {
+	Candidate bool `json:"candidate"`
+	Stable    bool `json:"stable"`
+}
+
 type nasHostFacts struct {
-	Machine                string   `json:"machine"`
-	System                 string   `json:"system"`
-	KernelRelease          string   `json:"kernel_release"`
-	PythonVersion          string   `json:"python_version"`
-	CPUModel               string   `json:"cpu_model"`
-	CPUCount               int      `json:"cpu_count"`
-	AffinityCPUs           int      `json:"affinity_cpus"`
-	CgroupCPULimit         *float64 `json:"cgroup_cpu_limit"`
-	MemTotalBytes          int64    `json:"mem_total_bytes"`
-	MemAvailableBytes      int64    `json:"mem_available_bytes"`
-	CgroupMemoryLimitBytes *int64   `json:"cgroup_memory_limit_bytes"`
-	StateExecAllowed       *bool    `json:"state_exec_allowed"`
-	Load1                  *float64 `json:"load1"`
+	Release                *nasReleaseHealth `json:"release,omitempty"`
+	Machine                string            `json:"machine"`
+	System                 string            `json:"system"`
+	KernelRelease          string            `json:"kernel_release"`
+	PythonVersion          string            `json:"python_version"`
+	CPUModel               string            `json:"cpu_model"`
+	CPUCount               int               `json:"cpu_count"`
+	AffinityCPUs           int               `json:"affinity_cpus"`
+	CgroupCPULimit         *float64          `json:"cgroup_cpu_limit"`
+	MemTotalBytes          int64             `json:"mem_total_bytes"`
+	MemAvailableBytes      int64             `json:"mem_available_bytes"`
+	CgroupMemoryLimitBytes *int64            `json:"cgroup_memory_limit_bytes"`
+	StateExecAllowed       *bool             `json:"state_exec_allowed"`
+	Load1                  *float64          `json:"load1"`
 }
 
 func validateNASHostFacts(h *nasHostFacts) error {

@@ -3993,7 +3993,14 @@ class NASBenchmarkTests(unittest.TestCase):
             runtime = pull.Runtime(cfg)
             self.assertNotIn("host", runtime.heartbeat_payload(None))
             runtime.host_facts = lambda: {"machine": "x86_64"}
-            self.assertEqual(runtime.heartbeat_payload(None)["host"], {"machine": "x86_64"})
+            self.assertEqual(runtime.heartbeat_payload(None)["host"],
+                             {"machine": "x86_64", "release": {"candidate": False, "stable": False}})
+            runtime.release_candidate_at_start = True
+            self.assertEqual(runtime.heartbeat_payload(None)["host"]["release"],
+                             {"candidate": True, "stable": False})
+            runtime.stable_marked = True
+            self.assertEqual(runtime.heartbeat_payload(None)["host"]["release"],
+                             {"candidate": False, "stable": True})
 
             def broken():
                 raise OSError("no proc")
