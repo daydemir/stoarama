@@ -531,11 +531,44 @@ class CleanupTests(unittest.TestCase):
         cfg = SimpleNamespace(is_candidate=True)
         runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False, phase=pull.Phase.DEGRADED)
         event = threading.Event(); event.set()
-        with mock.patch.object(pull, "promote_candidate", side_effect=OSError("metadata unavailable")), mock.patch.object(pull, "mark_runtime") as mark:
+        with mock.patch.object(pull, "promote_candidate", side_effect=ValueError("malformed release metadata")), mock.patch.object(pull, "mark_runtime") as mark:
             self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
         mark.assert_not_called()
         self.assertFalse(runtime.stable_marked)
         self.assertEqual(runtime.phase, pull.Phase.DEGRADED)
+
+    def test_backend_rollback_retries_only_optional_telemetry_and_lease_fields(self):
+        from types import SimpleNamespace
+        payload = {"client_version": "new", "cursor_id": 42,
+                   "host": {"machine": "x86_64", "release": {"candidate": False, "stable": True}}}
+        runtime = SimpleNamespace(heartbeat_payload=lambda outage: dict(payload))
+        calls = []
+        def heartbeat(cfg, method, path, **kwargs):
+            import copy
+            calls.append(copy.deepcopy(kwargs["body"]))
+            if len(calls) == 1:
+                raise pull.urllib.error.HTTPError(path, 400, "unknown release field", {}, None)
+            return {"ok": True}
+        with mock.patch.object(pull, "request_json", side_effect=heartbeat):
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), {"ok": True})
+        self.assertIn("release", calls[0]["host"])
+        self.assertEqual(calls[1], {"client_version": "new", "cursor_id": 42, "host": {"machine": "x86_64"}})
+        self.assertIn("release", payload["host"])
+        lease_calls = []
+        def lease(cfg, path, body):
+            lease_calls.append(dict(body))
+            if "limit" in body:
+                raise pull.urllib.error.HTTPError(path, 400, "unknown limit field", {}, None)
+            return {"tasks": [self.task], "retry_after_sec": 0}
+        with mock.patch.object(pull, "restore_api", side_effect=lease):
+            self.assertEqual(pull.cleanup_lease(self.cfg, 8)["tasks"], [self.task])
+        self.assertEqual(lease_calls[0]["limit"], 8)
+        self.assertNotIn("limit", lease_calls[1])
+        for code in (401, 403, 409, 500):
+            with mock.patch.object(pull, "restore_api", side_effect=pull.urllib.error.HTTPError("lease", code, "not compatibility", {}, None)) as request:
+                with self.assertRaises(pull.urllib.error.HTTPError):
+                    pull.cleanup_lease(self.cfg, 8)
+                self.assertEqual(request.call_count, 1)
 
 
 if __name__=='__main__':unittest.main()

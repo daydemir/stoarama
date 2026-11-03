@@ -1836,8 +1836,14 @@ CLEANUP_PREFLIGHT_TASKS = 64
 def cleanup_lease(cfg, limit=1):
     if type(limit) is not int or not 1 <= limit <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup lease bound")
-    lease = restore_api(cfg, "/account/connections/cleanup/lease",
-                        {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit})
+    body = {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit}
+    try:
+        lease = restore_api(cfg, "/account/connections/cleanup/lease", body)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 400:
+            raise
+        lease = restore_api(cfg, "/account/connections/cleanup/lease",
+                            {"client_version": CLIENT_VERSION, "protocol": 1})
     tasks = lease.get("tasks")
     if not isinstance(tasks, list) or len(tasks) > limit:
         raise RuntimeError("invalid cleanup lease")
@@ -7237,28 +7243,33 @@ def load_outage(cfg):
     return read_json(cfg.outage_file, None)
 
 
+def send_heartbeat(cfg, runtime, outage):
+    payload = runtime.heartbeat_payload(outage)
+    try:
+        return request_json(cfg, "POST", "/account/connections/heartbeat",
+                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+    except urllib.error.HTTPError as exc:
+        host = payload.get("host")
+        if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
+            raise
+        # A rolled-back backend may not know this optional diagnostic field.
+        # Retry only without that field; authentication and all other telemetry
+        # stay exact, and any second rejection follows normal outage handling.
+        payload["host"] = {k: v for k, v in host.items() if k != "release"}
+        return request_json(cfg, "POST", "/account/connections/heartbeat",
+                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+
+
 def heartbeat_loop(cfg, runtime, stop_event):
     outage = load_outage(cfg)
     while not stop_event.is_set():
         try:
-            response = request_json(
-                cfg,
-                "POST",
-                "/account/connections/heartbeat",
-                body=runtime.heartbeat_payload(outage),
-                timeout=HEARTBEAT_TIMEOUT_SEC,
-            )
+            response = send_heartbeat(cfg, runtime, outage)
             runtime.apply_joined_protocol_response(response)
             runtime.heartbeat_succeeded = True
             if outage:
                 outage["recovered_at"] = utc_now()
-                response = request_json(
-                    cfg,
-                    "POST",
-                    "/account/connections/heartbeat",
-                    body=runtime.heartbeat_payload(outage),
-                    timeout=HEARTBEAT_TIMEOUT_SEC,
-                )
+                response = send_heartbeat(cfg, runtime, outage)
                 runtime.apply_joined_protocol_response(response)
                 outage = None
                 try:
@@ -8372,6 +8383,8 @@ class CandidateMismatch(RuntimeError):
 
 
 def promote_candidate(cfg):
+    if not cfg.is_candidate:
+        return
     expected = executing_release_sha256(cfg)
     # The updater may already have staged another version at candidate_file.
     # Bind promotion to the artifact this boot actually executed, and serialize
@@ -9181,7 +9194,7 @@ def mark_cleanup_verified_healthy(cfg, runtime, storage_checked, verified):
         if cfg.is_candidate:
             promote_candidate(cfg)
         mark_runtime(cfg, runtime, "healthy")
-    except (OSError, RuntimeError) as exc:
+    except Exception as exc:
         log("WARN", "cleanup verifier release stability mark deferred: %s" % exc)
         return False
     runtime.stable_marked = True

@@ -113,3 +113,8 @@ blocking raw delivery. This also covers an external stager replacing the source
 pathname during interpreter startup; the expected hash is not read from that path.
 Optional heartbeat host.release
 telemetry reports candidate/stable status through the existing connection API.
+
+When a backend rollback rejects optional release telemetry or batch-limit fields
+with HTTP400, the client retries once without only that optional field. All
+authentication, source identities, bounds and other telemetry remain unchanged.
+Other status codes and a second rejection use the ordinary retry/outage path.
