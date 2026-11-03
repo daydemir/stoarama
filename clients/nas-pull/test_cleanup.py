@@ -424,7 +424,7 @@ class CleanupTests(unittest.TestCase):
                                   started_at="2026-11-03T00:00:00Z", phase=pull.Phase.DEGRADED,
                                   last_error="legacy cursor HTTP 502", last_success_at="old progress")
         event = threading.Event(); event.set()
-        with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", hashlib.sha256(b"new verified client").hexdigest()):
+        with mock.patch.object(pull, "executing_release_sha256", return_value=hashlib.sha256(b"new verified client").hexdigest()):
             self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
         self.assertFalse(cfg.is_candidate); self.assertTrue(runtime.stable_marked)
         self.assertEqual(cfg.current_file.read_bytes(), b"new verified client")
@@ -464,7 +464,7 @@ class CleanupTests(unittest.TestCase):
                                   boot_id="fixture", started_at="2026-11-03T00:00:00Z")
         event = threading.Event(); event.set()
         executed = hashlib.sha256(b"currently executing candidate").hexdigest()
-        with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", executed):
+        with mock.patch.object(pull, "executing_release_sha256", return_value=executed):
             self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
             with self.assertRaises(pull.CandidateMismatch):
                 pull.promote_candidate(cfg)
@@ -492,13 +492,50 @@ class CleanupTests(unittest.TestCase):
                 # in-process lock. Force its replacement after verification.
                 cfg.candidate_file.write_bytes(b"newer unexecuted C")
             return atomic(path, data, **kwargs)
-        with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", hashlib.sha256(b"executing verified B").hexdigest()), mock.patch.object(pull, "atomic_write", side_effect=external_stage_during_install):
+        with mock.patch.object(pull, "executing_release_sha256", return_value=hashlib.sha256(b"executing verified B").hexdigest()), mock.patch.object(pull, "atomic_write", side_effect=external_stage_during_install):
             self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
         self.assertEqual(cfg.current_file.read_bytes(), b"executing verified B")
         self.assertEqual(cfg.previous_file.read_bytes(), b"known good A")
         self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted C")
         self.assertEqual(json.loads(cfg.runtime_file.read_text())["exit"], "healthy")
         self.assertTrue(runtime.stable_marked); self.assertFalse(cfg.is_candidate)
+
+    def test_promotion_uses_the_executing_version_manifest_not_mutable_source_path(self):
+        from types import SimpleNamespace
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json",
+                              update_manifest_url="https://example.invalid/nas/download/latest.json")
+        cfg.current_file.write_bytes(b"known good A")
+        cfg.candidate_file.write_bytes(b"newer unexecuted C")
+        expected = hashlib.sha256(b"compiled approved B").hexdigest()
+        manifest = dict(version="compiled-B", artifact="stoarama-pull-compiled-B.py", sha256=expected)
+        with mock.patch.object(pull, "CLIENT_VERSION", "compiled-B"), mock.patch.object(pull, "request_json", return_value=manifest) as get:
+            self.assertEqual(pull.executing_release_sha256(cfg), expected)
+            self.assertEqual(get.call_args.args[2], "https://example.invalid/nas/download/latest-compiled-B.json")
+            with self.assertRaises(pull.CandidateMismatch):
+                pull.promote_candidate(cfg)
+            self.assertEqual(get.call_count, 1)
+        self.assertEqual(cfg.current_file.read_bytes(), b"known good A")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted C")
+        self.assertTrue(cfg.is_candidate)
+        bad = SimpleNamespace(update_manifest_url=cfg.update_manifest_url)
+        with mock.patch.object(pull, "CLIENT_VERSION", "compiled-B"), mock.patch.object(pull, "request_json", return_value=dict(manifest, version="newer-C")):
+            with self.assertRaises(RuntimeError):
+                pull.executing_release_sha256(bad)
+        self.assertFalse(hasattr(bad, "executing_release_sha256"))
+
+    def test_unavailable_release_metadata_defers_without_marking_storage_blocked(self):
+        from types import SimpleNamespace
+        cfg = SimpleNamespace(is_candidate=True)
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False, phase=pull.Phase.DEGRADED)
+        event = threading.Event(); event.set()
+        with mock.patch.object(pull, "promote_candidate", side_effect=OSError("metadata unavailable")), mock.patch.object(pull, "mark_runtime") as mark:
+            self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+        mark.assert_not_called()
+        self.assertFalse(runtime.stable_marked)
+        self.assertEqual(runtime.phase, pull.Phase.DEGRADED)
 
 
 if __name__=='__main__':unittest.main()

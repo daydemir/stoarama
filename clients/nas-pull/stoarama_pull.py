@@ -37,8 +37,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
-# Captured before any updater thread can replace the executing candidate path.
-EXECUTING_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 CANDIDATE_UPDATE_LOCK = threading.Lock()
 LIST_PAGE_LIMIT = 200
 DEFAULT_DOWNLOAD_WORKERS = 12
@@ -8353,11 +8351,28 @@ def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready, jo
         stop_event.wait(UPDATE_INTERVAL_SEC)
 
 
+def executing_release_sha256(cfg):
+    # CLIENT_VERSION is a literal in the code this interpreter compiled.
+    # The immutable version-specific manifest binds that boot to its approved
+    # full source hash, even if an external stager replaced __file__ at startup.
+    expected = getattr(cfg, "executing_release_sha256", None)
+    if expected is not None:
+        return expected
+    url = cfg.update_manifest_url.rsplit("/", 1)[0] + "/latest-" + CLIENT_VERSION + ".json"
+    manifest = request_json(cfg, "GET", url, authenticate=False, timeout=10)
+    version, artifact, expected = validate_manifest(manifest)
+    if version != CLIENT_VERSION or artifact != "stoarama-pull-" + CLIENT_VERSION + ".py":
+        raise RuntimeError("executing release identity is unavailable")
+    cfg.executing_release_sha256 = expected
+    return expected
+
+
 class CandidateMismatch(RuntimeError):
     """A newer staged artifact must be executed before it can be healthy."""
 
 
 def promote_candidate(cfg):
+    expected = executing_release_sha256(cfg)
     # The updater may already have staged another version at candidate_file.
     # Bind promotion to the artifact this boot actually executed, and serialize
     # its hash/rename with staging to close the check-to-rename race.
@@ -8365,7 +8380,7 @@ def promote_candidate(cfg):
         if not cfg.is_candidate:
             return
         source = cfg.candidate_file.read_bytes()
-        if hashlib.sha256(source).hexdigest() != EXECUTING_SOURCE_SHA256:
+        if hashlib.sha256(source).hexdigest() != expected:
             raise CandidateMismatch("staged candidate differs from executing release; defer promotion")
         if cfg.current_file.exists():
             atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
@@ -9162,12 +9177,13 @@ def mark_cleanup_verified_healthy(cfg, runtime, storage_checked, verified):
     if (not storage_checked or not runtime.heartbeat_succeeded
             or not verified.is_set() or runtime.stable_marked):
         return False
-    if cfg.is_candidate:
-        try:
+    try:
+        if cfg.is_candidate:
             promote_candidate(cfg)
-        except CandidateMismatch:
-            return False
-    mark_runtime(cfg, runtime, "healthy")
+        mark_runtime(cfg, runtime, "healthy")
+    except (OSError, RuntimeError) as exc:
+        log("WARN", "cleanup verifier release stability mark deferred: %s" % exc)
+        return False
     runtime.stable_marked = True
     return True
 

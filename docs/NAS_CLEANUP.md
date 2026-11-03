@@ -104,9 +104,12 @@ an exact matching nonexecuting backend acknowledgement with R2 SHA verification,
 and this boot has passed authenticated heartbeat and fresh mount checks. This
 does not clear legacy raw-feed errors or advance its progress. Replayed receipts,
 empty leases and mere thread liveness cannot qualify a release. Promotion checks
-the source SHA captured at boot and installs only the captured verified bytes,
+the immutable version-specific manifest for the compiled CLIENT_VERSION and
+installs only the captured verified source bytes,
 not a mutable candidate pathname. In-process staging is serialized, and the
 candidate path is retained so a concurrent external stager cannot lose its newer
-release. A candidate mismatch defers promotion without blocking raw delivery.
+release. A candidate mismatch or unavailable release metadata defers promotion without
+blocking raw delivery. This also covers an external stager replacing the source
+pathname during interpreter startup; the expected hash is not read from that path.
 Optional heartbeat host.release
 telemetry reports candidate/stable status through the existing connection API.
