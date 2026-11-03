@@ -550,6 +550,11 @@ func TestNASCleanupDryRunCacheCannotAuthorizeEnabledPolicy(t *testing.T) {
 	if err != nil || !bytes.Equal(cached, old) || !cachedAt.Equal(at) {
 		t.Fatal("dry-run snapshot was not explicitly bounded")
 	}
+	s.nasCleanupRankingCache[3] = nasCleanupRankingsSnapshot{Raw: old, At: time.Now().Add(-4 * time.Minute)}
+	fourMinute, _, err := s.cleanupRankings(ctx, pool, 3, true)
+	if err != nil || !bytes.Equal(fourMinute, old) {
+		t.Fatal("bounded five-minute advisory snapshot unavailable")
+	}
 	fresh, _, err := s.cleanupRankings(ctx, pool, 3, false)
 	if err != nil {
 		t.Fatal(err)
@@ -557,7 +562,7 @@ func TestNASCleanupDryRunCacheCannotAuthorizeEnabledPolicy(t *testing.T) {
 	if bytes.Equal(fresh, old) {
 		t.Fatal("enabled policy reused advisory dry-run rankings")
 	}
-	s.nasCleanupRankingCache[3] = nasCleanupRankingsSnapshot{Raw: old, At: time.Now().Add(-2 * time.Minute)}
+	s.nasCleanupRankingCache[3] = nasCleanupRankingsSnapshot{Raw: old, At: time.Now().Add(-6 * time.Minute)}
 	refreshed, _, err := s.cleanupRankings(ctx, pool, 3, true)
 	if err != nil || !bytes.Equal(refreshed, fresh) {
 		t.Fatal("expired preflight snapshot did not refresh")

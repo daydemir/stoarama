@@ -7,6 +7,10 @@ import (
 )
 
 // Advisory preflight only. Enabled observations always replay live rankings.
+// Keep expensive read-only sensitivity selection bounded to five minutes;
+// exact source metadata and protected-window checks still run per file.
+const cleanupDryRunRankingTTL = 5 * time.Minute
+
 type nasCleanupRankingsSnapshot struct {
 	Raw []byte
 	At  time.Time
@@ -30,7 +34,7 @@ func (s *Server) cleanupRankings(ctx context.Context, q interface {
 	s.nasCleanupMu.Lock()
 	entry, ok := s.nasCleanupRankingCache[stream]
 	age := started.Sub(entry.At)
-	if ok && age >= 0 && age < time.Minute {
+	if ok && age >= 0 && age < cleanupDryRunRankingTTL {
 		s.nasCleanupMu.Unlock()
 		return append([]byte(nil), entry.Raw...), entry.At, nil
 	}
