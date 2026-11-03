@@ -1117,6 +1117,7 @@ class Runtime:
         self.heartbeat_succeeded = False
         self.list_succeeded = False
         self.stable_marked = False
+        self.release_candidate_at_start = bool(getattr(cfg, "is_candidate", False))
         self.inventory = inventory
         # Remote authorization is process-local and fail-closed. A restart must
         # negotiate again; no manifest, environment, or progress file enables it.
@@ -1393,6 +1394,8 @@ class Runtime:
                 "capacity_blocked": self.capacity_blocked,
                 "joined_protocol_version": self.joined_protocol_version,
             }
+            release = {"candidate": self.release_candidate_at_start and not self.stable_marked,
+                       "stable": self.stable_marked}
             storage = self.storage.copy() if self.storage is not None else None
             storage_age = time.monotonic() - self.storage_observed_monotonic
             joined_delivery = self.joined_delivery.copy() if self.joined_delivery is not None else None
@@ -1414,7 +1417,8 @@ class Runtime:
         host_facts = getattr(self, "host_facts", None)
         if host_facts is not None:
             try:
-                payload["host"] = host_facts()
+                facts = host_facts()
+                payload["host"] = dict(facts, release=release) if isinstance(facts, dict) else facts
             except Exception as exc:
                 log("WARN", "host facts unavailable: %s" % exc)
         return payload
@@ -1751,6 +1755,23 @@ def cleanup_replay_receipts(cfg, inventory):
         cleanup_journal(inventory, item_id)
 
 
+def cleanup_verified_ack(task, proof, decision):
+    """Only a fresh, exact, nonexecuting full proof can qualify this boot."""
+    return (
+        task.get("approved_proof") is None
+        and isinstance(decision, dict)
+        and decision.get("delete") is False
+        and decision.get("action") == "would_delete"
+        and decision.get("recovery") == "r2_sha_verified"
+        and type(decision.get("item_id")) is int
+        and decision["item_id"] == task["item_id"]
+        and type(decision.get("attempt")) is int
+        and decision["attempt"] == task["attempt"]
+        and decision.get("plan_sha256") == task["plan_sha256"]
+        and decision.get("proof_sha256") == hashlib.sha256(json.dumps(proof).encode()).hexdigest()
+    )
+
+
 def cleanup_process_task(cfg, inventory, stop_event, task):
     item_id, attempt = task["item_id"], task["attempt"]
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
@@ -1791,6 +1812,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
                 cleanup_journal(inventory, item_id, "result", receipt)
                 restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, receipt)
             cleanup_journal(inventory, item_id)
+            return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
         # Never overwrite a durable intent/result with a speculative retry.
         if any(row[0] == item_id for row in cleanup_journal(inventory)):
@@ -1838,7 +1860,7 @@ def cleanup_once(cfg, inventory, stop_event):
 
 
 def cleanup_batch(cfg, inventory, stop_event, executor,
-                  workers=CLEANUP_PREFLIGHT_WORKERS, task_limit=CLEANUP_PREFLIGHT_TASKS):
+                  workers=CLEANUP_PREFLIGHT_WORKERS, task_limit=CLEANUP_PREFLIGHT_TASKS, verified_event=None):
     if type(workers) is not int or not 1 <= workers <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup worker bound")
     if type(task_limit) is not int or not 1 <= task_limit <= CLEANUP_PREFLIGHT_TASKS:
@@ -1852,6 +1874,9 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     exhausted = False
     executing = False
     error = None
+    def completed(future):
+        if future.result() is True and verified_event is not None:
+            verified_event.set()
     try:
         while not stop_event.is_set():
             # Refill a bounded rolling window instead of idling fast workers
@@ -1867,7 +1892,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                     leased += 1
                     if task.get("approved_proof") is not None:
                         for future in pending:
-                            future.result()
+                            completed(future)
                         pending.clear()
                         cleanup_process_task(cfg, inventory, stop_event, task)
                         executing = True
@@ -1880,7 +1905,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
             done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
                 pending.remove(future)
-                future.result()
+                completed(future)
     except Exception as exc:
         error = exc
     finally:
@@ -1888,7 +1913,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
         # all observe every worker's durable checkpoint before replay.
         for future in pending:
             try:
-                future.result()
+                completed(future)
             except Exception as exc:
                 if error is None:
                     error = exc
@@ -1897,12 +1922,12 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     return 0 if leased else retry
 
 
-def cleanup_loop(cfg, inventory, stop_event):
+def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
     with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_PREFLIGHT_WORKERS, thread_name_prefix="nas-cleanup") as executor:
         while not stop_event.wait(wait):
             try:
-                retry = cleanup_batch(cfg, inventory, stop_event, executor)
+                retry = cleanup_batch(cfg, inventory, stop_event, executor, verified_event=verified_event)
                 wait = 0 if retry == 0 else restore_wait(retry)
             except Exception as exc:
                 log("WARN", "NAS cleanup deferred: %s" % exc)
@@ -9112,6 +9137,20 @@ def space_audit_loop(cfg, stop_event, reported):
         stop_event.wait(60)
 
 
+def mark_cleanup_verified_healthy(cfg, runtime, storage_checked, verified):
+    # A fresh per-boot full NAS/R2 acknowledgement and authenticated heartbeat
+    # can qualify this verifier even when the independent raw cursor feed fails.
+    # Keep that feed's phase, error and progress unchanged.
+    if (not storage_checked or not runtime.heartbeat_succeeded
+            or not verified.is_set() or runtime.stable_marked):
+        return False
+    if cfg.is_candidate:
+        promote_candidate(cfg)
+    mark_runtime(cfg, runtime, "healthy")
+    runtime.stable_marked = True
+    return True
+
+
 def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_reported):
     # A full, correctly mounted NAS still needs audit updates. Promote only at
     # this main-thread safe boundary after two live authenticated API probes.
@@ -9150,6 +9189,7 @@ def run(cfg):
     storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
     storage_probe.start()
     space_audit_reported = threading.Event()
+    cleanup_verified = threading.Event()
     if not cfg.dry_run:
         threading.Thread(target=space_audit_loop, args=(cfg, stop_event, space_audit_reported), daemon=True).start()
     if not cfg.dry_run:
@@ -9161,7 +9201,7 @@ def run(cfg):
         threading.Thread(target=selected_verify_loop, args=(cfg, stop_event), daemon=True).start()
     cleanup_worker = None
     if not cfg.dry_run:
-        cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event), daemon=True)
+        cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event, cleanup_verified), daemon=True)
         cleanup_worker.start()
     updater = threading.Thread(
         target=update_loop,
@@ -9210,6 +9250,7 @@ def run(cfg):
             try:
                 check_storage(cfg)
                 storage_checked = True
+                mark_cleanup_verified_healthy(cfg, runtime, storage_checked, cleanup_verified)
                 require_storage_capacity(cfg, runtime)
             except (RuntimeError, OSError) as exc:
                 try:
