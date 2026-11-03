@@ -429,7 +429,7 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(cfg.is_candidate); self.assertTrue(runtime.stable_marked)
         self.assertEqual(cfg.current_file.read_bytes(), b"new verified client")
         self.assertEqual(cfg.previous_file.read_bytes(), b"previous verified client")
-        self.assertFalse(cfg.candidate_file.exists())
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"new verified client")
         self.assertEqual(json.loads(cfg.runtime_file.read_text())["exit"], "healthy")
         self.assertEqual(runtime.phase, pull.Phase.DEGRADED)
         self.assertEqual(runtime.last_error, "legacy cursor HTTP 502")
@@ -465,13 +465,40 @@ class CleanupTests(unittest.TestCase):
         event = threading.Event(); event.set()
         executed = hashlib.sha256(b"currently executing candidate").hexdigest()
         with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", executed):
-            with self.assertRaises(RuntimeError):
-                pull.mark_cleanup_verified_healthy(cfg, runtime, True, event)
+            self.assertFalse(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+            with self.assertRaises(pull.CandidateMismatch):
+                pull.promote_candidate(cfg)
         self.assertTrue(cfg.is_candidate); self.assertFalse(runtime.stable_marked)
         self.assertEqual(cfg.current_file.read_bytes(), b"known good client")
         self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted candidate")
         self.assertFalse(cfg.runtime_file.exists())
         self.assertFalse(cfg.previous_file.exists())
+
+    def test_external_stager_cannot_change_the_bytes_installed_after_hash_check(self):
+        from types import SimpleNamespace
+        state = self.cfg.state_dir
+        cfg = SimpleNamespace(is_candidate=True, state_dir=state,
+                              current_file=state / "current.py", previous_file=state / "previous.py",
+                              candidate_file=state / "candidate.py", runtime_file=state / "runtime.json")
+        cfg.current_file.write_bytes(b"known good A")
+        cfg.candidate_file.write_bytes(b"executing verified B")
+        runtime = SimpleNamespace(heartbeat_succeeded=True, stable_marked=False,
+                                  boot_id="fixture", started_at="2026-11-03T00:00:00Z")
+        event = threading.Event(); event.set()
+        atomic = pull.atomic_write
+        def external_stage_during_install(path, data, **kwargs):
+            if path == cfg.current_file:
+                # A separate/older self-update process need not honor our
+                # in-process lock. Force its replacement after verification.
+                cfg.candidate_file.write_bytes(b"newer unexecuted C")
+            return atomic(path, data, **kwargs)
+        with mock.patch.object(pull, "EXECUTING_SOURCE_SHA256", hashlib.sha256(b"executing verified B").hexdigest()), mock.patch.object(pull, "atomic_write", side_effect=external_stage_during_install):
+            self.assertTrue(pull.mark_cleanup_verified_healthy(cfg, runtime, True, event))
+        self.assertEqual(cfg.current_file.read_bytes(), b"executing verified B")
+        self.assertEqual(cfg.previous_file.read_bytes(), b"known good A")
+        self.assertEqual(cfg.candidate_file.read_bytes(), b"newer unexecuted C")
+        self.assertEqual(json.loads(cfg.runtime_file.read_text())["exit"], "healthy")
+        self.assertTrue(runtime.stable_marked); self.assertFalse(cfg.is_candidate)
 
 
 if __name__=='__main__':unittest.main()

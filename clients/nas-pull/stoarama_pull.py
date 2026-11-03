@@ -8353,6 +8353,10 @@ def update_loop(cfg, runtime, stop_event, inventory_stop_event, update_ready, jo
         stop_event.wait(UPDATE_INTERVAL_SEC)
 
 
+class CandidateMismatch(RuntimeError):
+    """A newer staged artifact must be executed before it can be healthy."""
+
+
 def promote_candidate(cfg):
     # The updater may already have staged another version at candidate_file.
     # Bind promotion to the artifact this boot actually executed, and serialize
@@ -8360,11 +8364,15 @@ def promote_candidate(cfg):
     with CANDIDATE_UPDATE_LOCK:
         if not cfg.is_candidate:
             return
-        if hashlib.sha256(cfg.candidate_file.read_bytes()).hexdigest() != EXECUTING_SOURCE_SHA256:
-            raise RuntimeError("staged candidate differs from executing release; defer promotion")
+        source = cfg.candidate_file.read_bytes()
+        if hashlib.sha256(source).hexdigest() != EXECUTING_SOURCE_SHA256:
+            raise CandidateMismatch("staged candidate differs from executing release; defer promotion")
         if cfg.current_file.exists():
             atomic_write(cfg.previous_file, cfg.current_file.read_bytes(), mode=0o700)
-        os.replace(str(cfg.candidate_file), str(cfg.current_file))
+        # Install the captured verified bytes, never a mutable path. A separate
+        # self-update process can replace candidate_file without our thread lock.
+        # Leave that path intact so its newer candidate is not lost or promoted.
+        atomic_write(cfg.current_file, source, mode=0o700)
         fsync_dir(cfg.state_dir)
         cfg.is_candidate = False
         log("INFO", "promoted candidate version=%s" % CLIENT_VERSION)
@@ -9155,7 +9163,10 @@ def mark_cleanup_verified_healthy(cfg, runtime, storage_checked, verified):
             or not verified.is_set() or runtime.stable_marked):
         return False
     if cfg.is_candidate:
-        promote_candidate(cfg)
+        try:
+            promote_candidate(cfg)
+        except CandidateMismatch:
+            return False
     mark_runtime(cfg, runtime, "healthy")
     runtime.stable_marked = True
     return True
