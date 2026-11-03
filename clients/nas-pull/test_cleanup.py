@@ -268,7 +268,7 @@ class CleanupTests(unittest.TestCase):
             return dict(delete=False,action="would_delete",recovery="r2_sha_verified")
         with pull.concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull.os,"unlink",side_effect=AssertionError("preflight never unlinks")):
-                self.assertEqual(pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor),0)
+                self.assertEqual(pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor,workers=4,task_limit=4),0)
         self.assertEqual(len(calls),8)
         self.assertFalse(pull.cleanup_journal(self.inventory))
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -305,6 +305,82 @@ class CleanupTests(unittest.TestCase):
                 self.assertTrue(finished.is_set())
                 self.assertEqual(replay.call_count,1)
         self.assertTrue(self.path.exists())
+
+    def test_rolling_preflight_refills_around_a_slow_file_with_bounded_leases(self):
+        import copy
+        lock = threading.Lock()
+        release_slow = threading.Event()
+        counts = dict(leased=0, active=0, peak=0, finished=0)
+        def api(cfg, path, body):
+            self.assertTrue(path.endswith("/lease"))
+            limit = body["limit"]
+            with lock:
+                self.assertGreaterEqual(limit, 1)
+                self.assertLessEqual(limit, 8)
+                self.assertLessEqual(limit + counts["active"], 8)
+                tasks = []
+                for _ in range(min(limit, 24 - counts["leased"])):
+                    counts["leased"] += 1
+                    tasks.append(dict(copy.deepcopy(self.task), item_id=counts["leased"]))
+                return dict(tasks=tasks, retry_after_sec=120)
+        def process(cfg, inventory, stop, task):
+            with lock:
+                counts["active"] += 1
+                counts["peak"] = max(counts["peak"], counts["active"])
+            try:
+                if task["item_id"] == 1:
+                    self.assertTrue(release_slow.wait(3), "fast slots waited for slowest file")
+                else:
+                    time.sleep(0.002)
+            finally:
+                with lock:
+                    counts["active"] -= 1
+                    counts["finished"] += 1
+                    if counts["finished"] >= 10:
+                        release_slow.set()
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            with mock.patch.object(pull, "restore_api", side_effect=api), mock.patch.object(pull, "cleanup_process_task", side_effect=process), mock.patch.object(pull, "cleanup_replay_receipts") as replay:
+                self.assertEqual(pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor, task_limit=24), 0)
+                self.assertEqual(replay.call_count, 1)
+        self.assertEqual(counts["leased"], 24)
+        self.assertEqual(counts["finished"], 24)
+        self.assertEqual(counts["active"], 0)
+        self.assertLessEqual(counts["peak"], 8)
+
+    def test_batch_validates_all_task_ids_and_execution_shape_before_dispatch(self):
+        for tasks in [
+                [dict(self.task, item_id=1), dict(self.task, item_id=1)],
+                [dict(self.task, item_id=1), dict(self.task, item_id=True)],
+                [dict(self.task, item_id=1), dict(self.task, item_id=2, approved_proof={})],
+                [dict(self.task, item_id=n) for n in range(1, 10)]]:
+            with mock.patch.object(pull, "restore_api", return_value=dict(tasks=tasks)):
+                with self.assertRaises(RuntimeError):
+                    pull.cleanup_lease(self.cfg, 8)
+
+    def test_stop_drains_all_preflight_workers_before_return(self):
+        import copy
+        stop = threading.Event()
+        lock = threading.Lock()
+        counts = dict(active=0, finished=0, leases=0)
+        def api(cfg, path, body):
+            counts["leases"] += 1
+            return dict(tasks=[dict(copy.deepcopy(self.task), item_id=n) for n in range(1, 9)], retry_after_sec=0)
+        def process(cfg, inventory, stop, task):
+            with lock:
+                counts["active"] += 1
+            if task["item_id"] == 1:
+                stop.set()
+            time.sleep(0.02)
+            with lock:
+                counts["active"] -= 1
+                counts["finished"] += 1
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            with mock.patch.object(pull, "restore_api", side_effect=api), mock.patch.object(pull, "cleanup_process_task", side_effect=process), mock.patch.object(pull, "cleanup_replay_receipts") as replay:
+                pull.cleanup_batch(self.cfg, self.inventory, stop, executor)
+                self.assertEqual(counts["active"], 0)
+                self.assertEqual(counts["finished"], 8)
+                self.assertEqual(counts["leases"], 1)
+                self.assertEqual(replay.call_count, 1)
 
 
 if __name__=='__main__':unittest.main()
