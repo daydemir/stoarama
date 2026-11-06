@@ -1,19 +1,29 @@
-// Package collation builds generation-2 joined hours ("collation v2").
+// Package collation builds joined hours: generation 2 ("collation-v2") and,
+// opt-in, generation 3 ("collation-v3").
 //
-// The one hard rule: never join non-sequential footage. Every seam between two
-// time-adjacent clips must pass every metadata gate AND a frame-match proof of
-// continuity; anything else is a split. Extra splits are acceptable, a wrong
-// join is not.
+// The one hard rule: never join non-sequential footage. Under v2 every seam
+// between two time-adjacent clips must pass every metadata gate AND a
+// frame-match proof of continuity; anything else is a split. v3 keeps every v2
+// decision and adds independent source evidence (see h264hrd.go): it may join
+// a seam v2 split on a heuristic only when the source's own encoder state
+// proves adjacency, and it splits a v2 join that the same evidence proves
+// discontinuous. Pixels alone never turn a split into a join. Extra splits are
+// acceptable, a wrong join is not.
 package collation
 
 import (
+	"fmt"
 	"math"
 	"time"
 )
 
 const (
+	// PolicyVersion and Generation identify the default (v2) policy.
 	PolicyVersion = "collation-v2"
 	Generation    = 2
+
+	PolicyVersionV3 = "collation-v3"
+	GenerationV3    = 3
 
 	DecisionJoin  = "join"
 	DecisionSplit = "split"
@@ -55,6 +65,30 @@ type SeamPolicy struct {
 	// A previous clip shorter than the recording's nominal clip length by more
 	// than this was cut early: a capture restart indicator.
 	ShortClipSlackSeconds float64 `json:"short_clip_slack_seconds"`
+	// HRD is the v3 source-continuity proof (nil under v2).
+	HRD *HRDPolicy `json:"hrd,omitempty"`
+}
+
+// PolicySpec is one versioned seam policy and the hour generation it writes.
+type PolicySpec struct {
+	Version    string
+	Generation int
+}
+
+var (
+	PolicyV2 = PolicySpec{Version: PolicyVersion, Generation: Generation}
+	PolicyV3 = PolicySpec{Version: PolicyVersionV3, Generation: GenerationV3}
+)
+
+// SpecFor resolves a policy version ("" is v2, for worklists written before v3).
+func SpecFor(version string) (PolicySpec, error) {
+	switch version {
+	case "", PolicyVersion:
+		return PolicyV2, nil
+	case PolicyVersionV3:
+		return PolicyV3, nil
+	}
+	return PolicySpec{}, fmt.Errorf("unknown collation policy %q", version)
 }
 
 func (p SeamPolicy) windows() []float64 {
@@ -85,6 +119,16 @@ func DefaultSeamPolicy() SeamPolicy {
 		SpanFrameSlack:        2,
 		ShortClipSlackSeconds: 2,
 	}
+}
+
+// SeamPolicyFor returns the thresholds of a policy version.
+func SeamPolicyFor(spec PolicySpec) SeamPolicy {
+	p := DefaultSeamPolicy()
+	if spec.Version == PolicyVersionV3 {
+		h := DefaultHRDPolicy()
+		p.HRD = &h
+	}
+	return p
 }
 
 // Clip is one source clip exactly as the planner froze it from the database.
@@ -157,6 +201,10 @@ type SeamDecision struct {
 	FrameSeconds   float64        `json:"frame_seconds"`
 	OverlapSeconds float64        `json:"overlap_seconds,omitempty"`
 	Match          *MatchEvidence `json:"frame_match,omitempty"`
+	// Source is the v3 independent source-continuity evidence.
+	Source *SourceEvidence `json:"source_evidence,omitempty"`
+	// GOP is the v3 keyframe-lattice check.
+	GOP *GOPEvidence `json:"gop_lattice,omitempty"`
 }
 
 // MetadataGate evaluates every non-visual join condition. It returns "" when
@@ -233,6 +281,52 @@ func DecideSeam(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia, match *Mat
 		return d
 	}
 	d.Decision, d.Reason = DecisionJoin, "continuous"
+	return d
+}
+
+// softGates are v2 metadata reasons that are heuristics about capture
+// restarts rather than facts about the media: a clip ending early, or DB
+// stamps disagreeing with the decoded duration. Exact source adjacency
+// overrides them; every other gate stays a hard split.
+var softGates = map[string]bool{"prev_clip_cut_short": true, "content_span_mismatch": true}
+
+// SoftGate reports whether a MetadataGate reason may be overridden by proof.
+func SoftGate(reason string) bool { return softGates[reason] }
+
+// sourceJoinVerdicts are the frame verdicts that show no duplicated footage.
+// A frame "jump" or "low_motion" verdict is not evidence of a discontinuity
+// once the source proves adjacency; an overlap is, and is never overridden.
+var sourceJoinVerdicts = map[string]bool{MatchContinuous: true, MatchJump: true, MatchLowMotion: true}
+
+// DecideSeamV3 is the collation-v3 rule. It starts from the v2 decision and
+//   - splits any seam whose previous clip ends inside a fixed-length GOP;
+//   - splits a v2 join whose source evidence proves a discontinuity;
+//   - joins a v2 split only when the source proves adjacency, every hard
+//     metadata gate passes, and the frame match shows no duplicated footage.
+//
+// match may be nil only when no frame match ran (the seam then never joins).
+func DecideSeamV3(policy SeamPolicy, prev, next Clip, pm, nm ClipMedia, match *MatchEvidence, src *SourceEvidence, gop *GOPEvidence) SeamDecision {
+	d := DecideSeam(policy, prev, next, pm, nm, match)
+	d.Source, d.GOP = src, gop
+	if gop != nil && gop.Status == GOPTruncated {
+		if d.Decision == DecisionJoin || d.Reason == "" {
+			d.Reason = "gop_truncated"
+		}
+		d.Decision = DecisionSplit
+		return d
+	}
+	if src == nil {
+		return d
+	}
+	switch {
+	case d.Decision == DecisionJoin && src.Status == SourceContradicts:
+		d.Decision, d.Reason = DecisionSplit, "source_discontinuity"
+	case d.Decision == DecisionSplit && src.Status == SourceAdjacent && match != nil && sourceJoinVerdicts[match.Verdict]:
+		gate := MetadataGate(policy, prev, next, pm, nm)
+		if gate == "" || SoftGate(gate) {
+			d.Decision, d.Reason, d.OverlapSeconds = DecisionJoin, "source_adjacent", 0
+		}
+	}
 	return d
 }
 
