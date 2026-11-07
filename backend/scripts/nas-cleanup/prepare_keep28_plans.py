@@ -64,7 +64,7 @@ def pg_env():
     env.update(PGHOST=url.hostname or '', PGPORT=str(url.port or 5432),
                PGUSER=urllib.parse.unquote(url.username or ''), PGPASSWORD=urllib.parse.unquote(url.password or ''),
                PGDATABASE=url.path.lstrip('/'), PGCONNECT_TIMEOUT='10',
-               PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=600000 -c timezone=UTC')
+               PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=300000 -c timezone=UTC')
     for k, v in urllib.parse.parse_qsl(url.query):
         if k in ('sslmode', 'connect_timeout'):
             env['PG' + k.upper()] = v
@@ -73,14 +73,24 @@ def pg_env():
 
 def query(sql, psql):
     p = subprocess.run([psql, '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=('BEGIN READ ONLY;' + sql + ';ROLLBACK;').encode(),
-                       env=pg_env(), capture_output=True, timeout=660)
+                       env=pg_env(), capture_output=True, timeout=330)
     if p.returncode:
         raise RuntimeError('read-only catalogue query failed: ' + p.stderr.decode()[:400])
     return json.loads(p.stdout)
 
 
 def candidates(policy, streams, bucket, psql):
-    windows = [{'stream_id': sid, 's': w['keep_start_utc'], 'e': w['keep_end_utc']} for sid, w in sorted(policy.items()) if not streams or sid in streams]
+    # One bounded read-only query per stream keeps each transaction short.
+    rows = []
+    for sid in sorted(streams or policy):
+        part = stream_candidates(policy[sid], bucket, psql)
+        rows += part
+        print(json.dumps({'phase': 'listed_stream', 'stream_id': sid, 'files': len(part), 'bytes': sum(r['size_bytes'] for r in part)}), file=sys.stderr, flush=True)
+    return rows
+
+
+def stream_candidates(w, bucket, psql):
+    windows = [{'stream_id': w['stream_id'], 's': w['keep_start_utc'], 'e': w['keep_end_utc']}]
     encoded = base64.b64encode(json.dumps(windows).encode()).decode()
     bucket_literal = "'" + bucket.replace("'", "''") + "'"
     return query("""WITH w AS MATERIALIZED (
