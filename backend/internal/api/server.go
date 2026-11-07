@@ -43,12 +43,9 @@ import (
 type Server struct {
 	nasCleanupMu                   sync.Mutex
 	nasCleanupReportCache          *nasCleanupReport
-	nasCleanupPolicyCache          *nasCleanupPolicy
 	nasCleanupInventoryIndex       *cleanupFrozenIndex
 	nasCleanupRankingCache         map[int64]nasCleanupRankingsSnapshot
 	nasCleanupRankingFlights       map[int64]*nasCleanupRankingsFlight
-	nasCleanupPublicVerifiedAt     time.Time
-	nasCleanupPublicETag           string
 	globalDeliveryStore            globalDeliveryObjectStore
 	globalDeliveryMu               sync.Mutex
 	globalDeliveryRegistry         *globalDeliveryRegistry
@@ -661,6 +658,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
 			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
 			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)
+			service.Post("/service/nas-cleanup/retire-superseded", s.handleAdminNASCleanupRetireSuperseded)
 			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)

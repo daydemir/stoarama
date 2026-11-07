@@ -11,9 +11,15 @@ import (
 	"sync"
 )
 
-// Produced from the complete immutable audit by nas_cleanup_index.py. The
-// pinned root binds every shard to the original source and reviewed ownership.
-const cleanupFrozenIndexSHA = "65682d111cb0419bbb28ddde8cc51159d2c5a4a4317a4db3c1ad1c8afc014240"
+// Produced from the complete immutable audit by
+// scripts/nas-cleanup/build_frozen_index.py (schema v2). The pinned root binds
+// every shard to the original source audit and to reviewed single-stream
+// folder ownership. v2 covers every folder owned by exactly one stream, not
+// only the old RETENTION_DELETE_CLEARED folders, so outside-window files in any
+// stream folder can be bound to their audited filesystem identity. The root is
+// deterministic; publish it with build_frozen_index.py --publish before use.
+const cleanupFrozenIndexSHA = "82b067b28b4e1ad0226f1ef32d670a22af11d825bf8bd1bc04d2ab26b90c4e20"
+const cleanupFrozenIndexParents = 3288
 const cleanupFrozenIndexPrefix = "staging/best14-20261021/nas-retention-20261025/frozen-index-20261102/"
 const cleanupFrozenAuditSHA = "480d85a49288d79e201b14405dc72d0f6fc979a0fd06f1b7a95663053583865b"
 const cleanupFrozenIndexKey = cleanupFrozenIndexPrefix + cleanupFrozenIndexSHA + "/index.json.gz"
@@ -65,16 +71,16 @@ func decodeCleanupIndexPayload(raw []byte, sha string, plainLimit int64, out any
 	return json.Unmarshal(plain, out)
 }
 func validateCleanupIndex(index *cleanupFrozenIndex, report nasCleanupReport) error {
-	if index.Schema != "nas-cleanup-frozen-index-v1" || index.AuditSHA != cleanupFrozenAuditSHA || index.ReportSHA != nasCleanupReportSHA || index.AuditID != "6cd48108-ca05-4df7-988b-0bd7e4d320fe" || index.AuditBytes != 88667812 || index.Totals.Entries != 2943864 {
+	if index.Schema != "nas-cleanup-frozen-index-v2" || index.AuditSHA != cleanupFrozenAuditSHA || index.ReportSHA != nasCleanupReportSHA || index.AuditID != "6cd48108-ca05-4df7-988b-0bd7e4d320fe" || index.AuditBytes != 88667812 || index.Totals.Entries != 2943864 {
 		return errors.New("frozen index provenance differs")
 	}
 	expected := map[string]int64{}
 	for _, n := range report.Nodes {
-		if n.Action == "RETENTION_DELETE_CLEARED" && len(n.Owners) == 1 {
+		if len(n.Owners) == 1 {
 			expected[n.Path] = n.Owners[0]
 		}
 	}
-	if len(expected) != len(index.Parents) {
+	if len(expected) != len(index.Parents) || (len(report.Nodes) == 3304 && len(index.Parents) != cleanupFrozenIndexParents) {
 		return errors.New("incomplete frozen index ownership")
 	}
 	for parent, p := range index.Parents {

@@ -20,8 +20,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// This first cleanup policy is pinned to the independently reviewed report.
-// A different selection requires a new reviewed report, never a wider prefix.
+// The independently reviewed folder report pins which stream owns each NAS
+// folder (path confinement). The keep28 policy, not the report's old folder
+// actions, decides KEEP per file; see server_nas_cleanup_policy.go.
 // Admission queues immutable proposals, not destructive grants. It spans audit
 // I/O while connection heartbeats keep updating the FK parent. READ COMMITTED
 // avoids false40001 failures; source locks and grant-time identity/policy checks
@@ -67,9 +68,13 @@ func cleanupSHA(b []byte) string { d := sha256.Sum256(b); return hex.EncodeToStr
 func validCleanupPath(p string) bool {
 	return validNASRelativePath(p) && path.Clean(p) == p && !strings.ContainsAny(p, "\x00\r\n") && !strings.HasPrefix(p, "#") && !strings.HasPrefix(p, "@")
 }
+
+// permits confines a file to a reviewed folder owned by exactly its own stream.
+// Under keep28 every stream's folders are eligible regardless of the old
+// folder action; the per-file window check decides KEEP.
 func (p nasCleanupReport) permits(i nasCleanupItem) bool {
 	for _, n := range p.Nodes {
-		if n.Path == path.Dir(i.RelativePath) && n.Action == "RETENTION_DELETE_CLEARED" && len(n.Owners) == 1 && n.Owners[0] == i.StreamID {
+		if n.Path == path.Dir(i.RelativePath) && len(n.Owners) == 1 && n.Owners[0] == i.StreamID && i.StreamID > 0 {
 			return true
 		}
 	}
@@ -164,6 +169,11 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, err.Error())
 		return
 	}
+	policy, err := s.cleanupPolicy(ctx)
+	if err != nil {
+		util.WriteError(w, 409, err.Error())
+		return
+	}
 	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		util.WriteError(w, 500, "begin cleanup plan failed")
@@ -179,8 +189,10 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 	seen := map[string]bool{}
 	for _, sel := range req.Items {
 		i, e := cleanupCatalogItem(ctx, tx, sel.Kind, sel.SourceID, s.r2.Bucket())
-		if e != nil || !report.permits(i) || seen[i.RelativePath] {
-			util.WriteError(w, 409, "source identity is unknown, duplicated or outside reviewed DELETE nodes")
+		// Early admission filter only; every observation rechecks the file and
+		// all of its sources against the window and the live best14 replay.
+		if e != nil || !report.permits(i) || seen[i.RelativePath] || !policy.outside(i.StreamID, i.StartAt, i.EndAt) {
+			util.WriteError(w, 409, "source identity is unknown, duplicated, outside its stream's folders or inside the keep28 window")
 			return
 		}
 		seen[i.RelativePath] = true
@@ -223,16 +235,16 @@ func (s *Server) handleAdminNASCleanupStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var manifest, jsonStates, results []byte
-	var label, sha, mode, reason string
+	var label, sha, mode, reason, binding string
 	var priority int
 	var allow bool
 	var until *time.Time
-	err := s.pool.QueryRow(r.Context(), `SELECT label,plan_sha256,mode,priority,allow_nas_only,approval_reason,approved_until,manifest,(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM nas_cleanup_items WHERE plan_id=p.id GROUP BY state) q),(SELECT coalesce(jsonb_agg(jsonb_build_object('item_id',id,'ordinal',ordinal,'state',state,'recovery',recovery,'policy_reason',policy_reason,'attempt',attempt,'proof',proof,'outcome',outcome,'delete_ever_issued',delete_ever_issued,'stage_timings',stage_timings,'updated_at',updated_at) ORDER BY ordinal),'[]') FROM nas_cleanup_items WHERE plan_id=p.id) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&label, &sha, &mode, &priority, &allow, &reason, &until, &manifest, &jsonStates, &results)
+	err := s.pool.QueryRow(r.Context(), `SELECT label,plan_sha256,report_sha256,mode,priority,allow_nas_only,approval_reason,approved_until,manifest,(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM nas_cleanup_items WHERE plan_id=p.id GROUP BY state) q),(SELECT coalesce(jsonb_agg(jsonb_build_object('item_id',id,'ordinal',ordinal,'state',state,'recovery',recovery,'policy_reason',policy_reason,'attempt',attempt,'proof',proof,'outcome',outcome,'delete_ever_issued',delete_ever_issued,'stage_timings',stage_timings,'updated_at',updated_at) ORDER BY ordinal),'[]') FROM nas_cleanup_items WHERE plan_id=p.id) FROM nas_cleanup_plans p WHERE id=$1 AND account_id=47 AND connection_id=13`, id).Scan(&label, &sha, &binding, &mode, &priority, &allow, &reason, &until, &manifest, &jsonStates, &results)
 	if err != nil {
 		util.WriteError(w, 404, "cleanup plan unavailable")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "results": json.RawMessage(results)})
+	util.WriteJSON(w, 200, map[string]any{"id": id, "label": label, "plan_sha256": sha, "policy_sha256": binding, "policy_current": binding == cleanupPolicySHA, "mode": mode, "allow_nas_only": allow, "approval_reason": reason, "approved_until": until, "priority": priority, "items": json.RawMessage(manifest), "states": json.RawMessage(jsonStates), "master_deletion_enabled": s.cfg.NASCleanupDeletionEnabled, "results": json.RawMessage(results)})
 }
 
 // Arming is deliberately not automatic. It requires the exact digest and a
@@ -276,9 +288,18 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	var current, currentMode string
-	if err = tx.QueryRow(ctx, `SELECT plan_sha256,mode FROM nas_cleanup_plans WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&current, &currentMode); err != nil || current != req.PlanSHA {
+	var current, currentMode, binding string
+	if err = tx.QueryRow(ctx, `SELECT plan_sha256,mode,report_sha256 FROM nas_cleanup_plans WHERE id=$1 AND account_id=47 AND connection_id=13 FOR UPDATE`, id).Scan(&current, &currentMode, &binding); err != nil || current != req.PlanSHA {
 		util.WriteError(w, 409, "plan identity differs")
+		return
+	}
+	if currentMode == "retired" {
+		util.WriteError(w, 409, "retired plans are terminal")
+		return
+	}
+	// Plans admitted under a superseded policy may only be paused or retired.
+	if req.Mode != "paused" && binding != cleanupPolicySHA {
+		util.WriteError(w, 409, "plan is bound to a superseded cleanup policy; retire it and prepare a new plan")
 		return
 	}
 	if req.Mode == "dry_run" {
@@ -329,6 +350,75 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 	util.WriteJSON(w, 200, map[string]any{"id": id, "mode": req.Mode, "plan_sha256": current})
 }
 
+// Retirement is a terminal, non-destructive state transition for plans bound
+// to a superseded cleanup policy. No row is deleted (guard triggers forbid it):
+// unfinished items become 'keep', and migration 0170 makes holds of retired
+// plans stop blocking R2 purges exactly as paused holds do. Enabled plans and
+// plans that ever issued a deletion are never retired here. Without
+// expected_plans the call is a read-only preview.
+func (s *Server) handleAdminNASCleanupRetireSuperseded(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reason        string `json:"reason"`
+		ExpectedPlans *int   `json:"expected_plans,omitempty"`
+	}
+	if util.DecodeJSON(r, &req) != nil || len(req.Reason) < 1 || len(req.Reason) > 500 || (req.ExpectedPlans != nil && *req.ExpectedPlans < 1) {
+		util.WriteError(w, 400, "reason and optional positive expected_plans required")
+		return
+	}
+	ctx := r.Context()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		util.WriteError(w, 500, "begin cleanup retirement failed")
+		return
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT id FROM nas_cleanup_plans p WHERE account_id=47 AND connection_id=13 AND report_sha256<>$1 AND mode IN ('dry_run','paused') AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued) ORDER BY id FOR UPDATE`, cleanupPolicySHA)
+	if err != nil {
+		util.WriteError(w, 500, "superseded cleanup plans unavailable")
+		return
+	}
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			break
+		}
+		ids = append(ids, id)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	var blocked int
+	if err == nil {
+		err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 AND report_sha256<>$1 AND mode<>'retired' AND NOT (id=ANY($2))`, cleanupPolicySHA, ids).Scan(&blocked)
+	}
+	if err != nil {
+		util.WriteError(w, 500, "superseded cleanup plans unavailable")
+		return
+	}
+	result := map[string]any{"policy_sha256": cleanupPolicySHA, "plans": len(ids), "plan_ids": ids, "not_retirable": blocked}
+	if req.ExpectedPlans == nil {
+		result["preview"] = true
+		util.WriteJSON(w, 200, result)
+		return
+	}
+	if *req.ExpectedPlans != len(ids) {
+		util.WriteJSON(w, 409, map[string]any{"error": "superseded plan count differs from expected_plans", "plans": len(ids)})
+		return
+	}
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep',lease_expires_at=NULL,policy_reason='retired: superseded cleanup policy',updated_at=now() WHERE plan_id=ANY($1) AND state IN ('pending','leased')`, ids)
+	if err == nil {
+		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='retired',approved_until=NULL,approval_reason=$2 WHERE id=ANY($1)`, ids, req.Reason)
+	}
+	if err != nil || tx.Commit(ctx) != nil {
+		util.WriteError(w, 500, "cleanup retirement failed")
+		return
+	}
+	result["retired"] = len(ids)
+	util.WriteJSON(w, 200, result)
+}
+
 type cleanupTask struct {
 	ItemID        int64           `json:"item_id"`
 	Attempt       int             `json:"attempt"`
@@ -357,7 +447,7 @@ JOIN LATERAL (
  WHERE candidate.plan_id=p.id AND candidate.state='pending'
  ORDER BY candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
 ) i ON true
-WHERE p.connection_id=$1
+WHERE p.connection_id=$1 AND p.report_sha256=$3
  AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2))
 ORDER BY p.priority DESC,p.id LIMIT 1`
 
@@ -395,7 +485,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, s.cfg.NASCleanupDeletionEnabled).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, s.cfg.NASCleanupDeletionEnabled, cleanupPolicySHA).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -517,7 +607,7 @@ func (s *Server) cleanupRecovery(ctx context.Context, i nasCleanupItem) string {
 
 // Share the immutable plan/mode fence across independent preflights; control
 // still requires an exclusive parent lock and cannot overtake observations.
-const cleanupObservationLoadSQL = `SELECT p.manifest->(i.ordinal-1),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,p.allow_nas_only,i.outcome FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
+const cleanupObservationLoadSQL = `SELECT p.manifest->(i.ordinal-1),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,p.allow_nas_only,i.outcome,p.report_sha256 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
 
 func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseInt64Path(w, r, "itemId")
@@ -555,12 +645,12 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	}
 	defer tx.Rollback(ctx)
 	var raw, oldProof, oldOutcome []byte
-	var mode, state, sha string
+	var mode, state, sha, binding string
 	var until *time.Time
 	var attempt int
 	var lease *time.Time
 	var allow bool
-	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &allow, &oldOutcome)
+	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &allow, &oldOutcome, &binding)
 	if err != nil || sha != req.PlanSHA || attempt != req.Attempt {
 		util.WriteError(w, 409, "cleanup task identity differs")
 		return
@@ -609,7 +699,10 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		bitem.Frozen = [5]int64{}
 		bitem.FrozenSidecar = [5]int64{}
 		b, _ := json.Marshal(bitem)
-		if e != nil || !bytes.Equal(a, b) {
+		if binding != cleanupPolicySHA || mode == "retired" {
+			action = "keep"
+			policyReason = "plan bound to a superseded cleanup policy or retired"
+		} else if e != nil || !bytes.Equal(a, b) {
 			action = "conflict"
 		} else {
 			policyStarted := time.Now()
@@ -695,12 +788,13 @@ func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items [
 	manifest, _ := json.Marshal(items)
 	sha := cleanupSHA(manifest)
 	var id int64
-	err := tx.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,$1,$2,$3,$4) ON CONFLICT(label) DO NOTHING RETURNING id`, label, nasCleanupReportSHA, string(manifest), sha).Scan(&id)
+	err := tx.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,$1,$2,$3,$4) ON CONFLICT(label) DO NOTHING RETURNING id`, label, cleanupPolicySHA, string(manifest), sha).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var old string
 		stage = "plan_collision"
-		err = tx.QueryRow(ctx, `SELECT id,plan_sha256 FROM nas_cleanup_plans WHERE label=$1`, label).Scan(&id, &old)
-		if err == nil && old != sha {
+		var oldBinding string
+		err = tx.QueryRow(ctx, `SELECT id,plan_sha256,report_sha256 FROM nas_cleanup_plans WHERE label=$1`, label).Scan(&id, &old, &oldBinding)
+		if err == nil && (old != sha || oldBinding != cleanupPolicySHA) {
 			err = errors.New("label already has a different plan")
 		}
 	} else if err == nil {

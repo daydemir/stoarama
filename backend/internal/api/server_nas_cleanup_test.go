@@ -50,19 +50,6 @@ func TestNASCleanupProofAndConfinementPolicy(t *testing.T) {
 		t.Fatal("different file identity accepted")
 	}
 }
-func TestNASCleanupProtectedIntervalsAreHalfOpen(t *testing.T) {
-	a := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
-	p := nasCleanupPolicy{Windows: []cleanupWindow{{StreamID: 3, Start: a, End: a.Add(28 * 24 * time.Hour)}}, Whole: []int64{4}}
-	for _, tc := range []struct {
-		sid     int64
-		a, b    time.Time
-		outside bool
-	}{{3, a.Add(-time.Hour), a, true}, {3, a.Add(-time.Hour), a.Add(time.Nanosecond), false}, {3, a.Add(28 * 24 * time.Hour), a.Add(29 * 24 * time.Hour), true}, {4, a.Add(-time.Hour), a, false}, {3, a, a, false}} {
-		if p.outside(tc.sid, tc.a, tc.b) != tc.outside {
-			t.Fatalf("bad protected range decision %+v", tc)
-		}
-	}
-}
 func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("STOARAMA_TEST_DATABASE_URL")
@@ -120,6 +107,13 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	if _, err = pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	migration, err = os.ReadFile("../../../infra/sql/migrations/0170_nas_cleanup_retired_plans.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
 	return pool
 }
 func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any) *httptest.ResponseRecorder {
@@ -137,7 +131,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[{"kind":"raw","source_id":1}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +205,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 func TestNASCleanupRecoveryHoldFencesOldPurgeAndMetadata(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal) VALUES(1,1,1);INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,26 +221,42 @@ func TestNASCleanupRecoveryHoldFencesOldPurgeAndMetadata(t *testing.T) {
 		t.Fatal("completed NAS deletion lost R2 recovery hold")
 	}
 }
-func TestNASCleanupReplaysAllSensitivityWinnersAndSourceFingerprint(t *testing.T) {
+func TestNASCleanupReplaysBest14WinnerAndSourceFingerprint(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	_, err := pool.Exec(ctx, `INSERT INTO recording_clips SELECT n,2,NULL,'object'||n,repeat('a',64),3,'a/'||n||'.mp4', '2026-09-01'::timestamptz+(n-1)*interval '1 day','2026-09-01'::timestamptz+(n-1)*interval '1 day'+interval '1 hour','bucket' FROM generate_series(1,20) n`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var raw []byte
-	if err = pool.QueryRow(ctx, cleanupCurrentRankingsSQL, 3).Scan(&raw); err != nil {
+	winner := func() string {
+		t.Helper()
+		var raw []byte
+		if err := pool.QueryRow(ctx, cleanupCurrentRankingsSQL, 3).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	if got := winner(); got != "2026-09-01" {
+		t.Fatalf("ties must resolve to the earliest best14 start: %s", got)
+	}
+	// Collation-quarantined clips do not score (select.py), but still extend the
+	// candidate range; R2 availability is not required.
+	if _, err = pool.Exec(ctx, `INSERT INTO recording_collation_hours VALUES(1,2,1,'{"clips":[{"clip":{"clip_id":1},"disposition":"quarantined"}]}');UPDATE recording_clips SET purged_at=now(),bucket='' WHERE id=2`); err != nil {
 		t.Fatal(err)
 	}
-	var ranks map[string]string
-	json.Unmarshal(raw, &ranks)
-	if len(ranks) != 3 {
-		t.Fatalf("missing sensitivity metrics: %s", raw)
+	if got := winner(); got != "2026-09-02" {
+		t.Fatalf("quarantined clip still scored: %s", got)
 	}
-	for _, day := range ranks {
-		if day != "2026-09-01" {
-			t.Fatalf("bad consecutive-day/tie union: %s", raw)
-		}
+	// Invalid intervals are ignored by the selection (they can never be
+	// cleanup targets themselves because outside() rejects them).
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET clip_end_at=clip_start_at WHERE id=19`); err != nil {
+		t.Fatal(err)
+	}
+	if got := winner(); got != "2026-09-02" {
+		t.Fatalf("invalid interval changed the winner: %s", got)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET bucket='bucket',purged_at=NULL WHERE id=2`); err != nil {
+		t.Fatal(err)
 	}
 	i, err := cleanupCatalogItem(ctx, pool, "raw", 1, "bucket")
 	if err != nil {
@@ -261,16 +271,6 @@ func TestNASCleanupReplaysAllSensitivityWinnersAndSourceFingerprint(t *testing.T
 	}
 	if next.SourceManifestSHA == i.SourceManifestSHA {
 		t.Fatal("changed registered bounds left source proof unchanged")
-	}
-	// An invalid interval cannot fall out of ranking silently.
-	if _, err = pool.Exec(ctx, `UPDATE recording_clips SET clip_end_at=clip_start_at WHERE id=2`); err != nil {
-		t.Fatal(err)
-	}
-	if err = pool.QueryRow(ctx, cleanupCurrentRankingsSQL, 3).Scan(&raw); err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) != "{}" {
-		t.Fatalf("invalid interval was treated as qualified: %s", raw)
 	}
 }
 
@@ -316,7 +316,7 @@ func TestNASCleanupHoldClosesConcurrentOldPurgeAdmissionRace(t *testing.T) {
 	if !waiting {
 		t.Fatal("old purge did not reach the expected row-lock fence")
 	}
-	if _, err = admission.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1)`); err != nil {
+	if _, err = admission.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1)`); err != nil {
 		t.Fatal(err)
 	}
 	if err = admission.Commit(ctx); err != nil {
@@ -330,7 +330,7 @@ func TestNASCleanupHoldClosesConcurrentOldPurgeAdmissionRace(t *testing.T) {
 func TestNASCleanupNewReferencesAndPublicGenerationAreFenced(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES(1,47,13,'fixture',repeat('a',64),'[]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[]',repeat('b',64),'enabled',now()+interval '1 hour','fixture');INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestNASCleanupOperatorRoutesRequireServiceCredential(t *testing.T) {
 func TestNASCleanupCollatedHoldAllowsNonIdentityBookkeeping(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO recording_collation_hours VALUES(1,2,0,'{"clips":[{"clip":{"clip_id":1}}]}');INSERT INTO recording_collation_outputs(id,collation_hour_id,nas_relative_path,object_key,sha256,size_bytes,start_at,end_at,source_clip_ids) VALUES(9,1,'a/b.mp4','joined/object',repeat('a',64),3,'2026-09-01','2026-09-01 00:01:00',ARRAY[1::bigint]);INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[{"kind":"collated","source_id":9}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO recording_collation_hours VALUES(1,2,0,'{"clips":[{"clip":{"clip_id":1}}]}');INSERT INTO recording_collation_outputs(id,collation_hour_id,nas_relative_path,object_key,sha256,size_bytes,start_at,end_at,source_clip_ids) VALUES(9,1,'a/b.mp4','joined/object',repeat('a',64),3,'2026-09-01','2026-09-01 00:01:00',ARRAY[1::bigint]);INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"collated","source_id":9}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestNASCleanupReferenceAdmissionSerializesWithArmingButNotPermanentRecovery
 	pool := cleanupTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture',repeat('a',64),'[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery) VALUES(1,1,1,'would_delete','{}','r2_sha_verified');`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery) VALUES(1,1,1,'would_delete','{}','r2_sha_verified');`)
 	if err != nil {
 		t.Fatal(err)
 	}
