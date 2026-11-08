@@ -223,12 +223,16 @@ const nasPurgeFactsSQL = `
   NOT EXISTS(SELECT 1 FROM unnest({COH_RECS}::bigint[], {COH_FROM}::timestamptz[], {COH_TO}::timestamptz[]) AS w(rid, wfrom, wto)
       WHERE w.rid=c.recording_id AND w.wfrom<c.clip_end_at AND w.wto>c.clip_start_at) AS no_cohort_window,
   NOT EXISTS(SELECT 1 FROM nas_restore_requests q WHERE q.clip_id=c.id
-      AND (q.state IN ('pending','leased') OR (q.target='original' AND q.state='verified' AND q.completed_at>now()-interval '30 days'))) AS no_restore`
+      AND (q.state IN ('pending','leased') OR (q.target='original' AND q.state='verified' AND q.completed_at>now()-interval '30 days'))) AS no_restore,
+  NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans cp ON cp.id=h.plan_id
+      WHERE h.clip_id=c.id AND cp.mode<>'retired') AS no_cleanup_plan,
+  NOT EXISTS(SELECT 1 FROM nas_cleanup_plans cp WHERE cp.mode='enabled') AS no_enabled_cleanup`
 
 var nasPurgeFactNames = []string{
 	"identity_ok", "managed_ok", "nas_ok", "aged", "schedule_ok", "no_snapshot", "no_scope",
 	"no_joined_window", "no_qualification_window", "no_restore",
 	"playable_signature", "raw_delivery", "not_candidate_recording", "no_cohort_window",
+	"no_cleanup_plan", "no_enabled_cleanup",
 }
 
 // nasPurgeFactReasons maps a failing fact to its skip reason, in check order.
@@ -238,6 +242,7 @@ var nasPurgeFactReasons = map[string]string{
 	"aged": "within_grace", "schedule_ok": "active_recording_recent", "no_restore": "restore_recent", "nas_ok": "nas_unverified",
 	"playable_signature": "unplayable_signature", "raw_delivery": "collated_only_delivery",
 	"not_candidate_recording": "candidate_recording", "no_cohort_window": "cohort_window",
+	"no_cleanup_plan": "nas_cleanup_plan", "no_enabled_cleanup": "nas_cleanup_enabled",
 }
 
 var nasPurgeCandidatesSQL = nasPurgeBindProtections(11, `
@@ -359,7 +364,7 @@ type nasPurgeCandidate struct {
 }
 
 func (c nasPurgeCandidate) skipReason() string {
-	for _, name := range []string{"identity_ok", "managed_ok", "raw_delivery", "no_snapshot", "no_scope", "no_joined_window",
+	for _, name := range []string{"no_enabled_cleanup", "no_cleanup_plan", "identity_ok", "managed_ok", "raw_delivery", "no_snapshot", "no_scope", "no_joined_window",
 		"no_qualification_window", "no_cohort_window", "not_candidate_recording", "playable_signature",
 		"aged", "schedule_ok", "no_restore", "nas_ok"} {
 		if !c.Facts[name] {
@@ -514,6 +519,17 @@ func resolveNASPurgeConnection(ctx context.Context, pool *pgxpool.Pool, id int64
 	return ids[0], nil
 }
 
+func refuseNASPurgeDuringCleanup(ctx context.Context, pool *pgxpool.Pool) error {
+	var enabled []int64
+	if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(id ORDER BY id),'{}') FROM nas_cleanup_plans WHERE mode='enabled'`).Scan(&enabled); err != nil {
+		return fmt.Errorf("check NAS cleanup plans: %w", err)
+	}
+	if len(enabled) > 0 {
+		return fmt.Errorf("refusing to run while NAS cleanup plan(s) %v are enabled; pause them first", enabled)
+	}
+	return nil
+}
+
 func runNASVerifiedPurgePass(ctx context.Context, pool *pgxpool.Pool, store nasPurgeStore, opts nasPurgeOptions, logw io.Writer) (summary nasPurgeSummary, err error) {
 	started := time.Now()
 	summary = nasPurgeSummary{Mode: "dry_run", ConnectionID: opts.connectionID, Protections: opts.protections, Skipped: map[string]int64{}, LogPath: opts.logPath, LastClipID: opts.afterClipID}
@@ -528,6 +544,13 @@ func runNASVerifiedPurgePass(ctx context.Context, pool *pgxpool.Pool, store nasP
 		summary.MonthlySavedUSD = float64(bytes) / 1e9 * nasPurgeUSDPerGB
 		summary.ElapsedSec = time.Since(started).Seconds()
 	}()
+	// Never purge R2 recovery copies while any NAS cleanup plan is enabled
+	// (dry run included, so a preview never suggests otherwise). Every page and
+	// the locked re-check also carry this as the no_enabled_cleanup fact, and
+	// clips in any non-retired cleanup plan are skipped (no_cleanup_plan).
+	if err = refuseNASPurgeDuringCleanup(ctx, pool); err != nil {
+		return summary, err
+	}
 	r := &nasPurgeRunner{pool: pool, store: store, opts: opts, summary: &summary, logw: logw}
 	var pending []nasPurgeCandidate
 	var pendingBytes int64

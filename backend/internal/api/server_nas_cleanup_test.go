@@ -86,33 +86,14 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	migration, err := os.ReadFile("../../../infra/sql/migrations/0167_nas_cleanup_dryruns.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatal(err)
-	}
-	migration, err = os.ReadFile("../../../infra/sql/migrations/0168_nas_cleanup_stage_timings.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatal(err)
-	}
-	migration, err = os.ReadFile("../../../infra/sql/migrations/0169_nas_cleanup_queue_priority.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatal(err)
-	}
-	migration, err = os.ReadFile("../../../infra/sql/migrations/0170_nas_cleanup_retired_plans.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql"} {
+		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(ctx, string(migration)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 	return pool
 }
@@ -181,7 +162,7 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 			t.Fatalf("dry run or ACK retry failed: %s", w.Body.String())
 		}
 	}
-	w := cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "allow_nas_only": true, "reason": "fixture"})
+	w := cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "reason": "fixture"})
 	if w.Code != 409 || !strings.Contains(w.Body.String(), "master switch") {
 		t.Fatal("master OFF allowed arming")
 	}
@@ -190,8 +171,12 @@ func TestNASCleanupLeaseRetriesAndMasterOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "allow_nas_only": true, "reason": "fixture"})
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "NAS-only deletion was removed") {
+		t.Fatalf("allow-nas-only was not rejected: %d %s", w.Code, w.Body.String())
+	}
+	w = cleanupCall(t, s.handleAdminNASCleanupControl, 47, 5, "id", "1", map[string]any{"plan_sha256": strings.Repeat("b", 64), "mode": "enabled", "reason": "fixture"})
 	if w.Code != 409 {
-		t.Fatal("allow-nas-only accepted unchecked recovery")
+		t.Fatal("enable accepted unchecked recovery")
 	}
 	s.cfg.NASCleanupDeletionEnabled = false
 	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_plans SET manifest='[]' WHERE id=1`); err == nil {

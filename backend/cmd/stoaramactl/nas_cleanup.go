@@ -16,7 +16,11 @@ import (
 // the NAS for read-only observations, including NAS-only candidates.
 func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	if len(args) < 1 {
-		log.Fatal("usage: nas-cleanup prepare|report|pause|enable|resume-dry-run|retire-superseded")
+		log.Fatal("usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|retire-superseded")
+	}
+	if args[0] == "verify-recovery" {
+		runNASCleanupVerifyRecovery(ctx, cfg, args[1:])
+		return
 	}
 	fs := flag.NewFlagSet("nas-cleanup "+args[0], flag.ExitOnError)
 	input := fs.String("input", "", "JSON {label,items:[{kind,source_id}]}; prepare only")
@@ -24,7 +28,6 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	sha := fs.String("expected-plan-sha256", "", "exact approved digest; control only")
 	reason := fs.String("reason", "", "audited approval/pause reason")
 	priority := fs.Int("priority", 0, "-100..100 scheduling priority; resume-dry-run only, no deletion authority")
-	nasOnly := fs.Bool("allow-nas-only", false, "explicitly permit proven NAS-only content; default retain")
 	expectedPlans := fs.Int("expected-plans", 0, "retire-superseded only: exact count from the preview; 0 previews without changes")
 	base := fs.String("backend-api-url", defaultBackendAPIURL(), "backend URL")
 	token := fs.String("api-token", cfg.APIToken, "service operator API token")
@@ -40,9 +43,6 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	})
 	if prioritySet && (args[0] != "resume-dry-run" || *priority < -100 || *priority > 100) {
 		log.Fatal("--priority requires resume-dry-run and -100..100")
-	}
-	if args[0] == "resume-dry-run" && *nasOnly {
-		log.Fatal("dry-run resume cannot permit NAS-only deletion")
 	}
 	switch args[0] {
 	case "prepare":
@@ -61,7 +61,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	case "retire-superseded":
 		// Terminal, non-destructive retirement of plans bound to a superseded
 		// cleanup policy. Without --expected-plans this is a read-only preview.
-		if *reason == "" || *expectedPlans < 0 || *id != 0 || *sha != "" || *nasOnly {
+		if *reason == "" || *expectedPlans < 0 || *id != 0 || *sha != "" {
 			log.Fatal("retire-superseded requires --reason and optionally --expected-plans N (from the preview)")
 		}
 		body := map[string]any{"reason": *reason}
@@ -85,12 +85,13 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		if args[0] == "resume-dry-run" {
 			mode = "dry_run"
 		}
-		body := map[string]any{"plan_sha256": *sha, "mode": mode, "reason": *reason, "allow_nas_only": *nasOnly}
+		// NAS-only deletion was removed (the API rejects true); there is no flag.
+		body := map[string]any{"plan_sha256": *sha, "mode": mode, "reason": *reason, "allow_nas_only": false}
 		if prioritySet {
 			body["priority"] = *priority
 		}
 		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/control", *id), body))
 	default:
-		log.Fatal("usage: nas-cleanup prepare|report|pause|enable|resume-dry-run|retire-superseded")
+		log.Fatal("usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|retire-superseded")
 	}
 }
