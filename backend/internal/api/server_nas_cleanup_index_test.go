@@ -78,10 +78,10 @@ func TestNASCleanupIndexedFrozenStatBindingAndFailClosed(t *testing.T) {
 	}
 }
 func TestNASCleanupIndexRejectsCorruptionProvenanceAndCrossParent(t *testing.T) {
-	index := cleanupFrozenIndex{Schema: "nas-cleanup-frozen-index-v1", AuditSHA: cleanupFrozenAuditSHA, AuditID: "6cd48108-ca05-4df7-988b-0bd7e4d320fe", AuditBytes: 88667812, ReportSHA: nasCleanupReportSHA, Parents: map[string]cleanupFrozenParent{}}
+	index := cleanupFrozenIndex{Schema: "nas-cleanup-frozen-index-v2", AuditSHA: cleanupFrozenAuditSHA, AuditID: "6cd48108-ca05-4df7-988b-0bd7e4d320fe", AuditBytes: 88667812, ReportSHA: nasCleanupReportSHA, Parents: map[string]cleanupFrozenParent{}}
 	index.Totals.Entries = 2943864
 	var report nasCleanupReport
-	raw, _ := json.Marshal(map[string]any{"complete_node_actions": []map[string]any{{"path": "a", "direct_files_action": "RETENTION_DELETE_CLEARED", "owner_stream_ids": []int64{3}}}})
+	raw, _ := json.Marshal(map[string]any{"complete_node_actions": []map[string]any{{"path": "a", "direct_files_action": "KEEP", "owner_stream_ids": []int64{3}}}})
 	json.Unmarshal(raw, &report)
 	ref, blob := cleanupIndexTestBlob(t, []cleanupFrozenIndexedEntry{{Path: "a/b", Kind: "file", Links: 1, Frozen: [5]int64{3, 1, 2, 3, 4}}}, "a")
 	index.Parents["a"] = cleanupFrozenParent{Owner: 3, Shards: []cleanupFrozenShard{ref}, Entries: 1}

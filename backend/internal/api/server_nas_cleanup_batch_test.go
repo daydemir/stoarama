@@ -11,11 +11,11 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 	ctx := context.Background()
 	s := &Server{pool: pool}
 	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256)
- SELECT 1,47,13,'batch',repeat('a',64),jsonb_agg(jsonb_build_object('kind','raw','source_id',n)),repeat('b',64) FROM generate_series(1,10)n;
+ SELECT 1,47,13,'batch','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',jsonb_agg(jsonb_build_object('kind','raw','source_id',n)),repeat('b',64) FROM generate_series(1,10)n;
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal)SELECT n,1,n FROM generate_series(1,10)n;
  INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason)
- VALUES(2,47,13,'execute',repeat('a',64),'[{"kind":"raw","source_id":11},{"kind":"raw","source_id":12}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture'),
- (3,48,14,'foreign',repeat('a',64),'[{"kind":"raw","source_id":13}]',repeat('b',64),'dry_run',NULL,'');
+ VALUES(2,47,13,'execute','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":11},{"kind":"raw","source_id":12}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture'),
+ (3,48,14,'foreign','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":13}]',repeat('b',64),'dry_run',NULL,'');
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal,proof)VALUES(11,2,1,'{}'),(12,2,2,'{}'),(13,3,1,NULL);`)
 	if err != nil {
 		t.Fatal(err)

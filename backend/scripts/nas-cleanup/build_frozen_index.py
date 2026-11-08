@@ -4,10 +4,19 @@
 Uses existing scoped R2 environment credentials; never transfers auth to CI.
 Every derived object is conditional and receives exact full readback verification.
 The root is published only after hashing the complete immutable source audit.
+
+Schema v2 (keep28 policy) indexes every reviewed folder node owned by exactly
+one stream, not only the old RETENTION_DELETE_CLEARED folders: the per-file
+keep28 window check, not the folder report action, now decides KEEP. Output is
+deterministic (sorted JSON, gzip mtime=0), so the default compute-only run prints
+the root SHA without any R2 write; pass --publish to upload the immutable
+shards/root after that SHA is pinned in server_nas_cleanup_index.go.
 """
 
 def main():
-    import os,json,subprocess,base64,hashlib
+    import os,json,subprocess,base64,hashlib,sys
+    publish='--publish' in sys.argv[1:]
+    assert set(sys.argv[1:])<={'--publish'},'usage: build_frozen_index.py [--publish]'
     env=os.environ.copy()
     env['AWS_ACCESS_KEY_ID']=env['R2_ACCESS_KEY_ID']
     env['AWS_SECRET_ACCESS_KEY']=env['R2_SECRET_ACCESS_KEY']
@@ -47,6 +56,7 @@ def main():
      data,code=p.stdout.rsplit(bytes([10]),1)
      return data,int(code)
     def immutable(key,body,content_type):
+     if not publish:return False
      _,code=metadata_request('PUT',key,body)
      assert code in (200,204,412),'R2 metadata conditional write failed: '+str(code)
      got,status=metadata_request('GET',key)
@@ -60,8 +70,8 @@ def main():
     rb,_=small(reportkey,500000);assert hashlib.sha256(rb).hexdigest()==REPORT
     report=json.loads(gzip.decompress(rb))
     nodes={n['path']:n for n in report['complete_node_actions']}
-    parents={n['path']:{'owner_stream_id':n['owner_stream_ids'][0],'shards':[],'entries':0} for n in report['complete_node_actions'] if n['direct_files_action']=='RETENTION_DELETE_CLEARED' and len(n['owner_stream_ids'])==1}
-    assert len(nodes)==3304 and len(parents)==935
+    parents={n['path']:{'owner_stream_id':n['owner_stream_ids'][0],'shards':[],'entries':0} for n in report['complete_node_actions'] if len(n['owner_stream_ids'])==1}
+    assert len(nodes)==3304 and len(parents)==3288
     prefix='staging/best14-20261021/nas-retention-20261025/frozen-index-20261102/'
     auditkey='nas-space-audits/13/6cd48108-ca05-4df7-988b-0bd7e4d320fe/'+AUDIT+'.jsonl.gz'
     head=json.loads(aws(['s3api','head-object','--bucket',bucket,'--key',auditkey]));assert head['ContentLength']==88667812
@@ -123,11 +133,14 @@ def main():
      assert totals['entries']==2943864,'full inventory entry accounting differs'
      for f in futures:f.result()
      pool.shutdown(wait=True)
-     index={'schema':'nas-cleanup-frozen-index-v1','audit_id':'6cd48108-ca05-4df7-988b-0bd7e4d320fe','source_audit_sha256':AUDIT,'source_audit_key':auditkey,'source_audit_bytes':compressed_count[0],'report_sha256':REPORT,'entry_totals':dict(totals),'parents':parents,'folder_totals':sorted(folder_totals.values(),key=lambda f:f['path']),'execution_enabled':False}
+     index={'schema':'nas-cleanup-frozen-index-v2','parent_scope':'all_single_owner_report_nodes','audit_id':'6cd48108-ca05-4df7-988b-0bd7e4d320fe','source_audit_sha256':AUDIT,'source_audit_key':auditkey,'source_audit_bytes':compressed_count[0],'report_sha256':REPORT,'entry_totals':dict(totals),'parents':parents,'folder_totals':sorted(folder_totals.values(),key=lambda f:f['path']),'execution_enabled':False}
      encoded=json.dumps(index,sort_keys=True,separators=(',',':')).encode()
      blob=gzip.compress(encoded,mtime=0);sha=hashlib.sha256(blob).hexdigest();key=prefix+sha+'/index.json.gz'
      immutable(key,blob,'application/gzip')
-     print(json.dumps({'phase':'INDEX_COMPLETE','index_key':key,'index_sha256':sha,'index_bytes':len(blob),'index_uncompressed_bytes':len(encoded),'parents':len(parents),'shards':sum(len(x['shards']) for x in parents.values()),'totals':dict(totals),'all_source_bytes_sha_verified':True,'all_shards_exact_readback':True,'deletion_enabled':False}),flush=True)
+     if not publish:
+      # Local, metadata-only copy for review and plan preparation.
+      with open('frozen-index-'+sha+'.json.gz','wb') as local:local.write(blob)
+     print(json.dumps({'phase':'INDEX_COMPLETE','index_key':key,'index_sha256':sha,'index_bytes':len(blob),'index_uncompressed_bytes':len(encoded),'parents':len(parents),'shards':sum(len(x['shards']) for x in parents.values()),'totals':dict(totals),'all_source_bytes_sha_verified':True,'published':publish,'all_shards_exact_readback':publish,'deletion_enabled':False}),flush=True)
     finally:
      if cp.poll() is None:cp.terminate()
      pool.shutdown(wait=True)

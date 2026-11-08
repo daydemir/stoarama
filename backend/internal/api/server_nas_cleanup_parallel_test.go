@@ -10,7 +10,7 @@ import (
 func TestNASCleanupConcurrentObservationStillFencesControl(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
-	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'parallel',repeat('a',64),'[]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal)VALUES(1,1,1),(2,1,2)`)
+	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'parallel','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[]',repeat('b',64));INSERT INTO nas_cleanup_items(id,plan_id,ordinal)VALUES(1,1,1),(2,1,2)`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,22 +56,5 @@ func TestNASCleanupConcurrentObservationStillFencesControl(t *testing.T) {
 	}
 	if _, err = pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=1`); err != nil {
 		t.Fatal("control did not proceed after readers drained: ", err)
-	}
-}
-func TestNASCleanupPublicPreflightCacheNeverAuthorizesEnabledCheck(t *testing.T) {
-	s := &Server{nasCleanupPublicETag: "known", nasCleanupPublicVerifiedAt: time.Now().UTC()}
-	if err := s.cleanupPublicUnchangedMode(context.Background(), true); err != nil {
-		t.Fatal("bounded advisory preflight cache: ", err)
-	}
-	if s.cleanupPublicUnchanged(context.Background()) == nil {
-		t.Fatal("enabled/default path reused advisory registry evidence")
-	}
-	s.nasCleanupPublicVerifiedAt = time.Now().Add(-2 * time.Minute)
-	if s.cleanupPublicUnchangedMode(context.Background(), true) == nil {
-		t.Fatal("expired registry preflight snapshot accepted")
-	}
-	s.nasCleanupPublicVerifiedAt = time.Now().Add(time.Minute)
-	if s.cleanupPublicUnchangedMode(context.Background(), true) == nil {
-		t.Fatal("future registry preflight snapshot accepted")
 	}
 }
