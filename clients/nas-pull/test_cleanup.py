@@ -44,6 +44,16 @@ class CleanupTests(unittest.TestCase):
         self.mount = mock.patch.object(pull.os.path, 'ismount', return_value=True)
         self.mount.start()
         self.addCleanup(self.mount.stop)
+        # Disposable fixture pins: folder "stream" is stream 33, whose keep
+        # window lies far from the fixture clip. Guard tests override them.
+        self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-29T00:00:00+00:00')
+        self.pinned = mock.patch.object(pull, 'cleanup_pins', side_effect=lambda: self.pins)
+        self.pinned.start()
+        self.addCleanup(self.pinned.stop)
+
+    def fixture_pins(self, start, end, folders=None):
+        parse = lambda v: datetime.datetime.fromisoformat(v)
+        return (dict(windows={33: (parse(start), parse(end), 'UTC')}, folders=folders or {'stream': 33}), None)
 
     def opened(self):
         return pull.CleanupFile(self.cfg, self.item, threading.Event(), time.monotonic()+20)
@@ -569,6 +579,197 @@ class CleanupTests(unittest.TestCase):
                 with self.assertRaises(pull.urllib.error.HTTPError):
                     pull.cleanup_lease(self.cfg, 8)
                 self.assertEqual(request.call_count, 1)
+
+
+def approve_api(test, calls, receipt_reply=None):
+    def api(cfg, path, body):
+        calls.append((path, dict(body) if isinstance(body, dict) else body))
+        if path.endswith('/lease'):
+            return dict(tasks=[test.task], retry_after_sec=0)
+        if path.endswith('/observe'):
+            if body['outcome'] != 'match':
+                return dict(action=body['outcome'], delete=False)
+            return dict(action='delete_issued', delete=True, item_id=1, attempt=1, plan_sha256='a'*64,
+                        proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
+                        expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+        if receipt_reply is not None:
+            return receipt_reply(body)
+        return dict(ok=True)
+    return api
+
+
+class CleanupGuardTests(unittest.TestCase):
+    """Safeguards 4-6: independent keep-window guard, local caps, ledger."""
+    setUp = CleanupTests.setUp
+    fixture_pins = CleanupTests.fixture_pins
+    opened = CleanupTests.opened
+
+    def approve(self):
+        with self.opened() as f:
+            self.task['approved_proof'] = f.proof()
+
+    def run_execution(self, receipt_reply=None):
+        calls = []
+        with mock.patch.object(pull, 'restore_api', side_effect=approve_api(self, calls, receipt_reply)):
+            pull.cleanup_once(self.cfg, self.inventory, threading.Event())
+        return calls
+
+    def ledger(self):
+        path = self.cfg.state_dir / pull.CLEANUP_LEDGER_NAME
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def assert_refused(self, calls, reason):
+        observes = [b for p, b in calls if p.endswith('/observe')]
+        self.assertEqual(len(observes), 1)
+        self.assertEqual(observes[0]['outcome'], 'conflict')
+        self.assertIn(reason, observes[0]['error'])
+        self.assertFalse(any(p.endswith('/result') for p, _ in calls))
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+        self.assertEqual(self.ledger(), [])
+
+    def test_pinned_copies_match_backend_policy_and_repo_folder_map(self):
+        repo = Path(__file__).resolve().parents[2]
+        policy = (repo/'backend/internal/api/nas_cleanup_keep28_policy.json').read_bytes()
+        embedded = pull.zlib.decompress(pull.base64.b64decode(''.join(pull.CLEANUP_KEEP28_POLICY_ZLIB_B64)))
+        self.assertEqual(embedded, policy)
+        self.assertEqual(pull.CLEANUP_FOLDER_STREAMS_JSON.encode(), (Path(__file__).with_name('nas_cleanup_folder_streams.json')).read_bytes())
+        pins = pull.load_cleanup_pins()
+        self.assertEqual(len(pins['windows']), 109)
+        self.assertEqual(pins['folders']['recordings/339'], 17200)
+        self.assertEqual(pins['folders']['01_na_usa_los-angeles_venice-beach'], 17238)
+        self.assertNotIn('recordings', pins['folders'])
+        self.assertEqual(pull.cleanup_folder_key('joined/01_na_usa_los-angeles_venice-beach/July/24-Friday/x_hour_08.mp4', 'collated'), '01_na_usa_los-angeles_venice-beach')
+        self.assertEqual(pull.cleanup_folder_key('recordings/339/continuous/1.mp4', 'raw'), 'recordings/339')
+        self.assertIsNone(pull.cleanup_folder_key('joined/x/y.mp4', 'raw'))
+        self.assertIsNone(pull.cleanup_folder_key('x/y.mp4', 'collated'))
+
+    def test_tampered_pins_refuse_every_deletion_but_dry_runs_continue(self):
+        self.pinned.stop()
+        with mock.patch.object(pull, 'CLEANUP_FOLDER_STREAMS_JSON', pull.CLEANUP_FOLDER_STREAMS_JSON.replace('17200', '17201')), \
+                mock.patch.object(pull, '_CLEANUP_PINS', None):
+            pins, error = pull.cleanup_pins()
+            self.assertIsNone(pins); self.assertIn('SHA mismatch', error)
+            # Non-delete work: the dry-run observation still reports a match.
+            calls = self.run_execution()
+            self.assertEqual([b['outcome'] for p, b in calls if p.endswith('/observe')], ['match'])
+            self.approve()
+            self.assert_refused(self.run_execution(), 'pinned keep-window files failed verification')
+        self.pinned.start()
+
+    def test_keep_window_overlap_refuses_without_asking_for_a_permit(self):
+        self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
+        self.approve()
+        self.assert_refused(self.run_execution(), 'overlaps stream 33 keep window')
+        # Half-open window: a clip ending exactly at keep_start is outside.
+        self.pins = self.fixture_pins('2026-09-01T00:01:00+00:00', '2026-09-28T00:00:00+00:00')
+        self.assertIsNone(pull.cleanup_guard_refusal(self.task, self.task['approved_proof']))
+
+    def test_unknown_folder_and_disagreeing_stream_refuse(self):
+        self.approve()
+        self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-29T00:00:00+00:00', folders={'other': 33})
+        self.assertIn('has no pinned stream', pull.cleanup_guard_refusal(self.task, self.task['approved_proof']))
+        self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-29T00:00:00+00:00')
+        self.item['stream_id'] = 34
+        self.assert_refused(self.run_execution(), 'disagrees with pinned stream 33')
+
+    def test_raw_interval_comes_from_the_physical_sidecar(self):
+        self.approve()
+        proof = json.loads(json.dumps(self.task['approved_proof']))
+        self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
+        # Even if the server-sent bounds claim otherwise, the sidecar decides.
+        self.item['start_at'], self.item['end_at'] = '2025-01-01T00:00:00+00:00', '2025-01-01T00:01:00+00:00'
+        self.assertIn('overlaps', pull.cleanup_guard_refusal(self.task, proof))
+        del proof['sidecar']
+        self.assertIn('no physical sidecar binding', pull.cleanup_guard_refusal(self.task, proof))
+
+    def test_collated_bounds_must_match_the_dated_path(self):
+        pins = self.fixture_pins('2026-07-01T00:00:00+00:00', '2026-07-29T00:00:00+00:00', folders={'03_Plac': 33})
+        pins[0]['windows'][33] = pins[0]['windows'][33][:2] + ('Europe/Warsaw',)
+        self.pins = pins
+        rel = 'joined/03_Plac/July/24-Friday/03_Plac_2026_July_W4_Friday_hour_08_part_01_080013-080114.mp4'
+        task = dict(item=dict(kind='collated', stream_id=33, relative_path=rel, sidecar_required=False,
+                              start_at='2026-07-24T06:00:13Z', end_at='2026-07-24T06:01:14.373Z'))
+        self.assertIn('overlaps', pull.cleanup_guard_refusal(task, {}))
+        self.pins = self.fixture_pins('2026-08-01T00:00:00+00:00', '2026-08-29T00:00:00+00:00', folders={'03_Plac': 33})
+        self.pins[0]['windows'][33] = self.pins[0]['windows'][33][:2] + ('Europe/Warsaw',)
+        self.assertIsNone(pull.cleanup_guard_refusal(task, {}))
+        for start, end, reason in (('2026-07-24T07:00:13Z', '2026-07-24T07:01:00Z', 'not confirmed by the dated NAS path'),
+                                   ('2026-07-24T06:00:13Z', '2026-07-24T09:00:00Z', 'implausibly long'),
+                                   (None, '2026-07-24T06:01:00Z', 'keep-window check failed')):
+            task['item'].update(start_at=start, end_at=end)
+            self.assertIn(reason, pull.cleanup_guard_refusal(task, {}))
+        task['item'].update(start_at='2026-08-25T16:43:38Z', end_at='2026-08-25T17:00:38Z',
+                            relative_path='joined/03_Plac/July/24-Friday/undated.mp4')
+        self.assertIn('not confirmed', pull.cleanup_guard_refusal(task, {}))
+        self.assertEqual(pull.cleanup_collated_path_hour('joined/recordings/339/joined/2026-08-25/339_2026-08-25_hour_18_184338-190038.mp4'),
+                         (datetime.date(2026, 8, 25), 18))
+
+    def test_local_24h_caps_refuse_beyond_files_and_bytes(self):
+        self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
+        reserve = dict(item_id=1, plan_sha256='a'*64, relative_path='x')
+        self.assertIsNone(pull.cleanup_local_caps(self.inventory, pull.CLEANUP_MAX_BYTES_24H - 10, reserve))
+        self.assertIn('cap reached', pull.cleanup_local_caps(self.inventory, 11))
+        self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
+        self.inventory.db.execute('DELETE FROM cleanup_local_deletions')
+        self.inventory.db.executemany('INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)',
+                                      [(n, 'a'*64, 'x', 1, time.time()) for n in range(pull.CLEANUP_MAX_FILES_24H)])
+        self.inventory.db.commit()
+        self.approve()
+        self.assert_refused(self.run_execution(), 'local 24h deletion cap reached')
+        self.inventory.db.execute('UPDATE cleanup_local_deletions SET at_epoch=?', (time.time() - 86401,))
+        self.inventory.db.commit()
+        self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
+
+    def test_append_only_ledger_records_intent_and_result_around_unlink(self):
+        old = self.cfg.state_dir / pull.CLEANUP_LEDGER_NAME
+        old.write_text('{"event":"earlier"}\n')
+        order = []
+        original_unlink = pull.os.unlink
+        def unlink(name, *args, **kwargs):
+            order.append(('unlink', [r['event'] for r in self.ledger()]))
+            return original_unlink(name, *args, **kwargs)
+        self.approve()
+        with mock.patch.object(pull.os, 'unlink', side_effect=unlink):
+            calls = self.run_execution()
+        self.assertFalse(self.path.exists())
+        self.assertEqual([b['outcome'] for p, b in calls if p.endswith('/result')], ['deleted'])
+        rows = self.ledger()
+        self.assertEqual([r['event'] for r in rows], ['earlier', 'intent', 'result'])
+        self.assertEqual(order[0], ('unlink', ['earlier', 'intent']))
+        intent, result = rows[1], rows[2]
+        for field in ('relative_path', 'size_bytes', 'sha256', 'plan_sha256', 'item_id', 'at', 'proof_sha256'):
+            self.assertIn(field, intent)
+        self.assertEqual(intent['relative_path'], 'stream/day/a.mp4'); self.assertEqual(intent['sha256'], self.item['sha256'])
+        self.assertEqual((result['outcome'], result['media_unlinked'], result['sidecar_unlinked']), ('deleted', True, True))
+        self.assertEqual(self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0], 1)
+
+    def test_ledger_write_failure_prevents_unlink(self):
+        self.approve()
+        with mock.patch.object(pull, 'cleanup_ledger_append', side_effect=OSError('state volume full')):
+            calls = self.run_execution()
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+        receipts = [b for p, b in calls if p.endswith('/result')]
+        self.assertEqual(receipts[0]['outcome'], 'unverified'); self.assertIn('state volume full', receipts[0]['error'])
+
+    def test_media_deleted_sidecar_failed_is_reported_honestly_with_legacy_fallback(self):
+        original_unlink = pull.os.unlink
+        def unlink(name, *args, **kwargs):
+            if name.endswith('.stoarama.json'):
+                raise PermissionError('sidecar locked')
+            return original_unlink(name, *args, **kwargs)
+        def old_server(body):
+            if body['outcome'] not in ('deleted', 'unverified'):
+                raise pull.urllib.error.HTTPError('result', 400, 'invalid cleanup deletion receipt', {}, None)
+            return dict(ok=True)
+        self.approve()
+        with mock.patch.object(pull.os, 'unlink', side_effect=unlink):
+            calls = self.run_execution(receipt_reply=old_server)
+        self.assertFalse(self.path.exists()); self.assertTrue(self.sidecar.exists())
+        receipts = [b for p, b in calls if p.endswith('/result')]
+        self.assertEqual([r['outcome'] for r in receipts], ['media_deleted_sidecar_failed', 'unverified'])
+        self.assertTrue(receipts[1]['error'].startswith('media_deleted_sidecar_failed: '))
+        self.assertEqual(self.ledger()[-1]['outcome'], 'media_deleted_sidecar_failed')
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
 
 
 if __name__=='__main__':unittest.main()
