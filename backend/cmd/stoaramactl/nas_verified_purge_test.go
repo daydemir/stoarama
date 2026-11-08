@@ -127,6 +127,12 @@ CREATE TABLE recording_qualification_windows(run_id bigint NOT NULL, recording_i
 INSERT INTO connections VALUES (13,47,'nas_pull'),(14,48,'nas_pull');
 INSERT INTO recordings VALUES (53,47,'completed','nas_pull','raw'),(54,47,'completed','nas_pull','raw'),(55,47,'completed','nas_pull','collated_only'),(1,47,'completed','nas_pull','raw'),(52,47,'completed','nas_pull','raw'),(50,47,'completed','nas_pull','raw'),(51,47,'active','nas_pull','raw'),(60,48,'completed','nas_pull','raw');
 INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
+CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY, mode text NOT NULL);
+CREATE TABLE nas_cleanup_source_holds(plan_id bigint NOT NULL, clip_id bigint NOT NULL, PRIMARY KEY(plan_id, clip_id));
+CREATE TABLE nas_cleanup_items(plan_id bigint NOT NULL, delete_ever_issued boolean NOT NULL);
+INSERT INTO nas_cleanup_plans VALUES (1,'paused'),(2,'retired'),(4,'retired');
+INSERT INTO nas_cleanup_items VALUES (2,false),(4,true);
+INSERT INTO nas_cleanup_source_holds VALUES (1,170),(2,101),(4,171);
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +177,8 @@ INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 		{163, 50, 5000, 20, 0, "ok", "ok"}, // unplayable size signature
 		{164, 55, 5500, 20, 0, "ok", "ok"}, // collated_only recording                  // active recording, old clip: eligible
 		{130, 60, 6000, 20, 0, "ok", "ok"}, // another account's recording
+		{170, 50, 5000, 20, 0, "ok", "ok"}, // in a non-retired NAS cleanup plan (101 is only in a retired one)
+		{171, 50, 5000, 20, 0, "ok", "ok"}, // in a retired plan that once issued a NAS deletion (permanent recovery hold)
 	}
 	bodies := map[int64][]byte{}
 	for _, s := range specs {
@@ -256,6 +264,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		"restore_recent": 1, "joined_scope": 1, "active_recording_recent": 1, "joined_snapshot": 9,
 		"excluded_clip": 1, "excluded_recording": 1,
 		"candidate_recording": 1, "cohort_window": 1, "unplayable_signature": 1, "collated_only_delivery": 1,
+		"nas_cleanup_plan": 2,
 	}
 	dry := run(base)
 	if dry.Mode != "dry_run" || dry.Eligible != 8 || dry.Purged != 0 || len(store.deleted) != 0 {
@@ -306,7 +315,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	if fmt.Sprint(store.deleted) != "[managed/acct-47/101.mp4 managed/acct-47/102.mp4 managed/acct-47/121.mp4 managed/acct-47/162.mp4]" {
 		t.Fatalf("deleted objects %v", store.deleted)
 	}
-	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140, 160, 161, 163, 164} {
+	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140, 160, 161, 163, 164, 170, 171} {
 		if _, ok := store.objects[fmt.Sprintf("managed/acct-47/%d.mp4", id)]; !ok {
 			t.Fatalf("object of protected clip %d was deleted", id)
 		}
@@ -343,6 +352,34 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	// too: the NAS holds the exact recorded bytes, so no good copy is lost.
 	if s := run(sample); s.Purged != 3 || store.heads != 0 {
 		t.Fatalf("sample mode summary %+v heads=%d", s, store.heads)
+	}
+	// While any NAS cleanup plan is enabled the tool refuses to run at all,
+	// dry run included, and deletes nothing.
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans VALUES (3,'enabled')`); err != nil {
+		t.Fatal(err)
+	}
+	deleted := len(store.deleted)
+	for _, opts := range []nasPurgeOptions{base, apply} {
+		if s, err := runNASVerifiedPurgePass(ctx, pool, store, opts, nil); err == nil || !strings.Contains(err.Error(), "refusing to run while NAS cleanup plan(s) [3] are enabled") || s.Scanned != 0 {
+			t.Fatalf("%s ran during an enabled cleanup plan: %v %+v", opts.headMode, err, s)
+		}
+	}
+	if len(store.deleted) != deleted {
+		t.Fatal("objects deleted while a cleanup plan was enabled")
+	}
+	// The per-clip fact also fences a plan enabled after the run started.
+	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused' WHERE id=3`); err != nil {
+		t.Fatal(err)
+	}
+	page, err := loadNASPurgeCandidates(ctx, pool, store.Bucket(), base, 0)
+	if err != nil || len(page) == 0 || !page[0].Facts["no_enabled_cleanup"] {
+		t.Fatalf("paused plan fenced the scan: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled' WHERE id=3`); err != nil {
+		t.Fatal(err)
+	}
+	if page, err = loadNASPurgeCandidates(ctx, pool, store.Bucket(), base, 0); err != nil || len(page) == 0 || page[0].Facts["no_enabled_cleanup"] || page[0].skipReason() != "nas_cleanup_enabled" {
+		t.Fatalf("enabled plan did not fence the scan: %v", err)
 	}
 }
 

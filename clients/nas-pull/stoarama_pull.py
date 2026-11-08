@@ -32,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from enum import Enum
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1582,6 +1583,8 @@ class CleanupFile:
         self.ancestors = []
         self.root_identity = None
         self.stage_timings = {}
+        self.media_unlinked = False
+        self.sidecar_unlinked = False
 
     def check_active(self):
         if self.stop_event.is_set() or time.monotonic() >= self.deadline:
@@ -1708,10 +1711,12 @@ class CleanupFile:
         self.check_paths()
         self.check_active()
         os.unlink(self.name, dir_fd=self.fds[-1])
+        self.media_unlinked = True
         if self.item["sidecar_required"]:
             self.check_paths(skip_media=True)
             self.check_active()
             os.unlink(self.files[1][0], dir_fd=self.fds[-1])
+            self.sidecar_unlinked = True
         os.fsync(self.fds[-1])
 
     def __exit__(self, *_args):
@@ -1722,9 +1727,421 @@ class CleanupFile:
         self.files, self.fds = [], []
 
 
+# Independent client-side deletion guard (safety council, 2026-11). Defence in
+# depth: it never trusts the server. Before every unlink the client itself maps
+# the file's top-level NAS folder to a stream (pinned map; unknown -> refuse),
+# reads the clip interval from the physical sidecar binding (raw) or the
+# output's bounds cross-checked against the dated collated path (collated;
+# unknown -> refuse), and refuses when the interval overlaps that stream's
+# pinned keep28 window or the server's stream_id disagrees. It also enforces
+# hard local 24h caps and writes an append-only, fsynced deletion ledger. A
+# client whose pinned files fail their SHA check refuses every deletion and
+# keeps doing all non-delete work. Refusal never unlinks; it is reported to the
+# server as a non-delete outcome (conflict observation or unverified receipt).
+#
+# CLEANUP_KEEP28_POLICY is backend/internal/api/nas_cleanup_keep28_policy.json
+# byte-for-byte (zlib+base64; the tests compare them). CLEANUP_FOLDER_STREAMS
+# is clients/nas-pull/nas_cleanup_folder_streams.json byte-for-byte, derived
+# read-only from production: every NAS folder prefix seen in
+# nas_inventory_files.relative_path, recording_collation_outputs.nas_relative_path
+# and recording_clips.display_path (account 47) that maps to exactly one stream;
+# the prefix is the first path component, or "recordings/<id>" for that layout.
+CLEANUP_KEEP28_POLICY_SHA256 = "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
+CLEANUP_KEEP28_POLICY_STREAMS = 109
+CLEANUP_KEEP28_POLICY_ZLIB_B64 = (
+    "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"
+    "6qbzqm7Qo+qG8UVOn1aovfjXb5HbxbI="
+)
+CLEANUP_FOLDER_STREAMS_SHA256 = "94efc6fe9f0b83db55be31d4c2fad7f47cff781fd01d88bc33c4c90cae0e7ab8"
+CLEANUP_FOLDER_STREAMS_JSON = """{
+ "01_na_usa_los-angeles_venice-beach": 17238,
+ "02_North_America_United_States_Seattle_Western_Ave_and_Broad_St": 2718,
+ "03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej": 17216,
+ "04_Asia_South_Korea_Seoul_Daechi_Station_Intersection": 78,
+ "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St": 94,
+ "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW": 178,
+ "07_North_America_United_States_Seattle_1st_Ave_and_Stewart_St": 179,
+ "08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon": 415,
+ "09_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_NS": 469,
+ "100000_North_America_US_Key_West_Duval_Street": 17243,
+ "100001_Asia_South_Korea_Seoul": 158,
+ "100002_Asia_South_Korea_Seoul": 175,
+ "100003_Asia_South_Korea_Seoul_2": 195,
+ "100004_South_America_Brazil_Porto_Seguro_Porto_Seguro_-_Praia_de_Taperapuan_Live_cam": 12672,
+ "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam": 12725,
+ "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam": 14303,
+ "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam": 14554,
+ "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam": 14782,
+ "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri": 17309,
+ "100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken": 17310,
+ "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna": 17311,
+ "100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica": 17312,
+ "100013_Europe_Netherlands_Sittard_Sittard_-_Markt": 17313,
+ "100014_Europe_Serbia_Novi_Sda_Novi_Sda_-_Novi_Sad": 17314,
+ "100015_Europe_Spain_Celanova_Celanova_-_Praza_Major": 17315,
+ "100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento": 17316,
+ "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square": 17317,
+ "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka": 17318,
+ "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square": 17319,
+ "100020_Europe_Poland_Bielsko_Biala_Bielsko_Biala_-_market_square": 17320,
+ "100021_Europe_Poland_Brzeg_Brzeg_-_Plac_Polonii_Amerykaskiej": 17321,
+ "100022_Europe_Poland_Brzesko_Brzesko_-_Market_square": 17322,
+ "100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja": 17323,
+ "100024_Europe_Poland_Czersk_Czersk_-_Market_square": 17324,
+ "100025_Europe_Poland_Frombork_Frombork_-_Market_square": 17325,
+ "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square": 17326,
+ "100027_Europe_Poland_Lublin_Lublin_-_Place": 17327,
+ "100028_Europe_Poland_Myslenice_Myslenice_-_Market_place": 17328,
+ "100029_Europe_Poland_Jelenia_Gora_Jelenia_Gora_-_Cieplice_-_Lalka": 17329,
+ "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place": 17330,
+ "100031_Europe_Italy_Montefalco_Montefalco_-_Piazza_del_comune": 17331,
+ "100032_Europe_Slovakia_Trencin_Trencin_-_Mierove": 17332,
+ "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru": 17333,
+ "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti": 17334,
+ "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie": 17335,
+ "100036_Europe_Czechia_Pribram_Pribram_-_Namesti_17._listopadu": 17336,
+ "100037_Europe_Poland_Debica_Debica_-_Market_Square": 17337,
+ "100038_Europe_Poland_Brzesko_Brzesko_-_Kazimierz_Wielki_Square": 17338,
+ "100039_Europe_Poland_Swidnik_Swidnik_-_Plac_Konstytucji_3_Maja": 17339,
+ "100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ": 17340,
+ "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach": 17341,
+ "100042_Europe_Czech_republic_Most_Public_square_089_Market_square": 17208,
+ "100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain": 17342,
+ "100044_Asia_South_Korea_Seoul_Seoul_-_Gwanghwamun": 17256,
+ "100045_Asia_South_Korea_Seoul_Seoul_-_Sicheong": 17261,
+ "100046_Asia_South_Korea_Seoul_Seoul_-_Jongro2ga": 17254,
+ "100047_Asia_South_Korea_Seoul_Seoul_-_Jongro1ga": 17268,
+ "100048_Asia_South_Korea_Seoul_Seoul_-_Myeongdongipgu": 17251,
+ "10_North_America_United_States_Seattle_2nd_Ave_Ext_S_and_S_Main_St": 487,
+ "11_North_America_United_States_Seattle_1st_Ave_and_Seneca_St": 2666,
+ "12_North_America_United_States_Seattle_Dexter_Ave_and_Denny_Way": 2675,
+ "13_North_America_United_States_Seattle_9th_Ave_N_and_Thomas_St": 2676,
+ "14_North_America_United_States_Seattle_Aurora_Ave_N_and_N_117th_Pl": 2678,
+ "15_North_America_United_States_Seattle_Aurora_Ave_N_and_N_145th_St_EW": 2680,
+ "16_North_America_United_States_Seattle_Aurora_Ave_N_and_N_85th_St_EW": 2681,
+ "17_North_America_United_States_Seattle_4th_Ave_and_Battery_St": 2693,
+ "18_North_America_United_States_Seattle_Bridge_Way_N_and_N_38th_St": 2708,
+ "19_North_America_United_States_Seattle_1st_Ave_and_Broad_St": 2717,
+ "20_North_America_United_States_Seattle_1st_Ave_N_and_Thomas_St_NWC": 2720,
+ "21_North_America_United_States_Seattle_Queen_Anne_Ave_N_and_Thomas_St_NWC": 2726,
+ "22_North_America_United_States_Seattle_Harbor_Ave_SW_and_S_Spokane_St": 2740,
+ "23_North_America_United_States_Seattle_35th_Ave_SW_and_SW_Barton_St": 2757,
+ "24_North_America_United_States_Seattle_Airport_Way_S_and_S_Doris_St": 2963,
+ "25_North_America_United_States_Seattle_Eastlake_Ave_E_and_Fuhrman_Ave_E": 2965,
+ "26_North_America_United_States_Seattle_Latona_Ave_NE_and_NE_50th_St": 2973,
+ "27_North_America_United_States_Seattle_4th_Ave_S_and_Michigan_St": 3007,
+ "28_North_America_United_States_Seattle_3rd_Ave_and_Columbia_St": 3039,
+ "29_North_America_United_States_Seattle_1st_Ave_S_and_S_Atlantic_St": 3049,
+ "30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja": 17219,
+ "31_North_America_United_States_Seattle_2nd_Ave_and_James_St": 17242,
+ "32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi": 17233,
+ "32_Europe_Italy_Assisi_Town_Square_Assisi": 17233,
+ "36_South_America_Peru_Cusco_Plaza_Mayor": 14478,
+ "99991_asia_japan_tokyo_shinjuku9": 3,
+ "99992_Asia_Thailand_Bangkok_Bangkok_-_Sukhumvit_Road_Bangkok_Thailand": 17234,
+ "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao": 17235,
+ "99994_Asia_Japan_Tokyo_Shinjuku1": 17240,
+ "99995_North_America_US_Leavenworth_Kris_Kringl": 17241,
+ "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar": 17247,
+ "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk": 17237,
+ "99998_North_America_United_States_Seattle_7th_Ave_N_and_Denny_Way_2": 2674,
+ "99999_Asia_Japan_Tokyo_Tokyo_Kabukicho": 17239,
+ "recordings/326": 2718,
+ "recordings/327": 17186,
+ "recordings/328": 415,
+ "recordings/330": 186,
+ "recordings/334": 2674,
+ "recordings/335": 17216,
+ "recordings/337": 78,
+ "recordings/338": 182,
+ "recordings/339": 17200,
+ "recordings/349": 17239,
+ "recordings/350": 17243,
+ "recordings/352": 94,
+ "recordings/353": 178,
+ "recordings/354": 179,
+ "recordings/356": 469,
+ "recordings/357": 487,
+ "recordings/358": 2666,
+ "recordings/359": 2675,
+ "recordings/360": 2676,
+ "recordings/361": 2678,
+ "recordings/362": 2680,
+ "recordings/363": 2681,
+ "recordings/364": 2693,
+ "recordings/365": 2708,
+ "recordings/366": 2717,
+ "recordings/367": 2720,
+ "recordings/368": 2726,
+ "recordings/370": 2757,
+ "recordings/371": 2963,
+ "recordings/372": 2965,
+ "recordings/373": 2973,
+ "recordings/374": 3007,
+ "recordings/375": 3039,
+ "recordings/376": 3049,
+ "recordings/377": 17219,
+ "recordings/378": 17242,
+ "recordings/386": 293,
+ "recordings/387": 295,
+ "recordings/388": 2667,
+ "recordings/389": 2677,
+ "recordings/390": 2713,
+ "recordings/391": 2747,
+ "recordings/392": 2975,
+ "recordings/393": 3006,
+ "recordings/394": 3018,
+ "recordings/395": 3021,
+ "recordings/396": 3022,
+ "recordings/397": 3025,
+ "recordings/398": 17186,
+ "recordings/399": 17248,
+ "recordings/400": 17249,
+ "recordings/July": 17216
+}
+"""
+CLEANUP_MAX_FILES_24H = 50000
+CLEANUP_MAX_BYTES_24H = 3_000_000_000_000  # 3 TB
+CLEANUP_MAX_COLLATED_SECONDS = 7200
+CLEANUP_LEDGER_NAME = "cleanup-deletions.jsonl"
+CLEANUP_MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+                  "August", "September", "October", "November", "December")
+CLEANUP_COLLATED_DATED_RE = re.compile(
+    r"^[^/]+/(%s)/(0[1-9]|[12][0-9]|3[01])-[A-Za-z]+/[^/]*_(20[0-9]{2})_(%s)_W[1-6]_[A-Za-z]+_hour_([01][0-9]|2[0-3])[^/]*$"
+    % ("|".join(CLEANUP_MONTHS), "|".join(CLEANUP_MONTHS)))
+CLEANUP_COLLATED_V1_DATED_RE = re.compile(
+    r"^recordings/[1-9][0-9]*/joined/([0-9]{4})-([0-9]{2})-([0-9]{2})/[^/]*_hour_([01][0-9]|2[0-3])[^/]*$")
+
+
+def load_cleanup_pins(policy_raw=None, folders_raw=None):
+    """Parse and SHA-check the pinned keep windows and folder map; raise on any defect."""
+    if policy_raw is None:
+        policy_raw = zlib.decompress(base64.b64decode("".join(CLEANUP_KEEP28_POLICY_ZLIB_B64)))
+    if folders_raw is None:
+        folders_raw = CLEANUP_FOLDER_STREAMS_JSON.encode("utf-8")
+    if hashlib.sha256(policy_raw).hexdigest() != CLEANUP_KEEP28_POLICY_SHA256:
+        raise RuntimeError("pinned keep28 policy SHA mismatch")
+    if hashlib.sha256(folders_raw).hexdigest() != CLEANUP_FOLDER_STREAMS_SHA256:
+        raise RuntimeError("pinned folder map SHA mismatch")
+    rows = json.loads(policy_raw)
+    if not isinstance(rows, list) or len(rows) != CLEANUP_KEEP28_POLICY_STREAMS:
+        raise RuntimeError("pinned keep28 policy is incomplete")
+    windows = {}
+    for row in rows:
+        stream = row.get("stream_id") if isinstance(row, dict) else None
+        if type(stream) is not int or stream <= 0 or stream in windows or not isinstance(row.get("tz"), str):
+            raise RuntimeError("pinned keep28 policy has an invalid stream")
+        start = parse_certification_timestamp(row.get("keep_start_utc"), "keep_start_utc")
+        end = parse_certification_timestamp(row.get("keep_end_utc"), "keep_end_utc")
+        if not end > start:
+            raise RuntimeError("pinned keep28 window is empty")
+        windows[stream] = (start, end, row["tz"])
+    folders = json.loads(folders_raw)
+    if not isinstance(folders, dict) or not folders or any(
+            not isinstance(k, str) or not k or type(v) is not int or v <= 0 or v not in windows for k, v in folders.items()):
+        raise RuntimeError("pinned folder map is invalid")
+    return {"windows": windows, "folders": folders}
+
+
+_CLEANUP_PINS_LOCK = threading.Lock()
+_CLEANUP_PINS = None
+
+
+def cleanup_pins():
+    """Return (pins, None) or (None, error); computed once per process."""
+    global _CLEANUP_PINS
+    with _CLEANUP_PINS_LOCK:
+        if _CLEANUP_PINS is None:
+            try:
+                _CLEANUP_PINS = (load_cleanup_pins(), None)
+            except Exception as exc:
+                _CLEANUP_PINS = (None, str(exc)[:200] or type(exc).__name__)
+        return _CLEANUP_PINS
+
+
+def cleanup_folder_key(relative_path, kind):
+    if not isinstance(relative_path, str):
+        return None
+    parts = relative_path.split("/")
+    if kind == "collated":
+        if parts[0] != JOINED_ROOT:
+            return None
+        parts = parts[1:]
+    elif parts[0] == JOINED_ROOT:
+        return None
+    if len(parts) < 2 or not parts[0]:
+        return None
+    if parts[0] == "recordings":
+        return "recordings/" + parts[1] if len(parts) > 2 and parts[1] else None
+    return parts[0]
+
+
+def cleanup_collated_path_hour(relative_path):
+    """Local (date, hour) a dated collated path names, or None."""
+    path = relative_path[len(JOINED_ROOT) + 1:]
+    match = CLEANUP_COLLATED_DATED_RE.match(path)
+    if match:
+        if match.group(1) != match.group(4):
+            return None
+        return datetime.date(int(match.group(3)), CLEANUP_MONTHS.index(match.group(1)) + 1, int(match.group(2))), int(match.group(5))
+    match = CLEANUP_COLLATED_V1_DATED_RE.match(path)
+    if match:
+        return datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3))), int(match.group(4))
+    return None
+
+
+def cleanup_guard_refusal(task, proof):
+    """None when this exact file is independently outside its keep window; else why not."""
+    pins, error = cleanup_pins()
+    if error is not None:
+        return "pinned keep-window files failed verification: %s" % error
+    try:
+        item = task["item"]
+        kind = item.get("kind")
+        key = cleanup_folder_key(item.get("relative_path"), kind)
+        stream = pins["folders"].get(key) if key else None
+        if stream is None:
+            return "NAS folder %r has no pinned stream" % key
+        if type(item.get("stream_id")) is not int or item["stream_id"] != stream:
+            return "server stream_id %r disagrees with pinned stream %d" % (item.get("stream_id"), stream)
+        keep_start, keep_end, timezone = pins["windows"][stream]
+        if kind == "raw":
+            sidecar = proof.get("sidecar") if isinstance(proof, dict) else None
+            binding = sidecar.get("binding") if isinstance(sidecar, dict) else None
+            if item.get("sidecar_required") is not True or not isinstance(binding, dict):
+                return "raw clip has no physical sidecar binding"
+            start = parse_certification_timestamp(binding.get("clip_start_at"), "sidecar clip_start_at")
+            end = parse_certification_timestamp(binding.get("clip_end_at"), "sidecar clip_end_at")
+        elif kind == "collated":
+            start = parse_certification_timestamp(item.get("start_at"), "collated start_at")
+            end = parse_certification_timestamp(item.get("end_at"), "collated end_at")
+            named = cleanup_collated_path_hour(item["relative_path"])
+            local = start.astimezone(ZoneInfo(timezone))
+            if named is None or named != (local.date(), local.hour):
+                return "collated bounds are not confirmed by the dated NAS path"
+            if (end - start).total_seconds() > CLEANUP_MAX_COLLATED_SECONDS:
+                return "collated bounds are implausibly long"
+        else:
+            return "unsupported cleanup kind %r" % kind
+        if not end > start:
+            return "clip interval is empty"
+        if start < keep_end and end > keep_start:
+            return "clip %s..%s overlaps stream %d keep window %s..%s" % (
+                start.isoformat(), end.isoformat(), stream, keep_start.isoformat(), keep_end.isoformat())
+        return None
+    except Exception as exc:
+        return "keep-window check failed: %s" % str(exc)[:200]
+
+
+def cleanup_local_caps(inventory, size_bytes, reserve=None):
+    """Refuse beyond the hard local rolling-24h caps; optionally reserve one deletion."""
+    if type(size_bytes) is not int or size_bytes <= 0:
+        return "invalid deletion size"
+    with inventory.lock:
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_local_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id INTEGER NOT NULL,plan_sha256 TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,at_epoch REAL NOT NULL)")
+        # A wall clock that moves backwards only keeps rows in the window longer.
+        files, total = inventory.db.execute("SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?",
+                                            (time.time() - 86400,)).fetchone()
+        if files + 1 > CLEANUP_MAX_FILES_24H or total + size_bytes > CLEANUP_MAX_BYTES_24H:
+            inventory.db.commit()
+            return "local 24h deletion cap reached (%d files, %d bytes)" % (files, total)
+        if reserve is not None:
+            inventory.db.execute("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
+                                 (reserve["item_id"], reserve["plan_sha256"], reserve["relative_path"], size_bytes, time.time()))
+        inventory.db.commit()
+    return None
+
+
+_CLEANUP_LEDGER_LOCK = threading.Lock()
+
+
+def cleanup_ledger_append(cfg, record):
+    """Append one fsynced JSON line; the ledger is never truncated or rewritten."""
+    path = Path(cfg.state_dir) / CLEANUP_LEDGER_NAME
+    line = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    with _CLEANUP_LEDGER_LOCK:
+        created = not path.exists()
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+        try:
+            view = memoryview(line)
+            while view:
+                view = view[os.write(descriptor, view):]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if created:
+            fsync_dir(Path(cfg.state_dir))
+
+
+def cleanup_send_result(cfg, item_id, receipt):
+    """Send a deletion receipt; servers before 2026-11 only know deleted/unverified."""
+    path = "/account/connections/cleanup/%d/result" % item_id
+    try:
+        return restore_api(cfg, path, receipt)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 400 or receipt.get("outcome") != "media_deleted_sidecar_failed":
+            raise
+    legacy = dict(receipt, outcome="unverified", error=("media_deleted_sidecar_failed: " + str(receipt.get("error") or ""))[:500])
+    return restore_api(cfg, path, legacy)
+
+
 def cleanup_replay_receipts(cfg, inventory):
     def replay(item_id, phase, body):
         try:
+            if phase == "result":
+                return cleanup_send_result(cfg, item_id, body)
             return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
         except urllib.error.HTTPError as exc:
             if exc.code != 409:
@@ -1790,6 +2207,15 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
             proof = current.proof()
             if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                 raise RuntimeError("cleanup dry-run proof changed; KEEP")
+            # Independent client guard, in dry runs too: a refused item is
+            # reported as a conflict observation (an outcome every server
+            # accepts), never would_delete, so enabling its plan fails up front
+            # instead of pausing mid-run. Local caps apply to execution only.
+            refusal = cleanup_guard_refusal(task, proof)
+            if refusal is None and task.get("approved_proof") is not None:
+                refusal = cleanup_local_caps(inventory, task["item"].get("size_bytes"))
+            if refusal:
+                raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
             cleanup_journal(inventory, item_id, "observe", body)
             permit_request_started = time.monotonic()
@@ -1797,6 +2223,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
             if decision.get("delete") is True:
                 receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
                 cleanup_journal(inventory, item_id, "intent", receipt)
+                ledger = None
                 try:
                     if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
                             or decision.get("attempt") != attempt or decision.get("plan_sha256") != task["plan_sha256"]
@@ -1806,12 +2233,35 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
                     permit_expiry = parse_certification_timestamp(decision["expires_at"], "cleanup permit")
                     wall_remaining = (permit_expiry - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
                     current.deadline = min(current.deadline, permit_request_started + 30, time.monotonic() + max(0, wall_remaining))
+                    item = task["item"]
+                    # Re-check immediately before unlink, reserve one deletion
+                    # against the local caps, then write the durable intent line.
+                    # Any failure here leaves the files untouched.
+                    refusal = cleanup_guard_refusal(task, proof) or cleanup_local_caps(
+                        inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
+                    if refusal:
+                        raise RuntimeError("client deletion guard refused; not unlinked: " + refusal)
+                    ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
+                              "proof_sha256": receipt["proof_sha256"], "relative_path": item["relative_path"],
+                              "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
+                              "size_bytes": item.get("size_bytes"), "sha256": proof["sha256"], "kind": item.get("kind"),
+                              "stream_id": item.get("stream_id"), "client_version": CLIENT_VERSION}
+                    cleanup_ledger_append(cfg, dict(ledger, event="intent", at=utc_now_precise()))
                     current.delete_exact(proof)
                     receipt["outcome"] = "deleted"
                 except Exception as exc:
                     receipt["error"] = str(exc)[:500]
+                    if current.media_unlinked and task["item"].get("sidecar_required") and not current.sidecar_unlinked:
+                        receipt["outcome"] = "media_deleted_sidecar_failed"
+                if ledger is not None:
+                    try:
+                        cleanup_ledger_append(cfg, dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
+                                                        media_unlinked=current.media_unlinked, sidecar_unlinked=current.sidecar_unlinked,
+                                                        error=receipt["error"]))
+                    except Exception as exc:
+                        log("ERROR", "cleanup item=%d deletion ledger result append failed: %s" % (item_id, exc))
                 cleanup_journal(inventory, item_id, "result", receipt)
-                restore_api(cfg, "/account/connections/cleanup/%d/result" % item_id, receipt)
+                cleanup_send_result(cfg, item_id, receipt)
             cleanup_journal(inventory, item_id)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
@@ -9218,6 +9668,10 @@ def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_rep
 def run(cfg):
     cfg.validate()
     lock_handle = acquire_lock(cfg)
+    _pins, pins_error = cleanup_pins()
+    if pins_error is not None:
+        # Deletion stays refused for this whole process; every other lane runs.
+        log("ERROR", "NAS cleanup deletions disabled: %s" % pins_error)
     inventory = Inventory(cfg)
     runtime = Runtime(cfg, inventory)
     runtime.host_facts = HostFacts(cfg.state_dir)

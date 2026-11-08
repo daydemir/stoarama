@@ -12,7 +12,7 @@ script lists every NAS file that lies entirely outside its stream's window:
 
 Files already in an active plan bound to the same policy are skipped. Items are
 grouped per stream, then per kind and recovery class (R2 copy present vs. R2
-purged, which needs an explicit --allow-nas-only decision later), ordered by
+purged; NAS-only deletion was removed, so those plans can never be enabled), ordered by
 path, and cut into plans of at most --max-items (<=500) items. Labels are
 deterministic: <prefix>-s<stream>-<raw|col>[-nasonly]-<n>.
 
