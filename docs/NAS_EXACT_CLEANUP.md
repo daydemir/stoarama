@@ -32,8 +32,8 @@ inside the period can be admitted, observed as `would_delete`, or deleted.
 - **Unchanged gates:** exact-file immutable manifests and plan digest; the
   frozen NAS filesystem identity (now index schema v2, covering every
   single-owner folder, root `82b067b2…`; see `build_frozen_index.py`); fresh NAS
-  rehash and exact proof; R2 byte-verified recovery copy, or `--allow-nas-only`
-  for files proven missing from R2; path confinement; per-plan enable with the
+  rehash and exact proof; R2 byte-verified recovery copy (NAS-only deletion was removed; see
+  NAS_CLEANUP.md safeguards); path confinement; per-plan enable with the
   expected plan SHA, a complete dry run fresher than 24 h and a 1-hour approval;
   and the backend `NAS_CLEANUP_DELETION_ENABLED` master switch (default off).
 - **Plan binding.** New plans store the keep28 policy SHA in

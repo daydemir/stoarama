@@ -36,8 +36,37 @@ Two independent gates remain OFF during preparation:
 1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
 2. A plan defaults `dry_run`. Explicit `nas-cleanup enable` requires its exact
    `--expected-plan-sha256`, `--reason`, a complete matching dry run less than 24 hours
-   old, and full R2 recovery. `--allow-nas-only` additionally permits only proven
-   R2absence; it never permits unchecked recovery. Approval expires after 1 hour.
+   old, and full R2 recovery for every item. Approval expires after 1 hour.
+
+### Belt-and-braces safeguards (safety council, 2026-11)
+
+All are code constants (raising one is a reviewed code change) and fail closed:
+
+- **No NAS-only deletion.** `allow_nas_only` is rejected (API 400, DB check
+  `nas_cleanup_plans_no_nas_only`); a permit is issued only for an item whose R2
+  copy was streamed and SHA-verified. Re-introducing NAS-only deletion needs its
+  own reviewed change.
+- **One enabled plan** at a time; a plan above **100 GB** cannot be enabled; no
+  permit is issued beyond a rolling **3 TB / 24 h** of issued deletions.
+- **Auto-pause.** During execution any observation that is not a permit
+  (unverified, conflict, missing, client error, policy/recovery mismatch,
+  budget), an expired execution lease, or any receipt other than `deleted`
+  pauses the plan.
+- **NAS client guard** (independent of the server): pinned copy of the keep28
+  selection and of `clients/nas-pull/nas_cleanup_folder_streams.json`, both
+  SHA-checked at startup (a failed check refuses every deletion; other work
+  continues). Before each unlink the client maps the folder to a stream, reads
+  the interval from the physical sidecar (raw) or the output bounds confirmed
+  by the dated path (collated), and refuses on keep-window overlap, unknown
+  folder/bounds or a disagreeing server `stream_id`. Hard local caps: 50,000
+  files / 3 TB per rolling 24 h. Every unlink is bracketed by fsynced intent and
+  result lines in `/state/cleanup-deletions.jsonl` (append-only). A media unlink
+  whose sidecar step failed is receipted `media_deleted_sidecar_failed`.
+- **R2 purge fence.** `nas-verified-purge` refuses to run (dry run included)
+  while any cleanup plan is enabled and skips clips held by any non-retired plan.
+- **Recovery check.** `stoaramactl nas-cleanup verify-recovery --plan-id ID`
+  HEADs (read-only) the R2 copy of every item whose deletion was ever issued
+  and reports any that are missing or differ in size (exit status 2).
 
 Enablement is a separate user decision. Do not change either gate while doing
 preparation or dry runs. A later exact-file permit expires after 30 seconds. The app
