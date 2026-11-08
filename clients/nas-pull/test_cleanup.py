@@ -649,12 +649,23 @@ class CleanupGuardTests(unittest.TestCase):
                 mock.patch.object(pull, '_CLEANUP_PINS', None):
             pins, error = pull.cleanup_pins()
             self.assertIsNone(pins); self.assertIn('SHA mismatch', error)
-            # Non-delete work: the dry-run observation still reports a match.
-            calls = self.run_execution()
-            self.assertEqual([b['outcome'] for p, b in calls if p.endswith('/observe')], ['match'])
+            # Dry runs still observe (and report a refusal, never would_delete);
+            # nothing is unlinked and the worker keeps running.
+            self.assert_refused(self.run_execution(), 'pinned keep-window files failed verification')
             self.approve()
             self.assert_refused(self.run_execution(), 'pinned keep-window files failed verification')
         self.pinned.start()
+
+    def test_dry_run_refusal_is_a_conflict_not_would_delete(self):
+        self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')
+        calls = self.run_execution()
+        self.assert_refused(calls, 'overlaps stream 33 keep window')
+        self.assertIsNone(self.task.get('approved_proof'))
+        # Local caps never block a dry run.
+        self.pins = self.fixture_pins('2027-01-01T00:00:00+00:00', '2027-01-29T00:00:00+00:00')
+        with mock.patch.object(pull, 'cleanup_local_caps', return_value='cap reached'):
+            calls = self.run_execution()
+        self.assertEqual([b['outcome'] for p, b in calls if p.endswith('/observe')], ['match'])
 
     def test_keep_window_overlap_refuses_without_asking_for_a_permit(self):
         self.pins = self.fixture_pins('2026-08-31T00:00:00+00:00', '2026-09-28T00:00:00+00:00')

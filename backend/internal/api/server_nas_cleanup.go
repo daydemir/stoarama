@@ -44,6 +44,10 @@ const (
 	nasCleanupMaxIssuedBytes24h int64 = 3_000_000_000_000 // 3 TB
 	// Serializes the budget check-and-issue step across observations.
 	nasCleanupBudgetLock int64 = 7343226011102
+	// Per-plan execution lock base (key = base + plan id). Observations of an
+	// enabled plan take it before any row lock so they can auto-pause the plan
+	// without two FOR SHARE holders deadlocking on the plan row.
+	nasCleanupPlanLockBase int64 = 7343226100000000
 )
 
 const nasCleanupReportSHA = "64eee0bc589c9be4dcab5b5ea7668270291a07ce4fd0db98dcd0a484e19d84c1"
@@ -726,10 +730,33 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	var until *time.Time
 	var attempt int
 	var lease *time.Time
-	var planID int64
+	var planID, fencedPlan int64
+	// Enabled-plan observations may UPDATE the plan row (auto-pause). Serialize
+	// them per plan with an advisory lock taken before any row lock, so two
+	// concurrent observations never both hold FOR SHARE and then wait on each
+	// other's UPDATE. Dry-run observations stay fully parallel.
+	var preMode string
+	if err = tx.QueryRow(ctx, `SELECT i.plan_id,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&fencedPlan, &preMode); err != nil {
+		util.WriteError(w, 409, "cleanup task identity differs")
+		return
+	}
+	if preMode == "enabled" {
+		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+fencedPlan); err != nil {
+			util.WriteError(w, 500, "cleanup plan execution fence failed")
+			return
+		}
+	} else {
+		fencedPlan = 0
+	}
 	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &planID, &oldOutcome, &binding)
 	if err != nil || sha != req.PlanSHA || attempt != req.Attempt {
 		util.WriteError(w, 409, "cleanup task identity differs")
+		return
+	}
+	if mode == "enabled" && fencedPlan != planID {
+		// The plan was enabled between the two reads; retry under the fence.
+		w.Header().Set("Retry-After", "1")
+		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
 		return
 	}
 	// A repeated dry-run observation is idempotent; a delete permit is never

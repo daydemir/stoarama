@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -282,5 +283,73 @@ func TestNASCleanupExecutionAnomaliesAutoPause(t *testing.T) {
 	receipt("4000", "unverified")
 	if m, _ := mode(4); m != "paused" {
 		t.Fatal("unverified receipt did not pause")
+	}
+}
+
+// Council fix: concurrent non-permit observations of one enabled plan both
+// auto-pause it; they must serialize on the per-plan fence, never deadlock.
+func TestNASCleanupConcurrentAutoPauseDoesNotDeadlock(t *testing.T) {
+	pool := cleanupTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s := &Server{pool: pool}
+	s.cfg.NASCleanupDeletionEnabled = true
+	observe := func(item int64) *httptest.ResponseRecorder {
+		return cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(item), cleanupObserve{Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "conflict", Error: "fixture", ClientVersion: "test"})
+	}
+	// Deterministic ordering: the fence is taken before any plan row lock.
+	safeguardPlan(t, ctx, s, 1, "enabled", 10)
+	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=1,lease_expires_at=now()+interval '10 minutes' WHERE plan_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+1); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- observe(1000) }()
+	waiting := false
+	for n := 0; n < 200 && !waiting; n++ {
+		if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("enabled-plan observation did not wait on the per-plan fence")
+	}
+	// While it waits it holds no lock on the plan row: an exclusive row lock
+	// is immediately available.
+	if _, err = holder.Exec(ctx, `SELECT id FROM nas_cleanup_plans WHERE id=1 FOR UPDATE NOWAIT`); err != nil {
+		t.Fatalf("waiting observation already holds the plan row: %v", err)
+	}
+	if err = holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w := <-done; w.Code != 200 || !strings.Contains(w.Body.String(), `"plan_paused":true`) {
+		t.Fatalf("fenced observation: %d %s", w.Code, w.Body.String())
+	}
+	// Racing pairs on the same enabled plan always complete.
+	for round := int64(2); round < 12; round++ {
+		safeguardPlan(t, ctx, s, round, "enabled", 10, 10)
+		if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=1,lease_expires_at=now()+interval '10 minutes' WHERE plan_id=$1`, round); err != nil {
+			t.Fatal(err)
+		}
+		results := make(chan *httptest.ResponseRecorder, 2)
+		for n := int64(0); n < 2; n++ {
+			go func(item int64) { results <- observe(item) }(1000*round + n)
+		}
+		for n := 0; n < 2; n++ {
+			if w := <-results; w.Code != 200 {
+				t.Fatalf("round %d concurrent observation: %d %s", round, w.Code, w.Body.String())
+			}
+		}
+		var mode string
+		if err := pool.QueryRow(ctx, `SELECT mode FROM nas_cleanup_plans WHERE id=$1`, round).Scan(&mode); err != nil || mode != "paused" {
+			t.Fatalf("round %d plan %s %v", round, mode, err)
+		}
 	}
 }

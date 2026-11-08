@@ -225,7 +225,8 @@ const nasPurgeFactsSQL = `
   NOT EXISTS(SELECT 1 FROM nas_restore_requests q WHERE q.clip_id=c.id
       AND (q.state IN ('pending','leased') OR (q.target='original' AND q.state='verified' AND q.completed_at>now()-interval '30 days'))) AS no_restore,
   NOT EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans cp ON cp.id=h.plan_id
-      WHERE h.clip_id=c.id AND cp.mode<>'retired') AS no_cleanup_plan,
+      WHERE h.clip_id=c.id AND (cp.mode<>'retired'
+        OR EXISTS(SELECT 1 FROM nas_cleanup_items ci WHERE ci.plan_id=cp.id AND ci.delete_ever_issued))) AS no_cleanup_plan,
   NOT EXISTS(SELECT 1 FROM nas_cleanup_plans cp WHERE cp.mode='enabled') AS no_enabled_cleanup`
 
 var nasPurgeFactNames = []string{

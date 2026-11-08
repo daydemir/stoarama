@@ -2207,12 +2207,15 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
             proof = current.proof()
             if task.get("approved_proof") is not None and {k:v for k,v in proof.items() if k != "parent_members_sha256"} != {k:v for k,v in task["approved_proof"].items() if k != "parent_members_sha256"}:
                 raise RuntimeError("cleanup dry-run proof changed; KEEP")
-            if task.get("approved_proof") is not None:
-                # Independent client guard before even asking for a permit. A
-                # refusal is reported as a conflict observation (never unlinks).
-                refusal = cleanup_guard_refusal(task, proof) or cleanup_local_caps(inventory, task["item"].get("size_bytes"))
-                if refusal:
-                    raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
+            # Independent client guard, in dry runs too: a refused item is
+            # reported as a conflict observation (an outcome every server
+            # accepts), never would_delete, so enabling its plan fails up front
+            # instead of pausing mid-run. Local caps apply to execution only.
+            refusal = cleanup_guard_refusal(task, proof)
+            if refusal is None and task.get("approved_proof") is not None:
+                refusal = cleanup_local_caps(inventory, task["item"].get("size_bytes"))
+            if refusal:
+                raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
             cleanup_journal(inventory, item_id, "observe", body)
             permit_request_started = time.monotonic()

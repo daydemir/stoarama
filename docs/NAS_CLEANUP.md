@@ -68,6 +68,23 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   HEADs (read-only) the R2 copy of every item whose deletion was ever issued
   and reports any that are missing or differ in size (exit status 2).
 
+Runbook notes:
+
+- **An auto-paused plan that already deleted items cannot be re-enabled.**
+  Enable requires every item to be a fresh `would_delete`, and resume-dry-run
+  refuses plans with any issued deletion. Investigate the pause reason
+  (`nas-cleanup report`, `approval_reason`), run `verify-recovery`, then admit
+  the remaining files as a new plan.
+- **`approved_until` expiring does not change the mode.** The plan stays
+  `enabled` (no new permits are issued) and still blocks enabling any other
+  plan and every `nas-verified-purge` run until it is explicitly paused.
+- **Deploy the API (and promote a NAS client) only while no cleanup item is
+  `leased`**: pause any enabled plan first and let outstanding leases finish or
+  expire. The client also refuses in dry runs (reported as `conflict`), so a
+  plan the client disagrees with fails to enable instead of pausing mid-run.
+- Migrations 0171 (metadata-only, NOT VALID) and 0172 (VALIDATE, which proves
+  no legacy `allow_nas_only=true` row exists) run as separate transactions.
+
 Enablement is a separate user decision. Do not change either gate while doing
 preparation or dry runs. A later exact-file permit expires after 30 seconds. The app
 fences its delivery writers and re-hashes/rechecks each approved file before its

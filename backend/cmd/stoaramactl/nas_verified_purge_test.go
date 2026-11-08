@@ -129,8 +129,10 @@ INSERT INTO recordings VALUES (53,47,'completed','nas_pull','raw'),(54,47,'compl
 INSERT INTO recording_qualification_runs VALUES (1,'active'),(2,'canceled');
 CREATE TABLE nas_cleanup_plans(id bigint PRIMARY KEY, mode text NOT NULL);
 CREATE TABLE nas_cleanup_source_holds(plan_id bigint NOT NULL, clip_id bigint NOT NULL, PRIMARY KEY(plan_id, clip_id));
-INSERT INTO nas_cleanup_plans VALUES (1,'paused'),(2,'retired');
-INSERT INTO nas_cleanup_source_holds VALUES (1,170),(2,101);
+CREATE TABLE nas_cleanup_items(plan_id bigint NOT NULL, delete_ever_issued boolean NOT NULL);
+INSERT INTO nas_cleanup_plans VALUES (1,'paused'),(2,'retired'),(4,'retired');
+INSERT INTO nas_cleanup_items VALUES (2,false),(4,true);
+INSERT INTO nas_cleanup_source_holds VALUES (1,170),(2,101),(4,171);
 `); err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +178,7 @@ INSERT INTO nas_cleanup_source_holds VALUES (1,170),(2,101);
 		{164, 55, 5500, 20, 0, "ok", "ok"}, // collated_only recording                  // active recording, old clip: eligible
 		{130, 60, 6000, 20, 0, "ok", "ok"}, // another account's recording
 		{170, 50, 5000, 20, 0, "ok", "ok"}, // in a non-retired NAS cleanup plan (101 is only in a retired one)
+		{171, 50, 5000, 20, 0, "ok", "ok"}, // in a retired plan that once issued a NAS deletion (permanent recovery hold)
 	}
 	bodies := map[int64][]byte{}
 	for _, s := range specs {
@@ -261,7 +264,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 		"restore_recent": 1, "joined_scope": 1, "active_recording_recent": 1, "joined_snapshot": 9,
 		"excluded_clip": 1, "excluded_recording": 1,
 		"candidate_recording": 1, "cohort_window": 1, "unplayable_signature": 1, "collated_only_delivery": 1,
-		"nas_cleanup_plan": 1,
+		"nas_cleanup_plan": 2,
 	}
 	dry := run(base)
 	if dry.Mode != "dry_run" || dry.Eligible != 8 || dry.Purged != 0 || len(store.deleted) != 0 {
@@ -312,7 +315,7 @@ INSERT INTO nas_restore_requests(connection_id,clip_id,recording_id,target,objec
 	if fmt.Sprint(store.deleted) != "[managed/acct-47/101.mp4 managed/acct-47/102.mp4 managed/acct-47/121.mp4 managed/acct-47/162.mp4]" {
 		t.Fatalf("deleted objects %v", store.deleted)
 	}
-	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140, 160, 161, 163, 164, 170} {
+	for _, id := range []int64{103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 130, 140, 160, 161, 163, 164, 170, 171} {
 		if _, ok := store.objects[fmt.Sprintf("managed/acct-47/%d.mp4", id)]; !ok {
 			t.Fatalf("object of protected clip %d was deleted", id)
 		}
