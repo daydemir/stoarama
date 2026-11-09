@@ -42,8 +42,8 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 	if python == "" {
 		python = "python3"
 	}
-	if _, err := exec.LookPath(python); err != nil {
-		t.Skip("python3 unavailable")
+	if exec.Command(python, "-c", "import sys; sys.exit(sys.version_info < (3, 11))").Run() != nil {
+		t.Skip("python3 >= 3.11 unavailable (set STOARAMA_TEST_PYTHON)")
 	}
 	bench := os.Getenv("STOARAMA_CLEANUP_BENCH") != ""
 	env := func(name string, small, large int) int {
