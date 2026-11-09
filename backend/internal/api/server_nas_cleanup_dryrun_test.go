@@ -187,3 +187,39 @@ func TestNASCleanupDryRunRecoveryIsParallelBoundedAndOutsideLocks(t *testing.T) 
 		t.Fatalf("over-budget items changed: %d %v", leased, err)
 	}
 }
+
+// Plan 1389 stall (2026-11-09): expired leases were only swept by the lease
+// call, and a request repeating an item id was rejected as a whole, so a
+// client replaying while a stale copy was still queued never recovered.
+func TestNASCleanupExpiredLeasesSweptWithoutLeaseAndDuplicateIDsTolerated(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.admit("stall-1", syntheticFiles(100, 3, 10))
+	tasks := f.leaseV2(64, 0, 0, "")
+	// Duplicate item id in one request: processed once, same answer twice.
+	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "request_id": strings.Repeat("a", 32)}
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{o, o}})
+	if w.Code != 200 || strings.Count(w.Body.String(), `"would_delete"`) != 2 {
+		t.Fatalf("duplicate ids: %d %s", w.Code, w.Body.String())
+	}
+	if gets, _ := f.bucket.counts(); gets != 1 {
+		t.Fatalf("duplicate was processed twice: %d downloads", gets)
+	}
+	// The remaining leases expire; no lease call follows. Housekeeping (run
+	// by the heartbeat and every batched call) returns them to pending.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET lease_expires_at=now()-interval '1 minute' WHERE state='leased'`); err != nil {
+		t.Fatal(err)
+	}
+	f.s.cleanupHousekeeping(f.ctx, 13)
+	var leased, pending int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FILTER (WHERE state='leased'),count(*) FILTER (WHERE state='pending') FROM nas_cleanup_items`).Scan(&leased, &pending); err != nil || leased != 0 || pending != 2 {
+		t.Fatalf("expired leases not swept: leased %d pending %d %v", leased, pending, err)
+	}
+	// A stale observation of the old attempt is refused; a fresh lease works.
+	stale := f.observe(tasks[1:2], nil)
+	if stale[0].Status != 409 {
+		t.Fatalf("stale observation after sweep: %+v", stale[0])
+	}
+	if again := f.leaseV2(64, 0, 0, ""); len(again) != 2 || again[0].Attempt != 2 {
+		t.Fatalf("re-lease after sweep: %+v", again)
+	}
+}

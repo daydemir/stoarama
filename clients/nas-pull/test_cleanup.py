@@ -1028,6 +1028,35 @@ class CleanupProtocol2Tests(unittest.TestCase):
         for recovery, ok in (('r2_sha_verified', True), ('r2_md5_etag_matched', True), ('r2_etag_bound', False), ('unchecked', False)):
             self.assertEqual(pull.cleanup_verified_ack(self.task, proof, dict(decision, recovery=recovery)), ok, recovery)
 
+    def test_batcher_sends_each_item_once_and_withdraws_abandoned_entries(self):
+        sent = []
+        release = threading.Event()
+        def api(cfg, path, body, retry_stale=False):
+            sent.append([o['item_id'] for o in body['observations']])
+            release.wait(2)
+            return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete') for o in body['observations']])
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            batcher = pull.CleanupBatcher(self.cfg, '/account/connections/cleanup/observe-batch', 'observations', senders=1, linger=0.2)
+            try:
+                a = batcher.submit(dict(item_id=5, attempt=1))
+                b = batcher.submit(dict(item_id=5, attempt=1))
+                c = batcher.submit(dict(item_id=6, attempt=1))
+                release.set()
+                self.assertEqual(a.result(2)['item_id'], 5); self.assertEqual(b.result(2)['item_id'], 5); c.result(2)
+                self.assertEqual(sent, [[5, 6]])
+                # An abandoned (timed-out) entry is withdrawn before it is sent.
+                release.clear()
+                busy = batcher.submit(dict(item_id=7, attempt=1))
+                time.sleep(0.3)  # item 7 is in flight; the next one queues
+                stale = batcher.submit(dict(item_id=8, attempt=1))
+                batcher.withdraw(stale)
+                release.set()
+                busy.result(2)
+                time.sleep(0.4)
+                self.assertNotIn([8], sent); self.assertTrue(stale.cancelled())
+            finally:
+                release.set(); batcher.close()
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)

@@ -594,9 +594,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	defer tx.Rollback(ctx)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
-	_, err = tx.Exec(ctx, `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
-pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id IN (SELECT plan_id FROM expired) RETURNING id)
-UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz)`, cid, "execution lease expired without a report")
+	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report")
 	if err != nil {
 		util.WriteError(w, 500, "cleanup lease expiry failed")
 		return

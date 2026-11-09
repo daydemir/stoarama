@@ -66,6 +66,27 @@ func cleanupRecoveryPermits(mode, recovery string) bool {
 	return recovery == "r2_sha_verified" || (mode == "enabled" && recovery == "r2_etag_bound")
 }
 
+// cleanupExpireLeasesSQL returns expired leases of a connection to pending
+// (or unverified after 3 attempts). An expired execution lease is an anomaly
+// and pauses its enabled plan and batch in the same statement.
+const cleanupExpireLeasesSQL = `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
+pz AS (UPDATE nas_cleanup_plans SET ` + cleanupAutoPauseSet + ` WHERE mode='enabled' AND id IN (SELECT plan_id FROM expired) RETURNING id)
+UPDATE nas_cleanup_batches SET ` + cleanupAutoPauseSet + ` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz)`
+
+// cleanupHousekeeping runs the lease and approval expiry sweeps from paths
+// the NAS app calls regardless of its cleanup state (heartbeat, batched
+// calls), so a client that stops leasing cannot leave expired leases or
+// approvals in place. Best effort: failures only delay the sweep.
+func (s *Server) cleanupHousekeeping(ctx context.Context, cid int64) {
+	if s.pool == nil {
+		return
+	}
+	if _, err := s.pool.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report"); err != nil {
+		log.Printf("nas cleanup lease expiry deferred: %v", err)
+	}
+	s.cleanupExpireApprovals(ctx)
+}
+
 // cleanupExpireApprovals pauses every enabled plan and batch whose approval
 // has passed, so an expired approval neither lingers as 'enabled' (blocking
 // new enables and purges) nor leaves a batch waiting forever. Pausing grants
@@ -455,24 +476,33 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		util.WriteError(w, 400, "client version and 1 to 64 observations required")
 		return
 	}
-	seen := map[int64]bool{}
-	for _, o := range req.Observations {
-		if o.ItemID <= 0 || seen[o.ItemID] {
-			util.WriteError(w, 400, "distinct positive item ids required")
+	// A repeated item id (a client resending an entry that was still queued)
+	// is processed once; every occurrence gets that one decision. Rejecting
+	// the whole request instead wedged older clients' replays.
+	first := map[int64]int{}
+	for n, o := range req.Observations {
+		if o.ItemID <= 0 {
+			util.WriteError(w, 400, "positive item ids required")
 			return
 		}
-		seen[o.ItemID] = true
+		if _, ok := first[o.ItemID]; !ok {
+			first[o.ItemID] = n
+		}
 	}
 	ctx := r.Context()
 	cid, ok := s.nasRestoreConnection(ctx, w, r)
 	if !ok {
 		return
 	}
+	s.cleanupHousekeeping(ctx, cid)
 	results := make([]map[string]any, len(req.Observations))
 	valid := make([]bool, len(req.Observations))
 	ids := []int64{}
 	md5s := map[int64]string{}
 	for n, o := range req.Observations {
+		if first[o.ItemID] != n {
+			continue
+		}
 		if msg := cleanupObserveRequestError(o.cleanupObserve); msg != "" {
 			results[n] = map[string]any{"item_id": o.ItemID, "status": 400, "error": msg}
 			continue
@@ -549,6 +579,11 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	if err = tx.Commit(ctx); err != nil {
 		util.WriteError(w, 500, "cleanup observation save failed")
 		return
+	}
+	for n, o := range req.Observations {
+		if f := first[o.ItemID]; f != n {
+			results[n] = results[f]
+		}
 	}
 	util.WriteJSON(w, 200, map[string]any{"results": results})
 }
@@ -633,19 +668,18 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 		util.WriteError(w, 400, "client version and 1 to 64 receipts required")
 		return
 	}
-	seen := map[int64]bool{}
 	for _, receipt := range req.Receipts {
-		if receipt.ItemID <= 0 || seen[receipt.ItemID] || !validCleanupReceipt(receipt) {
+		if receipt.ItemID <= 0 || !validCleanupReceipt(receipt) {
 			util.WriteError(w, 400, "invalid cleanup deletion receipt")
 			return
 		}
-		seen[receipt.ItemID] = true
 	}
 	ctx := r.Context()
 	cid, ok := s.nasRestoreConnection(ctx, w, r)
 	if !ok {
 		return
 	}
+	s.cleanupHousekeeping(ctx, cid)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup receipt save failed")
