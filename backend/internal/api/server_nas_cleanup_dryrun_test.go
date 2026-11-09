@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -185,5 +186,89 @@ func TestNASCleanupDryRunRecoveryIsParallelBoundedAndOutsideLocks(t *testing.T) 
 	var leased int
 	if err := g.pool.QueryRow(g.ctx, `SELECT count(*) FROM nas_cleanup_items WHERE state='leased' AND outcome IS NULL`).Scan(&leased); err != nil || leased != 2 {
 		t.Fatalf("over-budget items changed: %d %v", leased, err)
+	}
+}
+
+// Plan 1389 stall (2026-11-09): expired leases were only swept by the lease
+// call, and a request repeating an item id was rejected as a whole, so a
+// client replaying while a stale copy was still queued never recovered.
+func TestNASCleanupExpiredLeasesSweptWithoutLeaseAndDuplicateIDsTolerated(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.admit("stall-1", syntheticFiles(100, 3, 10))
+	tasks := f.leaseV2(64, 0, 0, "")
+	// Duplicate item id in one request: processed once, same answer twice.
+	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "request_id": strings.Repeat("a", 32)}
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{o, o}})
+	if w.Code != 200 || strings.Count(w.Body.String(), `"would_delete"`) != 2 {
+		t.Fatalf("duplicate ids: %d %s", w.Code, w.Body.String())
+	}
+	if gets, _ := f.bucket.counts(); gets != 1 {
+		t.Fatalf("duplicate was processed twice: %d downloads", gets)
+	}
+	// The remaining leases expire; no lease call follows. Housekeeping (run
+	// by the heartbeat and every batched call) returns them to pending.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET lease_expires_at=now()-interval '1 minute' WHERE state='leased'`); err != nil {
+		t.Fatal(err)
+	}
+	f.s.cleanupHousekeeping(f.ctx, 13)
+	var leased, pending int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FILTER (WHERE state='leased'),count(*) FILTER (WHERE state='pending') FROM nas_cleanup_items`).Scan(&leased, &pending); err != nil || leased != 0 || pending != 2 {
+		t.Fatalf("expired leases not swept: leased %d pending %d %v", leased, pending, err)
+	}
+	// A stale observation of the old attempt is refused; a fresh lease works.
+	stale := f.observe(tasks[1:2], nil)
+	if stale[0].Status != 409 {
+		t.Fatalf("stale observation after sweep: %+v", stale[0])
+	}
+	if again := f.leaseV2(64, 0, 0, ""); len(again) != 2 || again[0].Attempt != 2 {
+		t.Fatalf("re-lease after sweep: %+v", again)
+	}
+}
+
+// Only byte-identical duplicates are collapsed; a differing copy gets its own
+// 409, and conflicting duplicate receipts pause the plan.
+func TestNASCleanupConflictingDuplicatesAreRefused(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.admit("dups-1", syntheticFiles(100, 1, 10))
+	tasks := f.leaseV2(64, 0, 0, "")
+	o := map[string]any{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": "", "request_id": strings.Repeat("a", 32)}
+	other := map[string]any{}
+	for k, v := range o {
+		other[k] = v
+	}
+	other["request_id"] = strings.Repeat("b", 32)
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{o, other}})
+	var r struct {
+		Results []batchResult `json:"results"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil || w.Code != 200 || r.Results[0].Status != 200 || r.Results[1].Status != 409 {
+		t.Fatalf("differing duplicate observation: %d %s", w.Code, w.Body.String())
+	}
+
+	s := f.s
+	s.cfg.NASCleanupDeletionEnabled = true
+	safeguardPlan(t, f.ctx, s, 70, "enabled", 10)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='delete_issued',delete_ever_issued=true,attempt=1,proof_sha256=repeat('c',64) WHERE plan_id=70`); err != nil {
+		t.Fatal(err)
+	}
+	receipt := map[string]any{"item_id": 70000, "attempt": 1, "plan_sha256": strings.Repeat("b", 64), "proof_sha256": strings.Repeat("c", 64), "outcome": "deleted", "error": ""}
+	same := cleanupCall(t, s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "t", "receipts": []map[string]any{receipt, receipt}})
+	if same.Code != 200 || strings.Count(same.Body.String(), `"status":200`) != 2 {
+		t.Fatalf("identical duplicate receipts: %d %s", same.Code, same.Body.String())
+	}
+	if m, _ := f.planMode(70); m != "enabled" {
+		t.Fatal("identical duplicate receipts paused the plan")
+	}
+	conflict := map[string]any{}
+	for k, v := range receipt {
+		conflict[k] = v
+	}
+	conflict["outcome"], conflict["error"] = "unverified", "x"
+	w = cleanupCall(t, s.handleAccountNASCleanupResultBatch, 47, 5, "", "", map[string]any{"client_version": "t", "receipts": []map[string]any{receipt, conflict}})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"status":409`) {
+		t.Fatalf("conflicting duplicate receipts: %d %s", w.Code, w.Body.String())
+	}
+	if m, reason := f.planMode(70); m != "paused" || !strings.Contains(reason, "conflicting duplicate") {
+		t.Fatalf("conflicting receipts did not pause: %s %q", m, reason)
 	}
 }

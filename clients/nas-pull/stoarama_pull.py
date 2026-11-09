@@ -2609,6 +2609,13 @@ class CleanupBatcher:
             self.condition.notify_all()
         return future
 
+    def withdraw(self, future):
+        """Drop a still-queued entry whose caller gave up waiting, so a later
+        resend of the same item never shares a request with a stale copy."""
+        with self.condition:
+            self.queue = [(e, f) for e, f in self.queue if f is not future]
+        future.cancel()
+
     def close(self):
         with self.condition:
             self.closed = True
@@ -2634,22 +2641,49 @@ class CleanupBatcher:
                 self.send(batch)
 
     def send(self, batch):
+        # One entry per item id per request: a duplicate (e.g. a replayed
+        # journal entry beside a stale queued copy) shares the first one's
+        # decision instead of being sent twice.
+        # Only byte-identical copies share a decision; a copy whose payload
+        # differs from the first is a conflict and is never sent.
+        unique, seen, conflicts = [], {}, []
+        for entry, future in batch:
+            encoded = cleanup_json_bytes(entry)
+            if entry["item_id"] not in seen:
+                seen[entry["item_id"]] = encoded
+                unique.append(entry)
+            elif seen[entry["item_id"]] != encoded:
+                conflicts.append(future)
+        for future in conflicts:
+            try:
+                future.set_exception(urllib.error.HTTPError(self.path, 409, "conflicting duplicate cleanup payload for one item", {}, None))
+            except concurrent.futures.InvalidStateError:
+                pass
+        batch = [(e, f) for e, f in batch if f not in conflicts]
         try:
-            response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: [entry for entry, _ in batch]})
+            response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: unique})
             results = response.get("results") if isinstance(response, dict) else None
-            if not isinstance(results, list) or len(results) != len(batch):
+            if not isinstance(results, list) or len(results) != len(unique):
                 raise RuntimeError("invalid cleanup batch response")
             by_id = {r["item_id"]: r for r in results if isinstance(r, dict) and type(r.get("item_id")) is int}
             for entry, future in batch:
+                if future.cancelled():
+                    continue
                 result = by_id.get(entry["item_id"])
-                if result is None:
-                    future.set_exception(RuntimeError("cleanup batch response lacks item %d" % entry["item_id"]))
-                else:
-                    future.set_result(result)
+                try:
+                    if result is None:
+                        future.set_exception(RuntimeError("cleanup batch response lacks item %d" % entry["item_id"]))
+                    else:
+                        future.set_result(result)
+                except concurrent.futures.InvalidStateError:
+                    pass  # withdrawn by its caller meanwhile
         except BaseException as exc:
             for _, future in batch:
                 if not future.done():
-                    future.set_exception(exc)
+                    try:
+                        future.set_exception(exc)
+                    except concurrent.futures.InvalidStateError:
+                        pass
 
 
 class CleanupBatchAPI:
@@ -2664,7 +2698,12 @@ class CleanupBatchAPI:
         # 503 means "not decided yet, nothing recorded" (e.g. the server's
         # bounded R2 work for this request ran out of time): resend as is.
         for attempt in range(CLEANUP_RETRYABLE_ATTEMPTS):
-            result = batcher.submit(dict(body, item_id=item_id)).result(timeout=HTTP_TIMEOUT_SEC * 3)
+            future = batcher.submit(dict(body, item_id=item_id))
+            try:
+                result = future.result(timeout=HTTP_TIMEOUT_SEC * 3)
+            except concurrent.futures.TimeoutError:
+                batcher.withdraw(future)
+                raise
             status = result.get("status")
             if status == 200:
                 return {k: v for k, v in result.items() if k != "status"}

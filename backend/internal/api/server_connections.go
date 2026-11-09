@@ -1136,6 +1136,9 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		util.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("commit heartbeat: %v", err))
 		return
 	}
+	// NAS cleanup lease/approval expiry must not depend on the cleanup worker
+	// still leasing: the heartbeat is the one call the app always makes.
+	s.cleanupHousekeeping(r.Context(), connectionID)
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
 		OK: true, JoinedDeliveryAccepted: joinedDeliveryAccepted,
 		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,
