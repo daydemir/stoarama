@@ -100,7 +100,7 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 		t.Fatalf("batch enabled with master off: %d %s", code, body)
 	}
 	f.s.cfg.NASCleanupDeletionEnabled = true
-	w := cleanupCall(t, f.s.handleAdminNASCleanupBatchEnable, 47, 5, "", "", map[string]any{"plan_ids": []int64{p1, p2}, "batch_sha256": strings.Repeat("a", 64), "reason": "x", "approval_hours": 6})
+	w := cleanupCall(t, f.s.handleAdminNASCleanupBatchEnable, 47, 5, "", "", map[string]any{"plan_ids": []int64{p1, p2}, "batch_sha256": strings.Repeat("a", 64), "reason": "x", "approval_hours": 6, "allow_long_approval": true})
 	if w.Code != 409 || !strings.Contains(w.Body.String(), cleanupBatchDigest(cleanupPolicySHA, []int64{p1, p2}, []string{sha1, sha2})) {
 		t.Fatalf("wrong batch digest accepted: %d %s", w.Code, w.Body.String())
 	}
@@ -108,6 +108,10 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 		if code, _ := f.enableBatch([]int64{p1, p2}, []string{sha1, sha2}, hours); code != 400 {
 			t.Fatalf("approval_hours %d accepted", hours)
 		}
+	}
+	w = cleanupCall(t, f.s.handleAdminNASCleanupBatchEnable, 47, 5, "", "", map[string]any{"plan_ids": []int64{p1, p2}, "batch_sha256": cleanupBatchDigest(cleanupPolicySHA, []int64{p1, p2}, []string{sha1, sha2}), "reason": "x", "approval_hours": 6})
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "allow_long_approval") {
+		t.Fatalf("approval above 4h without the explicit flag: %d %s", w.Code, w.Body.String())
 	}
 	if code, body := f.enableBatch([]int64{p1, p1}, []string{sha1, sha1}, 6); code != 400 {
 		t.Fatalf("duplicate plan accepted: %d %s", code, body)
@@ -152,7 +156,7 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 	}
 	results := f.observe(tasks, ids)
 	for _, r := range results {
-		if r.Status != 200 || r.Action != "delete_issued" || !r.Delete || r.Recovery != "r2_sha_verified" {
+		if r.Status != 200 || r.Action != "delete_issued" || !r.Delete || r.Recovery != "r2_etag_bound" {
 			t.Fatalf("permit %+v", r)
 		}
 	}
@@ -186,6 +190,10 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 		t.Fatalf("a different request obtained a permit: %+v", other[0])
 	}
 	var issued int
+	var labels string
+	if err := f.pool.QueryRow(f.ctx, `SELECT string_agg(DISTINCT recovery,',') FROM nas_cleanup_items WHERE plan_id=$1`, p1).Scan(&labels); err != nil || labels != "r2_etag_bound" {
+		t.Fatalf("delete-time recovery must be labelled r2_etag_bound: %q %v", labels, err)
+	}
 	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_items WHERE delete_ever_issued`).Scan(&issued); err != nil || issued != 3 {
 		t.Fatalf("issued %d %v", issued, err)
 	}
@@ -407,4 +415,103 @@ func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
 		t.Fatalf("foreign connection observed another account's item: %d %s", w.Code, w.Body.String())
 	}
 	_ = time.Now
+}
+
+// Council follow-ups: a replayed permit is only returned while execution is
+// still authorized; expired approvals pause plan and batch; enable needs ETag
+// evidence; batched and single observations never deadlock.
+func TestNASCleanupCouncilFollowUps(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	p1, sha1, _ := f.admit("council-1", syntheticFiles(100, 4, 10))
+	p2, sha2, _ := f.admit("council-2", syntheticFiles(200, 1, 10))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+
+	// Enable refuses an item without dry-run ETag evidence.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET recovery_evidence=NULL WHERE id=(SELECT min(id) FROM nas_cleanup_items WHERE plan_id=$1)`, p2); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := f.enableBatch([]int64{p2}, []string{sha2}, 1); code != 409 || !strings.Contains(body, "ETag evidence") {
+		t.Fatalf("plan without ETag evidence enabled: %d %s", code, body)
+	}
+	if code, body := safeguardControl(t, f.s, p2, "enabled", map[string]any{"plan_sha256": sha2}); code != 409 {
+		t.Fatalf("single enable without ETag evidence: %d %s", code, body)
+	}
+
+	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	tasks := f.leaseV2(64, 2, 1<<40, "")
+	ids := map[int64]string{tasks[0].ItemID: strings.Repeat("a", 32), tasks[1].ItemID: strings.Repeat("b", 32)}
+	results := f.observe(tasks, ids)
+	if !results[0].Delete || !results[1].Delete {
+		t.Fatalf("permits %+v", results)
+	}
+	// Master switch off: the identical retry no longer returns the permit.
+	f.s.cfg.NASCleanupDeletionEnabled = false
+	if r := f.observe(tasks[:1], ids); r[0].Delete || r[0].Action != "reconcile" {
+		t.Fatalf("replay with master off returned a permit: %+v", r[0])
+	}
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	// Approval expired: neither the replay nor any new lease executes, and the
+	// next lease pauses the plan and its batch.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_plans SET approved_until=now()-interval '1 second' WHERE id=$1`, p1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_batches SET approved_until=now()-interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.observe(tasks[1:2], ids); r[0].Delete {
+		t.Fatalf("replay after approval expiry returned a permit: %+v", r[0])
+	}
+	if got := f.leaseV2(64, 64, 1<<40, ""); len(got) != 0 {
+		t.Fatalf("expired approval leased work: %d", len(got))
+	}
+	if m, reason := f.planMode(p1); m != "paused" || !strings.Contains(reason, "approval expired") {
+		t.Fatalf("expired plan left %s %q", m, reason)
+	}
+	if m, reason := f.batchMode(); m != "paused" || !strings.Contains(reason, "approval expired") {
+		t.Fatalf("expired batch left %s %q", m, reason)
+	}
+	f.receipts(tasks, results, "deleted") // outstanding permits may still be receipted
+	// Nothing stays enabled, so a new single enable is not blocked.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET recovery_evidence='{"etag":"x"}' WHERE plan_id=$1`, p2); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := safeguardControl(t, f.s, p2, "enabled", map[string]any{"plan_sha256": sha2}); code != 200 {
+		t.Fatalf("enable after expiry: %d %s", code, body)
+	}
+}
+
+// Single-item and batched observations of one enabled plan race without
+// deadlock aborts (both take the plan fence before the budget lock).
+func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	p1, sha1, _ := f.admit("locks-1", syntheticFiles(100, 40, 10))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 2); code != 200 {
+		t.Fatalf("batch enable: %d %s", code, body)
+	}
+	tasks := f.leaseV2(64, 64, 1<<40, "")
+	if len(tasks) != 40 {
+		t.Fatalf("lease %d", len(tasks))
+	}
+	done := make(chan string, 40)
+	for n := 0; n < 20; n++ {
+		single, batch := tasks[2*n], tasks[2*n+1]
+		go func() {
+			w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(single.ItemID), cleanupObserve{Attempt: single.Attempt, PlanSHA: single.PlanSHA, Outcome: "match", Proof: fixtureProof(single.Item), ClientVersion: "t"})
+			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
+		}()
+		go func() {
+			w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": batch.ItemID, "attempt": batch.Attempt, "plan_sha256": batch.PlanSHA, "outcome": "match", "proof": fixtureProof(batch.Item), "error": "", "request_id": fmt.Sprintf("%032x", n+1)}}})
+			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
+		}()
+	}
+	for n := 0; n < 40; n++ {
+		if r := <-done; !strings.HasPrefix(r, "200 ") || !strings.Contains(r, `"delete":true`) {
+			t.Fatalf("concurrent observation: %s", r)
+		}
+	}
 }

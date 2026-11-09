@@ -40,7 +40,9 @@ const (
 	nasCleanupMaxPlanBytes int64 = 100_000_000_000 // 100 GB
 	// Rolling 24h deletion budget across all plans, counted from issued
 	// deletion permits (delete_ever_issued). No permit is issued beyond it.
-	nasCleanupMaxIssuedBytes24h int64 = 3_000_000_000_000 // 3 TB
+	// Raised from 3 TB to 5 TB by owner decision (2026-11, PR #436); the NAS
+	// client's local byte cap (CLEANUP_MAX_BYTES_24H) is the same value.
+	nasCleanupMaxIssuedBytes24h int64 = 5_000_000_000_000 // 5 TB
 	// Serializes the budget check-and-issue step across observations.
 	nasCleanupBudgetLock int64 = 7343226011102
 	// Per-plan execution lock base (key = base + plan id). Observations of an
@@ -54,8 +56,10 @@ const (
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
 	// Default and maximum approval window of an enabled plan or batch.
-	nasCleanupDefaultApproval = time.Hour
+	nasCleanupDefaultApproval = 2 * time.Hour
 	nasCleanupMaxApproval     = 24 * time.Hour
+	// Windows above this need an explicit allow_long_approval.
+	nasCleanupLongApproval = 4 * time.Hour
 )
 
 const nasCleanupReportSHA = "64eee0bc589c9be4dcab5b5ea7668270291a07ce4fd0db98dcd0a484e19d84c1"
@@ -298,7 +302,8 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		Priority     *int   `json:"priority,omitempty"`
 		Reason       string `json:"reason"`
 		// Optional approval window for enable, 1..24 hours (default 1).
-		ApprovalHours *int `json:"approval_hours,omitempty"`
+		ApprovalHours     *int `json:"approval_hours,omitempty"`
+		AllowLongApproval bool `json:"allow_long_approval,omitempty"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || len(req.Reason) < 1 || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact plan digest,mode and reason required")
@@ -320,8 +325,8 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 	approval := nasCleanupDefaultApproval
 	if req.ApprovalHours != nil {
 		approval = time.Duration(*req.ApprovalHours) * time.Hour
-		if req.Mode != "enabled" || approval < time.Hour || approval > nasCleanupMaxApproval {
-			util.WriteError(w, 400, "approval_hours is 1..24 and only applies to enable")
+		if req.Mode != "enabled" || approval < time.Hour || approval > nasCleanupMaxApproval || (approval > nasCleanupLongApproval && !req.AllowLongApproval) {
+			util.WriteError(w, 400, "approval_hours is 1..24 (above 4 requires allow_long_approval) and only applies to enable")
 			return
 		}
 	}
@@ -576,6 +581,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	// A batch whose current plan finished (or stopped) advances or pauses
 	// before work is leased; it never runs inside the lease transaction.
+	s.cleanupExpireApprovals(ctx)
 	s.cleanupAdvanceBatchIfIdle(ctx)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -775,7 +781,7 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 // (and every other recovery state) never yields a permit; see
 // handleAdminNASCleanupControl before ever changing that.
 func cleanupMayIssue(mode string, master bool, until *time.Time, sameFile bool, recovery string) bool {
-	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && recovery == "r2_sha_verified"
+	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && cleanupRecoveryPermits(mode, recovery)
 }
 
 // Media bytes of every item whose deletion permit was issued in the last 24h.
@@ -900,6 +906,12 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if err := tx.QueryRow(ctx, `SELECT i.plan_id,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&fencedPlan, &preMode); err != nil {
 		return cleanupObserveError(409, "cleanup task identity differs")
 	}
+	if preMode == "enabled" && env.budgetHeld && !env.lockedPlans[fencedPlan] {
+		// Lock order is always plan fence(s) before the budget lock. A batch that
+		// already holds the budget lock must not take a plan fence it did not
+		// take up front (the plan became enabled meanwhile): retry instead.
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
+	}
 	if preMode == "enabled" {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+fencedPlan); err != nil {
 			return cleanupObserveError(500, "cleanup plan execution fence failed")
@@ -922,7 +934,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// The exact same request (same request_id and body) whose response was
 		// lost gets back the one permit already issued, with its original
 		// expiry; nothing is extended or issued again.
-		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
+		// It is only handed back while the plan is still enabled, its approval is
+		// unexpired and the master switch is on; otherwise the caller gets the
+		// non-deleting reconcile answer below.
+		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
+			mode == "enabled" && until != nil && until.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled {
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {

@@ -716,6 +716,8 @@ class CleanupGuardTests(unittest.TestCase):
                          (datetime.date(2026, 8, 25), 18))
 
     def test_local_24h_caps_refuse_beyond_files_and_bytes(self):
+        # Reviewed constants: 5 TB (same as the server budget) and 400,000 files.
+        self.assertEqual((pull.CLEANUP_MAX_BYTES_24H, pull.CLEANUP_MAX_FILES_24H), (5_000_000_000_000, 400_000))
         self.assertIsNone(pull.cleanup_local_caps(self.inventory, 10))
         reserve = dict(item_id=1, plan_sha256='a'*64, relative_path='x')
         self.assertIsNone(pull.cleanup_local_caps(self.inventory, pull.CLEANUP_MAX_BYTES_24H - 10, reserve))

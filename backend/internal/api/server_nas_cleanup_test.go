@@ -382,7 +382,7 @@ func TestNASCleanupReferenceAdmissionSerializesWithArmingButNotPermanentRecovery
 	pool := cleanupTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery) VALUES(1,1,1,'would_delete','{}','r2_sha_verified');`)
+	_, err := pool.Exec(ctx, `INSERT INTO recording_clips VALUES(1,2,NULL,'object',repeat('a',64),3,'a/b.mp4','2026-09-01','2026-09-01 00:01:00','bucket');INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(1,47,13,'fixture','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":1,"stream_id":3}]',repeat('b',64));INSERT INTO nas_cleanup_source_holds VALUES(1,1);INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery,recovery_evidence) VALUES(1,1,1,'would_delete','{}','r2_sha_verified','{"etag":"fixture"}');`)
 	if err != nil {
 		t.Fatal(err)
 	}

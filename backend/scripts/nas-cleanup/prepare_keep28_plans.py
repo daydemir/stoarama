@@ -225,6 +225,7 @@ def main():
     ap.add_argument('--max-items', type=int, default=MAX_PLAN_ITEMS, help='items per plan (1..10000)')
     ap.add_argument('--max-bytes', type=float, default=MAX_PLAN_BYTES, help='byte cap per plan (<=1e11, the backend cap; e.g. 5e9 for a pilot)')
     ap.add_argument('--batch-by', choices=('stream', 'all'), default='stream', help='--submit: group admitted plans into batch manifests')
+    ap.add_argument('--i-understand-large-batch', action='store_true', help='required with --batch-by all (one approval spanning every stream)')
     ap.add_argument('--max-plans', type=int, default=0, help='stop after N plans (0 = all)')
     ap.add_argument('--label-prefix', default='k28')
     ap.add_argument('--bucket', default=os.environ.get('R2_BUCKET', 'stoarama'))
@@ -236,6 +237,8 @@ def main():
     a = ap.parse_args()
     if not 1 <= a.max_items <= MAX_PLAN_ITEMS or not 0 < a.max_bytes <= MAX_PLAN_BYTES or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,15}', a.label_prefix):
         raise SystemExit('invalid batching arguments')
+    if a.batch_by == 'all' and not a.i_understand_large_batch:
+        raise SystemExit('--batch-by all puts every stream under one approval; add --i-understand-large-batch to confirm')
     policy = load_policy(a.policy)
     unknown = set(a.stream) - set(policy)
     if unknown:

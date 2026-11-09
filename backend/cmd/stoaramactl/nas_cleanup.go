@@ -33,7 +33,8 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	reason := fs.String("reason", "", "audited approval/pause reason")
 	priority := fs.Int("priority", 0, "-100..100 scheduling priority; resume-dry-run only, no deletion authority")
 	expectedPlans := fs.Int("expected-plans", 0, "retire-superseded only: exact count from the preview; 0 previews without changes")
-	approvalHours := fs.Int("approval-hours", 0, "enable/enable-batch: approval window 1..24 hours (enable defaults to 1)")
+	approvalHours := fs.Int("approval-hours", 2, "enable/enable-batch: approval window 1..24 hours (above 4 requires --allow-long-approval)")
+	allowLong := fs.Bool("allow-long-approval", false, "enable/enable-batch: explicitly allow an approval window above 4 hours")
 	batchInput := fs.String("batch-input", "", "enable-batch: batch manifest written by prepare_keep28_plans.py --submit")
 	batchSHA := fs.String("expected-batch-sha256", "", "enable-batch/pause-batch: exact approved batch digest")
 	batchID := fs.Int64("batch-id", 0, "pause-batch/batch-report: batch id")
@@ -86,8 +87,8 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		// One owner approval for an ordered list of plans. Only the first plan
 		// is enabled; each next plan is enabled by the backend after the
 		// previous one finished cleanly and after passing every gate again.
-		if *batchInput == "" || len(*batchSHA) != 64 || *reason == "" || *approvalHours < 1 || *approvalHours > 24 {
-			log.Fatal("enable-batch requires --batch-input, --expected-batch-sha256, --reason and --approval-hours 1..24")
+		if *batchInput == "" || len(*batchSHA) != 64 || *reason == "" || *approvalHours < 1 || *approvalHours > 24 || (*approvalHours > 4 && !*allowLong) {
+			log.Fatal("enable-batch requires --batch-input, --expected-batch-sha256, --reason and --approval-hours 1..24 (above 4 requires --allow-long-approval)")
 		}
 		b, err := os.ReadFile(*batchInput)
 		if err != nil || len(b) > 4<<20 {
@@ -100,7 +101,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		if digest != *batchSHA {
 			log.Fatalf("batch manifest digest %s differs from --expected-batch-sha256", digest)
 		}
-		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, "/api/v1/service/nas-cleanup/batches", map[string]any{"plan_ids": ids, "batch_sha256": digest, "reason": *reason, "approval_hours": *approvalHours}))
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, "/api/v1/service/nas-cleanup/batches", map[string]any{"plan_ids": ids, "batch_sha256": digest, "reason": *reason, "approval_hours": *approvalHours, "allow_long_approval": *allowLong}))
 	case "pause-batch":
 		if *batchID <= 0 || len(*batchSHA) != 64 || *reason == "" {
 			log.Fatal("pause-batch requires --batch-id, --expected-batch-sha256 and --reason")
@@ -115,8 +116,8 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		if *id <= 0 || len(*sha) != 64 || *reason == "" {
 			log.Fatal("--plan-id,--expected-plan-sha256,--reason required")
 		}
-		if *approvalHours != 0 && (args[0] != "enable" || *approvalHours < 1 || *approvalHours > 24) {
-			log.Fatal("--approval-hours is 1..24 and only applies to enable")
+		if args[0] == "enable" && (*approvalHours < 1 || *approvalHours > 24 || (*approvalHours > 4 && !*allowLong)) {
+			log.Fatal("--approval-hours is 1..24 (above 4 requires --allow-long-approval)")
 		}
 		mode := "paused"
 		if args[0] == "enable" {
@@ -130,8 +131,11 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		if prioritySet {
 			body["priority"] = *priority
 		}
-		if *approvalHours != 0 {
+		if args[0] == "enable" {
 			body["approval_hours"] = *approvalHours
+			if *allowLong {
+				body["allow_long_approval"] = true
+			}
 		}
 		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/control", *id), body))
 	default:

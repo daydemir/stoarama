@@ -310,7 +310,7 @@ func (f *cleanupFixture) receipts(tasks []cleanupTask, results []batchResult, ou
 func (f *cleanupFixture) enableBatch(ids []int64, shas []string, hours int) (int, string) {
 	f.t.Helper()
 	digest := cleanupBatchDigest(cleanupPolicySHA, ids, shas)
-	w := cleanupCall(f.t, f.s.handleAdminNASCleanupBatchEnable, 47, 5, "", "", map[string]any{"plan_ids": ids, "batch_sha256": digest, "reason": "fixture batch approval", "approval_hours": hours})
+	w := cleanupCall(f.t, f.s.handleAdminNASCleanupBatchEnable, 47, 5, "", "", map[string]any{"plan_ids": ids, "batch_sha256": digest, "reason": "fixture batch approval", "approval_hours": hours, "allow_long_approval": hours > 4})
 	return w.Code, w.Body.String()
 }
 

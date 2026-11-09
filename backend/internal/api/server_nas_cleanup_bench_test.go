@@ -221,7 +221,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		api := serve(f, 0)
 		run(api, root, state, 1)
 		f.s.cfg.NASCleanupDeletionEnabled = true
-		if code, body := safeguardControl(t, f.s, id, "enabled", map[string]any{"approval_hours": 24, "plan_sha256": sha}); code != 200 {
+		if code, body := safeguardControl(t, f.s, id, "enabled", map[string]any{"approval_hours": 24, "allow_long_approval": true, "plan_sha256": sha}); code != 200 {
 			t.Fatalf("enable: %d %s", code, body)
 		}
 		// Without activation or dry-run evidence every observation runs the

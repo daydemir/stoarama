@@ -38,8 +38,9 @@ Two independent gates remain OFF during preparation:
 1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
 2. A plan defaults `dry_run`. Explicit `nas-cleanup enable` requires its exact
    `--expected-plan-sha256`, `--reason`, a complete matching dry run less than 24 hours
-   old, and full R2 recovery for every item. Approval expires after 1 hour
-   (`--approval-hours` 1..24), or approve a whole batch of plans at once (below).
+   old, and full R2 recovery (with ETag evidence) for every item. Approval
+   expires after `--approval-hours` (default 2; 1..24, above 4 only with
+   `--allow-long-approval`), or approve a whole batch of plans at once (below).
 
 ### Belt-and-braces safeguards (safety council, 2026-11)
 
@@ -50,7 +51,8 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   copy was streamed and SHA-verified. Re-introducing NAS-only deletion needs its
   own reviewed change.
 - **One enabled plan** at a time; a plan above **100 GB** cannot be enabled; no
-  permit is issued beyond a rolling **3 TB / 24 h** of issued deletions.
+  permit is issued beyond a rolling **5 TB / 24 h** of issued deletions
+  (raised from 3 TB by owner decision, 2026-11).
 - **Auto-pause.** During execution any observation that is not a permit
   (unverified, conflict, missing, client error, policy/recovery mismatch,
   budget), an expired execution lease, or any receipt other than `deleted`
@@ -61,8 +63,9 @@ All are code constants (raising one is a reviewed code change) and fail closed:
   continues). Before each unlink the client maps the folder to a stream, reads
   the interval from the physical sidecar (raw) or the output bounds confirmed
   by the dated path (collated), and refuses on keep-window overlap, unknown
-  folder/bounds or a disagreeing server `stream_id`. Hard local caps: 50,000
-  files / 3 TB per rolling 24 h. Every unlink is bracketed by fsynced intent and
+  folder/bounds or a disagreeing server `stream_id`. Hard local caps: 400,000
+  files / 5 TB per rolling 24 h (bytes bind first; raised from 50,000 / 3 TB
+  by owner decision, 2026-11). Every unlink is bracketed by fsynced intent and
   result lines in `/state/cleanup-deletions.jsonl` (append-only). A media unlink
   whose sidecar step failed is receipted `media_deleted_sidecar_failed`.
 - **R2 purge fence.** `nas-verified-purge` refuses to run (dry run included)
@@ -78,9 +81,10 @@ Runbook notes:
   refuses plans with any issued deletion. Investigate the pause reason
   (`nas-cleanup report`, `approval_reason`), run `verify-recovery`, then admit
   the remaining files as a new plan.
-- **`approved_until` expiring does not change the mode.** The plan stays
-  `enabled` (no new permits are issued) and still blocks enabling any other
-  plan and every `nas-verified-purge` run until it is explicitly paused.
+- **An expired approval pauses.** Once `approved_until` passes, no permit is
+  issued; the next lease (or batch advance) sets the plan and its batch to
+  `paused` (reason "auto-paused: approval expired") so it no longer blocks
+  other enables or purges. Outstanding 30 s permits may still be receipted.
 - **Deploy the API (and promote a NAS client) only while no cleanup item is
   `leased`**: pause any enabled plan first and let outstanding leases finish or
   expire. The client also refuses in dry runs (reported as `conflict`), so a
@@ -166,6 +170,9 @@ gates above changed; the work each gate costs and the approval granularity did.
   stored `sha256` metadata to equal the catalog SHA. ETags are content
   derived, so a replaced object fails; 404 is NAS-only (no permit), 412 or any
   difference is a conflict and other errors are unchecked: all auto-pause.
+  Such a check is recorded as `r2_etag_bound` (never `r2_sha_verified`, which
+  stays reserved for full streamed hashes) and permits only during execution.
+  Enable refuses any plan with an item lacking dry-run ETag evidence.
   Missing evidence (plans dry-run by older servers) falls back to the full
   re-download.
 - **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
@@ -176,7 +183,9 @@ gates above changed; the work each gate costs and the approval granularity did.
   Every request is retry-safe: a lease `request_id` returns the same leased
   tasks; an observation `request_id` returns the recorded decision, or for an
   identical request the one permit already issued with its original expiry
-  (never a new or extended permit); receipts are idempotent. The client retries
+  (never a new or extended permit), and only while the plan is still enabled,
+  approved and the master switch is on; receipts are idempotent. Batched and
+  single observations take locks in one order: plan fence(s), then budget. The client retries
   502/503/504/429/timeouts with short back-off instead of pausing a minute.
 - **Concurrent execution.** Sixteen NAS workers each open, re-hash, re-check
   (pins, keep window, caps) and unlink their own file under their own permit
@@ -189,7 +198,9 @@ gates above changed; the work each gate costs and the approval granularity did.
   `batch_sha256 = sha256("stoarama-nas-cleanup-batch-v1\npolicy <sha>\n" +
   "plan <id> <sha>\n"...)`). After the dry runs complete, the owner approves it
   once: `stoaramactl nas-cleanup enable-batch --batch-input FILE
-  --expected-batch-sha256 SHA --reason TEXT --approval-hours 1..24`. The backend
+  --expected-batch-sha256 SHA --reason TEXT [--approval-hours 2]` (above 4 h
+  only with `--allow-long-approval`; `prepare --batch-by all` needs
+  `--i-understand-large-batch`). The backend
   requires the master switch, the exact digest over the plans' current digests
   and policy, no other enabled plan or batch, and that every plan is a
   policy-current dry-run plan with no issued deletion that passes the per-plan
@@ -202,10 +213,10 @@ gates above changed; the work each gate costs and the approval granularity did.
   stopped, and a paused batch cannot be re-enabled (approve the remainder as a
   new batch). `pause-batch --batch-id ID --expected-batch-sha256 SHA --reason`
   stops it; `batch-report --batch-id ID` shows per-plan states.
-- The 3 TB / 24 h server budget and the client's 50,000 files / 3 TB per 24 h
-  caps are unchanged code constants. At ~17 MB per raw clip the client's
-  50,000-file cap, not the pipeline, bounds daily volume (about 42 minutes at
-  20 files/s); raising it is a separate reviewed change.
+- The 24 h limits are code constants: server budget 5 TB, client 5 TB and
+  400,000 files. At ~17 MB per raw clip 5 TB is ~290,000 files, so bytes bind
+  first: about 4 hours at 20 files/s, then the pipeline waits for the window
+  to roll (~16 TB total takes about 3.3 days).
 
 Rollout: apply migration 0173 (additive; NOT VALID checks; one small partial
 index), deploy the API while no item is `leased`, then stage/promote the NAS

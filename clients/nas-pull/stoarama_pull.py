@@ -2058,8 +2058,10 @@ CLEANUP_FOLDER_STREAMS_JSON = """{
  "recordings/July": 17216
 }
 """
-CLEANUP_MAX_FILES_24H = 50000
-CLEANUP_MAX_BYTES_24H = 3_000_000_000_000  # 3 TB
+# Owner decision (2026-11, PR #436): 5 TB per rolling 24 h, equal to the
+# server budget, with a file cap high enough that bytes are the binding limit.
+CLEANUP_MAX_FILES_24H = 400_000
+CLEANUP_MAX_BYTES_24H = 5_000_000_000_000  # 5 TB
 CLEANUP_MAX_COLLATED_SECONDS = 7200
 CLEANUP_LEDGER_NAME = "cleanup-deletions.jsonl"
 CLEANUP_MONTHS = ("January", "February", "March", "April", "May", "June", "July",

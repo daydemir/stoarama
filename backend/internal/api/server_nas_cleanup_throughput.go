@@ -44,6 +44,32 @@ type cleanupObserveEnv struct {
 	issued       int64
 	fingerprints map[int64]string
 	prefetched   map[int64]cleanupPrefetchedRecovery
+	// Enabled plans whose execution fence was taken at top level before the
+	// budget lock (batch path); see cleanupObserveOne.
+	lockedPlans map[int64]bool
+}
+
+// cleanupRecoveryPermits: a permit needs a full streamed-SHA verification
+// (r2_sha_verified) or, during execution only, the conditional HEAD bound to
+// the generation a dry run SHA-verified (r2_etag_bound). Every other state
+// (nas_only_at_check, unchecked, conflict, ...) never permits.
+func cleanupRecoveryPermits(mode, recovery string) bool {
+	return recovery == "r2_sha_verified" || (mode == "enabled" && recovery == "r2_etag_bound")
+}
+
+// cleanupExpireApprovals pauses every enabled plan and batch whose approval
+// has passed, so an expired approval neither lingers as 'enabled' (blocking
+// new enables and purges) nor leaves a batch waiting forever. Pausing grants
+// nothing; outstanding 30 s permits may still be receipted.
+func (s *Server) cleanupExpireApprovals(ctx context.Context) {
+	if s.pool == nil {
+		return
+	}
+	_, err := s.pool.Exec(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: approval expired; '||approval_reason,500) WHERE mode='enabled' AND (approved_until IS NULL OR approved_until<=now()) RETURNING id)
+UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: approval expired; '||approval_reason,500) WHERE mode='enabled' AND (approved_until<=now() OR plan_ids && ARRAY(SELECT id FROM pz))`)
+	if err != nil {
+		log.Printf("nas cleanup approval expiry deferred: %v", err)
+	}
 }
 
 func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size int64) (bool, error) {
@@ -149,9 +175,9 @@ func cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID int64) error
 // cleanup fence. Status 0 means every gate passed.
 func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[string]any) {
 	var bad int
-	err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR recovery<>'r2_sha_verified')`, id).Scan(&bad)
+	err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR recovery<>'r2_sha_verified' OR coalesce(recovery_evidence->>'etag','')='')`, id).Scan(&bad)
 	if err != nil || bad != 0 {
-		return 409, map[string]any{"error": "fresh complete dry run with a verified R2 recovery copy for every item required"}
+		return 409, map[string]any{"error": "fresh complete dry run with a verified R2 recovery copy (and its ETag evidence) for every item required"}
 	}
 	// Under the exclusive public cleanup fence, so two concurrent enables are
 	// serialized and the second sees the first.
@@ -255,7 +281,7 @@ func (s *Server) cleanupRecoveryBound(ctx context.Context, i nasCleanupItem, ev 
 	if head.SHA256Metadata != "" && strings.ToLower(head.SHA256Metadata) != i.SHA256 {
 		return "conflict"
 	}
-	return "r2_sha_verified"
+	return "r2_etag_bound"
 }
 
 // usableEvidence returns the dry-run evidence only when it binds exactly
@@ -378,8 +404,22 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return
 	}
 	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
-		// Take the budget lock once at top level and keep an exact running
-		// total until commit (see cleanupObserveEnv.budgetHeld).
+		// Same lock order as the single-item path: every enabled plan's
+		// execution fence (ascending id), then the budget lock, taken once at
+		// top level with an exact running total until commit.
+		env.lockedPlans = map[int64]bool{}
+		var plans []int64
+		if err = tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT p.id ORDER BY p.id),'{}') FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled'`, ids, cid).Scan(&plans); err != nil {
+			util.WriteError(w, 500, "cleanup plan execution fence failed")
+			return
+		}
+		for _, plan := range plans {
+			if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+plan); err != nil {
+				util.WriteError(w, 500, "cleanup plan execution fence failed")
+				return
+			}
+			env.lockedPlans[plan] = true
+		}
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupBudgetLock); err == nil {
 			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
 		}
@@ -619,6 +659,12 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 			continue
 		}
 		if mode == "enabled" {
+			if until == nil || !until.After(time.Now()) {
+				if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: approval expired; '||approval_reason,500) WHERE id=$1`, id); err != nil {
+					return err
+				}
+				return pause("approval expired")
+			}
 			return tx.Commit(ctx)
 		}
 		if mode != "dry_run" || issued {
@@ -662,18 +708,19 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 // now. Only the first plan is enabled; later plans are re-gated on advance.
 func (s *Server) handleAdminNASCleanupBatchEnable(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PlanIDs       []int64 `json:"plan_ids"`
-		BatchSHA      string  `json:"batch_sha256"`
-		Reason        string  `json:"reason"`
-		ApprovalHours int     `json:"approval_hours"`
+		PlanIDs           []int64 `json:"plan_ids"`
+		BatchSHA          string  `json:"batch_sha256"`
+		Reason            string  `json:"reason"`
+		ApprovalHours     int     `json:"approval_hours"`
+		AllowLongApproval bool    `json:"allow_long_approval,omitempty"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.BatchSHA) != 64 || !lowerHex(req.BatchSHA) || len(req.Reason) < 1 || len(req.Reason) > 500 || len(req.PlanIDs) < 1 || len(req.PlanIDs) > nasCleanupMaxBatchPlans {
 		util.WriteError(w, 400, "1 to 500 plan ids, the exact batch digest and a reason required")
 		return
 	}
 	approval := time.Duration(req.ApprovalHours) * time.Hour
-	if approval < time.Hour || approval > nasCleanupMaxApproval {
-		util.WriteError(w, 400, "approval_hours must be 1..24")
+	if approval < time.Hour || approval > nasCleanupMaxApproval || (approval > nasCleanupLongApproval && !req.AllowLongApproval) {
+		util.WriteError(w, 400, "approval_hours must be 1..24; above 4 requires allow_long_approval")
 		return
 	}
 	seen := map[int64]bool{}

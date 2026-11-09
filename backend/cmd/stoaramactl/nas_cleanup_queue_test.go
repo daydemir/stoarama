@@ -85,8 +85,8 @@ func TestNASCleanupCLIEnableBatchSendsExactApprovedDigest(t *testing.T) {
 		w.Write([]byte(`{"mode":"enabled"}`))
 	}))
 	defer server.Close()
-	runNASCleanup(context.Background(), config.Config{APIToken: "fixture"}, []string{"enable-batch", "--batch-input", path, "--expected-batch-sha256", batchDigestVector, "--reason", "owner approved streams 3", "--approval-hours", "12", "--backend-api-url", server.URL})
-	if body["batch_sha256"] != batchDigestVector || body["approval_hours"] != float64(12) || len(body["plan_ids"].([]any)) != 2 {
+	runNASCleanup(context.Background(), config.Config{APIToken: "fixture"}, []string{"enable-batch", "--batch-input", path, "--expected-batch-sha256", batchDigestVector, "--reason", "owner approved streams 3", "--approval-hours", "12", "--allow-long-approval", "--backend-api-url", server.URL})
+	if body["batch_sha256"] != batchDigestVector || body["approval_hours"] != float64(12) || body["allow_long_approval"] != true || len(body["plan_ids"].([]any)) != 2 {
 		t.Fatalf("batch enable request %v", body)
 	}
 }
