@@ -80,7 +80,7 @@ func TestR2RetireWindowEdgesAndDST(t *testing.T) {
 		t.Fatalf("window %s..%s", w.Start, w.End)
 	}
 	windows := map[int64]api.Keep28Window{4: w}
-	picks := map[int64]r2RetirePick{4: {Choice: "none"}}
+	picks := map[int64]r2RetirePick{4: {Choice: "none", KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
 	cases := []struct {
 		name string
 		a, b time.Time
@@ -126,7 +126,11 @@ func TestR2RetireDecideFailsClosed(t *testing.T) {
 	w := r2tWindow(t, 3, "Asia/Tokyo", "2026-09-12", "2026-10-10")
 	windows := map[int64]api.Keep28Window{3: w, 5: r2tWindow(t, 5, "Asia/Tokyo", "2026-09-12", "2026-10-10")}
 	a, b := r2tUTC("2026-08-01T00:00:00Z"), r2tUTC("2026-08-01T00:01:00Z")
-	picks := map[int64]r2RetirePick{3: {Choice: "keep"}}
+	// Page format: local wall time with a space and an offset.
+	pk := func(choice string) r2RetirePick {
+		return r2RetirePick{Choice: choice, KeepStartUTC: "2026-09-11 11:00:00-04:00", KeepEndUTC: "2026-10-09 11:00:00-04:00"}
+	}
+	picks := map[int64]r2RetirePick{3: pk("keep")}
 	base := func() r2RetireCandidate { return r2tCandidate("raw", 3, "Asia/Tokyo", a, b) }
 	type mut func(*r2RetireCandidate, map[int64]r2RetirePick)
 	cases := []struct {
@@ -136,11 +140,21 @@ func TestR2RetireDecideFailsClosed(t *testing.T) {
 	}{
 		{"eligible", func(*r2RetireCandidate, map[int64]r2RetirePick) {}, r2RetireReason},
 		{"undecided stream", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.StreamID = 5 }, "undecided"},
-		{"pick all", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = r2RetirePick{Choice: "all"} }, "pick_all"},
-		{"pick none", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = r2RetirePick{Choice: "none"} }, r2RetireReason},
-		{"pick st", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = r2RetirePick{Choice: "st"} }, r2RetireReason},
+		{"pick all", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("all") }, "pick_all"},
+		{"pick none", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("none") }, r2RetireReason},
+		{"pick st", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = pk("st") }, r2RetireReason},
 		{"pick made against another window", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
-			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-01T15:00:00+00:00"}
+			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-01T15:00:00+00:00", KeepEndUTC: "2026-10-09T15:00:00+00:00"}
+		}, "pick_window_mismatch"},
+		{"pick without window fields", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) { p[3] = r2RetirePick{Choice: "none"} }, "pick_window_mismatch"},
+		{"pick with only a start", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
+			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-11 11:00:00-04:00"}
+		}, "pick_window_mismatch"},
+		{"pick end off by one hour", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
+			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-11 11:00:00-04:00", KeepEndUTC: "2026-10-09 12:00:00-04:00"}
+		}, "pick_window_mismatch"},
+		{"pick with unparseable window", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
+			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-11", KeepEndUTC: "2026-10-09"}
 		}, "pick_window_mismatch"},
 		{"pick with the same window", func(_ *r2RetireCandidate, p map[int64]r2RetirePick) {
 			p[3] = r2RetirePick{Choice: "none", KeepStartUTC: "2026-09-11T15:00:00+00:00", KeepEndUTC: "2026-10-09T15:00:00+00:00"}
@@ -162,6 +176,10 @@ func TestR2RetireDecideFailsClosed(t *testing.T) {
 			c.Kind, c.ObjectKey = "collated", "joined/best14-20261021/objects/a.mp4"
 		}, "protected_prefix"},
 		{"staging prefix", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.ObjectKey = "staging/x" }, "protected_prefix"},
+		{"repaired prefix", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.ObjectKey = "repaired/managed/acct-47/x.mp4" }, "protected_prefix"},
+		{"repaired prefix (collated)", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) {
+			c.Kind, c.ObjectKey = "collated", "repaired/joined/x.mp4"
+		}, "protected_prefix"},
 		{"raw outside managed/", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) { c.ObjectKey = "joined/goodplus-x/a.mp4" }, "unexpected_key"},
 		{"collated outside known prefixes", func(c *r2RetireCandidate, _ map[int64]r2RetirePick) {
 			c.Kind, c.ObjectKey = "collated", "joined/other/a.mp4"
@@ -175,7 +193,7 @@ func TestR2RetireDecideFailsClosed(t *testing.T) {
 		// Protected beats everything, including facts that would otherwise allow it.
 		{"protected even if in scope", func(c *r2RetireCandidate, p map[int64]r2RetirePick) {
 			c.Kind, c.ObjectKey = "collated", "joined/best14-20261021/x.mp4"
-			p[3] = r2RetirePick{Choice: "none"}
+			p[3] = pk("none")
 		}, "protected_prefix"},
 	}
 	for _, tc := range cases {
@@ -297,7 +315,7 @@ CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY, recording_id bigin
 CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY, collation_hour_id bigint NOT NULL REFERENCES recording_collation_hours(id), object_key text,
   nas_relative_path text, size_bytes bigint, sha256 text, start_at timestamptz, end_at timestamptz, source_clip_ids bigint[], created_at timestamptz NOT NULL);
 CREATE TABLE recording_collation_output_acks(output_id bigint NOT NULL REFERENCES recording_collation_outputs(id), connection_id bigint NOT NULL);
-CREATE TABLE nas_inventory_files(connection_id bigint NOT NULL, clip_id bigint NOT NULL REFERENCES recording_clips(id), relative_path text, state text NOT NULL);
+CREATE TABLE nas_inventory_files(connection_id bigint NOT NULL, clip_id bigint NOT NULL, relative_path text, state text NOT NULL); -- no FK, as in production
 CREATE TABLE nas_inventory_unmatched_files(connection_id bigint NOT NULL, relative_path text NOT NULL, state text NOT NULL);
 CREATE TABLE nas_restore_requests(id bigserial PRIMARY KEY, clip_id bigint NOT NULL, state text NOT NULL);
 CREATE TABLE recording_joined_source_snapshots(id bigserial PRIMARY KEY, clip_id bigint NOT NULL);
@@ -311,7 +329,7 @@ INSERT INTO streams VALUES (3,'Asia/Tokyo'),(4,'America/Los_Angeles'),(5,'Asia/T
 INSERT INTO recordings VALUES (30,47,3,'UTC'),(40,47,4,'UTC'),(50,47,5,'UTC'),(60,48,3,'UTC');
 `)
 	for _, m := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql",
-		"0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_r2_object_retirements.sql"} {
+		"0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0174_r2_object_retirements.sql"} {
 		body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), m))
 		if err != nil {
 			t.Fatal(err)
@@ -373,7 +391,15 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	picksPath := filepath.Join(dir, "r2-picks.json")
 	writePicks := func(c3 string) {
 		t.Helper()
-		body := fmt.Sprintf(`{"choices":{"3":{"choice":%q,"keep_start_utc":"2026-09-11T15:00:00+00:00","keep_end_utc":"2026-10-09T15:00:00+00:00"},"4":{"choice":"all"}},"saved_at":"2026-11-09T00:00:00Z"}`, c3)
+		// Exactly what the picks page saves (server.py adds saved_at/saved_by).
+		body := fmt.Sprintf(`{
+ "choices": {
+  "3": {"choice": %q, "bytes": 123456789, "keep_start_utc": "2026-09-11 11:00:00-04:00", "keep_end_utc": "2026-10-09 11:00:00-04:00"},
+  "4": {"choice": "all", "bytes": 5, "keep_start_utc": "2026-09-12 03:00:00-04:00", "keep_end_utc": "2026-10-10 03:00:00-04:00"}
+ },
+ "saved_at": "2026-11-09T19:00:00Z",
+ "saved_by": "owner@example.com"
+}`, c3)
 		if err := os.WriteFile(picksPath, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -453,6 +479,13 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		t.Fatalf("pick change: %v", err)
 	}
 	writePicks("none")
+	for _, age := range []time.Duration{0, -time.Hour, 8 * 24 * time.Hour} {
+		o := opts
+		o.MaxManifestAge = age
+		if _, err := apply(o); err == nil || !strings.Contains(err.Error(), "max-manifest-age") {
+			t.Fatalf("max manifest age %s accepted: %v", age, err)
+		}
+	}
 	assertDeleted()
 
 	// Byte cap: only the first item (output 201) fits.
@@ -504,18 +537,32 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	}
 
 	// 110 gains a NAS copy after the plan. By default that stops the run...
-	exec(`INSERT INTO nas_inventory_files VALUES (13,110,'p/110.mp4','present')`)
+	// 109 is now held: by default that stops the run...
 	if _, err := apply(opts); err == nil || !strings.Contains(err.Error(), "no longer eligible") {
 		t.Fatalf("ineligible: %v", err)
 	}
 	// ...and --skip-ineligible keeps both remaining items.
+	// ...and --skip-ineligible keeps it. 110 gains a NAS copy after its facts
+	// were read (no foreign key, so the row lock cannot block it); the last
+	// re-check right before the delete keeps it too.
+	store.beforeHead = func(key string) {
+		if key == "managed/acct-47/110.mp4" {
+			if _, err := pool.Exec(ctx, `INSERT INTO nas_inventory_files VALUES (13,110,'p/110.mp4','present')`); err != nil {
+				t.Error(err)
+			}
+		}
+	}
 	skip := opts
 	skip.SkipIneligible = true
 	s, err = apply(skip)
 	if err != nil || s.Retired != 0 || s.AlreadyDone != 3 || s.SkippedIneligible["nas_cleanup_hold"] != 1 || s.SkippedIneligible["nas_copy"] != 1 {
 		t.Fatalf("skip run %+v %v", s, err)
 	}
+	store.beforeHead = nil
 	assertDeleted("joined/nightly-collation-v2/o/201.mp4", "managed/acct-47/101.mp4")
+	if _, ok := store.objects["managed/acct-47/110.mp4"]; !ok {
+		t.Fatal("object with a new NAS copy was deleted")
+	}
 
 	var rows []string
 	r, err := pool.Query(ctx, `SELECT kind||':'||source_id||':'||choice||':'||already_absent||':'||manifest_sha256 FROM r2_object_retirements ORDER BY id`)
@@ -581,5 +628,33 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	var a errR2RetireAnomaly
 	if !errors.As(r2RetireAnomalyf("x"), &a) {
 		t.Fatal("anomaly type")
+	}
+}
+
+// A picks file exactly as the owner's page writes it, against the real
+// embedded keep28 window of stream 3 (Asia/Tokyo, 2026-09-12..2026-10-10).
+func TestR2RetirePageStylePicksSelect(t *testing.T) {
+	p, err := parseR2RetirePicks([]byte(`{"choices":{
+ "3":{"choice":"none","bytes":1234,"keep_start_utc":"2026-09-11 11:00:00-04:00","keep_end_utc":"2026-10-09 11:00:00-04:00"},
+ "78":{"choice":"st","bytes":1,"keep_start_utc":"2026-08-19 11:00:00-04:00"}},
+ "saved_at":"2026-11-09T19:00:00Z","saved_by":"owner@example.com"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, windows, err := api.Keep28Policy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := windows[3]
+	if got := r2RetireEffectiveChoice(p.Choices[3], true, w); got != "none" {
+		t.Fatalf("page-format pick for stream 3 resolved to %q", got)
+	}
+	c := r2tCandidate("raw", 3, "Asia/Tokyo", w.Start.Add(-time.Hour), w.Start)
+	if reason, choice, ok := r2RetireDecide(c, "stoarama", windows, p.Choices); !ok || choice != "none" {
+		t.Fatalf("page-format pick selects nothing: %s", reason)
+	}
+	// A missing window field is undecided: keep everything.
+	if got := r2RetireEffectiveChoice(p.Choices[78], true, windows[78]); got != "" {
+		t.Fatalf("pick without keep_end_utc resolved to %q", got)
 	}
 }

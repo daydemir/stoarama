@@ -49,6 +49,8 @@ const (
 	r2RetireAdvisoryLockKey = int64(7343226011173)
 	r2RetireFinishTimeout   = 2 * time.Minute
 	r2RetireManifestName    = "manifest.jsonl"
+	// r2RetireMaxManifestAge caps --max-manifest-age; staleness can't be disabled.
+	r2RetireMaxManifestAge = 7 * 24 * time.Hour
 )
 
 type r2RetireHeader struct {
@@ -550,7 +552,9 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		return sum, errors.New("manifest was planned under a different keep28 policy")
 	case h.Bucket != store.Bucket():
 		return sum, fmt.Errorf("manifest bucket %q is not the configured bucket %q", h.Bucket, store.Bucket())
-	case opts.MaxManifestAge > 0 && time.Since(h.CreatedAt) > opts.MaxManifestAge:
+	case opts.MaxManifestAge <= 0 || opts.MaxManifestAge > r2RetireMaxManifestAge:
+		return sum, fmt.Errorf("--max-manifest-age must be in (0, %s]", r2RetireMaxManifestAge)
+	case time.Since(h.CreatedAt) > opts.MaxManifestAge:
 		return sum, fmt.Errorf("manifest is older than %s; re-plan", opts.MaxManifestAge)
 	case h.GraceSeconds < int64((24*time.Hour)/time.Second):
 		return sum, errors.New("manifest grace is below 24h")
@@ -580,7 +584,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		return sum, err
 	}
 	if !has {
-		return sum, errors.New("r2_object_retirements is missing (migration 0173 not applied); refusing")
+		return sum, errors.New("r2_object_retirements is missing (migration 0174 not applied); refusing")
 	}
 	if ids, err := r2RetireEnabledPlans(ctx, pool); err != nil {
 		return sum, fmt.Errorf("check NAS cleanup plans: %w", err)
@@ -724,8 +728,11 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	} else if fp != a.fp {
 		return "", "", r2RetireAnomalyf("NAS cleanup plans, joined artifacts or stitched outputs changed during the run; re-plan")
 	}
-	// Row lock: blocks new NAS inventory rows, acks, holds and restores that
-	// reference this row (their foreign keys need KEY SHARE) until commit.
+	// Row lock: serializes against concurrent purged_at/identity changes and
+	// against inserts whose foreign keys reference this row (e.g. NAS cleanup
+	// holds). It does NOT block new NAS inventory rows (nas_inventory_files has
+	// no foreign key to recording_clips), so NAS presence is re-checked again
+	// immediately before the delete.
 	table := "recording_clips"
 	if it.Kind == "collated" {
 		table = "recording_collation_outputs"
@@ -789,6 +796,13 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		it.Kind, it.SourceID, it.StreamID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, r2RetireReason, it.Choice, a.digest, a.policySH, absent); err != nil {
 		return "", "", r2RetireAnomalyf("record retirement: %v", err)
 	}
+	// Last NAS presence check before the delete: a NAS copy that appeared
+	// since the facts were read keeps the object (the transaction rolls back).
+	if nas, err := r2RetireNASCopyNow(ctx, tx, it.Kind, it.SourceID, a.scope.ConnectionID); err != nil {
+		return "", "", err
+	} else if nas {
+		return "ineligible", "nas_copy", nil
+	}
 	line := r2RetireLedgerLine{ManifestSHA256: a.digest, Kind: it.Kind, SourceID: it.SourceID, StreamID: it.StreamID, ObjectKey: it.ObjectKey, SizeBytes: it.SizeBytes, SHA256: it.SHA256}
 	intent := line
 	intent.Event = "intent"
@@ -833,6 +847,26 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		return "retired_absent", "", nil
 	}
 	return "retired", "", nil
+}
+
+// r2RetireNASCopyNow re-reads NAS evidence for one object inside the apply
+// transaction (same evidence as the plan facts).
+func r2RetireNASCopyNow(ctx context.Context, q r2RetireQuerier, kind string, id, connectionID int64) (bool, error) {
+	sql := `SELECT EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.clip_id=c.id AND n.state<>'missing')
+  OR EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2 AND n.relative_path=c.display_path AND n.state<>'missing')
+  OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=$2 AND u.relative_path=c.display_path AND u.state<>'missing')
+FROM recording_clips c WHERE c.id=$1`
+	if kind == "collated" {
+		sql = `SELECT EXISTS(SELECT 1 FROM recording_collation_output_acks a WHERE a.output_id=o.id)
+  OR EXISTS(SELECT 1 FROM nas_inventory_unmatched_files u WHERE u.connection_id=$2
+    AND u.relative_path IN (o.nas_relative_path, 'joined/'||o.nas_relative_path) AND u.state<>'missing')
+FROM recording_collation_outputs o WHERE o.id=$1`
+	}
+	var nas bool
+	if err := q.QueryRow(ctx, sql, id, connectionID).Scan(&nas); err != nil {
+		return false, fmt.Errorf("re-check NAS presence: %w", err)
+	}
+	return nas, nil
 }
 
 // ---------------------------------------------------------------- CLI
@@ -935,7 +969,7 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 		log.Fatal(err)
 	}
 	if !hasRet {
-		log.Printf("r2-retire plan: r2_object_retirements not found (migration 0173 not applied); planning without it")
+		log.Printf("r2-retire plan: r2_object_retirements not found (migration 0174 not applied); planning without it")
 	}
 	enabled, err := r2RetireEnabledPlans(ctx, pool)
 	if err != nil {
@@ -1010,15 +1044,15 @@ func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usa
 	fs.StringVar(&opts.LedgerPath, "ledger", r2RetireDefaultLedger(), "append-only JSONL ledger")
 	fs.Float64Var(&opts.Rate, "rate", 10, "maximum objects per second")
 	fs.Int64Var(&opts.MaxItems, "max-items", 0, "stop after retiring this many objects (0 = no limit)")
-	fs.DurationVar(&opts.MaxManifestAge, "max-manifest-age", 72*time.Hour, "refuse manifests older than this")
+	fs.DurationVar(&opts.MaxManifestAge, "max-manifest-age", 72*time.Hour, "refuse manifests older than this (max 168h; cannot be disabled)")
 	fs.BoolVar(&opts.SkipIneligible, "skip-ineligible", false, "skip (keep) items that are no longer eligible instead of stopping")
 	fs.BoolVar(&opts.RecordAbsent, "record-already-absent", false, "mark items whose object is already missing from R2 instead of stopping")
 	asJSON := fs.Bool("json", false, "print the summary as JSON")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || opts.ManifestPath == "" || opts.ExpectedSHA == "" || opts.MaxBytes <= 0 {
 		log.Fatal(usage)
 	}
-	if opts.Rate <= 0 || opts.Rate > 100 || opts.MaxItems < 0 || opts.Budget24h <= 0 {
-		log.Fatal("r2-retire apply: --rate must be in (0,100], --max-items >= 0, --budget-24h-bytes > 0")
+	if opts.Rate <= 0 || opts.Rate > 100 || opts.MaxItems < 0 || opts.Budget24h <= 0 || opts.MaxManifestAge <= 0 || opts.MaxManifestAge > r2RetireMaxManifestAge {
+		log.Fatalf("r2-retire apply: --rate must be in (0,100], --max-items >= 0, --budget-24h-bytes > 0, --max-manifest-age in (0, %s]", r2RetireMaxManifestAge)
 	}
 	pool, err := r2RetireOpenPool(ctx, cfg, false)
 	if err != nil {

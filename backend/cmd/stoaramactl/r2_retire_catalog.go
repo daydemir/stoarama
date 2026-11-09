@@ -23,7 +23,7 @@ type r2RetireScope struct {
 	ConnectionID int64
 	Bucket       string
 	Grace        time.Duration
-	// HasRetirements is false only before migration 0173 is applied (plan only).
+	// HasRetirements is false only before migration 0174 is applied (plan only).
 	HasRetirements bool
 }
 

@@ -119,11 +119,11 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(body)); err != nil {
 		t.Fatalf("apply 0160: %v", err)
 	}
-	if body, err = os.ReadFile("../../../infra/sql/migrations/0173_r2_object_retirements.sql"); err != nil {
+	if body, err = os.ReadFile("../../../infra/sql/migrations/0174_r2_object_retirements.sql"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, string(body)); err != nil {
-		t.Fatalf("apply 0173: %v", err)
+		t.Fatalf("apply 0174: %v", err)
 	}
 	sha := strings.Repeat("a", 64)
 	dir := "f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_"

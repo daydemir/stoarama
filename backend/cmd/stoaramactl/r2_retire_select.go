@@ -32,7 +32,9 @@ const (
 // r2RetireProtectedPrefixes are never retired, whatever the database says.
 // joined/best14-20261021/ holds the V85 best14 outputs, tracked only in a
 // controller sqlite archived elsewhere.
-var r2RetireProtectedPrefixes = []string{"joined/best14-20261021/", "staging/"}
+// repaired/ holds repaired MP4s (moov-box repair of truncated clips). This is
+// an explicit denylist on top of the per-kind allowlist below.
+var r2RetireProtectedPrefixes = []string{"joined/best14-20261021/", "repaired/", "staging/"}
 
 // r2RetireCollatedPrefixes are the only stitched-output prefixes in scope.
 var r2RetireCollatedPrefixes = []string{"joined/goodplus-", "joined/nightly-collation-v2/"}
@@ -106,22 +108,37 @@ func parseR2RetirePicks(raw []byte) (r2RetirePicks, error) {
 // r2RetireEffectiveChoice is the choice the selection acts on: "" (undecided)
 // unless the stream has a valid pick made against the same window.
 func r2RetireEffectiveChoice(p r2RetirePick, ok bool, w api.Keep28Window) string {
-	if !ok || !r2RetireValidChoices[p.Choice] {
+	if !ok || !r2RetireValidChoices[p.Choice] || !r2RetireValidSpan(w.Start, w.End) {
 		return ""
 	}
 	for _, pair := range []struct {
 		raw  string
 		want time.Time
 	}{{p.KeepStartUTC, w.Start}, {p.KeepEndUTC, w.End}} {
-		if pair.raw == "" {
-			continue
-		}
-		got, err := time.Parse(time.RFC3339, pair.raw)
-		if err != nil || !got.Equal(pair.want) {
+		// A pick without the window it was made against is undecided: the
+		// check is never skipped.
+		got, ok := r2RetireParsePickTime(pair.raw)
+		if !ok || !got.Equal(pair.want) {
 			return ""
 		}
 	}
 	return p.Choice
+}
+
+// r2RetirePickTimeLayouts are the formats the picks page and select.py write:
+// "2026-09-11 11:00:00-04:00" (page) and RFC 3339 "2026-09-11T15:00:00+00:00".
+var r2RetirePickTimeLayouts = []string{"2006-01-02 15:04:05Z07:00", time.RFC3339}
+
+func r2RetireParsePickTime(raw string) (time.Time, bool) {
+	if raw == "" || strings.TrimSpace(raw) != raw {
+		return time.Time{}, false
+	}
+	for _, layout := range r2RetirePickTimeLayouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // r2RetireFacts are the database observations for one object. Every true
@@ -273,6 +290,10 @@ func r2RetireDecide(c r2RetireCandidate, bucket string, windows map[int64]api.Ke
 	case "all":
 		return "pick_all", choice, false
 	case "none", "st", "keep":
+		// Per the owner's picks page, none/st/keep all drop everything outside
+		// the kept period; they differ only inside it (none: nothing, st:
+		// stitched only, keep: raw + stitched). Phase 1 only touches footage
+		// outside the period, so the three are equivalent here.
 		return r2RetireReason, choice, true
 	}
 	return "invalid_pick", "", false

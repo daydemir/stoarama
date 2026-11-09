@@ -28,7 +28,7 @@ CREATE TABLE r2_object_retirements (
  UNIQUE (kind, source_id),
  UNIQUE (bucket, object_key),
  -- Protected prefixes are refused at the database too.
- CHECK (object_key NOT LIKE 'joined/best14-20261021/%' AND object_key NOT LIKE 'staging/%'),
+ CHECK (object_key NOT LIKE 'joined/best14-20261021/%' AND object_key NOT LIKE 'staging/%' AND object_key NOT LIKE 'repaired/%'),
  CHECK ((kind = 'raw' AND object_key LIKE 'managed/%')
      OR (kind = 'collated' AND (object_key LIKE 'joined/goodplus-%' OR object_key LIKE 'joined/nightly-collation-v2/%')))
 );
