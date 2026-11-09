@@ -1001,6 +1001,33 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(sum(calls), 6); self.assertLess(len(calls), 6)
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
 
+    def test_replay_drops_md5_for_a_server_that_rejects_it(self):
+        pull.cleanup_journal(self.inventory, 200, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % 1, md5='b'*32))
+        pull.cleanup_journal(self.inventory, 201, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % 2))
+        sent = []
+        def api(cfg, path, body, retry_stale=False):
+            obs = body['observations']
+            sent.append([o.get('md5') for o in obs])
+            if any('md5' in o for o in obs):
+                raise pull.urllib.error.HTTPError(path, 400, 'unknown field md5', {}, None)
+            return dict(results=[dict(item_id=o['item_id'], status=200, action='conflict', delete=False) for o in obs])
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                pull.cleanup_replay_receipts(self.cfg, self.inventory, batch_api)
+            finally:
+                batch_api.close()
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertTrue(any(None in batch for batch in sent))
+
+    def test_health_ack_accepts_md5_etag_matched_recovery(self):
+        with pull.CleanupFile(self.cfg, self.item, threading.Event(), time.monotonic()+20) as f:
+            proof = f.proof()
+        decision = dict(delete=False, action='would_delete', item_id=1, attempt=1, plan_sha256='a'*64,
+                        proof_sha256=hashlib.sha256(json.dumps(proof).encode()).hexdigest())
+        for recovery, ok in (('r2_sha_verified', True), ('r2_md5_etag_matched', True), ('r2_etag_bound', False), ('unchecked', False)):
+            self.assertEqual(pull.cleanup_verified_ack(self.task, proof, dict(decision, recovery=recovery)), ok, recovery)
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)

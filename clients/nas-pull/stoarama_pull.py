@@ -2263,7 +2263,16 @@ def cleanup_replay_receipts(cfg, inventory, api=None):
     def replay(item_id, phase, body):
         try:
             if api is not None:
-                return api.observe(cfg, item_id, body) if phase == "observe" else api.result(cfg, item_id, body)
+                call = api.observe if phase == "observe" else api.result
+                # A server that predates recovery_md5 rejects a whole batch
+                # that contains the field (also failing entries batched with
+                # it): resend without md5 rather than halting the replay.
+                for attempt in range(3):
+                    try:
+                        return call(cfg, item_id, body if attempt == 0 else {k: v for k, v in body.items() if k != "md5"})
+                    except urllib.error.HTTPError as exc:
+                        if exc.code != 400 or attempt == 2:
+                            raise
             if phase == "result":
                 return cleanup_send_result(cfg, item_id, body)
             try:
@@ -2321,7 +2330,7 @@ def cleanup_verified_ack(task, proof, decision):
         and isinstance(decision, dict)
         and decision.get("delete") is False
         and decision.get("action") == "would_delete"
-        and decision.get("recovery") == "r2_sha_verified"
+        and decision.get("recovery") in ("r2_sha_verified", "r2_md5_etag_matched")
         and type(decision.get("item_id")) is int
         and decision["item_id"] == task["item_id"]
         and type(decision.get("attempt")) is int

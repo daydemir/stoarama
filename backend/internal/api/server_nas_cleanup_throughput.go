@@ -57,7 +57,10 @@ type cleanupObserveEnv struct {
 
 // cleanupRecoveryPermits: a permit needs a full streamed-SHA verification
 // (r2_sha_verified) or, during execution only, the conditional HEAD bound to
-// the generation a dry run SHA-verified (r2_etag_bound). Every other state
+// the exact generation the dry run proved (r2_etag_bound). The dry run proved
+// it either by a full download + SHA-256 (r2_sha_verified) or by a single-part
+// ETag equal to both the catalogued upload ETag and the NAS client's MD5
+// (r2_md5_etag_matched); enable accepts either. Every other state
 // (nas_only_at_check, unchecked, conflict, ...) never permits.
 func cleanupRecoveryPermits(mode, recovery string) bool {
 	return recovery == "r2_sha_verified" || (mode == "enabled" && recovery == "r2_etag_bound")
@@ -308,6 +311,7 @@ type cleanupPrefetchedRecovery struct {
 	objectKey string
 	evidence  []byte
 	md5       string
+	catalog   string
 	recovery  string
 	out       *cleanupRecoveryEvidence
 	method    string
@@ -334,11 +338,14 @@ func singlePartETag(etag string) bool {
 // client hashed the NAS file once, getting both its SHA-256 (which the
 // observation proof must equal to the catalog SHA) and its MD5. R2's ETag of
 // a single-part object is the MD5 of the stored bytes, so size + ETag ==
-// client MD5 binds the R2 copy to the same bytes. Anything else (multipart
-// ETag, no MD5, mismatch, sha256 metadata disagreeing) returns ok=false and
-// the caller falls back to the full download. 404 is NAS-only.
-func (s *Server) cleanupRecoveryMD5(ctx context.Context, i nasCleanupItem, md5 string) (string, *cleanupRecoveryEvidence, bool) {
-	if !singlePartETag(md5) {
+// client MD5 binds the R2 copy to the same bytes, and ETag == the ETag the
+// catalog recorded at upload ties it to the catalogued upload without
+// trusting the client. Anything else (no catalogued ETag, e.g. collated
+// outputs; multipart ETag; no MD5; any mismatch; sha256 metadata
+// disagreeing) returns ok=false and the caller falls back to the full
+// download. 404 is NAS-only.
+func (s *Server) cleanupRecoveryMD5(ctx context.Context, i nasCleanupItem, md5, catalogETag string) (string, *cleanupRecoveryEvidence, bool) {
+	if !singlePartETag(md5) || !singlePartETag(catalogETag) || catalogETag != md5 {
 		return "", nil, false
 	}
 	head, err := s.r2.Head(ctx, i.ObjectKey)
@@ -359,8 +366,8 @@ func (s *Server) cleanupRecoveryMD5(ctx context.Context, i nasCleanupItem, md5 s
 //     full download;
 //   - dry run: the MD5/ETag match when the client sent an MD5 (with a random
 //     ~1% full-SHA audit), else the full download + SHA-256.
-func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, mode string, evidence []byte, md5 string) cleanupPrefetchedRecovery {
-	result := cleanupPrefetchedRecovery{mode: mode, objectKey: i.ObjectKey, evidence: evidence, md5: md5}
+func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, mode string, evidence []byte, md5, catalogETag string) cleanupPrefetchedRecovery {
+	result := cleanupPrefetchedRecovery{mode: mode, objectKey: i.ObjectKey, evidence: evidence, md5: md5, catalog: catalogETag}
 	if s.r2 == nil {
 		result.recovery, result.method = "unchecked", "none"
 		return result
@@ -372,7 +379,7 @@ func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, m
 		}
 	}
 	if mode == "dry_run" && md5 != "" {
-		if recovery, ev, ok := s.cleanupRecoveryMD5(ctx, i, md5); ok {
+		if recovery, ev, ok := s.cleanupRecoveryMD5(ctx, i, md5, catalogETag); ok {
 			result.recovery, result.out, result.method = recovery, ev, "md5_etag"
 			if recovery == "r2_md5_etag_matched" && rand.Float64() < cleanupMD5AuditRate {
 				full, fullEv := s.cleanupRecoveryFull(ctx, i)
@@ -401,6 +408,11 @@ func (s *Server) cleanupRecoveryCompute(ctx context.Context, i nasCleanupItem, m
 // runs while observation locks are held: without a matching result the
 // caller answers 503 and the client resends.
 func (s *Server) cleanupRecoveryFor(id int64, i nasCleanupItem, mode string, evidence []byte, md5 string, env *cleanupObserveEnv) (cleanupPrefetchedRecovery, bool) {
+	if s.r2 == nil {
+		// No recovery store configured: the historical "unchecked" outcome
+		// (never a permit), not an endless retry.
+		return cleanupPrefetchedRecovery{mode: mode, recovery: "unchecked", method: "none"}, true
+	}
 	if env == nil {
 		return cleanupPrefetchedRecovery{}, false
 	}
@@ -554,7 +566,12 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
 	for id := range md5s {
 		ids = append(ids, id)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT i.id,coalesce(i.item,p.manifest->(i.ordinal-1)),p.mode,i.recovery_evidence FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND i.state='leased' AND p.mode IN ('dry_run','enabled')`, ids, cid)
+	// The catalogued upload ETag exists for raw clips only (recording_clips.etag);
+	// collated outputs have none and always take the full download.
+	rows, err := s.pool.Query(ctx, `SELECT i.id,m.item,p.mode,i.recovery_evidence,
+ CASE WHEN m.item->>'kind'='raw' THEN coalesce((SELECT lower(btrim(btrim(c.etag),'"')) FROM recording_clips c WHERE c.id=(m.item->>'source_id')::bigint),'') ELSE '' END
+ FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id CROSS JOIN LATERAL (SELECT coalesce(i.item,p.manifest->(i.ordinal-1)) item) m
+ WHERE i.id=ANY($1) AND p.connection_id=$2 AND i.state='leased' AND p.mode IN ('dry_run','enabled')`, ids, cid)
 	if err != nil {
 		log.Printf("nas cleanup recovery prefetch: %v", err)
 		return out
@@ -564,12 +581,13 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
 		item     nasCleanupItem
 		mode     string
 		evidence []byte
+		catalog  string
 	}
 	var jobs []job
 	for rows.Next() {
 		var j job
 		var raw []byte
-		if rows.Scan(&j.id, &raw, &j.mode, &j.evidence) != nil || json.Unmarshal(raw, &j.item) != nil {
+		if rows.Scan(&j.id, &raw, &j.mode, &j.evidence, &j.catalog) != nil || json.Unmarshal(raw, &j.item) != nil {
 			continue
 		}
 		jobs = append(jobs, j)
@@ -590,7 +608,7 @@ func (s *Server) cleanupPrefetchRecovery(ctx context.Context, cid int64, md5s ma
 				return
 			}
 			defer func() { <-slots }()
-			result := s.cleanupRecoveryCompute(budget, j.item, j.mode, j.evidence, md5s[j.id])
+			result := s.cleanupRecoveryCompute(budget, j.item, j.mode, j.evidence, md5s[j.id], j.catalog)
 			if budget.Err() != nil {
 				return // cut short: no verdict either way
 			}

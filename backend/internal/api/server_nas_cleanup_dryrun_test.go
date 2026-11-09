@@ -62,6 +62,44 @@ func TestNASCleanupDryRunMD5ETagRecovery(t *testing.T) {
 	if gets, _ := f.bucket.counts(); gets != 3 {
 		t.Fatalf("only the three fallbacks may download: %d", gets)
 	}
+	// The catalogued upload ETag must agree too: without one, or with a
+	// different one, a correct client MD5 is not enough.
+	g := newCleanupFixture(t, 24)
+	g.admit("md5-catalog", syntheticFiles(300, 3, 10))
+	gt := g.leaseV2(64, 0, 0, "")
+	gm := map[int64]string{}
+	for _, task := range gt {
+		gm[task.ItemID] = fixtureMD5(g, task.Item.ObjectKey)
+	}
+	if _, err := g.pool.Exec(g.ctx, `UPDATE recording_clips SET etag='' WHERE id=$1`, gt[1].Item.SourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.pool.Exec(g.ctx, `UPDATE recording_clips SET etag=repeat('1',32) WHERE id=$1`, gt[2].Item.SourceID); err != nil {
+		t.Fatal(err)
+	}
+	g.observeMD5(gt, nil, gm)
+	if recovery, _, _ := g.recoveryOf(gt[0].ItemID); recovery != "r2_md5_etag_matched" {
+		t.Fatalf("quoted catalog ETag not matched: %s", recovery)
+	}
+	for _, task := range gt[1:] {
+		if recovery, mode, _ := g.recoveryOf(task.ItemID); recovery != "r2_sha_verified" || mode != "full_sha" {
+			t.Fatalf("catalog ETag missing/different must fall back: %s %s", recovery, mode)
+		}
+	}
+	// Without a recovery store the outcome is "unchecked", not a 503 loop.
+	h := newCleanupFixture(t, 24)
+	h.admit("no-r2", syntheticFiles(400, 1, 10))
+	h.s.r2 = nil
+	ht := h.leaseV2(64, 0, 0, "")
+	tx, err := h.pool.Begin(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := h.s.cleanupObserveOne(h.ctx, tx, 13, ht[0].ItemID, cleanupObserve{Attempt: ht[0].Attempt, PlanSHA: ht[0].PlanSHA, Outcome: "match", Proof: fixtureProof(ht[0].Item)}, &cleanupObserveEnv{})
+	tx.Rollback(h.ctx)
+	if r.status != 200 || r.body["recovery"] != "unchecked" {
+		t.Fatalf("no recovery store: %d %v", r.status, r.body)
+	}
 	// MD5-matched items are enable-eligible and execute via the bound HEAD
 	// (the multipart-style item stays bound to the ETag it was verified at).
 	f.s.cfg.NASCleanupDeletionEnabled = true

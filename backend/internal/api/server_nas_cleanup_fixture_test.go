@@ -176,8 +176,9 @@ func (f *cleanupFixture) admit(label string, files []cleanupFixtureFile) (int64,
 		}
 		key := fmt.Sprintf("bench/%d.mp4", file.ClipID)
 		f.bucket.put(key, body)
-		if _, err := f.pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket) VALUES($1,2,$2,$3,$4,$5,$6,$7,'bucket')`,
-			file.ClipID, key, file.SHA256, file.SizeBytes, file.RelativePath, file.StartAt, file.EndAt); err != nil {
+		uploadETag := md5.Sum(body) // what the uploader recorded (single part)
+		if _, err := f.pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket,etag) VALUES($1,2,$2,$3,$4,$5,$6,$7,'bucket',$8)`,
+			file.ClipID, key, file.SHA256, file.SizeBytes, file.RelativePath, file.StartAt, file.EndAt, `"`+hex.EncodeToString(uploadETag[:])+`"`); err != nil {
 			t.Fatal(err)
 		}
 		item, err := cleanupCatalogItem(ctx, f.pool, "raw", file.ClipID, "bucket")
