@@ -117,14 +117,19 @@ func (p *nasCleanupPolicy) outside(stream int64, a, b time.Time) bool {
 // best 14-day sum wins and ties go to the earliest start. Returns the winning
 // local date (empty when the stream has no valid clips). A different winner than
 // the pinned best_start keeps the whole stream (fail closed).
-const cleanupCurrentRankingsSQL = `WITH r AS (
+// cleanupRankingsInputSQL selects exactly the rows the replay scores: every
+// valid clip interval of the stream with its canonical timezone and whether it
+// is collation-quarantined. The replay is a pure function of this multiset.
+const cleanupRankingsInputSQL = `WITH r AS (
  SELECT r.id,coalesce(nullif(s.local_timezone,''),r.cron_timezone) tz FROM recordings r JOIN streams s ON s.id=r.stream_id WHERE r.account_id=47 AND r.stream_id=$1
 ), excluded AS (
  SELECT DISTINCT (p.item->'clip'->>'clip_id')::bigint clip_id FROM recording_collation_hours h JOIN r ON r.id=h.recording_id CROSS JOIN LATERAL jsonb_array_elements(h.manifest->'clips') p(item) WHERE h.excluded_clip_count>0 AND p.item->>'disposition'='quarantined'
 ), c AS (
  SELECT c.clip_start_at a,c.clip_end_at b,r.tz,e.clip_id IS NULL clean FROM recording_clips c JOIN r ON r.id=c.recording_id LEFT JOIN excluded e ON e.clip_id=c.id
  WHERE c.clip_end_at>c.clip_start_at AND c.clip_start_at>='2020-01-01' AND c.clip_end_at<'2028-01-01'
-), pieces AS (
+)`
+
+const cleanupRankingsScoresSQL = `, pieces AS (
  SELECT d::date local_date,tstzrange(greatest(c.a,d AT TIME ZONE c.tz),least(c.b,(d+interval '1 day') AT TIME ZONE c.tz),'[)') span,clean FROM c CROSS JOIN LATERAL generate_series(date_trunc('day',a AT TIME ZONE tz),date_trunc('day',(b-interval '1 microsecond') AT TIME ZONE tz),interval '1 day') d
 ), unions AS (
  SELECT local_date,range_agg(span) FILTER(WHERE clean) clean_spans FROM pieces GROUP BY local_date
@@ -134,7 +139,22 @@ const cleanupCurrentRankingsSQL = `WITH r AS (
  SELECT d::date local_date FROM generate_series((SELECT min(local_date)-13 FROM daily)::timestamp,(SELECT max(local_date) FROM daily)::timestamp,interval '1 day') d
 ), scores AS (
  SELECT candidates.local_date,(SELECT coalesce(sum(seconds),0) FROM daily WHERE daily.local_date>=candidates.local_date AND daily.local_date<candidates.local_date+14) score FROM candidates
-) SELECT coalesce((SELECT local_date::text FROM scores ORDER BY score DESC,local_date LIMIT 1),'')`
+)`
+
+const cleanupRankingsWinnerExpr = `coalesce((SELECT local_date::text FROM scores ORDER BY score DESC,local_date LIMIT 1),'')`
+
+// cleanupRankingsFingerprintExpr is a collision-resistant digest of the
+// replay's complete input multiset (count, exact microsecond bounds, timezone
+// and quarantine flag of every scored or range-extending clip).
+const cleanupRankingsFingerprintExpr = `(SELECT count(*)::text||':'||encode(sha256(convert_to(coalesce(string_agg(extract(epoch FROM c.a)::text||','||extract(epoch FROM c.b)::text||','||coalesce(c.tz,'~null~')||','||c.clean::text,';' ORDER BY c.a,c.b,c.tz,c.clean),''),'UTF8')),'hex') FROM c)`
+
+const cleanupCurrentRankingsSQL = cleanupRankingsInputSQL + cleanupRankingsScoresSQL + ` SELECT ` + cleanupRankingsWinnerExpr
+
+// One statement, one snapshot: the winner and the fingerprint of exactly the
+// rows it was computed from.
+const cleanupRankingsWithFingerprintSQL = cleanupRankingsInputSQL + cleanupRankingsScoresSQL + ` SELECT ` + cleanupRankingsWinnerExpr + `,` + cleanupRankingsFingerprintExpr
+
+const cleanupRankingsFingerprintSQL = cleanupRankingsInputSQL + ` SELECT ` + cleanupRankingsFingerprintExpr
 
 func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
@@ -152,6 +172,21 @@ func (s *Server) cleanupCurrentPolicy(ctx context.Context, q interface {
 func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, i nasCleanupItem, dryRun bool, stages map[string]any) error {
+	return s.cleanupCurrentPolicyCheck(ctx, q, i, dryRun, stages, nil)
+}
+
+// cleanupRankingsUnchanged reports whether the live replay inputs of a stream
+// are byte-identical (by fingerprint) to the inputs of a full replay that
+// already yielded the pinned best_start for this plan's execution. Only then
+// may the per-file check skip the replay; any error or difference means "no".
+type cleanupRankingsUnchanged func(stream int64, pinnedBest string) bool
+
+// cleanupCurrentPolicyCheck is cleanupCurrentPolicyMode with an optional
+// execution fast path for the best-14 replay (see cleanupRankingsUnchanged).
+// Every other check runs per file exactly as before.
+func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, i nasCleanupItem, dryRun bool, stages map[string]any, unchanged cleanupRankingsUnchanged) error {
 	report, err := s.cleanupReport(ctx)
 	if err != nil || !report.permits(i) {
 		return errors.New("reviewed folder ownership unavailable")
@@ -171,7 +206,19 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 		return errors.New("current media bounds overlap KEEP")
 	}
 	rankingStarted := time.Now()
-	best, rankingsAt, err := s.cleanupRankings(ctx, q, i.StreamID, dryRun)
+	var best []byte
+	var rankingsAt time.Time
+	if !dryRun && unchanged != nil && unchanged(i.StreamID, window.BestStart) {
+		best, rankingsAt = []byte(window.BestStart), rankingStarted.UTC()
+		if stages != nil {
+			stages["rankings_mode"] = "fingerprint"
+		}
+	} else {
+		best, rankingsAt, err = s.cleanupRankings(ctx, q, i.StreamID, dryRun)
+		if stages != nil {
+			stages["rankings_mode"] = "replay"
+		}
+	}
 	if stages != nil {
 		stages["rankings_ms"] = time.Since(rankingStarted).Milliseconds()
 	}

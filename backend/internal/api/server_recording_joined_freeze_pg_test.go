@@ -60,6 +60,7 @@ var joinedMigrationNames = []string{
 	"0170_nas_cleanup_retired_plans.sql",
 	"0171_nas_cleanup_safeguards.sql",
 	"0172_nas_cleanup_safeguards_validate.sql",
+	"0173_nas_cleanup_throughput.sql",
 }
 
 func testJoinedServerBeforeMigration(t *testing.T) (*Server, *pgxpool.Pool, func(), func()) {

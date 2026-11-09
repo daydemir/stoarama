@@ -378,6 +378,10 @@ func isLowerHexSHA256(raw string) bool {
 	return err == nil && raw == strings.ToLower(raw)
 }
 
+// IsPreconditionFailed reports whether a conditional request (If-Match /
+// If-None-Match) was refused because the object generation differs.
+func IsPreconditionFailed(err error) bool { return isPreconditionFailed(err) }
+
 func isPreconditionFailed(err error) bool {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
