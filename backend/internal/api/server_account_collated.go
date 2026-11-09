@@ -78,7 +78,8 @@ type collatedItem struct {
 
 // collatedEligibleSQL selects outputs this connection still needs: newest
 // generation of each recording hour, nas_pull recordings of the connection's
-// account, R2-verified, not yet acknowledged by this connection. $1=connection.
+// account, R2-verified, not yet acknowledged by this connection, and not
+// retired from R2 (r2-retire). $1=connection.
 const collatedEligibleSQL = `
 	FROM recording_collation_outputs o
 	JOIN recording_collation_hours h ON h.id=o.collation_hour_id
@@ -94,7 +95,10 @@ const collatedEligibleSQL = `
 	    WHERE newer.recording_id=h.recording_id AND newer.local_date=h.local_date
 	      AND newer.delivery_hour=h.delivery_hour AND newer.generation>h.generation)
 	  AND NOT EXISTS (SELECT 1 FROM recording_collation_output_acks ack
-	    WHERE ack.output_id=o.id AND ack.connection_id=$1)`
+	    WHERE ack.output_id=o.id AND ack.connection_id=$1)
+	  -- Outputs retired from R2 by stoaramactl r2-retire are gone for good.
+	  AND NOT EXISTS (SELECT 1 FROM r2_object_retirements retired
+	    WHERE retired.kind='collated' AND retired.source_id=o.id)`
 
 // collatedNotBackedOffSQL withholds outputs whose last delivery failed until
 // their backoff expires.

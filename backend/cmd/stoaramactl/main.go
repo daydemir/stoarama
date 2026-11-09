@@ -129,6 +129,8 @@ func main() {
 		runNASSelectedVerify(ctx, cfg, os.Args[2:])
 	case "nas-verified-purge":
 		runNASVerifiedPurge(ctx, cfg, os.Args[2:])
+	case "r2-retire":
+		runR2Retire(ctx, cfg, os.Args[2:])
 	case "collation-v2":
 		runCollationV2(ctx, cfg, os.Args[2:])
 	default:
@@ -257,6 +259,8 @@ func usage() {
   stoaramactl nas-selected-verify request [--clip-ids IDS] [--collated-ids IDS] [--joined-ids IDS] --label L [--dry-run | --expected-plan-sha256 SHA] [--json]
 	  stoaramactl nas-selected-verify report --label L [--json]
 	  stoaramactl nas-verified-purge run [--apply --cron --grace 168h --head sample|all --exclude-clip-ids-file F --exclude-recording-ids L --after-clip-id N --until-clip-id N --limit N --rate 200 --log PATH --json]
+	  stoaramactl r2-retire plan --picks FILE --out DIR [--sample 200 --grace 168h --json]
+	  stoaramactl r2-retire apply --manifest FILE --expected-sha256 SHA --max-bytes N [--budget-24h-bytes N --ledger PATH --rate 10 --skip-ineligible --json]
 `)
 }
 
