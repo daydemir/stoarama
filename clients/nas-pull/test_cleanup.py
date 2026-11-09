@@ -961,6 +961,46 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(seen[0]['execution_files'], 2)
         self.assertEqual(seen[0]['execution_bytes'], pull.CLEANUP_MAX_BYTES_24H - 50)
 
+    def test_dry_run_sends_md5_from_the_same_read_only_when_advertised(self):
+        for advertised in (False, True):
+            with self.subTest(advertised=advertised):
+                seen = []
+                def api(cfg, path, body, retry_stale=False):
+                    if path.endswith('/lease'):
+                        if seen:
+                            return dict(tasks=[], retry_after_sec=120)
+                        seen.append('leased')
+                        task = dict(self.task, item_id=7 if advertised else 8)
+                        task.pop('approved_proof', None)
+                        reply = dict(tasks=[task], retry_after_sec=0)
+                        if advertised:
+                            reply['recovery_md5'] = True
+                        return reply
+                    o = body['observations'][0]
+                    seen.append(o.get('md5'))
+                    return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete', delete=False)])
+                self.run_v2(api)
+                expected = hashlib.md5(self.path.read_bytes()).hexdigest() if advertised else None
+                self.assertEqual(seen[1], expected)
+                self.assertTrue(self.path.exists())
+
+    def test_replay_runs_through_the_batch_api_in_parallel(self):
+        for n in range(6):
+            pull.cleanup_journal(self.inventory, 100+n, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % n))
+        lock = threading.Lock(); calls = []
+        def api(cfg, path, body, retry_stale=False):
+            self.assertTrue(path.endswith('/observe-batch'), path)
+            with lock: calls.append(len(body['observations']))
+            return dict(results=[dict(item_id=o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                pull.cleanup_replay_receipts(self.cfg, self.inventory, batch_api)
+            finally:
+                batch_api.close()
+        self.assertEqual(sum(calls), 6); self.assertLess(len(calls), 6)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)

@@ -1,0 +1,151 @@
+package api
+
+import (
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"strings"
+	"testing"
+	"time"
+)
+
+func fixtureMD5(f *cleanupFixture, key string) string {
+	f.bucket.mu.Lock()
+	defer f.bucket.mu.Unlock()
+	sum := md5.Sum(f.bucket.objects[key])
+	return hex.EncodeToString(sum[:])
+}
+
+func (f *cleanupFixture) recoveryOf(id int64) (string, string, string) {
+	f.t.Helper()
+	var recovery, mode, md5 string
+	if err := f.pool.QueryRow(f.ctx, `SELECT recovery,coalesce(stage_timings->>'recovery_mode',''),coalesce(recovery_evidence->>'md5','') FROM nas_cleanup_items WHERE id=$1`, id).Scan(&recovery, &mode, &md5); err != nil {
+		f.t.Fatal(err)
+	}
+	return recovery, mode, md5
+}
+
+// The NAS client's MD5 (from the same read as its SHA-256) matched against
+// R2's single-part ETag proves R2 bytes == NAS bytes without a download;
+// multipart ETags, mismatches or a missing MD5 fall back to the full SHA.
+func TestNASCleanupDryRunMD5ETagRecovery(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	p1, sha1, _ := f.admit("md5-1", syntheticFiles(100, 4, 10))
+	tasks := f.leaseV2(64, 0, 0, "")
+	if len(tasks) != 4 {
+		t.Fatalf("lease %d", len(tasks))
+	}
+	keys := map[int64]string{}
+	md5s := map[int64]string{}
+	for _, task := range tasks {
+		keys[task.ItemID] = task.Item.ObjectKey
+		md5s[task.ItemID] = fixtureMD5(f, task.Item.ObjectKey)
+	}
+	// Item 1: multipart-style ETag; item 2: client MD5 differs from the ETag;
+	// item 3: no MD5 sent. All three fall back to the full download.
+	f.bucket.etags = map[string]string{keys[tasks[1].ItemID]: md5s[tasks[1].ItemID][:30] + "-2"}
+	md5s[tasks[2].ItemID] = strings.Repeat("0", 32)
+	delete(md5s, tasks[3].ItemID)
+	for _, r := range f.observeMD5(tasks, nil, md5s) {
+		if r.Status != 200 || r.Action != "would_delete" {
+			t.Fatalf("dry run %+v", r)
+		}
+	}
+	if recovery, mode, md5 := f.recoveryOf(tasks[0].ItemID); recovery != "r2_md5_etag_matched" || mode != "md5_etag" || md5 != md5s[tasks[0].ItemID] {
+		t.Fatalf("matched MD5: %s %s %s", recovery, mode, md5)
+	}
+	for _, task := range tasks[1:] {
+		if recovery, mode, _ := f.recoveryOf(task.ItemID); recovery != "r2_sha_verified" || mode != "full_sha" {
+			t.Fatalf("fallback for %d: %s %s", task.ItemID, recovery, mode)
+		}
+	}
+	if gets, _ := f.bucket.counts(); gets != 3 {
+		t.Fatalf("only the three fallbacks may download: %d", gets)
+	}
+	// MD5-matched items are enable-eligible and execute via the bound HEAD
+	// (the multipart-style item stays bound to the ETag it was verified at).
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{p1}, []string{sha1}, 2); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	exec := f.leaseV2(64, 64, 1<<40, "")
+	for _, r := range f.observe(exec, map[int64]string{exec[0].ItemID: strings.Repeat("a", 32)}) {
+		if !r.Delete || r.Recovery != "r2_etag_bound" {
+			t.Fatalf("execution %+v", r)
+		}
+	}
+}
+
+// A random ~1% of MD5 matches are also fully downloaded; any disagreement is
+// a conflict that pauses the (dry-run) plan.
+func TestNASCleanupDryRunMD5AuditDisagreementPausesPlan(t *testing.T) {
+	old := cleanupMD5AuditRate
+	cleanupMD5AuditRate = 1
+	defer func() { cleanupMD5AuditRate = old }()
+	f := newCleanupFixture(t, 24)
+	p1, _, _ := f.admit("audit-1", syntheticFiles(100, 2, 10))
+	tasks := f.leaseV2(64, 0, 0, "")
+	md5s := map[int64]string{}
+	for _, task := range tasks {
+		md5s[task.ItemID] = fixtureMD5(f, task.Item.ObjectKey)
+	}
+	// Item 1's stored bytes no longer match, but the store still reports the
+	// original ETag (which equals the client's MD5).
+	f.bucket.etags = map[string]string{tasks[1].Item.ObjectKey: md5s[tasks[1].ItemID]}
+	f.bucket.put(tasks[1].Item.ObjectKey, []byte(strings.Repeat("x", int(tasks[1].Item.SizeBytes))))
+	results := f.observeMD5(tasks, nil, md5s)
+	if recovery, mode, _ := f.recoveryOf(tasks[0].ItemID); recovery != "r2_sha_verified" || mode != "md5_etag+full_sha_audit" {
+		t.Fatalf("audited match: %s %s", recovery, mode)
+	}
+	if results[1].Action != "conflict" || !results[1].Paused {
+		t.Fatalf("audit disagreement: %+v", results[1])
+	}
+	if m, reason := f.planMode(p1); m != "paused" || !strings.Contains(reason, "audit") {
+		t.Fatalf("dry-run plan not paused: %s %q", m, reason)
+	}
+}
+
+// R2 work runs before (never inside) the observation transaction, in
+// parallel, under a time budget; unfinished items are 503 with nothing saved.
+func TestNASCleanupDryRunRecoveryIsParallelBoundedAndOutsideLocks(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.admit("parallel-1", syntheticFiles(100, 16, 20))
+	f.bucket.getDelay = 300 * time.Millisecond
+	tasks := f.leaseV2(64, 0, 0, "")
+	started := time.Now()
+	for _, r := range f.observe(tasks, nil) {
+		if r.Status != 200 || r.Recovery != "r2_sha_verified" {
+			t.Fatalf("%+v", r)
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("16 downloads of 300 ms took %v: not parallel", elapsed)
+	}
+	// Without a prefetched result the observation does no R2 I/O at all.
+	g := newCleanupFixture(t, 24)
+	g.admit("parallel-2", syntheticFiles(200, 2, 20))
+	tasks = g.leaseV2(64, 0, 0, "")
+	tx, err := g.pool.Begin(g.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := g.s.cleanupObserveOne(g.ctx, tx, 13, tasks[0].ItemID, cleanupObserve{Attempt: tasks[0].Attempt, PlanSHA: tasks[0].PlanSHA, Outcome: "match", Proof: fixtureProof(tasks[0].Item)}, &cleanupObserveEnv{})
+	tx.Rollback(context.Background())
+	if gets, heads := g.bucket.counts(); r.status != 503 || gets != 0 || heads != 0 {
+		t.Fatalf("observation without prefetch: %d gets %d heads %d", r.status, gets, heads)
+	}
+	// Budget exhausted: 503 per item, item stays leased, nothing recorded.
+	old := nasCleanupRecoveryBudget
+	nasCleanupRecoveryBudget = 100 * time.Millisecond
+	defer func() { nasCleanupRecoveryBudget = old }()
+	g.bucket.getDelay = time.Second
+	for _, r := range g.observe(tasks, nil) {
+		if r.Status != 503 {
+			t.Fatalf("over-budget item %+v", r)
+		}
+	}
+	var leased int
+	if err := g.pool.QueryRow(g.ctx, `SELECT count(*) FROM nas_cleanup_items WHERE state='leased' AND outcome IS NULL`).Scan(&leased); err != nil || leased != 2 {
+		t.Fatalf("over-budget items changed: %d %v", leased, err)
+	}
+}
