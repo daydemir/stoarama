@@ -659,7 +659,9 @@ UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND 
 			break
 		}
 		task.Attempt++
-		task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute)
+		// Microsecond precision: exactly what PostgreSQL stores, so a replayed
+		// lease reports the identical expiry.
+		task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute).Truncate(time.Microsecond)
 		if mode == "enabled" {
 			task.ApprovedProof = approved
 		}
@@ -1007,7 +1009,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		b, _ := json.Marshal(recoveryEvidence)
 		evidenceJSON = string(b)
 	}
-	expires := time.Now().UTC().Add(30 * time.Second)
+	expires := time.Now().UTC().Add(30 * time.Second).Truncate(time.Microsecond)
 	observed, _ := json.Marshal(req)
 	stages, _ := json.Marshal(stageTimings)
 	// Dry runs replace the recovery evidence (or clear it when the copy was not
