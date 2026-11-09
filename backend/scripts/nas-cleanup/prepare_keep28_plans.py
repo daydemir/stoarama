@@ -259,10 +259,10 @@ def main():
         for label, items in plans:
             submit(a.api, label, items, receipts, rejected)
         summary.update(receipts=receipts, rejected_at_admission=rejected)
-        batches = batch_manifests(receipts, a.label_prefix, a.batch_by)
-        for b in batches:
+        batch_list = batch_manifests(receipts, a.label_prefix, a.batch_by)
+        for b in batch_list:
             (out / ('batch-%s.json' % b['name'])).write_text(json.dumps(b, indent=1))
-        summary['batches'] = [{'name': b['name'], 'plans': len(b['plans']), 'files': b['files'], 'bytes': b['bytes'], 'batch_sha256': b['batch_sha256']} for b in batches]
+        summary['batches'] = [{'name': b['name'], 'plans': len(b['plans']), 'files': b['files'], 'bytes': b['bytes'], 'batch_sha256': b['batch_sha256']} for b in batch_list]
     (out / 'summary.json').write_text(json.dumps(summary, indent=1))
     print(json.dumps({'phase': 'KEEP28_PLANS_SUBMITTED' if a.submit else 'KEEP28_PLANS_PREVIEW', 'candidate_files': summary['candidate_files'],
                       'candidate_bytes': summary['candidate_bytes'], 'plans': len(plans), 'admitted': len(receipts), 'rejected_items': len(rejected),
