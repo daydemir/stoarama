@@ -1057,6 +1057,25 @@ class CleanupProtocol2Tests(unittest.TestCase):
             finally:
                 release.set(); batcher.close()
 
+    def test_batcher_refuses_conflicting_duplicates(self):
+        sent = []
+        def api(cfg, path, body, retry_stale=False):
+            sent.append(body['observations'])
+            return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete') for o in body['observations']])
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            batcher = pull.CleanupBatcher(self.cfg, '/account/connections/cleanup/observe-batch', 'observations', senders=1, linger=0.2)
+            try:
+                a = batcher.submit(dict(item_id=5, attempt=1, request_id='a'*32))
+                b = batcher.submit(dict(item_id=5, attempt=1, request_id='b'*32))
+                c = batcher.submit(dict(item_id=5, attempt=1, request_id='a'*32))
+                self.assertEqual(a.result(2)['item_id'], 5); self.assertEqual(c.result(2)['item_id'], 5)
+                with self.assertRaises(pull.urllib.error.HTTPError) as caught:
+                    b.result(2)
+                self.assertEqual(caught.exception.code, 409)
+                self.assertEqual(sent, [[dict(item_id=5, attempt=1, request_id='a'*32)]])
+            finally:
+                batcher.close()
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)

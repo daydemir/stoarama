@@ -2644,11 +2644,22 @@ class CleanupBatcher:
         # One entry per item id per request: a duplicate (e.g. a replayed
         # journal entry beside a stale queued copy) shares the first one's
         # decision instead of being sent twice.
-        unique, seen = [], set()
-        for entry, _ in batch:
+        # Only byte-identical copies share a decision; a copy whose payload
+        # differs from the first is a conflict and is never sent.
+        unique, seen, conflicts = [], {}, []
+        for entry, future in batch:
+            encoded = cleanup_json_bytes(entry)
             if entry["item_id"] not in seen:
-                seen.add(entry["item_id"])
+                seen[entry["item_id"]] = encoded
                 unique.append(entry)
+            elif seen[entry["item_id"]] != encoded:
+                conflicts.append(future)
+        for future in conflicts:
+            try:
+                future.set_exception(urllib.error.HTTPError(self.path, 409, "conflicting duplicate cleanup payload for one item", {}, None))
+            except concurrent.futures.InvalidStateError:
+                pass
+        batch = [(e, f) for e, f in batch if f not in conflicts]
         try:
             response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: unique})
             results = response.get("results") if isinstance(response, dict) else None

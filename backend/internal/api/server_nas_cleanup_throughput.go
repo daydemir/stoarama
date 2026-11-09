@@ -479,14 +479,21 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	// A repeated item id (a client resending an entry that was still queued)
 	// is processed once; every occurrence gets that one decision. Rejecting
 	// the whole request instead wedged older clients' replays.
+	// Only byte-identical copies are collapsed; a copy whose payload differs
+	// from the first gets its own 409 and is never processed.
 	first := map[int64]int{}
+	payloads := make([][]byte, len(req.Observations))
+	conflicting := make([]bool, len(req.Observations))
 	for n, o := range req.Observations {
 		if o.ItemID <= 0 {
 			util.WriteError(w, 400, "positive item ids required")
 			return
 		}
-		if _, ok := first[o.ItemID]; !ok {
+		payloads[n], _ = json.Marshal(o)
+		if f, ok := first[o.ItemID]; !ok {
 			first[o.ItemID] = n
+		} else if string(payloads[f]) != string(payloads[n]) {
+			conflicting[n] = true
 		}
 	}
 	ctx := r.Context()
@@ -581,7 +588,9 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		return
 	}
 	for n, o := range req.Observations {
-		if f := first[o.ItemID]; f != n {
+		if conflicting[n] {
+			results[n] = map[string]any{"item_id": o.ItemID, "status": 409, "error": "conflicting duplicate observation for this item in one request"}
+		} else if f := first[o.ItemID]; f != n {
 			results[n] = results[f]
 		}
 	}
@@ -688,8 +697,26 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 	defer tx.Rollback(ctx)
 	results := make([]map[string]any, 0, len(req.Receipts))
 	advance := map[int64]bool{}
+	firstReceipt := map[int64][]byte{}
 	for _, receipt := range req.Receipts {
 		id := receipt.ItemID
+		payload, _ := json.Marshal(receipt)
+		if prior, ok := firstReceipt[id]; ok && string(prior) != string(payload) {
+			// Two different receipts for one deletion: never first-wins. The
+			// copy gets 409 and the item's enabled plan (and batch) is paused.
+			reason := "item " + strconv.FormatInt(id, 10) + " conflicting duplicate deletion receipts"
+			var pausedPlans int
+			if err := tx.QueryRow(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id=(SELECT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$3) RETURNING id),
+bz AS (UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz) RETURNING id)
+SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err != nil {
+				util.WriteError(w, 500, "cleanup receipt save failed")
+				return
+			}
+			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "conflicting duplicate receipt for this item in one request", "plan_paused": pausedPlans > 0})
+			continue
+		} else if !ok {
+			firstReceipt[id] = payload
+		}
 		updated, paused, planID, err := cleanupApplyReceipt(ctx, tx, cid, id, receipt)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup receipt save failed")
