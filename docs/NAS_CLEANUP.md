@@ -6,8 +6,8 @@ service control APIs. Account and NAS pull keys cannot create or enable plans.
 The NAS app polls the backend over its existing authenticated outbound channel.
 No SSH or new service is required. Preparing a plan never enables deletion.
 
-`stoaramactl nas-cleanup prepare --input plan.json` accepts a label and up to 500
-explicit `{kind,source_id}` pairs. Supported media kinds are raw and collated;
+`stoaramactl nas-cleanup prepare --input plan.json` accepts a label and up to 10,000
+explicit `{kind,source_id}` pairs (and at most 100 GB of media). Supported media kinds are raw and collated;
 unknown/legacy joined artifacts remain retained. The backend derives identities
 from account 47/connection 13 catalog rows, requires their exact observed paths and
 fingerprints in the complete audit, and checks the independently reviewed folder
@@ -29,14 +29,17 @@ are never promoted into cleanup proof.
 
 Report a plan with `stoaramactl nas-cleanup report --plan-id ID`. Results separately
 show full R2 SHA verification, proven 404 absence, unchecked/failed recovery,
-physical conflicts and policy holds. HEAD equality alone is not recovery proof.
+physical conflicts and policy holds. HEAD equality alone is not recovery proof:
+every dry run streams the exact ETag generation and hashes it; execution may
+then rely on a conditional HEAD bound to that verified generation (below).
 
 Two independent gates remain OFF during preparation:
 
 1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
 2. A plan defaults `dry_run`. Explicit `nas-cleanup enable` requires its exact
    `--expected-plan-sha256`, `--reason`, a complete matching dry run less than 24 hours
-   old, and full R2 recovery for every item. Approval expires after 1 hour.
+   old, and full R2 recovery for every item. Approval expires after 1 hour
+   (`--approval-hours` 1..24), or approve a whole batch of plans at once (below).
 
 ### Belt-and-braces safeguards (safety council, 2026-11)
 
@@ -122,7 +125,8 @@ names, not unrelated sibling metadata. Full target/sidecar hashes, inode/stat/
 hardlink checks, directory-FD confinement and final permit deadlines still apply.
 Client namespace/hash/proof durations and backend policy/recovery durations are
 reported separately. Dry-run ranking snapshots may be reused for at most five
-minutes; enabled observations always query live rankings. Cached preflight evidence
+minutes; enabled observations query live rankings or, after activation, the
+live fingerprint of the replay's inputs (full replay on any difference). Cached preflight evidence
 never authorizes a deletion. Both deletion gates remain OFF by default.
 
 The November2 policy refresh covers all109 NAS streams in one read-only repeatable-read snapshot. All221 previous UTC intervals and all31 whole-stream holds remain; two newer intervals are added. Unassigned catalog records remain retained. Source snapshot and policy gzip fixtures are pinned by their full SHA256 values and monotonic-protection tests.
@@ -136,12 +140,86 @@ A missing, corrupt or mismatched index fails closed. This index grants no
 deletion authority; both gates and fresh live checks remain unchanged.
 The metadata-only producer is backend/scripts/nas-cleanup/build_frozen_index.py.
 
+### Throughput (protocol 2, batch approval; 2026-11)
+
+The pilot (plan 1388) ran at ~156 files/hour: per file a full best-14 replay
+(~0.8-4 s), a full R2 re-download + SHA (~0.6 s), three serial round trips and,
+dominating, ~60 s client back-off after each transient API error. None of the
+gates above changed; the work each gate costs and the approval granularity did.
+
+- **Plans** hold up to 10,000 items (still at most 100 GB). Each item row keeps
+  a write-once copy of its manifest entry and size (derived in SQL from the
+  stored manifest at admission), so leases, observations and the 24 h budget no
+  longer detoast a multi-MB manifest per item.
+- **Best-14 replay once per plan.** Enabling a plan runs the full live replay
+  per stream and stores the winner together with a SHA-256 fingerprint of the
+  replay's exact input rows (every valid clip interval, timezone and
+  quarantine flag of the stream), computed in the same statement. Each
+  execution observation recomputes only the fingerprint (once per batched
+  request); equal fingerprint means the replay would return the same pinned
+  winner. Any difference runs the full replay as before (a different winner
+  keeps the file and auto-pauses).
+- **R2 recovery without re-download.** Every dry run byte-verifies the copy
+  (now via `If-Match` on the HEAD's ETag) and records `{object_key, etag,
+  version_id, size, sha256}`. Execution issues a conditional HEAD (`If-Match`
+  that ETag and the version id) and requires the same size/ETag/version and any
+  stored `sha256` metadata to equal the catalog SHA. ETags are content
+  derived, so a replaced object fails; 404 is NAS-only (no permit), 412 or any
+  difference is a conflict and other errors are unchecked: all auto-pause.
+  Missing evidence (plans dry-run by older servers) falls back to the full
+  re-download.
+- **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
+  up to 64 tasks per lease, observations and receipts batched up to 64 per
+  request. Execution work is leased only within the client's remaining local
+  24 h caps (sent with the lease) and the server's remaining 24 h budget
+  (issued + already leased); a lease never mixes dry-run and execution tasks.
+  Every request is retry-safe: a lease `request_id` returns the same leased
+  tasks; an observation `request_id` returns the recorded decision, or for an
+  identical request the one permit already issued with its original expiry
+  (never a new or extended permit); receipts are idempotent. The client retries
+  502/503/504/429/timeouts with short back-off instead of pausing a minute.
+- **Concurrent execution.** Sixteen NAS workers each open, re-hash, re-check
+  (pins, keep window, caps) and unlink their own file under their own permit
+  and ledger lines. The app writer fence admits several cleanup holders but
+  never beside a writer (waiting writers block new cleanups). Parent-folder
+  namespace checks account exactly for names this process unlinked meanwhile;
+  any other change still refuses. Local caps reserve under the inventory lock.
+- **Batch approval.** `prepare_keep28_plans.py --submit` writes
+  `batch-<prefix>-s<stream>.json` (ordered plan ids/digests and
+  `batch_sha256 = sha256("stoarama-nas-cleanup-batch-v1\npolicy <sha>\n" +
+  "plan <id> <sha>\n"...)`). After the dry runs complete, the owner approves it
+  once: `stoaramactl nas-cleanup enable-batch --batch-input FILE
+  --expected-batch-sha256 SHA --reason TEXT --approval-hours 1..24`. The backend
+  requires the master switch, the exact digest over the plans' current digests
+  and policy, no other enabled plan or batch, and that every plan is a
+  policy-current dry-run plan with no issued deletion that passes the per-plan
+  gates now. It enables only the first plan. When a plan finishes cleanly
+  (every item `deleted`) it is closed (`paused`, reason `batch-completed`, holds
+  kept) and the next plan is enabled only after passing every per-plan gate
+  again (fresh <=24 h dry run, verified R2 copies, <=100 GB, one enabled plan,
+  master switch, approval not expiring within a minute). Any anomaly that
+  pauses a plan also pauses its batch; a batch never re-enables a plan that
+  stopped, and a paused batch cannot be re-enabled (approve the remainder as a
+  new batch). `pause-batch --batch-id ID --expected-batch-sha256 SHA --reason`
+  stops it; `batch-report --batch-id ID` shows per-plan states.
+- The 3 TB / 24 h server budget and the client's 50,000 files / 3 TB per 24 h
+  caps are unchanged code constants. At ~17 MB per raw clip the client's
+  50,000-file cap, not the pipeline, bounds daily volume (about 42 minutes at
+  20 files/s); raising it is a separate reviewed change.
+
+Rollout: apply migration 0173 (additive; NOT VALID checks; one small partial
+index), deploy the API while no item is `leased`, then stage/promote the NAS
+client. Old clients keep using protocol 1 unchanged against the new API; a new
+client detects an old API (HTTP 400 on protocol 2) and stays on protocol 1 for
+an hour before probing again.
+
 Preflight is bounded to eight concurrent read-only tasks, with rolling refills
 and at most64 leases per drain/replay cycle. Batch requests lease only free slots,
 up to eight; legacy requests default to one task. One coordinator owns
 receipt replay and drains every worker, including after a lease/worker failure,
-before replay, replacement or serial execution. Approved destructive tasks are
-never dispatched concurrently. Independent observations share a plan read lock;
+before replay, replacement or serial execution. Under protocol 1 approved
+destructive tasks are never dispatched concurrently; protocol 2 runs them on
+the bounded worker pool as described above. Independent observations share a plan read lock;
 operator control still needs the exclusive parent lock. Public-registry evidence
 may be cached for one minute only in dry runs; enabled grants always check live.
 

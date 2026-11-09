@@ -203,7 +203,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_permit_deadline_checked_after_slow_final_directory_walk(self):
         with self.opened() as f:self.task['approved_proof']=f.proof()
-        original_clock=time.monotonic;original_members=pull.CleanupFile.parent_members
+        original_clock=time.monotonic;original_members=pull.CleanupFile.list_parent
         offset=[0];permit_seen=[False]
         def members(current):
             result=original_members(current)
@@ -217,7 +217,7 @@ class CleanupTests(unittest.TestCase):
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
-        with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original_clock()+offset[0]),mock.patch.object(pull.CleanupFile,'parent_members',members):
+        with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original_clock()+offset[0]),mock.patch.object(pull.CleanupFile,'list_parent',members):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
 
@@ -781,6 +781,199 @@ class CleanupGuardTests(unittest.TestCase):
         self.assertTrue(receipts[1]['error'].startswith('media_deleted_sidecar_failed: '))
         self.assertEqual(self.ledger()[-1]['outcome'], 'media_deleted_sidecar_failed')
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+
+
+class CleanupProtocol2Tests(unittest.TestCase):
+    """Concurrent execution with batched round trips (protocol 2)."""
+    setUp = CleanupTests.setUp
+    fixture_pins = CleanupTests.fixture_pins
+
+    def make_file(self, n, folder='day'):
+        path = self.cfg.output_dir/'stream'/folder/('c%d.mp4' % n)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'media %d' % n)
+        item = dict(self.item, source_id=100+n, relative_path='stream/%s/c%d.mp4' % (folder, n), size_bytes=path.stat().st_size,
+                    sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+        binding = dict(clip_id=item['source_id'], recording_id=22, relative_path=item['relative_path'], size_bytes=item['size_bytes'],
+                       sha256=item['sha256'], clip_start_at=item['start_at'], clip_end_at=item['end_at'])
+        sidecar = Path(str(path)+'.stoarama.json')
+        sidecar.write_text(json.dumps(dict(schema_version=1, **binding)))
+        item['frozen_identity'] = pull.cleanup_identity(path.stat())
+        item['frozen_sidecar_identity'] = pull.cleanup_identity(sidecar.stat())
+        return path, sidecar, item
+
+    def execution_tasks(self, count, folder='day'):
+        tasks, paths = [], []
+        for n in range(count):
+            path, sidecar, item = self.make_file(n, folder)
+            with pull.CleanupFile(self.cfg, item, threading.Event(), time.monotonic()+20) as f:
+                proof = f.proof()
+            tasks.append(dict(item_id=1000+n, attempt=1, plan_sha256='a'*64, item=item, approved_proof=proof,
+                              expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(minutes=30)).isoformat()))
+            paths.append((path, sidecar))
+        return tasks, paths
+
+    def fake_server(self, tasks, fail_first=()):
+        lock = threading.Lock()
+        state = dict(leased=False, calls=[], observe_batches=0, active=0, peak=0, failures=list(fail_first), bodies={})
+        def api(cfg, path, body, retry_stale=False):
+            with lock:
+                state['calls'].append(path)
+                if state['failures'] and path.endswith(state['failures'][0]):
+                    state['failures'].pop(0)
+                    state['bodies'].setdefault(path, []).append(json.dumps(body, sort_keys=True))
+                    raise pull.urllib.error.HTTPError(path, 502, 'bad gateway', {}, None)
+                state['bodies'].setdefault(path, []).append(json.dumps(body, sort_keys=True))
+            if path.endswith('/lease'):
+                self.assertEqual(body['protocol'], 2)
+                with lock:
+                    if state['leased']:
+                        return dict(tasks=[], retry_after_sec=120)
+                    state['leased'] = True
+                return dict(tasks=tasks, retry_after_sec=0)
+            if path.endswith('/observe-batch'):
+                with lock:
+                    state['observe_batches'] += 1
+                results = []
+                for o in body['observations']:
+                    self.assertEqual(len(o['request_id']), 32)
+                    results.append(dict(item_id=o['item_id'], status=200, action='delete_issued', delete=True, attempt=o['attempt'], plan_sha256='a'*64,
+                                        proof_sha256=hashlib.sha256(json.dumps(o['proof']).encode()).hexdigest(),
+                                        expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat()))
+                return dict(results=results)
+            if path.endswith('/result-batch'):
+                for r in body['receipts']:
+                    self.assertEqual(r['outcome'], 'deleted', r)
+                return dict(results=[dict(item_id=r['item_id'], status=200, ok=True) for r in body['receipts']])
+            raise AssertionError('unexpected call %s' % path)
+        return api, state
+
+    def run_v2(self, api):
+        stop = threading.Event()
+        with pull.concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor, mock.patch.object(pull, 'restore_api', side_effect=api):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                while pull.cleanup_batch_v2(self.cfg, self.inventory, stop, executor, batch_api) == 0:
+                    pass
+            finally:
+                batch_api.close()
+
+    def ledger(self):
+        path = self.cfg.state_dir/pull.CLEANUP_LEDGER_NAME
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_concurrent_execution_in_one_folder_deletes_exact_files_with_batched_calls(self):
+        tasks, paths = self.execution_tasks(24)
+        keep = self.path.parent/'retained.txt'; keep.write_text('keep')
+        original = pull.CleanupFile.proof
+        active = dict(now=0, peak=0); lock = threading.Lock()
+        def proof(current):
+            with lock:
+                active['now'] += 1; active['peak'] = max(active['peak'], active['now'])
+            try:
+                time.sleep(0.01)
+                return original(current)
+            finally:
+                with lock: active['now'] -= 1
+        api, state = self.fake_server(tasks)
+        with mock.patch.object(pull.CleanupFile, 'proof', proof):
+            self.run_v2(api)
+        for path, sidecar in paths:
+            self.assertFalse(path.exists()); self.assertFalse(sidecar.exists())
+        self.assertTrue(keep.exists()); self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+        self.assertGreater(active['peak'], 1, 'execution was serial')
+        self.assertLess(state['observe_batches'], 24, 'observations were not batched')
+        ledger = self.ledger()
+        self.assertEqual(sorted(e['item_id'] for e in ledger if e['event'] == 'intent'), [t['item_id'] for t in tasks])
+        self.assertEqual(sum(1 for e in ledger if e['event'] == 'result' and e['outcome'] == 'deleted'), 24)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        rows = self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0]
+        self.assertEqual(rows, 24)
+
+    def test_foreign_change_in_a_shared_folder_still_refuses(self):
+        tasks, paths = self.execution_tasks(2)
+        with pull.CleanupFile(self.cfg, tasks[0]['item'], threading.Event(), time.monotonic()+20) as a, \
+                pull.CleanupFile(self.cfg, tasks[1]['item'], threading.Event(), time.monotonic()+20) as b:
+            pa, pb = a.proof(), b.proof()
+            a.delete_exact(pa)  # an own, exact, permitted unlink is accounted for
+            (self.path.parent/'foreign.mp4').write_bytes(b'new')
+            with self.assertRaises(RuntimeError):
+                b.delete_exact(pb)
+        self.assertFalse(paths[0][0].exists()); self.assertTrue(paths[1][0].exists()); self.assertTrue(paths[1][1].exists())
+
+    def test_own_unlink_between_proof_and_delete_is_not_a_foreign_change(self):
+        tasks, paths = self.execution_tasks(3)
+        files = [pull.CleanupFile(self.cfg, t['item'], threading.Event(), time.monotonic()+20) for t in tasks]
+        try:
+            opened = [f.__enter__() for f in files]
+            proofs = [f.proof() for f in opened]
+            for f, p in zip(reversed(opened), reversed(proofs)):
+                f.delete_exact(p)
+        finally:
+            for f in files:
+                f.__exit__(None, None, None)
+        self.assertTrue(all(not p.exists() and not s.exists() for p, s in paths))
+        self.assertEqual(pull.CLEANUP_DIRECTORIES.dirs, {})
+
+    def test_transient_502_retries_same_requests_and_never_double_deletes(self):
+        tasks, paths = self.execution_tasks(4)
+        api, state = self.fake_server(tasks, fail_first=('/lease', '/observe-batch', '/result-batch'))
+        with mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', (0.01, 0.01, 0.01)):
+            self.run_v2(api)
+        self.assertTrue(all(not p.exists() for p, _ in paths))
+        for path in ('/account/connections/cleanup/lease', '/account/connections/cleanup/observe-batch'):
+            bodies = state['bodies'][path]
+            self.assertEqual(bodies[0], bodies[1], 'retry changed the request (request ids must be reused)')
+        self.assertEqual(sum(1 for e in self.ledger() if e['event'] == 'intent'), 4)
+
+    def test_server_without_protocol_2_falls_back(self):
+        def api(cfg, path, body, retry_stale=False):
+            raise pull.urllib.error.HTTPError(path, 400, 'cleanup protocol1, client version and bounded limit required', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            with self.assertRaises(pull.CleanupProtocolUnsupported):
+                pull.cleanup_lease_v2(self.cfg, 8, 8, 1 << 30)
+
+    def test_lease_beyond_local_caps_is_refused_before_any_work(self):
+        tasks, paths = self.execution_tasks(3)
+        with mock.patch.object(pull, 'restore_api', return_value=dict(tasks=tasks)):
+            with self.assertRaises(RuntimeError):
+                pull.cleanup_lease_v2(self.cfg, 8, 2, 1 << 30)
+            with self.assertRaises(RuntimeError):
+                pull.cleanup_lease_v2(self.cfg, 8, 8, sum(t['item']['size_bytes'] for t in tasks) - 1)
+            mixed = [tasks[0], dict(self.task, item_id=7)]
+            with mock.patch.object(pull, 'restore_api', return_value=dict(tasks=mixed)):
+                with self.assertRaises(RuntimeError):
+                    pull.cleanup_lease_v2(self.cfg, 8, 8, 1 << 30)
+        self.assertTrue(all(p.exists() for p, _ in paths))
+        # The coordinator asks only for the remaining local headroom.
+        self.inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_local_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id INTEGER NOT NULL,plan_sha256 TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,at_epoch REAL NOT NULL)")
+        self.inventory.db.executemany("INSERT INTO cleanup_local_deletions(item_id,plan_sha256,relative_path,size_bytes,at_epoch) VALUES(?,?,?,?,?)",
+                                      [(n, 'a'*64, 'x', 10, time.time()) for n in range(5)])
+        self.inventory.db.commit()
+        seen = []
+        def api(cfg, path, body, retry_stale=False):
+            seen.append(body); return dict(tasks=[], retry_after_sec=120)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 7):
+            self.run_v2(api)
+        self.assertEqual(seen[0]['execution_files'], 2)
+        self.assertEqual(seen[0]['execution_bytes'], pull.CLEANUP_MAX_BYTES_24H - 50)
+
+    def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
+        fence = pull.NASMediaFence()
+        fence.acquire_cleanup(threading.Event(), time.monotonic()+1)
+        fence.acquire_cleanup(threading.Event(), time.monotonic()+1)
+        entered = threading.Event()
+        @fence.delivery
+        def writer():
+            entered.set()
+        thread = threading.Thread(target=writer); thread.start()
+        self.assertFalse(entered.wait(0.2), 'writer ran beside a cleanup deletion')
+        # A waiting writer blocks new cleanup holders (no starvation).
+        with self.assertRaises(pull.CleanupInterrupted):
+            fence.acquire_cleanup(threading.Event(), time.monotonic()+0.1)
+        fence.release_cleanup(); fence.release_cleanup()
+        self.assertTrue(entered.wait(2)); thread.join(1)
 
 
 if __name__=='__main__':unittest.main()

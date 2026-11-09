@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// Shared with cmd/stoaramactl and prepare_keep28_plans.py.
+func TestNASCleanupBatchDigestVector(t *testing.T) {
+	got := cleanupBatchDigest("060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811", []int64{1388, 1389}, []string{"a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc", strings.Repeat("b", 64)})
+	if got != "f2e8d37dca0fcb75e902fc2a1e4271022dc8cc23b5f6f1d4cbca53b9be8e3328" {
+		t.Fatalf("batch digest changed: %s", got)
+	}
+}
+
 // The fingerprint must change whenever any input of the best-14 replay
 // changes, and only then.
 func TestNASCleanupRankingsFingerprintCoversReplayInputs(t *testing.T) {

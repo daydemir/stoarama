@@ -1516,17 +1516,32 @@ class CleanupInterrupted(RuntimeError):
 
 
 class NASMediaFence:
-    """Allow concurrent delivery, then fence app writers for a deletion only."""
+    """Allow concurrent delivery, then fence app writers for deletions only.
+
+    App writers and cleanup deletions exclude each other. Several cleanup
+    workers may hold the fence together: each deletes only its own exact,
+    separately permitted file, and same-folder namespace changes made by them
+    are accounted for exactly (see CleanupDirectoryLog). A waiting writer
+    blocks new cleanup holders so delivery is never starved."""
     def __init__(self):
         self.condition = threading.Condition()
         self.writers = 0
-        self.exclusive = False
+        self.writers_waiting = 0
+        self.cleaners = 0
+
+    @property
+    def exclusive(self):
+        return self.cleaners > 0
 
     def delivery(self, fn):
         def wrapped(*args, **kwargs):
             with self.condition:
-                while self.exclusive:
-                    self.condition.wait(1)
+                self.writers_waiting += 1
+                try:
+                    while self.cleaners:
+                        self.condition.wait(1)
+                finally:
+                    self.writers_waiting -= 1
                 self.writers += 1
             try:
                 return fn(*args, **kwargs)
@@ -1538,19 +1553,57 @@ class NASMediaFence:
 
     def acquire_cleanup(self, stop_event, deadline):
         with self.condition:
-            while self.exclusive or self.writers:
+            while self.writers or self.writers_waiting:
                 if stop_event.is_set() or time.monotonic() >= deadline:
                     raise CleanupInterrupted("cleanup writer fence timed out or cancelled")
                 self.condition.wait(0.2)
-            self.exclusive = True
+            self.cleaners += 1
 
     def release_cleanup(self):
         with self.condition:
-            self.exclusive = False
+            self.cleaners -= 1
             self.condition.notify_all()
 
 
 NAS_MEDIA_FENCE = NASMediaFence()
+
+
+class CleanupDirectoryLog:
+    """Per-directory record of the names this process itself unlinked.
+
+    A cleanup file proves its parent's exact namespace and must find it
+    unchanged right before its own unlink. With several workers in one folder,
+    the only acceptable difference is exactly the set of names other workers
+    of this process unlinked meanwhile, each under its own permit and ledger
+    line. Listings and unlinks in one directory are serialized by its lock, so
+    every listing is consistent with the log. Any other change (a new, changed
+    or foreign-removed name) still fails closed."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.dirs = {}
+
+    def enter(self, key):
+        with self.lock:
+            state = self.dirs.get(key)
+            if state is None:
+                state = self.dirs[key] = {"lock": threading.Lock(), "seq": 0, "removed": [], "users": 0}
+            state["users"] += 1
+            return state
+
+    def leave(self, key):
+        with self.lock:
+            state = self.dirs.get(key)
+            if state is not None:
+                state["users"] -= 1
+                if state["users"] <= 0:
+                    del self.dirs[key]
+
+
+CLEANUP_DIRECTORIES = CleanupDirectoryLog()
+
+
+def cleanup_namespace_sha256(names):
+    return hashlib.sha256(cleanup_json_bytes({"namespace_version": 2, "names": sorted(names)})).hexdigest()
 
 
 def cleanup_identity(info):
@@ -1585,6 +1638,10 @@ class CleanupFile:
         self.stage_timings = {}
         self.media_unlinked = False
         self.sidecar_unlinked = False
+        self.directory_key = None
+        self.directory = None
+        self.proof_names = None
+        self.proof_seq = None
 
     def check_active(self):
         if self.stop_event.is_set() or time.monotonic() >= self.deadline:
@@ -1611,6 +1668,9 @@ class CleanupFile:
                     raise RuntimeError("cleanup nested filesystem excluded")
                 self.ancestors.append([info.st_dev, info.st_ino])
             self.name = raw.split("/")[-1]
+            parent = os.fstat(self.fds[-1])
+            self.directory_key = (parent.st_dev, parent.st_ino)
+            self.directory = CLEANUP_DIRECTORIES.enter(self.directory_key)
             self.open_file(self.name, self.item["frozen_identity"])
             if self.item["sidecar_required"]:
                 self.open_file(self.name + ".stoarama.json", self.item["frozen_sidecar_identity"])
@@ -1627,7 +1687,7 @@ class CleanupFile:
                 or cleanup_identity(info) != frozen):
             raise RuntimeError("cleanup file differs from exact audited identity")
 
-    def parent_members(self):
+    def list_parent(self):
         started = time.monotonic()
         before = os.fstat(self.fds[-1])
         entries = []
@@ -1640,7 +1700,29 @@ class CleanupFile:
         if cleanup_identity(before) != cleanup_identity(after):
             raise RuntimeError("cleanup directory changed during enumeration")
         self.stage_timings["namespace_ms"] = self.stage_timings.get("namespace_ms", 0) + (time.monotonic() - started) * 1000
-        return hashlib.sha256(cleanup_json_bytes({"namespace_version": 2, "names": sorted(entries)})).hexdigest()
+        return entries
+
+    def parent_snapshot(self):
+        """(names, seq): a listing consistent with this process's unlink log."""
+        if self.directory is None:
+            return self.list_parent(), 0
+        with self.directory["lock"]:
+            return self.list_parent(), self.directory["seq"]
+
+    def own_unlinks_since(self, seq):
+        if self.directory is None:
+            return set()
+        # removed[k] carries seq k+1 (seq only grows, by one per unlink).
+        return {name for _, name in self.directory["removed"][seq:]}
+
+    def namespace_unchanged(self, names, seq, current):
+        """True when current differs from names only by this process's own
+        exact unlinks after seq (the caller holds the directory lock or
+        passes a listing taken under it)."""
+        return set(current) == set(names) - self.own_unlinks_since(seq) and len(current) == len(set(current))
+
+    def parent_members(self):
+        return cleanup_namespace_sha256(self.parent_snapshot()[0])
 
     def check_paths(self, skip_media=False):
         self.check_active()
@@ -1662,7 +1744,8 @@ class CleanupFile:
 
     def proof(self):
         started = time.monotonic()
-        before_members = self.parent_members()
+        before_names, before_seq = self.parent_snapshot()
+        before_members = cleanup_namespace_sha256(before_names)
         hash_started = time.monotonic()
         hashes = []
         sidecar_bytes = b""
@@ -1682,8 +1765,10 @@ class CleanupFile:
             hashes.append(digest.hexdigest())
         self.stage_timings["hash_ms"] = (time.monotonic() - hash_started) * 1000
         self.check_paths()
-        if hashes[0] != self.item["sha256"] or self.parent_members() != before_members:
+        after_names, _ = self.parent_snapshot()
+        if hashes[0] != self.item["sha256"] or not self.namespace_unchanged(before_names, before_seq, after_names):
             raise RuntimeError("cleanup content or directory changed")
+        self.proof_names, self.proof_seq = before_names, before_seq
         proof = {"root": self.root_identity, "ancestors": self.ancestors, "identity": self.item["frozen_identity"],
                  "sha256": hashes[0], "parent_members_sha256": before_members}
         if self.item["sidecar_required"]:
@@ -1702,21 +1787,39 @@ class CleanupFile:
         self.stage_timings["proof_ms"] = (time.monotonic() - started) * 1000
         return proof
 
+    def record_unlink(self, name):
+        if self.directory is not None:
+            self.directory["seq"] += 1
+            self.directory["removed"].append((self.directory["seq"], os.fsencode(name).hex()))
+
     def delete_exact(self, proof):
         # Only reached after a short-lived, exact backend permit and app writer
         # fence. Directories and every unlisted entry are left intact.
         self.check_paths()
-        if self.parent_members() != proof["parent_members_sha256"]:
-            raise RuntimeError("cleanup folder membership changed before unlink")
-        self.check_paths()
-        self.check_active()
-        os.unlink(self.name, dir_fd=self.fds[-1])
-        self.media_unlinked = True
-        if self.item["sidecar_required"]:
-            self.check_paths(skip_media=True)
+        exact = (self.proof_names is not None and self.directory is not None
+                 and cleanup_namespace_sha256(self.proof_names) == proof["parent_members_sha256"])
+        lock = self.directory["lock"] if self.directory is not None else threading.Lock()
+        # The final listing, checks and unlinks are one step for this folder:
+        # no other worker of this process can list or unlink in between.
+        with lock:
+            current = self.list_parent()
+            if exact:
+                unchanged = self.namespace_unchanged(self.proof_names, self.proof_seq, current)
+            else:
+                unchanged = cleanup_namespace_sha256(current) == proof["parent_members_sha256"]
+            if not unchanged:
+                raise RuntimeError("cleanup folder membership changed before unlink")
+            self.check_paths()
             self.check_active()
-            os.unlink(self.files[1][0], dir_fd=self.fds[-1])
-            self.sidecar_unlinked = True
+            os.unlink(self.name, dir_fd=self.fds[-1])
+            self.media_unlinked = True
+            self.record_unlink(self.name)
+            if self.item["sidecar_required"]:
+                self.check_paths(skip_media=True)
+                self.check_active()
+                os.unlink(self.files[1][0], dir_fd=self.fds[-1])
+                self.sidecar_unlinked = True
+                self.record_unlink(self.files[1][0])
         os.fsync(self.fds[-1])
 
     def __exit__(self, *_args):
@@ -1725,6 +1828,9 @@ class CleanupFile:
         for fd in reversed(self.fds):
             os.close(fd)
         self.files, self.fds = [], []
+        if self.directory_key is not None:
+            CLEANUP_DIRECTORIES.leave(self.directory_key)
+            self.directory_key = self.directory = None
 
 
 # Independent client-side deletion guard (safety council, 2026-11). Defence in
@@ -2142,7 +2248,14 @@ def cleanup_replay_receipts(cfg, inventory):
         try:
             if phase == "result":
                 return cleanup_send_result(cfg, item_id, body)
-            return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
+            try:
+                return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
+            except urllib.error.HTTPError as exc:
+                # A rolled-back server does not know request_id (protocol 2).
+                if exc.code != 400 or "request_id" not in body:
+                    raise
+                return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase),
+                                   {k: v for k, v in body.items() if k != "request_id"})
         except urllib.error.HTTPError as exc:
             if exc.code != 409:
                 raise
@@ -2190,12 +2303,31 @@ def cleanup_verified_ack(task, proof, decision):
     )
 
 
-def cleanup_process_task(cfg, inventory, stop_event, task):
+class CleanupSingleAPI:
+    """Protocol 1: one observation or receipt per request (every server)."""
+    request_ids = False
+
+    def observe(self, cfg, item_id, body):
+        return restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+
+    def result(self, cfg, item_id, receipt):
+        return cleanup_send_result(cfg, item_id, receipt)
+
+
+CLEANUP_SINGLE_API = CleanupSingleAPI()
+
+
+def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
+    api = api or CLEANUP_SINGLE_API
     item_id, attempt = task["item_id"], task["attempt"]
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
         raise RuntimeError("invalid cleanup task identity")
     deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
     body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION}
+    if api.request_ids:
+        # Identifies this exact observation so a retry after a lost response
+        # gets the same recorded decision (or the same single permit) back.
+        body["request_id"] = uuid.uuid4().hex
     fenced = False
     try:
         # A previously approved proof marks the execution phase. Dry runs
@@ -2219,7 +2351,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
             cleanup_journal(inventory, item_id, "observe", body)
             permit_request_started = time.monotonic()
-            decision = restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+            decision = api.observe(cfg, item_id, body)
             if decision.get("delete") is True:
                 receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
                 cleanup_journal(inventory, item_id, "intent", receipt)
@@ -2261,7 +2393,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
                     except Exception as exc:
                         log("ERROR", "cleanup item=%d deletion ledger result append failed: %s" % (item_id, exc))
                 cleanup_journal(inventory, item_id, "result", receipt)
-                cleanup_send_result(cfg, item_id, receipt)
+                api.result(cfg, item_id, receipt)
             cleanup_journal(inventory, item_id)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
@@ -2272,7 +2404,7 @@ def cleanup_process_task(cfg, inventory, stop_event, task):
             raise
         body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
         cleanup_journal(inventory, item_id, "observe", body)
-        restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+        api.observe(cfg, item_id, body)
         cleanup_journal(inventory, item_id)
     finally:
         if fenced:
@@ -2379,16 +2511,266 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     return 0 if leased else retry
 
 
+# Protocol 2 (2026-11): bounded parallel execution with batched round trips.
+# Every file is still leased, freshly opened, re-hashed and independently
+# guarded by its own worker, gets its own single-use 30 s permit and its own
+# ledger lines; only transport and concurrency change. Servers that predate
+# protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
+CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
+CLEANUP_V2_WORKERS = 16        # concurrent file workers (mostly waiting on the API)
+CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
+CLEANUP_V2_CYCLE_TASKS = 2048  # tasks per drain/replay cycle
+CLEANUP_BATCH_MAX = 64         # observations or receipts per request
+CLEANUP_BATCH_LINGER_SEC = 0.02
+CLEANUP_RETRY_DELAYS = (0.25, 0.5, 1, 2, 4)
+CLEANUP_V2_FALLBACK_SEC = 3600
+CLEANUP_V2_ERROR_WAIT_SEC = 15
+
+
+class CleanupProtocolUnsupported(RuntimeError):
+    """The server predates cleanup protocol 2."""
+
+
+def cleanup_api_retry(cfg, path, body):
+    """POST an idempotent cleanup request, retrying transient failures.
+
+    Only used for requests the server treats idempotently: a lease carries a
+    request_id (a retry returns the same leased tasks), observations carry
+    request_ids (a retry returns the recorded decision or the one permit
+    already issued, never a new one) and receipts are idempotent."""
+    for delay in CLEANUP_RETRY_DELAYS + (None,):
+        try:
+            return restore_api(cfg, path, body, retry_stale=True)
+        except Exception as exc:
+            if delay is None or not transient_error(exc):
+                raise
+            log("WARN", "cleanup %s transient failure (%s); retrying" % (path.rsplit("/", 1)[-1], classify_transport_error(exc).value))
+            time.sleep(delay)
+
+
+class CleanupBatcher:
+    """Coalesce per-file calls from concurrent workers into batched requests."""
+    def __init__(self, cfg, path, field, max_items=CLEANUP_BATCH_MAX, senders=2, linger=CLEANUP_BATCH_LINGER_SEC):
+        self.cfg, self.path, self.field, self.max_items, self.linger = cfg, path, field, max_items, linger
+        self.condition = threading.Condition()
+        self.queue = []
+        self.closed = False
+        self.threads = [threading.Thread(target=self.run, daemon=True, name="nas-cleanup-batch") for _ in range(senders)]
+        for thread in self.threads:
+            thread.start()
+
+    def submit(self, entry):
+        future = concurrent.futures.Future()
+        with self.condition:
+            if self.closed:
+                raise RuntimeError("cleanup batcher closed")
+            self.queue.append((entry, future))
+            self.condition.notify_all()
+        return future
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        for thread in self.threads:
+            thread.join(HTTP_TIMEOUT_SEC * 2)
+
+    def run(self):
+        while True:
+            with self.condition:
+                while not self.queue and not self.closed:
+                    self.condition.wait()
+                if not self.queue:
+                    return
+                started = time.monotonic()
+                while len(self.queue) < self.max_items and not self.closed:
+                    remaining = started + self.linger - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.condition.wait(remaining)
+                batch, self.queue = self.queue[:self.max_items], self.queue[self.max_items:]
+            if batch:
+                self.send(batch)
+
+    def send(self, batch):
+        try:
+            response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: [entry for entry, _ in batch]})
+            results = response.get("results") if isinstance(response, dict) else None
+            if not isinstance(results, list) or len(results) != len(batch):
+                raise RuntimeError("invalid cleanup batch response")
+            by_id = {r["item_id"]: r for r in results if isinstance(r, dict) and type(r.get("item_id")) is int}
+            for entry, future in batch:
+                result = by_id.get(entry["item_id"])
+                if result is None:
+                    future.set_exception(RuntimeError("cleanup batch response lacks item %d" % entry["item_id"]))
+                else:
+                    future.set_result(result)
+        except BaseException as exc:
+            for _, future in batch:
+                if not future.done():
+                    future.set_exception(exc)
+
+
+class CleanupBatchAPI:
+    """Protocol 2: per-file observations and receipts over batched requests."""
+    request_ids = True
+
+    def __init__(self, cfg):
+        self.observations = CleanupBatcher(cfg, "/account/connections/cleanup/observe-batch", "observations")
+        self.receipts = CleanupBatcher(cfg, "/account/connections/cleanup/result-batch", "receipts")
+
+    def call(self, batcher, item_id, body):
+        for attempt in range(4):
+            result = batcher.submit(dict(body, item_id=item_id)).result(timeout=HTTP_TIMEOUT_SEC * 3)
+            status = result.get("status")
+            if status == 200:
+                return {k: v for k, v in result.items() if k != "status"}
+            if status == 503 and attempt < 3:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            code = status if type(status) is int and 400 <= status < 600 else 500
+            raise urllib.error.HTTPError(batcher.path, code, str(result.get("error", ""))[:200], {}, None)
+
+    def observe(self, cfg, item_id, body):
+        return self.call(self.observations, item_id, body)
+
+    def result(self, cfg, item_id, receipt):
+        return self.call(self.receipts, item_id, receipt)
+
+    def close(self):
+        self.observations.close()
+        self.receipts.close()
+
+
+def cleanup_local_headroom(inventory):
+    """Files and bytes still allowed by the local rolling-24h caps."""
+    with inventory.lock:
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_local_deletions(id INTEGER PRIMARY KEY AUTOINCREMENT,item_id INTEGER NOT NULL,plan_sha256 TEXT NOT NULL,relative_path TEXT NOT NULL,size_bytes INTEGER NOT NULL,at_epoch REAL NOT NULL)")
+        files, total = inventory.db.execute("SELECT count(*),coalesce(sum(size_bytes),0) FROM cleanup_local_deletions WHERE at_epoch>?",
+                                            (time.time() - 86400,)).fetchone()
+        inventory.db.commit()
+    return CLEANUP_MAX_FILES_24H - files, CLEANUP_MAX_BYTES_24H - total
+
+
+def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
+    if type(limit) is not int or not 1 <= limit <= CLEANUP_V2_LEASE:
+        raise ValueError("invalid cleanup lease bound")
+    execution_files = max(0, min(int(execution_files), CLEANUP_V2_LEASE))
+    execution_bytes = max(0, int(execution_bytes))
+    body = {"client_version": CLIENT_VERSION, "protocol": 2, "limit": limit, "execution_files": execution_files,
+            "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex}
+    try:
+        lease = cleanup_api_retry(cfg, "/account/connections/cleanup/lease", body)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 404, 405):
+            raise CleanupProtocolUnsupported("cleanup protocol 2 unavailable (HTTP %d)" % exc.code)
+        raise
+    tasks = lease.get("tasks") if isinstance(lease, dict) else None
+    if not isinstance(tasks, list) or len(tasks) > limit:
+        raise RuntimeError("invalid cleanup lease")
+    if any(not isinstance(task, dict) or type(task.get("item_id")) is not int
+           or task["item_id"] <= 0 or type(task.get("attempt")) is not int
+           or task["attempt"] <= 0 or not isinstance(task.get("item"), dict) for task in tasks):
+        raise RuntimeError("invalid cleanup task identity")
+    if len({task["item_id"] for task in tasks}) != len(tasks):
+        raise RuntimeError("duplicate cleanup task identity")
+    executing = [task for task in tasks if task.get("approved_proof") is not None]
+    if executing and len(executing) != len(tasks):
+        raise RuntimeError("cleanup lease mixes execution and dry-run work")
+    sizes = [task["item"].get("size_bytes") for task in executing]
+    if any(type(size) is not int or size <= 0 for size in sizes) or len(executing) > execution_files or sum(sizes) > execution_bytes:
+        raise RuntimeError("execution lease exceeds the client's local caps")
+    return lease
+
+
+def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=None,
+                     inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS):
+    """Protocol 2 coordinator: rolling window of leased tasks on the executor.
+
+    Execution tasks run concurrently (each is fully independent and re-checked
+    by its own worker). The coordinator alone replays durable receipts, after
+    every worker of the previous cycle has drained, exactly as protocol 1."""
+    cleanup_replay_receipts(cfg, inventory)
+    pins, pins_error = cleanup_pins()
+    pending = {}
+    leased = 0
+    retry = 120
+    exhausted = False
+    error = None
+
+    def completed(future):
+        if future.result() is True and verified_event is not None:
+            verified_event.set()
+    try:
+        while not stop_event.is_set():
+            while not exhausted and not stop_event.is_set() and error is None and len(pending) < inflight and leased < task_limit:
+                room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
+                files_left, bytes_left = cleanup_local_headroom(inventory)
+                running = [task for task in pending.values() if task.get("approved_proof") is not None]
+                files_left -= len(running)
+                bytes_left -= sum(task["item"]["size_bytes"] for task in running)
+                if pins_error is not None:
+                    files_left = bytes_left = 0  # every deletion would be refused
+                lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
+                retry = lease.get("retry_after_sec", 120)
+                if not lease["tasks"]:
+                    exhausted = True
+                    break
+                for task in lease["tasks"]:
+                    leased += 1
+                    pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
+            if not pending or error is not None:
+                break
+            done, _ = concurrent.futures.wait(list(pending), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                pending.pop(future)
+                try:
+                    completed(future)
+                except Exception as exc:
+                    if error is None:
+                        error = exc
+    except Exception as exc:
+        if error is None:
+            error = exc
+    finally:
+        for future in list(pending):
+            try:
+                completed(future)
+            except Exception as exc:
+                if error is None:
+                    error = exc
+    if error is not None:
+        raise error
+    return 0 if leased else retry
+
+
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
     wait = 15
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_PREFLIGHT_WORKERS, thread_name_prefix="nas-cleanup") as executor:
-        while not stop_event.wait(wait):
-            try:
-                retry = cleanup_batch(cfg, inventory, stop_event, executor, verified_event=verified_event)
-                wait = 0 if retry == 0 else restore_wait(retry)
-            except Exception as exc:
-                log("WARN", "NAS cleanup deferred: %s" % exc)
-                wait = restore_wait(min(60, RESTORE_ERROR_WAIT_SEC))
+    v2_after = 0.0
+    api = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(CLEANUP_PREFLIGHT_WORKERS, CLEANUP_V2_WORKERS), thread_name_prefix="nas-cleanup") as executor:
+        try:
+            while not stop_event.wait(wait):
+                v2 = time.monotonic() >= v2_after
+                try:
+                    retry = None
+                    if v2:
+                        if api is None:
+                            api = CleanupBatchAPI(cfg)
+                        try:
+                            retry = cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=verified_event)
+                        except CleanupProtocolUnsupported as exc:
+                            log("INFO", "NAS cleanup using protocol 1: %s" % exc)
+                            v2_after, v2 = time.monotonic() + CLEANUP_V2_FALLBACK_SEC, False
+                    if retry is None:
+                        retry = cleanup_batch(cfg, inventory, stop_event, executor, verified_event=verified_event)
+                    wait = 0 if retry == 0 else restore_wait(retry)
+                except Exception as exc:
+                    log("WARN", "NAS cleanup deferred: %s" % exc)
+                    wait = restore_wait(CLEANUP_V2_ERROR_WAIT_SEC if v2 else min(60, RESTORE_ERROR_WAIT_SEC))
+        finally:
+            if api is not None:
+                api.close()
 
 
 def prepare_clip_with_capacity(cfg, runtime, clip):
