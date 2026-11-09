@@ -13,8 +13,18 @@ script lists every NAS file that lies entirely outside its stream's window:
 Files already in an active plan bound to the same policy are skipped. Items are
 grouped per stream, then per kind and recovery class (R2 copy present vs. R2
 purged; NAS-only deletion was removed, so those plans can never be enabled), ordered by
-path, and cut into plans of at most --max-items (<=500) items. Labels are
-deterministic: <prefix>-s<stream>-<raw|col>[-nasonly]-<n>.
+path, and cut into plans of at most --max-items (<=10000) items and --max-bytes
+(<=100 GB, the backend's per-plan cap). Labels are deterministic:
+<prefix>-s<stream>-<raw|col>[-nasonly]-<n>.
+
+With --submit, the admitted plans that can ever be enabled (R2 copy present)
+are also grouped into batch manifests (--batch-by stream: one per stream, or
+all: one for everything, split at 500 plans): batch-<prefix>-<group>.json with
+the ordered plan ids/digests and batch_sha256. The owner approves a batch once
+with `stoaramactl nas-cleanup enable-batch --batch-input FILE
+--expected-batch-sha256 SHA --reason TEXT --approval-hours H` after the plans'
+dry runs are complete; the backend still enables one plan at a time and
+re-gates every plan before enabling it.
 
 Default is a read-only preview: the database runs in a READ ONLY transaction
 and plan inputs are written to --out for review. --submit admits each plan via
@@ -22,6 +32,9 @@ the service API (POST /api/v1/service/nas-cleanup/plans). Admission only creates
 a dry-run plan: it never arms or enables deletion. The server re-derives every
 identity and re-checks folder ownership, the frozen NAS identity index and the
 keep28 window; a 409 batch is bisected and single rejected items are reported.
+
+Batch (two streams, one approval per stream):
+  prepare_keep28_plans.py --stream 3 --stream 4 --out k28 --submit
 
 Pilot (one stream, a few GB):
   prepare_keep28_plans.py --stream 3 --max-bytes 5e9 --max-plans 1 --out pilot
@@ -45,6 +58,35 @@ import urllib.request
 POLICY_SHA = '060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811'
 POLICY_PATH = pathlib.Path(__file__).resolve().parents[2] / 'internal/api/nas_cleanup_keep28_policy.json'
 LABEL = re.compile(r'^[a-z0-9][a-z0-9._-]{0,79}$')
+MAX_PLAN_ITEMS = 10000
+MAX_PLAN_BYTES = 100_000_000_000  # backend nasCleanupMaxPlanBytes
+MAX_BATCH_PLANS = 500
+
+
+def batch_digest(policy_sha, plans):
+    """Same digest as the backend's cleanupBatchDigest and stoaramactl."""
+    text = 'stoarama-nas-cleanup-batch-v1\npolicy %s\n' % policy_sha
+    text += ''.join('plan %d %s\n' % (int(p['id']), p['plan_sha256']) for p in plans)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def batch_manifests(receipts, prefix, by):
+    """Ordered batch manifests over admitted plans that can ever be enabled."""
+    groups = {}
+    for r in receipts:
+        if '-nasonly-' in r['label']:
+            continue
+        key = 's%d' % r['stream_id'] if by == 'stream' else 'all'
+        groups.setdefault(key, []).append(r)
+    out = []
+    for key, plans in sorted(groups.items()):
+        for n in range(0, len(plans), MAX_BATCH_PLANS):
+            part = plans[n:n + MAX_BATCH_PLANS]
+            name = '%s-%s' % (prefix, key) + ('-%d' % (n // MAX_BATCH_PLANS + 1) if len(plans) > MAX_BATCH_PLANS else '')
+            entries = [{'id': p['id'], 'label': p['label'], 'plan_sha256': p['plan_sha256'], 'items': p['items'], 'bytes': p['bytes']} for p in part]
+            out.append({'name': name, 'policy_sha256': POLICY_SHA, 'plans': entries, 'files': sum(p['items'] for p in part),
+                        'bytes': sum(p['bytes'] for p in part), 'batch_sha256': batch_digest(POLICY_SHA, entries)})
+    return out
 
 
 def load_policy(path):
@@ -173,15 +215,17 @@ def submit(api, label, rows, receipts, rejected):
     detail = service(api, 'GET', 'plans/' + str(result['id']))
     assert detail['mode'] == 'dry_run' and detail['master_deletion_enabled'] is False and detail['policy_current'] is True
     assert {(i['kind'], i['source_id']) for i in detail['items']} == {(r['kind'], r['source_id']) for r in rows}
-    receipts.append({'id': result['id'], 'label': label, 'plan_sha256': result['plan_sha256'], 'items': len(rows), 'bytes': sum(r['size_bytes'] for r in rows)})
+    receipts.append({'id': result['id'], 'label': label, 'stream_id': rows[0]['stream_id'], 'plan_sha256': result['plan_sha256'], 'items': len(rows), 'bytes': sum(r['size_bytes'] for r in rows)})
     print(json.dumps({'phase': 'plan_admitted_dry_run', **receipts[-1]}), flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--stream', type=int, action='append', default=[], help='limit to stream id (repeatable)')
-    ap.add_argument('--max-items', type=int, default=500, help='items per plan (1..500)')
-    ap.add_argument('--max-bytes', type=float, default=0, help='optional byte cap per plan (e.g. 5e9 for a pilot)')
+    ap.add_argument('--max-items', type=int, default=MAX_PLAN_ITEMS, help='items per plan (1..10000)')
+    ap.add_argument('--max-bytes', type=float, default=MAX_PLAN_BYTES, help='byte cap per plan (<=1e11, the backend cap; e.g. 5e9 for a pilot)')
+    ap.add_argument('--batch-by', choices=('stream', 'all'), default='stream', help='--submit: group admitted plans into batch manifests')
+    ap.add_argument('--i-understand-large-batch', action='store_true', help='required with --batch-by all (one approval spanning every stream)')
     ap.add_argument('--max-plans', type=int, default=0, help='stop after N plans (0 = all)')
     ap.add_argument('--label-prefix', default='k28')
     ap.add_argument('--bucket', default=os.environ.get('R2_BUCKET', 'stoarama'))
@@ -191,8 +235,10 @@ def main():
     ap.add_argument('--submit', action='store_true', help='admit plans as read-only dry runs via the service API')
     ap.add_argument('--api', default='https://stoarama.com')
     a = ap.parse_args()
-    if not 1 <= a.max_items <= 500 or a.max_bytes < 0 or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,15}', a.label_prefix):
+    if not 1 <= a.max_items <= MAX_PLAN_ITEMS or not 0 < a.max_bytes <= MAX_PLAN_BYTES or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,15}', a.label_prefix):
         raise SystemExit('invalid batching arguments')
+    if a.batch_by == 'all' and not a.i_understand_large_batch:
+        raise SystemExit('--batch-by all puts every stream under one approval; add --i-understand-large-batch to confirm')
     policy = load_policy(a.policy)
     unknown = set(a.stream) - set(policy)
     if unknown:
@@ -213,6 +259,10 @@ def main():
         for label, items in plans:
             submit(a.api, label, items, receipts, rejected)
         summary.update(receipts=receipts, rejected_at_admission=rejected)
+        batches = batch_manifests(receipts, a.label_prefix, a.batch_by)
+        for b in batches:
+            (out / ('batch-%s.json' % b['name'])).write_text(json.dumps(b, indent=1))
+        summary['batches'] = [{'name': b['name'], 'plans': len(b['plans']), 'files': b['files'], 'bytes': b['bytes'], 'batch_sha256': b['batch_sha256']} for b in batches]
     (out / 'summary.json').write_text(json.dumps(summary, indent=1))
     print(json.dumps({'phase': 'KEEP28_PLANS_SUBMITTED' if a.submit else 'KEEP28_PLANS_PREVIEW', 'candidate_files': summary['candidate_files'],
                       'candidate_bytes': summary['candidate_bytes'], 'plans': len(plans), 'admitted': len(receipts), 'rejected_items': len(rejected),

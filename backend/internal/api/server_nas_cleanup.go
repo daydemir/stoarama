@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -41,13 +40,26 @@ const (
 	nasCleanupMaxPlanBytes int64 = 100_000_000_000 // 100 GB
 	// Rolling 24h deletion budget across all plans, counted from issued
 	// deletion permits (delete_ever_issued). No permit is issued beyond it.
-	nasCleanupMaxIssuedBytes24h int64 = 3_000_000_000_000 // 3 TB
+	// Raised from 3 TB to 5 TB by owner decision (2026-11, PR #436); the NAS
+	// client's local byte cap (CLEANUP_MAX_BYTES_24H) is the same value.
+	nasCleanupMaxIssuedBytes24h int64 = 5_000_000_000_000 // 5 TB
 	// Serializes the budget check-and-issue step across observations.
 	nasCleanupBudgetLock int64 = 7343226011102
 	// Per-plan execution lock base (key = base + plan id). Observations of an
 	// enabled plan take it before any row lock so they can auto-pause the plan
 	// without two FOR SHARE holders deadlocking on the plan row.
 	nasCleanupPlanLockBase int64 = 7343226100000000
+	// Public cleanup fence: enabling a plan or batch, batch advance and new
+	// source references serialize on it (see migration 0167).
+	nasCleanupPublicFence int64 = 7343226011101
+	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
+	// item limit only keeps one admission request bounded.
+	nasCleanupMaxPlanItems = 10000
+	// Default and maximum approval window of an enabled plan or batch.
+	nasCleanupDefaultApproval = 2 * time.Hour
+	nasCleanupMaxApproval     = 24 * time.Hour
+	// Windows above this need an explicit allow_long_approval.
+	nasCleanupLongApproval = 4 * time.Hour
 )
 
 const nasCleanupReportSHA = "64eee0bc589c9be4dcab5b5ea7668270291a07ce4fd0db98dcd0a484e19d84c1"
@@ -180,8 +192,8 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 			SourceID int64  `json:"source_id"`
 		} `json:"items"`
 	}
-	if util.DecodeJSON(r, &req) != nil || !relayArtifactName.MatchString(req.Label) || len(req.Label) > 80 || len(req.Items) < 1 || len(req.Items) > 500 {
-		util.WriteError(w, 400, "label and1to500 exact source identities required")
+	if util.DecodeJSON(r, &req) != nil || !relayArtifactName.MatchString(req.Label) || len(req.Label) > 80 || len(req.Items) < 1 || len(req.Items) > nasCleanupMaxPlanItems {
+		util.WriteError(w, 400, "label and 1 to 10000 exact source identities required")
 		return
 	}
 	ctx := r.Context()
@@ -218,6 +230,14 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		}
 		seen[i.RelativePath] = true
 		items = append(items, i)
+	}
+	var planBytes int64
+	for _, i := range items {
+		planBytes += i.SizeBytes
+	}
+	if planBytes > nasCleanupMaxPlanBytes {
+		util.WriteJSON(w, 409, map[string]any{"error": "plan exceeds the per-plan deletion cap", "plan_bytes": planBytes, "max_plan_bytes": nasCleanupMaxPlanBytes})
+		return
 	}
 	if err = s.bindCleanupFrozenInventory(ctx, items); err != nil {
 		util.WriteError(w, 409, err.Error())
@@ -281,6 +301,9 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		AllowNASOnly bool   `json:"allow_nas_only"`
 		Priority     *int   `json:"priority,omitempty"`
 		Reason       string `json:"reason"`
+		// Optional approval window for enable, 1..24 hours (default 1).
+		ApprovalHours     *int `json:"approval_hours,omitempty"`
+		AllowLongApproval bool `json:"allow_long_approval,omitempty"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || (req.Mode != "enabled" && req.Mode != "paused" && req.Mode != "dry_run") || len(req.Reason) < 1 || len(req.Reason) > 500 {
 		util.WriteError(w, 400, "exact plan digest,mode and reason required")
@@ -299,6 +322,14 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 400, "bounded priority is read-only")
 		return
 	}
+	approval := nasCleanupDefaultApproval
+	if req.ApprovalHours != nil {
+		approval = time.Duration(*req.ApprovalHours) * time.Hour
+		if req.Mode != "enabled" || approval < time.Hour || approval > nasCleanupMaxApproval || (approval > nasCleanupLongApproval && !req.AllowLongApproval) {
+			util.WriteError(w, 400, "approval_hours is 1..24 (above 4 requires allow_long_approval) and only applies to enable")
+			return
+		}
+	}
 	// Backend independent master switch defaults OFF even if an operator arms a
 	// batch. Setting it is a separate explicit deployment/configuration action.
 	if req.Mode == "enabled" && !s.cfg.NASCleanupDeletionEnabled {
@@ -313,7 +344,7 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 	}
 	defer tx.Rollback(ctx)
 	if req.Mode == "enabled" {
-		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7343226011101)`); err != nil {
+		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
 			return
 		}
@@ -362,33 +393,31 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if req.Mode == "enabled" {
-		var bad int
-		err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR recovery<>'r2_sha_verified')`, id).Scan(&bad)
-		if err != nil || bad != 0 {
-			util.WriteError(w, 409, "fresh complete dry run with a verified R2 recovery copy for every item required")
+		var batches int
+		if err = tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_batches WHERE mode='enabled'`).Scan(&batches); err != nil {
+			util.WriteError(w, 500, "cleanup batch evidence unavailable")
 			return
 		}
-		// Still under the exclusive public cleanup fence taken above, so two
-		// concurrent enables are serialized and the second sees the first.
-		var enabled int
-		var planBytes int64
-		err = tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_plans WHERE mode='enabled' AND id<>$1),(SELECT coalesce(sum((e->>'size_bytes')::bigint),0) FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) e WHERE p.id=$1)`, id).Scan(&enabled, &planBytes)
-		if err != nil {
-			util.WriteError(w, 500, "cleanup cap evidence unavailable")
+		if batches != 0 {
+			util.WriteError(w, 409, "a cleanup batch is enabled; pause it first (at most one enabled plan)")
 			return
 		}
-		if enabled+1 > nasCleanupMaxEnabledPlans {
-			util.WriteError(w, 409, "another cleanup plan is already enabled; pause it first (at most one enabled plan)")
-			return
-		}
-		if planBytes > nasCleanupMaxPlanBytes {
-			util.WriteJSON(w, 409, map[string]any{"error": "plan exceeds the per-plan deletion cap", "plan_bytes": planBytes, "max_plan_bytes": nasCleanupMaxPlanBytes})
+		if status, body := cleanupEnableGates(ctx, tx, id); status != 0 {
+			util.WriteJSON(w, status, body)
 			return
 		}
 	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+interval '1 hour' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority)
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+$5::bigint*interval '1 second' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority, int64(approval/time.Second))
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
+		if err == nil {
+			err = cleanupActivateRankings(ctx, tx, id)
+		}
+	}
+	if err == nil && req.Mode != "enabled" {
+		// Pausing (or resuming the dry run of) a plan stops any enabled batch
+		// that contains it; a batch never re-enables a plan an operator stopped.
+		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('paused with plan '||$3::text||': '||$2::text,500) WHERE mode='enabled' AND $1=ANY(plan_ids)`, id, req.Reason, strconv.FormatInt(id, 10))
 	}
 	if err != nil || tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "cleanup control failed")
@@ -482,12 +511,15 @@ type cleanupObserve struct {
 	Error         string             `json:"error"`
 	ClientVersion string             `json:"client_version"`
 	Timings       map[string]float64 `json:"timings,omitempty"`
+	// RequestID (protocol 2) makes a lost permit response replayable: only the
+	// identical request gets the already-issued permit back, never a new one.
+	RequestID string `json:"request_id,omitempty"`
 }
 
 // Plans are ordered without sorting/locking the entire pending file backlog.
 // The lateral probe uses nas_cleanup_pending and skips locked rows before the
 // outer LIMIT; it can keep looking in the next eligible plan if one is busy.
-const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,p.manifest->(i.ordinal-1),i.proof,p.mode
+const cleanupLeaseLoadSQL = `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode
 FROM nas_cleanup_plans p
 JOIN LATERAL (
  SELECT candidate.* FROM nas_cleanup_items candidate
@@ -498,13 +530,44 @@ WHERE p.connection_id=$1 AND p.report_sha256=$3
  AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2))
 ORDER BY p.priority DESC,p.id LIMIT 1`
 
+// Bytes of execution work already leased but not yet observed. Counted with
+// the issued bytes so a lease never hands out work the budget cannot permit.
+const cleanupLeasedExecutionBytesSQL = `SELECT coalesce(sum(coalesce(i.size_bytes,(p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)),0) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.mode='enabled' AND i.state='leased'`
+
+const (
+	// Protocol 1 (legacy clients): at most 8 dry-run tasks, execution serial.
+	nasCleanupLeaseMaxV1 = 8
+	// Protocol 2: up to 64 tasks per lease, including execution tasks, bounded
+	// by the client's remaining local caps and by the server budget.
+	nasCleanupLeaseMaxV2 = 64
+)
+
 func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ClientVersion string `json:"client_version"`
-		Protocol      int    `json:"protocol"`
-		Limit         int    `json:"limit"`
+		ClientVersion  string `json:"client_version"`
+		Protocol       int    `json:"protocol"`
+		Limit          int    `json:"limit"`
+		ExecutionFiles *int   `json:"execution_files,omitempty"`
+		ExecutionBytes *int64 `json:"execution_bytes,omitempty"`
+		// Protocol 2: a retried request returns the tasks it already leased.
+		RequestID string `json:"request_id,omitempty"`
 	}
-	if util.DecodeJSON(r, &req) != nil || req.Protocol != 1 || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || req.Limit < 0 || req.Limit > 8 {
+	if util.DecodeJSON(r, &req) != nil || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || req.Limit < 0 {
+		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
+		return
+	}
+	switch req.Protocol {
+	case 1:
+		if req.Limit > nasCleanupLeaseMaxV1 || req.ExecutionFiles != nil || req.ExecutionBytes != nil || req.RequestID != "" {
+			util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
+			return
+		}
+	case 2:
+		if req.Limit < 1 || req.Limit > nasCleanupLeaseMaxV2 || (req.RequestID != "" && (len(req.RequestID) != 32 || !lowerHex(req.RequestID))) || req.ExecutionFiles == nil || req.ExecutionBytes == nil || *req.ExecutionFiles < 0 || *req.ExecutionFiles > nasCleanupLeaseMaxV2 || *req.ExecutionBytes < 0 {
+			util.WriteError(w, 400, "cleanup protocol2 requires a bounded limit and the client's remaining execution caps")
+			return
+		}
+	default:
 		util.WriteError(w, 400, "cleanup protocol1, client version and bounded limit required")
 		return
 	}
@@ -516,6 +579,10 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
+	// A batch whose current plan finished (or stopped) advances or pauses
+	// before work is leased; it never runs inside the lease transaction.
+	s.cleanupExpireApprovals(ctx)
+	s.cleanupAdvanceBatchIfIdle(ctx)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup lease transaction failed")
@@ -523,19 +590,37 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	defer tx.Rollback(ctx)
 	// An execution lease that expires without a report is an execution
-	// anomaly: its enabled plan is paused in the same statement.
-	_, err = tx.Exec(ctx, `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id)
-UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id IN (SELECT plan_id FROM expired)`, cid, "execution lease expired without a report")
+	// anomaly: its enabled plan (and its batch) is paused in the same statement.
+	_, err = tx.Exec(ctx, `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
+pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id IN (SELECT plan_id FROM expired) RETURNING id)
+UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz)`, cid, "execution lease expired without a report")
 	if err != nil {
 		util.WriteError(w, 500, "cleanup lease expiry failed")
 		return
 	}
 	tasks := make([]cleanupTask, 0, req.Limit)
+	if req.RequestID != "" {
+		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID)
+		if err != nil {
+			util.WriteError(w, 500, "cleanup lease load failed")
+			return
+		}
+		if len(replayed) != 0 {
+			util.WriteJSON(w, 200, map[string]any{"tasks": replayed, "retry_after_sec": 0, "replayed": true})
+			return
+		}
+	}
+	executing := false
+	// Execution work is only offered while it could be permitted; otherwise
+	// the probe skips enabled plans and keeps leasing dry-run work.
+	allowExecution := s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
+	budgetKnown := false
+	var budgetLeft, execBytes int64
 	for len(tasks) < req.Limit {
 		var task cleanupTask
 		var raw, approved []byte
 		var mode string
-		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, s.cfg.NASCleanupDeletionEnabled, cleanupPolicySHA).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
+		err = tx.QueryRow(ctx, cleanupLeaseLoadSQL, cid, allowExecution, cleanupPolicySHA).Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}
@@ -543,23 +628,60 @@ UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
 		}
-		// An execution lease is always alone. Leave it pending if this response
-		// already contains dry-run work; the client drains that work first.
-		if mode == "enabled" && len(tasks) != 0 {
+		if mode == "enabled" {
+			// Protocol 1: an execution lease is always alone. Leave it pending if
+			// this response already contains dry-run work; the client drains that
+			// work first. Protocol 2 never mixes execution with dry-run work.
+			if len(tasks) != 0 && (req.Protocol == 1 || !executing) {
+				break
+			}
+			if !budgetKnown {
+				var issued, leased int64
+				if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err == nil {
+					err = tx.QueryRow(ctx, cleanupLeasedExecutionBytesSQL).Scan(&leased)
+				}
+				if err != nil {
+					util.WriteError(w, 500, "cleanup deletion budget unavailable")
+					return
+				}
+				budgetKnown, budgetLeft = true, nasCleanupMaxIssuedBytes24h-issued-leased
+			}
+			// Never lease execution work the rolling budget (or, protocol 2, the
+			// client's own remaining local caps) could not permit: it would only
+			// turn into a budget refusal that auto-pauses the plan.
+			// (An invalid size is still leased and then refused, and auto-paused,
+			// by the permit check itself.)
+			if (task.Item.SizeBytes > 0 && execBytes+task.Item.SizeBytes > budgetLeft) ||
+				(req.Protocol == 2 && (len(tasks)+1 > *req.ExecutionFiles || execBytes+task.Item.SizeBytes > *req.ExecutionBytes)) {
+				if executing {
+					break
+				}
+				allowExecution = false
+				continue
+			}
+			execBytes += task.Item.SizeBytes
+			executing = true
+		} else if executing {
 			break
 		}
 		task.Attempt++
-		task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute)
+		// Microsecond precision: exactly what PostgreSQL stores, so a replayed
+		// lease reports the identical expiry.
+		task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute).Truncate(time.Microsecond)
 		if mode == "enabled" {
 			task.ApprovedProof = approved
 		}
-		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=$2,lease_expires_at=$3,updated_at=now() WHERE id=$1`, task.ItemID, task.Attempt, task.ExpiresAt)
+		var requestID any
+		if req.RequestID != "" {
+			requestID = req.RequestID
+		}
+		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=$2,lease_expires_at=$3,lease_request_id=$4,updated_at=now() WHERE id=$1`, task.ItemID, task.Attempt, task.ExpiresAt, requestID)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease save failed")
 			return
 		}
 		tasks = append(tasks, task)
-		if mode == "enabled" {
+		if mode == "enabled" && req.Protocol == 1 {
 			break
 		}
 	}
@@ -572,6 +694,37 @@ UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id
 		retry = 120
 	}
 	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "retry_after_sec": retry})
+}
+
+// cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
+// identical lease request (its response was lost), with the same attempt and
+// expiry. Nothing is leased again and no lease is extended.
+func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string) ([]cleanupTask, error) {
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tasks := []cleanupTask{}
+	for rows.Next() {
+		var task cleanupTask
+		var raw, approved []byte
+		var mode string
+		if err = rows.Scan(&task.ItemID, &task.Attempt, &task.PlanSHA, &raw, &approved, &mode, &task.ExpiresAt); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal(raw, &task.Item); err != nil {
+			return nil, err
+		}
+		if mode == "enabled" {
+			task.ApprovedProof = approved
+		} else if mode != "dry_run" {
+			continue
+		}
+		task.ExpiresAt = task.ExpiresAt.UTC()
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
 }
 
 func validCleanupProof(raw []byte, i nasCleanupItem) bool {
@@ -628,13 +781,15 @@ func validCleanupProof(raw []byte, i nasCleanupItem) bool {
 // (and every other recovery state) never yields a permit; see
 // handleAdminNASCleanupControl before ever changing that.
 func cleanupMayIssue(mode string, master bool, until *time.Time, sameFile bool, recovery string) bool {
-	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && recovery == "r2_sha_verified"
+	return mode == "enabled" && master && until != nil && until.After(time.Now()) && sameFile && cleanupRecoveryPermits(mode, recovery)
 }
 
 // Media bytes of every item whose deletion permit was issued in the last 24h.
 // updated_at only moves forward, so later receipts can only keep an item in
 // the window longer (fail closed).
-const cleanupIssuedBytes24hSQL = `SELECT coalesce(sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint),0) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.delete_ever_issued AND i.updated_at>now()-interval '24 hours'`
+// The write-once item size avoids detoasting the plan manifest per issued
+// item; legacy rows (NULL) still read it from the manifest.
+const cleanupIssuedBytes24hSQL = `SELECT coalesce(sum(coalesce(i.size_bytes,(p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)),0) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.delete_ever_issued AND i.updated_at>now()-interval '24 hours'`
 
 // cleanupBudgetAllows takes the budget lock for the rest of tx and reports
 // whether issuing one more permit of size bytes stays within the rolling cap.
@@ -652,43 +807,39 @@ func cleanupBudgetAllows(ctx context.Context, tx pgx.Tx, size int64) (bool, erro
 // Auto-pause uses the same state transition as an operator pause.
 const cleanupAutoPauseSet = `mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$2::text,500)`
 
+// cleanupRecovery is the full recovery check (see cleanupRecoveryFull).
 func (s *Server) cleanupRecovery(ctx context.Context, i nasCleanupItem) string {
-	if s.r2 == nil {
-		return "unchecked"
-	}
-	head, err := s.r2.Head(ctx, i.ObjectKey)
-	if err != nil {
-		// Only a proven404 is NAS-only. Authorization/timeouts never prove absence.
-		if r2.IsNotFound(err) {
-			return "nas_only_at_check"
-		}
-		return "unchecked"
-	}
-	if head.SizeBytes != i.SizeBytes {
-		return "conflict"
-	}
-	// Bounded streaming verification. No media is saved on the backend or Jelly.
-	c, cancel := context.WithTimeout(ctx, 25*time.Second)
-	defer cancel()
-	source, err := s.r2.Open(c, i.ObjectKey)
-	if err != nil {
-		return "r2_present_unverified"
-	}
-	defer source.Close()
-	hash := sha256.New()
-	n, err := io.Copy(hash, io.LimitReader(source, i.SizeBytes+1))
-	if err != nil || n != i.SizeBytes {
-		return "r2_present_unverified"
-	}
-	if hex.EncodeToString(hash.Sum(nil)) != i.SHA256 {
-		return "conflict"
-	}
-	return "r2_sha_verified"
+	recovery, _ := s.cleanupRecoveryFull(ctx, i)
+	return recovery
 }
 
 // Share the immutable plan/mode fence across independent preflights; control
 // still requires an exclusive parent lock and cannot overtake observations.
-const cleanupObservationLoadSQL = `SELECT p.manifest->(i.ordinal-1),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,i.plan_id,i.outcome,p.report_sha256 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
+// New plans read their write-once item copy; legacy rows fall back to the
+// manifest (COALESCE is lazy, so the manifest is only detoasted for them).
+const cleanupObservationLoadSQL = `SELECT coalesce(i.item,p.manifest->(i.ordinal-1)),p.mode,i.state,p.plan_sha256,p.approved_until,i.attempt,i.lease_expires_at,i.proof,i.plan_id,i.outcome,p.report_sha256,i.recovery_evidence,p.execution_rankings,i.permit_expires_at,i.recovery FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2 FOR UPDATE OF i FOR SHARE OF p`
+
+// cleanupObserveRequestError validates one observation; "" means valid.
+func cleanupObserveRequestError(req cleanupObserve) string {
+	if req.Attempt < 1 || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || len(req.Error) > 500 || len(req.ClientVersion) > 64 {
+		return "invalid cleanup observation"
+	}
+	if req.RequestID != "" && (len(req.RequestID) != 32 || !lowerHex(req.RequestID)) {
+		return "invalid cleanup observation request id"
+	}
+	if len(req.Timings) > 3 {
+		return "invalid cleanup timings"
+	}
+	for name, value := range req.Timings {
+		if (name != "namespace_ms" && name != "hash_ms" && name != "proof_ms") || value < 0 || value > 1800000 {
+			return "invalid cleanup timings"
+		}
+	}
+	if req.Outcome != "match" && req.Outcome != "missing" && req.Outcome != "conflict" && req.Outcome != "unverified" {
+		return "invalid cleanup outcome"
+	}
+	return ""
+}
 
 func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseInt64Path(w, r, "itemId")
@@ -696,22 +847,12 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		return
 	}
 	var req cleanupObserve
-	if util.DecodeJSON(r, &req) != nil || req.Attempt < 1 || len(req.PlanSHA) != 64 || !lowerHex(req.PlanSHA) || len(req.Error) > 500 || len(req.ClientVersion) > 64 {
+	if util.DecodeJSON(r, &req) != nil {
 		util.WriteError(w, 400, "invalid cleanup observation")
 		return
 	}
-	if len(req.Timings) > 3 {
-		util.WriteError(w, 400, "invalid cleanup timings")
-		return
-	}
-	for name, value := range req.Timings {
-		if (name != "namespace_ms" && name != "hash_ms" && name != "proof_ms") || value < 0 || value > 1800000 {
-			util.WriteError(w, 400, "invalid cleanup timings")
-			return
-		}
-	}
-	if req.Outcome != "match" && req.Outcome != "missing" && req.Outcome != "conflict" && req.Outcome != "unverified" {
-		util.WriteError(w, 400, "invalid cleanup outcome")
+	if msg := cleanupObserveRequestError(req); msg != "" {
+		util.WriteError(w, 400, msg)
 		return
 	}
 	ctx := r.Context()
@@ -725,9 +866,35 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		return
 	}
 	defer tx.Rollback(ctx)
-	var raw, oldProof, oldOutcome []byte
-	var mode, state, sha, binding string
-	var until *time.Time
+	result := s.cleanupObserveOne(ctx, tx, cid, id, req, &cleanupObserveEnv{})
+	if result.status == 200 && result.write && tx.Commit(ctx) != nil {
+		util.WriteError(w, 500, "cleanup observation save failed")
+		return
+	}
+	if result.status == 503 {
+		w.Header().Set("Retry-After", "1")
+	}
+	util.WriteJSON(w, result.status, result.body)
+}
+
+type cleanupObserveResult struct {
+	status int
+	body   map[string]any
+	// write is true when the observation changed state and must be committed.
+	write bool
+}
+
+func cleanupObserveError(status int, msg string) cleanupObserveResult {
+	return cleanupObserveResult{status: status, body: map[string]any{"error": msg}}
+}
+
+// cleanupObserveOne records one exact-file observation inside tx and decides
+// whether it earns a single-use deletion permit. Both the single-item and the
+// batched endpoint use it; a batch runs each call in its own savepoint.
+func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64, req cleanupObserve, env *cleanupObserveEnv) cleanupObserveResult {
+	var raw, oldProof, oldOutcome, evidence, rankings []byte
+	var mode, state, sha, binding, oldRecovery string
+	var until, permitUntil *time.Time
 	var attempt int
 	var lease *time.Time
 	var planID, fencedPlan int64
@@ -736,68 +903,77 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	// concurrent observations never both hold FOR SHARE and then wait on each
 	// other's UPDATE. Dry-run observations stay fully parallel.
 	var preMode string
-	if err = tx.QueryRow(ctx, `SELECT i.plan_id,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&fencedPlan, &preMode); err != nil {
-		util.WriteError(w, 409, "cleanup task identity differs")
-		return
+	if err := tx.QueryRow(ctx, `SELECT i.plan_id,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&fencedPlan, &preMode); err != nil {
+		return cleanupObserveError(409, "cleanup task identity differs")
+	}
+	if preMode == "enabled" && env.budgetHeld && !env.lockedPlans[fencedPlan] {
+		// Lock order is always plan fence(s) before the budget lock. A batch that
+		// already holds the budget lock must not take a plan fence it did not
+		// take up front (the plan became enabled meanwhile): retry instead.
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
 	if preMode == "enabled" {
-		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+fencedPlan); err != nil {
-			util.WriteError(w, 500, "cleanup plan execution fence failed")
-			return
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+fencedPlan); err != nil {
+			return cleanupObserveError(500, "cleanup plan execution fence failed")
 		}
 	} else {
 		fencedPlan = 0
 	}
-	err = tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &planID, &oldOutcome, &binding)
+	err := tx.QueryRow(ctx, cleanupObservationLoadSQL, id, cid).Scan(&raw, &mode, &state, &sha, &until, &attempt, &lease, &oldProof, &planID, &oldOutcome, &binding, &evidence, &rankings, &permitUntil, &oldRecovery)
 	if err != nil || sha != req.PlanSHA || attempt != req.Attempt {
-		util.WriteError(w, 409, "cleanup task identity differs")
-		return
+		return cleanupObserveError(409, "cleanup task identity differs")
 	}
 	if mode == "enabled" && fencedPlan != planID {
 		// The plan was enabled between the two reads; retry under the fence.
-		w.Header().Set("Retry-After", "1")
-		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
-		return
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
 	if state != "leased" {
 		retryBody, _ := json.Marshal(req)
+		// The exact same request (same request_id and body) whose response was
+		// lost gets back the one permit already issued, with its original
+		// expiry; nothing is extended or issued again.
+		// It is only handed back while the plan is still enabled, its approval is
+		// unexpired and the master switch is on; otherwise the caller gets the
+		// non-deleting reconcile answer below.
+		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
+			mode == "enabled" && until != nil && until.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled {
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
+		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
-			util.WriteJSON(w, 200, map[string]any{"action": state, "delete": false})
-			return
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": state, "delete": false}}
 		}
 		if state == "delete_issued" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
-			util.WriteJSON(w, 200, map[string]any{"action": "reconcile", "delete": false, "proof_sha256": cleanupSHA(req.Proof)})
-			return
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "proof_sha256": cleanupSHA(req.Proof)}}
 		}
 		if state == "would_delete" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
-			util.WriteJSON(w, 200, map[string]any{"action": "would_delete", "delete": false})
-			return
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": "would_delete", "delete": false}}
 		}
-		util.WriteError(w, 409, "cleanup observation is stale or terminal")
-		return
+		return cleanupObserveError(409, "cleanup observation is stale or terminal")
 	}
 	if lease == nil || lease.Before(time.Now()) {
-		util.WriteError(w, 409, "cleanup lease expired")
-		return
+		return cleanupObserveError(409, "cleanup lease expired")
 	}
 	var item nasCleanupItem
 	if json.Unmarshal(raw, &item) != nil {
-		util.WriteError(w, 500, "invalid cleanup manifest")
-		return
+		return cleanupObserveError(500, "invalid cleanup manifest")
 	}
 	stageTimings := map[string]any{"client": req.Timings}
 	policyReason := ""
 	action := req.Outcome
 	recovery := "unchecked"
+	var recoveryEvidence *cleanupRecoveryEvidence
 	deletion := false
 	if req.Outcome == "match" {
 		if !validCleanupProof(req.Proof, item) {
-			util.WriteError(w, 400, "complete exact physical cleanup proof required")
-			return
+			return cleanupObserveError(400, "complete exact physical cleanup proof required")
 		}
-		current, e := cleanupCatalogItem(ctx, tx, item.Kind, item.SourceID, s.r2.Bucket())
+		var bucket string
+		if s.r2 != nil {
+			bucket = s.r2.Bucket()
+		}
+		current, e := cleanupCatalogItem(ctx, tx, item.Kind, item.SourceID, bucket)
 		a, _ := json.Marshal(current)
 		bitem := item
 		bitem.Frozen = [5]int64{}
@@ -810,24 +986,25 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 			action = "conflict"
 		} else {
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyMode(ctx, tx, item, mode == "dry_run", stageTimings)
+			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, env.rankingsUnchanged(ctx, tx, mode, rankings))
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"
 				policyReason = e.Error()
 			} else {
 				recoveryStarted := time.Now()
-				recovery = s.cleanupRecovery(ctx, item)
+				var method string
+				recovery, recoveryEvidence, method = s.cleanupRecoveryFor(ctx, id, item, mode, evidence, env)
 				stageTimings["recovery_ms"] = time.Since(recoveryStarted).Milliseconds()
+				stageTimings["recovery_mode"] = method
 				action = "would_delete"
 				if recovery == "conflict" {
 					action = "conflict"
 				}
 				if cleanupMayIssue(mode, s.cfg.NASCleanupDeletionEnabled, until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
-					allowed, e := cleanupBudgetAllows(ctx, tx, item.SizeBytes)
+					allowed, e := env.budgetAllows(ctx, tx, item.SizeBytes)
 					if e != nil {
-						util.WriteError(w, 500, "cleanup deletion budget unavailable")
-						return
+						return cleanupObserveError(500, "cleanup deletion budget unavailable")
 					}
 					if allowed {
 						action = "delete_issued"
@@ -843,9 +1020,20 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	if len(req.Proof) > 0 {
 		proof = string(req.Proof)
 	}
+	var evidenceJSON any
+	if recoveryEvidence != nil {
+		b, _ := json.Marshal(recoveryEvidence)
+		evidenceJSON = string(b)
+	}
+	expires := time.Now().UTC().Add(30 * time.Second).Truncate(time.Microsecond)
 	observed, _ := json.Marshal(req)
 	stages, _ := json.Marshal(stageTimings)
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,updated_at=now() WHERE id=$1`, id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages))
+	// Dry runs replace the recovery evidence (or clear it when the copy was not
+	// verified); executions only ever add evidence from a full verification.
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,
+ recovery_evidence=CASE WHEN $9::boolean THEN $10::jsonb ELSE coalesce($10::jsonb,recovery_evidence) END,
+ permit_expires_at=CASE WHEN $2='delete_issued' THEN $11::timestamptz ELSE permit_expires_at END,updated_at=now() WHERE id=$1`,
+		id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages), mode == "dry_run", evidenceJSON, expires)
 	// During execution every healthy observation becomes a permit. Anything
 	// else (unverified, conflict, missing, client error, policy or recovery
 	// mismatch, budget) pauses the whole plan in the same transaction.
@@ -858,29 +1046,59 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 			reason += ": " + policyReason
 		}
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE id=$1 AND mode='enabled'`, planID, reason)
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND $1=ANY(plan_ids)`, planID, reason)
+		}
 		paused = err == nil
 	}
-	if err != nil || tx.Commit(ctx) != nil {
-		util.WriteError(w, 500, "cleanup observation save failed")
-		return
+	if err != nil {
+		return cleanupObserveError(500, "cleanup observation save failed")
 	}
-	util.WriteJSON(w, 200, map[string]any{"action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": time.Now().UTC().Add(30 * time.Second), "plan_paused": paused})
+	return cleanupObserveResult{status: 200, write: true, body: map[string]any{"action": action, "delete": deletion, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": recovery, "expires_at": expires, "plan_paused": paused}}
 }
+
+type cleanupReceipt struct {
+	ItemID   int64  `json:"item_id,omitempty"`
+	Attempt  int    `json:"attempt"`
+	PlanSHA  string `json:"plan_sha256"`
+	ProofSHA string `json:"proof_sha256"`
+	Outcome  string `json:"outcome"`
+	Error    string `json:"error"`
+}
+
+// media_deleted_sidecar_failed is the honest receipt for a media unlink whose
+// sidecar step then failed (clients from 2026-11 on).
+func validCleanupReceipt(req cleanupReceipt) bool {
+	return req.Attempt >= 1 && len(req.PlanSHA) == 64 && len(req.ProofSHA) == 64 && (req.Outcome == "deleted" || req.Outcome == "unverified" || req.Outcome == "media_deleted_sidecar_failed") && len(req.Error) <= 500
+}
+
+// cleanupApplyReceipt records one deletion receipt. Any receipt other than a
+// clean deletion pauses its enabled plan (and its batch) in the same
+// statement. A replay of the identical receipt is idempotent.
+func cleanupApplyReceipt(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, cid, id int64, req cleanupReceipt) (updated int, paused bool, planID int64, err error) {
+	req.ItemID = 0
+	body, _ := json.Marshal(req)
+	var pausedPlans int
+	var plan *int64
+	err = q.QueryRow(ctx, `WITH u AS (UPDATE nas_cleanup_items i SET state=$6,outcome=$7::jsonb,updated_at=now() FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5 AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) RETURNING i.plan_id),
+pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT plan_id FROM u) AND mode='enabled' AND $6<>'deleted' RETURNING id),
+bz AS (UPDATE nas_cleanup_batches SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE mode='enabled' AND $6<>'deleted' AND plan_ids && ARRAY(SELECT plan_id FROM u) RETURNING id)
+SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT count(*) FROM bz)::int, (SELECT min(plan_id) FROM u)`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, req.Outcome, string(body), "item "+strconv.FormatInt(id, 10)+" deletion receipt "+req.Outcome).Scan(&updated, &pausedPlans, &plan)
+	if plan != nil {
+		planID = *plan
+	}
+	return updated, pausedPlans > 0, planID, err
+}
+
 func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseInt64Path(w, r, "itemId")
 	if !ok {
 		return
 	}
-	var req struct {
-		Attempt  int    `json:"attempt"`
-		PlanSHA  string `json:"plan_sha256"`
-		ProofSHA string `json:"proof_sha256"`
-		Outcome  string `json:"outcome"`
-		Error    string `json:"error"`
-	}
-	// media_deleted_sidecar_failed is the honest receipt for a media unlink
-	// whose sidecar step then failed (clients from 2026-11 on).
-	if util.DecodeJSON(r, &req) != nil || req.Attempt < 1 || len(req.PlanSHA) != 64 || len(req.ProofSHA) != 64 || (req.Outcome != "deleted" && req.Outcome != "unverified" && req.Outcome != "media_deleted_sidecar_failed") || len(req.Error) > 500 {
+	var req cleanupReceipt
+	if util.DecodeJSON(r, &req) != nil || req.ItemID != 0 || !validCleanupReceipt(req) {
 		util.WriteError(w, 400, "invalid cleanup deletion receipt")
 		return
 	}
@@ -888,18 +1106,15 @@ func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Re
 	if !ok {
 		return
 	}
-	body, _ := json.Marshal(req)
-	// Any receipt other than a clean deletion pauses its enabled plan in the
-	// same statement.
-	var updated, pausedPlans int
-	err := s.pool.QueryRow(r.Context(), `WITH u AS (UPDATE nas_cleanup_items i SET state=$6,outcome=$7::jsonb,updated_at=now() FROM nas_cleanup_plans p WHERE i.id=$1 AND p.id=i.plan_id AND p.connection_id=$2 AND p.plan_sha256=$3 AND i.attempt=$4 AND i.proof_sha256=$5 AND (i.state='delete_issued' OR (i.state=$6 AND i.outcome=$7::jsonb)) RETURNING i.plan_id),
-pz AS (UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason=left('auto-paused: '||$8::text,500) WHERE id IN (SELECT plan_id FROM u) AND mode='enabled' AND $6<>'deleted' RETURNING id)
-SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int`, id, cid, req.PlanSHA, req.Attempt, req.ProofSHA, req.Outcome, string(body), "item "+strconv.FormatInt(id, 10)+" deletion receipt "+req.Outcome).Scan(&updated, &pausedPlans)
+	updated, paused, planID, err := cleanupApplyReceipt(r.Context(), s.pool, cid, id, req)
 	if err != nil || updated != 1 {
 		util.WriteError(w, 409, "cleanup receipt differs or task is not deletion-issued")
 		return
 	}
-	util.WriteJSON(w, 200, map[string]any{"ok": true, "state": req.Outcome, "plan_paused": pausedPlans > 0})
+	if req.Outcome == "deleted" {
+		s.cleanupAdvanceBatchAfter(r.Context(), planID)
+	}
+	util.WriteJSON(w, 200, map[string]any{"ok": true, "state": req.Outcome, "plan_paused": paused})
 }
 
 // Each file is the destructive scope. Sibling membership may change after a
@@ -933,7 +1148,13 @@ func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items [
 		}
 	} else if err == nil {
 		stage = "item_insert"
-		_, err = tx.Exec(ctx, `INSERT INTO nas_cleanup_items(plan_id,ordinal) SELECT $1,generate_series(1,$2::integer)`, id, len(items))
+		// item/size_bytes are copied from the manifest stored in this very
+		// transaction (never from request input); both are write-once.
+		var inserted int
+		err = tx.QueryRow(ctx, `WITH ins AS (INSERT INTO nas_cleanup_items(plan_id,ordinal,item,size_bytes) SELECT p.id,e.n::integer,e.value,CASE WHEN (e.value->>'size_bytes')::bigint>0 THEN (e.value->>'size_bytes')::bigint END FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) WITH ORDINALITY e(value,n) WHERE p.id=$1 RETURNING 1) SELECT count(*) FROM ins`, id).Scan(&inserted)
+		if err == nil && inserted != len(items) {
+			err = errors.New("cleanup item rows differ from the manifest")
+		}
 	}
 	if err == nil {
 		for _, item := range items {

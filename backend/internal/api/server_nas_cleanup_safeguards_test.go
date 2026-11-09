@@ -65,7 +65,7 @@ func safeguardPlan(t *testing.T, ctx context.Context, s *Server, id int64, mode 
 		t.Fatal(err)
 	}
 	for n := range sizes {
-		if _, err := s.pool.Exec(ctx, `INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery) VALUES($1,$2,$3,'would_delete','{}','r2_sha_verified')`, 1000*id+int64(n), id, n+1); err != nil {
+		if _, err := s.pool.Exec(ctx, `INSERT INTO nas_cleanup_items(id,plan_id,ordinal,state,proof,recovery,recovery_evidence) VALUES($1,$2,$3,'would_delete','{}','r2_sha_verified','{"etag":"fixture"}')`, 1000*id+int64(n), id, n+1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -144,7 +144,10 @@ func TestNASCleanupRollingDeletionBudget(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
-	safeguardPlan(t, ctx, s, 1, "paused", 2_900_000_000_000, 50_000_000_000)
+	if nasCleanupMaxIssuedBytes24h != 5_000_000_000_000 {
+		t.Fatal("the 24h deletion budget is a reviewed constant (5 TB)")
+	}
+	safeguardPlan(t, ctx, s, 1, "paused", nasCleanupMaxIssuedBytes24h-100_000_000_000, 50_000_000_000)
 	safeguardPlan(t, ctx, s, 2, "paused", 40_000_000_000)
 	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='deleted',delete_ever_issued=true,updated_at=now()-interval '1 hour' WHERE id=1000;
 UPDATE nas_cleanup_items SET state='deleted',delete_ever_issued=true,updated_at=now()-interval '25 hours' WHERE id=1001;`); err != nil {
@@ -164,10 +167,10 @@ UPDATE nas_cleanup_items SET state='deleted',delete_ever_issued=true,updated_at=
 		return ok
 	}
 	if !allows(100_000_000_000) {
-		t.Fatal("permit within the 3 TB budget refused")
+		t.Fatal("permit within the 24h budget refused")
 	}
 	if allows(100_000_000_001) || allows(0) {
-		t.Fatal("permit beyond the 3 TB budget (or empty) issued")
+		t.Fatal("permit beyond the 24h budget (or empty) issued")
 	}
 	// A not-yet-receipted issued delete counts too, from any plan.
 	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='delete_issued',delete_ever_issued=true WHERE id=2000`); err != nil {
