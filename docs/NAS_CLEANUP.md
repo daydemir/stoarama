@@ -175,6 +175,26 @@ gates above changed; the work each gate costs and the approval granularity did.
   Enable refuses any plan with an item lacking dry-run ETag evidence.
   Missing evidence (plans dry-run by older servers) falls back to the full
   re-download.
+- **Dry-run recovery without downloading (2026-11, second pass).** The NAS
+  client computes the media MD5 in the same read as its SHA-256 and, when the
+  lease advertises `recovery_md5`, sends it with the observation. The server
+  HEADs the R2 object and records `r2_md5_etag_matched` when the size matches
+  and the ETag is a plain single-part MD5 equal to the client's MD5 (R2's
+  single-part ETag is the MD5 of the stored bytes), any `sha256` metadata
+  agrees, and the proof's SHA-256 equals the catalog SHA (R2 bytes == NAS bytes
+  == catalog). Multipart ETags (`…-N`), a missing or different MD5 and any
+  other doubt fall back to the full download + SHA-256 (`r2_sha_verified`). A
+  random ~1% of matches are also fully downloaded as an audit; a disagreement
+  is recorded as `conflict` and pauses the plan (dry-run plans too). Enable
+  accepts `r2_sha_verified` or `r2_md5_etag_matched` with ETag evidence.
+- **No R2 I/O under locks.** Both observation endpoints compute every R2
+  check before their transaction (16 in parallel, 40 s budget per request,
+  inside the edge proxy's 100 s origin timeout). An item whose check is not
+  ready gets a retryable 503 with nothing recorded; the observation itself
+  never touches R2. The client resends 503s and replays its journal through the
+  batched endpoints in parallel. (Before this, a large dry-run batch of big
+  objects could exceed the proxy timeout; the client then fell back to serial
+  single-item replays, each downloading inside its transaction.)
 - **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
   up to 64 tasks per lease, observations and receipts batched up to 64 per
   request. Execution work is leased only within the client's remaining local

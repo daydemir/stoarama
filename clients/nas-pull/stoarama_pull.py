@@ -1642,6 +1642,10 @@ class CleanupFile:
         self.directory = None
         self.proof_names = None
         self.proof_seq = None
+        # MD5 of the media bytes, computed in the same read as their SHA-256.
+        # It is not part of the proof; protocol-2 servers use it to match the
+        # R2 single-part ETag instead of downloading the recovery copy.
+        self.media_md5 = None
 
     def check_active(self):
         if self.stop_event.is_set() or time.monotonic() >= self.deadline:
@@ -1752,17 +1756,22 @@ class CleanupFile:
         for n, (_, fd, _) in enumerate(self.files):
             os.lseek(fd, 0, os.SEEK_SET)
             digest = hashlib.sha256()
+            md5 = hashlib.md5() if n == 0 else None
             while True:
                 self.check_active()
                 block = os.read(fd, 1024 * 1024)
                 if not block:
                     break
                 digest.update(block)
+                if md5 is not None:
+                    md5.update(block)
                 if n:
                     sidecar_bytes += block
                     if len(sidecar_bytes) > 1024 * 1024:
                         raise RuntimeError("cleanup sidecar exceeds bound")
             hashes.append(digest.hexdigest())
+            if md5 is not None:
+                self.media_md5 = md5.hexdigest()
         self.stage_timings["hash_ms"] = (time.monotonic() - hash_started) * 1000
         self.check_paths()
         after_names, _ = self.parent_snapshot()
@@ -2245,19 +2254,35 @@ def cleanup_send_result(cfg, item_id, receipt):
     return restore_api(cfg, path, legacy)
 
 
-def cleanup_replay_receipts(cfg, inventory):
+CLEANUP_REPLAY_WORKERS = 16
+
+
+def cleanup_replay_receipts(cfg, inventory, api=None):
+    """Replay every durable journal entry; protocol 2 replays in parallel
+    through the batched endpoints (same per-item rules as the single ones)."""
     def replay(item_id, phase, body):
         try:
+            if api is not None:
+                call = api.observe if phase == "observe" else api.result
+                # A server that predates recovery_md5 rejects a whole batch
+                # that contains the field (also failing entries batched with
+                # it): resend without md5 rather than halting the replay.
+                for attempt in range(3):
+                    try:
+                        return call(cfg, item_id, body if attempt == 0 else {k: v for k, v in body.items() if k != "md5"})
+                    except urllib.error.HTTPError as exc:
+                        if exc.code != 400 or attempt == 2:
+                            raise
             if phase == "result":
                 return cleanup_send_result(cfg, item_id, body)
             try:
                 return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
             except urllib.error.HTTPError as exc:
-                # A rolled-back server does not know request_id (protocol 2).
-                if exc.code != 400 or "request_id" not in body:
+                # A rolled-back server does not know protocol-2 fields.
+                if exc.code != 400 or not ({"request_id", "md5"} & set(body)):
                     raise
                 return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase),
-                                   {k: v for k, v in body.items() if k != "request_id"})
+                                   {k: v for k, v in body.items() if k not in ("request_id", "md5")})
         except urllib.error.HTTPError as exc:
             if exc.code != 409:
                 raise
@@ -2271,7 +2296,7 @@ def cleanup_replay_receipts(cfg, inventory):
             log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
             return None
 
-    for item_id, phase, encoded in cleanup_journal(inventory):
+    def one(item_id, phase, encoded):
         body = json.loads(encoded)
         if phase == "intent":
             body.update(outcome="unverified", error="client interrupted after permit; operator reconciliation required")
@@ -2279,13 +2304,23 @@ def cleanup_replay_receipts(cfg, inventory):
             cleanup_journal(inventory, item_id, phase, body)
         response = replay(item_id, "observe" if phase == "observe" else "result", body)
         if response is None:
-            continue
+            return
         if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed"}
             cleanup_journal(inventory, item_id, "result", body)
             replay(item_id, "result", body)
         cleanup_journal(inventory, item_id)
+
+    entries = cleanup_journal(inventory)
+    if api is None or len(entries) < 2:
+        for entry in entries:
+            one(*entry)
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_REPLAY_WORKERS, thread_name_prefix="nas-cleanup-replay") as pool:
+        futures = [pool.submit(one, *entry) for entry in entries]
+    for future in futures:
+        future.result()
 
 
 def cleanup_verified_ack(task, proof, decision):
@@ -2295,7 +2330,7 @@ def cleanup_verified_ack(task, proof, decision):
         and isinstance(decision, dict)
         and decision.get("delete") is False
         and decision.get("action") == "would_delete"
-        and decision.get("recovery") == "r2_sha_verified"
+        and decision.get("recovery") in ("r2_sha_verified", "r2_md5_etag_matched")
         and type(decision.get("item_id")) is int
         and decision["item_id"] == task["item_id"]
         and type(decision.get("attempt")) is int
@@ -2351,6 +2386,9 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
             if refusal:
                 raise RuntimeError("client deletion guard refused; KEEP: " + refusal)
             body.update(outcome="match", proof=proof, timings=dict(current.stage_timings))
+            # Only for tasks from a lease that advertised recovery_md5.
+            if api.request_ids and task.get("_recovery_md5") is True and current.media_md5:
+                body["md5"] = current.media_md5
             cleanup_journal(inventory, item_id, "observe", body)
             permit_request_started = time.monotonic()
             decision = api.observe(cfg, item_id, body)
@@ -2527,6 +2565,7 @@ CLEANUP_BATCH_LINGER_SEC = 0.02
 CLEANUP_RETRY_DELAYS = (0.25, 0.5, 1, 2, 4)
 CLEANUP_V2_FALLBACK_SEC = 3600
 CLEANUP_V2_ERROR_WAIT_SEC = 15
+CLEANUP_RETRYABLE_ATTEMPTS = 8
 
 
 class CleanupProtocolUnsupported(RuntimeError):
@@ -2622,13 +2661,15 @@ class CleanupBatchAPI:
         self.receipts = CleanupBatcher(cfg, "/account/connections/cleanup/result-batch", "receipts")
 
     def call(self, batcher, item_id, body):
-        for attempt in range(4):
+        # 503 means "not decided yet, nothing recorded" (e.g. the server's
+        # bounded R2 work for this request ran out of time): resend as is.
+        for attempt in range(CLEANUP_RETRYABLE_ATTEMPTS):
             result = batcher.submit(dict(body, item_id=item_id)).result(timeout=HTTP_TIMEOUT_SEC * 3)
             status = result.get("status")
             if status == 200:
                 return {k: v for k, v in result.items() if k != "status"}
-            if status == 503 and attempt < 3:
-                time.sleep(0.25 * (attempt + 1))
+            if status == 503 and attempt < CLEANUP_RETRYABLE_ATTEMPTS - 1:
+                time.sleep(min(5.0, 0.25 * 2 ** attempt))
                 continue
             code = status if type(status) is int and 400 <= status < 600 else 500
             raise urllib.error.HTTPError(batcher.path, code, str(result.get("error", ""))[:200], {}, None)
@@ -2692,7 +2733,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     Execution tasks run concurrently (each is fully independent and re-checked
     by its own worker). The coordinator alone replays durable receipts, after
     every worker of the previous cycle has drained, exactly as protocol 1."""
-    cleanup_replay_receipts(cfg, inventory)
+    cleanup_replay_receipts(cfg, inventory, api)
     pins, pins_error = cleanup_pins()
     pending = {}
     leased = 0
@@ -2720,6 +2761,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                     break
                 for task in lease["tasks"]:
                     leased += 1
+                    task["_recovery_md5"] = lease.get("recovery_md5") is True  # local only, never sent
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break

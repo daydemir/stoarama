@@ -33,6 +33,9 @@ type fakeCleanupBucket struct {
 	heads     int
 	headDelay time.Duration
 	getDelay  time.Duration
+	// etags overrides the reported ETag of a key (multipart-style or a lying
+	// store) while the body stays as stored.
+	etags map[string]string
 }
 
 func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +57,11 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sum := md5.Sum(body)
 	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	b.mu.Lock()
+	if override, ok := b.etags[key]; ok {
+		etag = `"` + override + `"`
+	}
+	b.mu.Unlock()
 	if m := r.Header.Get("If-Match"); m != "" && m != etag {
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
@@ -168,8 +176,9 @@ func (f *cleanupFixture) admit(label string, files []cleanupFixtureFile) (int64,
 		}
 		key := fmt.Sprintf("bench/%d.mp4", file.ClipID)
 		f.bucket.put(key, body)
-		if _, err := f.pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket) VALUES($1,2,$2,$3,$4,$5,$6,$7,'bucket')`,
-			file.ClipID, key, file.SHA256, file.SizeBytes, file.RelativePath, file.StartAt, file.EndAt); err != nil {
+		uploadETag := md5.Sum(body) // what the uploader recorded (single part)
+		if _, err := f.pool.Exec(ctx, `INSERT INTO recording_clips(id,recording_id,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket,etag) VALUES($1,2,$2,$3,$4,$5,$6,$7,'bucket',$8)`,
+			file.ClipID, key, file.SHA256, file.SizeBytes, file.RelativePath, file.StartAt, file.EndAt, `"`+hex.EncodeToString(uploadETag[:])+`"`); err != nil {
 			t.Fatal(err)
 		}
 		item, err := cleanupCatalogItem(ctx, f.pool, "raw", file.ClipID, "bucket")
@@ -266,12 +275,19 @@ type batchResult struct {
 
 // observe sends match observations for tasks (with request ids when given).
 func (f *cleanupFixture) observe(tasks []cleanupTask, requestIDs map[int64]string) []batchResult {
+	return f.observeMD5(tasks, requestIDs, nil)
+}
+
+func (f *cleanupFixture) observeMD5(tasks []cleanupTask, requestIDs map[int64]string, md5s map[int64]string) []batchResult {
 	f.t.Helper()
 	observations := []map[string]any{}
 	for _, task := range tasks {
 		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": "test"}
 		if id := requestIDs[task.ItemID]; id != "" {
 			o["request_id"] = id
+		}
+		if m := md5s[task.ItemID]; m != "" {
+			o["md5"] = m
 		}
 		observations = append(observations, o)
 	}

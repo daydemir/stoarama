@@ -179,6 +179,11 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		dryStarted := time.Now()
 		run(api, root, state, 2)
 		report["after_dry_run_files_per_sec"] = float64(afterFiles) / time.Since(dryStarted).Seconds()
+		var md5Matched int
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_items WHERE recovery='r2_md5_etag_matched'`).Scan(&md5Matched); err != nil {
+			t.Fatal(err)
+		}
+		report["after_dry_run_md5_matched"] = md5Matched
 		f.s.cfg.NASCleanupDeletionEnabled = true
 		if code, body := f.enableBatch(plans, shas, 24); code != 200 {
 			t.Fatalf("batch enable: %d %s", code, body)
@@ -212,6 +217,21 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		verify(f, files, deleted)
 	}
 
+	// Dry run without the MD5 shortcut (protocol 2, full download + SHA per
+	// file, parallel and outside locks).
+	if bench {
+		f, root, state := newScenario("dry-full")
+		files := prepare(root, 400000, min(afterFiles, 500))
+		f.admit("bench-dry-full", files)
+		f.bucket.headDelay, f.bucket.getDelay = headDelay, getDelay
+		cleanupLeaseAdvertisesMD5 = false
+		api := serve(f, 0)
+		started := time.Now()
+		run(api, root, state, 2)
+		report["dry_run_full_sha_files_per_sec"] = float64(len(files)) / time.Since(started).Seconds()
+		cleanupLeaseAdvertisesMD5 = true
+	}
+
 	// Before: protocol 1 with the old per-item server work.
 	{
 		f, root, state := newScenario("before")
@@ -219,7 +239,9 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		id, sha, _ := f.admit("bench-before", files)
 		f.bucket.headDelay, f.bucket.getDelay = headDelay, getDelay
 		api := serve(f, 0)
+		dryStarted := time.Now()
 		run(api, root, state, 1)
+		report["before_dry_run_protocol1_files_per_sec"] = float64(beforeFiles) / time.Since(dryStarted).Seconds()
 		f.s.cfg.NASCleanupDeletionEnabled = true
 		if code, body := safeguardControl(t, f.s, id, "enabled", map[string]any{"approval_hours": 24, "allow_long_approval": true, "plan_sha256": sha}); code != 200 {
 			t.Fatalf("enable: %d %s", code, body)

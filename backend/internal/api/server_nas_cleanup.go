@@ -514,6 +514,9 @@ type cleanupObserve struct {
 	// RequestID (protocol 2) makes a lost permit response replayable: only the
 	// identical request gets the already-issued permit back, never a new one.
 	RequestID string `json:"request_id,omitempty"`
+	// MD5 of the media bytes (protocol 2, lease advertises recovery_md5),
+	// computed by the client in the same read as the proof's SHA-256.
+	MD5 string `json:"md5,omitempty"`
 }
 
 // Plans are ordered without sorting/locking the entire pending file backlog.
@@ -606,7 +609,7 @@ UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND 
 			return
 		}
 		if len(replayed) != 0 {
-			util.WriteJSON(w, 200, map[string]any{"tasks": replayed, "retry_after_sec": 0, "replayed": true})
+			util.WriteJSON(w, 200, map[string]any{"tasks": replayed, "retry_after_sec": 0, "replayed": true, "recovery_md5": cleanupLeaseAdvertisesMD5})
 			return
 		}
 	}
@@ -693,7 +696,12 @@ UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND 
 	if len(tasks) == 0 {
 		retry = 120
 	}
-	util.WriteJSON(w, 200, map[string]any{"tasks": tasks, "retry_after_sec": retry})
+	body := map[string]any{"tasks": tasks, "retry_after_sec": retry}
+	if req.Protocol == 2 && cleanupLeaseAdvertisesMD5 {
+		// Observations may carry the media MD5 (see cleanupRecoveryMD5).
+		body["recovery_md5"] = true
+	}
+	util.WriteJSON(w, 200, body)
 }
 
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
@@ -827,6 +835,9 @@ func cleanupObserveRequestError(req cleanupObserve) string {
 	if req.RequestID != "" && (len(req.RequestID) != 32 || !lowerHex(req.RequestID)) {
 		return "invalid cleanup observation request id"
 	}
+	if req.MD5 != "" && (len(req.MD5) != 32 || !lowerHex(req.MD5)) {
+		return "invalid cleanup observation md5"
+	}
 	if len(req.Timings) > 3 {
 		return "invalid cleanup timings"
 	}
@@ -860,13 +871,18 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
+	// R2 work happens before the transaction (no locks held across it).
+	env := &cleanupObserveEnv{}
+	if req.Outcome == "match" {
+		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup observation begin failed")
 		return
 	}
 	defer tx.Rollback(ctx)
-	result := s.cleanupObserveOne(ctx, tx, cid, id, req, &cleanupObserveEnv{})
+	result := s.cleanupObserveOne(ctx, tx, cid, id, req, env)
 	if result.status == 200 && result.write && tx.Commit(ctx) != nil {
 		util.WriteError(w, 500, "cleanup observation save failed")
 		return
@@ -964,6 +980,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	action := req.Outcome
 	recovery := "unchecked"
 	var recoveryEvidence *cleanupRecoveryEvidence
+	recoveryAnomaly := false
 	deletion := false
 	if req.Outcome == "match" {
 		if !validCleanupProof(req.Proof, item) {
@@ -992,14 +1009,20 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 				action = "keep"
 				policyReason = e.Error()
 			} else {
-				recoveryStarted := time.Now()
-				var method string
-				recovery, recoveryEvidence, method = s.cleanupRecoveryFor(ctx, id, item, mode, evidence, env)
-				stageTimings["recovery_ms"] = time.Since(recoveryStarted).Milliseconds()
-				stageTimings["recovery_mode"] = method
+				pre, ok := s.cleanupRecoveryFor(id, item, mode, evidence, req.MD5, env)
+				if !ok {
+					// Never do R2 I/O while holding observation locks.
+					return cleanupObserveResult{status: 503, body: map[string]any{"error": "recovery check not ready; retry", "retryable": true}}
+				}
+				recovery, recoveryEvidence = pre.recovery, pre.out
+				stageTimings["recovery_mode"] = pre.method
 				action = "would_delete"
 				if recovery == "conflict" {
 					action = "conflict"
+				}
+				if pre.anomaly {
+					recoveryAnomaly = true
+					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
 				if cleanupMayIssue(mode, s.cfg.NASCleanupDeletionEnabled, until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
 					allowed, e := env.budgetAllows(ctx, tx, item.SizeBytes)
@@ -1049,6 +1072,12 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		if err == nil {
 			_, err = tx.Exec(ctx, `UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND $1=ANY(plan_ids)`, planID, reason)
 		}
+		paused = err == nil
+	}
+	if err == nil && recoveryAnomaly && mode == "dry_run" {
+		// An audit disagreement stops the dry run of the whole plan too.
+		reason := "item " + strconv.FormatInt(id, 10) + ": " + policyReason
+		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE id=$1 AND mode='dry_run'`, planID, reason)
 		paused = err == nil
 	}
 	if err != nil {
