@@ -119,6 +119,12 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	if _, err := pool.Exec(ctx, string(body)); err != nil {
 		t.Fatalf("apply 0160: %v", err)
 	}
+	if body, err = os.ReadFile("../../../infra/sql/migrations/0174_r2_object_retirements.sql"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(body)); err != nil {
+		t.Fatalf("apply 0174: %v", err)
+	}
 	sha := strings.Repeat("a", 64)
 	dir := "f/July/26-Sunday/01_P_2026_July_W4_Sunday_hour_"
 	for _, o := range []struct {
@@ -246,6 +252,18 @@ func TestCollatedDeliveryFeedDownloadAckAndPolicy(t *testing.T) {
 	}
 	if ids := feedIDs(); fmt.Sprint(ids) != "[102 103]" {
 		t.Fatalf("expired backoff not retried: feed=%v", ids)
+	}
+	// An output retired from R2 (stoaramactl r2-retire) leaves the feed and
+	// can no longer be downloaded.
+	if _, err := pool.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256)
+		VALUES ('collated',103,1,'stoarama','joined/nightly-collation-v2/objects/103.mp4',1000,$1,'outside_keep28_no_nas_copy','none',$1,$1)`, sha); err != nil {
+		t.Fatal(err)
+	}
+	if ids := feedIDs(); fmt.Sprint(ids) != "[102]" {
+		t.Fatalf("retired output still in feed=%v", ids)
+	}
+	if code, _ := do(s.handleAccountCollatedDownload, http.MethodGet, "/x", nil, map[string]string{"outputId": "103"}); code != 404 {
+		t.Fatalf("retired output download code=%d", code)
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM recording_collation_output_acks`); err == nil {
 		t.Fatal("ack rows are not append-only")

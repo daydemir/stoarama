@@ -584,6 +584,19 @@ func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
 	return nil
 }
 
+// DeleteObject deletes exactly one key: no prefix, batch or wildcard
+// semantics. A key with surrounding whitespace is refused rather than
+// normalized into a different key. Deleting an absent key succeeds.
+func (c *Client) DeleteObject(ctx context.Context, key string) error {
+	if key == "" || strings.TrimSpace(key) != key {
+		return fmt.Errorf("delete object key %q is empty or padded", key)
+	}
+	if _, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)}); err != nil {
+		return fmt.Errorf("delete object %s: %w", key, err)
+	}
+	return nil
+}
+
 // MaxDeleteBatch is the S3/R2 multi-object delete limit per request.
 const MaxDeleteBatch = 1000
 
