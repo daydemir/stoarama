@@ -58,6 +58,12 @@ func TestPullPathAllowed(t *testing.T) {
 		{http.MethodGet, "/api/v1/account/recordings/12/clips/34/download", true},
 		{http.MethodPost, "/api/v1/account/recordings/12/clips/34/release", true},
 
+		{http.MethodPost, "/api/v1/account/connections/cleanup/observe-batch", true},
+		{http.MethodPost, "/api/v1/account/connections/cleanup/result-batch", true},
+		{http.MethodGet, "/api/v1/account/connections/cleanup/observe-batch", false},
+		{http.MethodPost, "/api/v1/account/connections/cleanup/observe-batch/extra", false},
+		{http.MethodPost, "/api/v1/account/connections/cleanup/delete-batch", false},
+
 		// Wrong method on a pull path.
 		{http.MethodPost, "/api/v1/account/clips", false},
 		{http.MethodGet, "/api/v1/account/connections/heartbeat", false},
