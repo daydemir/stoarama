@@ -26,7 +26,7 @@ CREATE TABLE nas_stitch_tasks (
  id bigserial PRIMARY KEY, scope_id bigint NOT NULL REFERENCES nas_stitch_scopes(id),
  recording_id bigint NOT NULL REFERENCES recordings(id), hour_at timestamptz NOT NULL,
  plan jsonb NOT NULL, plan_sha256 text NOT NULL CHECK(plan_sha256 ~ '^[a-f0-9]{64}$'),
- state text NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','leased','verified','held')),
+ state text NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','leased','verified','held','completed_no_retirement')),
  attempt integer NOT NULL DEFAULT 0, lease_token text, lease_expires_at timestamptz,
  result jsonb, cleanup_plan_id bigint REFERENCES nas_cleanup_plans(id),
  updated_at timestamptz NOT NULL DEFAULT now(),
@@ -48,7 +48,11 @@ CREATE TRIGGER nas_stitch_corpus_immutable BEFORE UPDATE OR DELETE ON nas_stitch
 CREATE TRIGGER nas_stitch_edge_immutable BEFORE UPDATE OR DELETE ON nas_stitch_edges FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_evidence();
 CREATE FUNCTION guard_nas_stitch_task() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
  IF TG_OP='DELETE' OR ROW(NEW.scope_id,NEW.recording_id,NEW.hour_at,NEW.plan,NEW.plan_sha256) IS DISTINCT FROM ROW(OLD.scope_id,OLD.recording_id,OLD.hour_at,OLD.plan,OLD.plan_sha256)
- OR (OLD.state IN ('verified','held') AND ROW(NEW.state,NEW.result) IS DISTINCT FROM ROW(OLD.state,OLD.result))
+ OR (OLD.state IN ('verified','held','completed_no_retirement') AND
+     (NEW.result IS DISTINCT FROM OLD.result OR
+      (NEW.state IS DISTINCT FROM OLD.state AND NOT
+       (OLD.state IN ('verified','held') AND NEW.state='completed_no_retirement' AND OLD.cleanup_plan_id IS NULL AND NEW.cleanup_plan_id IS NULL))))
+ OR (NEW.state='completed_no_retirement' AND NEW.cleanup_plan_id IS NOT NULL)
  OR (OLD.cleanup_plan_id IS NOT NULL AND NEW.cleanup_plan_id IS DISTINCT FROM OLD.cleanup_plan_id) THEN
  RAISE EXCEPTION 'NAS stitch task identity/result is immutable'; END IF; RETURN NEW; END $$;
 CREATE TRIGGER nas_stitch_task_immutable BEFORE UPDATE OR DELETE ON nas_stitch_tasks FOR EACH ROW EXECUTE FUNCTION guard_nas_stitch_task();

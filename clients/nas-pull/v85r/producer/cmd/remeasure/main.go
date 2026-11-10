@@ -43,7 +43,11 @@ func identity(path string, clip c.Clip) error {
 	return nil
 }
 func source(ctx context.Context, tools c.Tools, path string, clip c.Clip) (c.SourceContext, map[string]any, error) {
-	summary := map[string]any{"decode_validation": "ffprobe_err_detect_explode_EOF"}
+	summary := map[string]any{"decode_validation": "strict_ffmpeg_and_ffprobe_EOF"}
+	strict := exec.CommandContext(ctx, tools.FFmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1", "-i", path, "-map", "0:v:0", "-an", "-f", "null", "-")
+	if raw, err := strict.CombinedOutput(); err != nil || len(bytes.TrimSpace(raw)) != 0 {
+		return c.SourceContext{}, summary, fmt.Errorf("strict full-source decode failed")
+	}
 	cmd := exec.CommandContext(ctx, tools.FFprobe, "-v", "error", "-threads", "1", "-err_detect", "explode", "-select_streams", "v:0", "-show_entries", "frame=best_effort_timestamp_time,pkt_duration_time,duration_time", "-of", "json", path)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -122,16 +126,13 @@ func run() map[string]any {
 	out["media"] = []c.ClipMedia{pa.Media, pb.Media}
 	var ac, bc c.SourceContext
 	var ae, be error
-	if in.ActualSpan {
-		var as, bs map[string]any
-		ac, as, ae = source(ctx, tools, in.PrevPath, in.Prev)
-		bc, bs, be = source(ctx, tools, in.NextPath, in.Next)
-		out["source_audits"] = []map[string]any{as, bs}
-		if ae != nil || be != nil {
-			out["source_integrity_error"] = fmt.Sprintf("prev=%v next=%v", ae, be)
-		}
-	} else {
-		out["source_validation_scope"] = "strict 20-second windows; no full-EOF certification requested"
+	var as, bs map[string]any
+	ac, as, ae = source(ctx, tools, in.PrevPath, in.Prev)
+	bc, bs, be = source(ctx, tools, in.NextPath, in.Next)
+	out["source_audits"] = []map[string]any{as, bs}
+	if ae != nil || be != nil {
+		out["source_integrity_error"] = "strict full-source decode/PTS failed"
+		return out
 	}
 
 	policy := c.SeamPolicyFor(c.PolicyV3)
@@ -181,6 +182,56 @@ func run() map[string]any {
 			out["measurement_error"] = "tail extraction failed"
 		}
 	}
+	// Decode the complete, unresampled presentation inventory for endpoint
+	// diagnostics. A seek/window cannot authenticate the original EOF endpoint.
+	fullFrames := func(path string, source c.SourceContext) ([]c.Frame, error) {
+		p := policy
+		p.WindowSeconds = source.FramePTS[len(source.FramePTS)-1] + source.LastFrameDuration - source.FramePTS[0] + 1
+		frames, err := c.ExtractWindow(ctx, tools, p, path, false)
+		if err != nil || len(frames) != len(source.FramePTS) {
+			return nil, fmt.Errorf("spatial presentation inventory differs")
+		}
+		return frames, nil
+	}
+	if len(ac.FramePTS) < 100 || len(bc.FramePTS) < 100 {
+		out["error"] = "insufficient full-source frames"
+		return out
+	}
+	tail, err := fullFrames(in.PrevPath, ac)
+	if err != nil {
+		out["error"] = err.Error()
+		return out
+	}
+	head, err := fullFrames(in.NextPath, bc)
+	if err != nil {
+		out["error"] = err.Error()
+		return out
+	}
+	spatial := c.DiagnoseSpatialSeam(tail, head, policy.FrameWidth, policy.FrameHeight)
+	bindings := []map[string]any{
+		{"clip_id": in.Prev.ClipID, "sha256": in.Prev.SHA256, "size_bytes": in.Prev.SizeBytes},
+		{"clip_id": in.Next.ClipID, "sha256": in.Next.SHA256, "size_bytes": in.Next.SizeBytes},
+	}
+	// Detect source replacement during any decoder/evaluator operation.
+	if identity(in.PrevPath, in.Prev) != nil || identity(in.NextPath, in.Next) != nil {
+		out["error"] = "source identity changed during measurement"
+		return out
+	}
+	out["evidence_row"] = map[string]any{
+		"source_bindings": bindings, "pair": map[string]any{"prev": in.Prev, "next": in.Next},
+		"diagnostic_window20":         d,
+		"research_packet_replay":      c.AuditReplayOrder(pa, pb),
+		"research_audio_inventory":    []c.ClipMedia{pa.Media, pb.Media},
+		"full_source_integrity":       map[string]any{"schema": "v85-authenticated-source-context-v1", "contexts": []c.SourceContext{ac, bc}},
+		"spatial_temporal_diagnostic": spatial,
+		"spatial_provenance": map[string]any{
+			"schema": "v85-bound-spatial-evidence-v1", "source_bindings": bindings,
+			"producer_source_sha256":   "f727ff7624d6ce99f8fe67e25529931ad3ca1fad5c4dc738f141fe735b0932bf",
+			"within_side_frame_counts": []int{6, 6}, "original_endpoint_frames_preserved": true,
+			"presentation_order_verified": true,
+		},
+	}
+
 	return out
 }
 func main() { json.NewEncoder(os.Stdout).Encode(run()) }

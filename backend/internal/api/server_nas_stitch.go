@@ -626,7 +626,7 @@ func (s *Server) handleAccountNASStitchResult(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 409, "stitch result identity differs")
 		return
 	}
-	if (state == "verified" || state == "held") && nasSpaceAuditJSONEqual(old, body) {
+	if (state == "verified" || state == "held" || state == "completed_no_retirement") && nasSpaceAuditJSONEqual(old, body) {
 		util.WriteJSON(w, 200, map[string]any{"recorded": true, "id": id})
 		return
 	}
@@ -784,16 +784,12 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 	var active bool
 	var pid *int64
 	err = tx.QueryRow(ctx, `SELECT t.plan,t.result,t.state,t.lease_token,t.plan_sha256,t.cleanup_plan_id,NOT s.paused AND s.approved_until>now() FROM nas_stitch_tasks t JOIN nas_stitch_scopes s ON s.id=t.scope_id WHERE t.id=$1 FOR UPDATE OF t FOR SHARE OF s`, id).Scan(&plan, &result, &state, &token, &sha, &pid, &active)
-	if err != nil || req.Token != token || req.PlanSHA != sha || (state != "verified" && state != "held") {
+	if err != nil || req.Token != token || req.PlanSHA != sha || (state != "verified" && state != "held" && state != "completed_no_retirement") {
 		util.WriteError(w, 409, "stitch readiness identity differs")
 		return
 	}
-	if pid != nil {
+	if pid != nil || state == "completed_no_retirement" {
 		util.WriteJSON(w, 200, map[string]any{"ready": true, "id": id})
-		return
-	}
-	if !s.cfg.NASStitchEnabled || !active {
-		util.WriteError(w, 409, "stitch scope inactive")
 		return
 	}
 	var p nasStitchPlan
@@ -807,7 +803,18 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, err.Error())
 		return
 	}
-	if len(items) > 0 {
+	if len(items) == 0 {
+		// Finishing without retirement grants no deletion authority. A scope
+		// pause must not strand durable outputs in the shared media lane.
+		if _, err = tx.Exec(ctx, `UPDATE nas_stitch_tasks SET state='completed_no_retirement',updated_at=now() WHERE id=$1`, id); err != nil {
+			util.WriteError(w, 500, "non-retiring completion failed")
+			return
+		}
+	} else {
+		if !s.cfg.NASStitchEnabled || !active {
+			util.WriteError(w, 409, "stitch scope inactive")
+			return
+		}
 		for n := range items {
 			items[n].StitchTaskID = id
 		}

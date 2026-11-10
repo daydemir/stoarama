@@ -1,4 +1,6 @@
 """Pins, recovered classifier replay, conservative fallback and actual Linux producer."""
+import copy
+import gzip
 import hashlib
 import io
 import threading
@@ -61,13 +63,95 @@ class V85rTests(unittest.TestCase):
                 pull.stitch_v85r_tools(SimpleNamespace(state_dir=state),time.monotonic()+20,threading.Event())
             self.assertEqual(list(Path(state).rglob('ffmpeg')),[])
 
-    def test_recovered_classifier_tree_replays_real_frozen_positive(self):
-        f=json.loads((ROOT/'v85r-replay-fixture.json').read_text())
-        c=runner.classifier()
-        bad,human=c.C.load_vetoes(ROOT/'v85r/source71.json',ROOT/'v85r/human12.json')
-        bindings=[dict(clip_id=k[0],sha256=k[1],size_bytes=k[2]) for k in f['frozen']['source_key']]
-        n,s=runner.decide(c,f['diagnostic'],bindings,bad,human,set())
-        self.assertEqual((n,s),(f['frozen']['nomination'],f['frozen']['status']))
+    def recorded_rows(self):
+        raw = (ROOT/'testdata/v85r-october-evidence.json.gz').read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), 'e62739b52a73cdd10dd20ab8d023aab801f0efbb1ef165cf8bba23bf9ce374e2')
+        rows = json.loads(gzip.decompress(raw))['rows']
+        self.assertEqual(len(rows), 14)
+        return rows
+
+    def policy(self):
+        c = runner.classifier()
+        bad, human = c.C.load_vetoes(ROOT/'v85r/source71.json', ROOT/'v85r/human12.json')
+        return c, bad, human
+
+    def test_complete_october_recorded_evidence_replays_through_production_adapter(self):
+        c, bad, human = self.policy()
+        for case in self.recorded_rows():
+            row = case['row']
+            with self.subTest(case=case['case']):
+                self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
+                                 tuple(case['expected']))
+
+    def stationary_row(self):
+        row = copy.deepcopy(self.recorded_rows()[0]['row'])
+        spatial = row['spatial_temporal_diagnostic']
+        spatial.update(tail_dx_pixels_per_frame=0, tail_dy_pixels_per_frame=0,
+                       head_dx_pixels_per_frame=0, head_dy_pixels_per_frame=0,
+                       motion_observable=False, ambiguities=['no_observable_motion'],
+                       texture_gradient_mad=3, minimum_spatial_novelty_margin=2, heldout_pixels=1000,
+                       forward_heldout_residual_mad=10, backward_heldout_residual_mad=10,
+                       internal_heldout_residual_mad=.1, direction_speed_disagreement=0,
+                       max_acceleration_pixels_per_frame_squared=0, boundary_unwarped_mad=10)
+        row['spatial_provenance']['diagnostic_sha256'] = hashlib.sha256(json.dumps(
+            spatial, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return row
+
+    def test_stationary_successor_veto_reaches_adapter_and_runtime(self):
+        c, bad, human = self.policy()
+        row = self.stationary_row()
+        result = c.decision(row, bad, human)
+        self.assertTrue(result['baselineK_nomination'])
+        self.assertEqual(result['status'], 'REJECT_stationary_severe_seam_forecast')
+        self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
+                         (False, result['status']))
+        request = dict(prev=row['source_bindings'][0], next=row['source_bindings'][1],
+                       tools=dict(ffmpeg='fixture', ffprobe='fixture'))
+        native = dict(evidence_row=row, diagnostic_window20=row['diagnostic_window20'])
+        with mock.patch.object(runner.subprocess, 'run', return_value=mock.Mock(stdout=json.dumps(native))):
+            decision = runner.run(request)
+        self.assertIn(decision['decision'], ('split', 'hold'))
+        self.assertFalse(decision['join'])
+
+    def test_missing_or_unauthenticated_evidence_holds_a_baseline_positive(self):
+        c, bad, human = self.policy()
+        original = self.recorded_rows()[0]['row']
+        for field in ('full_source_integrity', 'pair', 'spatial_temporal_diagnostic', 'spatial_provenance',
+                      'research_packet_replay', 'research_audio_inventory'):
+            row = copy.deepcopy(original)
+            del row[field]
+            self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
+                             (False, 'UNKNOWN_missing_authenticated_evidence'), field)
+        for mutate in (lambda r: r['full_source_integrity']['contexts'][0].update(VerifiedProofSHA='0'*64),
+                       lambda r: r['spatial_provenance'].update(diagnostic_sha256='0'*64),
+                       lambda r: r['spatial_provenance'].update(original_endpoint_frames_preserved=False),
+                       lambda r: r['pair']['prev'].update(sha256='0'*64)):
+            row = copy.deepcopy(original)
+            mutate(row)
+            self.assertFalse(runner.decide(c, row, row['source_bindings'], bad, human, set())[0])
+
+    def test_spatial_positive_research_route_never_promotes(self):
+        c, bad, human = self.policy()
+        row = self.stationary_row()
+        spatial = row['spatial_temporal_diagnostic']
+        spatial.update(tail_dx_pixels_per_frame=1, head_dx_pixels_per_frame=1,
+                       motion_observable=True, ambiguities=[],
+                       forward_heldout_residual_mad=.1, backward_heldout_residual_mad=.1)
+        row['spatial_provenance']['diagnostic_sha256'] = hashlib.sha256(json.dumps(
+            spatial, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        row['diagnostic_window20']['frame_match'].update(tail_frames=99, head_frames=99)
+        for context in row['full_source_integrity']['contexts']:
+            context.update(FramePTS=[i*.04 for i in range(1500)], LastFrameDuration=.04,
+                           RegisteredCaptureSpan=60)
+        # Supply complete matching capture identity, required by that research lane.
+        for n, side in enumerate(('prev', 'next')):
+            row['pair'][side].update(recording_id=1, recording_job_id=1,
+                                     capture_lease_token='fixture', capture_sequence=n+1)
+        raw = c.decision(row, bad, human)
+        self.assertTrue(raw['spatial_nomination'])
+        self.assertFalse(raw['baselineK_nomination'])
+        self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
+                         (False, 'SPLIT_frozen_score_reject'))
 
     def test_conservative_fallback(self):
         keys=[[1,'a'*64,10],[2,'b'*64,11]]
@@ -121,6 +205,19 @@ class V85rTests(unittest.TestCase):
                 (work/'request.json').write_text(json.dumps(request))
                 p=subprocess.run(['python3','-I','-B',str(bundle/'runner.py'),str(work/'request.json')],capture_output=True,text=True,check=True,timeout=400)
                 return json.loads(p.stdout)
+            produced = subprocess.run([str(bundle/'remeasure-linux-amd64')], input=json.dumps(request),
+                                      capture_output=True, text=True, check=True, timeout=200,
+                                      env=dict(os.environ, V85R_FFMPEG=tools['ffmpeg'], V85R_FFPROBE=tools['ffprobe']))
+            evidence = json.loads(produced.stdout)['evidence_row']
+            self.assertEqual(evidence['source_bindings'], [dict(clip_id=z['clip_id'], sha256=z['sha256'],
+                             size_bytes=z['size_bytes']) for z in (a, b)])
+            self.assertEqual(evidence['spatial_provenance']['within_side_frame_counts'], [6, 6])
+            self.assertTrue(evidence['spatial_provenance']['presentation_order_verified'])
+            self.assertEqual(evidence['spatial_temporal_diagnostic']['status'], 'diagnostic_only')
+            for context in evidence['full_source_integrity']['contexts']:
+                self.assertTrue(context['StrictDecodePassed'])
+                self.assertEqual(len(context['FramePTS']), 1500)
+                self.assertEqual(context['OwnerPinnedProofSHA'], context['VerifiedProofSHA'])
             actual=measure()
             self.assertIn('diagnostic_sha256',actual) # cannot pass through an import/measurement failure
             self.assertNotEqual(actual['reason'],'measurement_failed')

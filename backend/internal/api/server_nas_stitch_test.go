@@ -96,7 +96,7 @@ func stitchMigration(t *testing.T, f *cleanupFixture) {
 		t.Fatal(err)
 	}
 }
-func TestNASStitchRegisteredOutputRetiresOnlyIncludedRawWithSeparateGates(t *testing.T) {
+func newNASStitchTaskFixture(t *testing.T) (*cleanupFixture, nasStitchPlan, nasStitchResult) {
 	f := newCleanupFixture(t, 1)
 	stitchMigration(t, f)
 	p, q := stitchUnitFixture()
@@ -126,6 +126,10 @@ func TestNASStitchRegisteredOutputRetiresOnlyIncludedRawWithSeparateGates(t *tes
 	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_tasks(id,scope_id,recording_id,hour_at,plan,plan_sha256,state,lease_token,lease_expires_at) VALUES(7,1,2,'2026-09-20',$1,$2,'leased',$3,now()+interval '2 hours')`, string(plan), q.PlanSHA, q.Token); err != nil {
 		t.Fatal(err)
 	}
+	return f, p, q
+}
+func TestNASStitchRegisteredOutputRetiresOnlyIncludedRawWithSeparateGates(t *testing.T) {
+	f, _, q := newNASStitchTaskFixture(t)
 	result := func() int {
 		w := cleanupCall(t, f.s.handleAccountNASStitchResult, 47, 5, "id", "7", q)
 		if w.Code != 200 {
@@ -324,5 +328,65 @@ func TestNASStitchRecoveredExactCorpusImports(t *testing.T) {
 	var count, nominees int
 	if err = f.pool.QueryRow(f.ctx, `SELECT count(*),count(*) FILTER(WHERE nomination) FROM nas_stitch_edges`).Scan(&count, &nominees); err != nil || count != 73843 || nominees != 52462 {
 		t.Fatalf("corpus census %d/%d: %v", count, nominees, err)
+	}
+}
+
+func TestNASStitchNoRetirementReadinessReleasesLaneAndPreservesRaw(t *testing.T) {
+	for _, pause := range []bool{false, true} {
+		t.Run(fmt.Sprintf("paused_%t", pause), func(t *testing.T) {
+			f, p, q := newNASStitchTaskFixture(t)
+			f.s.cfg.NASStitchEnabled = true
+			for n := range q.Outputs[0].Inputs {
+				q.Outputs[0].Inputs[n].RetirementHeld = true
+			}
+			register := func() *httptest.ResponseRecorder {
+				return cleanupCall(t, f.s.handleAccountNASStitchResult, 47, 5, "id", "7", q)
+			}
+			if w := register(); w.Code != 200 {
+				t.Fatal(w.Body.String())
+			}
+			// A second exact task proves progress through the shared lease handler.
+			plan, _ := json.Marshal(p)
+			if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_scopes(id,stream_id,start_at,end_at,reason,approved_until) VALUES(2,3,'2026-09-21','2026-09-22','next scope',now()+interval '1 hour')`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_stitch_tasks(id,scope_id,recording_id,hour_at,plan,plan_sha256) VALUES(8,2,2,'2026-09-21',$1,$2)`, string(plan), q.PlanSHA); err != nil {
+				t.Fatal(err)
+			}
+			lease := func() *httptest.ResponseRecorder {
+				return cleanupCall(t, f.s.handleAccountNASStitchLease, 47, 5, "", "", nil)
+			}
+			if w := lease(); w.Code != 200 || !strings.Contains(w.Body.String(), `"task":null`) {
+				t.Fatalf("lane advanced before readiness: %s", w.Body.String())
+			}
+			if pause {
+				w := cleanupCall(t, f.s.handleAdminNASStitchPause, 47, 5, "id", "1", nil)
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+			}
+			for n := 0; n < 2; n++ {
+				w := cleanupCall(t, f.s.handleAccountNASStitchReady, 47, 5, "id", "7", map[string]any{"lease_token": q.Token, "plan_sha256": q.PlanSHA, "outputs_ready": true})
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+			}
+			if w := register(); w.Code != 200 {
+				t.Fatalf("lost registration ACK: %s", w.Body.String())
+			}
+			var state string
+			var cleanup, raw, outputs int
+			if err := f.pool.QueryRow(f.ctx, `SELECT state,(SELECT count(*) FROM nas_cleanup_plans),(SELECT count(*) FROM recording_clips WHERE id BETWEEN 1 AND 3),(SELECT count(*) FROM nas_stitch_outputs WHERE task_id=7) FROM nas_stitch_tasks WHERE id=7 AND cleanup_plan_id IS NULL`).Scan(&state, &cleanup, &raw, &outputs); err != nil || state != "completed_no_retirement" || cleanup != 0 || raw != 3 || outputs != 1 {
+				t.Fatalf("non-retiring disposition %s plans=%d raw=%d outputs=%d: %v", state, cleanup, raw, outputs, err)
+			}
+			if w := lease(); w.Code != 200 || !strings.Contains(w.Body.String(), `"id":8`) {
+				t.Fatalf("successor not leased: %s", w.Body.String())
+			}
+			for _, sql := range []string{`UPDATE nas_stitch_tasks SET state='verified' WHERE id=7`, `UPDATE nas_stitch_tasks SET result='{}' WHERE id=7`} {
+				if _, err := f.pool.Exec(f.ctx, sql); err == nil {
+					t.Fatal("terminal evidence changed", sql)
+				}
+			}
+		})
 	}
 }
