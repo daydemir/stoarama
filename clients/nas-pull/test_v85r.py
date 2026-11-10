@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import subprocess
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -84,6 +85,21 @@ class V85rTests(unittest.TestCase):
         self.assertEqual(runner.resolve(False,'SPLIT_frozen_score_reject',keys)['decision'],'split')
         self.assertTrue(runner.has_decode_error(dict(native=dict(decode_error='failed'))))
         self.assertTrue(runner.has_decode_error(dict(decode_errors=1)))
+
+    @unittest.skipUnless(os.environ.get('V85R_FROZEN_CORPUS'),'exact recovered JSONL required')
+    def test_client_indexes_entire_exact_corpus_including_unknown_rows(self):
+        import threading
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as state:
+            filename=str(Path(state)/'inventory.sqlite3')
+            db=sqlite3.connect(filename)
+            self.addCleanup(db.close)
+            inventory=SimpleNamespace(lock=threading.RLock(),db=db)
+            cfg=SimpleNamespace(inventory_file=filename,api_base='https://api.invalid',api_key='fixture')
+            with mock.patch.object(pull.urllib.request,'urlopen',side_effect=lambda *a,**kw:open(os.environ['V85R_FROZEN_CORPUS'],'rb')):
+                pull.stitch_corpus(cfg,inventory)
+            self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges').fetchone()[0],73843)
+            self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges WHERE nomination=1').fetchone()[0],52462)
 
     @unittest.skipUnless(platform.system()=='Linux' and platform.machine() in ('x86_64','amd64') and os.environ.get('V85R_TEST_TOOLS'),
                          'Linux amd64 with pinned V85R_TEST_TOOLS required')

@@ -291,3 +291,38 @@ func TestNASStitchToolCapabilityIsDefaultOffScopedAndExact(t *testing.T) {
 		t.Fatal("capability pin differs")
 	}
 }
+
+func TestNASStitchMissingFrozenFeaturesNeverCreateNomination(t *testing.T) {
+	f := map[string]any{"recording_id": 2, "source_key": [][3]any{{int64(1), strings.Repeat("a", 64), int64(3)}, {int64(2), strings.Repeat("b", 64), int64(4)}}, "nomination": false, "status": "UNKNOWN_frozen_features", "frozen_diagnostic_sha256": nil}
+	raw, _ := json.Marshal(f)
+	if _, err := parseNASStitchEdge(raw); err != nil {
+		t.Fatal("frozen negative/unknown must remain importable", err)
+	}
+	f["nomination"] = true
+	raw, _ = json.Marshal(f)
+	if _, err := parseNASStitchEdge(raw); err == nil {
+		t.Fatal("missing features nominated a frozen join")
+	}
+}
+func TestNASStitchRecoveredExactCorpusImports(t *testing.T) {
+	filename := os.Getenv("V85R_FROZEN_CORPUS")
+	if filename == "" {
+		t.Skip("set V85R_FROZEN_CORPUS to the exact recovered JSONL")
+	}
+	f := newCleanupFixture(t, 1)
+	stitchMigration(t, f)
+	file, err := os.Open(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	w := httptest.NewRecorder()
+	f.s.handleAdminNASStitchCorpus(w, httptest.NewRequest("POST", "/", file))
+	if w.Code != 200 {
+		t.Fatalf("exact recovered corpus import: %d %s", w.Code, w.Body.String())
+	}
+	var count, nominees int
+	if err = f.pool.QueryRow(f.ctx, `SELECT count(*),count(*) FILTER(WHERE nomination) FROM nas_stitch_edges`).Scan(&count, &nominees); err != nil || count != 73843 || nominees != 52462 {
+		t.Fatalf("corpus census %d/%d: %v", count, nominees, err)
+	}
+}

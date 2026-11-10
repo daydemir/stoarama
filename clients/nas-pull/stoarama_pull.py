@@ -30838,7 +30838,9 @@ def stitch_corpus(cfg, inventory):
                 digest.update(line)
                 row = json.loads(line)
                 keys = row["source_key"]
-                if (len(keys) != 2 or not re.fullmatch("[a-f0-9]{64}", row.get("frozen_diagnostic_sha256", ""))
+                diagnostic = row.get("frozen_diagnostic_sha256") or ""
+                if (len(keys) != 2 or (diagnostic and not re.fullmatch("[a-f0-9]{64}", diagnostic))
+                        or (row.get("nomination") is True and not diagnostic)
                         or type(row.get("nomination")) is not bool or not row.get("status")):
                     raise StitchHold("frozen decision incomplete")
                 database.execute("INSERT INTO v85r_stitch_edges VALUES(?,?,?,?)",

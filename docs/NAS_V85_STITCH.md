@@ -31,7 +31,11 @@ from a later recovered SDK. The owner explicitly chose this distinct policy.
 
 The server imports only the exact October JSONL (`5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b`,
 73,843 rows / 52,462 nominations; gzip pin `dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46`).
-The body and source71/human12/visual6 vetoes are now recovered. The client still
+The body and source71/human12/visual6 vetoes are now recovered. The exact
+export includes 5,283 non-nominated rows without diagnostic hashes; those rows
+remain importable as frozen denials/unknowns. A nominated row always needs a
+valid diagnostic hash. Full server import and independent client indexing of
+all 73,843 rows were exercised against the recovered bytes. The client still
 independently hashes/indexes the full export. Frozen lookup requires ordered
 clip ID + SHA-256 + size. Current metadata and actual bytes feed the recovered
 20-second feature producer; short-span replacement requires freshly decoded,

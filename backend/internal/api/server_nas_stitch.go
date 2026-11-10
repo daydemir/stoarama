@@ -44,7 +44,7 @@ type nasStitchEdge struct {
 
 func parseNASStitchEdge(raw []byte) (nasStitchEdge, error) {
 	var e nasStitchEdge
-	if json.Unmarshal(raw, &e) != nil || e.RecordingID <= 0 || !stitchSHA(e.Diagnostic) || e.Status == "" {
+	if json.Unmarshal(raw, &e) != nil || e.RecordingID <= 0 || (e.Diagnostic != "" && !stitchSHA(e.Diagnostic)) || (e.Nomination && !stitchSHA(e.Diagnostic)) || e.Status == "" {
 		return e, errors.New("incomplete frozen decision")
 	}
 	for n, k := range e.RawKey {
