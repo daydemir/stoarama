@@ -227,7 +227,11 @@ const cleanupFreezeDrainSQL = `LOCK TABLE streams,recordings,recording_clips,rec
 // it before publishing its xid-owned freeze until enable commits or rolls back,
 // so acquiring it proves no abandoned owner's attempt is still in progress.
 // Enabled freezes survive even after a process restart or a missing cache warm.
-const cleanupRecoverFreezesSQL = `WITH released AS (DELETE FROM nas_cleanup_frozen_streams f WHERE NOT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.id=f.plan_id AND p.mode='enabled') RETURNING plan_id)
+// Skip a concurrent mode transition's freeze rows: it may need a batch row
+// held by activation, which invokes recovery on a separate connection.
+const cleanupRecoverFreezesSQL = `WITH abandoned AS MATERIALIZED (
+ SELECT f.plan_id,f.stream_id FROM nas_cleanup_frozen_streams f WHERE NOT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.id=f.plan_id AND p.mode='enabled') FOR UPDATE OF f SKIP LOCKED
+), released AS (DELETE FROM nas_cleanup_frozen_streams f USING abandoned a WHERE f.plan_id=a.plan_id AND f.stream_id=a.stream_id RETURNING f.plan_id)
 DELETE FROM nas_cleanup_rankings_cache WHERE plan_id IN (SELECT plan_id FROM released)`
 
 func (s *Server) cleanupRecoverFreezes(ctx context.Context) error {

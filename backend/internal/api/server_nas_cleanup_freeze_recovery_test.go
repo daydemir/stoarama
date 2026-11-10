@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -113,6 +114,42 @@ func TestNASCleanupSourceFreezeEnabledRestartWithColdCache(t *testing.T) {
 	var cache string
 	if err := f.pool.QueryRow(f.ctx, `SELECT stage_timings->>'rankings_cache' FROM nas_cleanup_items WHERE id=$1`, tasks[0].ItemID).Scan(&cache); err != nil || cache != "replay" {
 		t.Fatalf("cold cache was not rebuilt: %s %v", cache, err)
+	}
+}
+
+func TestNASCleanupSourceFreezeRecoverySkipsConcurrentRelease(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, _, _ := f.admit("concurrent-release", syntheticFiles(100, 1, 10))
+	f.dryRun()
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) VALUES(999999,4)`); err != nil {
+		t.Fatal(err)
+	}
+	releasing, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releasing.Rollback(f.ctx)
+	// A concurrent pause may own this freeze row and then wait for the batch
+	// row that activation holds. Recovery on its separate connection must not
+	// wait on that release, or it introduces an application-level lock cycle.
+	if _, err = releasing.Exec(f.ctx, `DELETE FROM nas_cleanup_frozen_streams WHERE plan_id=999999`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, 2*time.Second)
+	defer cancel()
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `SELECT id FROM nas_cleanup_plans WHERE id=$1 FOR UPDATE`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.cleanupActivateRankings(ctx, tx, id); err != nil {
+		t.Fatalf("activation waited for an unrelated freeze release: %v", err)
 	}
 }
 
