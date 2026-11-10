@@ -40,6 +40,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
+CLEANUP_RECONCILIATION_PROTOCOL = 1
 CANDIDATE_UPDATE_LOCK = threading.Lock()
 LIST_PAGE_LIMIT = 200
 DEFAULT_DOWNLOAD_WORKERS = 12
@@ -3080,7 +3081,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
         raise RuntimeError("invalid cleanup task identity")
     deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
-    body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION}
+    body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION,
+            "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     if api.request_ids:
         # Identifies this exact observation so a retry after a lost response
         # gets the same recorded decision (or the same single permit) back.
@@ -3204,7 +3206,8 @@ CLEANUP_PREFLIGHT_TASKS = 64
 def cleanup_lease(cfg, limit=1):
     if type(limit) is not int or not 1 <= limit <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup lease bound")
-    body = {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit}
+    body = {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit,
+            "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     try:
         lease = restore_api(cfg, "/account/connections/cleanup/lease", body)
     except urllib.error.HTTPError as exc:
@@ -3540,7 +3543,8 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     execution_files = max(0, min(int(execution_files), CLEANUP_V2_LEASE))
     execution_bytes = max(0, int(execution_bytes))
     body = {"client_version": CLIENT_VERSION, "protocol": 2, "limit": limit, "execution_files": execution_files,
-            "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex}
+            "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex,
+            "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     try:
         lease = cleanup_api_retry(cfg, "/account/connections/cleanup/lease", body)
     except urllib.error.HTTPError as exc:

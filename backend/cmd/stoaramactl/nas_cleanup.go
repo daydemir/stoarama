@@ -58,7 +58,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal("--all requires recheck")
 	}
 	switch args[0] {
-	case "close", "release-unexecuted":
+	case "close":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
 			log.Fatal(args[0] + " requires --plan-id, --expected-plan-sha256 and --reason")
 		}
@@ -161,7 +161,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|close|release-unexecuted|retire-superseded|enable-batch|pause-batch|batch-report"
+const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|close|retire-superseded|enable-batch|pause-batch|batch-report"
 
 // nasCleanupBatchManifest validates a batch manifest and recomputes its
 // digest exactly as the backend does (cleanupBatchDigest): sha256 over

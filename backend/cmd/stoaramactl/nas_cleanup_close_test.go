@@ -34,21 +34,3 @@ func TestNASCleanupCLIClose(t *testing.T) {
 		t.Fatalf("requests: %d", calls)
 	}
 }
-
-func TestNASCleanupCLIReleaseUnexecuted(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || r.URL.Path != "/api/v1/service/nas-cleanup/plans/1391/release-unexecuted" || r.Header.Get("Authorization") != "Bearer fixture" {
-			t.Error("wrong service request")
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
-		}
-		if body["expected_plan_sha256"] != strings.Repeat("b", 64) || body["reason"] != "audited no unlink" || len(body) != 2 {
-			t.Errorf("body: %v", body)
-		}
-		w.Write([]byte(`{"released_item_ids":[1],"protected_item_ids":[],"deletion_enabled":false}`))
-	}))
-	defer server.Close()
-	runNASCleanup(context.Background(), config.Config{APIToken: "fixture"}, []string{"release-unexecuted", "--plan-id", "1391", "--expected-plan-sha256", strings.Repeat("b", 64), "--reason", "audited no unlink", "--backend-api-url", server.URL})
-}

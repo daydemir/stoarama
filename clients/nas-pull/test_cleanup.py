@@ -73,6 +73,7 @@ class CleanupTests(unittest.TestCase):
             calls.append((path,body))
             if path.endswith('/lease'): return dict(tasks=[self.task],retry_after_sec=0)
             self.assertEqual(len(pull.cleanup_journal(self.inventory)),1)
+            self.assertEqual(body['reconciliation_protocol'], pull.CLEANUP_RECONCILIATION_PROTOCOL)
             self.assertEqual(body['outcome'],'match')
             self.assertEqual(body['proof']['identity'],self.item['frozen_identity'])
             return fixture_ack(body, action='would_delete',delete=False,recovery='nas_only_at_check')
@@ -81,6 +82,17 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
         self.assertEqual(pull.cleanup_journal(self.inventory),[])
         self.assertEqual(len(calls),2)
+
+    def test_leases_advertise_reconciliation_only_replay_capability(self):
+        for protocol in (1, 2):
+            with self.subTest(protocol=protocol), mock.patch.object(pull, 'restore_api', return_value=dict(tasks=[], retry_after_sec=120)) as api:
+                if protocol == 1:
+                    pull.cleanup_lease(self.cfg, 1)
+                else:
+                    pull.cleanup_lease_v2(self.cfg, 64, 64, 1 << 30)
+                body = api.call_args.args[2]
+                self.assertEqual(body['protocol'], protocol)
+                self.assertEqual(body['reconciliation_protocol'], 1)
 
     def test_approved_disposable_fixture_only_deletes_exact_files(self):
         with self.opened() as f: proof=f.proof()

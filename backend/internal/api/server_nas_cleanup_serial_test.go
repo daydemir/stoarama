@@ -36,7 +36,7 @@ func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Co
 }
 func (*cleanupSlowPolicyTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
-func TestNASCleanupSixteenConcurrentLeasesSlowPolicyClientServer(t *testing.T) {
+func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	python := os.Getenv("STOARAMA_TEST_PYTHON")
 	if python == "" {
@@ -83,7 +83,7 @@ func TestNASCleanupSixteenConcurrentLeasesSlowPolicyClientServer(t *testing.T) {
 		t.Helper()
 		args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--protocol", "2"}
 		if concurrent {
-			args = append(args, "--simultaneous-tasks", "16")
+			args = append(args, "--simultaneous-tasks", "16", "--max-seconds", "90")
 		}
 		raw, err := exec.Command(python, args...).CombinedOutput()
 		if err != nil {
@@ -136,5 +136,5 @@ func TestNASCleanupSixteenConcurrentLeasesSlowPolicyClientServer(t *testing.T) {
 	if deleted != 16 || unverified != 0 || slowPolicy != 16 {
 		t.Fatalf("deleted=%d unverified=%d slow-policy=%d", deleted, unverified, slowPolicy)
 	}
-	t.Logf("16 simultaneous leased tasks, 1.1 s policy each: %s, peak requests=%d", fmt.Sprint(result.Seconds), peak.Load())
+	t.Logf("16 contending lease workers, 1.1 s policy each: %s, peak requests=%d", fmt.Sprint(result.Seconds), peak.Load())
 }

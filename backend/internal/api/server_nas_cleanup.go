@@ -55,6 +55,10 @@ const (
 	// Serialize admissions before catalog/source locks. Separate from the
 	// public fence: admission's frozen-index I/O must not block public reads.
 	nasCleanupAdmissionLock int64 = 7343226011103
+	// Serialize lease selection across concurrent clients before item locks.
+	nasCleanupLeaseLock int64 = 7343226011104
+	// Capability implemented only by clients whose journal replay uses /reconcile.
+	nasCleanupReconciliationProtocol = 1
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -514,13 +518,14 @@ type cleanupTask struct {
 	ApprovedProof json.RawMessage `json:"approved_proof,omitempty"`
 }
 type cleanupObserve struct {
-	Attempt       int                `json:"attempt"`
-	PlanSHA       string             `json:"plan_sha256"`
-	Outcome       string             `json:"outcome"`
-	Proof         json.RawMessage    `json:"proof"`
-	Error         string             `json:"error"`
-	ClientVersion string             `json:"client_version"`
-	Timings       map[string]float64 `json:"timings,omitempty"`
+	ReconciliationProtocol int                `json:"reconciliation_protocol,omitempty"`
+	Attempt                int                `json:"attempt"`
+	PlanSHA                string             `json:"plan_sha256"`
+	Outcome                string             `json:"outcome"`
+	Proof                  json.RawMessage    `json:"proof"`
+	Error                  string             `json:"error"`
+	ClientVersion          string             `json:"client_version"`
+	Timings                map[string]float64 `json:"timings,omitempty"`
 	// RequestID (protocol 2) makes a lost permit response replayable: only the
 	// identical request gets the already-issued permit back, never a new one.
 	RequestID string `json:"request_id,omitempty"`
@@ -542,7 +547,8 @@ JOIN LATERAL (
  ORDER BY candidate.attempt,candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
 ) i ON true
 WHERE p.connection_id=$1 AND p.report_sha256=$3
- AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2))
+ AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2
+ AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.state IN ('leased','delete_issued'))))
 ORDER BY i.attempt,p.priority DESC,p.id LIMIT 1`
 
 // Bytes of execution work already leased but not yet observed. Counted with
@@ -550,20 +556,21 @@ ORDER BY i.attempt,p.priority DESC,p.id LIMIT 1`
 const cleanupLeasedExecutionBytesSQL = `SELECT coalesce(sum(coalesce(i.size_bytes,(p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)),0) FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE p.mode='enabled' AND i.state='leased'`
 
 const (
-	// Protocol 1 (legacy clients): at most 8 dry-run tasks, execution serial.
+	// Protocol 1: at most 8 dry-run tasks. Execution requires the replay capability.
 	nasCleanupLeaseMaxV1 = 8
-	// Protocol 2: up to 64 tasks per lease, including execution tasks, bounded
-	// by the client's remaining local caps and by the server budget.
+	// Protocol 2: up to 64 dry-run tasks. Execution is one outstanding item
+	// per plan, also bounded by client caps and the server budget.
 	nasCleanupLeaseMaxV2 = 64
 )
 
 func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ClientVersion  string `json:"client_version"`
-		Protocol       int    `json:"protocol"`
-		Limit          int    `json:"limit"`
-		ExecutionFiles *int   `json:"execution_files,omitempty"`
-		ExecutionBytes *int64 `json:"execution_bytes,omitempty"`
+		ReconciliationProtocol int    `json:"reconciliation_protocol,omitempty"`
+		ClientVersion          string `json:"client_version"`
+		Protocol               int    `json:"protocol"`
+		Limit                  int    `json:"limit"`
+		ExecutionFiles         *int   `json:"execution_files,omitempty"`
+		ExecutionBytes         *int64 `json:"execution_bytes,omitempty"`
 		// Protocol 2: a retried request returns the tasks it already leased.
 		RequestID string `json:"request_id,omitempty"`
 	}
@@ -604,6 +611,11 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		return
 	}
 	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupLeaseLock); err != nil {
+		util.WriteError(w, 500, "cleanup lease fence unavailable")
+		return
+	}
+	allowExecution := req.ReconciliationProtocol == nasCleanupReconciliationProtocol && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
 	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report")
@@ -613,7 +625,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	tasks := make([]cleanupTask, 0, req.Limit)
 	if req.RequestID != "" {
-		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID)
+		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
@@ -623,12 +635,6 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	executing := false
-	// Execution work is only offered while it could be permitted; otherwise
-	// the probe skips enabled plans and keeps leasing dry-run work.
-	allowExecution := s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
-	budgetKnown := false
-	var budgetLeft, execBytes int64
 	for len(tasks) < req.Limit {
 		var task cleanupTask
 		var raw, approved []byte
@@ -642,40 +648,29 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			return
 		}
 		if mode == "enabled" {
-			// Protocol 1: an execution lease is always alone. Leave it pending if
-			// this response already contains dry-run work; the client drains that
-			// work first. Protocol 2 never mixes execution with dry-run work.
-			if len(tasks) != 0 && (req.Protocol == 1 || !executing) {
+			// Execution is always alone, for every client and protocol.
+			if len(tasks) != 0 {
 				break
 			}
-			if !budgetKnown {
-				var issued, leased int64
-				if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err == nil {
-					err = tx.QueryRow(ctx, cleanupLeasedExecutionBytesSQL).Scan(&leased)
-				}
-				if err != nil {
-					util.WriteError(w, 500, "cleanup deletion budget unavailable")
-					return
-				}
-				budgetKnown, budgetLeft = true, nasCleanupMaxIssuedBytes24h-issued-leased
+			var issued, leased int64
+			if err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&issued); err == nil {
+				err = tx.QueryRow(ctx, cleanupLeasedExecutionBytesSQL).Scan(&leased)
 			}
+			if err != nil {
+				util.WriteError(w, 500, "cleanup deletion budget unavailable")
+				return
+			}
+			budgetLeft := nasCleanupMaxIssuedBytes24h - issued - leased
 			// Never lease execution work the rolling budget (or, protocol 2, the
 			// client's own remaining local caps) could not permit: it would only
 			// turn into a budget refusal that auto-pauses the plan.
 			// (An invalid size is still leased and then refused, and auto-paused,
 			// by the permit check itself.)
-			if (task.Item.SizeBytes > 0 && execBytes+task.Item.SizeBytes > budgetLeft) ||
-				(req.Protocol == 2 && (len(tasks)+1 > *req.ExecutionFiles || execBytes+task.Item.SizeBytes > *req.ExecutionBytes)) {
-				if executing {
-					break
-				}
+			if (task.Item.SizeBytes > 0 && task.Item.SizeBytes > budgetLeft) ||
+				(req.Protocol == 2 && (*req.ExecutionFiles < 1 || task.Item.SizeBytes > *req.ExecutionBytes)) {
 				allowExecution = false
 				continue
 			}
-			execBytes += task.Item.SizeBytes
-			executing = true
-		} else if executing {
-			break
 		}
 		task.Attempt++
 		// Microsecond precision: exactly what PostgreSQL stores, so a replayed
@@ -694,7 +689,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 			return
 		}
 		tasks = append(tasks, task)
-		if mode == "enabled" && req.Protocol == 1 {
+		if mode == "enabled" {
 			break
 		}
 	}
@@ -717,8 +712,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
-func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string) ([]cleanupTask, error) {
-	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA)
+func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool) ([]cleanupTask, error) {
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable)
 	if err != nil {
 		return nil, err
 	}
@@ -978,6 +973,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// The plan was enabled between the two reads; retry under the fence.
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
+	// Legacy clients replay /observe and can turn a failed original request
+	// into its first permit. They must never receive execution authority.
+	if (mode == "enabled" || state == "delete_issued") && req.ReconciliationProtocol != nasCleanupReconciliationProtocol {
+		return cleanupObserveError(409, "cleanup execution requires reconciliation-only replay")
+	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
 	if state != "leased" {
@@ -1005,6 +1005,15 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	}
 	if lease == nil || lease.Before(time.Now()) {
 		return cleanupObserveError(409, "cleanup lease expired")
+	}
+	if mode == "enabled" && req.Outcome == "match" {
+		var busy bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND id<>$2 AND state IN ('leased','delete_issued'))`, planID, id).Scan(&busy); err != nil {
+			return cleanupObserveError(500, "cleanup execution occupancy unavailable")
+		}
+		if busy {
+			return cleanupObserveError(409, "cleanup execution already outstanding")
+		}
 	}
 	var item nasCleanupItem
 	if json.Unmarshal(raw, &item) != nil {

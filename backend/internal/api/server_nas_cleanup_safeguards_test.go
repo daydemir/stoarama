@@ -203,7 +203,7 @@ func TestNASCleanupExecutionAnomaliesAutoPause(t *testing.T) {
 	}
 	lease := func() []cleanupTask {
 		t.Helper()
-		w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1})
+		w := cleanupCall(t, s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": "test", "protocol": 1, "reconciliation_protocol": nasCleanupReconciliationProtocol})
 		if w.Code != 200 {
 			t.Fatal(w.Body.String())
 		}
@@ -224,7 +224,7 @@ func TestNASCleanupExecutionAnomaliesAutoPause(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].ItemID != 1000 {
 		t.Fatalf("execution lease %+v", tasks)
 	}
-	w := cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", "1000", cleanupObserve{Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "conflict", Error: "client keep-window guard refused", ClientVersion: "test"})
+	w := cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", "1000", cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "conflict", Error: "client keep-window guard refused", ClientVersion: "test"})
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"plan_paused":true`) {
 		t.Fatalf("conflict observation: %d %s", w.Code, w.Body.String())
 	}
@@ -298,7 +298,7 @@ func TestNASCleanupConcurrentAutoPauseDoesNotDeadlock(t *testing.T) {
 	s := &Server{pool: pool}
 	s.cfg.NASCleanupDeletionEnabled = true
 	observe := func(item int64) *httptest.ResponseRecorder {
-		return cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(item), cleanupObserve{Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "conflict", Error: "fixture", ClientVersion: "test"})
+		return cleanupCall(t, s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(item), cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: 1, PlanSHA: strings.Repeat("b", 64), Outcome: "conflict", Error: "fixture", ClientVersion: "test"})
 	}
 	// Deterministic ordering: the fence is taken before any plan row lock.
 	safeguardPlan(t, ctx, s, 1, "enabled", 10)

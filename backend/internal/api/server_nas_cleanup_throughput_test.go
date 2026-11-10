@@ -142,23 +142,44 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 	}
 	first := f.leaseV2(64, 2, 1<<40, strings.Repeat("1", 32))
 	again := f.leaseV2(64, 2, 1<<40, strings.Repeat("1", 32))
-	if len(first) != 2 || len(again) != 2 || first[0].ItemID != again[0].ItemID || first[1].Attempt != again[1].Attempt || !first[0].ExpiresAt.Equal(again[0].ExpiresAt) || len(first[0].ApprovedProof) == 0 {
+	if len(first) != 1 || len(again) != 1 || first[0].ItemID != again[0].ItemID || first[0].Attempt != again[0].Attempt || !first[0].ExpiresAt.Equal(again[0].ExpiresAt) || len(first[0].ApprovedProof) == 0 {
 		t.Fatalf("lease replay %+v %+v", first, again)
 	}
-	rest := f.leaseV2(64, 64, 1<<40, strings.Repeat("2", 32))
-	if len(rest) != 1 || rest[0].ItemID != items1[2] {
-		t.Fatalf("remaining execution lease %+v", rest)
+	if rest := f.leaseV2(64, 64, 1<<40, strings.Repeat("2", 32)); len(rest) != 0 {
+		t.Fatalf("leased beside outstanding execution: %+v", rest)
 	}
-	tasks := append(first, rest...)
-	ids := map[int64]string{}
-	for n, task := range tasks {
-		ids[task.ItemID] = fmt.Sprintf("%032x", n+1)
-	}
-	results := f.observe(tasks, ids)
-	for _, r := range results {
-		if r.Status != 200 || r.Action != "delete_issued" || !r.Delete || r.Recovery != "r2_etag_bound" {
-			t.Fatalf("permit %+v", r)
+	var tasks []cleanupTask
+	var results []batchResult
+	for n, itemID := range items1 {
+		current := first
+		if n > 0 {
+			current = f.leaseV2(64, 64, 1<<40, "")
 		}
+		if len(current) != 1 || current[0].ItemID != itemID {
+			t.Fatalf("serial lease: %+v", current)
+		}
+		ids := map[int64]string{itemID: fmt.Sprintf("%032x", n+1)}
+		permit := f.observe(current, ids)
+		if permit[0].Status != 200 || !permit[0].Delete || permit[0].Recovery != "r2_etag_bound" {
+			t.Fatalf("permit: %+v", permit)
+		}
+		replay := f.observe(current, ids)
+		if !replay[0].Delete || !replay[0].Replayed || !replay[0].ExpiresAt.Equal(permit[0].ExpiresAt) {
+			t.Fatalf("permit replay: %+v", replay)
+		}
+		if other := f.observe(current, map[int64]string{itemID: strings.Repeat("9", 32)}); other[0].Delete {
+			t.Fatal("different request obtained permit")
+		}
+		if got := f.leaseV2(64, 64, 1<<40, ""); len(got) != 0 {
+			t.Fatal("lease overtook permit")
+		}
+		for _, r := range f.receipts(current, permit, "deleted") {
+			if r["status"].(float64) != 200 {
+				t.Fatalf("receipt: %+v", r)
+			}
+		}
+		tasks = append(tasks, current...)
+		results = append(results, permit...)
 	}
 	if g, heads := f.bucket.counts(); g != 5 || heads < 8 {
 		t.Fatalf("execution re-downloaded R2 media: gets %d heads %d", g, heads)
@@ -176,18 +197,6 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 	rows.Close()
 	if strings.Join(modes, ",") != "fingerprint/etag_bound,fingerprint/etag_bound,fingerprint/etag_bound" {
 		t.Fatalf("execution did not use the fast paths: %v", modes)
-	}
-	// A retried identical request gets the same single permit back; a
-	// different request for the same item does not.
-	replay := f.observe(tasks, ids)
-	for n, r := range replay {
-		if !r.Delete || !r.Replayed || !r.ExpiresAt.Equal(results[n].ExpiresAt) {
-			t.Fatalf("permit replay %+v vs %+v", r, results[n])
-		}
-	}
-	other := f.observe(tasks[:1], map[int64]string{tasks[0].ItemID: strings.Repeat("9", 32)})
-	if other[0].Delete {
-		t.Fatalf("a different request obtained a permit: %+v", other[0])
 	}
 	var issued int
 	var labels string
@@ -210,12 +219,17 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 	if m, reason := f.planMode(p2); m != "enabled" || !strings.HasPrefix(reason, "batch ") {
 		t.Fatalf("batch did not advance: %s %q", m, reason)
 	}
-	tasks = f.leaseV2(64, 64, 1<<40, "")
-	if len(tasks) != 2 || tasks[0].ItemID != items2[0] {
-		t.Fatalf("second plan lease %+v", tasks)
+	for _, itemID := range items2 {
+		current := f.leaseV2(64, 64, 1<<40, "")
+		if len(current) != 1 || current[0].ItemID != itemID {
+			t.Fatalf("second plan serial lease: %+v", current)
+		}
+		permit := f.observe(current, map[int64]string{itemID: strings.Repeat("3", 32)})
+		if !permit[0].Delete {
+			t.Fatalf("second plan permit: %+v", permit)
+		}
+		f.receipts(current, permit, "deleted")
 	}
-	results = f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("3", 32), tasks[1].ItemID: strings.Repeat("4", 32)})
-	f.receipts(tasks, results, "deleted")
 	if m, _ := f.batchMode(); m != "completed" {
 		t.Fatalf("batch %s", m)
 	}
@@ -243,12 +257,18 @@ func TestNASCleanupBatchAnomaliesPauseAndFallBackToFullChecks(t *testing.T) {
 	// Replace one R2 object with different bytes of the same size: the ETag
 	// differs, so the bound check is a conflict (no permit) and everything pauses.
 	tasks := f.leaseV2(64, 64, 1<<40, "")
-	if len(tasks) != 2 {
+	if len(tasks) != 1 {
 		t.Fatalf("lease %d", len(tasks))
 	}
-	f.bucket.put(tasks[1].Item.ObjectKey, []byte(strings.Repeat("x", int(tasks[1].Item.SizeBytes))))
-	results := f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("a", 32), tasks[1].ItemID: strings.Repeat("b", 32)})
-	if !results[0].Delete || results[1].Delete || results[1].Action != "conflict" || !results[1].Paused {
+	results := f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("a", 32)})
+	if !results[0].Delete {
+		t.Fatalf("first permit: %+v", results)
+	}
+	f.receipts(tasks, results, "deleted")
+	tasks = f.leaseV2(64, 64, 1<<40, "")
+	f.bucket.put(tasks[0].Item.ObjectKey, []byte(strings.Repeat("x", int(tasks[0].Item.SizeBytes))))
+	results = f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("b", 32)})
+	if results[0].Delete || results[0].Action != "conflict" || !results[0].Paused {
 		t.Fatalf("replaced R2 object: %+v", results)
 	}
 	if m, _ := f.planMode(p1); m != "paused" {
@@ -257,7 +277,6 @@ func TestNASCleanupBatchAnomaliesPauseAndFallBackToFullChecks(t *testing.T) {
 	if m, reason := f.batchMode(); m != "paused" || !strings.Contains(reason, "observed conflict") {
 		t.Fatalf("batch not paused: %s %q", m, reason)
 	}
-	f.receipts(tasks[:1], results[:1], "deleted")
 	f.s.cleanupAdvanceBatchIfIdle(f.ctx)
 	if m, _ := f.planMode(p2); m != "dry_run" {
 		t.Fatalf("paused batch advanced: %s", m)
@@ -388,7 +407,7 @@ func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
 	}
 	// Leftover dry-run tasks are leased; then execution tasks come alone.
 	tasks = f.leaseV2(64, 64, 1<<40, "")
-	if len(tasks) != 2 || len(tasks[0].ApprovedProof) == 0 || len(tasks[1].ApprovedProof) == 0 {
+	if len(tasks) != 1 || len(tasks[0].ApprovedProof) == 0 {
 		t.Fatalf("execution lease %+v", tasks)
 	}
 	for _, bad := range []map[string]any{
@@ -406,7 +425,7 @@ func TestNASCleanupLeaseV2BudgetAndIsolation(t *testing.T) {
 	if w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{}}); w.Code != 400 {
 		t.Fatal("empty observation batch accepted")
 	}
-	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 48, 6, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": ""}}})
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 48, 6, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": tasks[0].ItemID, "attempt": tasks[0].Attempt, "plan_sha256": tasks[0].PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(tasks[0].Item), "error": ""}}})
 	var r struct {
 		Results []batchResult `json:"results"`
 	}
@@ -442,9 +461,9 @@ func TestNASCleanupCouncilFollowUps(t *testing.T) {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
 	tasks := f.leaseV2(64, 2, 1<<40, "")
-	ids := map[int64]string{tasks[0].ItemID: strings.Repeat("a", 32), tasks[1].ItemID: strings.Repeat("b", 32)}
+	ids := map[int64]string{tasks[0].ItemID: strings.Repeat("a", 32)}
 	results := f.observe(tasks, ids)
-	if !results[0].Delete || !results[1].Delete {
+	if !results[0].Delete {
 		t.Fatalf("permits %+v", results)
 	}
 	// Master switch off: the identical retry no longer returns the permit.
@@ -461,7 +480,7 @@ func TestNASCleanupCouncilFollowUps(t *testing.T) {
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_batches SET approved_until=now()-interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
-	if r := f.observe(tasks[1:2], ids); r[0].Delete {
+	if r := f.observe(tasks[:1], ids); r[0].Delete {
 		t.Fatalf("replay after approval expiry returned a permit: %+v", r[0])
 	}
 	if got := f.leaseV2(64, 64, 1<<40, ""); len(got) != 0 {
@@ -494,18 +513,18 @@ func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
 		t.Fatalf("batch enable: %d %s", code, body)
 	}
 	tasks := f.leaseV2(64, 64, 1<<40, "")
-	if len(tasks) != 40 {
+	if len(tasks) != 1 {
 		t.Fatalf("lease %d", len(tasks))
 	}
 	done := make(chan string, 40)
 	for n := 0; n < 20; n++ {
-		single, batch := tasks[2*n], tasks[2*n+1]
+		single, batch := tasks[0], tasks[0]
 		go func() {
-			w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(single.ItemID), cleanupObserve{Attempt: single.Attempt, PlanSHA: single.PlanSHA, Outcome: "match", Proof: fixtureProof(single.Item), ClientVersion: "t"})
+			w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(single.ItemID), cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: single.Attempt, PlanSHA: single.PlanSHA, Outcome: "match", Proof: fixtureProof(single.Item), ClientVersion: "t", RequestID: strings.Repeat("a", 32)})
 			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
 		}()
 		go func() {
-			w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": batch.ItemID, "attempt": batch.Attempt, "plan_sha256": batch.PlanSHA, "outcome": "match", "proof": fixtureProof(batch.Item), "error": "", "request_id": fmt.Sprintf("%032x", n+1)}}})
+			w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": batch.ItemID, "attempt": batch.Attempt, "plan_sha256": batch.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(batch.Item), "error": "", "client_version": "t", "request_id": strings.Repeat("a", 32)}}})
 			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
 		}()
 	}

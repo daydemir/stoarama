@@ -276,7 +276,9 @@ gates above changed; the work each gate costs and the approval granularity did.
   approved and the master switch is on; receipts are idempotent. Batched and
   single observations take locks in one order: plan fence(s), then budget. The client retries
   502/503/504/429/timeouts with short back-off instead of pausing a minute.
-- **Serialized execution.** Protocol 2 requests at most one execution lease
+- **Serialized execution.** The server permits one outstanding execution item
+  per plan and requires `reconciliation_protocol:1` on leases and observations.
+  Older clients receive dry-run work only. Protocol 2 requests at most one execution lease
   and drains its full observation/result lifecycle before leasing another.
   An execution mutex also serializes already-leased tasks and direct callers
   before opening files or starting the permit clock. Dry runs retain sixteen
@@ -309,7 +311,7 @@ gates above changed; the work each gate costs and the approval granularity did.
 
 Rollout: apply migration 0173 (additive; NOT VALID checks; one small partial
 index), deploy the API while no item is `leased`, then stage/promote the NAS
-client. Old clients keep using protocol 1 unchanged against the new API; a new
+client. Old clients receive only dry-run work against the new API; a new
 client detects an old API (HTTP 400 on protocol 2) and stays on protocol 1 for
 an hour before probing again.
 
@@ -318,8 +320,8 @@ and at most64 leases per drain/replay cycle. Batch requests lease only free slot
 up to eight; legacy requests default to one task. One coordinator owns
 receipt replay and drains every worker, including after a lease/worker failure,
 before replay, replacement or serial execution. Under protocol 1 approved
-destructive tasks are never dispatched concurrently; protocol 2 runs them on
-the bounded worker pool as described above. Independent observations share a plan read lock;
+destructive tasks are never dispatched concurrently; protocol 2 also drains
+each execution lifecycle before leasing another. Independent observations share a plan read lock;
 operator control still needs the exclusive parent lock. Public-registry evidence
 may be cached for one minute only in dry runs; enabled grants always check live.
 
@@ -468,58 +470,29 @@ reserved. A server lacking the endpoint leaves the journal unresolved; the
 client never falls back to a permit-capable endpoint. The compatible API and
 client must both be present before a future separately approved execution.
 
-### Audited release of proven unexecuted reservations
+### Permanent incident protection and server serialization
 
-After closing the paused plan, a service-token operator may run:
+All 28 unverified incident items remain permanently reserved: 12 in plan 1390
+and 16 in plan 1391. A restored stale journal can report `unlink_attempted:false`
+after a real deletion, so neither that flag nor its diagnostic proves no unlink.
+There is no command or endpoint to release ever-issued reservations. Closing a
+plan preserves every issued reservation and all recovery holds.
 
-```sh
-stoaramactl nas-cleanup release-unexecuted --plan-id ID \
-  --expected-plan-sha256 SHA --reason 'audited no-unlink checkpoint ordering'
-```
+Lease and observation requests must advertise `reconciliation_protocol:1` to
+receive execution work or permits. Older clients receive dry-run work only,
+including lease retries; replaying their ordinary observation cannot mint a first
+permit. This capability means observation journal replay exclusively uses
+`/reconcile`, never `/observe` or `/observe-batch`.
 
-`POST /api/v1/service/nas-cleanup/plans/{id}/release-unexecuted` requires the
-exact plan digest, a nonblank reason (at most 500 bytes), and mode `retired`.
-Only ever-issued `unverified` items with an expired recorded permit are
-candidates. The per-plan and item fences drain in-flight decisions/receipts.
-Each candidate must have an exact attempt/plan/proof-bound receipt, JSON boolean
-`unlink_attempted:false`, and a recognized diagnostic proving a pre-unlink path:
-`observation_replayed`, `deadline_exceeded`, `permit_expired`, `proof_mismatch`,
-`execution_disabled`, or `local_guard`. Its diagnostic text must match the known
-path too. The replay diagnostic comes from the owned `observe` checkpoint;
-execution refusals record the attempt flag after the guarded path returns.
+The server serializes lease selection and allows at most one outstanding
+`leased` or `delete_issued` item per enabled plan, across all clients and request
+sizes. A permit must receive its terminal receipt before the next execution
+lease. Existing parallel leases are refused execution until reconciled. The
+client execution lock and all existing gates, including the 15 s server
+execution budget, remain in place.
 
-A boolean alone, unknown/generic error (`pre_unlink_failure` included), missing
-flag, mismatched identity, interrupted intent, or any possible unlink stays
-protected. Permit expiry and old NAS inventory do not prove no unlink.
-Deleted/partial/issued states are never candidates. The response lists
-`released_item_ids` and refused `protected_item_ids` among the candidates;
-if none qualify, it returns 409 and changes nothing.
-
-Releases append immutable `nas_cleanup_unexecuted_releases` rows with the
-original receipt, attempt, digest, operator reason and timestamp. Retries
-preserve the first record. Only a retired plan's reservation is superseded;
-its item state, immutable issued flag, permit, proof, receipt and all R2/source
-recovery holds remain. Use a new label and plan, complete a fresh dry run, and
-obtain separate owner approval. This neither reschedules the original issued
-attempt nor asserts current NAS presence.
-
-The November 10 handoff receipts classify all 28 incident items conservatively:
-
-- **Plan 1391: 16 qualify**, IDs **252239–252253 and 252256**. Their explicit
-  `observation_replayed`, exact diagnostic and `unlink_attempted:false` are
-  backed by #445's owned-observe → durable-intent ordering.
-- **Plan 1390: all 12 stay protected**, IDs **248718–248720, 248724–248727,
-  248729–248733**. Their pre-#445 receipts lack `unlink_attempted` and a stable
-  refusal reason, despite source-level evidence suggesting a pre-unlink refusal.
-  Missing evidence is never inferred or backfilled.
-
-Eligibility also requires the live identities/receipts to remain identical,
-expired permits and a closed plan. The test fixture contains receipt fields
-only, without NAS paths or credentials. No production action was performed.
-
-Regression coverage includes 16 simultaneous execution leases submitted to the
-real client against PostgreSQL handlers, with a 1.1 s policy query inside the
-plan lock per item. The original 15 s server budget is unchanged: requests
-serialize before the permit clock, all 16 complete, and no unverified receipt
-is produced. Separate tests cover 503-before-issuance, lost committed permit
-responses, replay identity binding and refusal of ambiguous release evidence.
+Regression coverage includes 16 contending workers against PostgreSQL handlers
+and the real client, with a 1.1 s policy query inside the plan lock per item.
+Separate tests cover legacy capability refusal, concurrent leases, first-permit
+replay refusal, 503-before-issuance, lost committed permit responses and replay
+identity binding. No production action was performed.

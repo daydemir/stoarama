@@ -85,10 +85,27 @@ def run(args):
             while time.monotonic() - started < args.max_seconds:
                 cycles += 1
                 if args.simultaneous_tasks:
-                    # Test an already-leased backlog submitted all at once,
-                    # bypassing the coordinator's additional lease bound.
-                    lease = pull.cleanup_lease_v2(cfg, args.simultaneous_tasks, args.simultaneous_tasks, 1 << 30)
-                    futures = [executor.submit(pull.cleanup_process_task, cfg, inventory, stop, task, api) for task in lease["tasks"]]
+                    # Sixteen real workers contend for execution leases. The
+                    # server must serialize them even when each asks for many.
+                    barrier = threading.Barrier(args.simultaneous_tasks)
+                    progress_lock = threading.Lock()
+                    completed = 0
+                    def contend():
+                        nonlocal completed
+                        barrier.wait(timeout=10)
+                        while time.monotonic() - started < args.max_seconds:
+                            with progress_lock:
+                                if completed >= args.simultaneous_tasks:
+                                    return
+                            lease = pull.cleanup_lease_v2(cfg, args.simultaneous_tasks, args.simultaneous_tasks, 1 << 30)
+                            if not lease["tasks"]:
+                                time.sleep(0.1)
+                                continue
+                            for task in lease["tasks"]:
+                                pull.cleanup_process_task(cfg, inventory, stop, task, api)
+                                with progress_lock:
+                                    completed += 1
+                    futures = [executor.submit(contend) for _ in range(args.simultaneous_tasks)]
                     for future in futures:
                         try:
                             future.result()
@@ -142,7 +159,7 @@ def main():
     r.add_argument("--state", required=True)
     r.add_argument("--protocol", type=int, choices=(1, 2), default=2)
     r.add_argument("--max-seconds", type=float, default=1800)
-    r.add_argument("--simultaneous-tasks", type=int, default=0, help="submit an execution backlog concurrently (regression harness only)")
+    r.add_argument("--simultaneous-tasks", type=int, default=0, help="contend for execution leases with this many workers (regression harness only)")
     r.add_argument("--one-attempt", action="store_true", help="exercise one lease without replaying an uncertain observation")
     args = parser.parse_args()
     (prepare if args.command == "prepare" else run)(args)
