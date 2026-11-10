@@ -80,7 +80,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 	}
 	run := func(api, root, state string, protocol int) (float64, int) {
 		t.Helper()
-		cmd := exec.Command(python, script, "run", "--api", api, "--root", root, "--state", state, "--protocol", fmt.Sprint(protocol), "--max-seconds", "1500")
+		cmd := exec.Command(python, script, "run", "--api", api, "--root", root, "--state", state, "--protocol", fmt.Sprint(protocol), "--client-version", nasCleanupSerialExecutionClientVersion, "--max-seconds", "1500")
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Run(); err != nil {
@@ -168,6 +168,9 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 	}
 	newScenario := func(name string) (*cleanupFixture, string, string) {
 		f := newCleanupFixture(t, seedPerDay)
+		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, nasCleanupSerialExecutionClientVersion); err != nil {
+			t.Fatal(err)
+		}
 		root := filepath.Join(t.TempDir(), "nas")
 		state := filepath.Join(t.TempDir(), "state-"+name)
 		return f, root, state
@@ -208,6 +211,12 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		}
 		report["after_files"], report["after_plans"], report["after_seconds"] = afterFiles, len(plans), seconds
 		report["after_files_per_sec"] = float64(afterFiles) / seconds
+		report["after_files_per_minute"] = 60 * float64(afterFiles) / seconds
+		var hits int
+		if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_items WHERE stage_timings->>'rankings_cache'='hit'`).Scan(&hits); err != nil {
+			t.Fatal(err)
+		}
+		report["after_rankings_cache_hits"] = hits
 	}
 
 	// Lost responses and proxy errors in retryable calls (protocol 2 only):

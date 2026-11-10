@@ -94,10 +94,9 @@ type cleanupObserveEnv struct {
 	// top-level transaction (never in a savepoint, whose rollback could release
 	// it); issued then stays exact until commit because no other transaction
 	// can issue a permit meanwhile.
-	budgetHeld   bool
-	issued       int64
-	fingerprints map[int64]string
-	prefetched   map[int64]cleanupPrefetchedRecovery
+	budgetHeld bool
+	issued     int64
+	prefetched map[int64]cleanupPrefetchedRecovery
 	// Enabled plans whose execution fence was taken at top level before the
 	// budget lock (batch path); see cleanupObserveOne.
 	lockedPlans map[int64]bool
@@ -206,35 +205,6 @@ func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size in
 	return true, nil
 }
 
-// rankingsUnchanged returns the execution fast path for the best-14 replay,
-// or nil when it cannot apply (dry runs, no activation record).
-func (e *cleanupObserveEnv) rankingsUnchanged(ctx context.Context, tx pgx.Tx, mode string, stored []byte) cleanupRankingsUnchanged {
-	if mode != "enabled" || len(stored) == 0 {
-		return nil
-	}
-	var pinned map[string]cleanupExecutionRanking
-	if json.Unmarshal(stored, &pinned) != nil {
-		return nil
-	}
-	return func(stream int64, best string) bool {
-		want, ok := pinned[strconv.FormatInt(stream, 10)]
-		if !ok || want.BestStart != best || want.Fingerprint == "" {
-			return false
-		}
-		current, ok := e.fingerprints[stream]
-		if !ok {
-			if err := tx.QueryRow(ctx, cleanupRankingsFingerprintSQL, stream).Scan(&current); err != nil {
-				return false
-			}
-			if e.fingerprints == nil {
-				e.fingerprints = map[int64]string{}
-			}
-			e.fingerprints[stream] = current
-		}
-		return current == want.Fingerprint
-	}
-}
-
 type cleanupExecutionRanking struct {
 	BestStart   string    `json:"best_start"`
 	Fingerprint string    `json:"fingerprint"`
@@ -277,11 +247,16 @@ func cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID int64) error
 			continue
 		}
 		var best, fingerprint string
-		if err = tx.QueryRow(ctx, cleanupRankingsWithFingerprintSQL, stream).Scan(&best, &fingerprint); err != nil {
+		var version int64
+		var checked time.Time
+		if err = tx.QueryRow(ctx, cleanupRankingsVersionedReplaySQL, stream).Scan(&best, &fingerprint, &version, &checked); err != nil {
 			return err
 		}
 		if best == window.BestStart && fingerprint != "" {
-			pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: time.Now().UTC()}
+			pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: checked}
+			if _, err = tx.Exec(ctx, cleanupRankingsCacheStoreSQL, planID, stream, version, best, fingerprint, checked); err != nil {
+				return err
+			}
 		}
 	}
 	var stored any

@@ -60,8 +60,11 @@ const (
 	// Wire hint retained for compatibility; never grants execution authority.
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
-	// be17fd73 is this PR's reconciliation-only client release.
-	nasCleanupExecutionClientVersion = "be17fd73"
+	// Retain the reconciliation-only release; add only the reviewed client
+	// commit containing the immediate serial lease handoff. Release with
+	// NAS_VERSION=94d39bff (the release script otherwise uses HEAD).
+	nasCleanupExecutionClientVersion       = "be17fd73"
+	nasCleanupSerialExecutionClientVersion = "94d39bff"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -532,7 +535,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || session.version != nasCleanupExecutionClientVersion {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -1128,7 +1131,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			action = "conflict"
 		} else {
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, env.rankingsUnchanged(ctx, tx, mode, rankings))
+			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, mode, rankings, stageTimings))
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"

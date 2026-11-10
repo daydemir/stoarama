@@ -1068,6 +1068,28 @@ class CleanupProtocol2Tests(unittest.TestCase):
         calls = [p.rsplit('/', 1)[-1] for p in state['calls']]
         self.assertEqual(calls, ['lease', 'observe', 'result-batch'] * 3 + ['lease'])
 
+    def test_direct_execution_callers_hold_one_slot_through_the_entire_lifecycle(self):
+        tasks, _ = self.execution_tasks(8)
+        active = dict(now=0, peak=0, completed=0)
+        lock = threading.Lock()
+        start = threading.Barrier(len(tasks))
+        def lifecycle(*args):
+            with lock:
+                active['now'] += 1
+                active['peak'] = max(active['peak'], active['now'])
+            time.sleep(0.01)  # observation through acknowledged receipt
+            with lock:
+                active['now'] -= 1
+                active['completed'] += 1
+        def execute(task):
+            start.wait(timeout=5)
+            pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), task)
+        with mock.patch.object(pull, '_cleanup_process_task', side_effect=lifecycle):
+            with pull.concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                list(executor.map(execute, tasks))
+        self.assertEqual(active, dict(now=0, peak=1, completed=8))
+        self.assertEqual(self.inventory.cleanup_claims, {})
+
     def test_foreign_change_in_a_shared_folder_still_refuses(self):
         tasks, paths = self.execution_tasks(2)
         with pull.CleanupFile(self.cfg, tasks[0]['item'], threading.Event(), time.monotonic()+20) as a, \

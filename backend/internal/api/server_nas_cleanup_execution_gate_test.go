@@ -9,6 +9,50 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func TestNASCleanupSerialReleaseUsesSameSessionAndExecutionGates(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, sha, _ := f.admit("serial-release", syntheticFiles(100, 2, 10))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, nasCleanupSerialExecutionClientVersion); err != nil {
+		t.Fatal(err)
+	}
+	lease := func(session string) []cleanupTask {
+		t.Helper()
+		w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupSerialExecutionClientVersion, "protocol": 2, "limit": 64, "execution_files": 64, "execution_bytes": 1 << 30, "reconciliation_protocol": 1}, session)
+		var result struct {
+			Tasks []cleanupTask `json:"tasks"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &result) != nil {
+			t.Fatalf("lease: %d %s", w.Code, w.Body.String())
+		}
+		return result.Tasks
+	}
+	if tasks := lease("fixture-boot " + nasCleanupExecutionClientVersion); len(tasks) != 0 {
+		t.Fatal("old session bypassed the new heartbeat")
+	}
+	session := "fixture-boot " + nasCleanupSerialExecutionClientVersion
+	tasks := lease(session)
+	if len(tasks) != 1 {
+		t.Fatalf("new reviewed release did not lease exactly one execution: %+v", tasks)
+	}
+	if tasks := lease(session); len(tasks) != 0 {
+		t.Fatal("new release bypassed single slot")
+	}
+	task := tasks[0]
+	body := cleanupObserve{ReconciliationProtocol: 1, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: nasCleanupSerialExecutionClientVersion, RequestID: strings.Repeat("a", 32)}
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), body, session)
+	var permit struct {
+		Delete bool `json:"delete"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &permit) != nil || !permit.Delete {
+		t.Fatalf("permit: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("execution-gate", syntheticFiles(100, 20, 10))

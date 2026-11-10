@@ -86,7 +86,7 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0178_nas_cleanup_reconciliation.sql"} {
+	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0178_nas_cleanup_reconciliation.sql", "0180_nas_cleanup_rankings_cache.sql"} {
 		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
