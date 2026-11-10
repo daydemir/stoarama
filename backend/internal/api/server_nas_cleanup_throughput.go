@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -18,6 +19,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // NAS cleanup throughput (2026-11). Nothing here adds deletion authority:
@@ -94,10 +96,9 @@ type cleanupObserveEnv struct {
 	// top-level transaction (never in a savepoint, whose rollback could release
 	// it); issued then stays exact until commit because no other transaction
 	// can issue a permit meanwhile.
-	budgetHeld   bool
-	issued       int64
-	fingerprints map[int64]string
-	prefetched   map[int64]cleanupPrefetchedRecovery
+	budgetHeld bool
+	issued     int64
+	prefetched map[int64]cleanupPrefetchedRecovery
 	// Enabled plans whose execution fence was taken at top level before the
 	// budget lock (batch path); see cleanupObserveOne.
 	lockedPlans map[int64]bool
@@ -133,6 +134,9 @@ func (s *Server) cleanupHousekeeping(ctx context.Context, cid int64) {
 		log.Printf("nas cleanup lease expiry deferred: %v", err)
 	}
 	s.cleanupExpireApprovals(ctx)
+	if err := s.cleanupRecoverFreezes(ctx); err != nil {
+		log.Printf("nas cleanup freeze recovery deferred: %v", err)
+	}
 	if _, err := s.pool.Exec(ctx, cleanupPruneObservationRequestsSQL); err != nil {
 		log.Printf("nas cleanup request retention deferred: %v", err)
 	}
@@ -206,97 +210,174 @@ func (e *cleanupObserveEnv) budgetAllows(ctx context.Context, tx pgx.Tx, size in
 	return true, nil
 }
 
-// rankingsUnchanged returns the execution fast path for the best-14 replay,
-// or nil when it cannot apply (dry runs, no activation record).
-func (e *cleanupObserveEnv) rankingsUnchanged(ctx context.Context, tx pgx.Tx, mode string, stored []byte) cleanupRankingsUnchanged {
-	if mode != "enabled" || len(stored) == 0 {
-		return nil
-	}
-	var pinned map[string]cleanupExecutionRanking
-	if json.Unmarshal(stored, &pinned) != nil {
-		return nil
-	}
-	return func(stream int64, best string) bool {
-		want, ok := pinned[strconv.FormatInt(stream, 10)]
-		if !ok || want.BestStart != best || want.Fingerprint == "" {
-			return false
-		}
-		current, ok := e.fingerprints[stream]
-		if !ok {
-			if err := tx.QueryRow(ctx, cleanupRankingsFingerprintSQL, stream).Scan(&current); err != nil {
-				return false
-			}
-			if e.fingerprints == nil {
-				e.fingerprints = map[int64]string{}
-			}
-			e.fingerprints[stream] = current
-		}
-		return current == want.Fingerprint
-	}
-}
-
 type cleanupExecutionRanking struct {
 	BestStart   string    `json:"best_start"`
 	Fingerprint string    `json:"fingerprint"`
 	At          time.Time `json:"at"`
 }
 
-// cleanupActivateRankings runs the full live best-14 replay once per stream of
-// a plan that is being enabled and records its result with the fingerprint of
-// the exact rows it was computed from (one statement, one snapshot). Only a
-// replay that yields the pinned best_start is recorded; otherwise nothing is
-// stored and every observation runs the full replay (and keeps) as before.
-func cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID int64) error {
-	policy, err := cleanupEmbeddedPolicy()
-	if err != nil {
-		return nil
-	}
-	rows, err := tx.Query(ctx, `SELECT DISTINCT (e->>'stream_id')::bigint FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) e WHERE p.id=$1`, planID)
+// Publish the freeze in a separate committed transaction before excluding old
+// writers. A fresh READ COMMITTED replay then includes every writer that passed
+// the trigger before publication. Only enable/advance holds these table locks;
+// authorization and R2 operations never take them.
+const cleanupFreezePublishSQL = `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id,activation_attempt_id) SELECT p.id,(e->>'stream_id')::bigint,$2::bigint FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) e WHERE p.id=$1 GROUP BY p.id,(e->>'stream_id')::bigint ON CONFLICT(plan_id,stream_id) DO UPDATE SET generation=excluded.generation,activation_attempt_id=excluded.activation_attempt_id,created_at=excluded.created_at,validated=false RETURNING stream_id,generation`
+const cleanupFreezeDrainSQL = `LOCK TABLE streams,recordings,recording_clips,recording_collation_hours IN SHARE ROW EXCLUSIVE MODE NOWAIT`
+
+// Only run while holding the exclusive public fence. Every activation holds
+// it before publishing its xid-owned freeze until enable commits or rolls back,
+// so acquiring it proves no abandoned owner's attempt is still in progress.
+// Enabled freezes survive even after a process restart or a missing cache warm.
+// Skip a concurrent mode transition's freeze rows: it may need a batch row
+// held by activation, which invokes recovery on a separate connection.
+const cleanupRecoverFreezesSQL = `WITH abandoned AS MATERIALIZED (
+ SELECT f.plan_id,f.stream_id FROM nas_cleanup_frozen_streams f WHERE NOT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.id=f.plan_id AND p.mode='enabled') FOR UPDATE OF f SKIP LOCKED
+), released AS (DELETE FROM nas_cleanup_frozen_streams f USING abandoned a WHERE f.plan_id=a.plan_id AND f.stream_id=a.stream_id RETURNING f.plan_id)
+DELETE FROM nas_cleanup_rankings_cache WHERE plan_id IN (SELECT plan_id FROM released)`
+
+func (s *Server) cleanupRecoverFreezes(ctx context.Context) error {
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		return err
 	}
-	var streams []int64
+	defer tx.Rollback(ctx)
+	var held bool
+	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, nasCleanupPublicFence).Scan(&held); err != nil || !held {
+		return err // Housekeeping must not wait for an activation/public reader.
+	}
+	if _, err = tx.Exec(ctx, cleanupRecoverFreezesSQL); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// The permanent singleton's shared row lock is held through enable/permit
+// commit. Starting maintenance waits for those transactions before blocking
+// all later grants, including retries of an already-issued permit response.
+func cleanupMaintenanceCheck(ctx context.Context, tx pgx.Tx) error {
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT active FROM nas_cleanup_maintenance WHERE singleton FOR SHARE`).Scan(&active); err != nil {
+		return err
+	}
+	if active {
+		return errors.New("cleanup maintenance in progress")
+	}
+	return nil
+}
+
+func (s *Server) cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID int64) (func(), error) {
+	policy, err := cleanupEmbeddedPolicy()
+	if err != nil {
+		return nil, err
+	}
+	// The caller already holds the public fence and plan row. Recover all old
+	// attempts before publishing this one. Commit recovery separately: deleting
+	// the old freeze in tx would block publication on its uncommitted deletion.
+	if _, err = s.pool.Exec(ctx, cleanupRecoverFreezesSQL); err != nil {
+		return nil, err
+	}
+	var attemptID int64
+	if err = tx.QueryRow(ctx, `SELECT txid_current()`).Scan(&attemptID); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, cleanupFreezePublishSQL, planID, attemptID)
+	if err != nil {
+		return nil, err
+	}
+	generations := map[int64]int64{}
+	var tokens []int64
 	for rows.Next() {
-		var stream int64
-		if err = rows.Scan(&stream); err != nil {
+		var stream, generation int64
+		if err = rows.Scan(&stream, &generation); err != nil {
 			break
 		}
-		streams = append(streams, stream)
+		generations[stream] = generation
+		tokens = append(tokens, generation)
 	}
 	if err == nil {
 		err = rows.Err()
 	}
 	rows.Close()
+	// Prompt best-effort release after commit/rollback. Crash recovery is also
+	// run by housekeeping and the next activation, without needing this callback.
+	release := func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if e := s.cleanupRecoverFreezes(c); e != nil {
+			log.Printf("nas cleanup abandoned freeze release: %v", e)
+		}
+	}
 	if err != nil {
-		return err
+		return release, err
+	}
+	if len(generations) == 0 {
+		return release, errors.New("cleanup plan has no source streams")
+	}
+	// NOWAIT plus savepoints releases partial table acquisitions on contention.
+	// Waiting while holding a subset would deadlock with multi-table writers.
+	drainCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for {
+		save, e := tx.Begin(drainCtx)
+		if e != nil {
+			return release, e
+		}
+		_, e = save.Exec(drainCtx, cleanupFreezeDrainSQL)
+		if e == nil {
+			if e = save.Commit(drainCtx); e != nil {
+				return release, e
+			}
+			break
+		}
+		if rollbackErr := save.Rollback(ctx); rollbackErr != nil {
+			return release, rollbackErr
+		}
+		var pe *pgconn.PgError
+		if !errors.As(e, &pe) || pe.Code != "55P03" {
+			return release, e
+		}
+		select {
+		case <-drainCtx.Done():
+			return release, drainCtx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	pinned := map[string]cleanupExecutionRanking{}
-	for _, stream := range streams {
+	for stream, generation := range generations {
 		window, ok := policy.Streams[stream]
 		if !ok {
-			continue
+			return release, fmt.Errorf("stream %d has no pinned cleanup policy", stream)
 		}
 		var best, fingerprint string
-		if err = tx.QueryRow(ctx, cleanupRankingsWithFingerprintSQL, stream).Scan(&best, &fingerprint); err != nil {
-			return err
+		var checked time.Time
+		if err = tx.QueryRow(ctx, cleanupRankingsReplaySQL, stream).Scan(&best, &fingerprint, &checked); err != nil {
+			return release, err
 		}
-		if best == window.BestStart && fingerprint != "" {
-			pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: time.Now().UTC()}
+		if best != window.BestStart || fingerprint == "" {
+			return release, fmt.Errorf("stream %d best-14 replay differs from pinned verdict; KEEP", stream)
+		}
+		pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: checked}
+		if _, err = tx.Exec(ctx, cleanupRankingsCacheStoreSQL, planID, stream, generation, best, fingerprint, checked); err != nil {
+			return release, err
 		}
 	}
-	var stored any
-	if len(pinned) != 0 {
-		b, _ := json.Marshal(pinned)
-		stored = string(b)
+	stored, err := json.Marshal(pinned)
+	if err != nil {
+		return release, err
 	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET execution_rankings=$2::jsonb WHERE id=$1`, planID, stored)
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET execution_rankings=$2::jsonb WHERE id=$1`, planID, string(stored)); err != nil {
+		return release, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_frozen_streams SET validated=true WHERE plan_id=$1 AND generation=ANY($2)`, planID, tokens)
+	return release, err
 }
 
 // cleanupEnableGates are the per-plan enable conditions shared by the single
 // plan control and by batch enable/advance. It must run under the public
 // cleanup fence. Status 0 means every gate passed.
 func cleanupEnableGates(ctx context.Context, tx pgx.Tx, id int64) (int, map[string]any) {
+	if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
+		return 409, map[string]any{"error": "cleanup maintenance gate unavailable or active"}
+	}
 	var bad int
 	err := tx.QueryRow(ctx, `SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND (state<>'would_delete' OR proof IS NULL OR updated_at<now()-interval '24 hours' OR recovery NOT IN ('r2_sha_verified','r2_md5_etag_matched') OR coalesce(recovery_evidence->>'etag','')='')`, id).Scan(&bad)
 	if err != nil || bad != 0 {
@@ -890,7 +971,13 @@ func (s *Server) cleanupAdvanceBatchAfter(ctx context.Context, planID int64) {
 	}
 	var remaining int
 	var inBatch bool
-	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted'),EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND $1=ANY(plan_ids))`, planID).Scan(&remaining, &inBatch); err != nil || remaining != 0 || !inBatch {
+	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted'),EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND $1=ANY(plan_ids))`, planID).Scan(&remaining, &inBatch); err != nil || remaining != 0 {
+		return
+	}
+	if !inBatch {
+		if _, err := s.pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason='completed: all items deleted' WHERE id=$1 AND mode='enabled' AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted')`, planID); err != nil {
+			log.Printf("nas cleanup completion deferred: %v", err)
+		}
 		return
 	}
 	if err := s.cleanupAdvanceBatch(ctx); err != nil {
@@ -927,11 +1014,17 @@ const cleanupBatchAutoPauseSQL = `UPDATE nas_cleanup_batches SET mode='paused',a
 //     activated. Anything else (paused, retired, issued but incomplete, digest
 //     drift, a failed gate) pauses the batch. A batch never re-enables a plan.
 func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	var releaseFreeze func()
+	defer func() {
+		tx.Rollback(ctx)
+		if releaseFreeze != nil {
+			releaseFreeze()
+		}
+	}()
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 		return err
 	}
@@ -1004,13 +1097,14 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		why, _ := body["error"].(string)
 		return pause("plan " + strconv.FormatInt(current, 10) + " not enableable: " + why)
 	}
+	releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, current)
+	if err != nil {
+		return pause("source freeze/replay failed: " + err.Error())
+	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled',allow_nas_only=false,approved_until=$2,approval_reason=left('batch '||$3::text||': '||$4::text,500) WHERE id=$1`, current, *until, strconv.FormatInt(batchID, 10), reason); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, current); err != nil {
-		return err
-	}
-	if err = cleanupActivateRankings(ctx, tx, current); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

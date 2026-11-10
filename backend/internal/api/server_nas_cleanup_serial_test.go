@@ -19,13 +19,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Delay the real policy fingerprint query while the actual plan fence is
+// Delay the real policy cache lookup while the actual plan fence is
 // held. Sixteen simultaneous requests would need >15 s to drain that lock.
 // No production hook or deadline change is used by this harness.
 type cleanupSlowPolicyTracer struct{ calls atomic.Int32 }
 
 func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	if data.SQL == cleanupRankingsFingerprintSQL {
+	if data.SQL == cleanupRankingsCacheLoadSQL {
 		t.calls.Add(1)
 		select {
 		case <-time.After(1100 * time.Millisecond):

@@ -60,8 +60,11 @@ const (
 	// Wire hint retained for compatibility; never grants execution authority.
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
-	// be17fd73 is this PR's reconciliation-only client release.
-	nasCleanupExecutionClientVersion = "be17fd73"
+	// Retain the reconciliation-only release; add only the reviewed client
+	// commit containing the immediate serial lease handoff. Release with
+	// NAS_VERSION=94d39bff (the release script otherwise uses HEAD).
+	nasCleanupExecutionClientVersion       = "be17fd73"
+	nasCleanupSerialExecutionClientVersion = "94d39bff"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -354,12 +357,18 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		return
 	}
 	ctx := r.Context()
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		util.WriteError(w, 500, "begin cleanup control failed")
 		return
 	}
-	defer tx.Rollback(ctx)
+	var releaseFreeze func()
+	defer func() {
+		tx.Rollback(ctx)
+		if releaseFreeze != nil {
+			releaseFreeze()
+		}
+	}()
 	if req.Mode == "enabled" {
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
@@ -423,13 +432,15 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			util.WriteJSON(w, status, body)
 			return
 		}
+		releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, id)
+		if err != nil {
+			util.WriteError(w, 409, "cleanup freeze/replay failed: "+err.Error())
+			return
+		}
 	}
 	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+$5::bigint*interval '1 second' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority, int64(approval/time.Second))
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
-		if err == nil {
-			err = cleanupActivateRankings(ctx, tx, id)
-		}
 	}
 	if err == nil && req.Mode != "enabled" {
 		// Pausing (or resuming the dry run of) a plan stops any enabled batch
@@ -532,7 +543,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || session.version != nasCleanupExecutionClientVersion {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -1045,6 +1056,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// The plan was enabled between the two reads; retry under the fence.
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
+	if mode == "enabled" {
+		if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
+			return cleanupObserveError(503, "cleanup maintenance gate unavailable or active")
+		}
+	}
 	if mode == "enabled" || state == "delete_issued" {
 		var bound bool
 		if err := tx.QueryRow(ctx, `SELECT coalesce(lease_connection_id=$2 AND lease_client_boot_id=$3 AND lease_client_version=$4,false) FROM nas_cleanup_items WHERE id=$1`, id, cid, env.session.boot, env.session.version).Scan(&bound); err != nil {
@@ -1127,8 +1143,14 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		} else if e != nil || !bytes.Equal(a, b) {
 			action = "conflict"
 		} else {
+			var freezeGeneration int64
+			if mode == "enabled" {
+				if err := tx.QueryRow(ctx, cleanupRankingsFreezeSQL, planID, item.StreamID).Scan(&freezeGeneration); err != nil {
+					return cleanupObserveError(503, "cleanup source freeze unavailable")
+				}
+			}
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, env.rankingsUnchanged(ctx, tx, mode, rankings))
+			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, freezeGeneration, mode, rankings, stageTimings))
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"

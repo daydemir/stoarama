@@ -1,0 +1,81 @@
+package api
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestNASCleanupRankingCacheUsesFrozenVerdictAndReplaysOnExpiry(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, sha, _ := f.admit("cache-invalidation", syntheticFiles(100, 5, 10))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	execute := func(want string) {
+		t.Helper()
+		tasks := f.leaseV2(64, 64, 1<<40, "")
+		if len(tasks) != 1 {
+			t.Fatalf("lease: %+v", tasks)
+		}
+		permit := f.observe(tasks, map[int64]string{tasks[0].ItemID: fmt.Sprintf("%032x", tasks[0].ItemID)})
+		if len(permit) != 1 || !permit[0].Delete {
+			t.Fatalf("permit: %+v", permit)
+		}
+		var cache string
+		if err := f.pool.QueryRow(f.ctx, `SELECT stage_timings->>'rankings_cache' FROM nas_cleanup_items WHERE id=$1`, tasks[0].ItemID).Scan(&cache); err != nil || cache != want {
+			t.Fatalf("permit without required %s: cache=%s err=%v", want, cache, err)
+		}
+		f.receipts(tasks, permit, "deleted")
+	}
+	execute("hit")
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET size_bytes=size_bytes+1 WHERE id=5000001`); err == nil {
+		t.Fatal("frozen source changed")
+	}
+	execute("hit")
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_rankings_cache SET checked_at=clock_timestamp()-interval '61 seconds' WHERE plan_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	execute("replay")
+}
+
+func TestNASCleanupRankingCacheRollsBackWithObservation(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, sha, _ := f.admit("cache-rollback", syntheticFiles(100, 2, 10))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	var stored []byte
+	if err := f.pool.QueryRow(f.ctx, `SELECT execution_rankings FROM nas_cleanup_plans WHERE id=$1`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(f.ctx, `DELETE FROM nas_cleanup_rankings_cache WHERE plan_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(f.ctx)
+	var version int64
+	if err := tx.QueryRow(f.ctx, cleanupRankingsFreezeSQL, id, 3).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	check := f.s.cleanupExecutionRankingsUnchanged(f.ctx, tx, id, version, "enabled", stored, nil)
+	if check == nil {
+		t.Fatal("replay unavailable")
+	}
+	if verified, err := check(3, "2026-09-19"); err != nil || !verified {
+		t.Fatalf("fresh replay failed: %v", err)
+	}
+	if err := tx.Rollback(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_cleanup_rankings_cache WHERE plan_id=$1`, id).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("uncommitted verdict survived: %d %v", count, err)
+	}
+}
