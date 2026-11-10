@@ -1416,6 +1416,11 @@ class Runtime:
             inventory = self.inventory.summary()
             if inventory is not None:
                 payload["inventory"] = inventory
+        cleanup, cleanup_error, cleanup_error_at = CLEANUP_STATUS.snapshot()
+        if cleanup:
+            payload["cleanup"] = cleanup
+        if cleanup_error and not payload["client_last_error"]:
+            payload["client_last_error"], payload["client_last_error_at"] = cleanup_error, cleanup_error_at
         host_facts = getattr(self, "host_facts", None)
         if host_facts is not None:
             try:
@@ -2257,9 +2262,90 @@ def cleanup_send_result(cfg, item_id, receipt):
 CLEANUP_REPLAY_WORKERS = 16
 
 
-def cleanup_replay_receipts(cfg, inventory, api=None):
+class CleanupStatus:
+    """Small, thread-safe cleanup status for the heartbeat ("cleanup" field)
+    and for client_last_error when cleanup is what is failing."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.values = {}
+        self.error = ""
+        self.error_at = None
+
+    def update(self, **values):
+        with self.lock:
+            self.values.update(values)
+
+    def add(self, key, n=1):
+        with self.lock:
+            self.values[key] = self.values.get(key, 0) + n
+
+    def fail(self, message):
+        with self.lock:
+            self.error = ("cleanup: " + str(message))[:1000]
+            self.error_at = utc_now()
+            self.values["last_error"] = self.error[:300]
+            self.values["last_error_at"] = self.error_at
+
+    def clear_error(self):
+        with self.lock:
+            self.error, self.error_at = "", None
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.values), self.error, self.error_at
+
+
+CLEANUP_STATUS = CleanupStatus()
+# Journal replay is bounded: it never blocks leasing for longer than this,
+# and an entry that keeps failing is quarantined (kept on disk, reported).
+CLEANUP_REPLAY_BUDGET_SEC = 120
+CLEANUP_REPLAY_QUARANTINE_AFTER = 5
+_CLEANUP_REPLAY_INFLIGHT = set()
+_CLEANUP_REPLAY_INFLIGHT_LOCK = threading.Lock()
+
+
+def cleanup_quarantine_tables(inventory):
+    inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_replay_failures(item_id INTEGER PRIMARY KEY,failures INTEGER NOT NULL,last_error TEXT NOT NULL,last_at TEXT NOT NULL)")
+    inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_quarantine(item_id INTEGER NOT NULL,phase TEXT NOT NULL,body TEXT NOT NULL,error TEXT NOT NULL,failures INTEGER NOT NULL,quarantined_at TEXT NOT NULL)")
+
+
+def cleanup_replay_failed(inventory, item_id, phase, encoded, exc):
+    """Count a failed replay; after CLEANUP_REPLAY_QUARANTINE_AFTER failures
+    move the entry, byte for byte, to cleanup_quarantine. Quarantine only stops
+    automatic replay: nothing is sent, nothing is deleted, nothing is unlinked;
+    the entry stays on disk for operator reconciliation."""
+    message = ("%s: %s" % (type(exc).__name__, exc))[:500]
+    with inventory.lock:
+        cleanup_quarantine_tables(inventory)
+        inventory.db.execute("INSERT INTO cleanup_replay_failures VALUES(?,1,?,?) ON CONFLICT(item_id) DO UPDATE SET failures=failures+1,last_error=excluded.last_error,last_at=excluded.last_at",
+                             (item_id, message, utc_now_precise()))
+        failures = inventory.db.execute("SELECT failures FROM cleanup_replay_failures WHERE item_id=?", (item_id,)).fetchone()[0]
+        quarantined = failures >= CLEANUP_REPLAY_QUARANTINE_AFTER
+        if quarantined:
+            inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(?,?,?,?,?,?)", (item_id, phase, encoded, message, failures, utc_now_precise()))
+            inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
+            inventory.db.execute("DELETE FROM cleanup_replay_failures WHERE item_id=?", (item_id,))
+        inventory.db.commit()
+    if quarantined:
+        log("ERROR", "cleanup item=%d %s journal entry quarantined after %d failed replays: %s" % (item_id, phase, failures, message))
+    return quarantined
+
+
+def cleanup_quarantined_items(inventory):
+    with inventory.lock:
+        cleanup_quarantine_tables(inventory)
+        inventory.db.commit()
+        return {row[0] for row in inventory.db.execute("SELECT DISTINCT item_id FROM cleanup_quarantine")}
+
+
+def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     """Replay every durable journal entry; protocol 2 replays in parallel
-    through the batched endpoints (same per-item rules as the single ones)."""
+    through the batched endpoints (same per-item rules as the single ones).
+
+    With a budget (protocol 2) the call returns after at most `budget`
+    seconds; unfinished replays continue in the background and are not
+    resubmitted while in flight. Returns {"replayed", "failed", "pending",
+    "quarantined"} counts."""
     def replay(item_id, phase, body):
         try:
             if api is not None:
@@ -2313,14 +2399,57 @@ def cleanup_replay_receipts(cfg, inventory, api=None):
         cleanup_journal(inventory, item_id)
 
     entries = cleanup_journal(inventory)
-    if api is None or len(entries) < 2:
-        for entry in entries:
-            one(*entry)
-        return
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_REPLAY_WORKERS, thread_name_prefix="nas-cleanup-replay") as pool:
-        futures = [pool.submit(one, *entry) for entry in entries]
-    for future in futures:
-        future.result()
+    if budget is None:
+        if api is None or len(entries) < 2:
+            for entry in entries:
+                one(*entry)
+            return {"replayed": len(entries), "failed": 0, "pending": 0, "quarantined": 0}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_REPLAY_WORKERS, thread_name_prefix="nas-cleanup-replay") as pool:
+            futures = [pool.submit(one, *entry) for entry in entries]
+        for future in futures:
+            future.result()
+        return {"replayed": len(entries), "failed": 0, "pending": 0, "quarantined": 0}
+
+    counts = {"replayed": 0, "failed": 0, "pending": 0, "quarantined": 0, "errors": []}
+    counts_lock = threading.Lock()
+
+    def guarded(item_id, phase, encoded):
+        try:
+            one(item_id, phase, encoded)
+            with inventory.lock:
+                cleanup_quarantine_tables(inventory)
+                inventory.db.execute("DELETE FROM cleanup_replay_failures WHERE item_id=?", (item_id,))
+                inventory.db.commit()
+            with counts_lock:
+                counts["replayed"] += 1
+        except Exception as exc:
+            quarantined = cleanup_replay_failed(inventory, item_id, phase, encoded, exc)
+            with counts_lock:
+                counts["failed"] += 1
+                counts["quarantined"] += int(quarantined)
+                counts["errors"].append("item %d: %s: %s" % (item_id, type(exc).__name__, str(exc)[:200]))
+        finally:
+            with _CLEANUP_REPLAY_INFLIGHT_LOCK:
+                _CLEANUP_REPLAY_INFLIGHT.discard(item_id)
+
+    pool = api.replay_pool if api is not None and getattr(api, "replay_pool", None) is not None else None
+    owned = pool is None
+    if owned:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_REPLAY_WORKERS, thread_name_prefix="nas-cleanup-replay")
+    futures = []
+    for item_id, phase, encoded in entries:
+        with _CLEANUP_REPLAY_INFLIGHT_LOCK:
+            if item_id in _CLEANUP_REPLAY_INFLIGHT:
+                counts["pending"] += 1
+                continue
+            _CLEANUP_REPLAY_INFLIGHT.add(item_id)
+        futures.append(pool.submit(guarded, item_id, phase, encoded))
+    _, not_done = concurrent.futures.wait(futures, timeout=budget)
+    if owned:
+        pool.shutdown(wait=False)
+    with counts_lock:
+        counts["pending"] += len(not_done)
+        return dict(counts)
 
 
 def cleanup_verified_ack(task, proof, decision):
@@ -2593,6 +2722,11 @@ class CleanupBatcher:
     """Coalesce per-file calls from concurrent workers into batched requests."""
     def __init__(self, cfg, path, field, max_items=CLEANUP_BATCH_MAX, senders=2, linger=CLEANUP_BATCH_LINGER_SEC):
         self.cfg, self.path, self.field, self.max_items, self.linger = cfg, path, field, max_items, linger
+        # Adaptive request size: a request that fails as a whole is split in
+        # halves and resent (every call is idempotent), and the limit is
+        # halved; it grows back after consecutive successes.
+        self.ceiling = max_items
+        self.successes = 0
         self.condition = threading.Condition()
         self.queue = []
         self.closed = False
@@ -2661,11 +2795,7 @@ class CleanupBatcher:
                 pass
         batch = [(e, f) for e, f in batch if f not in conflicts]
         try:
-            response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: unique})
-            results = response.get("results") if isinstance(response, dict) else None
-            if not isinstance(results, list) or len(results) != len(unique):
-                raise RuntimeError("invalid cleanup batch response")
-            by_id = {r["item_id"]: r for r in results if isinstance(r, dict) and type(r.get("item_id")) is int}
+            by_id = self.post(unique)
             for entry, future in batch:
                 if future.cancelled():
                     continue
@@ -2673,6 +2803,8 @@ class CleanupBatcher:
                 try:
                     if result is None:
                         future.set_exception(RuntimeError("cleanup batch response lacks item %d" % entry["item_id"]))
+                    elif isinstance(result, BaseException):
+                        future.set_exception(result)
                     else:
                         future.set_result(result)
                 except concurrent.futures.InvalidStateError:
@@ -2685,6 +2817,37 @@ class CleanupBatcher:
                     except concurrent.futures.InvalidStateError:
                         pass
 
+    def post(self, entries):
+        """POST entries; on a whole-request failure split and resend halves.
+        Returns item_id -> result dict, or -> the exception for an item that
+        failed even alone."""
+        try:
+            response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: entries})
+            results = response.get("results") if isinstance(response, dict) else None
+            if not isinstance(results, list) or len(results) != len(entries):
+                raise RuntimeError("invalid cleanup batch response")
+        except Exception as exc:
+            reason = "HTTP %d" % exc.code if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+            CLEANUP_STATUS.update(**{"last_batch_failure": "%s %d items: %s" % (self.field, len(entries), reason)[:200]})
+            CLEANUP_STATUS.add("batch_failures")
+            if len(entries) < 2:
+                return {entries[0]["item_id"]: exc}
+            with self.condition:
+                self.max_items = max(1, min(self.max_items, len(entries) // 2))
+                self.successes = 0
+                CLEANUP_STATUS.update(**{self.field + "_batch_limit": self.max_items})
+            log("WARN", "cleanup %s request of %d failed (%s); resending in halves" % (self.field, len(entries), reason))
+            half = len(entries) // 2
+            merged = self.post(entries[:half])
+            merged.update(self.post(entries[half:]))
+            return merged
+        with self.condition:
+            self.successes += 1
+            if self.max_items < self.ceiling and self.successes >= 20:
+                self.max_items, self.successes = min(self.ceiling, self.max_items * 2), 0
+                CLEANUP_STATUS.update(**{self.field + "_batch_limit": self.max_items})
+        return {r["item_id"]: r for r in results if isinstance(r, dict) and type(r.get("item_id")) is int}
+
 
 class CleanupBatchAPI:
     """Protocol 2: per-file observations and receipts over batched requests."""
@@ -2693,6 +2856,9 @@ class CleanupBatchAPI:
     def __init__(self, cfg):
         self.observations = CleanupBatcher(cfg, "/account/connections/cleanup/observe-batch", "observations")
         self.receipts = CleanupBatcher(cfg, "/account/connections/cleanup/result-batch", "receipts")
+        # Long-lived so a replay that outlives its budget keeps running
+        # without blocking the coordinator.
+        self.replay_pool = concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_REPLAY_WORKERS, thread_name_prefix="nas-cleanup-replay")
 
     def call(self, batcher, item_id, body):
         # 503 means "not decided yet, nothing recorded" (e.g. the server's
@@ -2722,6 +2888,7 @@ class CleanupBatchAPI:
     def close(self):
         self.observations.close()
         self.receipts.close()
+        self.replay_pool.shutdown(wait=False)
 
 
 def cleanup_local_headroom(inventory):
@@ -2771,8 +2938,18 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
 
     Execution tasks run concurrently (each is fully independent and re-checked
     by its own worker). The coordinator alone replays durable receipts, after
-    every worker of the previous cycle has drained, exactly as protocol 1."""
-    cleanup_replay_receipts(cfg, inventory, api)
+    every worker of the previous cycle has drained, exactly as protocol 1.
+    Replay is bounded (CLEANUP_REPLAY_BUDGET_SEC) and its failures never stop
+    new work from being leased; a leased task whose item still has a journal
+    or quarantine entry is left unprocessed (its lease simply expires)."""
+    replay = cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC)
+    quarantined_total = len(cleanup_quarantined_items(inventory))
+    CLEANUP_STATUS.update(protocol=2, last_cycle_at=utc_now(), replay_replayed=replay["replayed"], replay_failed=replay["failed"],
+                          replay_pending=replay["pending"], quarantined=quarantined_total)
+    if replay["failed"]:
+        CLEANUP_STATUS.fail("journal replay: %d failed, %d pending, %d quarantined in total; %s" % (
+            replay["failed"], replay["pending"], quarantined_total, "; ".join(replay["errors"][:3])))
+        log("WARN", "NAS cleanup replay: %d failed, %d pending; leasing new work anyway" % (replay["failed"], replay["pending"]))
     pins, pins_error = cleanup_pins()
     pending = {}
     leased = 0
@@ -2795,11 +2972,19 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                     files_left = bytes_left = 0  # every deletion would be refused
                 lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
                 retry = lease.get("retry_after_sec", 120)
+                CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
                 if not lease["tasks"]:
                     exhausted = True
                     break
+                blocked = {row[0] for row in cleanup_journal(inventory)} | cleanup_quarantined_items(inventory)
                 for task in lease["tasks"]:
                     leased += 1
+                    if task["item_id"] in blocked:
+                        # An unresolved journal/quarantine entry for this item
+                        # must never be overwritten by a new attempt.
+                        CLEANUP_STATUS.add("skipped_blocked_items")
+                        log("WARN", "cleanup item=%d leased but its journal entry is unresolved; left unprocessed" % task["item_id"])
+                        continue
                     task["_recovery_md5"] = lease.get("recovery_md5") is True  # local only, never sent
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
@@ -2824,6 +3009,8 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                     error = exc
     if error is not None:
         raise error
+    if not replay["failed"]:
+        CLEANUP_STATUS.clear_error()
     return 0 if leased else retry
 
 
@@ -2850,6 +3037,8 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                     wait = 0 if retry == 0 else restore_wait(retry)
                 except Exception as exc:
                     log("WARN", "NAS cleanup deferred: %s" % exc)
+                    CLEANUP_STATUS.fail("cycle: %s: %s" % (type(exc).__name__, exc))
+                    CLEANUP_STATUS.add("cycle_errors")
                     wait = restore_wait(CLEANUP_V2_ERROR_WAIT_SEC if v2 else min(60, RESTORE_ERROR_WAIT_SEC))
         finally:
             if api is not None:
@@ -8158,6 +8347,19 @@ def load_outage(cfg):
     return read_json(cfg.outage_file, None)
 
 
+def send_heartbeat_payload(cfg, payload):
+    try:
+        return request_json(cfg, "POST", "/account/connections/heartbeat",
+                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+    except urllib.error.HTTPError as exc:
+        host = payload.get("host")
+        if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
+            raise
+        payload["host"] = {k: v for k, v in host.items() if k != "release"}
+        return request_json(cfg, "POST", "/account/connections/heartbeat",
+                            body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
+
+
 def send_heartbeat(cfg, runtime, outage):
     payload = runtime.heartbeat_payload(outage)
     try:
@@ -8165,6 +8367,10 @@ def send_heartbeat(cfg, runtime, outage):
                             body=payload, timeout=HEARTBEAT_TIMEOUT_SEC)
     except urllib.error.HTTPError as exc:
         host = payload.get("host")
+        if exc.code == 400 and "cleanup" in payload:
+            # A backend that predates the optional cleanup status field.
+            payload.pop("cleanup")
+            return send_heartbeat_payload(cfg, payload)
         if exc.code != 400 or not isinstance(host, dict) or "release" not in host:
             raise
         # A rolled-back backend may not know this optional diagnostic field.

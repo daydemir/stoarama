@@ -678,6 +678,8 @@ type connectionHeartbeatRequest struct {
 	JoinedDelivery     *connectionJoinedDelivery  `json:"joined_delivery,omitempty"`
 	JoinedTransfer     *connectionJoinedTransfer  `json:"joined_transfer,omitempty"`
 	Host               *nasHostFacts              `json:"host,omitempty"`
+	// Cleanup is the NAS app's optional cleanup status (diagnostics only).
+	Cleanup json.RawMessage `json:"cleanup,omitempty"`
 }
 
 type connectionHeartbeatResponse struct {
@@ -1139,6 +1141,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	// NAS cleanup lease/approval expiry must not depend on the cleanup worker
 	// still leasing: the heartbeat is the one call the app always makes.
 	s.cleanupHousekeeping(r.Context(), connectionID)
+	s.recordNASCleanupStatus(r.Context(), connectionID, req.Cleanup)
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
 		OK: true, JoinedDeliveryAccepted: joinedDeliveryAccepted,
 		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,

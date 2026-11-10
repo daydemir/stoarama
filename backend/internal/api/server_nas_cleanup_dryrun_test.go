@@ -272,3 +272,19 @@ func TestNASCleanupConflictingDuplicatesAreRefused(t *testing.T) {
 		t.Fatalf("conflicting receipts did not pause: %s %q", m, reason)
 	}
 }
+
+// The app's optional cleanup status is stored for operators; invalid or
+// oversized values are dropped without failing anything.
+func TestNASCleanupClientStatusIsRecordedBestEffort(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	f.s.recordNASCleanupStatus(f.ctx, 13, json.RawMessage(`{"replay_failed":2,"quarantined":1,"last_error":"cleanup: journal replay"}`))
+	var status string
+	if err := f.pool.QueryRow(f.ctx, `SELECT nas_cleanup_status->>'quarantined' FROM connections WHERE id=13 AND nas_cleanup_status_at IS NOT NULL`).Scan(&status); err != nil || status != "1" {
+		t.Fatalf("cleanup status not stored: %q %v", status, err)
+	}
+	f.s.recordNASCleanupStatus(f.ctx, 13, json.RawMessage(`[1,2]`))
+	f.s.recordNASCleanupStatus(f.ctx, 13, json.RawMessage(`{"x":"`+strings.Repeat("a", 9000)+`"}`))
+	if err := f.pool.QueryRow(f.ctx, `SELECT nas_cleanup_status->>'quarantined' FROM connections WHERE id=13`).Scan(&status); err != nil || status != "1" {
+		t.Fatalf("invalid status replaced a valid one: %q %v", status, err)
+	}
+}

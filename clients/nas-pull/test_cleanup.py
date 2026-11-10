@@ -1076,6 +1076,108 @@ class CleanupProtocol2Tests(unittest.TestCase):
             finally:
                 batcher.close()
 
+    def journal_observe(self, item_id, **extra):
+        pull.cleanup_journal(self.inventory, item_id, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % item_id, **extra))
+
+    def test_failing_replay_never_blocks_leasing_and_is_quarantined_not_dropped(self):
+        pull.CLEANUP_STATUS.__init__()
+        self.journal_observe(900)
+        leases = []
+        def api(cfg, path, body, retry_stale=False):
+            if path.endswith('/lease'):
+                leases.append(body)
+                return dict(tasks=[], retry_after_sec=120)
+            raise RuntimeError('replay keeps failing')
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', ()):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER):
+                    self.assertEqual(pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), pull.concurrent.futures.ThreadPoolExecutor(2), batch_api), 120)
+            finally:
+                batch_api.close()
+        self.assertEqual(len(leases), pull.CLEANUP_REPLAY_QUARANTINE_AFTER, 'replay failure blocked leasing')
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        rows = self.inventory.db.execute('SELECT item_id,phase,body,failures FROM cleanup_quarantine').fetchall()
+        self.assertEqual([(r[0], r[1], r[3]) for r in rows], [(900, 'observe', pull.CLEANUP_REPLAY_QUARANTINE_AFTER)])
+        self.assertEqual(json.loads(rows[0][2])['request_id'], '%032x' % 900)
+        self.assertTrue(self.path.exists())
+        status, error, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertIn('replay', error); self.assertEqual(status['quarantined'], 1)
+
+    def test_replay_is_time_bounded_and_blocked_items_are_not_processed(self):
+        pull.CLEANUP_STATUS.__init__()
+        self.journal_observe(901)
+        release = threading.Event(); processed = []; leases = []
+        task = dict(self.task, item_id=901)
+        task.pop('approved_proof', None)
+        def api(cfg, path, body, retry_stale=False):
+            if path.endswith('/lease'):
+                leases.append(1)
+                return dict(tasks=[dict(task)], retry_after_sec=120) if len(leases) == 1 else dict(tasks=[], retry_after_sec=120)
+            release.wait(5)
+            return dict(results=[dict(item_id=o['item_id'], status=409, error='stale') for o in body['observations']])
+        def process(*args, **kwargs):
+            processed.append(args[3]['item_id'])
+        started = time.monotonic()
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_REPLAY_BUDGET_SEC', 0.3), \
+                mock.patch.object(pull, 'cleanup_process_task', side_effect=process):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), pull.concurrent.futures.ThreadPoolExecutor(2), batch_api)
+                self.assertLess(time.monotonic() - started, 3, 'replay was not time bounded')
+                self.assertEqual(processed, [], 'an item with an unresolved journal entry was processed')
+            finally:
+                release.set(); batch_api.close()
+        self.assertEqual(pull.CLEANUP_STATUS.snapshot()[0].get('skipped_blocked_items'), 1)
+
+    def test_whole_request_failures_fall_back_to_smaller_batches(self):
+        pull.CLEANUP_STATUS.__init__()
+        sizes = []
+        def api(cfg, path, body, retry_stale=False):
+            obs = body['observations']; sizes.append(len(obs))
+            if len(obs) > 2 or any(o['item_id'] == 13 for o in obs):
+                raise pull.urllib.error.HTTPError(path, 413, 'too large', {}, None)
+            return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete') for o in obs])
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', ()):
+            batcher = pull.CleanupBatcher(self.cfg, '/account/connections/cleanup/observe-batch', 'observations', senders=1, linger=0.3)
+            try:
+                futures = {n: batcher.submit(dict(item_id=n, attempt=1)) for n in range(10, 18)}
+                for n, f in futures.items():
+                    if n == 13:
+                        with self.assertRaises(pull.urllib.error.HTTPError):
+                            f.result(5)
+                    else:
+                        self.assertEqual(f.result(5)['item_id'], n)
+                self.assertLessEqual(batcher.max_items, 4)
+            finally:
+                batcher.close()
+        self.assertEqual(sizes[0], 8)
+        status = pull.CLEANUP_STATUS.snapshot()[0]
+        self.assertIn('HTTP 413', status['last_batch_failure']); self.assertGreater(status['batch_failures'], 0)
+
+    def test_heartbeat_reports_cleanup_status_and_drops_it_for_old_servers(self):
+        pull.CLEANUP_STATUS.__init__()
+        pull.CLEANUP_STATUS.update(replay_failed=2, quarantined=1)
+        pull.CLEANUP_STATUS.fail('journal replay: 2 failed')
+        cfg = SimpleNamespace(progress_file=self.root/'state'/'progress.json', legacy_progress_file=self.root/'state'/'cursor.json',
+                              runtime_file=self.root/'state'/'runtime.json', capacity_file=self.root/'state'/'capacity.json', state_dir=self.root/'state',
+                              download_workers=12, outage_file=self.root/'state'/'outage.json', dry_run=False, output_dir=self.cfg.output_dir)
+        runtime = pull.Runtime(cfg)
+        payload = runtime.heartbeat_payload(None)
+        self.assertEqual(payload['cleanup']['quarantined'], 1)
+        self.assertTrue(payload['client_last_error'].startswith('cleanup: journal replay'))
+        sent = []
+        def fake(cfg, method, path, body=None, timeout=None):
+            sent.append(dict(body))
+            if 'cleanup' in body:
+                raise pull.urllib.error.HTTPError(path, 400, 'unknown field', {}, None)
+            return dict(ok=True)
+        with mock.patch.object(pull, 'request_json', side_effect=fake):
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), dict(ok=True))
+        self.assertIn('cleanup', sent[0]); self.assertNotIn('cleanup', sent[1])
+        self.assertTrue(sent[1]['client_last_error'].startswith('cleanup: journal replay'))
+        pull.CLEANUP_STATUS.__init__()
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)
