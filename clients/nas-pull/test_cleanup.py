@@ -1,6 +1,7 @@
 """Exercise the actual cleanup worker against disposable media fixtures only."""
 import importlib.util
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +16,14 @@ from unittest import mock
 spec = importlib.util.spec_from_file_location('pull', Path(__file__).with_name('stoarama_pull.py'))
 pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
+
+
+def fixture_ack(body, item_id=1, **fields):
+    ack = dict(item_id=item_id, attempt=body['attempt'], plan_sha256=body['plan_sha256'],
+               proof_sha256=(hashlib.sha256(json.dumps(body.get('proof')).encode()).hexdigest()
+                             if 'proof_sha256' not in body else body['proof_sha256']))
+    ack.update(fields)
+    return ack
 
 
 class CleanupTests(unittest.TestCase):
@@ -66,7 +75,7 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(len(pull.cleanup_journal(self.inventory)),1)
             self.assertEqual(body['outcome'],'match')
             self.assertEqual(body['proof']['identity'],self.item['frozen_identity'])
-            return dict(action='would_delete',delete=False,recovery='nas_only_at_check')
+            return fixture_ack(body, action='would_delete',delete=False,recovery='nas_only_at_check')
         with mock.patch.object(pull,'restore_api',side_effect=api), mock.patch.object(pull.os,'unlink',side_effect=AssertionError('dry run must never unlink')):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -85,7 +94,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'deleted');return dict(ok=True)
+            self.assertEqual(body['outcome'],'deleted');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api):pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertFalse(self.path.exists());self.assertFalse(self.sidecar.exists());self.assertTrue(extra.exists())
         self.assertTrue(extra.parent.is_dir());self.assertEqual(pull.cleanup_journal(self.inventory),[])
@@ -94,8 +103,10 @@ class CleanupTests(unittest.TestCase):
         def api(cfg,path,body):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):return dict(delete=True,action='delete_issued')
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
-        with mock.patch.object(pull,'restore_api',side_effect=api):pull.cleanup_once(self.cfg,self.inventory,threading.Event())
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
+        with mock.patch.object(pull,'restore_api',side_effect=api), self.assertRaises(pull.CleanupResponseError):
+            pull.cleanup_once(self.cfg,self.inventory,threading.Event())
+        self.assertEqual(pull.cleanup_journal(self.inventory)[0][1], 'observe')
         self.assertTrue(self.path.exists())
 
     def test_reject_path_traversal_and_symlinked_ancestor(self):
@@ -143,15 +154,15 @@ class CleanupTests(unittest.TestCase):
         calls=[]
         def api(cfg,path,body):
             calls.append(path)
-            if path.endswith('/observe'):return dict(action='reconcile',delete=False,proof_sha256='b'*64)
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+            if path.endswith('/observe'):return fixture_ack(body, action='reconcile', delete=False)
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.os,'unlink',side_effect=AssertionError('replay must not delete')):
             pull.cleanup_replay_receipts(self.cfg,self.inventory)
         self.assertEqual(len(calls),2);self.assertTrue(self.path.exists());self.assertFalse(pull.cleanup_journal(self.inventory))
 
     def test_interrupted_intent_never_retries_unlink(self):
         pull.cleanup_journal(self.inventory,1,'intent',dict(attempt=1,plan_sha256='a'*64,proof_sha256='b'*64))
-        with mock.patch.object(pull,'restore_api',return_value=dict(ok=True)) as api:
+        with mock.patch.object(pull,'restore_api',side_effect=lambda cfg, path, body: fixture_ack(body, ok=True)) as api:
             pull.cleanup_replay_receipts(self.cfg,self.inventory)
         self.assertEqual(api.call_args.args[2]['outcome'],'unverified');self.assertTrue(self.path.exists())
 
@@ -195,7 +206,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original()+offset[0]):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -216,7 +227,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original_clock()+offset[0]),mock.patch.object(pull.CleanupFile,'list_parent',members):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -253,7 +264,12 @@ class CleanupTests(unittest.TestCase):
         parent=os.open(self.path.parent,os.O_RDONLY|os.O_DIRECTORY)
         try:
             for name in (b"retained-\xff",b"retained-\xfe"):
-                fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=parent)
+                try:
+                    fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=parent)
+                except OSError as exc:
+                    if exc.errno == errno.EILSEQ:
+                        self.skipTest("filesystem rejects non-UTF8 filenames")
+                    raise
                 os.close(fd)
             with self.opened() as current:
                 proof=current.proof()
@@ -275,7 +291,7 @@ class CleanupTests(unittest.TestCase):
                     task=copy.deepcopy(self.task);task["item_id"]=counter[0]
                     return dict(tasks=[task],retry_after_sec=0)
             barrier.wait(4)
-            return dict(delete=False,action="would_delete",recovery="r2_sha_verified")
+            return fixture_ack(body, int(path.split("/")[-2]), delete=False,action="would_delete",recovery="r2_sha_verified")
         with pull.concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull.os,"unlink",side_effect=AssertionError("preflight never unlinks")):
                 self.assertEqual(pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor,workers=4,task_limit=4),0)
@@ -588,13 +604,13 @@ def approve_api(test, calls, receipt_reply=None):
             return dict(tasks=[test.task], retry_after_sec=0)
         if path.endswith('/observe'):
             if body['outcome'] != 'match':
-                return dict(action=body['outcome'], delete=False)
+                return fixture_ack(body, action=body['outcome'], delete=False)
             return dict(action='delete_issued', delete=True, item_id=1, attempt=1, plan_sha256='a'*64,
                         proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                         expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         if receipt_reply is not None:
             return receipt_reply(body)
-        return dict(ok=True)
+        return fixture_ack(body, int(path.split("/")[-2]), ok=True)
     return api
 
 
@@ -773,7 +789,7 @@ class CleanupGuardTests(unittest.TestCase):
         def old_server(body):
             if body['outcome'] not in ('deleted', 'unverified'):
                 raise pull.urllib.error.HTTPError('result', 400, 'invalid cleanup deletion receipt', {}, None)
-            return dict(ok=True)
+            return fixture_ack(body, ok=True)
         self.approve()
         with mock.patch.object(pull.os, 'unlink', side_effect=unlink):
             calls = self.run_execution(receipt_reply=old_server)
@@ -847,7 +863,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             if path.endswith('/result-batch'):
                 for r in body['receipts']:
                     self.assertEqual(r['outcome'], 'deleted', r)
-                return dict(results=[dict(item_id=r['item_id'], status=200, ok=True) for r in body['receipts']])
+                return dict(results=[fixture_ack(r, r['item_id'], status=200, ok=True) for r in body['receipts']])
             raise AssertionError('unexpected call %s' % path)
         return api, state
 
@@ -978,7 +994,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
                         return reply
                     o = body['observations'][0]
                     seen.append(o.get('md5'))
-                    return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete', delete=False)])
+                    return dict(results=[fixture_ack(o, o['item_id'], status=200, action='would_delete', delete=False)])
                 self.run_v2(api)
                 expected = hashlib.md5(self.path.read_bytes()).hexdigest() if advertised else None
                 self.assertEqual(seen[1], expected)
@@ -991,7 +1007,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         def api(cfg, path, body, retry_stale=False):
             self.assertTrue(path.endswith('/observe-batch'), path)
             with lock: calls.append(len(body['observations']))
-            return dict(results=[dict(item_id=o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
+            return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
         with mock.patch.object(pull, 'restore_api', side_effect=api):
             batch_api = pull.CleanupBatchAPI(self.cfg)
             try:
@@ -1010,7 +1026,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             sent.append([o.get('md5') for o in obs])
             if any('md5' in o for o in obs):
                 raise pull.urllib.error.HTTPError(path, 400, 'unknown field md5', {}, None)
-            return dict(results=[dict(item_id=o['item_id'], status=200, action='conflict', delete=False) for o in obs])
+            return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in obs])
         with mock.patch.object(pull, 'restore_api', side_effect=api):
             batch_api = pull.CleanupBatchAPI(self.cfg)
             try:
@@ -1076,6 +1092,258 @@ class CleanupProtocol2Tests(unittest.TestCase):
             finally:
                 batcher.close()
 
+    def journal_observe(self, item_id, **extra):
+        pull.cleanup_journal(self.inventory, item_id, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % item_id, **extra))
+
+    def test_failing_replay_never_blocks_leasing_and_is_quarantined_not_dropped(self):
+        pull.CLEANUP_STATUS.__init__()
+        self.journal_observe(900)
+        leases = []
+        def api(cfg, path, body, retry_stale=False):
+            if path.endswith('/lease'):
+                leases.append(body)
+                return dict(tasks=[], retry_after_sec=120)
+            raise pull.urllib.error.HTTPError(path, 422, 'invalid receipt', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', ()):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER):
+                    with mock.patch.object(pull.time, 'time', return_value=10000 + cycle * 901):
+                        self.assertEqual(pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), pull.concurrent.futures.ThreadPoolExecutor(2), batch_api), 120)
+            finally:
+                batch_api.close()
+        self.assertEqual(len(leases), pull.CLEANUP_REPLAY_QUARANTINE_AFTER, 'replay failure blocked leasing')
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        rows = self.inventory.db.execute('SELECT item_id,phase,body,failures FROM cleanup_quarantine').fetchall()
+        self.assertEqual([(r[0], r[1], r[3]) for r in rows], [(900, 'observe', pull.CLEANUP_REPLAY_QUARANTINE_AFTER)])
+        self.assertEqual(json.loads(rows[0][2])['request_id'], '%032x' % 900)
+        self.assertTrue(self.path.exists())
+        status, error, _ = pull.CLEANUP_STATUS.snapshot()
+        self.assertIn('replay', error); self.assertEqual(status['quarantined'], 1)
+
+    def test_protocol1_legacy_ack_quarantines_each_phase_and_leases_unrelated_work(self):
+        for coordinator in ('once', 'batch'):
+            for phase in ('observe', 'intent', 'result'):
+                with self.subTest(coordinator=coordinator, phase=phase):
+                    f = CleanupTests()
+                    f.setUp()
+                    try:
+                        if phase == 'observe':
+                            body = dict(attempt=1, plan_sha256='a'*64, proof=None, outcome='conflict')
+                        else:
+                            body = dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64, outcome='unverified')
+                        pull.cleanup_journal(f.inventory, 900, phase, body)
+                        calls, leases = [], []
+                        def api(cfg, path, body):
+                            calls.append(path)
+                            if path.endswith('/lease'):
+                                leases.append(body)
+                                return dict(tasks=[f.task], retry_after_sec=120)
+                            if '/900/' in path:
+                                # Valid legacy responses intentionally lack identity echoes.
+                                return dict(action='would_delete', delete=False) if path.endswith('/observe') else dict(ok=True)
+                            return fixture_ack(body, action='would_delete', delete=False)
+                        checkpoint = None
+                        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not delete')):
+                            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                                for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER):
+                                    with mock.patch.object(pull.time, 'time', return_value=10000 + cycle*901):
+                                        if coordinator == 'once':
+                                            pull.cleanup_once(f.cfg, f.inventory, threading.Event())
+                                        else:
+                                            pull.cleanup_batch(f.cfg, f.inventory, threading.Event(), executor, task_limit=1)
+                                    if cycle == 0:
+                                        checkpoint = pull.cleanup_journal(f.inventory)[0]
+                                    if cycle < pull.CLEANUP_REPLAY_QUARANTINE_AFTER - 1:
+                                        self.assertEqual(pull.cleanup_journal(f.inventory), [checkpoint])
+                                # Quarantine and subsequent legacy cycles do not crash/retry it.
+                                before = len([path for path in calls if '/900/' in path])
+                                pull.cleanup_once(f.cfg, f.inventory, threading.Event())
+                                self.assertEqual(len([path for path in calls if '/900/' in path]), before)
+                        self.assertEqual(len(leases), pull.CLEANUP_REPLAY_QUARANTINE_AFTER + 1)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                        rows = f.inventory.db.execute('SELECT item_id,phase,body FROM cleanup_quarantine').fetchall()
+                        self.assertEqual(rows, [checkpoint], 'exact current checkpoint must be kept')
+                        self.assertTrue(f.path.exists())
+                        self.assertTrue(f.sidecar.exists())
+                        if phase != 'observe':
+                            self.assertFalse(any('/900/observe' in path for path in calls), 'receipt must never request another permit')
+                    finally:
+                        f.doCleanups()
+
+    def test_protocol1_all_blocked_leases_wait_without_reopening_or_repermitting(self):
+        self.journal_observe(1)
+        original = pull.cleanup_journal(self.inventory)
+        def api(cfg, path, body):
+            if path.endswith('/lease'):
+                return dict(tasks=[self.task], retry_after_sec=120)
+            return dict(action='would_delete', delete=False)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('unresolved item reopened')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                retry = pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor, task_limit=3)
+        self.assertEqual(retry, 120)
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_protocol1_default_replay_budget_does_not_block_leases(self):
+        self.journal_observe(900)
+        original = pull.cleanup_journal(self.inventory)
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def api(cfg, path, body):
+            if path.endswith('/lease'):
+                self.assertTrue(entered.is_set())
+                return dict(tasks=[], retry_after_sec=120)
+            entered.set()
+            release.wait(5)
+            return dict(action='would_delete', delete=False)
+        record_failure = pull.cleanup_replay_failed
+        def failure(*args):
+            try:
+                return record_failure(*args)
+            finally:
+                finished.set()
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_REPLAY_BUDGET_SEC', 0.05), mock.patch.object(pull, 'cleanup_replay_failed', side_effect=failure):
+            try:
+                start = time.monotonic()
+                self.assertEqual(pull.cleanup_once(self.cfg, self.inventory, threading.Event()), 120)
+                self.assertLess(time.monotonic() - start, 1)
+                self.assertEqual(pull.cleanup_journal(self.inventory), original)
+                with mock.patch.object(pull, 'restore_api', side_effect=AssertionError('in-flight receipt resubmitted')):
+                    pull.cleanup_replay_receipts(self.cfg, self.inventory)
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(5))
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_replay_is_time_bounded_and_blocked_items_are_not_processed(self):
+        pull.CLEANUP_STATUS.__init__()
+        self.journal_observe(901)
+        release = threading.Event(); processed = []; leases = []
+        task = dict(self.task, item_id=901)
+        task.pop('approved_proof', None)
+        def api(cfg, path, body, retry_stale=False):
+            if path.endswith('/lease'):
+                leases.append(1)
+                return dict(tasks=[dict(task)], retry_after_sec=120) if len(leases) == 1 else dict(tasks=[], retry_after_sec=120)
+            release.wait(5)
+            return dict(results=[dict(item_id=o['item_id'], status=409, error='stale') for o in body['observations']])
+        def process(*args, **kwargs):
+            processed.append(args[3]['item_id'])
+        started = time.monotonic()
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_REPLAY_BUDGET_SEC', 0.3), \
+                mock.patch.object(pull, 'cleanup_process_task', side_effect=process):
+            batch_api = pull.CleanupBatchAPI(self.cfg)
+            try:
+                pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), pull.concurrent.futures.ThreadPoolExecutor(2), batch_api)
+                self.assertLess(time.monotonic() - started, 3, 'replay was not time bounded')
+                self.assertEqual(processed, [], 'an item with an unresolved journal entry was processed')
+            finally:
+                release.set(); batch_api.close()
+        self.assertEqual(pull.CLEANUP_STATUS.snapshot()[0].get('skipped_blocked_items'), 1)
+
+    def test_whole_request_failures_fall_back_to_smaller_batches(self):
+        pull.CLEANUP_STATUS.__init__()
+        sizes = []
+        def api(cfg, path, body, retry_stale=False):
+            obs = body['observations']; sizes.append(len(obs))
+            if len(obs) > 2 or any(o['item_id'] == 13 for o in obs):
+                raise pull.urllib.error.HTTPError(path, 413, 'too large', {}, None)
+            return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete') for o in obs])
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', ()):
+            batcher = pull.CleanupBatcher(self.cfg, '/account/connections/cleanup/observe-batch', 'observations', senders=1, linger=0.3)
+            try:
+                futures = {n: batcher.submit(dict(item_id=n, attempt=1)) for n in range(10, 18)}
+                for n, f in futures.items():
+                    if n in (12, 13):
+                        with self.assertRaises(pull.urllib.error.HTTPError):
+                            f.result(5)
+                    else:
+                        self.assertEqual(f.result(5)['item_id'], n)
+                self.assertLessEqual(batcher.max_items, 4)
+            finally:
+                batcher.close()
+        self.assertEqual(sizes[0], 8)
+        status = pull.CLEANUP_STATUS.snapshot()[0]
+        self.assertIn('HTTP 413', status['last_batch_failure']); self.assertGreater(status['batch_failures'], 0)
+
+    def test_heartbeat_reports_cleanup_status_and_drops_it_for_old_servers(self):
+        pull.CLEANUP_STATUS.__init__()
+        pull.CLEANUP_STATUS.update(replay_failed=2, quarantined=1)
+        pull.CLEANUP_STATUS.fail('journal replay: 2 failed')
+        cfg = SimpleNamespace(progress_file=self.root/'state'/'progress.json', legacy_progress_file=self.root/'state'/'cursor.json',
+                              runtime_file=self.root/'state'/'runtime.json', capacity_file=self.root/'state'/'capacity.json', state_dir=self.root/'state',
+                              download_workers=12, outage_file=self.root/'state'/'outage.json', dry_run=False, output_dir=self.cfg.output_dir)
+        runtime = pull.Runtime(cfg)
+        payload = runtime.heartbeat_payload(None)
+        self.assertEqual(payload['cleanup']['quarantined'], 1)
+        self.assertTrue(payload['client_last_error'].startswith('cleanup: journal replay'))
+        sent = []
+        def fake(cfg, method, path, body=None, timeout=None):
+            sent.append(dict(body))
+            if 'cleanup' in body:
+                raise pull.urllib.error.HTTPError(path, 400, 'unknown field', {}, None)
+            return dict(ok=True)
+        with mock.patch.object(pull, 'request_json', side_effect=fake):
+            self.assertEqual(pull.send_heartbeat(self.cfg, runtime, None), dict(ok=True))
+        self.assertIn('cleanup', sent[0]); self.assertNotIn('cleanup', sent[1])
+        self.assertTrue(sent[1]['client_last_error'].startswith('cleanup: journal replay'))
+        pull.CLEANUP_STATUS.__init__()
+
+    def test_log_redaction_removes_secrets_signed_urls_and_host_paths(self):
+        root = str(self.cfg.output_dir)
+        # Fixture values are assembled at runtime so secret scanners never see
+        # a credential-shaped literal in the source.
+        fake = ''.join(chr(97 + n % 26) for n in range(22))
+        prefixed = 'sir' + '_' + fake
+        cases = {
+            'Authorization: Bearer ' + fake: fake,
+            'GET https://acct.example/b/k.mp4?' + 'Sig' + 'nature=' + fake + ' failed': fake,
+            'api' + '_key=' + prefixed + ' retry': prefixed,
+            'R2_SECRET_ACCESS' + '_KEY: "' + fake + '"': fake,
+            'env leak ' + fake + ' seen': fake,
+            'open /etc/stoarama/config.env failed': '/etc/stoarama',
+        }
+        for line, secret in cases.items():
+            redacted = pull.redact_log_line(line, root, (fake,) if 'env leak' in line else ())
+            self.assertNotIn(secret, redacted, line)
+        kept = pull.redact_log_line('cleanup item=5 %s/stream/day/a.mp4 sha 6cd360d73985e0fa33db455c1bfc6190ebb2ef22febdf965e460744e41517111 POST /account/connections/cleanup/lease' % root, root)
+        self.assertIn('<nas>/stream/day/a.mp4', kept); self.assertIn('6cd360d7', kept); self.assertIn('/account/connections/cleanup/lease', kept)
+        self.assertNotIn(root, kept)
+        self.assertLessEqual(len(pull.redact_log_line('x' * 10000)), pull.CLIENT_LOG_LINE_MAX)
+        self.assertIn('[TRUNCATED]', pull.redact_log_line('x' * 10000))
+        with mock.patch.dict(pull.os.environ, {'STOARAMA_API' + '_KEY': fake}):
+            self.assertIn(fake, pull.client_log_secrets(SimpleNamespace(api_key='cfg-' + fake)))
+
+    def test_log_ring_keeps_only_relevant_lines_within_bounds(self):
+        ring = pull.ClientLogRing(max_lines=5, max_bytes=10 ** 6)
+        ring.record('INFO', 'delivered clip 7')        # neither WARN+ nor a cleanup topic
+        ring.record('INFO', 'NAS cleanup lease of 64')  # cleanup topic
+        ring.record('WARN', 'storage slow')
+        self.assertEqual([e['message'] for e, _ in ring.lines], ['NAS cleanup lease of 64', 'storage slow'])
+        for n in range(10):
+            ring.record('WARN', 'w%d' % n)
+        self.assertEqual(len(ring.lines), 5); self.assertEqual(ring.lines[-1][0]['message'], 'w9'); self.assertGreater(ring.dropped, 0)
+        small = pull.ClientLogRing(max_lines=1000, max_bytes=2000)
+        for n in range(100):
+            small.record('ERROR', 'e' * 100)
+        self.assertLessEqual(small.bytes, 2000)
+        self.assertTrue(small.error_event.is_set())
+
+    def test_log_upload_carries_identity_counts_and_only_new_lines(self):
+        ring = pull.ClientLogRing()
+        sent = []
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring), mock.patch.object(pull, 'request_json', side_effect=lambda cfg, m, path, body=None, timeout=None: sent.append((path, body)) or {}):
+            ring.record('WARN', 'first')
+            self.journal_observe(77)
+            runtime = SimpleNamespace(boot_id='boot-x')
+            seq = pull.client_log_upload_once(self.cfg, runtime, self.inventory, 0)
+            ring.record('ERROR', 'second')
+            pull.client_log_upload_once(self.cfg, runtime, self.inventory, seq)
+        path, body = sent[0]
+        self.assertEqual(path, '/account/connections/client-logs')
+        self.assertEqual((body['client_version'], body['boot_id'], body['journal_entries'], body['quarantined']), (pull.CLIENT_VERSION, 'boot-x', 1, 0))
+        self.assertEqual([l['message'] for l in body['lines']], ['first'])
+        self.assertEqual([l['message'] for l in sent[1][1]['lines']], ['second'])
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)
@@ -1092,5 +1360,609 @@ class CleanupProtocol2Tests(unittest.TestCase):
         fence.release_cleanup(); fence.release_cleanup()
         self.assertTrue(entered.wait(2)); thread.join(1)
 
+
+
+    def test_transient_errors_never_quarantine(self):
+        errors = [OSError('offline'), TimeoutError('timeout'), RuntimeError('restart')]
+        errors += [pull.urllib.error.HTTPError('/test', code, 'temporary', {}, None) for code in (408, 429, 500, 502, 503, 504)]
+        for exc in errors:
+            self.journal_observe(900)
+            original = pull.cleanup_journal(self.inventory)
+            for n in range(8):
+                with mock.patch.object(pull.time, 'time', return_value=10000 + n * 1000):
+                    self.assertFalse(pull.cleanup_replay_failed(self.inventory, 900, 'observe', original[0][2], exc))
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+            self.assertEqual(pull.cleanup_quarantined_items(self.inventory), set())
+
+    def test_quarantine_requires_hour_and_release_replays_without_delete(self):
+        self.journal_observe(900)
+        original = pull.cleanup_journal(self.inventory)[0]
+        exc = pull.CleanupResponseError('malformed')
+        for n in range(6):
+            with mock.patch.object(pull.time, 'time', return_value=10000 + n):
+                self.assertFalse(pull.cleanup_replay_failed(self.inventory, *original, exc))
+        # Simulate the receipt having advanced to an intent before failure.
+        pull.cleanup_journal(self.inventory, 900, 'intent', dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64))
+        latest = pull.cleanup_journal(self.inventory)[0]
+        with mock.patch.object(pull.time, 'time', return_value=13600):
+            self.assertTrue(pull.cleanup_replay_failed(self.inventory, *original, exc))
+        self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['quarantine_item_ids'], [900])
+        pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [latest])
+        self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['release_generation'], 1)
+        calls = []
+        def api(cfg, path, body):
+            self.assertTrue(path.endswith('/result'))
+            self.assertEqual(body['outcome'], 'unverified')
+            calls.append(body)
+            return fixture_ack(body, int(path.split("/")[-2]), ok=True)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('release must not delete')):
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertTrue(self.path.exists())
+
+    def test_upgrade_does_not_count_legacy_transient_failures(self):
+        self.journal_observe(900)
+        self.inventory.db.execute("CREATE TABLE cleanup_replay_failures(item_id INTEGER PRIMARY KEY,failures INTEGER NOT NULL,last_error TEXT NOT NULL,last_at TEXT NOT NULL)")
+        self.inventory.db.execute("INSERT INTO cleanup_replay_failures VALUES(900,100,'network','old')")
+        self.inventory.db.commit()
+        entry = pull.cleanup_journal(self.inventory)[0]
+        exc = pull.CleanupResponseError('invalid response')
+        for n in range(4):
+            with mock.patch.object(pull.time, 'time', return_value=10000 + 3600*n):
+                self.assertFalse(pull.cleanup_replay_failed(self.inventory, *entry, exc))
+        with mock.patch.object(pull.time, 'time', return_value=24400):
+            self.assertTrue(pull.cleanup_replay_failed(self.inventory, *entry, exc))
+
+    def test_release_preserves_conflicting_receipts(self):
+        self.journal_observe(900)
+        original = pull.cleanup_journal(self.inventory)[0]
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute('INSERT INTO cleanup_quarantine VALUES(?,?,?,?,?,?)', (900, 'result', '{}', 'x', 5, 'now'))
+        self.inventory.db.commit()
+        pull.cleanup_release_quarantine(self.inventory, 2)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [original])
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {900})
+
+    def test_worker_defers_existing_journal_in_every_phase_and_protocol1(self):
+        for phase in ('observe', 'intent', 'result'):
+            pull.cleanup_journal(self.inventory, 1, phase, {'evidence': phase})
+            original = pull.cleanup_journal(self.inventory)
+            with mock.patch.object(pull, 'cleanup_replay_receipts'), mock.patch.object(pull, 'cleanup_lease', return_value=dict(tasks=[self.task])), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('blocked filesystem access')), mock.patch.object(pull, 'restore_api', side_effect=AssertionError('blocked API access')):
+                pull.cleanup_once(self.cfg, self.inventory, threading.Event())
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_heartbeat_release_between_lease_check_and_worker_preserves_evidence(self):
+        pull.cleanup_journal(self.inventory, 1, 'intent', {'evidence': 'exact durable bytes'})
+        original = pull.cleanup_journal(self.inventory)
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,?,?,?,5,'now')", (*original[0][1:], 'rejected'))
+        self.inventory.db.execute('DELETE FROM cleanup_receipts WHERE item_id=1')
+        self.inventory.db.commit()
+        # Simulate a stale pre-submit view; heartbeat releases before the worker
+        # starts. The worker must atomically recheck both stores and refuse.
+        real_blocked = pull.cleanup_blocked_items
+        first = [True]
+        def stale_check(inventory):
+            if first[0]:
+                first[0] = False
+                pull.cleanup_release_quarantine(inventory, 1)
+                return set()
+            return real_blocked(inventory)
+        replay = dict(replayed=0, failed=0, pending=0, quarantined=0, errors=[])
+        with mock.patch.object(pull, 'cleanup_replay_receipts', return_value=replay), mock.patch.object(pull, 'cleanup_blocked_items', side_effect=stale_check), mock.patch.object(pull, 'cleanup_lease_v2', return_value=dict(tasks=[self.task])), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('released receipt processed')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None, task_limit=1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
+        self.assertFalse(pull.cleanup_quarantined_items(self.inventory))
+
+    def test_reservation_is_exclusive_and_release_does_not_replace_it(self):
+        owner = pull.cleanup_reserve_item(self.inventory, 1)
+        self.assertIsNotNone(owner)
+        self.assertIsNone(pull.cleanup_reserve_item(self.inventory, 1))
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,'intent','exact bytes','rejected',5,'now')")
+        self.inventory.db.commit()
+        pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {1})
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        with self.assertRaises(RuntimeError):
+            pull.cleanup_journal(self.inventory, 1, 'observe', {}, owner=owner)
+
+    def test_worker_never_overwrites_or_deletes_changed_checkpoint(self):
+        owner = pull.cleanup_reserve_item(self.inventory, 1)
+        pull.cleanup_journal(self.inventory, 1, 'observe', {'ours': True}, owner=owner)
+        self.inventory.db.execute("UPDATE cleanup_receipts SET phase='intent',body='exact replacement bytes' WHERE item_id=1")
+        self.inventory.db.commit()
+        original = pull.cleanup_journal(self.inventory)
+        for phase in ('observe', 'intent', 'result', None):
+            with self.assertRaises(RuntimeError):
+                pull.cleanup_journal(self.inventory, 1, phase, {}, owner=owner)
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_protocol1_quarantine_blocks_worker(self):
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,'intent','exact bytes','rejected',5,'now')")
+        self.inventory.db.commit()
+        with mock.patch.object(pull, 'cleanup_replay_receipts'), mock.patch.object(pull, 'cleanup_lease', return_value=dict(tasks=[self.task])), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('quarantined item')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor, task_limit=1)
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {1})
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+    def test_quarantine_release_rolls_back_move_and_ack_on_failure(self):
+        pull.cleanup_journal(self.inventory, 1, 'intent', {'evidence': 'exact bytes'})
+        original = pull.cleanup_journal(self.inventory)[0]
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,?,?,?,5,'now')", (*original[1:], 'rejected'))
+        self.inventory.db.execute('DELETE FROM cleanup_receipts WHERE item_id=1')
+        self.inventory.db.execute("CREATE TRIGGER fail_release BEFORE DELETE ON cleanup_quarantine BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        self.inventory.db.commit()
+        with self.assertRaises(pull.sqlite3.IntegrityError):
+            pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {1})
+        self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['release_generation'], 0)
+
+    def test_concurrent_released_item_cannot_replace_active_worker_receipt(self):
+        entered, release = threading.Event(), threading.Event()
+        def observe(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('fixture worker timed out')
+            return fixture_ack(args[2], action='would_delete', delete=False)
+        with mock.patch.object(pull, 'restore_api', side_effect=observe) as post:
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                first = executor.submit(pull.cleanup_process_task, self.cfg, self.inventory, threading.Event(), self.task)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    original = pull.cleanup_journal(self.inventory)
+                    self.assertFalse(pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), dict(self.task, attempt=2)))
+                    self.assertEqual(pull.cleanup_journal(self.inventory), original)
+                    self.assertEqual(post.call_count, 1)
+                finally:
+                    release.set()
+                first.result(timeout=5)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+    def test_stale_replay_snapshot_cannot_remove_replacement_evidence(self):
+        self.journal_observe(900)
+        journal = pull.cleanup_journal
+        replacement = ('intent', '{"evidence":"replacement bytes"}')
+        def snapshot(inventory, *args, **kwargs):
+            rows = journal(inventory, *args, **kwargs)
+            inventory.db.execute('UPDATE cleanup_receipts SET phase=?,body=? WHERE item_id=900', replacement)
+            inventory.db.commit()
+            return rows
+        with mock.patch.object(pull, 'cleanup_journal', side_effect=snapshot), mock.patch.object(pull, 'restore_api', side_effect=AssertionError('stale replay sent')):
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(journal(self.inventory), [(900, *replacement)])
+
+    def test_all_skipped_cycle_waits(self):
+        self.journal_observe(900)
+        calls = []
+        task = dict(self.task, item_id=900)
+        def lease(*args):
+            calls.append(1)
+            return dict(tasks=[task], retry_after_sec=120)
+        replay = dict(replayed=0, failed=0, pending=1, quarantined=0, errors=[])
+        with mock.patch.object(pull, 'cleanup_replay_receipts', return_value=replay), mock.patch.object(pull, 'cleanup_lease_v2', side_effect=lease), mock.patch.object(pull, 'cleanup_process_task', side_effect=AssertionError('blocked item')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                wait = pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None, task_limit=8)
+        self.assertEqual(wait, 120)
+        self.assertLessEqual(len(calls), 8)
+
+    def test_halving_stops_at_two_levels(self):
+        with mock.patch.object(pull, 'cleanup_api_retry', side_effect=pull.urllib.error.HTTPError('/x', 503, 'restart', {}, None)) as post:
+            batcher = pull.CleanupBatcher(self.cfg, '/x', 'observations', senders=0)
+            results = batcher.post([dict(item_id=n) for n in range(64)])
+        self.assertEqual(post.call_count, 7)
+        self.assertEqual(len(results), 64)
+        self.assertTrue(all(isinstance(v, pull.urllib.error.HTTPError) for v in results.values()))
+
+    def test_malformed_replay_never_drops_receipt(self):
+        for response in ({}, [], dict(action='reconcile'), dict(action='unknown')):
+            self.journal_observe(900)
+            original = pull.cleanup_journal(self.inventory)
+            with mock.patch.object(pull, 'restore_api', return_value=response):
+                counts = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=1)
+            self.assertEqual(counts['failed'], 1)
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_missing_recovered_result_ack_preserves_advanced_receipt(self):
+        self.journal_observe(900)
+        def api(cfg, path, body):
+            if path.endswith('/observe'):
+                return fixture_ack(body, 900, action='reconcile', delete=False)
+            return None
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay must not delete')):
+            counts = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=1)
+        self.assertEqual(counts['failed'], 1)
+        rows = pull.cleanup_journal(self.inventory)
+        self.assertEqual(rows[0][1], 'result')
+        self.assertEqual(json.loads(rows[0][2])['outcome'], 'unverified')
+
+    def test_all_diagnostic_patterns(self):
+        self.assertNotIn('hidden-value', json.dumps(pull.redact_diagnostics({'nested': {'api_key': 'hidden-value'}})))
+        for line, secret in diagnostic_patterns():
+            with self.subTest(line=line):
+                self.assertNotIn(secret, pull.redact_log_line(line))
+                self.assertNotIn(secret, json.dumps(pull.redact_diagnostics(dict(last_error=line))))
+                pull.CLEANUP_STATUS.fail(line)
+                self.assertNotIn(secret, pull.CLEANUP_STATUS.snapshot()[1])
+
+    def test_log_upload_error_storm_respects_minimum_gap(self):
+        stop = threading.Event()
+        clock = [1000.0]
+        attempts = []
+        def event_wait(wait):
+            clock[0] += 0.01
+            return True
+        def pause(delay):
+            clock[0] += delay
+            return False
+        def upload(*args):
+            attempts.append(clock[0])
+            if len(attempts) == 4:
+                stop.set()
+            raise OSError('offline')
+        with mock.patch.object(pull.CLIENT_LOG_RING, 'configure'), mock.patch.object(pull.CLIENT_LOG_RING.error_event, 'wait', side_effect=event_wait), mock.patch.object(stop, 'wait', side_effect=pause), mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock[0]), mock.patch.object(pull, 'client_log_upload_once', side_effect=upload):
+            pull.client_log_upload_loop(self.cfg, None, self.inventory, stop)
+        self.assertTrue(all(b-a >= 60 for a,b in zip(attempts, attempts[1:])), attempts)
+
+
+def diagnostic_patterns():
+    value = 'fixture-sensitive-value'
+    return [
+        ('{"api_key": "' + value + '"}', value),
+        ("{'token': '" + value + "'}", value),
+        ('secret=' + value, value),
+        (json.dumps({'api_key': 'prefix\"' + value}), value),
+        ('Authorization: Bearer ' + value, value),
+        ('{"Authorization": "Bearer ' + value + '"}', value),
+        (json.dumps({'Authorization': ['Bearer ' + value]}), value),
+        (json.dumps({'Cookie': {'session': value}}), value),
+        ('Authorization: Digest username="' + value + '", nonce="' + value + '", cnonce="' + value + '", response="' + value + '"', value),
+        (json.dumps(json.dumps({'api_key': value})), value),
+        (json.dumps(json.dumps(json.dumps({'password': value}))), value),
+        ('fd7a:115c:a1e0::1', 'fd7a:115c:a1e0::1'),
+        ('[FD7A:115C:A1E0:abcd:1234:5678:90ab:cdef]:443', 'FD7A:115C:A1E0'),
+        ('https://user:' + value + '@host/path', value),
+        *[(scheme + '://user:' + value + '@host/db', value) for scheme in ('postgres', 'postgresql', 'mysql', 'redis', 'rediss')],
+        ('eyJ' + 'a'*20 + '.' + 'b'*20 + '.' + 'c'*20, 'a'*20),
+        ('tskey-' + 'auth-' + value, value),
+        ('AKIA' + 'Q'*16, 'Q'*16),
+        ('{"R2_ACCESS_KEY_ID": "' + 'a'*32 + '"}', 'a'*32),
+        ('https://host/path?X-Amz-Signature=' + value + '&other=x', value),
+        ('https://nas.example.ts.net/path', 'nas.example.ts.net'),
+        ('100.64.0.1 100.127.255.255', '100.64.0.1'),
+        ('100.127.255.255', '100.127.255.255'),
+    ]
+
+
+class CleanupAcknowledgementTests(unittest.TestCase):
+    def response(self, case, body, phase):
+        if case == 'malformed_json':
+            return json.loads('{')
+        if case == 'http_5xx':
+            raise pull.urllib.error.HTTPError('/fixture', 503, 'unavailable', {}, None)
+        ack = fixture_ack(body, action='would_delete', delete=False) if phase == 'observe' else fixture_ack(body, ok=True)
+        changes = {'empty': {}, 'negative': {'ok': False}, 'negative_bound': dict(ack, ok=False), 'wrong_item': dict(ack, item_id=999),
+                   'wrong_attempt': dict(ack, attempt=2), 'wrong_plan': dict(ack, plan_sha256='f'*64),
+                   'wrong_proof': dict(ack, proof_sha256='f'*64), 'boolean_item': dict(ack, item_id=True),
+                   'malformed_action': dict(ack, action='unknown'), 'valid': ack}
+        return changes[case]
+
+    def fixture(self):
+        fixture = CleanupTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture
+
+    def test_fresh_result_requires_exact_positive_ack_and_replay_never_unlinks(self):
+        for protocol in (1, 2):
+            for case in ('empty', 'negative', 'negative_bound', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'boolean_item', 'http_5xx', 'valid'):
+                with self.subTest(protocol=protocol, case=case):
+                    f = self.fixture()
+                    with f.opened() as current:
+                        f.task['approved_proof'] = current.proof()
+                    calls = []
+                    def observe(cfg, item_id, body):
+                        calls.append('observe')
+                        return fixture_ack(body, action='delete_issued', delete=True,
+                                           expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+                    def result(cfg, item_id, body):
+                        calls.append('result')
+                        return self.response(case, body, 'result')
+                    api = SimpleNamespace(request_ids=protocol == 2, observe=observe, result=result)
+                    if case == 'valid':
+                        pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                    else:
+                        with self.assertRaises((pull.CleanupResponseError, json.JSONDecodeError, pull.urllib.error.HTTPError)):
+                            pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        original = pull.cleanup_journal(f.inventory)
+                        self.assertEqual(original[0][1], 'result')
+                        self.assertEqual(json.loads(original[0][2])['outcome'], 'deleted')
+                        with mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('must not reopen/unlink')):
+                            self.assertFalse(pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api))
+                            replay = pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
+                            self.assertEqual(replay['failed'], 1)
+                            self.assertEqual(pull.cleanup_journal(f.inventory), original)
+                            api.result = lambda cfg, item_id, body: fixture_ack(body, ok=True)
+                            pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                    self.assertFalse(f.path.exists())
+                    self.assertFalse(f.sidecar.exists())
+                    self.assertEqual(calls.count('observe'), 1, 'must never ask for another permit')
+
+    def test_fresh_observation_and_conflict_checkpoint_require_valid_ack(self):
+        for conflict in (False, True):
+            for case in ('empty', 'negative', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'http_5xx', 'malformed_action', 'valid'):
+                with self.subTest(conflict=conflict, case=case):
+                    f = self.fixture()
+                    if conflict:
+                        f.item['sha256'] = 'f'*64
+                    def observe(cfg, item_id, body):
+                        ack = self.response(case, body, 'observe')
+                        if case == 'valid' and conflict:
+                            ack['action'] = 'conflict'
+                        return ack
+                    api = SimpleNamespace(request_ids=True, observe=observe)
+                    if case == 'valid':
+                        pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                    else:
+                        with self.assertRaises((pull.CleanupResponseError, json.JSONDecodeError, pull.urllib.error.HTTPError)):
+                            pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        original = pull.cleanup_journal(f.inventory)
+                        self.assertEqual(original[0][1], 'observe')
+                        self.assertFalse(pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api))
+                        self.assertEqual(pull.cleanup_journal(f.inventory), original)
+                    self.assertTrue(f.path.exists())
+                    self.assertTrue(f.sidecar.exists())
+
+    def test_diagnostic_pairs_and_unicode_names_in_text_and_structures(self):
+        secret = 'fixture-sensitive-value'
+        for name in ('Authorization', 'aUtHoRiZaTiOn', 'Proxy-Authorization', 'Cookie', 'Set-Cookie', 'token', 'api_key', 'password'):
+            escaped = ''.join('\\u%04x' % ord(c) for c in name)
+            for key in (name, escaped):
+                for pair in ([key, 'Digest username="u", response="%s"' % secret], (key, {'nested': secret})):
+                    with self.subTest(key=key, pair=pair):
+                        for value in ({'headers': [pair]}, {'outer': {key: secret}}):
+                            self.assertNotIn(secret, json.dumps(pull.redact_diagnostics(value)))
+                        for line in (repr(pair), json.dumps(pair), 'cleanup ' + json.dumps({key: secret}),
+                                     json.dumps(json.dumps({key: secret})), '[[' + json.dumps(key) + ',"' + secret):
+                            self.assertNotIn(secret, pull.redact_log_line(line), line)
+        self.assertEqual(pull.redact_diagnostics([['Accept', 'application/json']]), [['Accept', 'application/json']])
+
+class DiagnosticSharedFixtureTests(unittest.TestCase):
+    def test_config_secret_encodings_are_removed_before_ring_storage(self):
+        import base64
+        import html
+        import urllib.parse
+        canary = 'synthetic-R4-<&>"/é+\\canary'
+        cfg = SimpleNamespace(api_key=canary, service_token='service-canary-123',
+                              pull_token='pull-canary-123', r2={'access_key_id': 'r2-canary-123'},
+                              s3={'secret_access_key': 's3-canary-123'}, db_pass='db-canary-123',
+                              relative_path='Stream/Day/Case.mp4', short_secret='tiny')
+        ring = pull.ClientLogRing()
+        with mock.patch.dict(pull.os.environ, {'CUSTOM_CREDENTIAL': 'env-canary-123'}):
+            ring.configure(cfg)
+        expected = {canary, cfg.service_token, cfg.pull_token, 'r2-canary-123', 's3-canary-123',
+                    cfg.db_pass, 'env-canary-123'}
+        self.assertTrue(expected.issubset(set(ring.secrets)))
+        self.assertNotIn('tiny', ring.secrets)
+        self.assertNotIn(cfg.relative_path, ring.secrets)
+        raw = canary.encode()
+        encodings = [canary, base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode(),
+                     base64.b64encode(raw).decode().rstrip('='),
+                     urllib.parse.quote(canary, safe=''), urllib.parse.quote_plus(canary),
+                     ''.join('%%%02X' % b for b in raw), ''.join('%%%02x' % b for b in raw),
+                     html.escape(canary), html.escape(canary, quote=False), json.dumps(canary)[1:-1],
+                     ''.join('\\u%04x' % ord(c) for c in canary), raw.hex(), raw.hex().upper()]
+        safe = 'item_id=42 relative_path=Stream/Day/Case.mp4 size_bytes=123456 sha256=' + 'a' * 64
+        for encoded in encodings:
+            with self.subTest(encoding=encoded):
+                ring.record('WARN', 'opaque ' + encoded + ' ' + safe)
+                stored = ring.lines[-1][0]['message']
+                self.assertNotIn(encoded, stored)
+                self.assertNotIn(canary, stored)
+                self.assertIn('[REDACTED]', stored)
+                self.assertIn(safe, stored)
+        ring.record('WARN', 'tiny ' + safe)
+        self.assertEqual(ring.lines[-1][0]['message'], 'tiny ' + safe)
+
+    def test_received_cookie_and_session_values_join_secret_backstop(self):
+        from email.message import Message
+        import io
+        headers = Message()
+        headers.add_header('Set-Cookie', 'SID=received-cookie-canary; Path=/; HttpOnly')
+        headers.add_header('Set-Cookie', 'opaque=second-cookie-canary; Secure')
+        ring = pull.ClientLogRing()
+        cfg = SimpleNamespace(api_base='https://example.invalid', api_key='test-config-canary')
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring):
+            response = io.BytesIO(json.dumps({'session': 'received-session-canary',
+                                             'object_key': 'Stream/Day/Case.mp4'}).encode())
+            response.headers = headers
+            with mock.patch.object(pull.urllib.request, 'urlopen', return_value=response):
+                pull.request_json(cfg, 'GET', '/test')
+            self.assertNotIn('Stream/Day/Case.mp4', ring.secrets)
+            ring.configure(cfg)  # uploader configuration must retain learned values
+            for value in ('received-cookie-canary', 'second-cookie-canary', 'received-session-canary'):
+                ring.record('WARN', 'opaque ' + value)
+                self.assertNotIn(value, ring.lines[-1][0]['message'])
+            error = pull.urllib.error.HTTPError(cfg.api_base, 403, 'denied', headers, None)
+            ring.secrets = ()
+            with mock.patch.object(pull.urllib.request, 'urlopen', side_effect=error), self.assertRaises(pull.urllib.error.HTTPError):
+                pull.request_json(cfg, 'GET', '/test')
+            ring.record('WARN', 'opaque received-cookie-canary')
+            self.assertNotIn('received-cookie-canary', ring.lines[-1][0]['message'])
+
+    def test_native_cookie_and_buffer_reprs(self):
+        from http.cookiejar import Cookie
+        from http.cookies import SimpleCookie
+        canary = 'synthetic-cookie-canary'
+        cookie = Cookie(0, 'SID', canary, None, False, 'example.com', True, False,
+                        '/', True, False, None, True, None, None, {})
+        simple = SimpleCookie({'SID': canary})
+        for value in (cookie, simple, simple['SID']):
+            for line in (str(value), repr(value)):
+                ring = pull.ClientLogRing()
+                ring.record('WARN', line)
+                self.assertNotIn(canary, ring.lines[-1][0]['message'])
+        for wrap in (bytes, bytearray, memoryview):
+            value = [[wrap(b'Cookie'), wrap(canary.encode())]]
+            self.assertNotIn(canary, json.dumps(pull.redact_diagnostics(value)))
+            ring = pull.ClientLogRing()
+            ring.record('WARN', value)
+            self.assertNotIn(canary, ring.lines[-1][0]['message'])
+
+    def test_shared_redaction_vectors_and_upload_ring(self):
+        fixture = Path(__file__).resolve().parents[2] / 'testdata/nas_diagnostic_redaction.json'
+        for vector in json.loads(fixture.read_text())['vectors']:
+            with self.subTest(vector=vector['name']):
+                value = vector['input']
+                result = pull.redact_diagnostics(value)
+                rendered = result if isinstance(result, str) else json.dumps(result)
+                ring = pull.ClientLogRing()
+                ring.record('WARN', value if isinstance(value, str) else repr(value))
+                stored = ring.lines[0][0]['message']
+                for secret in vector['absent']:
+                    self.assertNotIn(secret, rendered)
+                    self.assertNotIn(secret, stored)
+                for diagnostic in vector['present']:
+                    self.assertIn(diagnostic, rendered)
+                    self.assertIn(diagnostic, stored)
+                if vector['unchanged']:
+                    self.assertEqual(result, value)
+                    if isinstance(value, str):
+                        self.assertEqual(stored, value)
+
+    def test_native_bytes_are_redacted_before_ring_storage(self):
+        for name in (b'Cookie', b'Authorization', b'Proxy-Authorization', b'Session'):
+            value = {b'headers': [(name, b'synthetic-sensitive-value')]}
+            self.assertNotIn('synthetic-sensitive-value', json.dumps(pull.redact_diagnostics(value)))
+            ring = pull.ClientLogRing()
+            ring.record('WARN', value)
+            self.assertNotIn('synthetic-sensitive-value', ring.lines[0][0]['message'])
+
+class DiagnosticPerformanceTests(unittest.TestCase):
+    def assert_fast(self, call):
+        start = time.perf_counter()
+        result = call()
+        elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, 0.050, 'redaction took %.3f ms' % (elapsed * 1000))
+        return result
+
+    def test_pathological_inputs_are_bounded_and_fast(self):
+        for size in (8192, 32768, 1024 * 1024):
+            for unit in ('%61' + 'a' * size, '=' * size, ':' * size,
+                         "'" * size, '"' * size, '\\' * size,
+                         '[' * size, '(' * size, 'a.' * (size // 2),
+                         'https://' * (size // 8), '["' + ' ' * size,
+                         'x-amz-' + 'a' * size, 'token' + 'a' * size,
+                         '%25' * (size // 3)):
+                with self.subTest(size=size, prefix=unit[:20]):
+                    result = self.assert_fast(lambda: pull.redact_log_line(unit))
+                    self.assertLessEqual(len(result), pull.CLIENT_LOG_LINE_MAX)
+                    self.assertIn('[TRUNCATED]', result)
+                    structured = self.assert_fast(lambda: pull.redact_diagnostics({'last_error': unit}))
+                    self.assertLessEqual(len(structured['last_error']), pull.CLIENT_LOG_LINE_MAX)
+
+    def test_url_userinfo_nested_queries_and_safe_fragments_are_preserved(self):
+        for value in ('1https://u:private-canary@host.invalid',
+                      '.-https://u:private-canary@host.invalid',
+                      'https://outer.invalid/#https://inner.invalid/file?sig=private-canary',
+                      'https://outer.invalid/#safe?note#https://inner.invalid/file?sig=private-canary',
+                      'https://?note=https://inner.invalid/file?sig=private-canary'):
+            self.assertNotIn('private-canary', pull.redact_log_line(value))
+        safe = 'https://example.invalid/file#fragment?size=42'
+        self.assertEqual(pull.redact_log_line(safe), safe)
+
+    def test_deep_and_cyclic_diagnostics_fail_closed_quickly(self):
+        value = 'private-canary'
+        for _ in range(10000):
+            value = [value]
+        result = self.assert_fast(lambda: pull.redact_diagnostics(value))
+        self.assertNotIn('private-canary', json.dumps(result))
+        cycle = []
+        cycle.append(cycle)
+        self.assertIn('[REDACTED]', json.dumps(self.assert_fast(lambda: pull.redact_diagnostics(cycle))))
+
+    def test_cut_sensitive_values_and_known_secret_prefixes(self):
+        canary = 'synthetic fragment with spaces and punctuation / end'
+        for fragment in (canary[:8], canary[:20], canary[:-1]):
+            prefix = 'safe ' * ((pull.DIAGNOSTIC_INPUT_MAX - len(fragment)) // 5)
+            prefix += ' ' * (pull.DIAGNOSTIC_INPUT_MAX - len(fragment) - len(prefix))
+            text = prefix + canary + ' extra'
+            result = pull.redact_log_line(text, secrets=(canary,))
+            self.assertNotIn(fragment, result)
+            self.assertIn('[TRUNCATED]', result)
+            self.assertLessEqual(len(result), pull.CLIENT_LOG_LINE_MAX)
+        for lead in ('Authorization: Bearer ', 'password="', '["api_key", "',
+                     'Digest ', 'https://host.invalid/file?sig='):
+            prefix = 'ok ' * ((pull.DIAGNOSTIC_INPUT_MAX - len(lead) - 10) // 3)
+            result = pull.redact_log_line(prefix + lead + 'private-canary-value' * 10)
+            self.assertNotIn('private', result)
+            self.assertIn('[REDACTED]', result)
+            self.assertIn('[TRUNCATED]', result)
+        for variant in pull.diagnostic_secret_variants(canary):
+            prefix = 'x ' * ((pull.DIAGNOSTIC_INPUT_MAX - 12) // 2)
+            result = pull.redact_log_line(prefix + variant + ' extra', secrets=(canary,))
+            self.assertNotIn(variant[:8], result)
+
+    def test_buffers_and_each_structured_item_are_capped_before_normalization(self):
+        original = pull.normalize_diagnostic_text
+        observed = []
+        def bounded(text):
+            observed.append(len(text))
+            self.assertLessEqual(len(text), pull.DIAGNOSTIC_INPUT_MAX)
+            return original(text)
+        with mock.patch.object(pull, 'normalize_diagnostic_text', side_effect=bounded):
+            for wrap in (str, lambda x: x.encode(), lambda x: bytearray(x.encode()),
+                         lambda x: memoryview(x.encode()),
+                         lambda x: memoryview(x.encode()).cast('I')):
+                result = pull.redact_diagnostics({'errors': {'first': wrap('a' * 32768), 'second': wrap('b' * 32768)}})
+                self.assertTrue(all('[TRUNCATED]' in x for x in result['errors'].values()))
+        self.assertTrue(observed)
+        self.assertEqual(list(pull.redact_diagnostics({'a' * 32768: 'private-canary'}).values()), ['[REDACTED]'])
+
+    def test_redaction_exceptions_never_return_raw_text(self):
+        class BrokenText:
+            def __str__(self):
+                raise ValueError('private-canary')
+        class BrokenDict(dict):
+            def items(self):
+                raise ValueError('private-canary')
+        self.assertEqual(pull.redact_log_line(BrokenText()), '[REDACTED]')
+        self.assertEqual(pull.redact_diagnostics(BrokenDict()), '[REDACTED]')
+        for stage in ('bounded_diagnostic_text', 'normalize_diagnostic_text', 'diagnostic_secret_variants',
+                      'redact_known_diagnostic_secrets', 'finish_diagnostic_text'):
+            with mock.patch.object(pull, stage, side_effect=RuntimeError('private-canary')):
+                self.assertEqual(pull.redact_log_line('private-canary', secrets=('private-canary',)), '[REDACTED]')
+        with mock.patch.object(pull, 'diagnostic_secret_name', side_effect=RuntimeError('private-canary')):
+            self.assertEqual(pull.redact_diagnostics({'api_key': 'private-canary'}), '[REDACTED]')
+
+    def test_log_http_error_returns_quickly_and_ring_is_not_locked_during_redaction(self):
+        import io
+        from contextlib import redirect_stdout
+        ring = pull.ClientLogRing()
+        original = pull.redact_log_line
+        def unlocked(*args, **kwargs):
+            acquired = ring.lock.acquire(blocking=False)
+            self.assertTrue(acquired, 'redaction holds ring lock')
+            if acquired:
+                ring.lock.release()
+            return original(*args, **kwargs)
+        error = pull.urllib.error.HTTPError('https://example.invalid', 403, '%61' + 'a' * 32768, None, None)
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring), mock.patch.object(pull, 'redact_log_line', side_effect=unlocked), redirect_stdout(io.StringIO()):
+            self.assert_fast(lambda: pull.log('ERROR', error))
+        self.assertEqual(len(ring.lines), 1)
+        self.assertIn('[TRUNCATED]', ring.lines[0][0]['message'])
+        self.assertTrue(ring.error_event.is_set())
 
 if __name__=='__main__':unittest.main()

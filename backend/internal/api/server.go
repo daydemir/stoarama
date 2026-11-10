@@ -362,6 +362,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/cleanup/{itemId}/result", s.handleAccountNASCleanupResult)
 			account.Post("/connections/cleanup/observe-batch", s.handleAccountNASCleanupObserveBatch)
 			account.Post("/connections/cleanup/result-batch", s.handleAccountNASCleanupResultBatch)
+			account.Post("/connections/client-logs", s.handleAccountNASClientLogs)
 			account.Post("/connections/selected-verify/lease", s.handleAccountConnectionSelectedVerifyLease)
 			account.Post("/connections/selected-verify/{itemId}/result", s.handleAccountConnectionSelectedVerifyResult)
 			account.Post("/connections/benchmark/claim", s.handleAccountConnectionBenchmarkClaim)
@@ -664,6 +665,8 @@ func (s *Server) router() http.Handler {
 			service.Post("/service/nas-cleanup/batches", s.handleAdminNASCleanupBatchEnable)
 			service.Get("/service/nas-cleanup/batches/{id}", s.handleAdminNASCleanupBatchStatus)
 			service.Post("/service/nas-cleanup/batches/{id}/control", s.handleAdminNASCleanupBatchControl)
+			service.Get("/service/nas-connections/{id}/client-logs", s.handleAdminNASClientLogs)
+			service.Post("/service/nas-connections/{id}/release-quarantine", s.handleAdminNASReleaseQuarantine)
 			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)

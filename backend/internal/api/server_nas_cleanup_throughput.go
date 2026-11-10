@@ -87,6 +87,44 @@ func (s *Server) cleanupHousekeeping(ctx context.Context, cid int64) {
 	s.cleanupExpireApprovals(ctx)
 }
 
+// recordNASCleanupStatus stores the app's optional cleanup status (a small
+// JSON object) for operators. Best effort: it never fails a heartbeat.
+func (s *Server) recordNASCleanupStatus(ctx context.Context, cid int64, raw json.RawMessage) {
+	if s.pool == nil || len(raw) == 0 {
+		return
+	}
+	var status map[string]any
+	if len(raw) > 8192 || json.Unmarshal(raw, &status) != nil || status == nil {
+		log.Printf("nas heartbeat: dropping invalid cleanup status")
+		return
+	}
+	raw, _ = json.Marshal(redactNASDiagnostics(status))
+	if _, err := s.pool.Exec(ctx, `UPDATE connections SET nas_cleanup_status=$2::jsonb,nas_cleanup_status_at=now() WHERE id=$1`, cid, string(raw)); err != nil {
+		log.Printf("nas heartbeat: cleanup status not stored: %v", err)
+	}
+}
+
+// cleanupBatchError answers a batched request that failed as a whole and
+// logs it: such failures stall the client, so they must be visible.
+func cleanupBatchError(w http.ResponseWriter, status int, msg string) {
+	log.Printf("nas cleanup batch request failed: %d %s", status, msg)
+	util.WriteError(w, status, msg)
+}
+
+// logCleanupBatchOutcome logs a batched request whose items were not all
+// accepted, so stalls are visible in the API log (counts only, no payloads).
+func logCleanupBatchOutcome(kind string, cid int64, results []map[string]any) {
+	counts := map[any]int{}
+	for _, r := range results {
+		if r["status"] != 200 {
+			counts[r["status"]]++
+		}
+	}
+	if len(counts) != 0 {
+		log.Printf("nas cleanup %s connection=%d items=%d non-200 statuses=%v", kind, cid, len(results), counts)
+	}
+}
+
 // cleanupExpireApprovals pauses every enabled plan and batch whose approval
 // has passed, so an expired approval neither lingers as 'enabled' (blocking
 // new enables and purges) nor leaves a batch waiting forever. Pausing grants
@@ -473,7 +511,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		Observations  []cleanupBatchObservation `json:"observations"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || len(req.Observations) < 1 || len(req.Observations) > nasCleanupBatchItemsMax {
-		util.WriteError(w, 400, "client version and 1 to 64 observations required")
+		cleanupBatchError(w, 400, "client version and 1 to 64 observations required")
 		return
 	}
 	// A repeated item id (a client resending an entry that was still queued)
@@ -486,7 +524,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	conflicting := make([]bool, len(req.Observations))
 	for n, o := range req.Observations {
 		if o.ItemID <= 0 {
-			util.WriteError(w, 400, "positive item ids required")
+			cleanupBatchError(w, 400, "positive item ids required")
 			return
 		}
 		payloads[n], _ = json.Marshal(o)
@@ -523,13 +561,13 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	env := &cleanupObserveEnv{prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		util.WriteError(w, 500, "cleanup observation begin failed")
+		cleanupBatchError(w, 500, "cleanup observation begin failed")
 		return
 	}
 	defer tx.Rollback(ctx)
 	var anyEnabled bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled')`, ids, cid).Scan(&anyEnabled); err != nil {
-		util.WriteError(w, 500, "cleanup observation begin failed")
+		cleanupBatchError(w, 500, "cleanup observation begin failed")
 		return
 	}
 	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
@@ -539,12 +577,12 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		env.lockedPlans = map[int64]bool{}
 		var plans []int64
 		if err = tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT p.id ORDER BY p.id),'{}') FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled'`, ids, cid).Scan(&plans); err != nil {
-			util.WriteError(w, 500, "cleanup plan execution fence failed")
+			cleanupBatchError(w, 500, "cleanup plan execution fence failed")
 			return
 		}
 		for _, plan := range plans {
 			if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+plan); err != nil {
-				util.WriteError(w, 500, "cleanup plan execution fence failed")
+				cleanupBatchError(w, 500, "cleanup plan execution fence failed")
 				return
 			}
 			env.lockedPlans[plan] = true
@@ -553,7 +591,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
 		}
 		if err != nil {
-			util.WriteError(w, 500, "cleanup deletion budget unavailable")
+			cleanupBatchError(w, 500, "cleanup deletion budget unavailable")
 			return
 		}
 		env.budgetHeld = true
@@ -564,7 +602,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 		sp, err := tx.Begin(ctx)
 		if err != nil {
-			util.WriteError(w, 500, "cleanup observation save failed")
+			cleanupBatchError(w, 500, "cleanup observation save failed")
 			return
 		}
 		result := s.cleanupObserveOne(ctx, sp, cid, o.ItemID, o.cleanupObserve, env)
@@ -574,7 +612,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			err = sp.Rollback(ctx)
 		}
 		if err != nil {
-			util.WriteError(w, 500, "cleanup observation save failed")
+			cleanupBatchError(w, 500, "cleanup observation save failed")
 			return
 		}
 		body := map[string]any{"item_id": o.ItemID, "status": result.status}
@@ -584,9 +622,10 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		results[n] = body
 	}
 	if err = tx.Commit(ctx); err != nil {
-		util.WriteError(w, 500, "cleanup observation save failed")
+		cleanupBatchError(w, 500, "cleanup observation save failed")
 		return
 	}
+	defer func() { logCleanupBatchOutcome("observe-batch", cid, results) }()
 	for n, o := range req.Observations {
 		if conflicting[n] {
 			results[n] = map[string]any{"item_id": o.ItemID, "status": 409, "error": "conflicting duplicate observation for this item in one request"}
@@ -674,12 +713,12 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 		Receipts      []cleanupReceipt `json:"receipts"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || len(req.Receipts) < 1 || len(req.Receipts) > nasCleanupBatchItemsMax {
-		util.WriteError(w, 400, "client version and 1 to 64 receipts required")
+		cleanupBatchError(w, 400, "client version and 1 to 64 receipts required")
 		return
 	}
 	for _, receipt := range req.Receipts {
 		if receipt.ItemID <= 0 || !validCleanupReceipt(receipt) {
-			util.WriteError(w, 400, "invalid cleanup deletion receipt")
+			cleanupBatchError(w, 400, "invalid cleanup deletion receipt")
 			return
 		}
 	}
@@ -691,7 +730,7 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 	s.cleanupHousekeeping(ctx, cid)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		util.WriteError(w, 500, "cleanup receipt save failed")
+		cleanupBatchError(w, 500, "cleanup receipt save failed")
 		return
 	}
 	defer tx.Rollback(ctx)
@@ -709,7 +748,7 @@ func (s *Server) handleAccountNASCleanupResultBatch(w http.ResponseWriter, r *ht
 			if err := tx.QueryRow(ctx, `WITH pz AS (UPDATE nas_cleanup_plans SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND id=(SELECT i.plan_id FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$3) RETURNING id),
 bz AS (UPDATE nas_cleanup_batches SET `+cleanupAutoPauseSet+` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz) RETURNING id)
 SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err != nil {
-				util.WriteError(w, 500, "cleanup receipt save failed")
+				cleanupBatchError(w, 500, "cleanup receipt save failed")
 				return
 			}
 			results = append(results, map[string]any{"item_id": id, "status": 409, "error": "conflicting duplicate receipt for this item in one request", "plan_paused": pausedPlans > 0})
@@ -719,7 +758,7 @@ SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err
 		}
 		updated, paused, planID, err := cleanupApplyReceipt(ctx, tx, cid, id, receipt)
 		if err != nil {
-			util.WriteError(w, 500, "cleanup receipt save failed")
+			cleanupBatchError(w, 500, "cleanup receipt save failed")
 			return
 		}
 		if updated != 1 {
@@ -729,15 +768,18 @@ SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err
 		if receipt.Outcome == "deleted" {
 			advance[planID] = true
 		}
-		results = append(results, map[string]any{"item_id": id, "status": 200, "ok": true, "state": receipt.Outcome, "plan_paused": paused})
+		ack := cleanupReceiptAck(id, receipt, paused)
+		ack["status"] = 200
+		results = append(results, ack)
 	}
 	if err = tx.Commit(ctx); err != nil {
-		util.WriteError(w, 500, "cleanup receipt save failed")
+		cleanupBatchError(w, 500, "cleanup receipt save failed")
 		return
 	}
 	for planID := range advance {
 		s.cleanupAdvanceBatchAfter(ctx, planID)
 	}
+	logCleanupBatchOutcome("result-batch", cid, results)
 	util.WriteJSON(w, 200, map[string]any{"results": results})
 }
 
