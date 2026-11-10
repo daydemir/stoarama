@@ -23,6 +23,7 @@ import re
 import signal
 import socket
 import sqlite3
+import struct
 import stat as stat_module
 import subprocess
 import sys
@@ -245,7 +246,7 @@ DIAGNOSTIC_MAX_DEPTH = 32
 DIAGNOSTIC_TRUNCATED = " [TRUNCATED]"
 CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
-CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
+CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin|V85|stitch", re.IGNORECASE)
 # Keep normalization and redaction rules in sync with server_nas_client_logs.go;
 # both suites load testdata/nas_diagnostic_redaction.json.
 # Scan each name token only from its start. The marker lookahead and the
@@ -656,6 +657,8 @@ class Config:
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
         # Release/deploy safe by default. Operators enable only after migration,
         # API and a completed clean inventory are independently verified.
+        self.stitch_enabled = env_str("STOARAMA_V85_STITCH_ENABLED", "false").lower() == "true"
+        self.stitch_delete_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "false").lower() == "true"
         self.native_stitch_enabled = env_str("STOARAMA_NATIVE_STITCH_ENABLED", "false").lower() == "true"
         self.is_candidate = env_str("STOARAMA_CANDIDATE", "0") == "1"
         parsed = urllib.parse.urlsplit(self.api_base)
@@ -1126,7 +1129,7 @@ class Inventory:
 
     def _cached_regular_stat(self, relative_path):
         parts = Path(relative_path).parts
-        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS:
+        if not parts or parts[0] in (JOINED_ROOT,) + INVENTORY_ROOT_EXCLUSIONS or parts[0].endswith("_V85_keep28"):
             return None
         descriptor = None
         try:
@@ -1453,6 +1456,7 @@ def inventory_loop(cfg, inventory, stop_event):
 
 class Runtime:
     def __init__(self, cfg, inventory=None):
+        self.stitch_enabled = getattr(cfg, "stitch_enabled", False)
         progress = read_json(cfg.progress_file, {})
         if not progress and cfg.legacy_progress_file.exists():
             progress = read_json(cfg.legacy_progress_file, {})
@@ -1777,6 +1781,9 @@ class Runtime:
             payload["cleanup"] = redact_diagnostics(cleanup)
         if cleanup_error and not payload["client_last_error"]:
             payload["client_last_error"], payload["client_last_error_at"] = cleanup_error, cleanup_error_at
+        if getattr(self, "stitch_enabled", False):
+            stitch, error, at = STITCH_STATUS.snapshot()
+            payload["stitch"] = redact_diagnostics(dict(stitch, last_error=error, last_error_at=at))
         payload["client_last_error"] = redact_diagnostics(payload["client_last_error"])
         host_facts = getattr(self, "host_facts", None)
         if host_facts is not None:
@@ -2572,8 +2579,12 @@ def cleanup_collated_path_hour(relative_path):
     return None
 
 
-def cleanup_guard_refusal(task, proof):
+def cleanup_guard_refusal(task, proof, cfg=None):
     """None when this exact file is independently outside its keep window; else why not."""
+    if task.get("item", {}).get("permit_reason"):
+        if cfg is None:
+            return "stitched inclusion needs local output readback"
+        return stitch_output_recheck(cfg, task["item"], execution=task.get("approved_proof") is not None)
     pins, error = cleanup_pins()
     if error is not None:
         return "pinned keep-window files failed verification: %s" % error
@@ -3042,7 +3053,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
             # reported as a conflict observation (an outcome every server
             # accepts), never would_delete, so enabling its plan fails up front
             # instead of pausing mid-run. Local caps apply to execution only.
-            refusal = cleanup_guard_refusal(task, proof)
+            refusal = cleanup_guard_refusal(task, proof, cfg)
             if refusal is None and task.get("approved_proof") is not None:
                 refusal = cleanup_local_caps(inventory, task["item"].get("size_bytes"))
             if refusal:
@@ -3072,7 +3083,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                     # Re-check immediately before unlink, reserve one deletion
                     # against the local caps, then write the durable intent line.
                     # Any failure here leaves the files untouched.
-                    refusal = cleanup_guard_refusal(task, proof) or cleanup_local_caps(
+                    refusal = cleanup_guard_refusal(task, proof, cfg) or cleanup_local_caps(
                         inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
                     if refusal:
                         raise RuntimeError("client deletion guard refused; not unlinked: " + refusal)
@@ -3634,7 +3645,7 @@ def walk_raw_files(root):
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=fail_walk, followlinks=False):
         directory = Path(dirpath)
         if directory == root:
-            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS]
+            dirnames[:] = [name for name in dirnames if name != JOINED_ROOT and name not in INVENTORY_ROOT_EXCLUSIONS and not name.endswith("_V85_keep28")]
         for filename in filenames:
             if directory == root and filename in INVENTORY_ROOT_EXCLUSIONS:
                 continue
@@ -9730,6 +9741,730 @@ def clean_benchmark_root(state_dir):
     return clean
 
 
+# V85 NAS-local stitching. Kept in this single-file client so R2 self-updates
+# carry the whole worker. There is no service, timer or external Python package.
+STITCH_POLICY = "v85-qualified-negative-unknown-capture-successor-v2"
+STITCH_REVISION = "v85-qualified15-8c0ab4d0369d8d4b"
+STITCH_CORPUS_SHA = "dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46"
+STITCH_MAX_INPUT = 2_500_000_000
+STITCH_MIN_MEMORY = 384 * 1024 * 1024
+STITCH_ACTIVE = threading.Event()
+STITCH_STATUS = CleanupStatus()
+
+
+class StitchHold(RuntimeError):
+    pass
+
+
+def stitch_resources(cfg, input_bytes=0):
+    """Unknown resource telemetry is HOLD. Consult cgroup headroom as well."""
+    import shutil
+    _, memory = meminfo_bytes(_read_text("/proc/meminfo"))
+    try:
+        limit = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+        if limit != "max":
+            memory = min(memory, int(limit) - used)
+    except (OSError, ValueError):
+        # cgroup v1 is bounded independently when it is present.
+        try:
+            limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text())
+            used = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text())
+            memory = min(memory, limit - used)
+        except (OSError, ValueError):
+            if cgroup_memory_limit():
+                raise StitchHold("cgroup memory usage unavailable")
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpus = os.cpu_count() or 1
+    cpus = min(cpus, cgroup_cpu_limit() or cpus)
+    load = os.getloadavg()[0]
+    if memory < STITCH_MIN_MEMORY or load > 1.5 * max(1, cpus):
+        raise StitchHold("NAS memory or load critical")
+    if not os.path.ismount(str(cfg.output_dir)):
+        raise StitchHold("NAS output root is not mounted")
+    if shutil.disk_usage(cfg.output_dir).free < max(cfg.min_free_bytes, 1024**3) + int(input_bytes * 2.2):
+        raise StitchHold("NAS free-space reserve reached")
+
+
+def stitch_priority():
+    import shutil
+    if not sys.platform.startswith("linux") or not shutil.which("nice") or not shutil.which("ionice"):
+        raise StitchHold("Linux nice/ionice required for stitch lane")
+    tid = threading.get_native_id()
+    os.setpriority(os.PRIO_PROCESS, tid, 19)
+    subprocess.run(["ionice", "-c", "3", "-p", str(tid)], check=True,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class StitchStop:
+    """Kill the current child on shutdown/update or critical resources."""
+    def __init__(self, cfg, stop):
+        self.cfg, self.stop, self.last, self.reason = cfg, stop, 0.0, ""
+
+    def is_set(self):
+        if self.stop.is_set():
+            return True
+        if time.monotonic() - self.last > 5:
+            self.last = time.monotonic()
+            try:
+                stitch_resources(self.cfg)
+            except Exception as exc:
+                self.reason = str(exc)
+        return bool(self.reason)
+
+
+def stitch_run(args, deadline, stop, stdout=None):
+    # The worker thread is already nice19/idle; explicitly apply the same
+    # priorities to FFmpeg and ffprobe children. No '-t' silent ionice fallback.
+    prefix = ["nice", "-n", "19", "ionice", "-c", "3"] if sys.platform.startswith("linux") else []
+    measured = run_measured(prefix + list(args), deadline, stop, stdout_path=stdout, niced=False)
+    if measured["returncode"] != 0:
+        raise StitchHold("native media check failed: " + measured["stderr"][:200])
+    return measured
+
+
+def stitch_journal(inventory, task_id, sha, result=None, registered=False):
+    with inventory.lock:
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS stitch_jobs(task_id INTEGER PRIMARY KEY,plan_sha TEXT NOT NULL,result TEXT,registered INTEGER NOT NULL DEFAULT 0)")
+        old = inventory.db.execute("SELECT plan_sha,result FROM stitch_jobs WHERE task_id=?", (task_id,)).fetchone()
+        if old and old[0] != sha:
+            raise StitchHold("immutable local task identity changed")
+        if result is not None:
+            inventory.db.execute("INSERT INTO stitch_jobs VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET result=excluded.result,registered=excluded.registered",
+                                 (task_id, sha, cleanup_json_bytes(result).decode(), int(registered)))
+            inventory.db.commit()
+        return json.loads(old[1]) if old and old[1] else None
+
+
+def stitch_corpus(cfg, inventory):
+    """Stream the exact frozen JSONL into SQLite once; never trust a row alone."""
+    with inventory.lock:
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS stitch_corpus_meta(sha TEXT PRIMARY KEY)")
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS stitch_edges(a TEXT,b TEXT,nomination INTEGER,PRIMARY KEY(a,b))")
+        inventory.db.commit()
+        if inventory.db.execute("SELECT 1 FROM stitch_corpus_meta WHERE sha=?", (STITCH_CORPUS_SHA,)).fetchone():
+            return
+    req = urllib.request.Request(cfg.api_base + "/account/connections/stitch/corpus")
+    req.add_header("Authorization", "Bearer " + cfg.api_key)
+    digest, count, nominees, size = hashlib.sha256(), 0, 0, 0
+    # Import in a separate DB connection/transaction. Inventory heartbeats keep
+    # reading their last completed snapshot; no partial corpus becomes usable.
+    database = sqlite3.connect(str(cfg.inventory_file), timeout=60)
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute("DELETE FROM stitch_edges")
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response:
+            while True:
+                line = response.readline(1024 * 1024 + 1)
+                if not line:
+                    break
+                size += len(line)
+                if size > 64 * 1024 * 1024 or len(line) > 1024 * 1024:
+                    raise StitchHold("frozen corpus exceeds bound")
+                digest.update(line)
+                row = json.loads(line)
+                keys = row["source_key"]
+                if (len(keys) != 2 or not re.fullmatch("[a-f0-9]{64}", row.get("frozen_diagnostic_sha256", ""))
+                        or type(row.get("nomination")) is not bool or not row.get("status")):
+                    raise StitchHold("frozen decision incomplete")
+                database.execute("INSERT INTO stitch_edges VALUES(?,?,?)",
+                                 (json.dumps(keys[0], separators=(",", ":")), json.dumps(keys[1], separators=(",", ":")), int(row["nomination"])))
+                count += 1
+                nominees += int(row["nomination"])
+        if digest.hexdigest() != STITCH_CORPUS_SHA or count != 73843 or nominees != 52462:
+            raise StitchHold("frozen corpus hash/census differs")
+        database.execute("INSERT INTO stitch_corpus_meta VALUES(?)", (STITCH_CORPUS_SHA,))
+        database.commit()
+    finally:
+        database.close()
+
+
+def stitch_source_key(c):
+    return json.dumps([c["source_id"], c["sha256"], c["size_bytes"]], separators=(",", ":"))
+
+
+def stitch_admitted(inventory, clip, previous=None):
+    key = stitch_source_key(clip)
+    with inventory.lock:
+        if previous is None:
+            # No outside-corpus source is promoted into V85 even as a singleton.
+            return inventory.db.execute("SELECT 1 FROM stitch_edges WHERE nomination=1 AND (a=? OR b=?) LIMIT 1", (key, key)).fetchone() is not None
+        row = inventory.db.execute("SELECT nomination FROM stitch_edges WHERE a=? AND b=?", (stitch_source_key(previous), key)).fetchone()
+        return row == (1,)
+
+
+class StitchDirectory:
+    """Pin every directory with O_NOFOLLOW for the lifetime of a job.
+
+    Child I/O uses /proc/self/fd paths with inherited directory descriptors on
+    Linux, so renaming an ancestor cannot redirect FFmpeg outside the NAS root.
+    The portable path used by disposable Mac fixtures is never used on the NAS.
+    """
+    def __init__(self, root, relative):
+        if (not relative or relative.startswith(("/", "#", "@")) or "\\" in relative
+                or any(p in ("", ".", "..") for p in relative.split("/"))):
+            raise StitchHold("invalid stitch directory")
+        self.root, self.relative, self.fds = Path(root), relative, []
+
+    def __enter__(self):
+        try:
+            fd = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            self.fds.append(fd)
+            device = os.fstat(fd).st_dev
+            for part in self.relative.split("/"):
+                try:
+                    os.mkdir(part, 0o700, dir_fd=self.fds[-1])
+                    os.fsync(self.fds[-1])
+                except FileExistsError:
+                    pass
+                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self.fds[-1])
+                self.fds.append(fd)
+                if os.fstat(fd).st_dev != device:
+                    raise StitchHold("nested stitch filesystem refused")
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    @property
+    def path(self):
+        if sys.platform.startswith("linux"):
+            return Path("/proc/%d/fd/%d" % (os.getpid(), self.fds[-1]))
+        return self.root / self.relative
+
+    def __exit__(self, *unused):
+        for fd in reversed(self.fds):
+            os.close(fd)
+        self.fds.clear()
+
+    def publish(self, temporary, name):
+        fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fds[-1])
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # link+unlink is an atomic create-only publication, unlike rename which
+        # overwrites. A restart may adopt only byte-identical existing output.
+        try:
+            os.link(temporary, name, src_dir_fd=self.fds[-1], dst_dir_fd=self.fds[-1], follow_symlinks=False)
+        except FileExistsError:
+            a, b = self.path / temporary, self.path / name
+            _, st = confined_regular_file(self.root, self.relative + "/" + name)
+            if (st.st_nlink != 1 and not (st.st_nlink == 2 and os.path.samestat(a.stat(), st))) or sha256_file(a) != sha256_file(b):
+                raise StitchHold("published output collision")
+        os.unlink(temporary, dir_fd=self.fds[-1])
+        os.fsync(self.fds[-1])
+        return self.path / name
+
+
+def stitch_packet_rows(file):
+    with open(file, encoding="ascii") as source:
+        for line in source:
+            line = line.strip()
+            if not line:
+                continue
+            fields = dict(part.split("=", 1) for part in line.split("|") if "=" in part)
+            if (set(fields) != {"pts", "dts", "duration", "size", "flags", "data_hash"}
+                    or not fields["data_hash"].startswith("SHA256:") or len(fields["data_hash"]) != 71):
+                raise StitchHold("unsupported packet mapping/side data")
+            try:
+                yield (int(fields["pts"]), int(fields["dts"]), int(fields["duration"]),
+                       int(fields["size"]), fields["flags"], fields["data_hash"])
+            except ValueError as exc:
+                raise StitchHold("packet timestamps missing") from exc
+
+
+def stitch_packets(ffprobe, source, target, deadline, stop, hidden=False):
+    stitch_run([ffprobe, "-v", "error"] + (["-ignore_editlist", "1"] if hidden else []) +
+               ["-select_streams", "v:0", "-show_packets", "-show_data_hash", "sha256",
+                "-show_entries", "packet=pts,dts,duration,size,flags,data_hash:packet_side_data=side_data_type",
+                "-of", "compact=p=0", str(source)], deadline, stop, target)
+
+
+def stitch_frames(ffmpeg, source, target, deadline, stop):
+    stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+                "-threads", "1", "-filter_threads", "1", "-i", str(source), "-map", "0:v:0",
+                "-fps_mode", "passthrough", "-enc_time_base", "demux", "-f", "framehash", "-hash", "sha256", "-y", str(target)], deadline, stop)
+
+
+def stitch_frame_rows(file):
+    with open(file, encoding="ascii") as source:
+        for line in source:
+            if line.startswith("#") or not line.strip():
+                continue
+            row = [v.strip() for v in line.split(",")]
+            if len(row) != 6 or len(row[5]) != 64:
+                raise StitchHold("unsupported decoded frame audit")
+            yield int(row[2]), row[4], row[5]
+
+
+def stitch_probe(ffprobe, source, target, deadline, stop):
+    stitch_run([ffprobe, "-v", "error", "-show_streams", "-show_data_hash", "sha256", "-of", "json", str(source)], deadline, stop, target)
+    if target.stat().st_size > 1024 * 1024:
+        raise StitchHold("oversized stream metadata")
+    streams = json.loads(target.read_text())["streams"]
+    if len(streams) != 1 or streams[0].get("codec_type") != "video" or streams[0].get("codec_name") != "h264":
+        raise StitchHold("only positively audio-absent native H264 is admitted")
+    s = streams[0]
+    signature = tuple(s.get(k) for k in ("codec_name", "codec_tag_string", "width", "height", "pix_fmt", "time_base", "extradata_hash"))
+    if any(v is None for v in signature) or Fraction(s["time_base"]).numerator != 1:
+        raise StitchHold("unsupported codec/extradata/timebase")
+    return signature
+
+
+def stitch_audit_source(ffmpeg, ffprobe, source, work, index, deadline, stop):
+    prefix = work / ("source-%03d" % index)
+    signature = stitch_probe(ffprobe, source, prefix.with_suffix(".json"), deadline, stop)
+    packets, hidden, frames = (prefix.with_suffix(suffix) for suffix in (".packets", ".hidden", ".frames"))
+    stitch_packets(ffprobe, source, packets, deadline, stop)
+    stitch_packets(ffprobe, source, hidden, deadline, stop, hidden=True)
+    if sha256_file(packets) != sha256_file(hidden):
+        raise StitchHold("hidden edit-list inventory differs")
+    stitch_frames(ffmpeg, source, frames, deadline, stop)
+    chain, count, last, minimum, maximum = hashlib.sha256(), 0, None, None, 0
+    for pts, dts, duration, size, flags, payload in stitch_packet_rows(packets):
+        if duration <= 0 or (last is not None and dts <= last) or (count == 0 and "K" not in flags):
+            raise StitchHold("source native packet interval invalid")
+        chain.update(("%s:%s\n" % (size, payload)).encode())
+        minimum = pts if minimum is None else min(minimum, pts)
+        maximum = max(maximum, pts + duration)
+        count += 1
+        last = dts
+    decoded, last = 0, None
+    for pts, size, digest in stitch_frame_rows(frames):
+        if last is not None and pts <= last:
+            raise StitchHold("source presentation PTS not increasing")
+        last, decoded = pts, decoded + 1
+    if count == 0 or count != decoded or minimum != 0:
+        raise StitchHold("source EOF/packet/frame assumption failed")
+    return dict(signature=signature, packets=packets, frames=frames, count=count,
+                chain=chain.hexdigest(), span=maximum * Fraction(signature[5]))
+
+
+def stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop):
+    signature = stitch_probe(ffprobe, output, work / "output.json", deadline, stop)
+    if any(s["signature"] != signature for s in sources):
+        raise StitchHold("output codec/extradata/timebase changed")
+    packets, hidden, frames = (work / name for name in ("output.packets", "output.hidden", "output.frames"))
+    stitch_packets(ffprobe, output, packets, deadline, stop)
+    stitch_packets(ffprobe, output, hidden, deadline, stop, hidden=True)
+    if sha256_file(packets) != sha256_file(hidden):
+        raise StitchHold("output hidden payload inventory differs")
+    stitch_frames(ffmpeg, output, frames, deadline, stop)
+    actual, decoded, last_dts = iter(stitch_packet_rows(packets)), iter(stitch_frame_rows(frames)), None
+    offset = Fraction(0)
+    for source in sources:
+        translation = None
+        for expected in stitch_packet_rows(source["packets"]):
+            row = next(actual, None)
+            if row is None or row[2:] != expected[2:]:
+                raise StitchHold("source packet omitted, changed or reordered")
+            dp, dd = row[0] - expected[0], row[1] - expected[1]
+            if dp != dd or (translation is not None and dp != translation) or (last_dts is not None and row[1] <= last_dts):
+                raise StitchHold("non-affine PTS/DTS translation or DTS regression")
+            if abs(dp * Fraction(signature[5]) - offset) > Fraction(signature[5]):
+                raise StitchHold("native span changed or gap compressed")
+            translation, last_dts = dp, row[1]
+        for expected in stitch_frame_rows(source["frames"]):
+            row = next(decoded, None)
+            if row is None or row[1:] != expected[1:] or row[0]-expected[0] != translation:
+                raise StitchHold("decoded EOF/pixel/raw PTS inventory differs")
+        offset += source["span"]
+    if next(actual, None) is not None or next(decoded, None) is not None:
+        raise StitchHold("extra output packets or frames")
+    # Full strict EOF decode above includes every frame. Decode each seam again
+    # with an independent seek to exercise keyframe/preroll behavior.
+    offset = Fraction(0)
+    for source in sources[:-1]:
+        offset += source["span"]
+        stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode", "-threads", "1",
+                    "-ss", "%.6f" % max(0, float(offset) - 2), "-i", str(output), "-t", "4", "-map", "0:v:0", "-f", "null", "-"], deadline, stop)
+
+
+# mdat/Annex B and SPS/VUI parser ported from the existing repair owner,
+# ~/stoarama-repair/bin/repair.py SHA256
+# 0f662c6897002a0760e085477a31c2c07f9ce0c320ec3ce9e06e816f5a876e85.
+# Parser semantics are unchanged; this caller only admits bounded files with
+# genuine VUI fps. No inferred/default FPS or repaired continuity is admitted.
+class StitchRepairBits:
+    def __init__(s, b): s.b, s.p = b, 0
+    def u(s, n):
+        v = 0
+        for _ in range(n):
+            if s.p >= len(s.b) * 8: raise ValueError('eof')
+            v = (v << 1) | ((s.b[s.p >> 3] >> (7 - (s.p & 7))) & 1); s.p += 1
+        return v
+    def ue(s):
+        z = 0
+        while s.u(1) == 0:
+            z += 1
+            if z > 32: raise ValueError('ue')
+        return (1 << z) - 1 + (s.u(z) if z else 0)
+    def se(s):
+        k = s.ue(); return (k + 1) // 2 if k & 1 else -(k // 2)
+def stitch_repair_fps(nal):
+    b = bytes(nal[1:]); b = re.sub(rb'\x00\x00\x03', b'\x00\x00', b)
+    r = StitchRepairBits(b); prof = r.u(8); r.u(16); r.ue()
+    if prof in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+        cf = r.ue()
+        if cf == 3: r.u(1)
+        r.ue(); r.ue(); r.u(1)
+        if r.u(1):
+            for i in range(8 if cf != 3 else 12):
+                if r.u(1):
+                    last = nxt = 8
+                    for _ in range(16 if i < 6 else 64):
+                        if nxt: nxt = (last + r.se()) % 256
+                        last = last if nxt == 0 else nxt
+    r.ue(); pt = r.ue()
+    if pt == 0: r.ue()
+    elif pt == 1:
+        r.u(1); r.se(); r.se()
+        for _ in range(r.ue()): r.se()
+    r.ue(); r.u(1); r.ue(); r.ue()
+    if not r.u(1): r.u(1)
+    r.u(1)
+    if r.u(1): [r.ue() for _ in range(4)]
+    if not r.u(1): return None
+    if r.u(1):
+        if r.u(8) == 255: r.u(32)
+    if r.u(1): r.u(1)
+    if r.u(1):
+        r.u(4)
+        if r.u(1): r.u(24)
+    if r.u(1): r.ue(); r.ue()
+    if not r.u(1): return None
+    nu, ts = r.u(32), r.u(32)
+    if nu == 0 or ts == 0: return None
+    return Fraction(ts, 2 * nu)
+
+# ---------- mdat -> annexb ----------
+def stitch_repair_signature(head):
+    return len(head) >= 48 and head[44:48] == b'mdat' and struct.unpack('>I', head[40:44])[0] == 0 and head[4:8] == b'ftyp' and b'moov' not in head[:48]
+STITCH_REPAIR_AUD_RE = re.compile(rb'\x00\x00\x00\x02\x09[\x10\x30\x50\x70\x90\xb0\xd0\xf0]')
+def stitch_repair_mdat(data):
+    """Walk length-prefixed NALs; where junk (interleaved audio / zero holes) appears, resync on the next AUD. Returns (nals, stopmsg, gaps, gap_idx)"""
+    off = 0
+    while off + 8 <= len(data):
+        sz, typ = struct.unpack('>I4s', data[off:off+8])
+        if typ == b'mdat': off += 16 if sz == 1 else 8; break
+        off += sz
+    nals = []; stopmsg = 'eof'; gaps = 0; gap_idx = []
+    while off + 4 <= len(data):
+        ln = struct.unpack('>I', data[off:off+4])[0]
+        ok = 0 < ln <= 8_000_000 and off + 4 + ln <= len(data) and not (data[off+4] & 0x80) and (data[off+4] & 0x1f) in (1, 2, 3, 4, 5, 6, 7, 8, 9)
+        if not ok:
+            m = STITCH_REPAIR_AUD_RE.search(data, off + 1)
+            if off + 4 + ln > len(data) and 0 < ln <= 8_000_000 and (data[off+4] & 0x1f) in (1, 5) and not m:
+                stopmsg = 'partial'; break
+            if not m: stopmsg = 'junk_tail' if off + 4 + ln <= len(data) or ln > 8_000_000 else 'partial'; break
+            off = m.start(); gaps += 1; gap_idx.append(len(nals)); continue
+        nals.append(data[off+4:off+4+ln]); off += 4 + ln
+    return nals, stopmsg, gaps, gap_idx
+def stitch_repair_annexb(nals, drop_vcl=0, upto=None):
+    if upto is not None: nals = nals[:upto]
+    vcl = [i for i, n in enumerate(nals) if 1 <= (n[0] & 0x1f) <= 5]
+    if len(vcl) <= drop_vcl: return None
+    end = vcl[-1 - drop_vcl] + 1
+    return b''.join(b'\x00\x00\x00\x01' + n for n in nals[:end]), len(vcl) - drop_vcl
+
+
+def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
+    """Labeled partial recovery, always excluded from raw retirement/V85 joins."""
+    if clip["size_bytes"] > 16 * 1024 * 1024:
+        return None
+    with open(source, "rb") as f:
+        head = f.read(48)
+        if not stitch_repair_signature(head):
+            return None
+        data = head + f.read(16 * 1024 * 1024)
+    if len(data) != clip["size_bytes"]:
+        raise StitchHold("repair input size changed")
+    nals, stopmsg, gaps, gap_indices = stitch_repair_mdat(data)
+    del data
+    sps = next((n for n in nals if n[0] & 0x1f == 7), None)
+    fps = stitch_repair_fps(sps) if sps else None
+    if fps is None or not 5 <= fps <= 120:
+        return None
+    work = directory.path
+    h264, temporary = work / "repair.h264", work / "repair.partial.mp4"
+    choices = [(drop, None) for drop in (0, 1)] + ([(drop, gap_indices[0]) for drop in (0, 1)] if gap_indices else [])
+    for drop, upto in choices:
+        built = stitch_repair_annexb(nals, drop, upto)
+        if built is None:
+            continue
+        h264.write_bytes(built[0])
+        try:
+            stitch_run([tools["ffmpeg"], "-nostdin", "-v", "error", "-framerate", str(fps), "-f", "h264", "-i", str(h264),
+                        "-c:v", "copy", "-an", "-threads", "1", "-movflags", "+faststart", "-y", str(temporary)], deadline, stop)
+            stitch_frames(tools["ffmpeg"], temporary, work / "repair.frames", deadline, stop)
+        except StitchHold:
+            if stop.is_set():
+                raise
+            continue
+        count = sum(1 for _ in stitch_frame_rows(work / "repair.frames"))
+        duration = Fraction(count, 1) / fps
+        if not 1 <= duration <= 60:
+            continue
+        size, sha = sha256_file(temporary)
+        name = "repaired-%d-%s.mp4" % (clip["source_id"], sha)
+        directory.publish(temporary.name, name)
+        relative = directory.relative + "/" + name
+        hash_certification_file(cfg.output_dir, relative, size, sha)
+        proof = dict(clip_id=clip["source_id"], original_sha256=clip["sha256"], original_size_bytes=clip["size_bytes"],
+                     relative_path=relative, sha256=sha, size_bytes=size, method="mdat_annexb_vui_prefix_v1",
+                     fps=str(fps), fps_src="vui", frames=count, duration_seconds=float(duration),
+                     note="stop=%s gaps=%d dropped_vcl=%d prefix_before_gap=%s" % (stopmsg, gaps, drop, upto is not None),
+                     synthesized_timestamps=True, complete_original=False, full_decode=True, fsynced=True, readback_sha256=sha)
+        sidecar = work / "repair.proof.partial.json"
+        sidecar.write_bytes(cleanup_json_bytes(proof))
+        directory.publish(sidecar.name, name + ".repair.json")
+        return proof
+    return None
+
+
+def stitch_output_recheck(cfg, item, execution=True):
+    """Independent local deletion gate; a server boolean is never sufficient."""
+    if not getattr(cfg, "stitch_enabled", False) or (execution and not getattr(cfg, "stitch_delete_enabled", False)):
+        return "local stitch/deletion switch off"
+    try:
+        if item.get("permit_reason") != "stitched_included" or item.get("kind") != "raw":
+            return "unsupported stitch deletion reason"
+        path = item["stitch_output_path"]
+        marker, _ = confined_regular_file(cfg.output_dir, path + ".registered.json")
+        if marker.stat().st_size > 4096:
+            return "oversized registration receipt"
+        registration = json.loads(marker.read_text())
+        if (registration.get("recorded") is not True or registration.get("task_id") != item.get("stitch_task_id")
+                or registration.get("sha256") != item["stitch_output_sha256"]):
+            return "server registration receipt missing"
+        # The durable local proof was written only after all native verification.
+        proof_path, _ = confined_regular_file(cfg.output_dir, path + ".proof.json")
+        if proof_path.stat().st_size > 1024 * 1024:
+            return "oversized stitch proof"
+        proof = json.loads(proof_path.read_text())
+        if (proof.get("relative_path") != path or proof.get("sha256") != item["stitch_output_sha256"]
+                or proof.get("size_bytes") != item["stitch_output_size_bytes"]
+                or not all(proof.get(k) is True for k in ("full_decode", "seam_decode", "packet_chain", "native_audit", "original_sources_no_audio", "fsynced"))):
+            return "durable output proof mismatch"
+        included = [p for p in proof.get("inputs", []) if p.get("clip_id") == item["source_id"]]
+        if (len(included) != 1 or included[0].get("sha256") != item["sha256"] or included[0].get("size_bytes") != item["size_bytes"]
+                or included[0].get("repaired") is not False or included[0].get("frames", 0) <= 0
+                or included[0].get("frames") != included[0].get("packets") or not included[0].get("packet_chain_sha256")):
+            return "raw source lacks full inclusion"
+        hash_certification_file(cfg.output_dir, path, item["stitch_output_size_bytes"], item["stitch_output_sha256"])
+        return None
+    except Exception as exc:
+        return "output fresh readback failed: " + str(exc)[:200]
+
+
+@NAS_MEDIA_FENCE.delivery
+def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
+    """Build/verify first; this function never unlinks source media."""
+    plan = task["plan"]
+    if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
+            or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
+        raise StitchHold("unapproved V85 policy identity")
+    clips, joins = plan["clips"], plan["joins"]
+    if not 1 <= len(clips) <= 200 or len(joins) != len(clips) - 1 or len(plan.get("eligible", [])) != len(clips) or sum(c["size_bytes"] for c in clips) > STITCH_MAX_INPUT:
+        raise StitchHold("unbounded assembly unit")
+    expected = clips[0]["relative_path"].split("/")[0] + "_V85_keep28/" + str(plan["recording_id"]) + "/"
+    if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z", plan["output_folder"][len(expected):])):
+        raise StitchHold("output must be in the stream's new versioned sibling folder")
+    admitted = admitted or (lambda clip, previous=None: stitch_admitted(inventory, clip, previous))
+    deadline = min(time.monotonic() + 7000, time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30)
+    stop = StitchStop(cfg, stop_event)
+    result = dict(lease_token=task["lease_token"], plan_sha256=task["plan_sha256"], outputs=[], repairs=[], left_out=[], error="")
+    ffmpeg, ffprobe = tools["ffmpeg"], tools["ffprobe"]
+    # Deterministic owner directory allows an interrupted task to be rebuilt
+    # and byte-identical published runs to be adopted without overwriting.
+    import contextlib
+    with contextlib.ExitStack() as resources:
+        directory = resources.enter_context(StitchDirectory(cfg.output_dir, plan["output_folder"]))
+        work = directory.path
+        def clear_scratch():
+            names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "output.json", "output.packets", "output.hidden", "output.frames", "repair.h264", "repair.partial.mp4", "repair.frames", "repair.proof.partial.json"]
+            names += ["source-%03d.%s" % (n, suffix) for n in range(len(clips)) for suffix in ("json", "packets", "hidden", "frames")]
+            for name in names:
+                try:
+                    os.unlink(name, dir_fd=directory.fds[-1])
+                except FileNotFoundError:
+                    pass
+            os.fsync(directory.fds[-1])
+        resources.callback(clear_scratch)
+        sources, run_clips, run_index = [], [], 0
+
+        def flush():
+            nonlocal sources, run_clips, run_index
+            if not sources:
+                return
+            manifest, output = work / "concat.txt", work / "run.partial.mp4"
+            lines, cumulative, previous = [], Fraction(0), 0
+            for clip, source in zip(run_clips, sources):
+                cumulative += source["span"]
+                us = round(cumulative * 1000000)
+                lines.extend([concat_manifest_line(clip["_path"]), "duration %d.%06d\n" % divmod(us - previous, 1000000)])
+                previous = us
+            manifest.write_text("ffconcat version 1.0\n" + "".join(lines))
+            stitch_run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-protocol_whitelist", MEDIA_CERTIFICATION_PROTOCOLS,
+                        "-f", "concat", "-auto_convert", "0", "-safe", "0", "-i", str(manifest),
+                        "-map", "0:v:0", "-an", "-c:v", "copy", "-threads", "1", "-video_track_timescale",
+                        str(Fraction(sources[0]["signature"][5]).denominator), "-movflags", "+faststart", "-y", str(output)], deadline, stop)
+            stitch_audit_output(ffmpeg, ffprobe, output, sources, work, deadline, stop)
+            size, sha = sha256_file(output)
+            name = "run-%03d-%s.mp4" % (run_index, sha)
+            published = directory.publish(output.name, name)
+            relative = plan["output_folder"] + "/" + name
+            hash_certification_file(cfg.output_dir, relative, size, sha)  # reopen after fsync
+            proof = dict(relative_path=relative, sha256=sha, size_bytes=size, inputs=[], full_decode=True,
+                         seam_decode=True, packet_chain=True, native_audit=True, original_sources_no_audio=True,
+                         readback_sha256=sha, fsynced=True)
+            for clip, source in zip(run_clips, sources):
+                # Fresh input hash and exact physical sidecar proof after all
+                # child reads; a changed source invalidates the entire run.
+                with CleanupFile(cfg, clip, stop, deadline) as current:
+                    raw_proof = current.proof()
+                proof["inputs"].append(dict(clip_id=clip["source_id"], sha256=clip["sha256"], size_bytes=clip["size_bytes"],
+                                             packet_chain_sha256=source["chain"], packets=source["count"], frames=source["count"],
+                                             repaired=False, raw_proof=raw_proof))
+            proof_temp = work / "proof.partial.json"
+            proof_temp.write_bytes(cleanup_json_bytes(proof))
+            directory.publish(proof_temp.name, name + ".proof.json")
+            result["outputs"].append(proof)
+            STITCH_STATUS.add("outputs_verified")
+            run_index += 1
+            sources, run_clips = [], []
+
+        for index, original in enumerate(clips):
+            if stop.is_set():
+                raise StitchHold(stop.reason or "stitch cancelled")
+            clip = dict(original)
+            # Reuse the independent pinned folder/keep-window map for scope.
+            pins, error = cleanup_pins()
+            key = cleanup_folder_key(clip["relative_path"], "raw")
+            if error or pins["folders"].get(key) != plan["stream_id"] or clip["stream_id"] != plan["stream_id"]:
+                raise StitchHold("raw folder is not owned by approved stream")
+            start, end, _ = pins["windows"][plan["stream_id"]]
+            a = parse_certification_timestamp(clip["start_at"], "source start")
+            b = parse_certification_timestamp(clip["end_at"], "source end")
+            if a < start or b > end or b <= a:
+                raise StitchHold("source crosses keep boundary")
+            path, info, _ = hash_certification_file(cfg.output_dir, clip["relative_path"], clip["size_bytes"], clip["sha256"])
+            if sys.platform.startswith("linux"):
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                resources.callback(os.close, fd)
+                if cleanup_identity(os.fstat(fd)) != cleanup_identity(info):
+                    raise StitchHold("source identity changed before native audit")
+                path = Path("/proc/%d/fd/%d" % (os.getpid(), fd))
+            sidecar, scinfo = confined_regular_file(cfg.output_dir, clip["relative_path"] + ".stoarama.json")
+            clip.update(frozen_identity=cleanup_identity(info), frozen_sidecar_identity=cleanup_identity(scinfo), _path=path)
+            if not plan["eligible"][index] or not admitted(clip):
+                flush()
+                repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
+                if repaired:
+                    result["repairs"].append(repaired)
+                result["left_out"].append(clip["source_id"])
+                continue
+            try:
+                source = stitch_audit_source(ffmpeg, ffprobe, path, work, index, deadline, stop)
+            except StitchHold as exc:
+                if stop.is_set():
+                    raise
+                flush()
+                repaired = stitch_repair_local(cfg, clip, path, directory, tools, deadline, stop)
+                if repaired:
+                    result["repairs"].append(repaired)
+                result["left_out"].append(clip["source_id"])
+                log("WARN", "V85 source retained clip=%s: %s" % (clip["source_id"], exc))
+                continue
+            if sources and (not joins[index - 1] or not admitted(clip, run_clips[-1])
+                            or sources[-1]["signature"] != source["signature"]):
+                flush()
+            sources.append(source)
+            run_clips.append(clip)
+        flush()
+    stitch_journal(inventory, task["id"], task["plan_sha256"], result)
+    return result
+
+
+def stitch_register(cfg, inventory, task_id, result):
+    for output in result["outputs"] + result.get("repairs", []):
+        hash_certification_file(cfg.output_dir, output["relative_path"], output["size_bytes"], output["sha256"])
+    ack = restore_api(cfg, "/account/connections/stitch/%d/result" % task_id, result)
+    if ack.get("recorded") is not True or ack.get("id") != task_id:
+        raise StitchHold("server output registration not acknowledged")
+    for output in result["outputs"]:
+        relative = Path(output["relative_path"])
+        with StitchDirectory(cfg.output_dir, str(relative.parent)) as directory:
+            receipt = dict(recorded=True, task_id=task_id, plan_sha256=result["plan_sha256"], sha256=output["sha256"])
+            temporary = directory.path / "registration.partial.json"
+            temporary.write_bytes(cleanup_json_bytes(receipt))
+            directory.publish(temporary.name, relative.name + ".registered.json")
+    ready = restore_api(cfg, "/account/connections/stitch/%d/ready" % task_id,
+                        dict(lease_token=result["lease_token"], plan_sha256=result["plan_sha256"], outputs_ready=True))
+    if ready.get("ready") is not True or ready.get("id") != task_id:
+        raise StitchHold("server cleanup readiness not acknowledged")
+    stitch_journal(inventory, task_id, result["plan_sha256"], result, registered=True)
+    STITCH_STATUS.update(state="registered", completed_at=utc_now())
+    log("INFO", "V85 task=%s registered outputs=%d retained=%d" % (task_id, len(result["outputs"]), len(result["left_out"])))
+
+
+def stitch_once(cfg, inventory, stop_event):
+    # Registration reconciliation needs no growing media allocation. A crash
+    # after server commit but before local receipt must complete this gate.
+    stitch_journal(inventory, 0, "")
+    with inventory.lock:
+        pending = inventory.db.execute("SELECT task_id,result FROM stitch_jobs WHERE registered=0 AND result IS NOT NULL ORDER BY task_id LIMIT 1").fetchone()
+    if pending:
+        try:
+            stitch_register(cfg, inventory, pending[0], json.loads(pending[1]))
+            return 30
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                raise
+            # An uncommitted expired lease needs its new token below. An
+            # already committed result always answers idempotently first.
+    stitch_resources(cfg)
+    response = restore_api(cfg, "/account/connections/stitch/lease", {"client_version": CLIENT_VERSION})
+    task = response.get("task")
+    if task is None:
+        return max(30, min(600, response.get("retry_after_sec", 300)))
+    STITCH_STATUS.update(task_id=task["id"], state="working", started_at=utc_now())
+    stitch_resources(cfg, sum(c["size_bytes"] for c in task["plan"]["clips"]))
+    result = stitch_journal(inventory, task["id"], task["plan_sha256"])
+    if result is None:
+        stitch_corpus(cfg, inventory)
+        tools = ensure_benchmark_tools(cfg.state_dir, HostFacts(cfg.state_dir)().get("machine"), time.monotonic() + BENCHMARK_TOOL_INSTALL_SEC)
+        result = stitch_build(cfg, inventory, task, stop_event, tools)
+    result["lease_token"] = task["lease_token"]
+    stitch_journal(inventory, task["id"], task["plan_sha256"], result)
+    stitch_register(cfg, inventory, task["id"], result)
+    return 30
+
+
+def stitch_loop(cfg, inventory, stop_event):
+    try:
+        stitch_priority()
+    except Exception as exc:
+        STITCH_STATUS.fail(str(exc))
+        log("ERROR", "V85 stitch lane disabled: %s" % exc)
+        return
+    while not stop_event.is_set():
+        retry = 60
+        try:
+            STITCH_ACTIVE.set()
+            retry = stitch_once(cfg, inventory, stop_event)
+        except Exception as exc:
+            STITCH_STATUS.update(state="paused")
+            STITCH_STATUS.fail(str(exc))
+            log("WARN", "V85 stitch HOLD: %s" % str(exc)[:300])
+        finally:
+            STITCH_ACTIVE.clear()
+        stop_event.wait(retry)
+
+
 def valid_benchmark_task(task):
     if not isinstance(task, dict):
         raise BenchmarkError("invalid benchmark task")
@@ -10100,6 +10835,7 @@ def update_can_exec(update_ready, inventory_worker, stop_event=None, joined_work
         and (joined_worker is None or not joined_worker.is_alive())
         and (cleanup_worker is None or not cleanup_worker.is_alive())
         and not BENCHMARK_ACTIVE.is_set()
+        and not STITCH_ACTIVE.is_set()
     )
 
 
@@ -10935,6 +11671,10 @@ def run(cfg):
     if not cfg.dry_run:
         cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event, cleanup_verified), daemon=True)
         cleanup_worker.start()
+    stitch_worker = None
+    if getattr(cfg, "stitch_enabled", False) and not cfg.dry_run:
+        stitch_worker = threading.Thread(target=stitch_loop, args=(cfg, inventory, inventory_stop_event), daemon=True, name="nas-v85-stitch")
+        stitch_worker.start()
     updater = threading.Thread(
         target=update_loop,
         args=(cfg, runtime, stop_event, inventory_stop_event, update_ready, joined_stop_event),
@@ -11037,17 +11777,20 @@ def run(cfg):
             # The watchdog kills benchmark children within a second of stop;
             # wait for its temp-output cleanup before the process exits.
             benchmark_worker.join(timeout=15)
+        if stitch_worker is not None:
+            stitch_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
         if cleanup_worker is not None:
             cleanup_worker.join(timeout=HTTP_TIMEOUT_SEC + 5)
         cleanup_stuck = cleanup_worker is not None and cleanup_worker.is_alive()
-        joined_stuck = joined_worker.is_alive() or cleanup_stuck
+        stitch_stuck = stitch_worker is not None and stitch_worker.is_alive()
+        joined_stuck = joined_worker.is_alive() or cleanup_stuck or stitch_stuck
         if joined_stuck:
             log("ERROR", "joined delivery worker did not stop; process must exit unclean")
             mark_runtime(cfg, runtime, PreviousExit.UNCLEAN_PROCESS.value)
         elif not self_update_failed:
             mark_runtime(cfg, runtime, PreviousExit.CLEAN.value)
-        if inventory_worker.is_alive():
-            log("WARN", "inventory worker still running at shutdown; leaving database open")
+        if inventory_worker.is_alive() or (stitch_worker is not None and stitch_worker.is_alive()):
+            log("WARN", "inventory/stitch worker still running at shutdown; leaving database open")
         elif not joined_stuck:
             inventory.close()
         if not joined_stuck:

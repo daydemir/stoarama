@@ -203,3 +203,11 @@ decode errors, cancellation or identity changes create no usable-coverage
 upgrade; they never establish a zero upper bound or permission to delete.
 Current public delivery, unknowns, alternative periods and original sources
 remain protected. This read-only mode cannot approve cleanup or backfill.
+
+## NAS-local V85 stitching
+
+The separate, default-off `stitched_included` reason can retire kept-window raw
+only after exact complete inclusion in a registered, freshly rehashed local
+output. It shares this cleanup permit/receipt/ledger/budget path and its R2
+recovery requirement. See [NAS-local V85 pilot](NAS_V85_STITCH.md) for the new
+scope, switches, native verification, crash recovery and explicit rollout gates.

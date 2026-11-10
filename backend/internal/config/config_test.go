@@ -927,3 +927,16 @@ func TestNASCleanupDeletionDefaultsOff(t *testing.T) {
 		t.Fatal("NAS cleanup deletion must ship disabled")
 	}
 }
+
+func TestNASStitchDefaultsOffAndIndependent(t *testing.T) {
+	t.Setenv("NAS_STITCH_ENABLED", "")
+	t.Setenv("NAS_STITCH_DELETION_ENABLED", "")
+	t.Setenv("NAS_CLEANUP_DELETION_ENABLED", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NASStitchEnabled || cfg.NASStitchDeletionEnabled {
+		t.Fatal("NAS V85 switches must ship disabled independently of cleanup")
+	}
+}

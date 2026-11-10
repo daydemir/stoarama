@@ -187,6 +187,9 @@ type cleanupRankingsUnchanged func(stream int64, pinnedBest string) bool
 func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, i nasCleanupItem, dryRun bool, stages map[string]any, unchanged cleanupRankingsUnchanged) error {
+	if i.PermitReason != "" {
+		return s.stitchInclusionCurrent(ctx, q, i)
+	}
 	report, err := s.cleanupReport(ctx)
 	if err != nil || !report.permits(i) {
 		return errors.New("reviewed folder ownership unavailable")
