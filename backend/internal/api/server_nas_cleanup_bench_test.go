@@ -113,6 +113,14 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 				mu.Lock()
 				roll := rng.Float64()
 				mu.Unlock()
+				// Execution observations now fail closed on the first lost
+				// response. Their non-destructive reconciliation is covered
+				// by TestNASCleanupExecutionDeadlineClientServer; this
+				// throughput scenario measures retries of the other calls.
+				if f.s.cfg.NASCleanupDeletionEnabled && strings.HasSuffix(r.URL.Path, "/observe") {
+					next.ServeHTTP(w, r)
+					return
+				}
 				switch {
 				case roll < faults:
 					// Proxy error before the request reaches the API.
@@ -201,8 +209,9 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		report["after_files_per_sec"] = float64(afterFiles) / seconds
 	}
 
-	// Lost responses and proxy errors (protocol 2 only): every call is
-	// retried idempotently, nothing pauses, every file is deleted once.
+	// Lost responses and proxy errors in retryable calls (protocol 2 only):
+	// retries are idempotent and every file is deleted once. Execution
+	// observations are excluded: lost permits require reconciliation.
 	{
 		f, root, state := newScenario("faults")
 		files := prepare(root, 200000, min(afterFiles, 200))

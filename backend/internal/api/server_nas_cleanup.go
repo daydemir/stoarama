@@ -863,6 +863,12 @@ func cleanupObserveRequestError(req cleanupObserve) string {
 }
 
 func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := cleanupExecutionContext(r.Context())
+	defer cancel()
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	id, ok := parseInt64Path(w, r, "itemId")
 	if !ok {
 		return
@@ -876,25 +882,41 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		util.WriteError(w, 400, msg)
 		return
 	}
-	ctx := r.Context()
 	cid, ok := s.nasRestoreConnection(ctx, w, r)
 	if !ok {
 		return
 	}
+	ctx, dryRunOnly, err := s.cleanupObservationContext(ctx, r.Context(), cid, []int64{id})
+	if err != nil {
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation mode lookup failed")
+		return
+	}
 	// R2 work happens before the transaction (no locks held across it).
-	env := &cleanupObserveEnv{}
+	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly}
 	if req.Outcome == "match" {
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
 	}
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		util.WriteError(w, 500, "cleanup observation begin failed")
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
 		return
 	}
 	defer tx.Rollback(ctx)
 	result := s.cleanupObserveOne(ctx, tx, cid, id, req, env)
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	if result.status == 200 && result.write && tx.Commit(ctx) != nil {
-		util.WriteError(w, 500, "cleanup observation save failed")
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+		return
+	}
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
 	}
 	if result.status == 503 {
@@ -931,6 +953,9 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	var preMode string
 	if err := tx.QueryRow(ctx, `SELECT i.plan_id,p.mode FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=$1 AND p.connection_id=$2`, id, cid).Scan(&fencedPlan, &preMode); err != nil {
 		return cleanupObserveError(409, "cleanup task identity differs")
+	}
+	if preMode == "enabled" && env.dryRunOnly {
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
 	if preMode == "enabled" && env.budgetHeld && !env.lockedPlans[fencedPlan] {
 		// Lock order is always plan fence(s) before the budget lock. A batch that
@@ -1058,6 +1083,9 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		b, _ := json.Marshal(recoveryEvidence)
 		evidenceJSON = string(b)
 	}
+	if cleanupObservationExpired(ctx) {
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup observation deadline exceeded; retry", "retryable": true}}
+	}
 	expires := time.Now().UTC().Add(30 * time.Second).Truncate(time.Microsecond)
 	observed, _ := json.Marshal(req)
 	stages, _ := json.Marshal(stageTimings)
@@ -1097,17 +1125,35 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 }
 
 type cleanupReceipt struct {
-	ItemID   int64  `json:"item_id,omitempty"`
-	Attempt  int    `json:"attempt"`
-	PlanSHA  string `json:"plan_sha256"`
-	ProofSHA string `json:"proof_sha256"`
-	Outcome  string `json:"outcome"`
-	Error    string `json:"error"`
+	ItemID             int64  `json:"item_id,omitempty"`
+	Attempt            int    `json:"attempt"`
+	PlanSHA            string `json:"plan_sha256"`
+	ProofSHA           string `json:"proof_sha256"`
+	Outcome            string `json:"outcome"`
+	Error              string `json:"error"`
+	ObserveElapsedMS   *int64 `json:"observe_elapsed_ms,omitempty"`
+	ExecutionElapsedMS *int64 `json:"execution_elapsed_ms,omitempty"`
+	UnlinkAttempted    *bool  `json:"unlink_attempted,omitempty"`
+	RefusalReason      string `json:"refusal_reason,omitempty"`
 }
 
 // media_deleted_sidecar_failed is the honest receipt for a media unlink whose
 // sidecar step then failed (clients from 2026-11 on).
 func validCleanupReceipt(req cleanupReceipt) bool {
+	if (req.ObserveElapsedMS != nil && *req.ObserveElapsedMS < 0) || (req.ExecutionElapsedMS != nil && *req.ExecutionElapsedMS < 0) {
+		return false
+	}
+	switch req.RefusalReason {
+	case "", "deadline_exceeded", "proof_mismatch", "permit_expired", "execution_disabled", "local_guard", "pre_unlink_failure", "observation_replayed":
+	default:
+		return false
+	}
+	if req.RefusalReason != "" && (req.Outcome != "unverified" || req.UnlinkAttempted == nil || *req.UnlinkAttempted) {
+		return false
+	}
+	if req.UnlinkAttempted != nil && !*req.UnlinkAttempted && req.Outcome != "unverified" {
+		return false
+	}
 	return req.Attempt >= 1 && len(req.PlanSHA) == 64 && len(req.ProofSHA) == 64 && (req.Outcome == "deleted" || req.Outcome == "unverified" || req.Outcome == "media_deleted_sidecar_failed") && len(req.Error) <= 500
 }
 
