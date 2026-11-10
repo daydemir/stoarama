@@ -1924,7 +1924,8 @@ class DiagnosticPerformanceTests(unittest.TestCase):
             return original(text)
         with mock.patch.object(pull, 'normalize_diagnostic_text', side_effect=bounded):
             for wrap in (str, lambda x: x.encode(), lambda x: bytearray(x.encode()),
-                         lambda x: memoryview(x.encode())):
+                         lambda x: memoryview(x.encode()),
+                         lambda x: memoryview(x.encode()).cast('I')):
                 result = pull.redact_diagnostics({'errors': {'first': wrap('a' * 32768), 'second': wrap('b' * 32768)}})
                 self.assertTrue(all('[TRUNCATED]' in x for x in result['errors'].values()))
         self.assertTrue(observed)

@@ -282,6 +282,8 @@ def normalize_diagnostic_text(text):
 
 def bounded_diagnostic_text(value):
     """Limit work before decoding/normalization, including native buffers."""
+    if isinstance(value, memoryview):
+        value = value.cast("B")  # cap bytes, not potentially much larger elements
     if isinstance(value, (bytes, bytearray, memoryview)):
         truncated = len(value) > DIAGNOSTIC_INPUT_MAX
         return bytes(value[:DIAGNOSTIC_INPUT_MAX]).decode("utf-8", "replace"), truncated
