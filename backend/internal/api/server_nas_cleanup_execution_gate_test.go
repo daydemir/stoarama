@@ -199,7 +199,7 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 	for _, requestID := range []string{req.RequestID, duplicate.RequestID} {
 		req.RequestID = requestID
 		w = cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
-		if w.Code != 200 || strings.Contains(w.Body.String(), `"delete":true`) {
+		if w.Code != 409 || strings.Contains(w.Body.String(), `"delete":true`) {
 			t.Fatalf("reused ID minted permit on new attempt: %d %s", w.Code, w.Body.String())
 		}
 	}

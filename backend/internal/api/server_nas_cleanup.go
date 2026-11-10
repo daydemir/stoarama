@@ -1038,7 +1038,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	if mode == "enabled" && req.RequestID != "" && !env.freshRequests[id] {
 		// No first permit for a previously submitted request, even if its first
 		// transaction rolled back. /reconcile alone may release proven unissued work.
-		return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "item_id": id, "attempt": attempt}}
+		return cleanupObserveError(409, "cleanup observation already submitted; reconcile checkpoint")
 	}
 	if lease == nil || !lease.After(time.Now()) {
 		return cleanupObserveError(409, "cleanup lease expired")

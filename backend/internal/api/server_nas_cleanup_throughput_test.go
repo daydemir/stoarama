@@ -528,9 +528,16 @@ func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
 			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
 		}()
 	}
+	permits := 0
 	for n := 0; n < 40; n++ {
-		if r := <-done; !strings.HasPrefix(r, "200 ") || (!strings.Contains(r, `"delete":true`) && !strings.Contains(r, `"action":"reconcile"`)) {
+		r := <-done
+		if strings.HasPrefix(r, "200 ") && strings.Contains(r, `"delete":true`) {
+			permits++
+		} else if !strings.HasPrefix(r, "409 ") || !strings.Contains(r, "already submitted") {
 			t.Fatalf("concurrent observation: %s", r)
 		}
+	}
+	if permits == 0 {
+		t.Fatal("original observation did not issue a permit")
 	}
 }
