@@ -16,12 +16,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daydemir/stoarama/backend/internal/collation"
 	"github.com/daydemir/stoarama/backend/internal/util"
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 )
 
-const nasStitchPolicy = "v85-qualified-negative-unknown-capture-successor-v2"
-const nasStitchRevision = "v85-qualified15-8c0ab4d0369d8d4b"
+const nasStitchPolicy = "v85r"
+const nasStitchRevision = "v85r-rebuilt-1"
 const nasStitchCorpusSHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 const nasStitchReason = "stitched_included"
 const nasStitchFence int64 = 7343226011110
@@ -66,10 +68,12 @@ type nasStitchPlan struct {
 	StreamID    int64            `json:"stream_id"`
 	RecordingID int64            `json:"recording_id"`
 	Clips       []nasCleanupItem `json:"clips"`
-	// Only exact frozen ordered source-pair nominations may connect clips.
-	Eligible     []bool `json:"eligible"`
-	Joins        []bool `json:"joins"`
-	OutputFolder string `json:"output_folder"`
+	// Metadata bounds only; every joined seam also needs a V85r decision.
+	Eligible      []bool            `json:"eligible"`
+	Joins         []bool            `json:"joins"`
+	OutputFolder  string            `json:"output_folder"`
+	Frozen        []json.RawMessage `json:"frozen"`
+	FeatureInputs []collation.Clip  `json:"feature_inputs"`
 }
 type nasStitchTask struct {
 	ID      int64         `json:"id"`
@@ -79,17 +83,41 @@ type nasStitchTask struct {
 	PlanSHA string        `json:"plan_sha256"`
 	Plan    nasStitchPlan `json:"plan"`
 }
+type nasStitchDecision struct {
+	Policy        string `json:"policy"`
+	LeftID        int64  `json:"left_id"`
+	RightID       int64  `json:"right_id"`
+	Join          bool   `json:"join"`
+	Nomination    bool   `json:"nomination"`
+	Status        string `json:"status"`
+	Decision      string `json:"decision"`
+	Reason        string `json:"reason"`
+	Frozen        bool   `json:"frozen"`
+	DiagnosticSHA string `json:"diagnostic_sha256"`
+}
+type nasStitchProvenance struct {
+	OctoberRecovered bool   `json:"october_ffmpeg_recovered"`
+	Policy           string `json:"policy"`
+	ManifestSHA      string `json:"manifest_sha256"`
+	FFmpegVersion    string `json:"ffmpeg_version"`
+	FFprobeVersion   string `json:"ffprobe_version"`
+	FFmpegSHA        string `json:"ffmpeg_sha256"`
+	FFprobeSHA       string `json:"ffprobe_sha256"`
+}
 type nasStitchInputProof struct {
-	ID        int64           `json:"clip_id"`
-	SHA       string          `json:"sha256"`
-	Size      int64           `json:"size_bytes"`
-	PacketSHA string          `json:"packet_chain_sha256"`
-	Packets   int64           `json:"packets"`
-	Frames    int64           `json:"frames"`
-	Repaired  bool            `json:"repaired"`
-	RawProof  json.RawMessage `json:"raw_proof"`
+	RetirementHeld bool            `json:"retirement_held"`
+	ID             int64           `json:"clip_id"`
+	SHA            string          `json:"sha256"`
+	Size           int64           `json:"size_bytes"`
+	PacketSHA      string          `json:"packet_chain_sha256"`
+	Packets        int64           `json:"packets"`
+	Frames         int64           `json:"frames"`
+	Repaired       bool            `json:"repaired"`
+	RawProof       json.RawMessage `json:"raw_proof"`
 }
 type nasStitchOutput struct {
+	Policy      string                `json:"policy"`
+	Provenance  nasStitchProvenance   `json:"provenance"`
 	Path        string                `json:"relative_path"`
 	SHA         string                `json:"sha256"`
 	Size        int64                 `json:"size_bytes"`
@@ -103,26 +131,30 @@ type nasStitchOutput struct {
 	Fsynced     bool                  `json:"fsynced"`
 }
 type nasStitchRepair struct {
-	ID           int64   `json:"clip_id"`
-	OriginalSHA  string  `json:"original_sha256"`
-	OriginalSize int64   `json:"original_size_bytes"`
-	Path         string  `json:"relative_path"`
-	SHA          string  `json:"sha256"`
-	Size         int64   `json:"size_bytes"`
-	Method       string  `json:"method"`
-	FPS          string  `json:"fps"`
-	FPSSource    string  `json:"fps_src"`
-	Frames       int64   `json:"frames"`
-	Duration     float64 `json:"duration_seconds"`
-	Note         string  `json:"note"`
-	Synthesized  bool    `json:"synthesized_timestamps"`
-	Complete     bool    `json:"complete_original"`
-	FullDecode   bool    `json:"full_decode"`
-	Fsynced      bool    `json:"fsynced"`
-	ReadbackSHA  string  `json:"readback_sha256"`
+	Policy       string              `json:"policy"`
+	Provenance   nasStitchProvenance `json:"provenance"`
+	ID           int64               `json:"clip_id"`
+	OriginalSHA  string              `json:"original_sha256"`
+	OriginalSize int64               `json:"original_size_bytes"`
+	Path         string              `json:"relative_path"`
+	SHA          string              `json:"sha256"`
+	Size         int64               `json:"size_bytes"`
+	Method       string              `json:"method"`
+	FPS          string              `json:"fps"`
+	FPSSource    string              `json:"fps_src"`
+	Frames       int64               `json:"frames"`
+	Duration     float64             `json:"duration_seconds"`
+	Note         string              `json:"note"`
+	Synthesized  bool                `json:"synthesized_timestamps"`
+	Complete     bool                `json:"complete_original"`
+	FullDecode   bool                `json:"full_decode"`
+	Fsynced      bool                `json:"fsynced"`
+	ReadbackSHA  string              `json:"readback_sha256"`
 }
 type nasStitchResult struct {
-	Repairs []nasStitchRepair `json:"repairs"`
+	Policy  string              `json:"policy"`
+	Seams   []nasStitchDecision `json:"seams"`
+	Repairs []nasStitchRepair   `json:"repairs"`
 
 	Token   string            `json:"lease_token"`
 	PlanSHA string            `json:"plan_sha256"`
@@ -252,7 +284,7 @@ func (s *Server) handleAdminNASStitchPause(w http.ResponseWriter, r *http.Reques
 }
 func (s *Server) handleAdminNASStitchStatus(w http.ResponseWriter, r *http.Request) {
 	var raw []byte
-	err := s.pool.QueryRow(r.Context(), `SELECT jsonb_build_object('scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),'tasks',coalesce((SELECT jsonb_agg(t) FROM (SELECT id,scope_id,recording_id,hour_at,state,attempt,cleanup_plan_id,updated_at FROM nas_stitch_tasks ORDER BY id DESC LIMIT 100) t),'[]'),'client',(SELECT nas_stitch_status FROM connections WHERE id=13))`).Scan(&raw)
+	err := s.pool.QueryRow(r.Context(), `SELECT jsonb_build_object('policy','v85r','revision','v85r-rebuilt-1','scopes',coalesce((SELECT jsonb_agg(s ORDER BY id) FROM nas_stitch_scopes s),'[]'),'tasks',coalesce((SELECT jsonb_agg(t) FROM (SELECT id,scope_id,recording_id,hour_at,state,attempt,cleanup_plan_id,updated_at FROM nas_stitch_tasks ORDER BY id DESC LIMIT 100) t),'[]'),'client',(SELECT nas_stitch_status FROM connections WHERE id=13))`).Scan(&raw)
 	if err != nil {
 		util.WriteError(w, 500, "stitch status unavailable")
 		return
@@ -400,38 +432,51 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 		if !present {
 			return t, errors.New("assembly unit awaits exact NAS inputs")
 		}
+		var feature collation.Clip
+		feature.ClipID, feature.RecordingID, feature.SHA256, feature.SizeBytes, feature.StartUTC, feature.EndUTC = item.SourceID, item.RecordingID, item.SHA256, item.SizeBytes, item.StartAt, item.EndAt
+		if err = tx.QueryRow(ctx, `SELECT coalesce(c.recording_job_id,0),coalesce(c.capture_attempt_id::text,''),coalesce(c.capture_lease_token::text,''),coalesce(c.capture_sequence,0),r.clip_duration_sec::float8 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id WHERE c.id=$1`, id).Scan(&feature.JobID, &feature.CaptureAttemptID, &feature.CaptureLeaseToken, &feature.CaptureSequence, &feature.NominalSeconds); err != nil {
+			return t, err
+		}
+		if feature.NominalSeconds <= 0 {
+			return t, errors.New("V85r nominal duration missing")
+		}
+		t.Plan.FeatureInputs = append(t.Plan.FeatureInputs, feature)
 		total += item.SizeBytes
 		t.Plan.Clips = append(t.Plan.Clips, item)
 	}
 	if total > nasStitchMaxBytes {
 		return t, errors.New("assembly unit exceeds 2.5GB cap")
 	}
-	for _, c := range t.Plan.Clips {
-		var eligible bool
-		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_stitch_edges WHERE nomination AND ((left_id=$1 AND left_sha=$2 AND left_size=$3) OR (right_id=$1 AND right_sha=$2 AND right_size=$3)))`, c.SourceID, c.SHA256, c.SizeBytes).Scan(&eligible)
-		if err != nil {
-			return t, err
-		}
-		t.Plan.Eligible = append(t.Plan.Eligible, eligible)
+	for range t.Plan.Clips {
+		t.Plan.Eligible = append(t.Plan.Eligible, true)
 	}
 	for n := 1; n < len(t.Plan.Clips); n++ {
 		a, b := t.Plan.Clips[n-1], t.Plan.Clips[n]
-		var join bool
-		err = tx.QueryRow(ctx, `SELECT coalesce((SELECT nomination AND diagnostic_sha ~ '^[a-f0-9]{64}$' FROM nas_stitch_edges WHERE left_id=$1 AND left_sha=$2 AND left_size=$3 AND right_id=$4 AND right_sha=$5 AND right_size=$6 AND recording_id=$7),false)`, a.SourceID, a.SHA256, a.SizeBytes, b.SourceID, b.SHA256, b.SizeBytes, t.Plan.RecordingID).Scan(&join)
-		if err != nil {
+		var raw []byte
+		err = tx.QueryRow(ctx, `SELECT witness FROM nas_stitch_edges WHERE left_id=$1 AND left_sha=$2 AND left_size=$3 AND right_id=$4 AND right_sha=$5 AND right_size=$6 AND recording_id=$7`, a.SourceID, a.SHA256, a.SizeBytes, b.SourceID, b.SHA256, b.SizeBytes, t.Plan.RecordingID).Scan(&raw)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return t, err
 		}
-		// Capture gaps/overlaps cannot be erased by a visual nomination.
-		join = join && a.EndAt.Equal(b.StartAt)
+		t.Plan.Frozen = append(t.Plan.Frozen, json.RawMessage(raw))
+		// Frozen negatives may never be promoted by a rebuilt measurement.
+		join := a.EndAt.Equal(b.StartAt)
+		if len(raw) > 0 {
+			e, parseErr := parseNASStitchEdge(raw)
+			if parseErr != nil {
+				return t, parseErr
+			}
+			join = join && e.Nomination
+		}
 		t.Plan.Joins = append(t.Plan.Joins, join)
 	}
+
 	t.Plan.Policy = nasStitchPolicy
 	t.Plan.Revision = nasStitchRevision
 	t.Plan.CorpusSHA = nasStitchCorpusSHA
 	t.Plan.KeepSHA = cleanupPolicySHA
 	// New versioned sibling tree; never replace raw or previous joined output.
 	first := strings.Split(t.Plan.Clips[0].RelativePath, "/")[0]
-	t.Plan.OutputFolder = first + "_V85_keep28/" + strconv.FormatInt(t.Plan.RecordingID, 10) + "/" + hour.UTC().Format("2006-01-02T15-04-05Z")
+	t.Plan.OutputFolder = first + "_V85r_keep28/" + strconv.FormatInt(t.Plan.RecordingID, 10) + "/" + hour.UTC().Format("2006-01-02T15-04-05Z")
 	raw, _ := json.Marshal(t.Plan)
 	t.PlanSHA = cleanupSHA(raw)
 	err = tx.QueryRow(ctx, `INSERT INTO nas_stitch_tasks(scope_id,recording_id,hour_at,plan,plan_sha256) VALUES($1,$2,$3,$4,$5) RETURNING id`, sid, t.Plan.RecordingID, hour, string(raw), t.PlanSHA).Scan(&t.ID)
@@ -439,7 +484,7 @@ func (s *Server) stitchPlanNext(ctx context.Context, tx pgx.Tx) (nasStitchTask, 
 }
 
 func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupItem, error) {
-	if len(p.Eligible) != len(p.Clips) || len(p.Joins) != len(p.Clips)-1 {
+	if p.Policy != nasStitchPolicy || p.Revision != nasStitchRevision || q.Policy != nasStitchPolicy || len(p.Eligible) != len(p.Clips) || len(p.Joins) != len(p.Clips)-1 || len(q.Seams) != len(p.Joins) || len(p.Frozen) != len(p.Joins) {
 		return nil, errors.New("incomplete policy admission")
 	}
 	if len(q.Repairs) > len(p.Clips) {
@@ -447,6 +492,35 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 	}
 	if len(q.Outputs) > len(p.Clips) || len(q.LeftOut) > len(p.Clips) || len(q.Error) > 1000 {
 		return nil, errors.New("unbounded stitch result")
+	}
+	held := map[int64]bool{}
+	for n, d := range q.Seams {
+		a, b := p.Clips[n], p.Clips[n+1]
+		if d.Policy != nasStitchPolicy || d.LeftID != a.SourceID || d.RightID != b.SourceID || len(d.Status) > 200 || len(d.Reason) > 200 {
+			return nil, errors.New("V85r seam binding differs")
+		}
+		if d.Decision != "join" && d.Decision != "split" && d.Decision != "hold" {
+			return nil, errors.New("V85r decision unknown")
+		}
+		if d.Decision == "split" && (d.Nomination || !strings.HasPrefix(d.Status, "REJECT_") && !strings.HasPrefix(d.Status, "SPLIT_")) {
+			return nil, errors.New("ambiguous split must HOLD")
+		}
+		if d.Join != (d.Decision == "join") || (d.Join && (!p.Joins[n] || !d.Nomination || d.Status != "APPROVED85_nomination_requires_runtime_native_join_checks" || !stitchSHA(d.DiagnosticSHA))) {
+			return nil, errors.New("V85r seam is not an unambiguous nomination")
+		}
+		if len(p.Frozen[n]) > 0 && string(p.Frozen[n]) != "null" {
+			e, err := parseNASStitchEdge(p.Frozen[n])
+			if err != nil {
+				return nil, err
+			}
+			if d.Decision != "hold" && (e.Status != d.Status || e.Nomination != d.Nomination || !d.Frozen) {
+				return nil, errors.New("October difference must HOLD")
+			}
+		}
+		if d.Decision == "hold" {
+			held[a.SourceID] = true
+			held[b.SourceID] = true
+		}
 	}
 	clips := map[int64]nasCleanupItem{}
 	positions := map[int64]int{}
@@ -458,7 +532,7 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 	}
 	var included []nasCleanupItem
 	for _, o := range q.Outputs {
-		if !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
+		if o.Policy != nasStitchPolicy || !validNASStitchProvenance(o.Provenance) || !validCleanupPath(o.Path) || path.Dir(o.Path) != p.OutputFolder || paths[o.Path] || !stitchSHA(o.SHA) || o.ReadbackSHA != o.SHA || o.Size <= 0 || o.Size > nasStitchMaxBytes+nasStitchMaxBytes/10 || !o.FullDecode || !o.SeamDecode || !o.PacketChain || !o.NativeAudit || !o.NoAudio || !o.Fsynced || len(o.Inputs) == 0 {
 			return nil, errors.New("complete durable native output verification required")
 		}
 		paths[o.Path] = true
@@ -466,7 +540,7 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 		for _, proof := range o.Inputs {
 			c, ok := clips[proof.ID]
 			pos := positions[proof.ID]
-			if !ok || !p.Eligible[pos] || seen[proof.ID] || proof.SHA != c.SHA256 || proof.Size != c.SizeBytes || !stitchSHA(proof.PacketSHA) || proof.Packets <= 0 || proof.Frames != proof.Packets || proof.Repaired || (prev >= 0 && (pos != prev+1 || !p.Joins[prev])) {
+			if !ok || !p.Eligible[pos] || seen[proof.ID] || proof.SHA != c.SHA256 || proof.Size != c.SizeBytes || !stitchSHA(proof.PacketSHA) || proof.Packets <= 0 || proof.Frames != proof.Packets || proof.Repaired || (prev >= 0 && (pos != prev+1 || !q.Seams[prev].Join)) {
 				return nil, errors.New("missing, repaired, duplicate or unqualified inclusion proof")
 			}
 			// Freeze the exact physical NAS identity for existing cleanup machinery.
@@ -488,7 +562,12 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 			c.StitchOutputPath = o.Path
 			c.StitchOutputSHA = o.SHA
 			c.StitchOutputSize = o.Size
-			included = append(included, c)
+			if held[proof.ID] && !proof.RetirementHeld {
+				return nil, errors.New("held seam source must retain raw")
+			}
+			if !proof.RetirementHeld {
+				included = append(included, c)
+			}
 			seen[proof.ID] = true
 			prev = pos
 		}
@@ -506,7 +585,7 @@ func validateNASStitchResult(p nasStitchPlan, q nasStitchResult) ([]nasCleanupIt
 		for _, id := range q.LeftOut {
 			left = left || id == r.ID
 		}
-		if !ok || !left || repairSeen[r.ID] || r.OriginalSHA != c.SHA256 || r.OriginalSize != c.SizeBytes || !validCleanupPath(r.Path) || path.Dir(r.Path) != p.OutputFolder || !strings.HasPrefix(path.Base(r.Path), "repaired-") || !stitchSHA(r.SHA) || r.Size <= 0 || r.Size > 32<<20 || r.ReadbackSHA != r.SHA || r.Method != "mdat_annexb_vui_prefix_v1" || r.FPSSource != "vui" || !r.Synthesized || r.Complete || !r.FullDecode || !r.Fsynced || r.Frames <= 0 || r.Duration < 1 || r.Duration > 60 || len(r.Note) > 1000 {
+		if r.Policy != nasStitchPolicy || !validNASStitchProvenance(r.Provenance) || !ok || !left || repairSeen[r.ID] || r.OriginalSHA != c.SHA256 || r.OriginalSize != c.SizeBytes || !validCleanupPath(r.Path) || path.Dir(r.Path) != p.OutputFolder || !strings.HasPrefix(path.Base(r.Path), "repaired-") || !stitchSHA(r.SHA) || r.Size <= 0 || r.Size > 32<<20 || r.ReadbackSHA != r.SHA || r.Method != "mdat_annexb_vui_prefix_v1" || r.FPSSource != "vui" || !r.Synthesized || r.Complete || !r.FullDecode || !r.Fsynced || r.Frames <= 0 || r.Duration < 1 || r.Duration > 60 || len(r.Note) > 1000 {
 			return nil, errors.New("partial repair provenance incomplete or wrongly included")
 		}
 		repairSeen[r.ID] = true
@@ -747,4 +826,50 @@ func (s *Server) handleAccountNASStitchReady(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	util.WriteJSON(w, 200, map[string]any{"ready": true, "id": id})
+}
+
+func validNASStitchProvenance(p nasStitchProvenance) bool {
+	return p.OctoberRecovered && p.Policy == nasStitchPolicy && p.ManifestSHA == nasStitchManifestSHA && p.FFmpegVersion == "N-126826-gc0e8b139fd-20260924" && p.FFprobeVersion == "N-126826-gc0e8b139fd-20260924" && p.FFmpegSHA == "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" && p.FFprobeSHA == "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
+}
+
+// GET capabilities only; no cloud writes, no release or arbitrary object paths.
+func (s *Server) handleAccountNASStitchTool(w http.ResponseWriter, r *http.Request) {
+	cid, ok := s.nasRestoreConnection(r.Context(), w, r)
+	if !ok {
+		return
+	}
+	if cid != 13 || !s.cfg.NASStitchEnabled {
+		util.WriteError(w, 403, "V85r tool download disabled")
+		return
+	}
+	name := chi.URLParam(r, "name")
+	var sha string
+	var size int64
+	switch name {
+	case "ffmpeg":
+		sha = "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b"
+		size = 174165384
+	case "ffprobe":
+		sha = "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"
+		size = 173923656
+	default:
+		util.WriteError(w, 404, "unknown V85r tool")
+		return
+	}
+	if s.r2 == nil {
+		util.WriteError(w, 503, "V85r artifact storage unavailable")
+		return
+	}
+	key := "experimental/v85-retired-WORK-custody/20261013/" + sha + ".bin"
+	head, err := s.r2.Head(r.Context(), key)
+	if err != nil || head.SizeBytes != size || head.ETag == "" {
+		util.WriteError(w, 409, "pinned V85r tool unavailable")
+		return
+	}
+	cap, err := s.r2.PresignGetExactRequest(r.Context(), key, head.ETag, head.VersionID, 15*time.Minute)
+	if err != nil {
+		util.WriteError(w, 503, "V85r tool capability unavailable")
+		return
+	}
+	util.WriteJSON(w, 200, map[string]any{"url": cap.URL, "if_match": "\"" + strings.Trim(head.ETag, "\"") + "\"", "sha256": sha, "size_bytes": size, "policy": nasStitchPolicy})
 }

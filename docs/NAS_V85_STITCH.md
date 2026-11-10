@@ -1,4 +1,4 @@
-# NAS-local V85 pilot (ships disabled)
+# NAS-local V85r pilot (ships disabled)
 
 This worker runs **inside `stoarama_pull.py`**, in the existing NAS container.
 The single-file R2 client release already contains it; no second service or
@@ -7,44 +7,70 @@ deploy the API, change production data, or enable a scope.
 
 ## Scope and policy
 
-The only seam-positive authority is the approved October frozen decision export:
+Owner decision (2026-11-10): ship the **rebuilt V85 pipeline as V85r**. Every
+new task, result, output and repair proof uses policy `v85r`, revision
+`v85r-rebuilt-1`; historical frozen witnesses retain their original statuses.
+The versioned output folder is `_V85r_keep28`. No production scope is seeded.
 
-- policy `v85-qualified-negative-unknown-capture-successor-v2`
-- review revision `v85-qualified15-8c0ab4d0369d8d4b`
-- classifier entry SHA `a24b6014953d1d962fa55c569a834adbc5b638bf7c61f00f977164a18205cad3`
-- frozen decision gzip SHA `dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46` (9,028,408 bytes)
-- uncompressed JSONL SHA `5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b` (30,292,366 bytes)
-- export manifest SHA `e877140ad5f4cf93380ca58b3331391a34f445f1882628dba015bbcacb0103b1`
-- keep28 bytes SHA `060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`
+`clients/nas-pull/v85r/manifest.json` pins every recovered classifier file,
+rebuilt `cached_actual_span_features.py`, identity-only veto projection, recovered SDK source and
+rebuilt Linux amd64 evaluator by SHA-256. `build.py` uses Go 1.26.5, CGO off,
+GOAMD64=v1, trimpath and a stripped deterministic binary, then embeds the
+complete compressed package in the self-updating single-file client. The
+client pins the compressed bundle and manifest, checks exact member membership,
+and hashes every installed member before use. It never executes recovered code
+from an arbitrary `/tmp` path; historical imports are mapped inside an isolated
+child. Rebuild with `python3 clients/nas-pull/v85r/build.py` and review source,
+manifest, client and server-pin changes together. No artifact release is needed.
 
-The API imports only those exact uncompressed export bytes and its 73,843-edge /
-52,462-nomination census. The client independently downloads, hashes and indexes
-the entire export before using any row. Lookup binds the ordered **raw clip ID,
-whole SHA, byte size**, recording ID and frozen diagnostic identity. Existing
-final nominations retain their frozen negative vetoes. There is no fresh
-classifier, threshold port, spatial-positive route, CLOCK route or trimming.
-Missing membership splits a run; a source without any positive frozen endpoint
-membership remains raw. Capture-time gaps/overlaps and incompatible native
-layouts also split. No decision is inferred from file names or elapsed coverage.
+Evidence: 49,855/49,855 replayed decisions exact; 453/453 cached contexts exact;
+853/853 fresh nominations agree. Two fresh statuses and decoder-error fields
+differed. This is **not complete reproduction** of all 73,843 October rows:
+23,988 original feature rows remain missing, and the fresh evaluator is rebuilt
+from a later recovered SDK. The owner explicitly chose this distinct policy.
 
-**Activation prerequisite:** the handoff recovers the classifier sources, but
-not the export body, original feature-producer inputs or full veto bundles.
-The recovered manifest distinguishes gzip and JSONL hashes above. Import accepts
-only the exact JSONL body; verify the original gzip against its separate pin
-before decompression. The body has not been recovered. An exact export must be
-recovered and its identity/census confirmed before this worker can lease
-production work. Failure to recover it is HOLD, not permission
-to recreate the export from today's features. Any changed current negative
-evidence needs a reviewed admission/corpus revision; this implementation does
-not ingest new negative diagnostic bundles or extend October's source corpus.
-Do not activate against known newer denials without that admission work. The
-recovered source71 alias evidence intersects five frozen nominees, four inside
-the current kept windows. Those denials must be reconciled before activation.
-Frozen nominees overlap at most 41,986 of 1,158,902 currently kept clips across
-34 of 109 streams (identity/size upper bounds, pending current SHA verification).
-The remaining footage needs the approved feature producers and a versioned
-corpus extension with unchanged nomination and negative-only semantics. This
-frozen-replay draft does not complete that broader V85 goal.
+The server imports only the exact October JSONL (`5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b`,
+73,843 rows / 52,462 nominations; gzip pin `dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46`).
+The body and source71/human12/visual6 vetoes are now recovered. The client still
+independently hashes/indexes the full export. Frozen lookup requires ordered
+clip ID + SHA-256 + size. Current metadata and actual bytes feed the recovered
+20-second feature producer; short-span replacement requires freshly decoded,
+authenticated source contexts. No CLOCK, trimming, spatial-positive promotion,
+threshold port or assumed continuity is added.
+
+A join requires a fresh V85r nomination with the recognized unambiguous final
+status. An exact frozen witness takes precedence only when the current decision
+and status agree. Any status or nomination difference, missing input, unknown
+status, measurement failure or decoder error is **HOLD**. Zero extra decoder
+errors is deliberately stricter than October tolerance. Negative decisions split
+runs. A HOLD also marks both raw endpoints ineligible for retirement, even if
+separate verified singleton outputs include them. Server and client independently
+enforce that gate. New exact inputs can receive a fresh V85r nomination; they
+are never represented as October V85. Known-source and human vetoes apply by
+whole hash, visual vetoes by ordered hashes/sizes (including ID aliases).
+
+### FFmpeg pin and search
+
+October recorded `N-126826-gc0e8b139fd-20260924`, ffmpeg SHA
+`2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b` and
+ffprobe SHA `9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c`.
+Both exact linux x86_64 executables were recovered from R2's historical custody
+prefix `experimental/v85-retired-WORK-custody/20261013/<sha256>.bin`:
+ffmpeg **174,165,384 bytes**, ffprobe **173,923,656 bytes**. Whole readback hashes
+match October's pins. The search covered recovered evidence, Mooney archives,
+session logs, releases and read-only R2 listings through Jelly's existing
+credentials. Historical PUT-UNKNOWN receipts supplied the final object keys.
+No credentials moved and no R2 objects were changed.
+
+V85r downloads these exact binary artifacts through a scoped, default-off
+connection-13 API capability, with exact HEAD identity/If-Match and whole SHA/size
+verification, fsync and atomic installation. It never substitutes PATH tools or
+the older NAS benchmark build. A missing artifact or wrong hash is HOLD. The
+existing benchmark/other media lanes retain their original tool pins.
+
+Every output/repair proof records the policy, package manifest hash, both tool
+versions and binary hashes. Tool hash mismatch prevents measurement/build.
+The server checks that provenance before registration or retirement.
 
 The embedded policy selects all recordings for the approved stream. Ready hour
 units are bounded to 200 clips and 2.5 GB. They include only whole clips inside
@@ -70,7 +96,7 @@ For each supported source/output, software verification checks:
 6. File fsync, atomic create-only publication, directory fsync, then reopen and
    whole SHA readback. A restart adopts only byte-identical existing outputs.
 
-Media lives in `<raw-root-folder>_V85_keep28/<recording>/<UTC-hour>/` next to the
+Media lives in `<raw-root-folder>_V85r_keep28/<recording>/<UTC-hour>/` next to the
 raw tree. Raw inventory skips this reserved versioned tree; disk audits still
 count it. Packet/frame scratch is bounded to one assembly and removed after the
 child exits. Outputs, provenance and source media are preserved. Directory file
@@ -114,7 +140,7 @@ reconciles registration instead of deleting based on guessed completion.
 
 The self-updater sets the existing inventory stop event, which also cancels this
 lane. It waits for the lane's active call/children before replacement. Existing
-pull, inventory and cleanup behavior does not enable V85 when its switches are
+pull, inventory and cleanup behavior does not enable V85r when its switches are
 off. Stitch progress/errors ride the heartbeat (`connections.nas_stitch_status`)
 and the existing redacted client-log upload (V85/stitch topics included).
 
@@ -122,9 +148,8 @@ and the existing redacted client-log upload (V85/stitch topics included).
 
 No commands below were run against production for this PR.
 
-1. Recover the exact gzip export, verify both compressed and uncompressed
-   pins and the manifest census, and reconcile the known alias/negative
-   conflicts through reviewed corpus admission. Do not bypass hash validation.
+1. Use the recovered exact gzip export, verify both compressed/uncompressed
+   pins and the manifest census, and verify the bundled source/hash alias vetoes. Do not bypass hash validation.
    Replay/admit a representative production unit with the NAS's pinned FFmpeg
    before any deletion. This PR's synthetic corpus adapter is
    test-only and cannot admit production media.
@@ -176,8 +201,8 @@ uses one decoder thread, and nice19/idle yields to NAS activity. Budget roughly
 **5–15 recording h/wall h (49–148 days)** until a representative pilot measures
 strict verified throughput. This is an estimate, not a new NAS benchmark.
 
-Deferred admission work: recover/replay the full frozen artifacts; review corpus
-extensions/current negative bundles for sources outside October; audio-bearing
+Deferred work: full-corpus reproduction of missing original features; review
+new current-negative bundle revisions; audio-bearing
 native runs; unsupported B-frame/edit-list layouts; and automatic import/reuse
 of the ~1,103 complete historical V85 hours. Existing R2 V85 presence/ETag and
 old publication receipts are not fresh NAS-native verification or deletion
@@ -186,6 +211,20 @@ restart; it does not silently relabel collation-v2, best14 or historic V85.
 Local repairs support the existing bounded mdat→Annex B/VUI method, including a
 clean prefix before a gap; unsupported FPS/corruption patterns retain raw.
 Repaired prefixes are labeled with original/repaired hashes, VUI FPS, frame
-count and synthesized timing. They remain outside V85 membership and **never**
+count and synthesized timing. They remain outside V85r join admission and **never**
 authorize original deletion. Imported R2 repair-ledger copies and subsequent
 repair-qualified joins require separate exact provenance/admission work.
+
+## Cleanup integration and review conflicts
+
+Main's #445 is already integrated; cleanup retains bounded execution deadlines,
+recovery-copy checks, immutable observations, budgets and independent deletion
+switches. #448 (`fix/cleanup-reconciliation-only`) landed on main during this work
+(commit `acab94dd`, 2026-11-10T21:30:07Z). Its safety changes must be preserved
+when updating this draft; no unmerged cleanup implementation is a dependency. Both branches touch `stoarama_pull.py`, the
+cleanup API/tests and cleanup documentation, so reconcile its receipt/replay and
+shared media-fence changes when integrating. This branch moves its new migration
+to **0179_nas_v85r_stitch.sql**, leaving #448's 0178 reconciliation migration
+unclaimed. Neither migration has been deployed by this work. Recheck migration
+ordering and run the combined cleanup/stitch PostgreSQL and fake-NAS suites after
+either branch lands. Do not weaken existing gates to resolve a conflict.

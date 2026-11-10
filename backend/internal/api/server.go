@@ -359,6 +359,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
 			account.Post("/connections/stitch/lease", s.handleAccountNASStitchLease)
 			account.Get("/connections/stitch/corpus", s.handleAccountNASStitchCorpus)
+			account.Get("/connections/stitch/tools/{name}", s.handleAccountNASStitchTool)
 			account.Post("/connections/stitch/{id}/result", s.handleAccountNASStitchResult)
 			account.Post("/connections/stitch/{id}/ready", s.handleAccountNASStitchReady)
 			account.Post("/connections/cleanup/lease", s.handleAccountNASCleanupLease)

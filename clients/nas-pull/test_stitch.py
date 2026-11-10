@@ -55,14 +55,14 @@ class StitchIntegrationTests(unittest.TestCase):
         parse = datetime.datetime.fromisoformat
         pins = (dict(folders={'stream':33}, windows={33:(parse('2026-09-01T00:00:00+00:00'),parse('2026-09-29T00:00:00+00:00'),'UTC')}),None)
         for patch in [mock.patch.object(pull,'cleanup_pins',return_value=pins), mock.patch.object(pull.os.path,'ismount',return_value=True),
-                      mock.patch.object(pull,'stitch_resources')]:
+                      mock.patch.object(pull,'stitch_resources'), mock.patch.object(pull,'stitch_v85r_provenance', return_value=dict(policy='v85r',manifest_sha256=pull.V85R_MANIFEST_SHA,ffmpeg_version='fixture',ffprobe_version='fixture'))]:
             patch.start();self.addCleanup(patch.stop)
         self.task = dict(id=7, lease_token='f'*64, plan_sha256='a'*64,
             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=2)).isoformat(),
             plan=dict(policy=pull.STITCH_POLICY,revision=pull.STITCH_REVISION,corpus_sha256=pull.STITCH_CORPUS_SHA,
                       keep_policy_sha256=pull.CLEANUP_KEEP28_POLICY_SHA256,stream_id=33,recording_id=22,
                       clips=self.clips,joins=[True,False,False],eligible=[True,True,True,False],
-                      output_folder='stream_V85_keep28/22/2026-09-01T00-00-00Z'))
+                      output_folder='stream_V85r_keep28/22/2026-09-01T00-00-00Z'))
 
     def build(self):
         return pull.stitch_build(self.cfg,self.inventory,self.task,self.stop,self.tools,admitted=lambda c,previous=None:True)
@@ -144,11 +144,29 @@ class StitchIntegrationTests(unittest.TestCase):
         self.assertIsNone(pull.cleanup_guard_refusal(task,result['outputs'][0]['inputs'][0]['raw_proof'],self.cfg))
         self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
 
+    def test_v85r_status_hold_splits_output_and_retains_both_raw_endpoints(self):
+        self.task['plan']['feature_inputs']=[dict(clip_id=c['source_id']) for c in self.clips]
+        held=dict(policy='v85r',join=False,nomination=True,status='APPROVED85_nomination_requires_runtime_native_join_checks',
+                  decision='hold',reason='october_decision_difference')
+        split=dict(policy='v85r',join=False,nomination=False,status='SPLIT_frozen_score_reject',decision='split',reason='policy_negative')
+        with mock.patch.object(pull,'stitch_v85r_measure',side_effect=[held,split,split]):
+            result=pull.stitch_build(self.cfg,self.inventory,self.task,self.stop,self.tools)
+        self.assertEqual(len(result['outputs']),2)
+        self.assertEqual(result['policy'],'v85r')
+        for output in result['outputs']:
+            self.assertEqual(output['policy'],'v85r')
+            self.assertTrue(output['inputs'][0]['retirement_held'])
+        with mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.stitch_register(self.cfg,self.inventory,7,result)
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,self.cleanup_task(result))
+        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+        self.assertTrue((self.cfg.output_dir/self.clips[1]['relative_path']).exists())
+
     def test_symlink_output_directory_and_bad_policy_are_refused(self):
         self.task['plan']['policy']='collation-v2'
         with self.assertRaises(pull.StitchHold):self.build()
         self.task['plan']['policy']=pull.STITCH_POLICY
-        (self.cfg.output_dir/'stream_V85_keep28').symlink_to(self.cfg.state_dir,target_is_directory=True)
+        (self.cfg.output_dir/'stream_V85r_keep28').symlink_to(self.cfg.state_dir,target_is_directory=True)
         with self.assertRaises(OSError):self.build()
 
 

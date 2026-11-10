@@ -1,0 +1,150 @@
+{
+  "explicit_SPLIT_source_vetoes": [
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "ccb5d72c21855fdb8d334c3b2da2f1e8ac721f1e4335081f734389eb5089aaf2",
+          "size_bytes": 18907193
+        },
+        {
+          "sha256": "35671ff655a39f702cfb88bf48ac32fb3d9df9f31bc83b2e867d8ba73fa32a28",
+          "size_bytes": 29112950
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "52dea28ec22d8d6f6f0bb566cc41ff5ce7b284022cfccb2a788785180c7d0edd",
+          "size_bytes": 3947867
+        },
+        {
+          "sha256": "9cbb6d920566255545173571897d9b2590395bbce4d136075e0c83508002eca6",
+          "size_bytes": 363201
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "b1f0b36fa5ddf81069537d0afecb5af1d92f146db7958884c4fc023238a8cc96",
+          "size_bytes": 2616699
+        },
+        {
+          "sha256": "382792b9c4827217d8463743d86822a020550b70186ab43aa5649126dfc1cf32",
+          "size_bytes": 8224005
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "2299e7f932533f07fb4f9075fd0f43b5f0e7abe17decfc420a62f679ee5d0fdd",
+          "size_bytes": 3130439
+        },
+        {
+          "sha256": "3cb2991a8d3a7b8acab4fe85e9ed221edcaa20832df7a5b0c9be48d039388403",
+          "size_bytes": 3889609
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "1b40e02a2938334d02443134a8726fd84f4c1a23a6be0a04d8cfba0b37e92236",
+          "size_bytes": 3836069
+        },
+        {
+          "sha256": "41b0f4e5e34d62ed8c44ef1965bb68bdeda76b02e0de07327acf9f6bda94538c",
+          "size_bytes": 2771118
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "5552950ceb4c47c9c0c5360107ac21ab332f4fa55487a4023fa028ff52cbe89b",
+          "size_bytes": 14364444
+        },
+        {
+          "sha256": "7fa72862dfa9ade31e09897dd9a8f794a7dcdb81ca9509ecd99a76cd0079c659",
+          "size_bytes": 10901469
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "e73bb39d7e2930636d975d128585c90192abbaaf52008cae4c5f9d545fcb95b9",
+          "size_bytes": 1961859
+        },
+        {
+          "sha256": "886bf283383bc896fd45ef3d3ad2c11ed7144f949631f0f6062736210d08a939",
+          "size_bytes": 2050269
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "93568cab014ef6fe3e81e9dee8657083ddb9546d51823bbb0573bd662d740ac5",
+          "size_bytes": 3167304
+        },
+        {
+          "sha256": "3caa4f6d466c1a598d8d654605ff1c7f1bf6b3b30de61897f0c5f02f40e853d7",
+          "size_bytes": 1672066
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "803d86aa72f5492e8de4951f6b31a60bea97a6733b909c560a60e9925ab4b115",
+          "size_bytes": 3051393
+        },
+        {
+          "sha256": "d79a5a14799a2c1760efbecf2efb0a91457ffcdecdcd6c0ab4e64ca35dbc6963",
+          "size_bytes": 2994490
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "3b1355fab5b6ef4d779015198c6e7af7aad7d4bd12ba0d3d3dc16bd250b94d97",
+          "size_bytes": 14573547
+        },
+        {
+          "sha256": "b3c3736cd19fee84d5534db292f2cd220fe01e53c12bbe1cc5bc845d5db3b8d6",
+          "size_bytes": 14569676
+        }
+      ]
+    },
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "3a95b42d93ae6c1c24c238e514395fefe99ca44c70ce7e8d39462522d34095b1",
+          "size_bytes": 39788987
+        },
+        {
+          "sha256": "54792cbed6f1462de8eaf504f32dfd543730681922dc81c5fbd0703bb9b1537a",
+          "size_bytes": 31862127
+        }
+      ]
+    }
+  ],
+  "explicit_UNCERTAIN_source_holds": [
+    {
+      "ordered_source_bindings": [
+        {
+          "sha256": "837a0d463c149105bf5c02ea32c1167565e3a71ad5ef0b4b828722f84b9d589c",
+          "size_bytes": 7031710
+        },
+        {
+          "sha256": "048014f20e26b3a38ff1ab31e12f34630257068d5a9474612e5a2ad7030fd892",
+          "size_bytes": 6847752
+        }
+      ]
+    }
+  ]
+}

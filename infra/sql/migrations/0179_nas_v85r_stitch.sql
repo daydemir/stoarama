@@ -1,4 +1,4 @@
--- Opt-in NAS-local V85. No scope, job or deletion authority is seeded.
+-- Opt-in NAS-local V85r. No scope, job or deletion authority is seeded.
 CREATE TABLE nas_stitch_scopes (
  id bigserial PRIMARY KEY,
  stream_id bigint NOT NULL REFERENCES streams(id),

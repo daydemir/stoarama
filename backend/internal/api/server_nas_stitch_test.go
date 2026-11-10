@@ -2,8 +2,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/r2"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -13,15 +16,18 @@ import (
 
 func stitchUnitFixture() (nasStitchPlan, nasStitchResult) {
 	a := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
-	p := nasStitchPlan{Policy: nasStitchPolicy, Revision: nasStitchRevision, CorpusSHA: nasStitchCorpusSHA, KeepSHA: cleanupPolicySHA, StreamID: 3, RecordingID: 2, OutputFolder: "stream_V85_keep28/2/2026-09-20T00-00-00Z", Joins: []bool{true, false}, Eligible: []bool{true, true, false}}
+	p := nasStitchPlan{Policy: nasStitchPolicy, Revision: nasStitchRevision, CorpusSHA: nasStitchCorpusSHA, KeepSHA: cleanupPolicySHA, StreamID: 3, RecordingID: 2, OutputFolder: "stream_V85r_keep28/2/2026-09-20T00-00-00Z", Frozen: []json.RawMessage{nil, nil}, Joins: []bool{true, false}, Eligible: []bool{true, true, false}}
 	for n := int64(1); n <= 3; n++ {
 		p.Clips = append(p.Clips, nasCleanupItem{Kind: "raw", SourceID: n, SourceIDs: []int64{n}, RecordingID: 2, StreamID: 3, RelativePath: fmt.Sprintf("stream/day/%d.mp4", n), SizeBytes: 3, SHA256: strings.Repeat("a", 64), SidecarRequired: true, Frozen: [5]int64{3, 1, 2, n, 77}, FrozenSidecar: [5]int64{300, 1, 2, n + 100, 77}, StartAt: a.Add(time.Duration(n-1) * time.Minute), EndAt: a.Add(time.Duration(n) * time.Minute)})
 	}
-	o := nasStitchOutput{Path: p.OutputFolder + "/run-000.mp4", SHA: strings.Repeat("b", 64), ReadbackSHA: strings.Repeat("b", 64), Size: 5, FullDecode: true, SeamDecode: true, PacketChain: true, NativeAudit: true, NoAudio: true, Fsynced: true}
+	provenance := nasStitchProvenance{OctoberRecovered: true, Policy: nasStitchPolicy, ManifestSHA: nasStitchManifestSHA, FFmpegVersion: "N-126826-gc0e8b139fd-20260924", FFprobeVersion: "N-126826-gc0e8b139fd-20260924", FFmpegSHA: "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b", FFprobeSHA: "9b2bac862606a48f5bc36091d38e5334cf241538a6f4cc47c60f68e7973a365c"}
+	o := nasStitchOutput{Policy: nasStitchPolicy, Provenance: provenance, Path: p.OutputFolder + "/run-000.mp4", SHA: strings.Repeat("b", 64), ReadbackSHA: strings.Repeat("b", 64), Size: 5, FullDecode: true, SeamDecode: true, PacketChain: true, NativeAudit: true, NoAudio: true, Fsynced: true}
 	for _, c := range p.Clips[:2] {
 		o.Inputs = append(o.Inputs, nasStitchInputProof{ID: c.SourceID, SHA: c.SHA256, Size: c.SizeBytes, PacketSHA: strings.Repeat("c", 64), Packets: 10, Frames: 10, RawProof: fixtureProof(c)})
 	}
-	return p, nasStitchResult{Token: strings.Repeat("f", 64), PlanSHA: strings.Repeat("e", 64), Outputs: []nasStitchOutput{o}, LeftOut: []int64{3}}
+	return p, nasStitchResult{Policy: nasStitchPolicy, Seams: []nasStitchDecision{
+		{Policy: nasStitchPolicy, LeftID: 1, RightID: 2, Join: true, Nomination: true, Status: "APPROVED85_nomination_requires_runtime_native_join_checks", Decision: "join", DiagnosticSHA: strings.Repeat("d", 64)},
+		{Policy: nasStitchPolicy, LeftID: 2, RightID: 3, Status: "SPLIT_frozen_score_reject", Decision: "split"}}, Token: strings.Repeat("f", 64), PlanSHA: strings.Repeat("e", 64), Outputs: []nasStitchOutput{o}, LeftOut: []int64{3}}
 }
 func TestNASStitchResultRequiresCompleteExactInclusion(t *testing.T) {
 	p, q := stitchUnitFixture()
@@ -30,18 +36,25 @@ func TestNASStitchResultRequiresCompleteExactInclusion(t *testing.T) {
 		t.Fatalf("valid result: %v", err)
 	}
 	tests := map[string]func(*nasStitchPlan, *nasStitchResult){
-		"full decode":     func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].FullDecode = false },
-		"seam decode":     func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].SeamDecode = false },
-		"packet proof":    func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].PacketSHA = "" },
-		"native proof":    func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].NativeAudit = false },
-		"partial repair":  func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].Repaired = true },
-		"frame loss":      func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].Frames-- },
-		"fsync":           func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Fsynced = false },
-		"readback":        func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].ReadbackSHA = strings.Repeat("d", 64) },
-		"audio missing":   func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].NoAudio = false },
-		"source mismatch": func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].SHA = strings.Repeat("d", 64) },
-		"no frozen seam":  func(p *nasStitchPlan, q *nasStitchResult) { p.Joins[0] = false },
-		"outside corpus":  func(p *nasStitchPlan, q *nasStitchResult) { p.Eligible[0] = false },
+		"policy label": func(p *nasStitchPlan, q *nasStitchResult) { q.Policy = "v85" },
+		"untrusted package": func(p *nasStitchPlan, q *nasStitchResult) {
+			q.Outputs[0].Provenance.ManifestSHA = strings.Repeat("0", 64)
+		},
+		"unnominated join": func(p *nasStitchPlan, q *nasStitchResult) { q.Seams[0].Nomination = false },
+		"ambiguous join":   func(p *nasStitchPlan, q *nasStitchResult) { q.Seams[0].Status = "UNKNOWN_status" },
+		"held raw":         func(p *nasStitchPlan, q *nasStitchResult) { q.Seams[1].Decision = "hold" },
+		"full decode":      func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].FullDecode = false },
+		"seam decode":      func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].SeamDecode = false },
+		"packet proof":     func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].PacketSHA = "" },
+		"native proof":     func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].NativeAudit = false },
+		"partial repair":   func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].Repaired = true },
+		"frame loss":       func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].Frames-- },
+		"fsync":            func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Fsynced = false },
+		"readback":         func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].ReadbackSHA = strings.Repeat("d", 64) },
+		"audio missing":    func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].NoAudio = false },
+		"source mismatch":  func(p *nasStitchPlan, q *nasStitchResult) { q.Outputs[0].Inputs[0].SHA = strings.Repeat("d", 64) },
+		"no frozen seam":   func(p *nasStitchPlan, q *nasStitchResult) { p.Joins[0] = false },
+		"outside corpus":   func(p *nasStitchPlan, q *nasStitchResult) { p.Eligible[0] = false },
 		"wrong order": func(p *nasStitchPlan, q *nasStitchResult) {
 			q.Outputs[0].Inputs[0], q.Outputs[0].Inputs[1] = q.Outputs[0].Inputs[1], q.Outputs[0].Inputs[0]
 		},
@@ -75,7 +88,7 @@ func TestNASStitchResultRequiresCompleteExactInclusion(t *testing.T) {
 }
 func stitchMigration(t *testing.T, f *cleanupFixture) {
 	t.Helper()
-	b, err := os.ReadFile("../../../infra/sql/migrations/0178_nas_v85_stitch.sql")
+	b, err := os.ReadFile("../../../infra/sql/migrations/0179_nas_v85r_stitch.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,5 +222,67 @@ func TestNASStitchRejectsInventedCorpusAndOffLeavesQueueUntouched(t *testing.T) 
 	var count int
 	if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM nas_stitch_tasks`).Scan(&count); err != nil || count != 0 {
 		t.Fatal("master off changed queue")
+	}
+}
+
+func TestNASStitchHeldEndpointsRemainRawDespiteVerifiedOutput(t *testing.T) {
+	p, q := stitchUnitFixture()
+	q.Seams[1].Decision = "hold"
+	q.Outputs[0].Inputs[1].RetirementHeld = true
+	items, err := validateNASStitchResult(p, q)
+	if err != nil || len(items) != 1 || items[0].SourceID != 1 {
+		t.Fatalf("held leaf retired: %v %v", items, err)
+	}
+}
+func TestNASStitchFrozenDecisionDifferenceCannotJoin(t *testing.T) {
+	p, q := stitchUnitFixture()
+	f := map[string]any{"recording_id": 2, "source_key": [][3]any{{int64(1), strings.Repeat("a", 64), int64(3)}, {int64(2), strings.Repeat("a", 64), int64(3)}}, "nomination": true, "status": "UNKNOWN_october_status", "frozen_diagnostic_sha256": strings.Repeat("d", 64)}
+	raw, _ := json.Marshal(f)
+	p.Frozen[0] = raw
+	q.Seams[0].Frozen = true
+	if _, err := validateNASStitchResult(p, q); err == nil {
+		t.Fatal("status difference admitted")
+	}
+}
+
+func TestNASStitchToolCapabilityIsDefaultOffScopedAndExact(t *testing.T) {
+	f := newCleanupFixture(t, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "HEAD" || !strings.HasSuffix(r.URL.Path, "/experimental/v85-retired-WORK-custody/20261013/2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b.bin") {
+			t.Errorf("unexpected artifact request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		w.Header().Set("Content-Length", "174165384")
+		w.Header().Set("ETag", "\"immutable-tool\"")
+	}))
+	defer server.Close()
+	store, err := r2.New(context.Background(), r2.Config{AccessKey: "fake-key", SecretKey: "fake-secret", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.r2 = store
+	call := func(name string) *httptest.ResponseRecorder {
+		return cleanupCall(t, f.s.handleAccountNASStitchTool, 47, 5, "name", name, nil)
+	}
+	if w := call("ffmpeg"); w.Code != 403 {
+		t.Fatalf("off capability %d", w.Code)
+	}
+	f.s.cfg.NASStitchEnabled = true
+	if w := call("unknown"); w.Code != 404 {
+		t.Fatalf("arbitrary tool capability %d", w.Code)
+	}
+	w := call("ffmpeg")
+	if w.Code != 200 {
+		t.Fatalf("pinned tool capability %d", w.Code)
+	}
+	var cap struct {
+		SHA    string `json:"sha256"`
+		Size   int64  `json:"size_bytes"`
+		Match  string `json:"if_match"`
+		Policy string `json:"policy"`
+	}
+	if json.Unmarshal(w.Body.Bytes(), &cap) != nil || cap.SHA != "2388de8e05ad71c913ee1a9c4504a1aa5de09ac100a1de92858dd9ec08e9f98b" || cap.Size != 174165384 || cap.Match != "\"immutable-tool\"" || cap.Policy != "v85r" {
+		t.Fatal("capability pin differs")
 	}
 }
