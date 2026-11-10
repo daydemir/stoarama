@@ -154,11 +154,47 @@ class CleanupTests(unittest.TestCase):
         calls=[]
         def api(cfg,path,body, **kwargs):
             calls.append(path)
-            if path.endswith('/observe'):return fixture_ack(body, action='reconcile', delete=False)
+            if path.endswith('/reconcile'):return fixture_ack(body, action='reconcile', delete=False)
             self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.os,'unlink',side_effect=AssertionError('replay must not delete')):
             pull.cleanup_replay_receipts(self.cfg,self.inventory)
         self.assertEqual(len(calls),2);self.assertTrue(self.path.exists());self.assertFalse(pull.cleanup_journal(self.inventory))
+
+    def test_503_before_issuance_replays_only_to_pending_without_receipt(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        for protocol in (1, 2):
+            with self.subTest(protocol=protocol):
+                calls = []
+                def api(cfg, path, body, **kwargs):
+                    calls.append(path)
+                    if path.endswith('/observe'):
+                        raise pull.urllib.error.HTTPError(path, 503, 'policy deadline', {}, None)
+                    self.assertTrue(path.endswith('/reconcile'), path)
+                    return fixture_ack(body, action='pending', delete=False)
+                with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not unlink')):
+                    batch_api = pull.CleanupBatchAPI(self.cfg) if protocol == 2 else None
+                    try:
+                        with self.assertRaises(pull.urllib.error.HTTPError):
+                            pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task, batch_api)
+                        self.assertEqual(pull.cleanup_journal(self.inventory)[0][1], 'observe')
+                        counts = pull.cleanup_replay_receipts(self.cfg, self.inventory, batch_api)
+                    finally:
+                        if batch_api is not None: batch_api.close()
+                self.assertEqual(counts['failed'], 0)
+                self.assertEqual(calls, ['/account/connections/cleanup/1/observe', '/account/connections/cleanup/1/reconcile'])
+                self.assertEqual(pull.cleanup_journal(self.inventory), [])
+                self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+
+    def test_reconciliation_rejects_any_deletion_authority_and_keeps_journal(self):
+        body = dict(attempt=1, plan_sha256='a'*64, outcome='match', proof=None, error='')
+        pull.cleanup_journal(self.inventory, 1, 'observe', body)
+        original = pull.cleanup_journal(self.inventory)
+        with mock.patch.object(pull, 'restore_api', return_value=fixture_ack(body, action='delete_issued', delete=True)) as api:
+            counts = pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(counts['failed'], 1)
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
 
     def test_interrupted_intent_never_retries_unlink(self):
         pull.cleanup_journal(self.inventory,1,'intent',dict(attempt=1,plan_sha256='a'*64,proof_sha256='b'*64))
@@ -890,7 +926,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
 
     def fake_server(self, tasks, fail_first=()):
         lock = threading.Lock()
-        state = dict(leased=False, calls=[], observe_batches=0, active=0, peak=0, failures=list(fail_first), bodies={})
+        state = dict(leased=0, calls=[], observe_batches=0, active=0, peak=0, failures=list(fail_first), bodies={})
         def api(cfg, path, body, retry_stale=False, **kwargs):
             with lock:
                 state['calls'].append(path)
@@ -902,10 +938,10 @@ class CleanupProtocol2Tests(unittest.TestCase):
             if path.endswith('/lease'):
                 self.assertEqual(body['protocol'], 2)
                 with lock:
-                    if state['leased']:
-                        return dict(tasks=[], retry_after_sec=120)
-                    state['leased'] = True
-                return dict(tasks=tasks, retry_after_sec=0)
+                    start = state['leased']
+                    selected = tasks[start:start + min(body['limit'], body['execution_files'])]
+                    state['leased'] += len(selected)
+                return dict(tasks=selected, retry_after_sec=0)
             if path.endswith('/observe'):
                 self.assertEqual(kwargs.get('timeout'), pull.CLEANUP_EXECUTION_OBSERVE_SEC)
                 self.assertFalse(retry_stale)
@@ -942,7 +978,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         path = self.cfg.state_dir/pull.CLEANUP_LEDGER_NAME
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def test_concurrent_execution_in_one_folder_deletes_exact_files_with_batched_calls(self):
+    def test_execution_in_one_folder_serializes_lifecycle_and_bounds_leases(self):
         tasks, paths = self.execution_tasks(24)
         keep = self.path.parent/'retained.txt'; keep.write_text('keep')
         original = pull.CleanupFile.proof
@@ -961,7 +997,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         for path, sidecar in paths:
             self.assertFalse(path.exists()); self.assertFalse(sidecar.exists())
         self.assertTrue(keep.exists()); self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
-        self.assertGreater(active['peak'], 1, 'execution was serial')
+        self.assertEqual(active['peak'], 1, 'execution overlapped')
         self.assertEqual(state['observe_batches'], 0, 'execution observations must bypass batch queues')
         self.assertEqual(sum(path.endswith('/observe') for path in state['calls']), 24)
         ledger = self.ledger()
@@ -1036,7 +1072,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             seen.append(body); return dict(tasks=[], retry_after_sec=120)
         with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 7):
             self.run_v2(api)
-        self.assertEqual(seen[0]['execution_files'], 2)
+        self.assertEqual(seen[0]['execution_files'], 1)
         self.assertEqual(seen[0]['execution_bytes'], pull.CLEANUP_MAX_BYTES_24H - 50)
 
     def test_dry_run_sends_md5_from_the_same_read_only_when_advertised(self):
@@ -1062,41 +1098,36 @@ class CleanupProtocol2Tests(unittest.TestCase):
                 self.assertEqual(seen[1], expected)
                 self.assertTrue(self.path.exists())
 
-    def test_replay_runs_through_the_batch_api_in_parallel(self):
+    def test_replay_uses_only_reconciliation_endpoint_in_parallel(self):
         for n in range(6):
             pull.cleanup_journal(self.inventory, 100+n, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % n))
         lock = threading.Lock(); calls = []
-        def api(cfg, path, body, retry_stale=False, **kwargs):
-            self.assertTrue(path.endswith('/observe-batch'), path)
-            with lock: calls.append(len(body['observations']))
-            return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
+        def api(cfg, path, body, **kwargs):
+            self.assertTrue(path.endswith('/reconcile'), path)
+            with lock: calls.append(path)
+            return fixture_ack(body, int(path.split('/')[-2]), action='pending', delete=False)
         with mock.patch.object(pull, 'restore_api', side_effect=api):
             batch_api = pull.CleanupBatchAPI(self.cfg)
             try:
                 pull.cleanup_replay_receipts(self.cfg, self.inventory, batch_api)
             finally:
                 batch_api.close()
-        self.assertEqual(sum(calls), 6); self.assertLess(len(calls), 6)
+        self.assertEqual(len(set(calls)), 6)
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
 
-    def test_replay_drops_md5_for_a_server_that_rejects_it(self):
-        pull.cleanup_journal(self.inventory, 200, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % 1, md5='b'*32))
-        pull.cleanup_journal(self.inventory, 201, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % 2))
-        sent = []
-        def api(cfg, path, body, retry_stale=False, **kwargs):
-            obs = body['observations']
-            sent.append([o.get('md5') for o in obs])
-            if any('md5' in o for o in obs):
-                raise pull.urllib.error.HTTPError(path, 400, 'unknown field md5', {}, None)
-            return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in obs])
-        with mock.patch.object(pull, 'restore_api', side_effect=api):
-            batch_api = pull.CleanupBatchAPI(self.cfg)
-            try:
-                pull.cleanup_replay_receipts(self.cfg, self.inventory, batch_api)
-            finally:
-                batch_api.close()
-        self.assertEqual(pull.cleanup_journal(self.inventory), [])
-        self.assertTrue(any(None in batch for batch in sent))
+    def test_replay_never_falls_back_to_permit_endpoint_on_older_server(self):
+        for status in (400, 404, 405, 503):
+            with self.subTest(status=status):
+                pull.cleanup_journal(self.inventory, 200, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='match', proof=None, error='', request_id='a'*32, md5='b'*32))
+                original = pull.cleanup_journal(self.inventory)
+                def api(cfg, path, body, **kwargs):
+                    self.assertTrue(path.endswith('/reconcile'), path)
+                    raise pull.urllib.error.HTTPError(path, status, 'unsupported', {}, None)
+                with mock.patch.object(pull, 'restore_api', side_effect=api) as calls:
+                    counts = pull.cleanup_replay_receipts(self.cfg, self.inventory)
+                self.assertEqual(counts['failed'], 1)
+                self.assertEqual(calls.call_count, 1)
+                self.assertEqual(pull.cleanup_journal(self.inventory), original)
 
     def test_health_ack_accepts_md5_etag_matched_recovery(self):
         with pull.CleanupFile(self.cfg, self.item, threading.Event(), time.monotonic()+20) as f:
@@ -1637,7 +1668,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
     def test_missing_recovered_result_ack_preserves_advanced_receipt(self):
         self.journal_observe(900)
         def api(cfg, path, body, **kwargs):
-            if path.endswith('/observe'):
+            if path.endswith('/reconcile'):
                 return fixture_ack(body, 900, action='reconcile', delete=False)
             return None
         with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay must not delete')):

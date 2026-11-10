@@ -175,22 +175,19 @@ semantics and releases its holds.
 
 The shared `nas_cleanup_reserved_files` view makes never-issued files of retired
 plans available to both `prepare_keep28_plans.py` and server admission. Issued
-files remain excluded forever, across all policies and states, including a
-still-present file after an uncertain unlink. Missing legacy item rows also stay
+files remain excluded across policies and states, including after an uncertain
+unlink, except for an audited unexecuted reservation release (below). Missing legacy item rows also stay
 excluded. Other non-retired plans still reserve their files. Prepare with a
 **new `--label-prefix`** because old labels and manifests are immutable. The new
 plan starts `dry_run`/`pending`, requires a full new dry run with recovery
 verification, and needs its own explicit owner approval; old approval does not
 carry over. Reservation availability does not guarantee policy admission.
 
-For an `unverified` ever-issued item, the supported minimal reconciliation choice
-is **leave it uncertain and held indefinitely**. Close never asserts that it is
-deleted or still present and never asks the NAS to unlink it. Keep the append-only
-client journal and report evidence; `verify-recovery` checks the protected R2
-copy read-only. There is no state-changing reconcile command in this change.
-Read-only exact-file reconciliation can be added separately if needed. The NAS
-client's 30-second permit deadline is also unchanged; slow-link timeout handling
-is follow-up work and must preserve the server expiry and replay fences.
+For an `unverified` ever-issued item with any possibility of unlink, leave it
+uncertain and protected indefinitely. The narrow audited reservation release
+below applies only to receipts that prove a recognized pre-unlink code path.
+Close itself never asserts presence or deletion and never releases issued
+reservations. Keep the client journal, ledger and report evidence.
 
 The original 430 folder roots / 6.43 TB logical are policy candidates, not an executable
 recursive command or guaranteed reclaimed storage. This workflow materializes a
@@ -261,11 +258,10 @@ gates above changed; the work each gate costs and the approval granularity did.
   is recorded as `conflict` and pauses the plan (dry-run plans too). Enable
   accepts `r2_sha_verified` or `r2_md5_etag_matched` with ETag evidence.
 - **No R2 I/O under locks.** Both observation endpoints compute every R2
-  check before their transaction (16 in parallel, 40 s budget per request,
-  inside the edge proxy's 100 s origin timeout). An item whose check is not
-  ready gets a retryable 503 with nothing recorded; the observation itself
-  never touches R2. The client resends 503s and replays its journal through the
-  batched endpoints in parallel. (Before this, a large dry-run batch of big
+  check before their transaction (16 in parallel for dry runs; execution
+  keeps its 15 s total budget). A transport 503 alone is not a no-commit
+  certificate. Dry runs may retry; execution retains its journal and uses
+  reconciliation-only recovery. (Before this, a large dry-run batch of big
   objects could exceed the proxy timeout; the client then fell back to serial
   single-item replays, each downloading inside its transaction.)
 - **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
@@ -280,12 +276,12 @@ gates above changed; the work each gate costs and the approval granularity did.
   approved and the master switch is on; receipts are idempotent. Batched and
   single observations take locks in one order: plan fence(s), then budget. The client retries
   502/503/504/429/timeouts with short back-off instead of pausing a minute.
-- **Concurrent execution.** Sixteen NAS workers each open, re-hash, re-check
-  (pins, keep window, caps) and unlink their own file under their own permit
-  and ledger lines. The app writer fence admits several cleanup holders but
-  never beside a writer (waiting writers block new cleanups). Parent-folder
-  namespace checks account exactly for names this process unlinked meanwhile;
-  any other change still refuses. Local caps reserve under the inventory lock.
+- **Serialized execution.** Protocol 2 requests at most one execution lease
+  and drains its full observation/result lifecycle before leasing another.
+  An execution mutex also serializes already-leased tasks and direct callers
+  before opening files or starting the permit clock. Dry runs retain sixteen
+  workers and up to 64 in-flight leases. Writer fences, confined descriptors,
+  fresh proofs, namespace checks, local caps and ledger lines still apply.
 - **Batch approval.** `prepare_keep28_plans.py --submit` writes
   `batch-<prefix>-s<stream>.json` (ordered plan ids/digests and
   `batch_sha256 = sha256("stoarama-nas-cleanup-batch-v1\npolicy <sha>\n" +
@@ -447,3 +443,83 @@ It runs both client protocols against normal HEADs, 35-second HEADs, and lost
 permit responses, counts actual unlink calls, and checks database authority and
 saved receipt timings. Short-budget tests also cover batch execution, lock
 contention, dry-run budget preservation, and the enable race.
+
+### Reconciliation-only observation recovery (plans 1390/1391)
+
+Journal `observe` checkpoints use only
+`POST /api/v1/account/connections/cleanup/{itemId}/reconcile` in both protocols.
+The client owns the exact checkpoint through compare-and-swap; it must durably
+replace `observe` with `intent` before any unlink. The server takes the same
+plan fence as issuance, then item/plan row fences, so any original request must
+commit or roll back before reconciliation. This endpoint performs no policy/R2
+work and never returns deletion authority or a permit expiry.
+
+If no permit was ever committed and the exact attempt is still leased/pending,
+it releases the lease to `pending` and resets the lease-expiry baseline without
+pausing the plan. Approved dry-run proof/recovery stay intact; a fresh lease
+increments attempt and must pass all ordinary execution gates. Delayed original
+observations and stale journal replays cannot affect that new attempt. An
+immutable `nas_cleanup_reconciliations` row records the checkpoint and decision.
+
+Already-issued authority remains protected: replay gets `reconcile`, never a
+permit, then submits the existing explicit no-unlink refusal receipt. Interrupted
+`intent` and durable `result` checkpoints only report outcomes. Unknowns remain
+reserved. A server lacking the endpoint leaves the journal unresolved; the
+client never falls back to a permit-capable endpoint. The compatible API and
+client must both be present before a future separately approved execution.
+
+### Audited release of proven unexecuted reservations
+
+After closing the paused plan, a service-token operator may run:
+
+```sh
+stoaramactl nas-cleanup release-unexecuted --plan-id ID \
+  --expected-plan-sha256 SHA --reason 'audited no-unlink checkpoint ordering'
+```
+
+`POST /api/v1/service/nas-cleanup/plans/{id}/release-unexecuted` requires the
+exact plan digest, a nonblank reason (at most 500 bytes), and mode `retired`.
+Only ever-issued `unverified` items with an expired recorded permit are
+candidates. The per-plan and item fences drain in-flight decisions/receipts.
+Each candidate must have an exact attempt/plan/proof-bound receipt, JSON boolean
+`unlink_attempted:false`, and a recognized diagnostic proving a pre-unlink path:
+`observation_replayed`, `deadline_exceeded`, `permit_expired`, `proof_mismatch`,
+`execution_disabled`, or `local_guard`. Its diagnostic text must match the known
+path too. The replay diagnostic comes from the owned `observe` checkpoint;
+execution refusals record the attempt flag after the guarded path returns.
+
+A boolean alone, unknown/generic error (`pre_unlink_failure` included), missing
+flag, mismatched identity, interrupted intent, or any possible unlink stays
+protected. Permit expiry and old NAS inventory do not prove no unlink.
+Deleted/partial/issued states are never candidates. The response lists
+`released_item_ids` and refused `protected_item_ids` among the candidates;
+if none qualify, it returns 409 and changes nothing.
+
+Releases append immutable `nas_cleanup_unexecuted_releases` rows with the
+original receipt, attempt, digest, operator reason and timestamp. Retries
+preserve the first record. Only a retired plan's reservation is superseded;
+its item state, immutable issued flag, permit, proof, receipt and all R2/source
+recovery holds remain. Use a new label and plan, complete a fresh dry run, and
+obtain separate owner approval. This neither reschedules the original issued
+attempt nor asserts current NAS presence.
+
+The November 10 handoff receipts classify all 28 incident items conservatively:
+
+- **Plan 1391: 16 qualify**, IDs **252239–252253 and 252256**. Their explicit
+  `observation_replayed`, exact diagnostic and `unlink_attempted:false` are
+  backed by #445's owned-observe → durable-intent ordering.
+- **Plan 1390: all 12 stay protected**, IDs **248718–248720, 248724–248727,
+  248729–248733**. Their pre-#445 receipts lack `unlink_attempted` and a stable
+  refusal reason, despite source-level evidence suggesting a pre-unlink refusal.
+  Missing evidence is never inferred or backfilled.
+
+Eligibility also requires the live identities/receipts to remain identical,
+expired permits and a closed plan. The test fixture contains receipt fields
+only, without NAS paths or credentials. No production action was performed.
+
+Regression coverage includes 16 simultaneous execution leases submitted to the
+real client against PostgreSQL handlers, with a 1.1 s policy query inside the
+plan lock per item. The original 15 s server budget is unchanged: requests
+serialize before the permit clock, all 16 complete, and no unverified receipt
+is produced. Separate tests cover 503-before-issuance, lost committed permit
+responses, replay identity binding and refusal of ambiguous release evidence.

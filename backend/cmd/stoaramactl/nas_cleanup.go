@@ -58,11 +58,11 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 		log.Fatal("--all requires recheck")
 	}
 	switch args[0] {
-	case "close":
+	case "close", "release-unexecuted":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
-			log.Fatal("close requires --plan-id, --expected-plan-sha256 and --reason")
+			log.Fatal(args[0] + " requires --plan-id, --expected-plan-sha256 and --reason")
 		}
-		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/close", *id), map[string]any{"expected_plan_sha256": *sha, "reason": *reason}))
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/%s", *id, args[0]), map[string]any{"expected_plan_sha256": *sha, "reason": *reason}))
 	case "recheck":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
 			log.Fatal("recheck requires --plan-id, --expected-plan-sha256 and --reason")
@@ -161,7 +161,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|close|retire-superseded|enable-batch|pause-batch|batch-report"
+const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|close|release-unexecuted|retire-superseded|enable-batch|pause-batch|batch-report"
 
 // nasCleanupBatchManifest validates a batch manifest and recomputes its
 // digest exactly as the backend does (cleanupBatchDigest): sha256 over

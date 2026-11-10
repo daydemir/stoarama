@@ -84,6 +84,17 @@ def run(args):
         try:
             while time.monotonic() - started < args.max_seconds:
                 cycles += 1
+                if args.simultaneous_tasks:
+                    # Test an already-leased backlog submitted all at once,
+                    # bypassing the coordinator's additional lease bound.
+                    lease = pull.cleanup_lease_v2(cfg, args.simultaneous_tasks, args.simultaneous_tasks, 1 << 30)
+                    futures = [executor.submit(pull.cleanup_process_task, cfg, inventory, stop, task, api) for task in lease["tasks"]]
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            errors.append(str(exc))
+                    break
                 if args.one_attempt:
                     lease = (pull.cleanup_lease_v2(cfg, 1, 1, 1 << 30) if args.protocol == 2
                              else pull.cleanup_lease(cfg))
@@ -131,6 +142,7 @@ def main():
     r.add_argument("--state", required=True)
     r.add_argument("--protocol", type=int, choices=(1, 2), default=2)
     r.add_argument("--max-seconds", type=float, default=1800)
+    r.add_argument("--simultaneous-tasks", type=int, default=0, help="submit an execution backlog concurrently (regression harness only)")
     r.add_argument("--one-attempt", action="store_true", help="exercise one lease without replaying an uncertain observation")
     args = parser.parse_args()
     (prepare if args.command == "prepare" else run)(args)
