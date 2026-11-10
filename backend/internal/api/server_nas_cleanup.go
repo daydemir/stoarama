@@ -1056,6 +1056,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// The plan was enabled between the two reads; retry under the fence.
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
+	if mode == "enabled" {
+		if err := cleanupMaintenanceCheck(ctx, tx); err != nil {
+			return cleanupObserveError(503, "cleanup maintenance gate unavailable or active")
+		}
+	}
 	if mode == "enabled" || state == "delete_issued" {
 		var bound bool
 		if err := tx.QueryRow(ctx, `SELECT coalesce(lease_connection_id=$2 AND lease_client_boot_id=$3 AND lease_client_version=$4,false) FROM nas_cleanup_items WHERE id=$1`, id, cid, env.session.boot, env.session.version).Scan(&bound); err != nil {

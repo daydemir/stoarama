@@ -120,6 +120,58 @@ Runbook notes:
 - Migrations 0171 (metadata-only, NOT VALID) and 0172 (VALIDATE, which proves
   no legacy `allow_nas_only=true` row exists) run as separate transactions.
 
+### Privileged maintenance and source freezes
+
+Migration 0180 freezes the source streams of an enabled plan with database
+triggers. Privileged operations such as `session_replication_role=replica`,
+disabling triggers, or restoring source tables can bypass those guards.
+**Before any such maintenance, pause all enabled cleanup plans and batches
+and wait for every outstanding deletion authorization to expire or drain.**
+Do not treat a paused plan as proof that its last 30-second permit finished;
+wait for receipts or expiry and for outstanding client work/leases to drain.
+
+First commit this maintenance flag using the normal database session, before
+pausing plans or bypassing any triggers:
+
+```sql
+UPDATE nas_cleanup_maintenance
+SET active=true, reason='describe maintenance', started_at=clock_timestamp()
+WHERE singleton;
+```
+
+The permanent singleton row is shared-locked through activation and permit
+transactions. Setting it waits for in-flight grants to commit, then blocks new
+single/batch activation and permit responses (including retries). It does not
+cancel existing authorizations or block their receipts. Commit the flag update
+separately before pausing plans; do not hold its row lock while taking plan locks.
+Pause each enabled plan/batch with the operator CLI, verify no enabled plan or
+batch remains, and drain outstanding work before starting maintenance. Keep the
+flag active throughout maintenance. Never remove the singleton or replace its
+table during a restore; a missing row fails closed.
+
+After maintenance, restore normal trigger operation, leave all plans paused,
+and clear the flag in a committed normal session:
+
+```sql
+UPDATE nas_cleanup_maintenance
+SET active=false, reason='', started_at=NULL
+WHERE singleton;
+```
+
+Any later activation must pass its normal fresh dry-run gates and full source
+replay again. The flag grants no permission to bypass those checks.
+
+Migration 0181 records each freeze's plan, activation transaction id and creation
+time durably. Activation holds the public advisory fence from before freeze
+publication through enable commit/rollback. Housekeeping and the next activation
+recover non-enabled owners only while holding that same fence, proving no owning
+activation is still in progress. Recovery never uses age as permission to unfreeze.
+Thus a crash after publication cannot strand ingest permanently. Enabled owners
+retain their freeze across restarts; a cold rankings cache is replayed on demand.
+Mode transitions release freezes in the database, including pause, retirement and
+completion (represented by a paused plan); housekeeping also removes stale freezes
+and their cache rows for non-enabled or missing owners without process callbacks.
+
 Enablement is a separate user decision. Do not change either gate while doing
 preparation or dry runs. A later exact-file permit expires after 30 seconds. The app
 fences its delivery writers and re-hashes/rechecks each approved file before its
