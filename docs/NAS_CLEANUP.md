@@ -486,11 +486,15 @@ after a real deletion, so neither that flag nor its diagnostic proves no unlink.
 There is no command or endpoint to release ever-issued reservations. Closing a
 plan preserves every issued reservation and all recovery holds.
 
-Lease and observation requests must advertise `reconciliation_protocol:1` to
-receive execution work or permits. Older clients receive dry-run work only,
-including lease retries; replaying their ordinary observation cannot mint a first
-permit. This capability means observation journal replay exclusively uses
-`/reconcile`, never `/observe` or `/observe-batch`.
+The server grants execution leases only to its allowlisted heartbeat version
+(`be17fd73`) with a nonempty boot ID, and binds each lease to that exact
+connection, boot and version. Request-body versions and
+`reconciliation_protocol` flags grant no authority. Older recorded versions
+receive dry-run work only, including lease retries. A previously submitted
+request ID cannot mint a first permit, even after rollback or on a later boot or
+attempt; an exact retry can return only its already-issued permit. The reviewed
+client replays observation journals exclusively through `/reconcile`, never
+`/observe` or `/observe-batch`.
 
 The server serializes lease selection and allows at most one outstanding
 `leased` or `delete_issued` item per enabled plan, across all clients and request
