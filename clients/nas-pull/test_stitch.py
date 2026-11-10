@@ -75,7 +75,7 @@ class StitchIntegrationTests(unittest.TestCase):
                   frozen_sidecar_identity=proof['raw_proof']['sidecar']['identity'])
         return dict(item_id=index+100,attempt=1,plan_sha256='c'*64,item=item,approved_proof=proof['raw_proof'],expires_at=self.task['expires_at'])
 
-    def api(self,cfg,path,body):
+    def api(self,cfg,path,body,timeout=None):
         if path.endswith('/ready'):
             return dict(ready=True,id=7)
         if '/stitch/' in path:
@@ -85,6 +85,7 @@ class StitchIntegrationTests(unittest.TestCase):
         if path.endswith('/observe'):
             if body['outcome']!='match':
                 return dict(ack,action='conflict',delete=False)
+            self.assertEqual(timeout,pull.CLEANUP_EXECUTION_OBSERVE_SEC)
             return dict(ack,action='delete_issued',delete=True,expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         return dict(ack,ok=True)
 
