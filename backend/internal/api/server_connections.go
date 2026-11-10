@@ -51,7 +51,7 @@ func pullPathAllowed(method, path string) bool {
 	switch {
 	case method == http.MethodGet && path == "/api/v1/account/clips":
 		return true
-	case method == http.MethodPost && path == "/api/v1/account/connections/heartbeat":
+	case method == http.MethodPost && (path == "/api/v1/account/connections/heartbeat" || path == "/api/v1/account/connections/client-logs"):
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/inventory":
 		return true

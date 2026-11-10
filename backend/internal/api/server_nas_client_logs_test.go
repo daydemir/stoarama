@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -19,7 +21,7 @@ func TestNASClientLogsUploadRedactRetainAndRead(t *testing.T) {
 		w := cleanupCall(t, s.handleAccountNASClientLogs, 47, 5, "", "", map[string]any{"client_version": "b9f41fd0", "boot_id": "boot-1", "journal_entries": 64, "quarantined": 1, "dropped_lines": 0, "lines": lines})
 		return w.Code
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO nas_client_logs(connection_id,received_at,client_version,boot_id,lines) VALUES(13,now()-interval '8 days','old','b','[]')`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_client_logs(connection_id,received_at,client_version,boot_id,lines) VALUES(13,now()-interval '8 days','old','b','[]'),(14,now()-interval '8 days','old','b','[]'),(14,now()-interval '6 days','retained-offline','b','[]')`); err != nil {
 		t.Fatal(err)
 	}
 	if code := upload([]map[string]any{
@@ -36,6 +38,10 @@ func TestNASClientLogsUploadRedactRetainAndRead(t *testing.T) {
 	}
 	if strings.Contains(stored, "abcdefghijklmnop") || strings.Contains(stored, "deadbeef") || !strings.Contains(stored, "[REDACTED]") {
 		t.Fatalf("server did not redact: %s", stored)
+	}
+	var retained int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM nas_client_logs WHERE client_version='retained-offline'`).Scan(&retained); err != nil || retained != 1 {
+		t.Fatalf("disconnected logs within retention count=%d: %v", retained, err)
 	}
 	if old != 0 {
 		t.Fatal("rows older than 7 days were kept")
@@ -94,6 +100,16 @@ func nasDiagnosticPatterns() [][2]string {
 		{"100.64.0.1", "100.64.0.1"},
 		{"100.127.255.255", "100.127.255.255"},
 	}
+	out = append(out,
+		[2]string{`{"Authorization":["Bearer ` + v + `"]}`, v},
+		[2]string{`{"Cookie":{"session":"` + v + `"}}`, v},
+		[2]string{`Authorization: Digest username="` + v + `", nonce="` + v + `", cnonce="` + v + `", response="` + v + `"`, v},
+		[2]string{`{\"api_key\":\"` + v + `\"}`, v},
+		[2]string{`{\\\"password\\\":\\\"` + v + `\\\"}`, v},
+		[2]string{"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::1"},
+		[2]string{"[FD7A:115C:A1E0:abcd:1234:5678:90ab:cdef]:443", "FD7A:115C:A1E0"},
+	)
+
 	for _, scheme := range []string{"postgres", "postgresql", "mysql", "redis", "rediss"} {
 		out = append(out, [2]string{scheme + "://user:" + v + "@host/db", v})
 	}
@@ -215,5 +231,23 @@ func TestNASCleanupLeastLeasedItemDoesNotStarveFreshWork(t *testing.T) {
 	}
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &out) != nil || len(out.Tasks) != 1 || out.Tasks[0].ItemID != 2 || len(out.Tasks[0].ApprovedProof) != 0 {
 		t.Fatalf("fair lease %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNASClientLogsPullScopedCredential(t *testing.T) {
+	pool := cleanupTestPool(t)
+	s := &Server{pool: pool}
+	keyID := int64(5)
+	principal := accountPrincipal{AccountID: 47, AuthType: "api_key", APIKeyID: &keyID, KeyScopes: []string{accountScopePull}}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/client-logs", bytes.NewBufferString(`{"client_version":"test","lines":[{"level":"WARN","message":"cleanup deferred"}]}`))
+	req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey, principal))
+	w := httptest.NewRecorder()
+	s.confineAccountScope(http.HandlerFunc(s.handleAccountNASClientLogs)).ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("pull log upload: %d %s", w.Code, w.Body.String())
+	}
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM nas_client_logs WHERE connection_id=13`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("stored %d: %v", count, err)
 	}
 }

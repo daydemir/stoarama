@@ -1,6 +1,7 @@
 """Exercise the actual cleanup worker against disposable media fixtures only."""
 import importlib.util
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -253,7 +254,12 @@ class CleanupTests(unittest.TestCase):
         parent=os.open(self.path.parent,os.O_RDONLY|os.O_DIRECTORY)
         try:
             for name in (b"retained-\xff",b"retained-\xfe"):
-                fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=parent)
+                try:
+                    fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=parent)
+                except OSError as exc:
+                    if exc.errno == errno.EILSEQ:
+                        self.skipTest("filesystem rejects non-UTF8 filenames")
+                    raise
                 os.close(fd)
             with self.opened() as current:
                 proof=current.proof()
@@ -1317,6 +1323,120 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(pull.cleanup_journal(self.inventory), [original])
         self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {900})
 
+    def test_worker_defers_existing_journal_in_every_phase_and_protocol1(self):
+        for phase in ('observe', 'intent', 'result'):
+            pull.cleanup_journal(self.inventory, 1, phase, {'evidence': phase})
+            original = pull.cleanup_journal(self.inventory)
+            with mock.patch.object(pull, 'cleanup_replay_receipts'), mock.patch.object(pull, 'cleanup_lease', return_value=dict(tasks=[self.task])), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('blocked filesystem access')), mock.patch.object(pull, 'restore_api', side_effect=AssertionError('blocked API access')):
+                pull.cleanup_once(self.cfg, self.inventory, threading.Event())
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_heartbeat_release_between_lease_check_and_worker_preserves_evidence(self):
+        pull.cleanup_journal(self.inventory, 1, 'intent', {'evidence': 'exact durable bytes'})
+        original = pull.cleanup_journal(self.inventory)
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,?,?,?,5,'now')", (*original[0][1:], 'rejected'))
+        self.inventory.db.execute('DELETE FROM cleanup_receipts WHERE item_id=1')
+        self.inventory.db.commit()
+        # Simulate a stale pre-submit view; heartbeat releases before the worker
+        # starts. The worker must atomically recheck both stores and refuse.
+        real_blocked = pull.cleanup_blocked_items
+        first = [True]
+        def stale_check(inventory):
+            if first[0]:
+                first[0] = False
+                pull.cleanup_release_quarantine(inventory, 1)
+                return set()
+            return real_blocked(inventory)
+        replay = dict(replayed=0, failed=0, pending=0, quarantined=0, errors=[])
+        with mock.patch.object(pull, 'cleanup_replay_receipts', return_value=replay), mock.patch.object(pull, 'cleanup_blocked_items', side_effect=stale_check), mock.patch.object(pull, 'cleanup_lease_v2', return_value=dict(tasks=[self.task])), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('released receipt processed')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None, task_limit=1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
+        self.assertFalse(pull.cleanup_quarantined_items(self.inventory))
+
+    def test_reservation_is_exclusive_and_release_does_not_replace_it(self):
+        owner = pull.cleanup_reserve_item(self.inventory, 1)
+        self.assertIsNotNone(owner)
+        self.assertIsNone(pull.cleanup_reserve_item(self.inventory, 1))
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,'intent','exact bytes','rejected',5,'now')")
+        self.inventory.db.commit()
+        pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {1})
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        with self.assertRaises(RuntimeError):
+            pull.cleanup_journal(self.inventory, 1, 'observe', {}, owner=owner)
+
+    def test_worker_never_overwrites_or_deletes_changed_checkpoint(self):
+        owner = pull.cleanup_reserve_item(self.inventory, 1)
+        pull.cleanup_journal(self.inventory, 1, 'observe', {'ours': True}, owner=owner)
+        self.inventory.db.execute("UPDATE cleanup_receipts SET phase='intent',body='exact replacement bytes' WHERE item_id=1")
+        self.inventory.db.commit()
+        original = pull.cleanup_journal(self.inventory)
+        for phase in ('observe', 'intent', 'result', None):
+            with self.assertRaises(RuntimeError):
+                pull.cleanup_journal(self.inventory, 1, phase, {}, owner=owner)
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_protocol1_quarantine_blocks_worker(self):
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,'intent','exact bytes','rejected',5,'now')")
+        self.inventory.db.commit()
+        with mock.patch.object(pull, 'cleanup_replay_receipts'), mock.patch.object(pull, 'cleanup_lease', return_value=dict(tasks=[self.task])), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('quarantined item')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor, task_limit=1)
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {1})
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+    def test_quarantine_release_rolls_back_move_and_ack_on_failure(self):
+        pull.cleanup_journal(self.inventory, 1, 'intent', {'evidence': 'exact bytes'})
+        original = pull.cleanup_journal(self.inventory)[0]
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(1,?,?,?,5,'now')", (*original[1:], 'rejected'))
+        self.inventory.db.execute('DELETE FROM cleanup_receipts WHERE item_id=1')
+        self.inventory.db.execute("CREATE TRIGGER fail_release BEFORE DELETE ON cleanup_quarantine BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        self.inventory.db.commit()
+        with self.assertRaises(pull.sqlite3.IntegrityError):
+            pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {1})
+        self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['release_generation'], 0)
+
+    def test_concurrent_released_item_cannot_replace_active_worker_receipt(self):
+        entered, release = threading.Event(), threading.Event()
+        def observe(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError('fixture worker timed out')
+            return dict(action='would_delete', delete=False)
+        with mock.patch.object(pull, 'restore_api', side_effect=observe) as post:
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                first = executor.submit(pull.cleanup_process_task, self.cfg, self.inventory, threading.Event(), self.task)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    original = pull.cleanup_journal(self.inventory)
+                    self.assertFalse(pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), dict(self.task, attempt=2)))
+                    self.assertEqual(pull.cleanup_journal(self.inventory), original)
+                    self.assertEqual(post.call_count, 1)
+                finally:
+                    release.set()
+                first.result(timeout=5)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+
+    def test_stale_replay_snapshot_cannot_remove_replacement_evidence(self):
+        self.journal_observe(900)
+        journal = pull.cleanup_journal
+        replacement = ('intent', '{"evidence":"replacement bytes"}')
+        def snapshot(inventory, *args, **kwargs):
+            rows = journal(inventory, *args, **kwargs)
+            inventory.db.execute('UPDATE cleanup_receipts SET phase=?,body=? WHERE item_id=900', replacement)
+            inventory.db.commit()
+            return rows
+        with mock.patch.object(pull, 'cleanup_journal', side_effect=snapshot), mock.patch.object(pull, 'restore_api', side_effect=AssertionError('stale replay sent')):
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(journal(self.inventory), [(900, *replacement)])
+
     def test_all_skipped_cycle_waits(self):
         self.journal_observe(900)
         calls = []
@@ -1399,6 +1519,13 @@ def diagnostic_patterns():
         (json.dumps({'api_key': 'prefix\"' + value}), value),
         ('Authorization: Bearer ' + value, value),
         ('{"Authorization": "Bearer ' + value + '"}', value),
+        (json.dumps({'Authorization': ['Bearer ' + value]}), value),
+        (json.dumps({'Cookie': {'session': value}}), value),
+        ('Authorization: Digest username="' + value + '", nonce="' + value + '", cnonce="' + value + '", response="' + value + '"', value),
+        (json.dumps(json.dumps({'api_key': value})), value),
+        (json.dumps(json.dumps(json.dumps({'password': value}))), value),
+        ('fd7a:115c:a1e0::1', 'fd7a:115c:a1e0::1'),
+        ('[FD7A:115C:A1E0:abcd:1234:5678:90ab:cdef]:443', 'FD7A:115C:A1E0'),
         ('https://user:' + value + '@host/path', value),
         *[(scheme + '://user:' + value + '@host/db', value) for scheme in ('postgres', 'postgresql', 'mysql', 'redis', 'rediss')],
         ('eyJ' + 'a'*20 + '.' + 'b'*20 + '.' + 'c'*20, 'a'*20),

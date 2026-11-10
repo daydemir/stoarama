@@ -121,6 +121,7 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/account/clips"},
 		{http.MethodPost, "/api/v1/account/connections/heartbeat"},
+		{http.MethodPost, "/api/v1/account/connections/client-logs"},
 		{http.MethodPost, "/api/v1/account/connections/inventory"},
 		{http.MethodPost, "/api/v1/account/clips/release"},
 		{http.MethodGet, "/api/v1/account/joined"},
@@ -146,6 +147,8 @@ func TestConfineAccountScopePullKeyConfined(t *testing.T) {
 		{http.MethodDelete, "/api/v1/account/recordings/12/clips/34"},
 		{http.MethodDelete, "/api/v1/account/recordings/5/clips"},
 		{http.MethodGet, "/api/v1/account/me"},
+		{http.MethodGet, "/api/v1/account/connections/client-logs"},
+		{http.MethodPost, "/api/v1/service/nas-connections/13/release-quarantine"},
 	}
 	for _, p := range denyPaths {
 		if code := runConfine(pull, p.method, p.path); code != http.StatusForbidden {

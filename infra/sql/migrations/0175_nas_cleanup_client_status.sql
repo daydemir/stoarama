@@ -6,9 +6,9 @@ ALTER TABLE connections
  ADD COLUMN nas_cleanup_status_at timestamptz,
  ADD COLUMN nas_cleanup_release_generation bigint;
 
--- The migration runner sets a local 5s lock_timeout. Nullable columns above
--- avoid a table rewrite; this partial index supports fair lease selection.
-CREATE INDEX nas_cleanup_pending_attempt ON nas_cleanup_items(plan_id,attempt,id) WHERE state='pending';
+-- Keep this short transaction independent of the cleanup backlog. Fair lease
+-- selection uses the existing nas_cleanup_pending index and sorts within a plan;
+-- no index build on nas_cleanup_items may extend the connections ALTER lock.
 
 -- Redacted recent log lines uploaded by the NAS app (owner-approved remote
 -- diagnostics, 2026-11). Append-only (UPDATE refused); the API deletes rows

@@ -28,7 +28,10 @@ var nasClientLogRedactions = []struct {
 	re   *regexp.Regexp
 	with string
 }{
-	{regexp.MustCompile(`(?i)([\"']?\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)`), `${1}[REDACTED]`},
+	// Match arbitrary escaped quotes; redact the whole tail of sensitive
+	// assignments so arrays, objects and Digest parameters cannot leak.
+	{regexp.MustCompile(`(?is)(\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*(?:\\*["'])?\s*[=:]\s*)[\s\S]*`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)([\"']?\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)`), `${1}[REDACTED]`},
 	{regexp.MustCompile(`(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+|basic\s+)?[^\s\"',}]+`), `${1}[REDACTED]`},
 	{regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}`), `${1} [REDACTED]`},
 	{regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|redis(?:s)?)://[^\s'\"<>]+`), `[REDACTED]`},
@@ -38,11 +41,12 @@ var nasClientLogRedactions = []struct {
 	{regexp.MustCompile(`\btskey-[A-Za-z0-9_-]+`), `[REDACTED]`},
 	{regexp.MustCompile(`\bAKIA[A-Z0-9]{16}\b`), `[REDACTED]`},
 	{regexp.MustCompile(`\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b`), `[REDACTED]`},
+	{regexp.MustCompile(`(?i)\bfd7a:115c:a1e0(?::[0-9a-f]{0,4})+(?:%[A-Za-z0-9_.-]+)?`), `[REDACTED]`},
 	{regexp.MustCompile(`(?i)\b[A-Za-z0-9.-]+\.ts\.net\b`), `[REDACTED]`},
 	{regexp.MustCompile(`\b(?:sir|sk|rk|pk|ghp|gho|xox[abp])_[A-Za-z0-9_-]{8,}\b`), `[REDACTED]`},
 }
 
-var nasDiagnosticSecretName = regexp.MustCompile(`(?i)^[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*$`)
+var nasDiagnosticSecretName = regexp.MustCompile(`(?i)^[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*$`)
 
 var nasClientLogPath = regexp.MustCompile(`(^|[^\w:/.])(/[^\s'"<>,;)]+)`)
 
@@ -132,7 +136,7 @@ func (s *Server) handleAccountNASClientLogs(w http.ResponseWriter, r *http.Reque
 	}
 	// Time is the retention boundary: an upload storm must never evict
 	// another upload from within the seven-day diagnostic window.
-	_, _ = s.pool.Exec(ctx, `DELETE FROM nas_client_logs WHERE connection_id=$1 AND received_at<now()-interval '7 days'`, cid)
+	_, _ = s.pool.Exec(ctx, `DELETE FROM nas_client_logs WHERE received_at<now()-interval '7 days'`)
 	util.WriteJSON(w, 200, map[string]any{"ok": true, "stored_lines": len(req.Lines)})
 }
 

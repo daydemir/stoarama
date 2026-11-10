@@ -241,8 +241,12 @@ CLIENT_LOG_LINE_MAX = 2048
 CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
 CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
-_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
+_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
+# Fail closed for textual diagnostics: once a sensitive assignment starts, drop
+# its entire tail. This covers nested header values, Digest parameters and any
+# depth of escaped quotes without guessing where an untrusted value ends.
 _REDACTIONS = (
+    (re.compile(r"(?is)(\b" + _SECRET_NAME + r"(?:\\*[\"'])?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([\"']?\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+|basic\s+)?[^\s\"',}]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
@@ -253,6 +257,7 @@ _REDACTIONS = (
     (re.compile(r"\btskey-[A-Za-z0-9_-]+"), "[REDACTED]"),
     (re.compile(r"\bAKIA[A-Z0-9]{16}\b"), "[REDACTED]"),
     (re.compile(r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b"), "[REDACTED]"),
+    (re.compile(r"(?i)\bfd7a:115c:a1e0(?::[0-9a-f]{0,4})+(?:%[A-Za-z0-9_.-]+)?"), "[REDACTED]"),
     (re.compile(r"(?i)\b[A-Za-z0-9.-]+\.ts\.net\b"), "[REDACTED]"),
     (re.compile(r"\b(?:sir|sk|rk|pk|ghp|gho|xox[abp])_[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
 )
@@ -587,6 +592,7 @@ class Inventory:
     def __init__(self, cfg):
         self.cfg = cfg
         self.lock = threading.RLock()
+        self.cleanup_claims = {}
         # Whole-operation activity fence. Inventory holds this from the first
         # filesystem observation through completion publication; certification
         # only takes it nonblocking at a main-loop delivery-idle boundary.
@@ -1776,17 +1782,68 @@ def cleanup_json_bytes(payload):
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def cleanup_journal(inventory, item_id=None, phase=None, body=None):
+def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None):
     with inventory.lock:
         inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_receipts(item_id INTEGER PRIMARY KEY,phase TEXT NOT NULL,body TEXT NOT NULL)")
-        if item_id is not None:
-            if phase is None:
-                inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
-            else:
-                inventory.db.execute("INSERT OR REPLACE INTO cleanup_receipts VALUES(?,?,?)",
-                                     (item_id, phase, cleanup_json_bytes(body).decode()))
-        inventory.db.commit()
+        try:
+            if item_id is not None:
+                claim = inventory.cleanup_claims.get(item_id)
+                if claim is not None or owner is not None:
+                    if claim is None or claim[0] is not owner:
+                        raise RuntimeError("cleanup journal is reserved")
+                    current = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
+                    cleanup_quarantine_tables(inventory)
+                    quarantined = inventory.db.execute("SELECT 1 FROM cleanup_quarantine WHERE item_id=?", (item_id,)).fetchone()
+                    if current != claim[1] or quarantined:
+                        raise RuntimeError("cleanup journal changed; deferred without modifying evidence")
+                next_row = None if phase is None else (phase, cleanup_json_bytes(body).decode())
+                if owner is not None:
+                    # Compare-and-swap in SQL too: even an independent SQLite
+                    # writer cannot be overwritten between the check and write.
+                    expected = claim[1]
+                    if expected is None:
+                        if next_row is not None:
+                            inventory.db.execute("INSERT INTO cleanup_receipts VALUES(?,?,?)", (item_id, *next_row))
+                    elif next_row is None:
+                        changed = inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=? AND phase=? AND body=?", (item_id, *expected))
+                        if changed.rowcount != 1:
+                            raise RuntimeError("cleanup journal changed; deferred")
+                    else:
+                        changed = inventory.db.execute("UPDATE cleanup_receipts SET phase=?,body=? WHERE item_id=? AND phase=? AND body=?", (*next_row, item_id, *expected))
+                        if changed.rowcount != 1:
+                            raise RuntimeError("cleanup journal changed; deferred")
+                elif next_row is None:
+                    inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
+                else:
+                    inventory.db.execute("INSERT INTO cleanup_receipts VALUES(?,?,?) ON CONFLICT(item_id) DO UPDATE SET phase=excluded.phase,body=excluded.body", (item_id, *next_row))
+            inventory.db.commit()
+            if item_id is not None and owner is not None:
+                inventory.cleanup_claims[item_id] = (owner, next_row)
+        except Exception:
+            inventory.db.rollback()
+            raise
         return inventory.db.execute("SELECT item_id,phase,body FROM cleanup_receipts ORDER BY item_id").fetchall()
+
+
+def cleanup_blocked_items(inventory):
+    # Release holds this same lock across the quarantine -> journal transaction.
+    with inventory.lock:
+        cleanup_journal(inventory)
+        cleanup_quarantine_tables(inventory)
+        rows = inventory.db.execute("SELECT item_id FROM cleanup_receipts UNION SELECT item_id FROM cleanup_quarantine").fetchall()
+        inventory.db.commit()
+        return {row[0] for row in rows} | set(inventory.cleanup_claims)
+
+
+def cleanup_reserve_item(inventory, item_id):
+    with inventory.lock:
+        if item_id in cleanup_blocked_items(inventory):
+            CLEANUP_STATUS.add("skipped_blocked_items")
+            log("WARN", "cleanup item=%d journal unresolved; left unprocessed" % item_id)
+            return None
+        owner = object()
+        inventory.cleanup_claims[item_id] = (owner, None)
+        return owner
 
 
 class CleanupFile:
@@ -2518,6 +2575,7 @@ def cleanup_release_quarantine(inventory, generation):
     if type(generation) is not int or generation < 1:
         return
     with inventory.lock:
+        cleanup_journal(inventory)
         cleanup_quarantine_tables(inventory)
         current = inventory.db.execute("SELECT value FROM cleanup_control WHERE key='release_generation'").fetchone()
         if current and current[0] >= generation:
@@ -2526,7 +2584,7 @@ def cleanup_release_quarantine(inventory, generation):
             rows = inventory.db.execute("SELECT rowid,item_id,phase,body FROM cleanup_quarantine").fetchall()
             for rowid, item_id, phase, encoded in rows:
                 existing = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
-                if existing is not None and tuple(existing) != (phase, encoded):
+                if item_id in inventory.cleanup_claims or (existing is not None and tuple(existing) != (phase, encoded)):
                     continue
                 inventory.db.execute("INSERT OR IGNORE INTO cleanup_receipts VALUES(?,?,?)", (item_id, phase, encoded))
                 inventory.db.execute("DELETE FROM cleanup_quarantine WHERE rowid=?", (rowid,))
@@ -2564,7 +2622,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     seconds; unfinished replays continue in the background and are not
     resubmitted while in flight. Returns {"replayed", "failed", "pending",
     "quarantined"} counts."""
-    def replay(item_id, phase, body):
+    def replay(item_id, phase, body, owner):
         try:
             if api is not None:
                 call = api.observe if phase == "observe" else api.result
@@ -2595,8 +2653,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             with inventory.lock:
                 inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_rejected_receipts(item_id INTEGER,phase TEXT,body TEXT,rejected_at TEXT)")
                 inventory.db.execute("INSERT INTO cleanup_rejected_receipts VALUES(?,?,?,?)", (item_id, phase, cleanup_json_bytes(body).decode(), utc_now_precise()))
-                inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
-                inventory.db.commit()
+                cleanup_journal(inventory, item_id, owner=owner)
             log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
             return None
 
@@ -2614,12 +2671,29 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             raise CleanupResponseError("cleanup result not acknowledged")
 
     def one(item_id, phase, encoded):
+        # Own the exact snapshot until its replay finishes. A delayed replay
+        # must never advance/archive/remove another worker's checkpoint.
+        with inventory.lock:
+            cleanup_quarantine_tables(inventory)
+            current = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
+            quarantined = inventory.db.execute("SELECT 1 FROM cleanup_quarantine WHERE item_id=?", (item_id,)).fetchone()
+            if item_id in inventory.cleanup_claims or current != (phase, encoded) or quarantined:
+                return
+            owner = object()
+            inventory.cleanup_claims[item_id] = (owner, current)
+        try:
+            return replay_owned(item_id, phase, encoded, owner)
+        finally:
+            with inventory.lock:
+                inventory.cleanup_claims.pop(item_id, None)
+
+    def replay_owned(item_id, phase, encoded, owner):
         body = json.loads(encoded)
         if phase == "intent":
             body.update(outcome="unverified", error="client interrupted after permit; operator reconciliation required")
             phase = "result"
-            cleanup_journal(inventory, item_id, phase, body)
-        response = replay(item_id, "observe" if phase == "observe" else "result", body)
+            cleanup_journal(inventory, item_id, phase, body, owner=owner)
+        response = replay(item_id, "observe" if phase == "observe" else "result", body, owner)
         if response is None:
             # Only the explicit 409 archive path may resolve without a body.
             if any(row[0] == item_id for row in cleanup_journal(inventory)):
@@ -2629,15 +2703,16 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed"}
-            cleanup_journal(inventory, item_id, "result", body)
-            result = replay(item_id, "result", body)
+            cleanup_journal(inventory, item_id, "result", body, owner=owner)
+            result = replay(item_id, "result", body, owner)
             if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
                 raise CleanupResponseError("missing cleanup result acknowledgement")
             if result is not None:
                 validate_response("result", result)
-        cleanup_journal(inventory, item_id)
+        cleanup_journal(inventory, item_id, owner=owner)
 
-    entries = cleanup_journal(inventory)
+    with inventory.lock:
+        entries = [row for row in cleanup_journal(inventory) if row[0] not in inventory.cleanup_claims]
     if budget is None:
         if api is None or len(entries) < 2:
             for entry in entries:
@@ -2723,6 +2798,18 @@ CLEANUP_SINGLE_API = CleanupSingleAPI()
 
 
 def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
+    # Both protocols and direct callers reserve before any filesystem/API work.
+    owner = cleanup_reserve_item(inventory, task["item_id"])
+    if owner is None:
+        return False
+    try:
+        return _cleanup_process_task(cfg, inventory, stop_event, task, api, owner)
+    finally:
+        with inventory.lock:
+            inventory.cleanup_claims.pop(task["item_id"], None)
+
+
+def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
     api = api or CLEANUP_SINGLE_API
     item_id, attempt = task["item_id"], task["attempt"]
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
@@ -2757,12 +2844,12 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
             # Only for tasks from a lease that advertised recovery_md5.
             if api.request_ids and task.get("_recovery_md5") is True and current.media_md5:
                 body["md5"] = current.media_md5
-            cleanup_journal(inventory, item_id, "observe", body)
+            cleanup_journal(inventory, item_id, "observe", body, owner=owner)
             permit_request_started = time.monotonic()
             decision = api.observe(cfg, item_id, body)
             if decision.get("delete") is True:
                 receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
-                cleanup_journal(inventory, item_id, "intent", receipt)
+                cleanup_journal(inventory, item_id, "intent", receipt, owner=owner)
                 ledger = None
                 try:
                     if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
@@ -2800,9 +2887,9 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
                                                         error=receipt["error"]))
                     except Exception as exc:
                         log("ERROR", "cleanup item=%d deletion ledger result append failed: %s" % (item_id, exc))
-                cleanup_journal(inventory, item_id, "result", receipt)
+                cleanup_journal(inventory, item_id, "result", receipt, owner=owner)
                 api.result(cfg, item_id, receipt)
-            cleanup_journal(inventory, item_id)
+            cleanup_journal(inventory, item_id, owner=owner)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
         # Never overwrite a durable intent/result with a speculative retry.
@@ -2811,9 +2898,9 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
         if isinstance(exc, CleanupInterrupted):
             raise
         body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
-        cleanup_journal(inventory, item_id, "observe", body)
+        cleanup_journal(inventory, item_id, "observe", body, owner=owner)
         api.observe(cfg, item_id, body)
-        cleanup_journal(inventory, item_id)
+        cleanup_journal(inventory, item_id, owner=owner)
     finally:
         if fenced:
             NAS_MEDIA_FENCE.release_cleanup()
@@ -3222,7 +3309,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 if not lease["tasks"]:
                     exhausted = True
                     break
-                blocked = {row[0] for row in cleanup_journal(inventory)} | cleanup_quarantined_items(inventory)
+                blocked = cleanup_blocked_items(inventory)
                 for task in lease["tasks"]:
                     leased += 1
                     if task["item_id"] in blocked:
