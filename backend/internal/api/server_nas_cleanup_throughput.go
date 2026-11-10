@@ -43,6 +43,14 @@ var nasCleanupRecoveryBudget = 40 * time.Second
 // must leave ample room inside the client's independent 30 s refusal guard.
 var nasCleanupExecutionBudget = 15 * time.Second
 
+func cleanupExecutionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	started, ok := ctx.Value(accountRequestStartedContextKey).(time.Time)
+	if !ok {
+		started = time.Now() // Direct handler callers have no authentication phase.
+	}
+	return context.WithDeadline(ctx, started.Add(nasCleanupExecutionBudget))
+}
+
 // Start with the execution deadline. Only requests proved to contain no enabled
 // plan regain the original dry-run budget. A later enable is refused by
 // cleanupObserveOne rather than issuing under that longer context.
@@ -544,8 +552,12 @@ type cleanupBatchObservation struct {
 // R2 work runs in parallel before the transaction; its result is used only for
 // the exact (mode, object, evidence) it was computed for.
 func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), nasCleanupExecutionBudget)
+	ctx, cancel := cleanupExecutionContext(r.Context())
 	defer cancel()
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	var req struct {
 		ClientVersion string                    `json:"client_version"`
 		Observations  []cleanupBatchObservation `json:"observations"`

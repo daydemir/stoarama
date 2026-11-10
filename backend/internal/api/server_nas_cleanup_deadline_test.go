@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,74 @@ import (
 
 	"github.com/go-chi/chi/v5"
 )
+
+func TestNASCleanupExecutionDeadlineIncludesAuthentication(t *testing.T) {
+	old := nasCleanupExecutionBudget
+	nasCleanupExecutionBudget = 150 * time.Millisecond
+	defer func() { nasCleanupExecutionBudget = old }()
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%t", batch), func(t *testing.T) {
+			f := newCleanupFixture(t, 24)
+			id, sha, _ := f.admit("auth-budget", syntheticFiles(100, 1, 1))
+			f.dryRun()
+			f.s.cfg.NASCleanupDeletionEnabled = true
+			if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
+				t.Fatalf("enable: %d %s", code, body)
+			}
+			task := f.leaseV2(1, 1, 1<<30, "")[0]
+			_, err := f.pool.Exec(f.ctx, `ALTER TABLE accounts ADD COLUMN email text DEFAULT 'fixture@example.test', ADD COLUMN name text DEFAULT 'fixture', ADD COLUMN role text DEFAULT 'member', ADD COLUMN status text DEFAULT 'active';
+CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_hash text,scopes text[],revoked_at timestamptz,expires_at timestamptz,last_used_at timestamptz)`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.pool.Exec(f.ctx, `INSERT INTO account_api_keys(id,account_id,secret_hash,scopes) VALUES(5,47,$1,'{}')`, hashSecret("fixture-key")); err != nil {
+				t.Fatal(err)
+			}
+			lock, err := f.pool.Begin(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Rollback(f.ctx)
+			if _, err = lock.Exec(f.ctx, `LOCK TABLE account_api_keys IN ACCESS EXCLUSIVE MODE`); err != nil {
+				t.Fatal(err)
+			}
+			unlocked := make(chan struct{})
+			timer := time.AfterFunc(350*time.Millisecond, func() {
+				_ = lock.Rollback(context.Background())
+				close(unlocked)
+			})
+			defer timer.Stop()
+			router := chi.NewRouter()
+			router.Use(f.s.requireAccountAuth)
+			router.Post("/cleanup/{itemId}/observe", f.s.handleAccountNASCleanupObserve)
+			router.Post("/cleanup/observe-batch", f.s.handleAccountNASCleanupObserveBatch)
+			body := map[string]any{"attempt": task.Attempt, "plan_sha256": task.PlanSHA, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
+			url := fmt.Sprintf("/cleanup/%d/observe", task.ItemID)
+			if batch {
+				body["item_id"] = task.ItemID
+				body = map[string]any{"client_version": "test", "observations": []any{body}}
+				url = "/cleanup/observe-batch"
+			}
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest("POST", url, bytes.NewReader(raw))
+			req.Header.Set("Authorization", "Bearer fixture-key")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			<-unlocked
+			if w.Code != 503 || !strings.Contains(w.Body.String(), `"retryable":true`) {
+				t.Fatalf("slow authentication minted a late permit: %d %s", w.Code, w.Body.String())
+			}
+			var issued bool
+			var state string
+			if err = f.pool.QueryRow(f.ctx, `SELECT state,delete_ever_issued FROM nas_cleanup_items WHERE id=$1`, task.ItemID).Scan(&state, &issued); err != nil || issued || state != "leased" {
+				t.Fatalf("authentication timeout mutated authority: %s %t %v", state, issued, err)
+			}
+		})
+	}
+}
 
 type cleanupDeadlineClientResult struct {
 	Seconds  float64  `json:"seconds"`

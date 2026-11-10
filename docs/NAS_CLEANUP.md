@@ -378,10 +378,10 @@ upload count; the read endpoint filters and limits lines in PostgreSQL.
 
 ## Execution observation deadlines and refusal evidence
 
-Enabled observations use one **15-second server deadline**, starting at handler
-entry and covering connection/mode lookup, R2 recovery (including conditional
+Enabled observations use one **15-second server deadline**, starting before account
+authentication and covering connection/mode lookup, R2 recovery (including conditional
 ETag-bound HEAD), policy checks, advisory/row locks, and transaction commit.
-Both the single and batch endpoints use it. Recovery that cannot finish returns
+Both the single and batch endpoints use it. Expired authentication or recovery returns
 HTTP 503 with `retryable=true` and no permit; timed-out recovery leaves the item
 leased with no issued flag. Dry-run recovery retains its 40-second budget. An
 enable racing a dry-run request is refused for retry under an execution context.
@@ -428,9 +428,12 @@ does not erase granted authority. Issued identities and recovery holds stay
 reserved. There is no automatic reset, new permit, or deletion retry. A fresh
 inventory observation is still needed to independently prove current presence.
 
-These changes require server support for the optional receipt diagnostics before
-a client containing them is released; older servers reject unknown JSON fields.
-No release or deployment is part of this repair.
+Deploy and verify the server before releasing this client: older servers reject
+the optional receipt diagnostics as unknown JSON fields. Do not roll the server
+back to a version without receipt support while this client or its journals are
+active. Each legacy batch HTTP retry has its own server deadline; transport delay
+and time across retries remain bounded by the client's independent 30-second
+guard, not by the server's per-request timer.
 
 Regression harness (local disposable PostgreSQL only):
 

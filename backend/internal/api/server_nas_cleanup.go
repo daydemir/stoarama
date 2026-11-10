@@ -863,8 +863,12 @@ func cleanupObserveRequestError(req cleanupObserve) string {
 }
 
 func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), nasCleanupExecutionBudget)
+	ctx, cancel := cleanupExecutionContext(r.Context())
 	defer cancel()
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	id, ok := parseInt64Path(w, r, "itemId")
 	if !ok {
 		return
