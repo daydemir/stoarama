@@ -30,6 +30,11 @@ func (f *cleanupFixture) recoveryOf(id int64) (string, string, string) {
 // R2's single-part ETag proves R2 bytes == NAS bytes without a download;
 // multipart ETags, mismatches or a missing MD5 fall back to the full SHA.
 func TestNASCleanupDryRunMD5ETagRecovery(t *testing.T) {
+	// This test asserts the fast-path download count. Random full-SHA audits
+	// have their own explicit test below and must not make this assertion flaky.
+	old := cleanupMD5AuditRate
+	cleanupMD5AuditRate = 0
+	t.Cleanup(func() { cleanupMD5AuditRate = old })
 	f := newCleanupFixture(t, 24)
 	p1, sha1, _ := f.admit("md5-1", syntheticFiles(100, 4, 10))
 	tasks := f.leaseV2(64, 0, 0, "")

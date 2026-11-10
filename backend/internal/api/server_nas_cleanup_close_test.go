@@ -340,6 +340,20 @@ func TestNASCleanupAdmissionReservationFence(t *testing.T) {
 	if _, _, err = persistNASCleanupPlan(ctx, first, "first", items); err != nil {
 		t.Fatal(err)
 	}
+	// Admission must not monopolize the public-read fence while waiting on
+	// R2/catalog I/O. Public delivery and source references can still proceed.
+	public, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Rollback(ctx)
+	boundedPublic, cancelPublic := context.WithTimeout(ctx, 150*time.Millisecond)
+	_, err = public.Exec(boundedPublic, `SELECT pg_advisory_xact_lock_shared($1)`, nasCleanupPublicFence)
+	cancelPublic()
+	if err != nil {
+		t.Fatalf("admission blocked public reads: %v", err)
+	}
+	public.Rollback(ctx)
 	second, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)

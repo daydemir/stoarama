@@ -52,6 +52,9 @@ const (
 	// Public cleanup fence: enabling a plan or batch, batch advance and new
 	// source references serialize on it (see migration 0167).
 	nasCleanupPublicFence int64 = 7343226011101
+	// Serialize admissions before catalog/source locks. Separate from the
+	// public fence: admission's frozen-index I/O must not block public reads.
+	nasCleanupAdmissionLock int64 = 7343226011103
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -218,9 +221,10 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, "NAS connection unavailable")
 		return
 	}
-	// Serialize plan admission with close, enable and other admissions before
-	// taking catalog locks. The reservation check is repeated at persistence.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+	// Serialize admissions before taking catalog locks; persistence checks
+	// reservations again after the frozen-index I/O. A concurrent close can
+	// only release never-issued reservations once its transaction commits.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupAdmissionLock); err != nil {
 		util.WriteError(w, 503, "cleanup admission fence unavailable")
 		return
 	}
@@ -1175,7 +1179,7 @@ func cleanupSameFileProof(a, b []byte) bool {
 
 func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items []nasCleanupItem) (int64, string, error) {
 	stage := "admission_fence"
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupAdmissionLock); err != nil {
 		return 0, "", &cleanupPersistFailure{stage: stage, err: err}
 	}
 	// Same-label retries still return the immutable original plan. A different
