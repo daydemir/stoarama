@@ -136,6 +136,7 @@ func TestNASCleanupClientServerThroughput(t *testing.T) {
 		})
 		router.Post("/account/connections/cleanup/lease", f.s.handleAccountNASCleanupLease)
 		router.Post("/account/connections/cleanup/{itemId}/observe", f.s.handleAccountNASCleanupObserve)
+		router.Post("/account/connections/cleanup/{itemId}/reconcile", f.s.handleAccountNASCleanupReconcile)
 		router.Post("/account/connections/cleanup/{itemId}/result", f.s.handleAccountNASCleanupResult)
 		router.Post("/account/connections/cleanup/observe-batch", f.s.handleAccountNASCleanupObserveBatch)
 		router.Post("/account/connections/cleanup/result-batch", f.s.handleAccountNASCleanupResultBatch)

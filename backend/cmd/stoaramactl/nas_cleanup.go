@@ -60,9 +60,9 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	switch args[0] {
 	case "close":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
-			log.Fatal("close requires --plan-id, --expected-plan-sha256 and --reason")
+			log.Fatal(args[0] + " requires --plan-id, --expected-plan-sha256 and --reason")
 		}
-		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/close", *id), map[string]any{"expected_plan_sha256": *sha, "reason": *reason}))
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/%s", *id, args[0]), map[string]any{"expected_plan_sha256": *sha, "reason": *reason}))
 	case "recheck":
 		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
 			log.Fatal("recheck requires --plan-id, --expected-plan-sha256 and --reason")

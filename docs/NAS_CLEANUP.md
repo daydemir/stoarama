@@ -175,22 +175,20 @@ semantics and releases its holds.
 
 The shared `nas_cleanup_reserved_files` view makes never-issued files of retired
 plans available to both `prepare_keep28_plans.py` and server admission. Issued
-files remain excluded forever, across all policies and states, including a
-still-present file after an uncertain unlink. Missing legacy item rows also stay
+files remain excluded across policies and states, including after an uncertain
+unlink. The 28 incident items remain permanently protected, with no release
+path. Missing legacy item rows also stay
 excluded. Other non-retired plans still reserve their files. Prepare with a
 **new `--label-prefix`** because old labels and manifests are immutable. The new
 plan starts `dry_run`/`pending`, requires a full new dry run with recovery
 verification, and needs its own explicit owner approval; old approval does not
 carry over. Reservation availability does not guarantee policy admission.
 
-For an `unverified` ever-issued item, the supported minimal reconciliation choice
-is **leave it uncertain and held indefinitely**. Close never asserts that it is
-deleted or still present and never asks the NAS to unlink it. Keep the append-only
-client journal and report evidence; `verify-recovery` checks the protected R2
-copy read-only. There is no state-changing reconcile command in this change.
-Read-only exact-file reconciliation can be added separately if needed. The NAS
-client's 30-second permit deadline is also unchanged; slow-link timeout handling
-is follow-up work and must preserve the server expiry and replay fences.
+For an `unverified` ever-issued item with any possibility of unlink, leave it
+uncertain and protected indefinitely. Receipts never release issued reservations;
+all 28 incident items remain permanently protected.
+Close itself never asserts presence or deletion and never releases issued
+reservations. Keep the client journal, ledger and report evidence.
 
 The original 430 folder roots / 6.43 TB logical are policy candidates, not an executable
 recursive command or guaranteed reclaimed storage. This workflow materializes a
@@ -261,11 +259,10 @@ gates above changed; the work each gate costs and the approval granularity did.
   is recorded as `conflict` and pauses the plan (dry-run plans too). Enable
   accepts `r2_sha_verified` or `r2_md5_etag_matched` with ETag evidence.
 - **No R2 I/O under locks.** Both observation endpoints compute every R2
-  check before their transaction (16 in parallel, 40 s budget per request,
-  inside the edge proxy's 100 s origin timeout). An item whose check is not
-  ready gets a retryable 503 with nothing recorded; the observation itself
-  never touches R2. The client resends 503s and replays its journal through the
-  batched endpoints in parallel. (Before this, a large dry-run batch of big
+  check before their transaction (16 in parallel for dry runs; execution
+  keeps its 15 s total budget). A transport 503 alone is not a no-commit
+  certificate. Dry runs may retry; execution retains its journal and uses
+  reconciliation-only recovery. (Before this, a large dry-run batch of big
   objects could exceed the proxy timeout; the client then fell back to serial
   single-item replays, each downloading inside its transaction.)
 - **Protocol 2** (`lease` with `protocol: 2`, `observe-batch`, `result-batch`):
@@ -280,12 +277,22 @@ gates above changed; the work each gate costs and the approval granularity did.
   approved and the master switch is on; receipts are idempotent. Batched and
   single observations take locks in one order: plan fence(s), then budget. The client retries
   502/503/504/429/timeouts with short back-off instead of pausing a minute.
-- **Concurrent execution.** Sixteen NAS workers each open, re-hash, re-check
-  (pins, keep window, caps) and unlink their own file under their own permit
-  and ledger lines. The app writer fence admits several cleanup holders but
-  never beside a writer (waiting writers block new cleanups). Parent-folder
-  namespace checks account exactly for names this process unlinked meanwhile;
-  any other change still refuses. Local caps reserve under the inventory lock.
+- **Serialized execution.** The server permits one outstanding execution item
+  per plan. Live clients advertise `reconciliation_protocol:1` on leases and
+  observations; this body flag alone grants no authority.
+  Each live cleanup request supplies `X-Stoarama-Client-Session: <boot_id> <client_version>`
+  freshly from the running process, outside all journal/checkpoint bodies. An execution
+  lease requires an allowlisted header version and exact agreement with the connection's
+  latest heartbeat (received within five minutes); the lease records that header session.
+  An observation can return authority only when its header matches both the lease and
+  the fresh heartbeat. Missing, stale or mismatched identity yields dry-run leases or
+  a reconciliation-only observation response. Older clients receive dry-run work only.
+  Protocol 2 requests at most one execution lease
+  and drains its full observation/result lifecycle before leasing another.
+  An execution mutex also serializes already-leased tasks and direct callers
+  before opening files or starting the permit clock. Dry runs retain sixteen
+  workers and up to 64 in-flight leases. Writer fences, confined descriptors,
+  fresh proofs, namespace checks, local caps and ledger lines still apply.
 - **Batch approval.** `prepare_keep28_plans.py --submit` writes
   `batch-<prefix>-s<stream>.json` (ordered plan ids/digests and
   `batch_sha256 = sha256("stoarama-nas-cleanup-batch-v1\npolicy <sha>\n" +
@@ -313,7 +320,7 @@ gates above changed; the work each gate costs and the approval granularity did.
 
 Rollout: apply migration 0173 (additive; NOT VALID checks; one small partial
 index), deploy the API while no item is `leased`, then stage/promote the NAS
-client. Old clients keep using protocol 1 unchanged against the new API; a new
+client. Old clients receive only dry-run work against the new API; a new
 client detects an old API (HTTP 400 on protocol 2) and stays on protocol 1 for
 an hour before probing again.
 
@@ -322,8 +329,8 @@ and at most64 leases per drain/replay cycle. Batch requests lease only free slot
 up to eight; legacy requests default to one task. One coordinator owns
 receipt replay and drains every worker, including after a lease/worker failure,
 before replay, replacement or serial execution. Under protocol 1 approved
-destructive tasks are never dispatched concurrently; protocol 2 runs them on
-the bounded worker pool as described above. Independent observations share a plan read lock;
+destructive tasks are never dispatched concurrently; protocol 2 also drains
+each execution lifecycle before leasing another. Independent observations share a plan read lock;
 operator control still needs the exclusive parent lock. Public-registry evidence
 may be cached for one minute only in dry runs; enabled grants always check live.
 
@@ -447,3 +454,80 @@ It runs both client protocols against normal HEADs, 35-second HEADs, and lost
 permit responses, counts actual unlink calls, and checks database authority and
 saved receipt timings. Short-budget tests also cover batch execution, lock
 contention, dry-run budget preservation, and the enable race.
+
+### Reconciliation-only observation recovery (plans 1390/1391)
+
+Journal `observe` checkpoints use only
+`POST /api/v1/account/connections/cleanup/{itemId}/reconcile` in both protocols.
+The client owns the exact checkpoint through compare-and-swap; it must durably
+replace `observe` with `intent` before any unlink. The server takes the same
+plan fence as issuance, then item/plan row fences, so any original request must
+commit or roll back before reconciliation. This endpoint performs no policy/R2
+work and never returns deletion authority or a permit expiry.
+
+If no permit was ever committed and the exact attempt is still leased/pending,
+it releases the lease to `pending` and resets the lease-expiry baseline without
+pausing the plan. Approved dry-run proof/recovery stay intact; a fresh lease
+increments attempt and must pass all ordinary execution gates. Delayed original
+observations and stale journal replays cannot affect that new attempt. An
+immutable `nas_cleanup_reconciliations` row records the checkpoint and decision.
+
+Already-issued authority remains protected: replay gets `reconcile`, never a
+permit, then submits the existing explicit no-unlink refusal receipt. Interrupted
+`intent` and durable `result` checkpoints only report outcomes. Unknowns remain
+reserved. A server lacking the endpoint leaves the journal unresolved; the
+client never falls back to a permit-capable endpoint. Execution leases require
+a live `X-Stoarama-Client-Session: <boot_id> <client_version>` header, a matching heartbeat no older than five minutes, and the exact
+reviewed client release allowlist (`be17fd73`, this PR's reconciliation-only
+client). Request-body versions and capability flags grant no authority. Each
+lease binds the authenticated connection and the header's boot ID and version;
+an observation must
+carry the same live header and still match a fresh heartbeat to obtain authority.
+The transport builds this header on every request from the running process,
+never from a saved body. Replays carry the current session but use `/reconcile`,
+which cannot mint authority; a rollback client without the header cannot inherit
+the newer heartbeat's identity, even if the checkpoint never reached the server.
+Observation request IDs are durably recorded before recovery work or the
+issuance transaction, so even a rolled-back submission cannot earn a first
+permit on replay. An exact retry may only retrieve its already-issued, unexpired
+permit. Request IDs associated with any ever-authorized item are permanent;
+IDs for never-authorized items expire after 30 days, swept on heartbeats and
+batch observations. Pruning cannot remove issued authority: it only removes
+bookkeeping for items that never got authorization. Old leases have already
+expired; a replay from another boot/version cannot match the recorded lease
+session, an old client has no header, and current clients replay only through
+`/reconcile`. None can mint a first permit from a pruned checkpoint.
+The compatible API and client must both be present before a future
+separately approved execution.
+
+### Permanent incident protection and server serialization
+
+All 28 unverified incident items remain permanently reserved: 12 in plan 1390
+and 16 in plan 1391. A restored stale journal can report `unlink_attempted:false`
+after a real deletion, so neither that flag nor its diagnostic proves no unlink.
+There is no command or endpoint to release ever-issued reservations. Closing a
+plan preserves every issued reservation and all recovery holds.
+
+The server grants execution leases only to its allowlisted heartbeat version
+(`be17fd73`) when the live session header agrees with its nonempty boot ID
+and the heartbeat is at most five minutes old. Each lease records that header
+session; observations must match it and the fresh heartbeat. Request-body versions and
+`reconciliation_protocol` flags grant no authority. Older recorded versions
+receive dry-run work only, including lease retries. A previously submitted
+request ID cannot mint a first permit, even after rollback or on a later boot or
+attempt; an exact retry can return only its already-issued permit. The reviewed
+client replays observation journals exclusively through `/reconcile`, never
+`/observe` or `/observe-batch`.
+
+The server serializes lease selection and allows at most one outstanding
+`leased` or `delete_issued` item per enabled plan, across all clients and request
+sizes. A permit must receive its terminal receipt before the next execution
+lease. Existing parallel leases are refused execution until reconciled. The
+client execution lock and all existing gates, including the 15 s server
+execution budget, remain in place.
+
+Regression coverage includes 16 contending workers against PostgreSQL handlers
+and the real client, with a 1.1 s policy query inside the plan lock per item.
+Separate tests cover legacy capability refusal, concurrent leases, first-permit
+replay refusal, 503-before-issuance, lost committed permit responses and replay
+identity binding. No production action was performed.

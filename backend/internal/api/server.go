@@ -359,6 +359,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
 			account.Post("/connections/cleanup/lease", s.handleAccountNASCleanupLease)
 			account.Post("/connections/cleanup/{itemId}/observe", s.handleAccountNASCleanupObserve)
+			account.Post("/connections/cleanup/{itemId}/reconcile", s.handleAccountNASCleanupReconcile)
 			account.Post("/connections/cleanup/{itemId}/result", s.handleAccountNASCleanupResult)
 			account.Post("/connections/cleanup/observe-batch", s.handleAccountNASCleanupObserveBatch)
 			account.Post("/connections/cleanup/result-batch", s.handleAccountNASCleanupResultBatch)

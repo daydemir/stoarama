@@ -58,7 +58,7 @@ CREATE TABLE account_api_keys(id bigint PRIMARY KEY,account_id bigint,secret_has
 			router.Use(f.s.requireAccountAuth)
 			router.Post("/cleanup/{itemId}/observe", f.s.handleAccountNASCleanupObserve)
 			router.Post("/cleanup/observe-batch", f.s.handleAccountNASCleanupObserveBatch)
-			body := map[string]any{"attempt": task.Attempt, "plan_sha256": task.PlanSHA, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
+			body := map[string]any{"attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
 			url := fmt.Sprintf("/cleanup/%d/observe", task.ItemID)
 			if batch {
 				body["item_id"] = task.ItemID
@@ -141,6 +141,7 @@ func TestNASCleanupExecutionDeadlineClientServer(t *testing.T) {
 				})
 				router.Post("/account/connections/cleanup/lease", f.s.handleAccountNASCleanupLease)
 				router.Post("/account/connections/cleanup/{itemId}/observe", f.s.handleAccountNASCleanupObserve)
+				router.Post("/account/connections/cleanup/{itemId}/reconcile", f.s.handleAccountNASCleanupReconcile)
 				router.Post("/account/connections/cleanup/{itemId}/result", f.s.handleAccountNASCleanupResult)
 				router.Post("/account/connections/cleanup/observe-batch", f.s.handleAccountNASCleanupObserveBatch)
 				router.Post("/account/connections/cleanup/result-batch", f.s.handleAccountNASCleanupResultBatch)
@@ -268,7 +269,7 @@ func TestNASCleanupExecutionDeadlineIncludesBatchAndLockWait(t *testing.T) {
 					f.bucket.headDelay = 35 * time.Second
 					f.bucket.mu.Unlock()
 				}
-				body := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
+				body := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "client_version": "test"}
 				started := time.Now()
 				var w *httptest.ResponseRecorder
 				if batch {
@@ -349,7 +350,7 @@ func TestNASCleanupDryRunKeepsRecoveryBudgetAndRefusesEnableRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, cleanupObserve{Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}, &cleanupObserveEnv{dryRunOnly: true})
+	result := f.s.cleanupObserveOne(f.ctx, tx, 13, task.ItemID, cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: task.PlanSHA, Outcome: "match", Proof: fixtureProof(task.Item)}, &cleanupObserveEnv{dryRunOnly: true})
 	if result.status != 503 || result.body["retryable"] != true || result.write {
 		t.Fatalf("issued under dry-run context: %+v", result)
 	}

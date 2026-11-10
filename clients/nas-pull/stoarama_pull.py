@@ -40,6 +40,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 CLIENT_VERSION = "development"
+CLEANUP_RECONCILIATION_PROTOCOL = 1
 CANDIDATE_UPDATE_LOCK = threading.Lock()
 LIST_PAGE_LIMIT = 200
 DEFAULT_DOWNLOAD_WORKERS = 12
@@ -685,6 +686,14 @@ def boot_id():
         return "unknown"
 
 
+def cleanup_session_headers(path):
+    # Build from the running process on every send, including replay. Never
+    # copy an identity out of a journal/checkpoint (replay uses /reconcile).
+    if path.startswith("/account/connections/cleanup/"):
+        return {"X-Stoarama-Client-Session": boot_id() + " " + CLIENT_VERSION}
+    return {}
+
+
 def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True):
     base = cfg.api_base if base is None else base
     url = path_or_url if path_or_url.startswith("http") else base + path_or_url
@@ -692,6 +701,8 @@ def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TI
     req = urllib.request.Request(url, method=method, data=data)
     req.add_header("User-Agent", USER_AGENT)
     if authenticate:
+        for name, value in cleanup_session_headers(path_or_url).items():
+            req.add_header(name, value)
         req.add_header("Authorization", "Bearer " + cfg.api_key)
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -787,6 +798,10 @@ class Inventory:
         self.cfg = cfg
         self.lock = threading.RLock()
         self.cleanup_claims = {}
+        # Execution policy is serialized by the server per plan. Wait here,
+        # before opening files or starting the permit clock, including direct
+        # callers and already-leased work from an earlier coordinator.
+        self.cleanup_execution_lock = threading.Lock()
         # Whole-operation activity fence. Inventory holds this from the first
         # filesystem observation through completion publication; certification
         # only takes it nonblocking at a main-loop delivery-idle boundary.
@@ -2836,7 +2851,7 @@ def cleanup_validate_ack(item_id, phase, body, response):
             raise CleanupResponseError("cleanup acknowledgement differs: " + key)
     if phase == "observe":
         action = response.get("action")
-        if action not in ("would_delete", "keep", "missing", "conflict", "delete_issued", "deleted", "unverified", "reconcile"):
+        if action not in ("would_delete", "keep", "missing", "conflict", "delete_issued", "deleted", "unverified", "reconcile", "pending"):
             raise CleanupResponseError("invalid cleanup observation action")
         if type(response.get("delete")) is not bool or response["delete"] != (action == "delete_issued"):
             raise CleanupResponseError("inconsistent cleanup permit response")
@@ -2846,7 +2861,8 @@ def cleanup_validate_ack(item_id, phase, body, response):
 
 def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     """Replay every durable journal entry; protocol 2 replays in parallel
-    through the batched endpoints (same per-item rules as the single ones).
+    using the reconciliation-only endpoint for observations and the ordinary
+    result endpoint for durable outcomes. Replay never requests permits.
 
     Both protocols use the bounded failure/quarantine path. The call returns
     after at most `budget` seconds (CLEANUP_REPLAY_BUDGET_SEC by default);
@@ -2855,27 +2871,14 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     "quarantined"} counts."""
     def replay(item_id, phase, body, owner):
         try:
+            if phase == "observe":
+                # Deliberately no fallback to /observe or observe-batch: those
+                # endpoints may issue first permits. Old servers must leave the
+                # checkpoint unresolved until reconciliation is supported.
+                return restore_api(cfg, "/account/connections/cleanup/%d/reconcile" % item_id, body)
             if api is not None:
-                call = api.observe if phase == "observe" else api.result
-                # A server that predates recovery_md5 rejects a whole batch
-                # that contains the field (also failing entries batched with
-                # it): resend without md5 rather than halting the replay.
-                for attempt in range(3):
-                    try:
-                        return call(cfg, item_id, body if attempt == 0 else {k: v for k, v in body.items() if k != "md5"})
-                    except urllib.error.HTTPError as exc:
-                        if exc.code != 400 or attempt == 2:
-                            raise
-            if phase == "result":
-                return cleanup_send_result(cfg, item_id, body)
-            try:
-                return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase), body)
-            except urllib.error.HTTPError as exc:
-                # A rolled-back server does not know protocol-2 fields.
-                if exc.code != 400 or not ({"request_id", "md5"} & set(body)):
-                    raise
-                return restore_api(cfg, "/account/connections/cleanup/%d/%s" % (item_id, phase),
-                                   {k: v for k, v in body.items() if k not in ("request_id", "md5")})
+                return api.result(cfg, item_id, body)
+            return cleanup_send_result(cfg, item_id, body)
         except urllib.error.HTTPError as exc:
             if exc.code != 409:
                 raise
@@ -2918,7 +2921,9 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
                 raise CleanupResponseError("missing cleanup replay response")
             return
         cleanup_validate_ack(item_id, phase, body, response)
-        if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
+        if phase == "observe" and (response.get("delete") is not False or response.get("action") == "delete_issued"):
+            raise CleanupResponseError("reconciliation returned deletion authority")
+        if phase == "observe" and response.get("action") == "reconcile":
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed",
                     "unlink_attempted": False, "refusal_reason": "observation_replayed"}
@@ -3064,9 +3069,18 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
     owner = cleanup_reserve_item(inventory, task["item_id"])
     if owner is None:
         return False
+    executing = task.get("approved_proof") is not None
+    acquired = False
     try:
+        if executing:
+            while not acquired:
+                if stop_event.is_set():
+                    raise CleanupInterrupted("cleanup execution cancelled while queued")
+                acquired = inventory.cleanup_execution_lock.acquire(timeout=0.2)
         return _cleanup_process_task(cfg, inventory, stop_event, task, api, owner)
     finally:
+        if acquired:
+            inventory.cleanup_execution_lock.release()
         with inventory.lock:
             inventory.cleanup_claims.pop(task["item_id"], None)
 
@@ -3077,7 +3091,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
     if type(item_id) is not int or item_id <= 0 or type(attempt) is not int or attempt <= 0:
         raise RuntimeError("invalid cleanup task identity")
     deadline = time.monotonic() + min(1800, (parse_certification_timestamp(task["expires_at"], "cleanup lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 20)
-    body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION}
+    body = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "outcome": "unverified", "proof": None, "error": "", "client_version": CLIENT_VERSION,
+            "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     if api.request_ids:
         # Identifies this exact observation so a retry after a lost response
         # gets the same recorded decision (or the same single permit) back.
@@ -3201,7 +3216,8 @@ CLEANUP_PREFLIGHT_TASKS = 64
 def cleanup_lease(cfg, limit=1):
     if type(limit) is not int or not 1 <= limit <= CLEANUP_PREFLIGHT_WORKERS:
         raise ValueError("invalid cleanup lease bound")
-    body = {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit}
+    body = {"client_version": CLIENT_VERSION, "protocol": 1, "limit": limit,
+            "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     try:
         lease = restore_api(cfg, "/account/connections/cleanup/lease", body)
     except urllib.error.HTTPError as exc:
@@ -3307,7 +3323,8 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
 # ledger lines; only transport and concurrency change. Servers that predate
 # protocol 2 reject it with HTTP 400 and the client keeps using protocol 1.
 CLEANUP_V2_LEASE = 64          # tasks per lease request (server maximum)
-CLEANUP_V2_WORKERS = 16        # concurrent file workers (mostly waiting on the API)
+CLEANUP_V2_WORKERS = 16        # concurrent dry-run file workers
+CLEANUP_EXECUTION_INFLIGHT = 1 # execution includes observation through receipt
 CLEANUP_V2_INFLIGHT = 64       # leased tasks held locally (running + queued)
 CLEANUP_V2_CYCLE_TASKS = 2048  # tasks per drain/replay cycle
 CLEANUP_BATCH_MAX = 64         # observations or receipts per request
@@ -3536,7 +3553,8 @@ def cleanup_lease_v2(cfg, limit, execution_files, execution_bytes):
     execution_files = max(0, min(int(execution_files), CLEANUP_V2_LEASE))
     execution_bytes = max(0, int(execution_bytes))
     body = {"client_version": CLIENT_VERSION, "protocol": 2, "limit": limit, "execution_files": execution_files,
-            "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex}
+            "execution_bytes": execution_bytes, "request_id": uuid.uuid4().hex,
+            "reconciliation_protocol": CLEANUP_RECONCILIATION_PROTOCOL}
     try:
         lease = cleanup_api_retry(cfg, "/account/connections/cleanup/lease", body)
     except urllib.error.HTTPError as exc:
@@ -3565,8 +3583,9 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                      inflight=CLEANUP_V2_INFLIGHT, task_limit=CLEANUP_V2_CYCLE_TASKS):
     """Protocol 2 coordinator: rolling window of leased tasks on the executor.
 
-    Execution tasks run concurrently (each is fully independent and re-checked
-    by its own worker). The coordinator alone replays durable receipts, after
+    Execution has one leased/running task; dry runs retain their rolling
+    concurrency. No permit clock starts while waiting for another execution.
+    The coordinator alone replays durable receipts, after
     every worker of the previous cycle has drained, exactly as protocol 1.
     Replay is bounded (CLEANUP_REPLAY_BUDGET_SEC) and its failures never stop
     new work from being leased; a leased task whose item still has a journal
@@ -3589,8 +3608,9 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                 room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
                 files_left, bytes_left = cleanup_local_headroom(inventory)
                 running = [task for task in pending.values() if task.get("approved_proof") is not None]
-                files_left -= len(running)
-                bytes_left -= sum(task["item"]["size_bytes"] for task in running)
+                if running:
+                    break  # drain the entire execution lifecycle before leasing more
+                files_left = min(files_left, CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
                 lease = cleanup_lease_v2(cfg, room, files_left, bytes_left)
@@ -8674,6 +8694,7 @@ def restore_api(cfg, path, body, retry_stale=False, timeout=HTTP_TIMEOUT_SEC):
         return request_json(cfg, "POST", path, body=body, timeout=timeout)
     data = json.dumps(body).encode("utf-8")
     headers = {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"}
+    headers.update(cleanup_session_headers(path))
     target = parsed.path + ("?" + parsed.query if parsed.query else "")
     try:
         status, raw = restore_https(parsed.netloc, "POST", target, data, headers, timeout)
