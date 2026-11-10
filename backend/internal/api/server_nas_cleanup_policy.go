@@ -179,8 +179,9 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 // are byte-identical (by fingerprint) to the inputs of a full replay that
 // already yielded the pinned best_start for this plan's execution, or a
 // version-validated cached replay (maximum age 60 seconds) proves it. Only then
-// may the per-file check skip the replay; any error or difference means "no".
-type cleanupRankingsUnchanged func(stream int64, pinnedBest string) bool
+// may the per-file check skip the replay. Errors fail closed; an unavailable
+// verdict requires a full replay under the same source fence.
+type cleanupRankingsUnchanged func(stream int64, pinnedBest string) (bool, error)
 
 // cleanupCurrentPolicyCheck is cleanupCurrentPolicyMode with an optional
 // execution fast path for the best-14 replay (see cleanupRankingsUnchanged).
@@ -209,7 +210,14 @@ func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 	rankingStarted := time.Now()
 	var best []byte
 	var rankingsAt time.Time
-	if !dryRun && unchanged != nil && unchanged(i.StreamID, window.BestStart) {
+	verified := false
+	if !dryRun && unchanged != nil {
+		verified, err = unchanged(i.StreamID, window.BestStart)
+		if err != nil {
+			return err
+		}
+	}
+	if verified {
 		best, rankingsAt = []byte(window.BestStart), rankingStarted.UTC()
 		if stages != nil {
 			stages["rankings_mode"] = "fingerprint"

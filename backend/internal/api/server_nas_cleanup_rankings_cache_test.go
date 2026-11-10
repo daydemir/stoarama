@@ -105,9 +105,16 @@ func TestNASCleanupRankingCacheRollsBackWithObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(f.ctx)
-	check := f.s.cleanupExecutionRankingsUnchanged(f.ctx, tx, id, "enabled", stored, nil)
-	if check == nil || !check(3, "2026-09-19") {
-		t.Fatal("fresh replay failed")
+	var version int64
+	if err := tx.QueryRow(f.ctx, cleanupRankingsVersionLockSQL, 3).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	check := f.s.cleanupExecutionRankingsUnchanged(f.ctx, tx, id, version, "enabled", stored, nil)
+	if check == nil {
+		t.Fatal("replay unavailable")
+	}
+	if verified, err := check(3, "2026-09-19"); err != nil || !verified {
+		t.Fatalf("fresh replay failed: %v", err)
 	}
 	if err := tx.Rollback(f.ctx); err != nil {
 		t.Fatal(err)

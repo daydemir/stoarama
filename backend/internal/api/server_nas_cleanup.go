@@ -1130,8 +1130,18 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		} else if e != nil || !bytes.Equal(a, b) {
 			action = "conflict"
 		} else {
+			var sourceVersion int64
+			if mode == "enabled" {
+				// Catalog first, then source fence: source writers lock their
+				// catalog rows before the invalidation trigger updates this row.
+				// Hold SHARE through authorization commit, including every replay
+				// fallback and the per-file metadata checks below.
+				if err := tx.QueryRow(ctx, cleanupRankingsVersionLockSQL, item.StreamID).Scan(&sourceVersion); err != nil {
+					return cleanupObserveError(503, "cleanup source fence unavailable")
+				}
+			}
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, mode, rankings, stageTimings))
+			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, sourceVersion, mode, rankings, stageTimings))
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"
