@@ -98,6 +98,7 @@ func (s *Server) recordNASCleanupStatus(ctx context.Context, cid int64, raw json
 		log.Printf("nas heartbeat: dropping invalid cleanup status")
 		return
 	}
+	raw, _ = json.Marshal(redactNASDiagnostics(status))
 	if _, err := s.pool.Exec(ctx, `UPDATE connections SET nas_cleanup_status=$2::jsonb,nas_cleanup_status_at=now() WHERE id=$1`, cid, string(raw)); err != nil {
 		log.Printf("nas heartbeat: cleanup status not stored: %v", err)
 	}

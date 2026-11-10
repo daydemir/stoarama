@@ -1087,12 +1087,13 @@ class CleanupProtocol2Tests(unittest.TestCase):
             if path.endswith('/lease'):
                 leases.append(body)
                 return dict(tasks=[], retry_after_sec=120)
-            raise RuntimeError('replay keeps failing')
+            raise pull.urllib.error.HTTPError(path, 422, 'invalid receipt', {}, None)
         with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', ()):
             batch_api = pull.CleanupBatchAPI(self.cfg)
             try:
                 for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER):
-                    self.assertEqual(pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), pull.concurrent.futures.ThreadPoolExecutor(2), batch_api), 120)
+                    with mock.patch.object(pull.time, 'time', return_value=10000 + cycle * 901):
+                        self.assertEqual(pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), pull.concurrent.futures.ThreadPoolExecutor(2), batch_api), 120)
             finally:
                 batch_api.close()
         self.assertEqual(len(leases), pull.CLEANUP_REPLAY_QUARANTINE_AFTER, 'replay failure blocked leasing')
@@ -1143,7 +1144,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             try:
                 futures = {n: batcher.submit(dict(item_id=n, attempt=1)) for n in range(10, 18)}
                 for n, f in futures.items():
-                    if n == 13:
+                    if n in (12, 13):
                         with self.assertRaises(pull.urllib.error.HTTPError):
                             f.result(5)
                     else:
@@ -1249,5 +1250,152 @@ class CleanupProtocol2Tests(unittest.TestCase):
         fence.release_cleanup(); fence.release_cleanup()
         self.assertTrue(entered.wait(2)); thread.join(1)
 
+
+
+    def test_transient_errors_never_quarantine(self):
+        errors = [OSError('offline'), TimeoutError('timeout'), RuntimeError('restart')]
+        errors += [pull.urllib.error.HTTPError('/test', code, 'temporary', {}, None) for code in (408, 429, 500, 502, 503, 504)]
+        for exc in errors:
+            self.journal_observe(900)
+            original = pull.cleanup_journal(self.inventory)
+            for n in range(8):
+                with mock.patch.object(pull.time, 'time', return_value=10000 + n * 1000):
+                    self.assertFalse(pull.cleanup_replay_failed(self.inventory, 900, 'observe', original[0][2], exc))
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+            self.assertEqual(pull.cleanup_quarantined_items(self.inventory), set())
+
+    def test_quarantine_requires_hour_and_release_replays_without_delete(self):
+        self.journal_observe(900)
+        original = pull.cleanup_journal(self.inventory)[0]
+        exc = pull.CleanupResponseError('malformed')
+        for n in range(6):
+            with mock.patch.object(pull.time, 'time', return_value=10000 + n):
+                self.assertFalse(pull.cleanup_replay_failed(self.inventory, *original, exc))
+        # Simulate the receipt having advanced to an intent before failure.
+        pull.cleanup_journal(self.inventory, 900, 'intent', dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64))
+        latest = pull.cleanup_journal(self.inventory)[0]
+        with mock.patch.object(pull.time, 'time', return_value=13600):
+            self.assertTrue(pull.cleanup_replay_failed(self.inventory, *original, exc))
+        self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['quarantine_item_ids'], [900])
+        pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [latest])
+        self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['release_generation'], 1)
+        calls = []
+        def api(cfg, path, body):
+            self.assertTrue(path.endswith('/result'))
+            self.assertEqual(body['outcome'], 'unverified')
+            calls.append(body)
+            return dict(ok=True)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('release must not delete')):
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        pull.cleanup_release_quarantine(self.inventory, 1)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [])
+        self.assertTrue(self.path.exists())
+
+    def test_release_preserves_conflicting_receipts(self):
+        self.journal_observe(900)
+        original = pull.cleanup_journal(self.inventory)[0]
+        pull.cleanup_quarantined_items(self.inventory)
+        self.inventory.db.execute('INSERT INTO cleanup_quarantine VALUES(?,?,?,?,?,?)', (900, 'result', '{}', 'x', 5, 'now'))
+        self.inventory.db.commit()
+        pull.cleanup_release_quarantine(self.inventory, 2)
+        self.assertEqual(pull.cleanup_journal(self.inventory), [original])
+        self.assertEqual(pull.cleanup_quarantined_items(self.inventory), {900})
+
+    def test_all_skipped_cycle_waits(self):
+        self.journal_observe(900)
+        calls = []
+        task = dict(self.task, item_id=900)
+        def lease(*args):
+            calls.append(1)
+            return dict(tasks=[task], retry_after_sec=120)
+        replay = dict(replayed=0, failed=0, pending=1, quarantined=0, errors=[])
+        with mock.patch.object(pull, 'cleanup_replay_receipts', return_value=replay), mock.patch.object(pull, 'cleanup_lease_v2', side_effect=lease), mock.patch.object(pull, 'cleanup_process_task', side_effect=AssertionError('blocked item')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                wait = pull.cleanup_batch_v2(self.cfg, self.inventory, threading.Event(), executor, None, task_limit=8)
+        self.assertEqual(wait, 120)
+        self.assertLessEqual(len(calls), 8)
+
+    def test_halving_stops_at_two_levels(self):
+        with mock.patch.object(pull, 'cleanup_api_retry', side_effect=pull.urllib.error.HTTPError('/x', 503, 'restart', {}, None)) as post:
+            batcher = pull.CleanupBatcher(self.cfg, '/x', 'observations', senders=0)
+            results = batcher.post([dict(item_id=n) for n in range(64)])
+        self.assertEqual(post.call_count, 7)
+        self.assertEqual(len(results), 64)
+        self.assertTrue(all(isinstance(v, pull.urllib.error.HTTPError) for v in results.values()))
+
+    def test_malformed_replay_never_drops_receipt(self):
+        for response in ({}, [], dict(action='reconcile'), dict(action='unknown')):
+            self.journal_observe(900)
+            original = pull.cleanup_journal(self.inventory)
+            with mock.patch.object(pull, 'restore_api', return_value=response):
+                counts = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=1)
+            self.assertEqual(counts['failed'], 1)
+            self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_missing_recovered_result_ack_preserves_advanced_receipt(self):
+        self.journal_observe(900)
+        def api(cfg, path, body):
+            if path.endswith('/observe'):
+                return dict(action='reconcile', delete=False, proof_sha256='b'*64)
+            return None
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay must not delete')):
+            counts = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=1)
+        self.assertEqual(counts['failed'], 1)
+        rows = pull.cleanup_journal(self.inventory)
+        self.assertEqual(rows[0][1], 'result')
+        self.assertEqual(json.loads(rows[0][2])['outcome'], 'unverified')
+
+    def test_all_diagnostic_patterns(self):
+        self.assertNotIn('hidden-value', json.dumps(pull.redact_diagnostics({'nested': {'api_key': 'hidden-value'}})))
+        for line, secret in diagnostic_patterns():
+            with self.subTest(line=line):
+                self.assertNotIn(secret, pull.redact_log_line(line))
+                self.assertNotIn(secret, json.dumps(pull.redact_diagnostics(dict(last_error=line))))
+                pull.CLEANUP_STATUS.fail(line)
+                self.assertNotIn(secret, pull.CLEANUP_STATUS.snapshot()[1])
+
+    def test_log_upload_error_storm_respects_minimum_gap(self):
+        stop = threading.Event()
+        clock = [1000.0]
+        attempts = []
+        def event_wait(wait):
+            clock[0] += 0.01
+            return True
+        def pause(delay):
+            clock[0] += delay
+            return False
+        def upload(*args):
+            attempts.append(clock[0])
+            if len(attempts) == 4:
+                stop.set()
+            raise OSError('offline')
+        with mock.patch.object(pull.CLIENT_LOG_RING, 'configure'), mock.patch.object(pull.CLIENT_LOG_RING.error_event, 'wait', side_effect=event_wait), mock.patch.object(stop, 'wait', side_effect=pause), mock.patch.object(pull.time, 'monotonic', side_effect=lambda: clock[0]), mock.patch.object(pull, 'client_log_upload_once', side_effect=upload):
+            pull.client_log_upload_loop(self.cfg, None, self.inventory, stop)
+        self.assertTrue(all(b-a >= 60 for a,b in zip(attempts, attempts[1:])), attempts)
+
+
+def diagnostic_patterns():
+    value = 'fixture-sensitive-value'
+    return [
+        ('{"api_key": "' + value + '"}', value),
+        ("{'token': '" + value + "'}", value),
+        ('secret=' + value, value),
+        (json.dumps({'api_key': 'prefix\"' + value}), value),
+        ('Authorization: Bearer ' + value, value),
+        ('{"Authorization": "Bearer ' + value + '"}', value),
+        ('https://user:' + value + '@host/path', value),
+        *[(scheme + '://user:' + value + '@host/db', value) for scheme in ('postgres', 'postgresql', 'mysql', 'redis', 'rediss')],
+        ('eyJ' + 'a'*20 + '.' + 'b'*20 + '.' + 'c'*20, 'a'*20),
+        ('tskey-' + 'auth-' + value, value),
+        ('AKIA' + 'Q'*16, 'Q'*16),
+        ('{"R2_ACCESS_KEY_ID": "' + 'a'*32 + '"}', 'a'*32),
+        ('https://host/path?X-Amz-Signature=' + value + '&other=x', value),
+        ('https://nas.example.ts.net/path', 'nas.example.ts.net'),
+        ('100.64.0.1 100.127.255.255', '100.64.0.1'),
+        ('100.127.255.255', '100.127.255.255'),
+    ]
 
 if __name__=='__main__':unittest.main()

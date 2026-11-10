@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 
@@ -18,8 +20,8 @@ func runNASClient(ctx context.Context, cfg config.Config, args []string) {
 }
 
 func runNASClientTo(ctx context.Context, cfg config.Config, args []string, out io.Writer) {
-	if len(args) < 1 || args[0] != "logs" {
-		log.Fatal("usage: nas-client logs --connection-id ID [--since 1h] [--grep TEXT] [--limit N]")
+	if len(args) < 1 || (args[0] != "logs" && args[0] != "release-quarantine") {
+		log.Fatal("usage: nas-client {logs|release-quarantine} --connection-id ID [--since 1h] [--grep TEXT] [--limit N]")
 	}
 	fs := flag.NewFlagSet("nas-client logs", flag.ExitOnError)
 	id := fs.Int64("connection-id", 0, "NAS connection id")
@@ -31,6 +33,11 @@ func runNASClientTo(ctx context.Context, cfg config.Config, args []string, out i
 	_ = fs.Parse(args[1:])
 	if *id <= 0 || fs.NArg() != 0 {
 		log.Fatal("--connection-id required")
+	}
+	if args[0] == "release-quarantine" {
+		res := mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-connections/%d/release-quarantine", *id), map[string]any{})
+		_ = json.NewEncoder(out).Encode(res)
+		return
 	}
 	q := url.Values{"since": {*since}, "limit": {fmt.Sprint(*limit)}}
 	if *grep != "" {

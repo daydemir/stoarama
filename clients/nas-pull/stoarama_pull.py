@@ -241,15 +241,32 @@ CLIENT_LOG_LINE_MAX = 2048
 CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
 CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
-_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|apikey|signature|credential|authorization|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
+_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
 _REDACTIONS = (
-    (re.compile(r"(?i)\b(authorization)(\s*[:=]\s*)(?:bearer\s+|basic\s+)?\S+"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)([\"']?\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+|basic\s+)?[^\s\"',}]+"), r"\1[REDACTED]"),
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
-    (re.compile(r"(?i)\b(" + _SECRET_NAME + r")(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|redis(?:s)?)://[^\s'\"<>]+"), "[REDACTED]"),
+    (re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@"), r"\1[REDACTED]@"),
     (re.compile(r"(?i)\b((?:https?|s3)://[^\s?#'\"<>]+)\?[^\s'\"<>]*"), r"\1?[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,2}"), "[REDACTED]"),
+    (re.compile(r"\btskey-[A-Za-z0-9_-]+"), "[REDACTED]"),
+    (re.compile(r"\bAKIA[A-Z0-9]{16}\b"), "[REDACTED]"),
+    (re.compile(r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b"), "[REDACTED]"),
+    (re.compile(r"(?i)\b[A-Za-z0-9.-]+\.ts\.net\b"), "[REDACTED]"),
     (re.compile(r"\b(?:sir|sk|rk|pk|ghp|gho|xox[abp])_[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
 )
-_ABSOLUTE_PATH = re.compile(r"(?<![\w:/.])(/[^\s'\"<>,;)]+)")
+_ABSOLUTE_PATH = re.compile(r"(^|[^\w:/.])(/[^\s'\"<>,;)]+)")
+
+
+def redact_diagnostics(value):
+    if isinstance(value, str):
+        return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.secrets)
+    if isinstance(value, dict):
+        return {redact_diagnostics(k): ("[REDACTED]" if re.fullmatch(_SECRET_NAME, k, re.IGNORECASE) else redact_diagnostics(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_diagnostics(v) for v in value]
+    return value
 
 
 def redact_log_line(text, output_root=None, secrets=()):
@@ -264,12 +281,12 @@ def redact_log_line(text, output_root=None, secrets=()):
     root = str(output_root).rstrip("/") if output_root else None
 
     def path(match):
-        value = match.group(1)
+        prefix, value = match.group(1), match.group(2)
         if root and (value == root or value.startswith(root + "/")):
-            return "<nas>" + value[len(root):]
+            return prefix + "<nas>" + value[len(root):]
         if value.startswith(("/account/", "/api/", "/nas/", "/service/")):
-            return value  # API routes, not host paths
-        return "<path>"
+            return prefix + value  # API routes, not host paths
+        return prefix + "<path>"
     text = _ABSOLUTE_PATH.sub(path, text)
     return text[:CLIENT_LOG_LINE_MAX]
 
@@ -346,11 +363,15 @@ def client_log_upload_loop(cfg, runtime, inventory, stop_event):
     CLIENT_LOG_RING.configure(cfg)
     last_seq = 0
     wait = 60
+    last_attempt = None
     while not stop_event.is_set():
         CLIENT_LOG_RING.error_event.wait(wait)
         CLIENT_LOG_RING.error_event.clear()
         if stop_event.is_set():
             return
+        if last_attempt is not None and stop_event.wait(max(0, 60 - (time.monotonic() - last_attempt))):
+            return
+        last_attempt = time.monotonic()
         try:
             last_seq = client_log_upload_once(cfg, runtime, inventory, last_seq)
             wait = CLIENT_LOG_UPLOAD_SEC
@@ -1550,10 +1571,13 @@ class Runtime:
             if inventory is not None:
                 payload["inventory"] = inventory
         cleanup, cleanup_error, cleanup_error_at = CLEANUP_STATUS.snapshot()
+        if self.inventory is not None:
+            cleanup.update(cleanup_quarantine_status(self.inventory))
         if cleanup:
-            payload["cleanup"] = cleanup
+            payload["cleanup"] = redact_diagnostics(cleanup)
         if cleanup_error and not payload["client_last_error"]:
             payload["client_last_error"], payload["client_last_error_at"] = cleanup_error, cleanup_error_at
+        payload["client_last_error"] = redact_diagnostics(payload["client_last_error"])
         host_facts = getattr(self, "host_facts", None)
         if host_facts is not None:
             try:
@@ -2414,7 +2438,7 @@ class CleanupStatus:
 
     def fail(self, message):
         with self.lock:
-            self.error = ("cleanup: " + str(message))[:1000]
+            self.error = redact_diagnostics("cleanup: " + str(message))[:1000]
             self.error_at = utc_now()
             self.values["last_error"] = self.error[:300]
             self.values["last_error_at"] = self.error_at
@@ -2433,12 +2457,23 @@ CLEANUP_STATUS = CleanupStatus()
 # and an entry that keeps failing is quarantined (kept on disk, reported).
 CLEANUP_REPLAY_BUDGET_SEC = 120
 CLEANUP_REPLAY_QUARANTINE_AFTER = 5
+CLEANUP_REPLAY_QUARANTINE_SPAN_SEC = 3600
+
+
+class CleanupResponseError(ValueError):
+    """A definitely malformed/unprocessable cleanup response."""
+
+
 _CLEANUP_REPLAY_INFLIGHT = set()
 _CLEANUP_REPLAY_INFLIGHT_LOCK = threading.Lock()
 
 
 def cleanup_quarantine_tables(inventory):
     inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_replay_failures(item_id INTEGER PRIMARY KEY,failures INTEGER NOT NULL,last_error TEXT NOT NULL,last_at TEXT NOT NULL)")
+    columns = {row[1] for row in inventory.db.execute("PRAGMA table_info(cleanup_replay_failures)")}
+    if "first_at" not in columns:
+        inventory.db.execute("ALTER TABLE cleanup_replay_failures ADD COLUMN first_at REAL")
+    inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_control(key TEXT PRIMARY KEY,value INTEGER NOT NULL)")
     inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_quarantine(item_id INTEGER NOT NULL,phase TEXT NOT NULL,body TEXT NOT NULL,error TEXT NOT NULL,failures INTEGER NOT NULL,quarantined_at TEXT NOT NULL)")
 
 
@@ -2447,21 +2482,71 @@ def cleanup_replay_failed(inventory, item_id, phase, encoded, exc):
     move the entry, byte for byte, to cleanup_quarantine. Quarantine only stops
     automatic replay: nothing is sent, nothing is deleted, nothing is unlinked;
     the entry stays on disk for operator reconciliation."""
-    message = ("%s: %s" % (type(exc).__name__, exc))[:500]
+    definite = ((isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500 and exc.code not in (408, 429))
+                or isinstance(exc, (CleanupResponseError, json.JSONDecodeError)))
+    if not definite:
+        return False
+    message = redact_diagnostics("%s: %s" % (type(exc).__name__, exc))[:500]
+    now = time.time()
     with inventory.lock:
         cleanup_quarantine_tables(inventory)
-        inventory.db.execute("INSERT INTO cleanup_replay_failures VALUES(?,1,?,?) ON CONFLICT(item_id) DO UPDATE SET failures=failures+1,last_error=excluded.last_error,last_at=excluded.last_at",
-                             (item_id, message, utc_now_precise()))
-        failures = inventory.db.execute("SELECT failures FROM cleanup_replay_failures WHERE item_id=?", (item_id,)).fetchone()[0]
-        quarantined = failures >= CLEANUP_REPLAY_QUARANTINE_AFTER
+        inventory.db.execute("INSERT INTO cleanup_replay_failures(item_id,failures,last_error,last_at,first_at) VALUES(?,1,?,?,?) ON CONFLICT(item_id) DO UPDATE SET failures=failures+1,last_error=excluded.last_error,last_at=excluded.last_at,first_at=coalesce(first_at,excluded.first_at)",
+                             (item_id, message, utc_now_precise(), now))
+        failures, first_at = inventory.db.execute("SELECT failures,first_at FROM cleanup_replay_failures WHERE item_id=?", (item_id,)).fetchone()
+        quarantined = failures >= CLEANUP_REPLAY_QUARANTINE_AFTER and now - first_at >= CLEANUP_REPLAY_QUARANTINE_SPAN_SEC
         if quarantined:
-            inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(?,?,?,?,?,?)", (item_id, phase, encoded, message, failures, utc_now_precise()))
-            inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
-            inventory.db.execute("DELETE FROM cleanup_replay_failures WHERE item_id=?", (item_id,))
+            # Replay can advance observe/intent to result before failing. Move
+            # the CURRENT durable bytes, never the original worker snapshot.
+            row = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
+            if row is not None:
+                inventory.db.execute("INSERT INTO cleanup_quarantine VALUES(?,?,?,?,?,?)", (item_id, row[0], row[1], message, failures, utc_now_precise()))
+                inventory.db.execute("DELETE FROM cleanup_receipts WHERE item_id=?", (item_id,))
+                inventory.db.execute("DELETE FROM cleanup_replay_failures WHERE item_id=?", (item_id,))
+            else:
+                quarantined = False
         inventory.db.commit()
     if quarantined:
-        log("ERROR", "cleanup item=%d %s journal entry quarantined after %d failed replays: %s" % (item_id, phase, failures, message))
+        log("ERROR", "cleanup item=%d %s journal entry quarantined after %d definite failures over at least 1 hour: %s" % (item_id, phase, failures, message))
     return quarantined
+
+
+def cleanup_release_quarantine(inventory, generation):
+    """Durably requeue exact receipts and acknowledge only after the move.
+    A conflicting journal row leaves both records intact for reconciliation.
+    Replays still never execute deletes, including original intent entries.
+    """
+    if type(generation) is not int or generation < 1:
+        return
+    with inventory.lock:
+        cleanup_quarantine_tables(inventory)
+        current = inventory.db.execute("SELECT value FROM cleanup_control WHERE key='release_generation'").fetchone()
+        if current and current[0] >= generation:
+            return
+        try:
+            rows = inventory.db.execute("SELECT rowid,item_id,phase,body FROM cleanup_quarantine").fetchall()
+            for rowid, item_id, phase, encoded in rows:
+                existing = inventory.db.execute("SELECT phase,body FROM cleanup_receipts WHERE item_id=?", (item_id,)).fetchone()
+                if existing is not None and tuple(existing) != (phase, encoded):
+                    continue
+                inventory.db.execute("INSERT OR IGNORE INTO cleanup_receipts VALUES(?,?,?)", (item_id, phase, encoded))
+                inventory.db.execute("DELETE FROM cleanup_quarantine WHERE rowid=?", (rowid,))
+                inventory.db.execute("DELETE FROM cleanup_replay_failures WHERE item_id=?", (item_id,))
+            inventory.db.execute("INSERT OR REPLACE INTO cleanup_control VALUES('release_generation',?)", (generation,))
+            inventory.db.commit()
+        except Exception:
+            inventory.db.rollback()
+            raise
+
+
+def cleanup_quarantine_status(inventory):
+    with inventory.lock:
+        cleanup_quarantine_tables(inventory)
+        count = inventory.db.execute("SELECT count(DISTINCT item_id) FROM cleanup_quarantine").fetchone()[0]
+        ids = [r[0] for r in inventory.db.execute("SELECT DISTINCT item_id FROM cleanup_quarantine ORDER BY item_id LIMIT 100")]
+        ack = inventory.db.execute("SELECT value FROM cleanup_control WHERE key='release_generation'").fetchone()
+        inventory.db.commit()
+    return dict(quarantined=count, quarantine_item_ids=ids, quarantine_ids_truncated=count > len(ids),
+                release_generation=ack[0] if ack else 0)
 
 
 def cleanup_quarantined_items(inventory):
@@ -2515,6 +2600,19 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
             return None
 
+    def validate_response(phase, response):
+        if not isinstance(response, dict):
+            raise CleanupResponseError("invalid cleanup replay response")
+        if phase == "observe":
+            if response.get("action") not in ("would_delete", "keep", "missing", "conflict", "delete_issued", "deleted", "unverified", "reconcile"):
+                raise CleanupResponseError("invalid cleanup observation action")
+            if response.get("action") == "delete_issued" and response.get("delete") is not True:
+                raise CleanupResponseError("inconsistent cleanup permit response")
+            if (response.get("delete") is True or response.get("action") == "reconcile") and not isinstance(response.get("proof_sha256"), str):
+                raise CleanupResponseError("cleanup replay response lacks proof hash")
+        elif response.get("ok") is not True:
+            raise CleanupResponseError("cleanup result not acknowledged")
+
     def one(item_id, phase, encoded):
         body = json.loads(encoded)
         if phase == "intent":
@@ -2523,12 +2621,20 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             cleanup_journal(inventory, item_id, phase, body)
         response = replay(item_id, "observe" if phase == "observe" else "result", body)
         if response is None:
+            # Only the explicit 409 archive path may resolve without a body.
+            if any(row[0] == item_id for row in cleanup_journal(inventory)):
+                raise CleanupResponseError("missing cleanup replay response")
             return
+        validate_response(phase, response)
         if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed"}
             cleanup_journal(inventory, item_id, "result", body)
-            replay(item_id, "result", body)
+            result = replay(item_id, "result", body)
+            if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
+                raise CleanupResponseError("missing cleanup result acknowledgement")
+            if result is not None:
+                validate_response("result", result)
         cleanup_journal(inventory, item_id)
 
     entries = cleanup_journal(inventory)
@@ -2935,7 +3041,7 @@ class CleanupBatcher:
                 result = by_id.get(entry["item_id"])
                 try:
                     if result is None:
-                        future.set_exception(RuntimeError("cleanup batch response lacks item %d" % entry["item_id"]))
+                        future.set_exception(CleanupResponseError("cleanup batch response lacks item %d" % entry["item_id"]))
                     elif isinstance(result, BaseException):
                         future.set_exception(result)
                     else:
@@ -2950,29 +3056,31 @@ class CleanupBatcher:
                     except concurrent.futures.InvalidStateError:
                         pass
 
-    def post(self, entries):
+    def post(self, entries, depth=0):
         """POST entries; on a whole-request failure split and resend halves.
         Returns item_id -> result dict, or -> the exception for an item that
         failed even alone."""
         try:
             response = cleanup_api_retry(self.cfg, self.path, {"client_version": CLIENT_VERSION, self.field: entries})
             results = response.get("results") if isinstance(response, dict) else None
-            if not isinstance(results, list) or len(results) != len(entries):
-                raise RuntimeError("invalid cleanup batch response")
+            if (not isinstance(results, list) or len(results) != len(entries)
+                    or any(not isinstance(r, dict) or type(r.get("item_id")) is not int for r in results)
+                    or {r["item_id"] for r in results} != {e["item_id"] for e in entries}):
+                raise CleanupResponseError("invalid cleanup batch response")
         except Exception as exc:
             reason = "HTTP %d" % exc.code if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
             CLEANUP_STATUS.update(**{"last_batch_failure": "%s %d items: %s" % (self.field, len(entries), reason)[:200]})
             CLEANUP_STATUS.add("batch_failures")
-            if len(entries) < 2:
-                return {entries[0]["item_id"]: exc}
+            if len(entries) < 2 or depth >= 2:
+                return {entry["item_id"]: exc for entry in entries}
             with self.condition:
                 self.max_items = max(1, min(self.max_items, len(entries) // 2))
                 self.successes = 0
                 CLEANUP_STATUS.update(**{self.field + "_batch_limit": self.max_items})
             log("WARN", "cleanup %s request of %d failed (%s); resending in halves" % (self.field, len(entries), reason))
             half = len(entries) // 2
-            merged = self.post(entries[:half])
-            merged.update(self.post(entries[half:]))
+            merged = self.post(entries[:half], depth + 1)
+            merged.update(self.post(entries[half:], depth + 1))
             return merged
         with self.condition:
             self.successes += 1
@@ -3009,7 +3117,9 @@ class CleanupBatchAPI:
             if status == 503 and attempt < CLEANUP_RETRYABLE_ATTEMPTS - 1:
                 time.sleep(min(5.0, 0.25 * 2 ** attempt))
                 continue
-            code = status if type(status) is int and 400 <= status < 600 else 500
+            if type(status) is not int or not 400 <= status < 600:
+                raise CleanupResponseError("invalid cleanup item status")
+            code = status
             raise urllib.error.HTTPError(batcher.path, code, str(result.get("error", ""))[:200], {}, None)
 
     def observe(self, cfg, item_id, body):
@@ -3076,7 +3186,9 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     new work from being leased; a leased task whose item still has a journal
     or quarantine entry is left unprocessed (its lease simply expires)."""
     replay = cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC)
-    quarantined_total = len(cleanup_quarantined_items(inventory))
+    quarantine_status = cleanup_quarantine_status(inventory)
+    quarantined_total = quarantine_status["quarantined"]
+    CLEANUP_STATUS.update(**quarantine_status)
     CLEANUP_STATUS.update(protocol=2, last_cycle_at=utc_now(), replay_replayed=replay["replayed"], replay_failed=replay["failed"],
                           replay_pending=replay["pending"], quarantined=quarantined_total)
     if replay["failed"]:
@@ -3086,6 +3198,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     pins, pins_error = cleanup_pins()
     pending = {}
     leased = 0
+    processed = 0
     retry = 120
     exhausted = False
     error = None
@@ -3119,6 +3232,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                         log("WARN", "cleanup item=%d leased but its journal entry is unresolved; left unprocessed" % task["item_id"])
                         continue
                     task["_recovery_md5"] = lease.get("recovery_md5") is True  # local only, never sent
+                    processed += 1
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break
@@ -3144,7 +3258,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
         raise error
     if not replay["failed"]:
         CLEANUP_STATUS.clear_error()
-    return 0 if leased else retry
+    return 0 if processed else max(1, retry)
 
 
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
@@ -8520,6 +8634,8 @@ def heartbeat_loop(cfg, runtime, stop_event):
         try:
             response = send_heartbeat(cfg, runtime, outage)
             runtime.apply_joined_protocol_response(response)
+            if runtime.inventory is not None:
+                cleanup_release_quarantine(runtime.inventory, response.get("cleanup_release_generation"))
             runtime.heartbeat_succeeded = True
             if outage:
                 outage["recovered_at"] = utc_now()

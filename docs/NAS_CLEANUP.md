@@ -273,3 +273,31 @@ When a backend rollback rejects optional release telemetry or batch-limit fields
 with HTTP400, the client retries once without only that optional field. All
 authentication, source identities, bounds and other telemetry remain unchanged.
 Other status codes and a second rejection use the ordinary retry/outage path.
+
+
+### Receipt replay diagnostics and release
+
+The NAS client bounds journal replay to 120 seconds before leasing other work.
+It quarantines a receipt locally only after five definite failures spanning at
+least one hour: HTTP 4xx except 408/429, or malformed/unprocessable responses.
+Network errors, timeouts and server failures never count toward quarantine.
+Quarantine preserves the current journal phase and bytes; it never deletes media.
+Heartbeat cleanup status includes the total count, up to 100 item IDs and a
+truncation flag. The server prefers items with fewer prior leases; cycles that
+only skip unresolved receipts wait before trying again.
+
+After resolving the underlying error, operators can request replay with:
+
+```sh
+stoaramactl nas-client release-quarantine --connection-id ID
+```
+
+The release generation remains in heartbeat responses across response loss and
+old clients. The NAS records it durably after requeuing receipts. Conflicting
+local journal rows preserve both copies for reconciliation. Replayed intents
+and recovered permits produce unverified results; replay never executes deletes.
+
+`stoaramactl nas-client logs --connection-id ID --since 1h --grep cleanup` reads
+redacted diagnostics. Error-triggered uploads have a minimum 60-second gap,
+including failed attempts. Server retention preserves seven days regardless of
+upload count; the read endpoint filters and limits lines in PostgreSQL.

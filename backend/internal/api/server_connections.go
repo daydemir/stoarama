@@ -683,10 +683,11 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionHeartbeatResponse struct {
-	OK                       bool `json:"ok"`
-	JoinedDeliveryAccepted   bool `json:"joined_delivery_accepted"`
-	JoinedProtocolVersion    int  `json:"joined_protocol_version"`
-	JoinedProtocolGeneration int  `json:"joined_protocol_generation"`
+	CleanupReleaseGeneration int64 `json:"cleanup_release_generation,omitempty"`
+	OK                       bool  `json:"ok"`
+	JoinedDeliveryAccepted   bool  `json:"joined_delivery_accepted"`
+	JoinedProtocolVersion    int   `json:"joined_protocol_version"`
+	JoinedProtocolGeneration int   `json:"joined_protocol_generation"`
 }
 
 func desiredJoinedProtocol(cfg config.Config, connectionID int64) (int, int) {
@@ -960,9 +961,9 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		return
 	}
 	defer func() { _ = tx.Rollback(r.Context()) }()
-	var connectionID int64
-	if err := tx.QueryRow(r.Context(), `SELECT id FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`,
-		*principal.APIKeyID, principal.AccountID).Scan(&connectionID); err != nil {
+	var connectionID, cleanupReleaseGeneration int64
+	if err := tx.QueryRow(r.Context(), `SELECT id,coalesce(nas_cleanup_release_generation,0) FROM connections WHERE api_key_id=$1 AND account_id=$2 FOR UPDATE`,
+		*principal.APIKeyID, principal.AccountID).Scan(&connectionID, &cleanupReleaseGeneration); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			util.WriteError(w, http.StatusForbidden, "no connection for this key")
 			return
@@ -1026,7 +1027,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 		WHERE id=$42 AND api_key_id=$23 AND account_id=$24
 	`, req.CursorID, req.ClipsPulled, req.BytesPulled, req.ClientVersion,
 		req.ClientStartedAt, req.ClientBootID, req.ClientPhase, req.ClientPreviousExit,
-		req.ClientLastSuccess, req.ClientLastError, req.ClientLastErrorAt,
+		req.ClientLastSuccess, redactNASClientLogLine(req.ClientLastError), req.ClientLastErrorAt,
 		outageClass, outageStartedAt, outageRecoveredAt, outageFailureCount,
 		req.LastBatch.CompletedAt, req.LastBatch.Clips, req.LastBatch.Bytes,
 		req.LastBatch.DurationMS, req.LastBatch.Workers, req.LastBatch.Retries,
@@ -1143,7 +1144,7 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	s.cleanupHousekeeping(r.Context(), connectionID)
 	s.recordNASCleanupStatus(r.Context(), connectionID, req.Cleanup)
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
-		OK: true, JoinedDeliveryAccepted: joinedDeliveryAccepted,
+		OK: true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,
 		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,
 	})
 }

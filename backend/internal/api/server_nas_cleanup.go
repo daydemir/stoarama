@@ -519,6 +519,8 @@ type cleanupObserve struct {
 	MD5 string `json:"md5,omitempty"`
 }
 
+// Prefer the least-leased pending item so unresolved client journals cannot
+// repeatedly take the front of the queue from untouched work.
 // Plans are ordered without sorting/locking the entire pending file backlog.
 // The lateral probe uses nas_cleanup_pending and skips locked rows before the
 // outer LIMIT; it can keep looking in the next eligible plan if one is busy.
@@ -527,11 +529,11 @@ FROM nas_cleanup_plans p
 JOIN LATERAL (
  SELECT candidate.* FROM nas_cleanup_items candidate
  WHERE candidate.plan_id=p.id AND candidate.state='pending'
- ORDER BY candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
+ ORDER BY candidate.attempt,candidate.id LIMIT 1 FOR UPDATE SKIP LOCKED
 ) i ON true
 WHERE p.connection_id=$1 AND p.report_sha256=$3
  AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $2))
-ORDER BY p.priority DESC,p.id LIMIT 1`
+ORDER BY i.attempt,p.priority DESC,p.id LIMIT 1`
 
 // Bytes of execution work already leased but not yet observed. Counted with
 // the issued bytes so a lease never hands out work the budget cannot permit.

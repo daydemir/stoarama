@@ -3,11 +3,16 @@
 -- Diagnostics only; no authority. Nullable without default: metadata-only.
 ALTER TABLE connections
  ADD COLUMN nas_cleanup_status jsonb,
- ADD COLUMN nas_cleanup_status_at timestamptz;
+ ADD COLUMN nas_cleanup_status_at timestamptz,
+ ADD COLUMN nas_cleanup_release_generation bigint;
+
+-- The migration runner sets a local 5s lock_timeout. Nullable columns above
+-- avoid a table rewrite; this partial index supports fair lease selection.
+CREATE INDEX nas_cleanup_pending_attempt ON nas_cleanup_items(plan_id,attempt,id) WHERE state='pending';
 
 -- Redacted recent log lines uploaded by the NAS app (owner-approved remote
 -- diagnostics, 2026-11). Append-only (UPDATE refused); the API deletes rows
--- older than 7 days and keeps at most 2000 uploads per connection.
+-- older than 7 days. Count-based eviction must not shorten that window.
 CREATE TABLE nas_client_logs (
  id bigserial PRIMARY KEY,
  connection_id bigint NOT NULL REFERENCES connections(id),

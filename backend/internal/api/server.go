@@ -666,6 +666,7 @@ func (s *Server) router() http.Handler {
 			service.Get("/service/nas-cleanup/batches/{id}", s.handleAdminNASCleanupBatchStatus)
 			service.Post("/service/nas-cleanup/batches/{id}/control", s.handleAdminNASCleanupBatchControl)
 			service.Get("/service/nas-connections/{id}/client-logs", s.handleAdminNASClientLogs)
+			service.Post("/service/nas-connections/{id}/release-quarantine", s.handleAdminNASReleaseQuarantine)
 			service.Post("/recordings/{id}/clips/{clipId}/authoritative-frame", s.handleRecordingClipAuthoritativeFrame)
 
 			service.Post("/node-enrollment-tokens", s.handleServiceNodeEnrollmentTokensCreate)
