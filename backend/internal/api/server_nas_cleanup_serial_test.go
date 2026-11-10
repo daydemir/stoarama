@@ -77,10 +77,12 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 	router.Post("/account/connections/cleanup/{itemId}/result", f.s.handleAccountNASCleanupResult)
 	router.Post("/account/connections/cleanup/observe-batch", f.s.handleAccountNASCleanupObserveBatch)
 	router.Post("/account/connections/cleanup/result-batch", f.s.handleAccountNASCleanupResultBatch)
-	srv := httptest.NewServer(router)
-	defer srv.Close()
 	run := func(concurrent bool) cleanupDeadlineClientResult {
 		t.Helper()
+		// Drain every handler before changing the fixture's pool/config
+		// between dry run and execution; keep-alive handlers may still unwind.
+		srv := httptest.NewServer(router)
+		defer srv.Close()
 		args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--protocol", "2"}
 		if concurrent {
 			args = append(args, "--simultaneous-tasks", "16", "--max-seconds", "90")
