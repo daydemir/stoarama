@@ -90,3 +90,21 @@ func TestNASCleanupCLIEnableBatchSendsExactApprovedDigest(t *testing.T) {
 		t.Fatalf("batch enable request %v", body)
 	}
 }
+
+func TestNASClientLogsCLIReadsWindowAndFilter(t *testing.T) {
+	var query string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/service/nas-connections/13/client-logs" || r.Header.Get("Authorization") != "Bearer fixture" {
+			t.Error("wrong client log request")
+		}
+		query = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"uploads":1,"latest_upload":{"client_version":"b9f41fd0","boot_id":"b","journal_entries":64,"quarantined":1},"lines":[{"at":"t","level":"WARN","message":"NAS cleanup deferred: x","client_version":"b9f41fd0"}]}`))
+	}))
+	defer server.Close()
+	var out strings.Builder
+	runNASClientTo(context.Background(), config.Config{APIToken: "fixture"}, []string{"logs", "--connection-id", "13", "--since", "2h", "--grep", "deferred", "--backend-api-url", server.URL}, &out)
+	if !strings.Contains(query, "since=2h") || !strings.Contains(query, "grep=deferred") || !strings.Contains(out.String(), "journal_entries=64") || !strings.Contains(out.String(), "WARN [b9f41fd0] NAS cleanup deferred: x") {
+		t.Fatalf("query %q output %q", query, out.String())
+	}
+}

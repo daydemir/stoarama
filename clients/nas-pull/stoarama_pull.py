@@ -226,6 +226,139 @@ def utc_now():
 
 def log(level, message):
     print("%s %s %s" % (utc_now(), level, message), flush=True)
+    try:
+        CLIENT_LOG_RING.record(level, message)
+    except Exception:
+        pass  # diagnostics must never break the caller
+
+
+# Remote diagnostics (owner-approved, 2026-11): a bounded in-memory ring of
+# recent WARN/ERROR lines plus every cleanup/replay/lease line, redacted, and
+# uploaded periodically. Never written to disk; never contains secrets.
+CLIENT_LOG_MAX_LINES = 500
+CLIENT_LOG_MAX_BYTES = 256 * 1024
+CLIENT_LOG_LINE_MAX = 2048
+CLIENT_LOG_UPLOAD_SEC = 300
+CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
+CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
+_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|apikey|signature|credential|authorization|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
+_REDACTIONS = (
+    (re.compile(r"(?i)\b(authorization)(\s*[:=]\s*)(?:bearer\s+|basic\s+)?\S+"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)\b(" + _SECRET_NAME + r")(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&]+)"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)\b((?:https?|s3)://[^\s?#'\"<>]+)\?[^\s'\"<>]*"), r"\1?[REDACTED]"),
+    (re.compile(r"\b(?:sir|sk|rk|pk|ghp|gho|xox[abp])_[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
+)
+_ABSOLUTE_PATH = re.compile(r"(?<![\w:/.])(/[^\s'\"<>,;)]+)")
+
+
+def redact_log_line(text, output_root=None, secrets=()):
+    """Remove credentials, signed URL query strings, secret-looking values and
+    absolute host paths outside the NAS output root from one log line."""
+    text = str(text)
+    for secret in secrets:
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "[REDACTED]")
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    root = str(output_root).rstrip("/") if output_root else None
+
+    def path(match):
+        value = match.group(1)
+        if root and (value == root or value.startswith(root + "/")):
+            return "<nas>" + value[len(root):]
+        if value.startswith(("/account/", "/api/", "/nas/", "/service/")):
+            return value  # API routes, not host paths
+        return "<path>"
+    text = _ABSOLUTE_PATH.sub(path, text)
+    return text[:CLIENT_LOG_LINE_MAX]
+
+
+def client_log_secrets(cfg=None):
+    values = [getattr(cfg, "api_key", None)] if cfg is not None else []
+    for name, value in os.environ.items():
+        if re.fullmatch(_SECRET_NAME, name, re.IGNORECASE) or re.search(r"(?i)(key|token|secret|pass|cred|dsn)", name):
+            values.append(value)
+    return tuple(v for v in values if isinstance(v, str) and len(v) >= 6)
+
+
+class ClientLogRing:
+    """Bounded ring of redacted diagnostic lines (count and bytes)."""
+    def __init__(self, max_lines=CLIENT_LOG_MAX_LINES, max_bytes=CLIENT_LOG_MAX_BYTES):
+        self.lock = threading.Lock()
+        self.lines = []
+        self.bytes = 0
+        self.seq = 0
+        self.max_lines, self.max_bytes = max_lines, max_bytes
+        self.output_root = None
+        self.secrets = ()
+        self.error_event = threading.Event()
+        self.dropped = 0
+
+    def configure(self, cfg):
+        with self.lock:
+            self.output_root = getattr(cfg, "output_dir", None)
+            self.secrets = client_log_secrets(cfg)
+
+    def record(self, level, message):
+        level = str(level).upper()
+        if level not in CLIENT_LOG_LEVELS and not CLIENT_LOG_TOPICS.search(str(message)):
+            return
+        with self.lock:
+            line = redact_log_line(message, self.output_root, self.secrets)
+            self.seq += 1
+            entry = {"seq": self.seq, "at": utc_now_precise(), "level": level, "message": line}
+            size = len(line) + 64
+            self.lines.append((entry, size))
+            self.bytes += size
+            while self.lines and (len(self.lines) > self.max_lines or self.bytes > self.max_bytes):
+                self.bytes -= self.lines.pop(0)[1]
+                self.dropped += 1
+        if level in ("ERROR", "CRITICAL"):
+            self.error_event.set()
+
+    def since(self, seq):
+        with self.lock:
+            return [entry for entry, _ in self.lines if entry["seq"] > seq], self.dropped
+
+
+CLIENT_LOG_RING = ClientLogRing()
+
+
+def client_log_upload_once(cfg, runtime, inventory, last_seq):
+    """Upload the lines recorded after last_seq; returns the new last seq."""
+    lines, dropped = CLIENT_LOG_RING.since(last_seq)
+    journal = quarantined = None
+    if inventory is not None:
+        try:
+            journal = len(cleanup_journal(inventory))
+            quarantined = len(cleanup_quarantined_items(inventory))
+        except Exception:
+            pass
+    body = {"client_version": CLIENT_VERSION, "boot_id": getattr(runtime, "boot_id", ""), "journal_entries": journal,
+            "quarantined": quarantined, "dropped_lines": dropped, "lines": lines}
+    request_json(cfg, "POST", "/account/connections/client-logs", body=body, timeout=HTTP_TIMEOUT_SEC)
+    return lines[-1]["seq"] if lines else last_seq
+
+
+def client_log_upload_loop(cfg, runtime, inventory, stop_event):
+    """Every CLIENT_LOG_UPLOAD_SEC, or right after a new ERROR line."""
+    CLIENT_LOG_RING.configure(cfg)
+    last_seq = 0
+    wait = 60
+    while not stop_event.is_set():
+        CLIENT_LOG_RING.error_event.wait(wait)
+        CLIENT_LOG_RING.error_event.clear()
+        if stop_event.is_set():
+            return
+        try:
+            last_seq = client_log_upload_once(cfg, runtime, inventory, last_seq)
+            wait = CLIENT_LOG_UPLOAD_SEC
+        except urllib.error.HTTPError as exc:
+            # An API that predates the endpoint: try again in an hour.
+            wait = 3600 if exc.code in (400, 404, 405) else CLIENT_LOG_UPLOAD_SEC
+        except Exception:
+            wait = CLIENT_LOG_UPLOAD_SEC
 
 
 def env_str(name, default):
@@ -10361,6 +10494,7 @@ def run(cfg):
     signal.signal(signal.SIGINT, stop)
     heartbeat = threading.Thread(target=heartbeat_loop, args=(cfg, runtime, stop_event), daemon=True)
     heartbeat.start()
+    threading.Thread(target=client_log_upload_loop, args=(cfg, runtime, inventory, stop_event), daemon=True).start()
     storage_probe = threading.Thread(target=storage_probe_loop, args=(cfg, runtime, stop_event), daemon=True)
     storage_probe.start()
     space_audit_reported = threading.Event()

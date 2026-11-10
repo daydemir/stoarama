@@ -1178,6 +1178,61 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertTrue(sent[1]['client_last_error'].startswith('cleanup: journal replay'))
         pull.CLEANUP_STATUS.__init__()
 
+    def test_log_redaction_removes_secrets_signed_urls_and_host_paths(self):
+        root = str(self.cfg.output_dir)
+        # Fixture values are assembled at runtime so secret scanners never see
+        # a credential-shaped literal in the source.
+        fake = ''.join(chr(97 + n % 26) for n in range(22))
+        prefixed = 'sir' + '_' + fake
+        cases = {
+            'Authorization: Bearer ' + fake: fake,
+            'GET https://acct.example/b/k.mp4?' + 'Sig' + 'nature=' + fake + ' failed': fake,
+            'api' + '_key=' + prefixed + ' retry': prefixed,
+            'R2_SECRET_ACCESS' + '_KEY: "' + fake + '"': fake,
+            'env leak ' + fake + ' seen': fake,
+            'open /etc/stoarama/config.env failed': '/etc/stoarama',
+        }
+        for line, secret in cases.items():
+            redacted = pull.redact_log_line(line, root, (fake,) if 'env leak' in line else ())
+            self.assertNotIn(secret, redacted, line)
+        kept = pull.redact_log_line('cleanup item=5 %s/stream/day/a.mp4 sha 6cd360d73985e0fa33db455c1bfc6190ebb2ef22febdf965e460744e41517111 POST /account/connections/cleanup/lease' % root, root)
+        self.assertIn('<nas>/stream/day/a.mp4', kept); self.assertIn('6cd360d7', kept); self.assertIn('/account/connections/cleanup/lease', kept)
+        self.assertNotIn(root, kept)
+        self.assertEqual(len(pull.redact_log_line('x' * 10000)), pull.CLIENT_LOG_LINE_MAX)
+        with mock.patch.dict(pull.os.environ, {'STOARAMA_API' + '_KEY': fake}):
+            self.assertIn(fake, pull.client_log_secrets(SimpleNamespace(api_key='cfg-' + fake)))
+
+    def test_log_ring_keeps_only_relevant_lines_within_bounds(self):
+        ring = pull.ClientLogRing(max_lines=5, max_bytes=10 ** 6)
+        ring.record('INFO', 'delivered clip 7')        # neither WARN+ nor a cleanup topic
+        ring.record('INFO', 'NAS cleanup lease of 64')  # cleanup topic
+        ring.record('WARN', 'storage slow')
+        self.assertEqual([e['message'] for e, _ in ring.lines], ['NAS cleanup lease of 64', 'storage slow'])
+        for n in range(10):
+            ring.record('WARN', 'w%d' % n)
+        self.assertEqual(len(ring.lines), 5); self.assertEqual(ring.lines[-1][0]['message'], 'w9'); self.assertGreater(ring.dropped, 0)
+        small = pull.ClientLogRing(max_lines=1000, max_bytes=2000)
+        for n in range(100):
+            small.record('ERROR', 'e' * 100)
+        self.assertLessEqual(small.bytes, 2000)
+        self.assertTrue(small.error_event.is_set())
+
+    def test_log_upload_carries_identity_counts_and_only_new_lines(self):
+        ring = pull.ClientLogRing()
+        sent = []
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring), mock.patch.object(pull, 'request_json', side_effect=lambda cfg, m, path, body=None, timeout=None: sent.append((path, body)) or {}):
+            ring.record('WARN', 'first')
+            self.journal_observe(77)
+            runtime = SimpleNamespace(boot_id='boot-x')
+            seq = pull.client_log_upload_once(self.cfg, runtime, self.inventory, 0)
+            ring.record('ERROR', 'second')
+            pull.client_log_upload_once(self.cfg, runtime, self.inventory, seq)
+        path, body = sent[0]
+        self.assertEqual(path, '/account/connections/client-logs')
+        self.assertEqual((body['client_version'], body['boot_id'], body['journal_entries'], body['quarantined']), (pull.CLIENT_VERSION, 'boot-x', 1, 0))
+        self.assertEqual([l['message'] for l in body['lines']], ['first'])
+        self.assertEqual([l['message'] for l in sent[1][1]['lines']], ['second'])
+
     def test_media_fence_admits_concurrent_cleanups_but_never_beside_writers(self):
         fence = pull.NASMediaFence()
         fence.acquire_cleanup(threading.Event(), time.monotonic()+1)
