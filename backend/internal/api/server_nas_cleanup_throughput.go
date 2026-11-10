@@ -593,15 +593,16 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	}
 	freshRequests := map[int64]bool{}
 	for n, o := range req.Observations {
-		if first[o.ItemID] != n {
-			continue
-		}
+		// Conflicting duplicates are submissions too: retain their IDs even
+		// though only the first observation of an item may be processed.
 		fresh, err := s.cleanupRegisterObservation(ctx, o.RequestID)
 		if err != nil {
 			cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
 			return
 		}
-		freshRequests[o.ItemID] = fresh
+		if first[o.ItemID] == n {
+			freshRequests[o.ItemID] = fresh
+		}
 	}
 	idsForMode := make([]int64, 0, len(req.Observations))
 	for _, o := range req.Observations {

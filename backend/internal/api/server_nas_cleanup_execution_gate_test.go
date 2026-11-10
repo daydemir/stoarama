@@ -184,15 +184,24 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, `SELECT state='leased' AND NOT delete_ever_issued AND permit_expires_at IS NULL FROM nas_cleanup_items WHERE id=$1`, task.ItemID).Scan(&unchanged); err != nil || !unchanged {
 		t.Fatalf("authority changed: %t %v", unchanged, err)
 	}
+	duplicate := req
+	duplicate.RequestID = strings.Repeat("f", 32)
+	batch := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": nasCleanupExecutionClientVersion, "observations": []cleanupBatchObservation{{ItemID: task.ItemID, cleanupObserve: req}, {ItemID: task.ItemID, cleanupObserve: duplicate}}})
+	if batch.Code != 200 || !strings.Contains(batch.Body.String(), `"status":409`) {
+		t.Fatalf("conflicting duplicate: %d %s", batch.Code, batch.Body.String())
+	}
 	w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
 	if w.Code != 200 {
 		t.Fatalf("reconcile: %d %s", w.Code, w.Body.String())
 	}
 	next := f.leaseV2(1, 1, 1<<30, "")[0]
 	req.Attempt = next.Attempt
-	w = cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
-	if w.Code != 200 || strings.Contains(w.Body.String(), `"delete":true`) {
-		t.Fatalf("reused ID minted permit on new attempt: %d %s", w.Code, w.Body.String())
+	for _, requestID := range []string{req.RequestID, duplicate.RequestID} {
+		req.RequestID = requestID
+		w = cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
+		if w.Code != 200 || strings.Contains(w.Body.String(), `"delete":true`) {
+			t.Fatalf("reused ID minted permit on new attempt: %d %s", w.Code, w.Body.String())
+		}
 	}
 	// A genuinely new request can issue once; only that identical request can
 	// retrieve the identical permit, with no new expiry or authority.
@@ -205,7 +214,6 @@ func TestNASCleanupRolledBackCheckpointNeverMintsFirstPermit(t *testing.T) {
 	if first.Code != 200 || replay.Code != 200 || a["delete"] != true || b["delete"] != true || b["replayed"] != true || a["expires_at"] != b["expires_at"] {
 		t.Fatalf("permit replay: %s / %s", first.Body.String(), replay.Body.String())
 	}
-
 }
 
 func TestNASCleanupBootChangeMidLeaseCannotMintPermit(t *testing.T) {

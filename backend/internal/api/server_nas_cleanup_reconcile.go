@@ -18,7 +18,7 @@ func (s *Server) handleAccountNASCleanupReconcile(w http.ResponseWriter, r *http
 		return
 	}
 	var req cleanupObserve
-	if util.DecodeJSON(r, &req) != nil || cleanupObserveRequestError(req) != "" {
+	if util.DecodeJSON(r, &req) != nil {
 		util.WriteError(w, 400, "invalid cleanup reconciliation observation")
 		return
 	}
@@ -30,6 +30,10 @@ func (s *Server) handleAccountNASCleanupReconcile(w http.ResponseWriter, r *http
 	}
 	if _, err := s.cleanupRegisterObservation(ctx, req.RequestID); err != nil {
 		cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
+		return
+	}
+	if cleanupObserveRequestError(req) != "" {
+		util.WriteError(w, 400, "invalid cleanup reconciliation observation")
 		return
 	}
 	tx, err := s.pool.Begin(ctx)
