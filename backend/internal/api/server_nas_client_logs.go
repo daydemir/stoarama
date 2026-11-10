@@ -28,6 +28,7 @@ var nasClientLogRedactions = []struct {
 	re   *regexp.Regexp
 	with string
 }{
+	{regexp.MustCompile(`(?is)([\[(]\s*\\*["']\s*[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*\s*\\*["']\s*,\s*)[\s\S]*`), `${1}[REDACTED]`},
 	// Match arbitrary escaped quotes; redact the whole tail of sensitive
 	// assignments so arrays, objects and Digest parameters cannot leak.
 	{regexp.MustCompile(`(?is)(\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*(?:\\*["'])?\s*[=:]\s*)[\s\S]*`), `${1}[REDACTED]`},
@@ -50,7 +51,24 @@ var nasDiagnosticSecretName = regexp.MustCompile(`(?i)^[A-Za-z0-9_.-]*(?:token|s
 
 var nasClientLogPath = regexp.MustCompile(`(^|[^\w:/.])(/[^\s'"<>,;)]+)`)
 
+var nasDiagnosticUnicodeEscape = regexp.MustCompile(`\\+u([0-9a-fA-F]{4})`)
+
+func normalizeNASDiagnosticText(s string) string {
+	// Each pass shortens the input, including nested JSON backslash escapes.
+	for {
+		decoded := nasDiagnosticUnicodeEscape.ReplaceAllStringFunc(s, func(escape string) string {
+			n, _ := strconv.ParseUint(escape[len(escape)-4:], 16, 16)
+			return string(rune(n))
+		})
+		if decoded == s {
+			return s
+		}
+		s = decoded
+	}
+}
+
 func redactNASClientLogLine(s string) string {
+	s = normalizeNASDiagnosticText(s)
 	for _, r := range nasClientLogRedactions {
 		s = r.re.ReplaceAllString(s, r.with)
 	}
@@ -73,7 +91,7 @@ func redactNASDiagnostics(value any) any {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, x := range v {
-			if nasDiagnosticSecretName.MatchString(k) {
+			if nasDiagnosticSecretName.MatchString(normalizeNASDiagnosticText(k)) {
 				out[redactNASClientLogLine(k)] = "[REDACTED]"
 			} else {
 				out[redactNASClientLogLine(k)] = redactNASDiagnostics(x)
@@ -81,6 +99,11 @@ func redactNASDiagnostics(value any) any {
 		}
 		return out
 	case []any:
+		if len(v) >= 2 {
+			if name, ok := v[0].(string); ok && nasDiagnosticSecretName.MatchString(normalizeNASDiagnosticText(name)) {
+				return []any{redactNASClientLogLine(name), "[REDACTED]"}
+			}
+		}
 		for i, x := range v {
 			v[i] = redactNASDiagnostics(x)
 		}

@@ -251,3 +251,45 @@ func TestNASClientLogsPullScopedCredential(t *testing.T) {
 		t.Fatalf("stored %d: %v", count, err)
 	}
 }
+
+func TestNASDiagnosticsPairsAndUnicodeNames(t *testing.T) {
+	const secret = "fixture-sensitive-value"
+	for _, name := range []string{"Authorization", "aUtHoRiZaTiOn", "Proxy-Authorization", "Cookie", "Set-Cookie", "token", "api_key", "password"} {
+		escaped := ""
+		for _, c := range name {
+			escaped += fmt.Sprintf(`\u%04x`, c)
+		}
+		for _, key := range []string{name, escaped} {
+			t.Run(key, func(t *testing.T) {
+				for _, value := range []any{
+					map[string]any{"headers": []any{[]any{key, `Digest username="u", response="` + secret + `"`}}},
+					map[string]any{"outer": map[string]any{key: secret}},
+					[]any{key, map[string]any{"nested": secret}},
+				} {
+					encoded, _ := json.Marshal(redactNASDiagnostics(value))
+					if strings.Contains(string(encoded), secret) {
+						t.Fatalf("structured pair leaked: %s", encoded)
+					}
+				}
+				// Include Python tuple representations, embedded/truncated JSON,
+				// and JSON escaped an extra time, all handled as log text.
+				for _, line := range []string{
+					`[["` + key + `", "Digest username=\"u\", response=\"` + secret + `\""]]`,
+					`[('` + key + `', {'nested':'` + secret + `'})]`,
+					`cleanup {"` + key + `": "` + secret + `"}`,
+					`{\"` + key + `\":\"` + secret + `\"}`,
+					`[["` + key + `","` + secret,
+				} {
+					if got := redactNASClientLogLine(line); strings.Contains(got, secret) || !strings.Contains(got, "[REDACTED]") {
+						t.Fatalf("text pair leaked: %s", got)
+					}
+				}
+			})
+		}
+	}
+	safe := []any{[]any{"Accept", "application/json"}}
+	got, _ := json.Marshal(redactNASDiagnostics(safe))
+	if string(got) != `[["Accept","application/json"]]` {
+		t.Fatalf("overredacted safe pair: %s", got)
+	}
+}

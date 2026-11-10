@@ -958,13 +958,13 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": state, "delete": false}}
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
 		}
 		if state == "delete_issued" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "proof_sha256": cleanupSHA(req.Proof)}}
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
 		}
 		if state == "would_delete" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": "would_delete", "delete": false}}
+			return cleanupObserveResult{status: 200, body: map[string]any{"action": "would_delete", "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
 		}
 		return cleanupObserveError(409, "cleanup observation is stale or terminal")
 	}
@@ -1121,6 +1121,12 @@ SELECT (SELECT count(*) FROM u)::int, (SELECT count(*) FROM pz)::int+(SELECT cou
 	return updated, pausedPlans > 0, planID, err
 }
 
+// Echo only after the exact item/attempt/plan/proof receipt was accepted.
+func cleanupReceiptAck(id int64, req cleanupReceipt, paused bool) map[string]any {
+	return map[string]any{"ok": true, "item_id": id, "attempt": req.Attempt, "plan_sha256": req.PlanSHA,
+		"proof_sha256": req.ProofSHA, "state": req.Outcome, "plan_paused": paused}
+}
+
 func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Request) {
 	id, ok := parseInt64Path(w, r, "itemId")
 	if !ok {
@@ -1143,7 +1149,7 @@ func (s *Server) handleAccountNASCleanupResult(w http.ResponseWriter, r *http.Re
 	if req.Outcome == "deleted" {
 		s.cleanupAdvanceBatchAfter(r.Context(), planID)
 	}
-	util.WriteJSON(w, 200, map[string]any{"ok": true, "state": req.Outcome, "plan_paused": paused})
+	util.WriteJSON(w, 200, cleanupReceiptAck(id, req, paused))
 }
 
 // Each file is the destructive scope. Sibling membership may change after a

@@ -18,6 +18,14 @@ pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
 
 
+def fixture_ack(body, item_id=1, **fields):
+    ack = dict(item_id=item_id, attempt=body['attempt'], plan_sha256=body['plan_sha256'],
+               proof_sha256=(hashlib.sha256(json.dumps(body.get('proof')).encode()).hexdigest()
+                             if 'proof_sha256' not in body else body['proof_sha256']))
+    ack.update(fields)
+    return ack
+
+
 class CleanupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -67,7 +75,7 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(len(pull.cleanup_journal(self.inventory)),1)
             self.assertEqual(body['outcome'],'match')
             self.assertEqual(body['proof']['identity'],self.item['frozen_identity'])
-            return dict(action='would_delete',delete=False,recovery='nas_only_at_check')
+            return fixture_ack(body, action='would_delete',delete=False,recovery='nas_only_at_check')
         with mock.patch.object(pull,'restore_api',side_effect=api), mock.patch.object(pull.os,'unlink',side_effect=AssertionError('dry run must never unlink')):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -86,7 +94,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'deleted');return dict(ok=True)
+            self.assertEqual(body['outcome'],'deleted');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api):pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertFalse(self.path.exists());self.assertFalse(self.sidecar.exists());self.assertTrue(extra.exists())
         self.assertTrue(extra.parent.is_dir());self.assertEqual(pull.cleanup_journal(self.inventory),[])
@@ -95,8 +103,10 @@ class CleanupTests(unittest.TestCase):
         def api(cfg,path,body):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):return dict(delete=True,action='delete_issued')
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
-        with mock.patch.object(pull,'restore_api',side_effect=api):pull.cleanup_once(self.cfg,self.inventory,threading.Event())
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
+        with mock.patch.object(pull,'restore_api',side_effect=api), self.assertRaises(pull.CleanupResponseError):
+            pull.cleanup_once(self.cfg,self.inventory,threading.Event())
+        self.assertEqual(pull.cleanup_journal(self.inventory)[0][1], 'observe')
         self.assertTrue(self.path.exists())
 
     def test_reject_path_traversal_and_symlinked_ancestor(self):
@@ -144,15 +154,15 @@ class CleanupTests(unittest.TestCase):
         calls=[]
         def api(cfg,path,body):
             calls.append(path)
-            if path.endswith('/observe'):return dict(action='reconcile',delete=False,proof_sha256='b'*64)
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+            if path.endswith('/observe'):return fixture_ack(body, action='reconcile', delete=False)
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.os,'unlink',side_effect=AssertionError('replay must not delete')):
             pull.cleanup_replay_receipts(self.cfg,self.inventory)
         self.assertEqual(len(calls),2);self.assertTrue(self.path.exists());self.assertFalse(pull.cleanup_journal(self.inventory))
 
     def test_interrupted_intent_never_retries_unlink(self):
         pull.cleanup_journal(self.inventory,1,'intent',dict(attempt=1,plan_sha256='a'*64,proof_sha256='b'*64))
-        with mock.patch.object(pull,'restore_api',return_value=dict(ok=True)) as api:
+        with mock.patch.object(pull,'restore_api',side_effect=lambda cfg, path, body: fixture_ack(body, ok=True)) as api:
             pull.cleanup_replay_receipts(self.cfg,self.inventory)
         self.assertEqual(api.call_args.args[2]['outcome'],'unverified');self.assertTrue(self.path.exists())
 
@@ -196,7 +206,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original()+offset[0]):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -217,7 +227,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'unverified');return dict(ok=True)
+            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original_clock()+offset[0]),mock.patch.object(pull.CleanupFile,'list_parent',members):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -281,7 +291,7 @@ class CleanupTests(unittest.TestCase):
                     task=copy.deepcopy(self.task);task["item_id"]=counter[0]
                     return dict(tasks=[task],retry_after_sec=0)
             barrier.wait(4)
-            return dict(delete=False,action="would_delete",recovery="r2_sha_verified")
+            return fixture_ack(body, int(path.split("/")[-2]), delete=False,action="would_delete",recovery="r2_sha_verified")
         with pull.concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull.os,"unlink",side_effect=AssertionError("preflight never unlinks")):
                 self.assertEqual(pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor,workers=4,task_limit=4),0)
@@ -594,13 +604,13 @@ def approve_api(test, calls, receipt_reply=None):
             return dict(tasks=[test.task], retry_after_sec=0)
         if path.endswith('/observe'):
             if body['outcome'] != 'match':
-                return dict(action=body['outcome'], delete=False)
+                return fixture_ack(body, action=body['outcome'], delete=False)
             return dict(action='delete_issued', delete=True, item_id=1, attempt=1, plan_sha256='a'*64,
                         proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                         expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
         if receipt_reply is not None:
             return receipt_reply(body)
-        return dict(ok=True)
+        return fixture_ack(body, int(path.split("/")[-2]), ok=True)
     return api
 
 
@@ -779,7 +789,7 @@ class CleanupGuardTests(unittest.TestCase):
         def old_server(body):
             if body['outcome'] not in ('deleted', 'unverified'):
                 raise pull.urllib.error.HTTPError('result', 400, 'invalid cleanup deletion receipt', {}, None)
-            return dict(ok=True)
+            return fixture_ack(body, ok=True)
         self.approve()
         with mock.patch.object(pull.os, 'unlink', side_effect=unlink):
             calls = self.run_execution(receipt_reply=old_server)
@@ -853,7 +863,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             if path.endswith('/result-batch'):
                 for r in body['receipts']:
                     self.assertEqual(r['outcome'], 'deleted', r)
-                return dict(results=[dict(item_id=r['item_id'], status=200, ok=True) for r in body['receipts']])
+                return dict(results=[fixture_ack(r, r['item_id'], status=200, ok=True) for r in body['receipts']])
             raise AssertionError('unexpected call %s' % path)
         return api, state
 
@@ -984,7 +994,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
                         return reply
                     o = body['observations'][0]
                     seen.append(o.get('md5'))
-                    return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete', delete=False)])
+                    return dict(results=[fixture_ack(o, o['item_id'], status=200, action='would_delete', delete=False)])
                 self.run_v2(api)
                 expected = hashlib.md5(self.path.read_bytes()).hexdigest() if advertised else None
                 self.assertEqual(seen[1], expected)
@@ -997,7 +1007,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         def api(cfg, path, body, retry_stale=False):
             self.assertTrue(path.endswith('/observe-batch'), path)
             with lock: calls.append(len(body['observations']))
-            return dict(results=[dict(item_id=o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
+            return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
         with mock.patch.object(pull, 'restore_api', side_effect=api):
             batch_api = pull.CleanupBatchAPI(self.cfg)
             try:
@@ -1016,7 +1026,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             sent.append([o.get('md5') for o in obs])
             if any('md5' in o for o in obs):
                 raise pull.urllib.error.HTTPError(path, 400, 'unknown field md5', {}, None)
-            return dict(results=[dict(item_id=o['item_id'], status=200, action='conflict', delete=False) for o in obs])
+            return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in obs])
         with mock.patch.object(pull, 'restore_api', side_effect=api):
             batch_api = pull.CleanupBatchAPI(self.cfg)
             try:
@@ -1291,7 +1301,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             self.assertTrue(path.endswith('/result'))
             self.assertEqual(body['outcome'], 'unverified')
             calls.append(body)
-            return dict(ok=True)
+            return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('release must not delete')):
             pull.cleanup_replay_receipts(self.cfg, self.inventory)
         self.assertEqual(len(calls), 1)
@@ -1409,7 +1419,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
             entered.set()
             if not release.wait(5):
                 raise RuntimeError('fixture worker timed out')
-            return dict(action='would_delete', delete=False)
+            return fixture_ack(args[2], action='would_delete', delete=False)
         with mock.patch.object(pull, 'restore_api', side_effect=observe) as post:
             with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
                 first = executor.submit(pull.cleanup_process_task, self.cfg, self.inventory, threading.Event(), self.task)
@@ -1472,7 +1482,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.journal_observe(900)
         def api(cfg, path, body):
             if path.endswith('/observe'):
-                return dict(action='reconcile', delete=False, proof_sha256='b'*64)
+                return fixture_ack(body, 900, action='reconcile', delete=False)
             return None
         with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('replay must not delete')):
             counts = pull.cleanup_replay_receipts(self.cfg, self.inventory, budget=1)
@@ -1537,5 +1547,102 @@ def diagnostic_patterns():
         ('100.64.0.1 100.127.255.255', '100.64.0.1'),
         ('100.127.255.255', '100.127.255.255'),
     ]
+
+
+class CleanupAcknowledgementTests(unittest.TestCase):
+    def response(self, case, body, phase):
+        if case == 'malformed_json':
+            return json.loads('{')
+        if case == 'http_5xx':
+            raise pull.urllib.error.HTTPError('/fixture', 503, 'unavailable', {}, None)
+        ack = fixture_ack(body, action='would_delete', delete=False) if phase == 'observe' else fixture_ack(body, ok=True)
+        changes = {'empty': {}, 'negative': dict(ack, ok=False), 'wrong_item': dict(ack, item_id=999),
+                   'wrong_attempt': dict(ack, attempt=2), 'wrong_plan': dict(ack, plan_sha256='f'*64),
+                   'wrong_proof': dict(ack, proof_sha256='f'*64), 'boolean_item': dict(ack, item_id=True),
+                   'malformed_action': dict(ack, action='unknown'), 'valid': ack}
+        return changes[case]
+
+    def fixture(self):
+        fixture = CleanupTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture
+
+    def test_fresh_result_requires_exact_positive_ack_and_replay_never_unlinks(self):
+        for protocol in (1, 2):
+            for case in ('empty', 'negative', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'boolean_item', 'http_5xx', 'valid'):
+                with self.subTest(protocol=protocol, case=case):
+                    f = self.fixture()
+                    with f.opened() as current:
+                        f.task['approved_proof'] = current.proof()
+                    calls = []
+                    def observe(cfg, item_id, body):
+                        calls.append('observe')
+                        return fixture_ack(body, action='delete_issued', delete=True,
+                                           expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+                    def result(cfg, item_id, body):
+                        calls.append('result')
+                        return self.response(case, body, 'result')
+                    api = SimpleNamespace(request_ids=protocol == 2, observe=observe, result=result)
+                    if case == 'valid':
+                        pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                    else:
+                        with self.assertRaises((pull.CleanupResponseError, json.JSONDecodeError, pull.urllib.error.HTTPError)):
+                            pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        original = pull.cleanup_journal(f.inventory)
+                        self.assertEqual(original[0][1], 'result')
+                        self.assertEqual(json.loads(original[0][2])['outcome'], 'deleted')
+                        with mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('must not reopen/unlink')):
+                            self.assertFalse(pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api))
+                            with self.assertRaises((pull.CleanupResponseError, json.JSONDecodeError, pull.urllib.error.HTTPError)):
+                                pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
+                            self.assertEqual(pull.cleanup_journal(f.inventory), original)
+                            api.result = lambda cfg, item_id, body: fixture_ack(body, ok=True)
+                            pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                    self.assertFalse(f.path.exists())
+                    self.assertFalse(f.sidecar.exists())
+                    self.assertEqual(calls.count('observe'), 1, 'must never ask for another permit')
+
+    def test_fresh_observation_and_conflict_checkpoint_require_valid_ack(self):
+        for conflict in (False, True):
+            for case in ('empty', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'http_5xx', 'malformed_action', 'valid'):
+                with self.subTest(conflict=conflict, case=case):
+                    f = self.fixture()
+                    if conflict:
+                        f.item['sha256'] = 'f'*64
+                    def observe(cfg, item_id, body):
+                        ack = self.response(case, body, 'observe')
+                        if case == 'valid' and conflict:
+                            ack['action'] = 'conflict'
+                        return ack
+                    api = SimpleNamespace(request_ids=True, observe=observe)
+                    if case == 'valid':
+                        pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                    else:
+                        with self.assertRaises((pull.CleanupResponseError, json.JSONDecodeError, pull.urllib.error.HTTPError)):
+                            pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api)
+                        original = pull.cleanup_journal(f.inventory)
+                        self.assertEqual(original[0][1], 'observe')
+                        self.assertFalse(pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api))
+                        self.assertEqual(pull.cleanup_journal(f.inventory), original)
+                    self.assertTrue(f.path.exists())
+                    self.assertTrue(f.sidecar.exists())
+
+    def test_diagnostic_pairs_and_unicode_names_in_text_and_structures(self):
+        secret = 'fixture-sensitive-value'
+        for name in ('Authorization', 'aUtHoRiZaTiOn', 'Proxy-Authorization', 'Cookie', 'Set-Cookie', 'token', 'api_key', 'password'):
+            escaped = ''.join('\\u%04x' % ord(c) for c in name)
+            for key in (name, escaped):
+                for pair in ([key, 'Digest username="u", response="%s"' % secret], (key, {'nested': secret})):
+                    with self.subTest(key=key, pair=pair):
+                        for value in ({'headers': [pair]}, {'outer': {key: secret}}):
+                            self.assertNotIn(secret, json.dumps(pull.redact_diagnostics(value)))
+                        for line in (repr(pair), json.dumps(pair), 'cleanup ' + json.dumps({key: secret}),
+                                     json.dumps(json.dumps({key: secret})), '[[' + json.dumps(key) + ',"' + secret):
+                            self.assertNotIn(secret, pull.redact_log_line(line), line)
+        self.assertEqual(pull.redact_diagnostics([['Accept', 'application/json']]), [['Accept', 'application/json']])
 
 if __name__=='__main__':unittest.main()

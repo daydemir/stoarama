@@ -242,10 +242,24 @@ CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
 CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
 _SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
+_JSON_UNICODE_ESCAPE = re.compile(r"\\+u([0-9a-fA-F]{4})")
+
+
+def normalize_diagnostic_text(text):
+    # Decode even nested JSON encodings before identifying secret names.
+    # Each substitution shortens the input, including escaped backslashes.
+    while True:
+        decoded = _JSON_UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+        if decoded == text:
+            return text
+        text = decoded
+
+
 # Fail closed for textual diagnostics: once a sensitive assignment starts, drop
 # its entire tail. This covers nested header values, Digest parameters and any
 # depth of escaped quotes without guessing where an untrusted value ends.
 _REDACTIONS = (
+    (re.compile(r"(?is)([\[(]\s*\\*[\"']\s*" + _SECRET_NAME + r"\s*\\*[\"']\s*,\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?is)(\b" + _SECRET_NAME + r"(?:\\*[\"'])?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([\"']?\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+|basic\s+)?[^\s\"',}]+"), r"\1[REDACTED]"),
@@ -268,8 +282,10 @@ def redact_diagnostics(value):
     if isinstance(value, str):
         return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.secrets)
     if isinstance(value, dict):
-        return {redact_diagnostics(k): ("[REDACTED]" if re.fullmatch(_SECRET_NAME, k, re.IGNORECASE) else redact_diagnostics(v)) for k, v in value.items()}
-    if isinstance(value, list):
+        return {redact_diagnostics(k): ("[REDACTED]" if isinstance(k, str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(k), re.IGNORECASE) else redact_diagnostics(v)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        if len(value) >= 2 and isinstance(value[0], str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(value[0]), re.IGNORECASE):
+            return [redact_diagnostics(value[0]), "[REDACTED]"]
         return [redact_diagnostics(v) for v in value]
     return value
 
@@ -277,7 +293,7 @@ def redact_diagnostics(value):
 def redact_log_line(text, output_root=None, secrets=()):
     """Remove credentials, signed URL query strings, secret-looking values and
     absolute host paths outside the NAS output root from one log line."""
-    text = str(text)
+    text = normalize_diagnostic_text(str(text))
     for secret in secrets:
         if secret and len(secret) >= 6:
             text = text.replace(secret, "[REDACTED]")
@@ -2614,6 +2630,28 @@ def cleanup_quarantined_items(inventory):
         return {row[0] for row in inventory.db.execute("SELECT DISTINCT item_id FROM cleanup_quarantine")}
 
 
+def cleanup_validate_ack(item_id, phase, body, response):
+    """Only a positive response bound to this exact checkpoint retires it.
+    Older servers lacking identity echoes leave evidence available for replay.
+    """
+    if not isinstance(response, dict):
+        raise CleanupResponseError("invalid cleanup acknowledgement")
+    expected = dict(item_id=item_id, attempt=body["attempt"], plan_sha256=body["plan_sha256"],
+                    proof_sha256=(hashlib.sha256(json.dumps(body.get("proof")).encode()).hexdigest()
+                                  if phase == "observe" else body["proof_sha256"]))
+    for key, value in expected.items():
+        if type(response.get(key)) is not type(value) or response[key] != value:
+            raise CleanupResponseError("cleanup acknowledgement differs: " + key)
+    if phase == "observe":
+        action = response.get("action")
+        if action not in ("would_delete", "keep", "missing", "conflict", "delete_issued", "deleted", "unverified", "reconcile"):
+            raise CleanupResponseError("invalid cleanup observation action")
+        if type(response.get("delete")) is not bool or response["delete"] != (action == "delete_issued"):
+            raise CleanupResponseError("inconsistent cleanup permit response")
+    elif response.get("ok") is not True:
+        raise CleanupResponseError("cleanup result not acknowledged")
+
+
 def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     """Replay every durable journal entry; protocol 2 replays in parallel
     through the batched endpoints (same per-item rules as the single ones).
@@ -2657,19 +2695,6 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             log("WARN", "cleanup item=%d stale %s receipt archived; no destructive retry" % (item_id, phase))
             return None
 
-    def validate_response(phase, response):
-        if not isinstance(response, dict):
-            raise CleanupResponseError("invalid cleanup replay response")
-        if phase == "observe":
-            if response.get("action") not in ("would_delete", "keep", "missing", "conflict", "delete_issued", "deleted", "unverified", "reconcile"):
-                raise CleanupResponseError("invalid cleanup observation action")
-            if response.get("action") == "delete_issued" and response.get("delete") is not True:
-                raise CleanupResponseError("inconsistent cleanup permit response")
-            if (response.get("delete") is True or response.get("action") == "reconcile") and not isinstance(response.get("proof_sha256"), str):
-                raise CleanupResponseError("cleanup replay response lacks proof hash")
-        elif response.get("ok") is not True:
-            raise CleanupResponseError("cleanup result not acknowledged")
-
     def one(item_id, phase, encoded):
         # Own the exact snapshot until its replay finishes. A delayed replay
         # must never advance/archive/remove another worker's checkpoint.
@@ -2699,7 +2724,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             if any(row[0] == item_id for row in cleanup_journal(inventory)):
                 raise CleanupResponseError("missing cleanup replay response")
             return
-        validate_response(phase, response)
+        cleanup_validate_ack(item_id, phase, body, response)
         if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
                     "outcome": "unverified", "error": "recovered observation permit was not executed"}
@@ -2708,7 +2733,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
             if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
                 raise CleanupResponseError("missing cleanup result acknowledgement")
             if result is not None:
-                validate_response("result", result)
+                cleanup_validate_ack(item_id, "result", body, result)
         cleanup_journal(inventory, item_id, owner=owner)
 
     with inventory.lock:
@@ -2847,6 +2872,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
             cleanup_journal(inventory, item_id, "observe", body, owner=owner)
             permit_request_started = time.monotonic()
             decision = api.observe(cfg, item_id, body)
+            cleanup_validate_ack(item_id, "observe", body, decision)
             if decision.get("delete") is True:
                 receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
                 cleanup_journal(inventory, item_id, "intent", receipt, owner=owner)
@@ -2888,7 +2914,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                     except Exception as exc:
                         log("ERROR", "cleanup item=%d deletion ledger result append failed: %s" % (item_id, exc))
                 cleanup_journal(inventory, item_id, "result", receipt, owner=owner)
-                api.result(cfg, item_id, receipt)
+                response = api.result(cfg, item_id, receipt)
+                cleanup_validate_ack(item_id, "result", receipt, response)
             cleanup_journal(inventory, item_id, owner=owner)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
@@ -2899,7 +2926,8 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
             raise
         body.update(outcome="conflict" if isinstance(exc, (OSError, ValueError, RuntimeError)) else "unverified", proof=None, error=str(exc)[:500])
         cleanup_journal(inventory, item_id, "observe", body, owner=owner)
-        api.observe(cfg, item_id, body)
+        response = api.observe(cfg, item_id, body)
+        cleanup_validate_ack(item_id, "observe", body, response)
         cleanup_journal(inventory, item_id, owner=owner)
     finally:
         if fenced:

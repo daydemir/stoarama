@@ -768,7 +768,9 @@ SELECT (SELECT count(*) FROM pz)::int`, id, reason, cid).Scan(&pausedPlans); err
 		if receipt.Outcome == "deleted" {
 			advance[planID] = true
 		}
-		results = append(results, map[string]any{"item_id": id, "status": 200, "ok": true, "state": receipt.Outcome, "plan_paused": paused})
+		ack := cleanupReceiptAck(id, receipt, paused)
+		ack["status"] = 200
+		results = append(results, ack)
 	}
 	if err = tx.Commit(ctx); err != nil {
 		cleanupBatchError(w, 500, "cleanup receipt save failed")
