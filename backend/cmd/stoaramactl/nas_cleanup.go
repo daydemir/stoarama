@@ -29,8 +29,9 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("nas-cleanup "+args[0], flag.ExitOnError)
 	input := fs.String("input", "", "JSON {label,items:[{kind,source_id}]}; prepare only")
 	id := fs.Int64("plan-id", 0, "exact plan id")
-	sha := fs.String("expected-plan-sha256", "", "exact approved digest; control only")
-	reason := fs.String("reason", "", "audited approval/pause reason")
+	sha := fs.String("expected-plan-sha256", "", "exact plan digest; control/recheck only")
+	reason := fs.String("reason", "", "audited control/recheck reason")
+	all := fs.Bool("all", false, "recheck only: refresh every would_delete item as well as unverified items")
 	priority := fs.Int("priority", 0, "-100..100 scheduling priority; resume-dry-run only, no deletion authority")
 	expectedPlans := fs.Int("expected-plans", 0, "retire-superseded only: exact count from the preview; 0 previews without changes")
 	approvalHours := fs.Int("approval-hours", 2, "enable/enable-batch: approval window 1..24 hours (above 4 requires --allow-long-approval)")
@@ -53,7 +54,19 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	if prioritySet && (args[0] != "resume-dry-run" || *priority < -100 || *priority > 100) {
 		log.Fatal("--priority requires resume-dry-run and -100..100")
 	}
+	if *all && args[0] != "recheck" {
+		log.Fatal("--all requires recheck")
+	}
 	switch args[0] {
+	case "recheck":
+		if *id <= 0 || len(*sha) != 64 || strings.TrimSpace(*reason) == "" {
+			log.Fatal("recheck requires --plan-id, --expected-plan-sha256 and --reason")
+		}
+		scope := "unverified"
+		if *all {
+			scope = "all"
+		}
+		printJSON(mustAPIRequest(ctx, http.MethodPost, *base, *token, fmt.Sprintf("/api/v1/service/nas-cleanup/plans/%d/recheck", *id), map[string]any{"expected_plan_sha256": *sha, "reason": *reason, "scope": scope}))
 	case "prepare":
 		if *input == "" {
 			log.Fatal("--input required")
@@ -143,7 +156,7 @@ func runNASCleanup(ctx context.Context, cfg config.Config, args []string) {
 	}
 }
 
-const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|retire-superseded|enable-batch|pause-batch|batch-report"
+const nasCleanupUsage = "usage: nas-cleanup prepare|report|verify-recovery|pause|enable|resume-dry-run|recheck|retire-superseded|enable-batch|pause-batch|batch-report"
 
 // nasCleanupBatchManifest validates a batch manifest and recomputes its
 // digest exactly as the backend does (cleanupBatchDigest): sha256 over

@@ -258,6 +258,7 @@ func usage() {
 	  stoaramactl nas-restore request (--clip-ids 1,2 | --hour-record-id N | --recording-id N --from TIME --to TIME) [--test-prefix --label L --max-bytes N --limit N --dry-run --json]
 	  stoaramactl nas-restore status [--label L --json] | cancel --label L
 	  stoaramactl nas-cleanup prepare --input PLAN.json | report --plan-id ID | verify-recovery --plan-id ID | pause|enable --plan-id ID --expected-plan-sha256 SHA --reason TEXT | retire-superseded --reason TEXT [--expected-plans N] | enable-batch --batch-input BATCH.json --expected-batch-sha256 SHA --reason TEXT --approval-hours H | pause-batch|batch-report --batch-id ID
+	  stoaramactl nas-cleanup recheck --plan-id ID --expected-plan-sha256 SHA --reason TEXT [--all]
 	  stoaramactl nas-client logs --connection-id ID [--since 1h] [--grep TEXT] [--limit N]
   stoaramactl nas-client release-quarantine --connection-id ID
   stoaramactl nas-selected-verify request [--clip-ids IDS] [--collated-ids IDS] [--joined-ids IDS] --label L [--dry-run | --expected-plan-sha256 SHA] [--json]

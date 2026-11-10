@@ -33,6 +33,34 @@ physical conflicts and policy holds. HEAD equality alone is not recovery proof:
 every dry run streams the exact ETag generation and hashes it; execution may
 then rely on a conditional HEAD bound to that verified generation (below).
 
+To retry a transient recovery failure in a finished dry run, use the service-token
+operator command:
+
+```sh
+stoaramactl nas-cleanup recheck --plan-id ID --expected-plan-sha256 SHA --reason "retry recovery timeout"
+# Refresh all would_delete observations when the dry run is older than 24 hours:
+stoaramactl nas-cleanup recheck --plan-id ID --expected-plan-sha256 SHA --reason "refresh expired dry run" --all
+```
+
+This calls `POST /api/v1/service/nas-cleanup/plans/{id}/recheck` with
+`{expected_plan_sha256, reason, scope: "unverified"|"all"}`. The default
+`unverified` scope resets only `would_delete` items whose recovery is neither
+`r2_sha_verified` nor `r2_md5_etag_matched`, and `unverified` items. `all` also
+resets verified `would_delete` items. Keep, conflict, missing, pending, leased,
+and deletion states stay untouched. Reset items lose their previous lease,
+proof and recovery evidence and return to `pending` for the normal NAS client
+re-hash and server policy/recovery checks. Attempts remain monotonic to reject
+stale observations; a separate baseline grants three new lease-expiry attempts.
+
+Recheck requires the exact plan SHA, account 47 / connection 13, the current
+policy, mode `dry_run`, and **no item with `delete_ever_issued`**. Paused plans
+must first use `resume-dry-run` (which restores source holds); enabled and
+retired plans are refused. It never changes plan mode, approval, `allow_nas_only`,
+or permits. The required reason is recorded in the server's `nas cleanup recheck`
+log line with the plan digest, scope and reset count; `approval_reason` is
+unchanged. Pull keys cannot access this service route. Resetting timestamps
+does not satisfy enable: every item must finish a fresh, permitting dry run.
+
 Two independent gates remain OFF during preparation:
 
 1. Backend `NAS_CLEANUP_DELETION_ENABLED` defaults false.
