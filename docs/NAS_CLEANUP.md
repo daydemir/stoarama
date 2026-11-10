@@ -107,8 +107,8 @@ Runbook notes:
 - **An auto-paused plan that already deleted items cannot be re-enabled.**
   Enable requires every item to be a fresh `would_delete`, and resume-dry-run
   refuses plans with any issued deletion. Investigate the pause reason
-  (`nas-cleanup report`, `approval_reason`), run `verify-recovery`, then admit
-  the remaining files as a new plan.
+  (`nas-cleanup report`, `approval_reason`), run `verify-recovery`, then close
+  the paused plan as described below before preparing a new plan.
 - **An expired approval pauses.** Once `approved_until` passes, no permit is
   issued; the next lease (or batch advance) sets the plan and its batch to
   `paused` (reason "auto-paused: approval expired") so it no longer blocks
@@ -146,6 +146,51 @@ further cleanup permits until reviewed.
 `nas-cleanup pause --plan-id ID --expected-plan-sha256 SHA --reason TEXT` stops
 future grants. An already issued 30-second permit may finish. Recovery holds for any
 ever-issued operation remain; pausing never asserts that NAS bytes survived.
+
+To continue the never-issued remainder of a paused plan, use the service-token
+control (works with the deletion master switch OFF):
+
+```sh
+stoaramactl nas-cleanup close --plan-id ID --expected-plan-sha256 SHA --reason "split never-issued remainder after timeout"
+```
+
+`POST /api/v1/service/nas-cleanup/plans/{id}/close` requires
+`expected_plan_sha256` and a nonblank `reason` of at most 500 bytes. Under the
+public, per-plan and row fences, it accepts only `paused` (or already `retired`
+for idempotent retry), refuses any `delete_issued` item even with an expired
+permit, and refuses a `leased` item with an unexpired lease. Let leases finish
+or expire; never infer an unlink outcome from a timeout. It atomically reuses
+the terminal `retired` mode, clears approval, records the reason and pauses any
+enabled batch containing the plan. It cannot be resumed or enabled, including
+by a previously approved batch. Repeating close preserves the first reason.
+No file, item, manifest, receipt, attempt, proof, or hold row is deleted or reset.
+
+Recovery retention deliberately stays **conservative and plan-wide**: if any
+item ever received a deletion permit, every source/recovery hold of that plan
+remains permanent, including after close. `nas_cleanup_clip_held` remains true
+and the DB purge guards still refuse destruction of those R2 recovery identities.
+This may retain extra R2 data for never-issued items; freeing that storage is
+outside this control. A plan with no issued items uses existing retirement
+semantics and releases its holds.
+
+The shared `nas_cleanup_reserved_files` view makes never-issued files of retired
+plans available to both `prepare_keep28_plans.py` and server admission. Issued
+files remain excluded forever, across all policies and states, including a
+still-present file after an uncertain unlink. Missing legacy item rows also stay
+excluded. Other non-retired plans still reserve their files. Prepare with a
+**new `--label-prefix`** because old labels and manifests are immutable. The new
+plan starts `dry_run`/`pending`, requires a full new dry run with recovery
+verification, and needs its own explicit owner approval; old approval does not
+carry over. Reservation availability does not guarantee policy admission.
+
+For an `unverified` ever-issued item, the supported minimal reconciliation choice
+is **leave it uncertain and held indefinitely**. Close never asserts that it is
+deleted or still present and never asks the NAS to unlink it. Keep the append-only
+client journal and report evidence; `verify-recovery` checks the protected R2
+copy read-only. There is no state-changing reconcile command in this change.
+Read-only exact-file reconciliation can be added separately if needed. The NAS
+client's 30-second permit deadline is also unchanged; slow-link timeout handling
+is follow-up work and must preserve the server expiry and replay fences.
 
 The original 430 folder roots / 6.43 TB logical are policy candidates, not an executable
 recursive command or guaranteed reclaimed storage. This workflow materializes a

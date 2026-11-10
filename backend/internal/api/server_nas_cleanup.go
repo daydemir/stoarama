@@ -218,6 +218,12 @@ func (s *Server) handleAdminNASCleanupCreate(w http.ResponseWriter, r *http.Requ
 		util.WriteError(w, 409, "NAS connection unavailable")
 		return
 	}
+	// Serialize plan admission with close, enable and other admissions before
+	// taking catalog locks. The reservation check is repeated at persistence.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+		util.WriteError(w, 503, "cleanup admission fence unavailable")
+		return
+	}
 	items := []nasCleanupItem{}
 	seen := map[string]bool{}
 	for _, sel := range req.Items {
@@ -1168,8 +1174,26 @@ func cleanupSameFileProof(a, b []byte) bool {
 }
 
 func persistNASCleanupPlan(ctx context.Context, tx pgx.Tx, label string, items []nasCleanupItem) (int64, string, error) {
-	stage := "plan_insert"
+	stage := "admission_fence"
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
+		return 0, "", &cleanupPersistFailure{stage: stage, err: err}
+	}
+	// Same-label retries still return the immutable original plan. A different
+	// label must never admit an issued file, even from an old policy or retired
+	// plan. Missing legacy item rows reserve the identity conservatively.
 	manifest, _ := json.Marshal(items)
+	var reserved bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+ SELECT 1 FROM nas_cleanup_reserved_files f
+ JOIN jsonb_to_recordset($1::jsonb) AS requested(kind text,source_id bigint)
+ ON f.kind=requested.kind AND f.source_id=requested.source_id
+ WHERE f.account_id=47 AND f.connection_id=13 AND f.label<>$2)`, string(manifest), label).Scan(&reserved); err != nil {
+		return 0, "", &cleanupPersistFailure{stage: "file_reservation", err: err}
+	}
+	if reserved {
+		return 0, "", &cleanupPersistFailure{stage: "file_reservation", err: errors.New("cleanup file already reserved or deletion ever issued")}
+	}
+	stage = "plan_insert"
 	sha := cleanupSHA(manifest)
 	var id int64
 	err := tx.QueryRow(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256) VALUES(47,13,$1,$2,$3,$4) ON CONFLICT(label) DO NOTHING RETURNING id`, label, cleanupPolicySHA, string(manifest), sha).Scan(&id)
