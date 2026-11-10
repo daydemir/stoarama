@@ -127,6 +127,13 @@ class V85rTests(unittest.TestCase):
             del row[field]
             self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
                              (False, 'UNKNOWN_missing_authenticated_evidence'), field)
+        for field in ('motion_observable', 'ambiguities', 'heldout_pixels', 'forward_heldout_residual_mad'):
+            row = copy.deepcopy(original)
+            del row['spatial_temporal_diagnostic'][field]
+            row['spatial_provenance']['diagnostic_sha256'] = hashlib.sha256(json.dumps(
+                row['spatial_temporal_diagnostic'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            self.assertEqual(runner.decide(c, row, row['source_bindings'], bad, human, set()),
+                             (False, 'UNKNOWN_missing_authenticated_evidence'), field)
         for mutate in (lambda r: r['full_source_integrity']['contexts'][0].update(VerifiedProofSHA='0'*64),
                        lambda r: r['spatial_provenance'].update(diagnostic_sha256='0'*64),
                        lambda r: r['spatial_provenance'].update(original_endpoint_frames_preserved=False),

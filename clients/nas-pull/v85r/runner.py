@@ -72,7 +72,11 @@ def decide(c, row, bindings, bad, human, visual):
             result.get('spatial_provenance_status') != 'PASS_bound_spatial_diagnostic' or
             not isinstance(spatial, dict) or spatial.get('status') != 'diagnostic_only' or
             spatial.get('version') != 'v85-spatial-translation-diagnostic-v1' or
-            result.get('spatial_status') in ('UNKNOWN_spatial_malformed', 'UNKNOWN_spatial_version_or_status') or
+            type(spatial.get('motion_observable')) is not bool or
+            'ambiguities' not in spatial or not (spatial['ambiguities'] is None or
+                isinstance(spatial['ambiguities'], list) and all(isinstance(a, str) for a in spatial['ambiguities'])) or
+            result.get('spatial_status') in ('UNKNOWN_spatial_malformed', 'UNKNOWN_spatial_version_or_status',
+                                           'UNKNOWN_insufficient_heldout_pixels') or
             result.get('decoded_cadence_status') not in ('PASS_native_decoded_uniform_cadence',
                 'UNKNOWN_variable_decoded_cadence_no_PTS_normalization')):
         return False, 'UNKNOWN_missing_authenticated_evidence'
