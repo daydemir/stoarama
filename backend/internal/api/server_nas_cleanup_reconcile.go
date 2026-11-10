@@ -28,6 +28,10 @@ func (s *Server) handleAccountNASCleanupReconcile(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
+	if _, err := s.cleanupRegisterObservation(ctx, req.RequestID); err != nil {
+		cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
+		return
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup reconciliation begin failed")

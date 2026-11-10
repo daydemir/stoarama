@@ -176,7 +176,8 @@ semantics and releases its holds.
 The shared `nas_cleanup_reserved_files` view makes never-issued files of retired
 plans available to both `prepare_keep28_plans.py` and server admission. Issued
 files remain excluded across policies and states, including after an uncertain
-unlink, except for an audited unexecuted reservation release (below). Missing legacy item rows also stay
+unlink. The 28 incident items remain permanently protected, with no release
+path. Missing legacy item rows also stay
 excluded. Other non-retired plans still reserve their files. Prepare with a
 **new `--label-prefix`** because old labels and manifests are immutable. The new
 plan starts `dry_run`/`pending`, requires a full new dry run with recovery
@@ -184,8 +185,8 @@ verification, and needs its own explicit owner approval; old approval does not
 carry over. Reservation availability does not guarantee policy admission.
 
 For an `unverified` ever-issued item with any possibility of unlink, leave it
-uncertain and protected indefinitely. The narrow audited reservation release
-below applies only to receipts that prove a recognized pre-unlink code path.
+uncertain and protected indefinitely. Receipts never release issued reservations;
+all 28 incident items remain permanently protected.
 Close itself never asserts presence or deletion and never releases issued
 reservations. Keep the client journal, ledger and report evidence.
 
@@ -467,8 +468,15 @@ Already-issued authority remains protected: replay gets `reconcile`, never a
 permit, then submits the existing explicit no-unlink refusal receipt. Interrupted
 `intent` and durable `result` checkpoints only report outcomes. Unknowns remain
 reserved. A server lacking the endpoint leaves the journal unresolved; the
-client never falls back to a permit-capable endpoint. The compatible API and
-client must both be present before a future separately approved execution.
+client never falls back to a permit-capable endpoint. Execution leases use the server's authenticated heartbeat identity and the exact
+reviewed client release allowlist (`be17fd73`, this PR's reconciliation-only
+client). Request-body versions and capability flags grant no authority. Each
+lease binds connection, boot ID and version; a changed identity cannot obtain a
+permit. Observation request IDs are durably recorded before recovery work or the
+issuance transaction, so even a rolled-back submission cannot earn a first
+permit on replay. An exact retry may only retrieve its already-issued, unexpired
+permit. The compatible API and client must both be present before a future
+separately approved execution.
 
 ### Permanent incident protection and server serialization
 

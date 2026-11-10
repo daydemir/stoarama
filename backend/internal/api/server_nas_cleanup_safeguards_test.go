@@ -302,7 +302,7 @@ func TestNASCleanupConcurrentAutoPauseDoesNotDeadlock(t *testing.T) {
 	}
 	// Deterministic ordering: the fence is taken before any plan row lock.
 	safeguardPlan(t, ctx, s, 1, "enabled", 10)
-	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=1,lease_expires_at=now()+interval '10 minutes' WHERE plan_id=1`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=1,lease_connection_id=13,lease_client_boot_id='fixture-boot',lease_client_version='be17fd73',lease_expires_at=now()+interval '10 minutes' WHERE plan_id=1`); err != nil {
 		t.Fatal(err)
 	}
 	holder, err := pool.Begin(ctx)
@@ -338,7 +338,7 @@ func TestNASCleanupConcurrentAutoPauseDoesNotDeadlock(t *testing.T) {
 	// Racing pairs on the same enabled plan always complete.
 	for round := int64(2); round < 12; round++ {
 		safeguardPlan(t, ctx, s, round, "enabled", 10, 10)
-		if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=1,lease_expires_at=now()+interval '10 minutes' WHERE plan_id=$1`, round); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=1,lease_connection_id=13,lease_client_boot_id='fixture-boot',lease_client_version='be17fd73',lease_expires_at=now()+interval '10 minutes' WHERE plan_id=$1`, round); err != nil {
 			t.Fatal(err)
 		}
 		results := make(chan *httptest.ResponseRecorder, 2)

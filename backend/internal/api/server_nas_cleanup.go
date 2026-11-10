@@ -57,8 +57,11 @@ const (
 	nasCleanupAdmissionLock int64 = 7343226011103
 	// Serialize lease selection across concurrent clients before item locks.
 	nasCleanupLeaseLock int64 = 7343226011104
-	// Capability implemented only by clients whose journal replay uses /reconcile.
+	// Wire hint retained for compatibility; never grants execution authority.
 	nasCleanupReconciliationProtocol = 1
+	// Exact reviewed release allowlist; git hashes have no sortable version order.
+	// be17fd73 is this PR's reconciliation-only client release.
+	nasCleanupExecutionClientVersion = "be17fd73"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -615,7 +618,13 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		util.WriteError(w, 500, "cleanup lease fence unavailable")
 		return
 	}
-	allowExecution := req.ReconciliationProtocol == nasCleanupReconciliationProtocol && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
+	var boot, version string
+	// Lock against an authenticated heartbeat changing identity until commit.
+	if err = tx.QueryRow(ctx, `SELECT client_boot_id,client_version FROM connections WHERE id=$1 FOR SHARE`, cid).Scan(&boot, &version); err != nil {
+		util.WriteError(w, 500, "cleanup client identity unavailable")
+		return
+	}
+	allowExecution := boot != "" && version == nasCleanupExecutionClientVersion && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
 	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report")
@@ -625,7 +634,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	tasks := make([]cleanupTask, 0, req.Limit)
 	if req.RequestID != "" {
-		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution)
+		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, boot, version)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
@@ -683,7 +692,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		if req.RequestID != "" {
 			requestID = req.RequestID
 		}
-		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=$2,lease_expires_at=$3,lease_request_id=$4,updated_at=now() WHERE id=$1`, task.ItemID, task.Attempt, task.ExpiresAt, requestID)
+		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='leased',attempt=$2,lease_expires_at=$3,lease_request_id=$4,lease_connection_id=$5,lease_client_boot_id=$6,lease_client_version=$7,updated_at=now() WHERE id=$1`, task.ItemID, task.Attempt, task.ExpiresAt, requestID, cid, boot, version)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease save failed")
 			return
@@ -712,8 +721,8 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
-func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool) ([]cleanupTask, error) {
-	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable)
+func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string) ([]cleanupTask, error) {
+	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version)
 	if err != nil {
 		return nil, err
 	}
@@ -857,6 +866,16 @@ func cleanupObserveRequestError(req cleanupObserve) string {
 	return ""
 }
 
+// Register before mode lookup, recovery I/O or the observation transaction.
+// This autocommit survives every later failure, including a transaction rollback.
+func (s *Server) cleanupRegisterObservation(ctx context.Context, requestID string) (bool, error) {
+	if requestID == "" || len(requestID) != 32 || !lowerHex(requestID) {
+		return false, nil
+	}
+	ct, err := s.pool.Exec(ctx, `INSERT INTO nas_cleanup_observation_requests(request_id) VALUES($1) ON CONFLICT DO NOTHING`, requestID)
+	return ct.RowsAffected() == 1, err
+}
+
 func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := cleanupExecutionContext(r.Context())
 	defer cancel()
@@ -873,12 +892,17 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		util.WriteError(w, 400, "invalid cleanup observation")
 		return
 	}
-	if msg := cleanupObserveRequestError(req); msg != "" {
-		util.WriteError(w, 400, msg)
-		return
-	}
 	cid, ok := s.nasRestoreConnection(ctx, w, r)
 	if !ok {
+		return
+	}
+	fresh, err := s.cleanupRegisterObservation(ctx, req.RequestID)
+	if err != nil {
+		cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
+		return
+	}
+	if msg := cleanupObserveRequestError(req); msg != "" {
+		util.WriteError(w, 400, msg)
 		return
 	}
 	ctx, dryRunOnly, err := s.cleanupObservationContext(ctx, r.Context(), cid, []int64{id})
@@ -887,7 +911,7 @@ func (s *Server) handleAccountNASCleanupObserve(w http.ResponseWriter, r *http.R
 		return
 	}
 	// R2 work happens before the transaction (no locks held across it).
-	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly}
+	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly, freshRequests: map[int64]bool{id: fresh}}
 	if req.Outcome == "match" {
 		env.prefetched = s.cleanupPrefetchRecovery(ctx, cid, map[int64]string{id: req.MD5})
 	}
@@ -935,6 +959,10 @@ func cleanupObserveError(status int, msg string) cleanupObserveResult {
 // whether it earns a single-use deletion permit. Both the single-item and the
 // batched endpoint use it; a batch runs each call in its own savepoint.
 func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64, req cleanupObserve, env *cleanupObserveEnv) cleanupObserveResult {
+	var boot, version string
+	if err := tx.QueryRow(ctx, `SELECT client_boot_id,client_version FROM connections WHERE id=$1 FOR SHARE`, cid).Scan(&boot, &version); err != nil {
+		return cleanupObserveError(503, "cleanup client identity unavailable")
+	}
 	var raw, oldProof, oldOutcome, evidence, rankings []byte
 	var mode, state, sha, binding, oldRecovery string
 	var until, permitUntil *time.Time
@@ -973,10 +1001,14 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// The plan was enabled between the two reads; retry under the fence.
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true}}
 	}
-	// Legacy clients replay /observe and can turn a failed original request
-	// into its first permit. They must never receive execution authority.
-	if (mode == "enabled" || state == "delete_issued") && req.ReconciliationProtocol != nasCleanupReconciliationProtocol {
-		return cleanupObserveError(409, "cleanup execution requires reconciliation-only replay")
+	if mode == "enabled" || state == "delete_issued" {
+		var bound bool
+		if err := tx.QueryRow(ctx, `SELECT coalesce(lease_connection_id=$2 AND lease_client_boot_id=$3 AND lease_client_version=$4,false) FROM nas_cleanup_items WHERE id=$1`, id, cid, boot, version).Scan(&bound); err != nil {
+			return cleanupObserveError(503, "cleanup lease identity unavailable")
+		}
+		if !bound || boot == "" || version != nasCleanupExecutionClientVersion {
+			return cleanupObserveError(409, "cleanup lease client identity differs")
+		}
 	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
@@ -1003,7 +1035,12 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		}
 		return cleanupObserveError(409, "cleanup observation is stale or terminal")
 	}
-	if lease == nil || lease.Before(time.Now()) {
+	if mode == "enabled" && req.RequestID != "" && !env.freshRequests[id] {
+		// No first permit for a previously submitted request, even if its first
+		// transaction rolled back. /reconcile alone may release proven unissued work.
+		return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "item_id": id, "attempt": attempt}}
+	}
+	if lease == nil || !lease.After(time.Now()) {
 		return cleanupObserveError(409, "cleanup lease expired")
 	}
 	if mode == "enabled" && req.Outcome == "match" {
@@ -1068,7 +1105,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					recoveryAnomaly = true
 					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
-				if cleanupMayIssue(mode, s.cfg.NASCleanupDeletionEnabled, until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
+				if lease.After(time.Now()) && cleanupMayIssue(mode, s.cfg.NASCleanupDeletionEnabled, until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
 					allowed, e := env.budgetAllows(ctx, tx, item.SizeBytes)
 					if e != nil {
 						return cleanupObserveError(500, "cleanup deletion budget unavailable")
@@ -1094,6 +1131,9 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	}
 	if cleanupObservationExpired(ctx) {
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup observation deadline exceeded; retry", "retryable": true}}
+	}
+	if deletion && !lease.After(time.Now()) {
+		return cleanupObserveError(409, "cleanup lease expired")
 	}
 	expires := time.Now().UTC().Add(30 * time.Second).Truncate(time.Microsecond)
 	observed, _ := json.Marshal(req)

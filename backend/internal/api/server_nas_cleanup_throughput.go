@@ -87,7 +87,8 @@ func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, statu
 // observations. The zero value (single-item endpoint) caches nothing.
 type cleanupObserveEnv struct {
 	// Refuse an enable racing the initial mode lookup under the dry-run context.
-	dryRunOnly bool
+	dryRunOnly    bool
+	freshRequests map[int64]bool
 	// budgetHeld is set only when the budget advisory lock was taken in the
 	// top-level transaction (never in a savepoint, whose rollback could release
 	// it); issued then stays exact until commit because no other transaction
@@ -590,6 +591,18 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
+	freshRequests := map[int64]bool{}
+	for n, o := range req.Observations {
+		if first[o.ItemID] != n {
+			continue
+		}
+		fresh, err := s.cleanupRegisterObservation(ctx, o.RequestID)
+		if err != nil {
+			cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
+			return
+		}
+		freshRequests[o.ItemID] = fresh
+	}
 	idsForMode := make([]int64, 0, len(req.Observations))
 	for _, o := range req.Observations {
 		idsForMode = append(idsForMode, o.ItemID)
@@ -618,7 +631,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			md5s[o.ItemID] = o.MD5
 		}
 	}
-	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return

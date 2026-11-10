@@ -224,7 +224,7 @@ func TestNASCleanupBatchApprovalExecutesPlansWithoutRedownload(t *testing.T) {
 		if len(current) != 1 || current[0].ItemID != itemID {
 			t.Fatalf("second plan serial lease: %+v", current)
 		}
-		permit := f.observe(current, map[int64]string{itemID: strings.Repeat("3", 32)})
+		permit := f.observe(current, map[int64]string{itemID: fmt.Sprintf("%032x", itemID)})
 		if !permit[0].Delete {
 			t.Fatalf("second plan permit: %+v", permit)
 		}
@@ -529,7 +529,7 @@ func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
 		}()
 	}
 	for n := 0; n < 40; n++ {
-		if r := <-done; !strings.HasPrefix(r, "200 ") || !strings.Contains(r, `"delete":true`) {
+		if r := <-done; !strings.HasPrefix(r, "200 ") || (!strings.Contains(r, `"delete":true`) && !strings.Contains(r, `"action":"reconcile"`)) {
 			t.Fatalf("concurrent observation: %s", r)
 		}
 	}

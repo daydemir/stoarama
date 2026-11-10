@@ -76,13 +76,13 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 		admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
 		admin.Close()
 	})
-	_, err = pool.Exec(ctx, `CREATE TABLE accounts(id bigint PRIMARY KEY);CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text,api_key_id bigint);
+	_, err = pool.Exec(ctx, `CREATE TABLE accounts(id bigint PRIMARY KEY);CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text,api_key_id bigint,client_boot_id text NOT NULL DEFAULT 'fixture-boot',client_version text NOT NULL DEFAULT 'be17fd73');
  CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text);
  CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,purged_at timestamptz,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,bucket text,etag text NOT NULL DEFAULT '');
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,excluded_clip_count integer,manifest jsonb);
  CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,nas_relative_path text,object_key text,sha256 text,size_bytes bigint,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],created_at timestamptz DEFAULT now());
  CREATE TABLE recording_joined_source_snapshots(clip_id bigint);
- INSERT INTO accounts VALUES(47),(48);INSERT INTO connections VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);INSERT INTO streams VALUES(3,'UTC');INSERT INTO recordings VALUES(2,47,3,'UTC');`)
+ INSERT INTO accounts VALUES(47),(48);INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);INSERT INTO streams VALUES(3,'UTC');INSERT INTO recordings VALUES(2,47,3,'UTC');`)
 	if err != nil {
 		t.Fatal(err)
 	}
