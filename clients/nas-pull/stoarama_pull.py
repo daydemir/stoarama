@@ -1997,7 +1997,11 @@ def cleanup_journal(inventory, item_id=None, phase=None, body=None, owner=None):
                     quarantined = inventory.db.execute("SELECT 1 FROM cleanup_quarantine WHERE item_id=?", (item_id,)).fetchone()
                     if current != claim[1] or quarantined:
                         raise RuntimeError("cleanup journal changed; deferred without modifying evidence")
-                next_row = None if phase is None else (phase, cleanup_json_bytes(body).decode())
+                # Observation permits hash the submitted proof bytes. Preserve
+                # insertion order so replay sends the same proof serialization;
+                # sorting a journal would change its binding after a lost reply.
+                next_row = None if phase is None else (phase, json.dumps(body, ensure_ascii=False)
+                                                       if phase == "observe" else cleanup_json_bytes(body).decode())
                 if owner is not None:
                     # Compare-and-swap in SQL too: even an independent SQLite
                     # writer cannot be overwritten between the check and write.
@@ -2056,6 +2060,9 @@ class CleanupFile:
         self.ancestors = []
         self.root_identity = None
         self.stage_timings = {}
+        self.permit_started = None
+        self.permit_expiry = None
+        self.unlink_attempted = False
         self.media_unlinked = False
         self.sidecar_unlinked = False
         self.directory_key = None
@@ -2068,8 +2075,14 @@ class CleanupFile:
         self.media_md5 = None
 
     def check_active(self):
-        if self.stop_event.is_set() or time.monotonic() >= self.deadline:
-            raise CleanupInterrupted("cleanup stopped or lease expired")
+        if self.stop_event.is_set():
+            raise CleanupInterrupted("cleanup stopped")
+        if self.permit_started is not None and time.monotonic() - self.permit_started >= CLEANUP_PERMIT_MAX_AGE_SEC:
+            raise CleanupPermitRefused("deadline_exceeded", "cleanup observation deadline exceeded before next unlink")
+        if self.permit_expiry is not None and self.permit_expiry <= datetime.datetime.now(datetime.timezone.utc):
+            raise CleanupPermitRefused("permit_expired", "cleanup deletion permit expired before next unlink")
+        if time.monotonic() >= self.deadline:
+            raise CleanupInterrupted("cleanup lease or permit deadline exceeded")
 
     def __enter__(self):
         try:
@@ -2240,6 +2253,7 @@ class CleanupFile:
                 raise RuntimeError("cleanup folder membership changed before unlink")
             self.check_paths()
             self.check_active()
+            self.unlink_attempted = True
             os.unlink(self.name, dir_fd=self.fds[-1])
             self.media_unlinked = True
             self.record_unlink(self.name)
@@ -2917,7 +2931,8 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         cleanup_validate_ack(item_id, phase, body, response)
         if phase == "observe" and (response.get("delete") is True or response.get("action") == "reconcile"):
             body = {"attempt": body["attempt"], "plan_sha256": body["plan_sha256"], "proof_sha256": response["proof_sha256"],
-                    "outcome": "unverified", "error": "recovered observation permit was not executed"}
+                    "outcome": "unverified", "error": "recovered observation permit was not executed",
+                    "unlink_attempted": False, "refusal_reason": "observation_replayed"}
             cleanup_journal(inventory, item_id, "result", body, owner=owner)
             result = replay(item_id, "result", body, owner)
             if result is None and any(row[0] == item_id for row in cleanup_journal(inventory)):
@@ -3001,12 +3016,52 @@ def cleanup_verified_ack(task, proof, decision):
     )
 
 
+CLEANUP_EXECUTION_OBSERVE_SEC = 25
+CLEANUP_PERMIT_MAX_AGE_SEC = 30
+
+
+class CleanupPermitRefused(RuntimeError):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
+def cleanup_check_permit(cfg, fenced, task, proof, decision, started):
+    if not fenced or cfg.dry_run:
+        raise CleanupPermitRefused("execution_disabled", "cleanup deletion execution is disabled; not unlinked")
+    if time.monotonic() - started >= CLEANUP_PERMIT_MAX_AGE_SEC:
+        raise CleanupPermitRefused("deadline_exceeded", "cleanup observation deadline exceeded (30 s); not unlinked")
+    if (decision.get("action") != "delete_issued" or decision.get("item_id") != task["item_id"]
+            or decision.get("attempt") != task["attempt"] or decision.get("plan_sha256") != task["plan_sha256"]
+            or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()):
+        raise CleanupPermitRefused("proof_mismatch", "cleanup deletion permit does not match exact current proof; not unlinked")
+    expiry = parse_certification_timestamp(decision.get("expires_at"), "cleanup permit")
+    if expiry <= datetime.datetime.now(datetime.timezone.utc):
+        raise CleanupPermitRefused("permit_expired", "cleanup deletion permit expired; not unlinked")
+    return expiry
+
+
+def cleanup_execution_outcome(inventory, item_id, attempt, outcome):
+    # Keep transport failures and non-permit responses diagnosable too, without
+    # mutating the immutable observation body used for journal reconciliation.
+    with inventory.lock:
+        inventory.db.execute("CREATE TABLE IF NOT EXISTS cleanup_execution_outcomes(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,attempt INTEGER NOT NULL,at TEXT NOT NULL,body TEXT NOT NULL)")
+        inventory.db.execute("INSERT INTO cleanup_execution_outcomes(item_id,attempt,at,body) VALUES(?,?,?,?)",
+                             (item_id, attempt, utc_now_precise(), cleanup_json_bytes(outcome).decode()))
+        inventory.db.commit()
+
+
 class CleanupSingleAPI:
     """Protocol 1: one observation or receipt per request (every server)."""
     request_ids = False
 
-    def observe(self, cfg, item_id, body):
-        return restore_api(cfg, "/account/connections/cleanup/%d/observe" % item_id, body)
+    def observe(self, cfg, item_id, body, execution=False):
+        path = "/account/connections/cleanup/%d/observe" % item_id
+        if execution:
+            # No retry after transport uncertainty; retain the observation
+            # journal for non-destructive reconciliation instead.
+            return restore_api(cfg, path, body, timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+        return restore_api(cfg, path, body)
 
     def result(self, cfg, item_id, receipt):
         return cleanup_send_result(cfg, item_id, receipt)
@@ -3039,6 +3094,12 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
         # gets the same recorded decision (or the same single permit) back.
         body["request_id"] = uuid.uuid4().hex
     fenced = False
+    execution_started = time.monotonic()
+    permit_request_started = None
+    observe_elapsed_ms = None
+    receipt = None
+    current = None
+    execution_outcome = {"outcome": "observation_unresolved", "error": ""}
     try:
         # A previously approved proof marks the execution phase. Dry runs
         # never acquire the write fence and do not impede clip delivery.
@@ -3064,21 +3125,22 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                 body["md5"] = current.media_md5
             cleanup_journal(inventory, item_id, "observe", body, owner=owner)
             permit_request_started = time.monotonic()
-            decision = api.observe(cfg, item_id, body)
+            try:
+                decision = (api.observe(cfg, item_id, body, execution=True) if fenced
+                            else api.observe(cfg, item_id, body))
+            finally:
+                observe_elapsed_ms = round((time.monotonic() - permit_request_started) * 1000)
             cleanup_validate_ack(item_id, "observe", body, decision)
+            execution_outcome["outcome"] = decision["action"]
             if decision.get("delete") is True:
-                receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": ""}
+                receipt = {"attempt": attempt, "plan_sha256": task["plan_sha256"], "proof_sha256": decision.get("proof_sha256"), "outcome": "unverified", "error": "", "observe_elapsed_ms": observe_elapsed_ms}
                 cleanup_journal(inventory, item_id, "intent", receipt, owner=owner)
                 ledger = None
                 try:
-                    if (not fenced or cfg.dry_run or time.monotonic() - permit_request_started > 30 or decision.get("action") != "delete_issued" or decision.get("item_id") != item_id
-                            or decision.get("attempt") != attempt or decision.get("plan_sha256") != task["plan_sha256"]
-                            or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()
-                            or parse_certification_timestamp(decision.get("expires_at"), "cleanup permit") <= datetime.datetime.now(datetime.timezone.utc)):
-                        raise RuntimeError("cleanup deletion permit does not match exact current proof")
-                    permit_expiry = parse_certification_timestamp(decision["expires_at"], "cleanup permit")
+                    permit_expiry = cleanup_check_permit(cfg, fenced, task, proof, decision, permit_request_started)
                     wall_remaining = (permit_expiry - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-                    current.deadline = min(current.deadline, permit_request_started + 30, time.monotonic() + max(0, wall_remaining))
+                    current.permit_started, current.permit_expiry = permit_request_started, permit_expiry
+                    current.deadline = min(current.deadline, permit_request_started + CLEANUP_PERMIT_MAX_AGE_SEC, time.monotonic() + max(0, wall_remaining))
                     item = task["item"]
                     # Re-check immediately before unlink, reserve one deletion
                     # against the local caps, then write the durable intent line.
@@ -3086,7 +3148,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                     refusal = cleanup_guard_refusal(task, proof, cfg) or cleanup_local_caps(
                         inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
                     if refusal:
-                        raise RuntimeError("client deletion guard refused; not unlinked: " + refusal)
+                        raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
                               "proof_sha256": receipt["proof_sha256"], "relative_path": item["relative_path"],
                               "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
@@ -3097,8 +3159,12 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                     receipt["outcome"] = "deleted"
                 except Exception as exc:
                     receipt["error"] = str(exc)[:500]
+                    if not current.unlink_attempted:
+                        receipt["refusal_reason"] = exc.reason if isinstance(exc, CleanupPermitRefused) else "pre_unlink_failure"
                     if current.media_unlinked and task["item"].get("sidecar_required") and not current.sidecar_unlinked:
                         receipt["outcome"] = "media_deleted_sidecar_failed"
+                receipt.update(unlink_attempted=current.unlink_attempted,
+                               execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000))
                 if ledger is not None:
                     try:
                         cleanup_ledger_append(cfg, dict(ledger, event="result", at=utc_now_precise(), outcome=receipt["outcome"],
@@ -3112,6 +3178,9 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
             cleanup_journal(inventory, item_id, owner=owner)
             return cleanup_verified_ack(task, proof, decision)
     except Exception as exc:
+        execution_outcome["error"] = str(exc)[:500]
+        if isinstance(exc, CleanupResponseError) and "acknowledgement differs:" in str(exc):
+            execution_outcome["refusal_reason"] = "proof_mismatch"
         # Never overwrite a durable intent/result with a speculative retry.
         if any(row[0] == item_id for row in cleanup_journal(inventory)):
             raise
@@ -3125,6 +3194,15 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
     finally:
         if fenced:
             NAS_MEDIA_FENCE.release_cleanup()
+        if task.get("approved_proof") is not None:
+            outcome = dict(receipt or execution_outcome)
+            outcome.update(observe_elapsed_ms=observe_elapsed_ms,
+                           execution_elapsed_ms=round((time.monotonic() - execution_started) * 1000),
+                           unlink_attempted=bool(current and current.unlink_attempted))
+            try:
+                cleanup_execution_outcome(inventory, item_id, attempt, outcome)
+            except Exception as exc:
+                log("ERROR", "cleanup item=%d execution outcome not stored: %s" % (item_id, exc))
 
 
 CLEANUP_PREFLIGHT_WORKERS = 8
@@ -3437,7 +3515,11 @@ class CleanupBatchAPI:
             code = status
             raise urllib.error.HTTPError(batcher.path, code, str(result.get("error", ""))[:200], {}, None)
 
-    def observe(self, cfg, item_id, body):
+    def observe(self, cfg, item_id, body, execution=False):
+        if execution:
+            # Execution must not accumulate queue, retry and split latency.
+            # Preserve the same request_id and exact proof on the single path.
+            return CLEANUP_SINGLE_API.observe(cfg, item_id, body, execution=True)
         return self.call(self.observations, item_id, body)
 
     def result(self, cfg, item_id, receipt):
@@ -8570,6 +8652,9 @@ def restore_https(netloc, method, target, body, headers, timeout, read_limit=Non
         conn = http.client.HTTPSConnection(netloc, timeout=timeout, blocksize=RESTORE_BLOCK_BYTES)
         conns[netloc] = conn
     try:
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
         conn.request(method, target, body=body, headers=headers)
         response = conn.getresponse()
         remember_response_secrets(response)
@@ -8590,23 +8675,23 @@ def restore_https(netloc, method, target, body, headers, timeout, read_limit=Non
     return response.status, data
 
 
-def restore_api(cfg, path, body, retry_stale=False):
+def restore_api(cfg, path, body, retry_stale=False, timeout=HTTP_TIMEOUT_SEC):
     """POST JSON to the API over a keep-alive connection; request_json semantics."""
     base = getattr(cfg, "api_base", "")
     parsed = urllib.parse.urlsplit(base + path)
     proxied = bool(urllib.request.getproxies().get("https")) and not urllib.request.proxy_bypass(parsed.netloc)
     if parsed.scheme != "https" or proxied:
         # Plain HTTP (tests) and proxied installs keep urllib's transport.
-        return request_json(cfg, "POST", path, body=body, timeout=HTTP_TIMEOUT_SEC)
+        return request_json(cfg, "POST", path, body=body, timeout=timeout)
     data = json.dumps(body).encode("utf-8")
     headers = {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"}
     target = parsed.path + ("?" + parsed.query if parsed.query else "")
     try:
-        status, raw = restore_https(parsed.netloc, "POST", target, data, headers, HTTP_TIMEOUT_SEC)
+        status, raw = restore_https(parsed.netloc, "POST", target, data, headers, timeout)
     except _RESTORE_STALE_ERRORS:
         if not retry_stale:
             raise
-        status, raw = restore_https(parsed.netloc, "POST", target, data, headers, HTTP_TIMEOUT_SEC)
+        status, raw = restore_https(parsed.netloc, "POST", target, data, headers, timeout)
     if status >= 400:
         raise urllib.error.HTTPError(base + path, status, "HTTP %d" % status, {}, None)
     result = json.loads(raw.decode("utf-8")) if raw else {}

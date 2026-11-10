@@ -87,6 +87,7 @@ func principalCanManageBilling(p accountPrincipal) bool {
 type accountContextKey string
 
 const accountPrincipalContextKey accountContextKey = "account_principal"
+const accountRequestStartedContextKey accountContextKey = "account_request_started"
 
 func (s *Server) handleAccountApp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -100,12 +101,14 @@ func loadAccountHTML() ([]byte, error) {
 
 func (s *Server) requireAccountAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
 		principal, err := s.authenticateAccountRequest(r)
 		if err != nil {
 			util.WriteError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		ctx := context.WithValue(r.Context(), accountPrincipalContextKey, principal)
+		ctx := context.WithValue(r.Context(), accountRequestStartedContextKey, started)
+		ctx = context.WithValue(ctx, accountPrincipalContextKey, principal)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

@@ -76,12 +76,23 @@ def run(args):
     real_ismount = os.path.ismount
     started = time.monotonic()
     cycles = 0
+    errors = []
     with mock.patch.object(pull.os.path, "ismount", side_effect=lambda p: str(p) == root or real_ismount(p)), \
+            mock.patch.object(pull.os, "unlink", wraps=os.unlink) as unlink, \
             concurrent.futures.ThreadPoolExecutor(max_workers=pull.CLEANUP_V2_WORKERS, thread_name_prefix="nas-cleanup") as executor:
         api = pull.CleanupBatchAPI(cfg) if args.protocol == 2 else None
         try:
             while time.monotonic() - started < args.max_seconds:
                 cycles += 1
+                if args.one_attempt:
+                    lease = (pull.cleanup_lease_v2(cfg, 1, 1, 1 << 30) if args.protocol == 2
+                             else pull.cleanup_lease(cfg))
+                    for task in lease["tasks"]:
+                        try:
+                            pull.cleanup_process_task(cfg, inventory, stop, task, api)
+                        except Exception as exc:
+                            errors.append(str(exc))
+                    break
                 if args.protocol == 2:
                     retry = pull.cleanup_batch_v2(cfg, inventory, stop, executor, api)
                 else:
@@ -96,8 +107,13 @@ def run(args):
     deleted = 0
     if ledger.exists():
         deleted = sum(1 for line in ledger.read_text().splitlines() if json.loads(line).get("event") == "result" and json.loads(line).get("outcome") == "deleted")
+    outcomes = []
+    if inventory.db.execute("SELECT 1 FROM sqlite_master WHERE name='cleanup_execution_outcomes'").fetchone():
+        outcomes = [json.loads(row[0]) for row in inventory.db.execute("SELECT body FROM cleanup_execution_outcomes ORDER BY id")]
     inventory.close()
-    print("BENCH_RESULT " + json.dumps({"protocol": args.protocol, "seconds": round(elapsed, 3), "cycles": cycles, "ledger_deleted": deleted}), flush=True)
+    print("BENCH_RESULT " + json.dumps({"protocol": args.protocol, "seconds": round(elapsed, 3), "cycles": cycles,
+                                       "ledger_deleted": deleted, "unlink_calls": unlink.call_count,
+                                       "errors": errors, "execution_outcomes": outcomes}), flush=True)
 
 
 def main():
@@ -115,6 +131,7 @@ def main():
     r.add_argument("--state", required=True)
     r.add_argument("--protocol", type=int, choices=(1, 2), default=2)
     r.add_argument("--max-seconds", type=float, default=1800)
+    r.add_argument("--one-attempt", action="store_true", help="exercise one lease without replaying an uncertain observation")
     args = parser.parse_args()
     (prepare if args.command == "prepare" else run)(args)
 

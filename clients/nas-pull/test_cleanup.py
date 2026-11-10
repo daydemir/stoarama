@@ -69,7 +69,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_readonly_worker_exact_proof_and_durable_ack(self):
         calls=[]
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             calls.append((path,body))
             if path.endswith('/lease'): return dict(tasks=[self.task],retry_after_sec=0)
             self.assertEqual(len(pull.cleanup_journal(self.inventory)),1)
@@ -88,7 +88,7 @@ class CleanupTests(unittest.TestCase):
         extra=self.path.parent/'keep.txt';extra.write_text('keep')
         # Re-observe the complete parent membership after introducing retained data.
         with self.opened() as f: self.task['approved_proof']=f.proof()
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
@@ -100,7 +100,7 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(extra.parent.is_dir());self.assertEqual(pull.cleanup_journal(self.inventory),[])
 
     def test_unsolicited_delete_without_execution_phase_preserves_media(self):
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):return dict(delete=True,action='delete_issued')
             self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
@@ -152,7 +152,7 @@ class CleanupTests(unittest.TestCase):
         body=dict(attempt=1,plan_sha256='a'*64,outcome='match',proof=proof,error='',client_version='test')
         pull.cleanup_journal(self.inventory,1,'observe',body)
         calls=[]
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             calls.append(path)
             if path.endswith('/observe'):return fixture_ack(body, action='reconcile', delete=False)
             self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
@@ -199,18 +199,71 @@ class CleanupTests(unittest.TestCase):
     def test_late_permit_rejected_independently_of_wall_clock(self):
         with self.opened() as f:self.task['approved_proof']=f.proof()
         original=time.monotonic;offset=[0]
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):
-                offset[0]=31
+                offset[0]=35
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
-        with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original()+offset[0]):
+            self.assertEqual(body['outcome'], 'unverified')
+            self.assertEqual(body['refusal_reason'], 'deadline_exceeded')
+            self.assertFalse(body['unlink_attempted'])
+            self.assertGreaterEqual(body['observe_elapsed_ms'], 35000)
+            self.assertGreaterEqual(body['execution_elapsed_ms'], body['observe_elapsed_ms'])
+            self.assertIn('deadline exceeded', body['error'])
+            return fixture_ack(body, int(path.split("/")[-2]), ok=True)
+        with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original()+offset[0]), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('late permit must never unlink')):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
 
+
+    def test_permit_refusal_reasons_are_distinct(self):
+        with self.opened() as current:
+            proof = current.proof()
+        decision = fixture_ack(dict(attempt=1, plan_sha256='a'*64, proof=proof), action='delete_issued', delete=True,
+                               expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+        expired = dict(decision, expires_at=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=1)).isoformat())
+        for response, reason in ((dict(decision, proof_sha256='b'*64), 'proof_mismatch'), (expired, 'permit_expired')):
+            with self.subTest(reason=reason), self.assertRaises(pull.CleanupPermitRefused) as caught:
+                pull.cleanup_check_permit(self.cfg, True, self.task, proof, response, time.monotonic())
+            self.assertEqual(caught.exception.reason, reason)
+
+    def test_expired_permit_receipt_is_never_attempted(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        receipts = []
+        def api(cfg, path, body, **kwargs):
+            if path.endswith('/observe'):
+                return fixture_ack(body, action='delete_issued', delete=True,
+                                   expires_at=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(seconds=1)).isoformat())
+            receipts.append(body)
+            return fixture_ack(body, ok=True)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('expired permit must never unlink')):
+            pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task)
+        self.assertEqual(receipts[0]['refusal_reason'], 'permit_expired')
+        self.assertFalse(receipts[0]['unlink_attempted'])
+        self.assertIn('permit expired', receipts[0]['error'])
+
+    def test_execution_transport_failure_is_not_retried_or_unlinked(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        api = pull.CleanupBatchAPI(self.cfg)
+        self.addCleanup(api.close)
+        with mock.patch.object(pull, 'restore_api', side_effect=TimeoutError('observation socket timed out')) as request, \
+                mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('timeout must never unlink')):
+            with self.assertRaises(TimeoutError):
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task, api)
+        self.assertEqual(request.call_count, 1)
+        self.assertTrue(request.call_args.args[1].endswith('/1/observe'))
+        self.assertEqual(request.call_args.kwargs, dict(timeout=pull.CLEANUP_EXECUTION_OBSERVE_SEC))
+        self.assertEqual(pull.cleanup_journal(self.inventory)[0][1], 'observe')
+        outcome = json.loads(self.inventory.db.execute('SELECT body FROM cleanup_execution_outcomes').fetchone()[0])
+        self.assertFalse(outcome['unlink_attempted'])
+        self.assertIsInstance(outcome['observe_elapsed_ms'], int)
+        self.assertGreaterEqual(outcome['execution_elapsed_ms'], outcome['observe_elapsed_ms'])
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
 
     def test_permit_deadline_checked_after_slow_final_directory_walk(self):
         with self.opened() as f:self.task['approved_proof']=f.proof()
@@ -220,14 +273,17 @@ class CleanupTests(unittest.TestCase):
             result=original_members(current)
             if permit_seen[0]:offset[0]=31
             return result
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             if path.endswith('/lease'):return dict(tasks=[self.task],retry_after_sec=0)
             if path.endswith('/observe'):
                 permit_seen[0]=True
                 return dict(action='delete_issued',delete=True,item_id=1,attempt=1,plan_sha256='a'*64,
                             proof_sha256=hashlib.sha256(json.dumps(body['proof']).encode()).hexdigest(),
                             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
-            self.assertEqual(body['outcome'],'unverified');return fixture_ack(body, int(path.split("/")[-2]), ok=True)
+            self.assertEqual(body['outcome'], 'unverified')
+            self.assertEqual(body['refusal_reason'], 'deadline_exceeded')
+            self.assertFalse(body['unlink_attempted'])
+            return fixture_ack(body, int(path.split("/")[-2]), ok=True)
         with mock.patch.object(pull,'restore_api',side_effect=api),mock.patch.object(pull.time,'monotonic',side_effect=lambda:original_clock()+offset[0]),mock.patch.object(pull.CleanupFile,'list_parent',members):
             pull.cleanup_once(self.cfg,self.inventory,threading.Event())
         self.assertTrue(self.path.exists());self.assertTrue(self.sidecar.exists())
@@ -283,7 +339,7 @@ class CleanupTests(unittest.TestCase):
         import copy
         barrier=threading.Barrier(4)
         calls=[];lock=threading.Lock();counter=[0]
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             with lock:
                 calls.append(path)
                 if path.endswith("/lease"):
@@ -301,7 +357,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_execution_drains_preflight_before_serial_processing(self):
         order=[];counter=[0]
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             counter[0]+=1
             task=dict(self.task,item_id=counter[0])
             if counter[0]==2:task["approved_proof"]={}
@@ -319,7 +375,7 @@ class CleanupTests(unittest.TestCase):
 
     def test_lease_failure_drains_workers_before_next_receipt_replay(self):
         finished=threading.Event();counter=[0]
-        def api(cfg,path,body):
+        def api(cfg,path,body, **kwargs):
             counter[0]+=1
             if counter[0]>1:raise OSError("transient lease failure")
             return dict(tasks=[self.task],retry_after_sec=0)
@@ -337,7 +393,7 @@ class CleanupTests(unittest.TestCase):
         lock = threading.Lock()
         release_slow = threading.Event()
         counts = dict(leased=0, active=0, peak=0, finished=0)
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             self.assertTrue(path.endswith("/lease"))
             limit = body["limit"]
             with lock:
@@ -388,7 +444,7 @@ class CleanupTests(unittest.TestCase):
         stop = threading.Event()
         lock = threading.Lock()
         counts = dict(active=0, finished=0, leases=0)
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             counts["leases"] += 1
             return dict(tasks=[dict(copy.deepcopy(self.task), item_id=n) for n in range(1, 9)], retry_after_sec=0)
         def process(cfg, inventory, stop, task):
@@ -409,7 +465,7 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual(replay.call_count, 1)
 
     def test_completed_exact_nas_r2_ack_qualifies_only_this_fresh_proof(self):
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             self.assertTrue(path.endswith("/observe"))
             return dict(delete=False, action="would_delete", recovery="r2_sha_verified",
                         item_id=self.task["item_id"], attempt=self.task["attempt"],
@@ -465,7 +521,7 @@ class CleanupTests(unittest.TestCase):
     def test_rolling_coordinator_marks_health_only_for_completed_verified_result(self):
         tasks = [dict(self.task, item_id=n) for n in range(1, 4)]
         event = threading.Event()
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             count = min(body["limit"], len(tasks))
             leased = tasks[:count]
             del tasks[:count]
@@ -598,7 +654,7 @@ class CleanupTests(unittest.TestCase):
 
 
 def approve_api(test, calls, receipt_reply=None):
-    def api(cfg, path, body):
+    def api(cfg, path, body, **kwargs):
         calls.append((path, dict(body) if isinstance(body, dict) else body))
         if path.endswith('/lease'):
             return dict(tasks=[test.task], retry_after_sec=0)
@@ -835,7 +891,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
     def fake_server(self, tasks, fail_first=()):
         lock = threading.Lock()
         state = dict(leased=False, calls=[], observe_batches=0, active=0, peak=0, failures=list(fail_first), bodies={})
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             with lock:
                 state['calls'].append(path)
                 if state['failures'] and path.endswith(state['failures'][0]):
@@ -850,6 +906,11 @@ class CleanupProtocol2Tests(unittest.TestCase):
                         return dict(tasks=[], retry_after_sec=120)
                     state['leased'] = True
                 return dict(tasks=tasks, retry_after_sec=0)
+            if path.endswith('/observe'):
+                self.assertEqual(kwargs.get('timeout'), pull.CLEANUP_EXECUTION_OBSERVE_SEC)
+                self.assertFalse(retry_stale)
+                return fixture_ack(body, int(path.split('/')[-2]), action='delete_issued', delete=True,
+                                   expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
             if path.endswith('/observe-batch'):
                 with lock:
                     state['observe_batches'] += 1
@@ -901,7 +962,8 @@ class CleanupProtocol2Tests(unittest.TestCase):
             self.assertFalse(path.exists()); self.assertFalse(sidecar.exists())
         self.assertTrue(keep.exists()); self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
         self.assertGreater(active['peak'], 1, 'execution was serial')
-        self.assertLess(state['observe_batches'], 24, 'observations were not batched')
+        self.assertEqual(state['observe_batches'], 0, 'execution observations must bypass batch queues')
+        self.assertEqual(sum(path.endswith('/observe') for path in state['calls']), 24)
         ledger = self.ledger()
         self.assertEqual(sorted(e['item_id'] for e in ledger if e['event'] == 'intent'), [t['item_id'] for t in tasks])
         self.assertEqual(sum(1 for e in ledger if e['event'] == 'result' and e['outcome'] == 'deleted'), 24)
@@ -936,17 +998,17 @@ class CleanupProtocol2Tests(unittest.TestCase):
 
     def test_transient_502_retries_same_requests_and_never_double_deletes(self):
         tasks, paths = self.execution_tasks(4)
-        api, state = self.fake_server(tasks, fail_first=('/lease', '/observe-batch', '/result-batch'))
+        api, state = self.fake_server(tasks, fail_first=('/lease', '/result-batch'))
         with mock.patch.object(pull, 'CLEANUP_RETRY_DELAYS', (0.01, 0.01, 0.01)):
             self.run_v2(api)
         self.assertTrue(all(not p.exists() for p, _ in paths))
-        for path in ('/account/connections/cleanup/lease', '/account/connections/cleanup/observe-batch'):
+        for path in ('/account/connections/cleanup/lease',):
             bodies = state['bodies'][path]
             self.assertEqual(bodies[0], bodies[1], 'retry changed the request (request ids must be reused)')
         self.assertEqual(sum(1 for e in self.ledger() if e['event'] == 'intent'), 4)
 
     def test_server_without_protocol_2_falls_back(self):
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             raise pull.urllib.error.HTTPError(path, 400, 'cleanup protocol1, client version and bounded limit required', {}, None)
         with mock.patch.object(pull, 'restore_api', side_effect=api):
             with self.assertRaises(pull.CleanupProtocolUnsupported):
@@ -970,7 +1032,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
                                       [(n, 'a'*64, 'x', 10, time.time()) for n in range(5)])
         self.inventory.db.commit()
         seen = []
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             seen.append(body); return dict(tasks=[], retry_after_sec=120)
         with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_MAX_FILES_24H', 7):
             self.run_v2(api)
@@ -981,7 +1043,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         for advertised in (False, True):
             with self.subTest(advertised=advertised):
                 seen = []
-                def api(cfg, path, body, retry_stale=False):
+                def api(cfg, path, body, retry_stale=False, **kwargs):
                     if path.endswith('/lease'):
                         if seen:
                             return dict(tasks=[], retry_after_sec=120)
@@ -1004,7 +1066,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         for n in range(6):
             pull.cleanup_journal(self.inventory, 100+n, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % n))
         lock = threading.Lock(); calls = []
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             self.assertTrue(path.endswith('/observe-batch'), path)
             with lock: calls.append(len(body['observations']))
             return dict(results=[fixture_ack(o, o['item_id'], status=200, action='conflict', delete=False) for o in body['observations']])
@@ -1021,7 +1083,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         pull.cleanup_journal(self.inventory, 200, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % 1, md5='b'*32))
         pull.cleanup_journal(self.inventory, 201, 'observe', dict(attempt=1, plan_sha256='a'*64, outcome='conflict', proof=None, error='x', request_id='%032x' % 2))
         sent = []
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             obs = body['observations']
             sent.append([o.get('md5') for o in obs])
             if any('md5' in o for o in obs):
@@ -1047,7 +1109,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
     def test_batcher_sends_each_item_once_and_withdraws_abandoned_entries(self):
         sent = []
         release = threading.Event()
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             sent.append([o['item_id'] for o in body['observations']])
             release.wait(2)
             return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete') for o in body['observations']])
@@ -1075,7 +1137,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
 
     def test_batcher_refuses_conflicting_duplicates(self):
         sent = []
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             sent.append(body['observations'])
             return dict(results=[dict(item_id=o['item_id'], status=200, action='would_delete') for o in body['observations']])
         with mock.patch.object(pull, 'restore_api', side_effect=api):
@@ -1099,7 +1161,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         pull.CLEANUP_STATUS.__init__()
         self.journal_observe(900)
         leases = []
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             if path.endswith('/lease'):
                 leases.append(body)
                 return dict(tasks=[], retry_after_sec=120)
@@ -1134,7 +1196,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
                             body = dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64, outcome='unverified')
                         pull.cleanup_journal(f.inventory, 900, phase, body)
                         calls, leases = [], []
-                        def api(cfg, path, body):
+                        def api(cfg, path, body, **kwargs):
                             calls.append(path)
                             if path.endswith('/lease'):
                                 leases.append(body)
@@ -1174,7 +1236,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
     def test_protocol1_all_blocked_leases_wait_without_reopening_or_repermitting(self):
         self.journal_observe(1)
         original = pull.cleanup_journal(self.inventory)
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             if path.endswith('/lease'):
                 return dict(tasks=[self.task], retry_after_sec=120)
             return dict(action='would_delete', delete=False)
@@ -1188,7 +1250,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.journal_observe(900)
         original = pull.cleanup_journal(self.inventory)
         entered, release, finished = threading.Event(), threading.Event(), threading.Event()
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             if path.endswith('/lease'):
                 self.assertTrue(entered.is_set())
                 return dict(tasks=[], retry_after_sec=120)
@@ -1220,7 +1282,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         release = threading.Event(); processed = []; leases = []
         task = dict(self.task, item_id=901)
         task.pop('approved_proof', None)
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             if path.endswith('/lease'):
                 leases.append(1)
                 return dict(tasks=[dict(task)], retry_after_sec=120) if len(leases) == 1 else dict(tasks=[], retry_after_sec=120)
@@ -1243,7 +1305,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
     def test_whole_request_failures_fall_back_to_smaller_batches(self):
         pull.CLEANUP_STATUS.__init__()
         sizes = []
-        def api(cfg, path, body, retry_stale=False):
+        def api(cfg, path, body, retry_stale=False, **kwargs):
             obs = body['observations']; sizes.append(len(obs))
             if len(obs) > 2 or any(o['item_id'] == 13 for o in obs):
                 raise pull.urllib.error.HTTPError(path, 413, 'too large', {}, None)
@@ -1391,7 +1453,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(pull.cleanup_journal(self.inventory), [latest])
         self.assertEqual(pull.cleanup_quarantine_status(self.inventory)['release_generation'], 1)
         calls = []
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             self.assertTrue(path.endswith('/result'))
             self.assertEqual(body['outcome'], 'unverified')
             calls.append(body)
@@ -1574,7 +1636,7 @@ class CleanupProtocol2Tests(unittest.TestCase):
 
     def test_missing_recovered_result_ack_preserves_advanced_receipt(self):
         self.journal_observe(900)
-        def api(cfg, path, body):
+        def api(cfg, path, body, **kwargs):
             if path.endswith('/observe'):
                 return fixture_ack(body, 900, action='reconcile', delete=False)
             return None
@@ -1670,7 +1732,7 @@ class CleanupAcknowledgementTests(unittest.TestCase):
                     with f.opened() as current:
                         f.task['approved_proof'] = current.proof()
                     calls = []
-                    def observe(cfg, item_id, body):
+                    def observe(cfg, item_id, body, **kwargs):
                         calls.append('observe')
                         return fixture_ack(body, action='delete_issued', delete=True,
                                            expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
@@ -1706,7 +1768,7 @@ class CleanupAcknowledgementTests(unittest.TestCase):
                     f = self.fixture()
                     if conflict:
                         f.item['sha256'] = 'f'*64
-                    def observe(cfg, item_id, body):
+                    def observe(cfg, item_id, body, **kwargs):
                         ack = self.response(case, body, 'observe')
                         if case == 'valid' and conflict:
                             ack['action'] = 'conflict'
