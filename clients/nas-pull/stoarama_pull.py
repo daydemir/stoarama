@@ -240,14 +240,23 @@ def log(level, message):
 CLIENT_LOG_MAX_LINES = 500
 CLIENT_LOG_MAX_BYTES = 256 * 1024
 CLIENT_LOG_LINE_MAX = 2048
+DIAGNOSTIC_INPUT_MAX = CLIENT_LOG_LINE_MAX
+DIAGNOSTIC_MAX_DEPTH = 32
+DIAGNOSTIC_TRUNCATED = " [TRUNCATED]"
 CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
 CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
 # Keep normalization and redaction rules in sync with server_nas_client_logs.go;
 # both suites load testdata/nas_diagnostic_redaction.json.
-_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|session|dsn|database_url|x-amz-[a-z0-9_-]+)[A-Za-z0-9_.-]*"
-_DIAGNOSTIC_ESCAPE = re.compile(r"\\+(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|([nrt]))")
-_DIAGNOSTIC_QUOTES = re.compile(r"\\+([\"'/])")
+# Scan each name token only from its start. The marker lookahead and the
+# consuming token each make one pass; neither can restart inside the token.
+_SECRET_MARKER = r"token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|session|dsn|database_url|x-amz-[a-z0-9_-]+"
+_SECRET_NAME = r"(?<![A-Za-z0-9_.-])(?=[A-Za-z0-9_.-]*(?:" + _SECRET_MARKER + r"))[A-Za-z0-9_.-]+"
+_SECRET_MARKER_RE = re.compile(_SECRET_MARKER, re.IGNORECASE)
+_DIAGNOSTIC_NAME_TOKEN = re.compile(r"[A-Za-z0-9_.-]+")
+# A failed escape must consume a whole backslash run only once (Python 3.9+).
+_DIAGNOSTIC_ESCAPE = re.compile(r"(?<!\\)\\+(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|([nrt]))")
+_DIAGNOSTIC_QUOTES = re.compile(r"(?<!\\)\\+([\"'/])")
 _DIAGNOSTIC_BYTES = (re.compile(r"\bb'((?:\\.|[^'\\])*)'", re.IGNORECASE),
                      re.compile(r'\bb"((?:\\.|[^"\\])*)"', re.IGNORECASE))
 _DIAGNOSTIC_WRAPPER = re.compile(r"\b(?:bytearray|memoryview)\(([^()]*)\)", re.IGNORECASE)
@@ -271,10 +280,33 @@ def normalize_diagnostic_text(text):
     return "[REDACTED]"
 
 
-def diagnostic_secret_name(value):
+def bounded_diagnostic_text(value):
+    """Limit work before decoding/normalization, including native buffers."""
     if isinstance(value, (bytes, bytearray, memoryview)):
-        value = bytes(value).decode("utf-8", "replace")
-    return isinstance(value, str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(value).casefold()) is not None
+        truncated = len(value) > DIAGNOSTIC_INPUT_MAX
+        return bytes(value[:DIAGNOSTIC_INPUT_MAX]).decode("utf-8", "replace"), truncated
+    text = str(value)
+    return text[:DIAGNOSTIC_INPUT_MAX], len(text) > DIAGNOSTIC_INPUT_MAX
+
+
+def diagnostic_secret_name(value):
+    if not isinstance(value, (str, bytes, bytearray, memoryview)):
+        return False
+    text, truncated = bounded_diagnostic_text(value)
+    if truncated:
+        return True  # an omitted suffix may contain a sensitive name
+    text = normalize_diagnostic_text(text).casefold()
+    return _DIAGNOSTIC_NAME_TOKEN.fullmatch(text) is not None and _SECRET_MARKER_RE.search(text) is not None
+
+
+def redact_diagnostic_url(match):
+    # Consume the URL once; requiring a trailing '?' in the regex would retry
+    # the whole suffix for each embedded https:// in a query-less URL.
+    url = match.group()
+    query, fragment = url.find("?"), url.find("#")
+    if query >= 0 and (fragment < 0 or query < fragment):
+        return url[:query + 1] + "[REDACTED]"
+    return url
 
 
 # Fail closed after a sensitive assignment/pair or standalone auth scheme:
@@ -282,53 +314,94 @@ def diagnostic_secret_name(value):
 _REDACTIONS = (
     (re.compile(r"(?is)\b(?:RequestsCookieJar|CookieJar|SimpleCookie|Morsel|Cookie)(?:\s*[:(<]|\s+[A-Za-z0-9_.-]+\s*=)[\s\S]*"), "[REDACTED]"),
     (re.compile(r"(?is)(\bname\s*=\s*[\"'][^\"']*[\"']\s*,\s*value\s*=\s*)[\s\S]*"), r"\1[REDACTED]"),
-    (re.compile(r"(?is)([\[(]\s*[\"']?\s*" + _SECRET_NAME + r"\s*[\"']?\s*,\s*)[\s\S]*"), r"\1[REDACTED]"),
-    (re.compile(r"(?is)(\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
+    (re.compile(r"(?is)([\[(]\s*(?:[\"']\s*)?" + _SECRET_NAME + r"\s*(?:[\"']\s*)?,\s*)[\s\S]*"), r"\1[REDACTED]"),
+    (re.compile(r"(?is)(" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?is)\b(basic|bearer|digest|token|aws4-hmac-sha256)\s+\S[\s\S]*"), r"\1 [REDACTED]"),
     (re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|redis(?:s)?)://[^\s'\"<>]+"), "[REDACTED]"),
-    (re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@"), r"\1[REDACTED]@"),
-    (re.compile(r"(?i)\b((?:https?|s3)://[^\s?#'\"<>]+)\?[^\s'\"<>]*"), r"\1?[REDACTED]"),
+    (re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)\b(?:https?|s3)://[^\s'\"<>]+"), redact_diagnostic_url),
     (re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,2}"), "[REDACTED]"),
     (re.compile(r"\btskey-[A-Za-z0-9_-]+"), "[REDACTED]"),
     (re.compile(r"\bAKIA[A-Z0-9]{16}\b"), "[REDACTED]"),
     (re.compile(r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b"), "[REDACTED]"),
     (re.compile(r"(?i)\bfd7a:115c:a1e0(?::[0-9a-f]{0,4})+(?:%[A-Za-z0-9_.-]+)?"), "[REDACTED]"),
-    (re.compile(r"(?i)\b[A-Za-z0-9.-]+\.ts\.net\b"), "[REDACTED]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9.-])[A-Za-z0-9.-]+\.ts\.net\b"), "[REDACTED]"),
     (re.compile(r"\b(?:sir|sk|rk|pk|ghp|gho|xox[abp])_[A-Za-z0-9_-]{8,}\b"), "[REDACTED]"),
 )
 _ABSOLUTE_PATH = re.compile(r"(^|[^\w:/.])(/[^\s'\"<>,;)]+)")
 
 
 def redact_diagnostics(value):
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        value = bytes(value).decode("utf-8", "replace")
-    if isinstance(value, str):
+    try:
+        return _redact_diagnostics(value)
+    except Exception:
+        return "[REDACTED]"
+
+
+def _redact_diagnostics(value, depth=0):
+    if depth >= DIAGNOSTIC_MAX_DEPTH:
+        return "[REDACTED]"
+    if isinstance(value, (str, bytes, bytearray, memoryview)):
         return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.secrets)
     if isinstance(value, dict):
-        return {redact_diagnostics(k): ("[REDACTED]" if diagnostic_secret_name(k) else redact_diagnostics(v)) for k, v in value.items()}
+        return {_redact_diagnostics(k, depth + 1): ("[REDACTED]" if diagnostic_secret_name(k) else _redact_diagnostics(v, depth + 1)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         if len(value) >= 2 and diagnostic_secret_name(value[0]):
-            return [redact_diagnostics(value[0]), "[REDACTED]"]
-        return [redact_diagnostics(v) for v in value]
+            return [_redact_diagnostics(value[0], depth + 1), "[REDACTED]"]
+        return [_redact_diagnostics(v, depth + 1) for v in value]
     return value
 
 
 def redact_log_line(text, output_root=None, secrets=()):
-    """Remove credentials, signed URL query strings, secret-looking values and
-    absolute host paths outside the NAS output root from one log line."""
-    text = bytes(text).decode("utf-8", "replace") if isinstance(text, (bytes, bytearray, memoryview)) else str(text)
+    """Always fail closed, including conversion and known-secret failures."""
+    try:
+        return _redact_log_line(text, output_root, secrets)
+    except Exception:
+        return "[REDACTED]"
+
+
+def redact_known_diagnostic_secrets(text, variants, truncated):
+    for variant in variants:
+        text = text.replace(variant, "[REDACTED]")
+        if truncated and len(variant) >= 8:
+            # A cut can leave only a prefix, possibly spanning whitespace or
+            # encodings. Drop the tail from its first eight characters. This
+            # deliberately fails closed, without a quadratic suffix search.
+            cut = text.find(variant[:8])
+            if cut >= 0:
+                text = text[:cut] + "[REDACTED]"
+    return text
+
+
+def finish_diagnostic_text(text, truncated, variants):
+    if len(text) > CLIENT_LOG_LINE_MAX:
+        truncated = True
+    if not truncated:
+        return text
+    text = text[:CLIENT_LOG_LINE_MAX - len(DIAGNOSTIC_TRUNCATED) - len("[REDACTED]")]
+    text = redact_known_diagnostic_secrets(text, variants, True)
+    # Never retain a token severed by either the input or output cap, including
+    # a partial scheme, credential prefix, or incomplete quoted/escaped value.
+    tokens = list(re.finditer(r"\s+|\S+", text))
+    if tokens and not tokens[-1].group().isspace():
+        text = text[:tokens[-1].start()] + "[REDACTED]"
+    return text[:CLIENT_LOG_LINE_MAX - len(DIAGNOSTIC_TRUNCATED)] + DIAGNOSTIC_TRUNCATED
+
+
+def _redact_log_line(text, output_root=None, secrets=()):
+    """Remove credentials, signed URLs and absolute host paths from bounded text."""
+    text, truncated = bounded_diagnostic_text(text)
     variants = set()
     for secret in secrets:
         variants.update(diagnostic_secret_variants(secret))
+    variants = sorted(variants, key=len, reverse=True)
     # Replace before AND after decoding: normalization can alter opaque values.
-    for variant in sorted(variants, key=len, reverse=True):
-        text = text.replace(variant, "[REDACTED]")
+    text = redact_known_diagnostic_secrets(text, variants, truncated)
     normalized = normalize_diagnostic_text(text)
-    if normalized != text and re.search(_SECRET_NAME, normalized, re.IGNORECASE):
-        return "[REDACTED]"
-    text = normalized
-    for variant in sorted(variants, key=len, reverse=True):
-        text = text.replace(normalize_diagnostic_text(variant), "[REDACTED]")
+    normalized_variants = [normalize_diagnostic_text(v) for v in variants]
+    if normalized != text and _SECRET_MARKER_RE.search(normalized):
+        return finish_diagnostic_text("[REDACTED]", truncated, normalized_variants)
+    text = redact_known_diagnostic_secrets(normalized, normalized_variants, truncated)
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     root = str(output_root).rstrip("/") if output_root else None
@@ -341,7 +414,7 @@ def redact_log_line(text, output_root=None, secrets=()):
             return prefix + value  # API routes, not host paths
         return prefix + "<path>"
     text = _ABSOLUTE_PATH.sub(path, text)
-    return text[:CLIENT_LOG_LINE_MAX]
+    return finish_diagnostic_text(text, truncated, variants + normalized_variants)
 
 
 def diagnostic_secret_variants(value):
@@ -430,8 +503,8 @@ class ClientLogRing:
         level = str(level).upper()
         if level not in CLIENT_LOG_LEVELS and not CLIENT_LOG_TOPICS.search(str(message)):
             return
+        line = redact_log_line(message, self.output_root, self.secrets)
         with self.lock:
-            line = redact_log_line(message, self.output_root, self.secrets)
             self.seq += 1
             entry = {"seq": self.seq, "at": utc_now_precise(), "level": level, "message": line}
             size = len(line) + 64

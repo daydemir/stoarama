@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -409,5 +410,46 @@ func TestNASClientLogsSharedVectorsPersistRedacted(t *testing.T) {
 				t.Fatalf("safe diagnostics changed: %q -> %q", text, got)
 			}
 		})
+	}
+}
+
+// The shared redactor also handles historical diagnostics outside the upload
+// handler, so its own cap must precede normalization, even with linear RE2.
+func TestNASDiagnosticsInputCapAndPerformance(t *testing.T) {
+	var maxElapsed time.Duration
+	for _, size := range []int{8192, 32768, 1024 * 1024} {
+		for _, unit := range []string{"a", "=", ":", "'", "\"", `\`, "[", "(", "a.", "https://"} {
+			input := "%61" + strings.Repeat(unit, size/len(unit))
+			start := time.Now()
+			got := redactNASClientLogLine(input)
+			elapsed := time.Since(start)
+			if elapsed > maxElapsed {
+				maxElapsed = elapsed
+			}
+			if elapsed >= 50*time.Millisecond {
+				t.Fatalf("size=%d unit=%q took %s", size, unit, elapsed)
+			}
+			if len(got) > nasDiagnosticInputMaxBytes || !strings.Contains(got, "[TRUNCATED]") {
+				t.Fatalf("size=%d unit=%q: unbounded output (%d bytes)", size, unit, len(got))
+			}
+			value := redactNASDiagnostics(map[string]any{"error": input}).(map[string]any)
+			if len(value["error"].(string)) > nasDiagnosticInputMaxBytes {
+				t.Fatal("structured value exceeds cap")
+			}
+		}
+	}
+	t.Logf("maximum pathological redaction time: %s", maxElapsed)
+	for _, lead := range []string{"Authorization: Bearer ", `password="`, `["api_key", "`, "Digest ", "https://host.invalid/file?sig="} {
+		prefix := strings.Repeat("ok ", (nasDiagnosticInputMaxBytes-len(lead)-10)/3)
+		got := redactNASClientLogLine(prefix + lead + strings.Repeat("private-canary-value", 10))
+		if strings.Contains(got, "private") || !strings.Contains(got, "[REDACTED]") || !strings.Contains(got, "[TRUNCATED]") {
+			t.Fatalf("partial credential survived: %s", got)
+		}
+	}
+	value := redactNASDiagnostics(map[string]any{strings.Repeat("a", 32768): "private-canary"}).(map[string]any)
+	for _, item := range value {
+		if item != "[REDACTED]" {
+			t.Fatal("oversize name did not fail closed")
+		}
 	}
 }

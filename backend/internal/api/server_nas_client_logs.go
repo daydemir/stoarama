@@ -19,9 +19,11 @@ import (
 // credential redactions, stores each upload append-only and keeps 7 days. Operators read them with
 // `stoaramactl nas-client logs`.
 const (
-	nasClientLogMaxLines     = 500
-	nasClientLogMaxLineBytes = 4096
-	nasClientLogMaxBytes     = 512 * 1024
+	nasClientLogMaxLines       = 500
+	nasClientLogMaxLineBytes   = 4096
+	nasClientLogMaxBytes       = 512 * 1024
+	nasDiagnosticInputMaxBytes = 2048
+	nasDiagnosticTruncated     = " [TRUNCATED]"
 )
 
 // Keep normalization and rules in sync with the client. Both suites load
@@ -99,19 +101,28 @@ func normalizeNASDiagnosticText(s string) string {
 }
 
 func isNASDiagnosticSecretName(s string) bool {
+	if len(s) > nasDiagnosticInputMaxBytes {
+		return true // an omitted suffix may contain a sensitive name
+	}
 	return nasDiagnosticSecretName.MatchString(strings.ToLower(normalizeNASDiagnosticText(s)))
 }
 
 func redactNASClientLogLine(s string) string {
+	// Apply the cap at the shared boundary, including diagnostics outside the
+	// upload handler. RE2 is linear, but normalization still needs bounded input.
+	truncated := len(s) > nasDiagnosticInputMaxBytes
+	if truncated {
+		s = s[:nasDiagnosticInputMaxBytes]
+	}
 	normalized := normalizeNASDiagnosticText(s)
 	if normalized != s && nasDiagnosticSensitiveText.MatchString(normalized) {
-		return "[REDACTED]"
+		return finishNASDiagnosticText("[REDACTED]", truncated)
 	}
 	s = normalized
 	for _, r := range nasClientLogRedactions {
 		s = r.re.ReplaceAllString(s, r.with)
 	}
-	return nasClientLogPath.ReplaceAllStringFunc(s, func(match string) string {
+	s = nasClientLogPath.ReplaceAllStringFunc(s, func(match string) string {
 		parts := nasClientLogPath.FindStringSubmatch(match)
 		for _, route := range []string{"/account/", "/api/", "/nas/", "/service/"} {
 			if strings.HasPrefix(parts[2], route) {
@@ -120,6 +131,26 @@ func redactNASClientLogLine(s string) string {
 		}
 		return parts[1] + "<path>"
 	})
+	return finishNASDiagnosticText(s, truncated)
+}
+
+func finishNASDiagnosticText(s string, truncated bool) string {
+	if len(s) > nasDiagnosticInputMaxBytes {
+		truncated = true
+	}
+	if !truncated {
+		return s
+	}
+	limit := nasDiagnosticInputMaxBytes - len(nasDiagnosticTruncated) - len("[REDACTED]")
+	if len(s) > limit {
+		s = s[:limit]
+	}
+	// Drop a severed trailing token, including partial credentials/schemes.
+	cut := strings.LastIndexAny(s, " \t\r\n\v\f") + 1
+	if cut < len(s) {
+		s = s[:cut] + "[REDACTED]"
+	}
+	return s + nasDiagnosticTruncated
 }
 
 // Redact recursively after parsing so JSON quotes/escapes remain valid.

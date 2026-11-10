@@ -1308,7 +1308,8 @@ class CleanupProtocol2Tests(unittest.TestCase):
         kept = pull.redact_log_line('cleanup item=5 %s/stream/day/a.mp4 sha 6cd360d73985e0fa33db455c1bfc6190ebb2ef22febdf965e460744e41517111 POST /account/connections/cleanup/lease' % root, root)
         self.assertIn('<nas>/stream/day/a.mp4', kept); self.assertIn('6cd360d7', kept); self.assertIn('/account/connections/cleanup/lease', kept)
         self.assertNotIn(root, kept)
-        self.assertEqual(len(pull.redact_log_line('x' * 10000)), pull.CLIENT_LOG_LINE_MAX)
+        self.assertLessEqual(len(pull.redact_log_line('x' * 10000)), pull.CLIENT_LOG_LINE_MAX)
+        self.assertIn('[TRUNCATED]', pull.redact_log_line('x' * 10000))
         with mock.patch.dict(pull.os.environ, {'STOARAMA_API' + '_KEY': fake}):
             self.assertIn(fake, pull.client_log_secrets(SimpleNamespace(api_key='cfg-' + fake)))
 
@@ -1848,5 +1849,109 @@ class DiagnosticSharedFixtureTests(unittest.TestCase):
             ring = pull.ClientLogRing()
             ring.record('WARN', value)
             self.assertNotIn('synthetic-sensitive-value', ring.lines[0][0]['message'])
+
+class DiagnosticPerformanceTests(unittest.TestCase):
+    def assert_fast(self, call):
+        start = time.perf_counter()
+        result = call()
+        elapsed = time.perf_counter() - start
+        self.assertLess(elapsed, 0.050, 'redaction took %.3f ms' % (elapsed * 1000))
+        return result
+
+    def test_pathological_inputs_are_bounded_and_fast(self):
+        for size in (8192, 32768, 1024 * 1024):
+            for unit in ('%61' + 'a' * size, '=' * size, ':' * size,
+                         "'" * size, '"' * size, '\\' * size,
+                         '[' * size, '(' * size, 'a.' * (size // 2),
+                         'https://' * (size // 8), '["' + ' ' * size,
+                         'x-amz-' + 'a' * size, 'token' + 'a' * size,
+                         '%25' * (size // 3)):
+                with self.subTest(size=size, prefix=unit[:20]):
+                    result = self.assert_fast(lambda: pull.redact_log_line(unit))
+                    self.assertLessEqual(len(result), pull.CLIENT_LOG_LINE_MAX)
+                    self.assertIn('[TRUNCATED]', result)
+                    structured = self.assert_fast(lambda: pull.redact_diagnostics({'last_error': unit}))
+                    self.assertLessEqual(len(structured['last_error']), pull.CLIENT_LOG_LINE_MAX)
+
+    def test_deep_and_cyclic_diagnostics_fail_closed_quickly(self):
+        value = 'private-canary'
+        for _ in range(10000):
+            value = [value]
+        result = self.assert_fast(lambda: pull.redact_diagnostics(value))
+        self.assertNotIn('private-canary', json.dumps(result))
+        cycle = []
+        cycle.append(cycle)
+        self.assertIn('[REDACTED]', json.dumps(self.assert_fast(lambda: pull.redact_diagnostics(cycle))))
+
+    def test_cut_sensitive_values_and_known_secret_prefixes(self):
+        canary = 'synthetic fragment with spaces and punctuation / end'
+        for fragment in (canary[:8], canary[:20], canary[:-1]):
+            prefix = 'safe ' * ((pull.DIAGNOSTIC_INPUT_MAX - len(fragment)) // 5)
+            prefix += ' ' * (pull.DIAGNOSTIC_INPUT_MAX - len(fragment) - len(prefix))
+            text = prefix + canary + ' extra'
+            result = pull.redact_log_line(text, secrets=(canary,))
+            self.assertNotIn(fragment, result)
+            self.assertIn('[TRUNCATED]', result)
+            self.assertLessEqual(len(result), pull.CLIENT_LOG_LINE_MAX)
+        for lead in ('Authorization: Bearer ', 'password="', '["api_key", "',
+                     'Digest ', 'https://host.invalid/file?sig='):
+            prefix = 'ok ' * ((pull.DIAGNOSTIC_INPUT_MAX - len(lead) - 10) // 3)
+            result = pull.redact_log_line(prefix + lead + 'private-canary-value' * 10)
+            self.assertNotIn('private', result)
+            self.assertIn('[REDACTED]', result)
+            self.assertIn('[TRUNCATED]', result)
+        for variant in pull.diagnostic_secret_variants(canary):
+            prefix = 'x ' * ((pull.DIAGNOSTIC_INPUT_MAX - 12) // 2)
+            result = pull.redact_log_line(prefix + variant + ' extra', secrets=(canary,))
+            self.assertNotIn(variant[:8], result)
+
+    def test_buffers_and_each_structured_item_are_capped_before_normalization(self):
+        original = pull.normalize_diagnostic_text
+        observed = []
+        def bounded(text):
+            observed.append(len(text))
+            self.assertLessEqual(len(text), pull.DIAGNOSTIC_INPUT_MAX)
+            return original(text)
+        with mock.patch.object(pull, 'normalize_diagnostic_text', side_effect=bounded):
+            for wrap in (str, lambda x: x.encode(), lambda x: bytearray(x.encode()),
+                         lambda x: memoryview(x.encode())):
+                result = pull.redact_diagnostics({'errors': {'first': wrap('a' * 32768), 'second': wrap('b' * 32768)}})
+                self.assertTrue(all('[TRUNCATED]' in x for x in result['errors'].values()))
+        self.assertTrue(observed)
+        self.assertEqual(list(pull.redact_diagnostics({'a' * 32768: 'private-canary'}).values()), ['[REDACTED]'])
+
+    def test_redaction_exceptions_never_return_raw_text(self):
+        class BrokenText:
+            def __str__(self):
+                raise ValueError('private-canary')
+        class BrokenDict(dict):
+            def items(self):
+                raise ValueError('private-canary')
+        self.assertEqual(pull.redact_log_line(BrokenText()), '[REDACTED]')
+        self.assertEqual(pull.redact_diagnostics(BrokenDict()), '[REDACTED]')
+        for stage in ('bounded_diagnostic_text', 'normalize_diagnostic_text', 'diagnostic_secret_variants',
+                      'redact_known_diagnostic_secrets', 'finish_diagnostic_text'):
+            with mock.patch.object(pull, stage, side_effect=RuntimeError('private-canary')):
+                self.assertEqual(pull.redact_log_line('private-canary', secrets=('private-canary',)), '[REDACTED]')
+        with mock.patch.object(pull, 'diagnostic_secret_name', side_effect=RuntimeError('private-canary')):
+            self.assertEqual(pull.redact_diagnostics({'api_key': 'private-canary'}), '[REDACTED]')
+
+    def test_log_http_error_returns_quickly_and_ring_is_not_locked_during_redaction(self):
+        import io
+        from contextlib import redirect_stdout
+        ring = pull.ClientLogRing()
+        original = pull.redact_log_line
+        def unlocked(*args, **kwargs):
+            acquired = ring.lock.acquire(blocking=False)
+            self.assertTrue(acquired, 'redaction holds ring lock')
+            if acquired:
+                ring.lock.release()
+            return original(*args, **kwargs)
+        error = pull.urllib.error.HTTPError('https://example.invalid', 403, '%61' + 'a' * 32768, None, None)
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring), mock.patch.object(pull, 'redact_log_line', side_effect=unlocked), redirect_stdout(io.StringIO()):
+            self.assert_fast(lambda: pull.log('ERROR', error))
+        self.assertEqual(len(ring.lines), 1)
+        self.assertIn('[TRUNCATED]', ring.lines[0][0]['message'])
+        self.assertTrue(ring.error_event.is_set())
 
 if __name__=='__main__':unittest.main()
