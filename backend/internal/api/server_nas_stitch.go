@@ -22,7 +22,7 @@ import (
 
 const nasStitchPolicy = "v85-qualified-negative-unknown-capture-successor-v2"
 const nasStitchRevision = "v85-qualified15-8c0ab4d0369d8d4b"
-const nasStitchCorpusSHA = "dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46"
+const nasStitchCorpusSHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 const nasStitchReason = "stitched_included"
 const nasStitchFence int64 = 7343226011110
 const nasStitchMaxBytes int64 = 2500000000

@@ -12,7 +12,9 @@ The only seam-positive authority is the approved October frozen decision export:
 - policy `v85-qualified-negative-unknown-capture-successor-v2`
 - review revision `v85-qualified15-8c0ab4d0369d8d4b`
 - classifier entry SHA `a24b6014953d1d962fa55c569a834adbc5b638bf7c61f00f977164a18205cad3`
-- frozen decision JSONL SHA `dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46`
+- frozen decision gzip SHA `dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46` (9,028,408 bytes)
+- uncompressed JSONL SHA `5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b` (30,292,366 bytes)
+- export manifest SHA `e877140ad5f4cf93380ca58b3331391a34f445f1882628dba015bbcacb0103b1`
 - keep28 bytes SHA `060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`
 
 The API imports only those exact uncompressed export bytes and its 73,843-edge /
@@ -27,12 +29,22 @@ layouts also split. No decision is inferred from file names or elapsed coverage.
 
 **Activation prerequisite:** the handoff recovers the classifier sources, but
 not the export body, original feature-producer inputs or full veto bundles.
-An exact export must be recovered and its identity/census confirmed before this
-worker can lease production work. Failure to recover it is HOLD, not permission
+The recovered manifest distinguishes gzip and JSONL hashes above. Import accepts
+only the exact JSONL body; verify the original gzip against its separate pin
+before decompression. The body has not been recovered. An exact export must be
+recovered and its identity/census confirmed before this worker can lease
+production work. Failure to recover it is HOLD, not permission
 to recreate the export from today's features. Any changed current negative
 evidence needs a reviewed admission/corpus revision; this implementation does
 not ingest new negative diagnostic bundles or extend October's source corpus.
-Do not activate against known newer denials without that admission work.
+Do not activate against known newer denials without that admission work. The
+recovered source71 alias evidence intersects five frozen nominees, four inside
+the current kept windows. Those denials must be reconciled before activation.
+Frozen nominees overlap at most 41,986 of 1,158,902 currently kept clips across
+34 of 109 streams (identity/size upper bounds, pending current SHA verification).
+The remaining footage needs the approved feature producers and a versioned
+corpus extension with unchanged nomination and negative-only semantics. This
+frozen-replay draft does not complete that broader V85 goal.
 
 The embedded policy selects all recordings for the approved stream. Ready hour
 units are bounded to 200 clips and 2.5 GB. They include only whole clips inside
@@ -110,11 +122,11 @@ and the existing redacted client-log upload (V85/stitch topics included).
 
 No commands below were run against production for this PR.
 
-1. Recover the exact export and confirm whether the handoff pin is the actual
-   uncompressed JSONL body. If its manifest defines a different compressed/body
-   hash relationship, stop and reconcile that pin in review; do not bypass hash
-   validation. Replay/admit a representative production unit with the NAS's
-   pinned FFmpeg before any deletion. This PR's synthetic corpus adapter is
+1. Recover the exact gzip export, verify both compressed and uncompressed
+   pins and the manifest census, and reconcile the known alias/negative
+   conflicts through reviewed corpus admission. Do not bypass hash validation.
+   Replay/admit a representative production unit with the NAS's pinned FFmpeg
+   before any deletion. This PR's synthetic corpus adapter is
    test-only and cannot admit production media.
 2. Deploy migration/API and a reviewed client candidate through the existing
    release process. Verify `nice` and `ionice` exist inside the NAS container.

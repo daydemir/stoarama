@@ -11,7 +11,7 @@ CREATE TABLE nas_stitch_scopes (
  CHECK(end_at>start_at AND end_at<=start_at+interval '29 days')
 );
 CREATE TABLE nas_stitch_corpus (
- sha256 text PRIMARY KEY CHECK(sha256='dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46'),
+ sha256 text PRIMARY KEY CHECK(sha256='5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b'),
  body bytea NOT NULL,
  created_at timestamptz NOT NULL DEFAULT now()
 );

@@ -9745,7 +9745,7 @@ def clean_benchmark_root(state_dir):
 # carry the whole worker. There is no service, timer or external Python package.
 STITCH_POLICY = "v85-qualified-negative-unknown-capture-successor-v2"
 STITCH_REVISION = "v85-qualified15-8c0ab4d0369d8d4b"
-STITCH_CORPUS_SHA = "dbac9a28d62d35138163eb9fec7da6b5481b04a167c2522dd1dcf665f25b0f46"
+STITCH_CORPUS_SHA = "5b2765ecb4f6483c8e48b5a6c958c7c0d8082764d4da57901626a22569c6346b"
 STITCH_MAX_INPUT = 2_500_000_000
 STITCH_MIN_MEMORY = 384 * 1024 * 1024
 STITCH_ACTIVE = threading.Event()
