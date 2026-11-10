@@ -1294,6 +1294,19 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
         self.assertTrue(self.path.exists())
 
+    def test_upgrade_does_not_count_legacy_transient_failures(self):
+        self.journal_observe(900)
+        self.inventory.db.execute("CREATE TABLE cleanup_replay_failures(item_id INTEGER PRIMARY KEY,failures INTEGER NOT NULL,last_error TEXT NOT NULL,last_at TEXT NOT NULL)")
+        self.inventory.db.execute("INSERT INTO cleanup_replay_failures VALUES(900,100,'network','old')")
+        self.inventory.db.commit()
+        entry = pull.cleanup_journal(self.inventory)[0]
+        exc = pull.CleanupResponseError('invalid response')
+        for n in range(4):
+            with mock.patch.object(pull.time, 'time', return_value=10000 + 3600*n):
+                self.assertFalse(pull.cleanup_replay_failed(self.inventory, *entry, exc))
+        with mock.patch.object(pull.time, 'time', return_value=24400):
+            self.assertTrue(pull.cleanup_replay_failed(self.inventory, *entry, exc))
+
     def test_release_preserves_conflicting_receipts(self):
         self.journal_observe(900)
         original = pull.cleanup_journal(self.inventory)[0]

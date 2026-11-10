@@ -2490,7 +2490,7 @@ def cleanup_replay_failed(inventory, item_id, phase, encoded, exc):
     now = time.time()
     with inventory.lock:
         cleanup_quarantine_tables(inventory)
-        inventory.db.execute("INSERT INTO cleanup_replay_failures(item_id,failures,last_error,last_at,first_at) VALUES(?,1,?,?,?) ON CONFLICT(item_id) DO UPDATE SET failures=failures+1,last_error=excluded.last_error,last_at=excluded.last_at,first_at=coalesce(first_at,excluded.first_at)",
+        inventory.db.execute("INSERT INTO cleanup_replay_failures(item_id,failures,last_error,last_at,first_at) VALUES(?,1,?,?,?) ON CONFLICT(item_id) DO UPDATE SET failures=CASE WHEN first_at IS NULL THEN 1 ELSE failures+1 END,last_error=excluded.last_error,last_at=excluded.last_at,first_at=coalesce(first_at,excluded.first_at)",
                              (item_id, message, utc_now_precise(), now))
         failures, first_at = inventory.db.execute("SELECT failures,first_at FROM cleanup_replay_failures WHERE item_id=?", (item_id,)).fetchone()
         quarantined = failures >= CLEANUP_REPLAY_QUARANTINE_AFTER and now - first_at >= CLEANUP_REPLAY_QUARANTINE_SPAN_SEC
