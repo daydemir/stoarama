@@ -57,6 +57,10 @@ func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("execution-gate", syntheticFiles(100, 20, 10))
 	f.dryRun()
+	dryID, drySHA, _ := f.admit("legacy-dry-run", syntheticFiles(200, 3, 10))
+	if code, body := safeguardControl(t, f.s, dryID, "paused", map[string]any{"plan_sha256": drySHA}); code != 200 {
+		t.Fatalf("pause dry fixture: %d %s", code, body)
+	}
 	f.s.cfg.NASCleanupDeletionEnabled = true
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
@@ -134,7 +138,9 @@ func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
 		t.Fatal("receipt did not unblock next execution lease")
 	}
 	// Legacy clients remain useful for dry runs while execution is occupied.
-	f.admit("legacy-dry-run", syntheticFiles(200, 3, 10))
+	if code, body := safeguardControl(t, f.s, dryID, "dry_run", map[string]any{"plan_sha256": drySHA}); code != 200 {
+		t.Fatalf("resume dry fixture: %d %s", code, body)
+	}
 	dry := request(2, 0, "")
 	if len(dry) != 3 {
 		t.Fatalf("legacy dry-run tasks: %d", len(dry))
@@ -298,6 +304,7 @@ func TestNASCleanupLiveSessionRequiredBeforeRollbackHeartbeat(t *testing.T) {
 			f := newCleanupFixture(t, 24)
 			id, sha, _ := f.admit("live-session", syntheticFiles(100, 2, 1))
 			f.dryRun()
+			f.admit("old-client-dry-run", syntheticFiles(200, 1, 1))
 			f.s.cfg.NASCleanupDeletionEnabled = true
 			if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 				t.Fatalf("enable: %d %s", code, body)
@@ -308,7 +315,6 @@ func TestNASCleanupLiveSessionRequiredBeforeRollbackHeartbeat(t *testing.T) {
 				}
 			}
 			// Enabled work is pending, so occupancy cannot hide an unsafe lease.
-			f.admit("old-client-dry-run", syntheticFiles(200, 1, 1))
 			leaseBody := map[string]any{"protocol": 2, "limit": 64, "execution_files": 64, "execution_bytes": 1 << 30, "reconciliation_protocol": nasCleanupReconciliationProtocol, "client_version": nasCleanupExecutionClientVersion}
 			for _, protocol := range []int{1, 2} {
 				body := any(leaseBody)

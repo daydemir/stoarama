@@ -252,7 +252,7 @@ func TestNASCleanupConflictingDuplicatesAreRefused(t *testing.T) {
 
 	s := f.s
 	s.cfg.NASCleanupDeletionEnabled = true
-	safeguardPlan(t, f.ctx, s, 70, "enabled", 10)
+	safeguardPlan(t, f.ctx, s, 70, "enabled", 10, 10)
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_items SET state='delete_issued',delete_ever_issued=true,attempt=1,proof_sha256=repeat('c',64) WHERE plan_id=70`); err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestNASCleanupConflictingDuplicatesAreRefused(t *testing.T) {
 		t.Fatalf("identical duplicate receipts: %d %s", same.Code, same.Body.String())
 	}
 	if m, _ := f.planMode(70); m != "enabled" {
-		t.Fatal("identical duplicate receipts paused the plan")
+		t.Fatal("identical duplicate receipts paused the incomplete plan")
 	}
 	conflict := map[string]any{}
 	for k, v := range receipt {

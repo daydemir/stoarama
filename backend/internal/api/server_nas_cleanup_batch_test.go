@@ -10,11 +10,15 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 	pool := cleanupTestPool(t)
 	ctx := context.Background()
 	s := &Server{pool: pool}
+	// Synthetic enabled lease-selection fixture; real activation is tested separately.
+	if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id,validated) VALUES(2,3,true)`); err != nil {
+		t.Fatal(err)
+	}
 	_, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256)
  SELECT 1,47,13,'batch','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811',jsonb_agg(jsonb_build_object('kind','raw','source_id',n)),repeat('b',64) FROM generate_series(1,10)n;
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal)SELECT n,1,n FROM generate_series(1,10)n;
  INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason)
- VALUES(2,47,13,'execute','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":11},{"kind":"raw","source_id":12}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture'),
+ VALUES(2,47,13,'execute','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":11,"stream_id":3},{"kind":"raw","source_id":12,"stream_id":3}]',repeat('b',64),'enabled',now()+interval '1 hour','fixture'),
  (3,48,14,'foreign','060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811','[{"kind":"raw","source_id":13}]',repeat('b',64),'dry_run',NULL,'');
  INSERT INTO nas_cleanup_items(id,plan_id,ordinal,proof)VALUES(11,2,1,'{}'),(12,2,2,'{}'),(13,3,1,NULL);`)
 	if err != nil {

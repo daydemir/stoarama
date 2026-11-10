@@ -357,12 +357,18 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 		return
 	}
 	ctx := r.Context()
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		util.WriteError(w, 500, "begin cleanup control failed")
 		return
 	}
-	defer tx.Rollback(ctx)
+	var releaseFreeze func()
+	defer func() {
+		tx.Rollback(ctx)
+		if releaseFreeze != nil {
+			releaseFreeze()
+		}
+	}()
 	if req.Mode == "enabled" {
 		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 			util.WriteError(w, 500, "public cleanup fence failed")
@@ -426,13 +432,15 @@ func (s *Server) handleAdminNASCleanupControl(w http.ResponseWriter, r *http.Req
 			util.WriteJSON(w, status, body)
 			return
 		}
+		releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, id)
+		if err != nil {
+			util.WriteError(w, 409, "cleanup freeze/replay failed: "+err.Error())
+			return
+		}
 	}
 	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode=$2,allow_nas_only=false,approval_reason=$3,approved_until=CASE WHEN $2='enabled' THEN now()+$5::bigint*interval '1 second' END,priority=coalesce($4,priority) WHERE id=$1`, id, req.Mode, req.Reason, req.Priority, int64(approval/time.Second))
 	if err == nil && req.Mode == "enabled" {
 		_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, id)
-		if err == nil {
-			err = cleanupActivateRankings(ctx, tx, id)
-		}
 	}
 	if err == nil && req.Mode != "enabled" {
 		// Pausing (or resuming the dry run of) a plan stops any enabled batch
@@ -1130,18 +1138,14 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		} else if e != nil || !bytes.Equal(a, b) {
 			action = "conflict"
 		} else {
-			var sourceVersion int64
+			var freezeGeneration int64
 			if mode == "enabled" {
-				// Catalog first, then source fence: source writers lock their
-				// catalog rows before the invalidation trigger updates this row.
-				// Hold SHARE through authorization commit, including every replay
-				// fallback and the per-file metadata checks below.
-				if err := tx.QueryRow(ctx, cleanupRankingsVersionLockSQL, item.StreamID).Scan(&sourceVersion); err != nil {
-					return cleanupObserveError(503, "cleanup source fence unavailable")
+				if err := tx.QueryRow(ctx, cleanupRankingsFreezeSQL, planID, item.StreamID).Scan(&freezeGeneration); err != nil {
+					return cleanupObserveError(503, "cleanup source freeze unavailable")
 				}
 			}
 			policyStarted := time.Now()
-			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, sourceVersion, mode, rankings, stageTimings))
+			e = s.cleanupCurrentPolicyCheck(ctx, tx, item, mode == "dry_run", stageTimings, s.cleanupExecutionRankingsUnchanged(ctx, tx, planID, freezeGeneration, mode, rankings, stageTimings))
 			stageTimings["policy_ms"] = time.Since(policyStarted).Milliseconds()
 			if e != nil {
 				action = "keep"

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestNASCleanupRankingCacheInvalidatesBeforeNextPermit(t *testing.T) {
+func TestNASCleanupRankingCacheUsesFrozenVerdictAndReplaysOnExpiry(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("cache-invalidation", syntheticFiles(100, 5, 10))
 	f.dryRun()
@@ -29,60 +29,15 @@ func TestNASCleanupRankingCacheInvalidatesBeforeNextPermit(t *testing.T) {
 		}
 		f.receipts(tasks, permit, "deleted")
 	}
-	execute("hit") // activation seeded the versioned replay
-	// Any clip row change must replay, even if the scored inputs/fingerprint
-	// happen to be identical (metadata update, or an ABA interval edit).
-	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET size_bytes=size_bytes+1 WHERE id=5000001`); err != nil {
-		t.Fatal(err)
-	}
-	execute("replay")
 	execute("hit")
-	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET clip_end_at=clip_end_at+interval '1 microsecond' WHERE id=5000002; UPDATE recording_clips SET clip_end_at=clip_end_at-interval '1 microsecond' WHERE id=5000002`); err != nil {
-		t.Fatal(err)
+	if _, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET size_bytes=size_bytes+1 WHERE id=5000001`); err == nil {
+		t.Fatal("frozen source changed")
 	}
-	execute("replay")
+	execute("hit")
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_rankings_cache SET checked_at=clock_timestamp()-interval '61 seconds' WHERE plan_id=$1`, id); err != nil {
 		t.Fatal(err)
 	}
 	execute("replay")
-}
-
-func TestNASCleanupRankingVersionsCoverAllReplayDependencies(t *testing.T) {
-	f := newCleanupFixture(t, 24)
-	version := func() int64 {
-		t.Helper()
-		var v int64
-		if err := f.pool.QueryRow(f.ctx, `SELECT `+cleanupRankingsVersionExpr, 3).Scan(&v); err != nil {
-			t.Fatal(err)
-		}
-		return v
-	}
-	for _, change := range []string{
-		`UPDATE recording_clips SET clip_end_at=clip_end_at+interval '1 microsecond' WHERE id=5000000`,
-		`INSERT INTO recording_clips(id,recording_id) VALUES(9,2)`,
-		`DELETE FROM recording_clips WHERE id=9`,
-		`INSERT INTO recording_collation_hours VALUES(77,2,1,'{"clips":[]}')`,
-		`UPDATE recording_collation_hours SET manifest='{"clips":[{"clip":{"clip_id":5000001},"disposition":"quarantined"}]}' WHERE id=77`,
-		`DELETE FROM recording_collation_hours WHERE id=77`,
-		`UPDATE recordings SET cron_timezone='UTC' WHERE id=2`,
-		`UPDATE streams SET local_timezone='Asia/Seoul' WHERE id=3`,
-		`INSERT INTO recordings VALUES(5,47,3,'UTC')`,
-		`UPDATE recordings SET stream_id=4 WHERE id=5`,
-		`UPDATE recordings SET stream_id=3 WHERE id=5`,
-		`DELETE FROM recordings WHERE id=5`,
-		`TRUNCATE recording_clips CASCADE`,
-		`TRUNCATE recording_collation_hours`,
-		`TRUNCATE recordings`,
-		`TRUNCATE streams`,
-	} {
-		before := version()
-		if _, err := f.pool.Exec(f.ctx, change); err != nil {
-			t.Fatal(change, err)
-		}
-		if after := version(); after <= before {
-			t.Fatalf("version did not increase: %s (%d -> %d)", change, before, after)
-		}
-	}
 }
 
 func TestNASCleanupRankingCacheRollsBackWithObservation(t *testing.T) {
@@ -106,7 +61,7 @@ func TestNASCleanupRankingCacheRollsBackWithObservation(t *testing.T) {
 	}
 	defer tx.Rollback(f.ctx)
 	var version int64
-	if err := tx.QueryRow(f.ctx, cleanupRankingsVersionLockSQL, 3).Scan(&version); err != nil {
+	if err := tx.QueryRow(f.ctx, cleanupRankingsFreezeSQL, id, 3).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
 	check := f.s.cleanupExecutionRankingsUnchanged(f.ctx, tx, id, version, "enabled", stored, nil)

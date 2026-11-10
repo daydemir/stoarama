@@ -282,35 +282,20 @@ func TestNASCleanupBatchAnomaliesPauseAndFallBackToFullChecks(t *testing.T) {
 		t.Fatalf("paused batch advanced: %s", m)
 	}
 
-	// A fresh batch for p2: an extra clip changes the fingerprint, so the full
-	// replay runs (still the pinned winner, so the permit is issued).
+	// A fresh batch for p2 keeps the cached verdict stable by rejecting writers.
 	if code, body := f.enableBatch([]int64{p2}, []string{sha2}, 1); code != 200 {
 		t.Fatalf("second batch: %d %s", code, body)
 	}
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO recording_clips(id,recording_id,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket) VALUES(9,2,'x',repeat('a',64),1,'x.mp4','2026-07-01','2026-07-01 00:00:10','bucket')`); err != nil {
-		t.Fatal(err)
-	}
+	_, err := f.pool.Exec(f.ctx, `INSERT INTO recording_clips(id,recording_id) VALUES(9,2)`)
+	requireCleanupFrozen(t, err)
 	tasks = f.leaseV2(64, 1, 1<<40, "")
 	results = f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("c", 32)})
-	var mode string
-	if err := f.pool.QueryRow(f.ctx, `SELECT stage_timings->>'rankings_mode' FROM nas_cleanup_items WHERE id=$1`, tasks[0].ItemID).Scan(&mode); err != nil || mode != "replay" || !results[0].Delete {
-		t.Fatalf("changed inputs must fall back to the full replay: %s %+v %v", mode, results[0], err)
+	if !results[0].Delete {
+		t.Fatalf("frozen cached verdict: %+v", results[0])
 	}
 	f.receipts(tasks, results, "deleted")
-	// Now make the replay pick a different winner: KEEP, pause plan and batch.
-	if _, err := f.pool.Exec(f.ctx, `INSERT INTO recording_clips(id,recording_id,object_key,sha256,size_bytes,display_path,clip_start_at,clip_end_at,bucket) SELECT 6000000+n,2,'w',repeat('a',64),1,'w.mp4',timestamptz '2026-06-01 00:00:00+09'+n*interval '1 day',timestamptz '2026-06-01 00:00:00+09'+(n+1)*interval '1 day','bucket' FROM generate_series(0,20) n`); err != nil {
-		t.Fatal(err)
-	}
-	tasks = f.leaseV2(64, 1, 1<<40, "")
-	results = f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("d", 32)})
-	if results[0].Delete || results[0].Action != "keep" || !results[0].Paused {
-		t.Fatalf("changed best14 winner did not keep and pause: %+v", results[0])
-	}
-	if m, _ := f.batchMode(); m != "paused" {
-		t.Fatal("batch not paused on a policy keep")
-	}
-	if _, err := f.pool.Exec(f.ctx, `DELETE FROM recording_clips WHERE id>=6000000 AND id<6000100`); err != nil {
-		t.Fatal(err)
+	if code, body := safeguardControl(t, f.s, p2, "paused", map[string]any{"plan_sha256": sha2}); code != 200 {
+		t.Fatalf("pause: %d %s", code, body)
 	}
 
 	// Gates at batch enable: plans must be policy-current dry-run plans with a

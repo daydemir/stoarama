@@ -178,7 +178,7 @@ func (s *Server) cleanupCurrentPolicyMode(ctx context.Context, q interface {
 // cleanupRankingsUnchanged reports whether the live replay inputs of a stream
 // are byte-identical (by fingerprint) to the inputs of a full replay that
 // already yielded the pinned best_start for this plan's execution, or a
-// version-validated cached replay (maximum age 60 seconds) proves it. Only then
+// freeze-bound cached replay (maximum age 60 seconds) proves it. Only then
 // may the per-file check skip the replay. Errors fail closed; an unavailable
 // verdict requires a full replay under the same source fence.
 type cleanupRankingsUnchanged func(stream int64, pinnedBest string) (bool, error)

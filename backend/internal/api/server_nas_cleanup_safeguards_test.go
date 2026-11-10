@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -49,8 +50,25 @@ func safeguardControl(t *testing.T, s *Server, id int64, mode string, extra map[
 	return w.Code, w.Body.String()
 }
 
+// Compact policy-correct sources for tests concerned with caps/ledger/fences.
+// End-to-end authorization tests use newCleanupFixture's realistic clip corpus.
+func seedCleanupPinnedRankings(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var best string
+	if err := pool.QueryRow(context.Background(), cleanupCurrentRankingsSQL, 3).Scan(&best); err != nil {
+		t.Fatal(err)
+	}
+	if best == "2026-09-19" {
+		return
+	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO recording_clips(id,recording_id,clip_start_at,clip_end_at) VALUES(-1,2,'2026-09-19','2026-10-03') ON CONFLICT(id) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func safeguardPlan(t *testing.T, ctx context.Context, s *Server, id int64, mode string, sizes ...int64) {
 	t.Helper()
+	seedCleanupPinnedRankings(t, s.pool)
 	items := []map[string]any{}
 	for n, size := range sizes {
 		items = append(items, map[string]any{"kind": "raw", "source_id": 1000*id + int64(n), "stream_id": 3, "size_bytes": size})
@@ -59,6 +77,11 @@ func safeguardPlan(t *testing.T, ctx context.Context, s *Server, id int64, mode 
 	approved := "NULL"
 	reason := ""
 	if mode == "enabled" {
+		// Deliberately synthetic enabled state for isolated ledger/control tests.
+		// Real activation/freeze publication is covered by source-freeze tests.
+		if _, err := s.pool.Exec(ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id,validated) VALUES($1,3,true)`, id); err != nil {
+			t.Fatal(err)
+		}
 		approved, reason = "now()+interval '1 hour'", "fixture"
 	}
 	if _, err := s.pool.Exec(ctx, fmt.Sprintf(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approved_until,approval_reason) VALUES($1,47,13,$6,$2,$3,repeat('b',64),$4,%s,$5)`, approved), id, safeguardPolicy, string(manifest), mode, reason, fmt.Sprintf("safeguard-%d", id)); err != nil {
@@ -265,8 +288,8 @@ func TestNASCleanupExecutionAnomaliesAutoPause(t *testing.T) {
 	if body := receipt("4000", "deleted"); !strings.Contains(body, `"plan_paused":false`) {
 		t.Fatal(body)
 	}
-	if m, _ := mode(4); m != "enabled" {
-		t.Fatal("clean deletion paused its plan")
+	if m, reason := mode(4); m != "paused" || !strings.Contains(reason, "completed") {
+		t.Fatal("completed plan did not release its freeze")
 	}
 	if body := receipt("3000", "media_deleted_sidecar_failed"); !strings.Contains(body, `"plan_paused":true`) {
 		t.Fatal(body)

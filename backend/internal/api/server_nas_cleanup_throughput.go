@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -18,6 +19,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/r2"
 	"github.com/daydemir/stoarama/backend/internal/util"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // NAS cleanup throughput (2026-11). Nothing here adds deletion authority:
@@ -211,61 +213,108 @@ type cleanupExecutionRanking struct {
 	At          time.Time `json:"at"`
 }
 
-// cleanupActivateRankings runs the full live best-14 replay once per stream of
-// a plan that is being enabled and records its result with the fingerprint of
-// the exact rows it was computed from (one statement, one snapshot). Only a
-// replay that yields the pinned best_start is recorded; otherwise nothing is
-// stored and every observation runs the full replay (and keeps) as before.
-func cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID int64) error {
+// Publish the freeze in a separate committed transaction before excluding old
+// writers. A fresh READ COMMITTED replay then includes every writer that passed
+// the trigger before publication. Only enable/advance holds these table locks;
+// authorization and R2 operations never take them.
+const cleanupFreezePublishSQL = `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) SELECT p.id,(e->>'stream_id')::bigint FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) e WHERE p.id=$1 GROUP BY p.id,(e->>'stream_id')::bigint ON CONFLICT(plan_id,stream_id) DO UPDATE SET generation=excluded.generation,validated=false RETURNING stream_id,generation`
+const cleanupFreezeDrainSQL = `LOCK TABLE streams,recordings,recording_clips,recording_collation_hours IN SHARE ROW EXCLUSIVE MODE NOWAIT`
+
+func (s *Server) cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID int64) (func(), error) {
 	policy, err := cleanupEmbeddedPolicy()
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT DISTINCT (e->>'stream_id')::bigint FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) e WHERE p.id=$1`, planID)
+	rows, err := s.pool.Query(ctx, cleanupFreezePublishSQL, planID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var streams []int64
+	generations := map[int64]int64{}
+	var tokens []int64
 	for rows.Next() {
-		var stream int64
-		if err = rows.Scan(&stream); err != nil {
+		var stream, generation int64
+		if err = rows.Scan(&stream, &generation); err != nil {
 			break
 		}
-		streams = append(streams, stream)
+		generations[stream] = generation
+		tokens = append(tokens, generation)
 	}
 	if err == nil {
 		err = rows.Err()
 	}
 	rows.Close()
+	// Called only after the caller commits or rolls back. Generation matching
+	// prevents an abandoned activation from removing a newer attempt's freeze.
+	release := func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, e := s.pool.Exec(c, `DELETE FROM nas_cleanup_frozen_streams f WHERE plan_id=$1 AND generation=ANY($2) AND NOT EXISTS(SELECT 1 FROM nas_cleanup_plans p WHERE p.id=f.plan_id AND p.mode='enabled')`, planID, tokens); e != nil {
+			log.Printf("nas cleanup abandoned freeze release: %v", e)
+		}
+	}
 	if err != nil {
-		return err
+		return release, err
+	}
+	if len(generations) == 0 {
+		return release, errors.New("cleanup plan has no source streams")
+	}
+	// NOWAIT plus savepoints releases partial table acquisitions on contention.
+	// Waiting while holding a subset would deadlock with multi-table writers.
+	drainCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for {
+		save, e := tx.Begin(drainCtx)
+		if e != nil {
+			return release, e
+		}
+		_, e = save.Exec(drainCtx, cleanupFreezeDrainSQL)
+		if e == nil {
+			if e = save.Commit(drainCtx); e != nil {
+				return release, e
+			}
+			break
+		}
+		if rollbackErr := save.Rollback(ctx); rollbackErr != nil {
+			return release, rollbackErr
+		}
+		var pe *pgconn.PgError
+		if !errors.As(e, &pe) || pe.Code != "55P03" {
+			return release, e
+		}
+		select {
+		case <-drainCtx.Done():
+			return release, drainCtx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	pinned := map[string]cleanupExecutionRanking{}
-	for _, stream := range streams {
+	for stream, generation := range generations {
 		window, ok := policy.Streams[stream]
 		if !ok {
-			continue
+			return release, fmt.Errorf("stream %d has no pinned cleanup policy", stream)
 		}
 		var best, fingerprint string
-		var version int64
 		var checked time.Time
-		if err = tx.QueryRow(ctx, cleanupRankingsVersionedReplaySQL, stream).Scan(&best, &fingerprint, &version, &checked); err != nil {
-			return err
+		if err = tx.QueryRow(ctx, cleanupRankingsReplaySQL, stream).Scan(&best, &fingerprint, &checked); err != nil {
+			return release, err
 		}
-		if best == window.BestStart && fingerprint != "" {
-			pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: checked}
-			if _, err = tx.Exec(ctx, cleanupRankingsCacheStoreSQL, planID, stream, version, best, fingerprint, checked); err != nil {
-				return err
-			}
+		if best != window.BestStart || fingerprint == "" {
+			return release, fmt.Errorf("stream %d best-14 replay differs from pinned verdict; KEEP", stream)
+		}
+		pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: checked}
+		if _, err = tx.Exec(ctx, cleanupRankingsCacheStoreSQL, planID, stream, generation, best, fingerprint, checked); err != nil {
+			return release, err
 		}
 	}
-	var stored any
-	if len(pinned) != 0 {
-		b, _ := json.Marshal(pinned)
-		stored = string(b)
+	stored, err := json.Marshal(pinned)
+	if err != nil {
+		return release, err
 	}
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET execution_rankings=$2::jsonb WHERE id=$1`, planID, stored)
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET execution_rankings=$2::jsonb WHERE id=$1`, planID, string(stored)); err != nil {
+		return release, err
+	}
+	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_frozen_streams SET validated=true WHERE plan_id=$1 AND generation=ANY($2)`, planID, tokens)
+	return release, err
 }
 
 // cleanupEnableGates are the per-plan enable conditions shared by the single
@@ -865,7 +914,13 @@ func (s *Server) cleanupAdvanceBatchAfter(ctx context.Context, planID int64) {
 	}
 	var remaining int
 	var inBatch bool
-	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted'),EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND $1=ANY(plan_ids))`, planID).Scan(&remaining, &inBatch); err != nil || remaining != 0 || !inBatch {
+	if err := s.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted'),EXISTS(SELECT 1 FROM nas_cleanup_batches WHERE mode='enabled' AND $1=ANY(plan_ids))`, planID).Scan(&remaining, &inBatch); err != nil || remaining != 0 {
+		return
+	}
+	if !inBatch {
+		if _, err := s.pool.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='paused',approved_until=NULL,approval_reason='completed: all items deleted' WHERE id=$1 AND mode='enabled' AND NOT EXISTS(SELECT 1 FROM nas_cleanup_items WHERE plan_id=$1 AND state<>'deleted')`, planID); err != nil {
+			log.Printf("nas cleanup completion deferred: %v", err)
+		}
 		return
 	}
 	if err := s.cleanupAdvanceBatch(ctx); err != nil {
@@ -902,11 +957,17 @@ const cleanupBatchAutoPauseSQL = `UPDATE nas_cleanup_batches SET mode='paused',a
 //     activated. Anything else (paused, retired, issued but incomplete, digest
 //     drift, a failed gate) pauses the batch. A batch never re-enables a plan.
 func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, nasCleanupAdmissionOptions)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	var releaseFreeze func()
+	defer func() {
+		tx.Rollback(ctx)
+		if releaseFreeze != nil {
+			releaseFreeze()
+		}
+	}()
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPublicFence); err != nil {
 		return err
 	}
@@ -979,13 +1040,14 @@ func (s *Server) cleanupAdvanceBatch(ctx context.Context) error {
 		why, _ := body["error"].(string)
 		return pause("plan " + strconv.FormatInt(current, 10) + " not enableable: " + why)
 	}
+	releaseFreeze, err = s.cleanupActivateRankings(ctx, tx, current)
+	if err != nil {
+		return pause("source freeze/replay failed: " + err.Error())
+	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_plans SET mode='enabled',allow_nas_only=false,approved_until=$2,approval_reason=left('batch '||$3::text||': '||$4::text,500) WHERE id=$1`, current, *until, strconv.FormatInt(batchID, 10), reason); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state='pending',lease_expires_at=NULL WHERE plan_id=$1`, current); err != nil {
-		return err
-	}
-	if err = cleanupActivateRankings(ctx, tx, current); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
