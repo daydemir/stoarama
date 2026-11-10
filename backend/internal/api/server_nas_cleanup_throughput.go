@@ -69,7 +69,7 @@ func cleanupRecoveryPermits(mode, recovery string) bool {
 // cleanupExpireLeasesSQL returns expired leases of a connection to pending
 // (or unverified after 3 attempts). An expired execution lease is an anomaly
 // and pauses its enabled plan and batch in the same statement.
-const cleanupExpireLeasesSQL = `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
+const cleanupExpireLeasesSQL = `WITH expired AS (UPDATE nas_cleanup_items i SET state=CASE WHEN attempt-recheck_attempt_base>=3 THEN 'unverified' ELSE 'pending' END,lease_expires_at=NULL,updated_at=now() FROM nas_cleanup_plans p WHERE p.id=i.plan_id AND p.connection_id=$1 AND i.state='leased' AND i.lease_expires_at<now() RETURNING i.plan_id),
 pz AS (UPDATE nas_cleanup_plans SET ` + cleanupAutoPauseSet + ` WHERE mode='enabled' AND id IN (SELECT plan_id FROM expired) RETURNING id)
 UPDATE nas_cleanup_batches SET ` + cleanupAutoPauseSet + ` WHERE mode='enabled' AND plan_ids && ARRAY(SELECT id FROM pz)`
 

@@ -661,6 +661,7 @@ func (s *Server) router() http.Handler {
 			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
 			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
 			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)
+			service.Post("/service/nas-cleanup/plans/{id}/recheck", s.handleAdminNASCleanupRecheck)
 			service.Post("/service/nas-cleanup/retire-superseded", s.handleAdminNASCleanupRetireSuperseded)
 			service.Post("/service/nas-cleanup/batches", s.handleAdminNASCleanupBatchEnable)
 			service.Get("/service/nas-cleanup/batches/{id}", s.handleAdminNASCleanupBatchStatus)
