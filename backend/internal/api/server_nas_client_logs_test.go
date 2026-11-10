@@ -296,20 +296,22 @@ func TestNASDiagnosticsPairsAndUnicodeNames(t *testing.T) {
 	}
 }
 
-// Shared with the Python diagnostics and upload-ring tests; no DB required.
-func TestNASDiagnosticsSharedVectors(t *testing.T) {
+type nasDiagnosticVector struct {
+	Name      string   `json:"name"`
+	Input     any      `json:"input"`
+	Absent    []string `json:"absent"`
+	Present   []string `json:"present"`
+	Unchanged bool     `json:"unchanged"`
+}
+
+func loadNASDiagnosticVectors(t *testing.T) []nasDiagnosticVector {
+	t.Helper()
 	data, err := os.ReadFile("../../../testdata/nas_diagnostic_redaction.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var fixture struct {
-		Vectors []struct {
-			Name      string   `json:"name"`
-			Input     any      `json:"input"`
-			Absent    []string `json:"absent"`
-			Present   []string `json:"present"`
-			Unchanged bool     `json:"unchanged"`
-		} `json:"vectors"`
+		Vectors []nasDiagnosticVector `json:"vectors"`
 	}
 	if err := json.Unmarshal(data, &fixture); err != nil {
 		t.Fatal(err)
@@ -317,7 +319,12 @@ func TestNASDiagnosticsSharedVectors(t *testing.T) {
 	if len(fixture.Vectors) == 0 {
 		t.Fatal("empty shared fixture")
 	}
-	for _, vector := range fixture.Vectors {
+	return fixture.Vectors
+}
+
+// Shared with the Python diagnostics and upload-ring tests; no DB required.
+func TestNASDiagnosticsSharedVectors(t *testing.T) {
+	for _, vector := range loadNASDiagnosticVectors(t) {
 		t.Run(vector.Name, func(t *testing.T) {
 			// Clone because structured redaction may modify slices in place.
 			encoded, _ := json.Marshal(vector.Input)
@@ -346,6 +353,60 @@ func TestNASDiagnosticsSharedVectors(t *testing.T) {
 			}
 			if vector.Unchanged && !reflect.DeepEqual(result, vector.Input) {
 				t.Fatalf("safe diagnostics changed: %#v -> %#v", vector.Input, result)
+			}
+		})
+	}
+}
+
+// Exercise the unredacted input through the actual upload/persistence boundary.
+func TestNASClientLogsSharedVectorsPersistRedacted(t *testing.T) {
+	pool := cleanupTestPool(t)
+	server := &Server{pool: pool}
+	vectors := loadNASDiagnosticVectors(t)
+	lines := make([]nasClientLogLine, len(vectors))
+	for i, vector := range vectors {
+		text, ok := vector.Input.(string)
+		if !ok {
+			encoded, err := json.Marshal(vector.Input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text = string(encoded)
+		}
+		lines[i] = nasClientLogLine{Seq: int64(i + 1), Level: "WARN", Message: text}
+	}
+	w := cleanupCall(t, server.handleAccountNASClientLogs, 47, 5, "", "", map[string]any{
+		"client_version": "r4-fixtures", "lines": lines,
+	})
+	if w.Code != 200 {
+		t.Fatalf("upload: %d %s", w.Code, w.Body.String())
+	}
+	var stored []byte
+	if err := pool.QueryRow(context.Background(), `SELECT lines FROM nas_client_logs WHERE client_version='r4-fixtures'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	var persisted []nasClientLogLine
+	if err := json.Unmarshal(stored, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != len(vectors) {
+		t.Fatalf("stored %d, want %d", len(persisted), len(vectors))
+	}
+	for i, vector := range vectors {
+		t.Run(vector.Name, func(t *testing.T) {
+			got := persisted[i].Message
+			for _, secret := range vector.Absent {
+				if strings.Contains(got, secret) {
+					t.Fatalf("secret persisted: %q", got)
+				}
+			}
+			for _, diagnostic := range vector.Present {
+				if !strings.Contains(got, diagnostic) {
+					t.Fatalf("missing %q: %s", diagnostic, got)
+				}
+			}
+			if text, ok := vector.Input.(string); ok && vector.Unchanged && got != text {
+				t.Fatalf("safe diagnostics changed: %q -> %q", text, got)
 			}
 		})
 	}

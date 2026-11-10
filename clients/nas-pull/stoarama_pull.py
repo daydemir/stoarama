@@ -10,7 +10,9 @@ import fcntl
 import gzip
 import hashlib
 import hmac
+import html
 import http.client
+import http.cookies
 import io
 import json
 import math
@@ -244,36 +246,42 @@ CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
 # Keep normalization and redaction rules in sync with server_nas_client_logs.go;
 # both suites load testdata/nas_diagnostic_redaction.json.
 _SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|session|dsn|database_url|x-amz-[a-z0-9_-]+)[A-Za-z0-9_.-]*"
-_DIAGNOSTIC_ESCAPE = re.compile(r"\\+(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
-_DIAGNOSTIC_QUOTES = re.compile(r"\\+([\"'])")
+_DIAGNOSTIC_ESCAPE = re.compile(r"\\+(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|([nrt]))")
+_DIAGNOSTIC_QUOTES = re.compile(r"\\+([\"'/])")
 _DIAGNOSTIC_BYTES = (re.compile(r"\bb'((?:\\.|[^'\\])*)'", re.IGNORECASE),
                      re.compile(r'\bb"((?:\\.|[^"\\])*)"', re.IGNORECASE))
+_DIAGNOSTIC_WRAPPER = re.compile(r"\b(?:bytearray|memoryview)\(([^()]*)\)", re.IGNORECASE)
 
 
 def normalize_diagnostic_text(text):
-    # Canonicalize nested JSON and Python reprs before matching. This is text
-    # normalization only: never eval untrusted diagnostics. Each pass shortens
-    # the input. Case folding belongs to name matching (and (?i) text rules),
-    # preserving case in useful file paths, IDs and hashes.
-    while True:
-        decoded = _DIAGNOSTIC_ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+    # Canonicalize mixed/nested encodings as text, never eval. Bound work and
+    # fail closed if an adversarial representation exceeds the decoding budget.
+    for _ in range(16):
+        decoded = urllib.parse.unquote(html.unescape(text))
+        decoded = _DIAGNOSTIC_ESCAPE.sub(
+            lambda m: {"n": "\n", "r": "\r", "t": "\t"}[m.group(3)] if m.group(3)
+            else chr(int(m.group(1) or m.group(2), 16)), decoded)
         decoded = _DIAGNOSTIC_QUOTES.sub(r"\1", decoded)
         for pattern in _DIAGNOSTIC_BYTES:
             decoded = pattern.sub(r"\1", decoded)
+        decoded = _DIAGNOSTIC_WRAPPER.sub(r"\1", decoded)
         if decoded == text:
             return text
         text = decoded
+    return "[REDACTED]"
 
 
 def diagnostic_secret_name(value):
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", "replace")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = bytes(value).decode("utf-8", "replace")
     return isinstance(value, str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(value).casefold()) is not None
 
 
 # Fail closed after a sensitive assignment/pair or standalone auth scheme:
 # discard the entire tail, including nested/truncated values and Digest fields.
 _REDACTIONS = (
+    (re.compile(r"(?is)\b(?:RequestsCookieJar|CookieJar|SimpleCookie|Morsel|Cookie)(?:\s*[:(<]|\s+[A-Za-z0-9_.-]+\s*=)[\s\S]*"), "[REDACTED]"),
+    (re.compile(r"(?is)(\bname\s*=\s*[\"'][^\"']*[\"']\s*,\s*value\s*=\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?is)([\[(]\s*[\"']?\s*" + _SECRET_NAME + r"\s*[\"']?\s*,\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?is)(\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?is)\b(basic|bearer|digest|token|aws4-hmac-sha256)\s+\S[\s\S]*"), r"\1 [REDACTED]"),
@@ -292,8 +300,8 @@ _ABSOLUTE_PATH = re.compile(r"(^|[^\w:/.])(/[^\s'\"<>,;)]+)")
 
 
 def redact_diagnostics(value):
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", "replace")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = bytes(value).decode("utf-8", "replace")
     if isinstance(value, str):
         return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.secrets)
     if isinstance(value, dict):
@@ -308,10 +316,19 @@ def redact_diagnostics(value):
 def redact_log_line(text, output_root=None, secrets=()):
     """Remove credentials, signed URL query strings, secret-looking values and
     absolute host paths outside the NAS output root from one log line."""
-    text = normalize_diagnostic_text(text.decode("utf-8", "replace") if isinstance(text, bytes) else str(text))
+    text = bytes(text).decode("utf-8", "replace") if isinstance(text, (bytes, bytearray, memoryview)) else str(text)
+    variants = set()
     for secret in secrets:
-        if secret and len(secret) >= 6:
-            text = text.replace(normalize_diagnostic_text(secret), "[REDACTED]")
+        variants.update(diagnostic_secret_variants(secret))
+    # Replace before AND after decoding: normalization can alter opaque values.
+    for variant in sorted(variants, key=len, reverse=True):
+        text = text.replace(variant, "[REDACTED]")
+    normalized = normalize_diagnostic_text(text)
+    if normalized != text and re.search(_SECRET_NAME, normalized, re.IGNORECASE):
+        return "[REDACTED]"
+    text = normalized
+    for variant in sorted(variants, key=len, reverse=True):
+        text = text.replace(normalize_diagnostic_text(variant), "[REDACTED]")
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     root = str(output_root).rstrip("/") if output_root else None
@@ -327,12 +344,64 @@ def redact_log_line(text, output_root=None, secrets=()):
     return text[:CLIENT_LOG_LINE_MAX]
 
 
+def diagnostic_secret_variants(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = bytes(value).decode("utf-8", "replace")
+    if not isinstance(value, str) or len(value) < 8:
+        return ()
+    raw = value.encode("utf-8")
+    percent = "".join("%%%02X" % b for b in raw)
+    return {value, base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode(),
+            base64.b64encode(raw).decode().rstrip("="), base64.urlsafe_b64encode(raw).decode().rstrip("="),
+            urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value), percent, percent.lower(),
+            html.escape(value), html.escape(value, quote=False), json.dumps(value)[1:-1],
+            "".join("\\u%04x" % ord(c) for c in value), raw.hex(), raw.hex().upper()}
+
+
+def diagnostic_secret_values(value, sensitive=False, response=False):
+    """Collect private values, never their reprs, from config/response fields."""
+    if isinstance(value, dict):
+        values = []
+        for name, item in value.items():
+            # Responses include object_key paths: learn credential/cookie fields,
+            # while config/env intentionally treat every key-like name as private.
+            private = bool(re.search(r"(?i)token|secret|pass|cred|authorization|cookie|session|(?:api|service|pull|access)[_.-]*key", str(name))) if response else (
+                diagnostic_secret_name(name) or bool(re.search(r"(?i)pass|cred", str(name))))
+            values.extend(diagnostic_secret_values(item, sensitive or private, response))
+        return tuple(values)
+    if isinstance(value, (list, tuple)):
+        return tuple(secret for item in value for secret in diagnostic_secret_values(item, sensitive, response))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = bytes(value).decode("utf-8", "replace")
+    return (value,) if sensitive and isinstance(value, str) and len(value) >= 8 else ()
+
+
 def client_log_secrets(cfg=None):
-    values = [getattr(cfg, "api_key", None)] if cfg is not None else []
-    for name, value in os.environ.items():
-        if re.fullmatch(_SECRET_NAME, name, re.IGNORECASE) or re.search(r"(?i)(key|token|secret|pass|cred|dsn)", name):
-            values.append(value)
-    return tuple(v for v in values if isinstance(v, str) and len(v) >= 6)
+    values = diagnostic_secret_values(vars(cfg)) if cfg is not None else ()
+    return tuple(set(values + diagnostic_secret_values(dict(os.environ))))
+
+
+def remember_response_secrets(response):
+    """Learn cookie values before response bodies or exceptions can be logged."""
+    headers = getattr(response, "headers", None)
+    if headers is None or not callable(getattr(headers, "get_all", None)):
+        return
+    cookie_headers = headers.get_all("Set-Cookie", [])
+    if not isinstance(cookie_headers, (list, tuple)):
+        return
+    values = []
+    for header in cookie_headers:
+        if not isinstance(header, str):
+            continue
+        cookies = http.cookies.SimpleCookie()
+        try:
+            cookies.load(header)
+        except http.cookies.CookieError:
+            pass
+        values.extend(morsel.value for morsel in cookies.values())
+        # Retain the raw header as well, including malformed cookie responses.
+        values.append(header)
+    CLIENT_LOG_RING.add_secrets(values)
 
 
 class ClientLogRing:
@@ -344,14 +413,18 @@ class ClientLogRing:
         self.seq = 0
         self.max_lines, self.max_bytes = max_lines, max_bytes
         self.output_root = None
-        self.secrets = ()
+        self.secrets = client_log_secrets()
         self.error_event = threading.Event()
         self.dropped = 0
 
     def configure(self, cfg):
         with self.lock:
             self.output_root = getattr(cfg, "output_dir", None)
-            self.secrets = client_log_secrets(cfg)
+            self.secrets = tuple(set(self.secrets + client_log_secrets(cfg)))
+
+    def add_secrets(self, values):
+        with self.lock:
+            self.secrets = tuple(set(self.secrets).union(v for v in values if isinstance(v, str) and len(v) >= 8))
 
     def record(self, level, message):
         level = str(level).upper()
@@ -539,9 +612,16 @@ def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TI
         req.add_header("Authorization", "Bearer " + cfg.api_key)
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw = response.read()
-    return json.loads(raw.decode("utf-8")) if raw else {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            remember_response_secrets(response)
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        remember_response_secrets(exc)
+        raise
+    result = json.loads(raw.decode("utf-8")) if raw else {}
+    CLIENT_LOG_RING.add_secrets(diagnostic_secret_values(result, response=True))
+    return result
 
 
 def classify_transport_error(exc):
@@ -4656,6 +4736,7 @@ def download_verified(url, temp_path, expected_bytes, expected_sha):
     req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response, open(temp_path, "wb") as out:
+            remember_response_secrets(response)
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
@@ -7180,6 +7261,7 @@ def append_joined_range(prepared, directory_fd, part_name, item, start, end, sto
             raise RuntimeError("joined range was unsatisfiable; partial restarted") from exc
         raise
     with response_context as response:
+        remember_response_secrets(response)
         status = getattr(response, "status", None) or response.getcode()
         if status == 200:
             truncate_joined_part(directory_fd, part_name)
@@ -7731,6 +7813,7 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
     headers = {"User-Agent": USER_AGENT, "If-Match": prepared["if_match"], "Range": "bytes=%d-" % start}
     request = urllib.request.Request(prepared["url"], method="GET", headers=headers)
     with open_joined_url(request) as response:
+        remember_response_secrets(response)
         status = getattr(response, "status", None) or response.getcode()
         if status == 206:
             expected = "bytes %d-%d/%d" % (start, item["size_bytes"] - 1, item["size_bytes"])
@@ -8395,6 +8478,7 @@ def restore_https(netloc, method, target, body, headers, timeout, read_limit=Non
     try:
         conn.request(method, target, body=body, headers=headers)
         response = conn.getresponse()
+        remember_response_secrets(response)
         data = response.read() if read_limit is None else response.read(read_limit + 1)
     except BaseException:
         conns.pop(netloc, None)
@@ -8431,7 +8515,9 @@ def restore_api(cfg, path, body, retry_stale=False):
         status, raw = restore_https(parsed.netloc, "POST", target, data, headers, HTTP_TIMEOUT_SEC)
     if status >= 400:
         raise urllib.error.HTTPError(base + path, status, "HTTP %d" % status, {}, None)
-    return json.loads(raw.decode("utf-8")) if raw else {}
+    result = json.loads(raw.decode("utf-8")) if raw else {}
+    CLIENT_LOG_RING.add_secrets(diagnostic_secret_values(result, response=True))
+    return result
 
 
 def restore_put(task, body):
@@ -8892,6 +8978,7 @@ def download_probe_part(part, deadline, progress):
         if connection.sock is not None:
             connection.sock.settimeout(remaining())
         response = connection.getresponse()
+        remember_response_secrets(response)
         if response.status != 200:
             raise RuntimeError("download probe GET returned HTTP %d" % response.status)
         while progress[0] < part["size_bytes"]:
@@ -8944,6 +9031,7 @@ def upload_probe_part(part, body):
         headers["User-Agent"] = USER_AGENT
         connection.request("PUT", url.path + ("?" + url.query if url.query else ""), body=body, headers=headers)
         response = connection.getresponse()
+        remember_response_secrets(response)
         response.read(64 * 1024)
         if not 200 <= response.status < 300:
             raise RuntimeError("upload probe PUT returned HTTP %d" % response.status)
@@ -9344,6 +9432,7 @@ def _ensure_benchmark_tools_locked(state_dir, machine, deadline, opener=None, ca
         digest = hashlib.sha256()
         size = 0
         with (opener or urllib.request.urlopen)(request, timeout=min(60, max(.1, deadline-time.monotonic()))) as response, open(archive, "wb") as output:
+            remember_response_secrets(response)
             while True:
                 _check_benchmark_tool_budget(deadline, cancel)
                 chunk = response.read(1024 * 1024)
@@ -9836,6 +9925,7 @@ def stage_update(cfg):
     artifact_url = cfg.update_manifest_url.rsplit("/", 1)[0] + "/" + artifact
     req = urllib.request.Request(artifact_url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as response:
+        remember_response_secrets(response)
         source = response.read()
     if hashlib.sha256(source).hexdigest() != expected_sha:
         raise RuntimeError("update artifact checksum mismatch")
@@ -10610,6 +10700,7 @@ class SpaceAudit:
         try:
             connection.request("PUT", url.path + "?" + url.query, body=source, headers=headers)
             response = connection.getresponse()
+            remember_response_secrets(response)
             if response.status not in (200, 201, 204, 412):
                 raise RuntimeError("space audit upload HTTP %d" % response.status)
             # 412 is an idempotent create-only retry; the API checks exact HEAD identity.
@@ -10718,6 +10809,7 @@ def mark_capacity_blocked_audit_healthy(cfg, runtime, storage_checked, audit_rep
 
 
 def run(cfg):
+    CLIENT_LOG_RING.configure(cfg)
     cfg.validate()
     lock_handle = acquire_lock(cfg)
     _pins, pins_error = cleanup_pins()

@@ -1876,6 +1876,653 @@
       "absent": [],
       "present": [],
       "unchanged": true
+    },
+    {
+      "name": "r4-html-single",
+      "input": "cleanup {&#x27;Cookie&#x27;: &#x27;SID=synthetic-r4-canary&#x27;}",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-html-double",
+      "input": "cleanup {&quot;Cookie&quot;: &quot;opaque=synthetic-r4-canary&quot;}",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-angle",
+      "input": "cleanup <Cookie SID=synthetic-r4-canary for example.com/>",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-constructor",
+      "input": "cleanup Cookie(version=0, name='SID', value='synthetic-r4-canary', port=None)",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-name-value",
+      "input": "cleanup name='SID', value='synthetic-r4-canary', domain='example.com'",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-jar",
+      "input": "cleanup <RequestsCookieJar[<Cookie SID=synthetic-r4-canary for example.com/>]>",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-simple",
+      "input": "cleanup <SimpleCookie: SID='synthetic-r4-canary'>",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-morsel",
+      "input": "cleanup <Morsel: Set-Cookie: SID=synthetic-r4-canary>",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-cookie-bare-morsel",
+      "input": "cleanup <Morsel: SID=synthetic-r4-canary>",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-bytearray-pairs",
+      "input": "cleanup [(bytearray(b'Cookie'), bytearray(b'opaque=synthetic-r4-canary'))]",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-memoryview-pairs",
+      "input": "cleanup [(memoryview(b'Cookie'), memoryview(b'opaque=synthetic-r4-canary'))]",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-wrappers",
+      "input": "cleanup [(memoryview(bytearray(b'Cookie')), memoryview(bytearray(b'opaque=synthetic-r4-canary')))]",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-normalized-sensitive-anywhere",
+      "input": "cleanup opaque=synthetic-r4-canary &quot;Cookie&quot;",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-invalid-percent-before-header",
+      "input": "cleanup %ZZ %7B%27Cookie%27%3A%20%27SID%3Dsynthetic-r4-canary%27%7D",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-html-single",
+      "input": "cleanup %7B%26%23x27%3BCookie%26%23x27%3B%3A%20%26%23x27%3BSID%3Dsynthetic-r4-canary%26%23x27%3B%7D",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-html-single",
+      "input": "cleanup %7B%26amp%3B%23x27%3BCookie%26amp%3B%23x27%3B%3A%20%26amp%3B%23x27%3BSID%3Dsynthetic-r4-canary%26amp%3B%23x27%3B%7D",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-html-double",
+      "input": "cleanup %7B%26quot%3BCookie%26quot%3B%3A%20%26quot%3Bopaque%3Dsynthetic-r4-canary%26quot%3B%7D",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-html-double",
+      "input": "cleanup %7B%26amp%3Bquot%3BCookie%26amp%3Bquot%3B%3A%20%26amp%3Bquot%3Bopaque%3Dsynthetic-r4-canary%26amp%3Bquot%3B%7D",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-angle",
+      "input": "cleanup %3CCookie%20SID%3Dsynthetic-r4-canary%20for%20example.com%2F%3E",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-angle",
+      "input": "cleanup %26lt%3BCookie%20SID%3Dsynthetic-r4-canary%20for%20example.com%2F%26gt%3B",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-constructor",
+      "input": "cleanup Cookie%28version%3D0%2C%20name%3D%27SID%27%2C%20value%3D%27synthetic-r4-canary%27%2C%20port%3DNone%29",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-constructor",
+      "input": "cleanup Cookie%28version%3D0%2C%20name%3D%26%23x27%3BSID%26%23x27%3B%2C%20value%3D%26%23x27%3Bsynthetic-r4-canary%26%23x27%3B%2C%20port%3DNone%29",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-name-value",
+      "input": "cleanup name%3D%27SID%27%2C%20value%3D%27synthetic-r4-canary%27%2C%20domain%3D%27example.com%27",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-name-value",
+      "input": "cleanup name%3D%26%23x27%3BSID%26%23x27%3B%2C%20value%3D%26%23x27%3Bsynthetic-r4-canary%26%23x27%3B%2C%20domain%3D%26%23x27%3Bexample.com%26%23x27%3B",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-jar",
+      "input": "cleanup %3CRequestsCookieJar%5B%3CCookie%20SID%3Dsynthetic-r4-canary%20for%20example.com%2F%3E%5D%3E",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-jar",
+      "input": "cleanup %26lt%3BRequestsCookieJar%5B%26lt%3BCookie%20SID%3Dsynthetic-r4-canary%20for%20example.com%2F%26gt%3B%5D%26gt%3B",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-simple",
+      "input": "cleanup %3CSimpleCookie%3A%20SID%3D%27synthetic-r4-canary%27%3E",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-simple",
+      "input": "cleanup %26lt%3BSimpleCookie%3A%20SID%3D%26%23x27%3Bsynthetic-r4-canary%26%23x27%3B%26gt%3B",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-morsel",
+      "input": "cleanup %3CMorsel%3A%20Set-Cookie%3A%20SID%3Dsynthetic-r4-canary%3E",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-morsel",
+      "input": "cleanup %26lt%3BMorsel%3A%20Set-Cookie%3A%20SID%3Dsynthetic-r4-canary%26gt%3B",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-percent-cookie-bare-morsel",
+      "input": "cleanup %3CMorsel%3A%20SID%3Dsynthetic-r4-canary%3E",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-mixed-nested-cookie-bare-morsel",
+      "input": "cleanup %26lt%3BMorsel%3A%20SID%3Dsynthetic-r4-canary%26gt%3B",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Basic-\\n",
+      "input": "cleanup Basic\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Basic-\\t",
+      "input": "cleanup Basic\\tYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Basic-\\r\\n",
+      "input": "cleanup Basic\\r\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Basic-&#32;",
+      "input": "cleanup Basic&#32;YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Basic-%20",
+      "input": "cleanup Basic%20YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Bearer-\\n",
+      "input": "cleanup Bearer\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Bearer-\\t",
+      "input": "cleanup Bearer\\tYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Bearer-\\r\\n",
+      "input": "cleanup Bearer\\r\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Bearer-&#32;",
+      "input": "cleanup Bearer&#32;YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Bearer-%20",
+      "input": "cleanup Bearer%20YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Digest-\\n",
+      "input": "cleanup Digest\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Digest-\\t",
+      "input": "cleanup Digest\\tYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Digest-\\r\\n",
+      "input": "cleanup Digest\\r\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Digest-&#32;",
+      "input": "cleanup Digest&#32;YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Digest-%20",
+      "input": "cleanup Digest%20YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Token-\\n",
+      "input": "cleanup Token\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Token-\\t",
+      "input": "cleanup Token\\tYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Token-\\r\\n",
+      "input": "cleanup Token\\r\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Token-&#32;",
+      "input": "cleanup Token&#32;YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-Token-%20",
+      "input": "cleanup Token%20YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-AWS4-HMAC-SHA256-\\n",
+      "input": "cleanup AWS4-HMAC-SHA256\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-AWS4-HMAC-SHA256-\\t",
+      "input": "cleanup AWS4-HMAC-SHA256\\tYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-AWS4-HMAC-SHA256-\\r\\n",
+      "input": "cleanup AWS4-HMAC-SHA256\\r\\nYTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-AWS4-HMAC-SHA256-&#32;",
+      "input": "cleanup AWS4-HMAC-SHA256&#32;YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-scheme-AWS4-HMAC-SHA256-%20",
+      "input": "cleanup AWS4-HMAC-SHA256%20YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-over-budget",
+      "input": "cleanup %252525252525252525252525252525252525257B%2525252525252525252525252525252525252527Cookie%2525252525252525252525252525252525252527%252525252525252525252525252525252525253A%2525252525252525252525252525252525252520%2525252525252525252525252525252525252527SID%252525252525252525252525252525252525253Dsynthetic-r4-canary%2525252525252525252525252525252525252527%252525252525252525252525252525252525257D",
+      "absent": [
+        "synthetic-r4-canary"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "r4-normalized-safe-diagnostics",
+      "input": "cleanup item_id%3D42%20relative_path%3DStream%2FDay%2FCase.mp4%20size_bytes%3D123456%20sha256%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "absent": [],
+      "present": [
+        "item_id=42 relative_path=Stream/Day/Case.mp4 size_bytes=123456 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "unchanged": false
     }
   ]
 }

@@ -1739,6 +1739,87 @@ class CleanupAcknowledgementTests(unittest.TestCase):
         self.assertEqual(pull.redact_diagnostics([['Accept', 'application/json']]), [['Accept', 'application/json']])
 
 class DiagnosticSharedFixtureTests(unittest.TestCase):
+    def test_config_secret_encodings_are_removed_before_ring_storage(self):
+        import base64
+        import html
+        import urllib.parse
+        canary = 'synthetic-R4-<&>"/é+\\canary'
+        cfg = SimpleNamespace(api_key=canary, service_token='service-canary-123',
+                              pull_token='pull-canary-123', r2={'access_key_id': 'r2-canary-123'},
+                              s3={'secret_access_key': 's3-canary-123'}, db_pass='db-canary-123',
+                              relative_path='Stream/Day/Case.mp4', short_secret='tiny')
+        ring = pull.ClientLogRing()
+        with mock.patch.dict(pull.os.environ, {'CUSTOM_CREDENTIAL': 'env-canary-123'}):
+            ring.configure(cfg)
+        expected = {canary, cfg.service_token, cfg.pull_token, 'r2-canary-123', 's3-canary-123',
+                    cfg.db_pass, 'env-canary-123'}
+        self.assertTrue(expected.issubset(set(ring.secrets)))
+        self.assertNotIn('tiny', ring.secrets)
+        self.assertNotIn(cfg.relative_path, ring.secrets)
+        raw = canary.encode()
+        encodings = [canary, base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode(),
+                     base64.b64encode(raw).decode().rstrip('='),
+                     urllib.parse.quote(canary, safe=''), urllib.parse.quote_plus(canary),
+                     ''.join('%%%02X' % b for b in raw), ''.join('%%%02x' % b for b in raw),
+                     html.escape(canary), html.escape(canary, quote=False), json.dumps(canary)[1:-1],
+                     ''.join('\\u%04x' % ord(c) for c in canary), raw.hex(), raw.hex().upper()]
+        safe = 'item_id=42 relative_path=Stream/Day/Case.mp4 size_bytes=123456 sha256=' + 'a' * 64
+        for encoded in encodings:
+            with self.subTest(encoding=encoded):
+                ring.record('WARN', 'opaque ' + encoded + ' ' + safe)
+                stored = ring.lines[-1][0]['message']
+                self.assertNotIn(encoded, stored)
+                self.assertNotIn(canary, stored)
+                self.assertIn('[REDACTED]', stored)
+                self.assertIn(safe, stored)
+        ring.record('WARN', 'tiny ' + safe)
+        self.assertEqual(ring.lines[-1][0]['message'], 'tiny ' + safe)
+
+    def test_received_cookie_and_session_values_join_secret_backstop(self):
+        from email.message import Message
+        import io
+        headers = Message()
+        headers.add_header('Set-Cookie', 'SID=received-cookie-canary; Path=/; HttpOnly')
+        headers.add_header('Set-Cookie', 'opaque=second-cookie-canary; Secure')
+        ring = pull.ClientLogRing()
+        cfg = SimpleNamespace(api_base='https://example.invalid', api_key='test-config-canary')
+        with mock.patch.object(pull, 'CLIENT_LOG_RING', ring):
+            response = io.BytesIO(json.dumps({'session': 'received-session-canary',
+                                             'object_key': 'Stream/Day/Case.mp4'}).encode())
+            response.headers = headers
+            with mock.patch.object(pull.urllib.request, 'urlopen', return_value=response):
+                pull.request_json(cfg, 'GET', '/test')
+            self.assertNotIn('Stream/Day/Case.mp4', ring.secrets)
+            ring.configure(cfg)  # uploader configuration must retain learned values
+            for value in ('received-cookie-canary', 'second-cookie-canary', 'received-session-canary'):
+                ring.record('WARN', 'opaque ' + value)
+                self.assertNotIn(value, ring.lines[-1][0]['message'])
+            error = pull.urllib.error.HTTPError(cfg.api_base, 403, 'denied', headers, None)
+            ring.secrets = ()
+            with mock.patch.object(pull.urllib.request, 'urlopen', side_effect=error), self.assertRaises(pull.urllib.error.HTTPError):
+                pull.request_json(cfg, 'GET', '/test')
+            ring.record('WARN', 'opaque received-cookie-canary')
+            self.assertNotIn('received-cookie-canary', ring.lines[-1][0]['message'])
+
+    def test_native_cookie_and_buffer_reprs(self):
+        from http.cookiejar import Cookie
+        from http.cookies import SimpleCookie
+        canary = 'synthetic-cookie-canary'
+        cookie = Cookie(0, 'SID', canary, None, False, 'example.com', True, False,
+                        '/', True, False, None, True, None, None, {})
+        simple = SimpleCookie({'SID': canary})
+        for value in (cookie, simple, simple['SID']):
+            for line in (str(value), repr(value)):
+                ring = pull.ClientLogRing()
+                ring.record('WARN', line)
+                self.assertNotIn(canary, ring.lines[-1][0]['message'])
+        for wrap in (bytes, bytearray, memoryview):
+            value = [[wrap(b'Cookie'), wrap(canary.encode())]]
+            self.assertNotIn(canary, json.dumps(pull.redact_diagnostics(value)))
+            ring = pull.ClientLogRing()
+            ring.record('WARN', value)
+            self.assertNotIn(canary, ring.lines[-1][0]['message'])
+
     def test_shared_redaction_vectors_and_upload_ring(self):
         fixture = Path(__file__).resolve().parents[2] / 'testdata/nas_diagnostic_redaction.json'
         for vector in json.loads(fixture.read_text())['vectors']:

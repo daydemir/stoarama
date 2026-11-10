@@ -3,7 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"github.com/jackc/pgx/v5"
+	"html"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/util"
+	"github.com/jackc/pgx/v5"
 )
 
 // NAS app remote diagnostics (owner-approved, 2026-11). The app uploads a
@@ -32,6 +33,8 @@ var nasClientLogRedactions = []struct {
 	re   *regexp.Regexp
 	with string
 }{
+	{regexp.MustCompile(`(?is)\b(?:RequestsCookieJar|CookieJar|SimpleCookie|Morsel|Cookie)(?:\s*[:(<]|\s+[A-Za-z0-9_.-]+\s*=)[\s\S]*`), `[REDACTED]`},
+	{regexp.MustCompile(`(?is)(\bname\s*=\s*["'][^"']*["']\s*,\s*value\s*=\s*)[\s\S]*`), `${1}[REDACTED]`},
 	{regexp.MustCompile(`(?is)([\[(]\s*["']?\s*` + nasDiagnosticSecretPattern + `\s*["']?\s*,\s*)[\s\S]*`), `${1}[REDACTED]`},
 	{regexp.MustCompile(`(?is)(\b` + nasDiagnosticSecretPattern + `["']?\s*[=:]\s*)[\s\S]*`), `${1}[REDACTED]`},
 	{regexp.MustCompile(`(?is)\b(basic|bearer|digest|token|aws4-hmac-sha256)\s+\S[\s\S]*`), `${1} [REDACTED]`},
@@ -48,34 +51,51 @@ var nasClientLogRedactions = []struct {
 }
 
 var nasDiagnosticSecretName = regexp.MustCompile(`^` + nasDiagnosticSecretPattern + `$`)
+var nasDiagnosticSensitiveText = regexp.MustCompile(`(?i)` + nasDiagnosticSecretPattern)
 
 var nasClientLogPath = regexp.MustCompile(`(^|[^\w:/.])(/[^\s'"<>,;)]+)`)
 
-var nasDiagnosticEscape = regexp.MustCompile(`\\+(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2})`)
-var nasDiagnosticQuotes = regexp.MustCompile(`\\+(["'])`)
+var nasDiagnosticEscape = regexp.MustCompile(`\\+(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[nrt])`)
+var nasDiagnosticQuotes = regexp.MustCompile(`\\+(["'/])`)
+var nasDiagnosticPercent = regexp.MustCompile(`%[0-9a-fA-F]{2}`)
+var nasDiagnosticWrapper = regexp.MustCompile(`(?i)\b(?:bytearray|memoryview)\(([^()]*)\)`)
 var nasDiagnosticBytes = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bb'((?:\\.|[^'\\])*)'`),
 	regexp.MustCompile(`(?i)\bb"((?:\\.|[^"\\])*)"`),
 }
 
 func normalizeNASDiagnosticText(s string) string {
-	// Decode text only, never execute reprs. Each pass shortens the input.
-	// Case-fold names for matching below; preserve diagnostic path/ID case.
-	for {
-		decoded := nasDiagnosticEscape.ReplaceAllStringFunc(s, func(escape string) string {
-			hex := strings.TrimLeft(escape, `\`)[1:]
-			n, _ := strconv.ParseUint(hex, 16, 16)
+	// Decode text only, never execute reprs. Bound work and fail closed when
+	// mixed/nested encodings exceed the decoding budget. Preserve path/ID case.
+	for i := 0; i < 16; i++ {
+		decoded := nasDiagnosticPercent.ReplaceAllStringFunc(html.UnescapeString(s), func(escape string) string {
+			n, _ := strconv.ParseUint(escape[1:], 16, 8)
+			return string([]byte{byte(n)})
+		})
+		decoded = nasDiagnosticEscape.ReplaceAllStringFunc(decoded, func(escape string) string {
+			literal := strings.TrimLeft(escape, `\`)
+			switch literal {
+			case "n":
+				return "\n"
+			case "r":
+				return "\r"
+			case "t":
+				return "\t"
+			}
+			n, _ := strconv.ParseUint(literal[1:], 16, 16)
 			return string(rune(n))
 		})
 		decoded = nasDiagnosticQuotes.ReplaceAllString(decoded, `${1}`)
 		for _, pattern := range nasDiagnosticBytes {
 			decoded = pattern.ReplaceAllString(decoded, `${1}`)
 		}
+		decoded = nasDiagnosticWrapper.ReplaceAllString(decoded, `${1}`)
 		if decoded == s {
 			return s
 		}
 		s = decoded
 	}
+	return "[REDACTED]"
 }
 
 func isNASDiagnosticSecretName(s string) bool {
@@ -83,7 +103,11 @@ func isNASDiagnosticSecretName(s string) bool {
 }
 
 func redactNASClientLogLine(s string) string {
-	s = normalizeNASDiagnosticText(s)
+	normalized := normalizeNASDiagnosticText(s)
+	if normalized != s && nasDiagnosticSensitiveText.MatchString(normalized) {
+		return "[REDACTED]"
+	}
+	s = normalized
 	for _, r := range nasClientLogRedactions {
 		s = r.re.ReplaceAllString(s, r.with)
 	}
