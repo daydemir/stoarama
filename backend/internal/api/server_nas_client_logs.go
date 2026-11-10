@@ -23,18 +23,18 @@ const (
 	nasClientLogMaxBytes     = 512 * 1024
 )
 
-// Keep these patterns and their order in sync with the NAS client's _REDACTIONS.
+// Keep normalization and rules in sync with the client. Both suites load
+// testdata/nas_diagnostic_redaction.json. Fail closed for a sensitive value:
+// retain its name, drop the entire tail (including nested or truncated reprs).
+const nasDiagnosticSecretPattern = `[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|session|dsn|database_url|x-amz-[a-z0-9_-]+)[A-Za-z0-9_.-]*`
+
 var nasClientLogRedactions = []struct {
 	re   *regexp.Regexp
 	with string
 }{
-	{regexp.MustCompile(`(?is)([\[(]\s*\\*["']\s*[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*\s*\\*["']\s*,\s*)[\s\S]*`), `${1}[REDACTED]`},
-	// Match arbitrary escaped quotes; redact the whole tail of sensitive
-	// assignments so arrays, objects and Digest parameters cannot leak.
-	{regexp.MustCompile(`(?is)(\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*(?:\\*["'])?\s*[=:]\s*)[\s\S]*`), `${1}[REDACTED]`},
-	{regexp.MustCompile(`(?i)([\"']?\b[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)`), `${1}[REDACTED]`},
-	{regexp.MustCompile(`(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+|basic\s+)?[^\s\"',}]+`), `${1}[REDACTED]`},
-	{regexp.MustCompile(`(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}`), `${1} [REDACTED]`},
+	{regexp.MustCompile(`(?is)([\[(]\s*["']?\s*` + nasDiagnosticSecretPattern + `\s*["']?\s*,\s*)[\s\S]*`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?is)(\b` + nasDiagnosticSecretPattern + `["']?\s*[=:]\s*)[\s\S]*`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?is)\b(basic|bearer|digest|token|aws4-hmac-sha256)\s+\S[\s\S]*`), `${1} [REDACTED]`},
 	{regexp.MustCompile(`(?i)\b(?:postgres(?:ql)?|mysql|redis(?:s)?)://[^\s'\"<>]+`), `[REDACTED]`},
 	{regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@`), `${1}[REDACTED]@`},
 	{regexp.MustCompile(`(?i)\b((?:https?|s3)://[^\s?#'\"<>]+)\?[^\s'\"<>]*`), `${1}?[REDACTED]`},
@@ -47,24 +47,39 @@ var nasClientLogRedactions = []struct {
 	{regexp.MustCompile(`\b(?:sir|sk|rk|pk|ghp|gho|xox[abp])_[A-Za-z0-9_-]{8,}\b`), `[REDACTED]`},
 }
 
-var nasDiagnosticSecretName = regexp.MustCompile(`(?i)^[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*$`)
+var nasDiagnosticSecretName = regexp.MustCompile(`^` + nasDiagnosticSecretPattern + `$`)
 
 var nasClientLogPath = regexp.MustCompile(`(^|[^\w:/.])(/[^\s'"<>,;)]+)`)
 
-var nasDiagnosticUnicodeEscape = regexp.MustCompile(`\\+u([0-9a-fA-F]{4})`)
+var nasDiagnosticEscape = regexp.MustCompile(`\\+(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2})`)
+var nasDiagnosticQuotes = regexp.MustCompile(`\\+(["'])`)
+var nasDiagnosticBytes = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bb'((?:\\.|[^'\\])*)'`),
+	regexp.MustCompile(`(?i)\bb"((?:\\.|[^"\\])*)"`),
+}
 
 func normalizeNASDiagnosticText(s string) string {
-	// Each pass shortens the input, including nested JSON backslash escapes.
+	// Decode text only, never execute reprs. Each pass shortens the input.
+	// Case-fold names for matching below; preserve diagnostic path/ID case.
 	for {
-		decoded := nasDiagnosticUnicodeEscape.ReplaceAllStringFunc(s, func(escape string) string {
-			n, _ := strconv.ParseUint(escape[len(escape)-4:], 16, 16)
+		decoded := nasDiagnosticEscape.ReplaceAllStringFunc(s, func(escape string) string {
+			hex := strings.TrimLeft(escape, `\`)[1:]
+			n, _ := strconv.ParseUint(hex, 16, 16)
 			return string(rune(n))
 		})
+		decoded = nasDiagnosticQuotes.ReplaceAllString(decoded, `${1}`)
+		for _, pattern := range nasDiagnosticBytes {
+			decoded = pattern.ReplaceAllString(decoded, `${1}`)
+		}
 		if decoded == s {
 			return s
 		}
 		s = decoded
 	}
+}
+
+func isNASDiagnosticSecretName(s string) bool {
+	return nasDiagnosticSecretName.MatchString(strings.ToLower(normalizeNASDiagnosticText(s)))
 }
 
 func redactNASClientLogLine(s string) string {
@@ -91,7 +106,7 @@ func redactNASDiagnostics(value any) any {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, x := range v {
-			if nasDiagnosticSecretName.MatchString(normalizeNASDiagnosticText(k)) {
+			if isNASDiagnosticSecretName(k) {
 				out[redactNASClientLogLine(k)] = "[REDACTED]"
 			} else {
 				out[redactNASClientLogLine(k)] = redactNASDiagnostics(x)
@@ -100,7 +115,7 @@ func redactNASDiagnostics(value any) any {
 		return out
 	case []any:
 		if len(v) >= 2 {
-			if name, ok := v[0].(string); ok && nasDiagnosticSecretName.MatchString(normalizeNASDiagnosticText(name)) {
+			if name, ok := v[0].(string); ok && isNASDiagnosticSecretName(name) {
 				return []any{redactNASClientLogLine(name), "[REDACTED]"}
 			}
 		}

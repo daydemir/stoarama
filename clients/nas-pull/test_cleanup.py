@@ -1121,6 +1121,99 @@ class CleanupProtocol2Tests(unittest.TestCase):
         status, error, _ = pull.CLEANUP_STATUS.snapshot()
         self.assertIn('replay', error); self.assertEqual(status['quarantined'], 1)
 
+    def test_protocol1_legacy_ack_quarantines_each_phase_and_leases_unrelated_work(self):
+        for coordinator in ('once', 'batch'):
+            for phase in ('observe', 'intent', 'result'):
+                with self.subTest(coordinator=coordinator, phase=phase):
+                    f = CleanupTests()
+                    f.setUp()
+                    try:
+                        if phase == 'observe':
+                            body = dict(attempt=1, plan_sha256='a'*64, proof=None, outcome='conflict')
+                        else:
+                            body = dict(attempt=1, plan_sha256='a'*64, proof_sha256='b'*64, outcome='unverified')
+                        pull.cleanup_journal(f.inventory, 900, phase, body)
+                        calls, leases = [], []
+                        def api(cfg, path, body):
+                            calls.append(path)
+                            if path.endswith('/lease'):
+                                leases.append(body)
+                                return dict(tasks=[f.task], retry_after_sec=120)
+                            if '/900/' in path:
+                                # Valid legacy responses intentionally lack identity echoes.
+                                return dict(action='would_delete', delete=False) if path.endswith('/observe') else dict(ok=True)
+                            return fixture_ack(body, action='would_delete', delete=False)
+                        checkpoint = None
+                        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull.os, 'unlink', side_effect=AssertionError('must not delete')):
+                            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                                for cycle in range(pull.CLEANUP_REPLAY_QUARANTINE_AFTER):
+                                    with mock.patch.object(pull.time, 'time', return_value=10000 + cycle*901):
+                                        if coordinator == 'once':
+                                            pull.cleanup_once(f.cfg, f.inventory, threading.Event())
+                                        else:
+                                            pull.cleanup_batch(f.cfg, f.inventory, threading.Event(), executor, task_limit=1)
+                                    if cycle == 0:
+                                        checkpoint = pull.cleanup_journal(f.inventory)[0]
+                                    if cycle < pull.CLEANUP_REPLAY_QUARANTINE_AFTER - 1:
+                                        self.assertEqual(pull.cleanup_journal(f.inventory), [checkpoint])
+                                # Quarantine and subsequent legacy cycles do not crash/retry it.
+                                before = len([path for path in calls if '/900/' in path])
+                                pull.cleanup_once(f.cfg, f.inventory, threading.Event())
+                                self.assertEqual(len([path for path in calls if '/900/' in path]), before)
+                        self.assertEqual(len(leases), pull.CLEANUP_REPLAY_QUARANTINE_AFTER + 1)
+                        self.assertEqual(pull.cleanup_journal(f.inventory), [])
+                        rows = f.inventory.db.execute('SELECT item_id,phase,body FROM cleanup_quarantine').fetchall()
+                        self.assertEqual(rows, [checkpoint], 'exact current checkpoint must be kept')
+                        self.assertTrue(f.path.exists())
+                        self.assertTrue(f.sidecar.exists())
+                        if phase != 'observe':
+                            self.assertFalse(any('/900/observe' in path for path in calls), 'receipt must never request another permit')
+                    finally:
+                        f.doCleanups()
+
+    def test_protocol1_all_blocked_leases_wait_without_reopening_or_repermitting(self):
+        self.journal_observe(1)
+        original = pull.cleanup_journal(self.inventory)
+        def api(cfg, path, body):
+            if path.endswith('/lease'):
+                return dict(tasks=[self.task], retry_after_sec=120)
+            return dict(action='would_delete', delete=False)
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('unresolved item reopened')):
+            with pull.concurrent.futures.ThreadPoolExecutor(1) as executor:
+                retry = pull.cleanup_batch(self.cfg, self.inventory, threading.Event(), executor, task_limit=3)
+        self.assertEqual(retry, 120)
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
+    def test_protocol1_default_replay_budget_does_not_block_leases(self):
+        self.journal_observe(900)
+        original = pull.cleanup_journal(self.inventory)
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        def api(cfg, path, body):
+            if path.endswith('/lease'):
+                self.assertTrue(entered.is_set())
+                return dict(tasks=[], retry_after_sec=120)
+            entered.set()
+            release.wait(5)
+            return dict(action='would_delete', delete=False)
+        record_failure = pull.cleanup_replay_failed
+        def failure(*args):
+            try:
+                return record_failure(*args)
+            finally:
+                finished.set()
+        with mock.patch.object(pull, 'restore_api', side_effect=api), mock.patch.object(pull, 'CLEANUP_REPLAY_BUDGET_SEC', 0.05), mock.patch.object(pull, 'cleanup_replay_failed', side_effect=failure):
+            try:
+                start = time.monotonic()
+                self.assertEqual(pull.cleanup_once(self.cfg, self.inventory, threading.Event()), 120)
+                self.assertLess(time.monotonic() - start, 1)
+                self.assertEqual(pull.cleanup_journal(self.inventory), original)
+                with mock.patch.object(pull, 'restore_api', side_effect=AssertionError('in-flight receipt resubmitted')):
+                    pull.cleanup_replay_receipts(self.cfg, self.inventory)
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(5))
+        self.assertEqual(pull.cleanup_journal(self.inventory), original)
+
     def test_replay_is_time_bounded_and_blocked_items_are_not_processed(self):
         pull.CLEANUP_STATUS.__init__()
         self.journal_observe(901)
@@ -1595,8 +1688,8 @@ class CleanupAcknowledgementTests(unittest.TestCase):
                         self.assertEqual(json.loads(original[0][2])['outcome'], 'deleted')
                         with mock.patch.object(pull, 'CleanupFile', side_effect=AssertionError('must not reopen/unlink')):
                             self.assertFalse(pull.cleanup_process_task(f.cfg, f.inventory, threading.Event(), f.task, api))
-                            with self.assertRaises((pull.CleanupResponseError, json.JSONDecodeError, pull.urllib.error.HTTPError)):
-                                pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
+                            replay = pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
+                            self.assertEqual(replay['failed'], 1)
                             self.assertEqual(pull.cleanup_journal(f.inventory), original)
                             api.result = lambda cfg, item_id, body: fixture_ack(body, ok=True)
                             pull.cleanup_replay_receipts(f.cfg, f.inventory, api)
@@ -1644,5 +1737,35 @@ class CleanupAcknowledgementTests(unittest.TestCase):
                                      json.dumps(json.dumps({key: secret})), '[[' + json.dumps(key) + ',"' + secret):
                             self.assertNotIn(secret, pull.redact_log_line(line), line)
         self.assertEqual(pull.redact_diagnostics([['Accept', 'application/json']]), [['Accept', 'application/json']])
+
+class DiagnosticSharedFixtureTests(unittest.TestCase):
+    def test_shared_redaction_vectors_and_upload_ring(self):
+        fixture = Path(__file__).resolve().parents[2] / 'testdata/nas_diagnostic_redaction.json'
+        for vector in json.loads(fixture.read_text())['vectors']:
+            with self.subTest(vector=vector['name']):
+                value = vector['input']
+                result = pull.redact_diagnostics(value)
+                rendered = result if isinstance(result, str) else json.dumps(result)
+                ring = pull.ClientLogRing()
+                ring.record('WARN', value if isinstance(value, str) else repr(value))
+                stored = ring.lines[0][0]['message']
+                for secret in vector['absent']:
+                    self.assertNotIn(secret, rendered)
+                    self.assertNotIn(secret, stored)
+                for diagnostic in vector['present']:
+                    self.assertIn(diagnostic, rendered)
+                    self.assertIn(diagnostic, stored)
+                if vector['unchanged']:
+                    self.assertEqual(result, value)
+                    if isinstance(value, str):
+                        self.assertEqual(stored, value)
+
+    def test_native_bytes_are_redacted_before_ring_storage(self):
+        for name in (b'Cookie', b'Authorization', b'Proxy-Authorization', b'Session'):
+            value = {b'headers': [(name, b'synthetic-sensitive-value')]}
+            self.assertNotIn('synthetic-sensitive-value', json.dumps(pull.redact_diagnostics(value)))
+            ring = pull.ClientLogRing()
+            ring.record('WARN', value)
+            self.assertNotIn('synthetic-sensitive-value', ring.lines[0][0]['message'])
 
 if __name__=='__main__':unittest.main()

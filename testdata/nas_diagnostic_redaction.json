@@ -1,0 +1,1881 @@
+{
+  "description": "Synthetic credentials only. Shared Python/Go redaction contract, including client ring storage. Safe paths are relative or API paths; absolute host paths retain their existing privacy policy.",
+  "vectors": [
+    {
+      "name": "standalone-Basic-YTpi",
+      "input": "cleanup Basic YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Basic-x",
+      "input": "cleanup Basic x",
+      "absent": [
+        "x"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Bearer-YTpi",
+      "input": "cleanup Bearer YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Bearer-x",
+      "input": "cleanup Bearer x",
+      "absent": [
+        "x"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Digest-YTpi",
+      "input": "cleanup Digest YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Digest-x",
+      "input": "cleanup Digest x",
+      "absent": [
+        "x"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Token-YTpi",
+      "input": "cleanup Token YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-Token-x",
+      "input": "cleanup Token x",
+      "absent": [
+        "x"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-AWS4-HMAC-SHA256-YTpi",
+      "input": "cleanup AWS4-HMAC-SHA256 YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-AWS4-HMAC-SHA256-x",
+      "input": "cleanup AWS4-HMAC-SHA256 x",
+      "absent": [
+        "x"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "standalone-mixed-digest",
+      "input": "cleanup dIgEsT username=\"synthetic-sensitive-value\", nonce=\"other-private-value\"",
+      "absent": [
+        "synthetic-sensitive-value",
+        "other-private-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-authorization-11",
+      "input": "cleanup authorization=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-authorization-12",
+      "input": "cleanup aUtHoRiZaTiOn: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-authorization-13",
+      "input": "cleanup [('aUtHoRiZaTiOn', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-authorization-14",
+      "input": "cleanup [['aUtHoRiZaTiOn', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-authorization-15",
+      "input": "cleanup [(b'aUtHoRiZaTiOn', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-authorization",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "aUtHoRiZaTiOn",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-proxy-authorization-17",
+      "input": "cleanup proxy-authorization=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-proxy-authorization-18",
+      "input": "cleanup pRoXy-aUtHoRiZaTiOn: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-proxy-authorization-19",
+      "input": "cleanup [('pRoXy-aUtHoRiZaTiOn', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-proxy-authorization-20",
+      "input": "cleanup [['pRoXy-aUtHoRiZaTiOn', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-proxy-authorization-21",
+      "input": "cleanup [(b'pRoXy-aUtHoRiZaTiOn', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-proxy-authorization",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "pRoXy-aUtHoRiZaTiOn",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-cookie-23",
+      "input": "cleanup cookie=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-cookie-24",
+      "input": "cleanup cOoKiE: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-cookie-25",
+      "input": "cleanup [('cOoKiE', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-cookie-26",
+      "input": "cleanup [['cOoKiE', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-cookie-27",
+      "input": "cleanup [(b'cOoKiE', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-cookie",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "cOoKiE",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-set-cookie-29",
+      "input": "cleanup set-cookie=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-set-cookie-30",
+      "input": "cleanup sEt-cOoKiE: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-set-cookie-31",
+      "input": "cleanup [('sEt-cOoKiE', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-set-cookie-32",
+      "input": "cleanup [['sEt-cOoKiE', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-set-cookie-33",
+      "input": "cleanup [(b'sEt-cOoKiE', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-set-cookie",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "sEt-cOoKiE",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-password-35",
+      "input": "cleanup password=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-password-36",
+      "input": "cleanup pAsSwOrD: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-password-37",
+      "input": "cleanup [('pAsSwOrD', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-password-38",
+      "input": "cleanup [['pAsSwOrD', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-password-39",
+      "input": "cleanup [(b'pAsSwOrD', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-password",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "pAsSwOrD",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-passwd-41",
+      "input": "cleanup passwd=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-passwd-42",
+      "input": "cleanup pAsSwD: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-passwd-43",
+      "input": "cleanup [('pAsSwD', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-passwd-44",
+      "input": "cleanup [['pAsSwD', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-passwd-45",
+      "input": "cleanup [(b'pAsSwD', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-passwd",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "pAsSwD",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret-47",
+      "input": "cleanup secret=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret-48",
+      "input": "cleanup sEcReT: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret-49",
+      "input": "cleanup [('sEcReT', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret-50",
+      "input": "cleanup [['sEcReT', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret-51",
+      "input": "cleanup [(b'sEcReT', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-secret",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "sEcReT",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-token-53",
+      "input": "cleanup token=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-token-54",
+      "input": "cleanup tOkEn: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-token-55",
+      "input": "cleanup [('tOkEn', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-token-56",
+      "input": "cleanup [['tOkEn', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-token-57",
+      "input": "cleanup [(b'tOkEn', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-token",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "tOkEn",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-api_key-59",
+      "input": "cleanup api_key=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-api_key-60",
+      "input": "cleanup aPi_kEy: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-api_key-61",
+      "input": "cleanup [('aPi_kEy', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-api_key-62",
+      "input": "cleanup [['aPi_kEy', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-api_key-63",
+      "input": "cleanup [(b'aPi_kEy', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-api_key",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "aPi_kEy",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-apikey-65",
+      "input": "cleanup apikey=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-apikey-66",
+      "input": "cleanup aPiKeY: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-apikey-67",
+      "input": "cleanup [('aPiKeY', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-apikey-68",
+      "input": "cleanup [['aPiKeY', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-apikey-69",
+      "input": "cleanup [(b'aPiKeY', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-apikey",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "aPiKeY",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-access_key-71",
+      "input": "cleanup access_key=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-access_key-72",
+      "input": "cleanup aCcEsS_KeY: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-access_key-73",
+      "input": "cleanup [('aCcEsS_KeY', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-access_key-74",
+      "input": "cleanup [['aCcEsS_KeY', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-access_key-75",
+      "input": "cleanup [(b'aCcEsS_KeY', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-access_key",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "aCcEsS_KeY",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret_key-77",
+      "input": "cleanup secret_key=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret_key-78",
+      "input": "cleanup sEcReT_KeY: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret_key-79",
+      "input": "cleanup [('sEcReT_KeY', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret_key-80",
+      "input": "cleanup [['sEcReT_KeY', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-secret_key-81",
+      "input": "cleanup [(b'sEcReT_KeY', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-secret_key",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "sEcReT_KeY",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-session-83",
+      "input": "cleanup session=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-session-84",
+      "input": "cleanup sEsSiOn: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-session-85",
+      "input": "cleanup [('sEsSiOn', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-session-86",
+      "input": "cleanup [['sEsSiOn', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-session-87",
+      "input": "cleanup [(b'sEsSiOn', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-session",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "sEsSiOn",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-signature-89",
+      "input": "cleanup signature=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-signature-90",
+      "input": "cleanup sIgNaTuRe: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-signature-91",
+      "input": "cleanup [('sIgNaTuRe', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-signature-92",
+      "input": "cleanup [['sIgNaTuRe', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-signature-93",
+      "input": "cleanup [(b'sIgNaTuRe', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-signature",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "sIgNaTuRe",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-security-token-95",
+      "input": "cleanup x-amz-security-token=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-security-token-96",
+      "input": "cleanup x-aMz-sEcUrItY-ToKeN: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-security-token-97",
+      "input": "cleanup [('x-aMz-sEcUrItY-ToKeN', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-security-token-98",
+      "input": "cleanup [['x-aMz-sEcUrItY-ToKeN', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-security-token-99",
+      "input": "cleanup [(b'x-aMz-sEcUrItY-ToKeN', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-x-amz-security-token",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "x-aMz-sEcUrItY-ToKeN",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-meta-custom-101",
+      "input": "cleanup x-amz-meta-custom=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-meta-custom-102",
+      "input": "cleanup x-aMz-mEtA-CuStOm: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-meta-custom-103",
+      "input": "cleanup [('x-aMz-mEtA-CuStOm', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-meta-custom-104",
+      "input": "cleanup [['x-aMz-mEtA-CuStOm', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-x-amz-meta-custom-105",
+      "input": "cleanup [(b'x-aMz-mEtA-CuStOm', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-x-amz-meta-custom",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "x-aMz-mEtA-CuStOm",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-credential-107",
+      "input": "cleanup credential=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-credential-108",
+      "input": "cleanup cReDeNtIaL: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-credential-109",
+      "input": "cleanup [('cReDeNtIaL', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-credential-110",
+      "input": "cleanup [['cReDeNtIaL', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-credential-111",
+      "input": "cleanup [(b'cReDeNtIaL', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-credential",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "cReDeNtIaL",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-R2_ACCESS_KEY_ID-113",
+      "input": "cleanup R2_ACCESS_KEY_ID=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-R2_ACCESS_KEY_ID-114",
+      "input": "cleanup R2_ACCESS_KEY_ID: synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-R2_ACCESS_KEY_ID-115",
+      "input": "cleanup [('R2_ACCESS_KEY_ID', 'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-R2_ACCESS_KEY_ID-116",
+      "input": "cleanup [['R2_ACCESS_KEY_ID', [['synthetic-sensitive-value']]]]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "sensitive-R2_ACCESS_KEY_ID-117",
+      "input": "cleanup [(b'R2_ACCESS_KEY_ID', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "structured-R2_ACCESS_KEY_ID",
+      "input": {
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ],
+          [
+            "R2_ACCESS_KEY_ID",
+            {
+              "nested": [
+                [
+                  "synthetic-sensitive-value"
+                ]
+              ]
+            }
+          ]
+        ]
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "reviewer-byte-cookie",
+      "input": "cleanup [(b'Cookie', b'session=synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "reviewer-byte-digest",
+      "input": "cleanup [(b\"Authorization\", b'Digest username=\"synthetic-sensitive-value\", response=\"other-private-value\"')]",
+      "absent": [
+        "synthetic-sensitive-value",
+        "other-private-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "unicode-nested-0",
+      "input": "cleanup [(b'\\u0043\\u006f\\u004f\\u006b\\u0049\\u0065', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "unicode-nested-1",
+      "input": "\"cleanup [(b'\\\\u0043\\\\u006f\\\\u004f\\\\u006b\\\\u0049\\\\u0065', b'synthetic-sensitive-value')]\"",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "unicode-nested-2",
+      "input": "\"\\\"cleanup [(b'\\\\\\\\u0043\\\\\\\\u006f\\\\\\\\u004f\\\\\\\\u006b\\\\\\\\u0049\\\\\\\\u0065', b'synthetic-sensitive-value')]\\\"\"",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "unicode-structured",
+      "input": {
+        "\\u0043\\u006f\\u004f\\u006b\\u0049\\u0065": {
+          "nested": "synthetic-sensitive-value"
+        }
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "hex-nested-0",
+      "input": "cleanup [(b'\\x43\\x6f\\x4f\\x6b\\x49\\x65', b'synthetic-sensitive-value')]",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "hex-nested-1",
+      "input": "\"cleanup [(b'\\\\x43\\\\x6f\\\\x4f\\\\x6b\\\\x49\\\\x65', b'synthetic-sensitive-value')]\"",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "hex-nested-2",
+      "input": "\"\\\"cleanup [(b'\\\\\\\\x43\\\\\\\\x6f\\\\\\\\x4f\\\\\\\\x6b\\\\\\\\x49\\\\\\\\x65', b'synthetic-sensitive-value')]\\\"\"",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "hex-structured",
+      "input": {
+        "\\x43\\x6f\\x4f\\x6b\\x49\\x65": {
+          "nested": "synthetic-sensitive-value"
+        }
+      },
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "escaped-separators",
+      "input": "cleanup api_key\\x3dsynthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "escaped-scheme",
+      "input": "cleanup \\x42\\u0061sic YTpi",
+      "absent": [
+        "YTpi"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "truncated-byte-wrapper",
+      "input": "cleanup [(b'Cookie', b'synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "nested-escaped-value",
+      "input": "\"{\\\"password\\\": \\\"prefix\\\\\\\\\\\\\\\"synthetic-sensitive-value\\\"}\"",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "url-userinfo",
+      "input": "cleanup https://fixture-user:synthetic-sensitive-value@example.invalid/path",
+      "absent": [
+        "synthetic-sensitive-value",
+        "fixture-user"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "url-query",
+      "input": "cleanup https://example.invalid/path?SESSION=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "url-encoded-query-name",
+      "input": "cleanup https://example.invalid/path?%74oken=synthetic-sensitive-value",
+      "absent": [
+        "synthetic-sensitive-value"
+      ],
+      "present": [
+        "[REDACTED]"
+      ],
+      "unchanged": false
+    },
+    {
+      "name": "safe-file-diagnostics",
+      "input": "cleanup item_id=42 attempt=3 relative_path=Stream/Day/Case.mp4 size_bytes=123456 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "absent": [],
+      "present": [],
+      "unchanged": true
+    },
+    {
+      "name": "safe-structured-diagnostics",
+      "input": {
+        "item_id": 42,
+        "attempt": 3,
+        "relative_path": "Stream/Day/Case.mp4",
+        "size_bytes": 123456,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "headers": [
+          [
+            "Accept",
+            "application/json"
+          ]
+        ]
+      },
+      "absent": [],
+      "present": [],
+      "unchanged": true
+    },
+    {
+      "name": "safe-api-path",
+      "input": "POST /account/connections/cleanup/lease item=42",
+      "absent": [],
+      "present": [],
+      "unchanged": true
+    },
+    {
+      "name": "safe-path-pair",
+      "input": [
+        "relative_path",
+        "Stream/Day/Case.mp4"
+      ],
+      "absent": [],
+      "present": [],
+      "unchanged": true
+    },
+    {
+      "name": "safe-size-pair",
+      "input": [
+        "size_bytes",
+        123456
+      ],
+      "absent": [],
+      "present": [],
+      "unchanged": true
+    },
+    {
+      "name": "safe-hash-pair",
+      "input": [
+        "sha256",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "absent": [],
+      "present": [],
+      "unchanged": true
+    }
+  ]
+}

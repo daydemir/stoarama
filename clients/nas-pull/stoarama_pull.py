@@ -241,29 +241,42 @@ CLIENT_LOG_LINE_MAX = 2048
 CLIENT_LOG_UPLOAD_SEC = 300
 CLIENT_LOG_LEVELS = ("WARN", "WARNING", "ERROR", "CRITICAL")
 CLIENT_LOG_TOPICS = re.compile(r"cleanup|replay|lease|quarantin", re.IGNORECASE)
-_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|dsn|database_url|x-amz-[a-z-]+)[A-Za-z0-9_.-]*"
-_JSON_UNICODE_ESCAPE = re.compile(r"\\+u([0-9a-fA-F]{4})")
+# Keep normalization and redaction rules in sync with server_nas_client_logs.go;
+# both suites load testdata/nas_diagnostic_redaction.json.
+_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|key|signature|credential|authorization|cookie|session|dsn|database_url|x-amz-[a-z0-9_-]+)[A-Za-z0-9_.-]*"
+_DIAGNOSTIC_ESCAPE = re.compile(r"\\+(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
+_DIAGNOSTIC_QUOTES = re.compile(r"\\+([\"'])")
+_DIAGNOSTIC_BYTES = (re.compile(r"\bb'((?:\\.|[^'\\])*)'", re.IGNORECASE),
+                     re.compile(r'\bb"((?:\\.|[^"\\])*)"', re.IGNORECASE))
 
 
 def normalize_diagnostic_text(text):
-    # Decode even nested JSON encodings before identifying secret names.
-    # Each substitution shortens the input, including escaped backslashes.
+    # Canonicalize nested JSON and Python reprs before matching. This is text
+    # normalization only: never eval untrusted diagnostics. Each pass shortens
+    # the input. Case folding belongs to name matching (and (?i) text rules),
+    # preserving case in useful file paths, IDs and hashes.
     while True:
-        decoded = _JSON_UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+        decoded = _DIAGNOSTIC_ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+        decoded = _DIAGNOSTIC_QUOTES.sub(r"\1", decoded)
+        for pattern in _DIAGNOSTIC_BYTES:
+            decoded = pattern.sub(r"\1", decoded)
         if decoded == text:
             return text
         text = decoded
 
 
-# Fail closed for textual diagnostics: once a sensitive assignment starts, drop
-# its entire tail. This covers nested header values, Digest parameters and any
-# depth of escaped quotes without guessing where an untrusted value ends.
+def diagnostic_secret_name(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return isinstance(value, str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(value).casefold()) is not None
+
+
+# Fail closed after a sensitive assignment/pair or standalone auth scheme:
+# discard the entire tail, including nested/truncated values and Digest fields.
 _REDACTIONS = (
-    (re.compile(r"(?is)([\[(]\s*\\*[\"']\s*" + _SECRET_NAME + r"\s*\\*[\"']\s*,\s*)[\s\S]*"), r"\1[REDACTED]"),
-    (re.compile(r"(?is)(\b" + _SECRET_NAME + r"(?:\\*[\"'])?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)([\"']?\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)(\[REDACTED\]|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:bearer\s+|basic\s+)?[^\s,;&}\]]+)"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)(\bauthorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+|basic\s+)?[^\s\"',}]+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
+    (re.compile(r"(?is)([\[(]\s*[\"']?\s*" + _SECRET_NAME + r"\s*[\"']?\s*,\s*)[\s\S]*"), r"\1[REDACTED]"),
+    (re.compile(r"(?is)(\b" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
+    (re.compile(r"(?is)\b(basic|bearer|digest|token|aws4-hmac-sha256)\s+\S[\s\S]*"), r"\1 [REDACTED]"),
     (re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|redis(?:s)?)://[^\s'\"<>]+"), "[REDACTED]"),
     (re.compile(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@"), r"\1[REDACTED]@"),
     (re.compile(r"(?i)\b((?:https?|s3)://[^\s?#'\"<>]+)\?[^\s'\"<>]*"), r"\1?[REDACTED]"),
@@ -279,12 +292,14 @@ _ABSOLUTE_PATH = re.compile(r"(^|[^\w:/.])(/[^\s'\"<>,;)]+)")
 
 
 def redact_diagnostics(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
     if isinstance(value, str):
         return redact_log_line(value, CLIENT_LOG_RING.output_root, CLIENT_LOG_RING.secrets)
     if isinstance(value, dict):
-        return {redact_diagnostics(k): ("[REDACTED]" if isinstance(k, str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(k), re.IGNORECASE) else redact_diagnostics(v)) for k, v in value.items()}
+        return {redact_diagnostics(k): ("[REDACTED]" if diagnostic_secret_name(k) else redact_diagnostics(v)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        if len(value) >= 2 and isinstance(value[0], str) and re.fullmatch(_SECRET_NAME, normalize_diagnostic_text(value[0]), re.IGNORECASE):
+        if len(value) >= 2 and diagnostic_secret_name(value[0]):
             return [redact_diagnostics(value[0]), "[REDACTED]"]
         return [redact_diagnostics(v) for v in value]
     return value
@@ -293,10 +308,10 @@ def redact_diagnostics(value):
 def redact_log_line(text, output_root=None, secrets=()):
     """Remove credentials, signed URL query strings, secret-looking values and
     absolute host paths outside the NAS output root from one log line."""
-    text = normalize_diagnostic_text(str(text))
+    text = normalize_diagnostic_text(text.decode("utf-8", "replace") if isinstance(text, bytes) else str(text))
     for secret in secrets:
         if secret and len(secret) >= 6:
-            text = text.replace(secret, "[REDACTED]")
+            text = text.replace(normalize_diagnostic_text(secret), "[REDACTED]")
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     root = str(output_root).rstrip("/") if output_root else None
@@ -2656,8 +2671,9 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     """Replay every durable journal entry; protocol 2 replays in parallel
     through the batched endpoints (same per-item rules as the single ones).
 
-    With a budget (protocol 2) the call returns after at most `budget`
-    seconds; unfinished replays continue in the background and are not
+    Both protocols use the bounded failure/quarantine path. The call returns
+    after at most `budget` seconds (CLEANUP_REPLAY_BUDGET_SEC by default);
+    unfinished replays continue in the background and are not
     resubmitted while in flight. Returns {"replayed", "failed", "pending",
     "quarantined"} counts."""
     def replay(item_id, phase, body, owner):
@@ -2739,15 +2755,7 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
     with inventory.lock:
         entries = [row for row in cleanup_journal(inventory) if row[0] not in inventory.cleanup_claims]
     if budget is None:
-        if api is None or len(entries) < 2:
-            for entry in entries:
-                one(*entry)
-            return {"replayed": len(entries), "failed": 0, "pending": 0, "quarantined": 0}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=CLEANUP_REPLAY_WORKERS, thread_name_prefix="nas-cleanup-replay") as pool:
-            futures = [pool.submit(one, *entry) for entry in entries]
-        for future in futures:
-            future.result()
-        return {"replayed": len(entries), "failed": 0, "pending": 0, "quarantined": 0}
+        budget = CLEANUP_REPLAY_BUDGET_SEC
 
     counts = {"replayed": 0, "failed": 0, "pending": 0, "quarantined": 0, "errors": []}
     counts_lock = threading.Lock()
@@ -2788,7 +2796,18 @@ def cleanup_replay_receipts(cfg, inventory, api=None, budget=None):
         pool.shutdown(wait=False)
     with counts_lock:
         counts["pending"] += len(not_done)
-        return dict(counts)
+        result = dict(counts)
+    quarantine_status = cleanup_quarantine_status(inventory)
+    quarantined_total = quarantine_status["quarantined"]
+    CLEANUP_STATUS.update(**quarantine_status)
+    CLEANUP_STATUS.update(protocol=1 if api is None else 2, last_cycle_at=utc_now(),
+                          replay_replayed=result["replayed"], replay_failed=result["failed"],
+                          replay_pending=result["pending"])
+    if result["failed"]:
+        CLEANUP_STATUS.fail("journal replay: %d failed, %d pending, %d quarantined in total; %s" % (
+            result["failed"], result["pending"], quarantined_total, "; ".join(result["errors"][:3])))
+        log("WARN", "NAS cleanup replay: %d failed, %d pending; leasing new work anyway" % (result["failed"], result["pending"]))
+    return result
 
 
 def cleanup_verified_ack(task, proof, decision):
@@ -2982,6 +3001,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     cleanup_replay_receipts(cfg, inventory)
     pending = set()
     leased = 0
+    processed = 0
     retry = 120
     exhausted = False
     executing = False
@@ -3000,8 +3020,14 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                 if not lease["tasks"]:
                     exhausted = True
                     break
+                CLEANUP_STATUS.update(last_lease_at=utc_now(), last_lease_tasks=len(lease["tasks"]))
+                blocked = cleanup_blocked_items(inventory)
                 for task in lease["tasks"]:
                     leased += 1
+                    if task["item_id"] in blocked:
+                        CLEANUP_STATUS.add("skipped_blocked_items")
+                        continue
+                    processed += 1
                     if task.get("approved_proof") is not None:
                         for future in pending:
                             completed(future)
@@ -3031,7 +3057,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                     error = exc
     if error is not None:
         raise error
-    return 0 if leased else retry
+    return 0 if processed else retry
 
 
 # Protocol 2 (2026-11): bounded parallel execution with batched round trips.
@@ -3301,15 +3327,6 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     new work from being leased; a leased task whose item still has a journal
     or quarantine entry is left unprocessed (its lease simply expires)."""
     replay = cleanup_replay_receipts(cfg, inventory, api, budget=CLEANUP_REPLAY_BUDGET_SEC)
-    quarantine_status = cleanup_quarantine_status(inventory)
-    quarantined_total = quarantine_status["quarantined"]
-    CLEANUP_STATUS.update(**quarantine_status)
-    CLEANUP_STATUS.update(protocol=2, last_cycle_at=utc_now(), replay_replayed=replay["replayed"], replay_failed=replay["failed"],
-                          replay_pending=replay["pending"], quarantined=quarantined_total)
-    if replay["failed"]:
-        CLEANUP_STATUS.fail("journal replay: %d failed, %d pending, %d quarantined in total; %s" % (
-            replay["failed"], replay["pending"], quarantined_total, "; ".join(replay["errors"][:3])))
-        log("WARN", "NAS cleanup replay: %d failed, %d pending; leasing new work anyway" % (replay["failed"], replay["pending"]))
     pins, pins_error = cleanup_pins()
     pending = {}
     leased = 0

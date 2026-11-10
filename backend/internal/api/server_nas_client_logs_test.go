@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -291,5 +293,60 @@ func TestNASDiagnosticsPairsAndUnicodeNames(t *testing.T) {
 	got, _ := json.Marshal(redactNASDiagnostics(safe))
 	if string(got) != `[["Accept","application/json"]]` {
 		t.Fatalf("overredacted safe pair: %s", got)
+	}
+}
+
+// Shared with the Python diagnostics and upload-ring tests; no DB required.
+func TestNASDiagnosticsSharedVectors(t *testing.T) {
+	data, err := os.ReadFile("../../../testdata/nas_diagnostic_redaction.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Vectors []struct {
+			Name      string   `json:"name"`
+			Input     any      `json:"input"`
+			Absent    []string `json:"absent"`
+			Present   []string `json:"present"`
+			Unchanged bool     `json:"unchanged"`
+		} `json:"vectors"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.Vectors) == 0 {
+		t.Fatal("empty shared fixture")
+	}
+	for _, vector := range fixture.Vectors {
+		t.Run(vector.Name, func(t *testing.T) {
+			// Clone because structured redaction may modify slices in place.
+			encoded, _ := json.Marshal(vector.Input)
+			var value any
+			if err := json.Unmarshal(encoded, &value); err != nil {
+				t.Fatal(err)
+			}
+			result := redactNASDiagnostics(value)
+			rendered, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(rendered)
+			if text, ok := result.(string); ok {
+				got = text
+			}
+			for _, secret := range vector.Absent {
+				if strings.Contains(got, secret) {
+					t.Fatalf("leaked %q: %s", secret, got)
+				}
+			}
+			for _, diagnostic := range vector.Present {
+				if !strings.Contains(got, diagnostic) {
+					t.Fatalf("missing %q: %s", diagnostic, got)
+				}
+			}
+			if vector.Unchanged && !reflect.DeepEqual(result, vector.Input) {
+				t.Fatalf("safe diagnostics changed: %#v -> %#v", vector.Input, result)
+			}
+		})
 	}
 }
