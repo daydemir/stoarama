@@ -107,10 +107,15 @@ class V85rTests(unittest.TestCase):
                          (False, result['status']))
         request = dict(prev=row['source_bindings'][0], next=row['source_bindings'][1],
                        tools=dict(ffmpeg='fixture', ffprobe='fixture'))
+        # The live producer projects bindings to these three identity fields.
+        row['source_bindings'] = [dict(clip_id=b['clip_id'], sha256=b['sha256'], size_bytes=b['size_bytes'])
+                                  for b in row['source_bindings']]
+        row['spatial_provenance']['source_bindings'] = row['source_bindings']
         native = dict(evidence_row=row, diagnostic_window20=row['diagnostic_window20'])
         with mock.patch.object(runner.subprocess, 'run', return_value=mock.Mock(stdout=json.dumps(native))):
             decision = runner.run(request)
-        self.assertIn(decision['decision'], ('split', 'hold'))
+        self.assertEqual(decision['status'], 'REJECT_stationary_severe_seam_forecast')
+        self.assertEqual(decision['decision'], 'split')
         self.assertFalse(decision['join'])
 
     def test_missing_or_unauthenticated_evidence_holds_a_baseline_positive(self):
