@@ -531,14 +531,18 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 	return cleanupClientSession{boot: parts[0], version: parts[1]}
 }
 
-func cleanupSessionMatchesHeartbeat(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (bool, error) {
+func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
 	if session.boot == "" || session.boot == "unknown" || session.version != nasCleanupExecutionClientVersion {
-		return false, nil
+		return time.Time{}, nil
 	}
+	var seen *time.Time
 	var matches bool
 	// Hold the heartbeat row until commit, so identity cannot change under a permit.
-	err := tx.QueryRow(ctx, `SELECT coalesce(client_boot_id=$2 AND client_version=$3 AND last_seen_at>clock_timestamp()-interval '5 minutes',false) FROM connections WHERE id=$1 FOR SHARE`, cid, session.boot, session.version).Scan(&matches)
-	return matches, err
+	err := tx.QueryRow(ctx, `SELECT last_seen_at,coalesce(client_boot_id=$2 AND client_version=$3,false) FROM connections WHERE id=$1 FOR SHARE`, cid, session.boot, session.version).Scan(&seen, &matches)
+	if err != nil || !matches || seen == nil {
+		return time.Time{}, err
+	}
+	return seen.Add(5 * time.Minute), nil
 }
 
 type cleanupTask struct {
@@ -648,12 +652,12 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		return
 	}
 	session := cleanupRequestSession(r)
-	matches, err := cleanupSessionMatchesHeartbeat(ctx, tx, cid, session)
+	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, session)
 	if err != nil {
 		util.WriteError(w, 500, "cleanup client identity unavailable")
 		return
 	}
-	allowExecution := matches && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
+	allowExecution := sessionDeadline.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled && (req.Protocol == 1 || *req.ExecutionFiles > 0)
 	// An execution lease that expires without a report is an execution
 	// anomaly: its enabled plan (and its batch) is paused in the same statement.
 	_, err = tx.Exec(ctx, cleanupExpireLeasesSQL, cid, "execution lease expired without a report")
@@ -663,7 +667,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 	}
 	tasks := make([]cleanupTask, 0, req.Limit)
 	if req.RequestID != "" {
-		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, session.boot, session.version)
+		replayed, err := cleanupLeaseReplay(ctx, tx, cid, req.RequestID, allowExecution, session.boot, session.version, sessionDeadline)
 		if err != nil {
 			util.WriteError(w, 500, "cleanup lease load failed")
 			return
@@ -715,6 +719,10 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 		// lease reports the identical expiry.
 		task.ExpiresAt = time.Now().UTC().Add(30 * time.Minute).Truncate(time.Microsecond)
 		if mode == "enabled" {
+			if !sessionDeadline.After(time.Now()) {
+				allowExecution = false
+				continue
+			}
 			task.ApprovedProof = approved
 		}
 		var requestID any
@@ -750,7 +758,7 @@ func (s *Server) handleAccountNASCleanupLease(w http.ResponseWriter, r *http.Req
 // cleanupLeaseReplay returns the still-leased, unexpired tasks of an earlier
 // identical lease request (its response was lost), with the same attempt and
 // expiry. Nothing is leased again and no lease is extended.
-func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string) ([]cleanupTask, error) {
+func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID string, executionCapable bool, boot, version string, sessionDeadline time.Time) ([]cleanupTask, error) {
 	rows, err := tx.Query(ctx, `SELECT i.id,i.attempt,p.plan_sha256,coalesce(i.item,p.manifest->(i.ordinal-1)),i.proof,p.mode,i.lease_expires_at FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.lease_request_id=$1 AND i.state='leased' AND i.lease_expires_at>now() AND p.connection_id=$2 AND p.report_sha256=$3 AND (p.mode='dry_run' OR (p.mode='enabled' AND p.approved_until>now() AND $4 AND i.lease_connection_id=$2 AND i.lease_client_boot_id=$5 AND i.lease_client_version=$6 AND NOT EXISTS (SELECT 1 FROM nas_cleanup_items busy WHERE busy.plan_id=p.id AND busy.id<>i.id AND busy.state IN ('leased','delete_issued')))) ORDER BY i.id FOR UPDATE OF i`, requestID, cid, cleanupPolicySHA, executionCapable, boot, version)
 	if err != nil {
 		return nil, err
@@ -768,6 +776,9 @@ func cleanupLeaseReplay(ctx context.Context, tx pgx.Tx, cid int64, requestID str
 			return nil, err
 		}
 		if mode == "enabled" {
+			if !sessionDeadline.After(time.Now()) {
+				continue
+			}
 			task.ApprovedProof = approved
 		} else if mode != "dry_run" {
 			continue
@@ -984,11 +995,15 @@ func cleanupObserveError(status int, msg string) cleanupObserveResult {
 	return cleanupObserveResult{status: status, body: map[string]any{"error": msg}}
 }
 
+func cleanupObserveReconcile(id int64, attempt int, sha string, proof json.RawMessage) cleanupObserveResult {
+	return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(proof)}}
+}
+
 // cleanupObserveOne records one exact-file observation inside tx and decides
 // whether it earns a single-use deletion permit. Both the single-item and the
 // batched endpoint use it; a batch runs each call in its own savepoint.
 func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64, req cleanupObserve, env *cleanupObserveEnv) cleanupObserveResult {
-	matches, err := cleanupSessionMatchesHeartbeat(ctx, tx, cid, env.session)
+	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, env.session)
 	if err != nil {
 		return cleanupObserveError(503, "cleanup client identity unavailable")
 	}
@@ -1035,8 +1050,8 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		if err := tx.QueryRow(ctx, `SELECT coalesce(lease_connection_id=$2 AND lease_client_boot_id=$3 AND lease_client_version=$4,false) FROM nas_cleanup_items WHERE id=$1`, id, cid, env.session.boot, env.session.version).Scan(&bound); err != nil {
 			return cleanupObserveError(503, "cleanup lease identity unavailable")
 		}
-		if !bound || !matches {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
+		if !bound || !sessionDeadline.After(time.Now()) {
+			return cleanupObserveReconcile(id, attempt, sha, req.Proof)
 		}
 	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
@@ -1057,7 +1072,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": state, "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
 		}
 		if state == "delete_issued" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
-			return cleanupObserveResult{status: 200, body: map[string]any{"action": "reconcile", "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
+			return cleanupObserveReconcile(id, attempt, sha, req.Proof)
 		}
 		if state == "would_delete" && req.Outcome == "match" && nasSpaceAuditJSONEqual(oldProof, req.Proof) {
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": "would_delete", "delete": false, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof)}}
@@ -1160,6 +1175,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	}
 	if cleanupObservationExpired(ctx) {
 		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup observation deadline exceeded; retry", "retryable": true}}
+	}
+	// Policy/lock work can cross the heartbeat deadline after the initial
+	// identity check. Freshness must still hold when first authority is minted.
+	if deletion && !sessionDeadline.After(time.Now()) {
+		return cleanupObserveReconcile(id, attempt, sha, req.Proof)
 	}
 	if deletion && !lease.After(time.Now()) {
 		return cleanupObserveError(409, "cleanup lease expired")

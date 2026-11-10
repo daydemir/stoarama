@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestNASCleanupExecutionCapabilityAndConcurrentLeaseLimit(t *testing.T) {
@@ -380,5 +382,39 @@ func TestNASCleanupObservationRequestRetention(t *testing.T) {
 	}
 	if rows.Err() != nil || len(retained) != 2 || retained[0] != strings.Repeat("b", 32) || retained[1] != strings.Repeat("c", 32) {
 		t.Fatalf("retention: %v %v", retained, rows.Err())
+	}
+}
+
+// A heartbeat that was fresh when the request began may expire while policy
+// work holds the plan fence. It must still be fresh at actual permit issuance.
+func TestNASCleanupHeartbeatExpiresDuringPolicyWork(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, sha, _ := f.admit("heartbeat-deadline", syntheticFiles(100, 1, 1))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	task := f.leaseV2(1, 1, 1<<30, "")[0]
+	tracer := &cleanupSlowPolicyTracer{}
+	cfg := f.pool.Config()
+	cfg.ConnConfig.Tracer = tracer
+	slowPool, err := pgxpool.NewWithConfig(f.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slowPool.Close()
+	f.s.pool = slowPool
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET last_seen_at=clock_timestamp()-interval '5 minutes'+interval '800 milliseconds' WHERE id=13`); err != nil {
+		t.Fatal(err)
+	}
+	req := cleanupObserve{ReconciliationProtocol: nasCleanupReconciliationProtocol, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), RequestID: strings.Repeat("a", 32)}
+	w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), req)
+	if tracer.calls.Load() != 1 || w.Code != 200 || !strings.Contains(w.Body.String(), `"action":"reconcile"`) || strings.Contains(w.Body.String(), `"delete":true`) {
+		t.Fatalf("heartbeat expiry minted authority or bypassed policy: calls=%d %d %s", tracer.calls.Load(), w.Code, w.Body.String())
+	}
+	var unchanged bool
+	if err := f.pool.QueryRow(f.ctx, `SELECT state='leased' AND NOT delete_ever_issued AND permit_expires_at IS NULL FROM nas_cleanup_items WHERE id=$1`, task.ItemID).Scan(&unchanged); err != nil || !unchanged {
+		t.Fatalf("authority mutated: %t %v", unchanged, err)
 	}
 }
