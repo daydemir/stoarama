@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>com.stoarama.repair</string>
+ <key>ProgramArguments</key><array><string>/usr/bin/caffeinate</string><string>-i</string><string>/opt/homebrew/bin/python3</string><string>-I</string><string>/Users/jelly/stoarama-repair/bin/repair.py</string></array>
+ <key>WorkingDirectory</key><string>/Users/jelly/stoarama-repair/work</string>
+ <key>RunAtLoad</key><true/>
+ <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+ <key>ThrottleInterval</key><integer>60</integer>
+ <key>StandardOutPath</key><string>/Users/jelly/stoarama-repair/run.log</string>
+ <key>StandardErrorPath</key><string>/Users/jelly/stoarama-repair/run.log</string>
+ <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>REPAIR_CONC</key><string>16</string><key>REPAIR_BATCH</key><string>400</string><key>HOME</key><string>/Users/jelly</string></dict>
+</dict></plist>
