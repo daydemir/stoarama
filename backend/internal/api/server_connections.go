@@ -73,6 +73,10 @@ func pullPathAllowed(method, path string) bool {
 		return true
 	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/lease" || pullCleanupResultRe.MatchString(path)):
 		return true
+	// The batch forms carry the same per-item observations/results the pull key
+	// may already post one at a time; the NAS client uses them by default.
+	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/observe-batch" || path == "/api/v1/account/connections/cleanup/result-batch"):
+		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/selected-verify/lease":
 		return true
 	case method == http.MethodPost && pullSelectedVerifyResultRe.MatchString(path):
