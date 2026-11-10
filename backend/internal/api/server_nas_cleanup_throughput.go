@@ -34,14 +34,52 @@ const (
 	nasCleanupRecoveryParallel = 16
 )
 
-// Wall-clock budget for one request's R2 work, well inside the edge proxy's
-// 100 s origin timeout. Items not finished in time are answered 503 (nothing
-// recorded) and resent by the client. A variable only so tests can shorten it.
+// Dry-run prefetch budget. Execution additionally caps the entire observation
+// request below. Unfinished recovery never yields a permit. Variables allow
+// tests to shorten the budgets.
 var nasCleanupRecoveryBudget = 40 * time.Second
+
+// Includes authentication, mode lookup, recovery, lock waits and commit. This
+// must leave ample room inside the client's independent 30 s refusal guard.
+var nasCleanupExecutionBudget = 15 * time.Second
+
+// Start with the execution deadline. Only requests proved to contain no enabled
+// plan regain the original dry-run budget. A later enable is refused by
+// cleanupObserveOne rather than issuing under that longer context.
+func (s *Server) cleanupObservationContext(ctx context.Context, original context.Context, cid int64, ids []int64) (context.Context, bool, error) {
+	var enabled bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled')`, ids, cid).Scan(&enabled)
+	if err != nil {
+		return ctx, false, err
+	}
+	if !enabled {
+		return original, true, nil
+	}
+	return ctx, false, nil
+}
+
+func cleanupObservationExpired(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
+}
+
+func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, status int, msg string) {
+	if cleanupObservationExpired(ctx) {
+		w.Header().Set("Retry-After", "1")
+		util.WriteJSON(w, 503, map[string]any{"error": "cleanup observation deadline exceeded; retry", "retryable": true})
+		return
+	}
+	cleanupBatchError(w, status, msg)
+}
 
 // cleanupObserveEnv carries per-transaction caches for a batch of
 // observations. The zero value (single-item endpoint) caches nothing.
 type cleanupObserveEnv struct {
+	// Refuse an enable racing the initial mode lookup under the dry-run context.
+	dryRunOnly bool
 	// budgetHeld is set only when the budget advisory lock was taken in the
 	// top-level transaction (never in a savepoint, whose rollback could release
 	// it); issued then stays exact until commit because no other transaction
@@ -506,12 +544,14 @@ type cleanupBatchObservation struct {
 // R2 work runs in parallel before the transaction; its result is used only for
 // the exact (mode, object, evidence) it was computed for.
 func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), nasCleanupExecutionBudget)
+	defer cancel()
 	var req struct {
 		ClientVersion string                    `json:"client_version"`
 		Observations  []cleanupBatchObservation `json:"observations"`
 	}
 	if util.DecodeJSON(r, &req) != nil || len(req.ClientVersion) == 0 || len(req.ClientVersion) > 64 || len(req.Observations) < 1 || len(req.Observations) > nasCleanupBatchItemsMax {
-		cleanupBatchError(w, 400, "client version and 1 to 64 observations required")
+		cleanupObservationFailure(w, ctx, 400, "client version and 1 to 64 observations required")
 		return
 	}
 	// A repeated item id (a client resending an entry that was still queued)
@@ -524,7 +564,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	conflicting := make([]bool, len(req.Observations))
 	for n, o := range req.Observations {
 		if o.ItemID <= 0 {
-			cleanupBatchError(w, 400, "positive item ids required")
+			cleanupObservationFailure(w, ctx, 400, "positive item ids required")
 			return
 		}
 		payloads[n], _ = json.Marshal(o)
@@ -534,9 +574,17 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			conflicting[n] = true
 		}
 	}
-	ctx := r.Context()
 	cid, ok := s.nasRestoreConnection(ctx, w, r)
 	if !ok {
+		return
+	}
+	idsForMode := make([]int64, 0, len(req.Observations))
+	for _, o := range req.Observations {
+		idsForMode = append(idsForMode, o.ItemID)
+	}
+	ctx, dryRunOnly, err := s.cleanupObservationContext(ctx, r.Context(), cid, idsForMode)
+	if err != nil {
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation mode lookup failed")
 		return
 	}
 	s.cleanupHousekeeping(ctx, cid)
@@ -558,16 +606,25 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			md5s[o.ItemID] = o.MD5
 		}
 	}
-	env := &cleanupObserveEnv{prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		cleanupBatchError(w, 500, "cleanup observation begin failed")
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
 		return
 	}
 	defer tx.Rollback(ctx)
 	var anyEnabled bool
 	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled')`, ids, cid).Scan(&anyEnabled); err != nil {
-		cleanupBatchError(w, 500, "cleanup observation begin failed")
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation begin failed")
+		return
+	}
+	if anyEnabled && dryRunOnly {
+		w.Header().Set("Retry-After", "1")
+		util.WriteJSON(w, 503, map[string]any{"error": "cleanup plan mode changed; retry", "retryable": true})
 		return
 	}
 	if anyEnabled && s.cfg.NASCleanupDeletionEnabled {
@@ -577,12 +634,12 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		env.lockedPlans = map[int64]bool{}
 		var plans []int64
 		if err = tx.QueryRow(ctx, `SELECT coalesce(array_agg(DISTINCT p.id ORDER BY p.id),'{}') FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id WHERE i.id=ANY($1) AND p.connection_id=$2 AND p.mode='enabled'`, ids, cid).Scan(&plans); err != nil {
-			cleanupBatchError(w, 500, "cleanup plan execution fence failed")
+			cleanupObservationFailure(w, ctx, 500, "cleanup plan execution fence failed")
 			return
 		}
 		for _, plan := range plans {
 			if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, nasCleanupPlanLockBase+plan); err != nil {
-				cleanupBatchError(w, 500, "cleanup plan execution fence failed")
+				cleanupObservationFailure(w, ctx, 500, "cleanup plan execution fence failed")
 				return
 			}
 			env.lockedPlans[plan] = true
@@ -591,7 +648,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			err = tx.QueryRow(ctx, cleanupIssuedBytes24hSQL).Scan(&env.issued)
 		}
 		if err != nil {
-			cleanupBatchError(w, 500, "cleanup deletion budget unavailable")
+			cleanupObservationFailure(w, ctx, 500, "cleanup deletion budget unavailable")
 			return
 		}
 		env.budgetHeld = true
@@ -602,7 +659,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 		sp, err := tx.Begin(ctx)
 		if err != nil {
-			cleanupBatchError(w, 500, "cleanup observation save failed")
+			cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
 			return
 		}
 		result := s.cleanupObserveOne(ctx, sp, cid, o.ItemID, o.cleanupObserve, env)
@@ -612,7 +669,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			err = sp.Rollback(ctx)
 		}
 		if err != nil {
-			cleanupBatchError(w, 500, "cleanup observation save failed")
+			cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
 			return
 		}
 		body := map[string]any{"item_id": o.ItemID, "status": result.status}
@@ -621,8 +678,16 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 		}
 		results[n] = body
 	}
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
+		return
+	}
 	if err = tx.Commit(ctx); err != nil {
-		cleanupBatchError(w, 500, "cleanup observation save failed")
+		cleanupObservationFailure(w, ctx, 500, "cleanup observation save failed")
+		return
+	}
+	if cleanupObservationExpired(ctx) {
+		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return
 	}
 	defer func() { logCleanupBatchOutcome("observe-batch", cid, results) }()

@@ -374,3 +374,73 @@ and recovered permits produce unverified results; replay never executes deletes.
 redacted diagnostics. Error-triggered uploads have a minimum 60-second gap,
 including failed attempts. Server retention preserves seven days regardless of
 upload count; the read endpoint filters and limits lines in PostgreSQL.
+
+
+## Execution observation deadlines and refusal evidence
+
+Enabled observations use one **15-second server deadline**, starting at handler
+entry and covering connection/mode lookup, R2 recovery (including conditional
+ETag-bound HEAD), policy checks, advisory/row locks, and transaction commit.
+Both the single and batch endpoints use it. Recovery that cannot finish returns
+HTTP 503 with `retryable=true` and no permit; timed-out recovery leaves the item
+leased with no issued flag. Dry-run recovery retains its 40-second budget. An
+enable racing a dry-run request is refused for retry under an execution context.
+
+Execution clients send one observation directly per file, bypassing the dry-run
+batch queue, retry loop, and request splitting. The request uses a 25-second
+socket timeout; the independent **30-second monotonic age limit** still covers
+the complete observation call and the final pre-unlink checks. Socket timeouts
+are not a total network deadline (for example, a slowly streaming response can
+outlast one), so a late response must still pass the age guard. Absolute permit
+expiry, exact proof binding, the write fence, and local guards all remain
+required. The age and absolute-expiry guards also run before each actual unlink.
+A timeout/lost response retains the exact observation journal and follows
+non-destructive reconciliation; it never prompts an immediate permit retry.
+
+Deletion receipts add `observe_elapsed_ms`, `execution_elapsed_ms`, and
+`unlink_attempted`. A pre-unlink refusal has `unlink_attempted=false` plus a
+stable `refusal_reason`: `deadline_exceeded`, `proof_mismatch`, `permit_expired`,
+`execution_disabled`, `local_guard`, or `pre_unlink_failure`. Proof/identity
+acknowledgement mismatches retain the observation journal rather than trusting
+an unbound permit for a receipt. Recovered observation permits are receipted as
+`observation_replayed` with `unlink_attempted=false`; interrupted intent journals
+remain uncertain. No elapsed duration is invented after a crash.
+
+Every execution attempt also appends a JSON outcome to the client's inventory
+SQLite table `cleanup_execution_outcomes` (`item_id`, `attempt`, `at`, `body`).
+Receipt `execution_elapsed_ms` runs through the filesystem result; the local
+outcome measures through the worker's return, including acknowledgement time.
+Outcomes cover non-permit responses, transport errors, and acknowledgement
+mismatches. `observe_elapsed_ms=null` means observation never started. Keeping
+this separately preserves the immutable observation body used for replay.
+New observation journals preserve proof key order as submitted: sorting the
+proof before replay would change the byte SHA and prevent receipt acceptance.
+Already-written journals with a different proof serialization remain subject
+to the existing exact-binding checks; this change does not rewrite them.
+If the state volume cannot store this diagnostic, the client logs that failure;
+the existing durable journal and deletion ledger remain the safety evidence.
+
+The server deliberately retains state `unverified` and pauses an enabled plan
+after a refused **issued** permit, even when `unlink_attempted=false` proves this
+client never called unlink. That flag distinguishes a refusal from uncertain
+filesystem execution; it is not independent proof of current NAS presence and
+does not erase granted authority. Issued identities and recovery holds stay
+reserved. There is no automatic reset, new permit, or deletion retry. A fresh
+inventory observation is still needed to independently prove current presence.
+
+These changes require server support for the optional receipt diagnostics before
+a client containing them is released; older servers reject unknown JSON fields.
+No release or deployment is part of this repair.
+
+Regression harness (local disposable PostgreSQL only):
+
+```sh
+cd backend
+STOARAMA_TEST_DATABASE_URL=postgres://localhost/stoarama_test go test ./internal/api -run '^TestNASCleanup(ExecutionDeadline|NeverAttemptedReceipt|DryRunKeepsRecoveryBudget)' -count=1 -v
+```
+
+The harness uses the real Python worker, disposable media/sidecars and fake R2.
+It runs both client protocols against normal HEADs, 35-second HEADs, and lost
+permit responses, counts actual unlink calls, and checks database authority and
+saved receipt timings. Short-budget tests also cover batch execution, lock
+contention, dry-run budget preservation, and the enable race.

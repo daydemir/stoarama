@@ -50,7 +50,11 @@ func (b *fakeCleanupBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.heads++
 	}
 	b.mu.Unlock()
-	time.Sleep(delay)
+	select {
+	case <-time.After(delay):
+	case <-r.Context().Done():
+		return
+	}
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
