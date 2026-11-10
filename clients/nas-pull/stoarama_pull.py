@@ -299,13 +299,21 @@ def diagnostic_secret_name(value):
     return _DIAGNOSTIC_NAME_TOKEN.fullmatch(text) is not None and _SECRET_MARKER_RE.search(text) is not None
 
 
+_DIAGNOSTIC_URL_QUERY = re.compile(r"\b(?:https?|s3)://|[?#]", re.IGNORECASE)
+
+
 def redact_diagnostic_url(match):
-    # Consume the URL once; requiring a trailing '?' in the regex would retry
-    # the whole suffix for each embedded https:// in a query-less URL.
+    # Consume once, including embedded URLs. A fragment ends the current URL
+    # candidate; a later nested scheme can still introduce a signed query.
     url = match.group()
-    query, fragment = url.find("?"), url.find("#")
-    if query >= 0 and (fragment < 0 or query < fragment):
-        return url[:query + 1] + "[REDACTED]"
+    scheme_end = None
+    for part in _DIAGNOSTIC_URL_QUERY.finditer(url):
+        if part.group() in ("?", "#"):
+            if part.group() == "?" and scheme_end is not None and part.start() > scheme_end:
+                return url[:part.end()] + "[REDACTED]"
+            scheme_end = None
+        elif scheme_end is None:
+            scheme_end = part.end()
     return url
 
 

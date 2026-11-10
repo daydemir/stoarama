@@ -1873,6 +1873,14 @@ class DiagnosticPerformanceTests(unittest.TestCase):
                     structured = self.assert_fast(lambda: pull.redact_diagnostics({'last_error': unit}))
                     self.assertLessEqual(len(structured['last_error']), pull.CLIENT_LOG_LINE_MAX)
 
+    def test_nested_url_queries_and_safe_fragment_semantics_are_preserved(self):
+        for value in ('https://outer.invalid/#https://inner.invalid/file?sig=private-canary',
+                      'https://outer.invalid/#safe?note#https://inner.invalid/file?sig=private-canary',
+                      'https://?note=https://inner.invalid/file?sig=private-canary'):
+            self.assertNotIn('private-canary', pull.redact_log_line(value))
+        safe = 'https://example.invalid/file#fragment?size=42'
+        self.assertEqual(pull.redact_log_line(safe), safe)
+
     def test_deep_and_cyclic_diagnostics_fail_closed_quickly(self):
         value = 'private-canary'
         for _ in range(10000):
