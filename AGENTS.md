@@ -1,154 +1,17 @@
-# AGENTS: Stoarama
+# Stoarama map
 
-Stoarama is the new product/control-plane repo. It is CLI-first and Render-first in v1.
+Stoarama is the CLI-first product/control plane and a child of the Jellicomb
+home (`daydemir/jellicomb`). `README.md` and `docs/ROADMAP.md` describe the
+product model; private thesis research lives in `social-isolation`.
 
-## Supported Surfaces
+- `backend/cmd/stoarama-api/`: API; `backend/cmd/stoaramactl/`: operator CLI;
+  `backend/cmd/stoarama/`: account/node CLI. Run either CLI with `--help` from
+  `backend/`. Go packages and tests live under `backend/`.
+- `infra/sql/migrations/`: schema; `render.yaml`: deployed services.
+- `ops/jelly/README.md`: Jelly-only jobs and their service controls.
+- `local/*.env`: gitignored runtime credentials; `.example` files show names.
+- `docs/operations.md`: product workflow, credential locations, Render env/deploy and
+  DigitalOcean spend controls. Read it before those operations.
 
-- API service: `backend/cmd/stoarama-api`
-- Internal control CLI: `backend/cmd/stoaramactl`
-- User/node CLI: `backend/cmd/stoarama`
-- SQL migrations: `infra/sql/migrations`
-- Render blueprint: `render.yaml`
-
-The old `social-isolation` repo remains the private research/thesis repo. Do not reintroduce thesis-only pipelines or one-off ops workflows here as primary product surfaces.
-
-## Development Rule
-
-Every product workflow ships in this order:
-
-1. API behavior exists
-2. `stoaramactl` can exercise it end-to-end
-3. tests cover it
-4. the web UI follows the same model
-
-The public `stoarama` CLI is narrower and is for account/node workflows, not operator administration.
-
-## V1 Product Shape
-
-- admin-curated streams
-- magic-link accounts
-- account API keys
-- enrolled source/inference nodes
-- hosted capture
-- BYOC inference metadata and provenance
-
-## Core Commands
-
-- Run API:
-  - `cd backend && go run ./cmd/stoarama-api`
-- Run internal CLI:
-  - `cd backend && go run ./cmd/stoaramactl --help`
-- Run user CLI:
-  - `cd backend && go run ./cmd/stoarama --help`
-- Apply migrations:
-  - `cd backend && go run ./cmd/stoaramactl migrate up`
-- Test:
-  - `cd backend && go test ./...`
-
-## Deployment
-
-- Render blueprint: `render.yaml`
-- Fresh Stoarama Postgres
-- Fresh Stoarama R2 bucket
-- Email can stay in `EMAIL_PROVIDER=log` until domain and Resend are wired
-
-## Git Safety
-
-- keep secrets out of git
-- prefer small checkpoints
-- do not mix thesis experiments into this repo
-
-## Local Credentials
-
-Runtime secrets live in `local/*.env` (gitignored; committed `.example` files show the shape). Check there before asking for credentials or reaching for Render:
-
-- `render.env` — production env mirror: `SERVICE_TOKEN` plus R2 (`R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_REGION`, and `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`, which map to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` for AWS-style tooling)
-- `recording-supervisor.env` — operator API key AND the production Postgres `DATABASE_URL` (the only local source of prod DB access)
-- `youtube-relay-source.env` — operator API key + relay topology config
-- `mitscl.env` — account-47 API token (`BACKEND_API_URL` + `MITSCL_API_TOKEN`)
-- `do-capture.env` — `DIGITALOCEAN_TOKEN` + `TF_VAR_*` for the DigitalOcean capture boxes
-- `relay-signing-private.key` — relay payload signing key
-
-Load with: `set -a; . local/render.env; set +a`. Never print values; never copy between machines without Deniz approval.
-
-## Render Operator Access
-
-The Render CLI is installed at `~/.local/bin/render` and is already authenticated (workspace `ay` / `tea-d1g1uevfte5s7384s1q0`, deniz@denizay.org). Its config is `~/.render/cli.yaml`; the bearer token is at YAML path `.api.key` (NOT `.profiles.default.apiKey` — that path does not exist, and `yq` is not installed on this machine).
-
-The CLI has **no** `env-var` subcommand. Read/write service env vars through the REST API:
-
-```sh
-rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # re-read per call
-curl -fsS -H "Authorization: Bearer $(rkey)" \
-  "https://api.render.com/v1/services/$SERVICE_ID/env-vars?limit=100" \
-  | python3 -c 'import json,sys; [print(e.get("envVar",e)["key"]) for e in json.load(sys.stdin)]'
-```
-
-Print KEYS ONLY, as above. The raw response contains every production secret
-value, so piping it to stdout leaks the lot into a transcript. If you need one
-value, select that single key and use it without echoing it.
-
-Service IDs: `stoarama-api` = `srv-d6usqn94tr6s73d94cd0`, `stoarama-recorder-control` = `srv-d8vcdspo3t8c73far4e0`.
-
-**Change env vars ONE KEY AT A TIME (`PUT .../env-vars/KEY`). Never replace the whole env set.**
-A bulk env replacement on `stoarama-api` on 2026-07-29 dropped `STORAGE_CRED_KEY` and stopped
-all MIT clip capture for 33 minutes (01:33-02:06 UTC). It surfaced as misleading 409s, not as an
-auth error: upload-intent reserved an idempotency key, then returned 503 because the key was
-gone, and retries looked like duplicates. Recovery needed a Render deploy rollback (a rollback
-restores that deploy's env snapshot) plus a relay fleet rollback. The structural cause is that
-Blueprint sync preserves the service but does NOT materialize `sync: false` variables, so
-anything set only in the dashboard silently disappears from a replacement.
-
-**Never invent a replacement `STORAGE_CRED_KEY`** — every encrypted storage destination becomes
-unreadable. Rotating it means re-encrypting the destination ciphertexts in the same transaction.
-
-After any env edit, confirm the sensitive keys are still present before walking away:
-`STORAGE_CRED_KEY`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ACCOUNT_ID`, `DATABASE_URL`.
-
-Writing an env var (`PUT .../env-vars/KEY`) does **not** trigger a deploy, and `POST .../restart` does **not** reload env — the process keeps the values it booted with. To make an env change take effect, trigger a deploy of the same commit:
-
-```sh
-rkey() { awk '/^ *key:/{print $2}' ~/.render/cli.yaml; }   # short-lived, re-read per call
-
-LIVE=$(curl -fsS -H "Authorization: Bearer $(rkey)" \
-  "https://api.render.com/v1/services/$SERVICE_ID/deploys?limit=100" \
-  | python3 -c 'import json,sys
-live=[d for d in (e.get("deploy",e) for e in json.load(sys.stdin)) if d.get("status")=="live"]
-assert live, "no live deploy in this page; page further with ?cursor="
-print(live[0]["commit"]["id"])')
-
-curl -fsS --show-error -X POST -H "Authorization: Bearer $(rkey)" \
-  -H 'Content-Type: application/json' \
-  -d "{\"clearCache\":\"do_not_clear\",\"commitId\":\"$LIVE\"}" \
-  "https://api.render.com/v1/services/$SERVICE_ID/deploys" \
-  | LIVE="$LIVE" python3 -c 'import json,os,sys
-d=json.load(sys.stdin)
-assert d.get("id") and d.get("status"), d
-got=d.get("commit",{}).get("id")
-assert got==os.environ["LIVE"], "deployed %s, asked for %s" % (got, os.environ["LIVE"])
-print(d["id"], d["status"], got[:8])'
-```
-
-Three traps here. `curl -s` alone exits 0 on an HTTP 400+, so a bad service id or
-an expired token looks like a successful deploy trigger — hence `-f` and the
-assertion on the response rather than eyeballing it. A deploy POSTed without
-`commitId` takes whatever is newest on the connected branch, so anything pushed
-between your check and the POST ships too; pin it to the commit you verified.
-And the newest deploy is not necessarily the running one — it may be failed or
-still building — so filter for `status == "live"` rather than taking the first
-element.
-
-## DigitalOcean Spend Guard
-
-The DO token lives on Render as `DO_API_TOKEN`: on `stoarama-recorder-control` (pool autoscaler + scale-up spend guard), `stoarama-recording-health` (hourly spend alerts), and `stoarama-recording-health-summary` (digest section). `stoarama-api` has no DO token. Locally it is `DIGITALOCEAN_TOKEN` in `local/do-capture.env`.
-
-- `stoaramactl do-spend report [--json]` shows month-to-date usage, current burn at list price, the breakdown by tag/name prefix, and every droplet/volume nobody owns. It needs `DATABASE_URL` (prod: `local/recording-supervisor.env`) and `DO_API_TOKEN`.
-- Settings: code defaults are warn $5/day, critical $10/day, budget $150, allowlist `stoarama-survey-*,copresence-*,stoarama-collate-*=15`. Deployed on all three services (collation week, Sep-Oct 2026): warn $20/day, critical $30/day, budget $500, same allowlist. Read the live Render env before trusting either.
-- The hourly `recording-health run` emails operators (deduped in `ops_alert_episodes`, daily reminders) when burn exceeds `DO_SPEND_WARN_USD_PER_DAY` / `DO_SPEND_CRITICAL_USD_PER_DAY`, month to date exceeds `DO_SPEND_MONTHLY_BUDGET_USD`, a droplet/volume outside the recorder pool and `DO_SPEND_ALLOWLIST` has run over an hour, an allowlist entry with a cap (`glob=USD`, e.g. `stoarama-collate-*=15`) costs more than that per day across its droplets and their volumes, or the pool controller blocked a scale-up. Allowlisted resources always count toward burn.
-- Create hand-made DO resources knowing the tripwire pages at the first hourly sweep after the resource is an hour old (up to about two hours); add long-lived ones to `DO_SPEND_ALLOWLIST` instead of ignoring the mail.
-- The pool controller skips any scale-up whose projected account burn exceeds the critical ceiling. At the default $10/day with the current ~$4.6/day baseline that caps the pool near 10 s-2vcpu-4gb droplets; raise `DO_SPEND_CRITICAL_USD_PER_DAY` before planned growth.
-- `DO_SPEND_*` keys are read independently by `stoarama-recorder-control`, `stoarama-recording-health`, and `stoarama-recording-health-summary`: change them on all three (one key at a time), then redeploy recorder-control (the crons pick them up on their next run).
-
-`AUTO_MIGRATE=true` on `stoarama-api`, so a deploy runs migrations on boot. Before deploying, confirm `origin/main` matches the live commit and that no migration is unapplied, or you will ship more than the env change.
-
-`.api.key` is short-lived; `expires_at` sits beside it in the same file, so check there rather than trusting a date written down here. Re-read it from the file on each use rather than caching it; on a 401 refresh it with the CLI instead of asking Deniz for a dashboard value.
+Keep credentials out of output and Git. Production env edits are single-key;
+preserve the existing `STORAGE_CRED_KEY` and encrypted destination data.
