@@ -686,6 +686,14 @@ def boot_id():
         return "unknown"
 
 
+def cleanup_session_headers(path):
+    # Build from the running process on every send, including replay. Never
+    # copy an identity out of a journal/checkpoint (replay uses /reconcile).
+    if path.startswith("/account/connections/cleanup/"):
+        return {"X-Stoarama-Client-Session": boot_id() + " " + CLIENT_VERSION}
+    return {}
+
+
 def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TIMEOUT_SEC, authenticate=True):
     base = cfg.api_base if base is None else base
     url = path_or_url if path_or_url.startswith("http") else base + path_or_url
@@ -693,6 +701,8 @@ def request_json(cfg, method, path_or_url, base=None, body=None, timeout=HTTP_TI
     req = urllib.request.Request(url, method=method, data=data)
     req.add_header("User-Agent", USER_AGENT)
     if authenticate:
+        for name, value in cleanup_session_headers(path_or_url).items():
+            req.add_header(name, value)
         req.add_header("Authorization", "Bearer " + cfg.api_key)
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -8684,6 +8694,7 @@ def restore_api(cfg, path, body, retry_stale=False, timeout=HTTP_TIMEOUT_SEC):
         return request_json(cfg, "POST", path, body=body, timeout=timeout)
     data = json.dumps(body).encode("utf-8")
     headers = {"User-Agent": USER_AGENT, "Authorization": "Bearer " + cfg.api_key, "Content-Type": "application/json"}
+    headers.update(cleanup_session_headers(path))
     target = parsed.path + ("?" + parsed.query if parsed.query else "")
     try:
         status, raw = restore_https(parsed.netloc, "POST", target, data, headers, timeout)

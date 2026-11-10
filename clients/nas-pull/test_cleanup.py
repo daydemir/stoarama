@@ -83,6 +83,30 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(pull.cleanup_journal(self.inventory),[])
         self.assertEqual(len(calls),2)
 
+    def test_transport_uses_live_session_for_saved_body_on_both_transports(self):
+        import io
+        cfg = SimpleNamespace(api_base='https://example.invalid', api_key='fixture')
+        saved = dict(request_id='a' * 32, client_version='saved-version', boot_id='saved-boot')
+        original = json.dumps(saved, sort_keys=True)
+        captured = []
+        def urlopen(request, **kwargs):
+            captured.append(dict(request.header_items()))
+            return io.BytesIO(b'{}')
+        with mock.patch.object(pull.urllib.request, 'getproxies', return_value={}), \
+                mock.patch.object(pull.urllib.request, 'urlopen', side_effect=urlopen), \
+                mock.patch.object(pull, 'restore_https', return_value=(200, b'{}')) as https:
+            for boot, version in [('new-boot', 'new-version'), ('rollback-boot', 'old-version')]:
+                with mock.patch.object(pull, 'boot_id', return_value=boot), mock.patch.object(pull, 'CLIENT_VERSION', version):
+                    for suffix in ('lease', '1/observe', 'observe-batch', '1/reconcile'):
+                        path = '/account/connections/cleanup/' + suffix
+                        pull.request_json(cfg, 'POST', path, body=saved)
+                        self.assertEqual(captured[-1]['X-stoarama-client-session'], boot + ' ' + version)
+                        pull.restore_api(cfg, path, saved)
+                        self.assertEqual(https.call_args.args[4]['X-Stoarama-Client-Session'], boot + ' ' + version)
+            pull.request_json(cfg, 'POST', '/account/connections/heartbeat', body=saved)
+            self.assertNotIn('X-stoarama-client-session', captured[-1])
+        self.assertEqual(json.dumps(saved, sort_keys=True), original, 'transport persisted live session into checkpoint')
+
     def test_leases_advertise_reconciliation_only_replay_capability(self):
         for protocol in (1, 2):
             with self.subTest(protocol=protocol), mock.patch.object(pull, 'restore_api', return_value=dict(tasks=[], retry_after_sec=120)) as api:

@@ -525,7 +525,17 @@ func TestNASCleanupBatchAndSingleObservationsShareLockOrder(t *testing.T) {
 		}()
 		go func() {
 			w := cleanupCall(t, f.s.handleAccountNASCleanupObserveBatch, 47, 5, "", "", map[string]any{"client_version": "t", "observations": []map[string]any{{"item_id": batch.ItemID, "attempt": batch.Attempt, "plan_sha256": batch.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(batch.Item), "error": "", "client_version": "t", "request_id": strings.Repeat("a", 32)}}})
-			done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
+			// A batch uses HTTP 200 even when the item conflicts. Check the
+			// item's status, just as the single endpoint's HTTP status below.
+			var response struct {
+				Results []batchResult `json:"results"`
+			}
+			if w.Code == 200 && json.Unmarshal(w.Body.Bytes(), &response) == nil && len(response.Results) == 1 {
+				body, _ := json.Marshal(response.Results[0])
+				done <- fmt.Sprintf("%d %s", response.Results[0].Status, body)
+			} else {
+				done <- fmt.Sprintf("%d %s", w.Code, w.Body.String())
+			}
 		}()
 	}
 	permits := 0

@@ -278,8 +278,16 @@ gates above changed; the work each gate costs and the approval granularity did.
   single observations take locks in one order: plan fence(s), then budget. The client retries
   502/503/504/429/timeouts with short back-off instead of pausing a minute.
 - **Serialized execution.** The server permits one outstanding execution item
-  per plan and requires `reconciliation_protocol:1` on leases and observations.
-  Older clients receive dry-run work only. Protocol 2 requests at most one execution lease
+  per plan. Live clients advertise `reconciliation_protocol:1` on leases and
+  observations; this body flag alone grants no authority.
+  Each live cleanup request supplies `X-Stoarama-Client-Session: <boot_id> <client_version>`
+  freshly from the running process, outside all journal/checkpoint bodies. An execution
+  lease requires an allowlisted header version and exact agreement with the connection's
+  latest heartbeat (received within five minutes); the lease records that header session.
+  An observation can return authority only when its header matches both the lease and
+  the fresh heartbeat. Missing, stale or mismatched identity yields dry-run leases or
+  a reconciliation-only observation response. Older clients receive dry-run work only.
+  Protocol 2 requests at most one execution lease
   and drains its full observation/result lifecycle before leasing another.
   An execution mutex also serializes already-leased tasks and direct callers
   before opening files or starting the permit clock. Dry runs retain sixteen
@@ -468,14 +476,28 @@ Already-issued authority remains protected: replay gets `reconcile`, never a
 permit, then submits the existing explicit no-unlink refusal receipt. Interrupted
 `intent` and durable `result` checkpoints only report outcomes. Unknowns remain
 reserved. A server lacking the endpoint leaves the journal unresolved; the
-client never falls back to a permit-capable endpoint. Execution leases use the server's authenticated heartbeat identity and the exact
+client never falls back to a permit-capable endpoint. Execution leases require
+a live `X-Stoarama-Client-Session: <boot_id> <client_version>` header, a matching heartbeat no older than five minutes, and the exact
 reviewed client release allowlist (`be17fd73`, this PR's reconciliation-only
 client). Request-body versions and capability flags grant no authority. Each
-lease binds connection, boot ID and version; a changed identity cannot obtain a
-permit. Observation request IDs are durably recorded before recovery work or the
+lease binds the authenticated connection and the header's boot ID and version;
+an observation must
+carry the same live header and still match a fresh heartbeat to obtain authority.
+The transport builds this header on every request from the running process,
+never from a saved body. Replays carry the current session but use `/reconcile`,
+which cannot mint authority; a rollback client without the header cannot inherit
+the newer heartbeat's identity, even if the checkpoint never reached the server.
+Observation request IDs are durably recorded before recovery work or the
 issuance transaction, so even a rolled-back submission cannot earn a first
 permit on replay. An exact retry may only retrieve its already-issued, unexpired
-permit. The compatible API and client must both be present before a future
+permit. Request IDs associated with any ever-authorized item are permanent;
+IDs for never-authorized items expire after 30 days, swept on heartbeats and
+batch observations. Pruning cannot remove issued authority: it only removes
+bookkeeping for items that never got authorization. Old leases have already
+expired; a replay from another boot/version cannot match the recorded lease
+session, an old client has no header, and current clients replay only through
+`/reconcile`. None can mint a first permit from a pruned checkpoint.
+The compatible API and client must both be present before a future
 separately approved execution.
 
 ### Permanent incident protection and server serialization
@@ -487,8 +509,9 @@ There is no command or endpoint to release ever-issued reservations. Closing a
 plan preserves every issued reservation and all recovery holds.
 
 The server grants execution leases only to its allowlisted heartbeat version
-(`be17fd73`) with a nonempty boot ID, and binds each lease to that exact
-connection, boot and version. Request-body versions and
+(`be17fd73`) when the live session header agrees with its nonempty boot ID
+and the heartbeat is at most five minutes old. Each lease records that header
+session; observations must match it and the fresh heartbeat. Request-body versions and
 `reconciliation_protocol` flags grant no authority. Older recorded versions
 receive dry-run work only, including lease retries. A previously submitted
 request ID cannot mint a first permit, even after rollback or on a later boot or

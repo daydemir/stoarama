@@ -28,7 +28,7 @@ func (s *Server) handleAccountNASCleanupReconcile(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	if _, err := s.cleanupRegisterObservation(ctx, req.RequestID); err != nil {
+	if _, err := s.cleanupRegisterObservation(ctx, req.RequestID, id); err != nil {
 		cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
 		return
 	}

@@ -76,7 +76,7 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 		admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
 		admin.Close()
 	})
-	_, err = pool.Exec(ctx, `CREATE TABLE accounts(id bigint PRIMARY KEY);CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text,api_key_id bigint,client_boot_id text NOT NULL DEFAULT 'fixture-boot',client_version text NOT NULL DEFAULT 'be17fd73');
+	_, err = pool.Exec(ctx, `CREATE TABLE accounts(id bigint PRIMARY KEY);CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text,api_key_id bigint,client_boot_id text NOT NULL DEFAULT 'fixture-boot',client_version text NOT NULL DEFAULT 'be17fd73',last_seen_at timestamptz DEFAULT now());
  CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text);
  CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,purged_at timestamptz,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,bucket text,etag text NOT NULL DEFAULT '');
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,excluded_clip_count integer,manifest jsonb);
@@ -97,10 +97,17 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	return pool
 }
-func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any) *httptest.ResponseRecorder {
+func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any, session ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest("POST", "/cleanup", bytes.NewReader(b))
+	header := "fixture-boot " + nasCleanupExecutionClientVersion
+	if len(session) != 0 {
+		header = session[0]
+	}
+	if header != "" {
+		req.Header.Set(cleanupClientSessionHeader, header)
+	}
 	route := chi.NewRouteContext()
 	route.URLParams.Add(idParam, id)
 	req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, route), accountPrincipalContextKey, accountPrincipal{AccountID: account, APIKeyID: &key}))
