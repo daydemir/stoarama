@@ -1556,7 +1556,7 @@ class CleanupAcknowledgementTests(unittest.TestCase):
         if case == 'http_5xx':
             raise pull.urllib.error.HTTPError('/fixture', 503, 'unavailable', {}, None)
         ack = fixture_ack(body, action='would_delete', delete=False) if phase == 'observe' else fixture_ack(body, ok=True)
-        changes = {'empty': {}, 'negative': dict(ack, ok=False), 'wrong_item': dict(ack, item_id=999),
+        changes = {'empty': {}, 'negative': {'ok': False}, 'negative_bound': dict(ack, ok=False), 'wrong_item': dict(ack, item_id=999),
                    'wrong_attempt': dict(ack, attempt=2), 'wrong_plan': dict(ack, plan_sha256='f'*64),
                    'wrong_proof': dict(ack, proof_sha256='f'*64), 'boolean_item': dict(ack, item_id=True),
                    'malformed_action': dict(ack, action='unknown'), 'valid': ack}
@@ -1570,7 +1570,7 @@ class CleanupAcknowledgementTests(unittest.TestCase):
 
     def test_fresh_result_requires_exact_positive_ack_and_replay_never_unlinks(self):
         for protocol in (1, 2):
-            for case in ('empty', 'negative', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'boolean_item', 'http_5xx', 'valid'):
+            for case in ('empty', 'negative', 'negative_bound', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'boolean_item', 'http_5xx', 'valid'):
                 with self.subTest(protocol=protocol, case=case):
                     f = self.fixture()
                     with f.opened() as current:
@@ -1607,7 +1607,7 @@ class CleanupAcknowledgementTests(unittest.TestCase):
 
     def test_fresh_observation_and_conflict_checkpoint_require_valid_ack(self):
         for conflict in (False, True):
-            for case in ('empty', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'http_5xx', 'malformed_action', 'valid'):
+            for case in ('empty', 'negative', 'malformed_json', 'wrong_item', 'wrong_attempt', 'wrong_plan', 'wrong_proof', 'http_5xx', 'malformed_action', 'valid'):
                 with self.subTest(conflict=conflict, case=case):
                     f = self.fixture()
                     if conflict:
