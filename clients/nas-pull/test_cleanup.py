@@ -431,6 +431,7 @@ class CleanupTests(unittest.TestCase):
         order=[];counter=[0]
         def api(cfg,path,body, **kwargs):
             counter[0]+=1
+            if counter[0] == 3: return dict(tasks=[], retry_after_sec=120)
             task=dict(self.task,item_id=counter[0])
             if counter[0]==2:task["approved_proof"]={}
             return dict(tasks=[task],retry_after_sec=0)
@@ -443,7 +444,7 @@ class CleanupTests(unittest.TestCase):
             with mock.patch.object(pull,"restore_api",side_effect=api),mock.patch.object(pull,"cleanup_process_task",side_effect=process):
                 pull.cleanup_batch(self.cfg,self.inventory,threading.Event(),executor)
         self.assertEqual(order,["preflight_start","preflight_end","execute"])
-        self.assertEqual(counter[0],2)
+        self.assertEqual(counter[0],3)
 
     def test_lease_failure_drains_workers_before_next_receipt_replay(self):
         finished=threading.Event();counter=[0]
@@ -1042,6 +1043,30 @@ class CleanupProtocol2Tests(unittest.TestCase):
         self.assertEqual(pull.cleanup_journal(self.inventory), [])
         rows = self.inventory.db.execute('SELECT count(*) FROM cleanup_local_deletions').fetchone()[0]
         self.assertEqual(rows, 24)
+
+    def test_execution_loop_refills_immediately_and_waits_only_after_empty_lease(self):
+        tasks, paths = self.execution_tasks(3)
+        api, state = self.fake_server(tasks)
+        waits = []
+        class Stop:
+            def is_set(self):
+                return False
+            def wait(self, seconds):
+                waits.append(seconds)
+                if len(waits) == 1:
+                    return False  # initial startup wait
+                self.assert_completed()
+                return True  # stop after the empty lease, before polling again
+            def assert_completed(self):
+                assert state['leased'] == 3
+                assert sum(p.endswith('/result-batch') for p in state['calls']) == 3
+                assert all(not path.exists() for path, _ in paths)
+        with mock.patch.object(pull, 'restore_api', side_effect=api):
+            pull.cleanup_loop(self.cfg, self.inventory, Stop())
+        self.assertEqual(len(waits), 2, 'a poll wait interrupted serial execution')
+        self.assertGreater(waits[-1], 0, 'empty leases must back off')
+        calls = [p.rsplit('/', 1)[-1] for p in state['calls']]
+        self.assertEqual(calls, ['lease', 'observe', 'result-batch'] * 3 + ['lease'])
 
     def test_foreign_change_in_a_shared_folder_still_refuses(self):
         tasks, paths = self.execution_tasks(2)

@@ -3244,7 +3244,7 @@ def cleanup_once(cfg, inventory, stop_event):
     lease = cleanup_lease(cfg)
     for task in lease["tasks"]:
         cleanup_process_task(cfg, inventory, stop_event, task)
-    return lease.get("retry_after_sec", 120)
+    return 0 if lease["tasks"] else max(1, lease.get("retry_after_sec", 120))
 
 
 def cleanup_batch(cfg, inventory, stop_event, executor,
@@ -3261,7 +3261,6 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     processed = 0
     retry = 120
     exhausted = False
-    executing = False
     error = None
     def completed(future):
         if future.result() is True and verified_event is not None:
@@ -3290,12 +3289,9 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                             completed(future)
                         pending.clear()
                         cleanup_process_task(cfg, inventory, stop_event, task)
-                        executing = True
-                        break
+                        continue  # receipt acknowledged: request the next serial lease now
                     pending.add(executor.submit(cleanup_process_task, cfg, inventory, stop_event, task))
-                if executing:
-                    break
-            if executing or not pending:
+            if not pending:
                 break
             done, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -3314,7 +3310,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                     error = exc
     if error is not None:
         raise error
-    return 0 if processed else retry
+    return max(1, retry) if exhausted or not processed else 0
 
 
 # Protocol 2 (2026-11): bounded parallel execution with batched round trips.
@@ -3607,9 +3603,6 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
             while not exhausted and not stop_event.is_set() and error is None and len(pending) < inflight and leased < task_limit:
                 room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
                 files_left, bytes_left = cleanup_local_headroom(inventory)
-                running = [task for task in pending.values() if task.get("approved_proof") is not None]
-                if running:
-                    break  # drain the entire execution lifecycle before leasing more
                 files_left = min(files_left, CLEANUP_EXECUTION_INFLIGHT)
                 if pins_error is not None:
                     files_left = bytes_left = 0  # every deletion would be refused
@@ -3630,6 +3623,15 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                         continue
                     task["_recovery_md5"] = lease.get("recovery_md5") is True  # local only, never sent
                     processed += 1
+                    if task.get("approved_proof") is not None:
+                        # Drain dry runs, then finish observation, unlink and
+                        # acknowledged receipt inline. The next iteration leases
+                        # immediately, without an executor/cycle/poll handoff.
+                        for future in pending:
+                            completed(future)
+                        pending.clear()
+                        cleanup_process_task(cfg, inventory, stop_event, task, api)
+                        continue
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break
@@ -3655,7 +3657,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
         raise error
     if not replay["failed"]:
         CLEANUP_STATUS.clear_error()
-    return 0 if processed else max(1, retry)
+    return max(1, retry) if exhausted or not processed else 0
 
 
 def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
