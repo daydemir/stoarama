@@ -59,6 +59,13 @@ only, immutable keys, deterministic root): `python3
 backend/scripts/nas-cleanup/build_frozen_index.py --publish` with the R2
 environment; it must print `index_sha256` `82b067b2…`.
 
+A paused plan that issued any deletion cannot resume. Use
+`stoaramactl nas-cleanup close --plan-id ID --expected-plan-sha256 SHA --reason TEXT`
+to retire it terminally and release only never-issued file identities for
+replanning. Issued identities remain excluded forever and the existing
+plan-wide R2 recovery holds remain. Use a new label prefix and complete a fresh
+dry run and owner approval; see [the close/reconciliation runbook](NAS_CLEANUP.md).
+
 `backend/scripts/nas-cleanup/prepare_keep28_plans.py` lists every outside-window
 raw clip present on the NAS (`nas_inventory_files`) and every collated output
 acknowledged on the NAS (`recording_collation_output_acks`) whose sources are

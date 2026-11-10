@@ -10,7 +10,9 @@ script lists every NAS file that lies entirely outside its stream's window:
   * collated outputs acknowledged on the NAS (recording_collation_output_acks
     matching the catalog size/SHA) whose source clips are all outside too.
 
-Files already in an active plan bound to the same policy are skipped. Items are
+Files reserved by any non-retired plan or ever issued a deletion permit are
+skipped, regardless of policy. Closing a paused plan releases only never-issued
+files for a fresh plan; use a new --label-prefix (labels are immutable). Items are
 grouped per stream, then per kind and recovery class (R2 copy present vs. R2
 purged; NAS-only deletion was removed, so those plans can never be enabled), ordered by
 path, and cut into plans of at most --max-items (<=10000) items and --max-bytes
@@ -139,8 +141,8 @@ def stream_candidates(w, bucket, psql):
  SELECT (x->>'stream_id')::bigint stream_id,(x->>'s')::timestamptz s,(x->>'e')::timestamptz e
  FROM jsonb_array_elements(convert_from(decode('""" + encoded + """','base64'),'UTF8')::jsonb) x
 ), planned AS MATERIALIZED (
- SELECT DISTINCT i->>'kind' kind,(i->>'source_id')::bigint source_id FROM nas_cleanup_plans p CROSS JOIN LATERAL jsonb_array_elements(p.manifest) i
- WHERE p.account_id=47 AND p.connection_id=13 AND p.report_sha256='""" + POLICY_SHA + """' AND p.mode<>'retired'
+ SELECT DISTINCT kind,source_id FROM nas_cleanup_reserved_files
+ WHERE account_id=47 AND connection_id=13
 ), raw AS (
  SELECT 'raw' kind,c.id source_id,r.stream_id,c.display_path path,c.size_bytes,(c.purged_at IS NOT NULL) r2_purged
  FROM nas_inventory_files f JOIN recording_clips c ON c.id=f.clip_id JOIN recordings r ON r.id=c.recording_id JOIN w ON w.stream_id=r.stream_id
