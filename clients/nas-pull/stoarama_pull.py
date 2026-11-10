@@ -326,7 +326,7 @@ _REDACTIONS = (
     (re.compile(r"(?is)(" + _SECRET_NAME + r"[\"']?\s*[=:]\s*)[\s\S]*"), r"\1[REDACTED]"),
     (re.compile(r"(?is)\b(basic|bearer|digest|token|aws4-hmac-sha256)\s+\S[\s\S]*"), r"\1 [REDACTED]"),
     (re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|redis(?:s)?)://[^\s'\"<>]+"), "[REDACTED]"),
-    (re.compile(r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)(?<![a-z0-9+.-])([0-9+.-]*[a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@"), r"\1[REDACTED]@"),
     (re.compile(r"(?i)\b(?:https?|s3)://[^\s'\"<>]+"), redact_diagnostic_url),
     (re.compile(r"\beyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,2}"), "[REDACTED]"),
     (re.compile(r"\btskey-[A-Za-z0-9_-]+"), "[REDACTED]"),
