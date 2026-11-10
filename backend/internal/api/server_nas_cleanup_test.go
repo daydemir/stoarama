@@ -76,17 +76,17 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 		admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
 		admin.Close()
 	})
-	_, err = pool.Exec(ctx, `CREATE TABLE accounts(id bigint PRIMARY KEY);CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text,api_key_id bigint);
+	_, err = pool.Exec(ctx, `CREATE TABLE accounts(id bigint PRIMARY KEY);CREATE TABLE connections(id bigint PRIMARY KEY,account_id bigint,kind text,api_key_id bigint,client_boot_id text NOT NULL DEFAULT 'fixture-boot',client_version text NOT NULL DEFAULT 'be17fd73',last_seen_at timestamptz DEFAULT now());
  CREATE TABLE streams(id bigint PRIMARY KEY,local_timezone text);CREATE TABLE recordings(id bigint PRIMARY KEY,account_id bigint,stream_id bigint,cron_timezone text);
  CREATE TABLE recording_clips(id bigint PRIMARY KEY,recording_id bigint,purged_at timestamptz,object_key text,sha256 text,size_bytes bigint,display_path text,clip_start_at timestamptz,clip_end_at timestamptz,bucket text,etag text NOT NULL DEFAULT '');
  CREATE TABLE recording_collation_hours(id bigint PRIMARY KEY,recording_id bigint,excluded_clip_count integer,manifest jsonb);
  CREATE TABLE recording_collation_outputs(id bigint PRIMARY KEY,collation_hour_id bigint,nas_relative_path text,object_key text,sha256 text,size_bytes bigint,start_at timestamptz,end_at timestamptz,source_clip_ids bigint[],created_at timestamptz DEFAULT now());
  CREATE TABLE recording_joined_source_snapshots(clip_id bigint);
- INSERT INTO accounts VALUES(47),(48);INSERT INTO connections VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);INSERT INTO streams VALUES(3,'UTC');INSERT INTO recordings VALUES(2,47,3,'UTC');`)
+ INSERT INTO accounts VALUES(47),(48);INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,47,'nas_pull',5),(14,48,'nas_pull',6);INSERT INTO streams VALUES(3,'UTC');INSERT INTO recordings VALUES(2,47,3,'UTC');`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql"} {
+	for _, name := range []string{"0167_nas_cleanup_dryruns.sql", "0168_nas_cleanup_stage_timings.sql", "0169_nas_cleanup_queue_priority.sql", "0170_nas_cleanup_retired_plans.sql", "0171_nas_cleanup_safeguards.sql", "0172_nas_cleanup_safeguards_validate.sql", "0173_nas_cleanup_throughput.sql", "0175_nas_cleanup_client_status.sql", "0176_nas_cleanup_recheck.sql", "0177_nas_cleanup_reserved_files.sql", "0178_nas_cleanup_reconciliation.sql"} {
 		migration, err := os.ReadFile("../../../infra/sql/migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -97,10 +97,17 @@ func cleanupTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	return pool
 }
-func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any) *httptest.ResponseRecorder {
+func cleanupCall(t *testing.T, h http.HandlerFunc, account, key int64, idParam, id string, body any, session ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest("POST", "/cleanup", bytes.NewReader(b))
+	header := "fixture-boot " + nasCleanupExecutionClientVersion
+	if len(session) != 0 {
+		header = session[0]
+	}
+	if header != "" {
+		req.Header.Set(cleanupClientSessionHeader, header)
+	}
 	route := chi.NewRouteContext()
 	route.URLParams.Add(idParam, id)
 	req = req.WithContext(context.WithValue(context.WithValue(req.Context(), chi.RouteCtxKey, route), accountPrincipalContextKey, accountPrincipal{AccountID: account, APIKeyID: &key}))

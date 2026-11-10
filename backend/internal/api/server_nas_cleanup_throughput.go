@@ -86,8 +86,10 @@ func cleanupObservationFailure(w http.ResponseWriter, ctx context.Context, statu
 // cleanupObserveEnv carries per-transaction caches for a batch of
 // observations. The zero value (single-item endpoint) caches nothing.
 type cleanupObserveEnv struct {
+	session cleanupClientSession
 	// Refuse an enable racing the initial mode lookup under the dry-run context.
-	dryRunOnly bool
+	dryRunOnly    bool
+	freshRequests map[int64]bool
 	// budgetHeld is set only when the budget advisory lock was taken in the
 	// top-level transaction (never in a savepoint, whose rollback could release
 	// it); issued then stays exact until commit because no other transaction
@@ -131,7 +133,14 @@ func (s *Server) cleanupHousekeeping(ctx context.Context, cid int64) {
 		log.Printf("nas cleanup lease expiry deferred: %v", err)
 	}
 	s.cleanupExpireApprovals(ctx)
+	if _, err := s.pool.Exec(ctx, cleanupPruneObservationRequestsSQL); err != nil {
+		log.Printf("nas cleanup request retention deferred: %v", err)
+	}
 }
+
+// IDs for ever-authorized items remain permanent. Old unissued IDs may expire:
+// a different live session cannot mint first authority from a saved observation.
+const cleanupPruneObservationRequestsSQL = `DELETE FROM nas_cleanup_observation_requests r USING nas_cleanup_items i WHERE r.item_id=i.id AND NOT i.delete_ever_issued AND r.created_at<now()-interval '30 days'`
 
 // recordNASCleanupStatus stores the app's optional cleanup status (a small
 // JSON object) for operators. Best effort: it never fails a heartbeat.
@@ -590,6 +599,19 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 	if !ok {
 		return
 	}
+	freshRequests := map[int64]bool{}
+	for n, o := range req.Observations {
+		// Conflicting duplicates are submissions too: retain their IDs even
+		// though only the first observation of an item may be processed.
+		fresh, err := s.cleanupRegisterObservation(ctx, o.RequestID, o.ItemID)
+		if err != nil {
+			cleanupObservationFailure(w, ctx, 503, "cleanup request history unavailable")
+			return
+		}
+		if first[o.ItemID] == n {
+			freshRequests[o.ItemID] = fresh
+		}
+	}
 	idsForMode := make([]int64, 0, len(req.Observations))
 	for _, o := range req.Observations {
 		idsForMode = append(idsForMode, o.ItemID)
@@ -618,7 +640,7 @@ func (s *Server) handleAccountNASCleanupObserveBatch(w http.ResponseWriter, r *h
 			md5s[o.ItemID] = o.MD5
 		}
 	}
-	env := &cleanupObserveEnv{dryRunOnly: dryRunOnly, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
+	env := &cleanupObserveEnv{session: cleanupRequestSession(r), dryRunOnly: dryRunOnly, freshRequests: freshRequests, prefetched: s.cleanupPrefetchRecovery(ctx, cid, md5s)}
 	if cleanupObservationExpired(ctx) {
 		cleanupObservationFailure(w, ctx, 503, "cleanup observation deadline exceeded")
 		return

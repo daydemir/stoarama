@@ -188,17 +188,22 @@ func TestNASStitchRegisteredOutputRetiresOnlyIncludedRawWithSeparateGates(t *tes
 		t.Fatal("scoped plan not enabled")
 	}
 	tasks := f.leaseV2(64, 64, 10000, "")
-	if len(tasks) != 2 {
-		t.Fatalf("execution leaves %d", len(tasks))
+	if len(tasks) != 1 {
+		t.Fatalf("execution must serialize included leaves: %d", len(tasks))
 	}
 	issued := f.observe(tasks[:1], nil)
 	if len(issued) != 1 || !issued[0].Delete {
 		t.Fatalf("verified kept clip not permitted: %+v", issued)
 	}
+	f.receipts(tasks, issued, "deleted")
+	tasks = f.leaseV2(64, 64, 10000, "")
+	if len(tasks) != 1 {
+		t.Fatalf("second included leaf not serialized: %d", len(tasks))
+	}
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_stitch_scopes SET paused=true WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range f.observe(tasks[1:], nil) {
+	for _, r := range f.observe(tasks, nil) {
 		if r.Delete {
 			t.Fatal("paused scope issued deletion")
 		}

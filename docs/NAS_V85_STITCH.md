@@ -217,14 +217,16 @@ repair-qualified joins require separate exact provenance/admission work.
 
 ## Cleanup integration and review conflicts
 
-Main's #445 is already integrated; cleanup retains bounded execution deadlines,
-recovery-copy checks, immutable observations, budgets and independent deletion
-switches. #448 (`fix/cleanup-reconciliation-only`) landed on main during this work
-(commit `acab94dd`, 2026-11-10T21:30:07Z). Its safety changes must be preserved
-when updating this draft; no unmerged cleanup implementation is a dependency. Both branches touch `stoarama_pull.py`, the
-cleanup API/tests and cleanup documentation, so reconcile its receipt/replay and
-shared media-fence changes when integrating. This branch moves its new migration
-to **0179_nas_v85r_stitch.sql**, leaving #448's 0178 reconciliation migration
-unclaimed. Neither migration has been deployed by this work. Recheck migration
-ordering and run the combined cleanup/stitch PostgreSQL and fake-NAS suites after
-either branch lands. Do not weaken existing gates to resolve a conflict.
+Main's #445 is integrated, including bounded execution deadlines. #448
+(`fix/cleanup-reconciliation-only`) landed during this work at `acab94dd`
+(2026-11-10T21:30:07Z). Its reconciliation-only replay, session-bound execution
+and one-outstanding-item permit behavior are integrated into this draft.
+The cleanup-observation conflict preserves both its session/lease fences and
+V85r's independent stitch-deletion gate. The regression now exercises
+sequential permits, included leaves only and revocation before the next permit.
+No unmerged cleanup implementation is a dependency.
+
+The stitch migration is **0179_nas_v85r_stitch.sql**, after #448's 0178
+reconciliation migration; joined-lifecycle fixtures apply both in order.
+Neither migration was deployed by this work. Keep the combined cleanup/stitch
+PostgreSQL and fake-NAS suites as rollout gates.

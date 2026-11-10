@@ -247,7 +247,7 @@ func fixtureProof(i nasCleanupItem) json.RawMessage {
 
 func (f *cleanupFixture) leaseV2(limit, files int, bytes int64, requestID string) []cleanupTask {
 	f.t.Helper()
-	body := map[string]any{"client_version": "test", "protocol": 2, "limit": limit, "execution_files": files, "execution_bytes": bytes}
+	body := map[string]any{"client_version": "test", "protocol": 2, "reconciliation_protocol": nasCleanupReconciliationProtocol, "limit": limit, "execution_files": files, "execution_bytes": bytes}
 	if requestID != "" {
 		body["request_id"] = requestID
 	}
@@ -286,7 +286,7 @@ func (f *cleanupFixture) observeMD5(tasks []cleanupTask, requestIDs map[int64]st
 	f.t.Helper()
 	observations := []map[string]any{}
 	for _, task := range tasks {
-		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": "test"}
+		o := map[string]any{"item_id": task.ItemID, "attempt": task.Attempt, "plan_sha256": task.PlanSHA, "reconciliation_protocol": nasCleanupReconciliationProtocol, "outcome": "match", "proof": fixtureProof(task.Item), "error": "", "client_version": "test"}
 		if id := requestIDs[task.ItemID]; id != "" {
 			o["request_id"] = id
 		}

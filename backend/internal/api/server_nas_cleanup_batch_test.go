@@ -21,7 +21,7 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease := func(limit any) []cleanupTask {
-		body := map[string]any{"client_version": "test", "protocol": 1}
+		body := map[string]any{"client_version": "test", "protocol": 1, "reconciliation_protocol": nasCleanupReconciliationProtocol}
 		if limit != nil {
 			body["limit"] = limit
 		}
@@ -61,6 +61,13 @@ func TestNASCleanupBatchLeaseBoundAndExecutionIsolation(t *testing.T) {
 		tasks := lease(8)
 		if len(tasks) != 1 || tasks[0].ItemID != id || len(tasks[0].ApprovedProof) == 0 {
 			t.Fatal("execution batch was not serial")
+		}
+		if got := lease(8); len(got) != 0 {
+			t.Fatal("leased beside outstanding execution")
+		}
+		// Simulate a completed lifecycle; this fixture tests lease selection only.
+		if _, err := pool.Exec(ctx, `UPDATE nas_cleanup_items SET state='keep' WHERE id=$1`, id); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if tasks := lease(8); len(tasks) != 0 {

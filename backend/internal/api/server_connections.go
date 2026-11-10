@@ -29,7 +29,7 @@ var (
 	pullJoinedDownloadPathRe   = regexp.MustCompile(`^/api/v1/account/joined/\d+/download$`)
 	pullUploadProbeResultRe    = regexp.MustCompile(`^/api/v1/account/connections/upload-probe/\d+/result$`)
 	pullRestoreResultRe        = regexp.MustCompile(`^/api/v1/account/connections/nas-restore/\d+/result$`)
-	pullCleanupResultRe        = regexp.MustCompile(`^/api/v1/account/connections/cleanup/\d+/(observe|result)$`)
+	pullCleanupResultRe        = regexp.MustCompile(`^/api/v1/account/connections/cleanup/\d+/(observe|result|reconcile)$`)
 	pullSelectedVerifyResultRe = regexp.MustCompile(`^/api/v1/account/connections/selected-verify/\d+/result$`)
 	pullCollatedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/collated/\d+/download$`)
 	pullBenchmarkResultRe      = regexp.MustCompile(`^/api/v1/account/connections/benchmark/\d+/result$`)
