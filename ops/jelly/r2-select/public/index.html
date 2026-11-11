@@ -16,7 +16,7 @@
 <div><span>Decided</span><b id="k-dec">—</b><small>streams</small></div>
 </div>
 <details><summary>How coverage and keep options work</summary>
-<p>Coverage is the union of recorded clip seconds in each stream-local day ÷ 86,400, including gap days. Green is above 90%, yellow is 70–90%, red is below 70%. An empty outlined day has 0%. Daylight-saving days still use 86,400 seconds. Tap a day for its exact coverage.</p>
+<p>Coverage is the union of recorded clip seconds inside scheduled windows ÷ the union of scheduled window seconds in each stream-local day, including gap days. Green is above 90%, yellow is 70–90%, red is below 70%. An empty outlined day has 0%. Overlapping windows count once. Overnight windows split at midnight; daylight-saving changes use actual elapsed seconds. Tap a day for its exact coverage.</p>
 <p id="definition"></p>
 <p><b>Nothing:</b> R2 holds no footage; NAS is the only copy. <b>Kept period, stitched:</b> stitched hours in the pinned 28 days. <b>Kept period, raw + stitched:</b> also keeps the original clips for re-stitching. <b>Everything:</b> all days, including footage outside the NAS window.</p>
 <p>The pinned best 14 maximizes recorded seconds excluding known bad clips; it is not recalculated here. Storage figures are catalog estimates. V85 re-stitch outputs outside that catalog are not included.</p>
