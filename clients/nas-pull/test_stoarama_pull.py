@@ -1279,6 +1279,7 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
     def test_storage_status_only_reports_real_mount(self):
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw))
+            runtime = pull.Runtime(cfg)
             opened = SimpleNamespace(st_dev=1, st_ino=2)
             usage = SimpleNamespace(f_frsize=1, f_bsize=1, f_blocks=1000, f_bavail=250)
             with mock.patch.object(pull.os, "open", return_value=9), mock.patch.object(
@@ -1290,7 +1291,6 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ):
                 status = {"available": True, "total_bytes": 1000, "free_bytes": 250}
                 self.assertEqual(pull.storage_status(cfg), status)
-                runtime = pull.Runtime(cfg)
                 runtime.set_storage(status)
                 self.assertEqual(runtime.heartbeat_payload(None)["storage"], status)
                 outage = {"class": "timeout", "started_at": pull.utc_now(), "failure_count": 1}
