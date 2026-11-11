@@ -1504,7 +1504,7 @@ class Runtime:
         self.joined_protocol_generation = 0
         self.joined_delivery = None
         self.joined_delivery_error = ""
-        self.joined_quarantine_notice, self.joined_quarantine_notice_at = latest_joined_quarantine_notice(cfg)
+        self.joined_quarantine_notice, self.joined_quarantine_notice_at, self.joined_quarantine_status = joined_quarantine_startup_status(cfg)
         if self.joined_quarantine_notice:
             log("WARN", self.joined_quarantine_notice)
         self.joined_transfer = None
@@ -1808,6 +1808,8 @@ class Runtime:
         cleanup, cleanup_error, cleanup_error_at = CLEANUP_STATUS.snapshot()
         if self.inventory is not None:
             cleanup.update(cleanup_quarantine_status(self.inventory))
+        if self.joined_quarantine_status:
+            cleanup["joined_quarantine"] = self.joined_quarantine_status
         if cleanup:
             payload["cleanup"] = redact_diagnostics(cleanup)
         if cleanup_error and not payload["client_last_error"]:
@@ -7372,12 +7374,12 @@ def joined_sidecar_intent(cfg, directory_fd, name, content):
     return cfg.state_dir / ("joined-sidecar-intent-" + key + ".json"), identity
 
 
-def latest_joined_quarantine_notice(cfg):
+def joined_quarantine_startup_status(cfg):
     # Replay diagnostics only; neither the ledger nor this scan grants authority
     # to mutate NAS files. Scan the whole ledger to match older quarantined names.
     path = cfg.state_dir / "joined-alias-quarantine.jsonl"
-    latest = None
-    recorded_paths = set()
+    recorded_paths = {}
+    unfinished = {}
     problems = []
     malformed = 0
     try:
@@ -7395,12 +7397,20 @@ def latest_joined_quarantine_notice(cfg):
                             raise ValueError("incomplete or invalid record")
                     except ValueError as exc:
                         malformed += 1
-                        log("WARN", "joined quarantine ledger malformed line %d: %s" % (number, exc))
+                        if malformed <= 5:
+                            log("WARN", "joined quarantine ledger malformed line %d: %s" % (number, exc))
                         continue
                     if record.get("operation") == "alias_move" and isinstance(record.get("new_path"), str):
-                        recorded_paths.add(record["new_path"])
+                        recorded_paths[record["new_path"]] = record
                     if record.get("operation") in ("alias_move", "canonical_copy"):
-                        latest = record
+                        key = json.dumps([
+                            record["operation"], record.get("new_path"),
+                            record.get("canonical_path"), record.get("temporary_path"),
+                        ], sort_keys=True)
+                        if record.get("state") == "intent":
+                            unfinished[key] = record
+                        elif record.get("state") == "complete":
+                            unfinished.pop(key, None)
         finally:
             os.close(descriptor)
     except FileNotFoundError:
@@ -7412,7 +7422,21 @@ def latest_joined_quarantine_notice(cfg):
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = None
-    unrecorded = 0
+    unrecorded = total = 0
+    status = {"aliases": [], "pending_recoveries": []}
+    detail_bytes = 0
+
+    def add_detail(category, message):
+        # Share a byte budget so the complete heartbeat cleanup object stays
+        # below the server's 8 KiB limit, even with long paths. Each selected
+        # detail also fits one uploaded log line. Counts include omitted items.
+        nonlocal detail_bytes
+        size = len(json.dumps(message).encode("utf-8"))
+        if len(status[category]) < 5 and size <= 1900 and detail_bytes + size <= 5000:
+            status[category].append(message)
+            detail_bytes += size
+            log("WARN", message)
+
     try:
         descriptor = os.open(str(cfg.output_dir), flags)
         for part in (".stoarama-quarantine", "aliases"):
@@ -7422,12 +7446,17 @@ def latest_joined_quarantine_notice(cfg):
         qroot = cfg.output_dir.absolute() / ".stoarama-quarantine" / "aliases"
         for entry in sorted(os.listdir(descriptor)):
             alias = str(qroot / entry)
-            if alias not in recorded_paths:
+            total += 1
+            record = recorded_paths.get(alias)
+            if record is None:
                 unrecorded += 1
                 message = "joined quarantine unrecorded alias: " + alias
-                log("WARN", message)
-                if unrecorded == 1:
-                    problems.append(message)
+            else:
+                message = "joined quarantine alias: %s -> %s inode=%s size=%s reason=%s" % (
+                    record.get("old_path", "unknown"), alias, record.get("inode", "unknown"),
+                    record.get("size_bytes", "unknown"), record.get("reason", "unknown"),
+                )
+            add_detail("aliases", message)
     except FileNotFoundError:
         pass
     except OSError as exc:
@@ -7435,12 +7464,30 @@ def latest_joined_quarantine_notice(cfg):
     finally:
         if descriptor is not None:
             os.close(descriptor)
+    pending = 0
+    for record in unfinished.values():
+        pending += 1
+        add_detail("pending_recoveries", "joined quarantine pending recovery: " + json.dumps(record, sort_keys=True))
+    for journal in sorted(cfg.state_dir.glob("joined-sidecar-intent-*.json")):
+        pending += 1
+        add_detail("pending_recoveries", "joined sidecar pending recovery: " + journal.name)
+    if not (total or pending or problems):
+        return "", None, {}
+    status.update(alias_count=total, unrecorded_count=unrecorded, pending_recovery_count=pending,
+                  aliases_omitted=total - len(status["aliases"]),
+                  pending_recoveries_omitted=pending - len(status["pending_recoveries"]))
+    summary = "joined quarantine ledger replay: aliases=%d pending recoveries=%d" % (total, pending)
     if unrecorded:
-        problems.insert(0, "joined quarantine unrecorded aliases=%d" % unrecorded)
-    if latest:
-        problems.append("joined quarantine ledger replay: " + json.dumps(latest, sort_keys=True))
-    notice = "; ".join(problems)[:1000]
-    return notice, (utc_now() if problems else None)
+        summary += " unrecorded aliases=%d" % unrecorded
+    summary += "; listed aliases=%d pending=%d; omitted aliases=%d pending=%d (up to 5 each, byte bounded)" % (
+        len(status["aliases"]), len(status["pending_recoveries"]),
+        status["aliases_omitted"], status["pending_recoveries_omitted"],
+    )
+    # The short error directs operators to the complete bounded detail lists.
+    notice = "; ".join([summary] + problems)
+    suffix = "; details in heartbeat cleanup.joined_quarantine and uploaded log"
+    notice = notice.encode("utf-8")[:1000 - len(suffix)].decode("utf-8", "ignore") + suffix
+    return notice, utc_now(), status
 
 
 def append_joined_quarantine_ledger(cfg, record):

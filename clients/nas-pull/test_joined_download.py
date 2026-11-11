@@ -1858,6 +1858,124 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertEqual(ledger.exists(), ledger_kind != "missing")
                 self.assertEqual(ledger.read_bytes() if ledger.exists() else None, ledger_before)
 
+    def test_startup_reports_both_aliases_after_second_rename_or_canonical_replacement(self):
+        class Crash(BaseException): pass
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        for crash_point in ("second_rename", "canonical_replace", "canonical_complete"):
+            with self.subTest(crash_point=crash_point), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
+                parent = pull.joined_output_path(cfg, item).parent
+                try:
+                    journal, _ = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
+                    os.link(marker, "second-alias", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    self.write_entry(directory_fd, part, b"preserved partial")
+                    real_rename, real_replace = os.rename, os.replace
+                    real_append = pull.append_joined_quarantine_ledger
+                    renames = 0
+                    def rename(*args, **kwargs):
+                        nonlocal renames
+                        result = real_rename(*args, **kwargs)
+                        renames += 1
+                        if crash_point == "second_rename" and renames == 2: raise Crash()
+                        return result
+                    def replace(*args, **kwargs):
+                        result = real_replace(*args, **kwargs)
+                        if crash_point == "canonical_replace": raise Crash()
+                        return result
+                    def append(cfg, record):
+                        real_append(cfg, record)
+                        if crash_point == "canonical_complete" and record["operation"] == "canonical_copy" and record["state"] == "complete":
+                            raise Crash()
+                    with mock.patch.object(pull.os, "rename", side_effect=rename), \
+                            mock.patch.object(pull.os, "replace", side_effect=replace), \
+                            mock.patch.object(pull, "append_joined_quarantine_ledger", side_effect=append), self.assertRaises(Crash):
+                        pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    moves = {r["new_path"]: r for r in self.quarantine_records(cfg) if r["operation"] == "alias_move"}
+                    self.assertEqual(len(moves), 2)
+                    before = {path: self.entry_snapshot(Path(path)) for path in moves}
+                    ledger = cfg.state_dir / "joined-alias-quarantine.jsonl"
+                    ledger_before = ledger.read_bytes()
+                    ring = pull.ClientLogRing(); ring.configure(cfg)
+                    with mock.patch.object(pull, "CLIENT_LOG_RING", ring), mock.patch.object(pull, "request_json") as upload:
+                        restarted = self.runtime(cfg)
+                        heartbeat = restarted.heartbeat_payload(None)
+                        pull.client_log_upload_once(cfg, restarted, None, 0)
+                    status = heartbeat["cleanup"]["joined_quarantine"]
+                    self.assertEqual(status["alias_count"], 2)
+                    self.assertEqual(status["aliases_omitted"], 0)
+                    self.assertEqual(status["pending_recovery_count"], 1 if crash_point == "canonical_complete" else 2)
+                    self.assertEqual(status["pending_recoveries_omitted"], 0)
+                    self.assertIn(journal.name, str(status["pending_recoveries"]))
+                    self.assertIn("aliases=2", heartbeat["client_last_error"])
+                    messages = "\n".join(line["message"] for line in upload.call_args.kwargs["body"]["lines"])
+                    for move in moves.values():
+                        for path in (move["old_path"], move["new_path"]):
+                            visible = "<nas>/" + str(Path(path).relative_to(cfg.output_dir))
+                            self.assertIn(visible, str(status["aliases"]))
+                            self.assertIn(visible, messages)
+                        for fact in ("inode=%d" % move["inode"], "size=%d" % move["size_bytes"], "reason=" + move["reason"]):
+                            self.assertIn(fact, str(status["aliases"]))
+                            self.assertIn(fact, messages)
+                    self.assertEqual(before, {path: self.entry_snapshot(Path(path)) for path in moves})
+                    self.assertEqual(ledger.read_bytes(), ledger_before)
+                    self.assertEqual((parent / part).read_bytes(), b"preserved partial")
+                finally:
+                    os.close(directory_fd)
+
+    def test_startup_many_aliases_and_pending_recoveries_have_bounded_reports(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            qroot = cfg.output_dir / ".stoarama-quarantine" / "aliases"
+            qroot.mkdir(parents=True)
+            for index in range(40):
+                alias = qroot / ("alias-%02d" % index)
+                alias.write_bytes(b"preserved")
+                if index % 2 == 0:
+                    record = dict(operation="alias_move", old_path=str(cfg.output_dir / "old" / ("%02d" % index)),
+                                  new_path=str(alias), inode=alias.stat().st_ino, size_bytes=9, reason="test")
+                    pull.append_joined_quarantine_ledger(cfg, dict(record, state="intent"))
+                    pull.append_joined_quarantine_ledger(cfg, dict(record, state="complete"))
+                (cfg.state_dir / ("joined-sidecar-intent-%02d.json" % index)).write_text("{}")
+            ring = pull.ClientLogRing(); ring.configure(cfg)
+            with mock.patch.object(pull, "CLIENT_LOG_RING", ring), mock.patch.object(pull, "request_json") as upload:
+                runtime = self.runtime(cfg)
+                heartbeat = runtime.heartbeat_payload(None)
+                pull.client_log_upload_once(cfg, runtime, None, 0)
+            status = heartbeat["cleanup"]["joined_quarantine"]
+            self.assertEqual(status["alias_count"], 40)
+            self.assertEqual(status["unrecorded_count"], 20)
+            self.assertEqual(status["pending_recovery_count"], 40)
+            self.assertEqual(len(status["aliases"]), 5)
+            self.assertLessEqual(len(status["pending_recoveries"]), 5)
+            self.assertEqual(status["aliases_omitted"], 35)
+            self.assertEqual(status["pending_recoveries_omitted"], 40 - len(status["pending_recoveries"]))
+            self.assertLessEqual(len(heartbeat["client_last_error"].encode()), 1000)
+            self.assertLess(len(json.dumps(heartbeat["cleanup"]).encode()), 8192)
+            lines = upload.call_args.kwargs["body"]["lines"]
+            self.assertLessEqual(len(lines), 11)
+            messages = "\n".join(line["message"] for line in lines)
+            self.assertIn("omitted aliases=35", messages)
+            self.assertIn("unrecorded alias:", messages)
+            self.assertIn("<nas>/old/00 ->", messages)
+            self.assertIn("pending recoveries=40", messages)
+
+    def test_startup_reports_unfinished_ledger_recovery_without_quarantine_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            pull.append_joined_quarantine_ledger(cfg, dict(
+                operation="canonical_copy", state="intent", canonical_path=str(cfg.output_dir / "canonical"),
+                temporary_path=str(cfg.output_dir / "temporary"), old_inode=1, new_inode=2, size_bytes=8, reason="test"))
+            ring = pull.ClientLogRing(); ring.configure(cfg)
+            with mock.patch.object(pull, "CLIENT_LOG_RING", ring):
+                runtime = self.runtime(cfg)
+                heartbeat = runtime.heartbeat_payload(None)
+            status = heartbeat["cleanup"]["joined_quarantine"]
+            self.assertEqual(status["alias_count"], 0)
+            self.assertEqual(status["pending_recovery_count"], 1)
+            self.assertIn("<nas>/canonical", status["pending_recoveries"][0])
+            self.assertIn("pending recoveries=1", heartbeat["client_last_error"])
+
     def test_foreign_alias_after_crash_and_inode_reuse_are_quarantined_and_delivered(self):
         for reused_inode in (False, True):
             with self.subTest(reused_inode=reused_inode), tempfile.TemporaryDirectory() as raw:
