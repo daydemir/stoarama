@@ -79,6 +79,23 @@ def run(args):
     started = time.monotonic()
     cycles = 0
     errors = []
+    maintenance_stop = threading.Event()
+    maintenance_calls = [0]
+    maintenance_threads = []
+    if args.slow_joined_seconds:
+        @pull.NAS_MEDIA_FENCE.delivery
+        def joined_work():
+            maintenance_calls[0] += 1
+            maintenance_stop.wait(args.slow_joined_seconds)
+        def delivery():
+            while not maintenance_stop.is_set():
+                joined_work()
+        # Keep a writer queued at every per-item fence release. Before this
+        # change every item paid this full delay again, despite serial leases.
+        for _ in range(2):
+            worker = threading.Thread(target=delivery, daemon=True)
+            worker.start()
+            maintenance_threads.append(worker)
     with mock.patch.object(pull.os.path, "ismount", side_effect=lambda p: str(p) == root or real_ismount(p)), \
             mock.patch.object(pull.os, "unlink", wraps=os.unlink) as unlink, \
             concurrent.futures.ThreadPoolExecutor(max_workers=pull.CLEANUP_V2_WORKERS, thread_name_prefix="nas-cleanup") as executor:
@@ -130,6 +147,9 @@ def run(args):
                 if retry:
                     break
         finally:
+            maintenance_stop.set()
+            for worker in maintenance_threads:
+                worker.join(timeout=5)
             if api is not None:
                 api.close()
     elapsed = time.monotonic() - started
@@ -143,6 +163,7 @@ def run(args):
     inventory.close()
     print("BENCH_RESULT " + json.dumps({"protocol": args.protocol, "seconds": round(elapsed, 3), "cycles": cycles,
                                        "ledger_deleted": deleted, "unlink_calls": unlink.call_count,
+                                       "joined_calls": maintenance_calls[0],
                                        "errors": errors, "execution_outcomes": outcomes}), flush=True)
 
 
@@ -165,6 +186,7 @@ def main():
     r.add_argument("--max-seconds", type=float, default=1800)
     r.add_argument("--simultaneous-tasks", type=int, default=0, help="contend for execution leases with this many workers (regression harness only)")
     r.add_argument("--one-attempt", action="store_true", help="exercise one lease without replaying an uncertain observation")
+    r.add_argument("--slow-joined-seconds", type=float, default=0, help="continuously queue slow delivery work behind the real media fence")
     args = parser.parse_args()
     (prepare if args.command == "prepare" else run)(args)
 
