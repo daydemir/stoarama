@@ -642,9 +642,9 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			}
 			exec(string(body))
 		}
-		for _, id := range []int64{301, 302, 303, 304, 305, 306} {
+		for _, id := range []int64{301, 302, 303, 304, 305, 306, 307} {
 			at := windows[3].Start.Add(time.Hour)
-			if id == 302 || id == 306 {
+			if id == 302 || id == 306 || id == 307 {
 				at = outside
 			}
 			key := fmt.Sprintf("managed/acct-47/%d.mp4", id)
@@ -657,6 +657,11 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 		exec(`UPDATE nas_inventory_files SET sha256=repeat('a',64) WHERE clip_id=304`)
 		exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approval_reason,approved_until) VALUES
    (4,47,13,'unrelated-enabled',repeat('a',64),'[{"kind":"raw","source_id":306,"source_ids":[306]}]',repeat('e',64),'enabled','x',now()+interval '1 hour')`)
+		// A retired legacy plan with no item row is uncertain, even with no
+		// source hold. The shared reservation view must keep this R2 object.
+		exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode)
+ VALUES(5,47,13,'legacy-missing-item',repeat('a',64),'[{"kind":"raw","source_id":307}]',repeat('f',64),'retired')`)
+
 		scope.NASBacked = true
 		live := map[string]r2.ObjectInfo{}
 		for key, n := range store.objects {

@@ -153,7 +153,7 @@ type r2RetirePlanOptions struct {
 // and returns the summary and the sorted manifest items.
 func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOptions, policySHA string, windows map[int64]api.Keep28Window) (r2RetirePlanSummary, []r2RetireItem, error) {
 	started := time.Now()
-	sets, err := loadR2RetireSets(ctx, q)
+	sets, err := loadR2RetireSets(ctx, q, "", opts.Scope.NASBacked)
 	if err != nil {
 		return r2RetirePlanSummary{}, nil, err
 	}
@@ -668,7 +668,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	defer ledger.Close()
 	a := &r2RetireApplier{pool: pool, store: store, opts: opts, header: h, digest: digest, picks: picks, windows: windows, policySH: policySHA, ledger: ledger,
 		scope: r2RetireScope{AccountID: h.AccountID, ConnectionID: h.ConnectionID, Bucket: h.Bucket, Grace: time.Duration(h.GraceSeconds) * time.Second, HasRetirements: true, NASBacked: h.NASBacked}}
-	if a.sets, err = loadR2RetireSets(ctx, pool, digest); err != nil {
+	if a.sets, err = loadR2RetireSets(ctx, pool, digest, h.NASBacked); err != nil {
 		return sum, err
 	}
 	if a.fp, err = r2RetireFingerprint(ctx, pool); err != nil {
@@ -794,7 +794,7 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		if !a.scope.NASBacked {
 			return "", "", r2RetireAnomalyf("NAS cleanup plans, joined artifacts or stitched outputs changed during the run; re-plan")
 		}
-		a.sets, err = loadR2RetireSets(ctx, tx, a.digest)
+		a.sets, err = loadR2RetireSets(ctx, tx, a.digest, a.scope.NASBacked)
 		if err != nil {
 			return "", "", err
 		}

@@ -127,7 +127,7 @@ func r2RetireScanCandidate(kind string, rows pgx.Row, nasBacked bool) (r2RetireC
 		&c.SourceCount, &srcFound, &srcStart, &srcEnd,
 		&f.Purged, &f.Retired, &f.NASCopy, &f.Held, &f.JoinedRef, &f.RestorePending, &f.SharedKey, &f.Recent}
 	if nasBacked {
-		dest = append(dest, &f.ExactNAS, &c.RelativePath, &f.Held)
+		dest = append(dest, &f.ExactNAS, &c.RelativePath)
 	}
 	if err := rows.Scan(dest...); err != nil {
 		return c, err
@@ -196,7 +196,7 @@ SELECT md5(coalesce((SELECT string_agg(id||':'||mode, ',' ORDER BY id) FROM nas_
   ||'|'||(SELECT count(*)||':'||coalesce(max(id),0) FROM recording_joined_artifacts)
   ||'|'||(SELECT count(*)||':'||coalesce(max(id),0) FROM recording_collation_outputs))`
 
-func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest ...string) (r2RetireSets, error) {
+func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, nasBacked bool) (r2RetireSets, error) {
 	s := r2RetireSets{HeldRaw: map[int64]bool{}, HeldCollated: map[int64]bool{}, ArtifactKeys: map[string]bool{}, OutputKeyCount: map[string]int{}}
 	rows, err := q.Query(ctx, r2RetirePlanManifestSQL)
 	if err != nil {
@@ -258,15 +258,41 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest ...string
 			return s, err
 		}
 	}
+	if nasBacked {
+		// Materialize this shared view once, not again for every catalog page.
+		// It includes retired legacy items whose issuance state is uncertain.
+		rows, err := q.Query(ctx, `SELECT DISTINCT kind,source_id FROM nas_cleanup_reserved_files`)
+		if err != nil {
+			return s, err
+		}
+		for rows.Next() {
+			var kind string
+			var id int64
+			if err := rows.Scan(&kind, &id); err != nil {
+				rows.Close()
+				return s, err
+			}
+			if kind == "raw" {
+				s.HeldRaw[id] = true
+			} else if kind == "collated" {
+				s.HeldCollated[id] = true
+			} else {
+				rows.Close()
+				return s, fmt.Errorf("unknown reserved kind %q", kind)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return s, err
+		}
+	}
+
 	var has bool
 	if err := q.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&has); err != nil {
 		return s, err
 	}
 	if has {
-		exclude := ""
-		if len(manifest) > 0 {
-			exclude = manifest[0]
-		}
+		exclude := manifest
 		rows, err := q.Query(ctx, `SELECT kind,source_id FROM r2_retirement_reservations WHERE manifest_sha256<>$1`, exclude)
 		if err != nil {
 			return s, err
@@ -366,10 +392,7 @@ const r2RetireRawExactSQL = `,
    AND n.relative_path=c.display_path AND n.state='present' AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes
    AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
    AND n.server_received_at>=now()-interval '24 hours' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'),
- coalesce(c.display_path,''),
- (EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
-  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
-    WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued))))
+ coalesce(c.display_path,'')
 `
 const r2RetireCollatedExactSQL = `,
  EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2
@@ -377,6 +400,5 @@ const r2RetireCollatedExactSQL = `,
    AND n.state='present' AND n.sha256=lower(o.sha256) AND n.size_bytes=o.size_bytes
    AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
    AND n.server_received_at>=now()-interval '24 hours'),
- coalesce(o.nas_relative_path,''),
- EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='collated' AND f.source_id=o.id)
+ coalesce(o.nas_relative_path,'')
 `
