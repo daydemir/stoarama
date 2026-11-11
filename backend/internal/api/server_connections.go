@@ -18,7 +18,7 @@ import (
 	"github.com/daydemir/stoarama/backend/internal/util"
 )
 
-// The two pull endpoints that carry numeric path params. r.URL.Path is reliable in
+// Pull endpoints that carry numeric path params. r.URL.Path is reliable in
 // middleware (chi's RoutePattern is not, for nested-group middleware), so the
 // allowlist matches on the raw path with precompiled, anchored regexps for the
 // param routes and literal+method checks for the rest. Default is DENY: any account
@@ -33,6 +33,7 @@ var (
 	pullSelectedVerifyResultRe = regexp.MustCompile(`^/api/v1/account/connections/selected-verify/\d+/result$`)
 	pullCollatedDownloadPathRe = regexp.MustCompile(`^/api/v1/account/collated/\d+/download$`)
 	pullBenchmarkResultRe      = regexp.MustCompile(`^/api/v1/account/connections/benchmark/\d+/result$`)
+	pullStitchTaskRe           = regexp.MustCompile(`^/api/v1/account/connections/stitch/\d+/(checkpoint|result|ready)$`)
 )
 
 // pullPathAllowed reports whether a pull-scoped key may call (method, path). It is
@@ -76,6 +77,12 @@ func pullPathAllowed(method, path string) bool {
 	// The batch forms carry the same per-item observations/results the pull key
 	// may already post one at a time; the NAS client uses them by default.
 	case method == http.MethodPost && (path == "/api/v1/account/connections/cleanup/observe-batch" || path == "/api/v1/account/connections/cleanup/result-batch"):
+		return true
+	// Admit only the NAS stitch protocol; handlers retain connection, scope,
+	// lease, source-freeze and independent deletion authorization checks.
+	case method == http.MethodPost && (path == "/api/v1/account/connections/stitch/lease" || pullStitchTaskRe.MatchString(path)):
+		return true
+	case method == http.MethodGet && (path == "/api/v1/account/connections/stitch/corpus" || path == "/api/v1/account/connections/stitch/tools/ffmpeg" || path == "/api/v1/account/connections/stitch/tools/ffprobe"):
 		return true
 	case method == http.MethodPost && path == "/api/v1/account/connections/selected-verify/lease":
 		return true
