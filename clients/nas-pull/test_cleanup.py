@@ -346,6 +346,54 @@ class CleanupTests(unittest.TestCase):
         self.assertIsNone(fence.execution_owner)
         self.assertEqual(fence.cleaners, 0)
 
+    def test_unused_execution_lease_return_is_durable_and_replays_only_reconcile(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        lane = mock.Mock()
+        lane.run.side_effect = pull.CleanupDrainTimeout('long joined download')
+        import urllib.error
+        error = urllib.error.HTTPError('https://example.test', 502, 'Bad Gateway', {}, None)
+        with mock.patch.object(pull, 'restore_api', side_effect=error) as api, \
+                mock.patch.object(pull.time, 'sleep'), mock.patch.object(pull.os, 'unlink') as unlink:
+            with self.assertRaises(urllib.error.HTTPError):
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task, lane=lane)
+        unlink.assert_not_called()
+        self.assertTrue(all(call.args[1].endswith('/reconcile') for call in api.call_args_list))
+        journal = pull.cleanup_journal(self.inventory)
+        self.assertEqual(len(journal), 1)
+        self.assertEqual(journal[0][1], 'observe')
+        body = json.loads(journal[0][2])
+        self.assertTrue(body['return_lease'])
+        self.assertIsNone(body['proof'])
+        with mock.patch.object(pull, 'restore_api', side_effect=lambda cfg, path, body: fixture_ack(body, action='pending', delete=False)) as replay:
+            pull.cleanup_replay_receipts(self.cfg, self.inventory)
+        self.assertTrue(replay.call_args.args[1].endswith('/reconcile'))
+        self.assertFalse(pull.cleanup_journal(self.inventory))
+        self.assertTrue(self.path.exists())
+        self.assertTrue(self.sidecar.exists())
+
+    def test_interrupted_uncertain_observation_never_returns_execution_lease(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = current.proof()
+        with mock.patch.object(pull, 'restore_api', side_effect=pull.CleanupInterrupted('transport interrupted')) as api:
+            with self.assertRaises(pull.CleanupInterrupted):
+                pull.cleanup_process_task(self.cfg, self.inventory, threading.Event(), self.task)
+        self.assertEqual(api.call_count, 1)
+        self.assertTrue(api.call_args.args[1].endswith('/observe'))
+        body = json.loads(pull.cleanup_journal(self.inventory)[0][2])
+        self.assertNotIn('return_lease', body)
+        self.assertTrue(self.path.exists())
+
+    def test_cleanup_loop_retries_writer_drain_within_seconds(self):
+        stop = mock.Mock()
+        stop.wait.side_effect = [False, False, True]
+        with mock.patch.object(pull, 'CleanupBatchAPI') as api, \
+                mock.patch.object(pull, 'cleanup_batch_v2', side_effect=[pull.CleanupDrainTimeout('long delivery'), 120]), \
+                mock.patch.object(pull, 'restore_wait', return_value=120):
+            pull.cleanup_loop(self.cfg, self.inventory, stop)
+        self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [15, 2, 120])
+        api.return_value.close.assert_called_once()
+
     def test_stale_observe_and_result_receipts_are_archived_without_blocking(self):
         import urllib.error
         for phase in ('observe','result'):
@@ -545,7 +593,7 @@ class CleanupTests(unittest.TestCase):
             task=dict(self.task,item_id=counter[0])
             if counter[0]==2:task["approved_proof"]={}
             return dict(tasks=[task],retry_after_sec=0)
-        def process(cfg,inventory,stop,task):
+        def process(cfg,inventory,stop,task, lane=None):
             if task.get("approved_proof") is not None:
                 order.append("execute")
             else:

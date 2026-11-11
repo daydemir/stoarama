@@ -437,8 +437,8 @@ upload count; the read endpoint filters and limits lines in PostgreSQL.
 
 ## Execution scheduling and client version
 
-The reviewed client version is `raw-credit-drain-v1`; the release command requires
-explicit `NAS_VERSION=raw-credit-drain-v1` when staging these exact client bytes.
+The reviewed client version is `fence-progress-v1`; the release command requires
+explicit `NAS_VERSION=fence-progress-v1` when staging these exact client bytes.
 This change adds that version to the execution allowlist; it does not stage or
 promote a release.
 
@@ -447,14 +447,23 @@ Raw delivery continues while active writers drain because joined downloads may
 need raw-progress credits to finish. Only after that drain does cleanup reserve
 the media fence across serial leases, observations, unlinks and receipts.
 Lane admission and writer draining share a 15-second budget; a failed drain
-releases the window so maintenance can proceed. Direct per-file fence waits
-also have a 15-second bound. After at most five minutes between completed
-executions, the lane releases its fence for a 30-second maintenance interval.
+releases the window so maintenance can proceed and retries after two seconds.
+Before any permit request, an interrupted task durably journals a `return_lease`
+observation and sends it to `/reconcile`. The server requires the same live
+session, exact plan/attempt, and no previously issued permit; it returns the item
+to pending without changing approved proof, budgets or the ledger. Lost responses
+replay only through reconciliation. Direct per-file fence waits also have a
+15-second bound. Raw delivery list 502s use the existing transient retry/backoff
+so they do not immediately abandon a page that supplies joined progress credits.
+After at most five minutes between completed executions, the lane releases its fence for a 30-second maintenance interval.
 
 The regression in `test_joined_download.py` runs the actual joined-download
 entry point with cleanup and raw-delivery threads. The local client/server
 throughput harness adds five-second joined writers that require raw-progress
 credits, checks at least 15 files/minute, and verifies one execution in flight.
+The timeout regression uses 35-second joined writers, raw-list 502s, the real
+15-second fence timeout and two-second loop retry. It verifies immediate lease
+return, all 16 durable deletion receipts, and no outstanding execution slot.
 
 ## Execution observation deadlines and refusal evidence
 
