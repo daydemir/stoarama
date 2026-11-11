@@ -1725,6 +1725,12 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertEqual(os.stat(short, dir_fd=directory_fd).st_size, 7)
             finally: os.close(directory_fd)
 
+    def entry_snapshot(self, path):
+        current = path.stat()
+        # Reading can update atime; bytes, write timestamps, inode and links
+        # must remain unchanged on refusal.
+        return pull.certification_identity(current), current.st_nlink, path.read_bytes()
+
     def crash_marker_publication(self, cfg, runtime, directory_fd, marker, expected, after_link=True):
         real_link = os.link
         def interrupted_link(*args, **kwargs):
@@ -1797,7 +1803,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 os.link(marker, alias, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
                 self.write_entry(directory_fd, part, b"keep partial bytes")
                 parent = pull.joined_output_path(cfg, item).parent
-                before = {p.name: (p.stat(), p.read_bytes()) for p in parent.iterdir()}
+                before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
                 def resume(*_args):
                     return pull.ensure_owned_joined_partial(
                         cfg, runtime, directory_fd, part, marker, expected, threading.Event(),
@@ -1807,7 +1813,7 @@ class JoinedDownloadTests(unittest.TestCase):
                         mock.patch.object(pull, "download_joined_item", side_effect=resume), \
                         self.assertRaisesRegex(pull.ExistingFileMismatch, "no durable intent; operator decision required"):
                     pull.drain_joined(cfg, runtime, threading.Event())
-                self.assertEqual(before, {p.name: (p.stat(), p.read_bytes()) for p in parent.iterdir()})
+                self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
                 # Raw successes must not hide a joined lane that needs an operator.
                 runtime.add_successes(cfg, 1, [(1, 6)])
                 with mock.patch.object(pull, "CLIENT_LOG_RING", ring):
@@ -1818,7 +1824,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertEqual(upload.call_args.args[2], "/account/connections/client-logs")
                 for text in (error, lines[-1]["message"]):
                     for fragment in ("3830", "no durable intent", str(parent.relative_to(cfg.output_dir)),
-                                     "path=" + alias, "inode=%d" % before[alias][0].st_ino, "links=2"):
+                                     "path=" + alias, "inode=%d" % before[alias][0][4], "links=2"):
                         self.assertIn(fragment, text)
                 self.assertFalse(journal.exists())
                 runtime.clear_joined_delivery_error()
@@ -1853,13 +1859,13 @@ class JoinedDownloadTests(unittest.TestCase):
                         # An unknown partial must never be opened for writing on refusal.
                         if linked:
                             self.write_entry(directory_fd, part, b"keep partial bytes")
-                        before = {p.name: (p.stat(), p.read_bytes()) for p in parent.iterdir()}
+                        before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
                         journal_before = journal.read_bytes()
                         with self.assertRaisesRegex(pull.ExistingFileMismatch, "durable intent"):
                             pull.ensure_owned_joined_partial(
                                 cfg, self.runtime(cfg), directory_fd, part, marker, expected, threading.Event(),
                             )
-                        self.assertEqual(before, {p.name: (p.stat(), p.read_bytes()) for p in parent.iterdir()})
+                        self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
                         self.assertEqual(journal_before, journal.read_bytes())
                     finally:
                         os.close(directory_fd)
@@ -1901,12 +1907,12 @@ class JoinedDownloadTests(unittest.TestCase):
                 alias = marker + ".stage-" + "a" * 32
                 os.link(marker, alias, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
                 parent = pull.joined_output_path(cfg, item).parent
-                before = {p.name: (p.stat(), p.read_bytes()) for p in parent.iterdir()}
+                before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
                 with self.assertRaisesRegex(pull.ExistingFileMismatch, "no durable intent"):
                     pull.complete_existing_joined(
                         cfg, runtime, directory_fd, item, (final, part, marker), expected, threading.Event(),
                     )
-                self.assertEqual(before, {p.name: (p.stat(), p.read_bytes()) for p in parent.iterdir()})
+                self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
             finally:
                 os.close(directory_fd)
 
@@ -1923,7 +1929,7 @@ class JoinedDownloadTests(unittest.TestCase):
                 parent = pull.joined_output_path(cfg, item).parent
                 # Unrelated media must retain both bytes and filesystem identity.
                 self.write_entry(directory_fd, "media.mp4", b"media remains untouched")
-                media_before = ((parent / "media.mp4").stat(), (parent / "media.mp4").read_bytes())
+                media_before = self.entry_snapshot(parent / "media.mp4")
                 def operation(name):
                     def wrapped(*args, **kwargs):
                         result = real[name](*args, **kwargs)
@@ -1950,7 +1956,7 @@ class JoinedDownloadTests(unittest.TestCase):
                     self.assertFalse(journal.exists())
                     for name, content in unrecorded.items():
                         self.assertEqual((parent / name).read_bytes(), content)
-                    self.assertEqual(media_before, ((parent / "media.mp4").stat(), (parent / "media.mp4").read_bytes()))
+                    self.assertEqual(media_before, self.entry_snapshot(parent / "media.mp4"))
                 finally:
                     os.close(directory_fd)
             return trace
