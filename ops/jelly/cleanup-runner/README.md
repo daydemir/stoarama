@@ -15,12 +15,15 @@ The runner:
 - Takes an exclusive local lock. On startup, first reads active execution.
   With **no enabled plan**, forces master OFF as a barrier before policy loading,
   email checks, progress, or other work (including a latched failure). With an
-  enabled plan matching the persisted `current_plan`, resumes monitoring **without
-  toggling master** only if approval is still in the future, the plan is enabled,
+  enabled plan matching the persisted `current_plan` and `started_plan_sha256`,
+  resumes monitoring **without toggling master** only if approval is still in the
+  future, the plan is enabled,
   master is ON, no anomalous item states exist, and no failure is latched.
   An unknown/unhealthy enabled plan, enabled batch, or dry-run takeover forces
   OFF, alerts the owner, and stops. Never pauses a healthy plan on restart:
-  toggling OFF would expire its leases and force replanning.
+  toggling OFF would expire its leases and force replanning. The start digest is
+  durably recorded before the enable request, including recovery from a lost API
+  response; a plan merely selected for dry run has no execution ownership marker.
 - Forces master OFF through a single-key Render env edit, cancels any in-progress
   deploys, then explicitly redeploys the **current live SHA**, never HEAD. OFF
   bypasses the normal concurrent-deploy rejection and needs no successful disk
@@ -127,4 +130,5 @@ sh -n ops/jelly/cleanup-runner/run.sh
 
 Protocol references: [Render single env edit](https://api-docs.render.com/reference/update-env-var),
 [explicit commit redeploy](https://api-docs.render.com/reference/create-deploy),
+[in-progress deploy cancellation](https://api-docs.render.com/reference/cancel-deploy),
 [Resend email delivery](https://resend.com/docs/api-reference/emails/send-email).

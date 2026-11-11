@@ -506,7 +506,7 @@ class Runner:
             closed = self.api('POST', 'plans/' + str(plan['id']) + '/close', {
                 'expected_plan_sha256': plan['plan_sha256'], 'reason': 'Standing approval: expiry; retain issued R2 holds and replan never-issued remainder.'})
             require(closed['mode'] == 'retired', 'close was not confirmed')
-        self.save('batch_complete', current_plan=None)
+        self.save('batch_complete', current_plan=None, started_plan_sha256=None)
         self.progress()
 
     def monitor(self, pid):
@@ -536,7 +536,8 @@ class Runner:
             require(not self.dry_run and not self.status.get('last_error'),
                     'enabled plan cannot be resumed by this runner')
             p = self.plan(pid)
-            require(p['mode'] == 'enabled' and execution_state(p) == 'running'
+            require(p['mode'] == 'enabled' and execution_state(p) in {'running', 'done'}
+                    and self.status.get('started_plan_sha256') == p['plan_sha256']
                     and timestamp(p['approved_until']) > utcnow()
                     and p['master_deletion_enabled'] is True,
                     'saved enabled plan is unhealthy; owner review required')
@@ -583,7 +584,7 @@ class Runner:
             verify(p, self.catalog(p), self.windows, utcnow())
             require(budget_permits(self.recent_bytes(), size), 'budget changed before enable')
             self.idle()
-            self.save('enabling', current_plan=pid)
+            self.save('enabling', current_plan=pid, started_plan_sha256=p['plan_sha256'])
             if self.stopped():
                 self.master(False)
                 break

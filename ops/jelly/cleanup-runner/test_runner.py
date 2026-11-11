@@ -201,7 +201,7 @@ class LoopTests(unittest.TestCase):
     def test_restart_recovers_current_execution_before_next_batch(self):
         with tempfile.TemporaryDirectory() as root:
             job = FakeRunner(root)
-            job.status['current_plan'] = 42
+            job.status.update(current_plan=42, started_plan_sha256=job.p['plan_sha256'])
             job.p.update(mode='enabled', master_deletion_enabled=True)
             job.picks = [None]
             job.stopping = True
@@ -358,6 +358,17 @@ class SafetyRegressionTests(unittest.TestCase):
             self.assertEqual(json.loads((job.root / 'status.json').read_text())['last_error'], 'failure')
             self.assertIn('STOP write failed', stderr.getvalue())
 
+    def test_healthy_saved_completed_enabled_plan_resumes_before_off(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            job.status.update(current_plan=42, started_plan_sha256=job.p['plan_sha256'])
+            job.p.update(mode='enabled', master_deletion_enabled=True)
+            job.p['results'][0].update(state='deleted', delete_ever_issued=True)
+            job.stopping = True
+            with patch.object(r, 'utcnow', return_value=NOW):
+                job.run()
+            self.assertEqual(job.events[:3], ['monitor', 'OFF', 'recovery'])
+
     def test_no_enabled_plan_off_barrier_precedes_policy_email_and_latched_error(self):
         for latched in (False, True):
             with self.subTest(latched=latched), tempfile.TemporaryDirectory() as root:
@@ -376,6 +387,8 @@ class SafetyRegressionTests(unittest.TestCase):
         mutations = [
             lambda j: j.status.update(current_plan=None),
             lambda j: j.status.update(current_plan=99),
+            lambda j: j.status.pop('started_plan_sha256'),
+            lambda j: j.status.update(started_plan_sha256='c'*64),
             lambda j: j.p.update(approved_until=(NOW-timedelta(seconds=1)).isoformat()),
             lambda j: j.p.update(approved_until=None),
             lambda j: j.p['results'][0].update(state='conflict'),
@@ -387,7 +400,7 @@ class SafetyRegressionTests(unittest.TestCase):
         for mutate in mutations:
             with self.subTest(mutation=mutate), tempfile.TemporaryDirectory() as root:
                 job = FakeRunner(root)
-                job.status['current_plan'] = 42
+                job.status.update(current_plan=42, started_plan_sha256=job.p['plan_sha256'])
                 job.p.update(mode='enabled', master_deletion_enabled=True)
                 mutate(job)
                 with patch.object(r, 'Runner', return_value=job), \
