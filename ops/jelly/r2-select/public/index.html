@@ -1,0 +1,83 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stoarama R2 keep list</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1c1c1a;--mute:#6b6b66;--line:#e4e3de;--acc:#2f6fed;--good:#1f8a4c;--warn:#b2560b;--chip:#efeee9}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1d1d1b;--ink:#ecebe6;--mute:#9a9992;--line:#2e2e2b;--acc:#7aa2ff;--good:#53c486;--warn:#f0a35e;--chip:#2a2a27}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:14px 16px}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--mute);font-size:13px;max-width:900px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px;min-width:150px}
+.kpi b{display:block;font-size:20px;font-variant-numeric:tabular-nums}.kpi span{color:var(--mute);font-size:12px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
+button,select,input{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}button:hover{filter:brightness(1.05);cursor:pointer}
+main{padding:12px 16px 60px}.wrap{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;min-width:980px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:12px;color:var(--mute);font-weight:600;position:sticky;top:0;background:var(--card);cursor:pointer;white-space:nowrap}
+td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.name{max-width:520px;min-width:340px}.thumbs{display:flex;gap:4px;margin:6px 0 4px}.thumbs img{width:160px;height:90px;object-fit:cover;border-radius:6px;cursor:zoom-in;background:var(--chip)}.nothumb{display:flex;align-items:center;justify-content:center;width:100%;max-width:488px;height:90px;border-radius:6px;background:var(--chip);color:var(--mute);font-size:12px;margin:6px 0 4px;text-align:center;padding:0 8px}#lb{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:20;cursor:zoom-out}#lb img{max-width:94vw;max-height:90vh;border-radius:8px}.name div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loc{color:var(--mute);font-size:12px}.chip{display:inline-block;background:var(--chip);border-radius:6px;padding:1px 6px;font-size:12px}
+.opts{display:flex;flex-direction:column;gap:3px;min-width:250px}.opts label{display:flex;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:6px;cursor:pointer}
+.opts label:hover{background:var(--chip)}.opts label.on{background:color-mix(in srgb,var(--acc) 16%,transparent)}.opts small{color:var(--mute);font-variant-numeric:tabular-nums}
+tr.undecided td:first-child{box-shadow:inset 3px 0 var(--warn)}.status{font-size:13px;color:var(--mute)}.saved{color:var(--good)}
+details{margin-top:8px;font-size:13px;color:var(--mute);max-width:900px}
+</style></head><body>
+<header>
+<h1>Which streams should R2 keep?</h1>
+<div class="sub">NAS keeps one best-14-day period ±7 days (28 days) for every stream, whatever you pick here. This page only decides what <b>also</b> stays in Cloudflare R2, at about $15 per TB per month. Choices are saved on Jelly; nothing is deleted from this page.</div>
+<div class="kpis">
+<div class="kpi"><span>R2 today</span><b id="k-now"></b><span id="k-now-tb"></span></div>
+<div class="kpi"><span>R2 with your picks</span><b id="k-new"></b><span id="k-new-tb"></span></div>
+<div class="kpi"><span>Monthly saving</span><b id="k-save"></b><span id="k-save-d"></span></div>
+<div class="kpi"><span>Decided</span><b id="k-dec"></b><span>streams</span></div>
+</div>
+<div class="bar">
+<input id="q" placeholder="Filter by name, city, country" style="min-width:220px">
+<span class="status">Set all shown to:</span>
+<select id="bulk"><option value="">—</option><option value="none">Nothing</option><option value="st">Kept period, stitched only</option><option value="keep">Kept period, raw + stitched</option><option value="all">Everything (all days)</option></select>
+<button class="primary" id="save">Save choices</button><span class="status" id="st"></span>
+</div>
+<details><summary>What the options mean</summary>
+<p><b>Nothing</b>: R2 holds no footage for this stream; the NAS copy is the only one.<br>
+<b>Kept period, stitched only</b>: the stitched hour files for the 28 kept days. Smallest useful option. The V85 re-stitch outputs (about 1.8 TB so far) aren't counted per stream yet and will be added once stitching finishes.<br>
+<b>Kept period, raw + stitched</b>: the original 1-minute clips plus stitched hours for the 28 kept days, enough to re-stitch later.<br>
+<b>Everything</b>: every day ever recorded, raw and stitched. Days outside the kept period would then exist only in R2.</p>
+<p>"Best 14" = the 14 local days with the most recorded seconds, excluding clips known to be bad. Sizes come from the database catalog on Nov 7.</p></details>
+</header>
+<main><div class="wrap"><table><thead><tr>
+<th data-k="name">Stream</th><th data-k="best_start">Best 14 days</th><th data-k="best_hours">Hours in best 14</th><th data-k="days_recorded">Days recorded</th>
+<th data-k="all">R2 now</th><th>Keep in R2</th></tr></thead><tbody id="tb"></tbody></table></div></main><div id="lb" onclick="this.style.display='none'"><img alt=""></div>
+<script>
+const RATE=15/1e12, TB=b=>(b/1e12).toFixed(b<1e11?3:2)+' TB', USD=b=>'$'+(b*RATE).toFixed(b*RATE<10?2:0);
+let rows=[],choices={},sortK='name',sortDir=1,dirty=false;
+const sizeOf=(r,c)=>c==='none'?0:c==='st'?r.r2_st_keep:c==='keep'?r.r2_raw_keep+r.r2_st_keep:c==='all'?r.r2_raw_keep+r.r2_raw_out+r.r2_st_keep+r.r2_st_out:null;
+const nowOf=r=>r.r2_raw_keep+r.r2_raw_out+r.r2_st_keep+r.r2_st_out;
+const fmtD=d=>new Date(d+'T00:00:00').toLocaleDateString(undefined,{month:'short',day:'numeric'});
+function kpis(){let now=0,nw=0,dec=0;for(const r of rows){const n=nowOf(r);now+=n;const c=choices[r.stream_id];if(c){dec++;nw+=sizeOf(r,c)}else nw+=n}
+document.getElementById('k-now').textContent=USD(now)+'/mo';document.getElementById('k-now-tb').textContent=TB(now);
+document.getElementById('k-new').textContent=USD(nw)+'/mo';document.getElementById('k-new-tb').textContent=TB(nw)+' (undecided count as kept)';
+document.getElementById('k-save').textContent=USD(now-nw)+'/mo';document.getElementById('k-save-d').textContent='$'+((now-nw)*RATE/30).toFixed(2)+' a day';
+document.getElementById('k-dec').textContent=dec+' / '+rows.length}
+function render(){const q=document.getElementById('q').value.toLowerCase();
+const vis=rows.filter(r=>!q||[r.name,r.city,r.country].join(' ').toLowerCase().includes(q));
+vis.sort((a,b)=>{const va=sortK==='all'?nowOf(a):a[sortK],vb=sortK==='all'?nowOf(b):b[sortK];return (va>vb?1:va<vb?-1:0)*sortDir});
+const tb=document.getElementById('tb');tb.innerHTML='';
+for(const r of vis){const c=choices[r.stream_id]||'';const tr=document.createElement('tr');if(!c)tr.className='undecided';
+const opt=(v,l)=>`<label class="${c===v?'on':''}"><span><input type="radio" name="s${r.stream_id}" value="${v}" ${c===v?'checked':''}> ${l}</span><small>${TB(sizeOf(r,v))} · ${USD(sizeOf(r,v))}</small></label>`;
+tr.innerHTML=`<td class="name">${(r.thumbs&&r.thumbs.length)?`<div class="thumbs">${r.thumbs.map((t,i)=>`<img loading="lazy" src="${t}" alt="${["Morning","Midday","Evening"][i]||""} frame from the best 14 days" title="${["Morning","Midday","Evening"][i]||""}, best 14 days">`).join("")}</div>`:`<div class="nothumb">No preview: no playable clip found for this stream</div>`}<div title="${r.name.replace(/"/g,'&quot;')}">${r.name}</div><div class="loc">${[r.city,r.country].filter(Boolean).join(', ')} · #${r.stream_id} · <span class="chip">${r.statuses||''}</span></div></td>
+<td>${fmtD(r.best_start)} – ${fmtD(r.best_end_incl)}<div class="loc">NAS keeps ${fmtD(r.keep_start)} – ${fmtD(new Date(new Date(r.keep_end_excl).getTime()-864e5).toISOString().slice(0,10))}</div></td>
+<td class="n">${r.best_hours}</td><td class="n">${r.days_recorded}<div class="loc">${fmtD(r.first_day)} – ${fmtD(r.last_day)}</div></td>
+<td class="n">${TB(nowOf(r))}<div class="loc">${USD(nowOf(r))}/mo</div></td>
+<td><div class="opts">${opt('none','Nothing')}${opt('st','Kept period, stitched')}${opt('keep','Kept period, raw + stitched')}${opt('all','Everything')}</div></td>`;
+tr.querySelectorAll('.thumbs img').forEach(im=>im.onclick=()=>{const lb=document.getElementById('lb');lb.firstChild.src=im.src;lb.style.display='flex'});tr.querySelectorAll('input').forEach(i=>i.onchange=()=>{choices[r.stream_id]=i.value;dirty=true;st('Unsaved changes');render()});tb.appendChild(tr)}
+kpis()}
+function st(t,ok){const e=document.getElementById('st');e.textContent=t;e.className='status'+(ok?' saved':'')}
+document.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortDir=sortK===k?-sortDir:(k==='name'?1:-1);sortK=k;render()});
+document.getElementById('q').oninput=render;
+document.getElementById('bulk').onchange=e=>{const v=e.target.value;if(!v)return;const q=document.getElementById('q').value.toLowerCase();
+for(const r of rows)if(!q||[r.name,r.city,r.country].join(' ').toLowerCase().includes(q))choices[r.stream_id]=v;e.target.value='';dirty=true;st('Unsaved changes');render()};
+document.getElementById('save').onclick=async()=>{const sel={};for(const r of rows)if(choices[r.stream_id])sel[r.stream_id]={choice:choices[r.stream_id],bytes:sizeOf(r,choices[r.stream_id]),keep_start_utc:r.keep_start_utc,keep_end_utc:r.keep_end_utc};
+const res=await fetch('api/selection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choices:sel})});
+if(res.ok){const j=await res.json();dirty=false;st('Saved '+new Date(j.saved_at).toLocaleString(),true)}else st('Save failed: '+res.status)};
+window.onbeforeunload=()=>dirty?true:undefined;
+Promise.all([fetch('streams.json').then(r=>r.json()),fetch('api/selection',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}))]).then(([d,s])=>{rows=d;for(const[k,v]of Object.entries(s.choices||{}))choices[k]=v.choice;if(s.saved_at)st('Last saved '+new Date(s.saved_at).toLocaleString(),true);render()});
+</script></body></html>
