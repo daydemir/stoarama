@@ -60,11 +60,11 @@ const (
 	// Wire hint retained for compatibility; never grants execution authority.
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
-	// Retain the reconciliation-only release; add only the reviewed client
-	// commit containing the immediate serial lease handoff. Release with
-	// NAS_VERSION=94d39bff (the release script otherwise uses HEAD).
-	nasCleanupExecutionClientVersion       = "be17fd73"
-	nasCleanupSerialExecutionClientVersion = "94d39bff"
+	// Retain reviewed predecessors; the dedicated execution lane and 15 s
+	// client observe guard are released explicitly with NAS_VERSION=523b70ff.
+	nasCleanupExecutionClientVersion          = "be17fd73"
+	nasCleanupSerialExecutionClientVersion    = "94d39bff"
+	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -543,7 +543,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -1014,6 +1014,10 @@ func cleanupObserveReconcile(id int64, attempt int, sha string, proof json.RawMe
 // whether it earns a single-use deletion permit. Both the single-item and the
 // batched endpoint use it; a batch runs each call in its own savepoint.
 func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64, req cleanupObserve, env *cleanupObserveEnv) cleanupObserveResult {
+	permitDeadline := time.Now().Add(nasCleanupExecutionBudget)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(permitDeadline) {
+		permitDeadline = deadline
+	}
 	sessionDeadline, err := cleanupSessionDeadline(ctx, tx, cid, env.session)
 	if err != nil {
 		return cleanupObserveError(503, "cleanup client identity unavailable")
@@ -1211,10 +1215,15 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 	stages, _ := json.Marshal(stageTimings)
 	// Dry runs replace the recovery evidence (or clear it when the copy was not
 	// verified); executions only ever add evidence from a full verification.
-	_, err = tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,
+	// Check at the actual write too: a statement can wait after Go's last
+	// expiry check. A late UPDATE must never record deletion authority.
+	updated, err := tx.Exec(ctx, `UPDATE nas_cleanup_items SET state=$2,delete_ever_issued=delete_ever_issued OR $2='delete_issued',lease_expires_at=NULL,proof=$3::jsonb,proof_sha256=$4,recovery=$5,outcome=$6::jsonb,policy_reason=$7,stage_timings=$8::jsonb,
  recovery_evidence=CASE WHEN $9::boolean THEN $10::jsonb ELSE coalesce($10::jsonb,recovery_evidence) END,
- permit_expires_at=CASE WHEN $2='delete_issued' THEN $11::timestamptz ELSE permit_expires_at END,updated_at=now() WHERE id=$1`,
-		id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages), mode == "dry_run", evidenceJSON, expires)
+ permit_expires_at=CASE WHEN $2='delete_issued' THEN $11::timestamptz ELSE permit_expires_at END,updated_at=now() WHERE id=$1 AND ($2<>'delete_issued' OR clock_timestamp()<$12::timestamptz)`,
+		id, action, proof, cleanupSHA(req.Proof), recovery, string(observed), policyReason, string(stages), mode == "dry_run", evidenceJSON, expires, permitDeadline)
+	if err == nil && updated.RowsAffected() != 1 {
+		return cleanupObserveResult{status: 503, body: map[string]any{"error": "cleanup observation deadline exceeded; retry", "retryable": true}}
+	}
 	// During execution every healthy observation becomes a permit. Anything
 	// else (unverified, conflict, missing, client error, policy or recovery
 	// mismatch, budget) pauses the whole plan in the same transaction.

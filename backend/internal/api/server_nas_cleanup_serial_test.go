@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,7 +36,22 @@ func (t *cleanupSlowPolicyTracer) TraceQueryStart(ctx context.Context, _ *pgx.Co
 func (*cleanupSlowPolicyTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) {
+	testNASCleanupSerialClientServer(t, false)
+}
+
+func TestNASCleanupDedicatedLaneWithSlowJoinedDeliveryClientServer(t *testing.T) {
+	testNASCleanupSerialClientServer(t, true)
+}
+
+func testNASCleanupSerialClientServer(t *testing.T, slowJoined bool) {
 	f := newCleanupFixture(t, 24)
+	version := nasCleanupExecutionClientVersion
+	if slowJoined {
+		version = nasCleanupDedicatedExecutionClientVersion
+		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
+			t.Fatal(err)
+		}
+	}
 	python := os.Getenv("STOARAMA_TEST_PYTHON")
 	if python == "" {
 		python = "python3"
@@ -83,9 +97,12 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 		// between dry run and execution; keep-alive handlers may still unwind.
 		srv := httptest.NewServer(router)
 		defer srv.Close()
-		args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--protocol", "2"}
+		args := []string{script, "run", "--api", srv.URL, "--root", root, "--state", state, "--protocol", "2", "--client-version", version}
 		if concurrent {
 			args = append(args, "--simultaneous-tasks", "16", "--max-seconds", "90")
+		}
+		if slowJoined && f.s.cfg.NASCleanupDeletionEnabled {
+			args = append(args, "--slow-joined-seconds", "5")
 		}
 		raw, err := exec.Command(python, args...).CombinedOutput()
 		if err != nil {
@@ -119,7 +136,7 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 	}
 	defer slowPool.Close()
 	f.s.pool = slowPool
-	result := run(true)
+	result := run(!slowJoined)
 	if len(result.Errors) != 0 || result.Deleted != 16 || result.Unlinks != 32 || len(result.Outcomes) != 16 {
 		t.Fatalf("execution: %+v", result)
 	}
@@ -138,5 +155,9 @@ func TestNASCleanupSixteenContendingWorkersSlowPolicyClientServer(t *testing.T) 
 	if deleted != 16 || unverified != 0 || slowPolicy != 16 {
 		t.Fatalf("deleted=%d unverified=%d slow-policy=%d", deleted, unverified, slowPolicy)
 	}
-	t.Logf("16 contending lease workers, 1.1 s policy each: %s, peak requests=%d", fmt.Sprint(result.Seconds), peak.Load())
+	rate := 60 * 16 / result.Seconds
+	if slowJoined && (rate < 15 || result.JoinedCalls < 2 || result.JoinedCalls > 4) {
+		t.Fatalf("slow joined work interleaved between executions: rate=%.1f/min joined_calls=%d result=%+v", rate, result.JoinedCalls, result)
+	}
+	t.Logf("16 files, slow joined=%t, 1.1 s policy each: %.3f s, %.1f files/min, joined calls=%d, peak requests=%d", slowJoined, result.Seconds, rate, result.JoinedCalls, peak.Load())
 }
