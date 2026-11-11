@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,80 @@ func TestNASCleanupReconciliationRetainsIssuedAuthority(t *testing.T) {
 	}
 	if !pullPathAllowed("POST", "/api/v1/account/connections/cleanup/1/reconcile") {
 		t.Fatal("pull cannot reconcile")
+	}
+}
+
+// A pre-permit writer timeout can safely give up its serial slot. Identity,
+// attempts and monotonic issuance history must survive lost return responses.
+func TestNASCleanupReturnUnusedLeaseGuards(t *testing.T) {
+	f := newCleanupFixture(t, 24)
+	id, sha, _ := f.admit("return-lease", syntheticFiles(100, 1, 1))
+	f.dryRun()
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
+		t.Fatalf("enable: %d %s", code, body)
+	}
+	task := f.leaseV2(1, 1, 1<<30, "")[0]
+	body := cleanupObserve{Attempt: task.Attempt, PlanSHA: sha, Outcome: "unverified", Proof: json.RawMessage("null"), ReturnLease: true}
+	call := func(body cleanupObserve, session string) int {
+		return cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body, session).Code
+	}
+	session := "fixture-boot " + nasCleanupExecutionClientVersion
+	for _, wrong := range []string{"", "other-boot " + nasCleanupExecutionClientVersion, "fixture-boot unreviewed"} {
+		if code := call(body, wrong); code != 409 {
+			t.Fatalf("wrong session returned lease: %q %d", wrong, code)
+		}
+	}
+	wrong := body
+	wrong.Attempt++
+	if code := call(wrong, session); code != 409 {
+		t.Fatalf("wrong attempt returned lease: %d", code)
+	}
+	wrong = body
+	wrong.PlanSHA = strings.Repeat("f", 64)
+	if code := call(wrong, session); code != 409 {
+		t.Fatalf("wrong plan returned lease: %d", code)
+	}
+	if w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 48, 6, "itemId", fmt.Sprint(task.ItemID), body, session); w.Code != 409 {
+		t.Fatalf("foreign connection returned lease: %d", w.Code)
+	}
+	// A return flag cannot be sent to a live observation path to mint authority.
+	wrong = body
+	wrong.Outcome, wrong.Proof = "match", fixtureProof(task.Item)
+	if w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), wrong); w.Code != 400 {
+		t.Fatalf("return flag accepted by observe: %d %s", w.Code, w.Body.String())
+	}
+	if code := call(wrong, session); code != 400 {
+		t.Fatalf("return carried a matching proof: %d", code)
+	}
+	for n := 0; n < 2; n++ {
+		w := cleanupCall(t, f.s.handleAccountNASCleanupReconcile, 47, 5, "itemId", fmt.Sprint(task.ItemID), body, session)
+		var ack map[string]any
+		json.Unmarshal(w.Body.Bytes(), &ack)
+		if w.Code != 200 || ack["action"] != "pending" || ack["delete"] != false {
+			t.Fatalf("return: %d %s", w.Code, w.Body.String())
+		}
+	}
+	if mode, _ := f.planMode(id); mode != "enabled" {
+		t.Fatalf("return paused approval: %s", mode)
+	}
+	next := f.leaseV2(1, 1, 1<<30, "")[0]
+	if next.Attempt != task.Attempt+1 || !nasSpaceAuditJSONEqual(next.ApprovedProof, task.ApprovedProof) {
+		t.Fatal("return changed approved proof or failed to advance attempt")
+	}
+	if code := call(body, session); code != 409 {
+		t.Fatalf("old return affected new lease: %d", code)
+	}
+	if permit := f.observe([]cleanupTask{next}, nil)[0]; !permit.Delete {
+		t.Fatal("returned work did not progress to execution")
+	}
+	body.Attempt = next.Attempt
+	if code := call(body, session); code != 409 {
+		t.Fatalf("issued permit was returned: %d", code)
+	}
+	var issued bool
+	var state string
+	if err := f.pool.QueryRow(f.ctx, `SELECT state,delete_ever_issued FROM nas_cleanup_items WHERE id=$1`, task.ItemID).Scan(&state, &issued); err != nil || !issued || state != "delete_issued" {
+		t.Fatalf("lost issued authority: state=%s issued=%t err=%v", state, issued, err)
 	}
 }

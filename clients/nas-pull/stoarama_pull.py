@@ -1900,6 +1900,10 @@ class CleanupInterrupted(RuntimeError):
     """Cancellation is not evidence of a file conflict."""
 
 
+class CleanupDrainTimeout(CleanupInterrupted):
+    """No writer fence was acquired; return unused work and retry promptly."""
+
+
 class NASMediaFence:
     """Allow concurrent delivery, then fence app writers for deletions only.
 
@@ -1947,8 +1951,10 @@ class NASMediaFence:
     def acquire_cleanup(self, stop_event, deadline):
         with self.condition:
             while self.writers or (self.writers_waiting and self.execution_owner != threading.get_ident()):
-                if stop_event.is_set() or time.monotonic() >= deadline:
-                    raise CleanupInterrupted("cleanup writer fence timed out or cancelled")
+                if stop_event.is_set():
+                    raise CleanupInterrupted("cleanup writer fence cancelled")
+                if time.monotonic() >= deadline:
+                    raise CleanupDrainTimeout("cleanup writer fence timed out")
                 self.condition.wait(0.2)
             self.cleaners += 1
 
@@ -1991,8 +1997,10 @@ class CleanupExecutionLane:
         if self.started is None:
             deadline = time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC
             while not NAS_MEDIA_FENCE.execution_lock.acquire(timeout=0.2):
-                if self.stop_event.is_set() or time.monotonic() >= deadline:
-                    raise CleanupInterrupted("cleanup execution lane timed out or cancelled")
+                if self.stop_event.is_set():
+                    raise CleanupInterrupted("cleanup execution lane cancelled")
+                if time.monotonic() >= deadline:
+                    raise CleanupDrainTimeout("cleanup execution lane timed out")
             with NAS_MEDIA_FENCE.condition:
                 # Pause new joined/collated writers, but keep raw delivery
                 # flowing until active joined writers have consumed its credits.
@@ -3138,7 +3146,7 @@ class CleanupSingleAPI:
 CLEANUP_SINGLE_API = CleanupSingleAPI()
 
 
-def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
+def cleanup_process_task(cfg, inventory, stop_event, task, api=None, lane=None):
     # Both protocols and direct callers reserve before any filesystem/API work.
     owner = cleanup_reserve_item(inventory, task["item_id"])
     if owner is None:
@@ -3151,7 +3159,26 @@ def cleanup_process_task(cfg, inventory, stop_event, task, api=None):
                 if stop_event.is_set():
                     raise CleanupInterrupted("cleanup execution cancelled while queued")
                 acquired = inventory.cleanup_execution_lock.acquire(timeout=0.2)
+        if lane is not None:
+            return lane.run(_cleanup_process_task, cfg, inventory, stop_event, task, api, owner)
         return _cleanup_process_task(cfg, inventory, stop_event, task, api, owner)
+    except CleanupInterrupted as exc:
+        # An observe checkpoint precedes every permit request. Never return a
+        # task with uncertain authority; those checkpoints reconcile normally.
+        if executing and not any(row[0] == task["item_id"] for row in cleanup_journal(inventory)):
+            body = {"attempt": task["attempt"], "plan_sha256": task["plan_sha256"],
+                    "outcome": "unverified", "proof": None, "error": str(exc)[:500],
+                    "client_version": CLIENT_VERSION, "return_lease": True,
+                    "request_id": uuid.uuid4().hex}
+            # Durable before transport: a lost return response replays only to
+            # /reconcile, which can never issue deletion authority.
+            cleanup_journal(inventory, task["item_id"], "observe", body, owner=owner)
+            response = cleanup_api_retry(cfg, "/account/connections/cleanup/%d/reconcile" % task["item_id"], body)
+            cleanup_validate_ack(task["item_id"], "observe", body, response)
+            if response.get("delete") is not False or response.get("action") != "pending":
+                raise CleanupResponseError("unused cleanup lease was not returned")
+            cleanup_journal(inventory, task["item_id"], owner=owner)
+        raise
     finally:
         if acquired:
             inventory.cleanup_execution_lock.release()
@@ -3364,7 +3391,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                         for future in pending:
                             completed(future)
                         pending.clear()
-                        lane.run(cleanup_process_task, cfg, inventory, stop_event, task)
+                        cleanup_process_task(cfg, inventory, stop_event, task, lane=lane)
                         continue  # receipt acknowledged: request the next serial lease now
                     lane.close()
                     pending.add(executor.submit(cleanup_process_task, cfg, inventory, stop_event, task))
@@ -3406,6 +3433,7 @@ CLEANUP_BATCH_LINGER_SEC = 0.02
 CLEANUP_RETRY_DELAYS = (0.25, 0.5, 1, 2, 4)
 CLEANUP_V2_FALLBACK_SEC = 3600
 CLEANUP_V2_ERROR_WAIT_SEC = 15
+CLEANUP_DRAIN_RETRY_SEC = 2
 CLEANUP_RETRYABLE_ATTEMPTS = 8
 
 
@@ -3710,7 +3738,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                         for future in pending:
                             completed(future)
                         pending.clear()
-                        lane.run(cleanup_process_task, cfg, inventory, stop_event, task, api)
+                        cleanup_process_task(cfg, inventory, stop_event, task, api, lane=lane)
                         continue
                     lane.close()
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
@@ -3763,6 +3791,10 @@ def cleanup_loop(cfg, inventory, stop_event, verified_event=None):
                     if retry is None:
                         retry = cleanup_batch(cfg, inventory, stop_event, executor, verified_event=verified_event)
                     wait = 0 if retry == 0 else restore_wait(retry)
+                except CleanupDrainTimeout as exc:
+                    log("INFO", "NAS cleanup writer drain deferred: %s; retrying in %ds" % (exc, CLEANUP_DRAIN_RETRY_SEC))
+                    CLEANUP_STATUS.add("drain_timeouts")
+                    wait = CLEANUP_DRAIN_RETRY_SEC
                 except Exception as exc:
                     log("WARN", "NAS cleanup deferred: %s" % exc)
                     CLEANUP_STATUS.fail("cycle: %s: %s" % (type(exc).__name__, exc))
@@ -9010,8 +9042,9 @@ def restore_loop(cfg, stop_event, rng=random):
 
 def drain_page(cfg, runtime, inventory=None):
     require_storage_capacity(cfg, runtime)
-    page = request_json(
-        cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)
+    page, list_retries = retry_transient(
+        lambda: request_json(cfg, "GET", "/account/clips?after_id=%d&limit=%d" % (runtime.cursor_id, LIST_PAGE_LIMIT)),
+        runtime.cursor_id, "drain-list",
     )
     clips = page.get("clips", [])
     if not isinstance(clips, list):
@@ -9034,7 +9067,7 @@ def drain_page(cfg, runtime, inventory=None):
     successes = []
     prepared = [result for _, result, error in results if error is None]
     downloaded_bytes = sum(result[2] for result in prepared)
-    retries = sum(result[3] for result in prepared) + sum(
+    retries = list_retries + sum(result[3] for result in prepared) + sum(
         error.retries for _, _, error in results if isinstance(error, RetryExhausted)
     )
     clip_by_id = {int(clip["clip_id"]): clip for clip in clips}

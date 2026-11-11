@@ -73,7 +73,8 @@ def run(args):
     cfg = SimpleNamespace(api_base=args.api, api_key="bench", output_dir=Path(args.root), state_dir=state,
                           inventory_file=state / "inventory.sqlite3", dry_run=False,
                           progress_file=state / "progress.json", legacy_progress_file=state / "cursor.json",
-                          runtime_file=state / "runtime.json", download_workers=12)
+                          runtime_file=state / "runtime.json", download_workers=12,
+                          min_free_bytes=0, capacity_file=state / "capacity.json")
     inventory = pull.Inventory(cfg)
     stop = threading.Event()
     root = str(Path(args.root))
@@ -87,6 +88,9 @@ def run(args):
     maintenance_threads = []
     if args.slow_joined_seconds:
         runtime = pull.Runtime(cfg)
+        # Disposable fixtures reserve zero bytes; do not require the production
+        # resume watermark on the developer machine's temporary filesystem.
+        runtime.capacity_blocked = False
         runtime.apply_joined_protocol_response({
             "ok": True, "joined_delivery_accepted": True, "joined_protocol_version": 1,
             "joined_protocol_generation": pull.JOINED_FAIR_SHARE_MIN_GENERATION,
@@ -100,6 +104,8 @@ def run(args):
             pull.await_joined_work(cfg, runtime, maintenance_stop)
         @pull.NAS_MEDIA_FENCE.delivery
         def raw_work():
+            if args.drain_timeout_recovery:
+                pull.drain_page(cfg, runtime)
             raw_calls[0] += 1
             runtime.grant_joined_work_credit()
         def delivery():
@@ -110,8 +116,11 @@ def run(args):
                     if not maintenance_stop.is_set():
                         raise
         def raw_delivery():
-            while not maintenance_stop.wait(.05):
-                raw_work()
+            try:
+                while not maintenance_stop.wait(.05):
+                    raw_work()
+            except Exception as exc:
+                errors.append(str(exc))
         # Keep joined writers queued, with raw progress required to drain
         # each active writer. Only a bounded execution window can pause raw.
         maintenance_threads = [threading.Thread(target=target, daemon=True)
@@ -124,51 +133,68 @@ def run(args):
         for worker in maintenance_threads:
             worker.start()
         try:
-            while time.monotonic() - started < args.max_seconds:
-                cycles += 1
-                if args.simultaneous_tasks:
-                    # Sixteen real workers contend for execution leases. The
-                    # server must serialize them even when each asks for many.
-                    barrier = threading.Barrier(args.simultaneous_tasks)
-                    progress_lock = threading.Lock()
-                    completed = 0
-                    def contend():
-                        nonlocal completed
-                        barrier.wait(timeout=10)
-                        while time.monotonic() - started < args.max_seconds:
-                            with progress_lock:
-                                if completed >= args.simultaneous_tasks:
-                                    return
-                            lease = pull.cleanup_lease_v2(cfg, args.simultaneous_tasks, args.simultaneous_tasks, 1 << 30)
-                            if not lease["tasks"]:
-                                time.sleep(0.1)
-                                continue
-                            for task in lease["tasks"]:
-                                pull.cleanup_process_task(cfg, inventory, stop, task, api)
+            if args.drain_timeout_recovery:
+                batch = pull.cleanup_batch_v2
+                def until_idle(*batch_args, **kwargs):
+                    nonlocal cycles
+                    cycles += 1
+                    retry = batch(*batch_args, **kwargs)
+                    if retry:
+                        stop.set()
+                    return retry
+                watchdog = threading.Timer(args.max_seconds, stop.set)
+                watchdog.start()
+                try:
+                    with mock.patch.object(pull, "cleanup_batch_v2", side_effect=until_idle):
+                        pull.cleanup_loop(cfg, inventory, stop)
+                finally:
+                    watchdog.cancel()
+            else:
+                while time.monotonic() - started < args.max_seconds:
+                    cycles += 1
+                    if args.simultaneous_tasks:
+                        # Sixteen real workers contend for execution leases. The
+                        # server must serialize them even when each asks for many.
+                        barrier = threading.Barrier(args.simultaneous_tasks)
+                        progress_lock = threading.Lock()
+                        completed = 0
+                        def contend():
+                            nonlocal completed
+                            barrier.wait(timeout=10)
+                            while time.monotonic() - started < args.max_seconds:
                                 with progress_lock:
-                                    completed += 1
-                    futures = [executor.submit(contend) for _ in range(args.simultaneous_tasks)]
-                    for future in futures:
-                        try:
-                            future.result()
-                        except Exception as exc:
-                            errors.append(str(exc))
-                    break
-                if args.one_attempt:
-                    lease = (pull.cleanup_lease_v2(cfg, 1, 1, 1 << 30) if args.protocol == 2
-                             else pull.cleanup_lease(cfg))
-                    for task in lease["tasks"]:
-                        try:
-                            pull.cleanup_process_task(cfg, inventory, stop, task, api)
-                        except Exception as exc:
-                            errors.append(str(exc))
-                    break
-                if args.protocol == 2:
-                    retry = pull.cleanup_batch_v2(cfg, inventory, stop, executor, api)
-                else:
-                    retry = pull.cleanup_batch(cfg, inventory, stop, executor)
-                if retry:
-                    break
+                                    if completed >= args.simultaneous_tasks:
+                                        return
+                                lease = pull.cleanup_lease_v2(cfg, args.simultaneous_tasks, args.simultaneous_tasks, 1 << 30)
+                                if not lease["tasks"]:
+                                    time.sleep(0.1)
+                                    continue
+                                for task in lease["tasks"]:
+                                    pull.cleanup_process_task(cfg, inventory, stop, task, api)
+                                    with progress_lock:
+                                        completed += 1
+                        futures = [executor.submit(contend) for _ in range(args.simultaneous_tasks)]
+                        for future in futures:
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                errors.append(str(exc))
+                        break
+                    if args.one_attempt:
+                        lease = (pull.cleanup_lease_v2(cfg, 1, 1, 1 << 30) if args.protocol == 2
+                                 else pull.cleanup_lease(cfg))
+                        for task in lease["tasks"]:
+                            try:
+                                pull.cleanup_process_task(cfg, inventory, stop, task, api)
+                            except Exception as exc:
+                                errors.append(str(exc))
+                        break
+                    if args.protocol == 2:
+                        retry = pull.cleanup_batch_v2(cfg, inventory, stop, executor, api)
+                    else:
+                        retry = pull.cleanup_batch(cfg, inventory, stop, executor)
+                    if retry:
+                        break
         finally:
             maintenance_stop.set()
             for worker in maintenance_threads:
@@ -187,6 +213,7 @@ def run(args):
     print("BENCH_RESULT " + json.dumps({"protocol": args.protocol, "seconds": round(elapsed, 3), "cycles": cycles,
                                        "ledger_deleted": deleted, "unlink_calls": unlink.call_count,
                                        "joined_calls": maintenance_calls[0], "raw_calls": raw_calls[0],
+                                       "drain_timeouts": pull.CLEANUP_STATUS.snapshot()[0].get("drain_timeouts", 0),
                                        "errors": errors, "execution_outcomes": outcomes}), flush=True)
 
 
@@ -210,6 +237,7 @@ def main():
     r.add_argument("--simultaneous-tasks", type=int, default=0, help="contend for execution leases with this many workers (regression harness only)")
     r.add_argument("--one-attempt", action="store_true", help="exercise one lease without replaying an uncertain observation")
     r.add_argument("--slow-joined-seconds", type=float, default=0, help="continuously queue slow delivery work behind the real media fence")
+    r.add_argument("--drain-timeout-recovery", action="store_true", help="run the real cleanup loop with long delivery and raw-list 502s")
     args = parser.parse_args()
     (prepare if args.command == "prepare" else run)(args)
 
