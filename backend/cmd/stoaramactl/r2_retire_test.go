@@ -705,6 +705,16 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal("stale NAS proof accepted")
 		}
 		exec(`UPDATE nas_inventory_files SET verified_at=now() WHERE clip_id=301`)
+		store.beforeHead = func(key string) {
+			if key == "managed/acct-47/301.mp4" {
+				writePicks("all")
+			}
+		}
+		if _, err := apply(o); err == nil {
+			t.Fatal("pick changed during HEAD accepted")
+		}
+		store.beforeHead = nil
+		writePicks("none")
 		store.deleteErr = errors.New("injected R2 failure")
 		if _, err := apply(o); err == nil {
 			t.Fatal("R2 failure accepted")

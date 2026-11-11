@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"github.com/daydemir/stoarama/backend/internal/r2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -70,5 +73,26 @@ func TestR2RetireListingDigestBucketAndAge(t *testing.T) {
 		if _, err := readR2RetireListing(file, sha, "stoarama"); err == nil {
 			t.Fatal("bucket/age drift accepted")
 		}
+	}
+}
+
+type r2RetireTestLister struct{}
+
+func (r2RetireTestLister) ListPrefix(ctx context.Context, prefix string, _ int, fn func(r2.ObjectInfo) error) error {
+	if prefix == "broken/" {
+		return errors.New("listing failed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fn(r2.ObjectInfo{Key: prefix + "a", SizeBytes: 100, ETag: "e"})
+}
+func TestR2RetireParallelListingFailsClosed(t *testing.T) {
+	objects, err := r2RetireLiveObjects(context.Background(), r2RetireTestLister{}, []string{"managed/a/", "managed/b/", "joined/v/"})
+	if err != nil || len(objects) != 3 {
+		t.Fatalf("objects=%d err=%v", len(objects), err)
+	}
+	if objects, err := r2RetireLiveObjects(context.Background(), r2RetireTestLister{}, []string{"managed/a/", "broken/"}); err == nil || objects != nil {
+		t.Fatal("partial listing accepted")
 	}
 }

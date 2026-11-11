@@ -11,6 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/daydemir/stoarama/backend/internal/api"
@@ -38,6 +41,7 @@ type r2RetirePhaseSummary struct {
 	Manifests           map[r2RetirePhase]string                 `json:"manifests_sha256"`
 	CatalogAbsent       r2RetireStat                             `json:"catalog_already_absent_from_r2"`
 	NASRawRetainedBytes int64                                    `json:"nas_raw_retained_bytes"`
+	NASFreeReportedAt   *time.Time                               `json:"nas_free_reported_at"`
 	NASFreeBytes        int64                                    `json:"nas_free_bytes"`
 	NASReserveBytes     int64                                    `json:"nas_reserve_bytes"`
 	CopyFits            bool                                     `json:"copy_fits_with_reserve"`
@@ -144,6 +148,15 @@ func (p *r2RetirePhaseSummary) write(out string, h r2RetireHeader) error {
 		return err
 	}
 	p.Phase1SHA256 = digest
+	for key := range h.Choices {
+		id, err := strconv.ParseInt(key, 10, 64)
+		if err != nil {
+			return err
+		}
+		if p.Streams[id] == nil {
+			p.Streams[id] = map[r2RetirePhase]r2RetireStat{}
+		}
+	}
 	ids := make([]int64, 0, len(p.Streams))
 	for id := range p.Streams {
 		ids = append(ids, id)
@@ -164,14 +177,106 @@ func (p *r2RetirePhaseSummary) write(out string, h r2RetireHeader) error {
 
 // List exact current keys instead of treating stale catalog rows as billed R2
 // bytes. ETags are bound in the manifest and conditionally checked at deletion.
-func r2RetireLiveObjects(ctx context.Context, store *r2.Client) (map[string]r2.ObjectInfo, error) {
+func r2RetireLiveObjects(ctx context.Context, store interface {
+	ListPrefix(context.Context, string, int, func(r2.ObjectInfo) error) error
+}, prefixes []string) (map[string]r2.ObjectInfo, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	objects := map[string]r2.ObjectInfo{}
-	for _, prefix := range []string{"managed/", "joined/"} {
-		if err := store.ListPrefix(ctx, prefix, 0, func(o r2.ObjectInfo) error { objects[o.Key] = o; return nil }); err != nil {
-			return nil, err
-		}
+	var mu sync.Mutex
+	var first error
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, 8)
+	for _, prefix := range prefixes {
+		wg.Add(1)
+		go func(prefix string) {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-slots }()
+			err := store.ListPrefix(ctx, prefix, 0, func(o r2.ObjectInfo) error { mu.Lock(); defer mu.Unlock(); objects[o.Key] = o; return nil })
+			if err != nil {
+				mu.Lock()
+				if first == nil {
+					first = err
+					cancel()
+				}
+				mu.Unlock()
+			}
+		}(prefix)
+	}
+	wg.Wait()
+	if first != nil {
+		return nil, first
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return objects, nil
+}
+
+// The catalog's complete folder/version prefixes can be listed concurrently.
+// Never enumerate other accounts or unrelated historical prefixes to decide
+// whether these exact catalog objects exist. Unmapped keys within scope stay.
+func r2RetirePrefixes(ctx context.Context, q r2RetireQuerier, accountID int64, bucket string) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT DISTINCT prefix FROM (
+ SELECT CASE WHEN split_part(c.object_key,'/',4)='' THEN split_part(c.object_key,'/',1)||'/'||split_part(c.object_key,'/',2)||'/'
+ ELSE split_part(c.object_key,'/',1)||'/'||split_part(c.object_key,'/',2)||'/'||split_part(c.object_key,'/',3)||'/' END prefix
+ FROM recording_clips c JOIN recordings r ON r.id=c.recording_id
+ WHERE r.account_id=$1 AND c.bucket=$2 AND c.purged_at IS NULL AND c.object_key LIKE 'managed/%/%'
+ UNION
+ SELECT split_part(o.object_key,'/',1)||'/'||split_part(o.object_key,'/',2)||'/'
+ FROM recording_collation_outputs o JOIN recording_collation_hours h ON h.id=o.collation_hour_id JOIN recordings r ON r.id=h.recording_id
+ WHERE r.account_id=$1 AND o.object_key LIKE 'joined/%/%') p ORDER BY prefix`, accountID, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var prefixes []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		if len(prefixes) == 0 || !strings.HasPrefix(p, prefixes[len(prefixes)-1]) {
+			prefixes = append(prefixes, p)
+		}
+	}
+	return prefixes, rows.Err()
+}
+
+func writeR2RetireListing(path, bucket string, prefixes []string, objects map[string]r2.ObjectInfo) (string, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	hash := sha256.New()
+	w := bufio.NewWriter(io.MultiWriter(f, hash))
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(map[string]any{"bucket": bucket, "listed_at": time.Now().UTC(), "prefixes": prefixes, "objects": len(objects)}); err != nil {
+		return "", err
+	}
+	keys := make([]string, 0, len(objects))
+	for key := range objects {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := enc.Encode(objects[key]); err != nil {
+			return "", err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return "", err
+	}
+	if err := f.Sync(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // A planning manifest is not deletion authority. Every item is reselected under

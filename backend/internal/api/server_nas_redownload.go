@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -122,3 +123,14 @@ SELECT coalesce(r.stream_id,0),coalesce(c.bucket,''),coalesce(c.object_key,''),l
  'timestamp_contract_reason',to_jsonb(c)->'timestamp_contract_reason'),to_jsonb(c)->>'capture_lease_token'
 FROM recording_clips c JOIN recordings r ON r.id=c.recording_id LEFT JOIN streams s ON s.id=r.stream_id
 WHERE c.id=$1 AND r.account_id=$2`
+
+// LockNASCleanupR2Retirement shares admission/activation fencing with the
+// operator CLI. Keep the lock order here so API and CLI cannot drift apart.
+func LockNASCleanupR2Retirement(ctx context.Context, tx pgx.Tx) error {
+	for _, key := range []int64{nasCleanupAdmissionLock, nasCleanupPublicFence} {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}

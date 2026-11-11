@@ -10,9 +10,11 @@ Extend `stoaramactl r2-retire plan` with `--nas-backed --connection-id 13`.
 The saved pick must match the pinned keep28 window and timezone, policy SHA
 `060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811`.
 `all` and unknown picks stay. The existing prefix protections stay.
-A current R2 listing of `managed/` and `joined/` supplies exact keys, ETags and
-sizes; missing catalog objects do not count as savings. Uncatalogued/purged keys
-in those prefixes are blocked, with stream 0. Other bucket prefixes are outside
+A current R2 listing of the account catalog's managed folder and joined-version
+prefixes supplies exact keys, ETags and sizes; missing catalog objects do not count as savings. Uncatalogued/purged keys
+in those prefixes are blocked, with stream 0. The checksummed `r2-listing.jsonl`
+records the exact prefixes; eight concurrent listing workers avoid serializing
+millions of keys. Other bucket prefixes are outside
 this estimate. $/month = decimal bytes / 1e12 * $15; requests are not deducted.
 
 Every phase is an exact JSONL manifest with bucket, key, size, SHA/ETag and
@@ -128,7 +130,13 @@ the bucket/key from clip ID and account ownership. It checks the expected
 SHA/size, canonical timezone and intersection with the same pinned keep28 window,
 refuses purged/retired/reserved/cleanup-held files, HEADs the exact R2 identity,
 and signs an exact If-Match GET for 15 minutes. It changes no DB or lifecycle
-state, including for released clips. No credential is moved to Jelly or the NAS.
+state, including for released clips. Persistent credentials stay on their current
+machines; the NAS uses its existing connection key and the short-lived GET.
+
+Perform the copy between cleanup batches, with no enabled plan/batch and the
+cleanup master OFF. Gracefully drain the Jelly runner using its existing STOP
+mechanism and wait for `phase=stopped`; never pause an enabled plan or force-kill
+the runner to copy/deploy. Phase-1 R2 apply does not require that drain.
 
 Stop the ordinary NAS pull process first, then run the reviewed single-file
 client in the **existing connection-13 container configuration**, with its usual
