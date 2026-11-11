@@ -74,6 +74,17 @@ report again when stale. Each R2 delete uses `If-Match` on the manifest ETag,
 rechecks HEAD size/SHA metadata, and requires a missing-object HEAD afterward.
 The existing fsynced intent/done ledger, DB receipts and byte budgets remain.
 
+Cloudflare's [compatibility table](https://developers.cloudflare.com/r2/api/s3/api/)
+and [conditional-write documentation](https://developers.cloudflare.com/r2/api/s3/conditional-operations/)
+do not document conditional `DeleteObject`. NAS-backed apply therefore also
+requires a checksummed proof from the **operator-only**
+`ops/jelly/r2-retire/verify_conditional_delete.py` probe, no older than 24 hours.
+It creates one random 64-byte scratch key, requires a wrong ETag delete to return
+`PreconditionFailed` with identical bytes still readable, then confirms a matching
+ETag delete. If unsupported or ignored, it writes no proof and apply stays
+blocked. Never remove the precondition or substitute an unconditional delete.
+The implementation agent does not run this probe or any DELETE.
+
 ## Operator phase 1
 
 On Jelly, use the reviewed binary and plan paths in the delivered `OPERATOR.md`.
@@ -90,6 +101,8 @@ stoaramactl migrate up --dir /path/to/reviewed/infra/sql/migrations
 stoaramactl r2-retire apply \
   --manifest ~/r2-retire-plans/RUN/phase1.jsonl \
   --expected-sha256 PHASE1_SHA256 --max-bytes PHASE1_BYTES \
+  --conditional-delete-proof ~/r2-retire-plans/RUN/delete-proof.json \
+  --expected-delete-proof-sha256 DELETE_PROOF_SHA256 \
   --budget-24h-bytes 5000000000000 --rate 10 \
   --ledger ~/r2-retire-plans/RUN/phase1-receipts.jsonl --json
 ```

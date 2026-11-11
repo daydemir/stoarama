@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -686,6 +688,14 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 			t.Fatal(err)
 		}
 		o := opts
+		proofRaw := []byte(fmt.Sprintf(`{"bucket":"stoarama","created_at":%q,"wrong_etag_rejected":true,"object_preserved":true,"matching_delete_confirmed":true}`, time.Now().Format(time.RFC3339)))
+		proofPath := filepath.Join(t.TempDir(), "proof.json")
+		if err := os.WriteFile(proofPath, proofRaw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		proofSHA := sha256.Sum256(proofRaw)
+		o.DeleteProofPath = proofPath
+		o.DeleteProofSHA256 = hex.EncodeToString(proofSHA[:])
 		o.ManifestPath = manifest
 		o.ExpectedSHA = digest
 		o.LedgerPath = filepath.Join(t.TempDir(), "ledger.jsonl")
