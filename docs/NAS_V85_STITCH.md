@@ -272,7 +272,7 @@ building never unlinks or writes through a source descriptor. New leases pause
 conservatively while any cleanup source freeze exists. Registration replay is
 metadata-only and retains already verified outputs.
 
-The explicit future client release is **`NAS_VERSION=v85r-server-switch-v1`**,
+The explicit future client release is **`NAS_VERSION=v85r-corpus-ua-v1`** (predecessor `v85r-server-switch-v1`),
 allowlisted alongside reviewed predecessors, including `v85r-fence-progress-v1`
 and `joined-marker-recovery-v1`.
 Build that release from merged `main` with this explicit label. Local stitched
