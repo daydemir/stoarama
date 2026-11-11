@@ -102,6 +102,13 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		if kind == "collated" {
 			extra = r2RetireCollatedExactSQL
 		}
+		if !single {
+			path := "c.display_path"
+			if kind == "collated" {
+				path = "o.nas_relative_path"
+			}
+			extra = ", false, coalesce(" + path + ",'')" // One exact-NAS planning snapshot in sets.
+		}
 		anchor := "\nFROM recording_clips c\nJOIN recordings"
 		if kind == "collated" {
 			anchor = "\nFROM recording_collation_outputs o\nJOIN recording_collation_hours"
@@ -150,10 +157,16 @@ func r2RetireScanCandidate(kind string, rows pgx.Row, nasBacked bool) (r2RetireC
 	return c, nil
 }
 
-// r2RetireSets are catalog-wide observations applied in Go: NAS cleanup plan
-// manifests (non-retired or delete-issued plans), joined artifact keys, and
-// stitched output keys (shared or duplicated keys are kept).
+type r2RetireNASIdentity struct {
+	Path, SHA256 string
+	SizeBytes    int64
+}
+
+// r2RetireSets binds cleanup protections, shared/reference keys and the exact
+// NAS planning snapshot. Apply always reads NAS identity and freshness live.
 type r2RetireSets struct {
+	ExactRaw       map[int64]r2RetireNASIdentity
+	ExactPaths     map[r2RetireNASIdentity]bool
 	HeldRaw        map[int64]bool
 	HeldCollated   map[int64]bool
 	ArtifactKeys   map[string]bool
@@ -180,6 +193,18 @@ func (s r2RetireSets) apply(c *r2RetireCandidate) {
 	if s.ArtifactKeys[c.ObjectKey] {
 		c.Facts.JoinedRef = true
 	}
+}
+
+func (s r2RetireSets) applyPlanNAS(c *r2RetireCandidate) {
+	identity := r2RetireNASIdentity{c.RelativePath, c.SHA256, c.SizeBytes}
+	if c.Kind == "raw" {
+		got, ok := s.ExactRaw[c.SourceID]
+		c.Facts.ExactNAS = ok && got == identity
+		return
+	}
+	c.Facts.ExactNAS = s.ExactPaths[identity]
+	identity.Path = "joined/" + identity.Path
+	c.Facts.ExactNAS = c.Facts.ExactNAS || s.ExactPaths[identity]
 }
 
 const r2RetirePlanManifestSQL = `
@@ -287,6 +312,38 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest string, n
 		}
 	}
 
+	if nasBacked && manifest == "" {
+		// PostgreSQL otherwise rebuilds a full fresh-inventory hash for every
+		// page. Apply never uses this snapshot: its single-row query stays live.
+		s.ExactRaw = map[int64]r2RetireNASIdentity{}
+		s.ExactPaths = map[r2RetireNASIdentity]bool{}
+		rows, err := q.Query(ctx, `SELECT clip_id,relative_path,sha256,size_bytes,
+ coalesce(sidecar_size_bytes>0 AND sidecar_sha256 ~ '^[a-f0-9]{64}$',false)
+ FROM nas_inventory_files WHERE connection_id=13 AND state='present'
+ AND verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
+ AND server_received_at>=now()-interval '24 hours'`)
+		if err != nil {
+			return s, err
+		}
+		for rows.Next() {
+			var id int64
+			var identity r2RetireNASIdentity
+			var sidecar bool
+			if err := rows.Scan(&id, &identity.Path, &identity.SHA256, &identity.SizeBytes, &sidecar); err != nil {
+				rows.Close()
+				return s, err
+			}
+			s.ExactPaths[identity] = true
+			if sidecar {
+				s.ExactRaw[id] = identity
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return s, err
+		}
+	}
+
 	var has bool
 	if err := q.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&has); err != nil {
 		return s, err
@@ -363,6 +420,9 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 		}
 		for i := range page {
 			sets.apply(&page[i])
+			if scope.NASBacked {
+				sets.applyPlanNAS(&page[i])
+			}
 			if err := fn(page[i]); err != nil {
 				return err
 			}
