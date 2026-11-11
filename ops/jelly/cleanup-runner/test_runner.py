@@ -475,20 +475,20 @@ class SafetyRegressionTests(unittest.TestCase):
 
 
 class RenderOffTests(unittest.TestCase):
-    def make_render(self, job, failures=()):
+    def make_render(self, job, failures=(), enabled=False):
         # Model Render's env snapshots: PUT changes configuration, never the live process.
         self.calls = []
-        self.config = 'true'
+        self.config = 'false' if enabled else 'true'
         self.deploys = {
-            'old': dict(id='old', status='live', commit={'id': 'd'*40}, env='true'),
-            'on': dict(id='on', status='build_in_progress', commit={'id': 'd'*40}, env='true')}
+            'old': dict(id='old', status='live', commit={'id': 'd'*40}, env=self.config),
+            'on': dict(id='on', status='canceled' if enabled else 'build_in_progress', commit={'id': 'd'*40}, env='true')}
         self.failures = list(failures)
         self.created = []
         def render(method, path, body=None):
             self.calls.append((method, path, body))
             if method == 'PUT':
                 self.assertEqual(path, '/env-vars/NAS_CLEANUP_DELETION_ENABLED')
-                self.assertEqual(body, {'value': 'false'})
+                self.assertEqual(body, {'value': 'true' if enabled else 'false'})
                 if self.failures and self.failures[0] == 'put':
                     self.failures.pop(0)
                     raise r.Halt('HTTP request failed (PUT)')
@@ -630,8 +630,169 @@ class RenderOffTests(unittest.TestCase):
                         patch.object(r.sys, 'stderr', new=io.StringIO()):
                     r.Runner.master(job, False, emergency=True)
                 sleep.assert_called_once_with(15)
-                self.assertEqual(len(self.created), 2 if timeout else 1)
+                self.assertEqual(len(self.created), 1)
                 self.assertEqual(job.events.count('notify'), int(timeout))
+
+    def inject_reads(self, job, target, errors, enabled=False):
+        render, plan = job.render, job.plan
+        remaining = list(errors)
+        def fail():
+            if remaining:
+                raise remaining.pop(0)
+        def flaky_render(method, path, body=None):
+            if method == 'GET':
+                runtime_read = any(c[0] == 'runtime' for c in self.calls)
+                matches = (
+                    target == 'list' and path == '/deploys?limit=100' and not self.created
+                    or target == 'status' and path.startswith('/deploys/')
+                    or target == 'live' and path == '/deploys?limit=100' and self.created and not runtime_read
+                    or target == 'final_live' and path == '/deploys?limit=100' and runtime_read
+                    or target == 'env' and path == '/env-vars/NAS_CLEANUP_DELETION_ENABLED')
+                if matches:
+                    fail()
+            return render(method, path, body)
+        def flaky_plan(pid):
+            if target == 'plan':
+                fail()
+            return plan(pid)
+        def flaky_query(sql):
+            if target == 'query':
+                fail()
+            return {'plans': [], 'batches': 0} if enabled else 42
+        job.render, job.plan, job.query = flaky_render, flaky_plan, flaky_query
+        if enabled:
+            job.idle = lambda: r.Runner.idle(job)
+            job.active = lambda: r.Runner.active(job)
+        elif target == 'query':
+            job.status['current_plan'] = None
+        return remaining
+
+    def transient_errors(self):
+        errors = [r.urllib.error.HTTPError('https://example.invalid', code, 'fake-sensitive-body', {}, io.BytesIO())
+                  for code in (429, 503)]
+        for error in errors:
+            self.addCleanup(error.close)
+        return errors + [TimeoutError('fake-sensitive-timeout')]
+
+    def test_off_transient_reads_during_redeploy_wait_converge(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            self.make_render(job)
+            render = job.render
+            replies = [dict(id='off-0', status='build_in_progress')]
+            replies.extend(self.transient_errors())
+            def delayed(method, path, body=None):
+                if method == 'GET' and path == '/deploys/off-0' and replies:
+                    reply = replies.pop(0)
+                    if isinstance(reply, Exception):
+                        raise reply
+                    return reply
+                return render(method, path, body)
+            job.render = delayed
+            with patch.object(r.time, 'sleep') as sleep, \
+                    patch.object(r.sys, 'stderr', new=io.StringIO()):
+                r.Runner.master(job, False)
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [15, 5, 10, 20])
+            self.assertEqual(self.created, ['off-0'])
+            self.assertEqual(job.status['phase'], 'master_false')
+            self.assertEqual(job.events, [])
+
+    def test_off_retries_each_read_without_recreating_or_canceling_its_false_deploy(self):
+        for target in ('list', 'status', 'live', 'env', 'plan', 'query', 'final_live'):
+            for error in self.transient_errors():
+                with self.subTest(target=target, error=getattr(error, 'code', type(error).__name__)), tempfile.TemporaryDirectory() as root:
+                    job = FakeRunner(root)
+                    self.make_render(job)
+                    remaining = self.inject_reads(job, target, [error, error])
+                    with patch.object(r.time, 'sleep') as sleep, \
+                            patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                        r.Runner.master(job, False)
+                    self.assertEqual(remaining, [])
+                    self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10])
+                    self.assertEqual(self.created, ['off-0'])
+                    self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
+                    self.assertEqual(self.deploys['off-0']['env'], 'false')
+                    self.assertEqual(self.deploys['off-0']['status'], 'live')
+                    self.assertEqual(job.status['phase'], 'master_false')
+                    self.assertEqual(job.events, [])
+                    log = (Path(root) / 'runner.jsonl').read_text()
+                    self.assertEqual(len(log.splitlines()), 2)
+                    self.assertIn('STEP FAILED: OFF', stderr.getvalue())
+                    self.assertNotIn('fake-sensitive', log + stderr.getvalue())
+
+    def test_off_resumes_same_deploy_after_exhausted_reads_at_every_verification_step(self):
+        for target in ('status', 'live', 'env', 'plan', 'query', 'final_live'):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                self.make_render(job)
+                remaining = self.inject_reads(job, target, [TimeoutError('private')] * 7)
+                with patch.object(r.time, 'sleep') as sleep, \
+                        patch.object(r.sys, 'stderr', new=io.StringIO()):
+                    r.Runner.master(job, False)
+                self.assertEqual(remaining, [])
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10, 20, 30, 30, 25, 15])
+                self.assertEqual(job.events, ['notify'])
+                self.assertEqual(self.created, ['off-0'])
+                self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
+                self.assertEqual(sum(c[0] == 'PUT' for c in self.calls), 2)
+                self.assertEqual(job.status['phase'], 'master_false')
+
+    def test_persistent_off_status_failure_keeps_alerting_and_never_cancels_own_deploy(self):
+        class EndTest(BaseException): pass
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            self.make_render(job)
+            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * 14)
+            def sleep(delay):
+                if job.events.count('notify') == 2:
+                    raise EndTest
+            with patch.object(r.time, 'sleep', side_effect=sleep), \
+                    patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                with self.assertRaises(EndTest):
+                    r.Runner.master(job, False)
+            self.assertEqual(job.events, ['notify', 'notify'])
+            self.assertEqual(stderr.getvalue().count('MASTER OFF NOT CONFIRMED'), 2)
+            self.assertEqual(self.created, ['off-0'])
+            self.assertEqual(self.deploys['off-0']['status'], 'created')
+            self.assertNotEqual(job.status.get('phase'), 'master_false')
+            self.assertEqual([c[1] for c in self.calls if c[0] == 'POST' and c[1].endswith('/cancel')], ['/deploys/on/cancel'])
+            rows = [json.loads(line) for line in (Path(root) / 'runner.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 14)
+            self.assertTrue(all(row['step'] == 'OFF deploy status GET' for row in rows))
+            self.assertNotIn('fake-sensitive', stderr.getvalue() + json.dumps(rows))
+
+    def test_on_retries_reads_without_replaying_mutations(self):
+        for target in ('query', 'list', 'status', 'live', 'env', 'plan'):
+            for error in self.transient_errors():
+                with self.subTest(target=target, error=getattr(error, 'code', type(error).__name__)), tempfile.TemporaryDirectory() as root:
+                    job = FakeRunner(root)
+                    self.make_render(job, enabled=True)
+                    remaining = self.inject_reads(job, target, [error, error], enabled=True)
+                    with patch.object(r.time, 'sleep') as sleep, \
+                            patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                        r.Runner.master(job, True)
+                    self.assertEqual(remaining, [])
+                    self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10])
+                    self.assertEqual(len(self.created), 1)
+                    self.assertEqual(sum(c[0] == 'PUT' for c in self.calls), 1)
+                    self.assertFalse(any(c[0] == 'POST' and c[1].endswith('/cancel') for c in self.calls))
+                    self.assertEqual(job.status['phase'], 'master_true')
+                    self.assertEqual(self.deploys[self.created[0]]['env'], 'true')
+                    self.assertIn('STEP FAILED: ON', stderr.getvalue())
+
+    def test_persistent_on_read_failure_propagates_without_recreating_deploy(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = FakeRunner(root)
+            self.make_render(job, enabled=True)
+            self.inject_reads(job, 'status', [TimeoutError('fake-sensitive')] * 7, enabled=True)
+            with patch.object(r.time, 'sleep') as sleep, \
+                    patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                with self.assertRaises(TimeoutError):
+                    r.Runner.master(job, True)
+            self.assertEqual(sum(c.args[0] for c in sleep.call_args_list), 120)
+            self.assertEqual(len(self.created), 1)
+            self.assertEqual(stderr.getvalue().count('STEP FAILED: ON deploy status GET'), 7)
+            self.assertNotIn('fake-sensitive', stderr.getvalue() + (Path(root) / 'runner.jsonl').read_text())
 
     def test_off_email_and_retry_survive_broken_stderr(self):
         with tempfile.TemporaryDirectory() as root:
