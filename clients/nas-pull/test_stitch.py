@@ -9,6 +9,7 @@ import importlib.util
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ from unittest import mock
 spec = importlib.util.spec_from_file_location('stitch_pull', Path(__file__).with_name('stoarama_pull.py'))
 pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
+ORIGINAL_CHECKPOINT = pull.stitch_checkpoint
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe required')
@@ -55,7 +57,7 @@ class StitchIntegrationTests(unittest.TestCase):
         parse = datetime.datetime.fromisoformat
         pins = (dict(folders={'stream':33}, windows={33:(parse('2026-09-01T00:00:00+00:00'),parse('2026-09-29T00:00:00+00:00'),'UTC')}),None)
         for patch in [mock.patch.object(pull,'cleanup_pins',return_value=pins), mock.patch.object(pull.os.path,'ismount',return_value=True),
-                      mock.patch.object(pull,'stitch_resources'), mock.patch.object(pull,'stitch_v85r_provenance', return_value=dict(policy='v85r',manifest_sha256=pull.V85R_MANIFEST_SHA,ffmpeg_version='fixture',ffprobe_version='fixture'))]:
+                      mock.patch.object(pull,'stitch_resources'), mock.patch.object(pull,'stitch_checkpoint'), mock.patch.object(pull,'stitch_v85r_provenance', return_value=dict(policy='v85r',manifest_sha256=pull.V85R_MANIFEST_SHA,ffmpeg_version='fixture',ffprobe_version='fixture'))]:
             patch.start();self.addCleanup(patch.stop)
         self.task = dict(id=7, lease_token='f'*64, plan_sha256='a'*64,
             expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=2)).isoformat(),
@@ -161,6 +163,87 @@ class StitchIntegrationTests(unittest.TestCase):
             pull.cleanup_process_task(self.cfg,self.inventory,self.stop,self.cleanup_task(result))
         self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
         self.assertTrue((self.cfg.output_dir/self.clips[1]['relative_path']).exists())
+
+    def test_long_stitch_build_cannot_hold_cleanup_execution_lane(self):
+        result = self.build()
+        with mock.patch.object(pull, 'restore_api', side_effect=self.api):
+            pull.stitch_register(self.cfg, self.inventory, 7, result)
+        building, resume = threading.Event(), threading.Event()
+        errors = []
+        original = pull.stitch_audit_source
+        def slow_source(*args):
+            building.set()
+            if not resume.wait(5):
+                raise RuntimeError('test did not release slow native tool')
+            return original(*args)
+        def build_again():
+            try:
+                self.build()
+            except Exception as exc:
+                errors.append(exc)
+        lane = pull.CleanupExecutionLane(self.stop)
+        with mock.patch.object(pull, 'stitch_audit_source', side_effect=slow_source), mock.patch.object(pull, 'restore_api', side_effect=self.api):
+            worker = threading.Thread(target=build_again)
+            worker.start()
+            try:
+                self.assertTrue(building.wait(5))
+                self.assertEqual(pull.NAS_MEDIA_FENCE.writers, 0)
+                # A real proven-inclusion retirement finishes while the native
+                # build is deliberately still blocked, rather than timing out.
+                pull.cleanup_process_task(self.cfg, self.inventory, self.stop, self.cleanup_task(result), lane=lane)
+                self.assertFalse((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+                self.assertTrue(worker.is_alive())
+                resume.set()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], pull.StitchHold)
+            finally:
+                resume.set()
+                worker.join(5)
+                lane.close()
+        for clip in self.clips[1:]:
+            self.assertTrue((self.cfg.output_dir/clip['relative_path']).exists())
+
+    def test_cleanup_lane_cancels_running_native_child_without_waiting_for_it(self):
+        started, errors = threading.Event(), []
+        stop = pull.StitchStop(self.cfg, self.stop)
+        def run_child():
+            started.set()
+            try:
+                # Native child watchdog uses the same stop object as FFmpeg.
+                pull.stitch_run([sys.executable, '-c', 'import time; time.sleep(30)'], time.monotonic()+40, stop)
+            except Exception as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=run_child)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        lane = pull.CleanupExecutionLane(self.stop)
+        try:
+            lane.run(lambda: None)
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(stop.reason, 'cleanup execution lane active')
+        finally:
+            lane.close()
+            self.stop.set()
+            worker.join(5)
+
+    def test_stitch_stop_fails_closed_on_remote_freeze_or_unavailable_checkpoint(self):
+        # Exercise the real checkpoint rather than the fixture's default stub.
+        # The API contract itself is covered below through the original module
+        # function saved before fixture patches are installed.
+        for response in ({'continue': False}, {}):
+            with mock.patch.object(pull, 'restore_api', return_value=response):
+                with self.assertRaises(pull.StitchHold):
+                    ORIGINAL_CHECKPOINT(self.cfg, self.task)
+        with mock.patch.object(pull, 'restore_api', side_effect=ConnectionError('offline')):
+            stop = pull.StitchStop(self.cfg, self.stop, self.task)
+            with mock.patch.object(pull, 'stitch_checkpoint', side_effect=ORIGINAL_CHECKPOINT):
+                stop.refresh()
+                self.assertTrue(stop.is_set())
+                self.assertIn('offline', stop.reason)
 
     def test_symlink_output_directory_and_bad_policy_are_refused(self):
         self.task['plan']['policy']='collation-v2'

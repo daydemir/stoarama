@@ -128,6 +128,120 @@ func newNASStitchTaskFixture(t *testing.T) (*cleanupFixture, nasStitchPlan, nasS
 	}
 	return f, p, q
 }
+func advanceNASStitchRetirement(t *testing.T, f *cleanupFixture) {
+	t.Helper()
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var release func()
+	defer func() {
+		tx.Rollback(f.ctx)
+		if release != nil {
+			release()
+		}
+	}()
+	if release, err = f.s.stitchAdvanceRetirement(f.ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func enabledNASStitchFixture(t *testing.T) (*cleanupFixture, int64) {
+	t.Helper()
+	f, _, q := newNASStitchTaskFixture(t)
+	f.s.cfg.NASStitchEnabled = true
+	f.s.cfg.NASStitchDeletionEnabled = true
+	f.s.cfg.NASCleanupDeletionEnabled = true
+	for _, call := range []struct {
+		h    http.HandlerFunc
+		body any
+	}{
+		{f.s.handleAccountNASStitchResult, q},
+		{f.s.handleAccountNASStitchReady, map[string]any{"lease_token": q.Token, "plan_sha256": q.PlanSHA, "outputs_ready": true}},
+	} {
+		if w := cleanupCall(t, call.h, 47, 5, "id", "7", call.body); w.Code != 200 {
+			t.Fatal(w.Body.String())
+		}
+	}
+	f.dryRun()
+	advanceNASStitchRetirement(t, f)
+	var id int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT cleanup_plan_id FROM nas_stitch_tasks WHERE id=7`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return f, id
+}
+
+func TestNASStitchRetirementUsesExactCleanupFreezeGeneration(t *testing.T) {
+	for _, change := range []string{"", `UPDATE nas_cleanup_frozen_streams SET generation=generation+1 WHERE plan_id=$1`, `DELETE FROM nas_cleanup_frozen_streams WHERE plan_id=$1`, `UPDATE nas_cleanup_rankings_cache SET freeze_generation=freeze_generation+1 WHERE plan_id=$1`} {
+		t.Run(change, func(t *testing.T) {
+			f, id := enabledNASStitchFixture(t)
+			var bound bool
+			if err := f.pool.QueryRow(f.ctx, `SELECT f.validated AND f.generation=c.freeze_generation AND f.generation=(p.execution_rankings->'3'->>'freeze_generation')::bigint FROM nas_cleanup_frozen_streams f JOIN nas_cleanup_rankings_cache c USING(plan_id,stream_id) JOIN nas_cleanup_plans p ON p.id=f.plan_id WHERE p.id=$1`, id).Scan(&bound); err != nil || !bound {
+				t.Fatalf("missing shared activation: %t %v", bound, err)
+			}
+			_, err := f.pool.Exec(f.ctx, `UPDATE recording_clips SET size_bytes=size_bytes+1 WHERE id=1`)
+			requireCleanupFrozen(t, err)
+			tasks := f.leaseV2(64, 64, 10000, "")
+			if len(tasks) != 1 {
+				t.Fatalf("serial execution lease: %+v", tasks)
+			}
+			if change != "" {
+				if _, err := f.pool.Exec(f.ctx, change, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			results := f.observe(tasks, map[int64]string{tasks[0].ItemID: strings.Repeat("d", 32)})
+			if len(results) != 1 || results[0].Delete != (change == "") {
+				t.Fatalf("freeze change=%q: %+v", change, results)
+			}
+		})
+	}
+}
+
+func TestNASStitchCheckpointAndLeasePauseUnderCleanupFreeze(t *testing.T) {
+	f, _, q := newNASStitchTaskFixture(t)
+	f.s.cfg.NASStitchEnabled = true
+	checkpoint := func(token string, want bool) {
+		t.Helper()
+		w := cleanupCall(t, f.s.handleAccountNASStitchCheckpoint, 47, 5, "id", "7", map[string]any{"lease_token": token, "plan_sha256": q.PlanSHA})
+		var response struct {
+			Continue bool `json:"continue"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &response) != nil || response.Continue != want {
+			t.Fatalf("checkpoint: %d %s", w.Code, w.Body.String())
+		}
+	}
+	checkpoint(q.Token, true)
+	if w := cleanupCall(t, f.s.handleAccountNASStitchCheckpoint, 47, 5, "id", "7", map[string]any{"lease_token": "wrong", "plan_sha256": q.PlanSHA}); w.Code != 409 {
+		t.Fatal("foreign lease token accepted")
+	}
+	if _, err := f.pool.Exec(f.ctx, `INSERT INTO nas_cleanup_frozen_streams(plan_id,stream_id) VALUES(999,4)`); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint(q.Token, true) // running job's unrelated stream remains independent
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_frozen_streams SET stream_id=3; UPDATE nas_stitch_tasks SET lease_expires_at=now()-interval '1 second' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint(q.Token, false)
+	if w := cleanupCall(t, f.s.handleAccountNASStitchLease, 47, 5, "", "", map[string]any{}); w.Code != 200 || !strings.Contains(w.Body.String(), `"task":null`) {
+		t.Fatalf("frozen expired job re-leased: %d %s", w.Code, w.Body.String())
+	}
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_stitch_tasks SET lease_expires_at=now()+interval '1 hour' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint(q.Token, false)
+	if _, err := f.pool.Exec(f.ctx, `DELETE FROM nas_cleanup_frozen_streams`); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint(q.Token, true)
+	f.s.cfg.NASStitchEnabled = false
+	checkpoint(q.Token, false)
+}
+
 func TestNASStitchRegisteredOutputRetiresOnlyIncludedRawWithSeparateGates(t *testing.T) {
 	f, _, q := newNASStitchTaskFixture(t)
 	result := func() int {
@@ -168,19 +282,7 @@ func TestNASStitchRegisteredOutputRetiresOnlyIncludedRawWithSeparateGates(t *tes
 	if err := f.pool.QueryRow(f.ctx, `SELECT cleanup_plan_id FROM nas_stitch_tasks WHERE id=7`).Scan(&pid); err != nil {
 		t.Fatal(err)
 	}
-	advance := func() {
-		tx, err := f.pool.Begin(f.ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer tx.Rollback(f.ctx)
-		if err = f.s.stitchAdvanceRetirement(f.ctx, tx); err != nil {
-			t.Fatal(err)
-		}
-		if err = tx.Commit(f.ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
+	advance := func() { advanceNASStitchRetirement(t, f) }
 	f.s.cfg.NASCleanupDeletionEnabled = true
 	advance()
 	if mode, _ := f.planMode(pid); mode != "dry_run" {

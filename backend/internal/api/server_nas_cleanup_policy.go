@@ -190,6 +190,25 @@ func (s *Server) cleanupCurrentPolicyCheck(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, i nasCleanupItem, dryRun bool, stages map[string]any, unchanged cleanupRankingsUnchanged) error {
 	if i.PermitReason != "" {
+		// Stitched inclusion replaces only the ordinary outside-keep verdict.
+		// Execution still requires the exact activation's frozen rankings.
+		if !dryRun {
+			policy, err := cleanupEmbeddedPolicy()
+			if err != nil {
+				return err
+			}
+			window, ok := policy.Streams[i.StreamID]
+			if !ok || unchanged == nil {
+				return errors.New("stitch retirement freeze verdict unavailable")
+			}
+			same, err := unchanged(i.StreamID, window.BestStart)
+			if err != nil {
+				return err
+			}
+			if !same {
+				return errors.New("stitch retirement freeze verdict changed")
+			}
+		}
 		return s.stitchInclusionCurrent(ctx, q, i)
 	}
 	report, err := s.cleanupReport(ctx)

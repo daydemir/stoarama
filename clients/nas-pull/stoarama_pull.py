@@ -31488,20 +31488,42 @@ def stitch_priority():
 
 
 class StitchStop:
-    """Kill the current child on shutdown/update or critical resources."""
-    def __init__(self, cfg, stop):
-        self.cfg, self.stop, self.last, self.reason = cfg, stop, 0.0, ""
+    """Keep the native-child watchdog nonblocking; poll remote gates separately."""
+    def __init__(self, cfg, stop, task=None):
+        self.cfg, self.stop, self.task, self.reason = cfg, stop, task, ""
+        self.done = threading.Event()
+        self.monitor = None
 
     def is_set(self):
         if self.stop.is_set():
             return True
-        if time.monotonic() - self.last > 5:
-            self.last = time.monotonic()
-            try:
-                stitch_resources(self.cfg)
-            except Exception as exc:
-                self.reason = str(exc)
+        with NAS_MEDIA_FENCE.condition:
+            if NAS_MEDIA_FENCE.execution_owner is not None:
+                self.reason = "cleanup execution lane active"
         return bool(self.reason)
+
+    def refresh(self):
+        try:
+            stitch_resources(self.cfg)
+            if self.task is not None:
+                stitch_checkpoint(self.cfg, self.task)
+        except Exception as exc:
+            self.reason = str(exc)
+
+    def start(self):
+        def monitor():
+            while not self.done.wait(5):
+                if self.is_set():
+                    return
+                self.refresh()
+        self.monitor = threading.Thread(target=monitor, name="stitch-checkpoint", daemon=True)
+        self.monitor.start()
+
+    def close(self):
+        self.done.set()
+        # An in-flight checkpoint has a finite transport timeout. It can only
+        # latch HOLD after this job exits; it never signals or kills a process.
+        self.monitor.join(timeout=1)
 
 
 def stitch_run(args, deadline, stop, stdout=None):
@@ -32069,9 +32091,22 @@ def stitch_output_recheck(cfg, item, execution=True):
         return "output fresh readback failed: " + str(exc)[:200]
 
 
-@NAS_MEDIA_FENCE.delivery
+def stitch_checkpoint(cfg, task):
+    response = restore_api(cfg, "/account/connections/stitch/%d/checkpoint" % task["id"],
+                           dict(lease_token=task["lease_token"], plan_sha256=task["plan_sha256"]),
+                           timeout=CLEANUP_EXECUTION_OBSERVE_SEC)
+    if response.get("continue") is not True:
+        raise StitchHold("stitch paused by cleanup source freeze or inactive lease/scope")
+
+
 def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
-    """Build/verify first; this function never unlinks source media."""
+    """Read sources, write only the separate versioned sibling directory.
+
+    No delivery writer fence is held across native tools or hashing: cleanup
+    must always be able to drain. Source descriptors are read-only and pinned;
+    a concurrent retirement makes the fresh exact source proof fail closed.
+    Local execution cancels the tools immediately, remote freezes at checkpoints.
+    """
     plan = task["plan"]
     if (plan.get("policy") != STITCH_POLICY or plan.get("revision") != STITCH_REVISION
             or plan.get("corpus_sha256") != STITCH_CORPUS_SHA or plan.get("keep_policy_sha256") != CLEANUP_KEEP28_POLICY_SHA256):
@@ -32083,7 +32118,10 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
     if (not plan["output_folder"].startswith(expected) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}-00-00Z", plan["output_folder"][len(expected):])):
         raise StitchHold("output must be in the stream's new versioned sibling folder")
     deadline = min(time.monotonic() + 7000, time.monotonic() + (parse_certification_timestamp(task["expires_at"], "stitch lease") - datetime.datetime.now(datetime.timezone.utc)).total_seconds() - 30)
-    stop = StitchStop(cfg, stop_event)
+    stop = StitchStop(cfg, stop_event, task if admitted is None else None)
+    stop.refresh()
+    if stop.is_set():
+        raise StitchHold(stop.reason or "stitch cancelled")
     result = dict(policy=STITCH_POLICY, lease_token=task["lease_token"], plan_sha256=task["plan_sha256"], outputs=[], repairs=[], left_out=[], seams=[], error="")
     provenance = stitch_v85r_provenance(tools)
     root = stitch_v85r_bundle(cfg.state_dir) if admitted is None else None
@@ -32092,6 +32130,8 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
     # and byte-identical published runs to be adopted without overwriting.
     import contextlib
     with contextlib.ExitStack() as resources:
+        stop.start()
+        resources.callback(stop.close)
         directory = resources.enter_context(StitchDirectory(cfg.output_dir, plan["output_folder"]))
         work = directory.path
         def clear_scratch():
@@ -32267,6 +32307,8 @@ def stitch_once(cfg, inventory, stop_event):
             # An uncommitted expired lease needs its new token below. An
             # already committed result always answers idempotently first.
     stitch_resources(cfg)
+    if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+        raise StitchHold("stitch cancelled while cleanup executing")
     response = restore_api(cfg, "/account/connections/stitch/lease", {"client_version": CLIENT_VERSION})
     task = response.get("task")
     if task is None:

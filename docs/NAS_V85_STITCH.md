@@ -221,16 +221,41 @@ repair-qualified joins require separate exact provenance/admission work.
 
 ## Cleanup integration and review conflicts
 
-Main's #445 is integrated, including bounded execution deadlines. #448
-(`fix/cleanup-reconciliation-only`) landed during this work at `acab94dd`
-(2026-11-10T21:30:07Z). Its reconciliation-only replay, session-bound execution
-and one-outstanding-item permit behavior are integrated into this draft.
-The cleanup-observation conflict preserves both its session/lease fences and
-V85r's independent stitch-deletion gate. The regression now exercises
-sequential permits, included leaves only and revocation before the next permit.
-No unmerged cleanup implementation is a dependency.
+Main's #449 source freezes and freeze-generation verdict cache, #451 serial
+execution lane / 15-second observation budget, #452 writer-drain retry and
+unused execution-lease return, and #450 operations documentation move are
+integrated. #453's Jelly cleanup runner is operationally independent; this
+worker remains NAS-local. Never build it on Jelly.
 
-The stitch migration is **0179_nas_v85r_stitch.sql**, after #448's 0178
-reconciliation migration; joined-lifecycle fixtures apply both in order.
-Neither migration was deployed by this work. Keep the combined cleanup/stitch
-PostgreSQL and fake-NAS suites as rollout gates.
+Stitch retirement activation now calls the same committed-freeze publication,
+source-writer drain and replay/cache activation as ordinary cleanup, under the
+public cleanup fence. Both fresh stitched permits and the common cleanup lease,
+observe, receipt and reconciliation paths retain session binding, serial caps,
+15-second permit-observation deadlines, R2 recovery evidence and lease returns.
+The stitched inclusion check replaces only the outside-keep decision: a missing
+or changed activation/cache generation cannot grant a fresh permit.
+
+No writer fence spans a stitch build. All scratch/output writes stay inside the
+new versioned sibling tree; raw inputs are read-only, directory/file descriptors
+are pinned, and source/output proofs are freshly read back. Cleanup can acquire
+its execution lane even during a slow native tool or source hash. The local
+execution-owner signal cancels the native child on its watchdog checkpoint.
+Every five seconds the child also checks its exact task/token/plan against the
+server; a source freeze on that stream, expired lease, inactive scope/switch,
+transport error or missing response stops it. A source retired during the
+bounded checkpoint gap cannot be used for a successful fresh source proof;
+building never unlinks or writes through a source descriptor. New leases pause
+conservatively while any cleanup source freeze exists. Registration replay is
+metadata-only and retains already verified outputs.
+
+The explicit future client release is **`NAS_VERSION=v85r-fence-progress-v1`**,
+allowlisted alongside reviewed predecessors. Keep every stitch/deletion switch
+off until the separately approved pilot. This work does not stage/promote a
+release, mutate production, merge, or deploy.
+
+Regression coverage includes real PostgreSQL freeze/cached-generation changes,
+source-write refusal, checkpoint identity/stream/switch behavior, shared reviewed
+session gates, a deliberately blocked build concurrent with actual included-raw
+retirement, and cancellation of a live native child after lane acquisition.
+The stitch migration remains **0179_nas_v85r_stitch.sql**, with main's cleanup
+freeze migrations 0180/0181. Joined lifecycle fixtures apply them in order.
