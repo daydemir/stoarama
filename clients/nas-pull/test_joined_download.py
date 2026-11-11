@@ -1684,8 +1684,8 @@ class JoinedDownloadTests(unittest.TestCase):
                 descriptor = os.open(part, os.O_RDONLY, dir_fd=directory_fd)
                 try: self.assertEqual(os.read(descriptor, 8), b"unknown")
                 finally: os.close(descriptor)
-                self.write_entry(directory_fd, marker, self.marker(item)); os.link(part, "external-hardlink", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                with mock.patch.object(pull, "prepare_joined_download", return_value=prepared), mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "unknown hardlink"):
+                self.write_entry(directory_fd, marker, self.marker(item)); os.link(part, "other.mp4", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                with mock.patch.object(pull, "prepare_joined_download", return_value=prepared), mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "canonical ambiguity"):
                     pull.download_joined_item(cfg, runtime, item, threading.Event())
                 with self.assertRaisesRegex(pull.ExistingFileMismatch, "exclusively owned"): pull.truncate_joined_part(directory_fd, part)
                 self.assertEqual(os.stat(part, dir_fd=directory_fd).st_size, 7)
@@ -1717,7 +1717,7 @@ class JoinedDownloadTests(unittest.TestCase):
                     calls += 1
                     if calls == 1: return real_write(descriptor, content[:7])
                     raise OSError(errno.ENOSPC, "no space left")
-                with mock.patch.object(pull.os, "urandom", return_value=b"\xaa" * 16), mock.patch.object(pull.os, "write", side_effect=fail_write), self.assertRaisesRegex(OSError, "no space left"):
+                with mock.patch.object(pull.os, "urandom", return_value=b"\xaa" * 16), mock.patch.object(pull.os, "write", side_effect=fail_write), self.assertRaisesRegex(pull.ExistingFileMismatch, "no space left"):
                     pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
                 short = marker + ".stage-" + "a" * 32
                 with mock.patch.object(pull, "poll_raw_pending", return_value=False), mock.patch.object(pull.os, "urandom", return_value=b"\xbb" * 16):
@@ -1732,194 +1732,280 @@ class JoinedDownloadTests(unittest.TestCase):
         return pull.certification_identity(current), current.st_nlink, path.read_bytes()
 
     def crash_marker_publication(self, cfg, runtime, directory_fd, marker, expected, after_link=True):
-        real_link = os.link
-        def interrupted_link(*args, **kwargs):
-            if after_link:
-                real_link(*args, **kwargs)
-            raise RuntimeError("publication interrupted")
-        with mock.patch.object(pull, "poll_raw_pending", return_value=False), \
-                mock.patch.object(pull.os, "link", side_effect=interrupted_link), \
-                self.assertRaisesRegex(RuntimeError, "publication interrupted"):
-            pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
+        # Reproduce an intent left by the old hardlink publisher.
+        stage = marker + ".stage-" + "a" * 32
+        current = pull.write_joined_stage(directory_fd, stage, expected)
         journal, identity = pull.joined_sidecar_intent(cfg, directory_fd, marker, expected)
-        record = json.loads(journal.read_bytes())
-        self.assertEqual({key: record[key] for key in identity}, identity)
-        self.assertEqual(record["artifact_id"], json.loads(expected)["id"])
-        return journal, record["stage_name"]
+        record = dict(identity, stage_name=stage,
+                      stage_path=str(Path(identity["marker_path"]).with_name(stage)),
+                      device=current.st_dev, inode=current.st_ino)
+        pull.atomic_write(journal, json.dumps(record).encode())
+        if after_link:
+            os.link(stage, marker, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        return journal, stage
 
-    def test_restart_after_stage_link_removes_only_proven_link(self):
-        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
-        with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
-            directory_fd, _, _part, marker = self.names(cfg, item)
-            try:
-                journal, linked = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
-                unknown = marker + ".stage-" + "b" * 32
-                self.write_entry(directory_fd, unknown, b"unknown")
-                pull.publish_joined_sidecar(cfg, self.runtime(cfg), directory_fd, marker, expected, threading.Event())
-                self.assertFalse(journal.exists())
-                self.assertIsNone(pull.joined_entry_stat(directory_fd, linked))
-                self.assertEqual(os.stat(unknown, dir_fd=directory_fd).st_size, 7)
-                self.assertEqual(os.stat(marker, dir_fd=directory_fd).st_nlink, 1)
-            finally: os.close(directory_fd)
+    def quarantine_records(self, cfg):
+        return [json.loads(line) for line in (cfg.state_dir / "joined-alias-quarantine.jsonl").read_text().splitlines()]
 
-    def test_partial_resume_recovers_recorded_3830_marker_publication_crash(self):
-        item = pull.valid_joined_item(self.media_item(
-            artifact_id=3830, download_path="/api/v1/account/joined/3830/download",
-        )); expected = self.marker(item)
-        for existing_part in (False, True):
-            with self.subTest(existing_part=existing_part), tempfile.TemporaryDirectory() as raw:
+    def test_foreign_alias_after_crash_and_inode_reuse_are_quarantined_and_delivered(self):
+        for reused_inode in (False, True):
+            with self.subTest(reused_inode=reused_inode), tempfile.TemporaryDirectory() as raw:
                 cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
-                directory_fd, _, part, marker = self.names(cfg, item)
+                raw_item = self.media_item(); item = pull.valid_joined_item(raw_item)
+                expected = self.marker(item)
+                self.install_manifest(cfg, item)
+                directory_fd, final, part, marker = self.names(cfg, item)
+                parent = pull.joined_output_path(cfg, item).parent
+                ring = pull.ClientLogRing(); ring.configure(cfg)
                 try:
                     journal, stage = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
-                    if existing_part:
-                        self.write_entry(directory_fd, part, b"keep partial bytes")
-                    info = pull.ensure_owned_joined_partial(
-                        cfg, self.runtime(cfg), directory_fd, part, marker, expected, threading.Event(),
-                    )
-                    self.assertEqual(info.st_nlink, 1)
-                    self.assertEqual(info.st_size, 18 if existing_part else 0)
-                    if existing_part:
-                        self.assertEqual((pull.joined_output_path(cfg, item).parent / part).read_bytes(), b"keep partial bytes")
-                    self.assertEqual(os.stat(marker, dir_fd=directory_fd).st_nlink, 1)
-                    self.assertIsNone(pull.joined_entry_stat(directory_fd, stage))
+                    os.unlink(stage, dir_fd=directory_fd)  # Old publisher crashed before retiring intent.
+                    if reused_inode:
+                        # Deterministically model inode reuse: the stale inode now
+                        # equals a different, foreign file's actual inode.
+                        os.rename(marker, "saved-original", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                        self.write_entry(directory_fd, marker, expected)
+                        record = json.loads(journal.read_bytes())
+                        record["inode"] = os.stat(marker, dir_fd=directory_fd).st_ino
+                        journal.write_text(json.dumps(record))
+                    os.link(marker, stage, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    alias_inode = (parent / stage).stat().st_ino
+                    self.write_entry(directory_fd, part, b"abcdef")
+                    self.write_entry(directory_fd, "unrelated.mp4", b"preserved media")
+                    media_before = self.entry_snapshot(parent / "unrelated.mp4")
+                    acks = []
+                    def api(_cfg, _method, path, body=None, **_kwargs):
+                        if path == "/account/joined": return {"item": raw_item}
+                        if path.startswith("/account/clips?"): return {"clips": []}
+                        if path == raw_item["download_path"]: return self.prepared(raw_item)
+                        if path == "/account/joined/ack": acks.append(body); return {"ok": True}
+                        raise AssertionError(path)
+                    with mock.patch.object(pull, "CLIENT_LOG_RING", ring), \
+                            mock.patch.object(pull, "storage_status", return_value=self.storage()), \
+                            mock.patch.object(pull, "request_json", side_effect=api):
+                        self.assertTrue(pull.drain_joined(cfg, runtime, threading.Event()))
+                    self.assertEqual(len(acks), 1)
+                    self.assertEqual((parent / final).read_bytes(), b"abcdef")
+                    self.assertEqual(media_before, self.entry_snapshot(parent / "unrelated.mp4"))
                     self.assertFalse(journal.exists())
+                    self.assertFalse((parent / stage).exists())
+                    records = self.quarantine_records(cfg)
+                    move = next(r for r in records if r["operation"] == "alias_move" and r["state"] == "complete")
+                    quarantined = Path(move["new_path"])
+                    self.assertEqual(quarantined.read_bytes(), expected)
+                    self.assertEqual(quarantined.stat().st_ino, alias_inode)
+                    detached = next(r for r in records if r["operation"] == "canonical_copy" and r["state"] == "complete")
+                    self.assertEqual(detached["old_inode"], alias_inode)
+                    self.assertNotEqual(detached["new_inode"], alias_inode)
+                    self.assertEqual(detached["sha256"], hashlib.sha256(expected).hexdigest())
+                    self.assertEqual(detached["size_bytes"], len(expected))
+                    runtime.add_successes(cfg, 1, [(1, 6)])
+                    self.assertIn("quarantine", runtime.heartbeat_payload(None)["client_last_error"])
+                    with mock.patch.object(pull, "CLIENT_LOG_RING", ring), mock.patch.object(pull, "request_json") as upload:
+                        pull.client_log_upload_once(cfg, runtime, None, 0)
+                    messages = "\n".join(line["message"] for line in upload.call_args.kwargs["body"]["lines"])
+                    self.assertIn("<nas>/" + str(quarantined.relative_to(cfg.output_dir)), messages)
+                    self.assertIn("sha256=" + detached["sha256"], messages)
                 finally:
                     os.close(directory_fd)
 
-    def test_completed_marker_foreign_lookalike_is_refused_and_reported(self):
-        raw_item = self.media_item(artifact_id=3830, download_path="/api/v1/account/joined/3830/download")
-        item = pull.valid_joined_item(raw_item); expected = self.marker(item)
+    def test_foreign_unrelated_recorded_stage_is_preserved_without_inode_authority(self):
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
             directory_fd, _, part, marker = self.names(cfg, item)
-            ring = pull.ClientLogRing(); ring.configure(cfg)
+            parent = pull.joined_output_path(cfg, item).parent
             try:
-                pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
-                journal, _ = pull.joined_sidecar_intent(cfg, directory_fd, marker, expected)
+                journal, stage = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
+                os.unlink(stage, dir_fd=directory_fd)
+                self.write_entry(directory_fd, stage, b"foreign bytes with no relationship to marker")
+                alias_inode = (parent / stage).stat().st_ino
+                marker_before = self.entry_snapshot(parent / marker)
+                self.write_entry(directory_fd, part, b"preserved partial")
+                pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                self.assertEqual(marker_before, self.entry_snapshot(parent / marker))
+                self.assertEqual((parent / part).read_bytes(), b"preserved partial")
+                moves = [r for r in self.quarantine_records(cfg) if r["state"] == "complete"]
+                self.assertEqual(len(moves), 1)
+                quarantined = Path(moves[0]["new_path"])
+                self.assertEqual(quarantined.read_bytes(), b"foreign bytes with no relationship to marker")
+                self.assertEqual(quarantined.stat().st_ino, alias_inode)
                 self.assertFalse(journal.exists())
-                alias = marker + ".stage-" + "a" * 32
-                os.link(marker, alias, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                self.write_entry(directory_fd, part, b"keep partial bytes")
-                parent = pull.joined_output_path(cfg, item).parent
-                before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
-                def resume(*_args):
-                    return pull.ensure_owned_joined_partial(
-                        cfg, runtime, directory_fd, part, marker, expected, threading.Event(),
-                    )
-                with mock.patch.object(pull, "CLIENT_LOG_RING", ring), \
-                        mock.patch.object(pull, "request_json", return_value={"item": raw_item}), \
-                        mock.patch.object(pull, "download_joined_item", side_effect=resume), \
-                        self.assertRaisesRegex(pull.ExistingFileMismatch, "no durable intent; operator decision required"):
-                    pull.drain_joined(cfg, runtime, threading.Event())
-                self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
-                # Raw successes must not hide a joined lane that needs an operator.
-                runtime.add_successes(cfg, 1, [(1, 6)])
-                with mock.patch.object(pull, "CLIENT_LOG_RING", ring):
-                    error = runtime.heartbeat_payload(None)["client_last_error"]
-                    with mock.patch.object(pull, "request_json") as upload:
-                        pull.client_log_upload_once(cfg, runtime, None, 0)
-                    lines = upload.call_args.kwargs["body"]["lines"]
-                self.assertEqual(upload.call_args.args[2], "/account/connections/client-logs")
-                for text in (error, lines[-1]["message"]):
-                    for fragment in ("3830", "no durable intent", str(parent.relative_to(cfg.output_dir)),
-                                     "path=" + alias, "inode=%d" % before[alias][0][4], "links=2"):
-                        self.assertIn(fragment, text)
-                self.assertFalse(journal.exists())
-                runtime.clear_joined_delivery_error()
-                self.assertEqual(runtime.heartbeat_payload(None)["client_last_error"], "")
             finally:
                 os.close(directory_fd)
 
-    def test_recorded_stage_identity_mismatches_and_extra_links_are_refused(self):
-        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
-        for mutation in ("inode", "size", "hash", "extra_link", "artifact", "path", "device", "directory", "invalid", "null"):
-            for linked in (False, True):
-                with self.subTest(mutation=mutation, linked=linked), tempfile.TemporaryDirectory() as raw:
-                    cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
-                    directory_fd, _, part, marker = self.names(cfg, item)
-                    parent = pull.joined_output_path(cfg, item).parent
-                    try:
-                        journal, stage = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected, linked)
-                        if mutation == "inode":
-                            os.rename(stage, "original-stage", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                            self.write_entry(directory_fd, stage, expected)
-                        elif mutation in ("size", "hash"):
-                            (parent / stage).write_bytes(expected + b"x" if mutation == "size" else b"x" * len(expected))
-                        elif mutation == "extra_link":
-                            os.link(stage, "extra-link", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                        elif mutation in ("invalid", "null"):
-                            journal.write_text("{" if mutation == "invalid" else "null")
-                        else:
-                            record = json.loads(journal.read_bytes())
-                            field = {"artifact": "artifact_id", "path": "stage_path", "device": "device", "directory": "directory_inode"}[mutation]
-                            record[field] = record[field] + ("-wrong" if mutation == "path" else 1)
-                            journal.write_text(json.dumps(record))
-                        # An unknown partial must never be opened for writing on refusal.
-                        if linked:
-                            self.write_entry(directory_fd, part, b"keep partial bytes")
-                        before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
-                        journal_before = journal.read_bytes()
-                        with self.assertRaisesRegex(pull.ExistingFileMismatch, "durable intent"):
-                            pull.ensure_owned_joined_partial(
-                                cfg, self.runtime(cfg), directory_fd, part, marker, expected, threading.Event(),
-                            )
-                        self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
-                        self.assertEqual(journal_before, journal.read_bytes())
-                    finally:
-                        os.close(directory_fd)
-
-    def test_replaced_stage_before_intent_does_not_acquire_provenance(self):
+    def test_new_marker_publication_never_overwrites_a_concurrent_canonical(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         with tempfile.TemporaryDirectory() as raw:
             cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
-            directory_fd, _, _part, marker = self.names(cfg, item)
-            real_write = pull.write_joined_stage
-            def replaced_stage(directory_fd, stage, content):
-                created = real_write(directory_fd, stage, content)
-                os.rename(stage, "original-stage", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                self.write_entry(directory_fd, stage, content)
-                return created
+            directory_fd, _, _, marker = self.names(cfg, item)
+            parent = pull.joined_output_path(cfg, item).parent
+            real_link = os.link
+            def concurrent_marker(*args, **kwargs):
+                self.write_entry(directory_fd, marker, b"foreign canonical marker")
+                return real_link(*args, **kwargs)
             try:
-                with mock.patch.object(pull, "write_joined_stage", side_effect=replaced_stage), \
-                        self.assertRaisesRegex(pull.ExistingFileMismatch, "durable intent file mismatch"):
+                with mock.patch.object(pull.os, "link", side_effect=concurrent_marker), self.assertRaises(pull.ExistingFileMismatch):
                     pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
-                self.assertIsNone(pull.joined_entry_stat(directory_fd, marker))
-                parent = pull.joined_output_path(cfg, item).parent
-                self.assertEqual(len(list(parent.iterdir())), 2)
-                self.assertTrue(all(p.read_bytes() == expected for p in parent.iterdir()))
-                journal, _ = pull.joined_sidecar_intent(cfg, directory_fd, marker, expected)
-                record = json.loads(journal.read_bytes())
-                self.assertEqual(record["inode"], (parent / "original-stage").stat().st_ino)
+                self.assertEqual((parent / marker).read_bytes(), b"foreign canonical marker")
+                self.assertFalse((cfg.output_dir / ".stoarama-quarantine").exists())
             finally:
                 os.close(directory_fd)
 
-    def test_existing_final_refuses_unrecorded_marker_alias_before_any_unlink(self):
+    def test_partial_and_marker_aliases_preserve_bytes_and_canonical_names(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
-        with tempfile.TemporaryDirectory() as raw:
-            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
-            directory_fd, final, part, marker = self.names(cfg, item)
-            try:
-                self.write_entry(directory_fd, part, b"abcdef")
-                os.link(part, final, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
-                alias = marker + ".stage-" + "a" * 32
-                os.link(marker, alias, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        for canonical_kind in ("partial", "marker"):
+            with self.subTest(canonical_kind=canonical_kind), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
                 parent = pull.joined_output_path(cfg, item).parent
-                before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
-                with self.assertRaisesRegex(pull.ExistingFileMismatch, "no durable intent"):
-                    pull.complete_existing_joined(
-                        cfg, runtime, directory_fd, item, (final, part, marker), expected, threading.Event(),
-                    )
-                self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
-            finally:
-                os.close(directory_fd)
+                try:
+                    self.write_entry(directory_fd, marker, expected)
+                    self.write_entry(directory_fd, part, b"keep partial bytes")
+                    canonical = part if canonical_kind == "partial" else marker
+                    content = (parent / canonical).read_bytes()
+                    inode = (parent / canonical).stat().st_ino
+                    for alias in ("foreign-alias-1", "foreign-alias-2"):
+                        os.link(canonical, alias, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    info = pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    self.assertEqual(info.st_nlink, 1)
+                    self.assertEqual((parent / part).read_bytes(), b"keep partial bytes")
+                    self.assertEqual((parent / marker).read_bytes(), expected)
+                    self.assertEqual((parent / canonical).stat().st_nlink, 1)
+                    self.assertNotEqual((parent / canonical).stat().st_ino, inode)
+                    quarantined = list((cfg.output_dir / ".stoarama-quarantine" / "aliases").iterdir())
+                    self.assertEqual(len(quarantined), 2)
+                    for path in quarantined:
+                        self.assertEqual(path.read_bytes(), content)
+                        self.assertEqual(path.stat().st_ino, inode)
+                finally:
+                    os.close(directory_fd)
 
-    def test_publication_restart_after_every_persistent_operation(self):
+    def test_canonical_ambiguity_is_refused_without_changing_any_file(self):
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        for other in ("other.mp4", "other.json", ".other.mp4.joined-99.part", ".other.mp4.joined-99.part.stoarama.json"):
+            with self.subTest(other=other), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
+                parent = pull.joined_output_path(cfg, item).parent
+                try:
+                    self.write_entry(directory_fd, marker, expected)
+                    self.write_entry(directory_fd, part, b"preserved partial")
+                    os.link(marker, other, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
+                    with self.assertRaisesRegex(pull.ExistingFileMismatch, "canonical ambiguity"):
+                        pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
+                    self.assertIn("canonical ambiguity", runtime.heartbeat_payload(None)["client_last_error"])
+                finally:
+                    os.close(directory_fd)
+
+    def test_quarantine_preflight_failures_preserve_source_paths_and_bytes(self):
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        for failure in ("cross_device", "space", "hash", "fsync", "ledger", "symlink"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
+                parent = pull.joined_output_path(cfg, item).parent
+                try:
+                    self.write_entry(directory_fd, marker, expected)
+                    self.write_entry(directory_fd, part, b"preserved partial")
+                    os.link(marker, "foreign-alias", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
+                    with ExitStack() as patches:
+                        if failure == "cross_device":
+                            real_stat = os.fstat
+                            root_inode = cfg.output_dir.stat().st_ino
+                            def stat(descriptor):
+                                current = real_stat(descriptor)
+                                if current.st_ino == root_inode:
+                                    return SimpleNamespace(st_dev=current.st_dev + 1)
+                                return current
+                            patches.enter_context(mock.patch.object(pull.os, "fstat", side_effect=stat))
+                        elif failure == "space":
+                            patches.enter_context(mock.patch.object(pull.os, "fstatvfs", return_value=SimpleNamespace(f_bavail=0, f_frsize=4096)))
+                        elif failure == "hash":
+                            real_read = os.read
+                            reads = 0
+                            def corrupt_copy(descriptor, size):
+                                nonlocal reads
+                                block = real_read(descriptor, size)
+                                # Marker verification reads once, copy reads once,
+                                # and the independent copy hash reads third.
+                                if block:
+                                    reads += 1
+                                    if reads == 3: return b"x" * len(block)
+                                return block
+                            patches.enter_context(mock.patch.object(pull.os, "read", side_effect=corrupt_copy))
+                        elif failure == "fsync":
+                            patches.enter_context(mock.patch.object(pull.os, "fsync", side_effect=OSError(errno.EIO, "fsync failed")))
+                        elif failure == "ledger":
+                            patches.enter_context(mock.patch.object(pull, "append_joined_quarantine_ledger", side_effect=OSError(errno.ENOSPC, "ledger full")))
+                        else:
+                            (cfg.output_dir / ".stoarama-quarantine").symlink_to(parent, target_is_directory=True)
+                        with self.assertRaises(pull.ExistingFileMismatch):
+                            pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    for name, snapshot in before.items():
+                        self.assertEqual(snapshot, self.entry_snapshot(parent / name))
+                    self.assertIn("joined", runtime.heartbeat_payload(None)["client_last_error"])
+                finally:
+                    os.close(directory_fd)
+
+    def test_quarantine_restart_after_each_persistent_operation(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         class Crash(BaseException): pass
-        operations = ("write", "fsync", "replace", "link", "unlink")
+        operations = ("write", "fsync", "replace", "rename", "link", "unlink")
+        real = {name: getattr(os, name) for name in operations}
+        def run(crash_at=None):
+            trace = []
+            with tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
+                parent = pull.joined_output_path(cfg, item).parent
+                journal, stage = self.crash_marker_publication(cfg, runtime, directory_fd, marker, expected)
+                self.write_entry(directory_fd, part, b"preserved partial")
+                self.write_entry(directory_fd, "unrelated.mp4", b"preserved media")
+                media_before = self.entry_snapshot(parent / "unrelated.mp4")
+                old_inode = (parent / marker).stat().st_ino
+                def operation(name):
+                    def wrapped(*args, **kwargs):
+                        result = real[name](*args, **kwargs)
+                        trace.append(name)
+                        if len(trace) == crash_at: raise Crash()
+                        return result
+                    return wrapped
+                try:
+                    with ExitStack() as patches:
+                        for name in operations:
+                            patches.enter_context(mock.patch.object(pull.os, name, side_effect=operation(name)))
+                        if crash_at is None:
+                            pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                        else:
+                            with self.assertRaises(Crash):
+                                pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    pull.ensure_owned_joined_partial(cfg, self.runtime(cfg), directory_fd, part, marker, expected, threading.Event())
+                    self.assertEqual((parent / marker).read_bytes(), expected)
+                    self.assertEqual((parent / marker).stat().st_nlink, 1)
+                    self.assertEqual((parent / part).read_bytes(), b"preserved partial")
+                    self.assertFalse(journal.exists())
+                    quarantine = list((cfg.output_dir / ".stoarama-quarantine" / "aliases").iterdir())
+                    self.assertEqual(len(quarantine), 1)
+                    self.assertEqual(quarantine[0].read_bytes(), expected)
+                    self.assertEqual(quarantine[0].stat().st_ino, old_inode)
+                    self.assertEqual(media_before, self.entry_snapshot(parent / "unrelated.mp4"))
+                finally:
+                    os.close(directory_fd)
+            return trace
+        trace = run()
+        self.assertIn("rename", trace)
+        self.assertEqual(trace.count("unlink"), 1)  # Local intent only; no NAS alias deletion.
+        for step, operation in enumerate(trace, 1):
+            with self.subTest(step=step, operation=operation): run(step)
+
+    def test_publication_restart_after_each_persistent_operation(self):
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        class Crash(BaseException): pass
+        operations = ("write", "fsync", "replace", "rename", "link", "unlink")
         real = {name: getattr(os, name) for name in operations}
         def run(crash_at=None):
             trace = []
@@ -1927,15 +2013,11 @@ class JoinedDownloadTests(unittest.TestCase):
                 cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
                 directory_fd, _, _part, marker = self.names(cfg, item)
                 parent = pull.joined_output_path(cfg, item).parent
-                # Unrelated media must retain both bytes and filesystem identity.
-                self.write_entry(directory_fd, "media.mp4", b"media remains untouched")
-                media_before = self.entry_snapshot(parent / "media.mp4")
                 def operation(name):
                     def wrapped(*args, **kwargs):
                         result = real[name](*args, **kwargs)
                         trace.append(name)
-                        if len(trace) == crash_at:
-                            raise Crash()
+                        if len(trace) == crash_at: raise Crash()
                         return result
                     return wrapped
                 try:
@@ -1947,45 +2029,31 @@ class JoinedDownloadTests(unittest.TestCase):
                         else:
                             with self.assertRaises(Crash):
                                 pull.publish_joined_sidecar(cfg, runtime, directory_fd, marker, expected, threading.Event())
-                    # Unrecorded stages from crashes before intent are preserved.
-                    journal, _ = pull.joined_sidecar_intent(cfg, directory_fd, marker, expected)
-                    unrecorded = {p.name: p.read_bytes() for p in parent.iterdir() if ".stage-" in p.name} if not journal.exists() else {}
                     pull.publish_joined_sidecar(cfg, self.runtime(cfg), directory_fd, marker, expected, threading.Event())
                     self.assertEqual((parent / marker).read_bytes(), expected)
                     self.assertEqual((parent / marker).stat().st_nlink, 1)
-                    self.assertFalse(journal.exists())
-                    for name, content in unrecorded.items():
-                        self.assertEqual((parent / name).read_bytes(), content)
-                    self.assertEqual(media_before, self.entry_snapshot(parent / "media.mp4"))
                 finally:
                     os.close(directory_fd)
             return trace
-        trace = run()
-        self.assertIn("link", trace)
-        self.assertEqual(trace.count("unlink"), 2)  # Stage, then local intent.
-        for step, operation in enumerate(trace, 1):
-            with self.subTest(step=step, operation=operation):
-                run(step)
+        for step, operation in enumerate(run(), 1):
+            with self.subTest(step=step, operation=operation): run(step)
 
-    def test_partial_resume_leaves_unknown_marker_aliases_untouched(self):
+    def test_unknown_alias_outside_inspected_directory_is_refused(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
-        for third_link in (False, True):
-            with self.subTest(third_link=third_link), tempfile.TemporaryDirectory() as raw:
-                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
-                directory_fd, _, part, marker = self.names(cfg, item)
-                try:
-                    alias = marker + ".stage-" + "a" * 32 if third_link else "unknown-alias"
-                    self.write_entry(directory_fd, alias, expected)
-                    os.link(alias, marker, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                    if third_link:
-                        os.link(alias, "unknown-third", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-                    self.write_entry(directory_fd, part, b"keep partial bytes")
-                    before = {name: os.stat(name, dir_fd=directory_fd) for name in os.listdir(directory_fd)}
-                    with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "path=.*links="):
-                        pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
-                    self.assertEqual(before, {name: os.stat(name, dir_fd=directory_fd) for name in os.listdir(directory_fd)})
-                finally:
-                    os.close(directory_fd)
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+            directory_fd, _, part, marker = self.names(cfg, item)
+            parent = pull.joined_output_path(cfg, item).parent
+            try:
+                self.write_entry(directory_fd, marker, expected)
+                self.write_entry(directory_fd, part, b"keep partial bytes")
+                os.link(parent / marker, cfg.output_dir / "external-alias")
+                before = {p.name: self.entry_snapshot(p) for p in parent.iterdir()}
+                with self.assertRaisesRegex(pull.ExistingFileMismatch, "unknown hardlink outside"):
+                    pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                self.assertEqual(before, {p.name: self.entry_snapshot(p) for p in parent.iterdir()})
+            finally:
+                os.close(directory_fd)
 
     def test_conflicting_marker_is_never_modified(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
