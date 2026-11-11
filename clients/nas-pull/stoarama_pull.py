@@ -627,7 +627,37 @@ def read_json(path, default):
         raise RuntimeError("invalid state file %s: %s" % (path, exc)) from exc
 
 
+class StitchSwitches:
+    """Heartbeat authority; an OFF latches cancellation for the current job."""
+    def __init__(self):
+        self.local_enabled = env_str("STOARAMA_V85_STITCH_ENABLED", "true").lower() == "true"
+        self.local_deletion_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "true").lower() == "true"
+        cancel = threading.Event()
+        cancel.set()
+        self.state = (False, False, cancel)
+
+    def apply(self, response):
+        valid = isinstance(response, dict) and response.get("ok") is True
+        enabled = valid and self.local_enabled and response.get("stitch_enabled") is True
+        deletion = enabled and self.local_deletion_enabled and response.get("stitch_deletion_enabled") is True
+        cancel = self.state[2]
+        if not enabled:
+            cancel.set()
+        elif cancel.is_set():
+            # A later ON may start a new job, but cannot revive a cancelled one.
+            cancel = threading.Event()
+        self.state = (enabled, deletion, cancel)
+
+
 class Config:
+    @property
+    def stitch_enabled(self):
+        return self.stitch_switches.state[0]
+
+    @property
+    def stitch_delete_enabled(self):
+        return self.stitch_switches.state[1]
+
     def __init__(self):
         self.api_base = env_str("STOARAMA_API_BASE", "").rstrip("/")
         self.api_key = env_str("STOARAMA_API_KEY", "")
@@ -656,10 +686,8 @@ class Config:
             "STOARAMA_UPDATE_MANIFEST_URL", "https://stoarama.com/nas/download/latest.json"
         )
         self.dry_run = env_str("STOARAMA_DRY_RUN", "0") == "1"
-        # Release/deploy safe by default. Operators enable only after migration,
-        # API and a completed clean inventory are independently verified.
-        self.stitch_enabled = env_str("STOARAMA_V85_STITCH_ENABLED", "false").lower() == "true"
-        self.stitch_delete_enabled = env_str("STOARAMA_V85_STITCH_DELETION_ENABLED", "false").lower() == "true"
+        # Start OFF until an authenticated heartbeat; env false is a local veto.
+        self.stitch_switches = StitchSwitches()
         self.native_stitch_enabled = env_str("STOARAMA_NATIVE_STITCH_ENABLED", "false").lower() == "true"
         self.is_candidate = env_str("STOARAMA_CANDIDATE", "0") == "1"
         parsed = urllib.parse.urlsplit(self.api_base)
@@ -9546,6 +9574,8 @@ def heartbeat_loop(cfg, runtime, stop_event):
     while not stop_event.is_set():
         try:
             response = send_heartbeat(cfg, runtime, outage)
+            cfg.stitch_switches.apply(response)
+            runtime.stitch_enabled = cfg.stitch_enabled
             runtime.apply_joined_protocol_response(response)
             if runtime.inventory is not None:
                 cleanup_release_quarantine(runtime.inventory, response.get("cleanup_release_generation"))
@@ -9553,6 +9583,8 @@ def heartbeat_loop(cfg, runtime, stop_event):
             if outage:
                 outage["recovered_at"] = utc_now()
                 response = send_heartbeat(cfg, runtime, outage)
+                cfg.stitch_switches.apply(response)
+                runtime.stitch_enabled = cfg.stitch_enabled
                 runtime.apply_joined_protocol_response(response)
                 outage = None
                 try:
@@ -9561,6 +9593,8 @@ def heartbeat_loop(cfg, runtime, stop_event):
                     pass
                 log("INFO", "heartbeat recovered")
         except Exception as exc:
+            cfg.stitch_switches.apply(None)
+            runtime.stitch_enabled = False
             try:
                 classification = classify_transport_error(exc).value
                 now = utc_now()
@@ -31496,12 +31530,17 @@ class StitchStop:
     """Keep the native-child watchdog nonblocking; poll remote gates separately."""
     def __init__(self, cfg, stop, task=None):
         self.cfg, self.stop, self.task, self.reason = cfg, stop, task, ""
+        switches = getattr(cfg, "stitch_switches", None)
+        self.switch_cancel = switches.state[2] if switches is not None else None
         self.done = threading.Event()
         self.monitor = None
 
     def is_set(self):
         if self.stop.is_set():
             return True
+        if ((self.switch_cancel is not None and self.switch_cancel.is_set())
+                or not getattr(self.cfg, "stitch_enabled", False)):
+            self.reason = "stitch switch off"
         with NAS_MEDIA_FENCE.condition:
             if NAS_MEDIA_FENCE.execution_owner is not None:
                 self.reason = "cleanup execution lane active"
@@ -32308,6 +32347,8 @@ def stitch_register(cfg, inventory, task_id, result):
 
 
 def stitch_once(cfg, inventory, stop_event):
+    if not getattr(cfg, "stitch_enabled", False):
+        return 30
     # Registration reconciliation needs no growing media allocation. A crash
     # after server commit but before local receipt must complete this gate.
     stitch_journal(inventory, 0, "")
@@ -32325,6 +32366,8 @@ def stitch_once(cfg, inventory, stop_event):
     stitch_resources(cfg)
     if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
         raise StitchHold("stitch cancelled while cleanup executing")
+    if stop_event.is_set() or not cfg.stitch_enabled:
+        return 30
     response = restore_api(cfg, "/account/connections/stitch/lease", {"client_version": CLIENT_VERSION})
     task = response.get("task")
     if task is None:
@@ -33575,7 +33618,7 @@ def run(cfg):
         cleanup_worker = threading.Thread(target=cleanup_loop, args=(cfg, inventory, inventory_stop_event, cleanup_verified), daemon=True)
         cleanup_worker.start()
     stitch_worker = None
-    if getattr(cfg, "stitch_enabled", False) and not cfg.dry_run:
+    if not cfg.dry_run:
         stitch_worker = threading.Thread(target=stitch_loop, args=(cfg, inventory, inventory_stop_event), daemon=True, name="nas-v85r-stitch")
         stitch_worker.start()
     updater = threading.Thread(

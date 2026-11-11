@@ -58,6 +58,9 @@ class NASPullTests(unittest.TestCase):
             inventory_hash_mbps=1000,
             min_free_bytes=100,
             dry_run=dry_run,
+            stitch_switches=pull.StitchSwitches(),
+            stitch_enabled=False,
+            stitch_delete_enabled=False,
             is_candidate=False,
         )
 

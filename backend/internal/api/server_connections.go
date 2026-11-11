@@ -688,6 +688,8 @@ type connectionHeartbeatRequest struct {
 }
 
 type connectionHeartbeatResponse struct {
+	StitchEnabled            bool  `json:"stitch_enabled"`
+	StitchDeletionEnabled    bool  `json:"stitch_deletion_enabled"`
 	CleanupReleaseGeneration int64 `json:"cleanup_release_generation,omitempty"`
 	OK                       bool  `json:"ok"`
 	JoinedDeliveryAccepted   bool  `json:"joined_delivery_accepted"`
@@ -1150,7 +1152,9 @@ func (s *Server) handleAccountConnectionHeartbeat(w http.ResponseWriter, r *http
 	s.recordNASCleanupStatus(r.Context(), connectionID, req.Cleanup)
 	s.recordNASStitchStatus(r.Context(), connectionID, req.Stitch)
 	util.WriteJSON(w, http.StatusOK, connectionHeartbeatResponse{
-		OK: true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,
+		StitchEnabled:         connectionID == 13 && s.cfg.NASStitchEnabled,
+		StitchDeletionEnabled: connectionID == 13 && s.cfg.NASStitchDeletionEnabled,
+		OK:                    true, JoinedDeliveryAccepted: joinedDeliveryAccepted, CleanupReleaseGeneration: cleanupReleaseGeneration,
 		JoinedProtocolVersion: desiredProtocol, JoinedProtocolGeneration: desiredGeneration,
 	})
 }

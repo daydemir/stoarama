@@ -531,6 +531,40 @@ func TestValidateConnectionHeartbeat(t *testing.T) {
 	}
 }
 
+func TestNASStitchHeartbeatSwitches(t *testing.T) {
+	pool, cleanup := testAccountClipsPool(t)
+	defer cleanup()
+	ctx := context.Background()
+	const accountID, apiKeyID = int64(47), int64(123)
+	if _, err := pool.Exec(ctx, `INSERT INTO connections(id,account_id,kind,api_key_id) VALUES(13,$1,'nas_pull',$2)`, accountID, apiKeyID); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{pool: pool}
+	for _, connectionID := range []int64{13, 14} {
+		if _, err := pool.Exec(ctx, `UPDATE connections SET id=$1 WHERE api_key_id=$2`, connectionID, apiKeyID); err != nil {
+			t.Fatal(err)
+		}
+		for _, enabled := range []bool{false, true} {
+			for _, deletion := range []bool{false, true} {
+				s.cfg.NASStitchEnabled, s.cfg.NASStitchDeletionEnabled = enabled, deletion
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/account/connections/heartbeat", strings.NewReader(`{}`))
+				req = req.WithContext(context.WithValue(req.Context(), accountPrincipalContextKey,
+					accountPrincipal{AccountID: accountID, APIKeyID: ptrInt64(apiKeyID)}))
+				w := httptest.NewRecorder()
+				s.handleAccountConnectionHeartbeat(w, req)
+				var response map[string]any
+				if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &response) != nil {
+					t.Fatalf("heartbeat: %d %s", w.Code, w.Body.String())
+				}
+				if response["stitch_enabled"] != (connectionID == 13 && enabled) ||
+					response["stitch_deletion_enabled"] != (connectionID == 13 && deletion) {
+					t.Fatalf("connection=%d enabled=%v deletion=%v: %s", connectionID, enabled, deletion, w.Body.String())
+				}
+			}
+		}
+	}
+}
+
 func TestConnectionHeartbeatJoinedProtocolTracksCurrentClientCapability(t *testing.T) {
 	pool, cleanup := testAccountClipsPool(t)
 	defer cleanup()
