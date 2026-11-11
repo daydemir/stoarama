@@ -1,0 +1,88 @@
+{
+  "cases": [
+    {
+      "source_bindings": [
+        {
+          "clip_id": 1649924,
+          "sha256": "42889f7c7ec16c025c630870bb06a1d37c0787560b4a6b8f9be02d0752870fa9",
+          "size_bytes": 7344889
+        },
+        {
+          "clip_id": 1649944,
+          "sha256": "85cd18b58bf9df4657ba0dc13e73486740305bafc243ffaba46e52b91d6e807a",
+          "size_bytes": 7357579
+        }
+      ]
+    },
+    {
+      "source_bindings": [
+        {
+          "clip_id": 491588,
+          "sha256": "28e1338387696279289b9f93aebd1c9fbeac14436d308b6f72ce637f78fc7ee6",
+          "size_bytes": 2107611
+        },
+        {
+          "clip_id": 491624,
+          "sha256": "2a7f876baea0384d453d5b984eec1e6160a5ea0018d6928e4acf7868413030eb",
+          "size_bytes": 2136175
+        }
+      ]
+    },
+    {
+      "source_bindings": [
+        {
+          "clip_id": 1992311,
+          "sha256": "02293a3cc86849d03636681a527c4073050f1323ade216efc19a98aa40c63bd2",
+          "size_bytes": 14269947
+        },
+        {
+          "clip_id": 1992319,
+          "sha256": "b444b4bb7fee31acd6f8b6ccbcd58cd05c6dfebca0a81e2aeea037655330f190",
+          "size_bytes": 14403046
+        }
+      ]
+    },
+    {
+      "source_bindings": [
+        {
+          "clip_id": 1974342,
+          "sha256": "ec1c821e00f3ec5dabf8dd1381720654f68422f49ac689f6862eef7acdcc6209",
+          "size_bytes": 14591755
+        },
+        {
+          "clip_id": 1974365,
+          "sha256": "18b760e307143e0e5aedbe2319f6bbb30ba907206ef13fb9a09ca28f40285400",
+          "size_bytes": 14594859
+        }
+      ]
+    },
+    {
+      "source_bindings": [
+        {
+          "clip_id": 525206,
+          "sha256": "2cf5be5f6e58c9498deb7f44e25eee345b6324f70e58784f438bb953bb0366f0",
+          "size_bytes": 22487282
+        },
+        {
+          "clip_id": 525240,
+          "sha256": "978272b45ed3a7393ff9d42325834ce9fdcd25a3e6dd1f222ca844391717121d",
+          "size_bytes": 25324572
+        }
+      ]
+    },
+    {
+      "source_bindings": [
+        {
+          "clip_id": 663182,
+          "sha256": "b202ca19131dfe29b5ea0f73e497bf5d1af228f413cb96ea0fb29e6143338190",
+          "size_bytes": 4316433
+        },
+        {
+          "clip_id": 663218,
+          "sha256": "fbcff7e57e014b4bfdb990198fc0761d509d52913f490b8b0b3dfb184f754d6f",
+          "size_bytes": 3277048
+        }
+      ]
+    }
+  ]
+}

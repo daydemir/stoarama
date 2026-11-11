@@ -357,6 +357,12 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/upload-probe/{probeId}/result", s.handleAccountConnectionUploadProbeResult)
 			account.Post("/connections/nas-restore/lease", s.handleAccountConnectionRestoreLease)
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
+			account.Post("/connections/stitch/lease", s.handleAccountNASStitchLease)
+			account.Post("/connections/stitch/{id}/checkpoint", s.handleAccountNASStitchCheckpoint)
+			account.Get("/connections/stitch/corpus", s.handleAccountNASStitchCorpus)
+			account.Get("/connections/stitch/tools/{name}", s.handleAccountNASStitchTool)
+			account.Post("/connections/stitch/{id}/result", s.handleAccountNASStitchResult)
+			account.Post("/connections/stitch/{id}/ready", s.handleAccountNASStitchReady)
 			account.Post("/connections/cleanup/lease", s.handleAccountNASCleanupLease)
 			account.Post("/connections/cleanup/{itemId}/observe", s.handleAccountNASCleanupObserve)
 			account.Post("/connections/cleanup/{itemId}/reconcile", s.handleAccountNASCleanupReconcile)
@@ -659,6 +665,10 @@ func (s *Server) router() http.Handler {
 
 		api.Group(func(service chi.Router) {
 			service.Use(s.requireServiceAuth)
+			service.Post("/service/nas-stitch/scopes", s.handleAdminNASStitchScope)
+			service.Post("/service/nas-stitch/scopes/{id}/pause", s.handleAdminNASStitchPause)
+			service.Get("/service/nas-stitch/status", s.handleAdminNASStitchStatus)
+			service.Post("/service/nas-stitch/corpus", s.handleAdminNASStitchCorpus)
 			service.Post("/service/nas-cleanup/plans", s.handleAdminNASCleanupCreate)
 			service.Get("/service/nas-cleanup/plans/{id}", s.handleAdminNASCleanupStatus)
 			service.Post("/service/nas-cleanup/plans/{id}/control", s.handleAdminNASCleanupControl)

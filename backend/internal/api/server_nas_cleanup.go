@@ -61,13 +61,14 @@ const (
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
 	// Retain reviewed predecessors. Stage this fix only with explicit
-	// NAS_VERSION=joined-marker-recovery-v1; never reuse a predecessor version.
+	// NAS_VERSION=v85r-fence-progress-v1 from merged main; never reuse a predecessor version.
 	nasCleanupExecutionClientVersion          = "be17fd73"
 	nasCleanupSerialExecutionClientVersion    = "94d39bff"
 	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
 	nasCleanupRawCreditDrainClientVersion     = "raw-credit-drain-v1"
 	nasCleanupFenceProgressClientVersion      = "fence-progress-v1"
 	nasCleanupJoinedMarkerClientVersion       = "joined-marker-recovery-v1"
+	nasCleanupV85RClientVersion               = "v85r-fence-progress-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -82,6 +83,11 @@ const nasCleanupReportSHA = "64eee0bc589c9be4dcab5b5ea7668270291a07ce4fd0db98dcd
 const nasCleanupReportKey = "staging/best14-20261021/nas-retention-20261025/current-folder-preparation-20261031/" + nasCleanupReportSHA + "/retention-only-folder-report-109.json.gz"
 
 type nasCleanupItem struct {
+	PermitReason      string    `json:"permit_reason,omitempty"`
+	StitchTaskID      int64     `json:"stitch_task_id,omitempty"`
+	StitchOutputPath  string    `json:"stitch_output_path,omitempty"`
+	StitchOutputSHA   string    `json:"stitch_output_sha256,omitempty"`
+	StitchOutputSize  int64     `json:"stitch_output_size_bytes,omitempty"`
 	StartAt           time.Time `json:"start_at"`
 	EndAt             time.Time `json:"end_at"`
 	Timezone          string    `json:"timezone"`
@@ -546,7 +552,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time
@@ -1082,6 +1088,10 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			return cleanupObserveReconcile(id, attempt, sha, req.Proof)
 		}
 	}
+	var item nasCleanupItem
+	if json.Unmarshal(raw, &item) != nil {
+		return cleanupObserveError(500, "invalid cleanup manifest")
+	}
 	// A repeated dry-run observation is idempotent; a delete permit is never
 	// reissued after a lost response. Such a task requires operator reconciliation.
 	if state != "leased" {
@@ -1093,7 +1103,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		// unexpired and the master switch is on; otherwise the caller gets the
 		// non-deleting reconcile answer below.
 		if state == "delete_issued" && req.RequestID != "" && req.Outcome == "match" && permitUntil != nil && permitUntil.After(time.Now()) && nasSpaceAuditJSONEqual(oldOutcome, retryBody) &&
-			mode == "enabled" && until != nil && until.After(time.Now()) && s.cfg.NASCleanupDeletionEnabled {
+			mode == "enabled" && until != nil && until.After(time.Now()) && s.stitchDeletionMaster(item) && (item.PermitReason == "" || s.stitchInclusionCurrent(ctx, tx, item) == nil) {
 			return cleanupObserveResult{status: 200, body: map[string]any{"action": "delete_issued", "delete": true, "item_id": id, "attempt": attempt, "plan_sha256": sha, "proof_sha256": cleanupSHA(req.Proof), "recovery": oldRecovery, "expires_at": permitUntil.UTC(), "plan_paused": false, "replayed": true}}
 		}
 		if state != "delete_issued" && state != "deleted" && nasSpaceAuditJSONEqual(oldOutcome, retryBody) {
@@ -1124,10 +1134,6 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 			return cleanupObserveError(409, "cleanup execution already outstanding")
 		}
 	}
-	var item nasCleanupItem
-	if json.Unmarshal(raw, &item) != nil {
-		return cleanupObserveError(500, "invalid cleanup manifest")
-	}
 	stageTimings := map[string]any{"client": req.Timings}
 	policyReason := ""
 	action := req.Outcome
@@ -1148,6 +1154,11 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 		bitem := item
 		bitem.Frozen = [5]int64{}
 		bitem.FrozenSidecar = [5]int64{}
+		bitem.PermitReason = ""
+		bitem.StitchTaskID = 0
+		bitem.StitchOutputPath = ""
+		bitem.StitchOutputSHA = ""
+		bitem.StitchOutputSize = 0
 		b, _ := json.Marshal(bitem)
 		if binding != cleanupPolicySHA || mode == "retired" {
 			action = "keep"
@@ -1183,7 +1194,7 @@ func (s *Server) cleanupObserveOne(ctx context.Context, tx pgx.Tx, cid, id int64
 					recoveryAnomaly = true
 					policyReason = "R2 MD5/ETag match disagreed with the full SHA-256 audit"
 				}
-				if lease.After(time.Now()) && cleanupMayIssue(mode, s.cfg.NASCleanupDeletionEnabled, until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
+				if lease.After(time.Now()) && cleanupMayIssue(mode, s.stitchDeletionMaster(item), until, cleanupSameFileProof(oldProof, req.Proof), recovery) {
 					allowed, e := env.budgetAllows(ctx, tx, item.SizeBytes)
 					if e != nil {
 						return cleanupObserveError(500, "cleanup deletion budget unavailable")

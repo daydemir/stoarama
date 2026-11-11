@@ -85,7 +85,7 @@ jobs:
       - name: Test original NAS presentation witnesses first
         env:
           STOARAMA_TEST_DATABASE_URL: postgres://stoarama@localhost:5432/stoarama_test?sslmode=disable
-        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASSelectedVerify|OriginalWitness|NASCleanup|NASClient|NASDiagnostics)' -count=1 -v
+        run: go test ./internal/api ./cmd/stoaramactl ./internal/db -run '^Test(NASSelectedVerify|OriginalWitness|NASCleanup|NASStitch|NASClient|NASDiagnostics)' -count=1 -v
       - name: NAS cleanup exact-file dry run and failure recovery
         working-directory: .
         run: python3 -m unittest discover -s clients/nas-pull -p test_cleanup.py -v
@@ -169,6 +169,12 @@ jobs:
         run: go test ./internal/api -run '^TestRecordingJoinedProgressLazyEndpointAuthPublicParityAndIsolation$' -count=1 -v
       - name: Install system FFmpeg for NAS tests
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
+      - name: NAS V85r fake-NAS stitching and crash recovery
+        working-directory: .
+        run: python3 -m unittest discover -s clients/nas-pull -p test_stitch.py -v
+      - name: V85r package pins and conservative decisions
+        working-directory: .
+        run: python3 -m unittest discover -s clients/nas-pull -p test_v85r.py -v
       - name: Install pinned FFmpeg for joined lifecycle tests
         env:
           JOINED_RECORDING_FFMPEG_ARCHIVE_URL: https://github.com/daydemir/stoarama/releases/download/joined-media-tools-ffmpeg-N-126239-g88ae625e69/ffmpeg-N-126239-g88ae625e69-linux64-gpl.tar.xz

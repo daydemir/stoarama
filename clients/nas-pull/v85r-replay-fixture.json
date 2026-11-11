@@ -1,0 +1,60 @@
+{
+  "frozen": {
+    "case": "cohort79-355-14069-14094",
+    "frozen_diagnostic_sha256": "65b96f2baec3bf93a374d7030032cf803f016ba53a2be92c48fcf538f5673a99",
+    "nomination": true,
+    "recording_id": 355,
+    "source_key": [
+      [
+        14069,
+        "82dca49042c9805d3d4d78545db356dbe16f60f0b9595600ebff5ab48b7e7674",
+        6963294
+      ],
+      [
+        14094,
+        "60d7ef2ba420f317efef10050214063f8a4dc888dd912977b1c40bd866cac888",
+        7830251
+      ]
+    ],
+    "status": "APPROVED85_nomination_requires_runtime_native_join_checks"
+  },
+  "diagnostic": {
+    "db_gap_seconds": 0,
+    "decision": "split",
+    "frame_match": {
+      "boundary_mad": 1.8569,
+      "head_frames": 600,
+      "head_median_mad": 104.1512,
+      "head_min_mad": 1.7821,
+      "head_min_offset_frames": 26,
+      "key_step_median_mad": 0.8285,
+      "step_p95_mad": 2.7496,
+      "tail_frames": 600,
+      "tail_median_mad": 104.4504,
+      "tail_min_mad": 1.7984,
+      "tail_min_offset_frames": 3,
+      "verdict": "jump",
+      "window_seconds": 20
+    },
+    "frame_seconds": 0.033008,
+    "gop_lattice": {
+      "complete_gops_observed": 16,
+      "gop_length": 60,
+      "prev_last_gop": 60,
+      "status": "complete"
+    },
+    "next_clip_id": 14094,
+    "prev_clip_id": 14069,
+    "reason": "frame_jump",
+    "source_evidence": {
+      "calibration_transitions": 2,
+      "channel": "h264_hrd",
+      "cpb_step": 2,
+      "next_first_cpb": 120,
+      "prev_last_cpb": 118,
+      "prev_last_gop_units": 60,
+      "reason": "calibration_saturated_or_short",
+      "status": "unavailable"
+    }
+  }
+}
