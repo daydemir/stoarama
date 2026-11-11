@@ -1983,7 +1983,9 @@ class JoinedDownloadTests(unittest.TestCase):
                         else:
                             with self.assertRaises(Crash):
                                 pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
-                    pull.ensure_owned_joined_partial(cfg, self.runtime(cfg), directory_fd, part, marker, expected, threading.Event())
+                    restarted = self.runtime(cfg)
+                    pull.ensure_owned_joined_partial(cfg, restarted, directory_fd, part, marker, expected, threading.Event())
+                    self.assertIn("quarantine", restarted.heartbeat_payload(None)["client_last_error"])
                     self.assertEqual((parent / marker).read_bytes(), expected)
                     self.assertEqual((parent / marker).stat().st_nlink, 1)
                     self.assertEqual((parent / part).read_bytes(), b"preserved partial")

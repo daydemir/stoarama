@@ -1504,8 +1504,9 @@ class Runtime:
         self.joined_protocol_generation = 0
         self.joined_delivery = None
         self.joined_delivery_error = ""
-        self.joined_quarantine_notice = ""
-        self.joined_quarantine_notice_at = None
+        self.joined_quarantine_notice, self.joined_quarantine_notice_at = latest_joined_quarantine_notice(cfg)
+        if self.joined_quarantine_notice:
+            log("WARN", self.joined_quarantine_notice)
         self.joined_transfer = None
         self.joined_raw_priority_polled_at = 0.0
         self.joined_raw_priority_pending = False
@@ -7369,6 +7370,34 @@ def joined_sidecar_intent(cfg, directory_fd, name, content):
     }
     key = hashlib.sha256(str(marker_path).encode("utf-8")).hexdigest()
     return cfg.state_dir / ("joined-sidecar-intent-" + key + ".json"), identity
+
+
+def latest_joined_quarantine_notice(cfg):
+    # A crash may follow the NAS rename but precede its upload. Replay a bounded
+    # ledger tail as diagnostics only; it never grants filesystem authority.
+    path = cfg.state_dir / "joined-alias-quarantine.jsonl"
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return "", None
+    except OSError as exc:
+        return "joined quarantine ledger unreadable: %s" % exc, utc_now()
+    try:
+        current = os.fstat(descriptor)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            return "joined quarantine ledger is not exclusively owned", utc_now()
+        os.lseek(descriptor, max(0, current.st_size - 65536), os.SEEK_SET)
+        tail = os.read(descriptor, 65536)
+    finally:
+        os.close(descriptor)
+    for line in reversed(tail.splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # A crash can leave a partial final append.
+        if isinstance(record, dict) and record.get("operation") in ("alias_move", "canonical_copy"):
+            return "joined quarantine ledger replay: " + json.dumps(record, sort_keys=True)[:940], record.get("recorded_at")
+    return "", None
 
 
 def append_joined_quarantine_ledger(cfg, record):
