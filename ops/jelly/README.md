@@ -60,7 +60,9 @@ and empty object pointers. This is DB-catalog presence, **not** a new R2 HEAD
 inventory. Stitched outputs do not fill raw coverage gaps. Historical catalog
 bounds (including purged clips) preserve the full recording span; absent raw R2
 days show zero. Hours and days recorded count the surviving raw coverage. All
-days divide by 86,400, including 23/25-hour DST days (which can exceed 100%).
+days divide by their scheduled seconds: the union of recording daily windows,
+split at local midnight with DST-aware boundaries. Only clip seconds inside those
+windows count. Overlaps count once; cards show the recording windows.
 Green is strictly >90%; yellow includes exactly 70% and 90%; zero uses an empty
 dashed outline. Average coverage includes every gap day. `Days ≥90%` includes
 exactly 90%, even though that day's colour is yellow. Current raw and registered

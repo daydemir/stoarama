@@ -1,5 +1,5 @@
 -- CTE fixtures shadow production tables. This is SELECT-only, even on Jelly.
-recordings(id,account_id,stream_id) AS (VALUES (1,47,1),(2,48,2),(3,47,3)),
+recordings(id,account_id,stream_id,daily_window_start,daily_window_end) AS (VALUES (1,47,1,'00:00'::time,'00:00'::time),(2,48,2,'00:00'::time,'00:00'::time),(3,47,3,'23:00'::time,'01:00'::time),(4,47,1,'08:00'::time,'20:00'::time)),
 streams(id,name,location_city,location_country,local_timezone) AS (
  VALUES (1,'DST overlap','Los Angeles','United States','America/Los_Angeles'),
  (2,'Other account','','','UTC'),(3,'Extra R2 stream','','','UTC')),
