@@ -76,9 +76,18 @@ The runner:
 
 `~/stoarama-cleanup-runner/status.json` is atomically replaced; `runner.jsonl` is
 append-only. Totals and per-stream confirmed deletion progress come from the DB,
-so restart does not double-count. A short daily UTC progress email goes to
-`CLEANUP_OWNER_EMAIL` via the existing Resend credentials; an initial accepted
-email is required before enabling deletion. Failure handling first confirms OFF,
+so restart does not double-count. Every daily note and alert appends a JSON line
+with timestamp, subject and rendered plain text to `notes.jsonl` in this state
+directory (mode 600, file and directory fsync). The operator agent reads these
+local notes. Alerts also go to stderr. A successful durable startup note write
+is required before enabling deletion, including same-day restarts; a write
+failure blocks enabling and sets `owner_notification_failed` with a stderr alert.
+
+Email is optional: unset or empty `CLEANUP_OWNER_EMAIL` means no email requests
+and no Resend configuration requirement. In that mode durable local delivery
+satisfies the owner delivery gate. When an address is set, daily notes and alerts
+also use the existing `EMAIL_FROM` and `EMAIL_RESEND_API_KEY` configuration;
+Resend acceptance is still required for the daily delivery gate. Failure handling first confirms OFF,
 then alerts the owner, attempts recovery, and independently attempts state and
 STOP writes. Disk-full or other write errors cannot skip shutdown or notification;
 write failures also emit loud stderr messages. While OFF is unconfirmed, shutdown

@@ -505,24 +505,53 @@ class Runner:
     def stopped(self):
         return self.stopping or (self.root / 'STOP').exists()
 
+    def write_note(self, subject, text):
+        try:
+            fd = os.open(self.root / 'notes.jsonl', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, 'a') as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(json.dumps({'at': utcnow().isoformat(), 'subject': subject, 'text': text}) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            directory = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            return True
+        except Exception:
+            self.status['owner_notification_failed'] = True
+            critical('owner note write failed; operator intervention required')
+            return False
+
     def check_delivery(self):
-        require(os.environ.get('CLEANUP_OWNER_EMAIL') and os.environ.get('EMAIL_FROM')
-                and os.environ.get('EMAIL_RESEND_API_KEY'), 'owner email configuration missing')
+        if os.environ.get('CLEANUP_OWNER_EMAIL'):
+            require(os.environ.get('EMAIL_FROM') and os.environ.get('EMAIL_RESEND_API_KEY'),
+                    'owner email configuration missing')
+        # Check storage on every startup, even if today's daily note was sent.
+        title, plain, _ = render_email(self.status, 'daily progress startup', utcnow())
+        require(self.write_note(title, plain), 'owner note write failed')
 
     def notify(self, subject):
-        self.check_delivery()
         # Establish the old minimal payload before rendering. Formatting failures
         # must never suppress an owner notification or expose exception details.
         text = json.dumps({k: self.status.get(k) for k in ('phase', 'deleted_files', 'deleted_bytes', 'current_plan', 'last_error')})
-        payload = {'from': os.environ['EMAIL_FROM'], 'to': [os.environ['CLEANUP_OWNER_EMAIL']],
-                   'subject': '[Stoarama NAS cleanup] ' + subject, 'text': text}
+        title, plain, rich = '[Stoarama NAS cleanup] ' + subject, text, None
         try:
             title, plain, rich = render_email(self.status, subject, utcnow())
-            payload.update(subject=title, text=plain, html=rich)
         except Exception:
             pass  # No exception strings: this is also the emergency alert path.
-        reply = request('https://api.resend.com/emails', os.environ['EMAIL_RESEND_API_KEY'], 'POST', payload)
-        require(bool(reply.get('id')), 'owner email delivery not accepted')
+        written = self.write_note(title, plain)
+        if os.environ.get('CLEANUP_OWNER_EMAIL'):
+            require(os.environ.get('EMAIL_FROM') and os.environ.get('EMAIL_RESEND_API_KEY'),
+                    'owner email configuration missing')
+            payload = {'from': os.environ['EMAIL_FROM'], 'to': [os.environ['CLEANUP_OWNER_EMAIL']],
+                       'subject': title, 'text': plain}
+            if rich is not None:
+                payload['html'] = rich
+            reply = request('https://api.resend.com/emails', os.environ['EMAIL_RESEND_API_KEY'], 'POST', payload)
+            require(bool(reply.get('id')), 'owner email delivery not accepted')
+        require(written, 'owner note write failed')
 
     def progress(self):
         rows = self.query("""SELECT coalesce(json_agg(x),'[]') FROM (
