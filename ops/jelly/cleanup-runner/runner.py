@@ -4,6 +4,7 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import html
 import importlib.util
 import json
 import os
@@ -146,6 +147,77 @@ def execution_state(plan):
     require(all(r['state'] in {'pending', 'leased', 'would_delete', 'delete_issued', 'deleted'} for r in rows),
             'execution contains an anomalous item')
     return 'running'
+
+
+def human_size(value):
+    value = int(value or 0)
+    return '{:,.1f} {}'.format(value / (10**12 if value >= 10**12 else 10**9),
+                               'TB' if value >= 10**12 else 'GB')
+
+
+def render_email(status, reason, now):
+    """Render only owner-facing fields; never dump internal status or errors."""
+    daily = reason.startswith('daily progress ')
+    files = '{:,}'.format(int(status.get('deleted_files') or 0))
+    size = human_size(status.get('deleted_bytes'))
+    plan = status.get('current_plan')
+    plan = str(int(plan)) if plan is not None else 'none'
+    phases = {
+        'dry_run': 'checking the next batch (no deletion)',
+        'dry_run_pass': 'next batch checked (no deletion)',
+        'master_false': 'idle, deletion switched off',
+        'monitoring': 'deleting batch ' + plan,
+        'enabling': 'starting batch ' + plan,
+        'master_true': 'deletion switch enabled',
+        'master_true_requested': 'preparing the deletion switch',
+        'waiting_for_budget': 'waiting for the daily deletion allowance',
+        'batch_complete': 'batch finished',
+        'recovery_verified': 'R2 recovery copies verified',
+        'complete': 'cleanup complete', 'stopped': 'cleanup stopped',
+        'failed': 'cleanup stopped for owner review',
+        'starting': 'starting cleanup checks',
+    }
+    phase = phases.get(status.get('phase'), 'checking cleanup status')
+    subject = ('Stoarama NAS cleanup — {} {}: {} files ({}) deleted so far'.format(
+        now.strftime('%b'), now.day, files, size) if daily
+        else 'ACTION NEEDED: ' + reason)
+    lines = ['The runner is ' + phase + '. Current plan: ' + plan + '.',
+             'Deleted so far: ' + files + ' files (' + size + ').']
+    if status.get('deleted_24h_files') is not None:
+        lines.append('Deleted in the last 24 hours: {:,} files ({}).'.format(
+            int(status['deleted_24h_files']), human_size(status.get('deleted_24h_bytes'))))
+    if not daily:
+        # OFF may still be retrying; do not claim a confirmed shutdown in that case.
+        lines.append('What to do: reply or ask Claude to review. ' + (
+            'Deletion is off.' if status.get('phase') == 'master_false'
+            else 'Deletion is being switched off; check shutdown confirmation.'))
+        if status.get('last_error'):
+            lines.append('Last error: ' + status['last_error'])  # Fixed, sanitized by caller.
+    rows = []
+    for row in status.get('per_stream') or []:
+        sid = str(int(row['stream_id']))
+        name = row.get('stream_name')
+        # Stream names are catalog text, not diagnostic output. Omit URL-like names.
+        name = name if isinstance(name, str) and not re.search(r'[:/\\\r\n]', name) else None
+        rows.append((sid + (' — ' + name if name else ''),
+                     '{:,}'.format(int(row['files'])), human_size(row['bytes'])))
+    text = '\n\n'.join(lines)
+    text += '\n\nPer stream (stream, files, size):\n' + ('\n'.join(
+        ' | '.join(row) for row in rows) if rows else 'No deleted files reported yet.')
+    footer = 'Sent by the Jelly cleanup runner. R2 copies are kept.'
+    text += '\n\n' + footer
+    esc = html.escape
+    body = '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>'
+    body += '<body style="margin:0;padding:16px;background:#f5f6f8;color:#202532;font-family:Arial,sans-serif;line-height:1.5">'
+    body += '<div style="max-width:640px;margin:auto;padding:20px;background:#fff;border-radius:8px">'
+    body += '<h1 style="font-size:22px;line-height:1.3">' + esc(subject) + '</h1>'
+    body += ''.join('<p>' + esc(line) + '</p>' for line in lines)
+    body += '<h2 style="font-size:18px">Per stream</h2><table style="width:100%;border-collapse:collapse;font-size:14px">'
+    body += '<tr>' + ''.join('<th scope="col" style="text-align:left;padding:8px;border-bottom:2px solid #ddd">' + label + '</th>' for label in ('Stream', 'Files', 'Size')) + '</tr>'
+    body += ''.join('<tr>' + ''.join('<td style="padding:8px;border-bottom:1px solid #eee;overflow-wrap:anywhere">' + esc(cell) + '</td>' for cell in row) + '</tr>' for row in rows)
+    body += '</table>' + ('' if rows else '<p>No deleted files reported yet.</p>')
+    body += '<p style="font-size:12px;color:#576174">' + esc(footer) + '</p></div></body></html>'
+    return subject, text, body
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -439,20 +511,34 @@ class Runner:
 
     def notify(self, subject):
         self.check_delivery()
+        # Establish the old minimal payload before rendering. Formatting failures
+        # must never suppress an owner notification or expose exception details.
         text = json.dumps({k: self.status.get(k) for k in ('phase', 'deleted_files', 'deleted_bytes', 'current_plan', 'last_error')})
-        reply = request('https://api.resend.com/emails', os.environ['EMAIL_RESEND_API_KEY'], 'POST', {
-            'from': os.environ['EMAIL_FROM'], 'to': [os.environ['CLEANUP_OWNER_EMAIL']],
-            'subject': '[Stoarama NAS cleanup] ' + subject, 'text': text})
+        payload = {'from': os.environ['EMAIL_FROM'], 'to': [os.environ['CLEANUP_OWNER_EMAIL']],
+                   'subject': '[Stoarama NAS cleanup] ' + subject, 'text': text}
+        try:
+            title, plain, rich = render_email(self.status, subject, utcnow())
+            payload.update(subject=title, text=plain, html=rich)
+        except Exception:
+            pass  # No exception strings: this is also the emergency alert path.
+        reply = request('https://api.resend.com/emails', os.environ['EMAIL_RESEND_API_KEY'], 'POST', payload)
         require(bool(reply.get('id')), 'owner email delivery not accepted')
 
     def progress(self):
         rows = self.query("""SELECT coalesce(json_agg(x),'[]') FROM (
           SELECT (p.manifest->(i.ordinal-1)->>'stream_id')::bigint stream_id,
-            count(*) files,sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint) bytes
+            max(s.name) stream_name,
+            count(*) files,sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint) bytes,
+            count(*) FILTER (WHERE i.updated_at>now()-interval '24 hours') recent_files,
+            coalesce(sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)
+              FILTER (WHERE i.updated_at>now()-interval '24 hours'),0) recent_bytes
           FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
+          LEFT JOIN streams s ON s.id=(p.manifest->(i.ordinal-1)->>'stream_id')::bigint
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state='deleted' AND i.delete_ever_issued GROUP BY 1 ORDER BY 1) x""")
         self.save(self.status.get('phase', 'starting'), deleted_files=sum(r['files'] for r in rows),
-                  deleted_bytes=sum(r['bytes'] for r in rows), per_stream=rows)
+                  deleted_bytes=sum(r['bytes'] for r in rows), per_stream=rows,
+                  deleted_24h_files=sum(r.get('recent_files', 0) for r in rows),
+                  deleted_24h_bytes=sum(r.get('recent_bytes', 0) for r in rows))
         today = utcnow().date().isoformat()
         if self.status.get('last_note_day') != today:
             self.notify('daily progress ' + today)
