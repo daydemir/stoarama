@@ -527,14 +527,13 @@ class Runner:
     def progress(self):
         rows = self.query("""SELECT coalesce(json_agg(x),'[]') FROM (
           SELECT (p.manifest->(i.ordinal-1)->>'stream_id')::bigint stream_id,
-            max(s.name) stream_name,
             count(*) files,sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint) bytes,
             count(*) FILTER (WHERE i.updated_at>now()-interval '24 hours') recent_files,
             coalesce(sum((p.manifest->(i.ordinal-1)->>'size_bytes')::bigint)
               FILTER (WHERE i.updated_at>now()-interval '24 hours'),0) recent_bytes
           FROM nas_cleanup_items i JOIN nas_cleanup_plans p ON p.id=i.plan_id
-          LEFT JOIN streams s ON s.id=(p.manifest->(i.ordinal-1)->>'stream_id')::bigint
           WHERE p.account_id=47 AND p.connection_id=13 AND i.state='deleted' AND i.delete_ever_issued GROUP BY 1 ORDER BY 1) x""")
+        self.add_stream_names(rows)
         self.save(self.status.get('phase', 'starting'), deleted_files=sum(r['files'] for r in rows),
                   deleted_bytes=sum(r['bytes'] for r in rows), per_stream=rows,
                   deleted_24h_files=sum(r.get('recent_files', 0) for r in rows),
@@ -545,6 +544,21 @@ class Runner:
             self.save(self.status['phase'], last_note_day=today, daily_note={
                 'files': self.status['deleted_files'], 'bytes': self.status['deleted_bytes'],
                 'current_plan': self.status['current_plan']})
+
+    def add_stream_names(self, rows):
+        # Cosmetic only: a failed name lookup must never block progress or alerts.
+        try:
+            ids = sorted({int(r['stream_id']) for r in rows if r.get('stream_id') is not None})
+            if not ids:
+                return
+            names = self.query("SELECT coalesce(json_object_agg(id,name),'{}') FROM streams WHERE id = ANY(ARRAY["
+                               + ','.join(str(i) for i in ids) + "]::bigint[])")
+            for r in rows:
+                name = names.get(str(r.get('stream_id'))) if isinstance(names, dict) else None
+                if isinstance(name, str):
+                    r['stream_name'] = name
+        except Exception:
+            pass
 
     def recent_bytes(self):
         # Count ever-issued permits, including uncertain receipts: stricter than deleted bytes.

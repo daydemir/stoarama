@@ -816,6 +816,25 @@ class RenderOffTests(unittest.TestCase):
             self.assertIn(('runtime', 42, None), self.calls)
 
 
+class StreamNameTests(unittest.TestCase):
+    def test_name_lookup_failure_keeps_progress_rows(self):
+        job = r.Runner(Path('.'), Path('.'))
+        rows = [dict(stream_id=3, files=1, bytes=2)]
+        def fail(sql):
+            raise r.Halt('read-only catalog query failed')
+        job.query = fail
+        job.add_stream_names(rows)
+        self.assertEqual(rows, [dict(stream_id=3, files=1, bytes=2)])
+
+    def test_name_lookup_adds_names(self):
+        job = r.Runner(Path('.'), Path('.'))
+        rows = [dict(stream_id=3, files=1, bytes=2), dict(stream_id=4, files=1, bytes=2)]
+        job.query = lambda sql: {'3': 'Market square'}
+        job.add_stream_names(rows)
+        self.assertEqual(rows[0]['stream_name'], 'Market square')
+        self.assertNotIn('stream_name', rows[1])
+
+
 class EmailTests(unittest.TestCase):
     def status(self):
         return dict(phase='monitoring', current_plan=42, deleted_files=5841,
