@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestNASCleanupRankingCacheUsesFrozenVerdictAndReplaysOnExpiry(t *testing.T) {
+func TestNASCleanupRankingCacheUsesFrozenVerdictAcrossLongGaps(t *testing.T) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("cache-invalidation", syntheticFiles(100, 5, 10))
 	f.dryRun()
@@ -37,7 +37,41 @@ func TestNASCleanupRankingCacheUsesFrozenVerdictAndReplaysOnExpiry(t *testing.T)
 	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_rankings_cache SET checked_at=clock_timestamp()-interval '61 seconds' WHERE plan_id=$1`, id); err != nil {
 		t.Fatal(err)
 	}
-	execute("replay")
+	execute("hit")
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_rankings_cache SET checked_at=clock_timestamp()-interval '23 hours' WHERE plan_id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	execute("hit")
+	// A deployed #449 activation has no generation in execution_rankings;
+	// its persisted cache row still binds the verdict to the live freeze.
+	if _, err := f.pool.Exec(f.ctx, `UPDATE nas_cleanup_plans SET execution_rankings=jsonb_build_object('3',(execution_rankings->'3')-'freeze_generation') WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	execute("hit")
+}
+
+func TestNASCleanupRankingCacheFailsClosedOnFreezeChange(t *testing.T) {
+	for _, change := range []string{
+		`UPDATE nas_cleanup_frozen_streams SET generation=generation+1000 WHERE plan_id=$1`,
+		`UPDATE nas_cleanup_rankings_cache SET freeze_generation=freeze_generation+1000 WHERE plan_id=$1`,
+		`DELETE FROM nas_cleanup_frozen_streams WHERE plan_id=$1`,
+		`WITH removed AS (DELETE FROM nas_cleanup_rankings_cache WHERE plan_id=$1) UPDATE nas_cleanup_frozen_streams SET generation=generation+1000 WHERE plan_id=$1`,
+	} {
+		t.Run(change, func(t *testing.T) {
+			f, id, tasks := cleanupFenceFixture(t, false)
+			if _, err := f.pool.Exec(f.ctx, change, id); err != nil {
+				t.Fatal(err)
+			}
+			result := f.observe(tasks, map[int64]string{tasks[0].ItemID: fmt.Sprintf("%032x", tasks[0].ItemID)})[0]
+			if result.Delete {
+				t.Fatalf("changed freeze minted permit: %+v", result)
+			}
+			var issued bool
+			if err := f.pool.QueryRow(f.ctx, `SELECT delete_ever_issued FROM nas_cleanup_items WHERE id=$1`, tasks[0].ItemID).Scan(&issued); err != nil || issued {
+				t.Fatalf("changed freeze recorded authority: %t %v", issued, err)
+			}
+		})
+	}
 }
 
 func TestNASCleanupRankingCacheRollsBackWithObservation(t *testing.T) {

@@ -214,6 +214,7 @@ type cleanupExecutionRanking struct {
 	BestStart   string    `json:"best_start"`
 	Fingerprint string    `json:"fingerprint"`
 	At          time.Time `json:"at"`
+	Generation  int64     `json:"freeze_generation"`
 }
 
 // Publish the freeze in a separate committed transaction before excluding old
@@ -355,7 +356,7 @@ func (s *Server) cleanupActivateRankings(ctx context.Context, tx pgx.Tx, planID 
 		if best != window.BestStart || fingerprint == "" {
 			return release, fmt.Errorf("stream %d best-14 replay differs from pinned verdict; KEEP", stream)
 		}
-		pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: checked}
+		pinned[strconv.FormatInt(stream, 10)] = cleanupExecutionRanking{BestStart: best, Fingerprint: fingerprint, At: checked, Generation: generation}
 		if _, err = tx.Exec(ctx, cleanupRankingsCacheStoreSQL, planID, stream, generation, best, fingerprint, checked); err != nil {
 			return release, err
 		}

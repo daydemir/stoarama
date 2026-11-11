@@ -435,6 +435,27 @@ including failed attempts. Server retention preserves seven days regardless of
 upload count; the read endpoint filters and limits lines in PostgreSQL.
 
 
+## Execution scheduling and client version
+
+The reviewed client version is `raw-credit-drain-v1`; the release command requires
+explicit `NAS_VERSION=raw-credit-drain-v1` when staging these exact client bytes.
+This change adds that version to the execution allowlist; it does not stage or
+promote a release.
+
+An execution window pauses new joined/collated downloads and inventory work.
+Raw delivery continues while active writers drain because joined downloads may
+need raw-progress credits to finish. Only after that drain does cleanup reserve
+the media fence across serial leases, observations, unlinks and receipts.
+Lane admission and writer draining share a 15-second budget; a failed drain
+releases the window so maintenance can proceed. Direct per-file fence waits
+also have a 15-second bound. After at most five minutes between completed
+executions, the lane releases its fence for a 30-second maintenance interval.
+
+The regression in `test_joined_download.py` runs the actual joined-download
+entry point with cleanup and raw-delivery threads. The local client/server
+throughput harness adds five-second joined writers that require raw-progress
+credits, checks at least 15 files/minute, and verifies one execution in flight.
+
 ## Execution observation deadlines and refusal evidence
 
 Enabled observations use one **15-second server deadline**, starting before account

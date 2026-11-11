@@ -71,7 +71,9 @@ def run(args):
     state = Path(args.state)
     state.mkdir(parents=True, exist_ok=True)
     cfg = SimpleNamespace(api_base=args.api, api_key="bench", output_dir=Path(args.root), state_dir=state,
-                          inventory_file=state / "inventory.sqlite3", dry_run=False)
+                          inventory_file=state / "inventory.sqlite3", dry_run=False,
+                          progress_file=state / "progress.json", legacy_progress_file=state / "cursor.json",
+                          runtime_file=state / "runtime.json", download_workers=12)
     inventory = pull.Inventory(cfg)
     stop = threading.Event()
     root = str(Path(args.root))
@@ -79,10 +81,48 @@ def run(args):
     started = time.monotonic()
     cycles = 0
     errors = []
-    with mock.patch.object(pull.os.path, "ismount", side_effect=lambda p: str(p) == root or real_ismount(p)), \
+    maintenance_stop = threading.Event()
+    maintenance_calls = [0]
+    raw_calls = [0]
+    maintenance_threads = []
+    if args.slow_joined_seconds:
+        runtime = pull.Runtime(cfg)
+        runtime.apply_joined_protocol_response({
+            "ok": True, "joined_delivery_accepted": True, "joined_protocol_version": 1,
+            "joined_protocol_generation": pull.JOINED_FAIR_SHARE_MIN_GENERATION,
+        })
+        @pull.NAS_MEDIA_FENCE.background_delivery
+        def joined_work():
+            maintenance_calls[0] += 1
+            maintenance_stop.wait(args.slow_joined_seconds)
+            # Active joined writers depend on real Runtime raw-progress
+            # credits even after the execution window starts draining them.
+            pull.await_joined_work(cfg, runtime, maintenance_stop)
+        @pull.NAS_MEDIA_FENCE.delivery
+        def raw_work():
+            raw_calls[0] += 1
+            runtime.grant_joined_work_credit()
+        def delivery():
+            while not maintenance_stop.is_set():
+                try:
+                    joined_work()
+                except pull.JoinedDownloadYield:
+                    if not maintenance_stop.is_set():
+                        raise
+        def raw_delivery():
+            while not maintenance_stop.wait(.05):
+                raw_work()
+        # Keep joined writers queued, with raw progress required to drain
+        # each active writer. Only a bounded execution window can pause raw.
+        maintenance_threads = [threading.Thread(target=target, daemon=True)
+                               for target in (delivery, delivery, raw_delivery)]
+    with mock.patch.object(pull, "poll_raw_pending_cached", return_value=True), \
+            mock.patch.object(pull.os.path, "ismount", side_effect=lambda p: str(p) == root or real_ismount(p)), \
             mock.patch.object(pull.os, "unlink", wraps=os.unlink) as unlink, \
             concurrent.futures.ThreadPoolExecutor(max_workers=pull.CLEANUP_V2_WORKERS, thread_name_prefix="nas-cleanup") as executor:
         api = pull.CleanupBatchAPI(cfg) if args.protocol == 2 else None
+        for worker in maintenance_threads:
+            worker.start()
         try:
             while time.monotonic() - started < args.max_seconds:
                 cycles += 1
@@ -130,6 +170,9 @@ def run(args):
                 if retry:
                     break
         finally:
+            maintenance_stop.set()
+            for worker in maintenance_threads:
+                worker.join(timeout=5)
             if api is not None:
                 api.close()
     elapsed = time.monotonic() - started
@@ -143,6 +186,7 @@ def run(args):
     inventory.close()
     print("BENCH_RESULT " + json.dumps({"protocol": args.protocol, "seconds": round(elapsed, 3), "cycles": cycles,
                                        "ledger_deleted": deleted, "unlink_calls": unlink.call_count,
+                                       "joined_calls": maintenance_calls[0], "raw_calls": raw_calls[0],
                                        "errors": errors, "execution_outcomes": outcomes}), flush=True)
 
 
@@ -165,6 +209,7 @@ def main():
     r.add_argument("--max-seconds", type=float, default=1800)
     r.add_argument("--simultaneous-tasks", type=int, default=0, help="contend for execution leases with this many workers (regression harness only)")
     r.add_argument("--one-attempt", action="store_true", help="exercise one lease without replaying an uncertain observation")
+    r.add_argument("--slow-joined-seconds", type=float, default=0, help="continuously queue slow delivery work behind the real media fence")
     args = parser.parse_args()
     (prepare if args.command == "prepare" else run)(args)
 

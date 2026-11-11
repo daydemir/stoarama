@@ -5,7 +5,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
 
-NAS_VERSION="${NAS_VERSION:-$(git -C "${ROOT_DIR}" rev-parse --short=8 HEAD)}"
+if [[ -z "${NAS_VERSION:-}" ]]; then
+  echo "error: NAS_VERSION must name the explicitly reviewed client release" >&2
+  exit 1
+fi
 if [[ ! "${NAS_VERSION}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ || "${NAS_VERSION}" == *..* ]]; then
   echo "error: invalid NAS_VERSION" >&2
   exit 1

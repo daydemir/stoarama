@@ -1276,6 +1276,9 @@ class Inventory:
 
         known_paths = set()
         for sidecar in walk_raw_files(cfg.output_dir):
+            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                return
             if not sidecar.name.endswith(".stoarama.json"):
                 continue
             if stop_event.is_set():
@@ -1350,6 +1353,9 @@ class Inventory:
                 skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
                 log("WARN", f"inventory skipped reason={reason} count={skip_reasons[reason]}")
         for path in walk_raw_files(cfg.output_dir):
+            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                self._commit_scan_batch((scanned, skipped, skip_reasons))
+                return
             if stop_event.is_set():
                 self._commit_scan_batch((scanned, skipped, skip_reasons))
                 return
@@ -1456,6 +1462,8 @@ def inventory_loop(cfg, inventory, stop_event):
         return
     while not stop_event.is_set():
         try:
+            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                return
             with inventory.activity_lock:
                 inventory.sync_dirty(cfg, stop_event=stop_event)
                 if stop_event.is_set():
@@ -1898,24 +1906,32 @@ class NASMediaFence:
     App writers and cleanup deletions exclude each other. Several cleanup
     workers may hold the fence together: each deletes only its own exact,
     separately permitted file, and same-folder namespace changes made by them
-    are accounted for exactly (see CleanupDirectoryLog). A waiting writer
-    blocks new cleanup holders so delivery is never starved."""
+    are accounted for exactly (see CleanupDirectoryLog). A serial execution
+    lane reserves the fence across receipts and leases for a bounded window;
+    new background delivery waits for the next maintenance boundary. Raw
+    delivery stays admitted while existing writers drain, since joined writers
+    can depend on its progress credits."""
     def __init__(self):
         self.condition = threading.Condition()
         self.writers = 0
         self.writers_waiting = 0
         self.cleaners = 0
+        self.execution_owner = None
+        self.execution_lock = threading.Lock()
 
     @property
     def exclusive(self):
         return self.cleaners > 0
 
-    def delivery(self, fn):
+    def background_delivery(self, fn):
+        return self.delivery(fn, background=True)
+
+    def delivery(self, fn, background=False):
         def wrapped(*args, **kwargs):
             with self.condition:
                 self.writers_waiting += 1
                 try:
-                    while self.cleaners:
+                    while self.cleaners or (background and self.execution_owner is not None):
                         self.condition.wait(1)
                 finally:
                     self.writers_waiting -= 1
@@ -1930,7 +1946,7 @@ class NASMediaFence:
 
     def acquire_cleanup(self, stop_event, deadline):
         with self.condition:
-            while self.writers or self.writers_waiting:
+            while self.writers or (self.writers_waiting and self.execution_owner != threading.get_ident()):
                 if stop_event.is_set() or time.monotonic() >= deadline:
                     raise CleanupInterrupted("cleanup writer fence timed out or cancelled")
                 self.condition.wait(0.2)
@@ -1941,8 +1957,65 @@ class NASMediaFence:
             self.cleaners -= 1
             self.condition.notify_all()
 
+    def wait_maintenance(self, stop_event):
+        # Inventory and other background readers pause at safe checkpoints.
+        # Heartbeats, updates and reconciliation remain independent.
+        with self.condition:
+            while self.execution_owner is not None:
+                if stop_event.is_set():
+                    return False
+                self.condition.wait(0.2)
+        return not stop_event.is_set()
+
 
 NAS_MEDIA_FENCE = NASMediaFence()
+
+CLEANUP_EXECUTION_DRAIN_SEC = 15
+CLEANUP_EXECUTION_WINDOW_SEC = 5 * 60
+CLEANUP_MAINTENANCE_WINDOW_SEC = 30
+
+
+class CleanupExecutionLane:
+    """Reserve app I/O across serial lease -> observe -> unlink -> receipt."""
+    def __init__(self, stop_event):
+        self.stop_event = stop_event
+        self.started = None
+
+    def before_lease(self):
+        if self.started is not None and time.monotonic() - self.started >= CLEANUP_EXECUTION_WINDOW_SEC:
+            self.close()
+            if self.stop_event.wait(CLEANUP_MAINTENANCE_WINDOW_SEC):
+                raise CleanupInterrupted("cleanup execution cancelled during maintenance")
+
+    def run(self, fn, *args):
+        if self.started is None:
+            deadline = time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC
+            while not NAS_MEDIA_FENCE.execution_lock.acquire(timeout=0.2):
+                if self.stop_event.is_set() or time.monotonic() >= deadline:
+                    raise CleanupInterrupted("cleanup execution lane timed out or cancelled")
+            with NAS_MEDIA_FENCE.condition:
+                # Pause new joined/collated writers, but keep raw delivery
+                # flowing until active joined writers have consumed its credits.
+                NAS_MEDIA_FENCE.execution_owner = threading.get_ident()
+                NAS_MEDIA_FENCE.condition.notify_all()
+            try:
+                NAS_MEDIA_FENCE.acquire_cleanup(self.stop_event, deadline)
+            except BaseException:
+                with NAS_MEDIA_FENCE.condition:
+                    NAS_MEDIA_FENCE.execution_owner = None
+                    NAS_MEDIA_FENCE.condition.notify_all()
+                NAS_MEDIA_FENCE.execution_lock.release()
+                raise
+            self.started = time.monotonic()
+        return fn(*args)
+
+    def close(self):
+        if self.started is not None:
+            with NAS_MEDIA_FENCE.condition:
+                NAS_MEDIA_FENCE.execution_owner = None
+                NAS_MEDIA_FENCE.release_cleanup()
+            self.started = None
+            NAS_MEDIA_FENCE.execution_lock.release()
 
 
 class CleanupDirectoryLog:
@@ -3010,7 +3083,8 @@ def cleanup_verified_ack(task, proof, decision):
     )
 
 
-CLEANUP_EXECUTION_OBSERVE_SEC = 25
+CLEANUP_EXECUTION_OBSERVE_SEC = 25  # socket timeout leaves room for the server's 15 s refusal
+CLEANUP_EXECUTION_OBSERVE_BUDGET_SEC = 15
 CLEANUP_PERMIT_MAX_AGE_SEC = 30
 
 
@@ -3023,8 +3097,8 @@ class CleanupPermitRefused(RuntimeError):
 def cleanup_check_permit(cfg, fenced, task, proof, decision, started):
     if not fenced or cfg.dry_run:
         raise CleanupPermitRefused("execution_disabled", "cleanup deletion execution is disabled; not unlinked")
-    if time.monotonic() - started >= CLEANUP_PERMIT_MAX_AGE_SEC:
-        raise CleanupPermitRefused("deadline_exceeded", "cleanup observation deadline exceeded (30 s); not unlinked")
+    if time.monotonic() - started >= CLEANUP_EXECUTION_OBSERVE_BUDGET_SEC:
+        raise CleanupPermitRefused("deadline_exceeded", "cleanup observation deadline exceeded (15 s); not unlinked")
     if (decision.get("action") != "delete_issued" or decision.get("item_id") != task["item_id"]
             or decision.get("attempt") != task["attempt"] or decision.get("plan_sha256") != task["plan_sha256"]
             or decision.get("proof_sha256") != hashlib.sha256(json.dumps(proof).encode()).hexdigest()):
@@ -3108,7 +3182,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
         # A previously approved proof marks the execution phase. Dry runs
         # never acquire the write fence and do not impede clip delivery.
         if task.get("approved_proof") is not None:
-            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, deadline)
+            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, min(deadline, time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC))
             fenced = True
         with CleanupFile(cfg, task["item"], stop_event, deadline) as current:
             proof = current.proof()
@@ -3262,6 +3336,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     retry = 120
     exhausted = False
     error = None
+    lane = CleanupExecutionLane(stop_event)
     def completed(future):
         if future.result() is True and verified_event is not None:
             verified_event.set()
@@ -3271,6 +3346,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
             # behind the slowest file. Periodic drain/replay bounds each cycle.
             while (not exhausted and not stop_event.is_set()
                    and len(pending) < workers and leased < task_limit):
+                lane.before_lease()
                 lease = cleanup_lease(cfg, min(workers - len(pending), task_limit - leased))
                 retry = lease.get("retry_after_sec", 120)
                 if not lease["tasks"]:
@@ -3288,8 +3364,9 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
                         for future in pending:
                             completed(future)
                         pending.clear()
-                        cleanup_process_task(cfg, inventory, stop_event, task)
+                        lane.run(cleanup_process_task, cfg, inventory, stop_event, task)
                         continue  # receipt acknowledged: request the next serial lease now
+                    lane.close()
                     pending.add(executor.submit(cleanup_process_task, cfg, inventory, stop_event, task))
             if not pending:
                 break
@@ -3300,6 +3377,7 @@ def cleanup_batch(cfg, inventory, stop_event, executor,
     except Exception as exc:
         error = exc
     finally:
+        lane.close()
         # Failure, cancellation, execution, shutdown and app replacement must
         # all observe every worker's durable checkpoint before replay.
         for future in pending:
@@ -3594,6 +3672,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     retry = 120
     exhausted = False
     error = None
+    lane = CleanupExecutionLane(stop_event)
 
     def completed(future):
         if future.result() is True and verified_event is not None:
@@ -3601,6 +3680,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
     try:
         while not stop_event.is_set():
             while not exhausted and not stop_event.is_set() and error is None and len(pending) < inflight and leased < task_limit:
+                lane.before_lease()
                 room = min(CLEANUP_V2_LEASE, inflight - len(pending), task_limit - leased)
                 files_left, bytes_left = cleanup_local_headroom(inventory)
                 files_left = min(files_left, CLEANUP_EXECUTION_INFLIGHT)
@@ -3630,8 +3710,9 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
                         for future in pending:
                             completed(future)
                         pending.clear()
-                        cleanup_process_task(cfg, inventory, stop_event, task, api)
+                        lane.run(cleanup_process_task, cfg, inventory, stop_event, task, api)
                         continue
+                    lane.close()
                     pending[executor.submit(cleanup_process_task, cfg, inventory, stop_event, task, api)] = task
             if not pending or error is not None:
                 break
@@ -3647,6 +3728,7 @@ def cleanup_batch_v2(cfg, inventory, stop_event, executor, api, verified_event=N
         if error is None:
             error = exc
     finally:
+        lane.close()
         for future in list(pending):
             try:
                 completed(future)
@@ -7561,7 +7643,7 @@ def joined_identity_step(reason_code, operation, *args):
         raise
 
 
-@NAS_MEDIA_FENCE.delivery
+@NAS_MEDIA_FENCE.background_delivery
 def download_joined_item(cfg, runtime, item, stop_event):
     joined_raw_priority_boundary(cfg, runtime, stop_event)
     # Expose failures while opening or hashing prerequisite manifests. Offset
@@ -7807,6 +7889,8 @@ def joined_errno_class(exc):
 def joined_loop(cfg, runtime, stop_event):
     """Drain collated outputs and generation-1 joined artifacts beside the raw loop."""
     while not stop_event.is_set():
+        if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+            return
         progress = False
         try:
             progress = drain_collated(cfg, runtime, stop_event)
@@ -8028,7 +8112,7 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             raise RuntimeError("collated body length mismatch")
 
 
-@NAS_MEDIA_FENCE.delivery
+@NAS_MEDIA_FENCE.background_delivery
 def download_collated_item(cfg, item, limiter, stop_event):
     """Place one output at its contract path. Returns True when bytes were fetched."""
     relative = item["nas_relative_path"]
@@ -8899,6 +8983,8 @@ def selected_verify_once(cfg, stop_event=None):
 def selected_verify_loop(cfg, stop_event):
     wait = 30
     while not stop_event.wait(wait):
+        if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+            return
         try:
             retry = selected_verify_once(cfg, stop_event)
             # Each completed file gets a fresh individual lease immediately.
@@ -8913,6 +8999,8 @@ def restore_loop(cfg, stop_event, rng=random):
     """Background NAS -> R2 restore worker; never raises and never blocks updates."""
     wait = rng.uniform(*RESTORE_STARTUP_DELAY_SEC)
     while not stop_event.wait(wait):
+        if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+            return
         try:
             wait = restore_wait(restore_once(cfg, stop_event))
         except Exception as exc:
@@ -10579,6 +10667,9 @@ class SpaceAudit:
         count = 0
         last_report = 0.0
         while not stop_event.is_set():
+            if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+                self.db.commit()
+                return False
             self.check_scope()
             row = self.db.execute("SELECT path FROM dirs WHERE done=0 LIMIT 1").fetchone()
             if not row:
@@ -10904,6 +10995,8 @@ def space_audit_loop(cfg, stop_event, reported):
     if stop_event.wait(10):
         return
     while not stop_event.is_set():
+        if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
+            return
         audit = None
         try:
             audit = SpaceAudit(cfg)
@@ -11088,6 +11181,9 @@ def run(cfg):
                 joined_worker.start()
             storage_checked = False
             try:
+                # Raw delivery must keep supplying credits while an execution
+                # window drains active joined downloads. process_clip fences
+                # media writes once that drain has completed.
                 check_storage(cfg)
                 storage_checked = True
                 mark_cleanup_verified_healthy(cfg, runtime, storage_checked, cleanup_verified)

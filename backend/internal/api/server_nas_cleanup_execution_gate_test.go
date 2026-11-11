@@ -10,6 +10,12 @@ import (
 )
 
 func TestNASCleanupSerialReleaseUsesSameSessionAndExecutionGates(t *testing.T) {
+	for _, version := range []string{nasCleanupSerialExecutionClientVersion, nasCleanupDedicatedExecutionClientVersion, nasCleanupRawCreditDrainClientVersion} {
+		t.Run(version, func(t *testing.T) { testNASCleanupReviewedReleaseGates(t, version) })
+	}
+}
+
+func testNASCleanupReviewedReleaseGates(t *testing.T, version string) {
 	f := newCleanupFixture(t, 24)
 	id, sha, _ := f.admit("serial-release", syntheticFiles(100, 2, 10))
 	f.dryRun()
@@ -17,12 +23,12 @@ func TestNASCleanupSerialReleaseUsesSameSessionAndExecutionGates(t *testing.T) {
 	if code, body := f.enableBatch([]int64{id}, []string{sha}, 2); code != 200 {
 		t.Fatalf("enable: %d %s", code, body)
 	}
-	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, nasCleanupSerialExecutionClientVersion); err != nil {
+	if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 		t.Fatal(err)
 	}
 	lease := func(session string) []cleanupTask {
 		t.Helper()
-		w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": nasCleanupSerialExecutionClientVersion, "protocol": 2, "limit": 64, "execution_files": 64, "execution_bytes": 1 << 30, "reconciliation_protocol": 1}, session)
+		w := cleanupCall(t, f.s.handleAccountNASCleanupLease, 47, 5, "", "", map[string]any{"client_version": version, "protocol": 2, "limit": 64, "execution_files": 64, "execution_bytes": 1 << 30, "reconciliation_protocol": 1}, session)
 		var result struct {
 			Tasks []cleanupTask `json:"tasks"`
 		}
@@ -34,7 +40,7 @@ func TestNASCleanupSerialReleaseUsesSameSessionAndExecutionGates(t *testing.T) {
 	if tasks := lease("fixture-boot " + nasCleanupExecutionClientVersion); len(tasks) != 0 {
 		t.Fatal("old session bypassed the new heartbeat")
 	}
-	session := "fixture-boot " + nasCleanupSerialExecutionClientVersion
+	session := "fixture-boot " + version
 	tasks := lease(session)
 	if len(tasks) != 1 {
 		t.Fatalf("new reviewed release did not lease exactly one execution: %+v", tasks)
@@ -43,7 +49,7 @@ func TestNASCleanupSerialReleaseUsesSameSessionAndExecutionGates(t *testing.T) {
 		t.Fatal("new release bypassed single slot")
 	}
 	task := tasks[0]
-	body := cleanupObserve{ReconciliationProtocol: 1, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: nasCleanupSerialExecutionClientVersion, RequestID: strings.Repeat("a", 32)}
+	body := cleanupObserve{ReconciliationProtocol: 1, Attempt: task.Attempt, PlanSHA: sha, Outcome: "match", Proof: fixtureProof(task.Item), ClientVersion: version, RequestID: strings.Repeat("a", 32)}
 	w := cleanupCall(t, f.s.handleAccountNASCleanupObserve, 47, 5, "itemId", fmt.Sprint(task.ItemID), body, session)
 	var permit struct {
 		Delete bool `json:"delete"`

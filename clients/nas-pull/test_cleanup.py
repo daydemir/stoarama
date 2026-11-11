@@ -247,6 +247,105 @@ class CleanupTests(unittest.TestCase):
         release.set();thread.join(1)
         fence.acquire_cleanup(threading.Event(),time.monotonic()+1);fence.release_cleanup()
 
+    def test_execution_lane_reserves_io_until_idle_and_yields_for_maintenance(self):
+        fence = pull.NASMediaFence()
+        stop = threading.Event()
+        entered = threading.Event()
+        reader = threading.Event()
+        @fence.delivery
+        def writer():
+            entered.set()
+        def inventory():
+            if fence.wait_maintenance(stop):
+                reader.set()
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                lane.run(lambda: None)
+                threads = [threading.Thread(target=writer), threading.Thread(target=inventory)]
+                for worker in threads:
+                    worker.start()
+                self.assertFalse(entered.wait(0.05))
+                self.assertFalse(reader.is_set())
+                # Nested per-file fences admit the lane owner even with a
+                # delivery writer queued; no work slips between receipts.
+                for _ in range(3):
+                    fence.acquire_cleanup(stop, time.monotonic()+1)
+                    fence.release_cleanup()
+                    lane.before_lease()
+                    self.assertFalse(entered.is_set())
+                with mock.patch.object(pull.time, 'monotonic', return_value=lane.started+301), \
+                        mock.patch.object(stop, 'wait', side_effect=lambda seconds: not entered.wait(1)) as wait:
+                    lane.before_lease()
+                wait.assert_called_once_with(pull.CLEANUP_MAINTENANCE_WINDOW_SEC)
+                self.assertIsNone(lane.started)
+                self.assertTrue(reader.wait(1))
+            finally:
+                lane.close()
+                for worker in threads:
+                    worker.join(1)
+        self.assertEqual(fence.cleaners, 0)
+        self.assertIsNone(fence.execution_owner)
+
+    def test_execution_lane_cancellation_releases_waiting_delivery(self):
+        fence = pull.NASMediaFence()
+        stop = threading.Event()
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                lane.run(lambda: None)
+                stop.set()
+                with mock.patch.object(pull.time, 'monotonic', return_value=lane.started+301):
+                    with self.assertRaises(pull.CleanupInterrupted):
+                        lane.before_lease()
+            finally:
+                lane.close()
+        self.assertEqual(fence.cleaners, 0)
+        self.assertIsNone(fence.execution_owner)
+
+    def test_execution_drain_timeout_reopens_background_work_for_maintenance(self):
+        fence, stop = pull.NASMediaFence(), threading.Event()
+        active, release, resumed, next_joined = (threading.Event() for _ in range(4))
+        @fence.background_delivery
+        def joined():
+            active.set()
+            release.wait(2)
+        def inventory():
+            if fence.wait_maintenance(stop):
+                resumed.set()
+        worker = threading.Thread(target=joined)
+        worker.start()
+        self.assertTrue(active.wait(1))
+        reader = threading.Thread(target=inventory)
+        queued = threading.Thread(target=fence.background_delivery(next_joined.set))
+        acquire = fence.acquire_cleanup
+        def drain(*args):
+            reader.start()
+            queued.start()
+            self.assertFalse(resumed.wait(.02))
+            self.assertFalse(next_joined.is_set(), 'new joined writer entered during drain')
+            return acquire(*args)
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence), \
+                mock.patch.object(pull, 'CLEANUP_EXECUTION_DRAIN_SEC', .1), \
+                mock.patch.object(fence, 'acquire_cleanup', side_effect=drain):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                with self.assertRaises(pull.CleanupInterrupted):
+                    lane.run(lambda: self.fail('execution ran beside joined writer'))
+                self.assertTrue(resumed.wait(1), 'maintenance remained fenced after drain timeout')
+                self.assertTrue(next_joined.wait(1), 'joined admission remained fenced after drain timeout')
+                self.assertIsNone(lane.started)
+                self.assertTrue(fence.execution_lock.acquire(blocking=False))
+                fence.execution_lock.release()
+            finally:
+                release.set()
+                lane.close()
+                worker.join(1)
+                reader.join(1)
+                queued.join(1)
+        self.assertIsNone(fence.execution_owner)
+        self.assertEqual(fence.cleaners, 0)
+
     def test_stale_observe_and_result_receipts_are_archived_without_blocking(self):
         import urllib.error
         for phase in ('observe','result'):
@@ -335,6 +434,17 @@ class CleanupTests(unittest.TestCase):
         self.assertFalse(outcome['unlink_attempted'])
         self.assertIsInstance(outcome['observe_elapsed_ms'], int)
         self.assertGreaterEqual(outcome['execution_elapsed_ms'], outcome['observe_elapsed_ms'])
+        self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
+
+    def test_eighteen_second_observe_never_unlinks(self):
+        with self.opened() as current:
+            self.task['approved_proof'] = proof = current.proof()
+        decision = fixture_ack({'attempt': 1, 'plan_sha256': 'a'*64, 'proof': proof},
+                               action='delete_issued', delete=True,
+                               expires_at=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=30)).isoformat())
+        with self.assertRaises(pull.CleanupPermitRefused) as refused:
+            pull.cleanup_check_permit(self.cfg, True, self.task, proof, decision, time.monotonic()-18.3)
+        self.assertEqual(refused.exception.reason, 'deadline_exceeded')
         self.assertTrue(self.path.exists()); self.assertTrue(self.sidecar.exists())
 
     def test_permit_deadline_checked_after_slow_final_directory_walk(self):
