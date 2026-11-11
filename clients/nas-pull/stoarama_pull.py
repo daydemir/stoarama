@@ -7532,9 +7532,14 @@ def append_joined_quarantine_ledger(cfg, record):
 
 def report_joined_quarantine(runtime, message):
     # Keep the notice visible after successful joined/raw delivery clears errors.
-    with runtime.lock:
-        runtime.joined_quarantine_notice = message[:1000]
-        runtime.joined_quarantine_notice_at = utc_now()
+    if runtime is None:
+        # Local stitch publication shares the durable alias ledger. Its lane
+        # has no delivery Runtime; retain the live notice in stitch telemetry.
+        STITCH_STATUS.fail(message[:1000])
+    else:
+        with runtime.lock:
+            runtime.joined_quarantine_notice = message[:1000]
+            runtime.joined_quarantine_notice_at = utc_now()
     log("WARN", message)
 
 
@@ -7622,7 +7627,7 @@ def copy_joined_canonical(directory_fd, name, current, cfg, stop_event):
         # Failed/interrupted private copies are preserved, never treated as aliases.
 
 
-def quarantine_joined_aliases(cfg, runtime, directory_fd, name, artifact, stop_event, hinted_stage=None):
+def quarantine_joined_aliases(cfg, runtime, directory_fd, name, artifact, stop_event, hinted_stage=None, *, canonical_path=None):
     """Move only non-canonical names, then detach the canonical inode by copying."""
     current = joined_entry_stat(directory_fd, name)
     if current is None:
@@ -7649,7 +7654,7 @@ def quarantine_joined_aliases(cfg, runtime, directory_fd, name, artifact, stop_e
             raise ExistingFileMismatch("joined unknown hardlink outside inspected directory; refusing quarantine")
         # Complete every copy check before moving any source name.
         copied = copy_joined_canonical(directory_fd, name, current, cfg, stop_event) if current.st_nlink > 1 else None
-        parent = joined_output_path(cfg, artifact).parent.absolute()
+        parent = (joined_output_path(cfg, artifact) if canonical_path is None else canonical_path).parent.absolute()
         qroot = cfg.output_dir.absolute() / ".stoarama-quarantine" / "aliases"
         reason = "extra joined hardlink or interrupted sidecar stage"
         for entry, candidate in aliases:
@@ -31732,11 +31737,12 @@ class StitchDirectory:
     Linux, so renaming an ancestor cannot redirect FFmpeg outside the NAS root.
     The portable path used by disposable Mac fixtures is never used on the NAS.
     """
-    def __init__(self, root, relative):
+    def __init__(self, cfg, relative, task_id, stop):
         if (not relative or relative.startswith(("/", "#", "@")) or "\\" in relative
                 or any(p in ("", ".", "..") for p in relative.split("/"))):
             raise StitchHold("invalid stitch directory")
-        self.root, self.relative, self.fds = Path(root), relative, []
+        self.cfg, self.task_id, self.stop = cfg, task_id, stop
+        self.root, self.relative, self.fds = Path(cfg.output_dir), relative, []
 
     def __enter__(self):
         try:
@@ -31770,22 +31776,32 @@ class StitchDirectory:
         self.fds.clear()
 
     def publish(self, temporary, name):
+        descriptor = self.fds[-1]
+        current = joined_entry_stat(descriptor, temporary)
+        if current is None or current.st_nlink != 1:
+            raise StitchHold("stitch publication stage is not private")
         fd = os.open(temporary, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fds[-1])
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-        # link+unlink is an atomic create-only publication, unlike rename which
-        # overwrites. A restart may adopt only byte-identical existing output.
+        expected = sha256_file(self.path / temporary)
+        # Move the tool's scratch name before linking, so even a crash cannot
+        # leave a future tool writing through an alias of a published output.
+        # The opaque stage is preserved by the common #454 quarantine path.
+        stage = name + ".stage-" + os.urandom(16).hex()
+        os.rename(temporary, stage, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        os.fsync(descriptor)
         try:
-            os.link(temporary, name, src_dir_fd=self.fds[-1], dst_dir_fd=self.fds[-1], follow_symlinks=False)
+            os.link(stage, name, src_dir_fd=descriptor, dst_dir_fd=descriptor, follow_symlinks=False)
         except FileExistsError:
-            a, b = self.path / temporary, self.path / name
-            _, st = confined_regular_file(self.root, self.relative + "/" + name)
-            if (st.st_nlink != 1 and not (st.st_nlink == 2 and os.path.samestat(a.stat(), st))) or sha256_file(a) != sha256_file(b):
+            joined_entry_stat(descriptor, name)  # Refuse symlinks/special files.
+            if sha256_file(self.path / name) != expected:
                 raise StitchHold("published output collision")
-        os.unlink(temporary, dir_fd=self.fds[-1])
-        os.fsync(self.fds[-1])
+        os.fsync(descriptor)
+        quarantine_joined_aliases(self.cfg, None, descriptor, name, {"id": self.task_id}, self.stop,
+                                  hinted_stage=stage, canonical_path=self.root / self.relative / name)
+        hash_certification_file(self.root, self.relative + "/" + name, *expected)
         return self.path / name
 
 
@@ -32132,7 +32148,7 @@ def stitch_build(cfg, inventory, task, stop_event, tools, admitted=None):
     with contextlib.ExitStack() as resources:
         stop.start()
         resources.callback(stop.close)
-        directory = resources.enter_context(StitchDirectory(cfg.output_dir, plan["output_folder"]))
+        directory = resources.enter_context(StitchDirectory(cfg, plan["output_folder"], task["id"], stop))
         work = directory.path
         def clear_scratch():
             names = ["concat.txt", "run.partial.mp4", "proof.partial.json", "output.json", "output.packets", "output.hidden", "output.frames", "repair.h264", "repair.partial.mp4", "repair.frames", "repair.proof.partial.json", "v85r-request.json", "v85r-decision.json"]
@@ -32277,7 +32293,7 @@ def stitch_register(cfg, inventory, task_id, result):
         raise StitchHold("server output registration not acknowledged")
     for output in result["outputs"]:
         relative = Path(output["relative_path"])
-        with StitchDirectory(cfg.output_dir, str(relative.parent)) as directory:
+        with StitchDirectory(cfg, str(relative.parent), task_id, threading.Event()) as directory:
             receipt = dict(recorded=True, task_id=task_id, plan_sha256=result["plan_sha256"], sha256=output["sha256"])
             temporary = directory.path / "registration.partial.json"
             temporary.write_bytes(cleanup_json_bytes(receipt))

@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,88 @@ spec = importlib.util.spec_from_file_location('stitch_pull', Path(__file__).with
 pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
 ORIGINAL_CHECKPOINT = pull.stitch_checkpoint
+
+
+class StitchPublicationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = SimpleNamespace(output_dir=root/'clips', state_dir=root/'state', min_free_bytes=1)
+        self.cfg.output_dir.mkdir(); self.cfg.state_dir.mkdir()
+        self.stop = threading.Event()
+
+    def directory(self):
+        return pull.StitchDirectory(self.cfg, 'stream_V85r_keep28/22/hour', 7, self.stop)
+
+    def test_all_output_kinds_use_shared_quarantine_and_startup_reporting(self):
+        with self.directory() as directory:
+            for name in ('run.mp4', 'run.mp4.proof.json', 'run.mp4.registered.json',
+                         'repaired.mp4', 'repaired.mp4.repair.json'):
+                (directory.path/'scratch').write_bytes(b'verified output')
+                directory.publish('scratch', name)
+                self.assertEqual((directory.path/name).read_bytes(), b'verified output')
+                self.assertEqual((directory.path/name).stat().st_nlink, 1)
+                self.assertFalse((directory.path/'scratch').exists())
+        aliases = list((self.cfg.output_dir/'.stoarama-quarantine/aliases').iterdir())
+        self.assertEqual(len(aliases), 5)
+        self.assertTrue(all(p.read_bytes() == b'verified output' for p in aliases))
+        records = [json.loads(line) for line in (self.cfg.state_dir/'joined-alias-quarantine.jsonl').read_text().splitlines()]
+        self.assertEqual(sum(r['operation'] == 'canonical_copy' and r['state'] == 'complete' for r in records), 5)
+        notice, _, status = pull.joined_quarantine_startup_status(self.cfg)
+        self.assertIn('aliases=5', notice)
+        self.assertEqual(status['alias_count'], 5)
+        self.assertEqual(status['pending_recovery_count'], 0)
+        self.assertTrue(all(str(self.cfg.output_dir/'stream_V85r_keep28/22/hour') in r['canonical_path']
+                            for r in records if r['operation'] == 'canonical_copy'))
+
+    def test_interrupted_link_replays_without_writing_through_canonical(self):
+        with self.directory() as directory:
+            (directory.path/'scratch').write_bytes(b'original bytes')
+            with mock.patch.object(pull, 'quarantine_joined_aliases', side_effect=OSError('simulated crash')):
+                with self.assertRaisesRegex(OSError, 'simulated crash'):
+                    directory.publish('scratch', 'run.mp4')
+            original = (directory.path/'run.mp4').stat().st_ino
+            self.assertFalse((directory.path/'scratch').exists())
+            (directory.path/'scratch').write_bytes(b'original bytes')
+            directory.publish('scratch', 'run.mp4')
+            self.assertNotEqual((directory.path/'run.mp4').stat().st_ino, original)
+            self.assertEqual((directory.path/'run.mp4').stat().st_nlink, 1)
+            self.assertEqual((directory.path/'run.mp4').read_bytes(), b'original bytes')
+        aliases = list((self.cfg.output_dir/'.stoarama-quarantine/aliases').iterdir())
+        self.assertEqual(len(aliases), 2)
+        self.assertTrue(all(p.read_bytes() == b'original bytes' for p in aliases))
+
+    def test_copy_ledger_failure_replays_with_all_bytes_preserved(self):
+        append = pull.append_joined_quarantine_ledger
+        def fail(cfg, record):
+            if record['operation'] == 'canonical_copy' and record['state'] == 'intent':
+                raise OSError('ledger unavailable')
+            append(cfg, record)
+        with self.directory() as directory:
+            (directory.path/'scratch').write_bytes(b'original bytes')
+            with mock.patch.object(pull, 'append_joined_quarantine_ledger', side_effect=fail):
+                with self.assertRaisesRegex(pull.ExistingFileMismatch, 'ledger unavailable'):
+                    directory.publish('scratch', 'run.mp4')
+            self.assertEqual((directory.path/'run.mp4').read_bytes(), b'original bytes')
+            (directory.path/'scratch').write_bytes(b'original bytes')
+            directory.publish('scratch', 'run.mp4')
+            self.assertEqual((directory.path/'run.mp4').stat().st_nlink, 1)
+        self.assertTrue(all(p.read_bytes() == b'original bytes'
+                            for p in self.cfg.output_dir.rglob('*') if p.is_file()))
+
+    def test_unknown_and_canonical_aliases_refuse_publication(self):
+        for outside in (False, True):
+            with self.subTest(outside=outside), self.directory() as directory:
+                name = 'outside.mp4' if outside else 'canonical.mp4'
+                (directory.path/name).write_bytes(b'original bytes')
+                alias = self.cfg.output_dir/'unknown-link' if outside else directory.path/'another.mp4'
+                os.link(directory.path/name, alias)
+                (directory.path/'scratch').write_bytes(b'original bytes')
+                with self.assertRaises(pull.ExistingFileMismatch):
+                    directory.publish('scratch', name)
+                self.assertEqual(alias.read_bytes(), b'original bytes')
+                self.assertEqual((directory.path/name).read_bytes(), b'original bytes')
 
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg/ffprobe required')

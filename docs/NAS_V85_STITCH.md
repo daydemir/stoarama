@@ -249,7 +249,12 @@ conservatively while any cleanup source freeze exists. Registration replay is
 metadata-only and retains already verified outputs.
 
 The explicit future client release is **`NAS_VERSION=v85r-fence-progress-v1`**,
-allowlisted alongside reviewed predecessors. Keep every stitch/deletion switch
+allowlisted alongside reviewed predecessors, including `joined-marker-recovery-v1`.
+Build that release from merged `main` with this explicit label. Local stitched
+media, repairs, proofs and registration receipts use the same alias quarantine,
+verified private copy, atomic canonical replacement and crash-safe ledger as
+joined delivery. Startup reporting replays their shared quarantine ledger.
+Keep every stitch/deletion switch
 off until the separately approved pilot. This work does not stage/promote a
 release, mutate production, merge, or deploy.
 
