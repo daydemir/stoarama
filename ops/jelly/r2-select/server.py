@@ -21,4 +21,5 @@ class H(http.server.SimpleHTTPRequestHandler):
         tmp=SEL.with_suffix('.tmp'); tmp.write_bytes(b); os.replace(tmp,SEL)
         (HIST/f"selection-{int(time.time())}.json").write_bytes(b)
         s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(json.dumps({'saved_at':d['saved_at']}).encode())
-http.server.ThreadingHTTPServer(('127.0.0.1',8787),H).serve_forever()
+if __name__ == '__main__':
+    http.server.ThreadingHTTPServer(('127.0.0.1',8787),H).serve_forever()

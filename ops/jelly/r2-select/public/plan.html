@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stoarama deletion preview</title>
+<style>
+:root{
+  color-scheme:light;
+  --page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#6f6d68;
+  --grid:#e1e0d9;--axis:#c3c2b7;--ring:rgba(11,11,11,.10);--band:rgba(42,120,214,.09);--hover:rgba(11,11,11,.07);
+  --f-k:#2a78d6;--f-n:#eb6834;--f-r:#1baf7a;--f-s:#eda100;--f-x:#c3c2b7;--best:#0b0b0b;
+  --chip:#efeee9;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#9a9890;
+    --grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);--band:rgba(57,135,229,.14);--hover:rgba(255,255,255,.09);
+    --f-k:#3987e5;--f-n:#d95926;--f-r:#199e70;--f-s:#c98500;--f-x:#55544f;--best:#f0efec;
+    --chip:#262624;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#9a9890;
+  --grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);--band:rgba(57,135,229,.14);--hover:rgba(255,255,255,.09);
+  --f-k:#3987e5;--f-n:#d95926;--f-r:#199e70;--f-s:#c98500;--f-x:#55544f;--best:#f0efec;
+  --chip:#262624;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1280px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:24px;margin:0 0 4px;font-weight:650}
+h2{font-size:17px;margin:36px 0 8px;font-weight:650}
+p{margin:6px 0}
+.sub{color:var(--ink2);max-width:860px}
+.card{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:16px}
+.summary{margin:16px 0;max-width:900px}
+.summary li{margin:4px 0}
+.hero{display:grid;grid-template-columns:minmax(240px,1.2fr) 2fr;gap:12px;margin-top:16px}
+.herofig .lbl,.tile .lbl{color:var(--ink2);font-size:13px}
+.herofig .val{font-size:52px;font-weight:650;line-height:1.05;margin:6px 0}
+.herofig .note,.tile .note{color:var(--muted);font-size:12.5px}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.tile .val{font-size:22px;font-weight:620;margin:4px 0 2px}
+.r2flow{display:flex;align-items:stretch;gap:6px;flex-wrap:wrap;margin-top:6px}
+.r2flow>div{flex:1 1 120px;min-width:110px}
+.r2flow .arrow{flex:0 0 auto;min-width:0;align-self:center;color:var(--muted)}
+.r2flow .v{font-size:20px;font-weight:620}
+.r2flow .s{color:var(--muted);font-size:12px}
+.controls{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin:12px 0;position:sticky;top:0;z-index:5;background:var(--page);padding:8px 0}
+.controls label{display:flex;gap:6px;align-items:center;color:var(--ink2);font-size:13px}
+input[type=search],select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:8px;padding:6px 8px}
+input[type=search]{width:220px;max-width:100%}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--ink2);margin:8px 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block;flex:0 0 auto}
+.swband{background:var(--band);border:1px solid var(--axis)}
+.swbest{height:3px;width:16px;border-radius:2px;background:var(--best)}
+.rows{background:var(--surface);border:1px solid var(--ring);border-radius:12px}
+.axisrow,.row{display:grid;grid-template-columns:300px 1fr;gap:12px;padding:8px 12px}
+.axisrow{border-bottom:1px solid var(--grid);color:var(--muted);font-size:12px;position:sticky;top:var(--ctl-h,52px);background:var(--surface);z-index:4;border-radius:12px 12px 0 0}
+.row{border-bottom:1px solid var(--grid)}
+.row:last-child{border-bottom:0}
+.meta{display:grid;grid-template-columns:96px 1fr;gap:10px;min-width:0}
+.meta img,.meta .noimg{width:96px;height:54px;border-radius:6px;object-fit:cover;background:var(--chip)}
+.meta .noimg{display:flex;align-items:center;justify-content:center;font-size:10.5px;color:var(--muted);text-align:center;padding:2px}
+.nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.loc{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fig{font-size:12px;color:var(--ink2);margin-top:3px;font-variant-numeric:tabular-nums}
+.fig b{color:var(--ink);font-weight:600}.fig>span{white-space:nowrap;margin-right:8px;display:inline-block}
+.fig i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:3px;vertical-align:0}
+.chart{min-width:0;position:relative}
+.chart svg{display:block;width:100%;outline:none}
+.chart svg:focus-visible{box-shadow:0 0 0 2px var(--f-k);border-radius:4px}
+.ymax{position:absolute;right:0;top:-2px;font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums;pointer-events:none}
+.pick{display:inline-block;font-size:11px;padding:0 6px;border-radius:99px;background:var(--chip);color:var(--ink2);margin-left:4px}
+#tip{position:fixed;pointer-events:none;z-index:30;background:var(--surface);color:var(--ink);border:1px solid var(--ring);box-shadow:0 6px 24px rgba(0,0,0,.18);border-radius:10px;padding:10px 12px;font-size:12.5px;min-width:230px;display:none}
+#tip .d{font-weight:600;margin-bottom:2px}
+#tip .w{color:var(--muted);margin-bottom:6px}
+#tip .tr{display:grid;grid-template-columns:14px auto 1fr;gap:6px;align-items:center;margin:3px 0}
+#tip .tr .k{width:12px;height:3px;border-radius:2px}
+#tip .tr b{font-variant-numeric:tabular-nums}
+#tip .tr span{color:var(--ink2)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+.tablewrap{overflow-x:auto;background:var(--surface);border:1px solid var(--ring);border-radius:12px}
+th,td{padding:7px 10px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
+th{font-weight:600;color:var(--ink2);font-size:12px;position:sticky;top:0;background:var(--surface);cursor:pointer;white-space:nowrap}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+tfoot td{font-weight:650;border-top:2px solid var(--axis);border-bottom:0}
+td .loc{white-space:normal}
+.nt{max-width:900px}
+.nt li{margin:6px 0}
+.small{font-size:12px;color:var(--muted)}
+.stale{opacity:.55;transition:opacity .2s}
+.banner{border-left:3px solid var(--f-n);padding:8px 12px;background:var(--surface);border-radius:6px;margin:12px 0;max-width:900px}
+@media (max-width:860px){
+  .controls{position:static}
+  .axisrow{top:0}
+  .hero{grid-template-columns:1fr}
+  .tiles{grid-template-columns:1fr 1fr}
+  .axisrow,.row{grid-template-columns:1fr;gap:6px}
+  .axisrow .ax-l{display:none}
+  .herofig .val{font-size:44px}
+}
+@media (max-width:520px){.tiles{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<h1>What the Stoarama deletions will do</h1>
+<p class="sub">A preview, per stream and per day, of the NAS cleanup and the first R2 retire phase. Data snapshot from <b>7 November 2026</b>; owner picks for R2 are read live from the picks page. Nothing on this page deletes anything.</p>
+
+<div class="card summary" id="summary">Loading…</div>
+<div class="banner" id="pickbanner" hidden></div>
+
+<div class="hero">
+  <div class="card herofig">
+    <div class="lbl">Deleted from the NAS (an R2 copy stays)</div>
+    <div class="val" id="h-nasdel">–</div>
+    <div class="note" id="h-nasdel-n"></div>
+  </div>
+  <div class="tiles">
+    <div class="card tile"><div class="lbl">Stays on the NAS</div><div class="val" id="h-nasstay">–</div><div class="note" id="h-nasstay-n"></div></div>
+    <div class="card tile"><div class="lbl">Stays on NAS for now: no R2 backup</div><div class="val" id="h-nobk">–</div><div class="note" id="h-nobk-n"></div></div>
+    <div class="card tile"><div class="lbl">Deleted from R2 in phase 1</div><div class="val" id="h-r2del">–</div><div class="note" id="h-r2del-n"></div></div>
+    <div class="card tile" style="grid-column:1/-1">
+      <div class="lbl">Cloudflare R2 storage at $15 per TB-month</div>
+      <div class="r2flow">
+        <div><div class="s">Now</div><div class="v" id="h-r2now">–</div><div class="s" id="h-r2now-tb"></div></div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div><div class="s">After phase 1 (current picks)</div><div class="v" id="h-r2p1">–</div><div class="s" id="h-r2p1-tb"></div></div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div><div class="s">Eventual floor (picks honoured)</div><div class="v" id="h-r2fl">–</div><div class="s" id="h-r2fl-tb"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>Per stream, per day</h2>
+<p class="sub">Each row is one stream. Columns are calendar days 1 Jul – 10 Nov 2026, in that stream's local time. Bar height is the data recorded that day, split by what happens to it. The shaded band is the 28-day keep window; the dark line under it marks the best 14 days. Hover or focus a row and use ← → to read a day.</p>
+
+<div class="controls" id="controls">
+  <label>Search <input type="search" id="q" placeholder="name, city, country, #id"></label>
+  <label>Sort <select id="sort">
+    <option value="n">NAS deleted (most first)</option>
+    <option value="r">R2 deleted / R2-only outside window</option>
+    <option value="s">Stays: no backup</option>
+    <option value="tot">Total on NAS</option>
+    <option value="name">Name</option>
+    <option value="city">City</option>
+    <option value="ks">Keep window start</option>
+  </select></label>
+  <label>Bar scale <select id="scale"><option value="row">Per stream (fills each row)</option><option value="shared">Shared across streams</option></select></label>
+  <label>Undecided streams <select id="whatif">
+    <option value="">as now: R2 untouched</option>
+    <option value="keep">what if: “kept period” pick</option>
+    <option value="none">what if: “nothing” pick</option>
+  </select></label>
+  <span class="small" id="count"></span>
+</div>
+<div class="legend" id="legend"></div>
+
+<div class="rows" id="rows">
+  <div class="axisrow"><div class="ax-l">Stream</div><div><svg id="axis" height="16" width="100%" aria-hidden="true"></svg></div></div>
+</div>
+
+<h2>Table view</h2>
+<p class="sub">The same numbers per stream (filtered and sorted like the chart above). Bytes are what is stored on that side: NAS bytes for NAS files, R2 bytes for R2 objects. Click a header to sort.</p>
+<div class="tablewrap"><table id="tbl"><thead></thead><tbody></tbody><tfoot></tfoot></table></div>
+
+<h2>What is NOT touched</h2>
+<div class="card nt"><ul id="nottouched"></ul></div>
+
+<p class="small" style="margin-top:24px" id="foot"></p>
+</main>
+<div id="tip" role="tooltip"></div>
+
+<script>
+(()=>{
+const $=id=>document.getElementById(id);
+const RATE=15/1e12;
+const FATES=[ // stack order, bottom → top
+  {k:'k',label:'Kept on NAS (inside keep window)',col:'var(--f-k)'},
+  {k:'n',label:'Deleted from NAS (R2 copy stays)',col:'var(--f-n)'},
+  {k:'r',label:'Deleted from R2 (phase 1)',col:'var(--f-r)'},
+  {k:'s',label:'Stays on NAS for now: no backup',col:'var(--f-s)'},
+  {k:'x',label:'R2 only, kept (pick “everything” or undecided)',col:'var(--f-x)'},
+];
+const FI={k:0,n:1,s:2,r:3}; // index in data day arrays: [idx, kB,kf, nB,nf, sB,sf, rB,rf]
+const fmtB=b=>{b=+b||0;if(b>=1e12)return (b/1e12).toFixed(b>=1e13?1:2)+' TB';if(b>=1e9)return (b/1e9).toFixed(b>=1e11?0:1)+' GB';if(b>=1e6)return (b/1e6).toFixed(0)+' MB';return b>0?'<1 MB':'0'};
+const fmtN=n=>Math.round(n).toLocaleString('en-US');
+const usd=b=>'$'+(b*RATE).toLocaleString('en-US',{maximumFractionDigits:b*RATE<100?2:0});
+let D,streams=[],picks={},whatif='',sortK='n',scale='row',query='';
+const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+let dayDates=[];
+const dAt=i=>new Date(dayDates[0].getTime()+i*864e5);
+const dlabel=i=>{const d=dAt(i);return d.getUTCDate()+' '+MON[d.getUTCMonth()]};
+const dlong=i=>{const d=dAt(i);return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getUTCDay()]+' '+d.getUTCDate()+' '+MON[d.getUTCMonth()]+' 2026'};
+const pickOf=s=>picks[s.id]||'';
+const effPick=s=>picks[s.id]||whatif||'';
+const deletesR2=s=>['none','st','keep'].includes(effPick(s));
+const floorOf=s=>{const a=s.r2,c=effPick(s);if(c==='none')return 0;if(c==='st')return a.st_keep;if(c==='keep')return a.raw_keep+a.st_keep;return a.raw_keep+a.raw_out+a.st_keep+a.st_out};
+const r2now=s=>s.r2.raw_keep+s.r2.raw_out+s.r2.st_keep+s.r2.st_out;
+const r2del=s=>deletesR2(s)?s.t.r[0]:0;
+const PICKNAME={none:'Nothing',st:'Kept period, stitched',keep:'Kept period, raw + stitched',all:'Everything'};
+
+function legend(){
+  const L=$('legend');L.textContent='';
+  for(const f of FATES){const s=document.createElement('span');const w=document.createElement('i');w.className='sw';w.style.background=f.col;s.append(w,document.createTextNode(f.label));L.append(s)}
+  const b=document.createElement('span');const bw=document.createElement('i');bw.className='sw swband';b.append(bw,document.createTextNode('28-day keep window'));L.append(b);
+  const c=document.createElement('span');const cw=document.createElement('i');cw.className='swbest';c.append(cw,document.createTextNode('Best 14 days'));L.append(c);
+}
+
+function totals(list){
+  const T={k:[0,0],n:[0,0],s:[0,0],r:[0,0],rdel:[0,0],now:0,p1:0,floor:0,backup:0,onlyin:0,nasraw_in:0,nasraw_in_f:0,files:0};
+  for(const s of list){
+    for(const f of 'knsr'){T[f][0]+=s.t[f][0];T[f][1]+=s.t[f][1]}
+    if(deletesR2(s)){T.rdel[0]+=s.t.r[0];T.rdel[1]+=s.t.r[1]}
+    const now=r2now(s);T.now+=now;T.p1+=now-r2del(s);T.floor+=floorOf(s);
+    T.backup+=s.r2.backup;T.onlyin+=s.r2.only_in;T.nasraw_in+=s.r2.nasraw_in;T.nasraw_in_f+=s.r2.nasraw_in_files;T.files+=s.r2.files;
+  }
+  return T;
+}
+
+function hero(){
+  const T=totals(streams);
+  const nasAll=T.k[0]+T.n[0]+T.s[0];
+  $('h-nasdel').textContent=fmtB(T.n[0]);
+  $('h-nasdel-n').textContent=fmtN(T.n[1])+' files ('+Math.round(100*T.n[0]/nasAll)+'% of the '+fmtB(nasAll)+' on the NAS) · every one has a verified R2 copy';
+  $('h-nasstay').textContent=fmtB(T.k[0]+T.s[0]);
+  $('h-nasstay-n').textContent=fmtB(T.k[0])+' inside keep windows ('+fmtN(T.k[1])+' files) + '+fmtB(T.s[0])+' without backup';
+  $('h-nobk').textContent=fmtB(T.s[0]);
+  $('h-nobk-n').textContent=fmtN(T.s[1])+' raw clips outside windows whose R2 copy was already purged. Not deleted in this phase.';
+  $('h-r2del').textContent=fmtB(T.rdel[0]);
+  const npick=streams.filter(s=>deletesR2(s)).length;
+  $('h-r2del-n').textContent=fmtN(T.rdel[1])+' objects, '+npick+' of '+streams.length+' streams'+(whatif?' (incl. what-if for undecided)':'')+'. Of '+fmtB(T.r[0])+' R2-only footage outside windows.';
+  $('h-r2now').textContent=usd(T.now)+'/mo';$('h-r2now-tb').textContent=fmtB(T.now)+' · '+fmtN(T.files)+' objects';
+  $('h-r2p1').textContent=usd(T.p1)+'/mo';$('h-r2p1-tb').textContent=fmtB(T.p1)+(T.now-T.p1>0?' · −'+fmtB(T.now-T.p1):' · no change');
+  $('h-r2fl').textContent=usd(T.floor)+'/mo';$('h-r2fl-tb').textContent=fmtB(T.floor)+(Object.keys(picks).length<streams.length&&!whatif?' · undecided counted as kept':'');
+  const nPicked=Object.keys(picks).length;
+  const sm=$('summary');sm.textContent='';
+  const p=(t)=>{const e=document.createElement('p');e.textContent=t;return e};
+  sm.append(p('In plain words:'));
+  const ul=document.createElement('ul');
+  [
+   'Every stream keeps ONE 28-day window on the NAS (its best 14 days, plus 7 days either side). Inside that window nothing is deleted anywhere right now.',
+   'Outside the window, '+fmtB(T.n[0])+' ('+fmtN(T.n[1])+' files) leave the NAS. Each of those files has a verified copy in R2, and that copy stays.',
+   fmtB(T.s[0])+' ('+fmtN(T.s[1])+' raw clips) outside the windows have no R2 copy any more. They stay on the NAS for now and are not touched by this phase.',
+   'R2 phase 1 deletes footage that is outside the window AND not on the NAS, only for streams whose owner pick is “Nothing” or “Kept period”. '+(nPicked===0?'No picks are saved yet, so right now phase 1 would delete nothing from R2 ('+fmtB(T.r[0])+' would be eligible once picked).':nPicked+' of '+streams.length+' streams have a pick; with these picks phase 1 deletes '+fmtB(T.rdel[0])+' ('+fmtN(T.rdel[1])+' objects).'),
+   'R2 costs '+usd(T.now)+'/month today, '+usd(T.p1)+' after phase 1, and '+usd(T.floor)+' once the picks are fully applied (later phases).'
+  ].forEach(t=>{const li=document.createElement('li');li.textContent=t;ul.append(li)});
+  sm.append(ul);
+  const bn=$('pickbanner');
+  if(nPicked===0){bn.hidden=false;bn.textContent='No R2 picks are saved yet (live from the picks page). Use “Undecided streams → what if” above to preview R2 deletions as if every stream were picked.'}
+  else bn.hidden=true;
+  // not touched
+  const nt=$('nottouched');nt.textContent='';
+  [
+   ['Everything inside each stream\'s 28-day keep window: ',fmtB(T.k[0])+' on the NAS ('+fmtN(T.k[1])+' files) and the R2 copies of those days. Later, after V85 stitching is verified, the raw clips inside windows ('+fmtB(T.nasraw_in)+', '+fmtN(T.nasraw_in_f)+' clips on the NAS) are replaced by stitched files. That is a later step, not part of this preview.'],
+   ['R2 copies of the files leaving the NAS: ',fmtB(T.backup)+' stay in R2 as the backup of the NAS deletion. What happens to them is decided in a later phase.'],
+   ['Files outside the window with no R2 copy: ',fmtB(T.s[0])+' ('+fmtN(T.s[1])+' raw clips) stay on the NAS for now.'],
+   ['R2 for streams picked “Everything” or still undecided: ','nothing is deleted from R2 for those streams.'],
+   ['R2-only footage inside the keep windows: ',fmtB(T.onlyin)+' that exists only in R2 stays.'],
+   ['Not part of this preview: ','V85 stitch outputs, the picks page, selection.json, recording settings and the database. This page only reads.'],
+  ].forEach(([a,b])=>{const li=document.createElement('li');const s=document.createElement('b');s.textContent=a;li.append(s,document.createTextNode(b));nt.append(li)});
+}
+
+function visible(){
+  const q=query.trim().toLowerCase();
+  let v=streams.filter(s=>!q||[s.name,s.city,s.country,'#'+s.id].join(' ').toLowerCase().includes(q));
+  const key={n:s=>-s.t.n[0],r:s=>-s.t.r[0],s:s=>-s.t.s[0],tot:s=>-(s.t.k[0]+s.t.n[0]+s.t.s[0]),name:s=>s.name.toLowerCase(),city:s=>(s.city+' '+s.name).toLowerCase(),ks:s=>s.ks}[sortK]||(s=>0);
+  v.sort((a,b)=>{const x=key(a),y=key(b);return x<y?-1:x>y?1:a.id-b.id});
+  return v;
+}
+
+const H=84,PAD_T=4,BEST_H=3,BASE=H-8; // plot from PAD_T to BASE; best line under baseline
+let rowEls=[],chartW=600,sharedMax=1;
+function dayTotal(d){return d[1]+d[3]+d[5]+d[7]}
+function drawRow(s,svg){
+  const w=chartW,nd=D.nd,bw=w/nd,gap=bw>=6?2:bw>=3?1:0;
+  const max=scale==='shared'?sharedMax:Math.max(1,...s.days.map(dayTotal));
+  const ns='http://www.w3.org/2000/svg';
+  svg.setAttribute('viewBox','0 0 '+w+' '+H);svg.setAttribute('height',H);
+  svg.textContent='';
+  const mk=(t,a)=>{const e=document.createElementNS(ns,t);for(const k in a)e.setAttribute(k,a[k]);svg.append(e);return e};
+  // window band
+  mk('rect',{x:Math.max(0,s.ks)*bw,y:0,width:(s.ke-Math.max(0,s.ks)+1)*bw,height:BASE,fill:'var(--band)'});
+  // month gridlines
+  for(const i of D.months)mk('line',{x1:i*bw,x2:i*bw,y1:0,y2:BASE,stroke:'var(--grid)','stroke-width':1});
+  // stacks: one path per fate
+  const paths={k:'',n:'',r:'',s:'',x:''};
+  const ph=BASE-PAD_T;
+  for(const d of s.days){
+    const i=d[0];let y=BASE;const x=(i*bw+gap/2).toFixed(2),ww=Math.max(.6,bw-gap).toFixed(2);
+    const segs=[['k',d[1]],['n',d[3]],[deletesR2(s)?'r':'x',d[7]],['s',d[5]]];
+    let first=true;
+    for(const [f,mb] of segs){if(!mb)continue;let h=mb/max*ph;if(!first&&h>2)h-=1;const top=y-(first?0:1)-h;
+      if(h<0.5&&mb>0)h=0.5;
+      paths[f]+='M'+x+' '+(top).toFixed(2)+'h'+ww+'v'+h.toFixed(2)+'h-'+ww+'z';y=top;first=false}
+  }
+  for(const f of ['k','n','r','s','x'])if(paths[f])mk('path',{d:paths[f],fill:'var(--f-'+f+')'});
+  mk('line',{x1:0,x2:w,y1:BASE+.5,y2:BASE+.5,stroke:'var(--axis)','stroke-width':1});
+  mk('rect',{x:Math.max(0,s.bs)*bw,y:BASE+3,width:Math.max(0,s.be-Math.max(0,s.bs)+1)*bw,height:BEST_H,rx:1.5,fill:'var(--best)'});
+  const hl=mk('rect',{x:0,y:0,width:bw,height:BASE,fill:'var(--hover)',visibility:'hidden','class':'hl'});
+  svg._hl=hl;svg._bw=bw;
+  return max;
+}
+
+function render(){
+  const R=$('rows');
+  for(const e of rowEls)e.remove();rowEls=[];
+  const vis=visible();
+  $('count').textContent=vis.length+' of '+streams.length+' streams';
+  sharedMax=Math.max(1,...streams.map(s=>Math.max(0,...s.days.map(dayTotal))));
+  const probe=R.querySelector('.axisrow > div:last-child');chartW=Math.max(200,Math.floor(probe.getBoundingClientRect().width));
+  drawAxis();
+  document.documentElement.style.setProperty('--ctl-h',$('controls').offsetHeight+'px');
+  const frag=document.createDocumentFragment();
+  for(const s of vis){
+    const row=document.createElement('div');row.className='row';
+    const meta=document.createElement('div');meta.className='meta';
+    if(s.th){const im=document.createElement('img');im.loading='lazy';im.src=s.th;im.alt='Frame from '+s.name;meta.append(im)}
+    else{const n=document.createElement('div');n.className='noimg';n.textContent='No preview';meta.append(n)}
+    const tx=document.createElement('div');tx.style.minWidth='0';
+    const nm=document.createElement('div');nm.className='nm';nm.textContent=s.name;nm.title=s.name;
+    const loc=document.createElement('div');loc.className='loc';
+    loc.textContent=[s.city,s.country].filter(Boolean).join(', ')+' · #'+s.id+' · keeps '+dlabel(s.ks)+' – '+dlabel(s.ke);
+    const pk=document.createElement('span');pk.className='pick';const p=pickOf(s);pk.textContent='R2 pick: '+(p?PICKNAME[p]:(whatif?'what-if '+PICKNAME[whatif]:'undecided'));loc.append(document.createElement('br'),pk);
+    loc.style.whiteSpace='normal';
+    const fig=document.createElement('div');fig.className='fig';
+    const piece=(col,lab,val)=>{const sp=document.createElement('span');const i=document.createElement('i');i.style.background=col;const b=document.createElement('b');b.textContent=val;sp.append(i,document.createTextNode(lab+' '),b);return sp};
+    fig.append(piece('var(--f-n)','NAS −',fmtB(s.t.n[0])));
+    if(deletesR2(s))fig.append(piece('var(--f-r)','R2 −',fmtB(s.t.r[0])));
+    else if(s.t.r[0])fig.append(piece('var(--f-x)','R2-only kept',fmtB(s.t.r[0])));
+    if(s.t.s[0])fig.append(piece('var(--f-s)','no backup',fmtB(s.t.s[0])));
+    tx.append(nm,loc,fig);meta.append(tx);
+    const ch=document.createElement('div');ch.className='chart';
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('tabindex','0');svg.setAttribute('role','img');
+    svg.setAttribute('aria-label',s.name+': NAS deletes '+fmtB(s.t.n[0])+', keeps '+fmtB(s.t.k[0])+' inside '+dlabel(s.ks)+' to '+dlabel(s.ke)+'; R2 '+(deletesR2(s)?'deletes '+fmtB(s.t.r[0]):'unchanged')+'; '+fmtB(s.t.s[0])+' without backup stays. Use arrow keys to read days.');
+    ch.append(svg);
+    const ym=document.createElement('div');ym.className='ymax';ch.append(ym);
+    row.append(meta,ch);frag.append(row);rowEls.push(row);
+    row._s=s;row._svg=svg;row._ym=ym;
+    attach(svg,s);
+  }
+  R.append(frag);
+  for(const row of rowEls){const m=drawRow(row._s,row._svg);row._ym.textContent=scale==='shared'?'':'top: '+fmtB(m*1e6)+'/day'}
+  table(vis);
+}
+
+function drawAxis(){
+  const svg=$('axis');svg.textContent='';const w=chartW,bw=w/D.nd;svg.setAttribute('viewBox','0 0 '+w+' 16');
+  const ns='http://www.w3.org/2000/svg';
+  D.months.forEach((i,k)=>{const t=document.createElementNS(ns,'text');t.setAttribute('x',i*bw+3);t.setAttribute('y',12);t.setAttribute('fill','var(--muted)');t.setAttribute('font-size','11');t.textContent=MON[dayDates[i].getUTCMonth()]+(w<420?'':' 1');svg.append(t);
+    const l=document.createElementNS(ns,'line');l.setAttribute('x1',i*bw);l.setAttribute('x2',i*bw);l.setAttribute('y1',0);l.setAttribute('y2',16);l.setAttribute('stroke','var(--axis)');svg.append(l)});
+}
+
+const tip=$('tip');
+function showTip(s,svg,i,cx,cy){
+  const d=s.days.find(x=>x[0]===i);
+  const hl=svg._hl;hl.setAttribute('x',i*svg._bw);hl.setAttribute('width',svg._bw);hl.setAttribute('visibility','visible');
+  tip.textContent='';
+  const h=document.createElement('div');h.className='d';h.textContent=dlong(i);
+  const w=document.createElement('div');w.className='w';
+  w.textContent=(i>=s.bs&&i<=s.be?'Best 14 days · inside keep window':i>=s.ks&&i<=s.ke?'Inside 28-day keep window':'Outside keep window')+' · '+s.tz;
+  tip.append(h,w);
+  if(!d){const e=document.createElement('div');e.style.color='var(--muted)';e.textContent='Nothing recorded this day.';tip.append(e)}
+  else{
+    const rows=[['k',d[1],d[2]],['n',d[3],d[4]],[deletesR2(s)?'r':'x',d[7],d[8]],['s',d[5],d[6]]];
+    for(const [f,mb,n] of rows){if(!n)continue;const fm=FATES.find(x=>x.k===f);
+      const r=document.createElement('div');r.className='tr';const k=document.createElement('i');k.className='k';k.style.background=fm.col;
+      const b=document.createElement('b');b.textContent=fmtB(mb*1e6);const sp=document.createElement('span');sp.textContent=fm.label+' · '+fmtN(n)+' file'+(n===1?'':'s');
+      r.append(k,b,sp);tip.append(r)}
+  }
+  tip.style.display='block';
+  const tw=tip.offsetWidth,th=tip.offsetHeight;
+  let x=cx+14,y=cy+14;if(x+tw>innerWidth-8)x=cx-tw-14;if(x<8)x=8;if(y+th>innerHeight-8)y=cy-th-14;if(y<8)y=8;
+  tip.style.left=x+'px';tip.style.top=y+'px';
+}
+function hideTip(svg){tip.style.display='none';if(svg&&svg._hl)svg._hl.setAttribute('visibility','hidden')}
+function attach(svg,s){
+  let cur=-1;
+  const idxAt=e=>{const r=svg.getBoundingClientRect();return Math.max(0,Math.min(D.nd-1,Math.floor((e.clientX-r.left)/r.width*D.nd)))};
+  svg.addEventListener('pointermove',e=>{cur=idxAt(e);showTip(s,svg,cur,e.clientX,e.clientY)});
+  svg.addEventListener('pointerleave',()=>hideTip(svg));
+  svg.addEventListener('focus',()=>{if(cur<0)cur=s.days.length?s.days[0][0]:Math.max(0,s.ks);kb()});
+  svg.addEventListener('blur',()=>hideTip(svg));
+  const kb=()=>{const r=svg.getBoundingClientRect();showTip(s,svg,cur,r.left+(cur+.5)/D.nd*r.width,r.top+r.height/2)};
+  svg.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key==='ArrowLeft'){e.preventDefault();cur=Math.max(0,Math.min(D.nd-1,cur+(e.key==='ArrowRight'?1:-1)));kb()}else if(e.key==='Escape')hideTip(svg)});
+}
+
+let tSort={k:'n',dir:-1};
+const COLS=[
+  {k:'name',l:'Stream',v:s=>s.name,txt:true},
+  {k:'win',l:'Keep window (local)',v:s=>s.ks,txt:true,fmt:s=>dlabel(s.ks)+' – '+dlabel(s.ke)},
+  {k:'pick',l:'R2 pick',v:s=>pickOf(s),txt:true,fmt:s=>pickOf(s)?PICKNAME[pickOf(s)]:(whatif?'undecided (what-if: '+PICKNAME[whatif]+')':'undecided')},
+  {k:'k',l:'Kept on NAS',v:s=>s.t.k[0],f:s=>s.t.k[1],tot:T=>[T.k[0],T.k[1]]},
+  {k:'n',l:'NAS deleted',v:s=>s.t.n[0],f:s=>s.t.n[1],tot:T=>[T.n[0],T.n[1]]},
+  {k:'s',l:'Stays, no backup',v:s=>s.t.s[0],f:s=>s.t.s[1],tot:T=>[T.s[0],T.s[1]]},
+  {k:'r',l:'R2 deleted (phase 1)',v:s=>r2del(s),f:s=>deletesR2(s)?s.t.r[1]:0,tot:T=>[T.rdel[0],T.rdel[1]]},
+  {k:'now',l:'R2 now',v:s=>r2now(s),f:s=>s.r2.files,tot:T=>[T.now,T.files],usd:true},
+  {k:'p1',l:'R2 after phase 1',v:s=>r2now(s)-r2del(s),tot:T=>[T.p1],usd:true},
+  {k:'fl',l:'R2 eventual floor',v:s=>floorOf(s),tot:T=>[T.floor],usd:true},
+];
+function table(vis){
+  const th=$('tbl').tHead;th.textContent='';const tr=document.createElement('tr');
+  for(const c of COLS){const e=document.createElement('th');e.textContent=c.l+(tSort.k===c.k?(tSort.dir<0?' ↓':' ↑'):'');if(!c.txt)e.className='n';e.scope='col';
+    e.onclick=()=>{tSort={k:c.k,dir:tSort.k===c.k?-tSort.dir:(c.txt?1:-1)};table(visible())};tr.append(e)}
+  th.append(tr);
+  const col=COLS.find(c=>c.k===tSort.k);
+  const rows=[...vis].sort((a,b)=>{const x=col.v(a),y=col.v(b);return (typeof x==='string'?x.localeCompare(y):x-y)*tSort.dir});
+  const tb=$('tbl').tBodies[0];tb.textContent='';
+  const cell=(c,s)=>{const td=document.createElement('td');
+    if(c.k==='name'){const a=document.createElement('div');a.textContent=s.name;const b=document.createElement('div');b.className='loc';b.textContent=[s.city,s.country].filter(Boolean).join(', ')+' · #'+s.id;td.append(a,b);td.style.maxWidth='320px';return td}
+    if(c.txt){td.textContent=c.fmt?c.fmt(s):c.v(s);return td}
+    td.className='n';td.textContent=fmtB(c.v(s));
+    const sub=document.createElement('div');sub.className='loc';
+    sub.textContent=(c.f?fmtN(c.f(s))+' files':'')+(c.usd?(c.f?' · ':'')+usd(c.v(s))+'/mo':'');if(sub.textContent)td.append(sub);return td};
+  for(const s of rows){const r=document.createElement('tr');for(const c of COLS)r.append(cell(c,s));tb.append(r)}
+  const T=totals(vis);const tf=$('tbl').tFoot;tf.textContent='';const fr=document.createElement('tr');
+  COLS.forEach((c,i)=>{const td=document.createElement('td');
+    if(i===0)td.textContent='Total ('+vis.length+' streams)';
+    else if(c.tot){const [b,f]=c.tot(T);td.className='n';td.textContent=fmtB(b);const sub=document.createElement('div');sub.className='loc';sub.textContent=(f!=null?fmtN(f)+' files':'')+(c.usd?(f!=null?' · ':'')+usd(b)+'/mo':'');if(sub.textContent)td.append(sub)}
+    fr.append(td)});
+  tf.append(fr);
+}
+
+function all(){hero();render()}
+$('q').addEventListener('input',e=>{query=e.target.value;render()});
+$('sort').addEventListener('change',e=>{sortK=e.target.value;render()});
+$('scale').addEventListener('change',e=>{scale=e.target.value;render()});
+$('whatif').addEventListener('change',e=>{whatif=e.target.value;all()});
+let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(render,150)});
+
+Promise.all([
+  fetch('plan-data.json').then(r=>r.json()),
+  fetch('api/selection',{cache:'no-store'}).then(r=>r.ok?r.json():{}).catch(()=>({__err:true}))
+]).then(([d,sel])=>{
+  D=d;streams=d.streams;
+  const d0=new Date(d.d0+'T00:00:00Z');dayDates=Array.from({length:d.nd},(_,i)=>new Date(d0.getTime()+i*864e5));
+  D.months=dayDates.map((x,i)=>x.getUTCDate()===1?i:-1).filter(i=>i>=0);
+  for(const [k,v] of Object.entries((sel&&sel.choices)||{}))if(v&&v.choice)picks[k]=v.choice;
+  legend();all();
+  $('foot').textContent='Data snapshot: 7 Nov 2026 (DuckDB extract of clips, stitched hour files and NAS inventory). R2 picks: '+(sel&&sel.__err?'could not be loaded, treated as undecided':'live from api/selection'+(sel&&sel.saved_at?' (saved '+new Date(sel.saved_at).toLocaleString()+')':' (none saved)'))+'. Sizes are decimal (1 TB = 10¹² bytes). Days are local dates of each file\'s start time in the stream\'s time zone.';
+}).catch(e=>{$('summary').textContent='Could not load plan-data.json: '+e});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stoarama · R2 keep list</title>
+<link rel="stylesheet" href="app.css"><script src="app.js" defer></script>
+</head>
+<body>
+<header class="intro">
+<h1>Which streams should R2 keep?</h1>
+<p>Explore the full recording history, then choose what stays in Cloudflare R2. NAS keeps the pinned 28-day period for every stream. Nothing is deleted from this page.</p>
+<div class="kpis" aria-label="Storage estimate">
+<div><span>R2 today</span><b id="k-now">—</b><small id="k-now-tb"></small></div>
+<div><span>With your picks</span><b id="k-new">—</b><small id="k-new-tb">Undecided streams stay kept</small></div>
+<div><span>Monthly saving</span><b id="k-save">—</b><small>Estimate at $15 / TB / month</small></div>
+<div><span>Decided</span><b id="k-dec">—</b><small>streams</small></div>
+</div>
+<details><summary>How coverage and keep options work</summary>
+<p>Coverage is the union of recorded clip seconds in each stream-local day ÷ 86,400, including gap days. Green is above 90%, yellow is 70–90%, red is below 70%. An empty outlined day has 0%. Daylight-saving days still use 86,400 seconds. Tap a day for its exact coverage.</p>
+<p id="definition"></p>
+<p><b>Nothing:</b> R2 holds no footage; NAS is the only copy. <b>Kept period, stitched:</b> stitched hours in the pinned 28 days. <b>Kept period, raw + stitched:</b> also keeps the original clips for re-stitching. <b>Everything:</b> all days, including footage outside the NAS window.</p>
+<p>The pinned best 14 maximizes recorded seconds excluding known bad clips; it is not recalculated here. Storage figures are catalog estimates. V85 re-stitch outputs outside that catalog are not included.</p>
+<a href="plan.html">Open the existing deletion preview</a>
+</details>
+</header>
+<section class="toolbar" aria-label="Find and save streams">
+<div class="filters">
+<label class="search">Find a stream<input id="q" type="search" placeholder="Name, city, country or stream ID"></label>
+<label>Sort by<select id="sort"><option value="name">Name · A–Z</option><option value="total_hours">Total hours · most first</option><option value="avg_coverage">Average coverage · highest first</option><option value="days90">Days ≥90% · most first</option><option value="days_recorded">Days recorded · most first</option><option value="all">R2 storage · largest first</option></select></label>
+<label>Show<select id="filter"><option value="all">All streams</option><option value="undecided">Undecided</option><option value="decided">Decided</option><option value="gaps">Has gap days</option><option value="strong">Has days ≥90%</option></select></label>
+</div>
+<div class="actions"><label>Set all shown to<select id="bulk"><option value="">Choose…</option><option value="none">Nothing</option><option value="st">Kept period, stitched</option><option value="keep">Kept period, raw + stitched</option><option value="all">Everything</option></select></label><button class="primary" id="save" disabled>Save choices</button><span id="st" role="status" aria-live="polite">Loading saved choices…</span></div>
+</section>
+<main>
+<div class="guide"><div class="legend" aria-label="Calendar legend"><span><i class="green"></i>&gt;90%</span><span><i class="yellow"></i>70–90%</span><span><i class="red"></i>&lt;70%</span><span><i class="zero"></i>0% / gap</span><span><i class="keep"></i>Kept 28</span><span><i class="best"></i>Best 14</span></div><p id="count" role="status">Loading recording history…</p></div>
+<p id="snapshot" class="muted"></p>
+<div id="streams"></div>
+</main>
+<dialog id="lightbox"><button id="close-preview" autofocus>Close preview</button><img alt="" hidden></dialog>
+</body></html>
