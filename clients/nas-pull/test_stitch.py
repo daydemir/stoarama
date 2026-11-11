@@ -362,6 +362,21 @@ class StitchIntegrationTests(unittest.TestCase):
             pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
         self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
 
+    def test_switch_off_during_ledger_intent_keeps_raw(self):
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        real=pull.cleanup_ledger_append
+        def flip(cfg,entry,*a,**k):
+            out=real(cfg,entry,*a,**k)
+            if entry.get('event')=='intent': self.cfg.stitch_delete_enabled=False
+            return out
+        with mock.patch.object(pull,'cleanup_ledger_append',side_effect=flip), \
+                mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        raw=self.cfg.output_dir/self.clips[0]['relative_path']
+        self.assertTrue(raw.exists())
+        if task['item'].get('sidecar_required'): self.assertTrue(os.path.exists(str(raw)+'.stoarama.json'))
+
     def test_crash_after_publication_before_journal_rebuilds_without_raw_loss(self):
         with mock.patch.object(pull,'stitch_journal',side_effect=RuntimeError('simulated crash')):
             with self.assertRaisesRegex(RuntimeError,'simulated crash'): self.build()

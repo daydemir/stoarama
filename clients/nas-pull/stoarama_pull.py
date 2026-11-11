@@ -2391,6 +2391,11 @@ class CleanupFile:
                 raise RuntimeError("cleanup folder membership changed before unlink")
             self.check_paths()
             self.check_active()
+            if self.item.get("permit_reason"):
+                # Stitched retirement: read the live switches at the unlink itself.
+                switch = stitch_switch_refusal(self.cfg, True)
+                if switch:
+                    raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + switch)
             self.unlink_attempted = True
             os.unlink(self.name, dir_fd=self.fds[-1])
             self.media_unlinked = True
