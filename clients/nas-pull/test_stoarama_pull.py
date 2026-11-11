@@ -1881,14 +1881,16 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             cfg.validate = mock.Mock()
             fake_inventory = mock.Mock()
             fake_lock = mock.Mock()
+            started = []
 
             class FakeThread:
                 def __init__(self, target, args=(), **_kwargs):
                     self.target = target
                     self.args = args
-                    self.alive = target not in (pull.inventory_loop, pull.joined_loop, pull.cleanup_loop)
+                    self.alive = target not in (pull.inventory_loop, pull.joined_loop, pull.cleanup_loop, pull.stitch_loop)
 
                 def start(self):
+                    started.append(self.target)
                     if self.target is pull.update_loop:
                         self.target(*self.args)
 
@@ -1911,6 +1913,9 @@ if '-c' in sys.argv and sys.argv[sys.argv.index('-c')+1] == 'copy':
             ) as activate, self.assertRaisesRegex(pull.SelfUpdateExecError, "failed to activate"):
                 pull.run(cfg)
             activate.assert_called_once()
+            # The lane must exist while OFF so a later heartbeat can enable it.
+            self.assertFalse(cfg.stitch_enabled)
+            self.assertIn(pull.stitch_loop, started)
             self.assertEqual(mark.call_args_list[-1].args[2], pull.PreviousExit.SELF_UPDATE.value)
 
     def test_signal_during_delivery_never_activates_staged_candidate(self):
