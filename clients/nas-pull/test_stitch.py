@@ -6,6 +6,7 @@ cannot enter the production pinned export. No fixture uses real NAS data.
 import datetime
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import shutil
@@ -23,6 +24,128 @@ spec = importlib.util.spec_from_file_location('stitch_pull', Path(__file__).with
 pull = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pull)
 ORIGINAL_CHECKPOINT = pull.stitch_checkpoint
+
+
+class StitchSwitchTests(unittest.TestCase):
+    def config(self, enabled=None, deletion=None):
+        env = {}
+        if enabled is not None:
+            env['STOARAMA_V85_STITCH_ENABLED'] = enabled
+        if deletion is not None:
+            env['STOARAMA_V85_STITCH_DELETION_ENABLED'] = deletion
+        with mock.patch.dict(os.environ, env, clear=True):
+            return pull.Config()
+
+    def test_env_vetoes_and_server_flags_resolve_independently_each_cycle(self):
+        for local, local_delete, remote, remote_delete in itertools.product(
+                (None, 'false', 'true'), (None, 'false', 'true'),
+                (None, False, True), (None, False, True)):
+            with self.subTest(local=local, local_delete=local_delete, remote=remote, remote_delete=remote_delete):
+                cfg = self.config(local, local_delete)
+                self.assertFalse(cfg.stitch_enabled)
+                self.assertFalse(cfg.stitch_delete_enabled)
+                # Start ON to prove missing flags revoke previous authority.
+                cfg.stitch_switches.apply(dict(ok=True, stitch_enabled=True, stitch_deletion_enabled=True))
+                response = dict(ok=True)
+                if remote is not None:
+                    response['stitch_enabled'] = remote
+                if remote_delete is not None:
+                    response['stitch_deletion_enabled'] = remote_delete
+                cfg.stitch_switches.apply(response)
+                enabled = local != 'false' and remote is True
+                self.assertEqual(cfg.stitch_enabled, enabled)
+                self.assertEqual(cfg.stitch_delete_enabled,
+                                 enabled and local_delete != 'false' and remote_delete is True)
+
+    def test_unknown_or_failed_response_revokes_authority(self):
+        cfg = self.config()
+        on = dict(ok=True, stitch_enabled=True, stitch_deletion_enabled=True)
+        for response in (None, [], {}, dict(on, ok=False), dict(on, ok='true'),
+                         dict(on, stitch_enabled='true'), dict(on, stitch_enabled=1)):
+            cfg.stitch_switches.apply(on)
+            cfg.stitch_switches.apply(response)
+            self.assertFalse(cfg.stitch_enabled)
+            self.assertFalse(cfg.stitch_delete_enabled)
+        for value in ('true', 1, None):
+            cfg.stitch_switches.apply(dict(on, stitch_deletion_enabled=value))
+            self.assertTrue(cfg.stitch_enabled)
+            self.assertFalse(cfg.stitch_delete_enabled)
+
+    def test_heartbeat_applies_switches_on_every_cycle_and_transport_failure(self):
+        cfg = self.config()
+        runtime = SimpleNamespace(inventory=None, apply_joined_protocol_response=mock.Mock())
+        on = dict(ok=True, stitch_enabled=True, stitch_deletion_enabled=True)
+        responses = [on, dict(on, stitch_enabled=False), on, {}, on, ConnectionError('offline')]
+        expected = [True, False, True, False, True, False]
+        stop = threading.Event()
+        def wait(_):
+            enabled = expected.pop(0)
+            self.assertEqual((cfg.stitch_enabled, cfg.stitch_delete_enabled), (enabled, enabled))
+            self.assertEqual(runtime.stitch_enabled, enabled)
+            if not expected:
+                stop.set()
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(pull, 'load_outage', return_value=None), \
+             mock.patch.object(pull, 'send_heartbeat', side_effect=responses) as send, \
+             mock.patch.object(stop, 'wait', side_effect=wait):
+            cfg.outage_file = Path(root)/'outage.json'
+            pull.heartbeat_loop(cfg, runtime, stop)
+        self.assertEqual(send.call_count, len(responses))
+
+    def test_off_blocks_new_leases_including_after_maintenance_wait(self):
+        cfg = self.config()
+        stop = threading.Event()
+        inventory = mock.MagicMock()
+        inventory.db.execute.return_value.fetchone.return_value = None
+        on = dict(ok=True, stitch_enabled=True)
+        def pause(_):
+            cfg.stitch_switches.apply(dict(ok=True, stitch_enabled=False))
+            return True
+        with mock.patch.object(pull, 'restore_api') as api, \
+             mock.patch.object(pull, 'stitch_journal'), \
+             mock.patch.object(pull, 'stitch_resources'), \
+             mock.patch.object(pull.NAS_MEDIA_FENCE, 'wait_maintenance', side_effect=pause):
+            self.assertEqual(pull.stitch_once(cfg, inventory, stop), 30)
+            cfg.stitch_switches.apply(on)
+            self.assertEqual(pull.stitch_once(cfg, inventory, stop), 30)
+            api.assert_not_called()
+
+    def test_server_off_cancels_live_child_even_if_server_turns_back_on(self):
+        cfg = self.config()
+        on = dict(ok=True, stitch_enabled=True)
+        cfg.stitch_switches.apply(on)
+        stop = pull.StitchStop(cfg, threading.Event())
+        started, errors = threading.Event(), []
+        popen = subprocess.Popen
+        def launch(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            started.set()
+            return child
+        def run():
+            try:
+                pull.stitch_run([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                time.monotonic()+40, stop)
+            except Exception as exc:
+                errors.append(exc)
+        # This test exercises cancellation on macOS too, without Linux ionice.
+        with mock.patch.object(pull.sys, 'platform', 'darwin'), \
+             mock.patch.object(pull.subprocess, 'Popen', side_effect=launch):
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(started.wait(5))
+                cfg.stitch_switches.apply(dict(ok=True, stitch_enabled=False))
+                cfg.stitch_switches.apply(on)
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], pull.BenchmarkError)
+                self.assertEqual(str(errors[0]), 'client shutting down')
+                self.assertEqual(stop.reason, 'stitch switch off')
+                self.assertFalse(pull.StitchStop(cfg, threading.Event()).is_set())
+            finally:
+                stop.stop.set()
+                worker.join(5)
 
 
 class StitchRepairTests(unittest.TestCase):
@@ -211,6 +334,48 @@ class StitchIntegrationTests(unittest.TestCase):
         output=self.cfg.output_dir/result['outputs'][0]['relative_path'];output.write_bytes(b'corrupt')
         with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
         self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+
+    def test_switch_off_during_output_rehash_keeps_raw(self):
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        real=pull.hash_certification_file
+        def flip(*a,**k):
+            out=real(*a,**k); self.cfg.stitch_delete_enabled=False; return out
+        with mock.patch.object(pull,'hash_certification_file',side_effect=flip):
+            self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
+        self.cfg.stitch_delete_enabled=True
+        with mock.patch.object(pull,'hash_certification_file',side_effect=flip), \
+                mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+
+    def test_switch_off_at_unlink_boundary_keeps_raw(self):
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        real=pull.cleanup_local_caps
+        def flip(*a,**k):
+            out=real(*a,**k)
+            if len(a)>2: self.cfg.stitch_delete_enabled=False
+            return out
+        with mock.patch.object(pull,'cleanup_local_caps',side_effect=flip), \
+                mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+
+    def test_switch_off_during_ledger_intent_keeps_raw(self):
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        real=pull.cleanup_ledger_append
+        def flip(cfg,entry,*a,**k):
+            out=real(cfg,entry,*a,**k)
+            if entry.get('event')=='intent': self.cfg.stitch_delete_enabled=False
+            return out
+        with mock.patch.object(pull,'cleanup_ledger_append',side_effect=flip), \
+                mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        raw=self.cfg.output_dir/self.clips[0]['relative_path']
+        self.assertTrue(raw.exists())
+        if task['item'].get('sidecar_required'): self.assertTrue(os.path.exists(str(raw)+'.stoarama.json'))
 
     def test_crash_after_publication_before_journal_rebuilds_without_raw_loss(self):
         with mock.patch.object(pull,'stitch_journal',side_effect=RuntimeError('simulated crash')):

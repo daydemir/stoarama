@@ -123,7 +123,7 @@ retirement. A purged/missing R2 raw copy keeps the NAS raw even if stitched.
 R2 objects are neither overwritten nor deleted by this worker.
 
 Before each raw unlink, the client independently requires its local registration
-receipt, exact complete inclusion proof, enabled local switches, and a fresh
+receipt, exact complete inclusion proof, effective client switches, and a fresh
 whole output rehash. An output/source mismatch or missing receipt blocks unlink.
 The common cleanup machinery auto-pauses execution on anomalies. Failed/paused
 retirement blocks further growing work in this single lane until reconciled;
@@ -148,6 +148,24 @@ pull, inventory and cleanup behavior does not enable V85r when its switches are
 off. Stitch progress/errors ride the heartbeat (`connections.nas_stitch_status`)
 and the existing redacted client-log upload (V85/stitch topics included).
 
+The authenticated heartbeat returns `stitch_enabled` from server
+`NAS_STITCH_ENABLED` and `stitch_deletion_enabled` from server
+`NAS_STITCH_DELETION_ENABLED`, for **connection 13 only**. Other connections
+receive false. The client starts OFF and re-evaluates both on every heartbeat
+(normally every 30 seconds). Missing, unknown or failed responses revoke
+authority; only JSON boolean true enables a flag. Unset container variables
+`STOARAMA_V85_STITCH_ENABLED` / `STOARAMA_V85_STITCH_DELETION_ENABLED` follow the
+server; explicit `false` vetoes the corresponding flag locally. Explicit `true`
+also follows the server and cannot override OFF. No Container Manager edit is
+needed when these variables are unset. Unknown local values fail closed.
+
+Server stitching OFF blocks new leases and cancels the current native child
+through the existing stop/watchdog path, as checkpoint `continue:false` does.
+A later ON permits a new job but cannot revive the cancelled child. Deletion
+additionally requires the effective stitch flag, `NAS_CLEANUP_DELETION_ENABLED`,
+scope `deletion_approved`, receipts and every existing fresh inclusion/output
+proof and retirement gate.
+
 ## One-stream pilot procedure (operator action after review)
 
 No commands below were run against production for this PR.
@@ -159,8 +177,11 @@ No commands below were run against production for this PR.
    test-only and cannot admit production media.
 2. Deploy migration/API and a reviewed client candidate through the existing
    release process. Verify `nice` and `ionice` exist inside the NAS container.
-   Set server `NAS_STITCH_ENABLED=true` and client
-   `STOARAMA_V85_STITCH_ENABLED=true`. Leave **both new deletion switches OFF**.
+   Use `NAS_VERSION=v85r-server-switch-v1`. Set server
+   `NAS_STITCH_ENABLED=true`; leave `NAS_STITCH_DELETION_ENABLED=false`.
+   Unset container switches follow the server automatically; no container env
+   edit is required. A previously explicit local `false` remains a kill switch
+   and cannot be remotely overridden. Verify the next heartbeat enables the lane.
    Leave the existing cleanup master as otherwise required by normal cleanup.
 3. With the operator's existing service authentication, import the exact file:
    `stoaramactl nas-stitch import-corpus --input approved85-decisions.jsonl`.
@@ -174,24 +195,27 @@ No commands below were run against production for this PR.
    ```
 
    `--approve-deletion` records the owner's intent for this exact scope; it does
-   not turn on either deletion switch. Approvals expire within 180 days. Missing
+   not turn on deletion. Approvals expire within 180 days. Missing
    this flag leaves raw retained; scopes are immutable, so choose the intended
    authority explicitly before starting. Do not submit overlapping scopes.
 4. Use `stoaramactl nas-stitch status`, NAS heartbeat and client logs. Check the
    new output SHA, raw exception list, recovered-prefix provenance and the common
    cleanup plan's complete `would_delete`/verified R2 evidence. Missing corpus,
    unsupported native layouts, audio and missing recovery copies are HOLD.
-5. After reviewing that exact pilot, enable client
-   `STOARAMA_V85_STITCH_DELETION_ENABLED=true`, then server
-   `NAS_STITCH_DELETION_ENABLED=true` last. The existing
+5. After reviewing that exact pilot, set server
+   `NAS_STITCH_DELETION_ENABLED=true` last; the next successful heartbeat
+   enables client deletion unless explicitly vetoed locally. The existing
    `NAS_CLEANUP_DELETION_ENABLED` must also be on. No extra per-hour approval is
    needed within the owner's scope: each verified unit completes the common
    dry run, passes the common one-plan/budget gates, then is armed for at most
    24 hours and the remaining scope lifetime. Existing cleanup work has the
    same shared caps. Completion closes only this lane's cleanly deleted plan;
    R2 recovery holds persist. Verify ledger/receipts and measured NAS headroom.
-6. Stop with `stoaramactl nas-stitch pause --scope-id ID` or either new deletion
-   switch. Pause prevents new work and new grants; an already issued exact-file
+6. Stop stitching with server `NAS_STITCH_ENABLED=false` or
+   `stoaramactl nas-stitch pause --scope-id ID`. To stop retirement while keeping
+   stitching enabled, set `NAS_STITCH_DELETION_ENABLED=false`. The heartbeat
+   revokes client authority; checkpoint polling also stops inactive work.
+   Pause prevents new work and new grants; an already issued exact-file
    permit retains its existing <=30-second lifetime. Reconcile an anomaly using
    the common cleanup report/recheck tools; never widen an inclusion claim.
 
@@ -248,13 +272,14 @@ building never unlinks or writes through a source descriptor. New leases pause
 conservatively while any cleanup source freeze exists. Registration replay is
 metadata-only and retains already verified outputs.
 
-The explicit future client release is **`NAS_VERSION=v85r-fence-progress-v1`**,
-allowlisted alongside reviewed predecessors, including `joined-marker-recovery-v1`.
+The explicit future client release is **`NAS_VERSION=v85r-server-switch-v1`**,
+allowlisted alongside reviewed predecessors, including `v85r-fence-progress-v1`
+and `joined-marker-recovery-v1`.
 Build that release from merged `main` with this explicit label. Local stitched
 media, repairs, proofs and registration receipts use the same alias quarantine,
 verified private copy, atomic canonical replacement and crash-safe ledger as
 joined delivery. Startup reporting replays their shared quarantine ledger.
-Keep every stitch/deletion switch
+Keep both server stitch/deletion switches
 off until the separately approved pilot. This work does not stage/promote a
 release, mutate production, merge, or deploy.
 
