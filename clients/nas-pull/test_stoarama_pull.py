@@ -5462,5 +5462,105 @@ class OriginalWitnessTests(unittest.TestCase):
             self.assertLessEqual(sum(b-a for a,b in proof["intervals_us"]), 1000000)
 
 
+
+
+class R2RetireCopyTests(unittest.TestCase):
+    def setUp(self):
+        mount = mock.patch.object(pull.os.path, "ismount", return_value=True)
+        mount.start()
+        self.addCleanup(mount.stop)
+
+    def fixture(self, root):
+        cfg = NASPullTests().config(root)
+        cfg.validate = lambda: None
+        body = b"exact media copy"
+        sha = hashlib.sha256(body).hexdigest()
+        item = {"kind": "raw", "source_id": 901, "recording_id": 2, "stream_id": 3,
+                "bucket": "bucket", "object_key": "managed/acct-47/a.mp4", "relative_path": "p/a.mp4",
+                "size_bytes": len(body), "sha256": sha, "choice": "none", "reason": "copy_to_nas"}
+        header = {"phase": "copy", "nas_backed": True, "connection_id": 13, "bucket": "bucket",
+                  "policy_sha256": pull.R2_RETIRE_COPY_POLICY, "items": 1, "bytes": len(body)}
+        raw = (json.dumps({"header": header}) + "\n" + json.dumps(item) + "\n").encode()
+        manifest = root / "copy.jsonl"
+        manifest.write_bytes(raw)
+        clip = {"clip_id": 901, "recording_id": 2, "size_bytes": len(body), "sha256": sha,
+                "relative_path": "p/a.mp4", "clip_start_at": "2026-09-12T00:00:00+09:00",
+                "clip_end_at": "2026-09-12T00:01:00+09:00"}
+        return cfg, body, manifest, hashlib.sha256(raw).hexdigest(), clip
+
+    def test_atomic_sidecar_inventory_and_no_release(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg, body, manifest, digest, clip = self.fixture(Path(temp))
+            response = {"policy_sha256": pull.R2_RETIRE_COPY_POLICY, "clip": clip,
+                        "url": "https://r2.test/exact", "headers": {"If-Match": ['"etag"']}}
+            def prepare(_cfg, method, path, **kwargs):
+                self.assertEqual((method, path), ("POST", "/account/connections/redownload"))
+                return dict(response)
+            def download(_url, path, size, sha, headers):
+                self.assertEqual(headers, {"If-Match": '"etag"'})
+                path.write_bytes(body)
+            with mock.patch.object(pull, "request_json", side_effect=prepare), mock.patch.object(
+                    pull, "download_verified", side_effect=download), mock.patch.object(pull.Inventory, "sync_clip_ids") as sync:
+                result = pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
+            self.assertEqual(result["copied_or_verified_bytes"], len(body))
+            self.assertEqual((cfg.output_dir / "p/a.mp4").read_bytes(), body)
+            sidecar = cfg.output_dir / "p/a.mp4.stoarama.json"
+            self.assertEqual(json.loads(sidecar.read_bytes()), pull.stitch_provenance(clip))
+            with sqlite3.connect(cfg.inventory_file) as db:
+                row = db.execute("SELECT state,sha256,size_bytes,sidecar_sha256,sidecar_size_bytes,dirty FROM files WHERE clip_id=901").fetchone()
+            self.assertEqual(row[:3], ("present", clip["sha256"], len(body)))
+            self.assertEqual(row[3:5], (hashlib.sha256(sidecar.read_bytes()).hexdigest(), sidecar.stat().st_size))
+            sync.assert_called_once_with(cfg, [901])
+
+    def test_digest_policy_and_existing_conflict_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg, body, manifest, digest, clip = self.fixture(Path(temp))
+            with self.assertRaises(ValueError):
+                pull.read_r2_copy_manifest(manifest, "0" * 64)
+            original = manifest.read_bytes()
+            changed = original.replace(pull.R2_RETIRE_COPY_POLICY.encode(), b"0" * 64)
+            manifest.write_bytes(changed)
+            with self.assertRaises(ValueError):
+                pull.read_r2_copy_manifest(manifest, hashlib.sha256(changed).hexdigest())
+            manifest.write_bytes(original)
+            target = cfg.output_dir / "p/a.mp4"
+            target.parent.mkdir()
+            target.write_bytes(b"source data must survive")
+            response = {"policy_sha256": pull.R2_RETIRE_COPY_POLICY, "clip": clip,
+                        "url": "https://r2.test/exact", "headers": {"If-Match": ['"etag"']}}
+            with mock.patch.object(pull, "request_json", return_value=response), self.assertRaises(pull.ExistingFileMismatch):
+                pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
+            self.assertEqual(target.read_bytes(), b"source data must survive")
+            self.assertFalse(pull.stitch_sidecar_path(target).exists())
+
+    def test_running_client_and_capacity_reserve_block_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg, body, manifest, digest, clip = self.fixture(Path(temp))
+            with pull.acquire_lock(cfg), self.assertRaises(RuntimeError):
+                pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
+            response = {"policy_sha256": pull.R2_RETIRE_COPY_POLICY, "clip": clip,
+                        "url": "https://r2.test/exact", "headers": {"If-Match": ['"etag"']}}
+            with mock.patch.object(pull, "request_json", return_value=response), mock.patch.object(
+                    pull, "storage_status", return_value={"available": True, "free_bytes": 0}), self.assertRaises(RuntimeError):
+                pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
+            self.assertFalse((cfg.output_dir / "p/a.mp4").exists())
+
+
+    def test_policy_change_after_copy_never_reports_present_inventory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg, body, manifest, digest, clip = self.fixture(Path(temp))
+            good = {"policy_sha256": pull.R2_RETIRE_COPY_POLICY, "clip": clip,
+                    "url": "https://r2.test/exact", "headers": {"If-Match": ['"etag"']}}
+            bad = dict(good, policy_sha256="0" * 64)
+            with mock.patch.object(pull, "request_json", side_effect=[dict(good), dict(good), bad]), mock.patch.object(
+                    pull, "download_verified", side_effect=lambda _url, path, *_args: path.write_bytes(body)), mock.patch.object(
+                    pull.Inventory, "sync_clip_ids") as sync, self.assertRaises(RuntimeError):
+                pull.copy_r2_manifest(cfg, str(manifest), digest, 100)
+            sync.assert_not_called()
+            self.assertEqual((cfg.output_dir / "p/a.mp4").read_bytes(), body)
+            with sqlite3.connect(cfg.inventory_file) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

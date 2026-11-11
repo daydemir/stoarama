@@ -16,13 +16,12 @@ import (
 
 // r2-retire selection: pure decision logic, shared by plan and apply.
 //
-// Phase 1 retires ONLY objects whose footage lies entirely outside the
-// stream's single keep28 window, that have no NAS copy, and whose stream the
-// owner has decided on with a pick other than "all". Everything else is kept:
-// inside the window, any NAS evidence, any NAS cleanup plan/hold, joined
-// pipeline references, undecided streams, protected prefixes, unknown timing.
+// Legacy selection and phase 1 retire outside-window objects absent from NAS.
+// NAS-backed plans additionally admit kept-window "none" objects with fresh,
+// exact present inventory. Cleanup holds, references and unknowns always veto.
 
 const (
+	r2RetireNASReason  = "kept_none_exact_nas_copy"
 	r2RetireReason     = "outside_keep28_no_nas_copy"
 	r2RetireRawPrefix  = "managed/"
 	r2RetireUSDPerTB   = 15.0
@@ -147,6 +146,7 @@ type r2RetireFacts struct {
 	Purged         bool // raw: purged_at already set
 	Retired        bool // already in r2_object_retirements
 	NASCopy        bool // any NAS inventory/ack/unmatched evidence
+	ExactNAS       bool // connection inventory state present, exact path/SHA/size
 	Held           bool // any NAS cleanup plan item, hold, or delete-issued plan
 	JoinedRef      bool // joined snapshot/source/scope/artifact reference
 	RestorePending bool // NAS restore queued or running
@@ -167,12 +167,14 @@ type r2RetireCandidate struct {
 	StartAt     time.Time `json:"start_at"`
 	EndAt       time.Time `json:"end_at"`
 	// Not in the manifest: re-read from the database at apply time.
-	Timezone    string        `json:"-"`
-	SourceStart time.Time     `json:"-"`
-	SourceEnd   time.Time     `json:"-"`
-	SourceCount int           `json:"-"`
-	SourceFound int           `json:"-"`
-	Facts       r2RetireFacts `json:"-"`
+	Timezone     string        `json:"-"`
+	SourceStart  time.Time     `json:"-"`
+	SourceEnd    time.Time     `json:"-"`
+	SourceCount  int           `json:"-"`
+	SourceFound  int           `json:"-"`
+	Facts        r2RetireFacts `json:"-"`
+	ETag         string        `json:"etag,omitempty"`
+	RelativePath string        `json:"relative_path,omitempty"`
 }
 
 // r2RetireValidSpan mirrors the NAS cleanup policy: a nonempty interval
@@ -240,6 +242,10 @@ func r2RetireLowerHex64(s string) bool {
 // r2RetireDecide returns (reason, true) for an object phase 1 may retire, or
 // (keep reason, false). The order only affects which reason is reported.
 func r2RetireDecide(c r2RetireCandidate, bucket string, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick) (string, string, bool) {
+	return r2RetireDecideMode(c, bucket, windows, picks, false)
+}
+
+func r2RetireDecideMode(c r2RetireCandidate, bucket string, windows map[int64]api.Keep28Window, picks map[int64]r2RetirePick, nasBacked bool) (string, string, bool) {
 	if r := r2RetireKeyProtection(c.Kind, c.Bucket, c.ObjectKey, bucket); r != "" {
 		return r, "", false
 	}
@@ -262,11 +268,12 @@ func r2RetireDecide(c r2RetireCandidate, bucket string, windows map[int64]api.Ke
 	if !r2RetireValidSpan(c.StartAt, c.EndAt) || !r2RetireValidSpan(c.SourceStart, c.SourceEnd) || c.SourceCount < 1 || c.SourceFound != c.SourceCount {
 		return "unknown_timing", "", false
 	}
-	if !r2RetireOutside(w, c.StartAt, c.EndAt) || !r2RetireOutside(w, c.SourceStart, c.SourceEnd) {
+	outside := r2RetireOutside(w, c.StartAt, c.EndAt) && r2RetireOutside(w, c.SourceStart, c.SourceEnd)
+	if !nasBacked && !outside {
 		return "inside_keep_window", "", false
 	}
 	switch {
-	case c.Facts.NASCopy:
+	case !nasBacked && c.Facts.NASCopy:
 		return "nas_copy", "", false
 	case c.Facts.Held:
 		return "nas_cleanup_hold", "", false
@@ -290,6 +297,27 @@ func r2RetireDecide(c r2RetireCandidate, bucket string, windows map[int64]api.Ke
 	case "all":
 		return "pick_all", choice, false
 	case "none", "st", "keep":
+		if nasBacked {
+			if outside {
+				if c.Facts.NASCopy || c.Facts.ExactNAS {
+					return "after_nas_cleanup", choice, false
+				}
+				return r2RetireReason, choice, true
+			}
+			if choice != "none" {
+				return "inside_keep_window", choice, false
+			}
+			if c.Facts.ExactNAS {
+				return r2RetireNASReason, choice, true
+			}
+			if c.Facts.NASCopy {
+				return "nas_identity_unproven", choice, false
+			}
+			if c.Kind == "collated" {
+				return "kept_collated_no_exact_inventory", choice, false
+			}
+			return "copy_to_nas", choice, false
+		}
 		// Per the owner's picks page, none/st/keep all drop everything outside
 		// the kept period; they differ only inside it (none: nothing, st:
 		// stitched only, keep: raw + stitched). Phase 1 only touches footage

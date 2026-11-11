@@ -636,3 +636,13 @@ func (c *Client) DeleteObjectsEach(ctx context.Context, keys []string) (map[stri
 func cleanETag(v string) string {
 	return strings.Trim(v, "\"")
 }
+
+// DeleteObjectExact refuses a replacement object at the same key. Never use a
+// prefix, unconditional retry or multi-delete for a reviewed retirement item.
+func (c *Client) DeleteObjectExact(ctx context.Context, key, etag string) error {
+	if key == "" || cleanETag(etag) == "" {
+		return errors.New("exact delete requires key and ETag")
+	}
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key), IfMatch: aws.String(`"` + cleanETag(etag) + `"`)})
+	return err
+}

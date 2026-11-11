@@ -355,6 +355,7 @@ func (s *Server) router() http.Handler {
 			account.Post("/connections/space-audit", s.handleAccountConnectionSpaceAudit)
 			account.Post("/connections/upload-probe", s.handleAccountConnectionUploadProbe)
 			account.Post("/connections/upload-probe/{probeId}/result", s.handleAccountConnectionUploadProbeResult)
+			account.Post("/connections/redownload", s.handleAccountConnectionRedownload)
 			account.Post("/connections/nas-restore/lease", s.handleAccountConnectionRestoreLease)
 			account.Post("/connections/nas-restore/{taskId}/result", s.handleAccountConnectionRestoreResult)
 			account.Post("/connections/stitch/lease", s.handleAccountNASStitchLease)

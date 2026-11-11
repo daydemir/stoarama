@@ -25,6 +25,7 @@ type r2RetireScope struct {
 	Grace        time.Duration
 	// HasRetirements is false only before migration 0174 is applied (plan only).
 	HasRetirements bool
+	NASBacked      bool
 }
 
 // Raw clip facts. $1 account, $2 NAS connection, $3 bucket, $4 grace seconds.
@@ -94,6 +95,19 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 		retired = "false"
 	}
 	sel = strings.Replace(sel, "{RETIRED}", retired, 1)
+	if scope.NASBacked {
+		// Preserve the legacy query for old manifests. New plans require exact
+		// inventory identities and the shared reservation view, never ACK alone.
+		extra := r2RetireRawExactSQL
+		if kind == "collated" {
+			extra = r2RetireCollatedExactSQL
+		}
+		anchor := "\nFROM recording_clips c\nJOIN recordings"
+		if kind == "collated" {
+			anchor = "\nFROM recording_collation_outputs o\nJOIN recording_collation_hours"
+		}
+		sel = strings.Replace(sel, anchor, extra+anchor, 1)
+	}
 	if single {
 		return sel + "WHERE " + alias + ".id=$5"
 	}
@@ -104,14 +118,18 @@ func r2RetireSQL(kind string, scope r2RetireScope, single bool) string {
 	return sel + where + " ORDER BY " + alias + ".id LIMIT $6"
 }
 
-func r2RetireScanCandidate(kind string, rows pgx.Row) (r2RetireCandidate, error) {
+func r2RetireScanCandidate(kind string, rows pgx.Row, nasBacked bool) (r2RetireCandidate, error) {
 	c := r2RetireCandidate{Kind: kind}
 	var start, end, srcStart, srcEnd *time.Time
 	var srcFound *int
 	f := &c.Facts
-	if err := rows.Scan(&c.SourceID, &c.RecordingID, &c.StreamID, &c.Bucket, &c.ObjectKey, &c.SizeBytes, &c.SHA256, &start, &end, &c.Timezone,
+	dest := []any{&c.SourceID, &c.RecordingID, &c.StreamID, &c.Bucket, &c.ObjectKey, &c.SizeBytes, &c.SHA256, &start, &end, &c.Timezone,
 		&c.SourceCount, &srcFound, &srcStart, &srcEnd,
-		&f.Purged, &f.Retired, &f.NASCopy, &f.Held, &f.JoinedRef, &f.RestorePending, &f.SharedKey, &f.Recent); err != nil {
+		&f.Purged, &f.Retired, &f.NASCopy, &f.Held, &f.JoinedRef, &f.RestorePending, &f.SharedKey, &f.Recent}
+	if nasBacked {
+		dest = append(dest, &f.ExactNAS, &c.RelativePath, &f.Held)
+	}
+	if err := rows.Scan(dest...); err != nil {
 		return c, err
 	}
 	if start != nil {
@@ -178,7 +196,7 @@ SELECT md5(coalesce((SELECT string_agg(id||':'||mode, ',' ORDER BY id) FROM nas_
   ||'|'||(SELECT count(*)||':'||coalesce(max(id),0) FROM recording_joined_artifacts)
   ||'|'||(SELECT count(*)||':'||coalesce(max(id),0) FROM recording_collation_outputs))`
 
-func loadR2RetireSets(ctx context.Context, q r2RetireQuerier) (r2RetireSets, error) {
+func loadR2RetireSets(ctx context.Context, q r2RetireQuerier, manifest ...string) (r2RetireSets, error) {
 	s := r2RetireSets{HeldRaw: map[int64]bool{}, HeldCollated: map[int64]bool{}, ArtifactKeys: map[string]bool{}, OutputKeyCount: map[string]int{}}
 	rows, err := q.Query(ctx, r2RetirePlanManifestSQL)
 	if err != nil {
@@ -240,6 +258,38 @@ func loadR2RetireSets(ctx context.Context, q r2RetireQuerier) (r2RetireSets, err
 			return s, err
 		}
 	}
+	var has bool
+	if err := q.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&has); err != nil {
+		return s, err
+	}
+	if has {
+		exclude := ""
+		if len(manifest) > 0 {
+			exclude = manifest[0]
+		}
+		rows, err := q.Query(ctx, `SELECT kind,source_id FROM r2_retirement_reservations WHERE manifest_sha256<>$1`, exclude)
+		if err != nil {
+			return s, err
+		}
+		for rows.Next() {
+			var kind string
+			var id int64
+			if err := rows.Scan(&kind, &id); err != nil {
+				rows.Close()
+				return s, err
+			}
+			if kind == "raw" {
+				s.HeldRaw[id] = true
+			} else {
+				s.HeldCollated[id] = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return s, err
+		}
+	}
+
 	return s, nil
 }
 
@@ -273,7 +323,7 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 		n := 0
 		var page []r2RetireCandidate
 		for rows.Next() {
-			c, err := r2RetireScanCandidate(kind, rows)
+			c, err := r2RetireScanCandidate(kind, rows, scope.NASBacked)
 			if err != nil {
 				rows.Close()
 				return fmt.Errorf("scan %s row: %w", kind, err)
@@ -301,10 +351,32 @@ func r2RetireScan(ctx context.Context, q r2RetireQuerier, kind string, scope r2R
 // r2RetireLoadOne re-reads one catalog row (purged or not) for apply.
 func r2RetireLoadOne(ctx context.Context, q r2RetireQuerier, kind string, id int64, scope r2RetireScope, sets r2RetireSets) (r2RetireCandidate, error) {
 	row := q.QueryRow(ctx, r2RetireSQL(kind, scope, true), scope.AccountID, scope.ConnectionID, scope.Bucket, int64(scope.Grace/time.Second), id)
-	c, err := r2RetireScanCandidate(kind, row)
+	c, err := r2RetireScanCandidate(kind, row, scope.NASBacked)
 	if err != nil {
 		return c, err
 	}
 	sets.apply(&c)
 	return c, nil
 }
+
+// Extra columns are selected only for NAS-backed plans. Broad presence is a
+// veto outside keep28; only this exact inventory match authorizes kept footage.
+const r2RetireRawExactSQL = `,
+ EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2 AND n.clip_id=c.id
+   AND n.relative_path=c.display_path AND n.state='present' AND n.sha256=lower(c.sha256) AND n.size_bytes=c.size_bytes
+   AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
+   AND n.server_received_at>=now()-interval '24 hours' AND n.sidecar_size_bytes>0 AND n.sidecar_sha256 ~ '^[a-f0-9]{64}$'),
+ coalesce(c.display_path,''),
+ (EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='raw' AND f.source_id=c.id)
+  OR EXISTS(SELECT 1 FROM nas_cleanup_source_holds h JOIN nas_cleanup_plans p ON p.id=h.plan_id
+    WHERE h.clip_id=c.id AND (p.mode<>'retired' OR EXISTS(SELECT 1 FROM nas_cleanup_items i WHERE i.plan_id=p.id AND i.delete_ever_issued))))
+`
+const r2RetireCollatedExactSQL = `,
+ EXISTS(SELECT 1 FROM nas_inventory_files n WHERE n.connection_id=$2
+   AND n.relative_path IN (o.nas_relative_path,'joined/'||o.nas_relative_path)
+   AND n.state='present' AND n.sha256=lower(o.sha256) AND n.size_bytes=o.size_bytes
+   AND n.verified_at BETWEEN now()-interval '24 hours' AND now()+interval '5 minutes'
+   AND n.server_received_at>=now()-interval '24 hours'),
+ coalesce(o.nas_relative_path,''),
+ EXISTS(SELECT 1 FROM nas_cleanup_reserved_files f WHERE f.kind='collated' AND f.source_id=o.id)
+`

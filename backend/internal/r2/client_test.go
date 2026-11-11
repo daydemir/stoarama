@@ -362,3 +362,28 @@ func TestNASSpaceAuditMetadataPresignAndHead(t *testing.T) {
 		t.Fatalf("head=%+v err=%v", head, err)
 	}
 }
+
+func TestDeleteObjectExactUsesConditionalSingleKey(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodDelete || r.URL.Path != "/bucket/managed/a.mp4" || r.Header.Get("If-Match") != `"exact"` {
+			t.Errorf("unbound delete: %s %s %q", r.Method, r.URL.Path, r.Header.Get("If-Match"))
+		}
+		w.WriteHeader(412)
+	}))
+	defer server.Close()
+	c, err := New(context.Background(), Config{AccessKey: "k", SecretKey: "s", Region: "auto", Bucket: "bucket", Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteObjectExact(context.Background(), "managed/a.mp4", "exact"); err == nil {
+		t.Fatal("replacement accepted")
+	}
+	if calls != 1 {
+		t.Fatalf("conditional failure retried %d times", calls)
+	}
+	if err := c.DeleteObjectExact(context.Background(), "managed/a.mp4", ""); err == nil {
+		t.Fatal("empty ETag accepted")
+	}
+}

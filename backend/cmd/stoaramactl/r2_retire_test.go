@@ -269,6 +269,7 @@ type fakeR2RetireStore struct {
 	deleted    []string
 	heads      int
 	beforeHead func(key string)
+	deleteErr  error
 }
 
 func (f *fakeR2RetireStore) Bucket() string { return "stoarama" }
@@ -290,6 +291,9 @@ func (f *fakeR2RetireStore) Head(_ context.Context, key string) (r2.ObjectHead, 
 func (f *fakeR2RetireStore) DeleteObject(_ context.Context, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.objects, key)
 	f.deleted = append(f.deleted, key)
 	return nil
@@ -625,6 +629,105 @@ INSERT INTO recording_collation_hours(id,recording_id) VALUES (900,30);
 	}
 	l.Close()
 
+	t.Run("NASBackedReservationsAndFreshness", func(t *testing.T) {
+		exec(`ALTER TABLE nas_inventory_files ADD COLUMN size_bytes bigint, ADD COLUMN sha256 text,
+    ADD COLUMN verified_at timestamptz, ADD COLUMN server_received_at timestamptz,
+    ADD COLUMN sidecar_size_bytes bigint, ADD COLUMN sidecar_sha256 text`)
+		for _, m := range []string{"0177_nas_cleanup_reserved_files.sql", "0182_r2_retirement_reservations.sql"} {
+			body, err := os.ReadFile(filepath.Join(joinedPurgeMigrationsDir(), m))
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(string(body))
+		}
+		for _, id := range []int64{301, 302, 303, 304, 305, 306} {
+			at := windows[3].Start.Add(time.Hour)
+			if id == 302 || id == 306 {
+				at = outside
+			}
+			key := fmt.Sprintf("managed/acct-47/%d.mp4", id)
+			exec(`INSERT INTO recording_clips(id,recording_id,recording_job_id,bucket,object_key,size_bytes,sha256,display_path,clip_start_at,clip_end_at,created_at)
+    VALUES($1,30,1,'stoarama',$2,100,$3,$4,$5::timestamptz,$5::timestamptz+interval '1 minute',$5)`, id, key, r2tSHA, fmt.Sprintf("p/%d.mp4", id), at)
+			store.objects[key] = 100
+		}
+		exec(`INSERT INTO nas_inventory_files(connection_id,clip_id,relative_path,state,size_bytes,sha256,verified_at,server_received_at,sidecar_size_bytes,sidecar_sha256)
+   SELECT 13,id,'p/'||id||'.mp4','present',100,$1,CASE WHEN id=303 THEN now()-interval '2 days' ELSE now() END,now(),100,$1 FROM unnest(ARRAY[301,303,304]) id`, r2tSHA)
+		exec(`UPDATE nas_inventory_files SET sha256=repeat('a',64) WHERE clip_id=304`)
+		exec(`INSERT INTO nas_cleanup_plans(id,account_id,connection_id,label,report_sha256,manifest,plan_sha256,mode,approval_reason,approved_until) VALUES
+   (4,47,13,'unrelated-enabled',repeat('a',64),'[{"kind":"raw","source_id":306,"source_ids":[306]}]',repeat('e',64),'enabled','x',now()+interval '1 hour')`)
+		scope.NASBacked = true
+		live := map[string]r2.ObjectInfo{}
+		for key, n := range store.objects {
+			live[key] = r2.ObjectInfo{Key: key, SizeBytes: n, ETag: "e"}
+		}
+		sum, items, err := r2RetirePlanRun(ctx, pool, r2RetirePlanOptions{Picks: picks, Scope: scope, PageSize: 3, Now: time.Now(), LiveObjects: live}, r2tPolicy, windows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var selected []r2RetireItem
+		for _, it := range items {
+			if it.SourceID >= 301 && it.Kind == "raw" {
+				selected = append(selected, it)
+			}
+		}
+		if len(selected) != 2 || selected[0].SourceID != 301 || selected[1].SourceID != 302 {
+			t.Fatalf("selected %+v", selected)
+		}
+		if sum.Phases.Totals[r2RetireCopy].Objects != 2 {
+			t.Fatalf("copy %+v", sum.Phases)
+		} // 103 plus 305
+		h := sum.Header
+		h.Phase = r2RetireNow
+		h.Items = 2
+		h.Bytes = 200
+		manifest := filepath.Join(t.TempDir(), "manifest.jsonl")
+		digest, err := writeR2RetireManifest(manifest, h, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := opts
+		o.ManifestPath = manifest
+		o.ExpectedSHA = digest
+		o.LedgerPath = filepath.Join(t.TempDir(), "ledger.jsonl")
+		// A NAS proof made stale after planning blocks deletion.
+		exec(`UPDATE nas_inventory_files SET verified_at=now()-interval '2 days' WHERE clip_id=301`)
+		if _, err := apply(o); err == nil {
+			t.Fatal("stale NAS proof accepted")
+		}
+		exec(`UPDATE nas_inventory_files SET verified_at=now() WHERE clip_id=301`)
+		store.deleteErr = errors.New("injected R2 failure")
+		if _, err := apply(o); err == nil {
+			t.Fatal("R2 failure accepted")
+		}
+		var pending int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations WHERE source_id=301`).Scan(&pending); err != nil || pending != 1 {
+			t.Fatal("delete intent did not survive failure")
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_source_holds VALUES(4,301)`); err == nil {
+			t.Fatal("pending R2 key used as NAS recovery")
+		}
+		store.deleteErr = nil
+		result, err := apply(o)
+		if err != nil || result.Retired != 2 {
+			t.Fatalf("NAS-backed result %+v %v", result, err)
+		}
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM r2_retirement_reservations`).Scan(&n); err != nil || n != 2 {
+			t.Fatalf("reservations=%d %v", n, err)
+		}
+		// A deleted or deletion-pending R2 key can never become NAS recovery.
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_source_holds VALUES(4,301)`); err == nil {
+			t.Fatal("cleanup relied on retired R2 recovery")
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO nas_cleanup_plans(account_id,connection_id,label,report_sha256,manifest,plan_sha256)
+   VALUES(47,13,'cannot-rely',repeat('a',64),'[{"kind":"raw","source_id":302}]',repeat('f',64))`); err == nil {
+			t.Fatal("cleanup admitted retired R2 object")
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM r2_retirement_reservations`); err == nil {
+			t.Fatal("reservation mutable")
+		}
+	})
+
 	var a errR2RetireAnomaly
 	if !errors.As(r2RetireAnomalyf("x"), &a) {
 		t.Fatal("anomaly type")
@@ -656,5 +759,42 @@ func TestR2RetirePageStylePicksSelect(t *testing.T) {
 	// A missing window field is undecided: keep everything.
 	if got := r2RetireEffectiveChoice(p.Choices[78], true, windows[78]); got != "" {
 		t.Fatalf("pick without keep_end_utc resolved to %q", got)
+	}
+}
+
+func (f *fakeR2RetireStore) DeleteObjectExact(ctx context.Context, key, etag string) error {
+	if etag != "e" {
+		return errors.New("ETag precondition failed")
+	}
+	return f.DeleteObject(ctx, key)
+}
+
+func TestR2RetireNASBackedChoices(t *testing.T) {
+	w := r2tWindow(t, 3, "Asia/Tokyo", "2026-09-12", "2026-10-10")
+	windows := map[int64]api.Keep28Window{3: w}
+	for _, kind := range []string{"raw", "collated"} {
+		for _, choice := range []string{"none", "st", "keep", "all"} {
+			for _, outside := range []bool{false, true} {
+				for _, nas := range []bool{false, true} {
+					at := w.Start.Add(time.Hour)
+					if outside {
+						at = w.Start.Add(-2 * time.Hour)
+					}
+					c := r2tCandidate(kind, 3, w.Timezone, at, at.Add(time.Minute))
+					c.Facts.NASCopy = nas
+					c.Facts.ExactNAS = nas
+					picks := map[int64]r2RetirePick{3: {Choice: choice, KeepStartUTC: w.Start.Format(time.RFC3339), KeepEndUTC: w.End.Format(time.RFC3339)}}
+					reason, _, got := r2RetireDecideMode(c, "stoarama", windows, picks, true)
+					want := choice != "all" && ((outside && !nas) || (!outside && choice == "none" && nas))
+					if got != want {
+						t.Fatalf("kind=%s choice=%s outside=%t nas=%t got=%t reason=%s", kind, choice, outside, nas, got, reason)
+					}
+					c.Facts.Held = true
+					if _, _, ok := r2RetireDecideMode(c, "stoarama", windows, picks, true); ok {
+						t.Fatal("held object eligible")
+					}
+				}
+			}
+		}
 	}
 }
