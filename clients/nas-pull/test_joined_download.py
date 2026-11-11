@@ -1739,6 +1739,47 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertEqual(os.stat(marker, dir_fd=directory_fd).st_nlink, 1)
             finally: os.close(directory_fd)
 
+    def test_partial_resume_recovers_own_marker_publication_crash(self):
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        for existing_part in (False, True):
+            with self.subTest(existing_part=existing_part), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
+                try:
+                    stage = marker + ".stage-" + "a" * 32
+                    self.write_entry(directory_fd, stage, expected)
+                    os.link(stage, marker, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    if existing_part:
+                        self.write_entry(directory_fd, part, b"keep partial bytes")
+                    with mock.patch.object(pull, "poll_raw_pending", return_value=False):
+                        info = pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    self.assertEqual(info.st_nlink, 1)
+                    self.assertEqual(info.st_size, 18 if existing_part else 0)
+                    self.assertEqual(os.stat(marker, dir_fd=directory_fd).st_nlink, 1)
+                    self.assertIsNone(pull.joined_entry_stat(directory_fd, stage))
+                finally:
+                    os.close(directory_fd)
+
+    def test_partial_resume_leaves_unknown_marker_aliases_untouched(self):
+        item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
+        for third_link in (False, True):
+            with self.subTest(third_link=third_link), tempfile.TemporaryDirectory() as raw:
+                cfg = self.config(Path(raw)); runtime = self.runtime(cfg)
+                directory_fd, _, part, marker = self.names(cfg, item)
+                try:
+                    alias = marker + ".stage-" + "a" * 32 if third_link else "unknown-alias"
+                    self.write_entry(directory_fd, alias, expected)
+                    os.link(alias, marker, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    if third_link:
+                        os.link(alias, "unknown-third", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    self.write_entry(directory_fd, part, b"keep partial bytes")
+                    before = {name: os.stat(name, dir_fd=directory_fd) for name in os.listdir(directory_fd)}
+                    with mock.patch.object(pull, "poll_raw_pending", return_value=False), self.assertRaisesRegex(pull.ExistingFileMismatch, "marker=.*links="):
+                        pull.ensure_owned_joined_partial(cfg, runtime, directory_fd, part, marker, expected, threading.Event())
+                    self.assertEqual(before, {name: os.stat(name, dir_fd=directory_fd) for name in os.listdir(directory_fd)})
+                finally:
+                    os.close(directory_fd)
+
     def test_conflicting_marker_is_never_modified(self):
         item = pull.valid_joined_item(self.media_item()); expected = self.marker(item)
         with tempfile.TemporaryDirectory() as raw:

@@ -7414,14 +7414,22 @@ def same_joined_inode(left, right):
 def ensure_owned_joined_partial(cfg, runtime, directory_fd, part_name, marker_name, sidecar, stop_event):
     part_stat = joined_entry_stat(directory_fd, part_name)
     marker_stat = joined_entry_stat(directory_fd, marker_name)
-    if marker_stat is None:
-        if part_stat is not None:
-            raise ExistingFileMismatch("joined partial has no ownership marker")
+    if marker_stat is None and part_stat is not None:
+        raise ExistingFileMismatch("joined partial has no ownership marker")
+    # Run the publisher's restart recovery even when the marker already exists.
+    # It removes only an exact two-link marker + private stage pair, after the
+    # complete marker bytes match. Unknown aliases never grant write authority.
+    try:
         publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
-        marker_stat = joined_entry_stat(directory_fd, marker_name)
-    elif not verify_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event):
-        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    except ExistingFileMismatch as exc:
+        if marker_stat is not None and marker_stat.st_nlink != 1:
+            raise ExistingFileMismatch("%s: marker=%s links=%d inode=%d" % (
+                exc, marker_name, marker_stat.st_nlink, marker_stat.st_ino)) from exc
+        raise
     marker_stat = joined_entry_stat(directory_fd, marker_name)
+    if part_stat is not None and part_stat.st_nlink != 1:
+        raise ExistingFileMismatch("joined partial has an unknown hardlink: partial=%s links=%d inode=%d" % (
+            part_name, part_stat.st_nlink, part_stat.st_ino))
     if part_stat is None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(part_name, flags, 0o600, dir_fd=directory_fd)
