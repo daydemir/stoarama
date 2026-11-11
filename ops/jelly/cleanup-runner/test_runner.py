@@ -835,6 +835,62 @@ class StreamNameTests(unittest.TestCase):
         self.assertNotIn('stream_name', rows[1])
 
 
+class LocalDeliveryTests(unittest.TestCase):
+    def test_unset_and_empty_email_write_readable_notes_without_network(self):
+        for env in ({}, {'CLEANUP_OWNER_EMAIL': ''}):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(r.os.environ, env, clear=True), \
+                    patch.object(r, 'request', side_effect=AssertionError('network forbidden')) as request:
+                job = r.Runner(Path('.'), Path(root))
+                job.check_delivery()
+                job.notify('daily progress today')
+                with patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                    job.alert('review required')
+                notes = Path(root) / 'notes.jsonl'
+                rows = [json.loads(line) for line in notes.read_text().splitlines()]
+                self.assertEqual(len(rows), 3)
+                self.assertIn('Deleted so far:', rows[1]['text'])
+                self.assertIn('ACTION NEEDED: review required', rows[2]['subject'])
+                self.assertIn('review required', stderr.getvalue())
+                self.assertEqual(notes.stat().st_mode & 0o777, 0o600)
+                request.assert_not_called()
+
+    def test_startup_local_delivery_gates_enable_even_after_same_day_note(self):
+        for broken in (False, True):
+            with self.subTest(broken=broken), tempfile.TemporaryDirectory() as root, \
+                    patch.dict(r.os.environ, {}, clear=True), \
+                    patch.object(r, 'request', side_effect=AssertionError('network forbidden')), \
+                    patch.object(r, 'utcnow', return_value=NOW), \
+                    patch.object(r.sys, 'stderr', new=io.StringIO()):
+                job = FakeRunner(root)
+                job.status['last_note_day'] = NOW.date().isoformat()
+                job.check_delivery = lambda: r.Runner.check_delivery(job)
+                if broken:
+                    (Path(root) / 'notes.jsonl').mkdir()
+                    with self.assertRaisesRegex(r.Halt, 'owner note write failed'):
+                        job.run()
+                    self.assertNotIn('ON', job.events)
+                    self.assertTrue(job.status['owner_notification_failed'])
+                else:
+                    job.run()
+                    self.assertIn('ON', job.events)
+                    self.assertTrue((Path(root) / 'notes.jsonl').is_file())
+
+    def test_alert_survives_note_fsync_failure_and_still_emails(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(r.os.environ, {'CLEANUP_OWNER_EMAIL': 'owner@example.invalid',
+                    'EMAIL_FROM': 'runner@example.invalid', 'EMAIL_RESEND_API_KEY': 'fake'}), \
+                patch.object(r.os, 'fsync', side_effect=OSError('private failure')), \
+                patch.object(r, 'request', return_value={'id': 'accepted'}) as request, \
+                patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+            job = r.Runner(Path('.'), Path(root))
+            job.alert('review required')
+            self.assertTrue(job.status['owner_notification_failed'])
+            self.assertIn('owner note write failed', stderr.getvalue())
+            self.assertNotIn('private failure', stderr.getvalue())
+            request.assert_called_once()
+
+
 class EmailTests(unittest.TestCase):
     def status(self):
         return dict(phase='monitoring', current_plan=42, deleted_files=5841,
@@ -844,7 +900,9 @@ class EmailTests(unittest.TestCase):
                                      files=5841, bytes=161500000000)])
 
     def send(self, status, reason, fail=False):
-        job = r.Runner(Path('.'), Path('.'))
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        job = r.Runner(Path('.'), Path(root.name))
         job.status = status
         with patch.dict(r.os.environ, {'EMAIL_FROM': 'runner@example.invalid',
                         'CLEANUP_OWNER_EMAIL': 'owner@example.invalid',
