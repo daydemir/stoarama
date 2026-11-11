@@ -30,13 +30,20 @@ The runner:
 - Forces master OFF through a single-key Render env edit, cancels any in-progress
   deploys, then explicitly redeploys the **current live SHA**, never HEAD. OFF
   bypasses the normal concurrent-deploy rejection and needs no successful disk
-  write. Confirms its newly created deploy (after the OFF env edit) is live,
+  write. Remembers its new OFF deploy in memory across retries and never cancels
+  it while it is in progress, including after a polling timeout. Confirms that
+  deploy (created after the OFF env edit) is live,
   configured env is false, and the live API reports master false; rechecks live
   deploy identity after that report. With no saved plan, reads the latest existing
   account-47/connection-13 plan report for this runtime check. Missing reports
-  cannot confirm OFF. Failed/canceled/timed-out deploys, concurrent deploys, API
-  failures, or a runtime master mismatch trigger loud stderr + owner email alerts
+  cannot confirm OFF. OFF and ON retry idempotent reads (deploy status/list,
+  live identity, env, plan, and read-only queries) with at most 120 seconds of
+  added backoff per read, in addition to existing I/O timeouts. Exhausted reads,
+  failed/canceled/timed-out deploys, concurrent deploys, or a runtime master mismatch trigger loud stderr + owner email alerts
   and retries forever with 15-second exponential backoff capped at five minutes.
+  A terminal failed OFF deploy or a confirmed verification mismatch requires a
+  new OFF deploy; read failures alone resume the remembered deploy. ON read
+  exhaustion propagates to the normal fail-safe OFF path.
   ON still rejects concurrent deploys. Repeats OFF after completion or pause.
 - Uses a complete fresh dry run or invokes `prepare_keep28_plans.py --submit`
   for one stream, at most one <=100 GB plan. Unique `k28auto-YYYYMMDD-HHMMSS`
@@ -78,7 +85,8 @@ write failures also emit loud stderr messages. While OFF is unconfirmed, shutdow
 keeps retrying and alerting rather than exiting. Email/recovery failure flags stay
 in memory and are persisted if storage works; no disk write is required to alert.
 HTTP response bodies, subprocess output and credential values never enter logs or
-emails.
+emails. Failed OFF/ON steps emit fixed step names to stderr and `runner.jsonl`
+(best effort if storage is unavailable), including transient read retries.
 A delivery acknowledgment means Resend accepted the email, not that it was read.
 
 `STOP` or SIGTERM prevents new enables and naturally drains a currently enabled

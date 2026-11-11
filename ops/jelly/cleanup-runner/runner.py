@@ -295,41 +295,92 @@ class Runner:
             self.status['owner_notification_failed'] = True
             critical('owner email failed; operator intervention required')
 
+    def step_failed(self, step):
+        # Callers supply fixed step names, never URLs, SQL, or exception text.
+        critical('STEP FAILED: ' + step)
+        try:
+            with (self.root / 'runner.jsonl').open('a') as f:
+                f.write(json.dumps({'at': utcnow().isoformat(), 'phase': 'step_failed', 'step': step}) + '\n')
+        except Exception:
+            pass  # Diagnostics must never block shutdown, even before initialize().
+
+    def read(self, step, action):
+        # Retry only reads. Bound the added backoff to two minutes; each I/O also
+        # retains its existing timeout. Mutations must not be blindly replayed.
+        for delay in (5, 10, 20, 30, 30, 25, None):
+            try:
+                return action()
+            except Exception:
+                if delay is None:
+                    raise  # The enclosing OFF/ON handler logs the exhausted step.
+                self.step_failed(step)
+                time.sleep(delay)
+
     def off(self):
         delay = 15
+        pending = None
         while True:
             try:
                 # This PUT must precede every other dependency, including state writes.
+                step = 'OFF env PUT'
                 self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'false'})
-                deploys = [r['deploy'] for r in self.render('GET', '/deploys?limit=100')]
-                live = [d for d in deploys if d['status'] == 'live']
-                require(len(live) == 1 and re.fullmatch('[a-f0-9]{40}', live[0]['commit']['id']),
-                        'current live commit unavailable')
-                commit = live[0]['commit']['id']
-                for d in deploys:
-                    if d['status'] not in DEPLOY_TERMINAL:
-                        self.render('POST', '/deploys/' + d['id'] + '/cancel')
-                dep = self.render('POST', '/deploys', {'commitId': commit, 'clearCache': 'do_not_clear'})
-                # Only our new deploy, created AFTER the successful env PUT, can confirm OFF.
-                require(dep['id'] not in {d['id'] for d in deploys}, 'OFF deploy was not newly created')
+                if pending is None:
+                    step = 'OFF deploy list GET'
+                    deploys = [r['deploy'] for r in self.read(step,
+                        lambda: self.render('GET', '/deploys?limit=100'))]
+                    live = [d for d in deploys if d['status'] == 'live']
+                    require(len(live) == 1 and re.fullmatch('[a-f0-9]{40}', live[0]['commit']['id']),
+                            'current live commit unavailable')
+                    commit = live[0]['commit']['id']
+                    step = 'OFF deploy cancel POST'
+                    for d in deploys:
+                        if d['status'] not in DEPLOY_TERMINAL:
+                            self.render('POST', '/deploys/' + d['id'] + '/cancel')
+                    step = 'OFF deploy create POST'
+                    dep = self.render('POST', '/deploys', {'commitId': commit, 'clearCache': 'do_not_clear'})
+                    # Remember only a deploy proven created AFTER the successful false PUT.
+                    require(dep['id'] not in {d['id'] for d in deploys}, 'OFF deploy was not newly created')
+                    pending = (dep['id'], commit)
+                dep_id, commit = pending
                 deadline = time.monotonic() + 1800
                 while True:
-                    d = self.render('GET', '/deploys/' + dep['id'])
+                    step = 'OFF deploy status GET'
+                    d = self.read(step, lambda: self.render('GET', '/deploys/' + dep_id))
+                    if d['status'] in DEPLOY_TERMINAL and d['status'] != 'live':
+                        pending = None  # A terminal deploy cannot converge; replace it.
+                        raise Halt('OFF redeploy failed')
                     if d['status'] == 'live':
+                        if d['commit']['id'] != commit:
+                            pending = None
                         require(d['commit']['id'] == commit, 'Render deployed a different commit')
                         break
-                    require(d['status'] not in DEPLOY_TERMINAL, 'OFF redeploy failed')
+                    # Even after a timeout or exhausted read retries, keep waiting on
+                    # this false-env deploy. Never cancel our own in-progress OFF.
                     require(time.monotonic() < deadline, 'OFF redeploy timed out')
                     time.sleep(15)
-                require(self.live()['id'] == dep['id'], 'live deployment changed concurrently')
-                env = self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED')
+                step = 'OFF live deploy GET'
+                if self.read(step, self.live)['id'] != dep_id:
+                    pending = None
+                    raise Halt('live deployment changed concurrently')
+                step = 'OFF env GET'
+                env = self.read(step, lambda: self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED'))
+                if env['value'] != 'false':
+                    pending = None
                 require(env['value'] == 'false', 'Render master env differs')
-                pid = self.status['current_plan'] or self.query(
-                    'SELECT id FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 ORDER BY id DESC LIMIT 1')
-                require(pid and self.plan(pid)['master_deletion_enabled'] is False, 'live API master OFF not confirmed')
-                require(self.live()['id'] == dep['id'], 'live deployment changed during OFF verification')
+                step = 'OFF plan id query'
+                pid = self.status['current_plan'] or self.read(step, lambda: self.query(
+                    'SELECT id FROM nas_cleanup_plans WHERE account_id=47 AND connection_id=13 ORDER BY id DESC LIMIT 1'))
+                step = 'OFF runtime plan GET'
+                if not pid or self.read(step, lambda: self.plan(pid))['master_deletion_enabled'] is not False:
+                    pending = None
+                    raise Halt('live API master OFF not confirmed')
+                step = 'OFF final live deploy GET'
+                if self.read(step, self.live)['id'] != dep_id:
+                    pending = None
+                    raise Halt('live deployment changed during OFF verification')
                 break
             except Exception:
+                self.step_failed(step)
                 self.status['shutdown_or_recovery_failed'] = True
                 self.alert('MASTER OFF NOT CONFIRMED; retrying shutdown')
                 time.sleep(delay)
@@ -342,28 +393,42 @@ class Runner:
             self.off()
             return
         require(not emergency, 'emergency enable forbidden')
-        self.idle()
-        live = self.live()
-        self.save('master_true_requested', live_commit=live['commit']['id'])
-        self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'true'})
-        # Never deploy HEAD, origin/main, or a fix: redeploy exactly the live SHA.
-        dep = self.render('POST', '/deploys', {'commitId': live['commit']['id'], 'clearCache': 'do_not_clear'})
-        deadline = time.monotonic() + 1800
-        while True:
-            d = self.render('GET', '/deploys/' + dep['id'])
-            if d['status'] == 'live':
-                require(d['commit']['id'] == live['commit']['id'], 'Render deployed a different commit')
-                break
-            require(d['status'] in {'created', 'build_in_progress', 'pre_deploy_in_progress', 'update_in_progress', 'queued'}, 'Render redeploy failed')
-            require(time.monotonic() < deadline, 'Render redeploy timed out')
-            time.sleep(15)
-        require(self.live()['id'] == dep['id'], 'live deployment changed concurrently')
-        env = self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED')
-        require(env['value'] == 'true', 'Render master env differs')
-        pid = self.status['current_plan']
-        if pid:
-            require(self.plan(pid)['master_deletion_enabled'] is True, 'live API master differs')
-        self.save('master_true')
+        try:
+            step = 'ON idle query'
+            self.read(step, self.idle)
+            step = 'ON live deploy GET'
+            live = self.read(step, self.live)
+            step = 'ON state write'
+            self.save('master_true_requested', live_commit=live['commit']['id'])
+            step = 'ON env PUT'
+            self.render('PUT', '/env-vars/NAS_CLEANUP_DELETION_ENABLED', {'value': 'true'})
+            # Never deploy HEAD, origin/main, or a fix: redeploy exactly the live SHA.
+            step = 'ON deploy create POST'
+            dep = self.render('POST', '/deploys', {'commitId': live['commit']['id'], 'clearCache': 'do_not_clear'})
+            deadline = time.monotonic() + 1800
+            while True:
+                step = 'ON deploy status GET'
+                d = self.read(step, lambda: self.render('GET', '/deploys/' + dep['id']))
+                if d['status'] == 'live':
+                    require(d['commit']['id'] == live['commit']['id'], 'Render deployed a different commit')
+                    break
+                require(d['status'] in {'created', 'build_in_progress', 'pre_deploy_in_progress', 'update_in_progress', 'queued'}, 'Render redeploy failed')
+                require(time.monotonic() < deadline, 'Render redeploy timed out')
+                time.sleep(15)
+            step = 'ON live deploy GET'
+            require(self.read(step, self.live)['id'] == dep['id'], 'live deployment changed concurrently')
+            step = 'ON env GET'
+            env = self.read(step, lambda: self.render('GET', '/env-vars/NAS_CLEANUP_DELETION_ENABLED'))
+            require(env['value'] == 'true', 'Render master env differs')
+            pid = self.status['current_plan']
+            if pid:
+                step = 'ON runtime plan GET'
+                require(self.read(step, lambda: self.plan(pid))['master_deletion_enabled'] is True, 'live API master differs')
+            step = 'ON state write'
+            self.save('master_true')
+        except Exception:
+            self.step_failed(step)
+            raise
 
     def stopped(self):
         return self.stopping or (self.root / 'STOP').exists()
