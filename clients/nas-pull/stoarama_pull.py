@@ -5094,10 +5094,10 @@ def native_stitch_manifest_hash(clips):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def download_verified(url, temp_path, expected_bytes, expected_sha):
+def download_verified(url, temp_path, expected_bytes, expected_sha, headers=None):
     digest = hashlib.sha256()
     written = 0
-    req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as response, open(temp_path, "wb") as out:
             remember_response_secrets(response)
@@ -8782,7 +8782,7 @@ def write_stitch_sidecar(clip_path, clip):
 
 
 @NAS_MEDIA_FENCE.delivery
-def process_clip(cfg, clip, release=True):
+def process_clip(cfg, clip, release=True, prepare_download=None):
     clip_id = int(clip["clip_id"])
     recording_id = int(clip["recording_id"])
     expected_bytes = int(clip["size_bytes"])
@@ -8807,11 +8807,11 @@ def process_clip(cfg, clip, release=True):
         temp_path = final_path.with_name(final_path.name + ".part-%d" % clip_id)
 
         def download():
-            presigned = request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
+            presigned = prepare_download() if prepare_download else request_json(cfg, "GET", str(clip["download_path"]), base=cfg.origin)
             url = str(presigned.get("url", ""))
             if not url:
                 raise RuntimeError("clip %d presign returned no URL" % clip_id)
-            download_verified(url, temp_path, expected_bytes, expected_sha)
+            download_verified(url, temp_path, expected_bytes, expected_sha, presigned.get("headers"))
 
         _, retries = retry_transient(download, clip_id, "download")
         os.replace(str(temp_path), str(final_path))
@@ -34143,9 +34143,107 @@ def certify_media_canary_locked(cfg, recording_id, window_start, window_end, lim
     return report
 
 
+R2_RETIRE_COPY_POLICY = "060aa7070c7909d78013415f83b76bd0c027a885caf91c67c8b709ac1f4b5811"
+
+
+def read_r2_copy_manifest(filename, expected_sha):
+    if Path(filename).stat().st_size > 16 * 1024 * 1024:
+        raise ValueError("use a bounded copy-batches manifest, at most 16 MiB")
+    raw = Path(filename).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha or not raw.endswith(b"\n"):
+        raise ValueError("copy manifest digest differs or file is truncated")
+    lines = raw.splitlines()
+    header = json.loads(lines[0])["header"]
+    if (header.get("phase") != "copy" or header.get("connection_id") != 13
+            or header.get("policy_sha256") != R2_RETIRE_COPY_POLICY or not header.get("nas_backed")):
+        raise ValueError("copy manifest policy/connection/phase differs")
+    items = [json.loads(line) for line in lines[1:]]
+    ids, paths = set(), set()
+    for item in items:
+        path = item.get("relative_path", "")
+        if (item.get("kind") != "raw" or item.get("choice") != "none" or item.get("reason") != "copy_to_nas"
+                or item.get("source_id", 0) <= 0 or item["source_id"] in ids or path in paths
+                or item.get("bucket") != header.get("bucket") or item.get("size_bytes", 0) <= 0
+                or not re.fullmatch(r"[a-f0-9]{64}", item.get("sha256", ""))):
+            raise ValueError("invalid or duplicate copy item")
+        if str(valid_relative_path({"clip_id": item["source_id"], "relative_path": path})) != path:
+            raise ValueError("non-canonical copy path")
+        ids.add(item["source_id"])
+        paths.add(path)
+    if len(items) > 5000 or len(items) != header["items"] or sum(i["size_bytes"] for i in items) != header["bytes"]:
+        raise ValueError("copy manifest totals differ")
+    return header, items
+
+
+def copy_r2_manifest(cfg, filename, expected_sha, max_bytes):
+    header, items = read_r2_copy_manifest(filename, expected_sha)
+    if max_bytes <= 0 or cfg.dry_run:
+        raise ValueError("copy requires a positive byte cap and non-dry-run NAS config")
+    cfg.validate()
+    # Same exclusive process lock as normal pull, inventory, cleanup and stitch.
+    # Operator stops the normal client first; an active client fails immediately.
+    with acquire_lock(cfg):
+        check_storage(cfg)
+        inventory = Inventory(cfg)
+        copied = 0
+        try:
+            for item in items:
+                body = {"clip_id": item["source_id"], "sha256": item["sha256"],
+                        "size_bytes": item["size_bytes"], "policy_sha256": header["policy_sha256"]}
+                def prepare():
+                    response = request_json(cfg, "POST", "/account/connections/redownload", body=body)
+                    clip = response.get("clip", {})
+                    if (response.get("policy_sha256") != R2_RETIRE_COPY_POLICY
+                            or clip.get("clip_id") != item["source_id"] or clip.get("recording_id") != item["recording_id"]
+                            or clip.get("sha256") != item["sha256"] or clip.get("size_bytes") != item["size_bytes"]
+                            or clip.get("relative_path") != item["relative_path"]):
+                        raise RuntimeError("copy source identity/policy changed")
+                    response["headers"] = {k: v[0] for k, v in response["headers"].items()}
+                    return response
+                response = prepare()
+                clip = response["clip"]
+                # Reject existing conflicts before process_clip can quarantine one.
+                final = cfg.output_dir / valid_relative_path(clip)
+                for path in [final, *final.parents]:
+                    if path == cfg.output_dir.parent:
+                        break
+                    if path.is_symlink():
+                        raise RuntimeError("copy path contains a symlink")
+                exists = verified_file(final, item["size_bytes"], item["sha256"])
+                additional = 0 if exists else item["size_bytes"]
+                if copied + additional > max_bytes:
+                    break
+                capacity = storage_status(cfg)
+                if not capacity.get("available") or capacity["free_bytes"] < cfg.min_free_bytes + additional:
+                    raise RuntimeError("copy paused at the NAS free-space reserve")
+                process_clip(cfg, clip, release=False, prepare_download=prepare)
+                prepare()  # Recheck policy/holds before publishing NAS evidence.
+                # Rehash the committed bytes, with stable file identity, and
+                # bind the already-fsynced sidecar before reporting evidence.
+                size, sha, st = sha256_file_throttled_stable(final, cfg.inventory_hash_mbps, threading.Event())
+                if size != item["size_bytes"] or sha != item["sha256"]:
+                    raise RuntimeError("committed copy changed before inventory report")
+                sidecar = stitch_sidecar_path(final)
+                sidecar_bytes, _ = stable_regular_file_bytes(sidecar, 65536)
+                if json.loads(sidecar_bytes) != stitch_provenance(clip):
+                    raise RuntimeError("committed sidecar differs")
+                inventory._upsert(clip, "present", utc_now_precise(), st.st_mtime_ns,
+                                  file_identity=(st.st_ctime_ns, st.st_ino, st.st_dev),
+                                  sidecar_evidence=(str(sidecar.relative_to(cfg.output_dir)), len(sidecar_bytes),
+                                                    hashlib.sha256(sidecar_bytes).hexdigest()))
+                inventory.sync_clip_ids(cfg, [item["source_id"]])
+                copied += additional
+            return {"copied_or_verified_bytes": copied, "policy_sha256": R2_RETIRE_COPY_POLICY}
+        finally:
+            inventory.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stoarama NAS pull client")
-    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify"), default="run")
+    parser.add_argument("command", nargs="?", choices=("run", "check", "version", "self-update", "certify", "copy-manifest"), default="run")
+    parser.add_argument("--manifest", default="")
+    parser.add_argument("--expected-sha256", default="")
+    parser.add_argument("--max-bytes", type=int, default=0)
     parser.add_argument("--recording-id", type=int, default=0)
     parser.add_argument("--window-start", default="")
     parser.add_argument("--window-end", default="")
@@ -34157,6 +34255,9 @@ def main(argv=None):
         print(CLIENT_VERSION)
         return 0
     cfg = Config()
+    if args.command == "copy-manifest":
+        print(json.dumps(copy_r2_manifest(cfg, args.manifest, args.expected_sha256, args.max_bytes), sort_keys=True))
+        return 0
     if args.command == "check":
         return check(cfg)
     if args.command == "self-update":

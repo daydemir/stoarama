@@ -54,21 +54,24 @@ const (
 )
 
 type r2RetireHeader struct {
-	Version      int               `json:"version"`
-	Tool         string            `json:"tool"`
-	Reason       string            `json:"reason"`
-	CreatedAt    time.Time         `json:"created_at"`
-	PolicySHA256 string            `json:"policy_sha256"`
-	PicksPath    string            `json:"picks_path"`
-	PicksSHA256  string            `json:"picks_sha256"`
-	PicksSavedAt string            `json:"picks_saved_at"`
-	Choices      map[string]string `json:"choices"`
-	Bucket       string            `json:"bucket"`
-	AccountID    int64             `json:"account_id"`
-	ConnectionID int64             `json:"connection_id"`
-	GraceSeconds int64             `json:"grace_seconds"`
-	Items        int64             `json:"items"`
-	Bytes        int64             `json:"bytes"`
+	R2ListingSHA256 string            `json:"r2_listing_sha256,omitempty"`
+	NASBacked       bool              `json:"nas_backed,omitempty"`
+	Phase           r2RetirePhase     `json:"phase,omitempty"`
+	Version         int               `json:"version"`
+	Tool            string            `json:"tool"`
+	Reason          string            `json:"reason"`
+	CreatedAt       time.Time         `json:"created_at"`
+	PolicySHA256    string            `json:"policy_sha256"`
+	PicksPath       string            `json:"picks_path"`
+	PicksSHA256     string            `json:"picks_sha256"`
+	PicksSavedAt    string            `json:"picks_saved_at"`
+	Choices         map[string]string `json:"choices"`
+	Bucket          string            `json:"bucket"`
+	AccountID       int64             `json:"account_id"`
+	ConnectionID    int64             `json:"connection_id"`
+	GraceSeconds    int64             `json:"grace_seconds"`
+	Items           int64             `json:"items"`
+	Bytes           int64             `json:"bytes"`
 }
 
 type r2RetireItem struct {
@@ -106,6 +109,7 @@ type r2RetireHeadSample struct {
 }
 
 type r2RetirePlanSummary struct {
+	Phases           *r2RetirePhaseSummary              `json:"phases,omitempty"`
 	Header           r2RetireHeader                     `json:"header"`
 	ManifestPath     string                             `json:"manifest_path"`
 	ManifestSHA256   string                             `json:"manifest_sha256"`
@@ -136,6 +140,7 @@ var _ r2RetireStore = (*r2.Client)(nil)
 // ---------------------------------------------------------------- plan
 
 type r2RetirePlanOptions struct {
+	LiveObjects  map[string]r2.ObjectInfo
 	Picks        r2RetirePicks
 	Scope        r2RetireScope
 	PageSize     int
@@ -153,6 +158,13 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 		return r2RetirePlanSummary{}, nil, err
 	}
 	sum := r2RetirePlanSummary{SelectedByKind: map[string]r2RetireStat{}, Scanned: map[string]r2RetireStat{}, Kept: map[string]map[string]r2RetireStat{}}
+	if opts.Scope.NASBacked {
+		if opts.LiveObjects == nil {
+			return sum, nil, errors.New("NAS-backed planning requires a live R2 listing")
+		}
+		sum.Phases = newR2RetirePhases()
+	}
+	seenKeys := map[string]bool{}
 	var items []r2RetireItem
 	streams := map[int64]*r2RetireStreamStat{}
 	for _, kind := range []string{"raw", "collated"} {
@@ -161,7 +173,27 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 			st := sum.Scanned[kind]
 			st.add(c.SizeBytes)
 			sum.Scanned[kind] = st
-			reason, choice, ok := r2RetireDecide(c, opts.Scope.Bucket, windows, opts.Picks.Choices)
+			if opts.Scope.NASBacked {
+				if seenKeys[c.ObjectKey] {
+					return nil
+				}
+				seenKeys[c.ObjectKey] = true
+				o, exists := opts.LiveObjects[c.ObjectKey]
+				if !exists {
+					sum.Phases.CatalogAbsent.add(c.SizeBytes)
+					return nil
+				}
+				c.ETag = o.ETag
+				if o.SizeBytes != c.SizeBytes || o.ETag == "" {
+					c.SizeBytes = o.SizeBytes
+					sum.Phases.add(c, "r2_identity_mismatch", "", false)
+					return nil
+				}
+			}
+			reason, choice, ok := r2RetireDecideForScope(c, opts.Scope, windows, opts.Picks.Choices)
+			if sum.Phases != nil {
+				sum.Phases.add(c, reason, choice, ok)
+			}
 			if !ok {
 				k := sum.Kept[kind][reason]
 				k.add(c.SizeBytes)
@@ -203,7 +235,14 @@ func r2RetirePlanRun(ctx context.Context, q r2RetireQuerier, opts r2RetirePlanOp
 			}
 		}
 	}
-	sum.Header = r2RetireHeader{Version: r2RetireManifestVersion, Tool: "stoaramactl r2-retire", Reason: r2RetireReason, CreatedAt: opts.Now.UTC(),
+	if sum.Phases != nil {
+		for key, o := range opts.LiveObjects {
+			if !seenKeys[key] {
+				sum.Phases.add(r2RetireCandidate{Bucket: opts.Scope.Bucket, ObjectKey: key, SizeBytes: o.SizeBytes, ETag: o.ETag}, "uncatalogued_or_purged", "", false)
+			}
+		}
+	}
+	sum.Header = r2RetireHeader{NASBacked: opts.Scope.NASBacked, Version: r2RetireManifestVersion, Tool: "stoaramactl r2-retire", Reason: r2RetireReason, CreatedAt: opts.Now.UTC(),
 		PolicySHA256: policySHA, PicksPath: opts.Picks.Path, PicksSHA256: opts.Picks.SHA256, PicksSavedAt: opts.Picks.SavedAt, Choices: choices,
 		Bucket: opts.Scope.Bucket, AccountID: opts.Scope.AccountID, ConnectionID: opts.Scope.ConnectionID, GraceSeconds: int64(opts.Scope.Grace / time.Second)}
 	for _, it := range items {
@@ -340,7 +379,7 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 		return r2RetireHeader{}, nil, digest, errors.New("manifest has no header line")
 	}
 	h := *first.Header
-	if h.Version != r2RetireManifestVersion || h.Reason != r2RetireReason {
+	if h.Version != r2RetireManifestVersion || h.Reason != r2RetireReason || (h.Phase != "" && h.Phase != r2RetireNow) {
 		return h, nil, digest, fmt.Errorf("unsupported manifest version %d / reason %q", h.Version, h.Reason)
 	}
 	items := make([]r2RetireItem, 0, len(lines)-1)
@@ -354,7 +393,7 @@ func readR2RetireManifest(path string) (r2RetireHeader, []r2RetireItem, string, 
 			return h, nil, digest, fmt.Errorf("manifest line %d: %w", n+2, err)
 		}
 		src := it.Kind + ":" + strconv.FormatInt(it.SourceID, 10)
-		if (it.Kind != "raw" && it.Kind != "collated") || it.SourceID <= 0 || it.Reason != r2RetireReason || seenSource[src] || seenKey[it.ObjectKey] ||
+		if (it.Kind != "raw" && it.Kind != "collated") || it.SourceID <= 0 || (it.Reason != r2RetireReason && !(h.NASBacked && it.Reason == r2RetireNASReason)) || (h.NASBacked && it.ETag == "") || seenSource[src] || seenKey[it.ObjectKey] ||
 			it.Choice != h.Choices[strconv.FormatInt(it.StreamID, 10)] || it.Bucket != h.Bucket || it.SizeBytes <= 0 {
 			return h, nil, digest, fmt.Errorf("manifest line %d: invalid or duplicate item", n+2)
 		}
@@ -548,6 +587,8 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	}
 	sum.ManifestItems = int64(len(items))
 	switch {
+	case h.NASBacked && (h.ConnectionID != 13 || h.AccountID != 47):
+		return sum, errors.New("NAS-backed retirement requires account 47 connection 13")
 	case h.PolicySHA256 != policySHA:
 		return sum, errors.New("manifest was planned under a different keep28 policy")
 	case h.Bucket != store.Bucket():
@@ -588,7 +629,7 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	}
 	if ids, err := r2RetireEnabledPlans(ctx, pool); err != nil {
 		return sum, fmt.Errorf("check NAS cleanup plans: %w", err)
-	} else if len(ids) > 0 {
+	} else if len(ids) > 0 && !h.NASBacked {
 		return sum, fmt.Errorf("refusing to run while NAS cleanup plan(s) %v are enabled; pause them first", ids)
 	}
 	lockConn, err := pool.Acquire(ctx)
@@ -606,19 +647,31 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 	defer func() {
 		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
 	}()
+	if h.NASBacked {
+		var has bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&has); err != nil {
+			return sum, err
+		}
+		if !has {
+			return sum, errors.New("migration 0182 is required before NAS-backed apply")
+		}
+	}
 	ledger, err := openR2RetireLedger(opts.LedgerPath)
 	if err != nil {
 		return sum, err
 	}
 	defer ledger.Close()
 	a := &r2RetireApplier{pool: pool, store: store, opts: opts, header: h, digest: digest, picks: picks, windows: windows, policySH: policySHA, ledger: ledger,
-		scope: r2RetireScope{AccountID: h.AccountID, ConnectionID: h.ConnectionID, Bucket: h.Bucket, Grace: time.Duration(h.GraceSeconds) * time.Second, HasRetirements: true}}
-	if a.sets, err = loadR2RetireSets(ctx, pool); err != nil {
+		scope: r2RetireScope{AccountID: h.AccountID, ConnectionID: h.ConnectionID, Bucket: h.Bucket, Grace: time.Duration(h.GraceSeconds) * time.Second, HasRetirements: true, NASBacked: h.NASBacked}}
+	if a.sets, err = loadR2RetireSets(ctx, pool, digest); err != nil {
 		return sum, err
 	}
 	if a.fp, err = r2RetireFingerprint(ctx, pool); err != nil {
 		return sum, err
 	}
+	if a.scope.NASBacked {
+		a.fp = ""
+	} // First item reloads sets under the cleanup fences.
 	if err := pool.QueryRow(ctx, `SELECT coalesce(sum(size_bytes),0) FROM r2_object_retirements WHERE retired_at>now()-interval '24 hours'`).Scan(&sum.Used24hBefore); err != nil {
 		return sum, err
 	}
@@ -718,15 +771,31 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		return "", "", err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if a.scope.NASBacked {
+		// Admission takes this fence before catalog locks. Public fencing also
+		// excludes new activation/references while this exact R2 delete finishes.
+		for _, key := range []int64{7343226011103, 7343226011101} {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
+				return "", "", err
+			}
+		}
+	}
 	if ids, err := r2RetireEnabledPlans(ctx, tx); err != nil {
 		return "", "", err
-	} else if len(ids) > 0 {
+	} else if len(ids) > 0 && !a.scope.NASBacked {
 		return "", "", r2RetireAnomalyf("NAS cleanup plan(s) %v became enabled", ids)
 	}
 	if fp, err := r2RetireFingerprint(ctx, tx); err != nil {
 		return "", "", err
 	} else if fp != a.fp {
-		return "", "", r2RetireAnomalyf("NAS cleanup plans, joined artifacts or stitched outputs changed during the run; re-plan")
+		if !a.scope.NASBacked {
+			return "", "", r2RetireAnomalyf("NAS cleanup plans, joined artifacts or stitched outputs changed during the run; re-plan")
+		}
+		a.sets, err = loadR2RetireSets(ctx, tx, a.digest)
+		if err != nil {
+			return "", "", err
+		}
+		a.fp = fp
 	}
 	// Row lock: serializes against concurrent purged_at/identity changes and
 	// against inserts whose foreign keys reference this row (e.g. NAS cleanup
@@ -755,10 +824,20 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		return "already_done", "", nil
 	}
 	if cur.RecordingID != it.RecordingID || cur.StreamID != it.StreamID || cur.Bucket != it.Bucket || cur.ObjectKey != it.ObjectKey ||
-		cur.SizeBytes != it.SizeBytes || cur.SHA256 != it.SHA256 || !cur.StartAt.Equal(it.StartAt) || !cur.EndAt.Equal(it.EndAt) {
+		cur.SizeBytes != it.SizeBytes || cur.SHA256 != it.SHA256 || (a.scope.NASBacked && cur.RelativePath != it.RelativePath) || !cur.StartAt.Equal(it.StartAt) || !cur.EndAt.Equal(it.EndAt) {
 		return "", "", r2RetireAnomalyf("catalog identity changed since the plan")
 	}
-	reason, choice, ok := r2RetireDecide(cur, a.scope.Bucket, a.windows, a.picks.Choices)
+	picks := a.picks
+	if a.scope.NASBacked {
+		picks, err = loadR2RetirePicks(a.picks.Path)
+		if err != nil {
+			return "", "", err
+		}
+		if picks.SHA256 != a.header.PicksSHA256 {
+			return "", "", r2RetireAnomalyf("picks changed; re-plan")
+		}
+	}
+	reason, choice, ok := r2RetireDecideForScope(cur, a.scope, a.windows, picks.Choices)
 	if !ok {
 		return "ineligible", reason, nil
 	}
@@ -775,6 +854,8 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		absent = true
 	case herr != nil:
 		return "", "", fmt.Errorf("head: %w", herr)
+	case a.scope.NASBacked && strings.Trim(head.ETag, `"`) != strings.Trim(it.ETag, `"`):
+		return "", "", r2RetireAnomalyf("R2 ETag changed since plan")
 	case head.SizeBytes != it.SizeBytes:
 		return "", "", r2RetireAnomalyf("R2 size %d differs from catalog size %d", head.SizeBytes, it.SizeBytes)
 	case head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, it.SHA256):
@@ -793,16 +874,41 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO r2_object_retirements(kind,source_id,stream_id,bucket,object_key,size_bytes,sha256,reason,choice,manifest_sha256,policy_sha256,already_absent)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		it.Kind, it.SourceID, it.StreamID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, r2RetireReason, it.Choice, a.digest, a.policySH, absent); err != nil {
+		it.Kind, it.SourceID, it.StreamID, it.Bucket, it.ObjectKey, it.SizeBytes, it.SHA256, it.Reason, it.Choice, a.digest, a.policySH, absent); err != nil {
 		return "", "", r2RetireAnomalyf("record retirement: %v", err)
 	}
-	// Last NAS presence check before the delete: a NAS copy that appeared
-	// since the facts were read keeps the object (the transaction rolls back).
-	if nas, err := r2RetireNASCopyNow(ctx, tx, it.Kind, it.SourceID, a.scope.ConnectionID); err != nil {
+	if a.scope.NASBacked {
+		// Lock the actual matching inventory row through R2 deletion/commit.
+		// Inventory can no longer transition this proof to missing mid-delete.
+		if reason == r2RetireNASReason {
+			if err := r2RetireLockNASIdentity(ctx, tx, it, a.scope.ConnectionID); err != nil {
+				return "", "", err
+			}
+		}
+		latest, err := r2RetireLoadOne(ctx, tx, it.Kind, it.SourceID, a.scope, a.sets)
+		if err != nil {
+			return "", "", err
+		}
+		latest.Facts.Purged = false // Our uncommitted writes above.
+		latest.Facts.Retired = false
+		r, ch, eligible := r2RetireDecideForScope(latest, a.scope, a.windows, picks.Choices)
+		if !eligible || ch != it.Choice || r != it.Reason {
+			return "ineligible", r, nil
+		}
+	} else if nas, err := r2RetireNASCopyNow(ctx, tx, it.Kind, it.SourceID, a.scope.ConnectionID); err != nil {
 		return "", "", err
 	} else if nas {
 		return "ineligible", "nas_copy", nil
 	}
+
+	if a.scope.NASBacked {
+		// Commit intent on another connection BEFORE touching R2. The admission
+		// and public fences remain held by tx across this independent commit.
+		if err := a.reserve(ctx, it); err != nil {
+			return "", "", err
+		}
+	}
+
 	line := r2RetireLedgerLine{ManifestSHA256: a.digest, Kind: it.Kind, SourceID: it.SourceID, StreamID: it.StreamID, ObjectKey: it.ObjectKey, SizeBytes: it.SizeBytes, SHA256: it.SHA256}
 	intent := line
 	intent.Event = "intent"
@@ -822,7 +928,19 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 		return "", "", r2RetireAnomalyf("%s: %v", event, err)
 	}
 	if !absent {
-		if err := a.store.DeleteObject(finishCtx, it.ObjectKey); err != nil {
+		var deleteErr error
+		if a.scope.NASBacked {
+			exact, ok := a.store.(interface {
+				DeleteObjectExact(context.Context, string, string) error
+			})
+			if !ok {
+				return fail("delete_error", errors.New("conditional delete is required"))
+			}
+			deleteErr = exact.DeleteObjectExact(finishCtx, it.ObjectKey, it.ETag)
+		} else {
+			deleteErr = a.store.DeleteObject(finishCtx, it.ObjectKey)
+		}
+		if err := deleteErr; err != nil {
 			return fail("delete_error", err)
 		}
 		if _, err := a.store.Head(finishCtx, it.ObjectKey); !r2.IsNotFound(err) {
@@ -928,6 +1046,9 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	picksPath := fs.String("picks", "", "owner's R2 picks (r2-picks.json)")
 	out := fs.String("out", "", "output directory (manifest.jsonl, summary.json)")
 	sample := fs.Int("sample", 200, "HEAD this many random manifest items (0 = none)")
+	listingPath := fs.String("r2-listing", "", "reuse a complete checksummed R2 listing no older than 2 hours")
+	listingSHA := fs.String("expected-listing-sha256", "", "SHA-256 of --r2-listing")
+	nasBacked := fs.Bool("nas-backed", false, "plan NAS-backed kept footage and phased manifests using a live R2 listing")
 	grace := fs.Duration("grace", 7*24*time.Hour, "keep objects that ended or were registered within this age")
 	connectionID := fs.Int64("connection-id", 0, "NAS pull connection (default: the only one)")
 	pageSize := fs.Int("page-size", 5000, "rows per catalog page")
@@ -948,7 +1069,15 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	if err := cfg.ValidateR2(); err != nil {
 		log.Fatalf("r2-retire plan: R2 config required: %v", err)
 	}
-	if err := os.MkdirAll(*out, 0o700); err != nil {
+	if (*listingPath != "" || *listingSHA != "") && !*nasBacked {
+		log.Fatal("--r2-listing requires --nas-backed")
+	}
+	if *nasBacked {
+		err = os.Mkdir(*out, 0700)
+	} else {
+		err = os.MkdirAll(*out, 0700)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
 	pool, err := r2RetireOpenPool(ctx, cfg, true)
@@ -964,6 +1093,9 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	if err := pool.QueryRow(ctx, `SELECT account_id FROM connections WHERE id=$1`, conn).Scan(&accountID); err != nil {
 		log.Fatal(err)
 	}
+	if *nasBacked && (conn != 13 || accountID != 47) {
+		log.Fatal("NAS-backed retirement requires account 47 connection 13")
+	}
 	hasRet, err := r2RetireHasRetirementsTable(ctx, pool)
 	if err != nil {
 		log.Fatal(err)
@@ -976,15 +1108,37 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 		log.Fatal(err)
 	}
 	opts := r2RetirePlanOptions{Picks: picks, PageSize: *pageSize, Now: time.Now(),
-		Scope: r2RetireScope{AccountID: accountID, ConnectionID: conn, Bucket: cfg.R2Bucket, Grace: *grace, HasRetirements: hasRet}}
+		Scope: r2RetireScope{AccountID: accountID, ConnectionID: conn, Bucket: cfg.R2Bucket, Grace: *grace, HasRetirements: hasRet, NASBacked: *nasBacked}}
+	if *nasBacked {
+		log.Print("r2-retire: listing live managed/ and joined/ R2 objects (read-only)")
+		if *listingPath != "" {
+			opts.LiveObjects, err = readR2RetireListing(*listingPath, *listingSHA, cfg.R2Bucket)
+		} else {
+			opts.LiveObjects, err = r2RetireLiveObjects(ctx, mustArchiveR2Client(ctx, cfg))
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	sum, items, err := r2RetirePlanRun(ctx, pool, opts, policySHA, windows)
 	if err != nil {
 		log.Fatalf("r2-retire plan: %v", err)
 	}
+	sum.Header.R2ListingSHA256 = *listingSHA
 	if *sample > 0 {
 		store := mustArchiveR2Client(ctx, cfg)
 		hs := r2RetireHeadSampleRun(ctx, store, items, *sample, 8, time.Now().UnixNano())
 		sum.HeadSample = &hs
+	}
+	if sum.Phases != nil {
+		if err := pool.QueryRow(ctx, `SELECT coalesce(nas_storage_free_bytes,0) FROM connections WHERE id=$1`, conn).Scan(&sum.Phases.NASFreeBytes); err != nil {
+			log.Fatal(err)
+		}
+		sum.Phases.CopyFits = sum.Phases.NASFreeBytes >= sum.Phases.Totals[r2RetireCopy].Bytes+sum.Phases.NASReserveBytes
+		if err := sum.Phases.write(*out, sum.Header); err != nil {
+			log.Fatal(err)
+		}
+		sum.Header.Phase = r2RetireNow
 	}
 	sum.ManifestPath = filepath.Join(*out, r2RetireManifestName)
 	if sum.ManifestSHA256, err = writeR2RetireManifest(sum.ManifestPath, sum.Header, items); err != nil {
@@ -999,7 +1153,7 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	} else {
 		printR2RetirePlan(os.Stdout, sum)
 	}
-	if len(enabled) > 0 {
+	if len(enabled) > 0 && !*nasBacked {
 		fmt.Printf("WARNING: NAS cleanup plan(s) %v are enabled; apply will refuse until they are paused\n", enabled)
 	}
 }
