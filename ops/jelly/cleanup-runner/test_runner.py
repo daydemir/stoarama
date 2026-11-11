@@ -816,4 +816,102 @@ class RenderOffTests(unittest.TestCase):
             self.assertIn(('runtime', 42, None), self.calls)
 
 
+class StreamNameTests(unittest.TestCase):
+    def test_name_lookup_failure_keeps_progress_rows(self):
+        job = r.Runner(Path('.'), Path('.'))
+        rows = [dict(stream_id=3, files=1, bytes=2)]
+        def fail(sql):
+            raise r.Halt('read-only catalog query failed')
+        job.query = fail
+        job.add_stream_names(rows)
+        self.assertEqual(rows, [dict(stream_id=3, files=1, bytes=2)])
+
+    def test_name_lookup_adds_names(self):
+        job = r.Runner(Path('.'), Path('.'))
+        rows = [dict(stream_id=3, files=1, bytes=2), dict(stream_id=4, files=1, bytes=2)]
+        job.query = lambda sql: {'3': 'Market square'}
+        job.add_stream_names(rows)
+        self.assertEqual(rows[0]['stream_name'], 'Market square')
+        self.assertNotIn('stream_name', rows[1])
+
+
+class EmailTests(unittest.TestCase):
+    def status(self):
+        return dict(phase='monitoring', current_plan=42, deleted_files=5841,
+                    deleted_bytes=161500000000, deleted_24h_files=100,
+                    deleted_24h_bytes=2000000000,
+                    per_stream=[dict(stream_id=3, stream_name='Camera <north> & yard',
+                                     files=5841, bytes=161500000000)])
+
+    def send(self, status, reason, fail=False):
+        job = r.Runner(Path('.'), Path('.'))
+        job.status = status
+        with patch.dict(r.os.environ, {'EMAIL_FROM': 'runner@example.invalid',
+                        'CLEANUP_OWNER_EMAIL': 'owner@example.invalid',
+                        'EMAIL_RESEND_API_KEY': 'fake-test-key'}), \
+                patch.object(r, 'utcnow', return_value=NOW), \
+                patch.object(r, 'request', return_value={'id': 'test'}) as request:
+            if fail:
+                with patch.object(r, 'render_email', side_effect=ValueError('private exception')):
+                    job.notify(reason)
+            else:
+                job.notify(reason)
+        self.assertEqual(request.call_count, 1)
+        return request.call_args.args[3]
+
+    def test_daily(self):
+        payload = self.send(self.status(), 'daily progress 2026-11-11')
+        self.assertEqual(payload['subject'], 'Stoarama NAS cleanup — Nov 11: 5,841 files (161.5 GB) deleted so far')
+        for body in (payload['text'], payload['html']):
+            for value in ('deleting batch 42', 'Current plan: 42', '5,841', '161.5 GB', '100 files (2.0 GB)', 'R2 copies are kept'):
+                self.assertIn(value, body)
+        self.assertNotIn('<table', payload['text'])
+        self.assertIn('<table', payload['html'])
+        self.assertEqual(r.human_size(2000000000000), '2.0 TB')
+
+    def test_alert(self):
+        status = dict(self.status(), phase='master_false', last_error='R2 recovery verification failed')
+        payload = self.send(status, 'STOPPED: owner review required')
+        self.assertEqual(payload['subject'], 'ACTION NEEDED: STOPPED: owner review required')
+        for body in (payload['text'], payload['html']):
+            self.assertIn('What to do: reply or ask Claude', body)
+            self.assertIn('Deletion is off.', body)
+            self.assertIn(status['last_error'], body)
+        payload = self.send(self.status(), 'MASTER OFF NOT CONFIRMED; retrying shutdown')
+        self.assertIn('check shutdown confirmation', payload['text'])
+        self.assertNotIn('Deletion is off.', payload['text'])
+
+    def test_missing_fields_and_phases(self):
+        payload = self.send({}, 'daily progress 2026-11-11')
+        self.assertIn('Current plan: none', payload['text'])
+        self.assertIn('No deleted files reported yet', payload['html'])
+        self.assertIn('0 files (0.0 GB)', payload['subject'])
+        for phase, words in [('dry_run', 'checking the next batch (no deletion)'),
+                             ('master_false', 'idle, deletion switched off')]:
+            self.assertIn(words, self.send({'phase': phase}, 'daily progress')['text'])
+
+    def test_escaping_and_selected_fields_only(self):
+        status = dict(self.status(), sql='SELECT private', token='private-token',
+                      response='private-http-body', last_error='fixed <reason> & "detail"')
+        payload = self.send(status, 'STOPPED: <fixed> & "reason"')
+        self.assertIn('Camera &lt;north&gt; &amp; yard', payload['html'])
+        self.assertIn('fixed &lt;reason&gt; &amp; &quot;detail&quot;', payload['html'])
+        self.assertNotIn('<fixed>', payload['html'])
+        for secret in ('SELECT private', 'private-token', 'private-http-body'):
+            self.assertNotIn(secret, json.dumps(payload))
+        status['per_stream'][0]['stream_name'] = 'https://example.invalid/?token=private'
+        self.assertNotIn('https:', self.send(status, 'daily progress')['text'])
+
+    def test_render_failure_sends_old_minimal_text(self):
+        status = self.status()
+        payload = self.send(status, 'STOPPED: owner review required', fail=True)
+        self.assertEqual(json.loads(payload['text']), {k: status.get(k) for k in
+                         ('phase', 'deleted_files', 'deleted_bytes', 'current_plan', 'last_error')})
+        self.assertNotIn('html', payload)
+        self.assertNotIn('private exception', json.dumps(payload))
+        # Malformed optional data also falls back and sends once.
+        payload = self.send(dict(status, per_stream=[{}]), 'daily progress')
+        self.assertNotIn('html', payload)
+
+
 if __name__ == '__main__': unittest.main()
