@@ -1583,6 +1583,87 @@ class JoinedDownloadTests(unittest.TestCase):
                 self.assertFalse(pull.poll_raw_pending_cached(cfg, runtime))
             self.assertEqual(pending.call_count, 2)
 
+    def test_execution_drain_keeps_raw_credits_flowing_to_active_joined_download(self):
+        # The reviewers' three-thread cycle: a real joined download owns a
+        # writer slot while waiting for raw credit; cleanup begins draining;
+        # then raw delivery must enter the fence and supply that credit.
+        with tempfile.TemporaryDirectory() as raw:
+            cfg = self.config(Path(raw))
+            runtime = self.runtime(cfg)
+            runtime.apply_joined_protocol_response(self.protocol_response(1, pull.JOINED_FAIR_SHARE_MIN_GENERATION))
+            content = b"joined scheduling regression"
+            raw_item = self.media_item(content)
+            item = pull.valid_joined_item(raw_item)
+            self.install_manifest(cfg, item)
+            fence, stop = pull.NAS_MEDIA_FENCE, threading.Event()
+            waiting, draining, raw_done, executed = (threading.Event() for _ in range(4))
+            errors = []
+            lane = pull.CleanupExecutionLane(stop)
+            original_wait, original_acquire = runtime.wait_joined_work_credit, fence.acquire_cleanup
+
+            def wait_credit(timeout):
+                waiting.set()
+                return original_wait(timeout)
+
+            def acquire(*args):
+                draining.set()
+                return original_acquire(*args)
+
+            def api(_cfg, _method, path, body=None, **_kwargs):
+                if path.startswith("/account/clips?"):
+                    return {"clips": [] if raw_done.is_set() else [{"clip_id": 1}]}
+                if path == raw_item["download_path"]:
+                    return self.prepared(raw_item)
+                if path == "/account/joined/ack":
+                    return {"ok": True}
+                raise AssertionError(path)
+
+            @fence.delivery
+            def raw_delivery():
+                raw_done.set()
+                runtime.add_successes(cfg, 1, [(1, 1)])
+
+            def execute():
+                try:
+                    lane.run(executed.set)
+                finally:
+                    lane.close()
+
+            def run(fn, *args):
+                try:
+                    fn(*args)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=run, args=args, daemon=True) for args in (
+                (pull.download_joined_item, cfg, runtime, item, stop), (execute,), (raw_delivery,),
+            )]
+            with mock.patch.object(runtime, "wait_joined_work_credit", side_effect=wait_credit), \
+                    mock.patch.object(fence, "acquire_cleanup", side_effect=acquire), \
+                    mock.patch.object(pull, "storage_status", return_value=self.storage()), \
+                    mock.patch.object(pull, "request_json", side_effect=api), \
+                    mock.patch.object(pull, "open_joined_url", return_value=RangeResponse(content, 0, len(content)-1, len(content))):
+                try:
+                    threads[0].start()
+                    self.assertTrue(waiting.wait(1), "joined download did not await raw credit")
+                    self.assertEqual(fence.writers, 1)
+                    threads[1].start()
+                    self.assertTrue(draining.wait(1))
+                    threads[2].start()
+                    self.assertTrue(executed.wait(2), "raw -> joined -> execution scheduling stalled")
+                finally:
+                    stop.set()
+                    for thread in threads:
+                        if thread.ident is not None:
+                            thread.join(2)
+            self.assertFalse(errors, errors)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertTrue(raw_done.is_set())
+            self.assertEqual(pull.joined_output_path(cfg, item).read_bytes(), content)
+            self.assertEqual(fence.writers, 0)
+            self.assertEqual(fence.cleaners, 0)
+            self.assertIsNone(fence.execution_owner)
+
     def test_unknown_partial_and_hardlink_are_never_modified(self):
         item = pull.valid_joined_item(self.media_item())
         with tempfile.TemporaryDirectory() as raw:

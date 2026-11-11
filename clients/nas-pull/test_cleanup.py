@@ -303,6 +303,49 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(fence.cleaners, 0)
         self.assertIsNone(fence.execution_owner)
 
+    def test_execution_drain_timeout_reopens_background_work_for_maintenance(self):
+        fence, stop = pull.NASMediaFence(), threading.Event()
+        active, release, resumed, next_joined = (threading.Event() for _ in range(4))
+        @fence.background_delivery
+        def joined():
+            active.set()
+            release.wait(2)
+        def inventory():
+            if fence.wait_maintenance(stop):
+                resumed.set()
+        worker = threading.Thread(target=joined)
+        worker.start()
+        self.assertTrue(active.wait(1))
+        reader = threading.Thread(target=inventory)
+        queued = threading.Thread(target=fence.background_delivery(next_joined.set))
+        acquire = fence.acquire_cleanup
+        def drain(*args):
+            reader.start()
+            queued.start()
+            self.assertFalse(resumed.wait(.02))
+            self.assertFalse(next_joined.is_set(), 'new joined writer entered during drain')
+            return acquire(*args)
+        with mock.patch.object(pull, 'NAS_MEDIA_FENCE', fence), \
+                mock.patch.object(pull, 'CLEANUP_EXECUTION_DRAIN_SEC', .1), \
+                mock.patch.object(fence, 'acquire_cleanup', side_effect=drain):
+            lane = pull.CleanupExecutionLane(stop)
+            try:
+                with self.assertRaises(pull.CleanupInterrupted):
+                    lane.run(lambda: self.fail('execution ran beside joined writer'))
+                self.assertTrue(resumed.wait(1), 'maintenance remained fenced after drain timeout')
+                self.assertTrue(next_joined.wait(1), 'joined admission remained fenced after drain timeout')
+                self.assertIsNone(lane.started)
+                self.assertTrue(fence.execution_lock.acquire(blocking=False))
+                fence.execution_lock.release()
+            finally:
+                release.set()
+                lane.close()
+                worker.join(1)
+                reader.join(1)
+                queued.join(1)
+        self.assertIsNone(fence.execution_owner)
+        self.assertEqual(fence.cleaners, 0)
+
     def test_stale_observe_and_result_receipts_are_archived_without_blocking(self):
         import urllib.error
         for phase in ('observe','result'):

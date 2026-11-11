@@ -91,6 +91,7 @@ type cleanupDeadlineClientResult struct {
 	Unlinks     int      `json:"unlink_calls"`
 	Deleted     int      `json:"ledger_deleted"`
 	JoinedCalls int      `json:"joined_calls"`
+	RawCalls    int      `json:"raw_calls"`
 	Errors      []string `json:"errors"`
 	Outcomes    []struct {
 		ObserveMS   int64 `json:"observe_elapsed_ms"`

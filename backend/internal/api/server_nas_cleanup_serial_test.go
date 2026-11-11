@@ -47,7 +47,7 @@ func testNASCleanupSerialClientServer(t *testing.T, slowJoined bool) {
 	f := newCleanupFixture(t, 24)
 	version := nasCleanupExecutionClientVersion
 	if slowJoined {
-		version = nasCleanupDedicatedExecutionClientVersion
+		version = nasCleanupRawCreditDrainClientVersion
 		if _, err := f.pool.Exec(f.ctx, `UPDATE connections SET client_version=$1 WHERE id=13`, version); err != nil {
 			t.Fatal(err)
 		}
@@ -156,8 +156,8 @@ func testNASCleanupSerialClientServer(t *testing.T, slowJoined bool) {
 		t.Fatalf("deleted=%d unverified=%d slow-policy=%d", deleted, unverified, slowPolicy)
 	}
 	rate := 60 * 16 / result.Seconds
-	if slowJoined && (rate < 15 || result.JoinedCalls < 2 || result.JoinedCalls > 4) {
+	if slowJoined && (rate < 15 || result.JoinedCalls < 2 || result.JoinedCalls > 4 || result.RawCalls == 0) {
 		t.Fatalf("slow joined work interleaved between executions: rate=%.1f/min joined_calls=%d result=%+v", rate, result.JoinedCalls, result)
 	}
-	t.Logf("16 files, slow joined=%t, 1.1 s policy each: %.3f s, %.1f files/min, joined calls=%d, peak requests=%d", slowJoined, result.Seconds, rate, result.JoinedCalls, peak.Load())
+	t.Logf("16 files, slow joined=%t, 1.1 s policy each: %.3f s, %.1f files/min, joined calls=%d, raw calls=%d, peak requests=%d", slowJoined, result.Seconds, rate, result.JoinedCalls, result.RawCalls, peak.Load())
 }

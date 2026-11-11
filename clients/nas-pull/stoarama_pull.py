@@ -1908,7 +1908,9 @@ class NASMediaFence:
     separately permitted file, and same-folder namespace changes made by them
     are accounted for exactly (see CleanupDirectoryLog). A serial execution
     lane reserves the fence across receipts and leases for a bounded window;
-    waiting delivery gets a turn at the next maintenance boundary."""
+    new background delivery waits for the next maintenance boundary. Raw
+    delivery stays admitted while existing writers drain, since joined writers
+    can depend on its progress credits."""
     def __init__(self):
         self.condition = threading.Condition()
         self.writers = 0
@@ -1921,12 +1923,15 @@ class NASMediaFence:
     def exclusive(self):
         return self.cleaners > 0
 
-    def delivery(self, fn):
+    def background_delivery(self, fn):
+        return self.delivery(fn, background=True)
+
+    def delivery(self, fn, background=False):
         def wrapped(*args, **kwargs):
             with self.condition:
                 self.writers_waiting += 1
                 try:
-                    while self.cleaners or self.execution_owner is not None:
+                    while self.cleaners or (background and self.execution_owner is not None):
                         self.condition.wait(1)
                 finally:
                     self.writers_waiting -= 1
@@ -1965,6 +1970,7 @@ class NASMediaFence:
 
 NAS_MEDIA_FENCE = NASMediaFence()
 
+CLEANUP_EXECUTION_DRAIN_SEC = 15
 CLEANUP_EXECUTION_WINDOW_SEC = 5 * 60
 CLEANUP_MAINTENANCE_WINDOW_SEC = 30
 
@@ -1983,15 +1989,17 @@ class CleanupExecutionLane:
 
     def run(self, fn, *args):
         if self.started is None:
+            deadline = time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC
             while not NAS_MEDIA_FENCE.execution_lock.acquire(timeout=0.2):
-                if self.stop_event.is_set():
-                    raise CleanupInterrupted("cleanup execution lane cancelled")
+                if self.stop_event.is_set() or time.monotonic() >= deadline:
+                    raise CleanupInterrupted("cleanup execution lane timed out or cancelled")
             with NAS_MEDIA_FENCE.condition:
-                # Stop admitting new delivery before draining active writers.
+                # Pause new joined/collated writers, but keep raw delivery
+                # flowing until active joined writers have consumed its credits.
                 NAS_MEDIA_FENCE.execution_owner = threading.get_ident()
+                NAS_MEDIA_FENCE.condition.notify_all()
             try:
-                # Drain existing delivery once, before the first observation.
-                NAS_MEDIA_FENCE.acquire_cleanup(self.stop_event, time.monotonic() + 1800)
+                NAS_MEDIA_FENCE.acquire_cleanup(self.stop_event, deadline)
             except BaseException:
                 with NAS_MEDIA_FENCE.condition:
                     NAS_MEDIA_FENCE.execution_owner = None
@@ -3174,7 +3182,7 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
         # A previously approved proof marks the execution phase. Dry runs
         # never acquire the write fence and do not impede clip delivery.
         if task.get("approved_proof") is not None:
-            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, deadline)
+            NAS_MEDIA_FENCE.acquire_cleanup(stop_event, min(deadline, time.monotonic() + CLEANUP_EXECUTION_DRAIN_SEC))
             fenced = True
         with CleanupFile(cfg, task["item"], stop_event, deadline) as current:
             proof = current.proof()
@@ -7635,7 +7643,7 @@ def joined_identity_step(reason_code, operation, *args):
         raise
 
 
-@NAS_MEDIA_FENCE.delivery
+@NAS_MEDIA_FENCE.background_delivery
 def download_joined_item(cfg, runtime, item, stop_event):
     joined_raw_priority_boundary(cfg, runtime, stop_event)
     # Expose failures while opening or hashing prerequisite manifests. Offset
@@ -8104,7 +8112,7 @@ def append_collated_bytes(prepared, descriptor, digest, start, item, limiter, st
             raise RuntimeError("collated body length mismatch")
 
 
-@NAS_MEDIA_FENCE.delivery
+@NAS_MEDIA_FENCE.background_delivery
 def download_collated_item(cfg, item, limiter, stop_event):
     """Place one output at its contract path. Returns True when bytes were fetched."""
     relative = item["nas_relative_path"]
@@ -11173,8 +11181,9 @@ def run(cfg):
                 joined_worker.start()
             storage_checked = False
             try:
-                if not NAS_MEDIA_FENCE.wait_maintenance(stop_event):
-                    break
+                # Raw delivery must keep supplying credits while an execution
+                # window drains active joined downloads. process_clip fences
+                # media writes once that drain has completed.
                 check_storage(cfg)
                 storage_checked = True
                 mark_cleanup_verified_healthy(cfg, runtime, storage_checked, cleanup_verified)
