@@ -528,7 +528,7 @@ Regression harness (local disposable PostgreSQL only):
 
 ```sh
 cd backend
-STOARAMA_TEST_DATABASE_URL=postgres://localhost/stoarama_test go test ./internal/api -run '^TestNASCleanup(ExecutionDeadline|NeverAttemptedReceipt|DryRunKeepsRecoveryBudget)' -count=1 -v
+../scripts/test-db run -- go test ./internal/api -run '^TestNASCleanup(ExecutionDeadline|NeverAttemptedReceipt|DryRunKeepsRecoveryBudget)' -count=1 -v
 ```
 
 The harness uses the real Python worker, disposable media/sidecars and fake R2.

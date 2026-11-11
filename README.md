@@ -152,6 +152,60 @@ cd backend
 go run ./cmd/stoarama-api
 ```
 
+### Local tests
+
+Install Homebrew `postgresql@17` and use `scripts/test-db` for every local DB-backed
+test run. It needs only Python 3's standard library and discovers the Homebrew
+binaries without changing your PATH. From the repo root:
+
+```bash
+python3 -B scripts/test_test_db.py  # real shared-server lifecycle regressions
+scripts/test-db run -- go -C backend test ./... -count=1
+scripts/test-db run -- python3 -m unittest discover -s clients/nas-pull -p 'test_*.py' -q
+scripts/test-db run -- python3 -m unittest discover -s backend/scripts/nas-storage-dashboard -p 'test_*.py' -q
+scripts/test-db run -- python3 -m unittest discover -s backend/scripts/nas-cleanup -p 'test_*.py' -q
+scripts/test-db run -- python3 -m unittest discover -s ops/jelly/cleanup-runner -p 'test_*.py' -q
+scripts/test-db run -- python3 -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
+scripts/test-db run -- python3 backend/scripts/test_worker_artifact_workflow.py
+scripts/test-db stop
+```
+
+Go DB helpers read `STOARAMA_TEST_DATABASE_URL` and otherwise skip DB tests;
+`run` exports a fresh database URL, forwards INT/TERM/HUP, drops that run's database
+on exit (including failed commands), and preserves the command's exit status.
+Python uses `unittest`; there is no pytest/conftest database fixture. Keep CI's
+Postgres service container and explicit URL unchanged. Scratch databases default
+to UTC to match CI.
+
+All worktrees share one cluster at `<user-temp>/stoarama-shared-pg-<uid>/data`,
+listening only on `127.0.0.1:55432`, with a private Unix socket. On macOS user-temp
+comes from `getconf DARWIN_USER_TEMP_DIR`; elsewhere it uses `$TMPDIR` or the
+system temp directory. Lifecycle changes use a kernel lock; each run also holds
+a reservation so GC/stop cannot disrupt a test between connections. A conflicting
+port fails startup; the helper never uses another server or existing `/tmp` cluster.
+
+For an interactive test database:
+
+```bash
+export STOARAMA_TEST_DATABASE_URL="$(scripts/test-db create review)"
+# Run tests or connect to the printed URL, then close connections.
+scripts/test-db drop review  # also accepts stoarama_test_review
+scripts/test-db gc
+scripts/test-db stop
+```
+
+`create` without a name chooses a random one. Names contain 1–49 lowercase letters,
+digits or underscores. `gc` drops only helper-marked `stoarama_test_*` databases
+older than 12 hours with no connections or live run reservation; it also runs
+before create/run/stop. `stop` refuses live runs or client connections and uses
+smart shutdown to protect connections racing the check. The single reusable
+cluster stays on disk; stop it when finished. SIGKILL or machine failure cannot
+run exit cleanup; the next GC reclaims abandoned databases after 12 hours.
+
+Some media tests need the pinned FFmpeg/ffprobe described in
+`backend/scripts/install-pinned-media-tools.sh`; Python NAS stitching tests also
+use system `ffmpeg`/`ffprobe`.
+
 ### Run internal CLI
 
 ```bash

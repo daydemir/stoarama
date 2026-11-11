@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""One PostgreSQL 17 scratch cluster per user, shared across worktrees."""
+
+import argparse
+from contextlib import contextmanager, ExitStack
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+PORT = 55432
+ROLE = "stoarama_test_admin"
+PREFIX = "stoarama_test_"
+MARKER = "stoarama-test-db:v1:"
+
+
+def temp_root():
+    if sys.platform == "darwin":
+        result = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"],
+                                capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip())
+    return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+
+
+def pg_bin():
+    candidates = [Path(p) / "opt/postgresql@17/bin" for p in
+                  ("/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew")]
+    brew = shutil.which("brew")
+    if brew:
+        result = subprocess.run([brew, "--prefix", "postgresql@17"],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            candidates.insert(0, Path(result.stdout.strip()) / "bin")
+    for path in candidates:
+        if all((path / tool).is_file() for tool in ("initdb", "pg_ctl", "psql")):
+            return path
+    raise RuntimeError("Install Homebrew postgresql@17: brew install postgresql@17")
+
+
+def private_path(path):
+    if path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise RuntimeError(f"Refusing unowned or symlink path: {path}")
+
+
+class Cluster:
+    def __init__(self):
+        self.root = temp_root() / f"stoarama-shared-pg-{os.getuid()}"
+        self.data = self.root / "data"
+        self.bin = pg_bin()
+        # Ignore ambient production PG settings and interactive psql startup files.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+        self.env["PGCONNECT_TIMEOUT"] = "5"
+
+    @contextmanager
+    def lock(self):
+        path = self.root.with_suffix(".lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            private_path(path)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    def ctl(self, *args):
+        return subprocess.run([str(self.bin / "pg_ctl"), "-D", str(self.data), *args],
+                              env=self.env, stdout=sys.stderr, check=True)
+
+    def sql(self, query):
+        return subprocess.check_output([
+            str(self.bin / "psql"), "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
+            "-h", str(self.root), "-p", str(PORT), "-U", ROLE, "-d", "postgres",
+            "-c", query], env=self.env, text=True).strip()
+
+    def running(self):
+        return subprocess.run([str(self.bin / "pg_ctl"), "-D", str(self.data),
+                               "status"], env=self.env,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+
+    def verify(self):
+        if Path(self.sql("SHOW data_directory")).resolve() != self.data.resolve():
+            raise RuntimeError("Refusing SQL against a different PostgreSQL cluster")
+
+    def start(self, launch=True):
+        if not self.root.exists():
+            self.root.mkdir(mode=0o700)
+            (self.root / "identity").write_text(MARKER)
+        private_path(self.root)
+        if (self.root.stat().st_mode & 0o077 or
+                (self.root / "identity").read_text() != MARKER):
+            raise RuntimeError(f"Refusing unknown/shared-access cluster: {self.root}")
+        if not self.data.exists():
+            subprocess.run([str(self.bin / "initdb"), "-D", str(self.data),
+                            "-U", ROLE, "--auth=reject", "--encoding=UTF8",
+                            "--locale=C"], env=self.env, stdout=sys.stderr, check=True)
+            (self.data / "pg_hba.conf").write_text(
+                "local all all trust\nhost all all 127.0.0.1/32 trust\n")
+            socket_dir = str(self.root).replace("'", "''")
+            with (self.data / "postgresql.conf").open("a") as config:
+                config.write(f"\nlisten_addresses = '127.0.0.1'\nport = {PORT}\n"
+                             f"unix_socket_directories = '{socket_dir}'\n"
+                             "max_connections = 100\nshared_buffers = '32MB'\n")
+            (self.root / "initialized").touch()
+        private_path(self.data)
+        if not (self.root / "initialized").exists():
+            raise RuntimeError(f"Incomplete shared cluster initialization: inspect {self.root}")
+        if (self.data / "PG_VERSION").read_text().strip() != "17":
+            raise RuntimeError("Shared cluster must use PostgreSQL 17")
+        if not self.running():
+            if not launch:
+                return False
+            self.ctl("-l", str(self.root / "server.log"), "-w", "start")
+        self.verify()
+        return True
+
+    def databases(self):
+        return json.loads(self.sql(
+            "SELECT coalesce(json_agg(json_build_object('name', datname, "
+            "'marker', shobj_description(oid, 'pg_database'))), '[]') "
+            "FROM pg_database"))
+
+    @contextmanager
+    def reservation(self, name, blocking=False):
+        # A run holds this across connection-free build/test phases. Kernel locks
+        # disappear on crashes, so abandoned reservations cannot block GC forever.
+        path = self.root / (name + ".lease")
+        with path.open("a") as lease:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                raise RuntimeError(f"Database belongs to a live test run: {name}")
+            yield
+
+    def create(self, name):
+        self.sql(f'CREATE DATABASE "{name}"')
+        try:
+            self.sql(f"COMMENT ON DATABASE \"{name}\" IS '{MARKER}{int(time.time())}'")
+            # Match CI's UTC service container regardless of the Mac's timezone.
+            self.sql(f"ALTER DATABASE \"{name}\" SET timezone TO 'UTC'")
+        except BaseException:
+            # CREATE succeeded here, so this is ours even if COMMENT failed.
+            self.sql(f'DROP DATABASE "{name}" WITH (FORCE)')
+            raise
+
+    def drop(self, name, force=False):
+        db = next((db for db in self.databases() if db["name"] == name), None)
+        if db is None:
+            return
+        if not re.fullmatch(re.escape(MARKER) + r"\d+", db["marker"] or ""):
+            raise RuntimeError(f"Refusing database without helper ownership: {name}")
+        self.sql(f'DROP DATABASE "{name}"' + (" WITH (FORCE)" if force else ""))
+
+    def gc(self):
+        for db in self.databases():
+            if not re.fullmatch(PREFIX + r"[a-z0-9_]{1,49}", db["name"]):
+                continue
+            marker = db["marker"] or ""
+            if (not re.fullmatch(re.escape(MARKER) + r"\d+", marker) or
+                    int(marker[len(MARKER):]) >= time.time() - 12 * 3600):
+                continue
+            try:
+                with self.reservation(db["name"]):
+                    if self.sql("SELECT count(*) FROM pg_stat_activity "
+                                f"WHERE datname = '{db['name']}'") == "0":
+                        # No FORCE: a connection racing this check prevents DROP.
+                        self.drop(db["name"])
+            except (RuntimeError, subprocess.CalledProcessError) as error:
+                print(f"test-db gc: {error}", file=sys.stderr)
+        for lease in self.root.glob("*.lease"):
+            with lease.open("a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                lease.unlink()
+
+
+def database_name(value):
+    name = value or uuid.uuid4().hex
+    if name.startswith(PREFIX):
+        name = name[len(PREFIX):]
+    if not re.fullmatch(r"[a-z0-9_]{1,49}", name):
+        raise ValueError("name must be 1–49 lowercase letters, digits or underscores")
+    return PREFIX + name
+
+
+def run(cluster, command):
+    name = database_name(None)
+    child = None
+    interrupted = 0
+
+    def forward(signum, _frame):
+        nonlocal interrupted
+        interrupted = signum
+        if child is not None and child.poll() is None:
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    previous = {s: signal.signal(s, forward) for s in
+                (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        with ExitStack() as reservations:
+            with cluster.lock():
+                cluster.start()
+                cluster.gc()
+                reservations.enter_context(cluster.reservation(name, blocking=True))
+                cluster.create(name)
+            try:
+                if interrupted:
+                    return 128 + interrupted
+                env = dict(os.environ, STOARAMA_TEST_DATABASE_URL=url(name))
+                child = subprocess.Popen(command, env=env, start_new_session=True)
+                if interrupted:
+                    forward(interrupted, None)
+                code = child.wait()
+                return 128 - code if code < 0 else code
+            finally:
+                with cluster.lock():
+                    cluster.verify()
+                    cluster.drop(name, force=True)
+                    (cluster.root / (name + ".lease")).unlink(missing_ok=True)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def url(name):
+    return f"postgres://{ROLE}@127.0.0.1:{PORT}/{name}?sslmode=disable"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("create").add_argument("name", nargs="?")
+    sub.add_parser("drop").add_argument("name")
+    sub.add_parser("gc")
+    sub.add_parser("stop")
+    sub.add_parser("run").add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.action == "run":
+        command = args.command[1:] if args.command[:1] == ["--"] else []
+        if not command:
+            parser.error("use run -- <command> [args...]")
+        return run(Cluster(), command)
+    name = database_name(args.name) if args.action in ("create", "drop") else None
+    cluster = Cluster()
+    with cluster.lock():
+        if args.action == "stop" and not cluster.root.exists():
+            return 0
+        if not cluster.start(launch=args.action != "stop"):
+            return 0
+        if args.action == "create":
+            cluster.gc()
+            cluster.create(name)
+            print(url(name))
+        elif args.action == "drop":
+            with cluster.reservation(name):
+                cluster.drop(name)
+            (cluster.root / (name + ".lease")).unlink(missing_ok=True)
+        elif args.action == "gc":
+            cluster.gc()
+        else:
+            cluster.gc()
+            for lease in cluster.root.glob("*.lease"):
+                with cluster.reservation(lease.stem):
+                    pass
+            if cluster.sql("SELECT count(*) FROM pg_stat_activity "
+                           "WHERE backend_type = 'client backend' "
+                           "AND pid <> pg_backend_pid()") != "0":
+                raise RuntimeError("Shared cluster still has client connections")
+            # Smart shutdown refuses new clients and never terminates a racing one.
+            cluster.ctl("-m", "smart", "-t", "5", "-w", "stop")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"test-db: {error}", file=sys.stderr)
+        sys.exit(1)
