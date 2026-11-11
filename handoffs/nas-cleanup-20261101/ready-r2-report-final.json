@@ -1,0 +1,2169 @@
+{
+  "allow_nas_only": false,
+  "approval_reason": "",
+  "approved_until": null,
+  "id": 4,
+  "items": [
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-27T11:38:31.986Z",
+      "frozen_identity": [
+        88690,
+        1790579142504016400,
+        1790579142721018400,
+        4586731,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/9606f0fcea5f88a1f84523c15a9b6c58cc6929149488e19872fb1daff95926d0.mp4",
+      "recording_id": 406,
+      "relative_path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/27-Sunday/100005_Chile_-_Punta_Arenas_Live_cam_2026_September_W4_Sunday_hour_08_part_18_083828-083831.mp4",
+      "sha256": "9606f0fcea5f88a1f84523c15a9b6c58cc6929149488e19872fb1daff95926d0",
+      "sidecar_required": false,
+      "size_bytes": 88690,
+      "source_id": 24723,
+      "source_ids": [
+        1713930
+      ],
+      "source_manifest_sha256": "1f1d105adddbf262724986b6c93228de087a77f30880e3948577496b1bcb0ff0",
+      "start_at": "2026-09-27T11:38:28Z",
+      "stream_id": 12725,
+      "timezone": "America/Punta_Arenas"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-10-02T08:08:28.632Z",
+      "frozen_identity": [
+        119896,
+        1790965112988538600,
+        1790965113103539700,
+        4621350,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/7439277c1b4bb0bb1fecc03bb1be07bdc4354e7bb907c0a7c4dcb8d1453c9e03.mp4",
+      "recording_id": 385,
+      "relative_path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/02-Friday/99997_Seoul_-_Anguk_2026_October_W1_Friday_hour_17_part_02_170828-170828.mp4",
+      "sha256": "7439277c1b4bb0bb1fecc03bb1be07bdc4354e7bb907c0a7c4dcb8d1453c9e03",
+      "sidecar_required": false,
+      "size_bytes": 119896,
+      "source_id": 118110,
+      "source_ids": [
+        1910536
+      ],
+      "source_manifest_sha256": "cf11885faa7f3b572c9d5f0d3904cc54a13e7cdd27db1089e5de90ffc02b7333",
+      "start_at": "2026-10-02T08:08:28.382Z",
+      "stream_id": 17237,
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-29T17:59:59.584Z",
+      "frozen_identity": [
+        199068,
+        1790736689394710800,
+        1790736689883715600,
+        4600356,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/8edf96e14b2727e7ed72004cd88b5c0b87b90362683fa31c9fa29606026b1841.mp4",
+      "recording_id": 410,
+      "relative_path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/29-Tuesday/100009_Bevagna_-_Piazza_Silvestri_2026_September_W5_Tuesday_hour_19_part_57_195959-195959.mp4",
+      "sha256": "8edf96e14b2727e7ed72004cd88b5c0b87b90362683fa31c9fa29606026b1841",
+      "sidecar_required": false,
+      "size_bytes": 199068,
+      "source_id": 34802,
+      "source_ids": [
+        1812159
+      ],
+      "source_manifest_sha256": "74426565e68503786b6d95e08bebe20ccba6dd708db0e8c71fd8073b21767f53",
+      "start_at": "2026-09-29T17:59:59.451Z",
+      "stream_id": 17309,
+      "timezone": "Europe/Rome"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-26T02:46:17.724Z",
+      "frozen_identity": [
+        230135,
+        1790422078246048300,
+        1790422078550051300,
+        4571718,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/0a1c81e99e57f237e7082715591bcfc08445826570ad8e313ecb02f1102d80ce.mp4",
+      "recording_id": 383,
+      "relative_path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/25-Friday/99995_Kris_Kringl_2026_September_W4_Friday_hour_19_part_02_194612-194617.mp4",
+      "sha256": "0a1c81e99e57f237e7082715591bcfc08445826570ad8e313ecb02f1102d80ce",
+      "sidecar_required": false,
+      "size_bytes": 230135,
+      "source_id": 10448,
+      "source_ids": [
+        1650483
+      ],
+      "source_manifest_sha256": "fd5a3969c253980c7fa6808be12b655fe7d345af5e05f47e28fd50bf884287c4",
+      "start_at": "2026-09-26T02:46:12.758Z",
+      "stream_id": 17241,
+      "timezone": "America/Los_Angeles"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-27T18:05:26.986Z",
+      "frozen_identity": [
+        233132,
+        1790581331282000100,
+        1790581331390001200,
+        4587173,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/e5b6c3484786d85cf14b70fe0f9087d030a92566a6723d6d003980461319feef.mp4",
+      "recording_id": 406,
+      "relative_path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/27-Sunday/100005_Chile_-_Punta_Arenas_Live_cam_2026_September_W4_Sunday_hour_15_part_06_150523-150526.mp4",
+      "sha256": "e5b6c3484786d85cf14b70fe0f9087d030a92566a6723d6d003980461319feef",
+      "sidecar_required": false,
+      "size_bytes": 233132,
+      "source_id": 24978,
+      "source_ids": [
+        1729262
+      ],
+      "source_manifest_sha256": "930cc69553de43f0d8952d18e4fdf8ec96beaa9fa48fc095d7a9d34a04cf8ab9",
+      "start_at": "2026-09-27T18:05:23Z",
+      "stream_id": 12725,
+      "timezone": "America/Punta_Arenas"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-29T14:13:28.08Z",
+      "frozen_identity": [
+        294264,
+        1790738746941255400,
+        1790738747037256400,
+        4600709,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/c1a8c0b5950651e25be70a1556559b2019d1c41e69708eda8bf017034a203165.mp4",
+      "recording_id": 424,
+      "relative_path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/29-Tuesday/100023_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja_2026_September_W5_Tuesday_hour_16_part_03_161327-161328.mp4",
+      "sha256": "c1a8c0b5950651e25be70a1556559b2019d1c41e69708eda8bf017034a203165",
+      "sidecar_required": false,
+      "size_bytes": 294264,
+      "source_id": 35495,
+      "source_ids": [
+        1803054
+      ],
+      "source_manifest_sha256": "f6bc6ec1027ee737600f047e5ed5ffdd0b1b657a029a07da6d6bccae1d10afe3",
+      "start_at": "2026-09-29T14:13:27.79Z",
+      "stream_id": 17323,
+      "timezone": "Europe/Warsaw"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-27T12:44:14.566Z",
+      "frozen_identity": [
+        316609,
+        1790551120603522300,
+        1790551120702523400,
+        4581577,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/40b79328af1fd173a821174d8526d42df473e8ad8a912341b86bd6e2fc985a35.mp4",
+      "recording_id": 335,
+      "relative_path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/27-Sunday/03_Plac_Polonii_Amerykanskiej_2026_September_W4_Sunday_hour_14_part_03_144410-144414.mp4",
+      "sha256": "40b79328af1fd173a821174d8526d42df473e8ad8a912341b86bd6e2fc985a35",
+      "sidecar_required": false,
+      "size_bytes": 316609,
+      "source_id": 18404,
+      "source_ids": [
+        1716523
+      ],
+      "source_manifest_sha256": "3cc2ed9c0d0fdd55409d53229ba11636c4cc5a707a30dcea1d4701f3bda8b3ed",
+      "start_at": "2026-09-27T12:44:10Z",
+      "stream_id": 17216,
+      "timezone": "Europe/Warsaw"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-24T18:49:11.392Z",
+      "frozen_identity": [
+        355814,
+        1790334175928850700,
+        1790334176051851800,
+        4564120,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/be6498c77b82856eb521a1037a64ea7b482c89c6a0eec6edfd583c3f19deb3da.mp4",
+      "recording_id": 401,
+      "relative_path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/24-Thursday/36_Plaza_Mayor_2026_September_W4_Thursday_hour_13_part_09_134905-134911.mp4",
+      "sha256": "be6498c77b82856eb521a1037a64ea7b482c89c6a0eec6edfd583c3f19deb3da",
+      "sidecar_required": false,
+      "size_bytes": 355814,
+      "source_id": 4445,
+      "source_ids": [
+        1605047
+      ],
+      "source_manifest_sha256": "0fe30fbdbbbb4ec372981e59ed73eebd6a0027c940e8a51d9cab1ba8a4ba9eee",
+      "start_at": "2026-09-24T18:49:05.81Z",
+      "stream_id": 14478,
+      "timezone": "America/Lima"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-26T08:01:25.249Z",
+      "frozen_identity": [
+        361547,
+        1790468464364961300,
+        1790468464490962400,
+        4573725,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/84dbc1d70cac723797933f9377746b0d849c69e2f3a7ea37868d692e54807d6a.mp4",
+      "recording_id": 410,
+      "relative_path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/26-Saturday/100009_Bevagna_-_Piazza_Silvestri_2026_September_W4_Saturday_hour_10_part_02_100120-100125.mp4",
+      "sha256": "84dbc1d70cac723797933f9377746b0d849c69e2f3a7ea37868d692e54807d6a",
+      "sidecar_required": false,
+      "size_bytes": 361547,
+      "source_id": 12357,
+      "source_ids": [
+        1660357
+      ],
+      "source_manifest_sha256": "9222022b4379df645f5f011d1a1f24733bf1f49e7506bc59999962381e06a92e",
+      "start_at": "2026-09-26T08:01:20.249Z",
+      "stream_id": 17309,
+      "timezone": "Europe/Rome"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-27T07:13:33.806Z",
+      "frozen_identity": [
+        375133,
+        1790550014794503700,
+        1790550014999505700,
+        4581350,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/880719f49e07bb53cc8b6937ab05376955a6556d9fd2a08a4c9dfaa37c6d386f.mp4",
+      "recording_id": 335,
+      "relative_path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/27-Sunday/03_Plac_Polonii_Amerykanskiej_2026_September_W4_Sunday_hour_09_part_08_091327-091333.mp4",
+      "sha256": "880719f49e07bb53cc8b6937ab05376955a6556d9fd2a08a4c9dfaa37c6d386f",
+      "sidecar_required": false,
+      "size_bytes": 375133,
+      "source_id": 18369,
+      "source_ids": [
+        1700660
+      ],
+      "source_manifest_sha256": "a60cbbc09615c5aae9709a2280d1e263d699f2dae53b2f01c5bafa0be9d7c3d3",
+      "start_at": "2026-09-27T07:13:27Z",
+      "stream_id": 17216,
+      "timezone": "Europe/Warsaw"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-09-27T06:42:22.012Z",
+      "frozen_identity": [
+        400648,
+        1790564426420721400,
+        1790564426761724400,
+        4583918,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "kind": "collated",
+      "object_key": "joined/nightly-collation-v2/objects/f1f0102f0bdbafb1196355924cdd5a9e1ffe411cdaa817601a4c174b1804d84f.mp4",
+      "recording_id": 427,
+      "relative_path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/27-Sunday/100026_Jaworzno_-_Market_square_2026_September_W4_Sunday_hour_08_part_11_084214-084222.mp4",
+      "sha256": "f1f0102f0bdbafb1196355924cdd5a9e1ffe411cdaa817601a4c174b1804d84f",
+      "sidecar_required": false,
+      "size_bytes": 400648,
+      "source_id": 21297,
+      "source_ids": [
+        1699323
+      ],
+      "source_manifest_sha256": "941f36bb4111f55f38b38d00634f33da502f51ad8e6f132fc44e61563bd69a70",
+      "start_at": "2026-09-27T06:42:14.01Z",
+      "stream_id": 17326,
+      "timezone": "Europe/Warsaw"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-07-30T11:00:38.635Z",
+      "frozen_identity": [
+        1098721,
+        1785918256856957200,
+        1785918256995958500,
+        194719,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        426,
+        1785918257265961200,
+        1785918257315961600,
+        194722,
+        56
+      ],
+      "kind": "raw",
+      "object_key": "managed/acct-47/100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_195938.mp4",
+      "recording_id": 402,
+      "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_195938.mp4",
+      "sha256": "4bf1036bda962b02720bbaa47bea24cd0015e41f56f57c64e5b14ad9bcef8788",
+      "sidecar_required": true,
+      "size_bytes": 1098721,
+      "source_id": 167030,
+      "source_ids": [
+        167030
+      ],
+      "source_manifest_sha256": "f63a3a4a508f89f921b9e8d6a895622fb49a99ee06d54b9f81213bbc1c152249",
+      "start_at": "2026-07-30T10:59:38.635Z",
+      "stream_id": 158,
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-07-30T10:21:41.165Z",
+      "frozen_identity": [
+        7337632,
+        1785914593551072000,
+        1785914593776074000,
+        193640,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        426,
+        1785914594160077800,
+        1785914594260078800,
+        193649,
+        56
+      ],
+      "kind": "raw",
+      "object_key": "managed/acct-47/100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_192041.mp4",
+      "recording_id": 402,
+      "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_192041.mp4",
+      "sha256": "4fb36fdac7ae3f5537e1776566846b8ce59be9d9989aa256e0a643464e82a5af",
+      "sidecar_required": true,
+      "size_bytes": 7337632,
+      "source_id": 166493,
+      "source_ids": [
+        166493
+      ],
+      "source_manifest_sha256": "e4b991cc4b152a0a7943599099f85620b30a364516892e73579e95414e2aafed",
+      "start_at": "2026-07-30T10:20:41.227Z",
+      "stream_id": 158,
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-07-30T09:27:43.953Z",
+      "frozen_identity": [
+        7338819,
+        1785909668976014000,
+        1785909669127015400,
+        192111,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        422,
+        1785909669252016600,
+        1785909669302017000,
+        192112,
+        56
+      ],
+      "kind": "raw",
+      "object_key": "managed/acct-47/100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_182644.mp4",
+      "recording_id": 402,
+      "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_182644.mp4",
+      "sha256": "051b65da2b93827ec5247c0f20a31e0d5fb7e84ed08aeed4df2e0a197221def0",
+      "sidecar_required": true,
+      "size_bytes": 7338819,
+      "source_id": 165729,
+      "source_ids": [
+        165729
+      ],
+      "source_manifest_sha256": "1212d145b4f286225f9e06fd77c85077980dcf525b9884e93f3d8e4f4b724427",
+      "start_at": "2026-07-30T09:26:44Z",
+      "stream_id": 158,
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-07-30T09:31:43.671Z",
+      "frozen_identity": [
+        7339372,
+        1785910801968070000,
+        1785910802192072000,
+        192210,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        426,
+        1785910802590076000,
+        1785910802970079700,
+        192217,
+        56
+      ],
+      "kind": "raw",
+      "object_key": "managed/acct-47/100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183043.mp4",
+      "recording_id": 402,
+      "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183043.mp4",
+      "sha256": "a269fd8f669729d3669b6134b29dcc1084c0fb221e1841b216d13525bf8abf52",
+      "sidecar_required": true,
+      "size_bytes": 7339372,
+      "source_id": 165779,
+      "source_ids": [
+        165779
+      ],
+      "source_manifest_sha256": "5797dae335c26c5021e068d9967cafcec6f006b71daf92de5edaaae9cc55b4b4",
+      "start_at": "2026-07-30T09:30:43.748Z",
+      "stream_id": 158,
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-07-30T09:57:42.701Z",
+      "frozen_identity": [
+        7339457,
+        1785912162197342000,
+        1785912162516345000,
+        192964,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        426,
+        1785912162625346000,
+        1785912162671346700,
+        192967,
+        56
+      ],
+      "kind": "raw",
+      "object_key": "managed/acct-47/100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_185642.mp4",
+      "recording_id": 402,
+      "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_185642.mp4",
+      "sha256": "06ee2c3f5fadca81ffcf8e914c017d4f20201f823bbb017ef0036bb8afbb5131",
+      "sidecar_required": true,
+      "size_bytes": 7339457,
+      "source_id": 166155,
+      "source_ids": [
+        166155
+      ],
+      "source_manifest_sha256": "045dd9454ee45e706fdbdc07a1c492cb5bed96e72353ab33dd286a9a1cba69f6",
+      "start_at": "2026-07-30T09:56:42.779Z",
+      "stream_id": 158,
+      "timezone": "Asia/Seoul"
+    },
+    {
+      "bucket": "stoarama",
+      "end_at": "2026-07-30T09:36:43.389Z",
+      "frozen_identity": [
+        7339488,
+        1785910859950635500,
+        1785910860068636700,
+        192358,
+        56
+      ],
+      "frozen_sidecar_identity": [
+        426,
+        1785910860188638000,
+        1785910860242638600,
+        192359,
+        56
+      ],
+      "kind": "raw",
+      "object_key": "managed/acct-47/100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183543.mp4",
+      "recording_id": 402,
+      "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183543.mp4",
+      "sha256": "2a8c228d6b4996df2574e22e5813c122129e48251e72d862cee4bd6827e1f10e",
+      "sidecar_required": true,
+      "size_bytes": 7339488,
+      "source_id": 165852,
+      "source_ids": [
+        165852
+      ],
+      "source_manifest_sha256": "0b39ae7c6f4c9f4adc3102e0bb63cf437f674af2d43d184028728d2184439bd0",
+      "start_at": "2026-07-30T09:35:43.452Z",
+      "stream_id": 158,
+      "timezone": "Asia/Seoul"
+    }
+  ],
+  "label": "nas-cleanup-ready-r2-20261101",
+  "master_deletion_enabled": false,
+  "mode": "dry_run",
+  "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+  "results": [
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 19,
+      "ordinal": 1,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4563571
+            ],
+            [
+              56,
+              4563572
+            ],
+            [
+              56,
+              4586709
+            ]
+          ],
+          "identity": [
+            88690,
+            1790579142504016400,
+            1790579142721018400,
+            4586731,
+            56
+          ],
+          "parent_members_sha256": "91cea936fd688687b2b1b3c15439f6f62997bec700171b49fb4878e8914b9e42",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "9606f0fcea5f88a1f84523c15a9b6c58cc6929149488e19872fb1daff95926d0"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4563571
+          ],
+          [
+            56,
+            4563572
+          ],
+          [
+            56,
+            4586709
+          ]
+        ],
+        "identity": [
+          88690,
+          1790579142504016400,
+          1790579142721018400,
+          4586731,
+          56
+        ],
+        "parent_members_sha256": "91cea936fd688687b2b1b3c15439f6f62997bec700171b49fb4878e8914b9e42",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "9606f0fcea5f88a1f84523c15a9b6c58cc6929149488e19872fb1daff95926d0"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:35:13.264847+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 20,
+      "ordinal": 2,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4565519
+            ],
+            [
+              56,
+              4613486
+            ],
+            [
+              56,
+              4621305
+            ]
+          ],
+          "identity": [
+            119896,
+            1790965112988538600,
+            1790965113103539700,
+            4621350,
+            56
+          ],
+          "parent_members_sha256": "faa3ca6346f09705ad5aad8d3443e061944bcccfb03978ef8986296ef88da110",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "7439277c1b4bb0bb1fecc03bb1be07bdc4354e7bb907c0a7c4dcb8d1453c9e03"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4565519
+          ],
+          [
+            56,
+            4613486
+          ],
+          [
+            56,
+            4621305
+          ]
+        ],
+        "identity": [
+          119896,
+          1790965112988538600,
+          1790965113103539700,
+          4621350,
+          56
+        ],
+        "parent_members_sha256": "faa3ca6346f09705ad5aad8d3443e061944bcccfb03978ef8986296ef88da110",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "7439277c1b4bb0bb1fecc03bb1be07bdc4354e7bb907c0a7c4dcb8d1453c9e03"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:35:23.538419+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 21,
+      "ordinal": 3,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4566580
+            ],
+            [
+              56,
+              4566581
+            ],
+            [
+              56,
+              4598484
+            ]
+          ],
+          "identity": [
+            199068,
+            1790736689394710800,
+            1790736689883715600,
+            4600356,
+            56
+          ],
+          "parent_members_sha256": "65e3a436f67700540796bd6244edcec961fd64f96f413e6066292794f6d2858a",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "8edf96e14b2727e7ed72004cd88b5c0b87b90362683fa31c9fa29606026b1841"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4566580
+          ],
+          [
+            56,
+            4566581
+          ],
+          [
+            56,
+            4598484
+          ]
+        ],
+        "identity": [
+          199068,
+          1790736689394710800,
+          1790736689883715600,
+          4600356,
+          56
+        ],
+        "parent_members_sha256": "65e3a436f67700540796bd6244edcec961fd64f96f413e6066292794f6d2858a",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "8edf96e14b2727e7ed72004cd88b5c0b87b90362683fa31c9fa29606026b1841"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:35:39.136922+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 22,
+      "ordinal": 4,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4564099
+            ],
+            [
+              56,
+              4564100
+            ],
+            [
+              56,
+              4571434
+            ]
+          ],
+          "identity": [
+            230135,
+            1790422078246048300,
+            1790422078550051300,
+            4571718,
+            56
+          ],
+          "parent_members_sha256": "f10a106254ec80a43c9408adb856504831de1da6969a3686e3c9fc36bb1f0dfd",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "0a1c81e99e57f237e7082715591bcfc08445826570ad8e313ecb02f1102d80ce"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4564099
+          ],
+          [
+            56,
+            4564100
+          ],
+          [
+            56,
+            4571434
+          ]
+        ],
+        "identity": [
+          230135,
+          1790422078246048300,
+          1790422078550051300,
+          4571718,
+          56
+        ],
+        "parent_members_sha256": "f10a106254ec80a43c9408adb856504831de1da6969a3686e3c9fc36bb1f0dfd",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "0a1c81e99e57f237e7082715591bcfc08445826570ad8e313ecb02f1102d80ce"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:35:50.040607+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 23,
+      "ordinal": 5,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4563571
+            ],
+            [
+              56,
+              4563572
+            ],
+            [
+              56,
+              4586709
+            ]
+          ],
+          "identity": [
+            233132,
+            1790581331282000100,
+            1790581331390001200,
+            4587173,
+            56
+          ],
+          "parent_members_sha256": "91cea936fd688687b2b1b3c15439f6f62997bec700171b49fb4878e8914b9e42",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "e5b6c3484786d85cf14b70fe0f9087d030a92566a6723d6d003980461319feef"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4563571
+          ],
+          [
+            56,
+            4563572
+          ],
+          [
+            56,
+            4586709
+          ]
+        ],
+        "identity": [
+          233132,
+          1790581331282000100,
+          1790581331390001200,
+          4587173,
+          56
+        ],
+        "parent_members_sha256": "91cea936fd688687b2b1b3c15439f6f62997bec700171b49fb4878e8914b9e42",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "e5b6c3484786d85cf14b70fe0f9087d030a92566a6723d6d003980461319feef"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:35:54.930471+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 24,
+      "ordinal": 6,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4567863
+            ],
+            [
+              56,
+              4567864
+            ],
+            [
+              56,
+              4600453
+            ]
+          ],
+          "identity": [
+            294264,
+            1790738746941255400,
+            1790738747037256400,
+            4600709,
+            56
+          ],
+          "parent_members_sha256": "602f69645f8fd7a5e6714093f9055c879d59935bd12031790f2cf468dd9872a2",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "c1a8c0b5950651e25be70a1556559b2019d1c41e69708eda8bf017034a203165"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4567863
+          ],
+          [
+            56,
+            4567864
+          ],
+          [
+            56,
+            4600453
+          ]
+        ],
+        "identity": [
+          294264,
+          1790738746941255400,
+          1790738747037256400,
+          4600709,
+          56
+        ],
+        "parent_members_sha256": "602f69645f8fd7a5e6714093f9055c879d59935bd12031790f2cf468dd9872a2",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "c1a8c0b5950651e25be70a1556559b2019d1c41e69708eda8bf017034a203165"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:36:03.314424+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 25,
+      "ordinal": 7,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4566216
+            ],
+            [
+              56,
+              4566217
+            ],
+            [
+              56,
+              4581321
+            ]
+          ],
+          "identity": [
+            316609,
+            1790551120603522300,
+            1790551120702523400,
+            4581577,
+            56
+          ],
+          "parent_members_sha256": "3873c0260fef9d63dbe199613977c82ebd2480097502dd804aa53679e493fe34",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "40b79328af1fd173a821174d8526d42df473e8ad8a912341b86bd6e2fc985a35"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4566216
+          ],
+          [
+            56,
+            4566217
+          ],
+          [
+            56,
+            4581321
+          ]
+        ],
+        "identity": [
+          316609,
+          1790551120603522300,
+          1790551120702523400,
+          4581577,
+          56
+        ],
+        "parent_members_sha256": "3873c0260fef9d63dbe199613977c82ebd2480097502dd804aa53679e493fe34",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "40b79328af1fd173a821174d8526d42df473e8ad8a912341b86bd6e2fc985a35"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:36:13.750619+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 26,
+      "ordinal": 8,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4564108
+            ],
+            [
+              56,
+              4564109
+            ],
+            [
+              56,
+              4564110
+            ]
+          ],
+          "identity": [
+            355814,
+            1790334175928850700,
+            1790334176051851800,
+            4564120,
+            56
+          ],
+          "parent_members_sha256": "cd11b33eeec4dca96cf965bc586ba46a6acde6432df3f9859cfed8f7258f8005",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "be6498c77b82856eb521a1037a64ea7b482c89c6a0eec6edfd583c3f19deb3da"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4564108
+          ],
+          [
+            56,
+            4564109
+          ],
+          [
+            56,
+            4564110
+          ]
+        ],
+        "identity": [
+          355814,
+          1790334175928850700,
+          1790334176051851800,
+          4564120,
+          56
+        ],
+        "parent_members_sha256": "cd11b33eeec4dca96cf965bc586ba46a6acde6432df3f9859cfed8f7258f8005",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "be6498c77b82856eb521a1037a64ea7b482c89c6a0eec6edfd583c3f19deb3da"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:36:23.278551+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 27,
+      "ordinal": 9,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4566580
+            ],
+            [
+              56,
+              4566581
+            ],
+            [
+              56,
+              4573492
+            ]
+          ],
+          "identity": [
+            361547,
+            1790468464364961300,
+            1790468464490962400,
+            4573725,
+            56
+          ],
+          "parent_members_sha256": "3ab3aa7589943ee54547df3bf123975c79b31b96ab4ded053a1f93cf76ce129e",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "84dbc1d70cac723797933f9377746b0d849c69e2f3a7ea37868d692e54807d6a"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4566580
+          ],
+          [
+            56,
+            4566581
+          ],
+          [
+            56,
+            4573492
+          ]
+        ],
+        "identity": [
+          361547,
+          1790468464364961300,
+          1790468464490962400,
+          4573725,
+          56
+        ],
+        "parent_members_sha256": "3ab3aa7589943ee54547df3bf123975c79b31b96ab4ded053a1f93cf76ce129e",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "84dbc1d70cac723797933f9377746b0d849c69e2f3a7ea37868d692e54807d6a"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:36:33.386347+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 28,
+      "ordinal": 10,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4566216
+            ],
+            [
+              56,
+              4566217
+            ],
+            [
+              56,
+              4581321
+            ]
+          ],
+          "identity": [
+            375133,
+            1790550014794503700,
+            1790550014999505700,
+            4581350,
+            56
+          ],
+          "parent_members_sha256": "3873c0260fef9d63dbe199613977c82ebd2480097502dd804aa53679e493fe34",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "880719f49e07bb53cc8b6937ab05376955a6556d9fd2a08a4c9dfaa37c6d386f"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4566216
+          ],
+          [
+            56,
+            4566217
+          ],
+          [
+            56,
+            4581321
+          ]
+        ],
+        "identity": [
+          375133,
+          1790550014794503700,
+          1790550014999505700,
+          4581350,
+          56
+        ],
+        "parent_members_sha256": "3873c0260fef9d63dbe199613977c82ebd2480097502dd804aa53679e493fe34",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "880719f49e07bb53cc8b6937ab05376955a6556d9fd2a08a4c9dfaa37c6d386f"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:36:45.667521+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 29,
+      "ordinal": 11,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              1418342
+            ],
+            [
+              56,
+              4567869
+            ],
+            [
+              56,
+              4567870
+            ],
+            [
+              56,
+              4583904
+            ]
+          ],
+          "identity": [
+            400648,
+            1790564426420721400,
+            1790564426761724400,
+            4583918,
+            56
+          ],
+          "parent_members_sha256": "ebfaf4bd9b46cfe7ea7f44827466934e6c5d2ff5babf192bcc771802d1218ff5",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "f1f0102f0bdbafb1196355924cdd5a9e1ffe411cdaa817601a4c174b1804d84f"
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            1418342
+          ],
+          [
+            56,
+            4567869
+          ],
+          [
+            56,
+            4567870
+          ],
+          [
+            56,
+            4583904
+          ]
+        ],
+        "identity": [
+          400648,
+          1790564426420721400,
+          1790564426761724400,
+          4583918,
+          56
+        ],
+        "parent_members_sha256": "ebfaf4bd9b46cfe7ea7f44827466934e6c5d2ff5babf192bcc771802d1218ff5",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "f1f0102f0bdbafb1196355924cdd5a9e1ffe411cdaa817601a4c174b1804d84f"
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:36:53.030394+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 30,
+      "ordinal": 12,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              192083
+            ],
+            [
+              56,
+              192084
+            ],
+            [
+              56,
+              192085
+            ]
+          ],
+          "identity": [
+            1098721,
+            1785918256856957200,
+            1785918256995958500,
+            194719,
+            56
+          ],
+          "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "4bf1036bda962b02720bbaa47bea24cd0015e41f56f57c64e5b14ad9bcef8788",
+          "sidecar": {
+            "binding": {
+              "clip_end_at": "2026-07-30T11:00:38.635000+00:00",
+              "clip_id": 167030,
+              "clip_start_at": "2026-07-30T10:59:38.635000+00:00",
+              "recording_id": 402,
+              "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_195938.mp4",
+              "sha256": "4bf1036bda962b02720bbaa47bea24cd0015e41f56f57c64e5b14ad9bcef8788",
+              "size_bytes": 1098721
+            },
+            "identity": [
+              426,
+              1785918257265961200,
+              1785918257315961600,
+              194722,
+              56
+            ],
+            "sha256": "ed4c2a6cb28b1fbcd536899726f380c4866dc2feed88cca687d9793001ad2436"
+          }
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            192083
+          ],
+          [
+            56,
+            192084
+          ],
+          [
+            56,
+            192085
+          ]
+        ],
+        "identity": [
+          1098721,
+          1785918256856957200,
+          1785918256995958500,
+          194719,
+          56
+        ],
+        "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "4bf1036bda962b02720bbaa47bea24cd0015e41f56f57c64e5b14ad9bcef8788",
+        "sidecar": {
+          "binding": {
+            "clip_end_at": "2026-07-30T11:00:38.635000+00:00",
+            "clip_id": 167030,
+            "clip_start_at": "2026-07-30T10:59:38.635000+00:00",
+            "recording_id": 402,
+            "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_195938.mp4",
+            "sha256": "4bf1036bda962b02720bbaa47bea24cd0015e41f56f57c64e5b14ad9bcef8788",
+            "size_bytes": 1098721
+          },
+          "identity": [
+            426,
+            1785918257265961200,
+            1785918257315961600,
+            194722,
+            56
+          ],
+          "sha256": "ed4c2a6cb28b1fbcd536899726f380c4866dc2feed88cca687d9793001ad2436"
+        }
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:37:02.429641+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 31,
+      "ordinal": 13,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              192083
+            ],
+            [
+              56,
+              192084
+            ],
+            [
+              56,
+              192085
+            ]
+          ],
+          "identity": [
+            7337632,
+            1785914593551072000,
+            1785914593776074000,
+            193640,
+            56
+          ],
+          "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "4fb36fdac7ae3f5537e1776566846b8ce59be9d9989aa256e0a643464e82a5af",
+          "sidecar": {
+            "binding": {
+              "clip_end_at": "2026-07-30T10:21:41.165000+00:00",
+              "clip_id": 166493,
+              "clip_start_at": "2026-07-30T10:20:41.227000+00:00",
+              "recording_id": 402,
+              "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_192041.mp4",
+              "sha256": "4fb36fdac7ae3f5537e1776566846b8ce59be9d9989aa256e0a643464e82a5af",
+              "size_bytes": 7337632
+            },
+            "identity": [
+              426,
+              1785914594160077800,
+              1785914594260078800,
+              193649,
+              56
+            ],
+            "sha256": "93f924cd6751c18d7d769ff0c594020fe9a33b5a54ac129f862dc91d575f8f62"
+          }
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            192083
+          ],
+          [
+            56,
+            192084
+          ],
+          [
+            56,
+            192085
+          ]
+        ],
+        "identity": [
+          7337632,
+          1785914593551072000,
+          1785914593776074000,
+          193640,
+          56
+        ],
+        "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "4fb36fdac7ae3f5537e1776566846b8ce59be9d9989aa256e0a643464e82a5af",
+        "sidecar": {
+          "binding": {
+            "clip_end_at": "2026-07-30T10:21:41.165000+00:00",
+            "clip_id": 166493,
+            "clip_start_at": "2026-07-30T10:20:41.227000+00:00",
+            "recording_id": 402,
+            "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_192041.mp4",
+            "sha256": "4fb36fdac7ae3f5537e1776566846b8ce59be9d9989aa256e0a643464e82a5af",
+            "size_bytes": 7337632
+          },
+          "identity": [
+            426,
+            1785914594160077800,
+            1785914594260078800,
+            193649,
+            56
+          ],
+          "sha256": "93f924cd6751c18d7d769ff0c594020fe9a33b5a54ac129f862dc91d575f8f62"
+        }
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:37:17.296787+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 32,
+      "ordinal": 14,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              192083
+            ],
+            [
+              56,
+              192084
+            ],
+            [
+              56,
+              192085
+            ]
+          ],
+          "identity": [
+            7338819,
+            1785909668976014000,
+            1785909669127015400,
+            192111,
+            56
+          ],
+          "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "051b65da2b93827ec5247c0f20a31e0d5fb7e84ed08aeed4df2e0a197221def0",
+          "sidecar": {
+            "binding": {
+              "clip_end_at": "2026-07-30T09:27:43.953000+00:00",
+              "clip_id": 165729,
+              "clip_start_at": "2026-07-30T09:26:44+00:00",
+              "recording_id": 402,
+              "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_182644.mp4",
+              "sha256": "051b65da2b93827ec5247c0f20a31e0d5fb7e84ed08aeed4df2e0a197221def0",
+              "size_bytes": 7338819
+            },
+            "identity": [
+              422,
+              1785909669252016600,
+              1785909669302017000,
+              192112,
+              56
+            ],
+            "sha256": "e4d5cb3ceb5b196ce191524aca8a27278ef182e0292e89905770313c68ed2f9d"
+          }
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            192083
+          ],
+          [
+            56,
+            192084
+          ],
+          [
+            56,
+            192085
+          ]
+        ],
+        "identity": [
+          7338819,
+          1785909668976014000,
+          1785909669127015400,
+          192111,
+          56
+        ],
+        "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "051b65da2b93827ec5247c0f20a31e0d5fb7e84ed08aeed4df2e0a197221def0",
+        "sidecar": {
+          "binding": {
+            "clip_end_at": "2026-07-30T09:27:43.953000+00:00",
+            "clip_id": 165729,
+            "clip_start_at": "2026-07-30T09:26:44+00:00",
+            "recording_id": 402,
+            "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_182644.mp4",
+            "sha256": "051b65da2b93827ec5247c0f20a31e0d5fb7e84ed08aeed4df2e0a197221def0",
+            "size_bytes": 7338819
+          },
+          "identity": [
+            422,
+            1785909669252016600,
+            1785909669302017000,
+            192112,
+            56
+          ],
+          "sha256": "e4d5cb3ceb5b196ce191524aca8a27278ef182e0292e89905770313c68ed2f9d"
+        }
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:37:30.84012+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 33,
+      "ordinal": 15,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              192083
+            ],
+            [
+              56,
+              192084
+            ],
+            [
+              56,
+              192085
+            ]
+          ],
+          "identity": [
+            7339372,
+            1785910801968070000,
+            1785910802192072000,
+            192210,
+            56
+          ],
+          "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "a269fd8f669729d3669b6134b29dcc1084c0fb221e1841b216d13525bf8abf52",
+          "sidecar": {
+            "binding": {
+              "clip_end_at": "2026-07-30T09:31:43.671000+00:00",
+              "clip_id": 165779,
+              "clip_start_at": "2026-07-30T09:30:43.748000+00:00",
+              "recording_id": 402,
+              "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183043.mp4",
+              "sha256": "a269fd8f669729d3669b6134b29dcc1084c0fb221e1841b216d13525bf8abf52",
+              "size_bytes": 7339372
+            },
+            "identity": [
+              426,
+              1785910802590076000,
+              1785910802970079700,
+              192217,
+              56
+            ],
+            "sha256": "64b8af821bd004dacb06c65cbe27ce0612eae75c7cf8bc51eb7898583a367a61"
+          }
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            192083
+          ],
+          [
+            56,
+            192084
+          ],
+          [
+            56,
+            192085
+          ]
+        ],
+        "identity": [
+          7339372,
+          1785910801968070000,
+          1785910802192072000,
+          192210,
+          56
+        ],
+        "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "a269fd8f669729d3669b6134b29dcc1084c0fb221e1841b216d13525bf8abf52",
+        "sidecar": {
+          "binding": {
+            "clip_end_at": "2026-07-30T09:31:43.671000+00:00",
+            "clip_id": 165779,
+            "clip_start_at": "2026-07-30T09:30:43.748000+00:00",
+            "recording_id": 402,
+            "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183043.mp4",
+            "sha256": "a269fd8f669729d3669b6134b29dcc1084c0fb221e1841b216d13525bf8abf52",
+            "size_bytes": 7339372
+          },
+          "identity": [
+            426,
+            1785910802590076000,
+            1785910802970079700,
+            192217,
+            56
+          ],
+          "sha256": "64b8af821bd004dacb06c65cbe27ce0612eae75c7cf8bc51eb7898583a367a61"
+        }
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:37:48.525982+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 34,
+      "ordinal": 16,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              192083
+            ],
+            [
+              56,
+              192084
+            ],
+            [
+              56,
+              192085
+            ]
+          ],
+          "identity": [
+            7339457,
+            1785912162197342000,
+            1785912162516345000,
+            192964,
+            56
+          ],
+          "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "06ee2c3f5fadca81ffcf8e914c017d4f20201f823bbb017ef0036bb8afbb5131",
+          "sidecar": {
+            "binding": {
+              "clip_end_at": "2026-07-30T09:57:42.701000+00:00",
+              "clip_id": 166155,
+              "clip_start_at": "2026-07-30T09:56:42.779000+00:00",
+              "recording_id": 402,
+              "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_185642.mp4",
+              "sha256": "06ee2c3f5fadca81ffcf8e914c017d4f20201f823bbb017ef0036bb8afbb5131",
+              "size_bytes": 7339457
+            },
+            "identity": [
+              426,
+              1785912162625346000,
+              1785912162671346700,
+              192967,
+              56
+            ],
+            "sha256": "b275756b0de203fc8373c6c2fdb62946cdd99b07f90a6b428b8d99cdb2162100"
+          }
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            192083
+          ],
+          [
+            56,
+            192084
+          ],
+          [
+            56,
+            192085
+          ]
+        ],
+        "identity": [
+          7339457,
+          1785912162197342000,
+          1785912162516345000,
+          192964,
+          56
+        ],
+        "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "06ee2c3f5fadca81ffcf8e914c017d4f20201f823bbb017ef0036bb8afbb5131",
+        "sidecar": {
+          "binding": {
+            "clip_end_at": "2026-07-30T09:57:42.701000+00:00",
+            "clip_id": 166155,
+            "clip_start_at": "2026-07-30T09:56:42.779000+00:00",
+            "recording_id": 402,
+            "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_185642.mp4",
+            "sha256": "06ee2c3f5fadca81ffcf8e914c017d4f20201f823bbb017ef0036bb8afbb5131",
+            "size_bytes": 7339457
+          },
+          "identity": [
+            426,
+            1785912162625346000,
+            1785912162671346700,
+            192967,
+            56
+          ],
+          "sha256": "b275756b0de203fc8373c6c2fdb62946cdd99b07f90a6b428b8d99cdb2162100"
+        }
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:38:12.316549+00:00"
+    },
+    {
+      "attempt": 1,
+      "delete_ever_issued": false,
+      "item_id": 35,
+      "ordinal": 17,
+      "outcome": {
+        "attempt": 1,
+        "client_version": "0fc25cca",
+        "error": "",
+        "outcome": "match",
+        "plan_sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+        "proof": {
+          "ancestors": [
+            [
+              56,
+              192083
+            ],
+            [
+              56,
+              192084
+            ],
+            [
+              56,
+              192085
+            ]
+          ],
+          "identity": [
+            7339488,
+            1785910859950635500,
+            1785910860068636700,
+            192358,
+            56
+          ],
+          "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+          "root": [
+            56,
+            256
+          ],
+          "sha256": "2a8c228d6b4996df2574e22e5813c122129e48251e72d862cee4bd6827e1f10e",
+          "sidecar": {
+            "binding": {
+              "clip_end_at": "2026-07-30T09:36:43.389000+00:00",
+              "clip_id": 165852,
+              "clip_start_at": "2026-07-30T09:35:43.452000+00:00",
+              "recording_id": 402,
+              "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183543.mp4",
+              "sha256": "2a8c228d6b4996df2574e22e5813c122129e48251e72d862cee4bd6827e1f10e",
+              "size_bytes": 7339488
+            },
+            "identity": [
+              426,
+              1785910860188638000,
+              1785910860242638600,
+              192359,
+              56
+            ],
+            "sha256": "b17b094016cb2109c267d3e792eb312a461b51bbd227aa2342ccfa9008cec31f"
+          }
+        }
+      },
+      "policy_reason": "",
+      "proof": {
+        "ancestors": [
+          [
+            56,
+            192083
+          ],
+          [
+            56,
+            192084
+          ],
+          [
+            56,
+            192085
+          ]
+        ],
+        "identity": [
+          7339488,
+          1785910859950635500,
+          1785910860068636700,
+          192358,
+          56
+        ],
+        "parent_members_sha256": "ac24fea940cb1fef4a33082cbbb47cffc348130dda4da7ea3d063145f8e0b097",
+        "root": [
+          56,
+          256
+        ],
+        "sha256": "2a8c228d6b4996df2574e22e5813c122129e48251e72d862cee4bd6827e1f10e",
+        "sidecar": {
+          "binding": {
+            "clip_end_at": "2026-07-30T09:36:43.389000+00:00",
+            "clip_id": 165852,
+            "clip_start_at": "2026-07-30T09:35:43.452000+00:00",
+            "recording_id": 402,
+            "relative_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183543.mp4",
+            "sha256": "2a8c228d6b4996df2574e22e5813c122129e48251e72d862cee4bd6827e1f10e",
+            "size_bytes": 7339488
+          },
+          "identity": [
+            426,
+            1785910860188638000,
+            1785910860242638600,
+            192359,
+            56
+          ],
+          "sha256": "b17b094016cb2109c267d3e792eb312a461b51bbd227aa2342ccfa9008cec31f"
+        }
+      },
+      "recovery": "r2_sha_verified",
+      "state": "would_delete",
+      "updated_at": "2026-11-01T17:38:26.460291+00:00"
+    }
+  ],
+  "states": {
+    "would_delete": 17
+  }
+}

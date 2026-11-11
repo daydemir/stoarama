@@ -1,0 +1,150 @@
+{
+  "rows": [
+    {
+      "source_id": 24723,
+      "kind": "collated",
+      "size_bytes": 88690,
+      "stream_id": 12725,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 118110,
+      "kind": "collated",
+      "size_bytes": 119896,
+      "stream_id": 17237,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 34802,
+      "kind": "collated",
+      "size_bytes": 199068,
+      "stream_id": 17309,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 10448,
+      "kind": "collated",
+      "size_bytes": 230135,
+      "stream_id": 17241,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 24978,
+      "kind": "collated",
+      "size_bytes": 233132,
+      "stream_id": 12725,
+      "purged": false,
+      "rn": 2
+    },
+    {
+      "source_id": 15000,
+      "kind": "collated",
+      "size_bytes": 263207,
+      "stream_id": 17337,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 35495,
+      "kind": "collated",
+      "size_bytes": 294264,
+      "stream_id": 17323,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 18404,
+      "kind": "collated",
+      "size_bytes": 316609,
+      "stream_id": 17216,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 4445,
+      "kind": "collated",
+      "size_bytes": 355814,
+      "stream_id": 14478,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 12357,
+      "kind": "collated",
+      "size_bytes": 361547,
+      "stream_id": 17309,
+      "purged": false,
+      "rn": 2
+    },
+    {
+      "source_id": 18369,
+      "kind": "collated",
+      "size_bytes": 375133,
+      "stream_id": 17216,
+      "purged": false,
+      "rn": 2
+    },
+    {
+      "source_id": 21297,
+      "kind": "collated",
+      "size_bytes": 400648,
+      "stream_id": 17326,
+      "purged": false,
+      "rn": 1
+    },
+    {
+      "source_id": 167030,
+      "kind": "raw",
+      "size_bytes": 1098721,
+      "stream_id": 158,
+      "purged": false,
+      "display_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_195938.mp4"
+    },
+    {
+      "source_id": 166493,
+      "kind": "raw",
+      "size_bytes": 7337632,
+      "stream_id": 158,
+      "purged": false,
+      "display_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_192041.mp4"
+    },
+    {
+      "source_id": 165729,
+      "kind": "raw",
+      "size_bytes": 7338819,
+      "stream_id": 158,
+      "purged": false,
+      "display_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_182644.mp4"
+    },
+    {
+      "source_id": 165779,
+      "kind": "raw",
+      "size_bytes": 7339372,
+      "stream_id": 158,
+      "purged": false,
+      "display_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183043.mp4"
+    },
+    {
+      "source_id": 166155,
+      "kind": "raw",
+      "size_bytes": 7339457,
+      "stream_id": 158,
+      "purged": false,
+      "display_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_185642.mp4"
+    },
+    {
+      "source_id": 165852,
+      "kind": "raw",
+      "size_bytes": 7339488,
+      "stream_id": 158,
+      "purged": false,
+      "display_path": "100001_Asia_South_Korea_Seoul/July/30-Thursday/100001__2026_July_W5_Thursday_hour_183543.mp4"
+    }
+  ],
+  "no_NAS_mutation": true,
+  "deletion_enabled": false
+}

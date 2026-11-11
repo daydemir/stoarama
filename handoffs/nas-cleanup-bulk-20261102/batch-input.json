@@ -1,0 +1,517 @@
+{
+  "label": "nas-cleanup-bulk-r2-20261102-a",
+  "items": [
+    {
+      "kind": "raw",
+      "source_id": 824720
+    },
+    {
+      "kind": "collated",
+      "source_id": 117995
+    },
+    {
+      "kind": "raw",
+      "source_id": 145253
+    },
+    {
+      "kind": "raw",
+      "source_id": 1164953
+    },
+    {
+      "kind": "collated",
+      "source_id": 129659
+    },
+    {
+      "kind": "raw",
+      "source_id": 858169
+    },
+    {
+      "kind": "raw",
+      "source_id": 155873
+    },
+    {
+      "kind": "raw",
+      "source_id": 457010
+    },
+    {
+      "kind": "collated",
+      "source_id": 111391
+    },
+    {
+      "kind": "collated",
+      "source_id": 140059
+    },
+    {
+      "kind": "collated",
+      "source_id": 136969
+    },
+    {
+      "kind": "raw",
+      "source_id": 329061
+    },
+    {
+      "kind": "collated",
+      "source_id": 17459
+    },
+    {
+      "kind": "raw",
+      "source_id": 1275726
+    },
+    {
+      "kind": "collated",
+      "source_id": 110105
+    },
+    {
+      "kind": "collated",
+      "source_id": 157927
+    },
+    {
+      "kind": "collated",
+      "source_id": 18640
+    },
+    {
+      "kind": "collated",
+      "source_id": 33359
+    },
+    {
+      "kind": "raw",
+      "source_id": 740478
+    },
+    {
+      "kind": "collated",
+      "source_id": 32982
+    },
+    {
+      "kind": "raw",
+      "source_id": 1518983
+    },
+    {
+      "kind": "collated",
+      "source_id": 153631
+    },
+    {
+      "kind": "raw",
+      "source_id": 1494517
+    },
+    {
+      "kind": "collated",
+      "source_id": 32273
+    },
+    {
+      "kind": "raw",
+      "source_id": 1360666
+    },
+    {
+      "kind": "collated",
+      "source_id": 111474
+    },
+    {
+      "kind": "raw",
+      "source_id": 1384351
+    },
+    {
+      "kind": "collated",
+      "source_id": 117847
+    },
+    {
+      "kind": "collated",
+      "source_id": 16618
+    },
+    {
+      "kind": "raw",
+      "source_id": 1393721
+    },
+    {
+      "kind": "collated",
+      "source_id": 19132
+    },
+    {
+      "kind": "raw",
+      "source_id": 1342811
+    },
+    {
+      "kind": "collated",
+      "source_id": 19744
+    },
+    {
+      "kind": "raw",
+      "source_id": 1353472
+    },
+    {
+      "kind": "collated",
+      "source_id": 34910
+    },
+    {
+      "kind": "raw",
+      "source_id": 1067178
+    },
+    {
+      "kind": "collated",
+      "source_id": 19999
+    },
+    {
+      "kind": "raw",
+      "source_id": 899529
+    },
+    {
+      "kind": "collated",
+      "source_id": 20058
+    },
+    {
+      "kind": "collated",
+      "source_id": 119875
+    },
+    {
+      "kind": "raw",
+      "source_id": 1432933
+    },
+    {
+      "kind": "raw",
+      "source_id": 1306160
+    },
+    {
+      "kind": "raw",
+      "source_id": 1475011
+    },
+    {
+      "kind": "collated",
+      "source_id": 151190
+    },
+    {
+      "kind": "collated",
+      "source_id": 35718
+    },
+    {
+      "kind": "collated",
+      "source_id": 120495
+    },
+    {
+      "kind": "raw",
+      "source_id": 899376
+    },
+    {
+      "kind": "raw",
+      "source_id": 1032242
+    },
+    {
+      "kind": "raw",
+      "source_id": 1138234
+    },
+    {
+      "kind": "raw",
+      "source_id": 1173481
+    },
+    {
+      "kind": "raw",
+      "source_id": 933670
+    },
+    {
+      "kind": "collated",
+      "source_id": 30451
+    },
+    {
+      "kind": "collated",
+      "source_id": 133190
+    },
+    {
+      "kind": "raw",
+      "source_id": 1242663
+    },
+    {
+      "kind": "collated",
+      "source_id": 38858
+    },
+    {
+      "kind": "raw",
+      "source_id": 1299294
+    },
+    {
+      "kind": "collated",
+      "source_id": 111253
+    },
+    {
+      "kind": "raw",
+      "source_id": 489379
+    },
+    {
+      "kind": "collated",
+      "source_id": 129656
+    },
+    {
+      "kind": "raw",
+      "source_id": 858197
+    },
+    {
+      "kind": "raw",
+      "source_id": 457013
+    },
+    {
+      "kind": "collated",
+      "source_id": 11127
+    },
+    {
+      "kind": "collated",
+      "source_id": 10200
+    },
+    {
+      "kind": "collated",
+      "source_id": 149691
+    },
+    {
+      "kind": "raw",
+      "source_id": 177358
+    },
+    {
+      "kind": "collated",
+      "source_id": 25417
+    },
+    {
+      "kind": "raw",
+      "source_id": 228671
+    },
+    {
+      "kind": "collated",
+      "source_id": 31552
+    },
+    {
+      "kind": "collated",
+      "source_id": 129929
+    },
+    {
+      "kind": "collated",
+      "source_id": 25846
+    },
+    {
+      "kind": "collated",
+      "source_id": 18674
+    },
+    {
+      "kind": "raw",
+      "source_id": 740668
+    },
+    {
+      "kind": "collated",
+      "source_id": 104986
+    },
+    {
+      "kind": "raw",
+      "source_id": 1239918
+    },
+    {
+      "kind": "collated",
+      "source_id": 118102
+    },
+    {
+      "kind": "raw",
+      "source_id": 1447778
+    },
+    {
+      "kind": "collated",
+      "source_id": 17135
+    },
+    {
+      "kind": "raw",
+      "source_id": 1222819
+    },
+    {
+      "kind": "collated",
+      "source_id": 5493
+    },
+    {
+      "kind": "raw",
+      "source_id": 1267378
+    },
+    {
+      "kind": "collated",
+      "source_id": 54739
+    },
+    {
+      "kind": "collated",
+      "source_id": 16601
+    },
+    {
+      "kind": "raw",
+      "source_id": 1393699
+    },
+    {
+      "kind": "collated",
+      "source_id": 26072
+    },
+    {
+      "kind": "raw",
+      "source_id": 1324427
+    },
+    {
+      "kind": "collated",
+      "source_id": 113101
+    },
+    {
+      "kind": "raw",
+      "source_id": 1032051
+    },
+    {
+      "kind": "collated",
+      "source_id": 119482
+    },
+    {
+      "kind": "raw",
+      "source_id": 899448
+    },
+    {
+      "kind": "collated",
+      "source_id": 34988
+    },
+    {
+      "kind": "raw",
+      "source_id": 1173538
+    },
+    {
+      "kind": "collated",
+      "source_id": 150390
+    },
+    {
+      "kind": "collated",
+      "source_id": 113400
+    },
+    {
+      "kind": "raw",
+      "source_id": 1432972
+    },
+    {
+      "kind": "raw",
+      "source_id": 1306066
+    },
+    {
+      "kind": "raw",
+      "source_id": 1572712
+    },
+    {
+      "kind": "collated",
+      "source_id": 27869
+    },
+    {
+      "kind": "collated",
+      "source_id": 120421
+    },
+    {
+      "kind": "collated",
+      "source_id": 120498
+    },
+    {
+      "kind": "raw",
+      "source_id": 899402
+    },
+    {
+      "kind": "raw",
+      "source_id": 1032268
+    },
+    {
+      "kind": "raw",
+      "source_id": 1306075
+    },
+    {
+      "kind": "raw",
+      "source_id": 1306118
+    },
+    {
+      "kind": "raw",
+      "source_id": 899400
+    },
+    {
+      "kind": "collated",
+      "source_id": 23704
+    },
+    {
+      "kind": "collated",
+      "source_id": 109610
+    },
+    {
+      "kind": "raw",
+      "source_id": 1242424
+    },
+    {
+      "kind": "collated",
+      "source_id": 116980
+    },
+    {
+      "kind": "raw",
+      "source_id": 891324
+    },
+    {
+      "kind": "collated",
+      "source_id": 17934
+    },
+    {
+      "kind": "raw",
+      "source_id": 489331
+    },
+    {
+      "kind": "collated",
+      "source_id": 157789
+    },
+    {
+      "kind": "raw",
+      "source_id": 457019
+    },
+    {
+      "kind": "collated",
+      "source_id": 104892
+    },
+    {
+      "kind": "collated",
+      "source_id": 140075
+    },
+    {
+      "kind": "collated",
+      "source_id": 130300
+    },
+    {
+      "kind": "raw",
+      "source_id": 458328
+    },
+    {
+      "kind": "collated",
+      "source_id": 17446
+    },
+    {
+      "kind": "raw",
+      "source_id": 1306082
+    },
+    {
+      "kind": "collated",
+      "source_id": 152370
+    },
+    {
+      "kind": "collated",
+      "source_id": 25743
+    },
+    {
+      "kind": "collated",
+      "source_id": 111770
+    },
+    {
+      "kind": "collated",
+      "source_id": 118455
+    },
+    {
+      "kind": "raw",
+      "source_id": 716126
+    },
+    {
+      "kind": "collated",
+      "source_id": 104992
+    },
+    {
+      "kind": "raw",
+      "source_id": 859596
+    },
+    {
+      "kind": "collated",
+      "source_id": 5530
+    },
+    {
+      "kind": "raw",
+      "source_id": 1567048
+    }
+  ]
+}

@@ -1,0 +1,2045 @@
+{
+  "summary": {
+    "plan_id": 5,
+    "plan_sha256": "e4fff711bd50335e5c538391728c58129841296e0ac0193d64aba3fd3f09d615",
+    "checked_at": "2026-11-02T02:18:34.751599+00:00",
+    "completed": 128,
+    "total": 128,
+    "percent": 100.0,
+    "states": {
+      "keep": 7,
+      "would_delete": 121
+    },
+    "dispositions": {
+      "eligible_r2_verified": {
+        "files": 120,
+        "logical_bytes": 5102809337
+      },
+      "keep": {
+        "files": 7,
+        "logical_bytes": 196070795
+      },
+      "retained_recovery_r2_present_unverified": {
+        "files": 1,
+        "logical_bytes": 13631536
+      }
+    },
+    "hold_reasons": {
+      "current selection or sensitivity buffers changed; KEEP until reviewed": 3,
+      "current source/error protection; KEEP": 4
+    },
+    "eligible_folder_count": 106,
+    "master_deletion_enabled": false,
+    "allow_nas_only": false,
+    "actual_deleted_files": 0,
+    "full_NAS_dryrun": false
+  },
+  "folders": [
+    {
+      "folder": "99991_asia_japan_tokyo_shinjuku9/August/27-Thursday",
+      "stream_id": 3,
+      "raw_files": 1,
+      "raw_bytes": 22806576,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 22806576,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 824720,
+          "name": "99991_shinjuku9_2026_August_W4_Thursday_hour_080601.mp4",
+          "bytes": 22806576,
+          "sha256": "38a54b4f1d75d62eafccabdbbd87e377f77bbf8e7ea3c7ce468bd7b159b79f46"
+        }
+      ]
+    },
+    {
+      "folder": "99991_asia_japan_tokyo_shinjuku9/August/29-Saturday",
+      "stream_id": 3,
+      "raw_files": 1,
+      "raw_bytes": 20971568,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 20971568,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 891324,
+          "name": "99991_shinjuku9_2026_August_W5_Saturday_hour_080534.mp4",
+          "bytes": 20971568,
+          "sha256": "44e2ba6b79d9ba1e2ba950d643a7e27d9e92b0f29f6d4ea2e87d4cf1839ddc70"
+        }
+      ]
+    },
+    {
+      "folder": "99991_asia_japan_tokyo_shinjuku9/September/10-Thursday",
+      "stream_id": 3,
+      "raw_files": 1,
+      "raw_bytes": 21495856,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 21495856,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1299294,
+          "name": "99991_shinjuku9_2026_September_W2_Thursday_hour_080331.mp4",
+          "bytes": 21495856,
+          "sha256": "855b80cdd782274eeac44c7a7e7c7e471ea8494a1a34a64cbd1da7e83b6a3ad1"
+        }
+      ]
+    },
+    {
+      "folder": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October/01-Thursday",
+      "stream_id": 78,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63707879,
+      "logical_bytes": 63707879,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 111253,
+          "name": "04_Daechi_Station_Intersection_2026_October_W1_Thursday_hour_08_part_01_080010-080811.mp4",
+          "bytes": 63707879,
+          "sha256": "c3782c977c4d53c547a26e4d141e4ebd05af0bbd22b28907f9f342f5005e0366"
+        }
+      ]
+    },
+    {
+      "folder": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October/02-Friday",
+      "stream_id": 78,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66987400,
+      "logical_bytes": 66987400,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 117995,
+          "name": "04_Daechi_Station_Intersection_2026_October_W1_Friday_hour_09_part_02_093410-094310.mp4",
+          "bytes": 66987400,
+          "sha256": "8499978cdde0794e6f316906b9bf770801f5faec5527b117fe00ee9ad754a795"
+        }
+      ]
+    },
+    {
+      "folder": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/27-Sunday",
+      "stream_id": 78,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 62502366,
+      "logical_bytes": 62502366,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 17934,
+          "name": "04_Daechi_Station_Intersection_2026_September_W4_Sunday_hour_19_part_16_192426-193245.mp4",
+          "bytes": 62502366,
+          "sha256": "9b869756cda41ecf7540ddfd8112daaf6026fafc1b58d34dae78f2fe9467a0f6"
+        }
+      ]
+    },
+    {
+      "folder": "100001_Asia_South_Korea_Seoul/August/13-Thursday",
+      "stream_id": 158,
+      "raw_files": 2,
+      "raw_bytes": 59372199,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 59372199,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 489379,
+          "name": "100001__2026_August_W2_Thursday_hour_080711.mp4",
+          "bytes": 29742550,
+          "sha256": "bbad97050e16cdf9547608bc058da85171e60341bed50d65b58786a52dc14bf1"
+        },
+        {
+          "kind": "raw",
+          "source_id": 489331,
+          "name": "100001__2026_August_W2_Thursday_hour_080012.mp4",
+          "bytes": 29629649,
+          "sha256": "a48ccda3830acab5348ec7054ce53aa97fc0b3c632bcaab8191fd749c8f2d021"
+        }
+      ]
+    },
+    {
+      "folder": "100001_Asia_South_Korea_Seoul/September/06-Sunday",
+      "stream_id": 158,
+      "raw_files": 1,
+      "raw_bytes": 29798920,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 29798920,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1164953,
+          "name": "100001__2026_September_W1_Sunday_hour_080759.mp4",
+          "bytes": 29798920,
+          "sha256": "77dc430713e3048051cb079d0d39d6b3ba706579a91148924e2a20266c1c51c5"
+        }
+      ]
+    },
+    {
+      "folder": "100002_Asia_South_Korea_Seoul/August/28-Friday",
+      "stream_id": 175,
+      "raw_files": 2,
+      "raw_bytes": 2621536,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 2621536,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 858169,
+          "name": "100002__2026_August_W4_Friday_hour_080827.mp4",
+          "bytes": 1572912,
+          "sha256": "a1f5d97f36d8db5aea0072c40cefdfb19487b4dfbf1f6e90b316570942f9fc2b"
+        },
+        {
+          "kind": "raw",
+          "source_id": 858197,
+          "name": "100002__2026_August_W4_Friday_hour_080955.mp4",
+          "bytes": 1048624,
+          "sha256": "50ce7c2159a431cfe103b3ab301302e5441153f38386b17083e5cd4f412f6122"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100002_Asia_South_Korea_Seoul/October/04-Sunday",
+      "stream_id": 175,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 2,
+      "stitched_bytes": 131773391,
+      "logical_bytes": 131773391,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 129659,
+          "name": "100002__2026_October_W1_Sunday_hour_08_part_04_081511-082410.mp4",
+          "bytes": 65904144,
+          "sha256": "6a0d155f4c4c62ad42ec8b40620241cfe1abbb8e692952faf63e10c93a6dad6f"
+        },
+        {
+          "kind": "collated",
+          "source_id": 129656,
+          "name": "100002__2026_October_W1_Sunday_hour_08_part_01_080012-080911.mp4",
+          "bytes": 65869247,
+          "sha256": "6a7eef6238bc563350ebfa6d1297516743bcdbc733e880595a108a5b65bb8f08"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100002_Asia_South_Korea_Seoul/October/08-Thursday",
+      "stream_id": 175,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 65747597,
+      "logical_bytes": 65747597,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 157789,
+          "name": "100002__2026_October_W2_Thursday_hour_15_part_04_151636-152535.mp4",
+          "bytes": 65747597,
+          "sha256": "e681551b1fcd52dda9e0d63a5861e1d99e72705a0583d6afa19e7f81c3bc1d68"
+        }
+      ]
+    },
+    {
+      "folder": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/29-Wednesday",
+      "stream_id": 178,
+      "raw_files": 1,
+      "raw_bytes": 18874416,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 18874416,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 155873,
+          "name": "06_2nd_Ave_and_Pike_St_EW_2026_July_W5_Wednesday_hour_080430.mp4",
+          "bytes": 18874416,
+          "sha256": "55c441309731ad4076c7c1bbf4eaa09c0ed59d6656cac734db29659a7bfac977"
+        }
+      ]
+    },
+    {
+      "folder": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/October/01-Thursday",
+      "stream_id": 415,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64185835,
+      "logical_bytes": 64185835,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 111391,
+          "name": "08_Sebyeonggyo_Oncheoncheon_2026_October_W1_Thursday_hour_15_part_03_150833-151633.mp4",
+          "bytes": 64185835,
+          "sha256": "e1a532340a9b431f3f2776e2b4be0ad364d9c45930a361f68df8a788828b289b"
+        }
+      ]
+    },
+    {
+      "folder": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/26-Saturday",
+      "stream_id": 415,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 61767933,
+      "logical_bytes": 61767933,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 11127,
+          "name": "08_Sebyeonggyo_Oncheoncheon_2026_September_W4_Saturday_hour_19_part_01_190038-190848.mp4",
+          "bytes": 61767933,
+          "sha256": "1b834508e12da2be5d7110df4a0976a2e967a5fbde61dcc6a4bf3432f9ae9ef6"
+        }
+      ]
+    },
+    {
+      "folder": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/30-Wednesday",
+      "stream_id": 415,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 61339161,
+      "logical_bytes": 61339161,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 104892,
+          "name": "08_Sebyeonggyo_Oncheoncheon_2026_September_W5_Wednesday_hour_09_part_08_094422-095322.mp4",
+          "bytes": 61339161,
+          "sha256": "ee588f53540332aaff92e3be6f05d4013551c9ed43bd939b706bb5cb6151244e"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/05-Monday",
+      "stream_id": 12725,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 2,
+      "stitched_bytes": 127768189,
+      "logical_bytes": 127768189,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 140059,
+          "name": "100005_Chile_-_Punta_Arenas_Live_cam_2026_October_W1_Monday_hour_16_part_11_162100-164500.mp4",
+          "bytes": 66986078,
+          "sha256": "1488a6a8aeb2fce6dd51870c1f21a564574057b1060b84d801d15b21274902a4"
+        },
+        {
+          "kind": "collated",
+          "source_id": 140075,
+          "name": "100005_Chile_-_Punta_Arenas_Live_cam_2026_October_W1_Monday_hour_17_part_09_172100-174059.mp4",
+          "bytes": 60782111,
+          "sha256": "3ad7bd0136a8cc98fd882fd64a02538e52457c3412069c83595e467d12b9e66e"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/25-Friday",
+      "stream_id": 12725,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64295555,
+      "logical_bytes": 64295555,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 10200,
+          "name": "100005_Chile_-_Punta_Arenas_Live_cam_2026_September_W4_Friday_hour_17_part_02_171509-174310.mp4",
+          "bytes": 64295555,
+          "sha256": "bdf6ae43e76cfbe6a89eae02035bcf4e73f9d5045830db8eeadfb3d47f0bd0aa"
+        }
+      ]
+    },
+    {
+      "folder": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/08-Saturday",
+      "stream_id": 14303,
+      "raw_files": 1,
+      "raw_bytes": 9846555,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9846555,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 329061,
+          "name": "100006_Petra_-_Visitor_Center_Live_cam_2026_August_W2_Saturday_hour_080011.mp4",
+          "bytes": 9846555,
+          "sha256": "983ef9b2de3062a1fe6fa4ab7604de194f7967977e1a08aef9f98519374c999a"
+        }
+      ]
+    },
+    {
+      "folder": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/12-Wednesday",
+      "stream_id": 14303,
+      "raw_files": 1,
+      "raw_bytes": 9501335,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9501335,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 458328,
+          "name": "100006_Petra_-_Visitor_Center_Live_cam_2026_August_W2_Wednesday_hour_080011.mp4",
+          "bytes": 9501335,
+          "sha256": "812ed01b2b77547c99facd1f9bdf60e71e444f3e902cb390c5cd0e4d632c0d49"
+        }
+      ]
+    },
+    {
+      "folder": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/July/31-Friday",
+      "stream_id": 14303,
+      "raw_files": 1,
+      "raw_bytes": 9838213,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9838213,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 177358,
+          "name": "100006_Petra_-_Visitor_Center_Live_cam_2026_July_W5_Friday_hour_080008.mp4",
+          "bytes": 9838213,
+          "sha256": "c5133c9ea6b2f8d0ac17c29150c6c6ab60f4c95516bea8abfd917e4daf27d632"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/04-Sunday",
+      "stream_id": 14303,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 61679897,
+      "logical_bytes": 61679897,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 130300,
+          "name": "100006_Petra_-_Visitor_Center_Live_cam_2026_October_W1_Sunday_hour_15_part_01_150008-151009.mp4",
+          "bytes": 61679897,
+          "sha256": "e57325c1d31f550895ac327bd9d0e45ae4a3bc3a69c2cef17f2b7452acbd1262"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/05-Monday",
+      "stream_id": 14303,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64854599,
+      "logical_bytes": 64854599,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 136969,
+          "name": "100006_Petra_-_Visitor_Center_Live_cam_2026_October_W1_Monday_hour_14_part_06_144956-150056.mp4",
+          "bytes": 64854599,
+          "sha256": "bd642eae33ab0da8dd2af5e4daae8890a112bd16c269309319099499ce6544da"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/06-Tuesday",
+      "stream_id": 14303,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 62803706,
+      "logical_bytes": 62803706,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 149691,
+          "name": "100006_Petra_-_Visitor_Center_Live_cam_2026_October_W1_Tuesday_hour_18_part_01_180005-181406.mp4",
+          "bytes": 62803706,
+          "sha256": "a4c44eb4994b6e3878873a001086c588767f97b226e991b8f44f0131be301134"
+        }
+      ]
+    },
+    {
+      "folder": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/26-Saturday",
+      "stream_id": 14478,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 2,
+      "stitched_bytes": 129002181,
+      "logical_bytes": 129002181,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 17459,
+          "name": "36_Plaza_Mayor_2026_September_W4_Saturday_hour_19_part_03_192645-193549.mp4",
+          "bytes": 64634791,
+          "sha256": "4fc7ee91e944284c43cdc32f10bd20802bc573ee1964bb4ab1b2dbc19f5b16cb"
+        },
+        {
+          "kind": "collated",
+          "source_id": 17446,
+          "name": "36_Plaza_Mayor_2026_September_W4_Saturday_hour_17_part_01_170041-170948.mp4",
+          "bytes": 64367390,
+          "sha256": "2feb3d6916638abc99f312c0c3f578732b00504beaa30d8ab2e391f882b8de78"
+        }
+      ]
+    },
+    {
+      "folder": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/27-Sunday",
+      "stream_id": 14478,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64617151,
+      "logical_bytes": 64617151,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 25417,
+          "name": "36_Plaza_Mayor_2026_September_W4_Sunday_hour_16_part_02_160327-161227.mp4",
+          "bytes": 64617151,
+          "sha256": "dc80134333a1f95ea88f8eb87e336634d2301a9c3fc2779ad34883458397c7a9"
+        }
+      ]
+    },
+    {
+      "folder": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/August/03-Monday",
+      "stream_id": 14554,
+      "raw_files": 1,
+      "raw_bytes": 5642782,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 5642782,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 228671,
+          "name": "100007_Ballito_Beach_Live_cam_2026_August_W1_Monday_hour_080620.mp4",
+          "bytes": 5642782,
+          "sha256": "c998dc26daf54fae147591fb46cde02a8cca26bfbb013171b26ae741ef54ca6c"
+        }
+      ]
+    },
+    {
+      "folder": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/09-Wednesday",
+      "stream_id": 14554,
+      "raw_files": 1,
+      "raw_bytes": 5643689,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 5643689,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1275726,
+          "name": "100007_Ballito_Beach_Live_cam_2026_September_W2_Wednesday_hour_080007.mp4",
+          "bytes": 5643689,
+          "sha256": "ab63fe6d1072316c8c51d2d6436bbf4d41437b67e9aae8ee7dcc015546e35673"
+        }
+      ]
+    },
+    {
+      "folder": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/10-Thursday",
+      "stream_id": 14554,
+      "raw_files": 1,
+      "raw_bytes": 5642403,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 5642403,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1306082,
+          "name": "100007_Ballito_Beach_Live_cam_2026_September_W2_Thursday_hour_080437.mp4",
+          "bytes": 5642403,
+          "sha256": "f4a921256d758b545818e6d2f8ecbba79dd2e312854f641f2d9d417b3afd027b"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/06-Tuesday",
+      "stream_id": 17208,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 57392307,
+      "logical_bytes": 57392307,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 152370,
+          "name": "100042_Public_square_089_Market_square_2026_October_W1_Tuesday_hour_09_part_33_093720-094220.mp4",
+          "bytes": 57392307,
+          "sha256": "8c2a1fb72ce3ad2536ea5b5787fe124fb5d1e6caedeb85741478f870f8e5f4c3"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/28-Monday",
+      "stream_id": 17208,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 57922730,
+      "logical_bytes": 57922730,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 31552,
+          "name": "100042_Public_square_089_Market_square_2026_September_W4_Monday_hour_19_part_11_191346-191847.mp4",
+          "bytes": 57922730,
+          "sha256": "97615867699351084bd4f178d079c0f07f8636c1cfa1497f51ab8fcf28360ef8"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/30-Wednesday",
+      "stream_id": 17208,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 58307098,
+      "logical_bytes": 58307098,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 110105,
+          "name": "100042_Public_square_089_Market_square_2026_September_W5_Wednesday_hour_17_part_21_173202-173702.mp4",
+          "bytes": 58307098,
+          "sha256": "db8f3eabaa9a93228c4718ffff8957ddff34c69d502ef8818e326317c9a10635"
+        }
+      ]
+    },
+    {
+      "folder": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/04-Sunday",
+      "stream_id": 17216,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64526183,
+      "logical_bytes": 64526183,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 129929,
+          "name": "03_Plac_Polonii_Amerykanskiej_2026_October_W1_Sunday_hour_13_part_03_134709-135909.mp4",
+          "bytes": 64526183,
+          "sha256": "e6fd436553a5c86ce898129693ae97addd4c3a503aab1072c543702fe80a8c41"
+        }
+      ]
+    },
+    {
+      "folder": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/08-Thursday",
+      "stream_id": 17216,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66604859,
+      "logical_bytes": 66604859,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 157927,
+          "name": "03_Plac_Polonii_Amerykanskiej_2026_October_W2_Thursday_hour_09_part_03_091109-092510.mp4",
+          "bytes": 66604859,
+          "sha256": "f004e2b654b1e4fad110bf14ba368c8501eb5f62cc72a22edc1d1f65f4d6348d"
+        }
+      ]
+    },
+    {
+      "folder": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/28-Monday",
+      "stream_id": 17216,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64005481,
+      "logical_bytes": 64005481,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 25743,
+          "name": "03_Plac_Polonii_Amerykanskiej_2026_September_W4_Monday_hour_19_part_22_194710-195609.mp4",
+          "bytes": 64005481,
+          "sha256": "e6734e2fdfcc3ffdaf3c0e0b298e87bb853f790792236ef83c5e714c8234799d"
+        }
+      ]
+    },
+    {
+      "folder": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/01-Thursday",
+      "stream_id": 17219,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 62141029,
+      "logical_bytes": 62141029,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 111770,
+          "name": "30_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja_2026_October_W1_Thursday_hour_08_part_04_083308-083710.mp4",
+          "bytes": 62141029,
+          "sha256": "1547b3529d75eafd91d55aded8152fc0838b44c4f5442fe8db9ff598e6ef4c67"
+        }
+      ]
+    },
+    {
+      "folder": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/27-Sunday",
+      "stream_id": 17219,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64113839,
+      "logical_bytes": 64113839,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 18640,
+          "name": "30_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja_2026_September_W4_Sunday_hour_16_part_05_162047-162456.mp4",
+          "bytes": 64113839,
+          "sha256": "1ecae608a940a53742f2506f64492e9a9af855ccbf278fa53ab05010c61ce110"
+        }
+      ]
+    },
+    {
+      "folder": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/28-Monday",
+      "stream_id": 17219,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63323042,
+      "logical_bytes": 63323042,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 25846,
+          "name": "30_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja_2026_September_W4_Monday_hour_16_part_01_160032-160440.mp4",
+          "bytes": 63323042,
+          "sha256": "53ac2b1d6dd5d98916471dbea81413795de852fd2674635e9289c041e6840f36"
+        }
+      ]
+    },
+    {
+      "folder": "32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/21-Friday",
+      "stream_id": 17233,
+      "raw_files": 1,
+      "raw_bytes": 9961520,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9961520,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 716126,
+          "name": "32_Assisi_-_Town_Square_Assisi_2026_August_W3_Friday_hour_080411.mp4",
+          "bytes": 9961520,
+          "sha256": "99bcdf9abc8d9ba718d4f4c0d731efc4dc525d51a6a852456ee70460c825c09a"
+        }
+      ]
+    },
+    {
+      "folder": "32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/22-Saturday",
+      "stream_id": 17233,
+      "raw_files": 1,
+      "raw_bytes": 12845104,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 12845104,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 740668,
+          "name": "32_Assisi_-_Town_Square_Assisi_2026_August_W4_Saturday_hour_081144.mp4",
+          "bytes": 12845104,
+          "sha256": "7472aaa98dfe4e1200c706288f4aef724d2d38e4164b044ed8b5fc03b5db149a"
+        }
+      ]
+    },
+    {
+      "folder": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/October/02-Friday",
+      "stream_id": 17233,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63314019,
+      "logical_bytes": 63314019,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 118455,
+          "name": "32_Assisi_-_Town_Square_Assisi_2026_October_W1_Friday_hour_17_part_03_172959-173659.mp4",
+          "bytes": 63314019,
+          "sha256": "27398753a60b4381cda6dd5e13d034e726c3eeed07febaf3c4f74eb4a6245785"
+        }
+      ]
+    },
+    {
+      "folder": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/27-Sunday",
+      "stream_id": 17233,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63325655,
+      "logical_bytes": 63325655,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 18674,
+          "name": "32_Assisi_-_Town_Square_Assisi_2026_September_W4_Sunday_hour_09_part_02_095415-100015.mp4",
+          "bytes": 63325655,
+          "sha256": "b5cf7f730d1eb5e06e094fc7c3a034e6d4170a50f588349c7d73b0210a5d2910"
+        }
+      ]
+    },
+    {
+      "folder": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/29-Tuesday",
+      "stream_id": 17233,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 65300043,
+      "logical_bytes": 65300043,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 33359,
+          "name": "32_Assisi_-_Town_Square_Assisi_2026_September_W5_Tuesday_hour_17_part_05_175255-180055.mp4",
+          "bytes": 65300043,
+          "sha256": "80b9026107a675a3d9f450e5c47799cf8bc33871f2fb3dba0ba5a43933156eae"
+        }
+      ]
+    },
+    {
+      "folder": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/28-Friday",
+      "stream_id": 17235,
+      "raw_files": 1,
+      "raw_bytes": 41680944,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 41680944,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 859596,
+          "name": "99993_Soliman_Street_Agdao_2026_August_W4_Friday_hour_081117.mp4",
+          "bytes": 41680944,
+          "sha256": "1432a4a33cd799b4841ea6841b30f66c35bb94357f7fcc1609f463dfe36081f7"
+        }
+      ]
+    },
+    {
+      "folder": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/08-Tuesday",
+      "stream_id": 17235,
+      "raw_files": 1,
+      "raw_bytes": 43515952,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 43515952,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1239918,
+          "name": "99993_Soliman_Street_Agdao_2026_September_W2_Tuesday_hour_110754.mp4",
+          "bytes": 43515952,
+          "sha256": "4f4a452cf48dc8219f2b8dde45a25125a931486ffa3994518580fb366473708d"
+        }
+      ]
+    },
+    {
+      "folder": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/21-Monday",
+      "stream_id": 17235,
+      "raw_files": 1,
+      "raw_bytes": 62039868,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 62039868,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1518983,
+          "name": "99993_Soliman_Street_Agdao_2026_September_W3_Monday_hour_080740.mp4",
+          "bytes": 62039868,
+          "sha256": "70d506651931f77199858e9ef2268f3cf1ed14a12776b85df56c42b34f6b2e49"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/29-Tuesday",
+      "stream_id": 17235,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64160146,
+      "logical_bytes": 64160146,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 32982,
+          "name": "99993_Soliman_Street_Agdao_2026_September_W5_Tuesday_hour_18_part_02_182340-182540.mp4",
+          "bytes": 64160146,
+          "sha256": "cbe3368f87e790636137633fad6d8f06ea1d0e970d6580338b98bfb76ecedad8"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/30-Wednesday",
+      "stream_id": 17235,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 2,
+      "stitched_bytes": 105647174,
+      "logical_bytes": 105647174,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 104986,
+          "name": "99993_Soliman_Street_Agdao_2026_September_W5_Wednesday_hour_16_part_03_163704-163754.mp4",
+          "bytes": 58854232,
+          "sha256": "1dd3b7039abbd74a3659e63a538a9c1c729d5f56563eb896f2b269dcffcdd4ab"
+        },
+        {
+          "kind": "collated",
+          "source_id": 104992,
+          "name": "99993_Soliman_Street_Agdao_2026_September_W5_Wednesday_hour_19_part_01_190020-190116.mp4",
+          "bytes": 46792942,
+          "sha256": "c5f9fd6304508be7a9cc5f3bad2cb6e35d17c82395c633e8ec02d0bca44fb2eb"
+        }
+      ]
+    },
+    {
+      "folder": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/18-Friday",
+      "stream_id": 17237,
+      "raw_files": 1,
+      "raw_bytes": 14813769,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 14813769,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1447778,
+          "name": "99997_Seoul_-_Anguk_2026_September_W3_Friday_hour_080619.mp4",
+          "bytes": 14813769,
+          "sha256": "846a23367cf0b9948767df23e7ba4e1aca43fc5273c89944455ca961ec1b5261"
+        }
+      ]
+    },
+    {
+      "folder": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/20-Sunday",
+      "stream_id": 17237,
+      "raw_files": 1,
+      "raw_bytes": 14818695,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 14818695,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1494517,
+          "name": "99997_Seoul_-_Anguk_2026_September_W3_Sunday_hour_080409.mp4",
+          "bytes": 14818695,
+          "sha256": "ff633396fe57b35e37c484c3561998e5af987b5e1885363712e29ea2a11359b5"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/02-Friday",
+      "stream_id": 17237,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 58678529,
+      "logical_bytes": 58678529,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 118102,
+          "name": "99997_Seoul_-_Anguk_2026_October_W1_Friday_hour_14_part_02_142912-143313.mp4",
+          "bytes": 58678529,
+          "sha256": "9fceb461d6111df89b7e3fa6f0ff723b2b6180cff50149ea57e498de93321879"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/07-Wednesday",
+      "stream_id": 17237,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 62493850,
+      "logical_bytes": 62493850,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 153631,
+          "name": "99997_Seoul_-_Anguk_2026_October_W1_Wednesday_hour_14_part_01_140001-140419.mp4",
+          "bytes": 62493850,
+          "sha256": "de5a43f28175aa4c0d2d69601e84cb9e354e22636c87b71323d14f2b748b50ff"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/25-Friday",
+      "stream_id": 17237,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 58279847,
+      "logical_bytes": 58279847,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 5530,
+          "name": "99997_Seoul_-_Anguk_2026_September_W4_Friday_hour_16_part_02_165644-170044.mp4",
+          "bytes": 58279847,
+          "sha256": "d980c11ba949485b75a4c14194364860c2681085190a5a32af8a0bdf53e28156"
+        }
+      ]
+    },
+    {
+      "folder": "01_na_usa_los-angeles_venice-beach/September/07-Monday",
+      "stream_id": 17238,
+      "raw_files": 1,
+      "raw_bytes": 30670896,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 30670896,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1222819,
+          "name": "01_venice-beach_2026_September_W1_Monday_hour_080120.mp4",
+          "bytes": 30670896,
+          "sha256": "44a16f2378970cbb079704c9a995cc0413dbe964e0185a2b2c804d3156bfe526"
+        }
+      ]
+    },
+    {
+      "folder": "01_na_usa_los-angeles_venice-beach/September/13-Sunday",
+      "stream_id": 17238,
+      "raw_files": 1,
+      "raw_bytes": 34340912,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 34340912,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1360666,
+          "name": "01_venice-beach_2026_September_W2_Sunday_hour_135503.mp4",
+          "bytes": 34340912,
+          "sha256": "5c2200daf686032b979c359d3cb0e1922af94d7f3d598bb8149d83e46137ca11"
+        }
+      ]
+    },
+    {
+      "folder": "joined/01_na_usa_los-angeles_venice-beach/September/26-Saturday",
+      "stream_id": 17238,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 59564741,
+      "logical_bytes": 59564741,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 17135,
+          "name": "01_venice-beach_2026_September_W4_Saturday_hour_13_part_06_131926-132022.mp4",
+          "bytes": 59564741,
+          "sha256": "4c6c60556f5f040b126db4f3a556cbdea01ba56a7cae597b9ae516490f91ceb1"
+        }
+      ]
+    },
+    {
+      "folder": "joined/01_na_usa_los-angeles_venice-beach/September/28-Monday",
+      "stream_id": 17238,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 60721809,
+      "logical_bytes": 60721809,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 32273,
+          "name": "01_venice-beach_2026_September_W4_Monday_hour_12_part_01_120027-120323.mp4",
+          "bytes": 60721809,
+          "sha256": "a56fdab1213f90bf8474a032c3204210157ded3e8ab039be30fd1b1a95feb763"
+        }
+      ]
+    },
+    {
+      "folder": "99994_Asia_Japan_Tokyo_Shinjuku1/September/09-Wednesday",
+      "stream_id": 17240,
+      "raw_files": 1,
+      "raw_bytes": 22544432,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 22544432,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1267378,
+          "name": "99994_Shinjuku1_2026_September_W2_Wednesday_hour_080016.mp4",
+          "bytes": 22544432,
+          "sha256": "603dcc4f974ccc09e8d75690b63c39600c80fa5f1df316848585355cf883c49f"
+        }
+      ]
+    },
+    {
+      "folder": "99994_Asia_Japan_Tokyo_Shinjuku1/September/15-Tuesday",
+      "stream_id": 17240,
+      "raw_files": 1,
+      "raw_bytes": 23068720,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 23068720,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1384351,
+          "name": "99994_Shinjuku1_2026_September_W3_Tuesday_hour_120703.mp4",
+          "bytes": 23068720,
+          "sha256": "2ba1770ca9161f54c29ed77f1854a77d7d2b00ce8bdebf1a2e3b7f405cf5e3cc"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/October/01-Thursday",
+      "stream_id": 17240,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 47261253,
+      "logical_bytes": 47261253,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 111474,
+          "name": "99994_Shinjuku1_2026_October_W1_Thursday_hour_14_part_04_145744-150044.mp4",
+          "bytes": 47261253,
+          "sha256": "25b99f6eccd3fd5aaf6ab6e8066ae79202c7a2ad948dc7a583f29e5793b0b3f5"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/25-Friday",
+      "stream_id": 17240,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 39106359,
+      "logical_bytes": 39106359,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 5493,
+          "name": "99994_Shinjuku1_2026_September_W4_Friday_hour_08_part_02_085720-090020.mp4",
+          "bytes": 39106359,
+          "sha256": "7e02471d1bfa883c2571c070e701e5482e79da5d42e1fb75aa72893fee459dc0"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/October/01-Thursday",
+      "stream_id": 17241,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 67083961,
+      "logical_bytes": 67083961,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 117847,
+          "name": "99995_Kris_Kringl_2026_October_W1_Thursday_hour_08_part_04_080614-081314.mp4",
+          "bytes": 67083961,
+          "sha256": "53fbd198280dcb6885ba0ef0ec0020a6e3b99da00810ce31d08670eaafaff711"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/29-Tuesday",
+      "stream_id": 17241,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66322298,
+      "logical_bytes": 66322298,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 54739,
+          "name": "99995_Kris_Kringl_2026_September_W5_Tuesday_hour_08_part_10_081519-082219.mp4",
+          "bytes": 66322298,
+          "sha256": "99bc2630570d04048f4ea1e7c7ddddc20039450b9e262578d0f74eb959ce33e8"
+        }
+      ]
+    },
+    {
+      "folder": "100000_North_America_US_Key_West_Duval_Street/September/15-Tuesday",
+      "stream_id": 17243,
+      "raw_files": 2,
+      "raw_bytes": 28835936,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 28835936,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1393721,
+          "name": "100000_Duval_Street_2026_September_W3_Tuesday_hour_084159.mp4",
+          "bytes": 15728688,
+          "sha256": "b2c93d42e04a82c6b219b326b75796fee02945ae805fdcacae92308bc095887c"
+        },
+        {
+          "kind": "raw",
+          "source_id": 1393699,
+          "name": "100000_Duval_Street_2026_September_W3_Tuesday_hour_084055.mp4",
+          "bytes": 13107248,
+          "sha256": "82024f8558c5195df4f3f43538092b943febb5e1e12d090b7a40a612d71ea28f"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100000_North_America_US_Key_West_Duval_Street/September/26-Saturday",
+      "stream_id": 17243,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 2,
+      "stitched_bytes": 133274156,
+      "logical_bytes": 133274156,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 16618,
+          "name": "100000_Duval_Street_2026_September_W4_Saturday_hour_17_part_03_170324-170624.mp4",
+          "bytes": 66709168,
+          "sha256": "611061c14076b4c63dad6e29cccae62f223b030ed36cf4f07707e0cde5c5d91b"
+        },
+        {
+          "kind": "collated",
+          "source_id": 16601,
+          "name": "100000_Duval_Street_2026_September_W4_Saturday_hour_15_part_02_150123-150523.mp4",
+          "bytes": 66564988,
+          "sha256": "c7b5120fd67e1af5f3fb4bf5fe44ae87731357dda0262be6becdb2936c455c19"
+        }
+      ]
+    },
+    {
+      "folder": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/11-Friday",
+      "stream_id": 17247,
+      "raw_files": 1,
+      "raw_bytes": 30670896,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 30670896,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1324427,
+          "name": "99996_Chaweng_Beach_Hush_Bar_2026_September_W2_Friday_hour_080148.mp4",
+          "bytes": 30670896,
+          "sha256": "dcf1cf428c58ee99f38a7ca3de241611fdb7f233beb08aee1a3bdead455e3a78"
+        }
+      ]
+    },
+    {
+      "folder": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/12-Saturday",
+      "stream_id": 17247,
+      "raw_files": 1,
+      "raw_bytes": 36700208,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 36700208,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1342811,
+          "name": "99996_Chaweng_Beach_Hush_Bar_2026_September_W2_Saturday_hour_144517.mp4",
+          "bytes": 36700208,
+          "sha256": "81a5ba726d267b0439cb6217868fc5662c441b62471ccc3ecdd3dc1701282fcd"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/27-Sunday",
+      "stream_id": 17247,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 67087104,
+      "logical_bytes": 67087104,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 19132,
+          "name": "99996_Chaweng_Beach_Hush_Bar_2026_September_W4_Sunday_hour_19_part_01_190005-190402.mp4",
+          "bytes": 67087104,
+          "sha256": "ae40118eb6ab5d4414f2b00c94a81c63cfa8f34db81a3a30ae9908418ebd07f5"
+        }
+      ]
+    },
+    {
+      "folder": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/28-Monday",
+      "stream_id": 17247,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 67038629,
+      "logical_bytes": 67038629,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 26072,
+          "name": "99996_Chaweng_Beach_Hush_Bar_2026_September_W4_Monday_hour_11_part_15_112618-112915.mp4",
+          "bytes": 67038629,
+          "sha256": "48ee5bb0f5312f4288836ddcd4f0713a6a9e1e0e2b31069ac4f407d8d6de904e"
+        }
+      ]
+    },
+    {
+      "folder": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/02-Wednesday",
+      "stream_id": 17309,
+      "raw_files": 1,
+      "raw_bytes": 9437232,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9437232,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1032051,
+          "name": "100009_Bevagna_-_Piazza_Silvestri_2026_September_W1_Wednesday_hour_080655.mp4",
+          "bytes": 9437232,
+          "sha256": "06ee05c189469e046ce8e70706b8c2e6ccf988cac7957966da5077092cb643b2"
+        }
+      ]
+    },
+    {
+      "folder": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/13-Sunday",
+      "stream_id": 17309,
+      "raw_files": 1,
+      "raw_bytes": 10747952,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 10747952,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1353472,
+          "name": "100009_Bevagna_-_Piazza_Silvestri_2026_September_W2_Sunday_hour_094057.mp4",
+          "bytes": 10747952,
+          "sha256": "fd65405ffc865d8c9735a33b68e4c21f2c59a778869dba3dd0e4051ec13d8b0a"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/October/01-Thursday",
+      "stream_id": 17309,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63636480,
+      "logical_bytes": 63636480,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 113101,
+          "name": "100009_Bevagna_-_Piazza_Silvestri_2026_October_W1_Thursday_hour_18_part_14_181809-182709.mp4",
+          "bytes": 63636480,
+          "sha256": "daf5d7b40fdc5cd77a84b02a78ce84134f573edd19263902000cf4068f0270c2"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/27-Sunday",
+      "stream_id": 17309,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 65166035,
+      "logical_bytes": 65166035,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 19744,
+          "name": "100009_Bevagna_-_Piazza_Silvestri_2026_September_W4_Sunday_hour_12_part_05_125016-125917.mp4",
+          "bytes": 65166035,
+          "sha256": "105589d4360dc7ede450f42bfa32d8e70744300418c6e560ba8f5395c963daf0"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/October/02-Friday",
+      "stream_id": 17310,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66354035,
+      "logical_bytes": 66354035,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 119482,
+          "name": "100010_Varberg_-_Brunnparken_2026_October_W1_Friday_hour_08_part_05_082312-082812.mp4",
+          "bytes": 66354035,
+          "sha256": "c1a474ca6a942f36893c9d67001aec55a166af0db1f013615078cd8cab3bd3b6"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/29-Tuesday",
+      "stream_id": 17310,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66666750,
+      "logical_bytes": 66666750,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 34910,
+          "name": "100010_Varberg_-_Brunnparken_2026_September_W5_Tuesday_hour_18_part_10_184334-184834.mp4",
+          "bytes": 66666750,
+          "sha256": "a53cb6edda963ec2e8f160e7f416025f23d1589532a58f02223c93d489542b67"
+        }
+      ]
+    },
+    {
+      "folder": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/August/29-Saturday",
+      "stream_id": 17311,
+      "raw_files": 1,
+      "raw_bytes": 6815792,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 6815792,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 899448,
+          "name": "100011_Luhacovice_-_Namesti_28.rijna_2026_August_W5_Saturday_hour_080812.mp4",
+          "bytes": 6815792,
+          "sha256": "d39799fdccc313fbe8c4cfa5c0c105d0c3f3c2be6021bc88366d49eb8d34b76a"
+        }
+      ]
+    },
+    {
+      "folder": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/03-Thursday",
+      "stream_id": 17311,
+      "raw_files": 1,
+      "raw_bytes": 7077936,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 7077936,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1067178,
+          "name": "100011_Luhacovice_-_Namesti_28.rijna_2026_September_W1_Thursday_hour_080203.mp4",
+          "bytes": 7077936,
+          "sha256": "ad832702f77027df4f5f578724db5f9b6a087a4c4944f7ad444f7b0f4b8471e4"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/27-Sunday",
+      "stream_id": 17312,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 64909658,
+      "logical_bytes": 64909658,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 19999,
+          "name": "100012_Prijedor_-_Mali_trg_Nicole_Pastica_2026_September_W4_Sunday_hour_16_part_02_163050-163750.mp4",
+          "bytes": 64909658,
+          "sha256": "23db0a2ab2fc1be43745264c46f893d47dbfd34f93eb9bde0d9b7bff00e606d4"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/29-Tuesday",
+      "stream_id": 17312,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63047653,
+      "logical_bytes": 63047653,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 34988,
+          "name": "100012_Prijedor_-_Mali_trg_Nicole_Pastica_2026_September_W5_Tuesday_hour_08_part_03_082111-082815.mp4",
+          "bytes": 63047653,
+          "sha256": "437b763be58bd87e53b10afef6c5c87fab1d8cde6adc0a13b72aba753489d90f"
+        }
+      ]
+    },
+    {
+      "folder": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/August/29-Saturday",
+      "stream_id": 17313,
+      "raw_files": 1,
+      "raw_bytes": 9437232,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9437232,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 899529,
+          "name": "100013_Sittard_-_Markt_2026_August_W5_Saturday_hour_081058.mp4",
+          "bytes": 9437232,
+          "sha256": "a3ad79d83493f1405a89a118a1f8787f17d953b9e79b6f3846cf75e8c0384327"
+        }
+      ]
+    },
+    {
+      "folder": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/06-Sunday",
+      "stream_id": 17313,
+      "raw_files": 1,
+      "raw_bytes": 9437232,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 9437232,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1173538,
+          "name": "100013_Sittard_-_Markt_2026_September_W1_Sunday_hour_081450.mp4",
+          "bytes": 9437232,
+          "sha256": "a942b97d4beb3de7aa6539a653cb2f433f864a7d2572e68115104dd6cbf06651"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/06-Tuesday",
+      "stream_id": 17315,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 63640260,
+      "logical_bytes": 63640260,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 150390,
+          "name": "100015_Celanova_-_Praza_Major_2026_October_W1_Tuesday_hour_08_part_03_080408-080608.mp4",
+          "bytes": 63640260,
+          "sha256": "7bb124e42e70509fb2779a36ed17c597c181c7998131d0b9153fef23642d326d"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/27-Sunday",
+      "stream_id": 17315,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 65514936,
+      "logical_bytes": 65514936,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 20058,
+          "name": "100015_Celanova_-_Praza_Major_2026_September_W4_Sunday_hour_08_part_04_081042-081243.mp4",
+          "bytes": 65514936,
+          "sha256": "899532f6a9d250f3c55fb6a31c97d17c68d620d791d92848a60bcbdf4f23c669"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/01-Thursday",
+      "stream_id": 17316,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66380558,
+      "logical_bytes": 66380558,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 113400,
+          "name": "100016_Villamartin_-_Plaza_del_Ayuntamiento_2026_October_W1_Thursday_hour_15_part_01_150004-151503.mp4",
+          "bytes": 66380558,
+          "sha256": "1a696a6ea082ee2792efb931a4d912f7596f3a252eaf5add55faeb0b9b031332"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/02-Friday",
+      "stream_id": 17316,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66640276,
+      "logical_bytes": 66640276,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 119875,
+          "name": "100016_Villamartin_-_Plaza_del_Ayuntamiento_2026_October_W1_Friday_hour_11_part_01_110005-111654.mp4",
+          "bytes": 66640276,
+          "sha256": "78f542981c8631d68818572549163af578a8d69de66aac825d7ff53e5475630d"
+        }
+      ]
+    },
+    {
+      "folder": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/17-Thursday",
+      "stream_id": 17317,
+      "raw_files": 2,
+      "raw_bytes": 38287373,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 38287373,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1432933,
+          "name": "100017_Valask_Mezi_Valasske_-_Market_square_2026_September_W3_Thursday_hour_080017.mp4",
+          "bytes": 19463428,
+          "sha256": "24ab2100d523462d2e22d152f50c38f5159e1f85cb033507531a291819717a7e"
+        },
+        {
+          "kind": "raw",
+          "source_id": 1432972,
+          "name": "100017_Valask_Mezi_Valasske_-_Market_square_2026_September_W3_Thursday_hour_080217.mp4",
+          "bytes": 18823945,
+          "sha256": "81a371ea0484b08c4dede0812adb78749415e148303a48266c1a0ea1057d3c8c"
+        }
+      ]
+    },
+    {
+      "folder": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/10-Thursday",
+      "stream_id": 17318,
+      "raw_files": 2,
+      "raw_bytes": 57850498,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 57850498,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1306160,
+          "name": "100018_Vrchlabi_-_Nmst_T.G._Masaryka_2026_September_W2_Thursday_hour_080740.mp4",
+          "bytes": 28955631,
+          "sha256": "54e6d1bb9320a1735ec22d7ee579776875176a9416b8c2a712660fb6a8e7a21d"
+        },
+        {
+          "kind": "raw",
+          "source_id": 1306066,
+          "name": "100018_Vrchlabi_-_Nmst_T.G._Masaryka_2026_September_W2_Thursday_hour_080340.mp4",
+          "bytes": 28894867,
+          "sha256": "5cbbddb0de0a78a3171e7f84f13cf8b3f5dbd2bb3fb0a659ddd8bd4565bde8b1"
+        }
+      ]
+    },
+    {
+      "folder": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/19-Saturday",
+      "stream_id": 17319,
+      "raw_files": 1,
+      "raw_bytes": 2164528,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 2164528,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1475011,
+          "name": "100019_Szentendre_-_Market_square_2026_September_W3_Saturday_hour_080006.mp4",
+          "bytes": 2164528,
+          "sha256": "c42646a831b5d09eae41cd943f1d01a620d09d3a1d89d54b3557e36680324b07"
+        }
+      ]
+    },
+    {
+      "folder": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/23-Wednesday",
+      "stream_id": 17319,
+      "raw_files": 1,
+      "raw_bytes": 2140745,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 2140745,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1572712,
+          "name": "100019_Szentendre_-_Market_square_2026_September_W4_Wednesday_hour_080707.mp4",
+          "bytes": 2140745,
+          "sha256": "0ffc3d80a552329753ed1931f124f13718fd5419fccf54afed1725a85f2d14ba"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/06-Tuesday",
+      "stream_id": 17323,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66952206,
+      "logical_bytes": 66952206,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 151190,
+          "name": "100023_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja_2026_October_W1_Tuesday_hour_19_part_06_195241-195531.mp4",
+          "bytes": 66952206,
+          "sha256": "f619132d14d547c5f7dde0bc054c1c9ba329dc2f9615f4b36577fb5d957b1d47"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/28-Monday",
+      "stream_id": 17323,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66951825,
+      "logical_bytes": 66951825,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 27869,
+          "name": "100023_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja_2026_September_W4_Monday_hour_18_part_02_180656-180946.mp4",
+          "bytes": 66951825,
+          "sha256": "095207da2b0022b3b35fa4d99b712d0cd5133eeb918d5b0367b7deb0f51acf12"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/02-Friday",
+      "stream_id": 17326,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66170764,
+      "logical_bytes": 66170764,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 120421,
+          "name": "100026_Jaworzno_-_Market_square_2026_October_W1_Friday_hour_14_part_05_142610-144010.mp4",
+          "bytes": 66170764,
+          "sha256": "4a2bc97b3b153e5a417bc14d135048629dbeaae3ef5d3bd2544b1186422411c0"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/29-Tuesday",
+      "stream_id": 17326,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66762699,
+      "logical_bytes": 66762699,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 35718,
+          "name": "100026_Jaworzno_-_Market_square_2026_September_W5_Tuesday_hour_15_part_01_150016-150913.mp4",
+          "bytes": 66762699,
+          "sha256": "73df6e97acfe429575c8930385970d90391b769a185f018318db8f51d8eba705"
+        }
+      ]
+    },
+    {
+      "folder": "100027_Europe_Poland_Lublin_Lublin_-_Place/August/29-Saturday",
+      "stream_id": 17327,
+      "raw_files": 2,
+      "raw_bytes": 42103932,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 42103932,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 899376,
+          "name": "100027_Lublin_-_Place_2026_August_W5_Saturday_hour_080511.mp4",
+          "bytes": 21207940,
+          "sha256": "36503111381efeb1c706086907462d05346a0fb68b330ed17af08502d4100f24"
+        },
+        {
+          "kind": "raw",
+          "source_id": 899402,
+          "name": "100027_Lublin_-_Place_2026_August_W5_Saturday_hour_080611.mp4",
+          "bytes": 20895992,
+          "sha256": "c87fc63236708b59f43d44f81adf9d9907f886ad5f2bbde8c54cdb30110ea961"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/02-Friday",
+      "stream_id": 17327,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 2,
+      "stitched_bytes": 125723509,
+      "logical_bytes": 125723509,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 120495,
+          "name": "100027_Lublin_-_Place_2026_October_W1_Friday_hour_08_part_01_080010-080310.mp4",
+          "bytes": 63277883,
+          "sha256": "d153ce2977f4720da80254f72c7e791e1ebde6694fe660fc2cf9d3e313cca777"
+        },
+        {
+          "kind": "collated",
+          "source_id": 120498,
+          "name": "100027_Lublin_-_Place_2026_October_W1_Friday_hour_08_part_04_083410-083710.mp4",
+          "bytes": 62445626,
+          "sha256": "cdeb0c379f57fddfb0ea82a8162ff93abd6554b03e536c91005f40d111dd93c8"
+        }
+      ]
+    },
+    {
+      "folder": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/02-Wednesday",
+      "stream_id": 17330,
+      "raw_files": 2,
+      "raw_bytes": 54446654,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 54446654,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1032242,
+          "name": "100030_Lubliniec_-_Market_place_2026_September_W1_Wednesday_hour_081344.mp4",
+          "bytes": 27239610,
+          "sha256": "c7d1328a91ea5bdff245d10c2d8a36b2b02ea141961080b9b5a5073824b8798e"
+        },
+        {
+          "kind": "raw",
+          "source_id": 1032268,
+          "name": "100030_Lubliniec_-_Market_place_2026_September_W1_Wednesday_hour_081444.mp4",
+          "bytes": 27207044,
+          "sha256": "9804c0a17ff314cff16034f78e28ba0e08654274c02ed453e34c63a3c112d08a"
+        }
+      ]
+    },
+    {
+      "folder": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/05-Saturday",
+      "stream_id": 17333,
+      "raw_files": 1,
+      "raw_bytes": 6291504,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 6291504,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1138234,
+          "name": "100033_Zlin_-_Namesti_Miru_2026_September_W1_Saturday_hour_080643.mp4",
+          "bytes": 6291504,
+          "sha256": "c9074a48b5d0d9ba3d28ddbf9313f6c5868f342329928d3304c04477f66f3ac5"
+        }
+      ]
+    },
+    {
+      "folder": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/10-Thursday",
+      "stream_id": 17333,
+      "raw_files": 1,
+      "raw_bytes": 6291504,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 6291504,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1306075,
+          "name": "100033_Zlin_-_Namesti_Miru_2026_September_W2_Thursday_hour_080433.mp4",
+          "bytes": 6291504,
+          "sha256": "f303985b83e2c1b9f31c45b8094207dbf64f61ea1fabeb799c0bdf2f6d259277"
+        }
+      ]
+    },
+    {
+      "folder": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/06-Sunday",
+      "stream_id": 17334,
+      "raw_files": 1,
+      "raw_bytes": 10223664,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 10223664,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1173481,
+          "name": "100034_Kromeriz_-_Hanacke_namesti_2026_September_W1_Sunday_hour_081256.mp4",
+          "bytes": 10223664,
+          "sha256": "dc06abb99befb5673813e92acf8937d662512efd9d7316ff3c8fd36c0e5b0895"
+        }
+      ]
+    },
+    {
+      "folder": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/10-Thursday",
+      "stream_id": 17334,
+      "raw_files": 1,
+      "raw_bytes": 10223664,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 10223664,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1306118,
+          "name": "100034_Kromeriz_-_Hanacke_namesti_2026_September_W2_Thursday_hour_080603.mp4",
+          "bytes": 10223664,
+          "sha256": "58376e013d02b22e8feace858c33e4d12ea1f6f5aa874355e3992c973639bbdc"
+        }
+      ]
+    },
+    {
+      "folder": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/29-Saturday",
+      "stream_id": 17335,
+      "raw_files": 1,
+      "raw_bytes": 5767216,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 5767216,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 899400,
+          "name": "100035_Trencin_-_Sturovo_namestie_2026_August_W5_Saturday_hour_080621.mp4",
+          "bytes": 5767216,
+          "sha256": "61298faf0ef18a9c9ee1279852e56345b196fd25f3f821a119ee148e428208dd"
+        }
+      ]
+    },
+    {
+      "folder": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/30-Sunday",
+      "stream_id": 17335,
+      "raw_files": 1,
+      "raw_bytes": 6029360,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 6029360,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 933670,
+          "name": "100035_Trencin_-_Sturovo_namestie_2026_August_W5_Sunday_hour_080146.mp4",
+          "bytes": 6029360,
+          "sha256": "21ef2ab7b4113415702fff5478ab2c75cd57649634788e09e7bddb85171040c8"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/04-Sunday",
+      "stream_id": 17340,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66935832,
+      "logical_bytes": 66935832,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 133190,
+          "name": "100040_Nowy_Targ_-_Nowy_Targ_2026_October_W1_Sunday_hour_19_part_31_195751-195958.mp4",
+          "bytes": 66935832,
+          "sha256": "839cdbc3d42a2a582b99632b2fd262d5c2e4cfd53c76b39b5fcb389e8a755a44"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/30-Wednesday",
+      "stream_id": 17340,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66785939,
+      "logical_bytes": 66785939,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 109610,
+          "name": "100040_Nowy_Targ_-_Nowy_Targ_2026_September_W5_Wednesday_hour_19_part_26_194659-194907.mp4",
+          "bytes": 66785939,
+          "sha256": "e628abc15cc5641dafb802dcbee08e64121d2066e02d3219af412ad4e3f1328f"
+        }
+      ]
+    },
+    {
+      "folder": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/08-Tuesday",
+      "stream_id": 17341,
+      "raw_files": 2,
+      "raw_bytes": 7602272,
+      "stitched_files": 0,
+      "stitched_bytes": 0,
+      "logical_bytes": 7602272,
+      "files": [
+        {
+          "kind": "raw",
+          "source_id": 1242663,
+          "name": "100041_Biberach_-_Marktplatz_Biberach_2026_September_W2_Tuesday_hour_084956.mp4",
+          "bytes": 3932208,
+          "sha256": "96d5f40ecba90c7ab43d3a5c16bfd0042d06a626ebc05e214599801ccb8dd044"
+        },
+        {
+          "kind": "raw",
+          "source_id": 1242424,
+          "name": "100041_Biberach_-_Marktplatz_Biberach_2026_September_W2_Tuesday_hour_084011.mp4",
+          "bytes": 3670064,
+          "sha256": "f6f8fcf9cbc3e892a81c693253b0fb08fd7498b9baf84379b4866e8953a111c2"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/October/01-Thursday",
+      "stream_id": 17342,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 66538528,
+      "logical_bytes": 66538528,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 116980,
+          "name": "100043_Wolsztyn_-_Fountain_2026_October_W1_Thursday_hour_13_part_09_135051-135355.mp4",
+          "bytes": 66538528,
+          "sha256": "7b0dde43739e8e4777193c3b8f03892ea17810b11865fdd0f9e94ca4d2e68152"
+        }
+      ]
+    },
+    {
+      "folder": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/29-Tuesday",
+      "stream_id": 17342,
+      "raw_files": 0,
+      "raw_bytes": 0,
+      "stitched_files": 1,
+      "stitched_bytes": 67062223,
+      "logical_bytes": 67062223,
+      "files": [
+        {
+          "kind": "collated",
+          "source_id": 38858,
+          "name": "100043_Wolsztyn_-_Fountain_2026_September_W5_Tuesday_hour_09_part_13_094552-094941.mp4",
+          "bytes": 67062223,
+          "sha256": "ae69da34dda6a9b77ceb886030cd9dbd6757b20775acfcbe4dafcd71b88bcffe"
+        }
+      ]
+    }
+  ]
+}

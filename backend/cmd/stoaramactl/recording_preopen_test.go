@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,6 +33,24 @@ func TestPreopenStageBoundariesAndNoPostOpenProbe(t *testing.T) {
 				t.Fatalf("stage=%q want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRecordingPreopenRunSubcommandDoesNotSwallowFlags(t *testing.T) {
+	args := []string{"run", "--dry-run", "--concurrency", "6", "--probe-sec", "30"}
+	if args[0] != "run" {
+		t.Fatal("fixture must include the operator subcommand")
+	}
+	args = args[1:]
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	dryRun := fs.Bool("dry-run", false, "")
+	concurrency := fs.Int("concurrency", 4, "")
+	probeSec := fs.Int("probe-sec", 20, "")
+	if err := fs.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+	if !*dryRun || *concurrency != 6 || *probeSec != 30 {
+		t.Fatalf("flags swallowed: dry-run=%t concurrency=%d probe-sec=%d", *dryRun, *concurrency, *probeSec)
 	}
 }
 

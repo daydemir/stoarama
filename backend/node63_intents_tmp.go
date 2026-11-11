@@ -1,0 +1,3 @@
+package main
+import("context";"fmt";"os";"github.com/jackc/pgx/v5/pgxpool")
+func main(){c:=context.Background();p,e:=pgxpool.New(c,os.Getenv("DATABASE_URL"));if e!=nil{panic(e)};defer p.Close();var all,live int;var recs []int64;e=p.QueryRow(c,`select count(*),count(*) filter(where u.expires_at>now()),coalesce(array_agg(distinct u.recording_id order by u.recording_id),'{}') from recording_upload_intents u join recording_jobs j on j.id=u.recording_job_id where j.lease_owner='node:63' and u.status='pending'`).Scan(&all,&live,&recs);if e!=nil{panic(e)};fmt.Printf("NODE63 pending_intents=%d unexpired=%d recordings=%v\n",all,live,recs)}

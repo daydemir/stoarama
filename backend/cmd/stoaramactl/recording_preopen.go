@@ -61,6 +61,15 @@ func preopenStage(windowStart, now time.Time) string {
 
 func runRecordingPreopen(ctx context.Context, cfg config.Config, args []string) {
 	fs := flag.NewFlagSet("recording-preopen run", flag.ExitOnError)
+	// The operator surface (and Render cron) includes the explicit `run`
+	// subcommand. Strip it before parsing flags; otherwise Go's flag package
+	// stops at the first positional argument and silently ignores all options.
+	if len(args) > 0 {
+		if args[0] != "run" {
+			log.Fatalf("unknown recording-preopen subcommand: %s", args[0])
+		}
+		args = args[1:]
+	}
 	concurrency := fs.Int("concurrency", 4, "maximum concurrent probes")
 	probeSec := fs.Int("probe-sec", 20, "source-native media probe duration")
 	dryRun := fs.Bool("dry-run", false, "select only")

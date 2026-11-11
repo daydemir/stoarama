@@ -1,0 +1,73 @@
+{
+  "label": "nas-cleanup-ready-r2-20261101",
+  "items": [
+    {
+      "kind": "collated",
+      "source_id": 24723
+    },
+    {
+      "kind": "collated",
+      "source_id": 118110
+    },
+    {
+      "kind": "collated",
+      "source_id": 34802
+    },
+    {
+      "kind": "collated",
+      "source_id": 10448
+    },
+    {
+      "kind": "collated",
+      "source_id": 24978
+    },
+    {
+      "kind": "collated",
+      "source_id": 35495
+    },
+    {
+      "kind": "collated",
+      "source_id": 18404
+    },
+    {
+      "kind": "collated",
+      "source_id": 4445
+    },
+    {
+      "kind": "collated",
+      "source_id": 12357
+    },
+    {
+      "kind": "collated",
+      "source_id": 18369
+    },
+    {
+      "kind": "collated",
+      "source_id": 21297
+    },
+    {
+      "kind": "raw",
+      "source_id": 167030
+    },
+    {
+      "kind": "raw",
+      "source_id": 166493
+    },
+    {
+      "kind": "raw",
+      "source_id": 165729
+    },
+    {
+      "kind": "raw",
+      "source_id": 165779
+    },
+    {
+      "kind": "raw",
+      "source_id": 166155
+    },
+    {
+      "kind": "raw",
+      "source_id": 165852
+    }
+  ]
+}

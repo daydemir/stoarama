@@ -1,0 +1,82 @@
+{
+  "status": "APP_DEPLOYED_PILOT_COMPLETE_DELETION_OFF",
+  "verified_at": "2026-11-01T17:39:17.852512+00:00",
+  "backend_commit": "eeba924c88453e59d209969c3d64f563572fd41e",
+  "nas_app_version": "0fc25cca",
+  "outbound_polling_proven": true,
+  "ssh_required": false,
+  "pilot": {
+    "id": 3,
+    "sha256": "ddaaf5d273d6adbb9e457eaa4245c8ab078030723896c647e73619e9b7520084",
+    "items": 18,
+    "mode": "dry_run",
+    "deletion_enabled": false,
+    "states": {
+      "would_delete": 17,
+      "keep": 1
+    },
+    "r2_sha_verified": 17,
+    "would_delete_bytes": 40768425,
+    "keep_bytes": 263207,
+    "all_terminal": true,
+    "delete_ever_issued": false,
+    "report": "/Users/jelly/Build/stoarama/handoffs/nas-cleanup-20261101/pilot-report-final.json",
+    "hold_reason": "current selection or sensitivity buffers changed; KEEP until reviewed",
+    "held_stream_id": 17337
+  },
+  "ready_r2_only_batch": {
+    "id": 4,
+    "sha256": "95f2538995a1820222729ae06ecd313fd5ae7c466ba34d65f258483cfc31f326",
+    "items": 17,
+    "bytes": 40768425,
+    "mode": "dry_run",
+    "deletion_enabled": false,
+    "allow_nas_only": false,
+    "input": "/Users/jelly/Build/stoarama/handoffs/nas-cleanup-20261101/ready-r2-input.json",
+    "states": {
+      "would_delete": 17
+    },
+    "all_terminal": true,
+    "r2_sha_verified": 17,
+    "delete_ever_issued": false,
+    "report": "/Users/jelly/Build/stoarama/handoffs/nas-cleanup-20261101/ready-r2-report-final.json"
+  },
+  "master_deletion_enabled": false,
+  "no_NAS_media_changed": true,
+  "nas_only_policy": "retain pending final user decision",
+  "kept_window_protections": {
+    "report_sha256": "64eee0bc589c9be4dcab5b5ea7668270291a07ce4fd0db98dcd0a484e19d84c1",
+    "guard_sha256": "428620008349a12c468bd3663cf678a1047344c019ef9d53caa8adf6c6ad75a7",
+    "all_old_utc_windows": 185,
+    "dedup_windows": 221,
+    "whole_stream_keep": 31
+  },
+  "checks": {
+    "required_CI": "All PR423 and PR424 checks passed, including backend suite, NAS client suite, CodeRabbit, secret scans.",
+    "cleanup_client_adversarial": "15 disposable-file cleanup tests passed",
+    "cleanup_go": "12 NASCleanup cases passed with isolatedPostgres17, including actual2connection heartbeat, reference-fence and purge races.",
+    "independent_sol": "CLEAR; production retry confirmed admission fix and completed18filepilot.",
+    "merged_default_branch": "Both reviewed trees match merged main; focused checks passed on merged main."
+  },
+  "public_delivery": {
+    "public_registry_matches_protected": true,
+    "generation": "c4049f6dc0f940be8b7eb8b9bef6f42f",
+    "files_protected": 32413,
+    "ticket_http": 200,
+    "download_range_http": 206,
+    "response_bytes": 2,
+    "no_media_file_saved": true,
+    "checked_at": "2026-11-01T17:35:41.052245+00:00"
+  },
+  "scope_limit": "Physical dryrun completed only for18pilotfiles and17filepassingbatch;430folderroots/6.43TBlogical remainpolicycandidates, not a completed wholeNAS deletion dryrun. Unknown and legacyjoined content retained. Fullkept28day transfer remains separate.",
+  "next_enablement_requirements": [
+    "User selects exact batch and NAS-only policy.",
+    "Re-run dryrun if proof is older than24hours; recheck live guards.",
+    "Set backend master gate and enable exact plan digest with audited reason; plan approval lasts1hour."
+  ],
+  "source_changes": [
+    "https://github.com/daydemir/stoarama/pull/423",
+    "https://github.com/daydemir/stoarama/pull/424"
+  ],
+  "worktree_cleanup": "Owner muavin worktrees done successfully removed owned task worktree; source checkout preserved."
+}

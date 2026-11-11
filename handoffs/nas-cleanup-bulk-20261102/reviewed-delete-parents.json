@@ -1,0 +1,3742 @@
+[
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square",
+    "sid": 17337
+  },
+  {
+    "path": "327",
+    "sid": 17186
+  },
+  {
+    "path": "335",
+    "sid": 17216
+  },
+  {
+    "path": "337",
+    "sid": 78
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September",
+    "sid": 17238
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July",
+    "sid": 94
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July",
+    "sid": 178
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September",
+    "sid": 17243
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/July",
+    "sid": 158
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September",
+    "sid": 175
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September",
+    "sid": 195
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/July",
+    "sid": 12725
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/July",
+    "sid": 14303
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/July",
+    "sid": 14554
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/July",
+    "sid": 14782
+  },
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square/August",
+    "sid": 17337
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July",
+    "sid": 17242
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/July",
+    "sid": 3
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September",
+    "sid": 17240
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September",
+    "sid": 17247
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September",
+    "sid": 17237
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach",
+    "sid": 17238
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej",
+    "sid": 17216
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection",
+    "sid": 78
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon",
+    "sid": 415
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul",
+    "sid": 175
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain",
+    "sid": 17342
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja",
+    "sid": 17219
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi",
+    "sid": 17233
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor",
+    "sid": 14478
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk",
+    "sid": 17237
+  },
+  {
+    "path": "recordings/350",
+    "sid": 17243
+  },
+  {
+    "path": "recordings/352",
+    "sid": 94
+  },
+  {
+    "path": "recordings/353",
+    "sid": 178
+  },
+  {
+    "path": "recordings/378",
+    "sid": 17242
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/August/26-Wednesday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/August/27-Thursday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/August/28-Friday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/August/29-Saturday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/August/30-Sunday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/August/31-Monday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/July/Friday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/July/Thursday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/01-Tuesday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/02-Wednesday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/03-Thursday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/04-Friday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/05-Saturday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/06-Sunday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/07-Monday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/08-Tuesday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/09-Wednesday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/10-Thursday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/13-Sunday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/14-Monday",
+    "sid": 17238
+  },
+  {
+    "path": "01_na_usa_los-angeles_venice-beach/September/15-Tuesday",
+    "sid": 17238
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/23-Thursday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/24-Friday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/25-Saturday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/26-Sunday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/27-Monday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/28-Tuesday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/29-Wednesday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/Tuesday",
+    "sid": 94
+  },
+  {
+    "path": "05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/Wednesday",
+    "sid": 94
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/23-Thursday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/24-Friday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/25-Saturday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/26-Sunday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/27-Monday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/28-Tuesday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/29-Wednesday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/Tuesday",
+    "sid": 178
+  },
+  {
+    "path": "06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/Wednesday",
+    "sid": 178
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/August/26-Wednesday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/August/27-Thursday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/August/28-Friday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/August/29-Saturday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/August/30-Sunday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/August/31-Monday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/01-Tuesday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/02-Wednesday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/03-Thursday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/04-Friday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/05-Saturday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/06-Sunday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/07-Monday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/08-Tuesday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/09-Wednesday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/10-Thursday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/13-Sunday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/14-Monday",
+    "sid": 17243
+  },
+  {
+    "path": "100000_North_America_US_Key_West_Duval_Street/September/15-Tuesday",
+    "sid": 17243
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/01-Saturday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/02-Sunday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/03-Monday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/04-Tuesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/05-Wednesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/06-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/07-Friday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/08-Saturday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/09-Sunday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/10-Monday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/11-Tuesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/12-Wednesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/13-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/14-Friday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/26-Wednesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/27-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/28-Friday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/29-Saturday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/30-Sunday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/August/31-Monday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/July/30-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/July/31-Friday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/01-Tuesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/02-Wednesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/03-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/04-Friday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/05-Saturday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/06-Sunday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/07-Monday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/08-Tuesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/09-Wednesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/10-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/11-Friday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/12-Saturday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/13-Sunday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/14-Monday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/15-Tuesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/16-Wednesday",
+    "sid": 158
+  },
+  {
+    "path": "100001_Asia_South_Korea_Seoul/September/17-Thursday",
+    "sid": 158
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/August/26-Wednesday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/August/27-Thursday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/August/28-Friday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/August/29-Saturday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/August/30-Sunday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/August/31-Monday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/01-Tuesday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/02-Wednesday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/03-Thursday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/04-Friday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/05-Saturday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/06-Sunday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/07-Monday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/08-Tuesday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/09-Wednesday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/10-Thursday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/11-Friday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/12-Saturday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/13-Sunday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/14-Monday",
+    "sid": 175
+  },
+  {
+    "path": "100002_Asia_South_Korea_Seoul/September/15-Tuesday",
+    "sid": 175
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/12-Wednesday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/15-Saturday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/21-Friday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/22-Saturday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/26-Wednesday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/27-Thursday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/28-Friday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/29-Saturday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/30-Sunday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/August/31-Monday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/01-Tuesday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/02-Wednesday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/03-Thursday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/04-Friday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/05-Saturday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/06-Sunday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/07-Monday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/08-Tuesday",
+    "sid": 195
+  },
+  {
+    "path": "100003_Asia_South_Korea_Seoul_2/September/09-Wednesday",
+    "sid": 195
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/August/01-Saturday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/August/02-Sunday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/August/03-Monday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/August/04-Tuesday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/July/30-Thursday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/July/31-Friday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/06-Sunday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/07-Monday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/08-Tuesday",
+    "sid": 12725
+  },
+  {
+    "path": "100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/09-Wednesday",
+    "sid": 12725
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/01-Saturday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/02-Sunday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/03-Monday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/04-Tuesday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/05-Wednesday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/06-Thursday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/07-Friday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/08-Saturday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/09-Sunday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/10-Monday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/12-Wednesday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/13-Thursday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/14-Friday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/July/30-Thursday",
+    "sid": 14303
+  },
+  {
+    "path": "100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/July/31-Friday",
+    "sid": 14303
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/August/01-Saturday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/August/02-Sunday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/August/03-Monday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/August/04-Tuesday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/July/30-Thursday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/July/31-Friday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/02-Wednesday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/03-Thursday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/04-Friday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/05-Saturday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/06-Sunday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/07-Monday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/08-Tuesday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/09-Wednesday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/10-Thursday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/11-Friday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/12-Saturday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/13-Sunday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/14-Monday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/15-Tuesday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/16-Wednesday",
+    "sid": 14554
+  },
+  {
+    "path": "100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/17-Thursday",
+    "sid": 14554
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/August/01-Saturday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/August/02-Sunday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/August/03-Monday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/August/04-Tuesday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/July/30-Thursday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/July/31-Friday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/02-Wednesday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/03-Thursday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/04-Friday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/05-Saturday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/06-Sunday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/07-Monday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/08-Tuesday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/09-Wednesday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/10-Thursday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/11-Friday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/12-Saturday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/13-Sunday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/14-Monday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/15-Tuesday",
+    "sid": 14782
+  },
+  {
+    "path": "100008_Africa_Tanzania_Stone_Town_Stone_Town_-_Zanzibar_Live_cam/September/16-Wednesday",
+    "sid": 14782
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/August/28-Friday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/August/29-Saturday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/August/30-Sunday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/August/31-Monday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/01-Tuesday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/02-Wednesday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/03-Thursday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/04-Friday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/05-Saturday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/06-Sunday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/07-Monday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/08-Tuesday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/09-Wednesday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/10-Thursday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/11-Friday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/12-Saturday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/13-Sunday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/14-Monday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/15-Tuesday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/16-Wednesday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/17-Thursday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/18-Friday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/19-Saturday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/20-Sunday",
+    "sid": 17309
+  },
+  {
+    "path": "100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/21-Monday",
+    "sid": 17309
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/August/28-Friday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/August/29-Saturday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/August/30-Sunday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/August/31-Monday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/01-Tuesday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/02-Wednesday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/03-Thursday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/04-Friday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/05-Saturday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/06-Sunday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/07-Monday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/08-Tuesday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/09-Wednesday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/10-Thursday",
+    "sid": 17311
+  },
+  {
+    "path": "100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/11-Friday",
+    "sid": 17311
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/August/28-Friday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/August/29-Saturday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/August/30-Sunday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/August/31-Monday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/01-Tuesday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/02-Wednesday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/03-Thursday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/04-Friday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/05-Saturday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/06-Sunday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/07-Monday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/08-Tuesday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/09-Wednesday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/10-Thursday",
+    "sid": 17313
+  },
+  {
+    "path": "100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/11-Friday",
+    "sid": 17313
+  },
+  {
+    "path": "100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/August/07-Friday",
+    "sid": 17316
+  },
+  {
+    "path": "100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/05-Saturday",
+    "sid": 17316
+  },
+  {
+    "path": "100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/06-Sunday",
+    "sid": 17316
+  },
+  {
+    "path": "100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/07-Monday",
+    "sid": 17316
+  },
+  {
+    "path": "100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/09-Wednesday",
+    "sid": 17316
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/16-Wednesday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/17-Thursday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/18-Friday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/19-Saturday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/20-Sunday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/21-Monday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/22-Tuesday",
+    "sid": 17317
+  },
+  {
+    "path": "100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/23-Wednesday",
+    "sid": 17317
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/August/28-Friday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/August/29-Saturday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/August/30-Sunday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/August/31-Monday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/01-Tuesday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/02-Wednesday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/03-Thursday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/04-Friday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/05-Saturday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/06-Sunday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/07-Monday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/08-Tuesday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/09-Wednesday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/10-Thursday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/11-Friday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/12-Saturday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/13-Sunday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/14-Monday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/15-Tuesday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/16-Wednesday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/17-Thursday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/18-Friday",
+    "sid": 17318
+  },
+  {
+    "path": "100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/19-Saturday",
+    "sid": 17318
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/16-Wednesday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/17-Thursday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/18-Friday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/19-Saturday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/20-Sunday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/21-Monday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/22-Tuesday",
+    "sid": 17319
+  },
+  {
+    "path": "100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/23-Wednesday",
+    "sid": 17319
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/03-Thursday",
+    "sid": 17326
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/04-Friday",
+    "sid": 17326
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/05-Saturday",
+    "sid": 17326
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/06-Sunday",
+    "sid": 17326
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/07-Monday",
+    "sid": 17326
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/08-Tuesday",
+    "sid": 17326
+  },
+  {
+    "path": "100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/09-Wednesday",
+    "sid": 17326
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/August/28-Friday",
+    "sid": 17327
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/August/29-Saturday",
+    "sid": 17327
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/August/30-Sunday",
+    "sid": 17327
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/August/31-Monday",
+    "sid": 17327
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/September/01-Tuesday",
+    "sid": 17327
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/September/02-Wednesday",
+    "sid": 17327
+  },
+  {
+    "path": "100027_Europe_Poland_Lublin_Lublin_-_Place/September/03-Thursday",
+    "sid": 17327
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/August/28-Friday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/August/29-Saturday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/August/30-Sunday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/August/31-Monday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/01-Tuesday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/02-Wednesday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/03-Thursday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/04-Friday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/05-Saturday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/06-Sunday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/07-Monday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/08-Tuesday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/09-Wednesday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/10-Thursday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/11-Friday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/12-Saturday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/13-Sunday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/14-Monday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/15-Tuesday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/16-Wednesday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/17-Thursday",
+    "sid": 17330
+  },
+  {
+    "path": "100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/18-Friday",
+    "sid": 17330
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/August/28-Friday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/August/29-Saturday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/August/30-Sunday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/August/31-Monday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/01-Tuesday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/02-Wednesday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/03-Thursday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/04-Friday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/05-Saturday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/06-Sunday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/07-Monday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/08-Tuesday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/09-Wednesday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/10-Thursday",
+    "sid": 17333
+  },
+  {
+    "path": "100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/11-Friday",
+    "sid": 17333
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/August/28-Friday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/August/29-Saturday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/August/30-Sunday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/August/31-Monday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/01-Tuesday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/02-Wednesday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/03-Thursday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/04-Friday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/05-Saturday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/06-Sunday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/07-Monday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/08-Tuesday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/09-Wednesday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/10-Thursday",
+    "sid": 17334
+  },
+  {
+    "path": "100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/11-Friday",
+    "sid": 17334
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/28-Friday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/29-Saturday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/30-Sunday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/31-Monday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/01-Tuesday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/02-Wednesday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/03-Thursday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/04-Friday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/05-Saturday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/06-Sunday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/07-Monday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/08-Tuesday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/09-Wednesday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/10-Thursday",
+    "sid": 17335
+  },
+  {
+    "path": "100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/September/11-Friday",
+    "sid": 17335
+  },
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square/August/07-Friday",
+    "sid": 17337
+  },
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square/August/11-Tuesday",
+    "sid": 17337
+  },
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square/August/12-Wednesday",
+    "sid": 17337
+  },
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square/August/26-Wednesday",
+    "sid": 17337
+  },
+  {
+    "path": "100037_Europe_Poland_Debica_Debica_-_Market_Square/August/27-Thursday",
+    "sid": 17337
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/August/28-Friday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/August/29-Saturday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/August/30-Sunday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/August/31-Monday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/01-Tuesday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/02-Wednesday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/03-Thursday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/04-Friday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/05-Saturday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/06-Sunday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/07-Monday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/08-Tuesday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/09-Wednesday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/10-Thursday",
+    "sid": 17341
+  },
+  {
+    "path": "100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/11-Friday",
+    "sid": 17341
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/23-Thursday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/24-Friday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/25-Saturday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/26-Sunday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/27-Monday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/28-Tuesday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/29-Wednesday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/Tuesday",
+    "sid": 17242
+  },
+  {
+    "path": "31_North_America_United_States_Seattle_2nd_Ave_and_James_St/July/Wednesday",
+    "sid": 17242
+  },
+  {
+    "path": "32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/21-Friday",
+    "sid": 17233
+  },
+  {
+    "path": "32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/22-Saturday",
+    "sid": 17233
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August/26-Wednesday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August/27-Thursday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August/28-Friday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August/29-Saturday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August/30-Sunday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/August/31-Monday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/July/Tuesday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/01-Tuesday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/02-Wednesday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/03-Thursday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/04-Friday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/05-Saturday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/06-Sunday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/07-Monday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/08-Tuesday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/09-Wednesday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/10-Thursday",
+    "sid": 3
+  },
+  {
+    "path": "99991_asia_japan_tokyo_shinjuku9/September/11-Friday",
+    "sid": 3
+  },
+  {
+    "path": "99992_Asia_Thailand_Bangkok_Bangkok_-_Sukhumvit_Road_Bangkok_Thailand/July/23-Thursday",
+    "sid": 17234
+  },
+  {
+    "path": "99992_Asia_Thailand_Bangkok_Bangkok_-_Sukhumvit_Road_Bangkok_Thailand/July/25-Saturday",
+    "sid": 17234
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/26-Wednesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/27-Thursday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/28-Friday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/29-Saturday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/30-Sunday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/31-Monday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/01-Tuesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/02-Wednesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/03-Thursday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/04-Friday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/05-Saturday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/06-Sunday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/07-Monday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/08-Tuesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/09-Wednesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/10-Thursday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/11-Friday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/12-Saturday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/13-Sunday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/14-Monday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/15-Tuesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/16-Wednesday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/17-Thursday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/18-Friday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/19-Saturday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/20-Sunday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/21-Monday",
+    "sid": 17235
+  },
+  {
+    "path": "99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/22-Tuesday",
+    "sid": 17235
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/August/26-Wednesday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/August/27-Thursday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/August/28-Friday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/August/29-Saturday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/August/30-Sunday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/August/31-Monday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/01-Tuesday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/02-Wednesday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/03-Thursday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/04-Friday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/05-Saturday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/06-Sunday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/07-Monday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/08-Tuesday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/09-Wednesday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/10-Thursday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/11-Friday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/12-Saturday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/13-Sunday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/14-Monday",
+    "sid": 17240
+  },
+  {
+    "path": "99994_Asia_Japan_Tokyo_Shinjuku1/September/15-Tuesday",
+    "sid": 17240
+  },
+  {
+    "path": "99995_North_America_US_Leavenworth_Kris_Kringl/July/23-Thursday",
+    "sid": 17241
+  },
+  {
+    "path": "99995_North_America_US_Leavenworth_Kris_Kringl/July/24-Friday",
+    "sid": 17241
+  },
+  {
+    "path": "99995_North_America_US_Leavenworth_Kris_Kringl/July/25-Saturday",
+    "sid": 17241
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/August/26-Wednesday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/August/27-Thursday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/August/28-Friday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/August/29-Saturday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/August/30-Sunday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/August/31-Monday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/01-Tuesday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/02-Wednesday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/03-Thursday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/04-Friday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/05-Saturday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/06-Sunday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/07-Monday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/08-Tuesday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/09-Wednesday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/10-Thursday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/11-Friday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/12-Saturday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/13-Sunday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/14-Monday",
+    "sid": 17247
+  },
+  {
+    "path": "99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/15-Tuesday",
+    "sid": 17247
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/August/26-Wednesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/August/27-Thursday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/August/28-Friday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/August/29-Saturday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/August/30-Sunday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/August/31-Monday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/01-Tuesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/02-Wednesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/03-Thursday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/04-Friday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/05-Saturday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/06-Sunday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/07-Monday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/08-Tuesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/09-Wednesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/10-Thursday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/11-Friday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/12-Saturday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/13-Sunday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/14-Monday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/15-Tuesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/16-Wednesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/17-Thursday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/18-Friday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/19-Saturday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/20-Sunday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/21-Monday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/22-Tuesday",
+    "sid": 17237
+  },
+  {
+    "path": "99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/23-Wednesday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/October",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September",
+    "sid": 17238
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September",
+    "sid": 17216
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September",
+    "sid": 78
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/October",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September",
+    "sid": 415
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/October",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September",
+    "sid": 175
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/October",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/October",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September",
+    "sid": 17337
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/October",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September",
+    "sid": 17342
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September",
+    "sid": 17219
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/October",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September",
+    "sid": 17233
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September",
+    "sid": 14478
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/October",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/October",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/October",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/October",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September",
+    "sid": 17237
+  },
+  {
+    "path": "recordings/350/continuous",
+    "sid": 17243
+  },
+  {
+    "path": "recordings/352/continuous",
+    "sid": 94
+  },
+  {
+    "path": "recordings/353/continuous",
+    "sid": 178
+  },
+  {
+    "path": "recordings/378/continuous",
+    "sid": 17242
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/October/01-Thursday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/October/02-Friday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/24-Thursday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/25-Friday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/26-Saturday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/27-Sunday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/28-Monday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/29-Tuesday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/01_na_usa_los-angeles_venice-beach/September/30-Wednesday",
+    "sid": 17238
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/01-Thursday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/02-Friday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/03-Saturday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/04-Sunday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/05-Monday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/06-Tuesday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/07-Wednesday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/08-Thursday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/25-Friday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/26-Saturday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/27-Sunday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/28-Monday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/29-Tuesday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/30-Wednesday",
+    "sid": 17216
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October/01-Thursday",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October/02-Friday",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/25-Friday",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/26-Saturday",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/27-Sunday",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/29-Tuesday",
+    "sid": 78
+  },
+  {
+    "path": "joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/30-Wednesday",
+    "sid": 78
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/October/01-Thursday",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/October/02-Friday",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/25-Friday",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/26-Saturday",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/27-Sunday",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/29-Tuesday",
+    "sid": 415
+  },
+  {
+    "path": "joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/30-Wednesday",
+    "sid": 415
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/October/01-Thursday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/October/02-Friday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/24-Thursday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/25-Friday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/26-Saturday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/27-Sunday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/28-Monday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/29-Tuesday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100000_North_America_US_Key_West_Duval_Street/September/30-Wednesday",
+    "sid": 17243
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/01-Thursday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/02-Friday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/03-Saturday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/04-Sunday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/05-Monday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/06-Tuesday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/07-Wednesday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/October/08-Thursday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September/25-Friday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September/26-Saturday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September/27-Sunday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September/28-Monday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September/29-Tuesday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100002_Asia_South_Korea_Seoul/September/30-Wednesday",
+    "sid": 175
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/01-Thursday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/02-Friday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/03-Saturday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/04-Sunday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/05-Monday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/06-Tuesday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/07-Wednesday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/24-Thursday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/25-Friday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/26-Saturday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/27-Sunday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/28-Monday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/29-Tuesday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/30-Wednesday",
+    "sid": 12725
+  },
+  {
+    "path": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/03-Saturday",
+    "sid": 14303
+  },
+  {
+    "path": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/04-Sunday",
+    "sid": 14303
+  },
+  {
+    "path": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/05-Monday",
+    "sid": 14303
+  },
+  {
+    "path": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/06-Tuesday",
+    "sid": 14303
+  },
+  {
+    "path": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/07-Wednesday",
+    "sid": 14303
+  },
+  {
+    "path": "joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/08-Thursday",
+    "sid": 14303
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/October/01-Thursday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/October/02-Friday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/25-Friday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/26-Saturday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/27-Sunday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/28-Monday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/29-Tuesday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/30-Wednesday",
+    "sid": 17309
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/October/01-Thursday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/October/02-Friday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/25-Friday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/26-Saturday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/27-Sunday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/28-Monday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/29-Tuesday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/30-Wednesday",
+    "sid": 17310
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/01-Thursday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/02-Friday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/03-Saturday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/04-Sunday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/05-Monday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/06-Tuesday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/07-Wednesday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/October/08-Thursday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/25-Friday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/26-Saturday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/27-Sunday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/28-Monday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/29-Tuesday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/30-Wednesday",
+    "sid": 17312
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/01-Thursday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/02-Friday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/03-Saturday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/04-Sunday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/05-Monday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/06-Tuesday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/07-Wednesday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/08-Thursday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/25-Friday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/26-Saturday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/27-Sunday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/28-Monday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/29-Tuesday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/30-Wednesday",
+    "sid": 17315
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/01-Thursday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/02-Friday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/03-Saturday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/04-Sunday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/05-Monday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/06-Tuesday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/07-Wednesday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/08-Thursday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/25-Friday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/26-Saturday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/27-Sunday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/28-Monday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/29-Tuesday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/September/30-Wednesday",
+    "sid": 17316
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/01-Thursday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/02-Friday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/03-Saturday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/04-Sunday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/05-Monday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/06-Tuesday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/07-Wednesday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/25-Friday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/26-Saturday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/27-Sunday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/28-Monday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/29-Tuesday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/30-Wednesday",
+    "sid": 17323
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/01-Thursday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/02-Friday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/03-Saturday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/04-Sunday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/05-Monday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/25-Friday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/26-Saturday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/27-Sunday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/28-Monday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/29-Tuesday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/30-Wednesday",
+    "sid": 17326
+  },
+  {
+    "path": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/02-Friday",
+    "sid": 17327
+  },
+  {
+    "path": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/03-Saturday",
+    "sid": 17327
+  },
+  {
+    "path": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/04-Sunday",
+    "sid": 17327
+  },
+  {
+    "path": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/05-Monday",
+    "sid": 17327
+  },
+  {
+    "path": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/06-Tuesday",
+    "sid": 17327
+  },
+  {
+    "path": "joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/07-Wednesday",
+    "sid": 17327
+  },
+  {
+    "path": "joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/25-Friday",
+    "sid": 17337
+  },
+  {
+    "path": "joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/26-Saturday",
+    "sid": 17337
+  },
+  {
+    "path": "joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/27-Sunday",
+    "sid": 17337
+  },
+  {
+    "path": "joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/28-Monday",
+    "sid": 17337
+  },
+  {
+    "path": "joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/29-Tuesday",
+    "sid": 17337
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/01-Thursday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/02-Friday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/03-Saturday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/04-Sunday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/05-Monday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/06-Tuesday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/07-Wednesday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/25-Friday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/26-Saturday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/27-Sunday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/28-Monday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/29-Tuesday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/30-Wednesday",
+    "sid": 17340
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/01-Thursday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/02-Friday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/03-Saturday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/04-Sunday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/05-Monday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/06-Tuesday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/07-Wednesday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/25-Friday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/26-Saturday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/27-Sunday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/28-Monday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/29-Tuesday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/30-Wednesday",
+    "sid": 17208
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/October/01-Thursday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/October/02-Friday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/25-Friday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/26-Saturday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/27-Sunday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/28-Monday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/29-Tuesday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/30-Wednesday",
+    "sid": 17342
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/01-Thursday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/02-Friday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/03-Saturday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/04-Sunday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/05-Monday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/06-Tuesday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/07-Wednesday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/08-Thursday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/25-Friday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/26-Saturday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/27-Sunday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/28-Monday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/29-Tuesday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/30-Wednesday",
+    "sid": 17219
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/October/01-Thursday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/October/02-Friday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/25-Friday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/26-Saturday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/27-Sunday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/28-Monday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/29-Tuesday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/30-Wednesday",
+    "sid": 17233
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/01-Thursday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/02-Friday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/03-Saturday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/04-Sunday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/05-Monday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/06-Tuesday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/October/07-Wednesday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/24-Thursday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/25-Friday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/26-Saturday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/27-Sunday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/28-Monday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/29-Tuesday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/30-Wednesday",
+    "sid": 14478
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/October/01-Thursday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/October/02-Friday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/25-Friday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/26-Saturday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/27-Sunday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/28-Monday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/29-Tuesday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/30-Wednesday",
+    "sid": 17235
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/October/01-Thursday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/October/02-Friday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/25-Friday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/26-Saturday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/27-Sunday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/28-Monday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/29-Tuesday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/30-Wednesday",
+    "sid": 17240
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/October/01-Thursday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/October/02-Friday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/24-Thursday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/25-Friday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/26-Saturday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/27-Sunday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/28-Monday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/29-Tuesday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/30-Wednesday",
+    "sid": 17241
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/October/01-Thursday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/October/02-Friday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/25-Friday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/26-Saturday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/27-Sunday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/28-Monday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/29-Tuesday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/30-Wednesday",
+    "sid": 17247
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/01-Thursday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/02-Friday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/03-Saturday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/04-Sunday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/05-Monday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/06-Tuesday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/07-Wednesday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/08-Thursday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/25-Friday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/26-Saturday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/27-Sunday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/28-Monday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/29-Tuesday",
+    "sid": 17237
+  },
+  {
+    "path": "joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/30-Wednesday",
+    "sid": 17237
+  }
+]

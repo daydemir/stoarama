@@ -1,0 +1,3 @@
+package main
+import("context";"fmt";"os";"github.com/jackc/pgx/v5/pgxpool")
+func main(){c:=context.Background();p,e:=pgxpool.New(c,os.Getenv("DATABASE_URL"));if e!=nil{panic(e)};defer p.Close();rows,e:=p.Query(c,`select id,display_name,coalesce(relay_group_id,0),status,last_heartbeat_at,coalesce(relay_max_streams,0),coalesce(capabilities_jsonb->>'active_jobs','') from nodes where node_type='relay' and status='active' order by id`);if e!=nil{panic(e)};defer rows.Close();for rows.Next(){var id,grp,max int;var n,st,jobs string;var hb any;if e:=rows.Scan(&id,&n,&grp,&st,&hb,&max,&jobs);e!=nil{panic(e)};fmt.Printf("NODE %d name=%s group=%d status=%s max=%d jobs=%s heartbeat=%v\n",id,n,grp,st,max,jobs,hb)}}

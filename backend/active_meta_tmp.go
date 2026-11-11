@@ -1,0 +1,3 @@
+package main
+import("context";"fmt";"os";"github.com/jackc/pgx/v5/pgxpool")
+func main(){c:=context.Background();p,e:=pgxpool.New(c,os.Getenv("DATABASE_URL"));if e!=nil{panic(e)};defer p.Close();rows,e:=p.Query(c,`select r.id,r.capture_via,r.source_kind,coalesce(r.preferred_relay_group_id,0),r.status,r.next_fire_at,r.end_at from recordings r where r.account_id=47 and r.status='active' order by r.id`);if e!=nil{panic(e)};defer rows.Close();for rows.Next(){var id,grp int64;var via,sk,st string;var next,end any;if e:=rows.Scan(&id,&via,&sk,&grp,&st,&next,&end);e!=nil{panic(e)};fmt.Printf("ACTIVE %d via=%s source=%s relay_group=%d next=%v end=%v\n",id,via,sk,grp,next,end)}}

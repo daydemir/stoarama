@@ -1,0 +1,35 @@
+{
+  "plan_id": 5,
+  "plan_sha256": "e4fff711bd50335e5c538391728c58129841296e0ac0193d64aba3fd3f09d615",
+  "checked_at": "2026-11-02T02:18:34.751599+00:00",
+  "completed": 128,
+  "total": 128,
+  "percent": 100.0,
+  "states": {
+    "keep": 7,
+    "would_delete": 121
+  },
+  "dispositions": {
+    "eligible_r2_verified": {
+      "files": 120,
+      "logical_bytes": 5102809337
+    },
+    "keep": {
+      "files": 7,
+      "logical_bytes": 196070795
+    },
+    "retained_recovery_r2_present_unverified": {
+      "files": 1,
+      "logical_bytes": 13631536
+    }
+  },
+  "hold_reasons": {
+    "current selection or sensitivity buffers changed; KEEP until reviewed": 3,
+    "current source/error protection; KEEP": 4
+  },
+  "eligible_folder_count": 106,
+  "master_deletion_enabled": false,
+  "allow_nas_only": false,
+  "actual_deleted_files": 0,
+  "full_NAS_dryrun": false
+}

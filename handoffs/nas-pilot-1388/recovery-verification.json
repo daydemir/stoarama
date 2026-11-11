@@ -1,0 +1,12 @@
+{
+  "plan_id": 1388,
+  "plan_sha256": "a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc",
+  "items": 295,
+  "delete_ever_issued": 156,
+  "verified": 156,
+  "problems": 0,
+  "by_status": {
+    "ok": 156
+  },
+  "problem_items": null
+}

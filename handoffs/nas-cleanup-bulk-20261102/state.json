@@ -1,0 +1,40 @@
+{
+  "status": "LARGER_DRY_RUN_COMPLETE_DELETION_OFF",
+  "updated_at": "2026-11-02T02:19:12.840086+00:00",
+  "user_scope": "larger read-only dryrun, only R2 full-SHA verified files count as eligible; keep NAS-only and uncertain content; no deletion",
+  "files": 128,
+  "logical_bytes": 5312511668,
+  "streams": 44,
+  "folders": 111,
+  "kinds": {
+    "raw": 60,
+    "collated": 68
+  },
+  "master_deletion_enabled": false,
+  "allow_nas_only": false,
+  "max_file_bytes": 67108864,
+  "all_source_ids_explicit": true,
+  "plan_id": 5,
+  "plan_sha256": "e4fff711bd50335e5c538391728c58129841296e0ac0193d64aba3fd3f09d615",
+  "completed": 128,
+  "dispositions": {
+    "eligible_r2_verified": {
+      "files": 120,
+      "logical_bytes": 5102809337
+    },
+    "keep": {
+      "files": 7,
+      "logical_bytes": 196070795
+    },
+    "retained_recovery_r2_present_unverified": {
+      "files": 1,
+      "logical_bytes": 13631536
+    }
+  },
+  "next": "User reviews exact eligible files. After explicit deletion approval, prepare the narrower eligible-input as a new immutable plan, refresh its dryrun and current guards, then enable only if all checks pass. Do not enable mixed plan5.",
+  "scheduled_agent_wake": false,
+  "eligible_files": 120,
+  "eligible_logical_bytes": 5102809337,
+  "no_new_paid_workers": true,
+  "no_NAS_or_R2_media_changed": true
+}

@@ -1,0 +1,472 @@
+NAS cleanup dry-run report
+Checked: 2026-11-02T02:18:34.751599+00:00
+Plan: 5 / e4fff711bd50335e5c538391728c58129841296e0ac0193d64aba3fd3f09d615
+
+DELETION OFF. No files deleted. NAS-only and uncertain content retained.
+This report covers128 explicitly selected files, not the whole NAS.
+Folder rows summarize ONLY the listed files; they do not authorize removing folders or other files.
+Sizes are logical bytes / decimal GB, not guaranteed reclaimed filesystem capacity.
+
+PROGRESS: 128/128 files checked
+
+RESULTS
+eligible_r2_verified: 120 files / 5.102809 GB / 5102809337 bytes
+keep: 7 files / 0.196071 GB / 196070795 bytes
+retained_recovery_r2_present_unverified: 1 files / 0.013632 GB / 13631536 bytes
+
+ELIGIBLE FILES BY FOLDER (full NAS and R2 SHA verified)
+Stream 3 | 0.022807 GB | raw 1 files / 0.022807 GB | stitched 0 files / 0.000000 GB
+99991_asia_japan_tokyo_shinjuku9/August/27-Thursday
+  raw:824720 | 22806576 bytes | 99991_shinjuku9_2026_August_W4_Thursday_hour_080601.mp4
+
+Stream 3 | 0.020972 GB | raw 1 files / 0.020972 GB | stitched 0 files / 0.000000 GB
+99991_asia_japan_tokyo_shinjuku9/August/29-Saturday
+  raw:891324 | 20971568 bytes | 99991_shinjuku9_2026_August_W5_Saturday_hour_080534.mp4
+
+Stream 3 | 0.021496 GB | raw 1 files / 0.021496 GB | stitched 0 files / 0.000000 GB
+99991_asia_japan_tokyo_shinjuku9/September/10-Thursday
+  raw:1299294 | 21495856 bytes | 99991_shinjuku9_2026_September_W2_Thursday_hour_080331.mp4
+
+Stream 78 | 0.063708 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063708 GB
+joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October/01-Thursday
+  collated:111253 | 63707879 bytes | 04_Daechi_Station_Intersection_2026_October_W1_Thursday_hour_08_part_01_080010-080811.mp4
+
+Stream 78 | 0.066987 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066987 GB
+joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/October/02-Friday
+  collated:117995 | 66987400 bytes | 04_Daechi_Station_Intersection_2026_October_W1_Friday_hour_09_part_02_093410-094310.mp4
+
+Stream 78 | 0.062502 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.062502 GB
+joined/04_Asia_South_Korea_Seoul_Daechi_Station_Intersection/September/27-Sunday
+  collated:17934 | 62502366 bytes | 04_Daechi_Station_Intersection_2026_September_W4_Sunday_hour_19_part_16_192426-193245.mp4
+
+Stream 158 | 0.059372 GB | raw 2 files / 0.059372 GB | stitched 0 files / 0.000000 GB
+100001_Asia_South_Korea_Seoul/August/13-Thursday
+  raw:489379 | 29742550 bytes | 100001__2026_August_W2_Thursday_hour_080711.mp4
+  raw:489331 | 29629649 bytes | 100001__2026_August_W2_Thursday_hour_080012.mp4
+
+Stream 158 | 0.029799 GB | raw 1 files / 0.029799 GB | stitched 0 files / 0.000000 GB
+100001_Asia_South_Korea_Seoul/September/06-Sunday
+  raw:1164953 | 29798920 bytes | 100001__2026_September_W1_Sunday_hour_080759.mp4
+
+Stream 175 | 0.002622 GB | raw 2 files / 0.002622 GB | stitched 0 files / 0.000000 GB
+100002_Asia_South_Korea_Seoul/August/28-Friday
+  raw:858169 | 1572912 bytes | 100002__2026_August_W4_Friday_hour_080827.mp4
+  raw:858197 | 1048624 bytes | 100002__2026_August_W4_Friday_hour_080955.mp4
+
+Stream 175 | 0.131773 GB | raw 0 files / 0.000000 GB | stitched 2 files / 0.131773 GB
+joined/100002_Asia_South_Korea_Seoul/October/04-Sunday
+  collated:129659 | 65904144 bytes | 100002__2026_October_W1_Sunday_hour_08_part_04_081511-082410.mp4
+  collated:129656 | 65869247 bytes | 100002__2026_October_W1_Sunday_hour_08_part_01_080012-080911.mp4
+
+Stream 175 | 0.065748 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.065748 GB
+joined/100002_Asia_South_Korea_Seoul/October/08-Thursday
+  collated:157789 | 65747597 bytes | 100002__2026_October_W2_Thursday_hour_15_part_04_151636-152535.mp4
+
+Stream 178 | 0.018874 GB | raw 1 files / 0.018874 GB | stitched 0 files / 0.000000 GB
+06_North_America_United_States_Seattle_2nd_Ave_and_Pike_St_EW/July/29-Wednesday
+  raw:155873 | 18874416 bytes | 06_2nd_Ave_and_Pike_St_EW_2026_July_W5_Wednesday_hour_080430.mp4
+
+Stream 415 | 0.064186 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064186 GB
+joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/October/01-Thursday
+  collated:111391 | 64185835 bytes | 08_Sebyeonggyo_Oncheoncheon_2026_October_W1_Thursday_hour_15_part_03_150833-151633.mp4
+
+Stream 415 | 0.061768 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.061768 GB
+joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/26-Saturday
+  collated:11127 | 61767933 bytes | 08_Sebyeonggyo_Oncheoncheon_2026_September_W4_Saturday_hour_19_part_01_190038-190848.mp4
+
+Stream 415 | 0.061339 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.061339 GB
+joined/08_Asia_South_Korea_Busan_Sebyeonggyo_Oncheoncheon/September/30-Wednesday
+  collated:104892 | 61339161 bytes | 08_Sebyeonggyo_Oncheoncheon_2026_September_W5_Wednesday_hour_09_part_08_094422-095322.mp4
+
+Stream 12725 | 0.127768 GB | raw 0 files / 0.000000 GB | stitched 2 files / 0.127768 GB
+joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/October/05-Monday
+  collated:140059 | 66986078 bytes | 100005_Chile_-_Punta_Arenas_Live_cam_2026_October_W1_Monday_hour_16_part_11_162100-164500.mp4
+  collated:140075 | 60782111 bytes | 100005_Chile_-_Punta_Arenas_Live_cam_2026_October_W1_Monday_hour_17_part_09_172100-174059.mp4
+
+Stream 12725 | 0.064296 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064296 GB
+joined/100005_South_America_Chile_Punta_Arenas_Chile_-_Punta_Arenas_Live_cam/September/25-Friday
+  collated:10200 | 64295555 bytes | 100005_Chile_-_Punta_Arenas_Live_cam_2026_September_W4_Friday_hour_17_part_02_171509-174310.mp4
+
+Stream 14303 | 0.009847 GB | raw 1 files / 0.009847 GB | stitched 0 files / 0.000000 GB
+100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/08-Saturday
+  raw:329061 | 9846555 bytes | 100006_Petra_-_Visitor_Center_Live_cam_2026_August_W2_Saturday_hour_080011.mp4
+
+Stream 14303 | 0.009501 GB | raw 1 files / 0.009501 GB | stitched 0 files / 0.000000 GB
+100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/August/12-Wednesday
+  raw:458328 | 9501335 bytes | 100006_Petra_-_Visitor_Center_Live_cam_2026_August_W2_Wednesday_hour_080011.mp4
+
+Stream 14303 | 0.009838 GB | raw 1 files / 0.009838 GB | stitched 0 files / 0.000000 GB
+100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/July/31-Friday
+  raw:177358 | 9838213 bytes | 100006_Petra_-_Visitor_Center_Live_cam_2026_July_W5_Friday_hour_080008.mp4
+
+Stream 14303 | 0.061680 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.061680 GB
+joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/04-Sunday
+  collated:130300 | 61679897 bytes | 100006_Petra_-_Visitor_Center_Live_cam_2026_October_W1_Sunday_hour_15_part_01_150008-151009.mp4
+
+Stream 14303 | 0.064855 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064855 GB
+joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/05-Monday
+  collated:136969 | 64854599 bytes | 100006_Petra_-_Visitor_Center_Live_cam_2026_October_W1_Monday_hour_14_part_06_144956-150056.mp4
+
+Stream 14303 | 0.062804 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.062804 GB
+joined/100006_Asia_Jordan_Petra_Petra_-_Visitor_Center_Live_cam/October/06-Tuesday
+  collated:149691 | 62803706 bytes | 100006_Petra_-_Visitor_Center_Live_cam_2026_October_W1_Tuesday_hour_18_part_01_180005-181406.mp4
+
+Stream 14478 | 0.129002 GB | raw 0 files / 0.000000 GB | stitched 2 files / 0.129002 GB
+joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/26-Saturday
+  collated:17459 | 64634791 bytes | 36_Plaza_Mayor_2026_September_W4_Saturday_hour_19_part_03_192645-193549.mp4
+  collated:17446 | 64367390 bytes | 36_Plaza_Mayor_2026_September_W4_Saturday_hour_17_part_01_170041-170948.mp4
+
+Stream 14478 | 0.064617 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064617 GB
+joined/36_South_America_Peru_Cusco_Plaza_Mayor/September/27-Sunday
+  collated:25417 | 64617151 bytes | 36_Plaza_Mayor_2026_September_W4_Sunday_hour_16_part_02_160327-161227.mp4
+
+Stream 14554 | 0.005643 GB | raw 1 files / 0.005643 GB | stitched 0 files / 0.000000 GB
+100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/August/03-Monday
+  raw:228671 | 5642782 bytes | 100007_Ballito_Beach_Live_cam_2026_August_W1_Monday_hour_080620.mp4
+
+Stream 14554 | 0.005644 GB | raw 1 files / 0.005644 GB | stitched 0 files / 0.000000 GB
+100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/09-Wednesday
+  raw:1275726 | 5643689 bytes | 100007_Ballito_Beach_Live_cam_2026_September_W2_Wednesday_hour_080007.mp4
+
+Stream 14554 | 0.005642 GB | raw 1 files / 0.005642 GB | stitched 0 files / 0.000000 GB
+100007_Africa_South_Africa_Ballito_Ballito_Beach_Live_cam/September/10-Thursday
+  raw:1306082 | 5642403 bytes | 100007_Ballito_Beach_Live_cam_2026_September_W2_Thursday_hour_080437.mp4
+
+Stream 17208 | 0.057392 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.057392 GB
+joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/October/06-Tuesday
+  collated:152370 | 57392307 bytes | 100042_Public_square_089_Market_square_2026_October_W1_Tuesday_hour_09_part_33_093720-094220.mp4
+
+Stream 17208 | 0.057923 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.057923 GB
+joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/28-Monday
+  collated:31552 | 57922730 bytes | 100042_Public_square_089_Market_square_2026_September_W4_Monday_hour_19_part_11_191346-191847.mp4
+
+Stream 17208 | 0.058307 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.058307 GB
+joined/100042_Europe_Czech_republic_Most_Public_square_089_Market_square/September/30-Wednesday
+  collated:110105 | 58307098 bytes | 100042_Public_square_089_Market_square_2026_September_W5_Wednesday_hour_17_part_21_173202-173702.mp4
+
+Stream 17216 | 0.064526 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064526 GB
+joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/04-Sunday
+  collated:129929 | 64526183 bytes | 03_Plac_Polonii_Amerykanskiej_2026_October_W1_Sunday_hour_13_part_03_134709-135909.mp4
+
+Stream 17216 | 0.066605 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066605 GB
+joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/October/08-Thursday
+  collated:157927 | 66604859 bytes | 03_Plac_Polonii_Amerykanskiej_2026_October_W2_Thursday_hour_09_part_03_091109-092510.mp4
+
+Stream 17216 | 0.064005 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064005 GB
+joined/03_Europe_Poland_Brzeg_Plac_Polonii_Amerykanskiej/September/28-Monday
+  collated:25743 | 64005481 bytes | 03_Plac_Polonii_Amerykanskiej_2026_September_W4_Monday_hour_19_part_22_194710-195609.mp4
+
+Stream 17219 | 0.062141 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.062141 GB
+joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/October/01-Thursday
+  collated:111770 | 62141029 bytes | 30_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja_2026_October_W1_Thursday_hour_08_part_04_083308-083710.mp4
+
+Stream 17219 | 0.064114 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064114 GB
+joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/27-Sunday
+  collated:18640 | 64113839 bytes | 30_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja_2026_September_W4_Sunday_hour_16_part_05_162047-162456.mp4
+
+Stream 17219 | 0.063323 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063323 GB
+joined/30_Europe_Poland_Luban_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja/September/28-Monday
+  collated:25846 | 63323042 bytes | 30_Skwer_przy_Wiezy_Brackiej_Plac_3_Maja_2026_September_W4_Monday_hour_16_part_01_160032-160440.mp4
+
+Stream 17233 | 0.009962 GB | raw 1 files / 0.009962 GB | stitched 0 files / 0.000000 GB
+32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/21-Friday
+  raw:716126 | 9961520 bytes | 32_Assisi_-_Town_Square_Assisi_2026_August_W3_Friday_hour_080411.mp4
+
+Stream 17233 | 0.012845 GB | raw 1 files / 0.012845 GB | stitched 0 files / 0.000000 GB
+32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/22-Saturday
+  raw:740668 | 12845104 bytes | 32_Assisi_-_Town_Square_Assisi_2026_August_W4_Saturday_hour_081144.mp4
+
+Stream 17233 | 0.063314 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063314 GB
+joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/October/02-Friday
+  collated:118455 | 63314019 bytes | 32_Assisi_-_Town_Square_Assisi_2026_October_W1_Friday_hour_17_part_03_172959-173659.mp4
+
+Stream 17233 | 0.063326 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063326 GB
+joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/27-Sunday
+  collated:18674 | 63325655 bytes | 32_Assisi_-_Town_Square_Assisi_2026_September_W4_Sunday_hour_09_part_02_095415-100015.mp4
+
+Stream 17233 | 0.065300 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.065300 GB
+joined/32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/September/29-Tuesday
+  collated:33359 | 65300043 bytes | 32_Assisi_-_Town_Square_Assisi_2026_September_W5_Tuesday_hour_17_part_05_175255-180055.mp4
+
+Stream 17235 | 0.041681 GB | raw 1 files / 0.041681 GB | stitched 0 files / 0.000000 GB
+99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/August/28-Friday
+  raw:859596 | 41680944 bytes | 99993_Soliman_Street_Agdao_2026_August_W4_Friday_hour_081117.mp4
+
+Stream 17235 | 0.043516 GB | raw 1 files / 0.043516 GB | stitched 0 files / 0.000000 GB
+99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/08-Tuesday
+  raw:1239918 | 43515952 bytes | 99993_Soliman_Street_Agdao_2026_September_W2_Tuesday_hour_110754.mp4
+
+Stream 17235 | 0.062040 GB | raw 1 files / 0.062040 GB | stitched 0 files / 0.000000 GB
+99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/21-Monday
+  raw:1518983 | 62039868 bytes | 99993_Soliman_Street_Agdao_2026_September_W3_Monday_hour_080740.mp4
+
+Stream 17235 | 0.064160 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064160 GB
+joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/29-Tuesday
+  collated:32982 | 64160146 bytes | 99993_Soliman_Street_Agdao_2026_September_W5_Tuesday_hour_18_part_02_182340-182540.mp4
+
+Stream 17235 | 0.105647 GB | raw 0 files / 0.000000 GB | stitched 2 files / 0.105647 GB
+joined/99993_Asia_Phillipines_Davao_City_Soliman_Street_Agdao/September/30-Wednesday
+  collated:104986 | 58854232 bytes | 99993_Soliman_Street_Agdao_2026_September_W5_Wednesday_hour_16_part_03_163704-163754.mp4
+  collated:104992 | 46792942 bytes | 99993_Soliman_Street_Agdao_2026_September_W5_Wednesday_hour_19_part_01_190020-190116.mp4
+
+Stream 17237 | 0.014814 GB | raw 1 files / 0.014814 GB | stitched 0 files / 0.000000 GB
+99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/18-Friday
+  raw:1447778 | 14813769 bytes | 99997_Seoul_-_Anguk_2026_September_W3_Friday_hour_080619.mp4
+
+Stream 17237 | 0.014819 GB | raw 1 files / 0.014819 GB | stitched 0 files / 0.000000 GB
+99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/20-Sunday
+  raw:1494517 | 14818695 bytes | 99997_Seoul_-_Anguk_2026_September_W3_Sunday_hour_080409.mp4
+
+Stream 17237 | 0.058679 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.058679 GB
+joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/02-Friday
+  collated:118102 | 58678529 bytes | 99997_Seoul_-_Anguk_2026_October_W1_Friday_hour_14_part_02_142912-143313.mp4
+
+Stream 17237 | 0.062494 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.062494 GB
+joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/October/07-Wednesday
+  collated:153631 | 62493850 bytes | 99997_Seoul_-_Anguk_2026_October_W1_Wednesday_hour_14_part_01_140001-140419.mp4
+
+Stream 17237 | 0.058280 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.058280 GB
+joined/99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/25-Friday
+  collated:5530 | 58279847 bytes | 99997_Seoul_-_Anguk_2026_September_W4_Friday_hour_16_part_02_165644-170044.mp4
+
+Stream 17238 | 0.030671 GB | raw 1 files / 0.030671 GB | stitched 0 files / 0.000000 GB
+01_na_usa_los-angeles_venice-beach/September/07-Monday
+  raw:1222819 | 30670896 bytes | 01_venice-beach_2026_September_W1_Monday_hour_080120.mp4
+
+Stream 17238 | 0.034341 GB | raw 1 files / 0.034341 GB | stitched 0 files / 0.000000 GB
+01_na_usa_los-angeles_venice-beach/September/13-Sunday
+  raw:1360666 | 34340912 bytes | 01_venice-beach_2026_September_W2_Sunday_hour_135503.mp4
+
+Stream 17238 | 0.059565 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.059565 GB
+joined/01_na_usa_los-angeles_venice-beach/September/26-Saturday
+  collated:17135 | 59564741 bytes | 01_venice-beach_2026_September_W4_Saturday_hour_13_part_06_131926-132022.mp4
+
+Stream 17238 | 0.060722 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.060722 GB
+joined/01_na_usa_los-angeles_venice-beach/September/28-Monday
+  collated:32273 | 60721809 bytes | 01_venice-beach_2026_September_W4_Monday_hour_12_part_01_120027-120323.mp4
+
+Stream 17240 | 0.022544 GB | raw 1 files / 0.022544 GB | stitched 0 files / 0.000000 GB
+99994_Asia_Japan_Tokyo_Shinjuku1/September/09-Wednesday
+  raw:1267378 | 22544432 bytes | 99994_Shinjuku1_2026_September_W2_Wednesday_hour_080016.mp4
+
+Stream 17240 | 0.023069 GB | raw 1 files / 0.023069 GB | stitched 0 files / 0.000000 GB
+99994_Asia_Japan_Tokyo_Shinjuku1/September/15-Tuesday
+  raw:1384351 | 23068720 bytes | 99994_Shinjuku1_2026_September_W3_Tuesday_hour_120703.mp4
+
+Stream 17240 | 0.047261 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.047261 GB
+joined/99994_Asia_Japan_Tokyo_Shinjuku1/October/01-Thursday
+  collated:111474 | 47261253 bytes | 99994_Shinjuku1_2026_October_W1_Thursday_hour_14_part_04_145744-150044.mp4
+
+Stream 17240 | 0.039106 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.039106 GB
+joined/99994_Asia_Japan_Tokyo_Shinjuku1/September/25-Friday
+  collated:5493 | 39106359 bytes | 99994_Shinjuku1_2026_September_W4_Friday_hour_08_part_02_085720-090020.mp4
+
+Stream 17241 | 0.067084 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.067084 GB
+joined/99995_North_America_US_Leavenworth_Kris_Kringl/October/01-Thursday
+  collated:117847 | 67083961 bytes | 99995_Kris_Kringl_2026_October_W1_Thursday_hour_08_part_04_080614-081314.mp4
+
+Stream 17241 | 0.066322 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066322 GB
+joined/99995_North_America_US_Leavenworth_Kris_Kringl/September/29-Tuesday
+  collated:54739 | 66322298 bytes | 99995_Kris_Kringl_2026_September_W5_Tuesday_hour_08_part_10_081519-082219.mp4
+
+Stream 17243 | 0.028836 GB | raw 2 files / 0.028836 GB | stitched 0 files / 0.000000 GB
+100000_North_America_US_Key_West_Duval_Street/September/15-Tuesday
+  raw:1393721 | 15728688 bytes | 100000_Duval_Street_2026_September_W3_Tuesday_hour_084159.mp4
+  raw:1393699 | 13107248 bytes | 100000_Duval_Street_2026_September_W3_Tuesday_hour_084055.mp4
+
+Stream 17243 | 0.133274 GB | raw 0 files / 0.000000 GB | stitched 2 files / 0.133274 GB
+joined/100000_North_America_US_Key_West_Duval_Street/September/26-Saturday
+  collated:16618 | 66709168 bytes | 100000_Duval_Street_2026_September_W4_Saturday_hour_17_part_03_170324-170624.mp4
+  collated:16601 | 66564988 bytes | 100000_Duval_Street_2026_September_W4_Saturday_hour_15_part_02_150123-150523.mp4
+
+Stream 17247 | 0.030671 GB | raw 1 files / 0.030671 GB | stitched 0 files / 0.000000 GB
+99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/11-Friday
+  raw:1324427 | 30670896 bytes | 99996_Chaweng_Beach_Hush_Bar_2026_September_W2_Friday_hour_080148.mp4
+
+Stream 17247 | 0.036700 GB | raw 1 files / 0.036700 GB | stitched 0 files / 0.000000 GB
+99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/12-Saturday
+  raw:1342811 | 36700208 bytes | 99996_Chaweng_Beach_Hush_Bar_2026_September_W2_Saturday_hour_144517.mp4
+
+Stream 17247 | 0.067087 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.067087 GB
+joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/27-Sunday
+  collated:19132 | 67087104 bytes | 99996_Chaweng_Beach_Hush_Bar_2026_September_W4_Sunday_hour_19_part_01_190005-190402.mp4
+
+Stream 17247 | 0.067039 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.067039 GB
+joined/99996_Asia_Thailand_Koh_Samui_Chaweng_Beach_Hush_Bar/September/28-Monday
+  collated:26072 | 67038629 bytes | 99996_Chaweng_Beach_Hush_Bar_2026_September_W4_Monday_hour_11_part_15_112618-112915.mp4
+
+Stream 17309 | 0.009437 GB | raw 1 files / 0.009437 GB | stitched 0 files / 0.000000 GB
+100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/02-Wednesday
+  raw:1032051 | 9437232 bytes | 100009_Bevagna_-_Piazza_Silvestri_2026_September_W1_Wednesday_hour_080655.mp4
+
+Stream 17309 | 0.010748 GB | raw 1 files / 0.010748 GB | stitched 0 files / 0.000000 GB
+100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/13-Sunday
+  raw:1353472 | 10747952 bytes | 100009_Bevagna_-_Piazza_Silvestri_2026_September_W2_Sunday_hour_094057.mp4
+
+Stream 17309 | 0.063636 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063636 GB
+joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/October/01-Thursday
+  collated:113101 | 63636480 bytes | 100009_Bevagna_-_Piazza_Silvestri_2026_October_W1_Thursday_hour_18_part_14_181809-182709.mp4
+
+Stream 17309 | 0.065166 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.065166 GB
+joined/100009_Europe_Italy_Bevagna_Bevagna_-_Piazza_Silvestri/September/27-Sunday
+  collated:19744 | 65166035 bytes | 100009_Bevagna_-_Piazza_Silvestri_2026_September_W4_Sunday_hour_12_part_05_125016-125917.mp4
+
+Stream 17310 | 0.066354 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066354 GB
+joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/October/02-Friday
+  collated:119482 | 66354035 bytes | 100010_Varberg_-_Brunnparken_2026_October_W1_Friday_hour_08_part_05_082312-082812.mp4
+
+Stream 17310 | 0.066667 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066667 GB
+joined/100010_Europe_Sweden_Varberg_Varberg_-_Brunnparken/September/29-Tuesday
+  collated:34910 | 66666750 bytes | 100010_Varberg_-_Brunnparken_2026_September_W5_Tuesday_hour_18_part_10_184334-184834.mp4
+
+Stream 17311 | 0.006816 GB | raw 1 files / 0.006816 GB | stitched 0 files / 0.000000 GB
+100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/August/29-Saturday
+  raw:899448 | 6815792 bytes | 100011_Luhacovice_-_Namesti_28.rijna_2026_August_W5_Saturday_hour_080812.mp4
+
+Stream 17311 | 0.007078 GB | raw 1 files / 0.007078 GB | stitched 0 files / 0.000000 GB
+100011_Europe_Czechia_Luhacovice_Luhacovice_-_Namesti_28.rijna/September/03-Thursday
+  raw:1067178 | 7077936 bytes | 100011_Luhacovice_-_Namesti_28.rijna_2026_September_W1_Thursday_hour_080203.mp4
+
+Stream 17312 | 0.064910 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.064910 GB
+joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/27-Sunday
+  collated:19999 | 64909658 bytes | 100012_Prijedor_-_Mali_trg_Nicole_Pastica_2026_September_W4_Sunday_hour_16_part_02_163050-163750.mp4
+
+Stream 17312 | 0.063048 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063048 GB
+joined/100012_Europe_Bosnia_and_Herzegowina_Prijedor_Prijedor_-_Mali_trg_Nicole_Pastica/September/29-Tuesday
+  collated:34988 | 63047653 bytes | 100012_Prijedor_-_Mali_trg_Nicole_Pastica_2026_September_W5_Tuesday_hour_08_part_03_082111-082815.mp4
+
+Stream 17313 | 0.009437 GB | raw 1 files / 0.009437 GB | stitched 0 files / 0.000000 GB
+100013_Europe_Netherlands_Sittard_Sittard_-_Markt/August/29-Saturday
+  raw:899529 | 9437232 bytes | 100013_Sittard_-_Markt_2026_August_W5_Saturday_hour_081058.mp4
+
+Stream 17313 | 0.009437 GB | raw 1 files / 0.009437 GB | stitched 0 files / 0.000000 GB
+100013_Europe_Netherlands_Sittard_Sittard_-_Markt/September/06-Sunday
+  raw:1173538 | 9437232 bytes | 100013_Sittard_-_Markt_2026_September_W1_Sunday_hour_081450.mp4
+
+Stream 17315 | 0.063640 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.063640 GB
+joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/October/06-Tuesday
+  collated:150390 | 63640260 bytes | 100015_Celanova_-_Praza_Major_2026_October_W1_Tuesday_hour_08_part_03_080408-080608.mp4
+
+Stream 17315 | 0.065515 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.065515 GB
+joined/100015_Europe_Spain_Celanova_Celanova_-_Praza_Major/September/27-Sunday
+  collated:20058 | 65514936 bytes | 100015_Celanova_-_Praza_Major_2026_September_W4_Sunday_hour_08_part_04_081042-081243.mp4
+
+Stream 17316 | 0.066381 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066381 GB
+joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/01-Thursday
+  collated:113400 | 66380558 bytes | 100016_Villamartin_-_Plaza_del_Ayuntamiento_2026_October_W1_Thursday_hour_15_part_01_150004-151503.mp4
+
+Stream 17316 | 0.066640 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066640 GB
+joined/100016_Europe_Spain_Villamartin_Villamartin_-_Plaza_del_Ayuntamiento/October/02-Friday
+  collated:119875 | 66640276 bytes | 100016_Villamartin_-_Plaza_del_Ayuntamiento_2026_October_W1_Friday_hour_11_part_01_110005-111654.mp4
+
+Stream 17317 | 0.038287 GB | raw 2 files / 0.038287 GB | stitched 0 files / 0.000000 GB
+100017_Europe_Czechia_Valask_Mezi_Valasske_Valask_Mezi_Valasske_-_Market_square/September/17-Thursday
+  raw:1432933 | 19463428 bytes | 100017_Valask_Mezi_Valasske_-_Market_square_2026_September_W3_Thursday_hour_080017.mp4
+  raw:1432972 | 18823945 bytes | 100017_Valask_Mezi_Valasske_-_Market_square_2026_September_W3_Thursday_hour_080217.mp4
+
+Stream 17318 | 0.057850 GB | raw 2 files / 0.057850 GB | stitched 0 files / 0.000000 GB
+100018_Europe_Czechia_Vrchlabi_Vrchlabi_-_Nmst_T.G._Masaryka/September/10-Thursday
+  raw:1306160 | 28955631 bytes | 100018_Vrchlabi_-_Nmst_T.G._Masaryka_2026_September_W2_Thursday_hour_080740.mp4
+  raw:1306066 | 28894867 bytes | 100018_Vrchlabi_-_Nmst_T.G._Masaryka_2026_September_W2_Thursday_hour_080340.mp4
+
+Stream 17319 | 0.002165 GB | raw 1 files / 0.002165 GB | stitched 0 files / 0.000000 GB
+100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/19-Saturday
+  raw:1475011 | 2164528 bytes | 100019_Szentendre_-_Market_square_2026_September_W3_Saturday_hour_080006.mp4
+
+Stream 17319 | 0.002141 GB | raw 1 files / 0.002141 GB | stitched 0 files / 0.000000 GB
+100019_Europe_Hungary_Szentendre_Szentendre_-_Market_square/September/23-Wednesday
+  raw:1572712 | 2140745 bytes | 100019_Szentendre_-_Market_square_2026_September_W4_Wednesday_hour_080707.mp4
+
+Stream 17323 | 0.066952 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066952 GB
+joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/October/06-Tuesday
+  collated:151190 | 66952206 bytes | 100023_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja_2026_October_W1_Tuesday_hour_19_part_06_195241-195531.mp4
+
+Stream 17323 | 0.066952 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066952 GB
+joined/100023_Europe_Poland_Luban_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja/September/28-Monday
+  collated:27869 | 66951825 bytes | 100023_Luban_-_Skwer_przy_Wiey_Brackiej_Plac_3_Maja_2026_September_W4_Monday_hour_18_part_02_180656-180946.mp4
+
+Stream 17326 | 0.066171 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066171 GB
+joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/October/02-Friday
+  collated:120421 | 66170764 bytes | 100026_Jaworzno_-_Market_square_2026_October_W1_Friday_hour_14_part_05_142610-144010.mp4
+
+Stream 17326 | 0.066763 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066763 GB
+joined/100026_Europe_Poland_Jaworzno_Jaworzno_-_Market_square/September/29-Tuesday
+  collated:35718 | 66762699 bytes | 100026_Jaworzno_-_Market_square_2026_September_W5_Tuesday_hour_15_part_01_150016-150913.mp4
+
+Stream 17327 | 0.042104 GB | raw 2 files / 0.042104 GB | stitched 0 files / 0.000000 GB
+100027_Europe_Poland_Lublin_Lublin_-_Place/August/29-Saturday
+  raw:899376 | 21207940 bytes | 100027_Lublin_-_Place_2026_August_W5_Saturday_hour_080511.mp4
+  raw:899402 | 20895992 bytes | 100027_Lublin_-_Place_2026_August_W5_Saturday_hour_080611.mp4
+
+Stream 17327 | 0.125724 GB | raw 0 files / 0.000000 GB | stitched 2 files / 0.125724 GB
+joined/100027_Europe_Poland_Lublin_Lublin_-_Place/October/02-Friday
+  collated:120495 | 63277883 bytes | 100027_Lublin_-_Place_2026_October_W1_Friday_hour_08_part_01_080010-080310.mp4
+  collated:120498 | 62445626 bytes | 100027_Lublin_-_Place_2026_October_W1_Friday_hour_08_part_04_083410-083710.mp4
+
+Stream 17330 | 0.054447 GB | raw 2 files / 0.054447 GB | stitched 0 files / 0.000000 GB
+100030_Europe_Poland_Lubliniec_Lubliniec_-_Market_place/September/02-Wednesday
+  raw:1032242 | 27239610 bytes | 100030_Lubliniec_-_Market_place_2026_September_W1_Wednesday_hour_081344.mp4
+  raw:1032268 | 27207044 bytes | 100030_Lubliniec_-_Market_place_2026_September_W1_Wednesday_hour_081444.mp4
+
+Stream 17333 | 0.006292 GB | raw 1 files / 0.006292 GB | stitched 0 files / 0.000000 GB
+100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/05-Saturday
+  raw:1138234 | 6291504 bytes | 100033_Zlin_-_Namesti_Miru_2026_September_W1_Saturday_hour_080643.mp4
+
+Stream 17333 | 0.006292 GB | raw 1 files / 0.006292 GB | stitched 0 files / 0.000000 GB
+100033_Europe_Czechia_Zlin_Zlin_-_Namesti_Miru/September/10-Thursday
+  raw:1306075 | 6291504 bytes | 100033_Zlin_-_Namesti_Miru_2026_September_W2_Thursday_hour_080433.mp4
+
+Stream 17334 | 0.010224 GB | raw 1 files / 0.010224 GB | stitched 0 files / 0.000000 GB
+100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/06-Sunday
+  raw:1173481 | 10223664 bytes | 100034_Kromeriz_-_Hanacke_namesti_2026_September_W1_Sunday_hour_081256.mp4
+
+Stream 17334 | 0.010224 GB | raw 1 files / 0.010224 GB | stitched 0 files / 0.000000 GB
+100034_Europe_Czechia_Kromeriz_Kromeriz_-_Hanacke_namesti/September/10-Thursday
+  raw:1306118 | 10223664 bytes | 100034_Kromeriz_-_Hanacke_namesti_2026_September_W2_Thursday_hour_080603.mp4
+
+Stream 17335 | 0.005767 GB | raw 1 files / 0.005767 GB | stitched 0 files / 0.000000 GB
+100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/29-Saturday
+  raw:899400 | 5767216 bytes | 100035_Trencin_-_Sturovo_namestie_2026_August_W5_Saturday_hour_080621.mp4
+
+Stream 17335 | 0.006029 GB | raw 1 files / 0.006029 GB | stitched 0 files / 0.000000 GB
+100035_Europe_Slovakia_Trencin_Trencin_-_Sturovo_namestie/August/30-Sunday
+  raw:933670 | 6029360 bytes | 100035_Trencin_-_Sturovo_namestie_2026_August_W5_Sunday_hour_080146.mp4
+
+Stream 17340 | 0.066936 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066936 GB
+joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/October/04-Sunday
+  collated:133190 | 66935832 bytes | 100040_Nowy_Targ_-_Nowy_Targ_2026_October_W1_Sunday_hour_19_part_31_195751-195958.mp4
+
+Stream 17340 | 0.066786 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066786 GB
+joined/100040_Europe_Poland_Nowy_Targ_Nowy_Targ_-_Nowy_Targ/September/30-Wednesday
+  collated:109610 | 66785939 bytes | 100040_Nowy_Targ_-_Nowy_Targ_2026_September_W5_Wednesday_hour_19_part_26_194659-194907.mp4
+
+Stream 17341 | 0.007602 GB | raw 2 files / 0.007602 GB | stitched 0 files / 0.000000 GB
+100041_Europe_Germany_Biberach_Biberach_-_Marktplatz_Biberach/September/08-Tuesday
+  raw:1242663 | 3932208 bytes | 100041_Biberach_-_Marktplatz_Biberach_2026_September_W2_Tuesday_hour_084956.mp4
+  raw:1242424 | 3670064 bytes | 100041_Biberach_-_Marktplatz_Biberach_2026_September_W2_Tuesday_hour_084011.mp4
+
+Stream 17342 | 0.066539 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.066539 GB
+joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/October/01-Thursday
+  collated:116980 | 66538528 bytes | 100043_Wolsztyn_-_Fountain_2026_October_W1_Thursday_hour_13_part_09_135051-135355.mp4
+
+Stream 17342 | 0.067062 GB | raw 0 files / 0.000000 GB | stitched 1 files / 0.067062 GB
+joined/100043_Europe_Poland_Wolsztyn_Wolsztyn_-_Fountain/September/29-Tuesday
+  collated:38858 | 67062223 bytes | 100043_Wolsztyn_-_Fountain_2026_September_W5_Tuesday_hour_09_part_13_094552-094941.mp4
+
+RETAINED OR UNFINISHED FILES
+raw:145253 | keep | unchecked | 2359344 bytes | current selection or sensitivity buffers changed; KEEP until reviewed
+  05_North_America_United_States_Seattle_7th_Ave_and_Bell_St/July/28-Tuesday/05_7th_Ave_and_Bell_St_2026_July_W4_Tuesday_hour_170445.mp4
+raw:457010 | keep | unchecked | 15288426 bytes | current source/error protection; KEEP
+  100003_Asia_South_Korea_Seoul_2/August/12-Wednesday/100003_2_2026_August_W2_Wednesday_hour_080117.mp4
+raw:740478 | would_delete | r2_present_unverified | 13631536 bytes | 
+  32_Europe_Italy_Assisi_Assisi_-_Town_Square_Assisi/August/22-Saturday/32_Assisi_-_Town_Square_Assisi_2026_August_W4_Saturday_hour_080525.mp4
+collated:30451 | keep | unchecked | 66831541 bytes | current selection or sensitivity buffers changed; KEEP until reviewed
+  joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/28-Monday/100037_Debica_-_Market_Square_2026_September_W4_Monday_hour_12_part_11_121939-122341.mp4
+raw:457013 | keep | unchecked | 15287668 bytes | current source/error protection; KEEP
+  100003_Asia_South_Korea_Seoul_2/August/12-Wednesday/100003_2_2026_August_W2_Wednesday_hour_080217.mp4
+collated:23704 | keep | unchecked | 66214885 bytes | current selection or sensitivity buffers changed; KEEP until reviewed
+  joined/100037_Europe_Poland_Debica_Debica_-_Market_Square/September/27-Sunday/100037_Debica_-_Market_Square_2026_September_W4_Sunday_hour_15_part_02_150415-150847.mp4
+raw:457019 | keep | unchecked | 15276474 bytes | current source/error protection; KEEP
+  100003_Asia_South_Korea_Seoul_2/August/12-Wednesday/100003_2_2026_August_W2_Wednesday_hour_080417.mp4
+raw:1567048 | keep | unchecked | 14812457 bytes | current source/error protection; KEEP
+  99997_Asia_South_Korea_Seoul_Seoul_-_Anguk/September/23-Wednesday/99997_Seoul_-_Anguk_2026_September_W4_Wednesday_hour_080309.mp4

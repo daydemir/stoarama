@@ -1,0 +1,105 @@
+{
+  "plan_id": 1388,
+  "digest": "a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc",
+  "files": 295,
+  "bytes": 4991235920,
+  "commit": "da065d66b5b4350f2ceaacd827ec2c82236fe903",
+  "before": {
+    "enabled_plans": 0,
+    "leased_items": 0,
+    "bytes": 4991235920,
+    "nas_free_bytes": 1405024264192,
+    "nas_storage_reported_at": "2026-11-08T05:35:57.9686+00:00"
+  },
+  "r2_expiration_assumption": "User instructed assuming R2 never automatically deletes; lifecycle rules not inspected",
+  "started_at": "2026-11-08T05:36:28.478935+00:00",
+  "phase": "closed_partial_at_approval_expiry",
+  "master_must_finish_off": true,
+  "enable_deploy_id": "dep-dbo0kn95efls73cihmi0",
+  "enabled_at": "2026-11-08T05:39:00.942566+00:00",
+  "latest_progress": {
+    "mode": "enabled",
+    "master_deletion_enabled": true,
+    "states": {
+      "deleted": 156,
+      "leased": 1,
+      "pending": 138
+    },
+    "approved_until": "2026-11-08T06:39:00.721335Z",
+    "approval_reason": "Deniz approved this exact 295-file, 4.99 GB stream-3 Aug26-27 pilot; instructed Nov8 to proceed assuming R2 has no automatic deletion. Disable master after this pilot.",
+    "ever_issued": 156,
+    "recovery": {
+      "r2_sha_verified": 295
+    },
+    "anomalies": [],
+    "database_progress": {
+      "at": "2026-11-08T06:38:22.820967+00:00",
+      "mode": "enabled",
+      "approved_until": "2026-11-08T06:39:00.721335+00:00",
+      "states": {
+        "leased": 1,
+        "pending": 138,
+        "deleted": 156
+      },
+      "deleted_count": 156,
+      "deleted_bytes": 2665749824,
+      "ever_issued": 156,
+      "last_receipt": "2026-11-08T06:37:46.767936+00:00",
+      "client": {
+        "version": "da065d66",
+        "phase": "idle",
+        "last_seen_at": "2026-11-08T06:37:54.065286+00:00",
+        "last_error_at": "2026-11-08T05:35:33+00:00",
+        "nas_free_bytes": 1407635513344,
+        "storage_reported_at": "2026-11-08T06:37:54.065286+00:00"
+      }
+    }
+  },
+  "configured_master": false,
+  "paused_at": "2026-11-08T06:39:31.880197+00:00",
+  "disable_deploy_id": "dep-dbo1i949v7es73e20a9g",
+  "recovery_verification": {
+    "plan_id": 1388,
+    "plan_sha256": "a4a8bc7137d732ec9bf68df6e823b7ce4527e7cb4a13afdd05b87bc544601ccc",
+    "items": 295,
+    "delete_ever_issued": 156,
+    "verified": 156,
+    "problems": 0,
+    "by_status": {
+      "ok": 156
+    },
+    "problem_items": null
+  },
+  "recovery_verification_exit": 0,
+  "recovery_verified_at": "2026-11-08T06:40:21.482878+00:00",
+  "final_deleted_count": 156,
+  "final_deleted_bytes": 2665749824,
+  "remaining_count": 139,
+  "final_states": {
+    "deleted": 156,
+    "pending": 138,
+    "would_delete": 1
+  },
+  "outstanding_delete_permits": 0,
+  "outstanding_cleanup_leases": 0,
+  "enabled_plans": 0,
+  "final_plan_mode": "paused",
+  "stop_reason": "One-hour approval expired while item244979 was being checked; it received no delete permit. Its transaction started06:38:58.582567Z, then policy2980ms+R2recovery598ms crossed expiry06:39:00.721335Z; PostgreSQL updated_at is transaction-start time.",
+  "execution_data_anomalies": [],
+  "expected_expiry_refusals": 1,
+  "nas_free_bytes_after": 1407699697664,
+  "nas_storage_reported_at": "2026-11-08T06:39:38.160705Z",
+  "remainder_requirement": "A new plan with fresh dry-run is required; an already-partially-deleted plan cannot re-enable. No new plan was enabled.",
+  "effective_master": false,
+  "final_verified_at": "2026-11-08T06:42:11.172038+00:00",
+  "final_summary": {
+    "enabled_plans": 0,
+    "outstanding": 0,
+    "deleted_count": 156,
+    "deleted_bytes": 2665749824,
+    "ever_issued": 156,
+    "nas_free_bytes": 1407699566592,
+    "storage_reported_at": "2026-11-08T06:42:05.9891+00:00"
+  },
+  "disable_deploy_status": "live"
+}

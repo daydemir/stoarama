@@ -1,0 +1,77 @@
+{
+  "status": "LARGER_DRY_RUN_COMPLETE_DELETION_OFF",
+  "verified_at": "2026-11-02T02:19:12.840086+00:00",
+  "plan_id": 5,
+  "plan_sha256": "e4fff711bd50335e5c538391728c58129841296e0ac0193d64aba3fd3f09d615",
+  "files_checked": 128,
+  "streams_checked": 44,
+  "folders_checked": 111,
+  "logical_bytes_checked": 5312511668,
+  "eligible_files": 120,
+  "eligible_logical_bytes": 5102809337,
+  "eligible_streams": 41,
+  "eligible_folders": 106,
+  "eligible_by_kind": {
+    "raw": {
+      "files": 54,
+      "logical_bytes": 930940190
+    },
+    "collated": {
+      "files": 66,
+      "logical_bytes": 4171869147
+    }
+  },
+  "retained_files": 8,
+  "retained_policy_files": 7,
+  "retained_recovery_unverified_files": 1,
+  "retention_reasons": {
+    "current selection or sensitivity buffers changed; KEEP until reviewed": 3,
+    "current source/error protection; KEEP": 4
+  },
+  "master_deletion_enabled": false,
+  "plan_mode": "dry_run",
+  "allow_nas_only": false,
+  "actual_deleted_files": 0,
+  "actual_deleted_bytes": 0,
+  "full_NAS_dryrun": false,
+  "folder_removal_authorized": false,
+  "next_step": "User reviews exact eligible files. After explicit deletion approval, prepare the narrower eligible-input as a new immutable plan, refresh its dryrun and current guards, then enable only if all checks pass. Do not enable mixed plan5.",
+  "next_input_submitted": false,
+  "public_delivery": {
+    "public_registry_matches_protected": true,
+    "generation": "c4049f6dc0f940be8b7eb8b9bef6f42f",
+    "files_protected": 32413,
+    "ticket_http": 200,
+    "download_range_http": 206,
+    "response_bytes": 2,
+    "no_media_file_saved": true
+  },
+  "public_page": {
+    "checked_at": "2026-11-02T02:16:09.870341+00:00",
+    "page_http": 200,
+    "html_confirmed": true
+  },
+  "proof_checks": "All128 source identities accounted for exactly once; no deletion ever issued; all120 eligible physical SHA/size and R2fullSHA proofs match; folder and byte totals reconcile.",
+  "artifacts": {
+    "batch-report-final.json": {
+      "bytes": 491424,
+      "sha256": "54290722329792d93dbc927efff2b1d2ceb2b07ac881bd62353935bee50fb37a"
+    },
+    "batch-summary-final.json": {
+      "bytes": 867,
+      "sha256": "b63ab7ad8448ea0f8671febc43b22bc394f979795762f02cdf2d1efb54654e62"
+    },
+    "eligible-folders-final.json": {
+      "bytes": 67766,
+      "sha256": "46c95fa519f09891069dfa7c31c2f2186827e47fc085c3800ef51caf721e700f"
+    },
+    "eligible-input-not-submitted.json": {
+      "bytes": 7601,
+      "sha256": "31fc4b7a0abb324c2decbe49c7407d57a368a67d0f47d987f0ce12078f2b4255"
+    },
+    "review-final.txt": {
+      "bytes": 33731,
+      "sha256": "a97574f7a5dc3886c452a0a9a50d5bae227d228a69ca351f6fb3c4fb36110e7f"
+    }
+  }
+}
