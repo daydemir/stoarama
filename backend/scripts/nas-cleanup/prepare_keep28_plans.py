@@ -196,7 +196,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def service(api, method, path, body=None):
     req = urllib.request.Request(api.rstrip('/') + '/api/v1/service/nas-cleanup/' + path, method=method,
                                  data=None if body is None else json.dumps(body).encode(),
-                                 headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'], 'User-Agent': 'Stoarama-Operator/1.0', 'Content-Type': 'application/json'})
+                                 headers={'Authorization': 'Bearer ' + os.environ['SERVICE_TOKEN'], 'User-Agent': 'stoarama-operator/1', 'Content-Type': 'application/json'})
     with urllib.request.build_opener(NoRedirect()).open(req, timeout=300) as response:
         return json.loads(response.read(16 << 20))
 
@@ -237,7 +237,7 @@ def main():
     ap.add_argument('--submit', action='store_true', help='admit plans as read-only dry runs via the service API')
     ap.add_argument('--api', default='https://stoarama.com')
     a = ap.parse_args()
-    if not 1 <= a.max_items <= MAX_PLAN_ITEMS or not 0 < a.max_bytes <= MAX_PLAN_BYTES or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,15}', a.label_prefix):
+    if not 1 <= a.max_items <= MAX_PLAN_ITEMS or not 0 < a.max_bytes <= MAX_PLAN_BYTES or a.max_plans < 0 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', a.label_prefix):
         raise SystemExit('invalid batching arguments')
     if a.batch_by == 'all' and not a.i_understand_large_batch:
         raise SystemExit('--batch-by all puts every stream under one approval; add --i-understand-large-batch to confirm')

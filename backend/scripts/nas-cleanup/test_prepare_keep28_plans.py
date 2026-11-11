@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from unittest.mock import patch
 
 import prepare_keep28_plans as k
 
@@ -41,6 +43,16 @@ class Keep28PlanTests(unittest.TestCase):
         self.assertEqual([(b['name'], [p['id'] for p in b['plans']]) for b in batches], [('k28-s3', [1, 2]), ('k28-s4', [3])])
         self.assertEqual(batches[0]['batch_sha256'], k.batch_digest(k.POLICY_SHA, batches[0]['plans']))
         self.assertEqual(len(k.batch_manifests(receipts, 'k28', 'all')[0]['plans']), 3)
+
+    def test_runner_timestamp_prefix_fits_immutable_labels(self):
+        prefix = 'k28auto-20261111-120000'
+        with tempfile.TemporaryDirectory() as out, \
+             patch('sys.argv', ['prepare', '--label-prefix', prefix, '--out', out]), \
+             patch.object(k, 'candidates', return_value=[row(3, 'raw', 1)]), \
+             patch('builtins.print'):
+            k.main()
+            label = k.batches([row(3, 'raw', 1)], prefix, 10000, k.MAX_PLAN_BYTES)[0][0]
+            self.assertTrue(k.LABEL.fullmatch(label))
 
     def test_byte_cap_for_pilot(self):
         plans = k.batches([row(3, 'raw', n, size=2_000_000_000) for n in range(1, 6)], 'k28', 500, 5_000_000_000)
