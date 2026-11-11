@@ -779,10 +779,8 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	if a.scope.NASBacked {
 		// Admission takes this fence before catalog locks. Public fencing also
 		// excludes new activation/references while this exact R2 delete finishes.
-		for _, key := range []int64{7343226011103, 7343226011101} {
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
-				return "", "", err
-			}
+		if err := api.LockNASCleanupR2Retirement(ctx, tx); err != nil {
+			return "", "", err
 		}
 	}
 	if ids, err := r2RetireEnabledPlans(ctx, tx); err != nil {
@@ -866,6 +864,18 @@ func (a *r2RetireApplier) applyOne(ctx context.Context, it r2RetireItem) (string
 	case head.SHA256Metadata != "" && !strings.EqualFold(head.SHA256Metadata, it.SHA256):
 		return "", "", r2RetireAnomalyf("R2 sha256 metadata differs from the catalog")
 	}
+	if a.scope.NASBacked {
+		// HEAD may wait on the network; an owner pick changed during that
+		// interval revokes this item before any intent or lifecycle write.
+		latest, err := loadR2RetirePicks(a.picks.Path)
+		if err != nil {
+			return "", "", err
+		}
+		if latest.SHA256 != a.header.PicksSHA256 {
+			return "", "", r2RetireAnomalyf("picks changed during HEAD; re-plan")
+		}
+	}
+
 	if it.Kind == "raw" {
 		// The NAS cleanup hold and joined retention triggers veto here, before
 		// anything is deleted.
@@ -1115,15 +1125,25 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 	opts := r2RetirePlanOptions{Picks: picks, PageSize: *pageSize, Now: time.Now(),
 		Scope: r2RetireScope{AccountID: accountID, ConnectionID: conn, Bucket: cfg.R2Bucket, Grace: *grace, HasRetirements: hasRet, NASBacked: *nasBacked}}
 	if *nasBacked {
-		log.Print("r2-retire: listing live managed/ and joined/ R2 objects (read-only)")
+		log.Print("r2-retire: listing catalog folder/version prefixes in R2 (read-only, 8 workers)")
 		if *listingPath != "" {
 			opts.LiveObjects, err = readR2RetireListing(*listingPath, *listingSHA, cfg.R2Bucket)
 		} else {
-			opts.LiveObjects, err = r2RetireLiveObjects(ctx, mustArchiveR2Client(ctx, cfg))
+			prefixes, prefixErr := r2RetirePrefixes(ctx, pool, accountID, cfg.R2Bucket)
+			if prefixErr != nil {
+				log.Fatal(prefixErr)
+			}
+			opts.LiveObjects, err = r2RetireLiveObjects(ctx, mustArchiveR2Client(ctx, cfg), prefixes)
+			if err == nil {
+				*listingSHA, err = writeR2RetireListing(filepath.Join(*out, "r2-listing.jsonl"), cfg.R2Bucket, prefixes, opts.LiveObjects)
+			}
 		}
 		if err != nil {
 			log.Fatal(err)
 		}
+	}
+	if *nasBacked {
+		log.Printf("r2-retire: live listing complete (%d objects); scanning catalog", len(opts.LiveObjects))
 	}
 	sum, items, err := r2RetirePlanRun(ctx, pool, opts, policySHA, windows)
 	if err != nil {
@@ -1136,10 +1156,10 @@ func runR2RetirePlan(ctx context.Context, cfg config.Config, args []string, usag
 		sum.HeadSample = &hs
 	}
 	if sum.Phases != nil {
-		if err := pool.QueryRow(ctx, `SELECT coalesce(nas_storage_free_bytes,0) FROM connections WHERE id=$1`, conn).Scan(&sum.Phases.NASFreeBytes); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT coalesce(nas_storage_free_bytes,0),nas_storage_reported_at FROM connections WHERE id=$1`, conn).Scan(&sum.Phases.NASFreeBytes, &sum.Phases.NASFreeReportedAt); err != nil {
 			log.Fatal(err)
 		}
-		sum.Phases.CopyFits = sum.Phases.NASFreeBytes >= sum.Phases.Totals[r2RetireCopy].Bytes+sum.Phases.NASReserveBytes
+		sum.Phases.CopyFits = sum.Phases.NASFreeReportedAt != nil && time.Since(*sum.Phases.NASFreeReportedAt) <= 5*time.Minute && sum.Phases.NASFreeBytes >= sum.Phases.Totals[r2RetireCopy].Bytes+sum.Phases.NASReserveBytes
 		if err := sum.Phases.write(*out, sum.Header); err != nil {
 			log.Fatal(err)
 		}

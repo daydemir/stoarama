@@ -140,8 +140,8 @@ func r2RetireParsePickTime(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// r2RetireFacts are the database observations for one object. Every true
-// value keeps the object.
+// r2RetireFacts are protection and verified NAS identity observations used
+// by both legacy and NAS-backed selection.
 type r2RetireFacts struct {
 	Purged         bool // raw: purged_at already set
 	Retired        bool // already in r2_object_retirements
