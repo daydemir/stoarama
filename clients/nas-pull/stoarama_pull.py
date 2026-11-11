@@ -3307,6 +3307,11 @@ def _cleanup_process_task(cfg, inventory, stop_event, task, api, owner):
                         inventory, item.get("size_bytes"), {"item_id": item_id, "plan_sha256": task["plan_sha256"], "relative_path": item["relative_path"]})
                     if refusal:
                         raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + refusal)
+                    if item.get("permit_reason"):
+                        # Final switch read at the unlink boundary for stitched retirement.
+                        switch = stitch_switch_refusal(cfg, True)
+                        if switch:
+                            raise CleanupPermitRefused("local_guard", "client deletion guard refused; not unlinked: " + switch)
                     ledger = {"item_id": item_id, "attempt": attempt, "plan_id": task.get("plan_id"), "plan_sha256": task["plan_sha256"],
                               "proof_sha256": receipt["proof_sha256"], "relative_path": item["relative_path"],
                               "sidecar_relative_path": item["relative_path"] + ".stoarama.json" if item.get("sidecar_required") else None,
@@ -32110,10 +32115,17 @@ def stitch_repair_local(cfg, clip, source, directory, tools, deadline, stop):
     return None
 
 
-def stitch_output_recheck(cfg, item, execution=True):
-    """Independent local deletion gate; a server boolean is never sufficient."""
+def stitch_switch_refusal(cfg, execution=True):
     if not getattr(cfg, "stitch_enabled", False) or (execution and not getattr(cfg, "stitch_delete_enabled", False)):
         return "local stitch/deletion switch off"
+    return None
+
+
+def stitch_output_recheck(cfg, item, execution=True):
+    """Independent local deletion gate; a server boolean is never sufficient."""
+    switch = stitch_switch_refusal(cfg, execution)
+    if switch:
+        return switch
     try:
         if item.get("permit_reason") != "stitched_included" or item.get("kind") != "raw":
             return "unsupported stitch deletion reason"
@@ -32141,7 +32153,8 @@ def stitch_output_recheck(cfg, item, execution=True):
                 or included[0].get("frames") != included[0].get("packets") or not included[0].get("packet_chain_sha256")):
             return "raw source lacks full inclusion"
         hash_certification_file(cfg.output_dir, path, item["stitch_output_size_bytes"], item["stitch_output_sha256"])
-        return None
+        # Switches may flip during the (slow) rehash: re-read them afterwards.
+        return stitch_switch_refusal(cfg, execution)
     except Exception as exc:
         return "output fresh readback failed: " + str(exc)[:200]
 

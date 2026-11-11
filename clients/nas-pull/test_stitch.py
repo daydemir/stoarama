@@ -335,6 +335,33 @@ class StitchIntegrationTests(unittest.TestCase):
         with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
         self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
 
+    def test_switch_off_during_output_rehash_keeps_raw(self):
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        real=pull.hash_certification_file
+        def flip(*a,**k):
+            out=real(*a,**k); self.cfg.stitch_delete_enabled=False; return out
+        with mock.patch.object(pull,'hash_certification_file',side_effect=flip):
+            self.assertIn('switch off',pull.stitch_output_recheck(self.cfg,task['item']))
+        self.cfg.stitch_delete_enabled=True
+        with mock.patch.object(pull,'hash_certification_file',side_effect=flip), \
+                mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+
+    def test_switch_off_at_unlink_boundary_keeps_raw(self):
+        result=self.build(); task=self.cleanup_task(result)
+        with mock.patch.object(pull,'restore_api',side_effect=self.api): pull.stitch_register(self.cfg,self.inventory,7,result)
+        real=pull.cleanup_local_caps
+        def flip(*a,**k):
+            out=real(*a,**k)
+            if len(a)>2: self.cfg.stitch_delete_enabled=False
+            return out
+        with mock.patch.object(pull,'cleanup_local_caps',side_effect=flip), \
+                mock.patch.object(pull,'restore_api',side_effect=self.api):
+            pull.cleanup_process_task(self.cfg,self.inventory,self.stop,task)
+        self.assertTrue((self.cfg.output_dir/self.clips[0]['relative_path']).exists())
+
     def test_crash_after_publication_before_journal_rebuilds_without_raw_loss(self):
         with mock.patch.object(pull,'stitch_journal',side_effect=RuntimeError('simulated crash')):
             with self.assertRaisesRegex(RuntimeError,'simulated crash'): self.build()
