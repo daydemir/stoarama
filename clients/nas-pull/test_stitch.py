@@ -25,6 +25,15 @@ spec.loader.exec_module(pull)
 ORIGINAL_CHECKPOINT = pull.stitch_checkpoint
 
 
+class StitchRepairTests(unittest.TestCase):
+    def test_truncated_nal_length_without_payload_retains_verified_prefix(self):
+        media = b'\x00\x00\x00\x00mdat\x00\x00\x00\x02\x65\x01\x00\x00\x00\x10'
+        nals, reason, gaps, gap_indices = pull.stitch_repair_mdat(media)
+        self.assertEqual(nals, [b'\x65\x01'])
+        self.assertEqual(reason, 'partial')
+        self.assertEqual((gaps, gap_indices), (0, []))
+
+
 class StitchPublicationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

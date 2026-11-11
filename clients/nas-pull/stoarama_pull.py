@@ -32003,7 +32003,7 @@ def stitch_repair_mdat(data):
         ok = 0 < ln <= 8_000_000 and off + 4 + ln <= len(data) and not (data[off+4] & 0x80) and (data[off+4] & 0x1f) in (1, 2, 3, 4, 5, 6, 7, 8, 9)
         if not ok:
             m = STITCH_REPAIR_AUD_RE.search(data, off + 1)
-            if off + 4 + ln > len(data) and 0 < ln <= 8_000_000 and (data[off+4] & 0x1f) in (1, 5) and not m:
+            if off + 4 < len(data) and off + 4 + ln > len(data) and 0 < ln <= 8_000_000 and (data[off+4] & 0x1f) in (1, 5) and not m:
                 stopmsg = 'partial'; break
             if not m: stopmsg = 'junk_tail' if off + 4 + ln <= len(data) or ln > 8_000_000 else 'partial'; break
             off = m.start(); gaps += 1; gap_idx.append(len(nals)); continue
