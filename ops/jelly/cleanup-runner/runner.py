@@ -34,6 +34,10 @@ class Halt(Exception):
     """Only fixed, credential-free messages may enter the log or owner email."""
 
 
+class LockHeld(Exception):
+    """Another runner owns the master switch; leave it alone."""
+
+
 def require(ok, message):
     if not ok:
         raise Halt(message)
@@ -190,11 +194,33 @@ class Runner:
     def __init__(self, repo, state, dry_run=False):
         self.repo, self.root, self.dry_run = repo, state, dry_run
         self.stopping = False
+        self.lock = None
+        self.status = {'current_plan': None, 'last_error': None}
+
+    def initialize(self):
+        # Keep all startup I/O inside main's fail-safe, with usable in-memory state.
+        self.repo = self.repo.resolve()
+        self.root = self.root.expanduser()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = (self.root / 'lock').open('a')
-        fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LockHeld from None
         path = self.root / 'status.json'
-        self.status = json.loads(path.read_text()) if path.exists() else {'current_plan': None, 'last_error': None}
+        try:
+            try:
+                raw = path.read_text()
+            except FileNotFoundError:
+                return
+            status = json.loads(raw)
+            require(isinstance(status, dict)
+                    and (status['current_plan'] is None or type(status['current_plan']) is int and status['current_plan'] > 0)
+                    and (status['last_error'] is None or isinstance(status['last_error'], str)),
+                    'invalid ownership state')
+        except Exception:
+            raise Halt('execution ownership unreadable; unknown enabled plan; owner review required') from None
+        self.status = status
 
     def load_policy(self):
         repo = self.repo
@@ -497,7 +523,8 @@ class Runner:
         self.drain(plan['id'])
         plan = self.plan(plan['id'])
         self.recovery(plan)
-        # OFF/drain can race a manual pause: classify the final report, never the input.
+        # Verification can race a manual pause: classify a fresh report before close.
+        plan = self.plan(plan['id'])
         state = execution_state(plan)
         require(state in {'done', 'expired'}, 'plan paused for a non-expiry reason')
         require(not any(r['state'] in {'delete_issued', 'unverified', 'media_deleted_sidecar_failed', 'conflict', 'missing', 'keep'}
@@ -622,22 +649,22 @@ def main():
     ap.add_argument('--dry-run', action='store_true', help='prepare/verify only; still forces master OFF and sends daily notes')
     args = ap.parse_args()
     os.umask(0o077)
-    runner = None
+    runner = Runner(args.repo, args.state, args.dry_run)
     try:
-        runner = Runner(args.repo.resolve(), args.state.expanduser(), args.dry_run)
+        runner.initialize()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: setattr(runner, 'stopping', True))
         runner.run()
         return 0
-    except BlockingIOError:
+    except LockHeld:
         return 0  # Another process owns the lock; never touch its master switch.
     except Exception as exc:
         message = str(exc) if isinstance(exc, Halt) else 'unexpected runner failure; inspect code privately'
-        if runner is not None:
-            runner.fail(runner.status.get('last_error') or message)
-        else:
-            print('cleanup runner initialization failed; no enable attempted by this process', file=sys.stderr)
+        runner.fail(runner.status.get('last_error') or message)
         return 1
+    finally:
+        if runner.lock is not None:
+            runner.lock.close()
 
 
 if __name__ == '__main__':

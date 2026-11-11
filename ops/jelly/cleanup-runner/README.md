@@ -20,7 +20,10 @@ The runner:
   future, the plan is enabled,
   master is ON, no anomalous item states exist, and no failure is latched.
   An unknown/unhealthy enabled plan, enabled batch, or dry-run takeover forces
-  OFF, alerts the owner, and stops. Never pauses a healthy plan on restart:
+  OFF, alerts the owner, and stops. Startup errors also take this fail-safe path;
+  unreadable or malformed ownership state is treated as an unknown enabled plan.
+  Only actual lock contention exits without touching the master switch.
+  Never pauses a healthy plan on restart:
   toggling OFF would expire its leases and force replanning. The start digest is
   durably recorded before the enable request, including recovery from a lost API
   response; a plan merely selected for dry run has no execution ownership marker.
@@ -50,10 +53,10 @@ The runner:
 - Enables only the exact plan SHA with the dated standing approval and a 24h
   approval. Monitors for completion, expiry, anomalies and live-commit changes.
   OFF, drain outstanding receipts/leases, then recovery verification precede
-  close. Reclassifies the final report after drain/re-read: only exact backend
-  lease/approval expiry reasons may close never-issued remainder. A concurrent
-  manual/non-expiry pause, anomalies, and uncertain issued receipts stop for the
-  owner without closing or replanning.
+  close. Re-reads and reclassifies the final report after recovery verification:
+  only exact backend lease/approval expiry reasons may close never-issued
+  remainder. A concurrent manual/non-expiry pause, anomalies, and uncertain issued
+  receipts stop for the owner without closing or replanning.
 - Invokes the existing `verify-recovery` CLI because this API revision has no
   recovery route; checks plan identity, issued/verified counts and zero problems.
   This CLI GETs the report and HEAD-verifies every ever-issued R2 copy. It uses

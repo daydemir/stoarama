@@ -120,12 +120,14 @@ class FakeRunner(r.Runner):
         self.status = {'current_plan': None, 'last_error': None}
         self.dry_run = dry_run
         self.stopping = False
+        self.lock = None
         self.windows = WINDOWS
         self.events = []
         self.p, self.cat = fixture()
         self.picks = [42, None]
 
     def load_policy(self): pass
+    def initialize(self): pass
     def check_delivery(self): pass
     def active(self):
         return {'plans': [self.p['id']] if self.p['mode'] == 'enabled' else [], 'batches': 0}
@@ -298,6 +300,64 @@ class LoopTests(unittest.TestCase):
 
 
 class SafetyRegressionTests(unittest.TestCase):
+    def test_real_lock_contention_leaves_existing_runner_alone(self):
+        with tempfile.TemporaryDirectory() as root:
+            owner = r.Runner(Path(root), Path(root))
+            owner.initialize()
+            try:
+                with patch.object(r.Runner, 'fail') as fail, \
+                        patch.object(r.Runner, 'run') as run, \
+                        patch.object(r.sys, 'argv', ['runner', '--repo', root, '--state', root]):
+                    self.assertEqual(r.main(), 0)
+                fail.assert_not_called()
+                run.assert_not_called()
+                self.assertFalse((Path(root) / 'STOP').exists())
+            finally:
+                owner.lock.close()
+
+    def test_main_handles_other_startup_errors_through_fail_safe(self):
+        for stage in ('initialize', 'active', 'load_policy', 'check_delivery'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                error = OSError('fake-sensitive-error') if stage == 'initialize' else r.Halt('startup check failed')
+                with patch.object(job, stage, side_effect=error), \
+                        patch.object(r, 'Runner', return_value=job), \
+                        patch.object(r.sys, 'argv', ['runner']), \
+                        patch.object(r.signal, 'signal'), \
+                        patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(job.events[-2:], ['OFF', 'notify'])
+                self.assertNotIn('ON', job.events)
+                self.assertTrue((job.root / 'STOP').exists())
+                self.assertNotIn('fake-sensitive', stderr.getvalue() + json.dumps(job.status))
+
+    def test_manual_pause_during_recovery_preserves_ownership_and_stops(self):
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                job.status.update(current_plan=42, started_plan_sha256=job.p['plan_sha256'])
+                job.p.update(mode='paused', approval_reason='auto-paused: approval expired; prior approval')
+                if deleted:
+                    job.p['results'][0].update(state='deleted', delete_ever_issued=True)
+                def manual_pause(_):
+                    job.events.append('recovery')
+                    # A new server report, not a mutation of the already fetched snapshot.
+                    job.p = dict(copy.deepcopy(job.p), approval_reason='manual pause')
+                job.recovery = manual_pause
+                job.run = lambda: job.finish(copy.deepcopy(job.p))
+                with patch.object(r, 'Runner', return_value=job), \
+                        patch.object(r.sys, 'argv', ['runner']), \
+                        patch.object(r.signal, 'signal'), \
+                        patch.object(r.sys, 'stderr', new=io.StringIO()):
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(job.events[:3], ['OFF', 'recovery', 'OFF'])
+                self.assertIn('notify', job.events)
+                self.assertNotIn('plans/42/close', job.events)
+                self.assertEqual(job.status['current_plan'], 42)
+                self.assertEqual(job.status['started_plan_sha256'], 'b'*64)
+                self.assertEqual(job.picks, [42, None])
+                self.assertTrue((job.root / 'STOP').exists())
+
     def test_source_lookup_must_resolve_manifest_and_catalog_union_once(self):
         for manifest, catalog, resolved in [
                 ([1], [1, 2], [1]),  # JOIN silently dropped the catalog's missing clip.
@@ -469,6 +529,41 @@ class RenderOffTests(unittest.TestCase):
                 d['env'] == 'true' for d in self.deploys.values() if d['status'] == 'live'))
         job.plan = plan
         job.live = lambda: r.Runner.live(job)
+
+    def test_startup_unreadable_ownership_confirms_off_then_alerts_and_stops(self):
+        for failure in ('json', 'read', 'blocking_read', 'shape'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                job = FakeRunner(root)
+                self.make_render(job)
+                state = Path(root) / 'status.json'
+                state.write_text('fake-sensitive-corrupt-json' if failure == 'json' else '[]')
+                read_text = Path.read_text
+                def read(path, *args, **kwargs):
+                    if path == state and failure in {'read', 'blocking_read'}:
+                        error = PermissionError if failure == 'read' else BlockingIOError
+                        raise error('fake-sensitive-read-error')
+                    return read_text(path, *args, **kwargs)
+                def notify(subject):
+                    self.assertEqual(self.deploys['off-0']['status'], 'live')
+                    self.assertEqual(self.deploys['off-0']['env'], 'false')
+                    self.assertIn(('runtime', 42, None), self.calls)
+                    job.events.append(subject)
+                with patch.object(Path, 'read_text', new=read), \
+                        patch.object(r.Runner, 'render', side_effect=job.render), \
+                        patch.object(r.Runner, 'plan', side_effect=job.plan), \
+                        patch.object(r.Runner, 'query', return_value=42), \
+                        patch.object(r.Runner, 'notify', side_effect=notify), \
+                        patch.object(r, 'request', side_effect=AssertionError('network forbidden')), \
+                        patch.object(r.time, 'sleep', side_effect=AssertionError('unexpected retry')), \
+                        patch.object(r.sys, 'argv', ['runner', '--repo', root, '--state', root]), \
+                        patch.object(r.signal, 'signal'), \
+                        patch.object(r.sys, 'stderr', new=io.StringIO()) as stderr:
+                    self.assertEqual(r.main(), 1)
+                self.assertEqual(job.events, ['STOPPED: owner review required'])
+                self.assertTrue((Path(root) / 'STOP').exists())
+                status = json.loads(state.read_text())
+                self.assertIn('unknown enabled plan', status['last_error'])
+                self.assertNotIn('fake-sensitive', stderr.getvalue() + json.dumps(status))
 
     def test_off_cancels_inflight_on_and_verifies_new_live_env_without_disk(self):
         with tempfile.TemporaryDirectory() as root:
