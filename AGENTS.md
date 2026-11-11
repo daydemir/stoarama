@@ -13,5 +13,10 @@ product model; private thesis research lives in `social-isolation`.
 - `docs/operations.md`: product workflow, credential locations, Render env/deploy and
   DigitalOcean spend controls. Read it before those operations.
 
+Never initdb your own cluster; use `scripts/test-db run -- <tests>` from the repo
+root (`../scripts/test-db` from `backend/`). For local Python/Go suite commands,
+manual databases and cleanup, see README.md's “Local tests”. CI keeps its service
+container and explicit `STOARAMA_TEST_DATABASE_URL`.
+
 Keep credentials out of output and Git. Production env edits are single-key;
 preserve the existing `STORAGE_CRED_KEY` and encrypted destination data.
