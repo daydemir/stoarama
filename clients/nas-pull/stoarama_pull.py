@@ -1503,6 +1503,7 @@ class Runtime:
         self.joined_protocol_version = 0
         self.joined_protocol_generation = 0
         self.joined_delivery = None
+        self.joined_delivery_error = ""
         self.joined_transfer = None
         self.joined_raw_priority_polled_at = 0.0
         self.joined_raw_priority_pending = False
@@ -1671,10 +1672,11 @@ class Runtime:
             operation()
             return True
 
-    def set_joined_delivery_error(self, artifact_id, blocker, retry_sec):
+    def set_joined_delivery_error(self, artifact_id, blocker, retry_sec, message=""):
         attempted = datetime.datetime.now(datetime.timezone.utc)
         retry = attempted + datetime.timedelta(seconds=retry_sec)
         with self.lock:
+            self.joined_delivery_error = str(message)[:1000]
             self.joined_delivery = {
                 "artifact_id": artifact_id,
                 "blocker": blocker,
@@ -1685,6 +1687,7 @@ class Runtime:
     def clear_joined_delivery_error(self):
         with self.lock:
             self.joined_delivery = None
+            self.joined_delivery_error = ""
 
     def set_joined_transfer(self, artifact_id, offset_bytes, operation):
         with self.lock:
@@ -1773,6 +1776,9 @@ class Runtime:
                 "capacity_blocked": self.capacity_blocked,
                 "joined_protocol_version": self.joined_protocol_version,
             }
+            if self.joined_delivery_error and not payload["client_last_error"]:
+                payload["client_last_error"] = self.joined_delivery_error
+                payload["client_last_error_at"] = self.joined_delivery["attempted_at"]
             release = {"candidate": self.release_candidate_at_start and not self.stable_marked,
                        "stable": self.stable_marked}
             storage = self.storage.copy() if self.storage is not None else None
@@ -7339,72 +7345,135 @@ def write_joined_stage(directory_fd, name, content):
         while offset < len(content):
             offset += os.write(descriptor, content[offset:])
         os.fsync(descriptor)
+        current = os.fstat(descriptor)
     finally:
         os.close(descriptor)
     os.fsync(directory_fd)
+    return current
 
 
-def linked_joined_stage(directory_fd, marker_name, marker_stat):
-    prefix = marker_name + ".stage-"
-    matches = []
-    for candidate in os.listdir(directory_fd):
-        if not candidate.startswith(prefix) or not re.fullmatch(r"[0-9a-f]{32}", candidate[len(prefix):]):
+def joined_sidecar_intent(cfg, directory_fd, name, content):
+    artifact = json.loads(content)
+    marker_path = joined_output_path(cfg, artifact).with_name(name).absolute()
+    parent = os.fstat(directory_fd)
+    identity = {
+        "schema_version": 1, "artifact_id": artifact["id"],
+        "marker_path": str(marker_path), "directory_device": parent.st_dev,
+        "directory_inode": parent.st_ino, "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    key = hashlib.sha256(str(marker_path).encode("utf-8")).hexdigest()
+    return cfg.state_dir / ("joined-sidecar-intent-" + key + ".json"), identity
+
+
+def recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record):
+    # A filename, checksum or same-inode pair is never provenance. This record
+    # was fsynced locally before the publication hardlink could be created.
+    stage = record.get("stage_name") if isinstance(record, dict) else None
+    if (
+        not isinstance(stage, str) or not stage.startswith(name + ".stage-")
+        or re.fullmatch(r"[0-9a-f]{32}", stage[len(name + ".stage-"):]) is None
+        or set(record) != set(identity) | {"stage_name", "stage_path", "device", "inode"}
+        or any(type(record.get(key)) is not type(value) or record[key] != value for key, value in identity.items())
+        or record["stage_path"] != str(Path(identity["marker_path"]).with_name(stage))
+        or type(record["device"]) is not int or type(record["inode"]) is not int
+    ):
+        raise ExistingFileMismatch("joined sidecar durable intent conflicts")
+    marker_stat = joined_entry_stat(directory_fd, name)
+    stage_stat = joined_entry_stat(directory_fd, stage)
+    if marker_stat is None and stage_stat is None:
+        raise ExistingFileMismatch("joined sidecar durable intent has no matching file")
+    links = 2 if marker_stat is not None and stage_stat is not None else 1
+    for entry, current in ((name, marker_stat), (stage, stage_stat)):
+        if current is None:
             continue
-        try:
-            candidate_stat = os.stat(candidate, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat_module.S_ISREG(candidate_stat.st_mode) and same_joined_inode(marker_stat, candidate_stat):
-            matches.append((candidate, candidate_stat))
-    if len(matches) != 1:
-        raise ExistingFileMismatch("joined marker has an unknown hardlink")
-    stage_name, stage_stat = matches[0]
-    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2:
-        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
-    return stage_name
+        if (
+            (current.st_dev, current.st_ino, current.st_size, current.st_nlink)
+            != (record["device"], record["inode"], record["size_bytes"], links)
+            or not verify_joined_sidecar(cfg, runtime, directory_fd, entry, content, stop_event)
+        ):
+            raise ExistingFileMismatch("joined sidecar durable intent file mismatch: " + entry)
+    if marker_stat is None:
+        # A process may have stopped after journal rename but before its fsync.
+        fsync_dir(journal.parent)
+        os.link(stage, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        os.fsync(directory_fd)
+    if stage_stat is not None:
+        # Recheck both names after hashing and immediately before disposal.
+        marker_stat = joined_entry_stat(directory_fd, name)
+        stage_stat = joined_entry_stat(directory_fd, stage)
+        if any(current is None or (current.st_dev, current.st_ino, current.st_size, current.st_nlink)
+               != (record["device"], record["inode"], record["size_bytes"], 2)
+               for current in (marker_stat, stage_stat)):
+            raise ExistingFileMismatch("joined sidecar durable intent changed before unlink")
+        os.unlink(stage, dir_fd=directory_fd)
+    # Also fsync when a restart observes that unlink already happened. Only
+    # retire the intent after the single-link marker is durably installed.
+    os.fsync(directory_fd)
+    marker_stat = joined_entry_stat(directory_fd, name)
+    if marker_stat is None or (marker_stat.st_dev, marker_stat.st_ino, marker_stat.st_size, marker_stat.st_nlink) != (
+        record["device"], record["inode"], record["size_bytes"], 1,
+    ):
+        raise ExistingFileMismatch("joined sidecar durable intent completion mismatch")
+    journal.unlink()
+    fsync_dir(journal.parent)
 
 
 def publish_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-    marker_stat = joined_entry_stat(directory_fd, name)
-    if marker_stat is not None:
-        if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-            raise ExistingFileMismatch("joined partial ownership marker conflicts")
-        marker_stat = joined_entry_stat(directory_fd, name)
-        if marker_stat.st_nlink == 2:
-            stage_name = linked_joined_stage(directory_fd, name, marker_stat)
-            os.unlink(stage_name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        elif marker_stat.st_nlink != 1:
-            raise ExistingFileMismatch("joined marker has an unknown hardlink")
-        if joined_entry_stat(directory_fd, name).st_nlink != 1:
-            raise ExistingFileMismatch("joined marker has an unknown hardlink")
-        return
-    for _attempt in range(8):
-        stage_name = name + ".stage-" + os.urandom(16).hex()
-        try:
-            write_joined_stage(directory_fd, stage_name, content)
-            break
-        except FileExistsError:
-            continue
-    else:
-        raise ExistingFileMismatch("could not allocate a private joined sidecar stage")
+    journal, identity = joined_sidecar_intent(cfg, directory_fd, name, content)
+    record = None
     try:
-        os.link(stage_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-    except FileExistsError:
-        # Another publisher won. Our private, unlinked stage is left untouched;
-        # only an exact same-inode link is ever removed below or on restart.
-        raise ExistingFileMismatch("joined marker appeared during publication")
-    os.fsync(directory_fd)
-    marker_stat = joined_entry_stat(directory_fd, name)
-    stage_stat = joined_entry_stat(directory_fd, stage_name)
-    if marker_stat.st_nlink != 2 or stage_stat.st_nlink != 2 or not same_joined_inode(marker_stat, stage_stat):
-        raise ExistingFileMismatch("joined sidecar staging link count is invalid")
-    if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
-        raise ExistingFileMismatch("joined sidecar stage changed during publication")
-    os.unlink(stage_name, dir_fd=directory_fd)
-    os.fsync(directory_fd)
-    if joined_entry_stat(directory_fd, name).st_nlink != 1:
-        raise ExistingFileMismatch("joined marker has an unknown hardlink")
+        try:
+            encoded = journal.read_bytes()
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                record = json.loads(encoded)
+            except ValueError as exc:
+                raise ExistingFileMismatch("joined sidecar durable intent is invalid") from exc
+            recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record)
+            return
+        marker_stat = joined_entry_stat(directory_fd, name)
+        if marker_stat is not None:
+            if not verify_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event):
+                raise ExistingFileMismatch("joined partial ownership marker conflicts")
+            if joined_entry_stat(directory_fd, name).st_nlink != 1:
+                raise ExistingFileMismatch("joined marker has an unknown hardlink; no durable intent; operator decision required")
+            return
+        for _attempt in range(8):
+            stage = name + ".stage-" + os.urandom(16).hex()
+            try:
+                current = write_joined_stage(directory_fd, stage, content)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise ExistingFileMismatch("could not allocate a private joined sidecar stage")
+        record = dict(identity, stage_name=stage,
+                      stage_path=str(Path(identity["marker_path"]).with_name(stage)),
+                      device=current.st_dev, inode=current.st_ino)
+        atomic_write(journal, json.dumps(record, sort_keys=True).encode("utf-8"))
+        recover_joined_sidecar(cfg, runtime, directory_fd, name, content, stop_event, journal, identity, record)
+    except ExistingFileMismatch as exc:
+        # Diagnostics do not confer ownership. Include actual aliases so old
+        # installations without provenance can be resolved by an operator.
+        try:
+            marker_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            marker_stat = None
+        entries = []
+        for entry in sorted(os.listdir(directory_fd)):
+            try:
+                current = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            recorded_stage = record.get("stage_name") if isinstance(record, dict) else None
+            if entry in (name, recorded_stage) or same_joined_inode(marker_stat, current):
+                entries.append("path=%s inode=%d device=%d links=%d size=%d" % (
+                    entry, current.st_ino, current.st_dev, current.st_nlink, current.st_size))
+        relative_dir = Path(identity["marker_path"]).relative_to(cfg.output_dir.absolute()).parent
+        raise ExistingFileMismatch("%s: directory=%s; %s" % (exc, relative_dir, "; ".join(entries))) from exc
 
 
 def same_joined_inode(left, right):
@@ -7417,15 +7486,9 @@ def ensure_owned_joined_partial(cfg, runtime, directory_fd, part_name, marker_na
     if marker_stat is None and part_stat is not None:
         raise ExistingFileMismatch("joined partial has no ownership marker")
     # Run the publisher's restart recovery even when the marker already exists.
-    # It removes only an exact two-link marker + private stage pair, after the
-    # complete marker bytes match. Unknown aliases never grant write authority.
-    try:
-        publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
-    except ExistingFileMismatch as exc:
-        if marker_stat is not None and marker_stat.st_nlink != 1:
-            raise ExistingFileMismatch("%s: marker=%s links=%d inode=%d" % (
-                exc, marker_name, marker_stat.st_nlink, marker_stat.st_ino)) from exc
-        raise
+    # Disposal requires a durable local intent plus exact file identity and
+    # bytes. Unknown aliases never grant write authority.
+    publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, sidecar, stop_event)
     marker_stat = joined_entry_stat(directory_fd, marker_name)
     if part_stat is not None and part_stat.st_nlink != 1:
         raise ExistingFileMismatch("joined partial has an unknown hardlink: partial=%s links=%d inode=%d" % (
@@ -7655,10 +7718,9 @@ def complete_existing_joined(cfg, runtime, directory_fd, item, names, marker, st
             raise ExistingFileMismatch("joined final has an unknown hardlink")
     elif final_stat.st_nlink != 2 or part_stat.st_nlink != 2 or not same_joined_inode(final_stat, part_stat):
         raise ExistingFileMismatch("joined partial conflicts with final")
-    if marker_stat is not None and not verify_joined_sidecar(
-        cfg, runtime, directory_fd, marker_name, marker, stop_event,
-    ):
-        raise ExistingFileMismatch("joined partial ownership marker conflicts")
+    if marker_stat is not None:
+        # Refuse unknown marker aliases before removing even transfer scratch.
+        publish_joined_sidecar(cfg, runtime, directory_fd, marker_name, marker, stop_event)
     if part_stat is not None and marker_stat is None:
         raise ExistingFileMismatch("joined published partial has no ownership marker")
     validate_joined_artifact(cfg, runtime, directory_fd, final_name, item, stop_event)
@@ -7885,7 +7947,9 @@ def drain_joined(cfg, runtime, stop_event, report_phase=True):
         runtime.set_joined_transfer_error(item["id"], exc)
         runtime.set_joined_delivery_error(
             item["id"], classify_joined_delivery_error(exc), min(getattr(cfg, "poll_interval_sec", 60), 10),
+            "joined artifact_id=%d: %s" % (item["id"], exc),
         )
+        log("ERROR", "joined artifact_id=%d failed: %s" % (item["id"], exc))
         raise
     runtime.clear_joined_delivery_error()
     runtime.clear_joined_transfer()
