@@ -61,7 +61,7 @@ const (
 	nasCleanupReconciliationProtocol = 1
 	// Exact reviewed release allowlist; git hashes have no sortable version order.
 	// Retain reviewed predecessors. Stage this fix only with explicit
-	// NAS_VERSION=v85r-server-switch-v1 from merged main; never reuse a predecessor version.
+	// NAS_VERSION=v85r-corpus-ua-v1 from merged main; never reuse a predecessor version.
 	nasCleanupExecutionClientVersion          = "be17fd73"
 	nasCleanupSerialExecutionClientVersion    = "94d39bff"
 	nasCleanupDedicatedExecutionClientVersion = "523b70ff"
@@ -70,6 +70,7 @@ const (
 	nasCleanupJoinedMarkerClientVersion       = "joined-marker-recovery-v1"
 	nasCleanupV85RClientVersion               = "v85r-fence-progress-v1"
 	nasCleanupV85RServerSwitchClientVersion   = "v85r-server-switch-v1"
+	nasCleanupV85RCorpusUAClientVersion       = "v85r-corpus-ua-v1"
 	// Items per plan. Plans are still bounded by nasCleanupMaxPlanBytes; the
 	// item limit only keeps one admission request bounded.
 	nasCleanupMaxPlanItems = 10000
@@ -553,7 +554,7 @@ func cleanupRequestSession(r *http.Request) cleanupClientSession {
 }
 
 func cleanupSessionDeadline(ctx context.Context, tx pgx.Tx, cid int64, session cleanupClientSession) (time.Time, error) {
-	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion) {
+	if session.boot == "" || session.boot == "unknown" || (session.version != nasCleanupExecutionClientVersion && session.version != nasCleanupSerialExecutionClientVersion && session.version != nasCleanupDedicatedExecutionClientVersion && session.version != nasCleanupRawCreditDrainClientVersion && session.version != nasCleanupFenceProgressClientVersion && session.version != nasCleanupJoinedMarkerClientVersion && session.version != nasCleanupV85RClientVersion && session.version != nasCleanupV85RServerSwitchClientVersion && session.version != nasCleanupV85RCorpusUAClientVersion) {
 		return time.Time{}, nil
 	}
 	var seen *time.Time

@@ -1,7 +1,9 @@
 """Pins, recovered classifier replay, conservative fallback and actual Linux producer."""
+import contextlib
 import copy
 import gzip
 import hashlib
+import http.server
 import io
 import threading
 import importlib.util
@@ -24,6 +26,45 @@ runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
 
 
 class V85rTests(unittest.TestCase):
+    def test_corpus_download_identifies_client_and_rejects_unapproved_bytes(self):
+        from types import SimpleNamespace
+        requests = []
+        body = json.dumps(dict(source_key=[[1, 'a'*64, 10], [2, 'b'*64, 11]],
+                               nomination=False, status='UNKNOWN_fixture')).encode() + b'\n'
+
+        class Edge(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get('Authorization')))
+                if self.headers.get('User-Agent') != pull.USER_AGENT:
+                    self.send_error(403, 'Forbidden')
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with http.server.ThreadingHTTPServer(('127.0.0.1', 0), Edge) as server:
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with tempfile.TemporaryDirectory() as state:
+                    filename = str(Path(state)/'inventory.sqlite3')
+                    with contextlib.closing(sqlite3.connect(filename)) as db:
+                        inventory = SimpleNamespace(lock=threading.RLock(), db=db)
+                        cfg = SimpleNamespace(inventory_file=filename, api_key='fixture',
+                                              api_base='http://127.0.0.1:%d/api/v1' % server.server_port)
+                        with self.assertRaisesRegex(pull.StitchHold, 'frozen corpus hash/census differs'):
+                            pull.stitch_corpus(cfg, inventory)
+                        self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_corpus_meta').fetchone()[0], 0)
+                        self.assertEqual(db.execute('SELECT count(*) FROM v85r_stitch_edges').fetchone()[0], 0)
+                self.assertEqual(requests, [('/api/v1/account/connections/stitch/corpus', 'Bearer fixture')])
+            finally:
+                server.shutdown()
+                worker.join()
+
     def test_all_packaged_files_match_reviewed_pins_and_installed_bytes(self):
         raw=(ROOT/'v85r/manifest.json').read_bytes()
         self.assertEqual(hashlib.sha256(raw).hexdigest(),pull.V85R_MANIFEST_SHA)
