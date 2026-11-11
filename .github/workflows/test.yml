@@ -32,6 +32,8 @@ jobs:
         run: python -I ops/jelly/r2-select/test_app.py -q
       - name: Test supervised Jelly cleanup runner without production access
         run: python -m unittest discover -s ops/jelly/cleanup-runner -p 'test_*.py' -q
+      - name: Test operator R2 conditional-delete probe without production access
+        run: python -m unittest discover -s ops/jelly/r2-retire -p 'test_*.py' -q
       - name: Test finite capability staging on the control host Python version
         run: python -m unittest discover -s infra/collation-v2 -p 'test_*.py' -q
 

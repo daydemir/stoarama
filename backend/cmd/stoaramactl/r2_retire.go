@@ -502,17 +502,19 @@ func (l *r2RetireLedger) Close() error { return l.f.Close() }
 // ---------------------------------------------------------------- apply
 
 type r2RetireApplyOptions struct {
-	ManifestPath   string
-	ExpectedSHA    string
-	PicksPath      string
-	LedgerPath     string
-	MaxBytes       int64
-	Budget24h      int64
-	MaxItems       int64
-	Rate           float64
-	SkipIneligible bool
-	RecordAbsent   bool
-	MaxManifestAge time.Duration
+	DeleteProofPath   string
+	DeleteProofSHA256 string
+	ManifestPath      string
+	ExpectedSHA       string
+	PicksPath         string
+	LedgerPath        string
+	MaxBytes          int64
+	Budget24h         int64
+	MaxItems          int64
+	Rate              float64
+	SkipIneligible    bool
+	RecordAbsent      bool
+	MaxManifestAge    time.Duration
 }
 
 type r2RetireApplySummary struct {
@@ -648,6 +650,9 @@ func r2RetireApply(ctx context.Context, pool *pgxpool.Pool, store r2RetireStore,
 		_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, r2RetireAdvisoryLockKey)
 	}()
 	if h.NASBacked {
+		if err := checkR2RetireDeleteProof(opts.DeleteProofPath, opts.DeleteProofSHA256, h.Bucket); err != nil {
+			return sum, err
+		}
 		var has bool
 		if err := pool.QueryRow(ctx, `SELECT to_regclass('r2_retirement_reservations') IS NOT NULL`).Scan(&has); err != nil {
 			return sum, err
@@ -1190,6 +1195,8 @@ func printR2RetirePlan(w io.Writer, sum r2RetirePlanSummary) {
 func runR2RetireApply(ctx context.Context, cfg config.Config, args []string, usage, policySHA string, windows map[int64]api.Keep28Window) {
 	fs := flag.NewFlagSet("r2-retire apply", flag.ContinueOnError)
 	var opts r2RetireApplyOptions
+	fs.StringVar(&opts.DeleteProofPath, "conditional-delete-proof", "", "operator probe proof (required for NAS-backed apply)")
+	fs.StringVar(&opts.DeleteProofSHA256, "expected-delete-proof-sha256", "", "approved SHA-256 of the conditional-delete proof")
 	fs.StringVar(&opts.ManifestPath, "manifest", "", "manifest.jsonl from r2-retire plan")
 	fs.StringVar(&opts.ExpectedSHA, "expected-sha256", "", "approved manifest digest")
 	fs.Int64Var(&opts.MaxBytes, "max-bytes", 0, "stop before retiring more than this many bytes in this run (required)")
